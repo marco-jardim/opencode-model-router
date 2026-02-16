@@ -1,6 +1,6 @@
 {
   "name": "opencode-model-router",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "OpenCode plugin that routes tasks to tiered subagents (fast/medium/heavy) based on complexity",
   "type": "module",
   "main": "./src/index.ts",
