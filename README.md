@@ -73,7 +73,7 @@ The plugin ships with two presets:
 **openai**:
 | Tier | Model | Notes |
 |------|-------|-------|
-| fast | `openai/gpt-4.1-nano` | Cheapest, fastest |
+| fast | `openai/gpt-5.3-codex-spark` | Cheapest, fastest |
 | medium | `openai/o3` | Medium reasoning effort |
 | heavy | `openai/o3` | High reasoning effort |
 
