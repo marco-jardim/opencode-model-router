@@ -14,6 +14,8 @@ The plugin injects a **delegation protocol** into the system prompt that teaches
 
 The agent automatically delegates via the Task tool when it recognizes the task complexity, or when plan steps are annotated with `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` tags.
 
+This applies both to plan-driven execution and direct ad-hoc requests. For every new user message, the orchestrator performs an intent gate, splits multi-task requests into atomic units, and routes each unit to `@fast`, `@medium`, or `@heavy`.
+
 ## Installation
 
 ### Option A: npm package (recommended)

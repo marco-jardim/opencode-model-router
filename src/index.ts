@@ -112,6 +112,21 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
 
   const rules = cfg.rules.map((r, i) => `${i + 1}. ${r}`).join("\n");
 
+  const directRoutingRules = [
+    "Run an Intent Gate for every new user message, even without a plan file.",
+    "If the message contains multiple asks, split it into atomic tasks before routing.",
+    "Route read-only exploration/search tasks to @fast.",
+    "Route implementation/edit/test/refactor tasks to @medium.",
+    "Route architecture/security/performance/complex debugging tasks to @heavy.",
+    "If a request mixes tiers, delegate each subtask to the right tier and then synthesize one final response.",
+    "If a task is trivial (single grep/read), execute directly instead of delegating.",
+    "When uncertain, default to the configured default tier unless user constraints clearly require another tier.",
+  ];
+
+  const directRoutingList = directRoutingRules
+    .map((rule, index) => `${index + 1}. ${rule}`)
+    .join("\n");
+
   return [
     "## Model Delegation Protocol",
     "",
@@ -127,6 +142,10 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     "",
     "### Rules:",
     rules,
+    "",
+    "### Direct Request Routing (No Plan Required):",
+    "These rules also apply to ad-hoc user requests, not only PLAN.md execution.",
+    directRoutingList,
     "",
     "### How to delegate:",
     "Use the Task tool with the tier name as `subagent_type`:",
