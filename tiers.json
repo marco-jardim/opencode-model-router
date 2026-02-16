@@ -1,0 +1,97 @@
+{
+  "activePreset": "anthropic",
+  "presets": {
+    "anthropic": {
+      "fast": {
+        "model": "anthropic/claude-haiku-4-5",
+        "description": "Haiku 4.5 for exploration, search, and simple reads",
+        "steps": 30,
+        "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "anthropic/claude-sonnet-4-5",
+        "variant": "max",
+        "description": "Sonnet 4.5 max for implementation, refactoring, and tests",
+        "steps": 50,
+        "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "anthropic/claude-opus-4-6",
+        "variant": "max",
+        "description": "Opus 4.6 max for architecture, complex debugging, and security",
+        "steps": 30,
+        "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "openai": {
+      "fast": {
+        "model": "openai/gpt-4.1-nano",
+        "description": "GPT-4.1 Nano for fast exploration and simple tasks",
+        "steps": 30,
+        "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads",
+          "Quick lookups"
+        ]
+      },
+      "medium": {
+        "model": "openai/o3",
+        "reasoning": { "effort": "medium", "summary": "auto" },
+        "description": "o3 medium reasoning for implementation and standard coding",
+        "steps": 50,
+        "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "openai/o3",
+        "reasoning": { "effort": "high", "summary": "detailed" },
+        "description": "o3 high reasoning for architecture and complex tasks",
+        "steps": 30,
+        "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning.",
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    }
+  },
+  "rules": [
+    "When a plan step contains [tier:fast], [tier:medium], or [tier:heavy], delegate to that agent",
+    "When a plan says 'use a fast/cheap model' -> delegate to @fast",
+    "When a plan says 'use a medium/balanced model' -> delegate to @medium",
+    "When a plan says 'use a heavy/powerful model' -> delegate to @heavy",
+    "Default to @medium for implementation tasks you could delegate",
+    "Use @fast for any read-only exploration or research task",
+    "Keep orchestration (planning, decisions, verification) for yourself — delegate execution",
+    "For trivial tasks (single grep, single file read), execute directly without delegation",
+    "Never delegate to @heavy if you are already running on an opus-class model — do it yourself"
+  ],
+  "defaultTier": "medium"
+}
