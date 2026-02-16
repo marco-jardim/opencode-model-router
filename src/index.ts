@@ -1,5 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -37,6 +38,10 @@ interface RouterConfig {
   defaultTier: string;
 }
 
+interface RouterState {
+  activePreset?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Config loader
 // ---------------------------------------------------------------------------
@@ -50,13 +55,59 @@ function configPath(): string {
   return join(getPluginRoot(), "tiers.json");
 }
 
+function statePath(): string {
+  return join(homedir(), ".config", "opencode", "opencode-model-router.state.json");
+}
+
+function resolvePresetName(cfg: RouterConfig, requestedPreset: string): string | undefined {
+  if (cfg.presets[requestedPreset]) {
+    return requestedPreset;
+  }
+
+  const normalized = requestedPreset.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  return Object.keys(cfg.presets).find((name) => name.toLowerCase() === normalized);
+}
+
 function loadConfig(): RouterConfig {
-  return JSON.parse(readFileSync(configPath(), "utf-8")) as RouterConfig;
+  const cfg = JSON.parse(readFileSync(configPath(), "utf-8")) as RouterConfig;
+
+  try {
+    if (existsSync(statePath())) {
+      const state = JSON.parse(readFileSync(statePath(), "utf-8")) as RouterState;
+      if (state.activePreset) {
+        const resolved = resolvePresetName(cfg, state.activePreset);
+        if (resolved) {
+          cfg.activePreset = resolved;
+        }
+      }
+    }
+  } catch {
+    // Ignore state read errors and keep tiers.json active preset
+  }
+
+  return cfg;
 }
 
 function saveActivePreset(presetName: string): void {
   const cfg = loadConfig();
-  cfg.activePreset = presetName;
+  const resolved = resolvePresetName(cfg, presetName);
+  if (!resolved) {
+    return;
+  }
+
+  cfg.activePreset = resolved;
+
+  // Persist user-selected preset outside package cache so it survives npm updates
+  const presetState: RouterState = { activePreset: resolved };
+  const p = statePath();
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(presetState, null, 2) + "\n", "utf-8");
+
+  // Keep local tiers.json in sync as best effort
   writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n", "utf-8");
 }
 
@@ -180,19 +231,22 @@ function buildPresetOutput(cfg: RouterConfig, args: string): string {
   }
 
   // Switch preset
-  if (cfg.presets[requestedPreset]) {
-    saveActivePreset(requestedPreset);
-    const tiers = cfg.presets[requestedPreset]!;
+  const resolvedPreset = resolvePresetName(cfg, requestedPreset);
+  if (resolvedPreset) {
+    saveActivePreset(resolvedPreset);
+    cfg.activePreset = resolvedPreset;
+    const tiers = cfg.presets[resolvedPreset]!;
     const models = Object.entries(tiers)
       .map(([tier, t]) => `  @${tier} -> ${t.model}`)
       .join("\n");
     return [
-      `Preset switched to **${requestedPreset}**.`,
+      `Preset switched to **${resolvedPreset}**.`,
       "",
       models,
       "",
-      "Restart OpenCode for agent registration to take effect.",
-      "System prompt delegation rules will update immediately.",
+      "Selection is now persisted in ~/.config/opencode/opencode-model-router.state.json.",
+      "Restart OpenCode for subagent model registration to take effect.",
+      "System prompt delegation rules update immediately.",
     ].join("\n");
   }
 
