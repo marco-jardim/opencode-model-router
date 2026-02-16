@@ -16,6 +16,16 @@ The agent automatically delegates via the Task tool when it recognizes the task 
 
 This applies both to plan-driven execution and direct ad-hoc requests. For every new user message, the orchestrator performs an intent gate, splits multi-task requests into atomic units, and routes each unit to `@fast`, `@medium`, or `@heavy`.
 
+### Token overhead disclaimer
+
+The injected protocol is compact, but it still adds tokens on every iteration.
+
+- Estimated average injection: ~208 tokens per iteration
+- Preset breakdown (default `tiers.json`): `anthropic` ~209, `openai` ~206
+- Estimation method: `prompt_characters / 4` (rough heuristic)
+
+Real token usage varies by tokenizer/model and any custom changes you make to `tiers.json`.
+
 ## Installation
 
 ### Option A: npm package (recommended)
@@ -25,7 +35,7 @@ Add the plugin package in your `opencode.json`:
 ```json
 {
   "plugin": [
-    "opencode-model-router@1.0.0"
+    "opencode-model-router@latest"
   ]
 }
 ```
