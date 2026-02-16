@@ -79,6 +79,85 @@
           "Performance optimization"
         ]
       }
+    },
+    "github-copilot": {
+      "fast": {
+        "model": "github-copilot/claude-haiku-4-5",
+        "description": "Claude Haiku 4.5 via GitHub Copilot for fast exploration and simple tasks",
+        "steps": 30,
+        "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "github-copilot/claude-sonnet-4-5",
+        "description": "Claude Sonnet 4.5 via GitHub Copilot for implementation, refactoring, and tests",
+        "steps": 50,
+        "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "github-copilot/claude-opus-4-6",
+        "variant": "thinking",
+        "description": "Claude Opus 4.6 via GitHub Copilot for architecture, complex debugging, and security",
+        "steps": 30,
+        "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "google": {
+      "fast": {
+        "model": "google/gemini-2.5-flash",
+        "description": "Gemini 2.5 Flash for fast exploration and simple tasks",
+        "steps": 30,
+        "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "google/gemini-2.5-pro",
+        "description": "Gemini 2.5 Pro for implementation, refactoring, and tests",
+        "steps": 50,
+        "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "google/gemini-3-pro-preview",
+        "description": "Gemini 3 Pro Preview for architecture, complex debugging, and security",
+        "steps": 30,
+        "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
     }
   },
   "rules": [
@@ -88,9 +167,9 @@
     "When a plan says 'use a heavy/powerful model' -> delegate to @heavy",
     "Default to @medium for implementation tasks you could delegate",
     "Use @fast for any read-only exploration or research task",
-    "Keep orchestration (planning, decisions, verification) for yourself — delegate execution",
+    "Keep orchestration (planning, decisions, verification) for yourself - delegate execution",
     "For trivial tasks (single grep, single file read), execute directly without delegation",
-    "Never delegate to @heavy if you are already running on an opus-class model — do it yourself"
+    "Never delegate to @heavy if you are already running on an opus-class model - do it yourself"
   ],
   "defaultTier": "medium"
 }

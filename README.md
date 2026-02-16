@@ -95,7 +95,7 @@ All configuration lives in `tiers.json` at the plugin root. Edit it to match you
 
 ### Presets
 
-The plugin ships with two presets:
+The plugin ships with four presets:
 
 **anthropic** (default):
 | Tier | Model | Notes |
@@ -110,6 +110,20 @@ The plugin ships with two presets:
 | fast | `openai/gpt-5.3-codex-spark` | Cheapest, fastest |
 | medium | `openai/gpt-5.3-codex` | Default settings (no variant/reasoning override) |
 | heavy | `openai/gpt-5.3-codex` | Variant: `xhigh` |
+
+**github-copilot**:
+| Tier | Model | Notes |
+|------|-------|-------|
+| fast | `github-copilot/claude-haiku-4-5` | Cheapest, fastest |
+| medium | `github-copilot/claude-sonnet-4-5` | Balanced coding model |
+| heavy | `github-copilot/claude-opus-4-6` | Variant: `thinking` |
+
+**google**:
+| Tier | Model | Notes |
+|------|-------|-------|
+| fast | `google/gemini-2.5-flash` | Cheapest, fastest |
+| medium | `google/gemini-2.5-pro` | Balanced coding model |
+| heavy | `google/gemini-3-pro-preview` | Strongest reasoning in default set |
 
 Switch presets with the `/preset` command:
 
