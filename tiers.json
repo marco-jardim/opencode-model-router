@@ -44,8 +44,8 @@
     },
     "openai": {
       "fast": {
-        "model": "openai/gpt-4.1-nano",
-        "description": "GPT-4.1 Nano for fast exploration and simple tasks",
+        "model": "openai/gpt-5.3-codex-spark",
+        "description": "GPT-5.3 Codex Spark for fast exploration and simple tasks",
         "steps": 30,
         "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
         "whenToUse": [
