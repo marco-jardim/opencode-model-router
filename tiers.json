@@ -55,9 +55,8 @@
         ]
       },
       "medium": {
-        "model": "openai/o3",
-        "reasoning": { "effort": "medium", "summary": "auto" },
-        "description": "o3 medium reasoning for implementation and standard coding",
+        "model": "openai/gpt-5.3-codex",
+        "description": "GPT-5.3 Codex default settings for implementation and standard coding",
         "steps": 50,
         "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
         "whenToUse": [
@@ -68,9 +67,9 @@
         ]
       },
       "heavy": {
-        "model": "openai/o3",
-        "reasoning": { "effort": "high", "summary": "detailed" },
-        "description": "o3 high reasoning for architecture and complex tasks",
+        "model": "openai/gpt-5.3-codex",
+        "variant": "xhigh",
+        "description": "GPT-5.3 Codex xhigh for architecture and complex tasks",
         "steps": 30,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning.",
         "whenToUse": [

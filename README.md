@@ -16,7 +16,29 @@ The agent automatically delegates via the Task tool when it recognizes the task 
 
 ## Installation
 
-### Option A: Local plugin (recommended)
+### Option A: npm package (recommended)
+
+Add the plugin package in your `opencode.json`:
+
+```json
+{
+  "plugin": [
+    "opencode-model-router@1.0.0"
+  ]
+}
+```
+
+If you prefer always getting the latest release, use:
+
+```json
+{
+  "plugin": [
+    "opencode-model-router"
+  ]
+}
+```
+
+### Option B: Local plugin clone
 
 Clone directly into your OpenCode plugins directory:
 
@@ -35,7 +57,7 @@ Then add it to your `opencode.json`:
 }
 ```
 
-### Option B: Reference from anywhere
+### Option C: Reference from anywhere
 
 Clone wherever you want:
 
@@ -74,8 +96,8 @@ The plugin ships with two presets:
 | Tier | Model | Notes |
 |------|-------|-------|
 | fast | `openai/gpt-5.3-codex-spark` | Cheapest, fastest |
-| medium | `openai/o3` | Medium reasoning effort |
-| heavy | `openai/o3` | High reasoning effort |
+| medium | `openai/gpt-5.3-codex` | Default settings (no variant/reasoning override) |
+| heavy | `openai/gpt-5.3-codex` | Variant: `xhigh` |
 
 Switch presets with the `/preset` command:
 
