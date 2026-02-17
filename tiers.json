@@ -17,7 +17,7 @@
         ]
       },
       "medium": {
-        "model": "anthropic/claude-sonnet-4-5",
+        "model": "anthropic/claude-sonnet-4-6",
         "variant": "max",
         "costRatio": 5,
         "description": "Sonnet 4.5 max for implementation, refactoring, and tests",
@@ -102,7 +102,7 @@
         ]
       },
       "medium": {
-        "model": "github-copilot/claude-sonnet-4-5",
+        "model": "github-copilot/claude-sonnet-4-6",
         "costRatio": 5,
         "description": "Claude Sonnet 4.5 via GitHub Copilot for implementation, refactoring, and tests",
         "steps": 50,
@@ -174,9 +174,40 @@
     }
   },
   "taskPatterns": {
-    "fast": ["search", "grep", "read", "git-info", "ls", "lookup-docs/types", "count", "exists-check", "rename"],
-    "medium": ["impl-feature", "refactor", "write-tests", "bugfix(≤2)", "edit-logic", "code-review", "build-fix", "create-file", "db-migrate", "api-endpoint", "config-update"],
-    "heavy": ["arch-design", "debug(≥3fail)", "sec-audit", "perf-opt", "migrate-strategy", "multi-system-integration", "tradeoff-analysis", "rca"]
+    "fast": [
+      "search",
+      "grep",
+      "read",
+      "git-info",
+      "ls",
+      "lookup-docs/types",
+      "count",
+      "exists-check",
+      "rename"
+    ],
+    "medium": [
+      "impl-feature",
+      "refactor",
+      "write-tests",
+      "bugfix(≤2)",
+      "edit-logic",
+      "code-review",
+      "build-fix",
+      "create-file",
+      "db-migrate",
+      "api-endpoint",
+      "config-update"
+    ],
+    "heavy": [
+      "arch-design",
+      "debug(≥3fail)",
+      "sec-audit",
+      "perf-opt",
+      "migrate-strategy",
+      "multi-system-integration",
+      "tradeoff-analysis",
+      "rca"
+    ]
   },
   "modes": {
     "normal": {
@@ -208,10 +239,26 @@
   },
   "fallback": {
     "global": {
-      "anthropic": ["openai", "google", "github-copilot"],
-      "openai": ["anthropic", "google", "github-copilot"],
-      "github-copilot": ["anthropic", "openai", "google"],
-      "google": ["openai", "anthropic", "github-copilot"]
+      "anthropic": [
+        "openai",
+        "google",
+        "github-copilot"
+      ],
+      "openai": [
+        "anthropic",
+        "google",
+        "github-copilot"
+      ],
+      "github-copilot": [
+        "anthropic",
+        "openai",
+        "google"
+      ],
+      "google": [
+        "openai",
+        "anthropic",
+        "github-copilot"
+      ]
     }
   },
   "rules": [
