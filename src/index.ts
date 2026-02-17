@@ -328,11 +328,39 @@ function buildFallbackInstructions(cfg: RouterConfig): string {
 
 function buildTaskTaxonomy(cfg: RouterConfig): string {
   if (!cfg.taskPatterns || Object.keys(cfg.taskPatterns).length === 0) return "";
+  const lines = ["R:"];
+  for (const [tier, patterns] of Object.entries(cfg.taskPatterns)) {
+    if (Array.isArray(patterns) && patterns.length > 0) {
+      lines.push(`@${tier}→${patterns.join("/")}`);
+    }
+  }
+  return lines.join(" ");
+}
 
-  return Object.entries(cfg.taskPatterns)
-    .filter(([_, p]) => Array.isArray(p) && p.length > 0)
-    .map(([tier, patterns]) => `@${tier}→${(patterns as string[]).join("/")}`)
-    .join("\n");
+/**
+ * Injects a multi-phase decomposition hint into the delegation protocol.
+ * Teaches the orchestrator to split composite tasks (explore + implement)
+ * so the cheap @fast tier handles exploration and @medium handles execution.
+ * Only active in normal mode — budget/quality modes have their own override rules.
+ */
+function buildDecomposeHint(cfg: RouterConfig): string {
+  const mode = getActiveMode(cfg);
+  // Budget and quality modes handle this via overrideRules — skip to avoid conflicts
+  if (mode?.overrideRules?.length) return "";
+
+  const tiers = getActiveTiers(cfg);
+  const entries = Object.entries(tiers);
+  if (entries.length < 2) return "";
+
+  // Sort by costRatio ascending to find cheapest (explore) and next (execute) tiers
+  const sorted = [...entries].sort(
+    ([, a], [, b]) => (a.costRatio ?? 1) - (b.costRatio ?? 1)
+  );
+  const cheapest = sorted[0]?.[0];
+  const mid = sorted[1]?.[0];
+  if (!cheapest || !mid) return "";
+
+  return `Multi-phase: split explore(@${cheapest})→execute(@${mid}). Cheapest-first.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,14 +380,12 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     })
     .join(" ");
 
-  // Compact mode
   const mode = getActiveMode(cfg);
   const modeSuffix = cfg.activeMode ? ` mode:${cfg.activeMode}` : "";
 
-  // Compact task routing guide
   const taxonomy = buildTaskTaxonomy(cfg);
+  const decompose = buildDecomposeHint(cfg);
 
-  // Compact rules
   const effectiveRules = mode?.overrideRules?.length ? mode.overrideRules : cfg.rules;
   const rulesLine = effectiveRules.map((r, i) => `${i + 1}.${r}`).join(" ");
 
@@ -369,6 +395,7 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     `## Model Delegation Protocol`,
     `Preset: ${cfg.activePreset}. Tiers: ${tierLine}.${modeSuffix}`,
     ...(taxonomy ? [taxonomy] : []),
+    ...(decompose ? [decompose] : []),
     rulesLine,
     ...(fallback ? [fallback] : []),
     `Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").`,

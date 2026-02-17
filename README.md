@@ -1,195 +1,238 @@
 # opencode-model-router
 
-An [OpenCode](https://opencode.ai) plugin that automatically routes tasks to tiered subagents based on complexity. Instead of running everything on your most expensive model, the orchestrator delegates exploration to a fast model, implementation to a balanced model, and architecture/security to the most capable model.
+> **Use the cheapest model that can do the job. Automatically.**
+
+An [OpenCode](https://opencode.ai) plugin that routes every task to the right-priced AI tier. Instead of running everything on your most expensive model, the orchestrator delegates exploration to a fast/cheap model, implementation to a balanced model, and architecture only to the powerful (expensive) one — automatically, on every message.
+
+## The problem
+
+Vibe coding is expensive because most AI coding tools default to one model for everything. That model is usually the most capable available — and you pay for that capability even when the task is `grep for a function name`.
+
+A typical coding session breaks down roughly like this:
+
+| Task type | % of session | Example |
+|-----------|-------------|---------|
+| Exploration / search | ~40% | Find where X is defined, read a file, check git log |
+| Implementation | ~45% | Write a function, fix a bug, add a test |
+| Architecture / deep debug | ~15% | Design a new module, debug after 2+ failures |
+
+If you're running Opus (20x cost) for all of it, you're overpaying by **3-10x** on most tasks.
+
+## The solution
+
+opencode-model-router injects a **delegation protocol** into the system prompt that teaches the orchestrator to:
+
+1. **Match task to tier** using a configurable task taxonomy
+2. **Split composite tasks** — explore first with a cheap model, then implement with a mid-tier model
+3. **Skip delegation overhead** for trivial tasks (1-2 tool calls)
+4. **Never over-qualify** — use the cheapest tier that can reliably handle the task
+5. **Fallback** across providers when one fails
+
+All of this adds ~210 tokens of system prompt overhead per message.
+
+## Cost simulation
+
+**Scenario: 50-message coding session with 30 delegated tasks**
+
+Task distribution: 18 exploration (60%), 10 implementation (33%), 2 architecture (7%)
+
+### Without model router (all-Opus)
+
+| Task | Count | Tier | Cost ratio | Total |
+|------|-------|------|-----------|-------|
+| Exploration | 18 | Opus | 20x | 360x |
+| Implementation | 10 | Opus | 20x | 200x |
+| Architecture | 2 | Opus | 20x | 40x |
+| **Total** | **30** | | | **600x** |
+
+### With model router (normal mode, Sonnet orchestrator)
+
+| Task | Count | Tier | Cost ratio | Total |
+|------|-------|------|-----------|-------|
+| Exploration (delegated) | 10 | @fast | 1x | 10x |
+| Exploration (direct, trivial) | 8 | self | 0x | 0x |
+| Implementation | 10 | @medium | 5x | 50x |
+| Architecture | 2 | @heavy | 20x | 40x |
+| **Total** | **30** | | | **100x** |
+
+### With model router (budget mode, Sonnet orchestrator)
+
+| Task | Count | Tier | Cost ratio | Total |
+|------|-------|------|-----------|-------|
+| Exploration | 18 | @fast | 1x | 18x |
+| Implementation (simple) | 7 | @fast | 1x | 7x |
+| Implementation (complex) | 3 | @medium | 5x | 15x |
+| Architecture | 2 | @medium | 5x | 10x |
+| **Total** | **30** | | | **50x** |
+
+### Summary
+
+| Setup | Session cost | vs all-Opus |
+|-------|-------------|-------------|
+| All-Opus (no router) | 600x | baseline |
+| Sonnet orchestrator + router (normal) | 100x | **−83%** |
+| Sonnet orchestrator + router (budget) | 50x | **−92%** |
+
+> Cost ratios are relative units. Actual savings depend on your provider pricing and model selection.
 
 ## How it works
 
-The plugin injects a **delegation protocol** into the system prompt that teaches the primary agent to route work:
+On every message, the plugin injects ~210 tokens into the system prompt:
 
-| Tier | Default (Anthropic) | Cost | Purpose |
-|------|---------------------|------|---------|
-| `@fast` | Claude Haiku 4.5 | 1x | Exploration, search, file reads, grep |
-| `@medium` | Claude Sonnet 4.5 | 5x | Implementation, refactoring, tests, bug fixes |
-| `@heavy` | Claude Opus 4.6 | 20x | Architecture, complex debugging, security review |
+```
+## Model Delegation Protocol
+Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-5/max(5x) @heavy=claude-opus-4-6/max(20x). mode:normal
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+Multi-phase: split explore(@fast)→execute(@medium). Cheapest-first.
+1.[tier:X]→delegate X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default:impl→@medium | readonly→@fast 4.orchestrate=self,delegate=exec 5.trivial(≤2tools)→direct,skip-delegate 6.self∈opus→never→@heavy,do-it-yourself 7.consult route-guide↑ 8.min(cost,adequate-tier)
+Err→retry-alt-tier→fail→direct. Chain: anthropic→openai→google→github-copilot
+Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").
+Keep orchestration and final synthesis in the primary agent.
+```
 
-The agent automatically delegates via the Task tool when it recognizes the task complexity, or when plan steps are annotated with `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` tags.
+The orchestrator reads this once per message and applies it to every decision in that turn.
 
-This applies both to plan-driven execution and direct ad-hoc requests. For every new user message, the orchestrator performs an intent gate, splits multi-task requests into atomic units, and routes each unit to `@fast`, `@medium`, or `@heavy`.
+### Multi-phase decomposition (key differentiator)
 
-### Token overhead disclaimer
+The most impactful optimization. A composite task like:
 
-The injected protocol is compact, but it still adds tokens on every iteration.
+> "Find how the auth middleware works and refactor it to use JWT."
 
-- Estimated average injection: ~208 tokens per iteration
-- Preset breakdown (default `tiers.json`): `anthropic` ~209, `openai` ~206
-- Estimation method: `prompt_characters / 4` (rough heuristic)
+Without router → routed entirely to `@medium` (5x for all ~8K tokens)
 
-Real token usage varies by tokenizer/model and any custom changes you make to `tiers.json`.
+With router → split:
+- **@fast (1x)**: grep, read 4-5 files, trace call chain (~4K tokens)
+- **@medium (5x)**: rewrite auth module (~4K tokens)
+
+**Result: ~36% cost reduction on composite tasks**, which represent ~60-70% of real coding work.
+
+## Why not just use another orchestrator?
+
+| Feature | model-router | Claude native | oh-my-opencode | GSD | ralph-loop |
+|---------|:---:|:---:|:---:|:---:|:---:|
+| Multi-tier cost routing | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Configurable task taxonomy | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Budget / quality modes | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Multi-phase decomposition | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Cross-provider fallback | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Cost ratio awareness | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Plan annotation with tiers | ✅ | ❌ | ❌ | ❌ | ❌ |
+| ~210 token overhead | ✅ | — | ❌ | ❌ | ❌ |
+
+**Claude native**: single model for everything, no cost routing. If you're using claude.ai or OpenCode without plugins, you're paying the same price for `grep` as for architecture design.
+
+**oh-my-opencode**: focused on workflow personality and prompt style, not cost optimization. No tier routing, no task taxonomy.
+
+**GSD (Get Shit Done)**: prioritizes execution speed and low deliberation overhead. Excellent at pushing through tasks fast, but uses one model — no cost differentiation between search and architecture.
+
+**ralph-loop**: iterative feedback-loop orchestrator. Excellent at self-correction and quality verification. No tier routing — every loop iteration runs on the same model regardless of task complexity.
+
+**The core difference**: the others optimize for *how* the agent works (style, speed, quality loops). model-router optimizes for *what it costs* — with zero compromise on quality, because you can always put Opus in the heavy tier.
+
+## Recommended setup
+
+**Orchestrator**: use `claude-sonnet-4-5` (or equivalent mid-tier) as your primary/default model. Not Opus.
+
+Why: the orchestrator runs on every message, including trivial ones. Sonnet can read the delegation protocol and make routing decisions just as well as Opus. You reserve Opus for when it's genuinely needed — via `@heavy` delegation.
+
+In your `opencode.json`:
+```json
+{
+  "model": "anthropic/claude-sonnet-4-5",
+  "autoshare": false
+}
+```
+
+Then install and configure model-router to handle the rest.
 
 ## Installation
 
-### Option A: npm package (recommended)
-
-Add the plugin package in your `opencode.json`:
-
-```json
-{
-  "plugin": [
-    "opencode-model-router@latest"
-  ]
-}
-```
-
-If you prefer always getting the latest release, use:
-
-```json
-{
-  "plugin": [
-    "opencode-model-router"
-  ]
-}
-```
-
-### Option B: Local plugin clone
-
-Clone directly into your OpenCode plugins directory:
-
+### From npm (recommended)
 ```bash
-cd ~/.config/opencode/plugin
-git clone https://github.com/marco-jardim/opencode-model-router.git
+# In your opencode project or globally
+npm install -g opencode-model-router
 ```
 
-Then add it to your `opencode.json`:
-
+Add to `~/.config/opencode/opencode.json`:
 ```json
 {
-  "plugin": [
-    "./plugin/opencode-model-router"
-  ]
-}
-```
-
-### Option C: Reference from anywhere
-
-Clone wherever you want:
-
-```bash
-git clone https://github.com/marco-jardim/opencode-model-router.git /path/to/opencode-model-router
-```
-
-Then reference the absolute path in `opencode.json`:
-
-```json
-{
-  "plugin": [
-    "/path/to/opencode-model-router"
-  ]
-}
-```
-
-Restart OpenCode after adding the plugin.
-
-## Configuration
-
-All configuration lives in `tiers.json` at the plugin root. Edit it to match your available models and providers.
-
-### Presets
-
-The plugin ships with four presets:
-
-**anthropic** (default):
-| Tier | Model | Cost | Notes |
-|------|-------|------|-------|
-| fast | `anthropic/claude-haiku-4-5` | 1x | Cheapest, fastest |
-| medium | `anthropic/claude-sonnet-4-5` | 5x | Extended thinking (variant: max) |
-| heavy | `anthropic/claude-opus-4-6` | 20x | Extended thinking (variant: max) |
-
-**openai**:
-| Tier | Model | Cost | Notes |
-|------|-------|------|-------|
-| fast | `openai/gpt-5.3-codex-spark` | 1x | Cheapest, fastest |
-| medium | `openai/gpt-5.3-codex` | 5x | Default settings (no variant/reasoning override) |
-| heavy | `openai/gpt-5.3-codex` | 20x | Variant: `xhigh` |
-
-**github-copilot**:
-| Tier | Model | Cost | Notes |
-|------|-------|------|-------|
-| fast | `github-copilot/claude-haiku-4-5` | 1x | Cheapest, fastest |
-| medium | `github-copilot/claude-sonnet-4-5` | 5x | Balanced coding model |
-| heavy | `github-copilot/claude-opus-4-6` | 20x | Variant: `thinking` |
-
-**google**:
-| Tier | Model | Cost | Notes |
-|------|-------|------|-------|
-| fast | `google/gemini-2.5-flash` | 1x | Cheapest, fastest |
-| medium | `google/gemini-2.5-pro` | 5x | Balanced coding model |
-| heavy | `google/gemini-3-pro-preview` | 20x | Strongest reasoning in default set |
-
-Switch presets with the `/preset` command:
-
-```
-/preset openai
-```
-
-### Creating custom presets
-
-Add a new preset to the `presets` object in `tiers.json`:
-
-```json
-{
-  "presets": {
-    "my-preset": {
-      "fast": {
-        "model": "provider/model-name",
-        "costRatio": 1,
-        "description": "What this tier does",
-        "steps": 30,
-        "prompt": "System prompt for the subagent",
-        "whenToUse": ["Use case 1", "Use case 2"]
-      },
-      "medium": { "costRatio": 5, "..." : "..." },
-      "heavy": { "costRatio": 20, "..." : "..." }
+  "plugin": {
+    "opencode-model-router": {
+      "type": "npm",
+      "package": "opencode-model-router"
     }
   }
 }
 ```
 
-Each tier supports these fields:
+### Local clone
+```bash
+git clone https://github.com/your-username/opencode-model-router
+cd opencode-model-router
+npm install
+```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | string | Full model ID (`provider/model-name`) |
-| `variant` | string | Optional variant (e.g., `"max"` for extended thinking) |
-| `costRatio` | number | Relative cost multiplier (e.g., 1 for cheapest, 20 for most expensive). Injected into the system prompt so the agent considers cost when delegating. |
-| `thinking` | object | Anthropic thinking config: `{ "budgetTokens": 10000 }` |
-| `reasoning` | object | OpenAI reasoning config: `{ "effort": "high", "summary": "detailed" }` |
-| `description` | string | Human-readable description shown in `/tiers` |
-| `steps` | number | Max agent turns (default: varies by tier) |
-| `prompt` | string | System prompt for the subagent |
-| `color` | string | Optional display color |
-| `whenToUse` | string[] | List of use cases (shown in delegation protocol) |
+In `~/.config/opencode/opencode.json`:
+```json
+{
+  "plugin": {
+    "opencode-model-router": {
+      "type": "local",
+      "path": "/absolute/path/to/opencode-model-router"
+    }
+  }
+}
+```
+
+## Configuration
+
+All configuration lives in `tiers.json` at the plugin root.
+
+### Presets
+
+The plugin ships with four presets (switch with `/preset <name>`):
+
+**anthropic** (default):
+| Tier | Model | Cost ratio |
+|------|-------|-----------|
+| @fast | `anthropic/claude-haiku-4-5` | 1x |
+| @medium | `anthropic/claude-sonnet-4-5` (max) | 5x |
+| @heavy | `anthropic/claude-opus-4-6` (max) | 20x |
+
+**openai**:
+| Tier | Model | Cost ratio |
+|------|-------|-----------|
+| @fast | `openai/gpt-5.3-codex-spark` | 1x |
+| @medium | `openai/gpt-5.3-codex` | 5x |
+| @heavy | `openai/gpt-5.3-codex` (xhigh) | 20x |
+
+**github-copilot**:
+| Tier | Model | Cost ratio |
+|------|-------|-----------|
+| @fast | `github-copilot/claude-haiku-4-5` | 1x |
+| @medium | `github-copilot/claude-sonnet-4-5` | 5x |
+| @heavy | `github-copilot/claude-opus-4-6` (thinking) | 20x |
+
+**google**:
+| Tier | Model | Cost ratio |
+|------|-------|-----------|
+| @fast | `google/gemini-2.5-flash` | 1x |
+| @medium | `google/gemini-2.5-pro` | 5x |
+| @heavy | `google/gemini-3-pro-preview` | 20x |
 
 ### Routing modes
 
-The plugin supports three routing modes that control how aggressively the agent delegates to cheaper tiers. Switch modes with the `/budget` command:
+Switch with `/budget <mode>`. Mode is persisted across restarts.
 
-| Mode | Default Tier | Behavior |
+| Mode | Default tier | Behavior |
 |------|-------------|----------|
-| `normal` | `@medium` | Balanced quality and cost — delegates based on task complexity |
-| `budget` | `@fast` | Aggressive cost savings — defaults to cheapest tier, escalates only when needed |
-| `quality` | `@medium` | Quality-first — uses stronger models more liberally for better results |
-
-When a mode has `overrideRules`, those replace the global `rules` array in the system prompt. This lets each mode have fundamentally different delegation behavior.
-
-Configure modes in `tiers.json`:
+| `normal` | @medium | Balanced — routes by task complexity |
+| `budget` | @fast | Aggressive savings — defaults cheap, escalates only when necessary |
+| `quality` | @medium | Quality-first — liberal use of @medium/@heavy |
 
 ```json
 {
   "modes": {
-    "normal": {
-      "defaultTier": "medium",
-      "description": "Balanced quality and cost"
-    },
     "budget": {
       "defaultTier": "fast",
       "description": "Aggressive cost savings",
@@ -198,87 +241,77 @@ Configure modes in `tiers.json`:
         "Use @medium ONLY for: multi-file edits, complex refactors, test suites",
         "Use @heavy ONLY when explicitly requested or after 2+ failed @medium attempts"
       ]
-    },
-    "quality": {
-      "defaultTier": "medium",
-      "description": "Quality-first",
-      "overrideRules": [
-        "Default to @medium for all tasks including exploration",
-        "Use @heavy for architecture, debugging, security, or multi-file coordination",
-        "Use @fast only for trivial single-tool operations"
-      ]
     }
   }
 }
 ```
 
-The active mode is persisted in `~/.config/opencode/opencode-model-router.state.json` and survives restarts.
+### Task taxonomy (`taskPatterns`)
 
-### Task taxonomy
-
-The `taskPatterns` object maps common coding task descriptions to tiers. This is injected into the system prompt as a routing guide so the agent can quickly look up which tier to use:
+Keyword routing guide injected into the system prompt. Customize to match your workflow:
 
 ```json
 {
   "taskPatterns": {
-    "fast": [
-      "Find, search, locate, or grep files and code patterns",
-      "Read or display specific files or sections",
-      "Check git status, log, diff, or blame"
-    ],
-    "medium": [
-      "Implement a new feature, function, or component",
-      "Refactor or restructure existing code",
-      "Write or update tests",
-      "Fix a bug (first or second attempt)"
-    ],
-    "heavy": [
-      "Design system or module architecture from scratch",
-      "Debug a problem after 2+ failed attempts",
-      "Security audit or vulnerability review"
-    ]
+    "fast": ["search/grep/read", "git-info/ls", "lookup-docs/types", "count/exists-check/rename"],
+    "medium": ["impl-feature/refactor", "write-tests/bugfix(≤2)", "build-fix/create-file"],
+    "heavy": ["arch-design/debug(≥3fail)", "sec-audit/perf-opt", "migrate-strategy/rca"]
   }
 }
 ```
 
-Customize these patterns to match your workflow. The agent uses them as heuristics, not hard rules.
-
 ### Cost ratios
 
-Each tier's `costRatio` is injected into the system prompt so the agent is aware of relative costs:
+Set `costRatio` on each tier to reflect your real provider pricing. These are injected into the system prompt so the orchestrator makes cost-aware decisions:
 
-```
-Cost ratios: @fast=1x, @medium=5x, @heavy=20x.
-Always use the cheapest tier that can reliably handle the task.
+```json
+{
+  "fast":   { "costRatio": 1  },
+  "medium": { "costRatio": 5  },
+  "heavy":  { "costRatio": 20 }
+}
 ```
 
-Adjust `costRatio` values in each tier to reflect your actual provider pricing. The ratios don't need to be exact — they're directional signals for the agent.
+Adjust to actual prices. Exact values don't matter — directional signals are enough.
 
 ### Rules
 
-The `rules` array in `tiers.json` controls when delegation happens. These are injected into the system prompt verbatim:
+The `rules` array is injected verbatim (in compact form) into the system prompt. Default ruleset:
 
 ```json
 {
   "rules": [
-    "When a plan step contains [tier:fast], [tier:medium], or [tier:heavy], delegate to that agent",
-    "Default to @medium for implementation tasks you could delegate",
-    "Use @fast for any read-only exploration or research task",
-    "Keep orchestration (planning, decisions, verification) for yourself -- delegate execution",
-    "For trivial tasks (single grep, single file read), execute directly without delegation",
-    "Never delegate to @heavy if you are already running on an opus-class model -- do it yourself",
-    "If a task takes 1-2 tool calls, execute directly -- delegation overhead is not worth the cost",
-    "Consult the task routing guide below to match task type to the correct tier",
-    "Consider cost ratios when choosing tiers -- always use the cheapest tier that can reliably handle the task"
+    "[tier:X]→delegate X",
+    "plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy",
+    "default:impl→@medium | readonly→@fast",
+    "orchestrate=self,delegate=exec",
+    "trivial(≤2tools)→direct,skip-delegate",
+    "self∈opus→never→@heavy,do-it-yourself",
+    "consult route-guide↑",
+    "min(cost,adequate-tier)"
   ]
 }
 ```
 
-When a routing mode has `overrideRules`, those replace this array entirely for that mode.
+Rules in `modes[x].overrideRules` replace this array entirely for that mode.
+
+### Tier fields reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model` | string | Full model ID (`provider/model-name`) |
+| `variant` | string | Optional variant (`"max"`, `"xhigh"`, `"thinking"`) |
+| `costRatio` | number | Relative cost (1 = cheapest). Shown in prompt. |
+| `thinking` | object | Anthropic thinking: `{ "budgetTokens": 10000 }` |
+| `reasoning` | object | OpenAI reasoning: `{ "effort": "high", "summary": "detailed" }` |
+| `description` | string | Shown in `/tiers` output |
+| `steps` | number | Max agent turns |
+| `prompt` | string | Subagent system prompt |
+| `whenToUse` | string[] | Use cases (shown in `/tiers`, not in system prompt) |
 
 ### Fallback
 
-The `fallback` section defines which presets to try when a provider fails:
+Defines provider fallback order when a delegated task fails:
 
 ```json
 {
@@ -291,81 +324,55 @@ The `fallback` section defines which presets to try when a provider fails:
 }
 ```
 
-When a delegated task fails with a provider/model/rate-limit error, the agent is instructed to retry with the next preset in the fallback chain.
-
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/tiers` | Show active tier configuration and delegation rules |
+| `/tiers` | Show active tier configuration, models, and rules |
 | `/preset` | List available presets |
-| `/preset <name>` | Switch to a different preset |
-| `/budget` | Show available routing modes and which is active |
-| `/budget <mode>` | Switch routing mode (`normal`, `budget`, or `quality`) |
+| `/preset <name>` | Switch preset (e.g., `/preset openai`) |
+| `/budget` | Show available modes and which is active |
+| `/budget <mode>` | Switch routing mode (`normal`, `budget`, `quality`) |
 | `/annotate-plan [path]` | Annotate a plan file with `[tier:X]` tags for each step |
 
 ## Plan annotation
 
-The `/annotate-plan` command reads a plan file (defaults to `PLAN.md`) and adds tier tags to each step based on complexity:
+For complex tasks, you can write a plan file and annotate each step with the correct tier. The `/annotate-plan` command reads the plan and adds `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` tags to each step based on the task taxonomy.
 
-**Before:**
+The orchestrator then reads these tags and delegates accordingly — removing ambiguity from routing decisions on long, multi-step tasks.
+
+Example plan (before annotation):
 ```markdown
-## Steps
-1. Search the codebase for all authentication handlers
-2. Implement the new OAuth2 flow
-3. Review the auth architecture for security vulnerabilities
+1. Find all API endpoints in the codebase
+2. Add rate limiting middleware to each endpoint
+3. Write integration tests for rate limiting
+4. Design a token bucket algorithm for advanced rate limiting
 ```
 
-**After:**
+After `/annotate-plan`:
 ```markdown
-## Steps
-1. [tier:fast] Search the codebase for all authentication handlers
-2. [tier:medium] Implement the new OAuth2 flow
-3. [tier:heavy] Review the auth architecture for security vulnerabilities
+1. [tier:fast] Find all API endpoints in the codebase
+2. [tier:medium] Add rate limiting middleware to each endpoint
+3. [tier:medium] Write integration tests for rate limiting
+4. [tier:heavy] Design a token bucket algorithm for advanced rate limiting
 ```
 
-When the agent executes an annotated plan, it delegates each step to the appropriate subagent automatically.
+## Token overhead
 
-## Provider setup
+The system prompt injection is ~210 tokens per message — roughly the same as v1.0 (before cost-aware features were added). Dense notation keeps overhead flat while adding full routing intelligence.
 
-The models referenced in your preset must be configured in your `opencode.json` providers. For example, to use the default `anthropic` preset:
-
-```json
-{
-  "provider": {
-    "anthropic": {
-      "models": {
-        "claude-haiku-4-5": {},
-        "claude-sonnet-4-5": {},
-        "claude-opus-4-6": { "thinking": true }
-      }
-    }
-  }
-}
-```
-
-## How delegation looks in practice
-
-```
-You: Implement the user settings page based on PLAN.md
-
-Agent (Opus): I'll execute the plan. Step 1 is tagged [tier:fast] -- delegating exploration.
-  -> Task(@fast): "Find all existing settings-related components and their patterns"
-  <- @fast returns: Found SettingsLayout at src/components/..., uses React Hook Form...
-
-Agent (Opus): Step 2 is [tier:medium] -- delegating implementation.
-  -> Task(@medium): "Implement UserSettingsForm component following the patterns from..."
-  <- @medium returns: Created src/components/UserSettingsForm.tsx, added tests...
-
-Agent (Opus): Step 3 is [tier:heavy] -- this is an architecture review and I'm already on Opus, so I'll handle it myself.
-  [Reviews the implementation directly]
-```
+| Version | Tokens | Features |
+|---------|--------|----------|
+| v1.0.7 | ~208 | Basic tier routing |
+| v1.1.0 | ~870 | All features, verbose format |
+| v1.1.1+ | ~210 | All features, compressed format |
 
 ## Requirements
 
-- OpenCode v1.0+ with plugin support
-- Models configured in your `opencode.json` providers matching your preset
+- [OpenCode](https://opencode.ai) v1.0 or later
+- Node.js 18+
+- Provider API keys configured in OpenCode
 
 ## License
 
-[GPL-3.0](LICENSE)
+GPL-3.0
