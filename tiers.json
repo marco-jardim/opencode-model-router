@@ -174,39 +174,9 @@
     }
   },
   "taskPatterns": {
-    "fast": [
-      "Find, search, locate, or grep files and code patterns",
-      "List or show directory structure and file contents",
-      "Read or display specific files or sections",
-      "Check git status, log, diff, or blame",
-      "Lookup documentation, API signatures, or type definitions",
-      "Count occurrences, lines, or matches",
-      "Check if a file, function, or class exists",
-      "Simple rename or string replacement across files"
-    ],
-    "medium": [
-      "Implement a new feature, function, or component",
-      "Refactor or restructure existing code",
-      "Write or update tests",
-      "Fix a bug (first or second attempt)",
-      "Modify or update existing code logic",
-      "Code review with suggested changes",
-      "Run build/lint/test and fix resulting errors",
-      "Create a new file from a template or pattern",
-      "Database migration or schema changes",
-      "API endpoint implementation",
-      "Configuration or dependency updates"
-    ],
-    "heavy": [
-      "Design system or module architecture from scratch",
-      "Debug a problem after 2+ failed attempts",
-      "Security audit or vulnerability review",
-      "Performance profiling and optimization",
-      "Migration strategy (framework, language, infrastructure)",
-      "Complex multi-system integration design",
-      "Evaluate tradeoffs between competing approaches",
-      "Root cause analysis of complex or elusive failures"
-    ]
+    "fast": ["search", "grep", "read", "git-info", "ls", "lookup-docs/types", "count", "exists-check", "rename"],
+    "medium": ["impl-feature", "refactor", "write-tests", "bugfix(≤2)", "edit-logic", "code-review", "build-fix", "create-file", "db-migrate", "api-endpoint", "config-update"],
+    "heavy": ["arch-design", "debug(≥3fail)", "sec-audit", "perf-opt", "migrate-strategy", "multi-system-integration", "tradeoff-analysis", "rca"]
   },
   "modes": {
     "normal": {
@@ -217,22 +187,22 @@
       "defaultTier": "fast",
       "description": "Aggressive cost savings — defaults to cheapest tier, escalates only when needed",
       "overrideRules": [
-        "Default ALL tasks to @fast unless they clearly require code edits or complex reasoning",
-        "Use @medium ONLY for: multi-file edits, complex refactors, test suites, or build-fix cycles",
-        "Use @heavy ONLY when explicitly requested by user or after 2+ failed @medium attempts",
-        "Prefer executing simple tasks directly (grep, read, glob) over delegating — zero delegation overhead",
-        "Batch multiple related searches into a single @fast delegation instead of multiple calls",
-        "When uncertain between @fast and @medium, choose @fast — escalate only on failure"
+        "default→@fast unless edits/complex-reasoning needed",
+        "@medium ONLY: multi-file-edit/refactor/test-suite/build-fix",
+        "@heavy ONLY: user-requested OR ≥2 @medium failures",
+        "trivial(grep/read/glob)→direct,no-delegate",
+        "batch related searches→single @fast",
+        "uncertain @fast vs @medium→@fast,escalate on fail"
       ]
     },
     "quality": {
       "defaultTier": "medium",
       "description": "Quality-first — uses stronger models more liberally for better results",
       "overrideRules": [
-        "Default to @medium for all tasks including exploration when deep context understanding matters",
-        "Use @heavy for any task involving architecture, debugging, security, or multi-file coordination",
-        "Use @fast only for trivial single-tool operations (one grep, one file read)",
-        "Prefer thoroughness over speed — better to over-qualify a task than under-qualify it"
+        "default→@medium incl exploration when deep-context matters",
+        "@heavy: arch/debug/security/multi-file-coord",
+        "@fast ONLY: trivial single-tool ops (1 grep/1 read)",
+        "prefer thoroughness over speed"
       ]
     }
   },
@@ -245,18 +215,14 @@
     }
   },
   "rules": [
-    "When a plan step contains [tier:fast], [tier:medium], or [tier:heavy], delegate to that agent",
-    "When a plan says 'use a fast/cheap model' -> delegate to @fast",
-    "When a plan says 'use a medium/balanced model' -> delegate to @medium",
-    "When a plan says 'use a heavy/powerful model' -> delegate to @heavy",
-    "Default to @medium for implementation tasks you could delegate",
-    "Use @fast for any read-only exploration or research task",
-    "Keep orchestration (planning, decisions, verification) for yourself - delegate execution",
-    "For trivial tasks (single grep, single file read), execute directly without delegation",
-    "Never delegate to @heavy if you are already running on an opus-class model - do it yourself",
-    "If a task takes 1-2 tool calls, execute directly — delegation overhead is not worth the cost",
-    "Consult the task routing guide below to match task type to the correct tier",
-    "Consider cost ratios when choosing tiers — always use the cheapest tier that can reliably handle the task"
+    "[tier:X]→delegate X",
+    "plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy",
+    "default:impl→@medium | readonly→@fast",
+    "orchestrate=self,delegate=exec",
+    "trivial(≤2tools)→direct,skip-delegate",
+    "self∈opus→never→@heavy,do-it-yourself",
+    "consult route-guide↑",
+    "min(cost,adequate-tier)"
   ],
   "defaultTier": "medium"
 }

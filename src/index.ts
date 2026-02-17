@@ -310,23 +310,16 @@ function buildFallbackInstructions(cfg: RouterConfig): string {
   const map = presetMap && Object.keys(presetMap).length > 0 ? presetMap : fb.global;
   if (!map) return "";
 
-  const providerLines = Object.entries(map).flatMap(([provider, presetOrder]) => {
+  const chains = Object.entries(map).flatMap(([provider, presetOrder]) => {
     if (!Array.isArray(presetOrder)) return [];
-    const validOrder = presetOrder.filter(
-      (preset) => preset !== cfg.activePreset && Boolean(cfg.presets[preset]),
+    const valid = presetOrder.filter(
+      (p) => p !== cfg.activePreset && Boolean(cfg.presets[p]),
     );
-    return validOrder.length > 0 ? [`- ${provider}: ${validOrder.join(" -> ")}`] : [];
+    return valid.length > 0 ? [`${provider}→${valid.join("→")}`] : [];
   });
 
-  if (providerLines.length === 0) return "";
-
-  return [
-    "Fallback on delegated task errors:",
-    "1. If Task(...) returns provider/model/rate-limit/timeout/auth errors, retry once with a different tier suited to the same task.",
-    "2. If retry also fails, stop delegating that task and complete it directly in the primary agent.",
-    "3. Use the failing model prefix and this preset fallback order for next-run recovery (`/preset <name>` + restart):",
-    ...providerLines,
-  ].join("\n");
+  if (chains.length === 0) return "";
+  return `Err→retry-alt-tier→fail→direct. Chain: ${chains.join(" | ")}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,24 +329,10 @@ function buildFallbackInstructions(cfg: RouterConfig): string {
 function buildTaskTaxonomy(cfg: RouterConfig): string {
   if (!cfg.taskPatterns || Object.keys(cfg.taskPatterns).length === 0) return "";
 
-  const lines = ["Coding task routing guide:"];
-  for (const [tier, patterns] of Object.entries(cfg.taskPatterns)) {
-    if (Array.isArray(patterns) && patterns.length > 0) {
-      lines.push(`- @${tier}: ${patterns.join(", ")}`);
-    }
-  }
-  return lines.join("\n");
-}
-
-function buildCostAwareness(cfg: RouterConfig): string {
-  const tiers = getActiveTiers(cfg);
-  const costs = Object.entries(tiers)
-    .filter(([_, t]) => t.costRatio != null)
-    .map(([name, t]) => `@${name}=${t.costRatio}x`)
-    .join(", ");
-
-  if (!costs) return "";
-  return `Cost ratios: ${costs}. Always use the cheapest tier that can reliably handle the task.`;
+  return Object.entries(cfg.taskPatterns)
+    .filter(([_, p]) => Array.isArray(p) && p.length > 0)
+    .map(([tier, patterns]) => `@${tier}→${(patterns as string[]).join("/")}`)
+    .join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -363,51 +342,35 @@ function buildCostAwareness(cfg: RouterConfig): string {
 function buildDelegationProtocol(cfg: RouterConfig): string {
   const tiers = getActiveTiers(cfg);
 
-  const tierSummary = Object.entries(tiers)
+  // Compact tier summary: @name=model/variant(costRatio)
+  const tierLine = Object.entries(tiers)
     .map(([name, t]) => {
-      const shortModel = t.model.split("/").pop() ?? t.model;
-      const variant = t.variant ? ` (${t.variant})` : "";
-      return `@${name}=${shortModel}${variant}`;
+      const short = t.model.split("/").pop() ?? t.model;
+      const v = t.variant ? `/${t.variant}` : "";
+      const c = t.costRatio != null ? `(${t.costRatio}x)` : "";
+      return `@${name}=${short}${v}${c}`;
     })
-    .join(" | ");
+    .join(" ");
 
-  // Build per-tier whenToUse descriptions so the agent knows when to pick each tier
-  const tierDescriptions = Object.entries(tiers)
-    .map(([name, t]) => {
-      const uses = t.whenToUse.length > 0 ? t.whenToUse.join(", ") : t.description;
-      return `- @${name}: ${uses}`;
-    })
-    .join("\n");
+  // Compact mode
+  const mode = getActiveMode(cfg);
+  const modeSuffix = cfg.activeMode ? ` mode:${cfg.activeMode}` : "";
 
-  // Task taxonomy from config
+  // Compact task routing guide
   const taxonomy = buildTaskTaxonomy(cfg);
 
-  // Cost awareness
-  const costLine = buildCostAwareness(cfg);
-
-  // Mode-aware rules: if active mode has overrideRules, use those; otherwise use global rules
-  const mode = getActiveMode(cfg);
+  // Compact rules
   const effectiveRules = mode?.overrideRules?.length ? mode.overrideRules : cfg.rules;
-  const numberedRules = effectiveRules
-    .map((rule, i) => `${i + 1}. ${rule}`)
-    .join("\n");
+  const rulesLine = effectiveRules.map((r, i) => `${i + 1}.${r}`).join(" ");
 
-  const fallbackInstructions = buildFallbackInstructions(cfg);
+  const fallback = buildFallbackInstructions(cfg);
 
   return [
-    "## Model Delegation Protocol",
-    `Preset: ${cfg.activePreset}. Tiers: ${tierSummary}.`,
-    "",
-    "Tier capabilities:",
-    tierDescriptions,
-    ...(taxonomy ? ["", taxonomy] : []),
-    ...(costLine ? ["", costLine] : []),
-    ...(mode ? [`\nActive mode: ${cfg.activeMode} (${mode.description})`] : []),
-    "",
-    "Apply to every user message (plan and ad-hoc):",
-    numberedRules,
-    ...(fallbackInstructions ? ["", fallbackInstructions] : []),
-    "",
+    `## Model Delegation Protocol`,
+    `Preset: ${cfg.activePreset}. Tiers: ${tierLine}.${modeSuffix}`,
+    ...(taxonomy ? [taxonomy] : []),
+    rulesLine,
+    ...(fallback ? [fallback] : []),
     `Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").`,
     "Keep orchestration and final synthesis in the primary agent.",
   ].join("\n");
