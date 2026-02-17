@@ -2,7 +2,44 @@
 
 > **Use the cheapest model that can do the job. Automatically.**
 
-An [OpenCode](https://opencode.ai) plugin that routes every task to the right-priced AI tier. Instead of running everything on your most expensive model, the orchestrator delegates exploration to a fast/cheap model, implementation to a balanced model, and architecture only to the powerful (expensive) one — automatically, on every message.
+An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with ~210 tokens of overhead.
+
+## Why it's different
+
+Most AI coding tools give you one model for everything. You pay Opus prices to run `grep`. opencode-model-router changes that with a stack of interlocking ideas:
+
+**Use a mid-tier model as orchestrator.**
+The orchestrator runs on *every* message. Put Sonnet there, not Opus. Sonnet reads a routing protocol and delegates just as well as Opus — at 4x lower cost. Reserve Opus for when it genuinely matters.
+
+**Inject a compressed, LLM-optimized routing protocol.**
+Instead of verbose instructions, the plugin injects ~210 tokens of dense, machine-readable notation the orchestrator understands perfectly. Same routing intelligence as 870 tokens of prose — 75% smaller. Every message, every session.
+
+**Match task to tier using a configurable taxonomy.**
+A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/test`, `@heavy→arch/debug/security`) tells the orchestrator exactly which tier fits each task type. Fully customizable. No ambiguity.
+
+**Split composite tasks: explore cheap, execute smart.**
+"Find how auth works and refactor it" shouldn't cost @medium for the whole thing. The multi-phase decomposition rule splits it: @fast reads the files (1x cost), @medium does the rewrite (5x cost). ~36% savings on composite tasks, which are ~65% of real coding sessions.
+
+**Skip delegation overhead for trivial work.**
+Single grep? One file read? The orchestrator executes directly — zero delegation cost, zero latency.
+
+**Three routing modes for different budgets.**
+`/budget normal` (balanced), `/budget budget` (aggressive savings, defaults everything to @fast), `/budget quality` (liberal use of stronger models). Mode persists across restarts.
+
+**Cost ratios in the prompt.**
+Every tier carries its `costRatio` (fast=1x, medium=5x, heavy=20x) injected into the system prompt. The orchestrator sees the price before deciding. It picks the cheapest tier that can reliably handle the task.
+
+**Orchestrator-awareness.**
+If the orchestrator is already running on Opus, the rule `self∈opus→never→@heavy` fires — it does the heavy work itself rather than delegating to another Opus instance.
+
+**Multi-provider support with automatic fallback.**
+Four presets out of the box: Anthropic, OpenAI, GitHub Copilot, Google. Switch with `/preset`. If a provider fails, the fallback chain tries the next one automatically.
+
+**Plan annotation for long tasks.**
+`/annotate-plan` reads a markdown plan and tags each step with `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` — removing all routing ambiguity from multi-step workflows.
+
+**Fully configurable.**
+Tiers, models, cost ratios, rules, task patterns, routing modes, fallback chains — all in `tiers.json`. No code changes needed.
 
 ## The problem
 
@@ -77,7 +114,9 @@ Task distribution: 18 exploration (60%), 10 implementation (33%), 2 architecture
 
 ## How it works
 
-On every message, the plugin injects ~210 tokens into the system prompt:
+On every message, the plugin injects ~210 tokens into the system prompt. The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it. That's by design: verbose prose would cost 4x more tokens per message with no routing benefit.
+
+What the orchestrator sees (Anthropic preset, normal mode):
 
 ```
 ## Model Delegation Protocol
@@ -90,7 +129,17 @@ Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").
 Keep orchestration and final synthesis in the primary agent.
 ```
 
-The orchestrator reads this once per message and applies it to every decision in that turn.
+**What each line means (for humans):**
+
+| Line | What it encodes |
+|------|----------------|
+| `Tiers: @fast=...(1x) @medium=...(5x) @heavy=...(20x)` | Model + cost ratio per tier, all in one compact token |
+| `R: @fast→search/grep/... @medium→impl/...` | Full task taxonomy — keyword triggers for each tier |
+| `Multi-phase: split explore(@fast)→execute(@medium)` | Composite task decomposition rule |
+| `1.[tier:X]→... 5.trivial(≤2tools)→direct... 6.self∈opus→...` | Numbered routing rules in abbreviated form |
+| `Err→retry-alt-tier→fail→direct. Chain: anthropic→...` | Fallback strategy in one line |
+
+The orchestrator reads this once per message and applies it to every tool call and delegation decision in that turn.
 
 ### Multi-phase decomposition (key differentiator)
 
