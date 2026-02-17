@@ -160,6 +160,14 @@
       }
     }
   },
+  "fallback": {
+    "global": {
+      "anthropic": ["openai", "google", "github-copilot"],
+      "openai": ["anthropic", "google", "github-copilot"],
+      "github-copilot": ["anthropic", "openai", "google"],
+      "google": ["openai", "anthropic", "github-copilot"]
+    }
+  },
   "rules": [
     "When a plan step contains [tier:fast], [tier:medium], or [tier:heavy], delegate to that agent",
     "When a plan says 'use a fast/cheap model' -> delegate to @fast",

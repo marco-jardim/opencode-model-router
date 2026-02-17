@@ -31,11 +31,17 @@ interface TierConfig {
 
 type Preset = Record<string, TierConfig>;
 
+interface FallbackConfig {
+  global?: Record<string, string[]>;
+  presets?: Record<string, Record<string, string[]>>;
+}
+
 interface RouterConfig {
   activePreset: string;
   presets: Record<string, Preset>;
   rules: string[];
   defaultTier: string;
+  fallback?: FallbackConfig;
 }
 
 interface RouterState {
@@ -43,8 +49,16 @@ interface RouterState {
 }
 
 // ---------------------------------------------------------------------------
-// Config loader
+// Config loader with caching
 // ---------------------------------------------------------------------------
+
+let _cachedConfig: RouterConfig | null = null;
+let _configDirty = true;
+
+/** Mark config cache as stale so it is re-read on next access. */
+function invalidateConfigCache(): void {
+  _configDirty = true;
+}
 
 function getPluginRoot(): string {
   const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -72,8 +86,60 @@ function resolvePresetName(cfg: RouterConfig, requestedPreset: string): string |
   return Object.keys(cfg.presets).find((name) => name.toLowerCase() === normalized);
 }
 
+function validateConfig(raw: unknown): RouterConfig {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error("tiers.json: expected a JSON object at root");
+  }
+
+  const obj = raw as Record<string, unknown>;
+
+  if (typeof obj.activePreset !== "string" || !obj.activePreset) {
+    throw new Error("tiers.json: 'activePreset' must be a non-empty string");
+  }
+  if (typeof obj.presets !== "object" || obj.presets === null || Array.isArray(obj.presets)) {
+    throw new Error("tiers.json: 'presets' must be a non-null object");
+  }
+
+  const presets = obj.presets as Record<string, unknown>;
+  for (const [presetName, preset] of Object.entries(presets)) {
+    if (typeof preset !== "object" || preset === null || Array.isArray(preset)) {
+      throw new Error(`tiers.json: preset '${presetName}' must be an object`);
+    }
+    const tiers = preset as Record<string, unknown>;
+    for (const [tierName, tier] of Object.entries(tiers)) {
+      if (typeof tier !== "object" || tier === null) {
+        throw new Error(`tiers.json: tier '${presetName}.${tierName}' must be an object`);
+      }
+      const t = tier as Record<string, unknown>;
+      if (typeof t.model !== "string" || !t.model) {
+        throw new Error(`tiers.json: '${presetName}.${tierName}.model' must be a non-empty string`);
+      }
+      if (typeof t.description !== "string") {
+        throw new Error(`tiers.json: '${presetName}.${tierName}.description' must be a string`);
+      }
+      if (!Array.isArray(t.whenToUse)) {
+        throw new Error(`tiers.json: '${presetName}.${tierName}.whenToUse' must be an array`);
+      }
+    }
+  }
+
+  if (!Array.isArray(obj.rules)) {
+    throw new Error("tiers.json: 'rules' must be an array of strings");
+  }
+  if (typeof obj.defaultTier !== "string") {
+    throw new Error("tiers.json: 'defaultTier' must be a string");
+  }
+
+  return raw as RouterConfig;
+}
+
 function loadConfig(): RouterConfig {
-  const cfg = JSON.parse(readFileSync(configPath(), "utf-8")) as RouterConfig;
+  if (_cachedConfig && !_configDirty) {
+    return _cachedConfig;
+  }
+
+  const raw = JSON.parse(readFileSync(configPath(), "utf-8"));
+  const cfg = validateConfig(raw);
 
   try {
     if (existsSync(statePath())) {
@@ -89,6 +155,8 @@ function loadConfig(): RouterConfig {
     // Ignore state read errors and keep tiers.json active preset
   }
 
+  _cachedConfig = cfg;
+  _configDirty = false;
   return cfg;
 }
 
@@ -101,14 +169,14 @@ function saveActivePreset(presetName: string): void {
 
   cfg.activePreset = resolved;
 
-  // Persist user-selected preset outside package cache so it survives npm updates
+  // Persist user-selected preset to state file only — never mutate tiers.json
   const presetState: RouterState = { activePreset: resolved };
   const p = statePath();
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, JSON.stringify(presetState, null, 2) + "\n", "utf-8");
 
-  // Keep local tiers.json in sync as best effort
-  writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n", "utf-8");
+  // Invalidate cache so next read picks up the new active preset
+  invalidateConfigCache();
 }
 
 function getActiveTiers(cfg: RouterConfig): Preset {
@@ -143,6 +211,37 @@ function buildAgentOptions(tier: TierConfig): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// Fallback instructions builder
+// ---------------------------------------------------------------------------
+
+function buildFallbackInstructions(cfg: RouterConfig): string {
+  const fb = cfg.fallback;
+  if (!fb) return "";
+
+  const presetMap = fb.presets?.[cfg.activePreset];
+  const map = presetMap && Object.keys(presetMap).length > 0 ? presetMap : fb.global;
+  if (!map) return "";
+
+  const providerLines = Object.entries(map).flatMap(([provider, presetOrder]) => {
+    if (!Array.isArray(presetOrder)) return [];
+    const validOrder = presetOrder.filter(
+      (preset) => preset !== cfg.activePreset && Boolean(cfg.presets[preset]),
+    );
+    return validOrder.length > 0 ? [`- ${provider}: ${validOrder.join(" -> ")}`] : [];
+  });
+
+  if (providerLines.length === 0) return "";
+
+  return [
+    "Fallback on delegated task errors:",
+    "1. If Task(...) returns provider/model/rate-limit/timeout/auth errors, retry once with a different tier suited to the same task.",
+    "2. If retry also fails, stop delegating that task and complete it directly in the primary agent.",
+    "3. Use the failing model prefix and this preset fallback order for next-run recovery (`/preset <name>` + restart):",
+    ...providerLines,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // System prompt builder
 // ---------------------------------------------------------------------------
 
@@ -157,21 +256,33 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     })
     .join(" | ");
 
+  // Build per-tier whenToUse descriptions so the agent knows when to pick each tier
+  const tierDescriptions = Object.entries(tiers)
+    .map(([name, t]) => {
+      const uses = t.whenToUse.length > 0 ? t.whenToUse.join(", ") : t.description;
+      return `- @${name}: ${uses}`;
+    })
+    .join("\n");
+
+  // Use configurable rules from tiers.json instead of hardcoded ones
+  const numberedRules = cfg.rules
+    .map((rule, i) => `${i + 1}. ${rule}`)
+    .join("\n");
+
+  const fallbackInstructions = buildFallbackInstructions(cfg);
+
   return [
     "## Model Delegation Protocol",
     `Preset: ${cfg.activePreset}. Tiers: ${tierSummary}.`,
     "",
-    "Apply to every user message (plan and ad-hoc):",
-    "1. Split multi-part requests into atomic tasks.",
-    "2. Respect explicit tier instructions and [tier:fast|medium|heavy] tags.",
-    "3. Route read-only search/exploration tasks to @fast.",
-    "4. Route implementation/edit/refactor/test/bugfix tasks to @medium.",
-    "5. Route architecture/security/performance/complex debugging to @heavy.",
-    "6. For mixed requests, delegate each subtask to the matching tier, then synthesize one final response.",
-    "7. For trivial single read/grep tasks, execute directly.",
-    `8. If uncertain, default to @${cfg.defaultTier}.`,
+    "Tier capabilities:",
+    tierDescriptions,
     "",
-    "Delegate with Task(subagent_type=\"fast|medium|heavy\", prompt=\"...\").",
+    "Apply to every user message (plan and ad-hoc):",
+    numberedRules,
+    ...(fallbackInstructions ? ["", fallbackInstructions] : []),
+    "",
+    `Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").`,
     "Keep orchestration and final synthesis in the primary agent.",
   ].join("\n");
 }
@@ -332,13 +443,13 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     },
 
     // -----------------------------------------------------------------------
-    // Inject delegation protocol — re-reads config each time for live updates
+    // Inject delegation protocol — uses cached config (invalidated on /preset)
     // -----------------------------------------------------------------------
     "experimental.chat.system.transform": async (_input: any, output: any) => {
       try {
-        cfg = loadConfig(); // Re-read for live preset switches
+        cfg = loadConfig(); // Returns cache unless invalidated
       } catch {
-        // Use cached config if file read fails
+        // Use last known config if file read fails
       }
       output.system.push(buildDelegationProtocol(cfg));
     },
