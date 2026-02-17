@@ -22,6 +22,7 @@ interface TierConfig {
   variant?: string;
   thinking?: ThinkingConfig;
   reasoning?: ReasoningConfig;
+  costRatio?: number;
   color?: string;
   description: string;
   steps?: number;
@@ -36,16 +37,26 @@ interface FallbackConfig {
   presets?: Record<string, Record<string, string[]>>;
 }
 
+interface ModeConfig {
+  defaultTier: string;
+  description: string;
+  overrideRules?: string[];
+}
+
 interface RouterConfig {
   activePreset: string;
+  activeMode?: string;
   presets: Record<string, Preset>;
   rules: string[];
   defaultTier: string;
   fallback?: FallbackConfig;
+  taskPatterns?: Record<string, string[]>;
+  modes?: Record<string, ModeConfig>;
 }
 
 interface RouterState {
   activePreset?: string;
+  activeMode?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +141,39 @@ function validateConfig(raw: unknown): RouterConfig {
     throw new Error("tiers.json: 'defaultTier' must be a string");
   }
 
+  // Validate modes if present
+  if (obj.modes !== undefined) {
+    if (typeof obj.modes !== "object" || obj.modes === null || Array.isArray(obj.modes)) {
+      throw new Error("tiers.json: 'modes' must be an object");
+    }
+    const modes = obj.modes as Record<string, unknown>;
+    for (const [modeName, mode] of Object.entries(modes)) {
+      if (typeof mode !== "object" || mode === null) {
+        throw new Error(`tiers.json: mode '${modeName}' must be an object`);
+      }
+      const m = mode as Record<string, unknown>;
+      if (typeof m.defaultTier !== "string") {
+        throw new Error(`tiers.json: mode '${modeName}.defaultTier' must be a string`);
+      }
+      if (typeof m.description !== "string") {
+        throw new Error(`tiers.json: mode '${modeName}.description' must be a string`);
+      }
+    }
+  }
+
+  // Validate taskPatterns if present
+  if (obj.taskPatterns !== undefined) {
+    if (typeof obj.taskPatterns !== "object" || obj.taskPatterns === null || Array.isArray(obj.taskPatterns)) {
+      throw new Error("tiers.json: 'taskPatterns' must be an object");
+    }
+    const tp = obj.taskPatterns as Record<string, unknown>;
+    for (const [tierName, patterns] of Object.entries(tp)) {
+      if (!Array.isArray(patterns)) {
+        throw new Error(`tiers.json: taskPatterns.'${tierName}' must be an array of strings`);
+      }
+    }
+  }
+
   return raw as RouterConfig;
 }
 
@@ -150,14 +194,41 @@ function loadConfig(): RouterConfig {
           cfg.activePreset = resolved;
         }
       }
+      if (state.activeMode && cfg.modes?.[state.activeMode]) {
+        cfg.activeMode = state.activeMode;
+      }
     }
   } catch {
-    // Ignore state read errors and keep tiers.json active preset
+    // Ignore state read errors and keep tiers.json defaults
   }
 
   _cachedConfig = cfg;
   _configDirty = false;
   return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// State persistence helpers
+// ---------------------------------------------------------------------------
+
+/** Read current persisted state (or empty object on failure). */
+function readState(): RouterState {
+  try {
+    if (existsSync(statePath())) {
+      return JSON.parse(readFileSync(statePath(), "utf-8")) as RouterState;
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+/** Write state to disk (merges with existing keys). */
+function writeState(patch: Partial<RouterState>): void {
+  const state = { ...readState(), ...patch };
+  const p = statePath();
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(state, null, 2) + "\n", "utf-8");
 }
 
 function saveActivePreset(presetName: string): void {
@@ -170,12 +241,20 @@ function saveActivePreset(presetName: string): void {
   cfg.activePreset = resolved;
 
   // Persist user-selected preset to state file only — never mutate tiers.json
-  const presetState: RouterState = { activePreset: resolved };
-  const p = statePath();
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(presetState, null, 2) + "\n", "utf-8");
+  writeState({ activePreset: resolved });
 
   // Invalidate cache so next read picks up the new active preset
+  invalidateConfigCache();
+}
+
+function saveActiveMode(modeName: string): void {
+  const cfg = loadConfig();
+  if (!cfg.modes?.[modeName]) {
+    return;
+  }
+
+  cfg.activeMode = modeName;
+  writeState({ activeMode: modeName });
   invalidateConfigCache();
 }
 
@@ -211,6 +290,15 @@ function buildAgentOptions(tier: TierConfig): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// Mode helpers
+// ---------------------------------------------------------------------------
+
+function getActiveMode(cfg: RouterConfig): ModeConfig | undefined {
+  if (!cfg.modes || !cfg.activeMode) return undefined;
+  return cfg.modes[cfg.activeMode];
+}
+
+// ---------------------------------------------------------------------------
 // Fallback instructions builder
 // ---------------------------------------------------------------------------
 
@@ -242,6 +330,33 @@ function buildFallbackInstructions(cfg: RouterConfig): string {
 }
 
 // ---------------------------------------------------------------------------
+// Cost & taxonomy builders
+// ---------------------------------------------------------------------------
+
+function buildTaskTaxonomy(cfg: RouterConfig): string {
+  if (!cfg.taskPatterns || Object.keys(cfg.taskPatterns).length === 0) return "";
+
+  const lines = ["Coding task routing guide:"];
+  for (const [tier, patterns] of Object.entries(cfg.taskPatterns)) {
+    if (Array.isArray(patterns) && patterns.length > 0) {
+      lines.push(`- @${tier}: ${patterns.join(", ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function buildCostAwareness(cfg: RouterConfig): string {
+  const tiers = getActiveTiers(cfg);
+  const costs = Object.entries(tiers)
+    .filter(([_, t]) => t.costRatio != null)
+    .map(([name, t]) => `@${name}=${t.costRatio}x`)
+    .join(", ");
+
+  if (!costs) return "";
+  return `Cost ratios: ${costs}. Always use the cheapest tier that can reliably handle the task.`;
+}
+
+// ---------------------------------------------------------------------------
 // System prompt builder
 // ---------------------------------------------------------------------------
 
@@ -264,8 +379,16 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     })
     .join("\n");
 
-  // Use configurable rules from tiers.json instead of hardcoded ones
-  const numberedRules = cfg.rules
+  // Task taxonomy from config
+  const taxonomy = buildTaskTaxonomy(cfg);
+
+  // Cost awareness
+  const costLine = buildCostAwareness(cfg);
+
+  // Mode-aware rules: if active mode has overrideRules, use those; otherwise use global rules
+  const mode = getActiveMode(cfg);
+  const effectiveRules = mode?.overrideRules?.length ? mode.overrideRules : cfg.rules;
+  const numberedRules = effectiveRules
     .map((rule, i) => `${i + 1}. ${rule}`)
     .join("\n");
 
@@ -277,6 +400,9 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     "",
     "Tier capabilities:",
     tierDescriptions,
+    ...(taxonomy ? ["", taxonomy] : []),
+    ...(costLine ? ["", costLine] : []),
+    ...(mode ? [`\nActive mode: ${cfg.activeMode} (${mode.description})`] : []),
     "",
     "Apply to every user message (plan and ad-hoc):",
     numberedRules,
@@ -318,6 +444,50 @@ function buildTiersOutput(cfg: RouterConfig): string {
   lines.push(`Edit \`tiers.json\` to customize.`);
 
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// /budget command output
+// ---------------------------------------------------------------------------
+
+function buildBudgetOutput(cfg: RouterConfig, args: string): string {
+  const modes = cfg.modes;
+  if (!modes || Object.keys(modes).length === 0) {
+    return 'No modes configured in tiers.json. Add a "modes" section to enable budget mode.';
+  }
+
+  const requested = args.trim().toLowerCase();
+  const currentMode = cfg.activeMode || "normal";
+
+  // No args: show current mode and available modes
+  if (!requested) {
+    const lines = ["# Routing Modes\n"];
+    for (const [name, mode] of Object.entries(modes)) {
+      const active = name === currentMode ? " <- active" : "";
+      lines.push(`- **${name}**${active}: ${mode.description} (default tier: @${mode.defaultTier})`);
+    }
+    lines.push(`\nSwitch with: \`/budget <mode>\``);
+    return lines.join("\n");
+  }
+
+  // Switch mode
+  if (modes[requested]) {
+    saveActiveMode(requested);
+    const mode = modes[requested];
+    return [
+      `Routing mode switched to **${requested}**.`,
+      "",
+      mode.description,
+      `Default tier: @${mode.defaultTier}`,
+      ...(mode.overrideRules?.length
+        ? ["", "Active rules:", ...mode.overrideRules.map((r) => `- ${r}`)]
+        : []),
+      "",
+      "Mode change takes effect immediately on the next message.",
+    ].join("\n");
+  }
+
+  return `Unknown mode: "${requested}". Available: ${Object.keys(modes).join(", ")}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +583,10 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         template: "$ARGUMENTS",
         description: "Show or switch model presets (e.g., /preset openai)",
       };
+      opencodeConfig.command["budget"] = {
+        template: "$ARGUMENTS",
+        description: "Show or switch routing mode (e.g., /budget, /budget budget, /budget quality)",
+      };
       opencodeConfig.command["annotate-plan"] = {
         template: [
           "Annotate the plan with tier directives for model delegation.",
@@ -443,7 +617,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     },
 
     // -----------------------------------------------------------------------
-    // Inject delegation protocol — uses cached config (invalidated on /preset)
+    // Inject delegation protocol — uses cached config (invalidated on /preset or /budget)
     // -----------------------------------------------------------------------
     "experimental.chat.system.transform": async (_input: any, output: any) => {
       try {
@@ -455,7 +629,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     },
 
     // -----------------------------------------------------------------------
-    // Handle /tiers and /preset commands
+    // Handle /tiers, /preset, and /budget commands
     // -----------------------------------------------------------------------
     "command.execute.before": async (input: any, output: any) => {
       if (input.command === "tiers") {
@@ -472,6 +646,16 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         output.parts.push({
           type: "text" as const,
           text: buildPresetOutput(cfg, input.arguments ?? ""),
+        });
+      }
+
+      if (input.command === "budget") {
+        try {
+          cfg = loadConfig();
+        } catch {}
+        output.parts.push({
+          type: "text" as const,
+          text: buildBudgetOutput(cfg, input.arguments ?? ""),
         });
       }
     },

@@ -1,9 +1,11 @@
 {
   "activePreset": "anthropic",
+  "activeMode": "normal",
   "presets": {
     "anthropic": {
       "fast": {
         "model": "anthropic/claude-haiku-4-5",
+        "costRatio": 1,
         "description": "Haiku 4.5 for exploration, search, and simple reads",
         "steps": 30,
         "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
@@ -17,6 +19,7 @@
       "medium": {
         "model": "anthropic/claude-sonnet-4-5",
         "variant": "max",
+        "costRatio": 5,
         "description": "Sonnet 4.5 max for implementation, refactoring, and tests",
         "steps": 50,
         "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
@@ -31,6 +34,7 @@
       "heavy": {
         "model": "anthropic/claude-opus-4-6",
         "variant": "max",
+        "costRatio": 20,
         "description": "Opus 4.6 max for architecture, complex debugging, and security",
         "steps": 30,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
@@ -45,6 +49,7 @@
     "openai": {
       "fast": {
         "model": "openai/gpt-5.3-codex-spark",
+        "costRatio": 1,
         "description": "GPT-5.3 Codex Spark for fast exploration and simple tasks",
         "steps": 30,
         "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
@@ -56,6 +61,7 @@
       },
       "medium": {
         "model": "openai/gpt-5.3-codex",
+        "costRatio": 5,
         "description": "GPT-5.3 Codex default settings for implementation and standard coding",
         "steps": 50,
         "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
@@ -69,6 +75,7 @@
       "heavy": {
         "model": "openai/gpt-5.3-codex",
         "variant": "xhigh",
+        "costRatio": 20,
         "description": "GPT-5.3 Codex xhigh for architecture and complex tasks",
         "steps": 30,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning.",
@@ -83,6 +90,7 @@
     "github-copilot": {
       "fast": {
         "model": "github-copilot/claude-haiku-4-5",
+        "costRatio": 1,
         "description": "Claude Haiku 4.5 via GitHub Copilot for fast exploration and simple tasks",
         "steps": 30,
         "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
@@ -95,6 +103,7 @@
       },
       "medium": {
         "model": "github-copilot/claude-sonnet-4-5",
+        "costRatio": 5,
         "description": "Claude Sonnet 4.5 via GitHub Copilot for implementation, refactoring, and tests",
         "steps": 50,
         "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
@@ -109,6 +118,7 @@
       "heavy": {
         "model": "github-copilot/claude-opus-4-6",
         "variant": "thinking",
+        "costRatio": 20,
         "description": "Claude Opus 4.6 via GitHub Copilot for architecture, complex debugging, and security",
         "steps": 30,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
@@ -123,6 +133,7 @@
     "google": {
       "fast": {
         "model": "google/gemini-2.5-flash",
+        "costRatio": 1,
         "description": "Gemini 2.5 Flash for fast exploration and simple tasks",
         "steps": 30,
         "prompt": "You are a fast exploration agent. Focus on speed and efficiency. Read files, search code, and return findings concisely. Do NOT make edits unless explicitly asked.",
@@ -135,6 +146,7 @@
       },
       "medium": {
         "model": "google/gemini-2.5-pro",
+        "costRatio": 5,
         "description": "Gemini 2.5 Pro for implementation, refactoring, and tests",
         "steps": 50,
         "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
@@ -148,6 +160,7 @@
       },
       "heavy": {
         "model": "google/gemini-3-pro-preview",
+        "costRatio": 20,
         "description": "Gemini 3 Pro Preview for architecture, complex debugging, and security",
         "steps": 30,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
@@ -158,6 +171,69 @@
           "Performance optimization"
         ]
       }
+    }
+  },
+  "taskPatterns": {
+    "fast": [
+      "Find, search, locate, or grep files and code patterns",
+      "List or show directory structure and file contents",
+      "Read or display specific files or sections",
+      "Check git status, log, diff, or blame",
+      "Lookup documentation, API signatures, or type definitions",
+      "Count occurrences, lines, or matches",
+      "Check if a file, function, or class exists",
+      "Simple rename or string replacement across files"
+    ],
+    "medium": [
+      "Implement a new feature, function, or component",
+      "Refactor or restructure existing code",
+      "Write or update tests",
+      "Fix a bug (first or second attempt)",
+      "Modify or update existing code logic",
+      "Code review with suggested changes",
+      "Run build/lint/test and fix resulting errors",
+      "Create a new file from a template or pattern",
+      "Database migration or schema changes",
+      "API endpoint implementation",
+      "Configuration or dependency updates"
+    ],
+    "heavy": [
+      "Design system or module architecture from scratch",
+      "Debug a problem after 2+ failed attempts",
+      "Security audit or vulnerability review",
+      "Performance profiling and optimization",
+      "Migration strategy (framework, language, infrastructure)",
+      "Complex multi-system integration design",
+      "Evaluate tradeoffs between competing approaches",
+      "Root cause analysis of complex or elusive failures"
+    ]
+  },
+  "modes": {
+    "normal": {
+      "defaultTier": "medium",
+      "description": "Balanced quality and cost — delegates based on task complexity"
+    },
+    "budget": {
+      "defaultTier": "fast",
+      "description": "Aggressive cost savings — defaults to cheapest tier, escalates only when needed",
+      "overrideRules": [
+        "Default ALL tasks to @fast unless they clearly require code edits or complex reasoning",
+        "Use @medium ONLY for: multi-file edits, complex refactors, test suites, or build-fix cycles",
+        "Use @heavy ONLY when explicitly requested by user or after 2+ failed @medium attempts",
+        "Prefer executing simple tasks directly (grep, read, glob) over delegating — zero delegation overhead",
+        "Batch multiple related searches into a single @fast delegation instead of multiple calls",
+        "When uncertain between @fast and @medium, choose @fast — escalate only on failure"
+      ]
+    },
+    "quality": {
+      "defaultTier": "medium",
+      "description": "Quality-first — uses stronger models more liberally for better results",
+      "overrideRules": [
+        "Default to @medium for all tasks including exploration when deep context understanding matters",
+        "Use @heavy for any task involving architecture, debugging, security, or multi-file coordination",
+        "Use @fast only for trivial single-tool operations (one grep, one file read)",
+        "Prefer thoroughness over speed — better to over-qualify a task than under-qualify it"
+      ]
     }
   },
   "fallback": {
@@ -177,7 +253,10 @@
     "Use @fast for any read-only exploration or research task",
     "Keep orchestration (planning, decisions, verification) for yourself - delegate execution",
     "For trivial tasks (single grep, single file read), execute directly without delegation",
-    "Never delegate to @heavy if you are already running on an opus-class model - do it yourself"
+    "Never delegate to @heavy if you are already running on an opus-class model - do it yourself",
+    "If a task takes 1-2 tool calls, execute directly — delegation overhead is not worth the cost",
+    "Consult the task routing guide below to match task type to the correct tier",
+    "Consider cost ratios when choosing tiers — always use the cheapest tier that can reliably handle the task"
   ],
   "defaultTier": "medium"
 }
