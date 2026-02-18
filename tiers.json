@@ -36,7 +36,7 @@
         "variant": "max",
         "costRatio": 20,
         "description": "Opus 4.6 max for architecture, complex debugging, and security",
-        "steps": 30,
+        "steps": 120,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
         "whenToUse": [
           "Architecture decisions",
@@ -77,7 +77,7 @@
         "variant": "xhigh",
         "costRatio": 20,
         "description": "GPT-5.3 Codex xhigh for architecture and complex tasks",
-        "steps": 30,
+        "steps": 120,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning.",
         "whenToUse": [
           "Architecture decisions",
@@ -120,7 +120,7 @@
         "variant": "thinking",
         "costRatio": 20,
         "description": "Claude Opus 4.6 via GitHub Copilot for architecture, complex debugging, and security",
-        "steps": 30,
+        "steps": 120,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
         "whenToUse": [
           "Architecture decisions",
@@ -162,7 +162,7 @@
         "model": "google/gemini-3-pro-preview",
         "costRatio": 20,
         "description": "Gemini 3 Pro Preview for architecture, complex debugging, and security",
-        "steps": 30,
+        "steps": 120,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
         "whenToUse": [
           "Architecture decisions",
@@ -206,7 +206,7 @@
         "variant": "max",
         "costRatio": 20,
         "description": "Claude Opus 4.6 max for architecture, complex debugging, and security",
-        "steps": 30,
+        "steps": 120,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
         "whenToUse": [
           "Architecture decisions",
@@ -278,6 +278,17 @@
         "@heavy: arch/debug/security/multi-file-coord",
         "@fast ONLY: trivial single-tool ops (1 grep/1 read)",
         "prefer thoroughness over speed"
+      ]
+    },
+    "deep": {
+      "defaultTier": "heavy",
+      "description": "Deep analysis mode — prioritizes thorough architecture/debug work with long heavy runs",
+      "overrideRules": [
+        "default→@medium for implementation and multi-file changes",
+        "@heavy for architecture/debug/security/tradeoff-analysis by default",
+        "allow long heavy runs before fallback; avoid premature downshift",
+        "trivial(grep/read/glob)→direct,no-delegate",
+        "if task is composite: explore@fast then execute@heavy"
       ]
     }
   },

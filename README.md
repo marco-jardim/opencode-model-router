@@ -23,8 +23,8 @@ A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/te
 **Skip delegation overhead for trivial work.**
 Single grep? One file read? The orchestrator executes directly — zero delegation cost, zero latency.
 
-**Three routing modes for different budgets.**
-`/budget normal` (balanced), `/budget budget` (aggressive savings, defaults everything to @fast), `/budget quality` (liberal use of stronger models). Mode persists across restarts.
+**Four routing modes for different budgets.**
+`/budget normal` (balanced), `/budget budget` (aggressive savings, defaults everything to @fast), `/budget quality` (liberal use of stronger models), `/budget deep` (heavy-first for long architecture/debug runs). Mode persists across restarts.
 
 **Cost ratios in the prompt.**
 Every tier carries its `costRatio` (fast=1x, medium=5x, heavy=20x) injected into the system prompt. The orchestrator sees the price before deciding. It picks the cheapest tier that can reliably handle the task.
@@ -278,6 +278,7 @@ Switch with `/budget <mode>`. Mode is persisted across restarts.
 | `normal` | @medium | Balanced — routes by task complexity |
 | `budget` | @fast | Aggressive savings — defaults cheap, escalates only when necessary |
 | `quality` | @medium | Quality-first — liberal use of @medium/@heavy |
+| `deep` | @heavy | Deep-analysis mode — heavy-first for architecture/debug/security with longer heavy runs |
 
 ```json
 {
@@ -286,14 +287,27 @@ Switch with `/budget <mode>`. Mode is persisted across restarts.
       "defaultTier": "fast",
       "description": "Aggressive cost savings",
       "overrideRules": [
-        "Default ALL tasks to @fast unless they clearly require code edits",
-        "Use @medium ONLY for: multi-file edits, complex refactors, test suites",
-        "Use @heavy ONLY when explicitly requested or after 2+ failed @medium attempts"
+        "default→@fast unless edits/complex-reasoning needed",
+        "@medium ONLY: multi-file-edit/refactor/test-suite/build-fix",
+        "@heavy ONLY: user-requested OR ≥2 @medium failures"
+      ]
+    },
+    "deep": {
+      "defaultTier": "heavy",
+      "description": "Deep analysis mode — prioritizes thorough architecture/debug work with long heavy runs",
+      "overrideRules": [
+        "default→@medium for implementation and multi-file changes",
+        "@heavy for architecture/debug/security/tradeoff-analysis by default",
+        "allow long heavy runs before fallback; avoid premature downshift",
+        "trivial(grep/read/glob)→direct,no-delegate",
+        "if task is composite: explore@fast then execute@heavy"
       ]
     }
   }
 }
 ```
+
+**Heavy tool-call budget:** `@heavy.steps=120` by default across presets (raised from 60) to reduce premature cutoffs on long architecture/debug tasks.
 
 ### Task taxonomy (`taskPatterns`)
 
@@ -381,7 +395,7 @@ Defines provider fallback order when a delegated task fails:
 | `/preset` | List available presets |
 | `/preset <name>` | Switch preset (e.g., `/preset openai`) |
 | `/budget` | Show available modes and which is active |
-| `/budget <mode>` | Switch routing mode (`normal`, `budget`, `quality`) |
+| `/budget <mode>` | Switch routing mode (`normal`, `budget`, `quality`, `deep`) |
 | `/annotate-plan [path]` | Annotate a plan file with `[tier:X]` tags for each step |
 
 ## Plan annotation
