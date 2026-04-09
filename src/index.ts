@@ -580,7 +580,24 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
   let cfg = loadConfig();
   const activeTiers = getActiveTiers(cfg);
 
+  // Track child (subagent) sessions so we can skip delegation protocol
+  // injection for them. Child sessions have a parentID — primary sessions don't.
+  const subagentSessionIDs = new Set<string>();
+
   return {
+    // -----------------------------------------------------------------------
+    // Track subagent sessions via session lifecycle events
+    // -----------------------------------------------------------------------
+    event: async (input: { event: any }) => {
+      const evt = input.event;
+      if (evt.type === "session.created" && evt.properties?.info?.parentID) {
+        subagentSessionIDs.add(evt.properties.info.id);
+      }
+      if (evt.type === "session.deleted") {
+        subagentSessionIDs.delete(evt.properties?.info?.id);
+      }
+    },
+
     // -----------------------------------------------------------------------
     // Register tier agents + commands at load time
     // -----------------------------------------------------------------------
@@ -659,8 +676,8 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     // -----------------------------------------------------------------------
     // Inject delegation protocol — uses cached config (invalidated on /preset or /budget)
     // Only inject for the primary orchestrator, NOT for subagent calls.
-    // Smaller models (e.g. Haiku) get confused by delegation instructions
-    // when they're supposed to just execute a task.
+    // Subagents get confused by delegation instructions when they should
+    // just execute a task (especially smaller models like Haiku).
     // -----------------------------------------------------------------------
     "experimental.chat.system.transform": async (_input: any, output: any) => {
       try {
@@ -669,20 +686,10 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         // Use last known config if file read fails
       }
 
-      // Skip injection when the model matches a registered subagent tier.
-      // This prevents subagents from seeing delegation instructions that
-      // conflict with their task-executor role.
-      const model = _input?.model;
-      if (model) {
-        const tiers = getActiveTiers(cfg);
-        const isSubagentModel = Object.values(tiers).some((tier) => {
-          const parts = tier.model.split("/");
-          const providerID = parts[0];
-          const modelID = parts.slice(1).join("/");
-          return model.providerID === providerID && model.id === modelID;
-        });
-        if (isSubagentModel) return;
-      }
+      // Skip injection for child (subagent) sessions.
+      // Child sessions are detected via session.created events with a parentID.
+      const sessionID = _input?.sessionID;
+      if (sessionID && subagentSessionIDs.has(sessionID)) return;
 
       output.system.push(buildDelegationProtocol(cfg));
     },
