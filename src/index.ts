@@ -81,10 +81,18 @@ function configPath(): string {
 }
 
 function statePath(): string {
-  return join(homedir(), ".config", "opencode", "opencode-model-router.state.json");
+  return join(
+    homedir(),
+    ".config",
+    "opencode",
+    "opencode-model-router.state.json",
+  );
 }
 
-function resolvePresetName(cfg: RouterConfig, requestedPreset: string): string | undefined {
+function resolvePresetName(
+  cfg: RouterConfig,
+  requestedPreset: string,
+): string | undefined {
   if (cfg.presets[requestedPreset]) {
     return requestedPreset;
   }
@@ -94,7 +102,9 @@ function resolvePresetName(cfg: RouterConfig, requestedPreset: string): string |
     return undefined;
   }
 
-  return Object.keys(cfg.presets).find((name) => name.toLowerCase() === normalized);
+  return Object.keys(cfg.presets).find(
+    (name) => name.toLowerCase() === normalized,
+  );
 }
 
 function validateConfig(raw: unknown): RouterConfig {
@@ -107,29 +117,45 @@ function validateConfig(raw: unknown): RouterConfig {
   if (typeof obj.activePreset !== "string" || !obj.activePreset) {
     throw new Error("tiers.json: 'activePreset' must be a non-empty string");
   }
-  if (typeof obj.presets !== "object" || obj.presets === null || Array.isArray(obj.presets)) {
+  if (
+    typeof obj.presets !== "object" ||
+    obj.presets === null ||
+    Array.isArray(obj.presets)
+  ) {
     throw new Error("tiers.json: 'presets' must be a non-null object");
   }
 
   const presets = obj.presets as Record<string, unknown>;
   for (const [presetName, preset] of Object.entries(presets)) {
-    if (typeof preset !== "object" || preset === null || Array.isArray(preset)) {
+    if (
+      typeof preset !== "object" ||
+      preset === null ||
+      Array.isArray(preset)
+    ) {
       throw new Error(`tiers.json: preset '${presetName}' must be an object`);
     }
     const tiers = preset as Record<string, unknown>;
     for (const [tierName, tier] of Object.entries(tiers)) {
       if (typeof tier !== "object" || tier === null) {
-        throw new Error(`tiers.json: tier '${presetName}.${tierName}' must be an object`);
+        throw new Error(
+          `tiers.json: tier '${presetName}.${tierName}' must be an object`,
+        );
       }
       const t = tier as Record<string, unknown>;
       if (typeof t.model !== "string" || !t.model) {
-        throw new Error(`tiers.json: '${presetName}.${tierName}.model' must be a non-empty string`);
+        throw new Error(
+          `tiers.json: '${presetName}.${tierName}.model' must be a non-empty string`,
+        );
       }
       if (typeof t.description !== "string") {
-        throw new Error(`tiers.json: '${presetName}.${tierName}.description' must be a string`);
+        throw new Error(
+          `tiers.json: '${presetName}.${tierName}.description' must be a string`,
+        );
       }
       if (!Array.isArray(t.whenToUse)) {
-        throw new Error(`tiers.json: '${presetName}.${tierName}.whenToUse' must be an array`);
+        throw new Error(
+          `tiers.json: '${presetName}.${tierName}.whenToUse' must be an array`,
+        );
       }
     }
   }
@@ -143,7 +169,11 @@ function validateConfig(raw: unknown): RouterConfig {
 
   // Validate modes if present
   if (obj.modes !== undefined) {
-    if (typeof obj.modes !== "object" || obj.modes === null || Array.isArray(obj.modes)) {
+    if (
+      typeof obj.modes !== "object" ||
+      obj.modes === null ||
+      Array.isArray(obj.modes)
+    ) {
       throw new Error("tiers.json: 'modes' must be an object");
     }
     const modes = obj.modes as Record<string, unknown>;
@@ -153,23 +183,33 @@ function validateConfig(raw: unknown): RouterConfig {
       }
       const m = mode as Record<string, unknown>;
       if (typeof m.defaultTier !== "string") {
-        throw new Error(`tiers.json: mode '${modeName}.defaultTier' must be a string`);
+        throw new Error(
+          `tiers.json: mode '${modeName}.defaultTier' must be a string`,
+        );
       }
       if (typeof m.description !== "string") {
-        throw new Error(`tiers.json: mode '${modeName}.description' must be a string`);
+        throw new Error(
+          `tiers.json: mode '${modeName}.description' must be a string`,
+        );
       }
     }
   }
 
   // Validate taskPatterns if present
   if (obj.taskPatterns !== undefined) {
-    if (typeof obj.taskPatterns !== "object" || obj.taskPatterns === null || Array.isArray(obj.taskPatterns)) {
+    if (
+      typeof obj.taskPatterns !== "object" ||
+      obj.taskPatterns === null ||
+      Array.isArray(obj.taskPatterns)
+    ) {
       throw new Error("tiers.json: 'taskPatterns' must be an object");
     }
     const tp = obj.taskPatterns as Record<string, unknown>;
     for (const [tierName, patterns] of Object.entries(tp)) {
       if (!Array.isArray(patterns)) {
-        throw new Error(`tiers.json: taskPatterns.'${tierName}' must be an array of strings`);
+        throw new Error(
+          `tiers.json: taskPatterns.'${tierName}' must be an array of strings`,
+        );
       }
     }
   }
@@ -187,7 +227,9 @@ function loadConfig(): RouterConfig {
 
   try {
     if (existsSync(statePath())) {
-      const state = JSON.parse(readFileSync(statePath(), "utf-8")) as RouterState;
+      const state = JSON.parse(
+        readFileSync(statePath(), "utf-8"),
+      ) as RouterState;
       if (state.activePreset) {
         const resolved = resolvePresetName(cfg, state.activePreset);
         if (resolved) {
@@ -307,7 +349,8 @@ function buildFallbackInstructions(cfg: RouterConfig): string {
   if (!fb) return "";
 
   const presetMap = fb.presets?.[cfg.activePreset];
-  const map = presetMap && Object.keys(presetMap).length > 0 ? presetMap : fb.global;
+  const map =
+    presetMap && Object.keys(presetMap).length > 0 ? presetMap : fb.global;
   if (!map) return "";
 
   const chains = Object.entries(map).flatMap(([provider, presetOrder]) => {
@@ -327,7 +370,8 @@ function buildFallbackInstructions(cfg: RouterConfig): string {
 // ---------------------------------------------------------------------------
 
 function buildTaskTaxonomy(cfg: RouterConfig): string {
-  if (!cfg.taskPatterns || Object.keys(cfg.taskPatterns).length === 0) return "";
+  if (!cfg.taskPatterns || Object.keys(cfg.taskPatterns).length === 0)
+    return "";
   const lines = ["R:"];
   for (const [tier, patterns] of Object.entries(cfg.taskPatterns)) {
     if (Array.isArray(patterns) && patterns.length > 0) {
@@ -354,7 +398,7 @@ function buildDecomposeHint(cfg: RouterConfig): string {
 
   // Sort by costRatio ascending to find cheapest (explore) and next (execute) tiers
   const sorted = [...entries].sort(
-    ([, a], [, b]) => (a.costRatio ?? 1) - (b.costRatio ?? 1)
+    ([, a], [, b]) => (a.costRatio ?? 1) - (b.costRatio ?? 1),
   );
   const cheapest = sorted[0]?.[0];
   const mid = sorted[1]?.[0];
@@ -386,7 +430,9 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
   const taxonomy = buildTaskTaxonomy(cfg);
   const decompose = buildDecomposeHint(cfg);
 
-  const effectiveRules = mode?.overrideRules?.length ? mode.overrideRules : cfg.rules;
+  const effectiveRules = mode?.overrideRules?.length
+    ? mode.overrideRules
+    : cfg.rules;
   const rulesLine = effectiveRules.map((r, i) => `${i + 1}.${r}`).join(" ");
 
   const fallback = buildFallbackInstructions(cfg);
@@ -454,7 +500,9 @@ function buildBudgetOutput(cfg: RouterConfig, args: string): string {
     const lines = ["# Routing Modes\n"];
     for (const [name, mode] of Object.entries(modes)) {
       const active = name === currentMode ? " <- active" : "";
-      lines.push(`- **${name}**${active}: ${mode.description} (default tier: @${mode.defaultTier})`);
+      lines.push(
+        `- **${name}**${active}: ${mode.description} (default tier: @${mode.defaultTier})`,
+      );
     }
     lines.push(`\nSwitch with: \`/budget <mode>\``);
     return lines.join("\n");
@@ -544,7 +592,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
           model: tier.model,
           mode: "subagent",
           description: tier.description,
-          steps: tier.steps,
+          maxSteps: tier.steps,
           prompt: tier.prompt,
           color: tier.color,
         };
@@ -575,7 +623,8 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       };
       opencodeConfig.command["budget"] = {
         template: "$ARGUMENTS",
-        description: "Show or switch routing mode (e.g., /budget, /budget budget, /budget quality)",
+        description:
+          "Show or switch routing mode (e.g., /budget, /budget budget, /budget quality)",
       };
       opencodeConfig.command["annotate-plan"] = {
         template: [
@@ -602,12 +651,16 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
           "## Output",
           "Rewrite the entire plan in the file with the tags. Do not change the substance — only add tags and break mixed steps.",
         ].join("\n"),
-        description: "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
+        description:
+          "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
       };
     },
 
     // -----------------------------------------------------------------------
     // Inject delegation protocol — uses cached config (invalidated on /preset or /budget)
+    // Only inject for the primary orchestrator, NOT for subagent calls.
+    // Smaller models (e.g. Haiku) get confused by delegation instructions
+    // when they're supposed to just execute a task.
     // -----------------------------------------------------------------------
     "experimental.chat.system.transform": async (_input: any, output: any) => {
       try {
@@ -615,6 +668,22 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       } catch {
         // Use last known config if file read fails
       }
+
+      // Skip injection when the model matches a registered subagent tier.
+      // This prevents subagents from seeing delegation instructions that
+      // conflict with their task-executor role.
+      const model = _input?.model;
+      if (model) {
+        const tiers = getActiveTiers(cfg);
+        const isSubagentModel = Object.values(tiers).some((tier) => {
+          const parts = tier.model.split("/");
+          const providerID = parts[0];
+          const modelID = parts.slice(1).join("/");
+          return model.providerID === providerID && model.id === modelID;
+        });
+        if (isSubagentModel) return;
+      }
+
       output.system.push(buildDelegationProtocol(cfg));
     },
 
@@ -626,7 +695,10 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         try {
           cfg = loadConfig();
         } catch {}
-        output.parts.push({ type: "text" as const, text: buildTiersOutput(cfg) });
+        output.parts.push({
+          type: "text" as const,
+          text: buildTiersOutput(cfg),
+        });
       }
 
       if (input.command === "preset") {
