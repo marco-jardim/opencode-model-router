@@ -580,21 +580,19 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
   let cfg = loadConfig();
   const activeTiers = getActiveTiers(cfg);
 
-  // Track child (subagent) sessions so we can skip delegation protocol
-  // injection for them. Child sessions have a parentID — primary sessions don't.
+  // Track subagent sessions so we can skip delegation protocol injection.
+  // Populated by chat.params (which has the agent name) before system.transform fires.
   const subagentSessionIDs = new Set<string>();
 
   return {
     // -----------------------------------------------------------------------
-    // Track subagent sessions via session lifecycle events
+    // Detect subagent calls via chat.params (has agent field).
+    // When the agent name matches a registered tier, record the sessionID.
     // -----------------------------------------------------------------------
-    event: async (input: { event: any }) => {
-      const evt = input.event;
-      if (evt.type === "session.created" && evt.properties?.info?.parentID) {
-        subagentSessionIDs.add(evt.properties.info.id);
-      }
-      if (evt.type === "session.deleted") {
-        subagentSessionIDs.delete(evt.properties?.info?.id);
+    "chat.params": async (input: any, _output: any) => {
+      const tierNames = Object.keys(activeTiers);
+      if (input.agent && tierNames.includes(input.agent)) {
+        subagentSessionIDs.add(input.sessionID);
       }
     },
 
