@@ -20,7 +20,7 @@
         "model": "anthropic/claude-sonnet-4-6",
         "variant": "max",
         "costRatio": 5,
-        "description": "Sonnet 4.5 max for implementation, refactoring, and tests",
+        "description": "Sonnet 4.6 max for implementation, refactoring, and tests",
         "steps": 50,
         "prompt": "You are an implementation agent. Write clean, production-quality code matching existing project patterns. Run linters/tests after changes when possible.",
         "whenToUse": [
@@ -32,10 +32,10 @@
         ]
       },
       "heavy": {
-        "model": "anthropic/claude-opus-4-6",
-        "variant": "max",
+        "model": "anthropic/claude-opus-4-7",
+        "variant": "high",
         "costRatio": 20,
-        "description": "Opus 4.6 max for architecture, complex debugging, and security",
+        "description": "Opus 4.7 high for architecture, complex debugging, and security",
         "steps": 120,
         "prompt": "You are a senior architecture consultant. Analyze deeply, consider tradeoffs, and provide thorough reasoning. Be exhaustive in your analysis.",
         "whenToUse": [

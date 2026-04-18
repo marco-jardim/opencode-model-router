@@ -446,6 +446,8 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     ...(fallback ? [fallback] : []),
     `Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").`,
     "Keep orchestration and final synthesis in the primary agent.",
+    "OVERRIDE: search/grep/read/lookup → @fast (not explore). explore only for unfamiliar-repo architectural mapping with very-thorough thoroughness.",
+    "This protocol takes precedence over general orchestration guides (CLAUDE.md/AGENTS.md) when they conflict on tier selection.",
   ].join("\n");
 }
 
@@ -586,11 +588,29 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
 
   return {
     // -----------------------------------------------------------------------
-    // Detect subagent calls via chat.params (has agent field).
-    // When the agent name matches a registered tier, record the sessionID.
+    // Detect subagent calls via chat.message. When the agent name matches a
+    // registered tier, record the sessionID so system.transform can skip
+    // delegation-protocol injection.
+    //
+    // IMPORTANT: must be chat.message, NOT chat.params. The opencode hook
+    // order is chat.message -> system.transform -> chat.params, so populating
+    // the Set in chat.params is always one step too late — system.transform
+    // already ran with an empty Set and leaked the "Delegate with Task(...)"
+    // instructions into the subagent's system prompt. Sonnet subagents like
+    // @explore silently ignore that noise, but literal-minded Haiku (@fast)
+    // emits malformed XML tool calls for the nonexistent Task tool, which
+    // surface in the UI as "<parameter>...</parameter>" leakage.
+    //
+    // chat.message fires inside SessionPrompt.createUserMessage() BEFORE the
+    // loop -> LLM.stream path, so by the time system.transform runs the Set
+    // is fully populated and await-safe (yield* on the plugin trigger).
     // -----------------------------------------------------------------------
-    "chat.params": async (input: any, _output: any) => {
-      const tierNames = Object.keys(activeTiers);
+    "chat.message": async (input: any, _output: any) => {
+      // Re-read cfg so /preset switches take effect without restart
+      try {
+        cfg = loadConfig();
+      } catch {}
+      const tierNames = Object.keys(getActiveTiers(cfg));
       if (input.agent && tierNames.includes(input.agent)) {
         subagentSessionIDs.add(input.sessionID);
       }
