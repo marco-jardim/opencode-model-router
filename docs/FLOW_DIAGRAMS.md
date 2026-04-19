@@ -201,8 +201,11 @@
 │                                                                 │
 │ ## Model Delegation Protocol                                    │
 │ Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) ...       │
-│ R: @fast→search/grep/read ... @medium→impl ... @heavy→arch ... │
-│ Multi-phase: split explore(@fast)→execute(@medium). Cheap...   │
+│ R: @fast→broader read-only exploration ... @medium→impl ...    │
+│ @heavy→arch ...                                                │
+│ Multi-phase: prefer explore(@fast)→execute(@medium) when sep... │
+│ One-off direct lookups can stay direct when clearly faster;    │
+│ gather extra context before @heavy only when needed.           │
 │ 1.rule1 2.rule2 3.rule3 ...                                     │
 │ Err→retry-alt-tier→fail→direct. Chain: anthropic→openai...      │
 │ Delegate with Task(subagent_type="fast|medium|heavy"...)        │
@@ -441,4 +444,3 @@ Handler receives: input.arguments = "user input" or null
                         │            ││ options    │
                         └────────────┘└────────────┘
 ```
-

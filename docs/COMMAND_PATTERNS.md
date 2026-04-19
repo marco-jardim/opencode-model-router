@@ -252,8 +252,9 @@ The injected content is built dynamically (lines 370-404):
 ```
 ## Model Delegation Protocol
 Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-6/max(5x) @heavy=claude-opus-4-6/max(20x). mode:normal
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
-Multi-phase: split explore(@fast)→execute(@medium). Cheapest-first.
+R: @fast→broader read-only exploration/search/grep/read/git-info/ls/lookup-docs/type-check/count/exists-check @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
+One-off direct lookups can stay in the primary agent when clearly faster; gather context before @heavy only when more evidence is still needed.
 1.priority rules 2.more rules ...
 Err→retry-alt-tier→fail→direct. Chain: anthropic→openai→github-copilot
 Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").
@@ -427,4 +428,3 @@ function saveActivePreset(presetName: string): void {
 | **Config Caching** | Lines 66-73, 180-208 | Use `invalidateConfigCache()` after state changes |
 | **System Prompt Injection** | `experimental.chat.system.transform` hook, lines 612-619 | Append to `output.system` array |
 | **User Feedback** | Helper functions, lines 410-525 | Markdown formatted strings, no `tui.showToast()` |
-

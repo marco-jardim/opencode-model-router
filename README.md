@@ -17,11 +17,11 @@ Instead of verbose instructions, the plugin injects ~210 tokens of dense, machin
 **Match task to tier using a configurable taxonomy.**
 A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/test`, `@heavy→arch/debug/security`) tells the orchestrator exactly which tier fits each task type. Fully customizable. No ambiguity.
 
-**Split composite tasks: explore cheap, execute smart.**
-"Find how auth works and refactor it" shouldn't cost @medium for the whole thing. The multi-phase decomposition rule splits it: @fast reads the files (1x cost), @medium does the rewrite (5x cost). ~36% savings on composite tasks, which are ~65% of real coding sessions.
+**Split separable composite tasks: explore cheap, execute smart.**
+"Find how auth works and refactor it" shouldn't cost @medium for the whole thing. The multi-phase guidance prefers a split when phases are separable: @fast reads the files (1x cost), @medium does the rewrite (5x cost). ~36% savings on composite tasks, which are ~65% of real coding sessions.
 
 **Skip delegation overhead for trivial work.**
-Single grep? One file read? The orchestrator executes directly — zero delegation cost, zero latency.
+Single grep? One file read (or a quick follow-up)? The orchestrator can execute directly — zero delegation cost, zero latency.
 
 **Four routing modes for different budgets.**
 `/budget normal` (balanced), `/budget budget` (aggressive savings, defaults everything to @fast), `/budget quality` (liberal use of stronger models), `/budget deep` (heavy-first for long architecture/debug runs). Mode persists across restarts.
@@ -122,8 +122,8 @@ What the orchestrator sees (Anthropic preset, normal mode):
 ## Model Delegation Protocol
 Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-5/max(5x) @heavy=claude-opus-4-6/max(20x). mode:normal
 R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
-Multi-phase: split explore(@fast)→execute(@medium). Cheapest-first.
-1.[tier:X]→delegate X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default:impl→@medium | readonly→@fast 4.orchestrate=self,delegate=exec 5.trivial(≤2tools)→direct,skip-delegate 6.self∈opus→never→@heavy,do-it-yourself 7.consult route-guide↑ 8.min(cost,adequate-tier)
+Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
+1.[tier:X] tag in plan→delegate X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default preference: read-only→@fast | implementation→@medium 4.orchestrate=self,execute=subagent 5.trivial(≤1 tool call,no expected follow-up)→direct,skip-delegate 6.before @heavy: gather context first(usually via @fast); if already sufficient, dispatch directly 7.if self is opus: skip-@heavy(do locally), still route broader read-only exploration to @fast 8.min(cost,adequate-tier)
 Err→retry-alt-tier→fail→direct. Chain: anthropic→openai→google→github-copilot
 Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").
 Keep orchestration and final synthesis in the primary agent.
@@ -135,8 +135,8 @@ Keep orchestration and final synthesis in the primary agent.
 |------|----------------|
 | `Tiers: @fast=...(1x) @medium=...(5x) @heavy=...(20x)` | Model + cost ratio per tier, all in one compact token |
 | `R: @fast→search/grep/... @medium→impl/...` | Full task taxonomy — keyword triggers for each tier |
-| `Multi-phase: split explore(@fast)→execute(@medium)` | Composite task decomposition rule |
-| `1.[tier:X]→... 5.trivial(≤2tools)→direct... 6.self∈opus→...` | Numbered routing rules in abbreviated form |
+| `Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable` | Preferred decomposition for separable composite tasks |
+| `1.[tier:X]→... 5.trivial(≤1 tool call)... 6.before @heavy: gather context...` | Numbered routing rules in abbreviated form |
 | `Err→retry-alt-tier→fail→direct. Chain: anthropic→...` | Fallback strategy in one line |
 
 The orchestrator reads this once per message and applies it to every tool call and delegation decision in that turn.
@@ -300,7 +300,7 @@ Switch with `/budget <mode>`. Mode is persisted across restarts.
         "@heavy for architecture/debug/security/tradeoff-analysis by default",
         "allow long heavy runs before fallback; avoid premature downshift",
         "trivial(grep/read/glob)→direct,no-delegate",
-        "if task is composite: explore@fast then execute@heavy"
+        "if task is composite and phases are separable: prefer explore@fast then execute@heavy"
       ]
     }
   }
@@ -346,11 +346,11 @@ The `rules` array is injected verbatim (in compact form) into the system prompt.
   "rules": [
     "[tier:X]→delegate X",
     "plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy",
-    "default:impl→@medium | readonly→@fast",
+    "default preference: read-only work → @fast; implementation → @medium",
     "orchestrate=self,delegate=exec",
-    "trivial(≤2tools)→direct,skip-delegate",
-    "self∈opus→never→@heavy,do-it-yourself",
-    "consult route-guide↑",
+    "trivial (≤1 tool call, no expected follow-up) → direct, skip-delegate",
+    "before dispatching @heavy: gather context first (usually via @fast); if context is already sufficient, dispatch directly",
+    "if self is opus: skip-@heavy (do locally); still prefer routing broader read-only exploration to @fast",
     "min(cost,adequate-tier)"
   ]
 }

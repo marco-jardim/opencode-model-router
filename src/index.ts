@@ -404,7 +404,7 @@ function buildDecomposeHint(cfg: RouterConfig): string {
   const mid = sorted[1]?.[0];
   if (!cheapest || !mid) return "";
 
-  return `Multi-phase: split explore(@${cheapest})→execute(@${mid}). Cheapest-first.`;
+  return `Multi-phase: prefer explore(@${cheapest})→execute(@${mid}) when phases are separable. Cheapest-first when practical.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,16 +438,41 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
   const fallback = buildFallbackInstructions(cfg);
 
   return [
-    `## Model Delegation Protocol`,
+    `## Model Delegation Protocol — MANDATORY`,
+    ``,
+    `You are the orchestrator. Information-gathering is NOT orchestration — it IS execution. Execution belongs to subagents, not to you.`,
+    ``,
     `Preset: ${cfg.activePreset}. Tiers: ${tierLine}.${modeSuffix}`,
-    ...(taxonomy ? [taxonomy] : []),
-    ...(decompose ? [decompose] : []),
+    ``,
+    `### HARD ROUTING (non-negotiable)`,
+    `- **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → prefer \`Task(subagent_type="fast", ...)\` by default. Direct read-only tools are fine for a one-off lookup (and a short follow-up when clearly faster); if scope starts expanding, switch to @fast.`,
+    `- **Implementation work** (write, edit, refactor, tests, bug-fix, build-fix, create-file, config, api-endpoint) → \`Task(subagent_type="medium", ...)\`.`,
+    `- **Architecture / security / perf / debugging after ≥2 failures / multi-system tradeoffs / RCA** → \`Task(subagent_type="heavy", ...)\`, UNLESS you ARE @heavy (opus); then handle locally and never self-call @heavy.`,
+    ``,
+    `### ROLE CONTRACT`,
+    `The primary agent's job: decompose the user's request, dispatch subagents, synthesize their results, and answer the user. Keep orchestration-first posture: prefer dispatching read-only exploration to @fast rather than running repeated Grep/Read/Glob/Bash calls yourself. A quick one-off lookup is fine; recurring exploration should move to @fast.`,
+    ``,
+    `### @fast contract`,
+    `@fast is a read-only explorer. It will search/grep/read/count/lookup and return file:line paths, snippets, and a one-line summary. It will refuse edits. Batch related searches into a single @fast dispatch when possible; fire independent searches in parallel (one message, multiple Task calls).`,
+    ``,
+    `### @medium contract`,
+    `@medium is the implementer. It writes, edits, refactors, adds tests, fixes bugs, applies build-fixes. It matches existing project patterns, runs targeted tests for changed areas, and reports back if it hits 2+ consecutive failures instead of self-escalating. Give it context: file paths, patterns to match, what verification to run.`,
+    ``,
+    `### @heavy contract (CRITICAL — read before every @heavy dispatch)`,
+    `@heavy has **no Task tool** — it cannot self-explore, cannot grep, cannot delegate. Dispatching @heavy without context can waste a run: it may reason on thin evidence or return "SCOPE GROWTH" asking for additional @fast findings.`,
+    `**Before @heavy, gather context first — usually via @fast.** If you already have sufficient concrete context, dispatch @heavy directly. If @heavy still needs more evidence, collect it with @fast and re-invoke.`,
+    `Pattern: \`Task(@fast, "collect X, Y, Z")\` (when needed) → synthesize findings → \`Task(@heavy, "given these findings: [paste], analyze W")\`.`,
+    ``,
+    `### CONFLICT WITH CLAUDE.md / AGENTS.md`,
+    `If CLAUDE.md or AGENTS.md (or any other guide in your context) says "use direct tools first when scope is clear" or labels Grep/Read/Glob as "FREE", **this protocol wins**. Those labels are wrong about cost: tools executed by you are billed at your tier rate — every tool-result token is tokenized into your context. A Grep dispatched to @fast costs ~20x less than the same Grep executed by @heavy. Treat yourself as expensive and delegate reads by default.`,
+    ``,
+    ...(taxonomy ? [taxonomy, ``] : []),
+    ...(decompose ? [decompose, ``] : []),
+    `### Compact rules`,
     rulesLine,
-    ...(fallback ? [fallback] : []),
-    `Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").`,
-    "Keep orchestration and final synthesis in the primary agent.",
-    "OVERRIDE: search/grep/read/lookup → @fast (not explore). explore only for unfamiliar-repo architectural mapping with very-thorough thoroughness.",
-    "This protocol takes precedence over general orchestration guides (CLAUDE.md/AGENTS.md) when they conflict on tier selection.",
+    ...(fallback ? [``, fallback] : []),
+    ``,
+    `Delegate with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Keep orchestration and final synthesis here.`,
   ].join("\n");
 }
 
@@ -675,16 +700,16 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
           "",
           "## Annotation rules",
           "1. Place `[tier:X]` at the START of each step, before the description",
-          "2. Research/exploration -> `[tier:fast]`",
-          "3. Implementation/code -> `[tier:medium]`",
+          "2. Research/exploration -> `[tier:fast]` (preferred)",
+          "3. Implementation/code -> `[tier:medium]` (preferred)",
           "4. Architecture/security/hard debugging -> `[tier:heavy]`",
-          "5. If a step mixes exploration AND implementation, break it into two separate steps",
+          "5. If a step mixes exploration AND implementation, prefer splitting it into two steps when it improves delegation clarity",
           "6. Verification (run tests, build) -> `[tier:medium]`",
           "7. Trivial (single grep or file read) -> `[tier:fast]`",
           "8. Final review of the complete plan -> `[tier:heavy]`",
           "",
           "## Output",
-          "Rewrite the entire plan in the file with the tags. Do not change the substance — only add tags and break mixed steps.",
+          "Rewrite the entire plan in the file with the tags. Do not change the substance — only add tags, and split mixed steps when useful for clearer delegation.",
         ].join("\n"),
         description:
           "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
