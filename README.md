@@ -518,6 +518,38 @@ Detection is by model string, not preset. A `hybrid` preset that mixes providers
 
 No configuration is needed — the prefixes are always applied for Claude-backed tiers. If you want to disable them, override the tier's `prompt` field (per-tier overrides replace the whole prompt, including the prefix).
 
+### Anti-narration guardrail (Claude models)
+
+Thinking-enabled Claude models (especially Sonnet with the `max` variant) sometimes produce progress narration instead of actual work — phrasings like *"Still writing the X function..."*, *"Now I'll implement Y..."*, *"Let me add Z..."* — without the X/Y/Z ever appearing. This is a known thinking-mode failure pattern.
+
+The router counters this on two layers:
+
+**1. Prompt-level clause (prevention).** A dedicated `ANTI-NARRATION` block is appended to every Claude-backed tier prompt and to the Claude-backed orchestrator delegation protocol. It names the forbidden phrasings explicitly and requires concrete output to follow any such phrase. A carve-out preserves legitimate explanation/plan requests from the user.
+
+**2. Post-hoc detector (telemetry).** An `experimental.text.complete` hook scans completed text for narration regex patterns. On match, it:
+
+- Logs a warning to the plugin console:
+  ```
+  [model-router] narration detected (session abc123): "Still writing the auth", "Now I'll add the tests"
+  ```
+- Appends a visible banner to the text as it's rendered to the user:
+  ```
+  [⚠ narration detected: "Still writing the auth", "Now I'll add the tests"]
+  ```
+
+The detector is not blocking — plugin hooks cannot modify tokens mid-stream. It signals post-hoc so you can spot the pattern in the UI and in logs, and judge whether the prompt-level clause is holding up.
+
+Detected patterns (conservative set to minimize false positives):
+
+- `Still (writing|implementing|working on|...) the X`
+- `Now (I'll)? (write|implement|add|...) the X`
+- `Let me (write|implement|add|...) (the )? X`
+- `I'll (now)? (write|implement|...) the X`
+- `Going to (write|implement|...) the X`
+- `Continuing (with|by ...ing) (the )? X`
+
+Applies to all models, not only Claude — but the prompt-level clause is Claude-only, so non-Claude models get detector-only.
+
 ### Tier fields reference
 
 | Field | Type | Description |

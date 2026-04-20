@@ -823,6 +823,73 @@ const CLAUDE_ORCHESTRATOR_PREFIX = [
   "dispatching the right tier, not by you becoming the explorer.",
 ].join("\n");
 
+/**
+ * Anti-narration clause appended to every Claude-model prefix (tier + orchestrator).
+ *
+ * Thinking-enabled Claude models (esp. Sonnet with `max` variant) sometimes
+ * produce progress narration in place of actual work — "Still writing X...",
+ * "Now I'll implement Y...", "Let me add Z..." — without the X/Y/Z ever
+ * appearing. This clause names the pattern, lists specific forbidden phrasings
+ * (A3 — exemplified), and carves out an escape valve for legitimate
+ * explanation/plan requests (A2 — with exception).
+ */
+const CLAUDE_ANTI_NARRATION = [
+  "ANTI-NARRATION — do NOT write progress commentary in your response or",
+  "thinking output. Forbidden phrasings include:",
+  "  - \"Still writing the X function...\"",
+  "  - \"Now I'll implement Y...\"",
+  "  - \"Let me add Z...\"",
+  "  - \"Continuing with W...\"",
+  "  - \"Going to fix V...\"",
+  "",
+  "Each of these signals planning without production. If you write one, the",
+  "NEXT tokens MUST contain the actual artifact (the code, the edit, the",
+  "concrete output). Otherwise, stop and return with status.",
+  "",
+  "Exception: when the user explicitly asks for an explanation, plan, or",
+  "walkthrough, prose is welcome — this rule targets unsolicited progress",
+  "narration during code and implementation tasks.",
+].join("\n");
+
+// ---------------------------------------------------------------------------
+// Narration detector (telemetry — logs + appends banner)
+// ---------------------------------------------------------------------------
+
+/** Regex patterns that flag progress narration without production. */
+const NARRATION_PATTERNS: RegExp[] = [
+  // "Still writing the X", "Still implementing the Y"
+  /\bstill\s+(writing|implementing|working on|adding|creating|fixing|building|refactoring|handling)\s+(the\s+)?\w+/gi,
+  // "Now I'll write the X", "Now writing the Y"
+  /\bnow\s+(i['']ll\s+)?(writ|implement|add|creat|work|fix|build|handl|refactor|updat|mov)\w*\s+(the\s+)?\w+/gi,
+  // "Let me write X", "Let me implement Y"
+  /\blet\s+me\s+(write|implement|add|create|fix|build|handle|refactor|work on|move|update|set up)\s+(the\s+)?\w+/gi,
+  // "I'll write the X", "I'll now implement Y"
+  /\bi['']ll\s+(now\s+)?(write|implement|add|create|fix|build|handle|refactor|set up|work on|move|update)\s+(the\s+)?\w+/gi,
+  // "Going to fix the X"
+  /\bgoing\s+to\s+(write|implement|add|create|fix|build|handle|refactor|set up|work on|move|update)\s+(the\s+)?\w+/gi,
+  // "Continuing with X", "Continuing by adding Y"
+  /\bcontinuing\s+(with|by\s+\w+ing)\s+(the\s+)?\w+/gi,
+];
+
+/** Returns matched narration phrases, deduped and capped. Empty array = no narration detected. */
+function detectNarration(text: string): string[] {
+  if (text.length < 20) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const pattern of NARRATION_PATTERNS) {
+    const matches = text.match(pattern);
+    if (!matches) continue;
+    for (const m of matches) {
+      const trimmed = m.trim().toLowerCase();
+      if (seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      out.push(m.trim());
+      if (out.length >= 5) return out;
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -914,6 +981,31 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     },
 
     // -----------------------------------------------------------------------
+    // Narration detector — flags progress-commentary-without-production.
+    //
+    // Fires per completed text part. Scans for narration patterns; if any
+    // match, logs a warning to the plugin console and appends a visible
+    // banner to the text so the user sees the detection in the UI. This is
+    // telemetry, not blocking — we cannot modify mid-stream generation, only
+    // post-hoc signal.
+    // -----------------------------------------------------------------------
+    "experimental.text.complete": async (input: any, output: any) => {
+      const text = output?.text;
+      if (typeof text !== "string" || text.length < 20) return;
+
+      const found = detectNarration(text);
+      if (found.length === 0) return;
+
+      const quoted = found
+        .map((m) => `"${m.slice(0, 60)}${m.length > 60 ? "…" : ""}"`)
+        .join(", ");
+      console.warn(
+        `[model-router] narration detected (session ${input?.sessionID ?? "?"}): ${quoted}`,
+      );
+      output.text = `${text}\n\n[⚠ narration detected: ${quoted}]`;
+    },
+
+    // -----------------------------------------------------------------------
     // Register tier agents + commands at load time
     // -----------------------------------------------------------------------
     config: async (opencodeConfig: any) => {
@@ -928,7 +1020,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         // Detection is by model string, so hybrid presets get the override
         // only on their Claude-backed tiers.
         const claudePrefix = isClaudeModel(tier.model)
-          ? CLAUDE_TIER_PREFIX[name]
+          ? `${CLAUDE_TIER_PREFIX[name]}\n\n${CLAUDE_ANTI_NARRATION}`
           : undefined;
         const finalPrompt =
           claudePrefix && resolvedPrompt
@@ -1029,7 +1121,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       const orchestratorModel = providerID && modelID ? `${providerID}/${modelID}` : modelID;
       const delegationProtocol = buildDelegationProtocol(cfg);
       const finalProtocol = isClaudeModel(orchestratorModel)
-        ? `${CLAUDE_ORCHESTRATOR_PREFIX}\n\n---\n\n${delegationProtocol}`
+        ? `${CLAUDE_ORCHESTRATOR_PREFIX}\n\n${CLAUDE_ANTI_NARRATION}\n\n---\n\n${delegationProtocol}`
         : delegationProtocol;
 
       output.system.push(finalProtocol);
