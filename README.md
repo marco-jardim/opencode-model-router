@@ -487,6 +487,37 @@ Each tier (`@fast`, `@medium`, `@heavy`) has a system prompt that describes its 
 }
 ```
 
+### Claude-model adversarial prefixes (automatic)
+
+Anthropic models (served directly via `anthropic/*` or routed through other providers as `*/claude-*`) ship with a large cached system prompt that primes them toward broad exploratory Read/Grep/Glob behavior. When such a prompt sits in front of your router instructions, primacy bias and prompt caching weaken the router's authority — subagents ignore caps, orchestrators run read-only work themselves instead of dispatching.
+
+To counteract this, the router **automatically prepends an adversarial opener** to:
+
+- The tier prompt for any tier whose `model` matches a Claude identifier
+- The orchestrator delegation protocol when the session model is a Claude identifier
+
+Detection is by model string, not preset. A `hybrid` preset that mixes providers (e.g. `openai/*` for @fast, `anthropic/*` for @medium and @heavy) gets the override only on its Claude-backed tiers.
+
+**Tone assignment:**
+
+| Target | Tone | Opener label |
+|--------|------|--------------|
+| `@fast` (Claude) | Scoping — conversational | `SCOPE NOTE` |
+| `@medium` (Claude) | Scoping — conversational | `SCOPE NOTE` |
+| `@heavy` (Claude) | Override — firm | `AUTHORITY OVERRIDE` |
+| Orchestrator (Claude) | Override — firm | `AUTHORITY OVERRIDE` |
+
+`@heavy` and the orchestrator use the firmer tone because that's where reconnaissance loops were worst in observed sessions. `@fast` and `@medium` use a softer scoping note to avoid over-correcting legitimate multi-read tasks.
+
+**Detection rules:**
+
+- `anthropic/<anything>` → Claude
+- `<provider>/claude-<anything>` (e.g. `github-copilot/claude-sonnet-4-6`) → Claude
+- `<provider>/<namespace>.claude-<anything>` (e.g. `bedrock/us.anthropic.claude-3-5-sonnet-...`) → Claude
+- Everything else → untouched
+
+No configuration is needed — the prefixes are always applied for Claude-backed tiers. If you want to disable them, override the tier's `prompt` field (per-tier overrides replace the whole prompt, including the prefix).
+
 ### Tier fields reference
 
 | Field | Type | Description |

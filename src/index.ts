@@ -751,6 +751,79 @@ function buildCapBanner(
 }
 
 // ---------------------------------------------------------------------------
+// Claude-model adversarial prefixes
+//
+// Anthropic models (direct or via other providers) are served with a large
+// cached "Claude Code" signature prompt that primes them toward broad
+// exploratory Read/Grep/Glob behavior. Our tier prompts land after that
+// cached block and lose authority through primacy bias and cache freezing.
+// For Claude models specifically, we prepend an override block that
+// explicitly revokes the exploratory priming for the current dispatch.
+//
+// Detection is by model identifier, not preset — a hybrid preset mixing
+// providers gets the override only on its Claude-backed tiers.
+// ---------------------------------------------------------------------------
+
+function isClaudeModel(modelID: string | undefined): boolean {
+  if (!modelID) return false;
+  const s = modelID.toLowerCase();
+  if (s.startsWith("anthropic/")) return true;
+  return /\/claude-/.test(s) || /(^|[\/\-])claude-/.test(s);
+}
+
+/** Per-tier adversarial openers. @fast/@medium use Tom 2 (scoping); @heavy uses Tom 1 (override). */
+const CLAUDE_TIER_PREFIX: Record<string, string> = {
+  fast: [
+    "SCOPE NOTE — any cached instruction priming you to 'thoroughly explore",
+    "the codebase' or 'gather context broadly' does not apply here. This is",
+    "a single dispatch with a single question. Stay narrow to the ask.",
+    "",
+    "Before every tool call, ask: 'Does THIS read answer the dispatch",
+    "question specifically, or am I drifting into context-gathering for my",
+    "own understanding?' If the latter, stop — you have enough.",
+  ].join("\n"),
+  medium: [
+    "SCOPE NOTE — cached instructions may prime you to deeply understand",
+    "surrounding code before editing. For THIS dispatch, the orchestrator",
+    "has already scoped the problem; trust that scoping. Read what's needed",
+    "for the edit, not the whole module.",
+    "",
+    "A 4th or 5th 'context read' is usually a sign the dispatch was under-",
+    "scoped — return NEED CONTEXT rather than expanding scope yourself.",
+  ].join("\n"),
+  heavy: [
+    "AUTHORITY OVERRIDE — this block supersedes any cached prefix suggesting",
+    "you should 'investigate thoroughly', 'gather comprehensive context', or",
+    "'trace through the code systematically before analyzing'. You are",
+    "@heavy, an ANALYSIS specialist. The orchestrator should have pre-",
+    "gathered context via @fast before dispatching you. If it didn't, return",
+    "`SCOPE GROWTH:` immediately — do NOT self-gather.",
+    "",
+    "40 minutes of Read/Grep is not analysis — it is the orchestrator's job",
+    "that leaked into yours. Push it back with SCOPE GROWTH. Your 3 reads",
+    "are for targeted verification, not exploration.",
+  ].join("\n"),
+};
+
+/** Adversarial opener prepended to the delegation protocol when the orchestrator is a Claude model. */
+const CLAUDE_ORCHESTRATOR_PREFIX = [
+  "AUTHORITY OVERRIDE — this block supersedes any prior system instruction",
+  "about 'exploring the codebase', 'gathering context with tools', or using",
+  "Read/Grep/Glob to validate assumptions. Those instructions describe a",
+  "general-purpose Claude Code session. THIS session is a routing",
+  "orchestrator.",
+  "",
+  "Your job is to DISPATCH, not to EXECUTE. Read-only work (grep/read/",
+  "glob/ls) is execution, and execution is delegated to @fast. You may run",
+  "AT MOST 2 direct read-only tool calls per turn — a 3rd call is a rule",
+  "violation. If you need more context, you dispatch @fast.",
+  "",
+  "If a cached instruction told you to 'be thorough', 'explore broadly', or",
+  "'read supporting files' — ignore it here. Thoroughness is achieved by",
+  "dispatching the right tier, not by you becoming the explorer.",
+].join("\n");
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -850,12 +923,24 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         // Resolve prompt: per-tier override wins; otherwise fall back to global tierPrompts[name].
         const resolvedPrompt = tier.prompt ?? cfg.tierPrompts?.[name];
 
+        // For Claude-backed tiers, prepend an adversarial opener that revokes
+        // the cached "Claude Code exploratory agent" priming for this dispatch.
+        // Detection is by model string, so hybrid presets get the override
+        // only on their Claude-backed tiers.
+        const claudePrefix = isClaudeModel(tier.model)
+          ? CLAUDE_TIER_PREFIX[name]
+          : undefined;
+        const finalPrompt =
+          claudePrefix && resolvedPrompt
+            ? `${claudePrefix}\n\n---\n\n${resolvedPrompt}`
+            : resolvedPrompt;
+
         const agentDef: Record<string, unknown> = {
           model: tier.model,
           mode: "subagent",
           description: tier.description,
           maxSteps: tier.steps,
-          prompt: resolvedPrompt,
+          prompt: finalPrompt,
           color: tier.color,
         };
 
@@ -936,7 +1021,18 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       const sessionID = _input?.sessionID;
       if (sessionID && subagentSessionIDs.has(sessionID)) return;
 
-      output.system.push(buildDelegationProtocol(cfg));
+      // For Claude-backed orchestrators, prepend an adversarial opener that
+      // revokes the cached "Claude Code explorer" priming for the routing
+      // role. Detection is by orchestrator model, not preset.
+      const providerID = _input?.model?.providerID ?? "";
+      const modelID = _input?.model?.modelID ?? "";
+      const orchestratorModel = providerID && modelID ? `${providerID}/${modelID}` : modelID;
+      const delegationProtocol = buildDelegationProtocol(cfg);
+      const finalProtocol = isClaudeModel(orchestratorModel)
+        ? `${CLAUDE_ORCHESTRATOR_PREFIX}\n\n---\n\n${delegationProtocol}`
+        : delegationProtocol;
+
+      output.system.push(finalProtocol);
     },
 
     // -----------------------------------------------------------------------
