@@ -358,6 +358,135 @@ The `rules` array is injected verbatim (in compact form) into the system prompt.
 
 Rules in `modes[x].overrideRules` replace this array entirely for that mode.
 
+### Read-only call caps
+
+Subagents carry a cap on their own read-only tool calls (grep/read/glob/ls) per dispatch. Enforcement is **two-layered**: prompt-level stop rules + runtime banners injected into tool results. Baselines (configurable via `tierCaps` — see below):
+
+| Tier | Baseline cap | Orchestrator self-cap |
+|------|-------------:|----------------------:|
+| `@fast` | 8 | — |
+| `@medium` | 5 | — |
+| `@heavy` | 3 | — |
+| Orchestrator (direct tools) | — | 2 per turn (prompt-level only) |
+
+The orchestrator can override any subagent's cap per dispatch by including a directive in the `Task` prompt:
+
+- `CAP:N` — tighten or loosen to N calls (e.g., `CAP:3` for a focused lookup).
+- `CAP:none` — disable the numeric cap entirely (used in `quality` mode and for `@heavy` in `deep` mode).
+
+Omitting the directive falls back to the tier baseline. Subagents may **exceed** their cap with a 1-line `reason:` in the return (target, not hard block).
+
+#### Runtime enforcement (subagents only)
+
+Prompt-level rules alone are unreliable: many models (including strong ones like Opus 4.7) ignore "please stop at N reads" and loop on reconnaissance for tens of minutes. To address this, the plugin tracks read-only tool calls per subagent session and **appends a banner to every read-only tool result** via the `tool.execute.after` hook. The subagent sees this banner inside the tool's own response text — not as advisory system prompt noise — which makes it very hard to ignore.
+
+What the subagent sees inside each `grep`/`read`/`glob`/`ls` result:
+
+```
+...normal tool output...
+
+[cap: 3/5]
+```
+
+Approaching or hitting the cap:
+
+```
+[cap: 4/5]
+[⚠ CAP WARNING: 1 read-only call(s) remaining before forced return]
+```
+
+```
+[cap: 5/5]
+[⚠ CAP REACHED (5/5): your NEXT response MUST be a return — do NOT make another read-only call. Start the response with DONE:, NEED MORE:, NEED CONTEXT:, SCOPE GROWTH:, or ESCALATE:.]
+```
+
+Redundancy (same file re-read, same `grep` pattern re-run):
+
+```
+[cap: 3/5]
+[⚠ REDUNDANT: this is the same grep you ran at call #1. STOP now — repeated reads add no information. Return with DONE/NEED MORE/NEED CONTEXT/SCOPE GROWTH/ESCALATE.]
+```
+
+The orchestrator session is **not tracked** — its self-cap of 2 direct reads per turn is prompt-only. Tool counting applies only to sessions whose `agent` matches a registered tier name.
+
+#### Configuring caps (`tierCaps`)
+
+```json
+{
+  "tierCaps": {
+    "fast": 8,
+    "medium": 5,
+    "heavy": 3
+  }
+}
+```
+
+Values are positive integers. Missing tier → falls back to the hardcoded default (same numbers). Change these to tighten/loosen the baseline without editing any prompt.
+
+#### Return protocol
+
+Independent of the numeric cap, every subagent runs a redundancy check before each new tool call. On stop (cap reached, redundancy detected, scope satisfied, or runtime banner), the subagent returns with exactly one of:
+
+| Return prefix | Meaning |
+|--------------|---------|
+| `DONE: …` | Dispatch request fully satisfied — synthesize into final answer. |
+| `NEED MORE: …` (or `NEED CONTEXT:` for `@medium`, `SCOPE GROWTH:` for `@heavy`) | Subagent needs another targeted round — orchestrator decides what to dispatch. |
+| `ESCALATE: …` | Scope grew beyond the subagent's role — orchestrator re-routes. |
+
+This keeps subagents from burning tokens on repeated lookups when they already have enough context. `CAP:none` lifts the numeric cap but **does not** disable the redundancy check — the runtime still injects `[⚠ REDUNDANT]` banners regardless of cap setting.
+
+**Mode interactions:**
+
+| Mode | Dispatch directive | Orchestrator self-cap |
+|------|-------------------|-----------------------|
+| `normal` | baselines (omit directive) | ≤2 direct reads |
+| `budget` | `CAP:5` @fast, `CAP:2` @medium, `CAP:2` @heavy | ≤1 direct read |
+| `quality` | `CAP:none` on all dispatches | ≤2 direct reads |
+| `deep` | `CAP:none` on `@heavy` only; baselines elsewhere | ≤2 direct reads |
+
+### Tier prompts (`tierPrompts`)
+
+Each tier (`@fast`, `@medium`, `@heavy`) has a system prompt that describes its role, scope, call cap, and return protocol. To avoid duplicating the same string across every preset, the router uses a **global default with per-tier override**:
+
+```json
+{
+  "tierPrompts": {
+    "fast":   "You are @fast — ... (full global prompt)",
+    "medium": "You are @medium — ...",
+    "heavy":  "You are @heavy — ..."
+  },
+  "presets": {
+    "anthropic": {
+      "fast":   { "model": "anthropic/claude-haiku-4-5", ... },
+      "medium": { "model": "anthropic/claude-sonnet-4-6", ... },
+      "heavy":  { "model": "anthropic/claude-opus-4-7", ... }
+    }
+  }
+}
+```
+
+**Resolution order per tier:**
+
+1. If the preset's tier defines `"prompt": "..."` inline → use it (per-tier override).
+2. Otherwise → fall back to `tierPrompts[<tierName>]`.
+3. If neither is set → the tier registers without a system prompt.
+
+**When to customize:** if a specific provider/model in a preset needs different instructions (e.g. Gemini-specific tool format, tighter/looser caps for a weaker local model), add `"prompt": "..."` on that tier only. All other presets keep using the global.
+
+```json
+{
+  "presets": {
+    "google": {
+      "fast": {
+        "model": "google/gemini-2.5-flash",
+        "prompt": "You are @fast (Gemini-tuned variant) — ...",
+        ...
+      }
+    }
+  }
+}
+```
+
 ### Tier fields reference
 
 | Field | Type | Description |
@@ -369,7 +498,7 @@ Rules in `modes[x].overrideRules` replace this array entirely for that mode.
 | `reasoning` | object | OpenAI reasoning: `{ "effort": "high", "summary": "detailed" }` |
 | `description` | string | Shown in `/tiers` output |
 | `steps` | number | Max agent turns |
-| `prompt` | string | Subagent system prompt |
+| `prompt` | string | Optional per-tier system prompt override. Falls back to top-level `tierPrompts[<tierName>]` when omitted. |
 | `whenToUse` | string[] | Use cases (shown in `/tiers`, not in system prompt) |
 
 ### Fallback

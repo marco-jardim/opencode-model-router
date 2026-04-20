@@ -52,6 +52,10 @@ interface RouterConfig {
   fallback?: FallbackConfig;
   taskPatterns?: Record<string, string[]>;
   modes?: Record<string, ModeConfig>;
+  /** Global default prompts per tier name. A preset-level tier.prompt overrides this. */
+  tierPrompts?: Record<string, string>;
+  /** Read-only tool-call caps per tier, enforced at runtime via tool.execute.after banner injection. */
+  tierCaps?: Record<string, number>;
 }
 
 interface RouterState {
@@ -190,6 +194,44 @@ function validateConfig(raw: unknown): RouterConfig {
       if (typeof m.description !== "string") {
         throw new Error(
           `tiers.json: mode '${modeName}.description' must be a string`,
+        );
+      }
+    }
+  }
+
+  // Validate tierCaps if present
+  if (obj.tierCaps !== undefined) {
+    if (
+      typeof obj.tierCaps !== "object" ||
+      obj.tierCaps === null ||
+      Array.isArray(obj.tierCaps)
+    ) {
+      throw new Error("tiers.json: 'tierCaps' must be an object");
+    }
+    const tc = obj.tierCaps as Record<string, unknown>;
+    for (const [tierName, cap] of Object.entries(tc)) {
+      if (typeof cap !== "number" || !Number.isFinite(cap) || cap < 1) {
+        throw new Error(
+          `tiers.json: tierCaps.'${tierName}' must be a positive integer`,
+        );
+      }
+    }
+  }
+
+  // Validate tierPrompts if present
+  if (obj.tierPrompts !== undefined) {
+    if (
+      typeof obj.tierPrompts !== "object" ||
+      obj.tierPrompts === null ||
+      Array.isArray(obj.tierPrompts)
+    ) {
+      throw new Error("tiers.json: 'tierPrompts' must be an object");
+    }
+    const tp = obj.tierPrompts as Record<string, unknown>;
+    for (const [tierName, prompt] of Object.entries(tp)) {
+      if (typeof prompt !== "string") {
+        throw new Error(
+          `tiers.json: tierPrompts.'${tierName}' must be a string`,
         );
       }
     }
@@ -445,12 +487,15 @@ function buildDelegationProtocol(cfg: RouterConfig): string {
     `Preset: ${cfg.activePreset}. Tiers: ${tierLine}.${modeSuffix}`,
     ``,
     `### HARD ROUTING (non-negotiable)`,
-    `- **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → prefer \`Task(subagent_type="fast", ...)\` by default. Direct read-only tools are fine for a one-off lookup (and a short follow-up when clearly faster); if scope starts expanding, switch to @fast.`,
+    `- **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → default to \`Task(subagent_type="fast", ...)\`. Self-cap (TARGET): ≤2 direct read-only calls per user turn; on the 3rd read-only need, dispatch @fast instead. You may exceed with a 1-line \`reason:\` note when dispatching feels clearly wrong. Rationale: every tool-result token is billed at your tier rate — a grep via @fast costs ~20x less than the same grep here.`,
     `- **Implementation work** (write, edit, refactor, tests, bug-fix, build-fix, create-file, config, api-endpoint) → \`Task(subagent_type="medium", ...)\`.`,
     `- **Architecture / security / perf / debugging after ≥2 failures / multi-system tradeoffs / RCA** → \`Task(subagent_type="heavy", ...)\`, UNLESS you ARE @heavy (opus); then handle locally and never self-call @heavy.`,
     ``,
+    `### DISPATCH CAPS (read-only budget per subagent)`,
+    `Subagents carry a TARGET cap on their own read-only tool calls (baseline: @fast=8, @medium=5, @heavy=3). Include \`CAP:N\` in the dispatch prompt to override (e.g., \`CAP:3\` for a tight lookup, \`CAP:none\` to disable). Mode adjustments apply automatically via rules below. Subagents also run a redundancy check every call: if they detect repeated reads/greps of the same area, they STOP and return partial findings with \`DONE: ...\`, \`NEED MORE: ...\`, or \`ESCALATE: ...\` — you decide the next step from their return.`,
+    ``,
     `### ROLE CONTRACT`,
-    `The primary agent's job: decompose the user's request, dispatch subagents, synthesize their results, and answer the user. Keep orchestration-first posture: prefer dispatching read-only exploration to @fast rather than running repeated Grep/Read/Glob/Bash calls yourself. A quick one-off lookup is fine; recurring exploration should move to @fast.`,
+    `The primary agent's job: decompose the user's request, dispatch subagents, synthesize their results, and answer the user. Keep orchestration-first posture: prefer dispatching read-only exploration to @fast rather than running repeated Grep/Read/Glob/Bash calls yourself. Self-cap applies (see HARD ROUTING above): ≤2 direct read-only calls per turn as a target; beyond that, dispatch @fast.`,
     ``,
     `### @fast contract`,
     `@fast is a read-only explorer. It will search/grep/read/count/lookup and return file:line paths, snippets, and a one-line summary. It will refuse edits. Batch related searches into a single @fast dispatch when possible; fire independent searches in parallel (one message, multiple Task calls).`,
@@ -600,6 +645,112 @@ function buildPresetOutput(cfg: RouterConfig, args: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime cap enforcement (tool.execute.after banner injection for subagents)
+// ---------------------------------------------------------------------------
+
+/** Tools that count against the read-only cap. Keep narrow — editing tools should never count. */
+const READ_ONLY_TOOLS = new Set(["grep", "read", "glob", "ls"]);
+
+/** Fallback caps when tiers.json has no tierCaps block. */
+const DEFAULT_TIER_CAPS: Record<string, number> = {
+  fast: 8,
+  medium: 5,
+  heavy: 3,
+};
+
+type Cap = number | "none";
+
+interface SubagentState {
+  tierName: string;
+  cap: Cap;
+  calls: number;
+  /** Fingerprint → call index where this fingerprint was first seen. */
+  seen: Map<string, number>;
+}
+
+/** Extract the first `CAP:N` or `CAP:none` directive from a dispatch prompt. */
+function parseCapDirective(text: string): Cap | null {
+  const m = text.match(/\bCAP\s*:\s*(none|\d+)\b/i);
+  if (!m) return null;
+  const raw = m[1]!.toLowerCase();
+  if (raw === "none") return "none";
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Fingerprint a read-only tool call for redundancy detection. */
+function fingerprintToolCall(tool: string, args: unknown): string {
+  const a = (args ?? {}) as Record<string, unknown>;
+  switch (tool) {
+    case "read":
+      return `read:${a.file_path ?? a.filePath ?? ""}`;
+    case "grep":
+      return `grep:${a.pattern ?? ""}:${a.path ?? a.glob ?? ""}`;
+    case "glob":
+      return `glob:${a.pattern ?? ""}:${a.path ?? ""}`;
+    case "ls":
+      return `ls:${a.path ?? ""}`;
+    default:
+      return `${tool}:${JSON.stringify(a).slice(0, 120)}`;
+  }
+}
+
+/** Best-effort extraction of textual content from a chat.message output payload. */
+function extractDispatchText(output: unknown): string {
+  const o = output as Record<string, unknown> | undefined;
+  const parts = (o?.parts as unknown[]) ?? [];
+  const chunks: string[] = [];
+  for (const p of parts) {
+    if (typeof p === "string") {
+      chunks.push(p);
+    } else if (p && typeof p === "object") {
+      const rec = p as Record<string, unknown>;
+      if (typeof rec.text === "string") chunks.push(rec.text);
+      else if (typeof rec.content === "string") chunks.push(rec.content);
+    }
+  }
+  if (chunks.length === 0) {
+    const msg = o?.message as Record<string, unknown> | undefined;
+    const content = msg?.content;
+    if (typeof content === "string") chunks.push(content);
+  }
+  return chunks.join("\n");
+}
+
+/** Build the banner appended to every read-only tool result in a subagent session. */
+function buildCapBanner(
+  state: SubagentState,
+  isRedundant: boolean,
+  previousCall: number | undefined,
+  tool: string,
+): string {
+  const lines: string[] = [];
+  const capDisplay = state.cap === "none" ? "∞" : String(state.cap);
+  lines.push(`[cap: ${state.calls}/${capDisplay}]`);
+
+  if (isRedundant && previousCall !== undefined) {
+    lines.push(
+      `[⚠ REDUNDANT: this is the same ${tool} you ran at call #${previousCall}. STOP now — repeated reads add no information. Return with DONE/NEED MORE/NEED CONTEXT/SCOPE GROWTH/ESCALATE.]`,
+    );
+  }
+
+  if (state.cap !== "none") {
+    const remaining = state.cap - state.calls;
+    if (remaining <= 0) {
+      lines.push(
+        `[⚠ CAP REACHED (${state.calls}/${state.cap}): your NEXT response MUST be a return — do NOT make another read-only call. Start the response with DONE:, NEED MORE:, NEED CONTEXT:, SCOPE GROWTH:, or ESCALATE:.]`,
+      );
+    } else if (remaining <= 2) {
+      lines.push(
+        `[⚠ CAP WARNING: ${remaining} read-only call(s) remaining before forced return]`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -610,6 +761,11 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
   // Track subagent sessions so we can skip delegation protocol injection.
   // Populated by chat.params (which has the agent name) before system.transform fires.
   const subagentSessionIDs = new Set<string>();
+
+  // Per-subagent-session cap state for runtime enforcement. Populated on chat.message,
+  // read/updated by tool.execute.after. Keyed by sessionID. Orchestrator sessions are
+  // intentionally NOT tracked here (per user decision: enforce on subagents only).
+  const subagentCapState = new Map<string, SubagentState>();
 
   return {
     // -----------------------------------------------------------------------
@@ -630,7 +786,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     // loop -> LLM.stream path, so by the time system.transform runs the Set
     // is fully populated and await-safe (yield* on the plugin trigger).
     // -----------------------------------------------------------------------
-    "chat.message": async (input: any, _output: any) => {
+    "chat.message": async (input: any, output: any) => {
       // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig();
@@ -638,7 +794,50 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       const tierNames = Object.keys(getActiveTiers(cfg));
       if (input.agent && tierNames.includes(input.agent)) {
         subagentSessionIDs.add(input.sessionID);
+
+        // Initialize cap state on first dispatch; reset on subsequent rounds to the same
+        // subagent session (rare but supported — treats each round as a fresh budget).
+        const tierName = input.agent as string;
+        const dispatchText = extractDispatchText(output);
+        const override = parseCapDirective(dispatchText);
+        const baseline =
+          cfg.tierCaps?.[tierName] ?? DEFAULT_TIER_CAPS[tierName] ?? 5;
+        const cap: Cap = override ?? baseline;
+        subagentCapState.set(input.sessionID, {
+          tierName,
+          cap,
+          calls: 0,
+          seen: new Map(),
+        });
       }
+    },
+
+    // -----------------------------------------------------------------------
+    // Runtime cap + redundancy enforcement (subagents only).
+    // Appends `[cap: N/MAX]` and `[⚠ REDUNDANT]` / `[⚠ CAP REACHED]` banners
+    // to every read-only tool result the subagent sees. Because these land
+    // inside `output.output` — the tool's own response text — the model
+    // treats them as ground truth rather than advisory system noise.
+    // -----------------------------------------------------------------------
+    "tool.execute.after": async (input: any, output: any) => {
+      const state = subagentCapState.get(input.sessionID);
+      if (!state) return; // not a tracked subagent session
+      if (!READ_ONLY_TOOLS.has(input.tool)) return;
+
+      const fp = fingerprintToolCall(input.tool, input.args);
+      const previousCall = state.seen.get(fp);
+      const isRedundant = previousCall !== undefined;
+
+      state.calls += 1;
+      if (!isRedundant) {
+        state.seen.set(fp, state.calls);
+      }
+
+      const banner = buildCapBanner(state, isRedundant, previousCall, input.tool);
+
+      const existing =
+        typeof output.output === "string" ? output.output : "";
+      output.output = existing ? `${existing}\n\n${banner}` : banner;
     },
 
     // -----------------------------------------------------------------------
@@ -648,12 +847,15 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       opencodeConfig.agent ??= {};
 
       for (const [name, tier] of Object.entries(activeTiers)) {
+        // Resolve prompt: per-tier override wins; otherwise fall back to global tierPrompts[name].
+        const resolvedPrompt = tier.prompt ?? cfg.tierPrompts?.[name];
+
         const agentDef: Record<string, unknown> = {
           model: tier.model,
           mode: "subagent",
           description: tier.description,
           maxSteps: tier.steps,
-          prompt: tier.prompt,
+          prompt: resolvedPrompt,
           color: tier.color,
         };
 
