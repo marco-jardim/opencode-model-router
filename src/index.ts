@@ -999,9 +999,6 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       const quoted = found
         .map((m) => `"${m.slice(0, 60)}${m.length > 60 ? "…" : ""}"`)
         .join(", ");
-      console.warn(
-        `[model-router] narration detected (session ${input?.sessionID ?? "?"}): ${quoted}`,
-      );
       output.text = `${text}\n\n[⚠ narration detected: ${quoted}]`;
     },
 
