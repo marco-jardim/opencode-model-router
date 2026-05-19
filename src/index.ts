@@ -1,5 +1,5 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -69,6 +69,8 @@ interface RouterState {
 
 let _cachedConfig: RouterConfig | null = null;
 let _configDirty = true;
+let _cachedBaseSig = "";
+let _cachedUserSig = "";
 
 /** Mark config cache as stale so it is re-read on next access. */
 function invalidateConfigCache(): void {
@@ -82,6 +84,123 @@ function getPluginRoot(): string {
 
 function configPath(): string {
   return join(getPluginRoot(), "tiers.json");
+}
+
+function userConfigDir(): string {
+  if (process.platform === "win32") {
+    return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "opencode");
+  }
+  if (process.platform === "darwin") {
+    return join(homedir(), "Library", "Application Support", "opencode");
+  }
+  return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
+}
+
+function userConfigPath(): string {
+  return join(userConfigDir(), "tiers.json");
+}
+
+function fileSignature(path: string): string {
+  if (!existsSync(path)) {
+    return "missing";
+  }
+  const st = statSync(path);
+  return `${st.mtimeMs}:${st.size}`;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function mergeObjects(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    if (isObject(value) && isObject(out[key])) {
+      out[key] = mergeObjects(out[key] as Record<string, unknown>, value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function mergePresetsWithTierDefaults(
+  basePresets: Record<string, unknown> | undefined,
+  userPresets: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const safeBasePresets = isObject(basePresets) ? basePresets : {};
+  const safeUserPresets = isObject(userPresets) ? userPresets : {};
+
+  const firstBasePreset = Object.values(safeBasePresets).find(isObject) as
+    | Record<string, unknown>
+    | undefined;
+
+  const tierDefaultsByName: Record<string, Record<string, unknown>> = {};
+  if (firstBasePreset) {
+    for (const [tierName, tier] of Object.entries(firstBasePreset)) {
+      if (isObject(tier)) {
+        tierDefaultsByName[tierName] = tier;
+      }
+    }
+  }
+
+  const presetNames = new Set([
+    ...Object.keys(safeBasePresets),
+    ...Object.keys(safeUserPresets),
+  ]);
+  const merged: Record<string, unknown> = {};
+
+  for (const presetName of presetNames) {
+    const basePresetRaw = safeBasePresets[presetName];
+    const userPresetRaw = safeUserPresets[presetName];
+
+    const basePreset = isObject(basePresetRaw) ? basePresetRaw : undefined;
+    const userPreset = isObject(userPresetRaw) ? userPresetRaw : undefined;
+
+    if (!basePreset && !userPreset) {
+      continue;
+    }
+
+    const tierNames = new Set<string>([
+      ...Object.keys(basePreset ?? {}),
+      ...Object.keys(userPreset ?? {}),
+    ]);
+    const mergedPreset: Record<string, unknown> = {};
+
+    for (const tierName of tierNames) {
+      const tierBaseDefault = tierDefaultsByName[tierName] ?? {};
+      const tierFromBasePreset = isObject(basePreset?.[tierName])
+        ? (basePreset?.[tierName] as Record<string, unknown>)
+        : {};
+      const tierFromUserPreset = isObject(userPreset?.[tierName])
+        ? (userPreset?.[tierName] as Record<string, unknown>)
+        : {};
+
+      mergedPreset[tierName] = mergeObjects(
+        mergeObjects(tierBaseDefault, tierFromBasePreset),
+        tierFromUserPreset,
+      );
+    }
+
+    merged[presetName] = mergedPreset;
+  }
+
+  return merged;
+}
+
+function mergeConfig(
+  baseRaw: Record<string, unknown>,
+  userRaw: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = mergeObjects(baseRaw, userRaw);
+  merged.presets = mergePresetsWithTierDefaults(
+    baseRaw.presets as Record<string, unknown> | undefined,
+    userRaw.presets as Record<string, unknown> | undefined,
+  );
+  return merged;
 }
 
 function statePath(): string {
@@ -260,11 +379,34 @@ function validateConfig(raw: unknown): RouterConfig {
 }
 
 function loadConfig(): RouterConfig {
-  if (_cachedConfig && !_configDirty) {
+  const basePath = configPath();
+  const userPath = userConfigPath();
+  const baseSig = fileSignature(basePath);
+  const userSig = fileSignature(userPath);
+
+  if (
+    _cachedConfig &&
+    !_configDirty &&
+    baseSig === _cachedBaseSig &&
+    userSig === _cachedUserSig
+  ) {
     return _cachedConfig;
   }
 
-  const raw = JSON.parse(readFileSync(configPath(), "utf-8"));
+  const baseRaw = JSON.parse(readFileSync(basePath, "utf-8")) as Record<
+    string,
+    unknown
+  >;
+  let raw = baseRaw;
+
+  if (existsSync(userPath)) {
+    const userRaw = JSON.parse(readFileSync(userPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    raw = mergeConfig(baseRaw, userRaw);
+  }
+
   const cfg = validateConfig(raw);
 
   try {
@@ -288,6 +430,8 @@ function loadConfig(): RouterConfig {
 
   _cachedConfig = cfg;
   _configDirty = false;
+  _cachedBaseSig = baseSig;
+  _cachedUserSig = userSig;
   return cfg;
 }
 
