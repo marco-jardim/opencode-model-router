@@ -120,7 +120,7 @@ What the orchestrator sees (Anthropic preset, normal mode):
 
 ```
 ## Model Delegation Protocol
-Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-5/max(5x) @heavy=claude-opus-4-6/max(20x). mode:normal
+Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-6/max(5x) @heavy=claude-opus-4-8/max(20x). mode:normal
 R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 1.[tier:X] tag in plan→delegate X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default preference: read-only→@fast | implementation→@medium 4.orchestrate=self,execute=subagent 5.trivial(≤1 tool call,no expected follow-up)→direct,skip-delegate 6.before @heavy: gather context first(usually via @fast); if already sufficient, dispatch directly 7.if self is opus: skip-@heavy(do locally), still route broader read-only exploration to @fast 8.min(cost,adequate-tier)
@@ -187,7 +187,7 @@ Why: the orchestrator runs on every message, including trivial ones. Sonnet can 
 In your `opencode.json`:
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-5",
+  "model": "anthropic/claude-sonnet-4-6",
   "autoshare": false
 }
 ```
@@ -245,29 +245,29 @@ The plugin ships with four presets (switch with `/preset <name>`):
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `anthropic/claude-haiku-4-5` | 1x |
-| @medium | `anthropic/claude-sonnet-4-5` (max) | 5x |
-| @heavy | `anthropic/claude-opus-4-6` (max) | 20x |
+| @medium | `anthropic/claude-sonnet-4-6` (max) | 5x |
+| @heavy | `anthropic/claude-opus-4-8` (max) | 20x |
 
 **openai**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `openai/gpt-5.3-codex-spark` | 1x |
-| @medium | `openai/gpt-5.3-codex` | 5x |
-| @heavy | `openai/gpt-5.3-codex` (xhigh) | 20x |
+| @fast | `openai/gpt-5.4-mini` | 1x |
+| @medium | `openai/gpt-5.4` | 5x |
+| @heavy | `openai/gpt-5.5` | 20x |
 
 **github-copilot**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `github-copilot/claude-haiku-4-5` | 1x |
-| @medium | `github-copilot/claude-sonnet-4-5` | 5x |
-| @heavy | `github-copilot/claude-opus-4-6` (thinking) | 20x |
+| @medium | `github-copilot/claude-sonnet-4-6` | 5x |
+| @heavy | `github-copilot/claude-opus-4-8` (thinking) | 20x |
 
 **google**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `google/gemini-2.5-flash` | 1x |
-| @medium | `google/gemini-2.5-pro` | 5x |
-| @heavy | `google/gemini-3-pro-preview` | 20x |
+| @fast | `google/gemini-3.1-flash-lite` | 1x |
+| @medium | `google/gemini-3.5-flash` | 5x |
+| @heavy | `google/gemini-3.1-pro-preview` | 20x |
 
 ### Routing modes
 
@@ -478,7 +478,7 @@ Each tier (`@fast`, `@medium`, `@heavy`) has a system prompt that describes its 
   "presets": {
     "google": {
       "fast": {
-        "model": "google/gemini-2.5-flash",
+        "model": "google/gemini-3.1-flash-lite",
         "prompt": "You are @fast (Gemini-tuned variant) — ...",
         ...
       }
