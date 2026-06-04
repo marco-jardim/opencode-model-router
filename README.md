@@ -205,12 +205,15 @@ npm install -g opencode-model-router
 Add to `~/.config/opencode/opencode.json`:
 ```json
 {
-  "plugin": {
-    "opencode-model-router": {
-      "type": "npm",
-      "package": "opencode-model-router"
-    }
-  }
+  "plugin": [
+    [
+      "opencode-model-router",
+      {
+        "type": "npm",
+        "package": "opencode-model-router"
+      }
+    ]
+  ]
 }
 ```
 
@@ -224,18 +227,23 @@ npm install
 In `~/.config/opencode/opencode.json`:
 ```json
 {
-  "plugin": {
-    "opencode-model-router": {
-      "type": "local",
-      "path": "/absolute/path/to/opencode-model-router"
-    }
-  }
+  "plugin": [
+    [
+      "opencode-model-router",
+      {
+        "type": "local",
+        "package": "/absolute/path/to/opencode-model-router"
+      }
+    ]
+  ]
 }
 ```
 
 ## Configuration
 
-All configuration lives in `tiers.json` at the plugin root.
+All configuration lives in `tiers.json` at the plugin root, which is located inside the cached package directory in your home folder (e.g. `~/.cache/opencode/packages/opencode-model-router@latest/node_modules/opencode-model-router/tiers.json`).
+
+> ⚠️ **IMPORTANT**: You **must** edit this cached version of `tiers.json` for opencode to respect your changes and custom model configurations.
 
 ### Presets
 
