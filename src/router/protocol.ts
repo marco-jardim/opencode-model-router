@@ -258,16 +258,49 @@ export const CLAUDE_ANTI_NARRATION = [
 // ---------------------------------------------------------------------------
 
 /**
+ * Builds the DoD / Acceptance block protocol section shown when enforcement is ON.
+ * Pure: no side-effects, no I/O.
+ */
+export function buildDoDProtocolSection(cfg: RouterConfig): string {
+  const requireExplicit = cfg.enforcement?.verify?.requireExplicitDoD === true;
+  const omitLine = requireExplicit
+    ? "A DoD is REQUIRED: a non-trivial dispatch without an [acceptance] block is rejected."
+    : "If you omit the block, a minimal DoD is auto-inferred from the task type.";
+  return [
+    "### Acceptance / Definition of Done (enforcement is ON)",
+    "Non-trivial delegations are independently verified before their result is accepted (producer \u2260 grader; grader \u2265 producer tier). Attach an acceptance block to your dispatch so the gate knows what \"done\" means:",
+    "",
+    "[acceptance]",
+    "check: testsPass",
+    "check: buildPasses",
+    "check: fileExists path=src/foo.ts",
+    "check: run command=\"node -e ...\" expect=OK",
+    "criteria: <plain-language success condition>",
+    "deliverable: <path or short description>",
+    "[/acceptance]",
+    "",
+    "- check kinds: testsPass | buildPasses | lintClean | fileExists path=\u2026 | schemaMatch path=\u2026 schema=\u2026 | run command=\"\u2026\" expect=\u2026",
+    "- " + omitLine,
+    "- A failing DoD causes the result to be rejected and retried/escalated, not silently accepted.",
+  ].join("\n");
+}
+
+/**
  * Assembles the full system prompt injected by the experimental.chat.system.transform hook.
  * For Claude orchestrators: prepends CLAUDE_ORCHESTRATOR_PREFIX + CLAUDE_ANTI_NARRATION.
  * For non-Claude orchestrators: returns the delegation protocol verbatim.
+ *
+ * When enforcementOn is true, appends the DoD/Acceptance protocol section.
+ * When false/omitted (default), the output is byte-identical to the pre-enforcement baseline (GA-1).
  */
 export function assembleSystemPrompt(
   cfg: RouterConfig,
   orchestratorModel: string | undefined,
+  enforcementOn: boolean = false,
 ): string {
   const delegationProtocol = buildDelegationProtocol(cfg);
+  const dodSection = enforcementOn ? `\n\n---\n\n${buildDoDProtocolSection(cfg)}` : "";
   return isClaudeModel(orchestratorModel)
-    ? `${CLAUDE_ORCHESTRATOR_PREFIX}\n\n${CLAUDE_ANTI_NARRATION}\n\n---\n\n${delegationProtocol}`
-    : delegationProtocol;
+    ? `${CLAUDE_ORCHESTRATOR_PREFIX}\n\n${CLAUDE_ANTI_NARRATION}\n\n---\n\n${delegationProtocol}${dodSection}`
+    : `${delegationProtocol}${dodSection}`;
 }

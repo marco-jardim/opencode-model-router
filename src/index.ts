@@ -555,6 +555,15 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
           "",
           "## Output",
           "Rewrite the entire plan in the file with the tags. Do not change the substance — only add tags, and split mixed steps when useful for clearer delegation.",
+          "",
+          "## Acceptance blocks (for enforcement)",
+          "For each NON-TRIVIAL task, append an acceptance block immediately after the step so the router can verify the work:",
+          "[acceptance]",
+          "check: <testsPass | buildPasses | lintClean | fileExists path=... | run command=\"...\" expect=...>",
+          "criteria: <plain-language success condition, when no deterministic check applies>",
+          "deliverable: <path or short description>",
+          "[/acceptance]",
+          "Prefer deterministic checks (testsPass/buildPasses/fileExists). Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
         ].join("\n"),
         description:
           "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
@@ -591,7 +600,9 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       const modelID = _input?.model?.modelID ?? "";
       const orchestratorModel = providerID && modelID ? `${providerID}/${modelID}` : modelID;
 
-      output.system.push(assembleSystemPrompt(cfg, orchestratorModel));
+      let enfOn = false;
+      try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
+      output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
     },
 
     // -----------------------------------------------------------------------

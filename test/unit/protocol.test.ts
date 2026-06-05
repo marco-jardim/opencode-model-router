@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   getActiveTiers,
@@ -6,9 +8,11 @@ import {
   buildTaskTaxonomy,
   buildDecomposeHint,
   buildDelegationProtocol,
+  buildDoDProtocolSection,
   isClaudeModel,
   assembleSystemPrompt,
 } from "../../src/router/protocol";
+import { validateConfig } from "../../src/router/config";
 import type { RouterConfig } from "../../src/router/config";
 
 function tier(model: string, extra: Record<string, unknown> = {}) {
@@ -155,5 +159,31 @@ describe("assembleSystemPrompt", () => {
     const out = assembleSystemPrompt(minimal, "openai/gpt-5");
     expect(out.startsWith("## Model Delegation Protocol")).toBe(true);
     expect(out).not.toContain("AUTHORITY OVERRIDE");
+  });
+});
+
+describe("buildDoDProtocolSection", () => {
+  const raw = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8"));
+  const base = validateConfig(raw);
+
+  it("contains [acceptance] and required check examples", () => {
+    const out = buildDoDProtocolSection(base);
+    expect(out).toContain("[acceptance]");
+    expect(out).toContain("check: testsPass");
+    expect(out).toContain("schemaMatch");
+  });
+
+  it("yields 'auto-inferred' wording by default", () => {
+    const out = buildDoDProtocolSection(base);
+    expect(out).toContain("auto-inferred");
+    expect(out).not.toContain("REQUIRED");
+  });
+
+  it("yields 'REQUIRED' wording when requireExplicitDoD is true", () => {
+    const cfg = { ...base };
+    cfg.enforcement = { verify: { requireExplicitDoD: true } };
+    const out = buildDoDProtocolSection(cfg);
+    expect(out).toContain("REQUIRED");
+    expect(out).not.toContain("auto-inferred");
   });
 });
