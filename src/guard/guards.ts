@@ -312,3 +312,32 @@ export function trajectoryMetrics(state: GuardState): Record<string, unknown> {
     consecutive_non_producing: state.consecutiveNonProducing,
   };
 }
+
+// ---------------------------------------------------------------------------
+// observationOk
+// ---------------------------------------------------------------------------
+
+const ERROR_PREFIXES = [
+  "DENIED",
+  "BLOCKED",
+  "Error",
+  "error:",
+  "ERROR",
+  "Exception",
+  "Traceback",
+  "FAIL",
+  "failed:",
+];
+
+/**
+ * Heuristic: did a tool result indicate success? Used by the after-hook to set
+ * `ok` for updateState so a FAILED mutation does not mark the deliverable as
+ * executed. Mirrors the reference observationOk: empty/non-string => ok (no
+ * evidence of failure); otherwise false only when the (left-trimmed) text
+ * starts with a known error prefix.
+ */
+export function observationOk(output: unknown): boolean {
+  const s = typeof output === "string" ? output.trimStart() : "";
+  if (s.length === 0) return true;
+  return !ERROR_PREFIXES.some((p) => s.startsWith(p));
+}

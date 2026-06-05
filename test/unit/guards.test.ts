@@ -8,6 +8,7 @@ import {
   recordBlock,
   forcingMessage,
   trajectoryMetrics,
+  observationOk,
   type GuardPolicy,
   type GuardCall,
   type GuardState,
@@ -697,5 +698,32 @@ describe("property-based: termination", () => {
       const dNext = evaluateGuards(s, c, p);
       expect(dNext.allow).toBe(false);
     }
+  });
+});
+
+describe("observationOk", () => {
+  it("empty string => true", () => {
+    expect(observationOk("")).toBe(true);
+  });
+  it('"OK done" => true', () => {
+    expect(observationOk("OK done")).toBe(true);
+  });
+  it('"DENIED: ..." => false', () => {
+    expect(observationOk("DENIED: not allowed")).toBe(false);
+  });
+  it('"  Error: x" with leading whitespace => false', () => {
+    expect(observationOk("  Error: something went wrong")).toBe(false);
+  });
+  it('"Traceback ..." => false', () => {
+    expect(observationOk("Traceback (most recent call last)")).toBe(false);
+  });
+  it("non-string (number) => true", () => {
+    expect(observationOk(123)).toBe(true);
+  });
+  it("undefined => true", () => {
+    expect(observationOk(undefined)).toBe(true);
+  });
+  it("null => true", () => {
+    expect(observationOk(null)).toBe(true);
   });
 });

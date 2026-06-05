@@ -28,6 +28,8 @@ import {
 } from "./router/sessions";
 import type { Cap, SubagentState } from "./router/sessions";
 import { createTrajectoryStore } from "./telemetry/trajectory";
+import { createGuardStore } from "./guard/store";
+import { guardBeforeCall, guardAfterCall } from "./guard/enforce";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -62,6 +64,19 @@ export {
 export type { TrajectoryState, TrajectoryToolEvent } from "./telemetry/trajectory";
 export { resolveEnforcementMode, DEFAULT_ENV_GATE } from "./router/enforcement";
 export type { EnforcementMode } from "./router/enforcement";
+export { createGuardStore } from "./guard/store";
+export { guardBeforeCall, guardAfterCall, buildGuardPolicy, DEFAULT_GUARD_BUDGET } from "./guard/enforce";
+export { scrubText } from "./guard/scrub";
+export {
+  evaluateGuards,
+  updateState,
+  newGuardState,
+  forcingMessage,
+  observationOk,
+  classify,
+  isSelfScript,
+} from "./guard/guards";
+export type { GuardPolicy, GuardState, GuardCall, GuardDecision } from "./guard/guards";
 
 function saveActivePreset(presetName: string): void {
   const cfg = loadConfig();
@@ -257,6 +272,11 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
   // is an opt-in debug dump gated behind MODEL_ROUTER_TRAJECTORY_DEBUG=1.
   const trajectoryStore = createTrajectoryStore();
 
+  // Per-plugin-instance guard state (Layer 1 hard-block). Only engaged for
+  // subagent sessions when enforcement mode is advisory/enforced; in "off"
+  // mode no guard state is ever created, so behaviour stays byte-identical.
+  const guardStore = createGuardStore();
+
   // Bypass mode: when true, the router skips all system prompt injection,
   // subagent tracking, cap enforcement, and narration detection for the
   // current plugin lifetime (i.e., until OpenCode is restarted).
@@ -298,6 +318,43 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     },
 
     // -----------------------------------------------------------------------
+    // Hard-block enforcement (Layer 1). Fires before tool execution; only
+    // engaged for subagent sessions when enforcement mode is advisory/enforced.
+    // Throws to abort the tool call when a guard fires; never throws for
+    // non-subagent sessions or when enforcement is off (GA-1 preserved).
+    // -----------------------------------------------------------------------
+    "tool.execute.before": async (input: any, output: any) => {
+      if (bypassed) return;
+      const sid = input?.sessionID;
+      if (!sid || !sessionStore.isSubagent(sid) || typeof input?.tool !== "string") {
+        return;
+      }
+      let res;
+      try {
+        res = guardBeforeCall({
+          cfg,
+          tier: sessionStore.getTier(sid),
+          sessionID: sid,
+          tool: input.tool,
+          toolArgs: output?.args,
+          store: guardStore,
+          env: process.env,
+        });
+      } catch {
+        return; // never break a real session on a guard-internal error
+      }
+      if (res.block) {
+        trajectoryStore.recordToolEvent(sid, {
+          tool: input.tool,
+          readOnly: READ_ONLY_TOOLS.has(input.tool),
+          blocked: true,
+          selfScript: res.guard === "anti_self_script",
+        });
+        throw new Error(res.message);
+      }
+    },
+
+    // -----------------------------------------------------------------------
     // Runtime cap + redundancy enforcement (subagents only).
     // Appends `[cap: N/MAX]` and `[⚠ REDUNDANT]` / `[⚠ CAP REACHED]` banners
     // to every read-only tool result the subagent sees. Because these land
@@ -316,6 +373,19 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
           tool: input.tool,
           readOnly: READ_ONLY_TOOLS.has(input.tool),
         });
+        try {
+          guardAfterCall({
+            cfg,
+            tier: sessionStore.getTier(sid),
+            sessionID: sid,
+            tool: input.tool,
+            toolArgs: input?.args,
+            output,
+            store: guardStore,
+          });
+        } catch {
+          // best-effort: enforcement must never crash a real session
+        }
       }
     },
 

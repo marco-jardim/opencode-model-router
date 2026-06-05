@@ -198,3 +198,63 @@ describe("resolvePresetName", () => {
     expect(resolvePresetName(cfg, "openai")).toBeUndefined();
   });
 });
+
+describe("validateConfig — enforcement.guard validation", () => {
+  function withEnf(enf: unknown) {
+    return validRaw({ enforcement: enf });
+  }
+
+  it("accepts guard.budget=12 (valid positive number)", () => {
+    expect(() => validateConfig(withEnf({ guard: { budget: 12 } }))).not.toThrow();
+  });
+
+  it("accepts guard.budget=1 (minimum boundary)", () => {
+    expect(() => validateConfig(withEnf({ guard: { budget: 1 } }))).not.toThrow();
+  });
+
+  it("throws when guard.budget=0 (below minimum)", () => {
+    expect(() => validateConfig(withEnf({ guard: { budget: 0 } }))).toThrow(
+      "enforcement.guard.budget must be a number >= 1",
+    );
+  });
+
+  it("throws when guard.budget is a string", () => {
+    expect(() => validateConfig(withEnf({ guard: { budget: "x" } }))).toThrow(
+      "enforcement.guard.budget must be a number >= 1",
+    );
+  });
+
+  it("throws when guard.budget is Infinity", () => {
+    expect(() => validateConfig(withEnf({ guard: { budget: Infinity } }))).toThrow(
+      "enforcement.guard.budget must be a number >= 1",
+    );
+  });
+
+  it("accepts guard.blockScriptWrites=true (valid boolean)", () => {
+    expect(() =>
+      validateConfig(withEnf({ guard: { blockScriptWrites: true } })),
+    ).not.toThrow();
+  });
+
+  it("accepts guard.blockScriptWrites=false (valid boolean)", () => {
+    expect(() =>
+      validateConfig(withEnf({ guard: { blockScriptWrites: false } })),
+    ).not.toThrow();
+  });
+
+  it('throws when guard.blockScriptWrites="yes" (string, not boolean)', () => {
+    expect(() =>
+      validateConfig(withEnf({ guard: { blockScriptWrites: "yes" } })),
+    ).toThrow("enforcement.guard.blockScriptWrites must be a boolean");
+  });
+
+  it("accepts guard absent — no validation performed", () => {
+    expect(() => validateConfig(withEnf({ mode: "enforced" }))).not.toThrow();
+  });
+
+  it("accepts guard with both valid fields together", () => {
+    expect(() =>
+      validateConfig(withEnf({ guard: { budget: 20, blockScriptWrites: true } })),
+    ).not.toThrow();
+  });
+});

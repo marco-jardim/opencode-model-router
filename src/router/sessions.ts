@@ -129,6 +129,11 @@ export function createSessionStore() {
       return subagentSessionIDs.has(sessionID);
     },
 
+    /** Returns the tier name for a tracked subagent session, or null. */
+    getTier(sessionID: string): string | null {
+      return subagentCapState.get(sessionID)?.tierName ?? null;
+    },
+
     /**
      * Called from the chat.message hook. If the incoming message is directed
      * at a registered tier agent, records the session and initialises its cap state.

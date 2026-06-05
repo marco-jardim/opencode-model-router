@@ -184,3 +184,43 @@ describe("createSessionStore", () => {
     expect(out.output).toContain("[cap: 1/7]");
   });
 });
+
+describe("createSessionStore — getTier", () => {
+  it("returns the tier name after registerFromChatMessage for a tier agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_tier1" },
+      dispatch("explore the repo"),
+      cfg,
+      tierNames,
+    );
+    expect(store.getTier("ses_tier1")).toBe("fast");
+  });
+
+  it("returns the tier name for a heavy agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "heavy", sessionID: "ses_tier2" },
+      dispatch("architecture review"),
+      cfg,
+      tierNames,
+    );
+    expect(store.getTier("ses_tier2")).toBe("heavy");
+  });
+
+  it("returns null for an unknown / unregistered session", () => {
+    const store = createSessionStore();
+    expect(store.getTier("unknown-session")).toBeNull();
+  });
+
+  it("returns null for a session registered via a non-tier agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "unknown-agent", sessionID: "ses_tier3" },
+      dispatch("do something"),
+      cfg,
+      tierNames,
+    );
+    expect(store.getTier("ses_tier3")).toBeNull();
+  });
+});

@@ -46,7 +46,7 @@ export interface EnforcementConfig {
   mode?: "off" | "advisory" | "enforced";
   envGate?: string;
   perTier?: Record<string, "off" | "advisory" | "enforced">;
-  guard?: { readDraftCap?: number; sameOpRetryCap?: number; blockSelfScript?: boolean; deliverableFirst?: boolean };
+  guard?: { readDraftCap?: number; sameOpRetryCap?: number; blockSelfScript?: boolean; deliverableFirst?: boolean; budget?: number; blockScriptWrites?: boolean };
   verify?: { require?: "never" | "whenDoDPresent" | "always"; requireExplicitDoD?: boolean; preferDeterministic?: boolean; graderPolicy?: "atLeastProducerTier"; graderTemperature?: number; minGraderTier?: string };
   escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number } };
   proportional?: { trivialBypass?: boolean; trivialClassifier?: string };
@@ -344,6 +344,27 @@ export function validateConfig(raw: unknown): RouterConfig {
           throw new Error(
             `tiers.json: enforcement.perTier.${tierName} must be one of off|advisory|enforced`,
           );
+        }
+      }
+    }
+    if (
+      enforcement.guard !== undefined &&
+      typeof enforcement.guard === "object" &&
+      enforcement.guard !== null
+    ) {
+      const guard = enforcement.guard as Record<string, unknown>;
+      if (guard.budget !== undefined) {
+        if (
+          typeof guard.budget !== "number" ||
+          !Number.isFinite(guard.budget) ||
+          guard.budget < 1
+        ) {
+          throw new Error("enforcement.guard.budget must be a number >= 1");
+        }
+      }
+      if (guard.blockScriptWrites !== undefined) {
+        if (typeof guard.blockScriptWrites !== "boolean") {
+          throw new Error("enforcement.guard.blockScriptWrites must be a boolean");
         }
       }
     }
