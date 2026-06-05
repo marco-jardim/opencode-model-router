@@ -19,6 +19,7 @@ import {
   CLAUDE_ANTI_NARRATION,
   assembleSystemPrompt,
 } from "./router/protocol";
+import { resolveEnforcementMode } from "./router/enforcement";
 import {
   createSessionStore,
   parseCapDirective,
@@ -29,7 +30,7 @@ import {
 import type { Cap, SubagentState } from "./router/sessions";
 import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
-import { guardBeforeCall, guardAfterCall } from "./guard/enforce";
+import { guardBeforeCall, guardAfterCall, formatScorecard } from "./guard/enforce";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -73,6 +74,50 @@ function saveActiveMode(modeName: string): void {
   cfg.activeMode = modeName;
   writeState({ activeMode: modeName });
   invalidateConfigCache();
+}
+
+function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
+  writeState({ enforcementMode: mode });
+  invalidateConfigCache();
+}
+
+function buildRouterOutput(cfg: RouterConfig, args: string): string {
+  const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  const sub = (tokens[0] ?? "").toLowerCase();
+  if (sub === "enforce") {
+    const mode = (tokens[1] ?? "").toLowerCase();
+    if (mode === "off" || mode === "advisory" || mode === "enforced") {
+      saveEnforcementMode(mode);
+      const desc =
+        mode === "off"
+          ? "Hard-block guard disabled (default routing behaviour)."
+          : mode === "advisory"
+            ? "Guard evaluates and surfaces banners but never hard-blocks."
+            : "Guard hard-blocks subagent tool calls that violate budget / redundancy / self-script policy.";
+      return [
+        `Enforcement mode set to **${mode}** and persisted.`,
+        "",
+        desc,
+        "",
+        "Note: the `MODEL_ROUTER_ENFORCE` env var, when set to `0` or `1`, overrides this setting.",
+      ].join("\n");
+    }
+    const current = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+    return [
+      `Current enforcement mode: **${current}**`,
+      "",
+      "Usage: `/router enforce <off|advisory|enforced>`",
+    ].join("\n");
+  }
+  const current = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+  return [
+    `# Model Router`,
+    `Enforcement: **${current}**`,
+    "",
+    "Commands:",
+    "- `/router enforce <off|advisory|enforced>` — set hard-block enforcement (persisted)",
+    "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +349,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         res = guardBeforeCall({
           cfg,
           tier: sessionStore.getTier(sid),
+          trivial: sessionStore.isTrivial(sid),
           sessionID: sid,
           tool: input.tool,
           toolArgs: output?.args,
@@ -390,10 +436,25 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     // Emits nothing model-visible, so GA-1 (no-regression) is preserved.
     // -----------------------------------------------------------------------
     event: async ({ event }: any) => {
-      if (process.env.MODEL_ROUTER_TRAJECTORY_DEBUG !== "1") return;
       if (event?.type !== "session.idle") return;
       const sid = event?.properties?.sessionID;
       if (typeof sid !== "string") return;
+
+      // Per-delegation scorecard: only when enforcement was active (guard state exists).
+      try {
+        const gstate = guardStore.get(sid);
+        if (gstate) {
+          const line = formatScorecard(gstate, sessionStore.getTier(sid));
+          const dir = join(tmpdir(), "opencode-model-router-trajectory");
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, `${sid}.scorecard.log`), line + "\n", { flag: "a" });
+        }
+      } catch {
+        // best-effort: a scorecard must never crash a real session
+      }
+
+      // Opt-in full trajectory dump (unchanged gating).
+      if (process.env.MODEL_ROUTER_TRAJECTORY_DEBUG !== "1") return;
       const dump = trajectoryStore.dump(sid);
       if (!dump) return;
       try {
@@ -401,7 +462,7 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, `${sid}.log`), dump + "\n", { flag: "a" });
       } catch {
-        // best-effort: a debug dump must never crash a real session
+        // best-effort
       }
     },
 
@@ -498,6 +559,10 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         description:
           "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
       };
+      opencodeConfig.command["router"] = {
+        template: "$ARGUMENTS",
+        description: "Model-router controls (e.g., /router enforce off|advisory|enforced)",
+      };
     },
 
     // -----------------------------------------------------------------------
@@ -579,6 +644,16 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
         output.parts.push({
           type: "text" as const,
           text: buildBudgetOutput(cfg, input.arguments ?? ""),
+        });
+      }
+
+      if (input.command === "router") {
+        try {
+          cfg = loadConfig();
+        } catch {}
+        output.parts.push({
+          type: "text" as const,
+          text: buildRouterOutput(cfg, input.arguments ?? ""),
         });
       }
     },

@@ -52,6 +52,7 @@ describe("buildCapBanner golden", () => {
       cap: 8 as Cap,
       calls: 3,
       seen: new Map<string, number>(),
+      trivial: false,
     };
     expect(buildCapBanner(state, false, undefined, "read")).toMatchSnapshot();
   });
@@ -62,6 +63,7 @@ describe("buildCapBanner golden", () => {
       cap: 8 as Cap,
       calls: 6,
       seen: new Map<string, number>(),
+      trivial: false,
     };
     expect(buildCapBanner(state, false, undefined, "grep")).toMatchSnapshot();
   });
@@ -72,6 +74,7 @@ describe("buildCapBanner golden", () => {
       cap: 5 as Cap,
       calls: 5,
       seen: new Map<string, number>(),
+      trivial: false,
     };
     expect(buildCapBanner(state, false, undefined, "glob")).toMatchSnapshot();
   });
@@ -82,6 +85,7 @@ describe("buildCapBanner golden", () => {
       cap: 8 as Cap,
       calls: 4,
       seen: new Map<string, number>(),
+      trivial: false,
     };
     expect(buildCapBanner(state, true, 2, "read")).toMatchSnapshot();
   });
@@ -92,6 +96,7 @@ describe("buildCapBanner golden", () => {
       cap: "none" as Cap,
       calls: 10,
       seen: new Map<string, number>(),
+      trivial: false,
     };
     expect(buildCapBanner(state, false, undefined, "grep")).toMatchSnapshot();
   });

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,6 +71,7 @@ export interface RouterConfig {
 export interface RouterState {
   activePreset?: string;
   activeMode?: string;
+  enforcementMode?: "off" | "advisory" | "enforced";
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +396,9 @@ export function loadConfig(): RouterConfig {
       if (state.activeMode && cfg.modes?.[state.activeMode]) {
         cfg.activeMode = state.activeMode;
       }
+      if (state.enforcementMode) {
+        cfg.enforcement = { ...(cfg.enforcement ?? {}), mode: state.enforcementMode };
+      }
     }
   } catch {
     // Ignore state read errors and keep tiers.json defaults
@@ -421,12 +425,14 @@ export function readState(): RouterState {
   return {};
 }
 
-/** Write state to disk (merges with existing keys). */
+/** Write state to disk atomically (merges with existing keys). */
 export function writeState(patch: Partial<RouterState>): void {
   const state = { ...readState(), ...patch };
   const p = statePath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  renameSync(tmp, p);
 }
 
 // ---------------------------------------------------------------------------

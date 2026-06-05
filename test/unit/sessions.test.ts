@@ -1,13 +1,23 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   parseCapDirective,
   buildCapBanner,
   createSessionStore,
+  classifyTrivial,
   DEFAULT_TIER_CAPS,
   type SubagentState,
   type Cap,
 } from "../../src/router/sessions";
+import { validateConfig } from "../../src/router/config";
 import type { RouterConfig } from "../../src/router/config";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const tiersJson = JSON.parse(readFileSync(join(__dirname, "../../tiers.json"), "utf-8"));
+const fullCfg = validateConfig(tiersJson);
 
 describe("parseCapDirective", () => {
   it("parses CAP:none (with/without space, any case) → 'none'", () => {
@@ -28,7 +38,7 @@ describe("parseCapDirective", () => {
 });
 
 function st(partial: Partial<SubagentState> & { cap: Cap; calls: number }): SubagentState {
-  return { tierName: "fast", seen: new Map(), ...partial };
+  return { tierName: "fast", seen: new Map(), trivial: false, ...partial };
 }
 
 describe("buildCapBanner", () => {
@@ -182,6 +192,70 @@ describe("createSessionStore", () => {
     const out: Record<string, unknown> = {};
     store.recordToolCall({ sessionID: "ses_j", tool: "read", args: { file_path: "a.ts" } }, out);
     expect(out.output).toContain("[cap: 1/7]");
+  });
+});
+
+describe("classifyTrivial", () => {
+  it("fast tier + 'search the codebase for X' => true", () => {
+    expect(classifyTrivial("search the codebase for X", "fast", fullCfg)).toBe(true);
+  });
+  it("fast tier + 'grep for the handler' => true", () => {
+    expect(classifyTrivial("grep for the handler", "fast", fullCfg)).toBe(true);
+  });
+  it("fast tier + 'refactor the auth module' => false (medium disqualifier)", () => {
+    expect(classifyTrivial("refactor the auth module", "fast", fullCfg)).toBe(false);
+  });
+  it("medium tier + 'search' text => false (tier gate)", () => {
+    expect(classifyTrivial("search the codebase for X", "medium", fullCfg)).toBe(false);
+  });
+  it("heavy tier + any text => false", () => {
+    expect(classifyTrivial("search the codebase", "heavy", fullCfg)).toBe(false);
+  });
+  it("null tier => false", () => {
+    expect(classifyTrivial("search the codebase", null, fullCfg)).toBe(false);
+  });
+  it("empty text => false", () => {
+    expect(classifyTrivial("", "fast", fullCfg)).toBe(false);
+  });
+  it("fast tier + no matching keyword => false", () => {
+    expect(classifyTrivial("do the thing xyz", "fast", fullCfg)).toBe(false);
+  });
+});
+
+describe("createSessionStore — isTrivial", () => {
+  it("returns true for a fast subagent whose dispatch matches a fast keyword", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_triv1" },
+      dispatch("grep for the handler"),
+      fullCfg,
+      tierNames,
+    );
+    expect(store.isTrivial("ses_triv1")).toBe(true);
+  });
+  it("returns false for a medium subagent regardless of text", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "medium", sessionID: "ses_triv2" },
+      dispatch("search the codebase"),
+      fullCfg,
+      tierNames,
+    );
+    expect(store.isTrivial("ses_triv2")).toBe(false);
+  });
+  it("returns false for an unknown session", () => {
+    const store = createSessionStore();
+    expect(store.isTrivial("unknown-session")).toBe(false);
+  });
+  it("returns false for a fast dispatch with no matching keyword", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_triv3" },
+      dispatch("implement the feature"),
+      fullCfg,
+      tierNames,
+    );
+    expect(store.isTrivial("ses_triv3")).toBe(false);
   });
 });
 

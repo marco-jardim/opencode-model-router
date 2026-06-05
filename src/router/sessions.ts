@@ -13,6 +13,7 @@ export interface SubagentState {
   calls: number;
   /** Fingerprint → call index where this fingerprint was first seen. */
   seen: Map<string, number>;
+  trivial: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +112,46 @@ export function buildCapBanner(
 export const READ_ONLY_TOOLS = new Set(["grep", "read", "glob", "ls"]);
 
 // ---------------------------------------------------------------------------
+// Trivial classifier
+// ---------------------------------------------------------------------------
+
+/** Normalise a taskPattern keyword to a lowercase stem for substring matching. */
+function normTaskKw(kw: string): string {
+  return kw.toLowerCase().split("(")[0]!.split("/")[0]!.trim();
+}
+
+/**
+ * Classify a dispatch as "trivial" AT DISPATCH TIME (m2): conservative,
+ * tier-gated. Only a `fast`-tier dispatch whose text matches a fast taskPattern
+ * and contains NO medium/heavy signal is trivial. Real work (medium/heavy tier,
+ * or implementation keywords) is NEVER trivial — so proportional bypass can
+ * never silently disable enforcement on real work.
+ */
+export function classifyTrivial(
+  dispatchText: string,
+  tier: string | null,
+  cfg: RouterConfig,
+): boolean {
+  if (tier !== "fast") return false;
+  const text = (dispatchText || "").toLowerCase();
+  if (!text.trim()) return false;
+  const disqualifiers = [
+    ...(cfg.taskPatterns?.medium ?? []),
+    ...(cfg.taskPatterns?.heavy ?? []),
+  ];
+  for (const kw of disqualifiers) {
+    const n = normTaskKw(kw);
+    if (n.length >= 3 && text.includes(n)) return false;
+  }
+  const fast = cfg.taskPatterns?.fast ?? [];
+  for (const kw of fast) {
+    const n = normTaskKw(kw);
+    if (n.length >= 3 && text.includes(n)) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Session store factory
 // ---------------------------------------------------------------------------
 
@@ -132,6 +173,11 @@ export function createSessionStore() {
     /** Returns the tier name for a tracked subagent session, or null. */
     getTier(sessionID: string): string | null {
       return subagentCapState.get(sessionID)?.tierName ?? null;
+    },
+
+    /** Returns true when the session was classified as trivial at dispatch time. */
+    isTrivial(sessionID: string): boolean {
+      return subagentCapState.get(sessionID)?.trivial === true;
     },
 
     /**
@@ -162,6 +208,7 @@ export function createSessionStore() {
           cap,
           calls: 0,
           seen: new Map(),
+          trivial: classifyTrivial(dispatchText, tierName, cfg),
         });
       }
     },

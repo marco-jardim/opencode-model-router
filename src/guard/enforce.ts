@@ -49,6 +49,12 @@ export interface BeforeResult {
   guard?: string | null;
 }
 
+/** Compact per-delegation scorecard, emitted only when enforcement was active. */
+export function formatScorecard(state: GuardState, tier: string | null): string {
+  const ttfa = state.ttfa == null ? "n/a" : String(state.ttfa);
+  return `[router scorecard | tier=${tier ?? "?"} | ttfa=${ttfa} | read:exec=${state.readCount}:${state.execCount} | self_scripts=${state.selfScriptCount} | tool_calls=${state.toolCallCount} | blocks=${state.blockedCount} | stop=${state.lastBlock ?? "none"}]`;
+}
+
 /**
  * Decide whether a subagent tool call must be hard-blocked. The caller (the
  * tool.execute.before hook) throws with `message` when block===true. In "off"
@@ -63,9 +69,17 @@ export function guardBeforeCall(params: {
   toolArgs: unknown;
   store: GuardStoreLike;
   env: Record<string, string | undefined>;
+  trivial?: boolean;
 }): BeforeResult {
-  const { cfg, tier, sessionID, tool, toolArgs, store, env } = params;
-  const { mode } = resolveEnforcementMode({ config: cfg, tier: tier ?? undefined, env });
+  const { cfg, tier, sessionID, tool, toolArgs, store, env, trivial } = params;
+  let mode = resolveEnforcementMode({ config: cfg, tier: tier ?? undefined, env }).mode;
+  if (
+    mode === "enforced" &&
+    trivial === true &&
+    cfg.enforcement?.proportional?.trivialBypass !== false
+  ) {
+    mode = "advisory";
+  }
   if (mode === "off") return { block: false, mode };
 
   const policy = buildGuardPolicy(cfg, tier);
