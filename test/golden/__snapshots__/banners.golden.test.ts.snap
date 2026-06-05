@@ -1,0 +1,34 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildCapBanner golden > cap none unlimited 1`] = `"[cap: 10/∞]"`;
+
+exports[`buildCapBanner golden > cap reached 1`] = `
+"[cap: 5/5]
+[⚠ CAP REACHED (5/5): your NEXT response MUST be a return — do NOT make another read-only call. Start the response with DONE:, NEED MORE:, NEED CONTEXT:, SCOPE GROWTH:, or ESCALATE:.]"
+`;
+
+exports[`buildCapBanner golden > cap warning 2 remaining 1`] = `
+"[cap: 6/8]
+[⚠ CAP WARNING: 2 read-only call(s) remaining before forced return]"
+`;
+
+exports[`buildCapBanner golden > redundant call 1`] = `
+"[cap: 4/8]
+[⚠ REDUNDANT: this is the same read you ran at call #2. STOP now — repeated reads add no information. Return with DONE/NEED MORE/NEED CONTEXT/SCOPE GROWTH/ESCALATE.]"
+`;
+
+exports[`buildCapBanner golden > under cap no warning 1`] = `"[cap: 3/8]"`;
+
+exports[`fingerprintToolCall golden > glob with pattern and path 1`] = `"glob:**/*.ts:src/"`;
+
+exports[`fingerprintToolCall golden > grep with pattern and glob 1`] = `"grep:export:**/*.ts"`;
+
+exports[`fingerprintToolCall golden > grep with pattern and path 1`] = `"grep:function foo:src/"`;
+
+exports[`fingerprintToolCall golden > ls with path 1`] = `"ls:src/"`;
+
+exports[`fingerprintToolCall golden > read with file_path 1`] = `"read:src/index.ts"`;
+
+exports[`fingerprintToolCall golden > read with filePath 1`] = `"read:src/index.ts"`;
+
+exports[`fingerprintToolCall golden > unknown tool bash with args 1`] = `"bash:{"command":"npm test"}"`;

@@ -1,0 +1,30 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`detectNarration golden > clean technical sentence no narration 1`] = `[]`;
+
+exports[`detectNarration golden > let me check the file 1`] = `[]`;
+
+exports[`detectNarration golden > multiple narration phrases exercises 5-item cap 1`] = `
+[
+  "Still writing the parser",
+  "Now I'll implement the handler",
+  "now create the test",
+  "Let me add the type",
+  "I'll implement the handler",
+]
+`;
+
+exports[`detectNarration golden > now i'll implement the handler 1`] = `
+[
+  "Now I'll implement the handler",
+  "I'll implement the handler",
+]
+`;
+
+exports[`detectNarration golden > short string under 20 chars 1`] = `[]`;
+
+exports[`detectNarration golden > still writing the parser 1`] = `
+[
+  "Still writing the parser",
+]
+`;

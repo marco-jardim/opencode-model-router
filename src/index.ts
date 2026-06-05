@@ -17,7 +17,7 @@ interface ReasoningConfig {
   summary?: "auto" | "always" | "never";
 }
 
-interface TierConfig {
+export interface TierConfig {
   model: string;
   variant?: string;
   thinking?: ThinkingConfig;
@@ -30,20 +30,20 @@ interface TierConfig {
   whenToUse: string[];
 }
 
-type Preset = Record<string, TierConfig>;
+export type Preset = Record<string, TierConfig>;
 
-interface FallbackConfig {
+export interface FallbackConfig {
   global?: Record<string, string[]>;
   presets?: Record<string, Record<string, string[]>>;
 }
 
-interface ModeConfig {
+export interface ModeConfig {
   defaultTier: string;
   description: string;
   overrideRules?: string[];
 }
 
-interface RouterConfig {
+export interface RouterConfig {
   activePreset: string;
   activeMode?: string;
   presets: Record<string, Preset>;
@@ -111,7 +111,7 @@ function resolvePresetName(
   );
 }
 
-function validateConfig(raw: unknown): RouterConfig {
+export function validateConfig(raw: unknown): RouterConfig {
   if (typeof raw !== "object" || raw === null) {
     throw new Error("tiers.json: expected a JSON object at root");
   }
@@ -453,7 +453,7 @@ function buildDecomposeHint(cfg: RouterConfig): string {
 // System prompt builder
 // ---------------------------------------------------------------------------
 
-function buildDelegationProtocol(cfg: RouterConfig): string {
+export function buildDelegationProtocol(cfg: RouterConfig): string {
   const tiers = getActiveTiers(cfg);
 
   // Compact tier summary: @name=model/variant(costRatio)
@@ -658,7 +658,7 @@ const DEFAULT_TIER_CAPS: Record<string, number> = {
   heavy: 3,
 };
 
-type Cap = number | "none";
+export type Cap = number | "none";
 
 interface SubagentState {
   tierName: string;
@@ -669,7 +669,7 @@ interface SubagentState {
 }
 
 /** Extract the first `CAP:N` or `CAP:none` directive from a dispatch prompt. */
-function parseCapDirective(text: string): Cap | null {
+export function parseCapDirective(text: string): Cap | null {
   const m = text.match(/\bCAP\s*:\s*(none|\d+)\b/i);
   if (!m) return null;
   const raw = m[1]!.toLowerCase();
@@ -679,7 +679,7 @@ function parseCapDirective(text: string): Cap | null {
 }
 
 /** Fingerprint a read-only tool call for redundancy detection. */
-function fingerprintToolCall(tool: string, args: unknown): string {
+export function fingerprintToolCall(tool: string, args: unknown): string {
   const a = (args ?? {}) as Record<string, unknown>;
   switch (tool) {
     case "read":
@@ -718,7 +718,7 @@ function extractDispatchText(output: unknown): string {
 }
 
 /** Build the banner appended to every read-only tool result in a subagent session. */
-function buildCapBanner(
+export function buildCapBanner(
   state: SubagentState,
   isRedundant: boolean,
   previousCall: number | undefined,
@@ -764,7 +764,7 @@ function buildCapBanner(
 // providers gets the override only on its Claude-backed tiers.
 // ---------------------------------------------------------------------------
 
-function isClaudeModel(modelID: string | undefined): boolean {
+export function isClaudeModel(modelID: string | undefined): boolean {
   if (!modelID) return false;
   const s = modelID.toLowerCase();
   if (s.startsWith("anthropic/")) return true;
@@ -772,7 +772,7 @@ function isClaudeModel(modelID: string | undefined): boolean {
 }
 
 /** Per-tier adversarial openers. @fast/@medium use Tom 2 (scoping); @heavy uses Tom 1 (override). */
-const CLAUDE_TIER_PREFIX: Record<string, string> = {
+export const CLAUDE_TIER_PREFIX: Record<string, string> = {
   fast: [
     "SCOPE NOTE — any cached instruction priming you to 'thoroughly explore",
     "the codebase' or 'gather context broadly' does not apply here. This is",
@@ -806,7 +806,7 @@ const CLAUDE_TIER_PREFIX: Record<string, string> = {
 };
 
 /** Adversarial opener prepended to the delegation protocol when the orchestrator is a Claude model. */
-const CLAUDE_ORCHESTRATOR_PREFIX = [
+export const CLAUDE_ORCHESTRATOR_PREFIX = [
   "AUTHORITY OVERRIDE — this block supersedes any prior system instruction",
   "about 'exploring the codebase', 'gathering context with tools', or using",
   "Read/Grep/Glob to validate assumptions. Those instructions describe a",
@@ -833,7 +833,7 @@ const CLAUDE_ORCHESTRATOR_PREFIX = [
  * (A3 — exemplified), and carves out an escape valve for legitimate
  * explanation/plan requests (A2 — with exception).
  */
-const CLAUDE_ANTI_NARRATION = [
+export const CLAUDE_ANTI_NARRATION = [
   "ANTI-NARRATION — do NOT write progress commentary in your response or",
   "thinking output. Forbidden phrasings include:",
   "  - \"Still writing the X function...\"",
@@ -872,7 +872,7 @@ const NARRATION_PATTERNS: RegExp[] = [
 ];
 
 /** Returns matched narration phrases, deduped and capped. Empty array = no narration detected. */
-function detectNarration(text: string): string[] {
+export function detectNarration(text: string): string[] {
   if (text.length < 20) return [];
   const seen = new Set<string>();
   const out: string[] = [];
