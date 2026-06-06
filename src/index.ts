@@ -49,6 +49,7 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
+import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard } from "./escalate/ladder";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -395,6 +396,23 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     require: cfg.enforcement?.verify?.require,
   });
 
+  // Best-effort, secret-free delegate scorecard dump (counts only).
+  const dumpDelegateScorecard = (
+    sid: string,
+    st: Parameters<typeof formatLadderScorecard>[0],
+    accepted: boolean,
+    method: string,
+  ): void => {
+    try {
+      const line = formatLadderScorecard(st, accepted, method);
+      const dir = join(tmpdir(), "opencode-model-router-trajectory");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${sid}.delegate.log`), line + "\n", { flag: "a" });
+    } catch {
+      // best-effort only
+    }
+  };
+
   // Bypass mode: when true, the router skips all system prompt injection,
   // subagent tracking, cap enforcement, and narration detection for the
   // current plugin lifetime (i.e., until OpenCode is restarted).
@@ -432,7 +450,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             } catch {
               activeCfg = cfg;
             }
-            const tier =
+            const initialTier =
               typeof args.tier === "string" && args.tier.trim()
                 ? args.tier.trim()
                 : activeCfg.defaultTier || "medium";
@@ -440,46 +458,146 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               prompt: args.task,
               acceptance: args.acceptance,
             });
-            const created: any = await ctx.client.session.create({});
-            const producerSid: string | undefined = created?.data?.id;
-            if (!producerSid) {
-              return "[router] delegate failed: could not create a producer session.";
+
+            const policy = buildEscalatePolicy(activeCfg);
+            let state = newLadderState(initialTier, policy);
+            const tiersForCost: any = getActiveTiers(activeCfg);
+
+            // Independent safety net: even a policy bug cannot loop unbounded.
+            const safetyMax =
+              Math.max(
+                policy.maxTotalAttempts,
+                policy.ladder.length * (policy.maxAttemptsPerTier + 1),
+              ) + 2;
+            let safety = 0;
+
+            let producerText = "";
+            let forcing: string | null = null;
+
+            while (true) {
+              if (safety++ > safetyMax) {
+                return (
+                  `[router status: unmet] delegation stopped by the safety net after ` +
+                  `${state.totalAttempts} attempt(s).\n\n${scrubText(producerText)}`
+                );
+              }
+              const tier = state.currentTier;
+              const taskText = forcing
+                ? `${scrubText(forcing)}\n\n${args.task}`
+                : args.task;
+
+              const created: any = await ctx.client.session.create({});
+              const producerSid: string | undefined = created?.data?.id;
+              if (!producerSid) {
+                return "[router] delegate failed: could not create a producer session.";
+              }
+              // Compose with Layer 1: guard the plugin-created producer session.
+              try {
+                sessionStore.registerProducerSession(producerSid, tier, activeCfg);
+              } catch {
+                // non-fatal
+              }
+
+              const model = tierModel(activeCfg, tier) ?? undefined;
+              producerText = "";
+              try {
+                const res: any = await ctx.client.session.prompt({
+                  path: { id: producerSid },
+                  body: {
+                    ...(model ? { model } : {}),
+                    ...(tier ? { agent: tier } : {}),
+                    parts: [{ type: "text", text: taskText }],
+                  },
+                });
+                const parts: any[] = res?.data?.parts ?? [];
+                producerText = parts
+                  .filter((p) => p?.type === "text" && typeof p.text === "string")
+                  .map((p) => p.text)
+                  .join("\n");
+              } catch {
+                producerText = "";
+              }
+
+              const artefact = {
+                changedFiles: changedFileStore.get(producerSid),
+                finalReturnText: producerText,
+                declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+                producerSessionID: producerSid,
+                producerTier: tier,
+              };
+
+              let gateRes;
+              try {
+                gateRes = await accept(
+                  { dod, trivial: false, mode: "modeA" },
+                  artefact,
+                  buildGateDeps(),
+                );
+              } catch {
+                gateRes = {
+                  accepted: false,
+                  verdict: {
+                    pass: false,
+                    method: "none" as const,
+                    reasons: ["verification failed (fail-closed)"],
+                  },
+                  dodSource: dod.source,
+                };
+              }
+
+              // Per-attempt cleanup (drop producer session tracking + state).
+              changedFileStore.clear(producerSid);
+              try {
+                sessionStore.unregister(producerSid);
+              } catch {
+                // non-fatal
+              }
+              try {
+                guardStore.clear(producerSid);
+              } catch {
+                // non-fatal
+              }
+
+              const costRatio =
+                typeof tiersForCost?.[tier]?.costRatio === "number"
+                  ? tiersForCost[tier].costRatio
+                  : 1;
+              state = recordAttempt(state, costRatio);
+
+              const action = nextAction(
+                state,
+                { pass: gateRes.accepted, reasons: gateRes.verdict.reasons },
+                policy,
+              );
+
+              if (action.action === "accept") {
+                dumpDelegateScorecard(
+                  producerSid,
+                  state,
+                  true,
+                  gateRes.verdict.method,
+                );
+                return producerText + buildAcceptedSuffix(gateRes.verdict.method);
+              }
+              if (action.action === "give_up") {
+                dumpDelegateScorecard(
+                  producerSid,
+                  state,
+                  false,
+                  gateRes.verdict.method,
+                );
+                const note = scrubText(buildForcingNote(gateRes.verdict.reasons));
+                return (
+                  `[router status: unmet] The delegated result was not accepted after ` +
+                  `${state.totalAttempts} attempt(s) across ${state.escalations} escalation(s) ` +
+                  `(final tier ${state.currentTier}; ${action.reason ?? "verification failed"}).\n\n` +
+                  `${scrubText(producerText)}\n\n${note}`
+                );
+              }
+              // retry or escalate
+              forcing = action.forcingMessage ?? null;
+              state = advance(state, action);
             }
-            const model = tierModel(activeCfg, tier) ?? undefined;
-            const res: any = await ctx.client.session.prompt({
-              path: { id: producerSid },
-              body: {
-                ...(model ? { model } : {}),
-                ...(tier ? { agent: tier } : {}),
-                parts: [{ type: "text", text: args.task }],
-              },
-            });
-            const parts: any[] = res?.data?.parts ?? [];
-            const producerText = parts
-              .filter((p) => p?.type === "text" && typeof p.text === "string")
-              .map((p) => p.text)
-              .join("\n");
-            const artefact = {
-              changedFiles: changedFileStore.get(producerSid),
-              finalReturnText: producerText,
-              declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
-              producerSessionID: producerSid,
-              producerTier: tier,
-            };
-            const gateRes = await accept(
-              { dod, trivial: false, mode: "modeA" },
-              artefact,
-              buildGateDeps(),
-            );
-            changedFileStore.clear(producerSid);
-            if (gateRes.accepted) {
-              return producerText + buildAcceptedSuffix(gateRes.verdict.method);
-            }
-            const note = scrubText(buildForcingNote(gateRes.verdict.reasons));
-            return (
-              `[router status: unmet] The delegated result was not accepted by independent verification.\n\n` +
-              `${scrubText(producerText)}\n\n${note}`
-            );
           } catch {
             return "[router] delegate failed (fail-closed): the delegation or verification could not complete.";
           }
