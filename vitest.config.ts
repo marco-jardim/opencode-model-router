@@ -22,8 +22,23 @@ export default defineConfig({
       provider: "v8",
       reportsDirectory: "coverage",
       include: ["src/**/*.ts"],
-      // thresholds: wired in Phase 5.1 (kept off here so Wave 0 never fails on
-      // coverage while pure modules are still being extracted).
+      // Thresholds turned on in Phase 5.1. Global floors are computed across the
+      // whole `src/` total (index.ts is plugin wiring, intentionally covered by
+      // the integration/smoke suites rather than unit tests, so it is not gated
+      // per-file). The per-directory branch gates lock in the global DoD target
+      // (>=90% branch on the pure guard/verify/escalate/telemetry/router modules);
+      // each is set a few points below the measured baseline to avoid brittleness.
+      thresholds: {
+        statements: 80,
+        branches: 85,
+        functions: 80,
+        lines: 80,
+        "src/guard/**/*.ts": { branches: 90, lines: 90, functions: 90 },
+        "src/verify/**/*.ts": { branches: 90, lines: 90, functions: 90 },
+        "src/router/**/*.ts": { branches: 90, lines: 90, functions: 90 },
+        "src/escalate/**/*.ts": { branches: 95, lines: 95, functions: 95 },
+        "src/telemetry/**/*.ts": { branches: 95, lines: 95, functions: 95 },
+      },
     },
   },
 });
