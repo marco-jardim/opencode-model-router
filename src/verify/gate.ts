@@ -96,6 +96,23 @@ export async function accept(
     };
   }
 
+  // Trivial dispatch (classified at dispatch, m2) carrying only an AUTO-INFERRED
+  // DoD: bypass verification overhead (GA-6 proportional). An explicit author
+  // [acceptance] block (source "explicit"/"annotation") is a deliberate request
+  // to verify and is always honored, even for a trivially-classified dispatch.
+  if (delegation.trivial && dod.source === "inferred") {
+    return {
+      accepted: true,
+      verdict: {
+        pass: false,
+        method: "none",
+        skipped: true,
+        reasons: ["trivial dispatch; verification skipped (auto-inferred DoD)"],
+      },
+      dodSource,
+    };
+  }
+
   // No checkable DoD: apply the proportional / never-silently-accept policy.
   if (!isCheckable(dod)) {
     if (delegation.trivial) {

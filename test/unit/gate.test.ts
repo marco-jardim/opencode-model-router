@@ -117,6 +117,37 @@ describe("accept() — gate policy", () => {
     expect(r.verdict.reasons[0]).toMatch(/trivial/i);
   });
 
+  it("2b. trivial + auto-inferred checkable DoD => skip + accept, grader NOT called (GA-6)", async () => {
+    const dod = normalizeDoD({ kind: "checker", checks: [], criteria: ["the result is correct"], deliverable: null, source: "inferred" });
+    let graderCalls = 0;
+    const d = deps();
+    d.checker = {
+      ...d.checker,
+      dispatchGrader: async () => {
+        graderCalls++;
+        return { sessionID: "grader_sess", text: '{"pass":true,"reasons":[]}' };
+      },
+    };
+    const r = await accept({ dod, trivial: true }, artefact(), d);
+    expect(r.accepted).toBe(true);
+    expect(r.verdict.skipped).toBe(true);
+    expect(r.verdict.reasons[0]).toMatch(/trivial/i);
+    expect(graderCalls).toBe(0);
+  });
+
+  it("2c. trivial + EXPLICIT checkable DoD => still verified (explicit overrides trivial)", async () => {
+    const dod = normalizeDoD({ kind: "checker", checks: [], criteria: ["the result is correct"], deliverable: null, source: "explicit" });
+    const d = deps();
+    d.checker = {
+      ...d.checker,
+      dispatchGrader: async () => ({ sessionID: "grader_sess", text: '{"pass":false,"reasons":["nope"]}' }),
+    };
+    const r = await accept({ dod, trivial: true }, artefact(), d);
+    expect(r.accepted).toBe(false);
+    expect(r.verdict.skipped).toBeFalsy();
+    expect(r.verdict.method).toBe("checker");
+  });
+
   it("3. no checkable DoD + non-trivial + Mode A => not accepted (forcing)", async () => {
     const del: Delegation = { dod: noneDoD(), mode: "modeA" };
     const r = await accept(del, artefact(), deps());
