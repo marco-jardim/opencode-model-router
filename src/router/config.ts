@@ -332,6 +332,37 @@ export function validateConfig(raw: unknown): RouterConfig {
           );
         }
       }
+      if (escalate.maxAttemptsPerTier !== undefined) {
+        if (
+          typeof escalate.maxAttemptsPerTier !== "number" ||
+          !Number.isInteger(escalate.maxAttemptsPerTier) ||
+          escalate.maxAttemptsPerTier < 0
+        ) {
+          throw new Error(
+            "tiers.json: enforcement.escalate.maxAttemptsPerTier must be an integer >= 0",
+          );
+        }
+      }
+      if (escalate.maxTotalAttempts !== undefined) {
+        if (
+          typeof escalate.maxTotalAttempts !== "number" ||
+          !Number.isInteger(escalate.maxTotalAttempts) ||
+          escalate.maxTotalAttempts < 1
+        ) {
+          throw new Error(
+            "tiers.json: enforcement.escalate.maxTotalAttempts must be an integer >= 1",
+          );
+        }
+      }
+      if (
+        escalate.floorTier !== undefined &&
+        escalate.floorTier !== null &&
+        typeof escalate.floorTier !== "string"
+      ) {
+        throw new Error(
+          "tiers.json: enforcement.escalate.floorTier must be a string or null",
+        );
+      }
     }
     if (
       enforcement.perTier !== undefined &&

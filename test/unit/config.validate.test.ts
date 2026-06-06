@@ -173,6 +173,48 @@ describe("validateConfig — enforcement block", () => {
   });
 });
 
+describe("validateConfig — enforcement.escalate extra fields", () => {
+  function withEnf(enf: unknown) {
+    return validRaw({ enforcement: enf });
+  }
+
+  it("accepts valid {maxAttemptsPerTier:0, maxTotalAttempts:1, floorTier:null}", () => {
+    expect(() =>
+      validateConfig(withEnf({ escalate: { maxAttemptsPerTier: 0, maxTotalAttempts: 1, floorTier: null } })),
+    ).not.toThrow();
+  });
+
+  it("accepts valid floorTier:'medium'", () => {
+    expect(() =>
+      validateConfig(withEnf({ escalate: { floorTier: "medium" } })),
+    ).not.toThrow();
+  });
+
+  it("throws when maxAttemptsPerTier is -1", () => {
+    expect(() =>
+      validateConfig(withEnf({ escalate: { maxAttemptsPerTier: -1 } })),
+    ).toThrow("enforcement.escalate.maxAttemptsPerTier must be an integer >= 0");
+  });
+
+  it("throws when maxAttemptsPerTier is 1.5 (non-integer)", () => {
+    expect(() =>
+      validateConfig(withEnf({ escalate: { maxAttemptsPerTier: 1.5 } })),
+    ).toThrow("enforcement.escalate.maxAttemptsPerTier must be an integer >= 0");
+  });
+
+  it("throws when maxTotalAttempts is 0", () => {
+    expect(() =>
+      validateConfig(withEnf({ escalate: { maxTotalAttempts: 0 } })),
+    ).toThrow("enforcement.escalate.maxTotalAttempts must be an integer >= 1");
+  });
+
+  it("throws when floorTier is 123 (number, not string or null)", () => {
+    expect(() =>
+      validateConfig(withEnf({ escalate: { floorTier: 123 } })),
+    ).toThrow("enforcement.escalate.floorTier must be a string or null");
+  });
+});
+
 describe("normalizeEnforcement", () => {
   it("missing enforcement ⇒ mode:off", () => {
     expect(normalizeEnforcement(undefined)).toEqual({ mode: "off" });

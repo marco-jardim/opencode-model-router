@@ -259,6 +259,34 @@ describe("createSessionStore — isTrivial", () => {
   });
 });
 
+describe("registerProducerSession / unregister", () => {
+  it("registers session: isSubagent=true, getTier=tier, isTrivial=false", () => {
+    const store = createSessionStore();
+    store.registerProducerSession("prod_a", "medium", cfg);
+    expect(store.isSubagent("prod_a")).toBe(true);
+    expect(store.getTier("prod_a")).toBe("medium");
+    expect(store.isTrivial("prod_a")).toBe(false);
+  });
+
+  it("cap baseline comes from cfg.tierCaps when present", () => {
+    const customCfg = { tierCaps: { medium: 10 } } as unknown as RouterConfig;
+    const store = createSessionStore();
+    store.registerProducerSession("prod_b", "medium", customCfg);
+    const out: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "prod_b", tool: "read", args: { file_path: "x.ts" } }, out);
+    expect(out.output).toContain("1/10");
+  });
+
+  it("after unregister: isSubagent=false, getTier=null", () => {
+    const store = createSessionStore();
+    store.registerProducerSession("prod_c", "heavy", cfg);
+    expect(store.isSubagent("prod_c")).toBe(true);
+    store.unregister("prod_c");
+    expect(store.isSubagent("prod_c")).toBe(false);
+    expect(store.getTier("prod_c")).toBeNull();
+  });
+});
+
 describe("createSessionStore — getTier", () => {
   it("returns the tier name after registerFromChatMessage for a tier agent", () => {
     const store = createSessionStore();

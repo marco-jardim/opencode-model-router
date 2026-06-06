@@ -183,3 +183,19 @@ export function buildEscalatePolicy(cfg: RouterConfig): EscalatePolicy {
     costMultiple: esc?.costCeiling?.multiple ?? 4,
   };
 }
+
+/**
+ * One-line, secret-free scorecard for a finished delegation (counts only).
+ */
+export function formatLadderScorecard(
+  state: LadderState,
+  accepted: boolean,
+  method: string,
+): string {
+  return (
+    `[router delegate scorecard | final_tier=${state.currentTier} | ` +
+    `attempts=${state.totalAttempts} | escalations=${state.escalations} | ` +
+    `cost=${state.cumulativeCost} | verdict=${accepted ? "PASS" : "UNMET"} | ` +
+    `method=${method}]`
+  );
+}

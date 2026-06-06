@@ -9,6 +9,7 @@ import {
   nextAction,
   advance,
   buildEscalatePolicy,
+  formatLadderScorecard,
   type EscalatePolicy,
   type LadderState,
   type LadderVerdict,
@@ -738,6 +739,35 @@ describe("edge cases: explicit scenario coverage", () => {
     s = recordAttempt(s, 3);
     expect(s.firstAttemptCost).toBe(7); // unchanged
     expect(s.cumulativeCost).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatLadderScorecard
+// ---------------------------------------------------------------------------
+
+describe("formatLadderScorecard", () => {
+  it("accepted=true => verdict=PASS with all fields present", () => {
+    const p = makePolicy({ ladder: ["fast", "medium", "heavy"] });
+    let s = newLadderState("fast", p);
+    s = recordAttempt(s, 3);
+    s = advance(s, { action: "escalate", tier: "medium" });
+    s = recordAttempt(s, 5);
+    const result = formatLadderScorecard(s, true, "grader");
+    expect(result).toContain("verdict=PASS");
+    expect(result).toContain(`final_tier=${s.currentTier}`);
+    expect(result).toContain(`attempts=${s.totalAttempts}`);
+    expect(result).toContain(`escalations=${s.escalations}`);
+    expect(result).toContain(`cost=${s.cumulativeCost}`);
+    expect(result).toContain("method=grader");
+  });
+
+  it("accepted=false => verdict=UNMET", () => {
+    const p = makePolicy();
+    const s = newLadderState("fast", p);
+    const result = formatLadderScorecard(s, false, "heuristic");
+    expect(result).toContain("verdict=UNMET");
+    expect(result).not.toContain("verdict=PASS");
   });
 });
 

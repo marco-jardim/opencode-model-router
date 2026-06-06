@@ -181,6 +181,29 @@ export function createSessionStore() {
     },
 
     /**
+     * Register a plugin-created producer session (from the delegate tool) so that
+     * Layer-1 (tool.execute.before) guards it like any other subagent. trivial:false
+     * ensures the producer is always fully enforced (never downgraded to advisory).
+     */
+    registerProducerSession(sessionID: string, tier: string, cfg: RouterConfig): void {
+      subagentSessionIDs.add(sessionID);
+      const baseline = cfg.tierCaps?.[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5;
+      subagentCapState.set(sessionID, {
+        tierName: tier,
+        cap: baseline,
+        calls: 0,
+        seen: new Map(),
+        trivial: false,
+      });
+    },
+
+    /** Remove a session from tracking (used to clean up delegate producer sessions). */
+    unregister(sessionID: string): void {
+      subagentSessionIDs.delete(sessionID);
+      subagentCapState.delete(sessionID);
+    },
+
+    /**
      * Called from the chat.message hook. If the incoming message is directed
      * at a registered tier agent, records the session and initialises its cap state.
      * Accepts `tierNames` (from getActiveTiers) so this module doesn't need to
