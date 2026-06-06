@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0]
+
+### Changed — advisory enforcement is now the default
+
+- **Default enforcement mode flipped `off` → `advisory`.** With `enforcement.mode`
+  unset, every non-trivial delegation is now verified and any miss surfaces a
+  non-blocking forcing-note; the orchestrator system prompt grows by ~200 tokens for
+  the DoD/acceptance section, and subagents may receive non-blocking guard banners.
+  Nothing is ever hard-blocked in `advisory`. To restore the previous byte-identical
+  behaviour (zero added tokens, zero new latency), set `"mode": "off"` explicitly, run
+  `/router enforce off`, or set `MODEL_ROUTER_ENFORCE=0`.
+- **The custom `delegate` tool is now hidden by default.** Delegation routes through the
+  native `Task()` tool so subagents render inline in the TUI instead of running in an
+  invisible orphan session (fixes the `delegate [tier=…, task=…]` stall). The
+  independently-verified `delegate` tool remains available behind an opt-in flag.
+- The acceptance forcing-note now includes tier-escalation guidance
+  (`Task(subagent_type="<nextTier>")`) when a delegated result is not accepted.
+
+### Added
+
+- `experimental.verifiedDelegateTool` config flag in `tiers.json`, and the
+  `MODEL_ROUTER_VERIFIED_DELEGATE=1` environment variable, to opt back into the
+  authoritative `delegate` tool.
+
 ## [1.2.0]
 
 ### Added — Enforced delegation (opt-in, default OFF)

@@ -73,7 +73,8 @@ describe("guard-before-wiring integration", () => {
 
   // (c) GA-1: enforcement off — byte-identical behaviour (no guard activity).
   it("(c) GA-1: enforcement off — no throw and no GUARD: text injected", async () => {
-    delete process.env.MODEL_ROUTER_ENFORCE;
+    // Pin to "off" mode explicitly so advisory default does not activate the guard.
+    process.env.MODEL_ROUTER_ENFORCE = "0";
 
     // before-hook must not throw even for a self-script
     await expect(

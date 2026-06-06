@@ -114,25 +114,25 @@ describe("resolveEnforcementMode — unrecognised env value", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveEnforcementMode — config resolution", () => {
-  it("config undefined returns mode off", () => {
+  it("config undefined returns mode advisory", () => {
     const result = resolveEnforcementMode({ config: undefined });
-    expect(result.mode).toBe("off");
+    expect(result.mode).toBe("advisory");
   });
 
-  it("config present but enforcement undefined returns mode off", () => {
+  it("config present but enforcement undefined returns mode advisory", () => {
     const result = resolveEnforcementMode({
       config: cfg(undefined),
       env: {},
     });
-    expect(result.mode).toBe("off");
+    expect(result.mode).toBe("advisory");
   });
 
-  it("config enforcement with no mode field defaults to off", () => {
+  it("config enforcement with no mode field defaults to advisory", () => {
     const result = resolveEnforcementMode({
       config: cfg({}),
       env: {},
     });
-    expect(result.mode).toBe("off");
+    expect(result.mode).toBe("advisory");
   });
 
   it("config.enforcement.mode is used as base when env is unset", () => {

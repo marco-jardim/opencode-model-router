@@ -66,6 +66,8 @@ export interface RouterConfig {
   /** Read-only tool-call caps per tier, enforced at runtime via tool.execute.after banner injection. */
   tierCaps?: Record<string, number>;
   enforcement?: EnforcementConfig;
+  /** Experimental, opt-in features. Off by default. */
+  experimental?: { verifiedDelegateTool?: boolean };
 }
 
 export interface RouterState {
@@ -470,9 +472,9 @@ export function writeState(patch: Partial<RouterState>): void {
 // Enforcement helpers
 // ---------------------------------------------------------------------------
 
-/** Returns the effective enforcement mode. Missing enforcement ⇒ mode:"off". */
+/** Returns the effective enforcement mode. Missing enforcement ⇒ mode:"advisory". */
 export function normalizeEnforcement(
   e: EnforcementConfig | undefined,
 ): { mode: "off" | "advisory" | "enforced" } {
-  return { mode: e?.mode ?? "off" };
+  return { mode: e?.mode ?? "advisory" };
 }

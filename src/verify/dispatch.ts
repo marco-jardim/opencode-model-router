@@ -135,15 +135,24 @@ export function shouldVerifyTask(
 }
 
 /** Build the advisory forcing note appended to a task result the gate did not accept. */
-export function buildForcingNote(reasons: string[]): string {
+export function buildForcingNote(
+  reasons: string[],
+  escalation?: { producerTier?: string; nextTier?: string | null },
+): string {
   const body =
     reasons.length > 0
       ? reasons.map((r) => `- ${r}`).join("\n")
       : "- (no reasons provided)";
+  const next =
+    escalation?.nextTier
+      ? `NEXT: address the above, then re-run via \`Task(subagent_type="${escalation.nextTier}")\`` +
+        `${escalation.producerTier ? ` (escalated from ${escalation.producerTier})` : ""}; ` +
+        `do not treat the prior result as complete.`
+      : `NEXT: address the above and re-run the delegation; do not treat the prior result as complete.`;
   return (
     `[router \u26a0 NOT ACCEPTED] The delegated result was not accepted by independent verification:\n` +
     `${body}\n` +
-    `NEXT: address the above and re-run the delegation; do not treat the prior result as complete.`
+    next
   );
 }
 

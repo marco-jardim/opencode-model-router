@@ -83,6 +83,7 @@ describe("Mode B end-to-end (plan-annotation)", () => {
     process.env.HOME = dir;
     process.env.USERPROFILE = dir;
     delete process.env.MODEL_ROUTER_ENFORCE;
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
     invalidateConfigCache();
   });
 
@@ -98,6 +99,7 @@ describe("Mode B end-to-end (plan-annotation)", () => {
       delete process.env.USERPROFILE;
     }
     delete process.env.MODEL_ROUTER_ENFORCE;
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
     try {
       fs.rmSync(dir, { recursive: true, force: true });

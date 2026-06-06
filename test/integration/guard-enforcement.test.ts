@@ -11,7 +11,7 @@ describe("guard-enforcement integration", () => {
   // 1: OFF mode — state never created, output unchanged [GA-1]
   it("1: OFF mode — state never created, output unchanged [GA-1]", () => {
     const store = createGuardStore();
-    const cfg = {} as unknown as RouterConfig;
+    const cfg = { enforcement: { mode: "off" } } as unknown as RouterConfig;
     const sid = "s1";
     const env: Record<string, string | undefined> = {};
     const readArgs = { file_path: "a.ts" };

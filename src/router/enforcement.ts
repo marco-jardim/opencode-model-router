@@ -33,7 +33,7 @@ export function resolveEnforcementMode(args: {
   }
 
   // Config resolution
-  const base: EnforcementMode = enf?.mode ?? "off";
+  const base: EnforcementMode = enf?.mode ?? "advisory";
   let mode: EnforcementMode;
 
   if (

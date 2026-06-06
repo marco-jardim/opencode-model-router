@@ -58,6 +58,7 @@ describe("Layer-2 wiring", () => {
     process.env.USERPROFILE = dir;
     // Ensure MODEL_ROUTER_ENFORCE is clean (tests that need it set it themselves).
     delete process.env.MODEL_ROUTER_ENFORCE;
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
     invalidateConfigCache();
   });
 
@@ -75,6 +76,7 @@ describe("Layer-2 wiring", () => {
     }
     // Clean up enforcement override.
     delete process.env.MODEL_ROUTER_ENFORCE;
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
     // Best-effort temp dir removal.
     try {
@@ -139,8 +141,8 @@ describe("Layer-2 wiring", () => {
     });
 
     it("CASE C: is a no-op when enforcement is OFF (GA-1 preserved)", async () => {
-      // MODEL_ROUTER_ENFORCE not set => resolveEnforcementMode returns "off"
-      // shouldVerifyTask("task","off",...) => false => entire verify block skipped
+      // Pin to "off" mode so shouldVerifyTask returns false and the verify block is skipped.
+      process.env.MODEL_ROUTER_ENFORCE = "0";
       const hooks: any = await ModelRouterPlugin(makeCtx(dir, "grader/producer reply") as any);
 
       const input = {

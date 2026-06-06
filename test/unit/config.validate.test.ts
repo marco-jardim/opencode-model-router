@@ -216,9 +216,9 @@ describe("validateConfig — enforcement.escalate extra fields", () => {
 });
 
 describe("normalizeEnforcement", () => {
-  it("missing enforcement ⇒ mode:off", () => {
-    expect(normalizeEnforcement(undefined)).toEqual({ mode: "off" });
-    expect(normalizeEnforcement({})).toEqual({ mode: "off" });
+  it("missing enforcement ⇒ mode:advisory", () => {
+    expect(normalizeEnforcement(undefined)).toEqual({ mode: "advisory" });
+    expect(normalizeEnforcement({})).toEqual({ mode: "advisory" });
   });
   it("passes through an explicit mode", () => {
     expect(normalizeEnforcement({ mode: "enforced" })).toEqual({ mode: "enforced" });

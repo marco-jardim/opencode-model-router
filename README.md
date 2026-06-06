@@ -579,9 +579,9 @@ Defines provider fallback order when a delegated task fails:
 }
 ```
 
-## Enforced delegation (opt-in)
+## Delegation enforcement (advisory by default)
 
-The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The optional **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with real hard-blocks, independent acceptance, and quality escalation. It is **opt-in and off by default** — with `enforcement` absent from `tiers.json` or `"mode": "off"` set explicitly, routing behaviour is byte-for-byte unchanged: zero added prompt tokens, zero new latency.
+The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with independent acceptance and quality escalation. As of v1.3.0 it runs in **`advisory` mode by default**: every non-trivial delegation is verified and any miss surfaces a forcing-note, but nothing is ever hard-blocked (the orchestrator system prompt grows by ~200 tokens for the DoD/acceptance section, and subagents may receive non-blocking guard banners). Set `"mode": "off"` — or run `/router enforce off` — to restore byte-for-byte-unchanged routing with zero added prompt tokens and zero new latency. Hard-blocks only activate in `"mode": "enforced"`.
 
 ### The three enforcement layers
 
@@ -591,18 +591,18 @@ The read-only cap banners described above are advisory: a well-behaved subagent 
 
 ### Two operating modes
 
-- **Mode A — on-the-fly.** The orchestrator calls the plugin's `delegate` tool (or a raw `Task()` call is observed and annotated) and the full enforcement pipeline runs automatically.
+- **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed and verified automatically by the enforcement pipeline, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
 - **Mode B — plan-annotated.** `/annotate-plan` emits `[tier:X]` plus an `[acceptance]` block per task; the enforcement loop is wired up at execution time based on those annotations.
 
-### Enabling enforcement
+### Tuning enforcement
 
-Three equivalent ways to turn it on:
+Advisory is the default. To change the level:
 
-1. Add an `enforcement` block to `tiers.json` with `"mode": "advisory"` or `"mode": "enforced"` (see `docs/CONFIG_REFERENCE.md`).
-2. Set `MODEL_ROUTER_ENFORCE=1` in your environment to try it for a session (equivalent to `mode: "enforced"`).
+1. Add or edit the `enforcement` block in `tiers.json` — `"mode": "off"`, `"advisory"`, or `"enforced"` (see `docs/CONFIG_REFERENCE.md`).
+2. Set `MODEL_ROUTER_ENFORCE=1` to force `enforced` for a session, or `MODEL_ROUTER_ENFORCE=0` to force `off`.
 3. Run `/router enforce <off|advisory|enforced>` from the chat to toggle at runtime.
 
-**Modes:** `off` — no-op, identical to having no `enforcement` key; `advisory` — evaluates and surfaces guidance, never blocks (safe adoption step); `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
+**Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
 
 > Enforcement applies to subagent/delegate sessions only. The orchestrator session is never hard-blocked.
 

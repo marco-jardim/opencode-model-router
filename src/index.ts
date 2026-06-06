@@ -422,9 +422,13 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
 
+  const enableDelegateTool =
+    cfg.experimental?.verifiedDelegateTool === true ||
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
+
   return {
     tool: {
-      delegate: tool({
+      ...(enableDelegateTool ? { delegate: tool({
         description:
           "Delegate a task to a tier subagent (fast | medium | heavy). The subagent's result is INDEPENDENTLY VERIFIED (deterministic checks, or an independent grader at >= the producer tier in a fresh session) before it is returned. Returns an accepted result on PASS, or an honest 'unmet' status on FAIL — never a self-reported completion. Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.",
         args: {
@@ -613,7 +617,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             return "[router] delegate failed (fail-closed): the delegation or verification could not complete.";
           }
         },
-      }),
+      }) } : {}),
     },
 
     // -----------------------------------------------------------------------
@@ -778,7 +782,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               buildGateDeps(),
             );
             if (!res.accepted && !res.verdict.skipped) {
-              const note = scrubText(buildForcingNote(res.verdict.reasons));
+              const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
+              const li = ladder.indexOf(producerTier);
+              const nextTier = li >= 0 && li < ladder.length - 1 ? ladder[li + 1] : null;
+              const note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier }));
               output.output =
                 typeof output.output === "string"
                   ? output.output + "\n\n" + note
