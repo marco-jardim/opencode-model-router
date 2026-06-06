@@ -1,13 +1,30 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as os from "node:os";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
+import { invalidateConfigCache } from "../../src/router/config";
 
 describe("guard-before-wiring integration", () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let hooks: any;
   let savedEnforce: string | undefined;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let dir: string;
 
   beforeEach(async () => {
     savedEnforce = process.env.MODEL_ROUTER_ENFORCE;
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    // Hermetic home: never read the developer's real state file
+    // (~/.config/opencode/opencode-model-router.state.json), whose persisted
+    // enforcementMode would otherwise leak into these off/on assertions.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "gbw-"));
+    process.env.HOME = dir;
+    process.env.USERPROFILE = dir;
+    delete process.env.MODEL_ROUTER_ENFORCE;
+    invalidateConfigCache();
     hooks = await ModelRouterPlugin({} as any);
     // Register "SUB" as a subagent session by passing agent:"fast"
     // which matches the "fast" tier key in the default anthropic preset.
@@ -19,6 +36,16 @@ describe("guard-before-wiring integration", () => {
       delete process.env.MODEL_ROUTER_ENFORCE;
     } else {
       process.env.MODEL_ROUTER_ENFORCE = savedEnforce;
+    }
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    invalidateConfigCache();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
     }
   });
 
