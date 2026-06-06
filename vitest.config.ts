@@ -13,6 +13,11 @@ export default defineConfig({
     include: ["test/**/*.test.ts"],
     exclude: ["test/smoke/**", "node_modules/**", "dist/**", "tmp/**"],
     environment: "node",
+    server: {
+      deps: {
+        inline: ["@opencode-ai/plugin"],
+      },
+    },
     coverage: {
       provider: "v8",
       reportsDirectory: "coverage",

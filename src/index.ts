@@ -33,7 +33,22 @@ import { createGuardStore } from "./guard/store";
 import { guardBeforeCall, guardAfterCall, formatScorecard } from "./guard/enforce";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
+import { exec as nodeExec } from "node:child_process";
+import { access, readFile as fsReadFile } from "node:fs/promises";
+import { tool } from "@opencode-ai/plugin";
+import { scrubText } from "./guard/scrub";
+import { accept } from "./verify/gate";
+import { createMutexRegistry } from "./verify/deterministic";
+import {
+  createChangedFileStore,
+  parseTaskResult,
+  buildDelegationDoD,
+  tierModel,
+  shouldVerifyTask,
+  buildForcingNote,
+  buildAcceptedSuffix,
+} from "./verify/dispatch";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -274,7 +289,7 @@ function buildPresetOutput(cfg: RouterConfig, args: string): string {
 // Plugin
 // ---------------------------------------------------------------------------
 
-const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
+const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   let cfg = loadConfig();
   const activeTiers = getActiveTiers(cfg);
 
@@ -292,12 +307,186 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
   // mode no guard state is ever created, so behaviour stays byte-identical.
   const guardStore = createGuardStore();
 
+  const changedFileStore = createChangedFileStore();
+  const graderSessions = new Set<string>();
+
+  // Layer-2 real adapters (live-only; every call site is fail-closed).
+  const execSeam = (
+    command: string,
+    opts?: { cwd?: string; timeoutMs?: number },
+  ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> =>
+    new Promise((resolve) => {
+      try {
+        nodeExec(
+          command,
+          {
+            cwd: opts?.cwd ?? ctx.directory,
+            timeout: opts?.timeoutMs ?? 120000,
+            maxBuffer: 10 * 1024 * 1024,
+            windowsHide: true,
+          },
+          (err: any, stdout: any, stderr: any) => {
+            const timedOut = !!(err && err.killed && err.signal === "SIGTERM");
+            const code =
+              err && typeof err.code === "number" ? err.code : err ? 1 : 0;
+            resolve({
+              code,
+              stdout: String(stdout ?? ""),
+              stderr: String(stderr ?? ""),
+              timedOut,
+            });
+          },
+        );
+      } catch {
+        resolve({ code: 1, stdout: "", stderr: "exec failed", timedOut: false });
+      }
+    });
+  const fsSeam = {
+    async fileExists(p: string): Promise<boolean> {
+      try {
+        await access(isAbsolute(p) ? p : join(ctx.directory, p));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    async readFile(p: string): Promise<string> {
+      return await fsReadFile(isAbsolute(p) ? p : join(ctx.directory, p), "utf-8");
+    },
+  };
+  const verifyMutex = createMutexRegistry();
+  const dispatchGrader = async (req: {
+    tier: string;
+    system: string;
+    prompt: string;
+  }): Promise<{ sessionID: string; text: string }> => {
+    const created: any = await ctx.client.session.create({});
+    const sid: string | undefined = created?.data?.id;
+    if (!sid) return { sessionID: "", text: "" };
+    graderSessions.add(sid);
+    const model = tierModel(cfg, req.tier) ?? undefined;
+    const res: any = await ctx.client.session.prompt({
+      path: { id: sid },
+      body: {
+        ...(model ? { model } : {}),
+        system: req.system,
+        parts: [{ type: "text", text: req.prompt }],
+      },
+    });
+    const parts: any[] = res?.data?.parts ?? [];
+    const text = parts
+      .filter((p) => p?.type === "text" && typeof p.text === "string")
+      .map((p) => p.text)
+      .join("\n");
+    return { sessionID: sid, text };
+  };
+  const buildGateDeps = () => ({
+    deterministic: {
+      exec: execSeam,
+      fs: fsSeam,
+      cwd: ctx.directory,
+      mutex: verifyMutex,
+    },
+    checker: {
+      dispatchGrader,
+      ladder: ["fast", "medium", "heavy"],
+      minGraderTier: cfg.enforcement?.verify?.minGraderTier ?? null,
+    },
+    require: cfg.enforcement?.verify?.require,
+  });
+
   // Bypass mode: when true, the router skips all system prompt injection,
   // subagent tracking, cap enforcement, and narration detection for the
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
 
   return {
+    tool: {
+      delegate: tool({
+        description:
+          "Delegate a task to a tier subagent (fast | medium | heavy). The subagent's result is INDEPENDENTLY VERIFIED (deterministic checks, or an independent grader at >= the producer tier in a fresh session) before it is returned. Returns an accepted result on PASS, or an honest 'unmet' status on FAIL — never a self-reported completion. Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.",
+        args: {
+          task: tool.schema
+            .string()
+            .describe("The task for the subagent to perform."),
+          tier: tool.schema
+            .string()
+            .optional()
+            .describe("fast | medium | heavy. Defaults to the router default tier."),
+          acceptance: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Optional [acceptance]...[/acceptance] block defining the Definition of Done (check: / criteria: / deliverable: directives).",
+            ),
+        },
+        async execute(args: {
+          task: string;
+          tier?: string;
+          acceptance?: string;
+        }): Promise<string> {
+          try {
+            let activeCfg = cfg;
+            try {
+              activeCfg = loadConfig();
+            } catch {
+              activeCfg = cfg;
+            }
+            const tier =
+              typeof args.tier === "string" && args.tier.trim()
+                ? args.tier.trim()
+                : activeCfg.defaultTier || "medium";
+            const dod = buildDelegationDoD({
+              prompt: args.task,
+              acceptance: args.acceptance,
+            });
+            const created: any = await ctx.client.session.create({});
+            const producerSid: string | undefined = created?.data?.id;
+            if (!producerSid) {
+              return "[router] delegate failed: could not create a producer session.";
+            }
+            const model = tierModel(activeCfg, tier) ?? undefined;
+            const res: any = await ctx.client.session.prompt({
+              path: { id: producerSid },
+              body: {
+                ...(model ? { model } : {}),
+                ...(tier ? { agent: tier } : {}),
+                parts: [{ type: "text", text: args.task }],
+              },
+            });
+            const parts: any[] = res?.data?.parts ?? [];
+            const producerText = parts
+              .filter((p) => p?.type === "text" && typeof p.text === "string")
+              .map((p) => p.text)
+              .join("\n");
+            const artefact = {
+              changedFiles: changedFileStore.get(producerSid),
+              finalReturnText: producerText,
+              declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+              producerSessionID: producerSid,
+              producerTier: tier,
+            };
+            const gateRes = await accept(
+              { dod, trivial: false, mode: "modeA" },
+              artefact,
+              buildGateDeps(),
+            );
+            changedFileStore.clear(producerSid);
+            if (gateRes.accepted) {
+              return producerText + buildAcceptedSuffix(gateRes.verdict.method);
+            }
+            const note = scrubText(buildForcingNote(gateRes.verdict.reasons));
+            return (
+              `[router status: unmet] The delegated result was not accepted by independent verification.\n\n` +
+              `${scrubText(producerText)}\n\n${note}`
+            );
+          } catch {
+            return "[router] delegate failed (fail-closed): the delegation or verification could not complete.";
+          }
+        },
+      }),
+    },
+
     // -----------------------------------------------------------------------
     // Detect subagent calls via chat.message. When the agent name matches a
     // registered tier, record the sessionID so system.transform can skip
@@ -316,6 +505,16 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
     // loop -> LLM.stream path, so by the time system.transform runs the Set
     // is fully populated and await-safe (yield* on the plugin trigger).
     // -----------------------------------------------------------------------
+    "chat.params": async (input: any, output: any) => {
+      try {
+        if (input?.sessionID && graderSessions.has(input.sessionID)) {
+          output.temperature = cfg.enforcement?.verify?.graderTemperature ?? 0;
+        }
+      } catch {
+        // best-effort: never crash a real session
+      }
+    },
+
     "chat.message": async (input: any, output: any) => {
       if (bypassed) return;
       // Re-read cfg so /preset switches take effect without restart
@@ -384,6 +583,12 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
       // Record-only trajectory observation (mutates internal maps only; never
       // touches output, so emitted banners/observations stay byte-identical).
       const sid = input?.sessionID;
+
+      // Attribute changed files to whichever session made the edit (any session).
+      if (sid && typeof input?.tool === "string") {
+        changedFileStore.record(sid, input.tool, input?.args);
+      }
+
       if (sid && sessionStore.isSubagent(sid) && typeof input?.tool === "string") {
         trajectoryStore.recordToolEvent(sid, {
           tool: input.tool,
@@ -401,6 +606,59 @@ const ModelRouterPlugin: Plugin = async (_ctx: PluginInput) => {
           });
         } catch {
           // best-effort: enforcement must never crash a real session
+        }
+      }
+
+      // Option (i): verify-dispatch around the built-in `task` tool (advisory-grade —
+      // we observe the finished task result and append a forcing note if it is not
+      // accepted; we cannot retry a task call that already finished).
+      if (typeof input?.tool === "string") {
+        let mode = "off";
+        try {
+          mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+        } catch {
+          // fall through with mode "off"
+        }
+        const requireMode = cfg.enforcement?.verify?.require;
+        if (shouldVerifyTask(input.tool, mode, requireMode)) {
+          try {
+            const { finalReturnText, childSessionID } = parseTaskResult(output);
+            const producerTier =
+              typeof input?.args?.subagent_type === "string"
+                ? input.args.subagent_type
+                : "";
+            const dod = buildDelegationDoD({
+              prompt: input?.args?.prompt,
+              description: input?.args?.description,
+            });
+            const artefact = {
+              changedFiles: childSessionID
+                ? changedFileStore.get(childSessionID)
+                : [],
+              finalReturnText,
+              declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+              producerSessionID: childSessionID ?? "",
+              producerTier,
+            };
+            const trivial = childSessionID
+              ? sessionStore.isTrivial(childSessionID)
+              : false;
+            const res = await accept(
+              { dod, trivial, mode: "modeA" },
+              artefact,
+              buildGateDeps(),
+            );
+            if (!res.accepted && !res.verdict.skipped) {
+              const note = scrubText(buildForcingNote(res.verdict.reasons));
+              output.output =
+                typeof output.output === "string"
+                  ? output.output + "\n\n" + note
+                  : note;
+            }
+            if (childSessionID) changedFileStore.clear(childSessionID);
+          } catch {
+            // fail-closed: a verification error must NEVER throw out of the after-hook
+          }
         }
       }
     },

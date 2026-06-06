@@ -5,6 +5,9 @@ import {
   parseTaskResult,
   buildDelegationDoD,
   tierModel,
+  shouldVerifyTask,
+  buildForcingNote,
+  buildAcceptedSuffix,
 } from "../../src/verify/dispatch";
 import type { RouterConfig } from "../../src/router/config";
 
@@ -165,5 +168,47 @@ describe("tierModel", () => {
   it("model without a usable slash => null", () => {
     expect(tierModel(cfg, "weird")).toBeNull();
     expect(tierModel(cfg, "empty")).toBeNull();
+  });
+});
+
+describe("shouldVerifyTask", () => {
+  it("tool !== 'task' => false", () => {
+    expect(shouldVerifyTask("delegate", "enforced", undefined)).toBe(false);
+  });
+  it("tool === 'task' & mode === 'off' => false", () => {
+    expect(shouldVerifyTask("task", "off", undefined)).toBe(false);
+  });
+  it("tool === 'task' & mode !== 'off' & require === 'never' => false", () => {
+    expect(shouldVerifyTask("task", "advisory", "never")).toBe(false);
+  });
+  it("tool === 'task' & mode === 'enforced' & require undefined => true", () => {
+    expect(shouldVerifyTask("task", "enforced", undefined)).toBe(true);
+  });
+  it("tool === 'task' & mode === 'advisory' & require === 'always' => true", () => {
+    expect(shouldVerifyTask("task", "advisory", "always")).toBe(true);
+  });
+  it("tool === 'task' & require === 'whenDoDPresent' => true", () => {
+    expect(shouldVerifyTask("task", "enforced", "whenDoDPresent")).toBe(true);
+  });
+});
+
+describe("buildForcingNote", () => {
+  it("with reasons contains NOT ACCEPTED, bullet items, and NEXT:", () => {
+    const note = buildForcingNote(["a", "b"]);
+    expect(note).toContain("NOT ACCEPTED");
+    expect(note).toContain("- a");
+    expect(note).toContain("- b");
+    expect(note).toContain("NEXT:");
+  });
+  it("empty reasons contains fallback message", () => {
+    expect(buildForcingNote([])).toContain("(no reasons provided)");
+  });
+});
+
+describe("buildAcceptedSuffix", () => {
+  it("returns the expected suffix string", () => {
+    expect(buildAcceptedSuffix("deterministic")).toBe(
+      "\n\n[router \u2713 accepted: deterministic]",
+    );
   });
 });

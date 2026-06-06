@@ -121,3 +121,33 @@ export function tierModel(
     modelID: t.model.slice(slash + 1),
   };
 }
+
+/** Decide whether a built-in `task` tool call should be verify-dispatched (Option i). */
+export function shouldVerifyTask(
+  tool: string,
+  mode: string,
+  require: string | undefined,
+): boolean {
+  if (tool !== "task") return false;
+  if (mode === "off") return false;
+  if ((require ?? "whenDoDPresent") === "never") return false;
+  return true;
+}
+
+/** Build the advisory forcing note appended to a task result the gate did not accept. */
+export function buildForcingNote(reasons: string[]): string {
+  const body =
+    reasons.length > 0
+      ? reasons.map((r) => `- ${r}`).join("\n")
+      : "- (no reasons provided)";
+  return (
+    `[router \u26a0 NOT ACCEPTED] The delegated result was not accepted by independent verification:\n` +
+    `${body}\n` +
+    `NEXT: address the above and re-run the delegation; do not treat the prior result as complete.`
+  );
+}
+
+/** Suffix appended to an accepted delegate-tool result. */
+export function buildAcceptedSuffix(method: string): string {
+  return `\n\n[router \u2713 accepted: ${method}]`;
+}
