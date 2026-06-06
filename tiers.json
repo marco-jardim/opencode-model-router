@@ -40,10 +40,10 @@
         ]
       },
       "heavy": {
-        "model": "anthropic/claude-opus-4-6",
-        "variant": "high",
+        "model": "anthropic/claude-opus-4-8",
+        "variant": "max",
         "costRatio": 20,
-        "description": "Opus 4.6 high for architecture, complex debugging, and security",
+        "description": "Opus 4.8 max for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
@@ -66,10 +66,10 @@
         ]
       },
       "medium": {
-        "model": "openai/gpt-5.4-fast",
+        "model": "openai/gpt-5.5-fast",
         "variant": "high",
         "costRatio": 5,
-        "description": "GPT-5.4 fast default settings for implementation and standard coding",
+        "description": "GPT-5.5 fast default settings for implementation and standard coding",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -173,9 +173,9 @@
     },
     "hybrid": {
       "fast": {
-        "model": "firepass/accounts/fireworks/routers/kimi-k2p6-turbo",
+        "model": "anthropic/claude-haiku-4-5",
         "costRatio": 1,
-        "description": "Kimi 2.6 turbo for exploration, search, and simple reads",
+        "description": "Haiku 4.5 for exploration, search, and simple reads",
         "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",
@@ -198,10 +198,10 @@
         ]
       },
       "heavy": {
-        "model": "anthropic/claude-opus-4-6",
+        "model": "anthropic/claude-opus-4-8",
         "variant": "max",
         "costRatio": 20,
-        "description": "Claude Opus 4.6 max for architecture, complex debugging, and security",
+        "description": "Claude Opus 4.8 max for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
