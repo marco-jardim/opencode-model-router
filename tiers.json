@@ -94,7 +94,7 @@
     },
     "github-copilot": {
       "fast": {
-        "model": "github-copilot/claude-haiku-4-5",
+        "model": "github-copilot/claude-haiku-4.5",
         "costRatio": 1,
         "description": "Claude Haiku 4.5 via GitHub Copilot for fast exploration and simple tasks",
         "steps": 30,
@@ -106,9 +106,9 @@
         ]
       },
       "medium": {
-        "model": "github-copilot/claude-sonnet-4-6",
+        "model": "github-copilot/claude-sonnet-4.6",
         "costRatio": 5,
-        "description": "Claude Sonnet 4.5 via GitHub Copilot for implementation, refactoring, and tests",
+        "description": "Claude Sonnet 4.6 via GitHub Copilot for implementation, refactoring, and tests",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -119,8 +119,7 @@
         ]
       },
       "heavy": {
-        "model": "github-copilot/claude-opus-4-6",
-        "variant": "thinking",
+        "model": "github-copilot/claude-opus-4.6",
         "costRatio": 20,
         "description": "Claude Opus 4.6 via GitHub Copilot for architecture, complex debugging, and security",
         "steps": 120,
