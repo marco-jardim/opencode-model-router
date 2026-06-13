@@ -97,6 +97,15 @@ export function configPath(): string {
   return join(getPluginRoot(), "tiers.json");
 }
 
+export function overridePath(): string {
+  return join(
+    homedir(),
+    ".config",
+    "opencode",
+    "model-router-overrides.json",
+  );
+}
+
 export function statePath(): string {
   return join(
     homedir(),
@@ -407,12 +416,53 @@ export function validateConfig(raw: unknown): RouterConfig {
   return raw as RouterConfig;
 }
 
+// ---------------------------------------------------------------------------
+// Deep merge utility — merges override into base recursively.
+// Arrays are replaced (not concatenated). Scalar values are overwritten.
+// ---------------------------------------------------------------------------
+
+function deepMerge(base: unknown, override: unknown): unknown {
+  if (
+    typeof base !== "object" || base === null || Array.isArray(base) ||
+    typeof override !== "object" || override === null || Array.isArray(override)
+  ) {
+    return override;
+  }
+
+  const result: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  for (const [key, value] of Object.entries(override as Record<string, unknown>)) {
+    if (value === undefined) continue;
+    if (
+      key in result &&
+      typeof result[key] === "object" && result[key] !== null && !Array.isArray(result[key]) &&
+      typeof value === "object" && value !== null && !Array.isArray(value)
+    ) {
+      result[key] = deepMerge(result[key], value);
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 export function loadConfig(): RouterConfig {
   if (_cachedConfig && !_configDirty) {
     return _cachedConfig;
   }
 
-  const raw = JSON.parse(readFileSync(configPath(), "utf-8"));
+  let raw = JSON.parse(readFileSync(configPath(), "utf-8"));
+
+  // Apply user overrides from ~/.config/opencode/model-router-overrides.json
+  try {
+    const op = overridePath();
+    if (existsSync(op)) {
+      const overrides = JSON.parse(readFileSync(op, "utf-8"));
+      raw = deepMerge(raw, overrides);
+    }
+  } catch {
+    // Ignore override read/parse errors — fall back to base config
+  }
+
   const cfg = validateConfig(raw);
 
   try {
