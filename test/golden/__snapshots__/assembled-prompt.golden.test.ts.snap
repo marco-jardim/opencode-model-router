@@ -265,7 +265,7 @@ exports[`assembled-prompt golden > assembled-prompt-openai-enforcement-on > asse
 
 You are the orchestrator. Information-gathering is NOT orchestration — it IS execution. Execution belongs to subagents, not to you.
 
-Preset: openai. Tiers: @fast=gpt-5.4-mini-fast(1x) @medium=gpt-5.5-fast/high(5x) @heavy=gpt-5.5-fast/xhigh(20x).
+Preset: openai. Tiers: @fast=gpt-5.4-mini(1x) @medium=gpt-5.5/high(5x) @heavy=gpt-5.5/xhigh(20x).
 
 ### HARD ROUTING (non-negotiable)
 - **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → default to \`Task(subagent_type="fast", ...)\`. Self-cap (TARGET): ≤2 direct read-only calls per user turn; on the 3rd read-only need, dispatch @fast instead. You may exceed with a 1-line \`reason:\` note when dispatching feels clearly wrong. Rationale: every tool-result token is billed at your tier rate — a grep via @fast costs ~20x less than the same grep here.
@@ -360,7 +360,7 @@ narration during code and implementation tasks.
 
 You are the orchestrator. Information-gathering is NOT orchestration — it IS execution. Execution belongs to subagents, not to you.
 
-Preset: openai. Tiers: @fast=gpt-5.4-mini-fast(1x) @medium=gpt-5.5-fast/high(5x) @heavy=gpt-5.5-fast/xhigh(20x).
+Preset: openai. Tiers: @fast=gpt-5.4-mini(1x) @medium=gpt-5.5/high(5x) @heavy=gpt-5.5/xhigh(20x).
 
 ### HARD ROUTING (non-negotiable)
 - **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → default to \`Task(subagent_type="fast", ...)\`. Self-cap (TARGET): ≤2 direct read-only calls per user turn; on the 3rd read-only need, dispatch @fast instead. You may exceed with a 1-line \`reason:\` note when dispatching feels clearly wrong. Rationale: every tool-result token is billed at your tier rate — a grep via @fast costs ~20x less than the same grep here.
@@ -404,7 +404,7 @@ exports[`assembled-prompt golden > assembled-prompt-openai-model-openai > assemb
 
 You are the orchestrator. Information-gathering is NOT orchestration — it IS execution. Execution belongs to subagents, not to you.
 
-Preset: openai. Tiers: @fast=gpt-5.4-mini-fast(1x) @medium=gpt-5.5-fast/high(5x) @heavy=gpt-5.5-fast/xhigh(20x).
+Preset: openai. Tiers: @fast=gpt-5.4-mini(1x) @medium=gpt-5.5/high(5x) @heavy=gpt-5.5/xhigh(20x).
 
 ### HARD ROUTING (non-negotiable)
 - **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → default to \`Task(subagent_type="fast", ...)\`. Self-cap (TARGET): ≤2 direct read-only calls per user turn; on the 3rd read-only need, dispatch @fast instead. You may exceed with a 1-line \`reason:\` note when dispatching feels clearly wrong. Rationale: every tool-result token is billed at your tier rate — a grep via @fast costs ~20x less than the same grep here.
@@ -448,7 +448,7 @@ exports[`assembled-prompt golden > assembled-prompt-openai-model-undefined > ass
 
 You are the orchestrator. Information-gathering is NOT orchestration — it IS execution. Execution belongs to subagents, not to you.
 
-Preset: openai. Tiers: @fast=gpt-5.4-mini-fast(1x) @medium=gpt-5.5-fast/high(5x) @heavy=gpt-5.5-fast/xhigh(20x).
+Preset: openai. Tiers: @fast=gpt-5.4-mini(1x) @medium=gpt-5.5/high(5x) @heavy=gpt-5.5/xhigh(20x).
 
 ### HARD ROUTING (non-negotiable)
 - **Read-only work** (grep, glob, read, ls, lookup, count, git-info, doc-lookup, type-check, exists-check) → default to \`Task(subagent_type="fast", ...)\`. Self-cap (TARGET): ≤2 direct read-only calls per user turn; on the 3rd read-only need, dispatch @fast instead. You may exceed with a 1-line \`reason:\` note when dispatching feels clearly wrong. Rationale: every tool-result token is billed at your tier rate — a grep via @fast costs ~20x less than the same grep here.
