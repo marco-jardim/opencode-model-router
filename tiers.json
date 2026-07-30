@@ -210,6 +210,45 @@
           "Performance optimization"
         ]
       }
+    },
+    "zen-value": {
+      "fast": {
+        "model": "opencode/deepseek-v4-flash-free",
+        "costRatio": 0,
+        "description": "DeepSeek V4 Flash (free) for exploration and simple reads",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "opencode/claude-sonnet-5",
+        "costRatio": 5,
+        "description": "Claude Sonnet 5 — best price/quality ($2/$10 per 1M) for implementation",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "opencode/claude-opus-5",
+        "costRatio": 20,
+        "description": "Claude Opus 5 for architecture and complex work",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
     }
   },
   "taskPatterns": {
