@@ -44,7 +44,7 @@
     "@opencode-ai/plugin": ">=1.0.0"
   },
   "devDependencies": {
-    "@types/node": "^25.2.3",
+    "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^4.1.8",
     "cross-env": "^7.0.3",
     "typescript": "^5.9.3",
