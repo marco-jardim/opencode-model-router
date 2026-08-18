@@ -641,7 +641,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     "chat.params": async (input: any, output: any) => {
       try {
         if (input?.sessionID && graderSessions.has(input.sessionID)) {
-          output.temperature = cfg.enforcement?.verify?.graderTemperature ?? 0;
+          const graderTemperature = cfg.enforcement?.verify?.graderTemperature;
+          if (graderTemperature !== undefined) {
+            output.temperature = graderTemperature;
+          }
         }
       } catch {
         // best-effort: never crash a real session
