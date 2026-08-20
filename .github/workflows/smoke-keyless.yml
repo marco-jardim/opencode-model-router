@@ -32,14 +32,17 @@ name: smoke-keyless
 # models since the 1.8.0 refresh, and nobody found out, because it never ran.
 # A lane that cannot run cannot rot loudly.
 #
-# ASSUMPTION THE FIRST RUN WILL PROVE OR DISPROVE: that `opencode debug agent`
-# needs no credential and no network in a cold CI container. It was verified
-# on a dev host with HOME repointed at a temp dir (so the developer's
-# ~/.local/share/opencode/auth.json was not visible), which is good evidence
-# but not the same as a container that has never seen opencode. If the first
-# run fails on auth or on a cold model-catalog fetch, the honest fix is to
-# narrow what the test asserts, not to add a secret — the moment this lane
-# needs a credential it stops being able to run on forks and loses its point.
+# PROVEN, not assumed: that `opencode debug agent` needs no credential in a
+# container that has never seen opencode. The first run on ba93ace was green
+# on a cold ubuntu-latest with opencode-ai 1.18.19 — 7 passed, 0 skipped, in
+# 21s. Recorded here because the dev-host evidence (HOME repointed at a temp
+# dir, so ~/.local/share/opencode/auth.json was invisible) was suggestive but
+# not equivalent.
+#
+# If a future run ever fails on auth or on a cold model-catalog fetch, the
+# honest fix is to narrow what the test asserts, not to add a secret — the
+# moment this lane needs a credential it stops being able to run on forks,
+# which is the whole point of it.
 
 on:
   push:

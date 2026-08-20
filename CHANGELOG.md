@@ -5,9 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.10.0] - 2026-08-20
+
+Minor release. Config errors are caught at load instead of drifting to a later turn,
+the logging path 1.9.0 introduced is finished — it was losing messages entirely in
+short-lived processes, and one warning had never been routed through it at all — and
+there is now a smoke lane that needs no credential and therefore actually runs.
 
 ### Added
+
+- **A credential-free smoke lane, running on every push.** `opencode debug agent`
+  loads the plugin, runs the `config` hook, resolves overrides and registers agents
+  with no API key and no model call, so an end-to-end check of registration costs
+  ~20s. The existing smoke lane is gated on secrets, which made it a green no-op on
+  forks — and meant the only test covering the `config` hook had been asserting the
+  pre-1.8.0 anthropic preset for a whole release without anyone finding out. Those
+  pins are repaired, and the new lane asserts that **stderr is empty**, which is
+  coverage unit tests structurally cannot provide: they hand the plugin a stub client,
+  so they have neither a real SDK receiver nor a real process's stderr to check.
 
 - **A malformed tier `model` is rejected when the config loads, not on some later
   turn.** `"model": "claude-sonnet-5"` — a ref missing its provider — used to validate
@@ -33,6 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched rather than orphaned, so the only way to reach the warning is a user-authored
   pattern naming something genuinely absent. The copy now says that and forecloses the
   separator fix explicitly.
+
+- **Passive warnings are no longer lost in short-lived processes.** 1.9.0 sent them to
+  opencode's log fire-and-forget, which is right for a hook — a warning must never
+  block one — but in `opencode run` or `opencode debug` the post never settled before
+  the process exited, and the console fallback never fired because nothing had failed.
+  The warning reached neither the log nor the terminal. The plugin API has
+  `dispose?: () => Promise<void>`, and opencode calls *and awaits* it even on a
+  two-second run, so the logger now tracks in-flight posts and `dispose` drains them.
+  The tracked promise is the already-`catch`-wrapped one, so a failing post can never
+  reject out of teardown. ([#36](https://github.com/marco-jardim/opencode-model-router/issues/36))
+
+- **The `opencode-anthropic-fix` dependency notice reaches the log instead of the
+  terminal.** 1.9.0 routed five of the six `warnAgentOptionsEffortOnce` call sites
+  through the logger and missed the one in `index.ts`, so that warning kept writing to
+  stderr — the exact symptom the change existed to remove. Found by running a real
+  process, not by a test; there is now a test.
 
 ## [1.9.0] - 2026-08-20
 
