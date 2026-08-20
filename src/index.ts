@@ -727,13 +727,15 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             catalogWarned = true;
             const catalog = deferredCatalog;
             if (catalog) {
-              // Strong-model patterns matching nothing any configured provider
-              // serves, which can silently flip prompt-style resolution for
-              // tiers on auto. Catalog-dependent, so it rides the same deferred
-              // path — it is NOT emitted on turn 1.
+              // User-authored strong-model patterns matching nothing any
+              // configured provider serves. Shipped defaults are never reported
+              // (see findOrphanedStrongPatterns), so reaching here means the
+              // user wrote a claim about this environment that is false.
+              // Catalog-dependent, so it rides the same deferred path — it is
+              // NOT emitted on turn 1.
               for (const p of findOrphanedStrongPatterns(cfg, catalog)) {
                 logger.warn(
-                  `strong-model pattern '${p}' matches no model your providers serve — may silently change prompt-style resolution for tiers on auto`,
+                  `strong-model pattern '${p}' from your modelGenerations.strong matches no model your providers serve, so it decides nothing — separator style is already ignored when matching`,
                   { pattern: p },
                 );
               }

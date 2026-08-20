@@ -284,8 +284,9 @@ export function buildModelsOutput(
 }
 
 /**
- * Render strong-model patterns that match no model in the active preset (see
- * `findOrphanedStrongPatterns`). Report-only — the router never edits the
+ * Render strong-model patterns that match no model the configured providers
+ * serve (see `findOrphanedStrongPatterns`). Only ever user-authored patterns:
+ * shipped defaults are not reported. Report-only — the router never edits the
  * user's pattern list.
  */
 export function formatOrphanedStrongPatterns(patterns: string[]): string {
@@ -293,7 +294,7 @@ export function formatOrphanedStrongPatterns(patterns: string[]): string {
     "⚠ **Strong-model patterns matching no model your providers serve:**",
     ...patterns.map((p) => `- \`${p}\``),
     "",
-    "This may silently change prompt-style resolution for tiers on `promptStyle: auto`. If a provider renamed a model, update `modelGenerations.strong` in your overrides file (`/router overrides`).",
+    "You set these in `modelGenerations.strong`, so they decide nothing here and tiers on `promptStyle: auto` resolve without them. Matching already ignores case and separator style, so `opus-4-8` finds `opus-4.8` — a pattern listed above is absent, not merely spelled differently. Fix or drop it in your overrides file (`/router overrides`).",
   ].join("\n");
 }
 

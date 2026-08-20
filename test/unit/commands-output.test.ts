@@ -298,19 +298,23 @@ describe("buildModelsOutput — orphaned strong patterns", () => {
     providers: [{ id: "anthropic", models: [{ id: "opus-4.8", status: "active" }] }],
   };
 
+  // `opus-4-8` against a served `opus-4.8` is deliberately NOT the fixture: the
+  // matcher normalizes separators, so that pair matches and can never reach
+  // this formatter. Only a genuinely absent pattern can.
   it("appends the orphan warning to the model listing", () => {
-    const out = buildModelsOutput(catalog, "", ["opus-4-8"]);
+    const out = buildModelsOutput(catalog, "", ["ghost-model-9"]);
     expect(out).toContain("`anthropic/opus-4.8`");
     expect(out).toContain("matching no model your providers serve");
-    expect(out).toContain("- `opus-4-8`");
-    // honest scope: a dead pattern *may* flip resolution — a tier whose model
-    // still contains the pattern keeps resolving goal-oriented
-    expect(out).toContain("may silently change prompt-style resolution");
+    expect(out).toContain("- `ghost-model-9`");
+    // says whose pattern it is, since defaults are never reported
+    expect(out).toContain("modelGenerations.strong");
+    // and forecloses the wrong fix: this is not a separator problem
+    expect(out).toContain("ignores case and separator style");
     expect(out).not.toContain("now resolves to the **prescriptive** prompt");
   });
 
   it("warns even when the catalog could not be fetched", () => {
-    const out = buildModelsOutput(null, "", ["opus-4-8"]);
+    const out = buildModelsOutput(null, "", ["ghost-model-9"]);
     expect(out).toContain("Model catalog unavailable");
     expect(out).toContain("matching no model your providers serve");
   });
