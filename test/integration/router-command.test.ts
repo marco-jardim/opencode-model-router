@@ -5,6 +5,7 @@ import { join, dirname } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import { resolveEnforcementMode } from "../../src/router/enforcement";
 import { loadConfig, invalidateConfigCache } from "../../src/router/config";
+import { resetAgentOptionsEffortWarnings } from "../../src/router/agent-options";
 
 describe("router-command integration", () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -427,6 +428,59 @@ describe("router-command — passive warnings go to opencode's log", () => {
       expect(warn).not.toHaveBeenCalled();
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  // The registration path warns too, and it is the noisiest of the lot: the
+  // anthropic-fix dependency notice is ~230 characters, which is exactly the
+  // line the original bug report watched smear across the TUI. It fires from
+  // the `config` hook, so nothing above reaches it.
+  it("routes the agent-options effort warning to app.log and leaves the console alone", async () => {
+    // A Claude-backed tier carrying a string `effort` is what makes
+    // buildAgentOptions emit `options.effort`, which is the trigger.
+    const overrides = join(
+      testHomeDir,
+      ".config/opencode/opencode-model-router.overrides.jsonc",
+    );
+    mkdirSync(dirname(overrides), { recursive: true });
+    writeFileSync(
+      overrides,
+      JSON.stringify({
+        presets: {
+          local: { fast: { model: "anthropic/claude-haiku-4-5", effort: "high" } },
+        },
+        activePreset: "local",
+      }),
+      "utf-8",
+    );
+    invalidateConfigCache();
+    // warnAgentOptionsEffortOnce dedupes through a module-level Set that lives
+    // for the whole process, and this key is a fixed string rather than one
+    // qualified by tier. Any earlier test in this file that registered a
+    // Claude tier with an effort would have consumed it and left this
+    // assertion passing on an empty log. Reset it so the test is deterministic
+    // regardless of what ran before.
+    resetAgentOptionsEffortWarnings();
+
+    const logged: any[] = [];
+    const h: any = await ModelRouterPlugin(ctxWithLog(logged) as any);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await h["config"]({});
+      await flush();
+
+      const entry = logged.find((l) =>
+        String(l.body.message).includes("opencode-anthropic-fix"),
+      );
+      expect(entry).toBeDefined();
+      expect(entry.body.service).toBe("model-router");
+      expect(entry.body.level).toBe("warn");
+      // the regression: this used to reach stderr because the call site
+      // dropped the logger argument and fell through to console.warn
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      resetAgentOptionsEffortWarnings();
     }
   });
 });

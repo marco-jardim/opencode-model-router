@@ -123,4 +123,73 @@ describe("createPluginLogger", () => {
     await flush();
     expect(warn).not.toHaveBeenCalled();
   });
+
+  // -------------------------------------------------------------------------
+  // flush(): the counterpart to fire-and-forget. A short-lived process
+  // (`opencode run`, `opencode debug`) exits before a post settles, so the
+  // warning is lost without a failure anyone can see. `dispose` awaits this.
+  //
+  // Note: the module-level `flush` helper above is the "let microtasks/timers
+  // run" tick, NOT the logger method. The method is always called as
+  // `logger.flush()` below.
+  // -------------------------------------------------------------------------
+
+  it("flush() resolves only after an in-flight post settles", async () => {
+    let settled = false;
+    const log = () =>
+      new Promise((r) =>
+        setTimeout(() => {
+          settled = true;
+          r({ data: {}, error: undefined });
+        }, 20),
+      );
+    const logger = createPluginLogger({ app: { log } });
+    logger.warn("m");
+    // warn is still fire-and-forget: it returned before the post finished.
+    expect(settled).toBe(false);
+    await logger.flush();
+    expect(settled).toBe(true);
+  });
+
+  it("flush() on the console-fallback logger resolves without throwing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logger = createPluginLogger({});
+    logger.warn("m");
+    await expect(logger.flush()).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(`[${LOG_SERVICE}] m`);
+  });
+
+  // A failing flush must not be the thing that breaks teardown.
+  it("flush() does not reject when the post rejects", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logger = createPluginLogger({
+      app: { log: () => Promise.reject(new Error("down")) },
+    });
+    logger.warn("m");
+    await expect(logger.flush()).resolves.toBeUndefined();
+    // the diagnostic still went somewhere
+    expect(warn).toHaveBeenCalledWith(`[${LOG_SERVICE}] m`);
+  });
+
+  it("flush() with nothing in flight resolves immediately", async () => {
+    const log = vi.fn(() => Promise.resolve({ data: {}, error: undefined }));
+    const logger = createPluginLogger({ app: { log } });
+    await expect(logger.flush()).resolves.toBeUndefined();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  // Entries remove themselves once settled, so the set stays bounded on a
+  // long-lived server. A second flush must neither hang on a stale entry nor
+  // re-run the fallback for a post that already reported.
+  it("flush() drains the tracked set, so a second flush is a no-op", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logger = createPluginLogger({
+      app: { log: () => Promise.resolve({ data: undefined, error: { message: "bad" } }) },
+    });
+    logger.warn("m");
+    await logger.flush();
+    expect(warn).toHaveBeenCalledTimes(1);
+    await expect(logger.flush()).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
 });

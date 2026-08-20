@@ -326,6 +326,13 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
 
   return {
+    // Warnings post to /log fire-and-forget, which loses the message when the
+    // process is about to exit — `opencode run` and `opencode debug` are short
+    // enough for that to be the normal case. Verified against opencode 1.18.16
+    // that dispose is both called and awaited, so flushing here is enough.
+    dispose: async () => {
+      await logger.flush();
+    },
     tool: {
       ...(enableDelegateTool ? { delegate: tool({
         description:
@@ -1038,6 +1045,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
           warnAgentOptionsEffortOnce(
             "anthropic-effort-dependency",
             "effort on Anthropic models requires the opencode-anthropic-fix plugin (commit 307aea9+ for fable/mythos); non-adaptive Claude models (e.g. haiku) silently strip effort at the API layer, and without the plugin a top-level effort can break Claude-Code billing fingerprinting",
+            logger,
           );
         }
 

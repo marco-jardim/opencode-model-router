@@ -26,10 +26,29 @@
  *  2. `App.log` defaults to `ThrowOnError = false`, so an HTTP failure RESOLVES
  *     as `{ data: undefined, error }` instead of rejecting. A bare `.catch()`
  *     sees nothing on a 400, so the settled value is inspected as well.
+ *  3. Fire-and-forget loses the message outright when the process is about to
+ *     exit: the post never settles, and the fallback never runs because nothing
+ *     failed. A long-lived server never notices; `opencode run` and `opencode
+ *     debug` are short-lived and would go silent, which is strictly worse than
+ *     the stderr write this file exists to avoid. Hence `flush()`, awaited from
+ *     the plugin's `dispose` hook. Verified against a live opencode 1.18.16:
+ *     `dispose` is both called and awaited on `opencode debug agent`.
+ *
+ * One thing to know before debugging this: the `service` tag is a namespace,
+ * not a rendered field. Entries land as
+ * `timestamp=... level=WARN run=... message="..." <extra keys>` with no
+ * `service=` anywhere, so grepping opencode's log for `service=model-router`
+ * finds nothing even when the entry is there. Match on the message text.
  */
 
 export interface PluginLogger {
   warn(message: string, extra?: Record<string, unknown>): void;
+  /**
+   * Await every post still in flight, so a shutting-down process does not drop
+   * warnings it already decided to emit. Never rejects: a failing flush must
+   * not be the thing that breaks teardown.
+   */
+  flush(): Promise<void>;
 }
 
 /** The service tag on every entry, so entries are greppable by origin. */
@@ -86,8 +105,14 @@ export function createPluginLogger(client?: unknown): PluginLogger {
       warn(message) {
         console.warn(`${CONSOLE_PREFIX} ${message}`);
       },
+      // console.warn is synchronous, so there is never anything to wait for.
+      flush: () => Promise.resolve(),
     };
   }
+
+  // Posts still in flight. Entries remove themselves once settled, so this
+  // stays bounded on a long-lived server rather than growing for its lifetime.
+  const inFlight = new Set<Promise<void>>();
 
   return {
     warn(message, extra) {
@@ -112,11 +137,20 @@ export function createPluginLogger(client?: unknown): PluginLogger {
       // Fire-and-forget: never await, but never leave a rejection unhandled
       // either, and do not lose the diagnostic when the post fails — whether it
       // fails by rejecting or by resolving with an error. See (2) above.
-      void Promise.resolve(result)
-        .then((settled) => {
-          if (isErrorResult(settled)) toConsole();
+      const settled: Promise<void> = Promise.resolve(result)
+        .then((value) => {
+          if (isErrorResult(value)) toConsole();
         })
         .catch(toConsole);
+      // Tracked so `flush` can wait for it. `settled` already absorbs its own
+      // failures, so nothing here can reject. See (3) above.
+      inFlight.add(settled);
+      void settled.finally(() => {
+        inFlight.delete(settled);
+      });
+    },
+    async flush() {
+      await Promise.allSettled([...inFlight]);
     },
   };
 }
