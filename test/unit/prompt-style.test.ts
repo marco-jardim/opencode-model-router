@@ -361,7 +361,7 @@ describe("validateConfig prompt style schema", () => {
         defaultTier: "fast",
         rules: [],
         modelGenerations: [],
-        presets: { test: { fast: { model: "m", description: "d", whenToUse: ["w"] } } },
+        presets: { test: { fast: { model: "p/m", description: "d", whenToUse: ["w"] } } },
       }),
     ).toThrow("tiers.json: modelGenerations must be an object");
 
@@ -371,7 +371,7 @@ describe("validateConfig prompt style schema", () => {
         defaultTier: "fast",
         rules: [],
         modelGenerations: { strong: "my-model" },
-        presets: { test: { fast: { model: "m", description: "d", whenToUse: ["w"] } } },
+        presets: { test: { fast: { model: "p/m", description: "d", whenToUse: ["w"] } } },
       }),
     ).toThrow("tiers.json: modelGenerations.strong must be an array");
 
@@ -384,7 +384,7 @@ describe("validateConfig prompt style schema", () => {
         defaultTier: "fast",
         rules: [],
         modelGenerations: { claude5x: 1, strong: ["claude-opus-5"] },
-        presets: { test: { fast: { model: "m", description: "d", whenToUse: ["w"] } } },
+        presets: { test: { fast: { model: "p/m", description: "d", whenToUse: ["w"] } } },
       }),
     ).not.toThrow();
   });
@@ -396,7 +396,7 @@ describe("validateConfig prompt style schema", () => {
         defaultTier: "fast",
         rules: [],
         tierPromptsGoalOriented: ["fast"],
-        presets: { test: { fast: { model: "m", description: "d", whenToUse: ["w"] } } },
+        presets: { test: { fast: { model: "p/m", description: "d", whenToUse: ["w"] } } },
       }),
     ).toThrow("tiers.json: 'tierPromptsGoalOriented' must be an object");
   });
@@ -408,7 +408,7 @@ describe("validateConfig prompt style schema", () => {
         defaultTier: "fast",
         rules: [],
         tierPromptsGoalOriented: { fast: 123 },
-        presets: { test: { fast: { model: "m", description: "d", whenToUse: ["w"] } } },
+        presets: { test: { fast: { model: "p/m", description: "d", whenToUse: ["w"] } } },
       }),
     ).toThrow("tiers.json: tierPromptsGoalOriented.'fast' must be a string");
   });

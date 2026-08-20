@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A malformed tier `model` is rejected when the config loads, not on some later
+  turn.** `"model": "claude-sonnet-5"` — a ref missing its provider — used to validate
+  clean and only surface as a catalog issue on a turn that happened to have the catalog
+  in hand, or never, if the fetch failed. The `provider/model` shape needs no network,
+  so it is now decided at load, alongside the existing `effort` and `promptStyle`
+  checks. `parseModelRef` moved to `config.ts` (re-exported from `catalog.ts`) so load
+  validation and catalog lookup share one definition of well-formed: passing the first
+  now guarantees parsing in the second. Observed by @MetalbolicX in
+  [#17](https://github.com/marco-jardim/opencode-model-router/issues/17); implementation
+  is independent of the fork's.
+
+  Behaviour change for an existing malformed config: an overrides file carrying a bad
+  ref is now dropped with a warning naming the offending value, and the bundled
+  defaults stand. Startup is never blocked — the layer-drop path already guaranteed
+  that, and there is now a test pinning it for this case specifically.
+
+### Fixed
+
+- **The orphaned-pattern warning no longer suggests a fix that cannot apply.** It still
+  told the user a provider rename was the likely cause and to update
+  `modelGenerations.strong` to match. Since 1.9.0 normalizes separators, a rename is
+  matched rather than orphaned, so the only way to reach the warning is a user-authored
+  pattern naming something genuinely absent. The copy now says that and forecloses the
+  separator fix explicitly.
+
 ## [1.9.0] - 2026-08-20
 
 Minor release. One real bug — prompt-style resolution broke when a provider renamed a

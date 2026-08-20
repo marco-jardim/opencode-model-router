@@ -339,6 +339,25 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /**
+ * Split a tier model reference (`"provider/model"`) into its parts. Splits on
+ * the FIRST slash only, so multi-segment model ids (e.g.
+ * `openrouter/deepseek/deepseek-v3.2`) keep their full model id.
+ *
+ * Lives here rather than in catalog.ts because the `provider/model` shape is a
+ * property of the config format, not of the catalog. Config load and catalog
+ * lookup have to agree on what a well-formed ref is; sharing one function is
+ * what makes "it validated at load" mean "it will parse later". catalog.ts
+ * re-exports it so the reference is still reachable from where it is used.
+ */
+export function parseModelRef(
+  ref: string,
+): { providerId: string; modelId: string } | undefined {
+  const i = ref.indexOf("/");
+  if (i <= 0 || i === ref.length - 1) return undefined;
+  return { providerId: ref.slice(0, i), modelId: ref.slice(i + 1) };
+}
+
+/**
  * Shape of every preset and every tier within it. Returns the presets map so
  * the caller can hand it to validateActivePreset without re-narrowing.
  */
@@ -370,6 +389,18 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
       if (typeof t.model !== "string" || !t.model) {
         throw new Error(
           `tiers.json: '${presetName}.${tierName}.model' must be a non-empty string`,
+        );
+      }
+      // Same reasoning as effort and promptStyle below, one step earlier: a ref
+      // missing its provider (`claude-sonnet-5`) or missing its model
+      // (`anthropic/`) used to load clean and only surface much later, as a
+      // catalog issue on a turn that happened to fetch the catalog — or never,
+      // if the fetch failed. The shape is knowable without the network, so it
+      // is decided here. parseModelRef is the same function the catalog lookup
+      // uses, so passing this guarantees the ref parses there too.
+      if (!parseModelRef(t.model)) {
+        throw new Error(
+          `tiers.json: '${presetName}.${tierName}.model' must be 'provider/model' (got '${t.model}')`,
         );
       }
       if (t.description !== undefined && typeof t.description !== "string") {

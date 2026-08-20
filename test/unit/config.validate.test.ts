@@ -94,13 +94,34 @@ describe("validateConfig — tier shape", () => {
     expect(() => validateConfig(withTier({ model: "", description: "d", whenToUse: [] }))).toThrow(/\.model/);
   });
   it("throws when tier.description is not a string", () => {
-    expect(() => validateConfig(withTier({ model: "m", description: 1, whenToUse: [] }))).toThrow(/\.description/);
+    expect(() => validateConfig(withTier({ model: "provider/m", description: 1, whenToUse: [] }))).toThrow(/\.description/);
   });
   it("throws when tier.whenToUse is not an array", () => {
-    expect(() => validateConfig(withTier({ model: "m", description: "d", whenToUse: "x" }))).toThrow(/whenToUse/);
+    expect(() => validateConfig(withTier({ model: "provider/m", description: "d", whenToUse: "x" }))).toThrow(/whenToUse/);
   });
   it("accepts a tier with only `model` (description/whenToUse optional)", () => {
     expect(() => validateConfig(withTier({ model: "provider/m" }))).not.toThrow();
+  });
+
+  // Reported in #17: a malformed ref used to load clean and only surface as a
+  // catalog issue on some later turn, or never if the catalog fetch failed.
+  // The shape needs no network, so it is decided at load.
+  it("throws when tier.model has no provider", () => {
+    expect(() => validateConfig(withTier({ model: "claude-sonnet-5" }))).toThrow(
+      "tiers.json: 'anthropic.fast.model' must be 'provider/model' (got 'claude-sonnet-5')",
+    );
+  });
+  it("throws when tier.model has an empty provider or an empty model", () => {
+    expect(() => validateConfig(withTier({ model: "/claude-sonnet-5" }))).toThrow(/'provider\/model'/);
+    expect(() => validateConfig(withTier({ model: "anthropic/" }))).toThrow(/'provider\/model'/);
+    expect(() => validateConfig(withTier({ model: "/" }))).toThrow(/'provider\/model'/);
+  });
+  // Multi-segment model ids are legal: the split takes the FIRST slash only, so
+  // the provider is `openrouter` and the model keeps its remaining slashes.
+  it("accepts a multi-segment model id", () => {
+    expect(() =>
+      validateConfig(withTier({ model: "openrouter/deepseek/deepseek-v3.2" })),
+    ).not.toThrow();
   });
 });
 

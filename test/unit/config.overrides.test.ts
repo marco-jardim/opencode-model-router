@@ -329,6 +329,24 @@ describe("loadConfig — user overrides file", () => {
       expect.stringContaining("must be a non-empty string"),
     );
   });
+
+  // The provider-less ref is the realistic mistake — it looks like a model name,
+  // so it reads as correct. What matters is that rejecting it at load DEGRADES:
+  // the layer is dropped and the bundled config stands, rather than the plugin
+  // failing to start. Reported in #17.
+  it("drops the layer, without bricking startup, when a model ref has no provider", () => {
+    writeOverride(
+      JSON.stringify({
+        presets: { anthropic: { fast: { model: "claude-sonnet-5" } } },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-sonnet-5");
+    // and the warning names the offending value, not just the field
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("must be 'provider/model' (got 'claude-sonnet-5')"),
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

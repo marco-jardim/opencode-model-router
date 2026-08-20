@@ -5,7 +5,11 @@
 // raw payload is handed here for normalization and analysis.
 // ---------------------------------------------------------------------------
 
-import { DEFAULT_STRONG_MODEL_PATTERNS, type RouterConfig } from "./config";
+import {
+  DEFAULT_STRONG_MODEL_PATTERNS,
+  parseModelRef,
+  type RouterConfig,
+} from "./config";
 import { flattenModelID } from "./prompts";
 import { getActiveTiers } from "./protocol";
 
@@ -80,17 +84,12 @@ export function isCatalogEmpty(catalog: Catalog): boolean {
 }
 
 /**
- * Split a tier model reference (`"provider/model"`) into its parts. Splits on
- * the FIRST slash only, so multi-segment model ids (e.g.
- * `openrouter/deepseek/deepseek-v3.2`) keep their full model id.
+ * Re-exported from config.ts, where it lives because the `provider/model` shape
+ * is a property of the config format rather than of the catalog. Config load
+ * rejects a ref this cannot parse, so by the time a ref reaches the lookups
+ * below it has already been through the same function.
  */
-export function parseModelRef(
-  ref: string,
-): { providerId: string; modelId: string } | undefined {
-  const i = ref.indexOf("/");
-  if (i <= 0 || i === ref.length - 1) return undefined;
-  return { providerId: ref.slice(0, i), modelId: ref.slice(i + 1) };
-}
+export { parseModelRef };
 
 function findProvider(
   catalog: Catalog,
