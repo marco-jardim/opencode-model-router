@@ -21,7 +21,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const RUN = process.env.RUN_OC_SMOKE === "1";
+// `opencode debug agent` needs no API key, so this file also runs in the
+// keyless lane (`npm run smoke:keyless`) alongside registration.smoke.test.ts.
+const RUN =
+  process.env.RUN_OC_SMOKE === "1" ||
+  process.env.RUN_OC_SMOKE_KEYLESS === "1";
 const d = RUN ? describe : describe.skip;
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -30,8 +34,13 @@ const AGENT = "SmokeScout";
 // From the bundled `anthropic` preset in tiers.json. Pinned here on purpose:
 // if a preset refresh changes these, this test should fail and be updated,
 // because it is asserting the end-to-end mapping, not re-deriving it.
-const FAST_MODEL = { providerID: "anthropic", modelID: "claude-haiku-4-5" };
-const HEAVY_MODEL = { providerID: "anthropic", modelID: "claude-opus-4-8" };
+//
+// Repaired: these had gone stale (they still claimed `claude-haiku-4-5` /
+// `claude-opus-4-8`, which predate a preset refresh) and were re-derived
+// from tiers.json's `anthropic` preset — fast is now claude-sonnet-5 with
+// no variant, heavy is claude-fable-5 with variant "max".
+const FAST_MODEL = { providerID: "anthropic", modelID: "claude-sonnet-5" };
+const HEAVY_MODEL = { providerID: "anthropic", modelID: "claude-fable-5" };
 const HEAVY_VARIANT = "max";
 
 // Each case shells out to a real opencode. The first one also pays process
