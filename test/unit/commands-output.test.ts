@@ -388,32 +388,20 @@ describe("formatModelIssues", () => {
   });
 });
 
-describe("formatOrphanedStrongPatterns — near misses", () => {
-  it("renders bare when no near miss is known", () => {
-    const out = formatOrphanedStrongPatterns(["opus-9"]);
+// This block used to assert a "served under a different separator" hint built
+// from near misses. That hint is gone: `isStrongModel` now normalizes
+// separators, so a pattern that would have been a near miss simply matches, and
+// an orphan reaching this formatter matches nothing under any spelling. There
+// is no longer a suggestion to make, only the dead pattern to name.
+describe("formatOrphanedStrongPatterns", () => {
+  it("names each orphaned pattern", () => {
+    const out = formatOrphanedStrongPatterns(["opus-9", "ghost-model"]);
     expect(out).toContain("- `opus-9`");
+    expect(out).toContain("- `ghost-model`");
+  });
+
+  it("offers no separator suggestion, because a near miss is now a match", () => {
+    const out = formatOrphanedStrongPatterns(["opus-4-8"]);
     expect(out).not.toContain("different separator");
-  });
-
-  it("names the served id when there is one", () => {
-    const out = formatOrphanedStrongPatterns(
-      ["opus-4-8"],
-      { "opus-4-8": ["anthropic/claude-opus-4.8"] },
-    );
-    expect(out).toContain("served under a different separator");
-    expect(out).toContain("`anthropic/claude-opus-4.8`");
-  });
-
-  it("caps the list at three", () => {
-    const out = formatOrphanedStrongPatterns(["p"], { p: ["a/1", "a/2", "a/3", "a/4"] });
-    expect(out).toContain("`a/3`");
-    expect(out).not.toContain("`a/4`");
-  });
-
-  // Defaulting the map keeps every existing call site working unchanged.
-  it("is unchanged from the one-argument form when no map is passed", () => {
-    expect(formatOrphanedStrongPatterns(["x"])).toBe(
-      formatOrphanedStrongPatterns(["x"], {}),
-    );
   });
 });

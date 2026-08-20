@@ -232,7 +232,6 @@ export function buildModelsOutput(
   catalog: Catalog | null,
   filter: string,
   orphanedStrongPatterns: string[] = [],
-  strongPatternNearMisses: Record<string, string[]> = {},
 ): string {
   // Orphan patterns are pure config analysis, so they are appended to EVERY
   // return path — including the catalog-unavailable ones, where the warning is
@@ -240,7 +239,7 @@ export function buildModelsOutput(
   const suffix =
     orphanedStrongPatterns.length > 0
       ? "\n\n" +
-        formatOrphanedStrongPatterns(orphanedStrongPatterns, strongPatternNearMisses)
+        formatOrphanedStrongPatterns(orphanedStrongPatterns)
       : "";
   if (!catalog) {
     return (
@@ -289,22 +288,10 @@ export function buildModelsOutput(
  * `findOrphanedStrongPatterns`). Report-only — the router never edits the
  * user's pattern list.
  */
-export function formatOrphanedStrongPatterns(
-  patterns: string[],
-  nearMisses: Record<string, string[]> = {},
-): string {
+export function formatOrphanedStrongPatterns(patterns: string[]): string {
   return [
     "⚠ **Strong-model patterns matching no model your providers serve:**",
-    ...patterns.map((p) => {
-      const near = nearMisses[p] ?? [];
-      if (near.length === 0) return `- \`${p}\``;
-      // Named separately from the generic rename hint below: when we can point
-      // at the served id, the user can fix it without going to look.
-      return `- \`${p}\` — served under a different separator: ${near
-        .slice(0, 3)
-        .map((r) => `\`${r}\``)
-        .join(", ")}`;
-    }),
+    ...patterns.map((p) => `- \`${p}\``),
     "",
     "This may silently change prompt-style resolution for tiers on `promptStyle: auto`. If a provider renamed a model, update `modelGenerations.strong` in your overrides file (`/router overrides`).",
   ].join("\n");

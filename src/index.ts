@@ -49,7 +49,6 @@ import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
 import {
   findOrphanedStrongPatterns,
-  findStrongPatternNearMisses,
   normalizeCatalog,
   validateModels,
 } from "./router/catalog";
@@ -733,15 +732,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // tiers on auto. Catalog-dependent, so it rides the same deferred
               // path — it is NOT emitted on turn 1.
               for (const p of findOrphanedStrongPatterns(cfg, catalog)) {
-                // Naming the served id turns "something is wrong" into a fix.
-                const near = findStrongPatternNearMisses(p, catalog);
-                const hint =
-                  near.length > 0
-                    ? ` — served under a different separator: ${near.slice(0, 3).join(", ")}`
-                    : "";
                 logger.warn(
-                  `strong-model pattern '${p}' matches no model your providers serve — may silently change prompt-style resolution for tiers on auto${hint}`,
-                  { pattern: p, nearMisses: near },
+                  `strong-model pattern '${p}' matches no model your providers serve — may silently change prompt-style resolution for tiers on auto`,
+                  { pattern: p },
                 );
               }
               for (const it of validateModels(cfg, catalog)) {
@@ -1220,18 +1213,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         if (sub === "models") {
           const catalog = await fetchCatalog();
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
-          const nearMisses: Record<string, string[]> = {};
-          if (catalog) {
-            for (const p of orphans) {
-              nearMisses[p] = findStrongPatternNearMisses(p, catalog);
-            }
-          }
-          text = buildModelsOutput(
-            catalog,
-            parts.slice(1).join(" "),
-            orphans,
-            nearMisses,
-          );
+          text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
         } else {
           text = buildRouterOutput(cfg, args);
           // On the bare status view, surface stale or missing models inline.

@@ -36,7 +36,7 @@ falls back to its in-code default), so you only ever see them in an overrides fi
 | Key | Type | Default when absent | Notes |
 |---|---|---|---|
 | `tierPromptsGoalOriented` | `Record<string, string>` | built-in goal-oriented prompts in `src/router/prompts.ts` | Goal-oriented twin of `tierPrompts`; an entry replaces the built-in for that tier. See [Prompt styles](#prompt-styles-promptstyle). |
-| `modelGenerations` | `{ claude5x?: string[]; strong?: string[] }` | `DEFAULT_CLAUDE5X_PATTERNS` / `DEFAULT_STRONG_MODEL_PATTERNS` in `src/router/config.ts` | Shared model-ID substring pattern lists. `strong` drives `promptStyle: "auto"` resolution. |
+| `modelGenerations` | `{ strong?: string[] }` | `DEFAULT_STRONG_MODEL_PATTERNS` in `src/router/config.ts` | Shared model-ID substring pattern lists. `strong` drives `promptStyle: "auto"` resolution. |
 | `subagentTiers` | `Record<string, string>` | `{}` — no pre-existing agent is touched | Opt-in map of your own subagent names to tier names, repointing them at the active preset's model for that tier. Unknown tier names are skipped at resolve time rather than rejected. |
 | `antiNarration` | `boolean` | `false` | Adds the anti-narration clause to Claude tier prompts and enables the non-blocking narration detector. |
 | `experimental` | `{ verifiedDelegateTool?: boolean }` | `{}` — every experimental feature off | Opt-in features. `verifiedDelegateTool` exposes the independently-verified `delegate` tool, also settable via `MODEL_ROUTER_VERIFIED_DELEGATE=1`. |
@@ -294,15 +294,17 @@ prompt, exactly as before.
 ### The `auto` rule
 
 `auto` matches the tier's `model` string against `modelGenerations.strong`, as a
-**case-insensitive substring** test. Any match makes the model "strong".
+**substring test with case and separators normalized**. Any match makes the model
+"strong".
 
 | Field | Type | Default |
 |---|---|---|
 | `modelGenerations.strong` | `string[]` | `["claude-fable-5", "claude-mythos-5", "opus-4-8", "claude-opus-5"]` |
-| `modelGenerations.claude5x` | `string[]` | `["claude-fable-5", "claude-mythos-5"]` |
 
-`strong` is a superset of `claude5x` by construction: every Claude 5.x model is treated as
-a strong model. Setting either key **replaces** the default list rather than extending it,
+`strong` is curated per model, not by generation: being a Claude 5.x model does not make a
+model strong — `claude-sonnet-5` ships on two tiers and is deliberately left out of the
+list. Matching is a substring test with case **and** separators normalized, so `opus-4-8`
+matches `opus-4.8`. Setting the key **replaces** the default list rather than extending it,
 so `"strong": []` disables auto-detection entirely and every tier falls back to
 `prescriptive`. A missing or empty model ID also resolves to `prescriptive` — the rule
 fails safe toward the more explicit prompt.
@@ -471,7 +473,7 @@ one. `CAP:N` is unaffected. Prompt rules asked for a reason; this makes it deter
 
 - `promptStyle` must be one of `prescriptive`, `goal-oriented`, `auto` — a typo throws at load.
 - `tierPromptsGoalOriented` must be an object of strings.
-- `modelGenerations` must be an object; `claude5x` and `strong` must be arrays when present.
+- `modelGenerations` must be an object; `strong` must be an array when present.
 
 ---
 

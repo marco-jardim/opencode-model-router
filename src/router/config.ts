@@ -55,18 +55,25 @@ export const PROMPT_STYLES = ["prescriptive", "goal-oriented", "auto"] as const;
 export type PromptStyle = (typeof PROMPT_STYLES)[number];
 
 /**
- * Shared model-generation pattern lists, matched case-insensitively as substrings
- * of a tier's model ID.
+ * Model-ID patterns, matched as substrings of a tier's model ID with case and
+ * separators normalized (see flattenModelID in ./prompts).
  */
 export interface ModelGenerationsConfig {
-  claude5x?: string[];
   strong?: string[];
 }
 
-export const DEFAULT_CLAUDE5X_PATTERNS = ["claude-fable-5", "claude-mythos-5"];
-// NOTE: strong is a superset of claude5x by construction — editing DEFAULT_CLAUDE5X_PATTERNS also widens strong. Deliberate: every Claude 5.x model is a strong model.
+// Curated per model, NOT by generation. There used to be a `claude5x` list that
+// this one spread, with a note claiming "strong is a superset of claude5x by
+// construction — every Claude 5.x model is a strong model". Both halves stopped
+// being true: `claude-opus-5` was added here without being added there, and
+// `claude-sonnet-5` ships on two tiers as a Claude 5.x model that is
+// deliberately not strong. Worse, the `claude5x` config field was validated and
+// documented but never read — the spread happened once at module load from the
+// default array, so a user override could not reach it. Generation is not the
+// criterion; whether goal-oriented prompting suits the model is.
 export const DEFAULT_STRONG_MODEL_PATTERNS = [
-  ...DEFAULT_CLAUDE5X_PATTERNS,
+  "claude-fable-5",
+  "claude-mythos-5",
   "opus-4-8",
   "claude-opus-5",
 ];
@@ -525,13 +532,14 @@ function validateModelGenerations(obj: Record<string, unknown>): void {
       throw new Error("tiers.json: modelGenerations must be an object");
     }
     const modelGenerations = obj.modelGenerations as Record<string, unknown>;
-    for (const key of ["claude5x", "strong"] as const) {
-      if (
-        modelGenerations[key] !== undefined &&
-        !Array.isArray(modelGenerations[key])
-      ) {
-        throw new Error(`tiers.json: modelGenerations.${key} must be an array`);
-      }
+    // Only `strong` is validated because only `strong` is read. Unknown keys —
+    // including the removed `claude5x` — are ignored rather than rejected, so an
+    // existing tiers.json carrying one still loads.
+    if (
+      modelGenerations.strong !== undefined &&
+      !Array.isArray(modelGenerations.strong)
+    ) {
+      throw new Error("tiers.json: modelGenerations.strong must be an array");
     }
   }
 }

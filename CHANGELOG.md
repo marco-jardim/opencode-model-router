@@ -5,9 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] - 2026-08-20
+
+Minor release. One real bug — prompt-style resolution broke when a provider renamed a
+model across separators — plus the diagnostics that were compensating for it, which are
+gone now that the cause is fixed.
 
 ### Fixed
+
+- **`promptStyle: "auto"` survives a provider renaming a model across separators.**
+  `isStrongModel` matched patterns case-insensitively but not separator-insensitively, so
+  the moment a provider shipped `claude-opus-4.8` where the pattern said `opus-4-8`, the
+  tier silently stopped resolving as strong and dropped from `goal-oriented` to
+  `prescriptive` — a different system prompt, with nothing said. Matching now normalizes
+  case and `.`, `-`, `_` on both sides. The provider boundary is preserved: `/` is not
+  normalized, so a pattern cannot match across it. A pattern consisting only of
+  separators now matches nothing instead of everything.
+
+  This is not hypothetical drift. Our own `tiers.json` carries the same model as
+  `anthropic/claude-haiku-4-5` and `github-copilot/claude-haiku-4.5`, because each
+  provider spells it its own way.
 
 - **Passive warnings go to opencode's log instead of the terminal.** `console.warn`
   from a plugin lands on the server's stderr, which the TUI does not own, so a warning
@@ -16,17 +33,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `model-router` service tag and structured `extra`. Fire-and-forget and fail-soft: a
   server without the endpoint, a rejected post, a post that resolves reporting an error,
   and a synchronous throw all fall back to `console.warn`, so a diagnostic is never
-  silently dropped. Config-parse warnings still use `console.warn`: they are emitted
-  from `loadConfig`, which runs before a client exists, and only fire on a malformed
-  override file.
-- **Orphaned strong-model patterns are only reported when they concern a model the
-  active preset actually uses.** The evidence gate accepted a near-miss anywhere in the
-  catalog. Because github-copilot serves `claude-opus-4.8`, the default `opus-4-8`
-  pattern found one for every copilot user, including those whose tiers were on
-  unrelated models, naming a rename that would not have changed their routing. A
-  default pattern now needs both near-miss evidence and relevance to an active tier,
-  matched separator-insensitively so a tier still pinned to the pre-rename spelling
-  reports as before. User-authored `modelGenerations.strong` entries are unaffected.
+  silently dropped.
+
+  Config-parse warnings deliberately still use `console.warn`. They are emitted from
+  `loadConfig`, which runs before a client exists, and they only fire on a malformed
+  override file — a case where being loud is the point.
+
+### Removed
+
+- **`modelGenerations.claude5x`.** The field was declared, type-validated on load and
+  documented in three places, and never read by anything. `isStrongModel` reads
+  `strong`, and the default `strong` list was a module-level constant computed once
+  from the built-in array, so a user's `claude5x` could not reach it. Setting it did
+  nothing, and passing validation implied otherwise. An existing config carrying the key
+  still loads — unknown keys under `modelGenerations` are ignored, not rejected.
+
+  The note that `strong` was "a superset of `claude5x` by construction — every Claude 5.x
+  model is a strong model" is gone with it. It had stopped being true in both directions:
+  `claude-opus-5` was strong without being in `claude5x`, and `claude-sonnet-5` ships on
+  two tiers as a Claude 5 model that is deliberately not strong. `strong` is curated per
+  model, and the docs now say so.
+
+- **Near-miss detection for orphaned strong-model patterns.** It existed to spot exactly
+  the rename the matcher now absorbs, so under the fixed matcher a near miss *is* a match
+  and can no longer be an orphan — the code was unreachable. The `/router models` output
+  and the passive warning both drop the "served under a different separator" hint. What
+  remains is narrower and honest: a pattern **you** wrote in `modelGenerations.strong`
+  that matches nothing your providers serve is still reported, because that is a claim
+  about your environment that turned out to be wrong. Shipped defaults are never
+  reported — most of a cross-provider union is unserved on any given install, and saying
+  so is noise you cannot act on.
+
+### Changed
+
+- **`@opencode-ai/plugin` peer range is now `>=1.0.0 <2.0.0`.** The open-ended `>=1.0.0`
+  claimed compatibility with a major version that does not exist yet and whose plugin API
+  is by definition unknown.
 
 ## [1.8.0] - 2026-08-19
 

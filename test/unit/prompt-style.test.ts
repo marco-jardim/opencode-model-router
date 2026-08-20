@@ -375,15 +375,18 @@ describe("validateConfig prompt style schema", () => {
       }),
     ).toThrow("tiers.json: modelGenerations.strong must be an array");
 
+    // `claude5x` was removed: it was validated and documented but never read,
+    // so it could only ever mislead. An existing config carrying it must still
+    // load — unknown keys are ignored, not rejected.
     expect(() =>
       validateConfig({
         activePreset: "test",
         defaultTier: "fast",
         rules: [],
-        modelGenerations: { claude5x: 1 },
+        modelGenerations: { claude5x: 1, strong: ["claude-opus-5"] },
         presets: { test: { fast: { model: "m", description: "d", whenToUse: ["w"] } } },
       }),
-    ).toThrow("tiers.json: modelGenerations.claude5x must be an array");
+    ).not.toThrow();
   });
 
   test("rejects non-object tierPromptsGoalOriented", () => {

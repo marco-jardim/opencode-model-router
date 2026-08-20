@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   findOrphanedStrongPatterns,
-  findStrongPatternNearMisses,
   normalizeCatalog,
   isCatalogEmpty,
   parseModelRef,
@@ -354,21 +353,20 @@ describe("findOrphanedStrongPatterns", () => {
 
   // Reported by a real user on the fable-effort preset with only anthropic
   // configured: `claude-mythos-5` is simply a model that provider does not
-  // serve. No tier names it, nothing is served under a drifted separator, and
-  // no edit to the config would change anything — a default pattern with no
-  // near-miss is not actionable, so it must stay silent.
+  // serve. It genuinely matches nothing here, so it IS an orphan — it is
+  // silent purely because the shipped list makes no claim about this host.
   it("says nothing about a default pattern the providers merely do not serve", () => {
+    // silent because: default patterns are never reported
     const anthropicOnly = catalogOf(
       "anthropic/claude-fable-5",
       "anthropic/claude-opus-4-8",
       "anthropic/claude-sonnet-4-6",
       "anthropic/claude-haiku-4-5",
     );
-    expect(findStrongPatternNearMisses("claude-mythos-5", anthropicOnly)).toEqual([]);
     expect(findOrphanedStrongPatterns(shippedCfg, anthropicOnly)).toEqual([]);
   });
 
-  it("still reports a user-authored pattern with no near-miss at all", () => {
+  it("still reports a user-authored pattern that matches nothing served", () => {
     // an explicit list is a claim the user made about their own environment,
     // so a dead entry in it is actionable whether or not we can suggest a fix
     const cfg = strongCfg(
@@ -376,7 +374,6 @@ describe("findOrphanedStrongPatterns", () => {
       { strong: ["ghost-model-9"] },
     );
     const cat = catalogOf("anthropic/claude-opus-4-8");
-    expect(findStrongPatternNearMisses("ghost-model-9", cat)).toEqual([]);
     expect(findOrphanedStrongPatterns(cfg, cat)).toEqual(["ghost-model-9"]);
   });
 
@@ -390,18 +387,17 @@ describe("findOrphanedStrongPatterns", () => {
     expect(findOrphanedStrongPatterns(shippedCfg, healthy)).toEqual([]);
   });
 
-  it("flags the provider-rename case the check exists for", () => {
-    // the rename `claude-opus-4-8` -> `opus-4.8` (dot) stops matching, while
-    // the other two default patterns are still served
+  // This catalog IS the provider rename this check was built for: `opus-4-8`
+  // served as `opus-4.8`. It used to be reported, because matching was
+  // separator-sensitive and the pattern genuinely had stopped matching. The
+  // matcher now normalizes separators, so the pattern still matches and there
+  // is nothing dead left to report.
+  it("no longer flags a separator rename, because matching survives it", () => {
     const renamed = catalogOf(
       "anthropic/opus-4.8",
       "anthropic/claude-fable-5",
       "anthropic/claude-mythos-5",
     );
-    // A tier has to be ON the pre-rename spelling for the warning to mean
-    // anything: the pattern is only worth reporting when correcting it would
-    // change how THIS config resolves. The shipped anthropic preset moved off
-    // `claude-opus-4-8` in 1.8.0, so it no longer exercises this case.
     const pinnedToOldSpelling = {
       ...shippedCfg,
       presets: {
@@ -412,21 +408,21 @@ describe("findOrphanedStrongPatterns", () => {
         },
       },
     } as typeof shippedCfg;
-    expect(findOrphanedStrongPatterns(pinnedToOldSpelling, renamed)).toEqual([
-      "opus-4-8",
-    ]);
-    // and the downgrade it warns about is real
-    expect(isStrongModel("anthropic/opus-4.8", shippedCfg)).toBe(false);
+    // silent because: the normalizer matches it, so it is not an orphan at all
+    // (and these are default patterns, which are never reported either way)
+    expect(findOrphanedStrongPatterns(pinnedToOldSpelling, renamed)).toEqual([]);
+    // the load-bearing assertion: the silent downgrade this warned about is
+    // gone. Before the normalizer landed, this was `false`.
+    expect(isStrongModel("anthropic/opus-4.8", shippedCfg)).toBe(true);
   });
 
-  // Same catalog, same dead pattern, but no tier is on the pre-rename model.
-  // Correcting `opus-4-8` would change nothing here, so it stays silent.
   it("stays silent when no tier is on the renamed model", () => {
     const renamed = catalogOf(
       "anthropic/opus-4.8",
       "anthropic/claude-fable-5",
       "anthropic/claude-mythos-5",
     );
+    // silent because: the normalizer matches it, so it is not an orphan
     expect(findOrphanedStrongPatterns(shippedCfg, renamed)).toEqual([]);
   });
 
@@ -489,64 +485,66 @@ describe("findOrphanedStrongPatterns", () => {
   });
 });
 
-describe("findStrongPatternNearMisses", () => {
-  const cat = (...refs: string[]): Catalog =>
-    ({
-      providers: [
-        {
-          id: "anthropic",
-          name: "anthropic",
-          models: refs.map((r) => ({ id: r, status: "active" as const })),
-        },
-      ],
-    }) as Catalog;
+// `findStrongPatternNearMisses` used to live here. It answered "is this dead
+// pattern actually the same model under a drifted separator?" — a question that
+// only had to be asked because the matcher could not answer it itself. Now that
+// `isStrongModel` normalizes separators, a near miss IS a match, the set is
+// always empty, and the function and its tests are gone. What it was really
+// testing — that `opus-4-8`, `opus-4.8` and `claude_opus_4_8` are one model —
+// is now covered directly against the matcher below.
+describe("isStrongModel — separator normalization", () => {
+  const patterns = (...strong: string[]) =>
+    ({ modelGenerations: { strong } }) as unknown as RouterConfig;
 
-  // The reason this exists: a provider moving hyphen to dot un-matches a
-  // pattern that is still naming the right model.
-  it("finds a served model that differs only by separator", () => {
+  it("matches across every separator style, in both directions", () => {
+    expect(isStrongModel("anthropic/claude-opus-4.8", patterns("opus-4-8"))).toBe(true);
+    expect(isStrongModel("anthropic/claude-opus-4-8", patterns("opus-4.8"))).toBe(true);
+    expect(isStrongModel("anthropic/claude_opus_4_8", patterns("opus-4-8"))).toBe(true);
+  });
+
+  it("is case-insensitive on top of that", () => {
+    expect(isStrongModel("anthropic/claude-Opus-4.8", patterns("OPUS-4-8"))).toBe(true);
+  });
+
+  // The normalizer must not turn matching promiscuous: folding separators away
+  // is not licence to match a different model of the same family.
+  it("still does not match a genuinely different model", () => {
+    expect(isStrongModel("anthropic/claude-opus-4-5", patterns("claude-opus-5"))).toBe(
+      false,
+    );
+    expect(isStrongModel("anthropic/claude-opus-4.8", patterns("opus-9"))).toBe(false);
+  });
+
+  // A pattern of nothing but separators flattens to the empty string, and
+  // `"anything".includes("")` is true — so without a guard it would mark every
+  // model strong.
+  it("treats an all-separator pattern as matching nothing, not everything", () => {
+    expect(isStrongModel("anthropic/claude-opus-4.8", patterns("---"))).toBe(false);
+    expect(isStrongModel("anthropic/claude-opus-4.8", patterns("..."))).toBe(false);
+  });
+
+  // `/` is deliberately NOT folded away. If it were, a pattern could run
+  // straight through the provider boundary: `anthropicclaude` would match
+  // `anthropic/claude-opus-5`. It must not.
+  it("keeps the provider boundary intact", () => {
+    expect(isStrongModel("anthropic/claude-opus-5", patterns("anthropicclaude"))).toBe(
+      false,
+    );
+    // and a pattern that spells the boundary out still works
     expect(
-      findStrongPatternNearMisses("opus-4-8", cat("claude-opus-4.8")),
-    ).toEqual(["anthropic/claude-opus-4.8"]);
-  });
-
-  it("works in the other direction too", () => {
-    expect(
-      findStrongPatternNearMisses("opus-4.8", cat("claude-opus-4-8")),
-    ).toEqual(["anthropic/claude-opus-4-8"]);
-  });
-
-  it("treats underscores as a separator as well", () => {
-    expect(
-      findStrongPatternNearMisses("opus-4-8", cat("claude_opus_4_8")),
-    ).toEqual(["anthropic/claude_opus_4_8"]);
-  });
-
-  it("returns empty when the pattern is simply wrong", () => {
-    expect(findStrongPatternNearMisses("opus-9", cat("claude-opus-4.8"))).toEqual([]);
-  });
-
-  it("is case-insensitive", () => {
-    expect(
-      findStrongPatternNearMisses("OPUS-4-8", cat("claude-Opus-4.8")),
-    ).toEqual(["anthropic/claude-Opus-4.8"]);
-  });
-
-  it("returns every match, not just the first", () => {
-    expect(
-      findStrongPatternNearMisses("opus-4-8", cat("claude-opus-4.8", "claude-opus-4_8")),
-    ).toHaveLength(2);
-  });
-
-  it("returns empty for an all-separator pattern rather than matching everything", () => {
-    expect(findStrongPatternNearMisses("---", cat("claude-opus-4.8"))).toEqual([]);
+      isStrongModel("anthropic/claude-opus-5", patterns("anthropic/claude-opus-5")),
+    ).toBe(true);
+    expect(isStrongModel("openai/gpt-5", patterns("anthropic/claude"))).toBe(false);
   });
 });
 
 // Reported from a live 1.7.0 install and still reproducing on 1.8.0: a
 // github-copilot user on a custom hybrid preset saw the default `opus-4-8`
 // reported because copilot serves claude-opus-4.8, a model none of their
-// tiers used.
-describe("findOrphanedStrongPatterns — relevance to the active preset", () => {
+// tiers used. The first fix was to require the pattern be relevant to an
+// active tier. The real fix was to stop the separator drift from un-matching
+// anything in the first place, which is what these now pin.
+describe("findOrphanedStrongPatterns — the reported copilot case", () => {
   const mkCatalog = (...refs: string[]): Catalog => {
     const byProvider = new Map<string, string[]>();
     for (const r of refs) {
@@ -585,11 +583,15 @@ describe("findOrphanedStrongPatterns — relevance to the active preset", () => 
     },
   } as unknown as RouterConfig;
 
+  // The exact false positive that was reported.
   it("stays silent when the pattern is about a model no tier uses", () => {
+    // silent because: default patterns are never reported. `opus-4-8` is not
+    // even an orphan here — copilot serves claude-opus-4.8 and the normalizer
+    // matches it — but the defaults gate would silence it regardless.
     expect(findOrphanedStrongPatterns(hybrid, copilot)).toEqual([]);
   });
 
-  it("reports once a tier is pinned to the pre-rename spelling", () => {
+  it("stays silent when a tier is pinned to the pre-rename spelling", () => {
     const pinned = {
       ...hybrid,
       presets: {
@@ -599,15 +601,20 @@ describe("findOrphanedStrongPatterns — relevance to the active preset", () => 
         },
       },
     } as unknown as RouterConfig;
-    expect(findOrphanedStrongPatterns(pinned, copilot)).toEqual(["opus-4-8"]);
+    // silent because: the normalizer matches it, so it is not an orphan
+    expect(findOrphanedStrongPatterns(pinned, copilot)).toEqual([]);
+    // the tier keeps its goal-oriented prompt even though it spells the model
+    // with hyphens while copilot serves dots
+    expect(isStrongModel("github-copilot/claude-opus-4-8", pinned)).toBe(true);
   });
 
-  // The case the whole check exists for, and the one that actually happens: the
-  // provider renamed the model, the tier follows the NEW spelling the catalog
-  // serves, and only the pattern is left behind. Nothing is missing — the tier
-  // resolves fine — so `model-missing` stays silent and this warning is the only
-  // signal that the prompt style silently downgraded.
-  it("reports when a tier is on the served, post-rename spelling", () => {
+  // THE regression this whole change exists for. The provider renamed the
+  // model, the user updated their tier to the NEW spelling the catalog serves,
+  // and the pattern list was left on the old one. Nothing is missing — the tier
+  // resolves fine, so `model-missing` stays quiet — and before the normalizer
+  // landed the only symptom was that this returned `false` and the tier
+  // silently dropped from goal-oriented to prescriptive.
+  it("keeps a tier strong when it is on the served, post-rename spelling", () => {
     const onNewSpelling = {
       ...hybrid,
       presets: {
@@ -617,14 +624,11 @@ describe("findOrphanedStrongPatterns — relevance to the active preset", () => 
         },
       },
     } as unknown as RouterConfig;
-    expect(findOrphanedStrongPatterns(onNewSpelling, copilot)).toEqual([
-      "opus-4-8",
-    ]);
-    // and the downgrade it warns about is real: on `auto` this tier drops from
-    // goal-oriented to prescriptive without anything else saying so
     expect(isStrongModel("github-copilot/claude-opus-4.8", onNewSpelling)).toBe(
-      false,
+      true,
     );
+    // and there is nothing left to warn about
+    expect(findOrphanedStrongPatterns(onNewSpelling, copilot)).toEqual([]);
   });
 
   // A user-authored list is a claim about this environment, so relevance is

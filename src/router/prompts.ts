@@ -47,13 +47,46 @@ Ground every claim in a tool result or the context you were given; flag anything
 Begin your response with exactly one of \`DONE:\` (structured analysis), \`SCOPE GROWTH:\` (prefer @fast pre-exploration of [specific files/patterns/areas] before I continue), or \`ESCALATE:\`.`,
 };
 
-/** Case-insensitive substring match against the strong-model pattern list. */
+/**
+ * Fold away case and separator style (`.`, `-`, `_`) so two spellings of the
+ * same model id compare equal. `/` is deliberately preserved: it separates the
+ * provider prefix from the model id, and collapsing it would let a pattern
+ * match across that boundary.
+ *
+ * Exported because `findOrphanedStrongPatterns` in ./catalog must ask exactly
+ * the question `isStrongModel` answers — "would this pattern match anything?" —
+ * and a second, drifting copy of this rule would reintroduce the mismatch it
+ * exists to remove.
+ */
+export const flattenModelID = (v: string): string =>
+  v.toLowerCase().replace(/[.\-_]/g, "");
+
+/**
+ * Substring match against the strong-model pattern list, ignoring case AND
+ * separator style: `.`, `-` and `_` are normalized away on both sides, so the
+ * pattern `opus-4-8` matches the served id `claude-opus-4.8`, and
+ * `claude-haiku-4-5` matches `claude-haiku-4.5`.
+ *
+ * Why separator-insensitive: providers spell the same model differently and
+ * change their minds. Our own shipped tiers.json carries
+ * `anthropic/claude-haiku-4-5` and `github-copilot/claude-haiku-4.5` for one
+ * model. Under a plain substring match, that drift silently un-matched the
+ * pattern list and quietly downgraded a tier's prompt style from
+ * `goal-oriented` to `prescriptive` — no error, no log, just a weaker prompt.
+ * Normalizing separators here removes that failure mode at the source.
+ *
+ * The provider prefix still participates in the match (see
+ * {@link flattenModelID}), so a pattern may target `provider/model` refs.
+ */
 export function isStrongModel(modelID: string | undefined, cfg: RouterConfig): boolean {
   if (typeof modelID !== "string" || modelID.length === 0) return false;
   const raw = cfg.modelGenerations?.strong ?? DEFAULT_STRONG_MODEL_PATTERNS;
   const patterns = raw.filter((p): p is string => typeof p === "string" && p.length > 0);
-  const id = modelID.toLowerCase();
-  return patterns.some((p) => id.includes(p.toLowerCase()));
+  const id = flattenModelID(modelID);
+  return patterns.some((p) => {
+    const needle = flattenModelID(p);
+    return needle.length > 0 && id.includes(needle);
+  });
 }
 
 /** Resolve "auto" (or absent) to a concrete style. Fail-safe: unknown/empty model -> prescriptive. */

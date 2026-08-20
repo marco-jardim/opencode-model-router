@@ -684,16 +684,18 @@ for that tier name only, and tiers you do not list keep theirs.
 
 #### `modelGenerations`
 
-`modelGenerations` holds shared, case-insensitive substring patterns matched against a
-tier's model ID. Two lists exist:
+`modelGenerations` holds substring patterns matched against a tier's model ID, with case
+and separators (`.`, `-`, `_`) normalized on both sides — so `opus-4-8` matches
+`opus-4.8`, and a provider renaming a model across separators cannot silently change how
+it resolves. One list exists:
 
 | List | Default | What it drives |
 |------|---------|----------------|
 | `strong` | `["claude-fable-5", "claude-mythos-5", "opus-4-8", "claude-opus-5"]` | `promptStyle: "auto"` resolution — a match resolves to `goal-oriented`, everything else to `prescriptive` (`isStrongModel` in `src/router/prompts.ts`). |
-| `claude5x` | `["claude-fable-5", "claude-mythos-5"]` | The Claude 5.x generation list. In code it seeds the default `strong` list (`DEFAULT_STRONG_MODEL_PATTERNS` in `src/router/config.ts`), so `strong` is a superset of it by construction. |
 
-Only `strong` is read at match time, and setting it replaces the default list outright
-rather than extending it — include the built-in patterns you still want. Claude-specific
+Setting `strong` replaces the default list outright rather than extending it — include the
+built-in patterns you still want. The list is curated per model, not by generation:
+`claude-sonnet-5` is a Claude 5 model that is deliberately not in it. Claude-specific
 prompt prefixes and the anti-narration detector do **not** use these lists; they match the
 model ID directly (`isClaudeModel` in `src/router/protocol.ts`).
 

@@ -139,8 +139,10 @@ describe("router-command — model catalog", () => {
                 name: "Anthropic",
                 models: {
                   "claude-haiku-4-5": { id: "claude-haiku-4-5", status: "active" },
-                  // separator drift against the default `opus-4-8` pattern, so
-                  // the orphan check has the near-miss evidence it now requires
+                  // separator drift against the default `opus-4-8` pattern.
+                  // isStrongModel now normalizes separators, so this MATCHES
+                  // and is not an orphan — kept as the regression fixture for
+                  // exactly that.
                   "claude-opus-4.8": { id: "claude-opus-4.8", status: "active" },
                 },
               },
@@ -246,17 +248,56 @@ describe("router-command — model catalog", () => {
       await h["chat.message"]({ sessionID: "s1" }, { parts: [] });
       const late = warnings();
       expect(late.some((m) => m.includes("model-missing"))).toBe(true);
-      // This mock catalog serves claude-opus-4.8, so the default `opus-4-8` is
-      // dead here with near-miss evidence. It is still NOT reported, because no
-      // tier in the active preset is on any 4.8 model: correcting the pattern
-      // would not change how this config resolves. (Before 1.8.0 the shipped
-      // anthropic heavy was `claude-opus-4-8`, which is why this used to fire.)
+      // No pattern warning. This catalog serves claude-opus-4.8 against the
+      // default `opus-4-8`, which is precisely the separator drift the matcher
+      // now absorbs — so the pattern is live, not orphaned. The remaining
+      // defaults match nothing here, but a shipped default matching nothing is
+      // the normal state of a cross-provider union and is never reported.
       expect(late.some((m) => m.includes("strong-model pattern"))).toBe(false);
 
       // and it stays a one-shot: a third turn adds nothing
       const before = late.length;
       await h["chat.message"]({ sessionID: "s1" }, { parts: [] });
       expect(warnings()).toHaveLength(before);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // The one orphan case that still reports end to end. Everything above
+  // asserts silence, so without this the warning could stop firing entirely
+  // and the integration suite would stay green.
+  it("still warns about a user-authored pattern that matches nothing served", async () => {
+    const overrides = join(
+      testHomeDir,
+      ".config/opencode/opencode-model-router.overrides.jsonc",
+    );
+    mkdirSync(dirname(overrides), { recursive: true });
+    writeFileSync(
+      overrides,
+      JSON.stringify({
+        // the tier resolves, so nothing else has anything to say about it
+        presets: { local: { fast: { model: "anthropic/claude-haiku-4-5" } } },
+        activePreset: "local",
+        // a claim about THIS environment, and it is wrong
+        modelGenerations: { strong: ["ghost-model-9"] },
+      }),
+      "utf-8",
+    );
+    invalidateConfigCache();
+    const h: any = await ModelRouterPlugin(ctx as any);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await h["chat.message"]({ sessionID: "s1" }, { parts: [] });
+      await flush();
+      await h["chat.message"]({ sessionID: "s1" }, { parts: [] });
+
+      const msgs = warn.mock.calls.map((c) => String(c[0]));
+      expect(
+        msgs.some((m) => m.includes("strong-model pattern 'ghost-model-9'")),
+      ).toBe(true);
+      // and the tier itself is fine, so nothing else fires about it
+      expect(msgs.some((m) => m.includes("model-missing"))).toBe(false);
     } finally {
       warn.mockRestore();
     }

@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 import { DEFAULT_STRONG_MODEL_PATTERNS, type RouterConfig } from "./config";
+import { flattenModelID } from "./prompts";
 import { getActiveTiers } from "./protocol";
 
 export interface CatalogModel {
@@ -145,19 +146,24 @@ export function suggestModels(
  * {@link DEFAULT_STRONG_MODEL_PATTERNS}) that match NO model in the live
  * catalog. Report-only: the router never rewrites the user's pattern list.
  *
- * Why this exists: prompt-style resolution is a case-insensitive substring match
- * (`isStrongModel` in ./prompts). When a provider renames a model
- * (`claude-opus-4-8` -> `opus-4.8`), every pattern that used to match silently
- * stops matching, the tier drops back to the prescriptive prompt, and nothing
- * anywhere errors. This surfaces that silence.
+ * Why this exists: prompt-style resolution matches patterns against tier model
+ * ids (`isStrongModel` in ./prompts). A pattern that matches nothing any
+ * configured provider serves decides nothing, so it is dead weight the user
+ * probably meant to be doing something.
+ *
+ * Matching is IDENTICAL to `isStrongModel`: case- and separator-insensitive via
+ * the shared {@link flattenModelID}. That equivalence is the contract of this
+ * function — "orphaned" means precisely "isStrongModel would never match this
+ * against anything served". Historically the two used different rules, which is
+ * what made the old near-miss machinery necessary; see the note on `reportable`
+ * below.
  *
  * Comparison base: the CATALOG, not the active preset. The default pattern list
  * is a cross-preset union by construction (see DEFAULT_STRONG_MODEL_PATTERNS in
  * ./config), so any single preset leaves most of it unmatched — checking against
- * the active preset would warn on every clean install. A pattern matching no
- * model any configured provider serves is dead in THIS environment, which is
- * exactly the rename signal we want. Refs are compared as `provider/model`,
- * mirroring `isStrongModel`, which is fed the full provider-prefixed tier model.
+ * the active preset would warn on every clean install. Refs are compared as
+ * `provider/model`, mirroring `isStrongModel`, which is fed the full
+ * provider-prefixed tier model.
  *
  * Never cries wolf: an empty catalog (fetch failed) or a catalog with no models
  * returns `[]`, like `validateModels`.
@@ -165,6 +171,15 @@ export function suggestModels(
  * Gate: reported only when at least one active tier resolves its style by `auto`
  * (`promptStyle` absent or `"auto"`). With every tier pinned to an explicit
  * style the pattern list decides nothing, so an orphan there is harmless noise.
+ *
+ * SCOPE BOUNDARY, DELIBERATE: `usesAuto` reads the ACTIVE preset only
+ * (`getActiveTiers` in ./protocol returns `cfg.presets[cfg.activePreset]`). A
+ * preset reachable only by failing over through `cfg.fallback` is not consulted,
+ * so a pattern that matters solely to such a preset is out of scope here. This
+ * is a choice, not an oversight: fallback presets are conditional futures, and
+ * warning about prompt-style resolution in a preset the session may never enter
+ * trades a real signal for speculative noise. The tier the user is actually
+ * running is what this check speaks about.
  */
 export function findOrphanedStrongPatterns(
   cfg: RouterConfig,
@@ -180,7 +195,7 @@ export function findOrphanedStrongPatterns(
 
   const refs: string[] = [];
   for (const p of catalog.providers) {
-    for (const m of p.models) refs.push(`${p.id}/${m.id}`.toLowerCase());
+    for (const m of p.models) refs.push(flattenModelID(`${p.id}/${m.id}`));
   }
   if (refs.length === 0) return [];
 
@@ -189,80 +204,37 @@ export function findOrphanedStrongPatterns(
   const patterns = raw.filter(
     (p): p is string => typeof p === "string" && p.length > 0,
   );
-  // Same semantics as isStrongModel(): case-insensitive substring match.
-  const orphans = patterns.filter(
-    (p) => !refs.some((r) => r.includes(p.toLowerCase())),
-  );
+  // Exactly isStrongModel()'s rule, via the shared normalizer: case- and
+  // separator-insensitive substring match. A pattern that flattens to nothing
+  // (e.g. "---") matches nothing there, so it is an orphan here too.
+  const orphans = patterns.filter((p) => {
+    const needle = flattenModelID(p);
+    return needle.length === 0 || !refs.some((r) => r.includes(needle));
+  });
 
-  // Evidence gate for the defaults. A user-authored list is a claim about THIS
-  // environment, so a dead entry in it is actionable on its own. The default
-  // list is not a claim about anything — it is a cross-provider union we ship,
-  // so most of it is unserved on any given install and saying so is noise the
-  // user cannot act on.
+  // Defaults are never reported; user-authored patterns are reported when dead.
   //
-  // Two conditions have to hold together for a default pattern to be worth
-  // reporting, and each rules out a different kind of false positive:
+  // This used to be an evidence gate: a default pattern was reported only if it
+  // had a separator "near miss" AND named a model the active preset used. That
+  // gate was correct for the matcher of the time — `isStrongModel` compared
+  // separators literally, so `opus-4-8` genuinely failed against a served
+  // `claude-opus-4.8`, and a provider re-spelling a model could silently
+  // downgrade a tier from `goal-oriented` to `prescriptive`. The gate existed to
+  // catch that silence without drowning every install in noise from a default
+  // list that is a cross-provider union.
   //
-  //  1. A near-miss must exist, proving the model IS served under a drifted
-  //     separator. Without this, a pattern for a model the providers simply do
-  //     not carry gets reported, and if a tier is on that model the useful
-  //     signal is the `model-missing` issue, not a second one about a pattern.
-  //  2. The pattern must be about a model the active preset actually uses.
-  //     Without this, github-copilot serving `claude-opus-4.8` makes the default
-  //     `opus-4-8` reportable for every copilot user, including those whose
-  //     tiers are on entirely different models, naming a rename that would not
-  //     change their routing.
+  // `isStrongModel` now normalizes separators itself, so that failure mode is
+  // gone at the source: a "near miss" IS a match, and a default pattern can no
+  // longer be simultaneously orphaned and about a real served model. The gate
+  // became unreachable rather than wrong, and carrying unreachable code that
+  // implies a live hazard is worse than deleting it.
   //
-  // Matching for (2) is separator-insensitive so a tier still pinned to the
-  // pre-rename spelling reports, which is the case this check exists for.
-  const flatten = (v: string) => v.toLowerCase().replace(/[.\-_]/g, "");
-  const activeFlat = tiers
-    .map((t) => t?.model)
-    .filter((m): m is string => typeof m === "string")
-    .map(flatten);
-  const aboutAnActiveTier = (pattern: string): boolean => {
-    const needle = flatten(pattern);
-    return needle.length > 0 && activeFlat.some((m) => m.includes(needle));
-  };
-  const reportable =
-    configured === undefined
-      ? orphans.filter(
-          (p) =>
-            findStrongPatternNearMisses(p, catalog).length > 0 &&
-            aboutAnActiveTier(p),
-        )
-      : orphans;
+  // What remains actionable is narrow and genuine: a user wrote a
+  // `modelGenerations.strong` entry that matches nothing their providers serve.
+  // That is a claim about THIS environment which is false, so we say so. The
+  // shipped defaults make no such claim and stay silent.
+  const reportable = configured === undefined ? [] : orphans;
   return [...new Set(reportable)];
-}
-
-/**
- * For an orphaned pattern, the served refs it would match if separators were
- * ignored.
- *
- * `findOrphanedStrongPatterns` says a pattern is dead; this says why. The
- * failure this exists for is separator drift, not a wrong name: `anthropic`
- * ships `claude-opus-4-8` while the copilot preset uses `claude-opus-4.6`, so a
- * provider moving between the two un-matches a pattern that is otherwise still
- * describing the right model. Normalizing `.`, `-` and `_` away turns "this
- * matches nothing" into "this matches nothing, but here is the model it almost
- * certainly means", which is the difference between a warning and a fix.
- *
- * Returns empty when nothing plausibly matches, i.e. the pattern is simply
- * wrong or the model is genuinely gone.
- */
-export function findStrongPatternNearMisses(
-  pattern: string,
-  catalog: Catalog,
-): string[] {
-  const flatten = (v: string) => v.toLowerCase().replace(/[.\-_]/g, "");
-  const needle = flatten(pattern);
-  if (!needle) return [];
-
-  const refs: string[] = [];
-  for (const p of catalog.providers) {
-    for (const m of p.models) refs.push(`${p.id}/${m.id}`);
-  }
-  return refs.filter((r) => flatten(r).includes(needle));
 }
 
 export type ModelIssueKind =
