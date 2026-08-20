@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently dropped. Config-parse warnings still use `console.warn`: they are emitted
   from `loadConfig`, which runs before a client exists, and only fire on a malformed
   override file.
+- **Orphaned strong-model patterns are only reported when they concern a model the
+  active preset actually uses.** The evidence gate accepted a near-miss anywhere in the
+  catalog. Because github-copilot serves `claude-opus-4.8`, the default `opus-4-8`
+  pattern found one for every copilot user, including those whose tiers were on
+  unrelated models, naming a rename that would not have changed their routing. A
+  default pattern now needs both near-miss evidence and relevance to an active tier,
+  matched separator-insensitively so a tier still pinned to the pre-rename spelling
+  reports as before. User-authored `modelGenerations.strong` entries are unaffected.
 
 ## [1.8.0] - 2026-08-19
 

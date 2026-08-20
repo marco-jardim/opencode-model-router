@@ -398,11 +398,36 @@ describe("findOrphanedStrongPatterns", () => {
       "anthropic/claude-fable-5",
       "anthropic/claude-mythos-5",
     );
-    expect(findOrphanedStrongPatterns(shippedCfg, renamed)).toEqual([
+    // A tier has to be ON the pre-rename spelling for the warning to mean
+    // anything: the pattern is only worth reporting when correcting it would
+    // change how THIS config resolves. The shipped anthropic preset moved off
+    // `claude-opus-4-8` in 1.8.0, so it no longer exercises this case.
+    const pinnedToOldSpelling = {
+      ...shippedCfg,
+      presets: {
+        ...shippedCfg.presets,
+        anthropic: {
+          ...shippedCfg.presets.anthropic,
+          heavy: { model: "anthropic/claude-opus-4-8" },
+        },
+      },
+    } as typeof shippedCfg;
+    expect(findOrphanedStrongPatterns(pinnedToOldSpelling, renamed)).toEqual([
       "opus-4-8",
     ]);
     // and the downgrade it warns about is real
     expect(isStrongModel("anthropic/opus-4.8", shippedCfg)).toBe(false);
+  });
+
+  // Same catalog, same dead pattern, but no tier is on the pre-rename model.
+  // Correcting `opus-4-8` would change nothing here, so it stays silent.
+  it("stays silent when no tier is on the renamed model", () => {
+    const renamed = catalogOf(
+      "anthropic/opus-4.8",
+      "anthropic/claude-fable-5",
+      "anthropic/claude-mythos-5",
+    );
+    expect(findOrphanedStrongPatterns(shippedCfg, renamed)).toEqual([]);
   });
 
   it("never cries wolf when the catalog is empty or model-less", () => {
@@ -514,5 +539,103 @@ describe("findStrongPatternNearMisses", () => {
 
   it("returns empty for an all-separator pattern rather than matching everything", () => {
     expect(findStrongPatternNearMisses("---", cat("claude-opus-4.8"))).toEqual([]);
+  });
+});
+
+// Reported from a live 1.7.0 install and still reproducing on 1.8.0: a
+// github-copilot user on a custom hybrid preset saw the default `opus-4-8`
+// reported because copilot serves claude-opus-4.8, a model none of their
+// tiers used.
+describe("findOrphanedStrongPatterns — relevance to the active preset", () => {
+  const mkCatalog = (...refs: string[]): Catalog => {
+    const byProvider = new Map<string, string[]>();
+    for (const r of refs) {
+      const i = r.indexOf("/");
+      const p = r.slice(0, i);
+      byProvider.set(p, [...(byProvider.get(p) ?? []), r.slice(i + 1)]);
+    }
+    return {
+      providers: [...byProvider].map(([id, models]) => ({
+        id,
+        name: id,
+        models: models.map((m) => ({ id: m, status: "active" as const })),
+      })),
+    } as Catalog;
+  };
+
+  // exactly what `/router models github-copilot` returned on the reporting host
+  const copilot = mkCatalog(
+    "github-copilot/claude-opus-4.8",
+    "github-copilot/claude-opus-4.8-fast",
+    "github-copilot/claude-opus-5",
+    "github-copilot/claude-sonnet-4.6",
+    "github-copilot/claude-sonnet-5",
+    "github-copilot/gpt-5.6-luna",
+  );
+  const hybrid = {
+    activePreset: "hybrid",
+    defaultTier: "medium",
+    rules: [],
+    presets: {
+      hybrid: {
+        fast: { model: "github-copilot/gpt-5.6-luna" },
+        medium: { model: "github-copilot/claude-sonnet-5" },
+        heavy: { model: "github-copilot/claude-opus-5" },
+      },
+    },
+  } as unknown as RouterConfig;
+
+  it("stays silent when the pattern is about a model no tier uses", () => {
+    expect(findOrphanedStrongPatterns(hybrid, copilot)).toEqual([]);
+  });
+
+  it("reports once a tier is pinned to the pre-rename spelling", () => {
+    const pinned = {
+      ...hybrid,
+      presets: {
+        hybrid: {
+          ...hybrid.presets.hybrid,
+          heavy: { model: "github-copilot/claude-opus-4-8" },
+        },
+      },
+    } as unknown as RouterConfig;
+    expect(findOrphanedStrongPatterns(pinned, copilot)).toEqual(["opus-4-8"]);
+  });
+
+  // The case the whole check exists for, and the one that actually happens: the
+  // provider renamed the model, the tier follows the NEW spelling the catalog
+  // serves, and only the pattern is left behind. Nothing is missing — the tier
+  // resolves fine — so `model-missing` stays silent and this warning is the only
+  // signal that the prompt style silently downgraded.
+  it("reports when a tier is on the served, post-rename spelling", () => {
+    const onNewSpelling = {
+      ...hybrid,
+      presets: {
+        hybrid: {
+          ...hybrid.presets.hybrid,
+          heavy: { model: "github-copilot/claude-opus-4.8" },
+        },
+      },
+    } as unknown as RouterConfig;
+    expect(findOrphanedStrongPatterns(onNewSpelling, copilot)).toEqual([
+      "opus-4-8",
+    ]);
+    // and the downgrade it warns about is real: on `auto` this tier drops from
+    // goal-oriented to prescriptive without anything else saying so
+    expect(isStrongModel("github-copilot/claude-opus-4.8", onNewSpelling)).toBe(
+      false,
+    );
+  });
+
+  // A user-authored list is a claim about this environment, so relevance is
+  // not required: they wrote it, a dead entry is theirs to fix.
+  it("reports a user-authored dead pattern regardless of relevance", () => {
+    const authored = {
+      ...hybrid,
+      modelGenerations: { strong: ["totally-absent-model"] },
+    } as unknown as RouterConfig;
+    expect(findOrphanedStrongPatterns(authored, copilot)).toEqual([
+      "totally-absent-model",
+    ]);
   });
 });

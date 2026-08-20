@@ -198,12 +198,39 @@ export function findOrphanedStrongPatterns(
   // environment, so a dead entry in it is actionable on its own. The default
   // list is not a claim about anything — it is a cross-provider union we ship,
   // so most of it is unserved on any given install and saying so is noise the
-  // user cannot act on. A default pattern is only worth reporting when a
-  // near-miss proves the model is there under a drifted separator
-  // (`opus-4-8` vs `opus-4.8`), which is the rename this check exists to catch.
+  // user cannot act on.
+  //
+  // Two conditions have to hold together for a default pattern to be worth
+  // reporting, and each rules out a different kind of false positive:
+  //
+  //  1. A near-miss must exist, proving the model IS served under a drifted
+  //     separator. Without this, a pattern for a model the providers simply do
+  //     not carry gets reported, and if a tier is on that model the useful
+  //     signal is the `model-missing` issue, not a second one about a pattern.
+  //  2. The pattern must be about a model the active preset actually uses.
+  //     Without this, github-copilot serving `claude-opus-4.8` makes the default
+  //     `opus-4-8` reportable for every copilot user, including those whose
+  //     tiers are on entirely different models, naming a rename that would not
+  //     change their routing.
+  //
+  // Matching for (2) is separator-insensitive so a tier still pinned to the
+  // pre-rename spelling reports, which is the case this check exists for.
+  const flatten = (v: string) => v.toLowerCase().replace(/[.\-_]/g, "");
+  const activeFlat = tiers
+    .map((t) => t?.model)
+    .filter((m): m is string => typeof m === "string")
+    .map(flatten);
+  const aboutAnActiveTier = (pattern: string): boolean => {
+    const needle = flatten(pattern);
+    return needle.length > 0 && activeFlat.some((m) => m.includes(needle));
+  };
   const reportable =
     configured === undefined
-      ? orphans.filter((p) => findStrongPatternNearMisses(p, catalog).length > 0)
+      ? orphans.filter(
+          (p) =>
+            findStrongPatternNearMisses(p, catalog).length > 0 &&
+            aboutAnActiveTier(p),
+        )
       : orphans;
   return [...new Set(reportable)];
 }

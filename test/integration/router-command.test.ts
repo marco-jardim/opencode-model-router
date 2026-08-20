@@ -246,12 +246,12 @@ describe("router-command — model catalog", () => {
       await h["chat.message"]({ sessionID: "s1" }, { parts: [] });
       const late = warnings();
       expect(late.some((m) => m.includes("model-missing"))).toBe(true);
-      // this mock catalog serves claude-opus-4.8, so the default `opus-4-8`
-      // pattern is dead here WITH near-miss evidence — the one default-pattern
-      // case that is actionable, and therefore still reported
-      expect(late.some((m) => m.includes("strong-model pattern 'opus-4-8'"))).toBe(true);
-      // the other defaults have no near-miss and stay silent
-      expect(late.some((m) => m.includes("claude-mythos-5"))).toBe(false);
+      // This mock catalog serves claude-opus-4.8, so the default `opus-4-8` is
+      // dead here with near-miss evidence. It is still NOT reported, because no
+      // tier in the active preset is on any 4.8 model: correcting the pattern
+      // would not change how this config resolves. (Before 1.8.0 the shipped
+      // anthropic heavy was `claude-opus-4-8`, which is why this used to fire.)
+      expect(late.some((m) => m.includes("strong-model pattern"))).toBe(false);
 
       // and it stays a one-shot: a third turn adds nothing
       const before = late.length;
