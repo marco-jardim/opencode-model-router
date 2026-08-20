@@ -11,8 +11,22 @@ describe("packaging: published tarball excludes tests and dev config (plan C4)",
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-    const parsed = JSON.parse(raw) as Array<{ files: Array<{ path: string }> }>;
-    const paths = parsed
+    // npm's --json shape is NOT stable across majors: through npm 11 this is an
+    // array of package entries, and npm 12 returns an object keyed by package
+    // name. Normalising both is what keeps this test surviving an npm upgrade
+    // instead of dying with `parsed.flatMap is not a function` — which is how
+    // it actually failed on npm 12.0.2, and is the "flaky packaging test" a
+    // contributor reported (it looked intermittent because it tracks whichever
+    // npm happens to be on the machine, not anything in this repo).
+    type PackEntry = { files: Array<{ path: string }> };
+    const parsed = JSON.parse(raw) as PackEntry[] | Record<string, PackEntry>;
+    const entries: PackEntry[] = Array.isArray(parsed)
+      ? parsed
+      : Object.values(parsed);
+    // If a future npm returns a third shape, fail here naming it rather than
+    // silently reporting an empty file list.
+    expect(entries.length).toBeGreaterThan(0);
+    const paths = entries
       .flatMap((p) => p.files.map((f) => f.path.replace(/\\/g, "/")))
       .sort();
 
