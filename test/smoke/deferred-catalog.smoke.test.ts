@@ -130,7 +130,18 @@ async function sendMessage(sessionId: string): Promise<number> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         parts: [{ type: "text", text: "oi" }],
-        model: { providerID: "anthropic", modelID: "claude-haiku-4-5" },
+        // The model is deliberately NONEXISTENT. This test needs the
+        // `chat.message` hook to fire twice; it does not need a model to
+        // answer. The hook runs inside SessionPrompt.createUserMessage(),
+        // before the provider is called, so a turn that cannot possibly
+        // succeed still drives the path under test.
+        //
+        // Naming a real model instead would make the test depend on a
+        // resolvable provider, which on a credentialless runner is exactly
+        // what does not exist — and it would hide that dependency behind a
+        // plausible-looking model id. Failing fast also cuts this file from
+        // ~78s to ~25s, because no turn waits on inference.
+        model: { providerID: "no-such-provider", modelID: "no-such-model" },
       }),
     },
   );
@@ -251,12 +262,28 @@ d("deferred catalog warning smoke", () => {
 
       // TWO turns in the SAME non-subagent session. Turn 1 only starts the
       // catalog fetch; the report can only come from a later turn.
+      //
+      // The HTTP STATUS OF THESE TURNS IS DELIBERATELY NOT ASSERTED. These
+      // turns are expected to FAIL — see sendMessage, the model does not
+      // exist — because all this test needs from them is that the hook ran.
+      //
+      // It asserted 200 originally and passed locally, on a false premise: on
+      // Windows opencode caches provider metadata under AppData\Roaming,
+      // OUTSIDE the HOME this test repoints, so the dev host still had a
+      // resolvable provider and the isolation was weaker than it looked. The
+      // first cold-container run came back 500 and failed. The lane caught a
+      // bad assumption inside its own test on its first real outing, which is
+      // the argument for having the lane.
+      //
+      // Nothing is lost by not asserting it: the substantive assertion is that
+      // the warning reaches the log. If the hook never ran, that one fails —
+      // loudly, and for the right reason. The statuses are still captured and
+      // reported in that failure message, so a future regression here is
+      // diagnosable without a re-run.
       const firstStatus = await sendMessage(sessionId);
       await delay(2_000);
       const secondStatus = await sendMessage(sessionId);
-
-      expect(firstStatus).toBe(200);
-      expect(secondStatus).toBe(200);
+      const turns = `turn statuses: ${firstStatus}, ${secondStatus}`;
 
       // The log write is asynchronous relative to the HTTP response, so poll.
       // If the turn-1 fetch had not settled by turn 2, the one-shot simply
@@ -274,7 +301,7 @@ d("deferred catalog warning smoke", () => {
       const log = readLog();
       expect(
         found,
-        `'${GHOST}' never appeared in the opencode log.\nLOG:\n${log}\nSTDERR:\n${stderr}`,
+        `'${GHOST}' never appeared in the opencode log.\n${turns}\nLOG:\n${log}\nSTDERR:\n${stderr}`,
       ).toBe(true);
 
       const warnLine = log
