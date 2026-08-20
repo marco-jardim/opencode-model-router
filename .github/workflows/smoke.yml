@@ -102,10 +102,14 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: npm ci
 
+      # Pinned to match smoke-keyless.yml. This lane already costs real model
+      # calls; letting the CLI float on top of that would make a failure
+      # ambiguous between three causes (us, opencode, the model) instead of two.
+      # smoke-upstream.yml is the lane that deliberately tracks @latest.
       - name: Install opencode CLI
         if: steps.gate.outputs.enabled == 'true'
         run: |
-          npm i -g opencode-ai@latest
+          npm i -g opencode-ai@1.18.19
           opencode --version
 
       - name: Point opencode at the checked-out plugin

@@ -75,10 +75,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # PINNED ON PURPOSE, and the pin is the point.
+      #
+      # This lane gates every push and every pull request, so it has to be
+      # deterministic. A floating `@latest` means an upstream release can turn
+      # a contributor's PR red for a reason they cannot see, reproduce, or fix,
+      # and a red build becomes ambiguous: did we break, or did opencode move?
+      # That is not hypothetical — opencode went 1.18.16 -> 1.18.19 inside a
+      # single afternoon.
+      #
+      # Upstream drift is still caught: smoke-upstream.yml runs these exact
+      # tests against @latest on a schedule, where a failure unambiguously
+      # means "opencode moved" and blocks nobody's PR. When that lane goes red,
+      # bump this pin deliberately rather than discovering the break here.
       - name: Install opencode CLI
         # Same inferred package name as smoke.yml: the repo never states it.
         run: |
-          npm i -g opencode-ai@latest
+          npm i -g opencode-ai@1.18.19
           opencode --version
 
       # No global plugin config step, deliberately. Unlike smoke.yml, these
