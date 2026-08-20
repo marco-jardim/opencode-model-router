@@ -9,7 +9,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "smoke": "cross-env RUN_OC_SMOKE=1 vitest run --config vitest.smoke.config.ts test/smoke",
-    "smoke:keyless": "cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts",
+    "smoke:keyless": "cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts test/smoke/deferred-catalog.smoke.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "license": "GPL-3.0-only",
