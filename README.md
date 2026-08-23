@@ -33,7 +33,7 @@ Every tier carries its `costRatio` (fast=1x, medium=5x, heavy=20x) injected into
 If the orchestrator is already running on Opus, the rule `self∈opus→never→@heavy` fires — it does the heavy work itself rather than delegating to another Opus instance.
 
 **Multi-provider support with automatic fallback.**
-Four presets out of the box: Anthropic, OpenAI, GitHub Copilot, Google. Switch with `/preset`. If a provider fails, the fallback chain tries the next one automatically.
+Five presets out of the box: Anthropic, OpenAI, GitHub Copilot, Google, Zai (GLM). Switch with `/preset`. If a provider fails, the fallback chain tries the next one automatically.
 
 **Plan annotation for long tasks.**
 `/annotate-plan` reads a markdown plan and tags each step with `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` — removing all routing ambiguity from multi-step workflows.
@@ -276,6 +276,13 @@ The plugin ships with four presets (switch with `/preset <name>`):
 | @fast | `google/gemini-2.5-flash` | 1x |
 | @medium | `google/gemini-2.5-pro` | 5x |
 | @heavy | `google/gemini-3-pro-preview` | 20x |
+
+**zai**:
+| Tier | Model | Cost ratio |
+|------|-------|-----------|
+| @fast | `zai/glm-4.7` | 1x |
+| @medium | `zai/glm-5.3` (high) | 5x |
+| @heavy | `zai/glm-5.3` (max) | 20x |
 
 ### Routing modes
 
