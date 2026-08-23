@@ -170,6 +170,47 @@
         ]
       }
     },
+    "zai": {
+      "fast": {
+        "model": "zai/glm-4.7",
+        "costRatio": 1,
+        "description": "GLM-4.7 for read-only exploration, search, and simple lookups",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "zai/glm-5.3",
+        "variant": "high",
+        "costRatio": 5,
+        "description": "GLM-5.3 (high reasoning) for implementation, refactoring, and tests",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "zai/glm-5.3",
+        "variant": "max",
+        "costRatio": 20,
+        "description": "GLM-5.3 (max reasoning) for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
     "hybrid": {
       "fast": {
         "model": "anthropic/claude-haiku-4-5",
