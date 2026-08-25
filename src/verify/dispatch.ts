@@ -90,10 +90,24 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   };
 }
 
-// No `\s*` padding around the capture: it overlaps the lazy any-char group and
-// backtracks polynomially on an unclosed tag (CodeQL js/polynomial-redos). The
-// capture is trimmed at the use site below instead.
-const TASK_RESULT_RE = /<task_result>([\s\S]*?)<\/task_result>/i;
+const TASK_RESULT_OPEN = "<task_result>";
+const TASK_RESULT_CLOSE = "</task_result>";
+
+/**
+ * Linear-time extraction of the <task_result> body. Any regex scan here, even a
+ * lazy one, backtracks polynomially on repeated open tags with no close
+ * (CodeQL js/polynomial-redos), so this walks the string with indexOf instead.
+ * Case-insensitive, like the regex it replaced: first open tag, then the first
+ * close tag after it. Returns null when either tag is missing.
+ */
+function extractTaskResult(raw: string): string | null {
+  const lower = raw.toLowerCase();
+  const start = lower.indexOf(TASK_RESULT_OPEN);
+  if (start === -1) return null;
+  const end = lower.indexOf(TASK_RESULT_CLOSE, start + TASK_RESULT_OPEN.length);
+  if (end === -1) return null;
+  return raw.slice(start + TASK_RESULT_OPEN.length, end);
+}
 
 /**
  * Parse the built-in `task` tool's after-hook output: the child's final return
@@ -106,8 +120,8 @@ export function parseTaskResult(output: unknown): {
 } {
   const o = (output ?? {}) as Record<string, unknown>;
   const raw = typeof o.output === "string" ? o.output : "";
-  const m = raw.match(TASK_RESULT_RE);
-  const finalReturnText = (m ? m[1] : raw).trim();
+  const inner = extractTaskResult(raw);
+  const finalReturnText = (inner ?? raw).trim();
   const meta = (o.metadata ?? {}) as Record<string, unknown>;
   const childSessionID =
     typeof meta.sessionId === "string"

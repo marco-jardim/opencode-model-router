@@ -22,9 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ad-hoc script detection (`isSelfScript`) and the subagent task-result parser. The guard
   now caps the command it scans at 20k characters and fails closed above that: truncating
   would let padding push a redirect past the scan window, and a shell command that long is
-  itself a signal. The task-result regex dropped the `\s*` padding around its lazy capture,
-  which overlapped the any-char group and backtracked on an unclosed tag; the capture was
-  already trimmed at the use site, so the parse result is unchanged.
+  itself a signal. The task-result parser dropped its regex entirely for a linear `indexOf`
+  scan — even a lazy capture backtracks polynomially on repeated open tags with no close —
+  keeping the same semantics: first open tag, first close tag after it, case-insensitive,
+  trimmed at the use site, raw output as the fallback.
 
 ## [1.11.0] - 2026-08-24
 

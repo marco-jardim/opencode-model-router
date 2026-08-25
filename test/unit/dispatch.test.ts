@@ -133,6 +133,22 @@ describe("parseTaskResult", () => {
     const r = parseTaskResult({ output: raw });
     expect(r.finalReturnText).toBe(raw.trim());
   });
+
+  it("repeated open tags with no close anywhere fall back to the raw text", () => {
+    const raw = "<task_result>a".repeat(1000);
+    const r = parseTaskResult({ output: raw });
+    expect(r.finalReturnText).toBe(raw.trim());
+  });
+
+  it("extracts across mixed-case open and close tags", () => {
+    const r = parseTaskResult({ output: "<TASK_result>x</task_RESULT>" });
+    expect(r.finalReturnText).toBe("x");
+  });
+
+  it("empty wrapped content yields an empty string, not the raw output", () => {
+    const r = parseTaskResult({ output: "junk<task_result></task_result>junk" });
+    expect(r.finalReturnText).toBe("");
+  });
 });
 
 describe("buildDelegationDoD", () => {
