@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has to be checked against the models.dev catalog, and a new preset also needs a
   `fallback.global` chain plus the README and config-reference counts.
 
+### Fixed
+
+- **Two polynomial-ReDoS findings on LLM-influenced input.** CodeQL flagged the guard's
+  ad-hoc script detection (`isSelfScript`) and the subagent task-result parser. The guard
+  now caps the command it scans at 20k characters and fails closed above that: truncating
+  would let padding push a redirect past the scan window, and a shell command that long is
+  itself a signal. The task-result regex dropped the `\s*` padding around its lazy capture,
+  which overlapped the any-char group and backtracked on an unclosed tag; the capture was
+  already trimmed at the use site, so the parse result is unchanged.
+
 ## [1.11.0] - 2026-08-24
 
 ### Added

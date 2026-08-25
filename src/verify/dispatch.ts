@@ -90,7 +90,10 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   };
 }
 
-const TASK_RESULT_RE = /<task_result>\s*([\s\S]*?)\s*<\/task_result>/i;
+// No `\s*` padding around the capture: it overlaps the lazy any-char group and
+// backtracks polynomially on an unclosed tag (CodeQL js/polynomial-redos). The
+// capture is trimmed at the use site below instead.
+const TASK_RESULT_RE = /<task_result>([\s\S]*?)<\/task_result>/i;
 
 /**
  * Parse the built-in `task` tool's after-hook output: the child's final return

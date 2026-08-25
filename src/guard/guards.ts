@@ -64,6 +64,13 @@ const INLINE_SCRIPT_RE = /\b(node|python3?|deno|bun)\s+-(e|c)\b/i;
 const CAT_WRITE_RE = /\bcat\s+>\s*\S/i;
 const BASH_C_RE = /\bbash\s+-c\b/i;
 
+// Upper bound on the command length we are willing to scan with the regexes
+// above. Several of them are polynomial on adversarial input (CodeQL
+// js/polynomial-redos), and a shell command this long is itself a signal.
+// Truncating instead would let padding push a redirect past the scan window, so
+// an over-length command is flagged, not waved through.
+const MAX_GUARD_SCAN_CHARS = 20_000;
+
 // ---------------------------------------------------------------------------
 // Write tools set (module-level)
 // ---------------------------------------------------------------------------
@@ -113,6 +120,8 @@ export function isSelfScript(call: GuardCall, policy: GuardPolicy): boolean {
   if (call.tool === "bash" || call.tool === "shell") {
     const cmd = String(args.command ?? args.cmd ?? "");
     if (!cmd) return false;
+    // Fail closed: too long to scan safely, so treat it as suspicious.
+    if (cmd.length > MAX_GUARD_SCAN_CHARS) return true;
     return (
       HEREDOC_RE.test(cmd) ||
       REDIRECT_SCRIPT_RE.test(cmd) ||

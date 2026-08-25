@@ -138,6 +138,16 @@ describe("isSelfScript", () => {
     ).toBe(true);
   });
 
+  it("bash 'git status' => false", () => {
+    expect(isSelfScript({ tool: "bash", args: { command: "git status" } }, policy)).toBe(false);
+  });
+
+  it("over-length command => true (fail closed, not scanned)", () => {
+    const cmd = ">" + ">!".repeat(15000);
+    expect(cmd.length).toBeGreaterThan(20000);
+    expect(isSelfScript({ tool: "bash", args: { command: cmd } }, policy)).toBe(true);
+  });
+
   it("inline node -c => true (INLINE_SCRIPT_RE)", () => {
     expect(
       isSelfScript({ tool: "bash", args: { command: "node -c script.js" } }, policy),

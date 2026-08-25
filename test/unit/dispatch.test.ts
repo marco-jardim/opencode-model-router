@@ -120,6 +120,19 @@ describe("parseTaskResult", () => {
     expect(parseTaskResult({ output: 123 }).finalReturnText).toBe("");
     expect(parseTaskResult(undefined).finalReturnText).toBe("");
   });
+
+  it("trims whitespace padded inside the tags", () => {
+    const r = parseTaskResult({
+      output: "before <task_result>\n\n  DONE: padded  \n\n</task_result> after",
+    });
+    expect(r.finalReturnText).toBe("DONE: padded");
+  });
+
+  it("unclosed tag falls back to the raw text", () => {
+    const raw = "<task_result>" + " ".repeat(50000);
+    const r = parseTaskResult({ output: raw });
+    expect(r.finalReturnText).toBe(raw.trim());
+  });
 });
 
 describe("buildDelegationDoD", () => {
