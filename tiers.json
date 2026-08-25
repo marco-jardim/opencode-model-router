@@ -203,6 +203,47 @@
         ]
       }
     },
+    "zai": {
+      "fast": {
+        "model": "zai-coding-plan/glm-4.7",
+        "costRatio": 1,
+        "description": "GLM-4.7 for read-only exploration, search, and simple lookups (requires the Z.AI Coding Plan; token-spend ratios are estimates, not price differences)",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "zai-coding-plan/glm-5.3",
+        "variant": "high",
+        "costRatio": 3,
+        "description": "GLM-5.3 at high effort for implementation, refactoring, and tests (requires the Z.AI Coding Plan; costRatio is an estimated token-spend multiplier, not a price difference)",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "zai-coding-plan/glm-5.3",
+        "variant": "max",
+        "costRatio": 6,
+        "description": "GLM-5.3 at max effort for architecture, complex debugging, and security (requires the Z.AI Coding Plan; costRatio is an estimated token-spend multiplier, not a price difference)",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
     "hybrid": {
       "fast": {
         "model": "anthropic/claude-haiku-4-5",
@@ -387,6 +428,11 @@
         "openai",
         "anthropic",
         "github-copilot"
+      ],
+      "zai-coding-plan": [
+        "anthropic",
+        "openai",
+        "google"
       ]
     }
   },
