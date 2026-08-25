@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A `zai` preset, routing GLM models through the Z.AI Coding Plan.** `@fast` takes
+  `glm-4.7`, `@medium` and `@heavy` share `glm-5.3` at `high` and `max` effort. Contributed
+  by @MarCYK in
+  [#37](https://github.com/marco-jardim/opencode-model-router/pull/37), closing
+  [#18](https://github.com/marco-jardim/opencode-model-router/issues/18).
+
+  Landed with three fixes on top. The preset originally named the `zai` provider, but
+  `glm-5.3` is not published under it in the models.dev catalog opencode resolves against
+  — it exists only under `zai-coding-plan`, whose reasoning options (`low`/`high`/`max`)
+  are also what make the `high` and `max` variants valid. All three tiers now point at
+  `zai-coding-plan/*` and say so in their descriptions, since the plan is a prerequisite.
+  `fallback.global` gained a `zai-coding-plan` chain, so a Z.AI outage now fails over
+  instead of dead-ending. And `costRatio` follows the `fable-effort` precedent — `1`/`3`/`6`
+  as an estimated token-spend multiplier, not a price difference, because `@medium` and
+  `@heavy` are the same model on a flat-rate plan where the catalog prices every model at
+  zero.
+
 ## [1.10.0] - 2026-08-20
 
 Minor release. Config errors are caught at load instead of drifting to a later turn,
