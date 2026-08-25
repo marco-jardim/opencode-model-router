@@ -251,7 +251,7 @@ The injected content is built dynamically (lines 370-404):
 
 ```
 ## Model Delegation Protocol
-Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-6/max(5x) @heavy=claude-opus-4-6/max(20x). mode:normal
+Preset: anthropic. Tiers: @fast=claude-sonnet-5(1x) @medium=claude-opus-5/high(5x) @heavy=claude-fable-5/max(20x). mode:normal
 R: @fast→broader read-only exploration/search/grep/read/git-info/ls/lookup-docs/type-check/count/exists-check @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 One-off direct lookups can stay in the primary agent when clearly faster; gather context before @heavy only when more evidence is still needed.
@@ -324,9 +324,9 @@ The model-router plugin **does not use `tui.showToast()`**. All feedback is retu
   "presets": {
     "anthropic": {
       "fast": {
-        "model": "anthropic/claude-haiku-4-5",
+        "model": "anthropic/claude-sonnet-5",
         "costRatio": 1,
-        "description": "Haiku 4.5 for exploration, search, and simple reads",
+        "description": "Sonnet 5 for exploration, search, and simple reads",
         "steps": 30,
         "prompt": "You are a fast exploration agent...",
         "whenToUse": [...]
@@ -346,6 +346,11 @@ The model-router plugin **does not use `tui.showToast()`**. All feedback is retu
   }
 }
 ```
+
+- **Bundled defaults:** the cached `tiers.json`.
+- **Global overrides:** `~/.config/opencode/opencode-model-router.overrides.jsonc`.
+- **Project overrides:** `<repo>/.opencode/opencode-model-router.overrides.jsonc` (found by upward search; deep-merged over global).
+- **Persisted UI state:** `~/.config/opencode/opencode-model-router.state.json` (active preset/mode/enforcement only).
 
 ---
 

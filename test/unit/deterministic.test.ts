@@ -382,7 +382,7 @@ describe("runDeterministic — schemaMatch", () => {
     const deps = makeDeps({
       fs: {
         fileExists: async () => true,
-        readFile: async (p) => (p === "target.json" ? target : schema),
+        readFile: async (p) => (p.endsWith("target.json") ? target : schema),
       },
     });
     const verdict = await runDeterministic(
@@ -413,7 +413,7 @@ describe("runDeterministic — schemaMatch", () => {
     const deps = makeDeps({
       fs: {
         fileExists: async () => true,
-        readFile: async (p) => (p === "target.json" ? target : schema),
+        readFile: async (p) => (p.endsWith("target.json") ? target : schema),
       },
     });
     const verdict = await runDeterministic(
@@ -430,7 +430,7 @@ describe("runDeterministic — schemaMatch", () => {
     const deps = makeDeps({
       fs: {
         fileExists: async () => true,
-        readFile: async (p) => (p === "target.json" ? target : schema),
+        readFile: async (p) => (p.endsWith("target.json") ? target : schema),
       },
     });
     const verdict = await runDeterministic(

@@ -75,6 +75,8 @@ describe("security scrub sweep", () => {
     const state: GuardState = {
       budget: 25,
       toolCallCount: 3,
+      totalToolCallCount: 3,
+      dispatches: 1,
       readCount: 2,
       execCount: 1,
       selfScriptCount: 0,

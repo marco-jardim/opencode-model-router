@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
 import { fingerprintToolCall } from "../../src/guard/fingerprint";
 import { buildCapBanner } from "../../src/router/sessions";
 import type { Cap } from "../../src/index";
+import type { SubagentState } from "../../src/router/sessions";
+
+/** Fill the resume-accounting fields so golden fixtures stay assertion-identical. */
+function bannerState(
+  state: Omit<SubagentState, "dispatches" | "totalCalls">,
+): SubagentState {
+  return { dispatches: 1, totalCalls: state.calls, ...state };
+}
 
 describe("fingerprintToolCall golden", () => {
   it("read with file_path", () => {
@@ -47,57 +55,57 @@ describe("fingerprintToolCall golden", () => {
 
 describe("buildCapBanner golden", () => {
   it("under cap no warning", () => {
-    const state = {
+    const state = bannerState({
       tierName: "fast",
       cap: 8 as Cap,
       calls: 3,
       seen: new Map<string, number>(),
       trivial: false,
-    };
+    });
     expect(buildCapBanner(state, false, undefined, "read")).toMatchSnapshot();
   });
 
   it("cap warning 2 remaining", () => {
-    const state = {
+    const state = bannerState({
       tierName: "fast",
       cap: 8 as Cap,
       calls: 6,
       seen: new Map<string, number>(),
       trivial: false,
-    };
+    });
     expect(buildCapBanner(state, false, undefined, "grep")).toMatchSnapshot();
   });
 
   it("cap reached", () => {
-    const state = {
+    const state = bannerState({
       tierName: "medium",
       cap: 5 as Cap,
       calls: 5,
       seen: new Map<string, number>(),
       trivial: false,
-    };
+    });
     expect(buildCapBanner(state, false, undefined, "glob")).toMatchSnapshot();
   });
 
   it("redundant call", () => {
-    const state = {
+    const state = bannerState({
       tierName: "fast",
       cap: 8 as Cap,
       calls: 4,
       seen: new Map<string, number>(),
       trivial: false,
-    };
+    });
     expect(buildCapBanner(state, true, 2, "read")).toMatchSnapshot();
   });
 
   it("cap none unlimited", () => {
-    const state = {
+    const state = bannerState({
       tierName: "custom",
       cap: "none" as Cap,
       calls: 10,
       seen: new Map<string, number>(),
       trivial: false,
-    };
+    });
     expect(buildCapBanner(state, false, undefined, "grep")).toMatchSnapshot();
   });
 });

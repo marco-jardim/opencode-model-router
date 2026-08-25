@@ -7,6 +7,8 @@ import { READ_ONLY_TOOLS } from "../router/sessions";
 
 export interface GuardPolicy {
   budget: number;
+  /** Cumulative tool-call ceiling across resumed dispatches. Unset = no ceiling. */
+  cumulativeBudget?: number;
   readDraftCap: number;
   sameOpRetryCap: number;
   blockSelfScript: boolean;
@@ -33,7 +35,12 @@ export interface GuardDecision {
 
 export interface GuardState {
   budget: number;
+  /** Tool calls in the CURRENT dispatch (reset by guardStore.beginDispatch). */
   toolCallCount: number;
+  /** Tool calls across all dispatches of this session (never reset). */
+  totalToolCallCount: number;
+  /** Dispatch rounds seen for this session (1 on first dispatch). */
+  dispatches: number;
   readCount: number;
   execCount: number;
   selfScriptCount: number;
@@ -71,6 +78,8 @@ export function newGuardState(policy: GuardPolicy): GuardState {
   return {
     budget: policy.budget,
     toolCallCount: 0,
+    totalToolCallCount: 0,
+    dispatches: 1,
     readCount: 0,
     execCount: 0,
     selfScriptCount: 0,
@@ -178,6 +187,20 @@ export function evaluateGuards(
     };
   }
 
+  // CLAUSE 3b: cumulative budget across resumed dispatches. Without this, a
+  // session that keeps getting resumed gets a fresh per-dispatch budget every
+  // round — an unbounded loop that CLAUSE 3 alone cannot see.
+  if (
+    policy.cumulativeBudget !== undefined &&
+    state.totalToolCallCount >= policy.cumulativeBudget
+  ) {
+    return {
+      allow: false,
+      guard: "cumulative_iteration_cap",
+      observation: `DENIED: cumulative tool-call budget ${policy.cumulativeBudget} exhausted across ${state.dispatches} dispatches. Stop now and emit your final answer with what you have.`,
+    };
+  }
+
   // CLAUSE 4: redundancy
   if (kind === "read" && (state.seen.get(fp) ?? 0) >= policy.sameOpRetryCap) {
     return {
@@ -230,6 +253,7 @@ export function updateState(
   if (kind === "finish") return state;
 
   state.toolCallCount += 1;
+  state.totalToolCallCount += 1;
 
   const fp = fingerprintToolCall(call.tool, call.args);
 
@@ -306,6 +330,8 @@ export function trajectoryMetrics(state: GuardState): Record<string, unknown> {
       state.execCount === 0 ? state.readCount : state.readCount / state.execCount,
     self_script_count: state.selfScriptCount,
     tool_call_count: state.toolCallCount,
+    total_tool_call_count: state.totalToolCallCount,
+    dispatches: state.dispatches,
     deliverable_executed: state.deliverableExecuted,
     blocked_count: state.blockedCount,
     redundant_count: state.redundantCount,

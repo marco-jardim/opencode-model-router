@@ -76,6 +76,10 @@ describe("validateConfig — root shape", () => {
   it("throws when defaultTier is not a string", () => {
     expect(() => validateConfig(validRaw({ defaultTier: 3 }))).toThrow(/defaultTier/);
   });
+  it("accepts antiNarration boolean, rejects non-boolean", () => {
+    expect(() => validateConfig(validRaw({ antiNarration: true }))).not.toThrow();
+    expect(() => validateConfig(validRaw({ antiNarration: "yes" }))).toThrow(/antiNarration/);
+  });
 });
 
 describe("validateConfig — tier shape", () => {
@@ -90,10 +94,34 @@ describe("validateConfig — tier shape", () => {
     expect(() => validateConfig(withTier({ model: "", description: "d", whenToUse: [] }))).toThrow(/\.model/);
   });
   it("throws when tier.description is not a string", () => {
-    expect(() => validateConfig(withTier({ model: "m", description: 1, whenToUse: [] }))).toThrow(/\.description/);
+    expect(() => validateConfig(withTier({ model: "provider/m", description: 1, whenToUse: [] }))).toThrow(/\.description/);
   });
   it("throws when tier.whenToUse is not an array", () => {
-    expect(() => validateConfig(withTier({ model: "m", description: "d", whenToUse: "x" }))).toThrow(/whenToUse/);
+    expect(() => validateConfig(withTier({ model: "provider/m", description: "d", whenToUse: "x" }))).toThrow(/whenToUse/);
+  });
+  it("accepts a tier with only `model` (description/whenToUse optional)", () => {
+    expect(() => validateConfig(withTier({ model: "provider/m" }))).not.toThrow();
+  });
+
+  // Reported in #17: a malformed ref used to load clean and only surface as a
+  // catalog issue on some later turn, or never if the catalog fetch failed.
+  // The shape needs no network, so it is decided at load.
+  it("throws when tier.model has no provider", () => {
+    expect(() => validateConfig(withTier({ model: "claude-sonnet-5" }))).toThrow(
+      "tiers.json: 'anthropic.fast.model' must be 'provider/model' (got 'claude-sonnet-5')",
+    );
+  });
+  it("throws when tier.model has an empty provider or an empty model", () => {
+    expect(() => validateConfig(withTier({ model: "/claude-sonnet-5" }))).toThrow(/'provider\/model'/);
+    expect(() => validateConfig(withTier({ model: "anthropic/" }))).toThrow(/'provider\/model'/);
+    expect(() => validateConfig(withTier({ model: "/" }))).toThrow(/'provider\/model'/);
+  });
+  // Multi-segment model ids are legal: the split takes the FIRST slash only, so
+  // the provider is `openrouter` and the model keeps its remaining slashes.
+  it("accepts a multi-segment model id", () => {
+    expect(() =>
+      validateConfig(withTier({ model: "openrouter/deepseek/deepseek-v3.2" })),
+    ).not.toThrow();
   });
 });
 
@@ -256,19 +284,19 @@ describe("validateConfig — enforcement.guard validation", () => {
 
   it("throws when guard.budget=0 (below minimum)", () => {
     expect(() => validateConfig(withEnf({ guard: { budget: 0 } }))).toThrow(
-      "enforcement.guard.budget must be a number >= 1",
+      "tiers.json: enforcement.guard.budget must be a number >= 1",
     );
   });
 
   it("throws when guard.budget is a string", () => {
     expect(() => validateConfig(withEnf({ guard: { budget: "x" } }))).toThrow(
-      "enforcement.guard.budget must be a number >= 1",
+      "tiers.json: enforcement.guard.budget must be a number >= 1",
     );
   });
 
   it("throws when guard.budget is Infinity", () => {
     expect(() => validateConfig(withEnf({ guard: { budget: Infinity } }))).toThrow(
-      "enforcement.guard.budget must be a number >= 1",
+      "tiers.json: enforcement.guard.budget must be a number >= 1",
     );
   });
 
@@ -287,7 +315,7 @@ describe("validateConfig — enforcement.guard validation", () => {
   it('throws when guard.blockScriptWrites="yes" (string, not boolean)', () => {
     expect(() =>
       validateConfig(withEnf({ guard: { blockScriptWrites: "yes" } })),
-    ).toThrow("enforcement.guard.blockScriptWrites must be a boolean");
+    ).toThrow("tiers.json: enforcement.guard.blockScriptWrites must be a boolean");
   });
 
   it("accepts guard absent — no validation performed", () => {
@@ -298,5 +326,41 @@ describe("validateConfig — enforcement.guard validation", () => {
     expect(() =>
       validateConfig(withEnf({ guard: { budget: 20, blockScriptWrites: true } })),
     ).not.toThrow();
+  });
+});
+
+describe("validateConfig — subagentTiers", () => {
+  it("accepts the key being absent", () => {
+    expect(() => validateConfig(validRaw())).not.toThrow();
+  });
+
+  it("accepts a well-formed map", () => {
+    expect(() =>
+      validateConfig(validRaw({ subagentTiers: { ContextScout: "fast" } })),
+    ).not.toThrow();
+  });
+
+  it("accepts a tier name no preset defines — skipped at resolve time, never fatal", () => {
+    expect(() =>
+      validateConfig(validRaw({ subagentTiers: { ContextScout: "ultra" } })),
+    ).not.toThrow();
+  });
+
+  it("throws when subagentTiers is not an object", () => {
+    expect(() => validateConfig(validRaw({ subagentTiers: "fast" }))).toThrow(
+      "'subagentTiers' must be an object",
+    );
+  });
+
+  it("throws when a value is not a string", () => {
+    expect(() =>
+      validateConfig(validRaw({ subagentTiers: { ContextScout: 1 } })),
+    ).toThrow("subagentTiers.'ContextScout' must be a non-empty tier name");
+  });
+
+  it("throws when a value is an empty string", () => {
+    expect(() =>
+      validateConfig(validRaw({ subagentTiers: { ContextScout: "" } })),
+    ).toThrow("subagentTiers.'ContextScout' must be a non-empty tier name");
   });
 });

@@ -8,6 +8,12 @@ import type { RouterConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
+import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
+
+export interface ChangedFileStoreOptions {
+  /** Injectable clock (tests). Defaults to Date.now. */
+  now?: () => number;
+}
 
 /** Tools that mutate the workspace (mirrors the guard taxonomy). */
 const WRITE_TOOLS = new Set(["write", "edit", "patch", "multiedit"]);
@@ -39,10 +45,23 @@ export function extractChangedFile(tool: string, args: unknown): ChangedFile | n
  * by observing that session's own edit/write tool calls (ADR 0002 D3 — NOT a
  * global git diff), which is concurrency-safe under interleaved subagents.
  */
-export function createChangedFileStore() {
+export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
+  const now = options.now ?? Date.now;
   const bySession = new Map<string, Map<string, string>>();
+  const lastTouch = new Map<string, number>();
+
+  function touch(sessionID: string): void {
+    lastTouch.set(sessionID, now());
+  }
+
+  function evict(sessionID: string): void {
+    bySession.delete(sessionID);
+    lastTouch.delete(sessionID);
+  }
+
   return {
     record(sessionID: string, tool: string, args: unknown): void {
+      touch(sessionID);
       const cf = extractChangedFile(tool, args);
       if (!cf) return;
       let m = bySession.get(sessionID);
@@ -60,7 +79,13 @@ export function createChangedFileStore() {
       return [...m.entries()].map(([path, status]) => ({ path, status }));
     },
     clear(sessionID: string): void {
-      bySession.delete(sessionID);
+      evict(sessionID);
+    },
+    /** Evict every session idle for >= ttlMs. Future stamps are never evicted. */
+    sweep(nowMs: number = now(), ttlMs: number = DEFAULT_IDLE_TTL_MS): void {
+      for (const [sessionID, stamp] of [...lastTouch.entries()]) {
+        if (nowMs - stamp >= ttlMs) evict(sessionID);
+      }
     },
   };
 }

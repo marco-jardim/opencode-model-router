@@ -5,3 +5,5 @@ dist/
 Thumbs.db
 tmp/
 coverage/
+.opencode/
+.env

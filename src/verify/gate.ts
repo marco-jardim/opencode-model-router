@@ -23,6 +23,7 @@ import { isCheckable } from "./dod";
 import { runDeterministic } from "./deterministic";
 import { runChecker } from "./checker";
 import type { ArtefactView, CheckerDeps } from "./checker";
+import { resolveBaseDir } from "./paths";
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
 export interface Artefact {
@@ -40,6 +41,13 @@ export interface Delegation {
   trivial?: boolean;
   /** Mode A (on-the-fly) vs Mode B (plan annotation) — drives the no-DoD message. */
   mode?: "modeA" | "modeB";
+  /**
+   * Working directory the producer was told to work in. When present it becomes
+   * the base directory for verification: relative deterministic-check paths
+   * resolve against it, and the grader is scoped to it. Absent means "the
+   * router's own directory", which is the pre-existing behaviour exactly.
+   */
+  cwd?: string;
 }
 
 export interface GateDeps {
@@ -146,9 +154,21 @@ export async function accept(
   // The two wirings (Option i verify-dispatch / Option ii delegate tool) still
   // wrap accept() defensively so that any unexpected throw surfaces as a
   // visible failure (forcing note / honest status), never a silent accept.
+  // A delegation that declared a working directory must be verified against
+  // THAT directory, not the router's. Both verifiers get the same effective
+  // base dir so a deterministic check and a grader can never disagree about
+  // where the work was supposed to land.
+  const effectiveBaseDir = resolveBaseDir(
+    delegation.cwd,
+    deps.deterministic.cwd,
+  );
+
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
-    verdict = await runDeterministic(dod, deps.deterministic);
+    verdict = await runDeterministic(dod, {
+      ...deps.deterministic,
+      cwd: effectiveBaseDir,
+    });
   } else {
     // "checker" is the only remaining checkable kind.
     verdict = await runChecker(
@@ -157,6 +177,10 @@ export async function accept(
         artefact: view(artefact),
         producerTier: artefact.producerTier,
         producerSessionID: artefact.producerSessionID,
+        // Only when the delegation actually declared one. Passing the router's
+        // own directory here would scope every existing grader and add a
+        // working-directory line to every existing prompt for no reason.
+        ...(delegation.cwd ? { workingDir: effectiveBaseDir } : {}),
       },
       deps.checker,
     );

@@ -1,6 +1,6 @@
 {
   "name": "opencode-model-router",
-  "version": "1.3.1",
+  "version": "1.10.0",
   "description": "OpenCode plugin that routes tasks to tiered subagents (fast/medium/heavy) based on complexity",
   "type": "module",
   "main": "./src/index.ts",
@@ -9,9 +9,13 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "smoke": "cross-env RUN_OC_SMOKE=1 vitest run --config vitest.smoke.config.ts test/smoke",
+    "smoke:keyless": "cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts test/smoke/deferred-catalog.smoke.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=20"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/marco-jardim/opencode-model-router.git"
@@ -38,10 +42,11 @@
     "src/",
     "tiers.json",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0"
+    "@opencode-ai/plugin": ">=1.0.0 <2.0.0"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

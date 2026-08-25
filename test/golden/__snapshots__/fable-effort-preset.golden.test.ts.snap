@@ -1,0 +1,59 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`fable-effort preset golden > matches the assembled agent options snapshot 1`] = `
+{
+  "fast": {
+    "effort": "low",
+  },
+  "heavy": {
+    "effort": "xhigh",
+  },
+  "medium": {
+    "effort": "high",
+  },
+}
+`;
+
+exports[`fable-effort preset golden > matches the fable-effort preset snapshot 1`] = `
+{
+  "fast": {
+    "costRatio": 1,
+    "description": "Fable 5 at low effort for exploration, search, and simple reads (token-spend ratios are estimates; same model across tiers preserves prompt cache)",
+    "effort": "low",
+    "model": "anthropic/claude-fable-5",
+    "steps": 30,
+    "whenToUse": [
+      "Codebase exploration and search",
+      "Simple file reads and listing",
+      "Grep/glob operations",
+      "Quick lookups and research",
+    ],
+  },
+  "heavy": {
+    "costRatio": 6,
+    "description": "Fable 5 at xhigh effort for architecture, complex debugging, and security (costRatio is an estimated token-spend multiplier, not a price difference)",
+    "effort": "xhigh",
+    "model": "anthropic/claude-fable-5",
+    "steps": 120,
+    "whenToUse": [
+      "Architecture decisions",
+      "Complex debugging (after 2+ failures)",
+      "Security review",
+      "Performance optimization",
+    ],
+  },
+  "medium": {
+    "costRatio": 3,
+    "description": "Fable 5 at high effort for implementation and standard coding (costRatio is an estimated token-spend multiplier, not a price difference)",
+    "effort": "high",
+    "model": "anthropic/claude-fable-5",
+    "steps": 50,
+    "whenToUse": [
+      "Feature implementation",
+      "Refactoring",
+      "Writing tests",
+      "Bug fixes",
+    ],
+  },
+}
+`;

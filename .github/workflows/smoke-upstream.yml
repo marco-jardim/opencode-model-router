@@ -1,0 +1,78 @@
+name: smoke-upstream
+
+# Upstream-drift canary.
+#
+# This runs the SAME credential-free tests as smoke-keyless.yml, but against
+# `opencode-ai@latest` instead of the pinned version. It exists to separate two
+# failures that used to look identical:
+#
+#   smoke-keyless red  -> WE broke something. Deterministic, pinned CLI.
+#   smoke-upstream red -> OPENCODE moved. Nothing in this repo changed.
+#
+# Before the split, both lanes floated on @latest, so a red build on a Monday
+# morning could mean either, and the only way to tell was to bisect against a
+# moving target. opencode went 1.18.16 -> 1.18.19 in a single afternoon, so
+# this is a live cadence rather than a theoretical concern.
+#
+# WHEN THIS GOES RED, that is information, not a break-glass. The plugin's
+# entire contract is with opencode's plugin API surface — `dispose`, the hook
+# signatures, `client.app.log`, the `config` hook's mutate-in-place argument —
+# and none of it is versioned independently of the CLI. Finding out here, on a
+# schedule, is the cheap way to find out. The expensive way is a user report.
+#
+# Response when it fails:
+#   1. Read the diff between the pinned version and latest.
+#   2. Fix the plugin if the API genuinely changed.
+#   3. Bump the pin in smoke-keyless.yml AND smoke.yml, in the same commit as
+#      the fix, so the two lanes agree again.
+# Do NOT "fix" it by loosening an assertion here — this lane is supposed to be
+# the strict one.
+#
+# Deliberately requires no secrets, so it runs on forks too.
+
+on:
+  schedule:
+    # 06:23 UTC every Monday, an hour before the credentialed smoke lane, so a
+    # CLI-level break is already visible before the expensive lane spends
+    # model budget rediscovering it.
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-upstream
+  cancel-in-progress: false
+
+jobs:
+  smoke-upstream:
+    runs-on: ubuntu-latest
+    # Same three files as the keyless lane, ~80s locally. Generous headroom for
+    # a cold container plus a global npm install.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The one place in this repo that deliberately floats. Every other lane
+      # pins; this is what tells us when to move the pin.
+      - name: Install opencode CLI (latest, unpinned on purpose)
+        run: |
+          npm i -g opencode-ai@latest
+          echo "OC_VERSION=$(opencode --version)" >> "$GITHUB_ENV"
+          opencode --version
+
+      - name: Run keyless smoke lane against latest
+        run: npm run smoke:keyless
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          echo "::warning title=Upstream drift::The keyless smoke tests fail against opencode-ai ${OC_VERSION:-latest}, while the pinned version in smoke-keyless.yml passes. This means opencode changed something the plugin depends on. Fix the plugin, then bump the pin in smoke-keyless.yml and smoke.yml in the same commit."

@@ -37,8 +37,102 @@ describe("parseCapDirective", () => {
   });
 });
 
+describe("CAP:none justification gate", () => {
+  it("falls back to the tier baseline for an unjustified CAP:none", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_cap_none_bare" },
+      dispatch("CAP:none do a broad survey"),
+      cfg,
+      tierNames,
+    );
+
+    const out: Record<string, unknown> = {};
+    store.recordToolCall(
+      { sessionID: "ses_cap_none_bare", tool: "read", args: { file_path: "a.ts" } },
+      out,
+    );
+
+    expect(out.output).toContain("[cap: 1/8]");
+    expect(out.output).not.toContain("∞");
+  });
+
+  it("honors CAP:none when the dispatch includes a reason line", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_cap_none_reason" },
+      dispatch("CAP:none reason: full-repo audit"),
+      cfg,
+      tierNames,
+    );
+
+    const out: Record<string, unknown> = {};
+    store.recordToolCall(
+      { sessionID: "ses_cap_none_reason", tool: "read", args: { file_path: "a.ts" } },
+      out,
+    );
+
+    expect(out.output).toContain("[cap: 1/∞]");
+  });
+
+  it("leaves numeric CAP:N untouched by the gate", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_cap_numeric_nogate" },
+      dispatch("CAP:2 no justification here"),
+      cfg,
+      tierNames,
+    );
+
+    const out: Record<string, unknown> = {};
+    store.recordToolCall(
+      { sessionID: "ses_cap_numeric_nogate", tool: "read", args: { file_path: "a.ts" } },
+      out,
+    );
+
+    expect(out.output).toContain("[cap: 1/2]");
+  });
+
+  it("re-applies the gate on same-tier resume", () => {
+    const store = createSessionStore();
+    const sessionID = "ses_cap_none_resume_gate";
+
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID },
+      dispatch("CAP:none reason: full-repo audit"),
+      cfg,
+      tierNames,
+    );
+
+    const first: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "a.ts" } }, first);
+    expect(first.output).toContain("[cap: 1/∞]");
+
+    const resumed = store.registerFromChatMessage(
+      { agent: "fast", sessionID },
+      dispatch("CAP:none keep going"),
+      cfg,
+      tierNames,
+    );
+    expect(resumed).toEqual({ registered: true, resumed: true });
+
+    const second: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "b.ts" } }, second);
+
+    expect(second.output).toContain("[cap: 1/8]");
+    expect(second.output).not.toContain("∞");
+  });
+});
+
 function st(partial: Partial<SubagentState> & { cap: Cap; calls: number }): SubagentState {
-  return { tierName: "fast", seen: new Map(), trivial: false, ...partial };
+  return {
+    tierName: "fast",
+    dispatches: 1,
+    totalCalls: partial.calls,
+    seen: new Map(),
+    trivial: false,
+    ...partial,
+  };
 }
 
 describe("buildCapBanner", () => {
@@ -219,6 +313,203 @@ describe("classifyTrivial", () => {
   });
   it("fast tier + no matching keyword => false", () => {
     expect(classifyTrivial("do the thing xyz", "fast", fullCfg)).toBe(false);
+  });
+
+  // --- narrowing: trivial means SINGLE-SHOT lookup, not merely "read-only" ---
+  // Before this narrowing every case below returned true, which exempted
+  // multi-file @fast recon from enforced-mode hard blocks.
+
+  it("single named file => true (the canonical single-shot lookup)", () => {
+    expect(
+      classifyTrivial("read package.json and tell me the version", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("multi-file recon (6 paths) => false (path-count gate)", () => {
+    expect(
+      classifyTrivial(
+        "read README.md, package.json, tsconfig.json, tiers.json, LICENSE.md and src/index.ts",
+        "fast",
+        fullCfg,
+      ),
+    ).toBe(false);
+  });
+
+  it("two named files => false (exceeds MAX_TRIVIAL_PATHS)", () => {
+    expect(
+      classifyTrivial("read package.json and tsconfig.json", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("same file named twice => true (paths are de-duplicated)", () => {
+    expect(
+      classifyTrivial("read package.json and recheck package.json", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("'then' sequencing marker => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read the config then summarise it", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'one at a time' marker => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read these files one at a time using the read tool", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'each' distributive marker => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("search each module for the handler", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("numbered list => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read the following:\n1. the config\n2. the manifest", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("bulleted list => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read the following:\n- the config\n- the manifest", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("long prose brief with no markers => false (length backstop)", () => {
+    const long = "read the source and report back. " + "context filler. ".repeat(20);
+    expect(long.length).toBeGreaterThan(240);
+    expect(classifyTrivial(long, "fast", fullCfg)).toBe(false);
+  });
+
+  it("the cwd/platform footer alone does not defeat trivial", () => {
+    // Dispatch prompts commonly arrive with this footer. It is NOT emitted by
+    // this plugin -- it comes from the host/orchestrator prompt conventions --
+    // which is exactly why PATH_TOKEN_RE requires a file extension: a POSIX cwd
+    // must not be counted as a target file, and the footer must not blow the
+    // length gate.
+    const withFooter =
+      "read package.json and tell me the version" +
+      "\n\nWorking directory: /home/u/proj\nPlatform: linux\nShell: bash";
+    expect(classifyTrivial(withFooter, "fast", fullCfg)).toBe(true);
+  });
+
+  it("the guard-hardblock smoke prompt is NOT trivial (regression pin)", () => {
+    // Verbatim from test/smoke/guard-hardblock.smoke.test.ts. This returning
+    // true is the bug that made the read_budget guard unfireable on @fast.
+    const smokePrompt =
+      "Read these files ONE AT A TIME using the read tool, in this exact order, " +
+      "and after each give a one-line summary: README.md, then package.json, then " +
+      "tsconfig.json, then tiers.json, then LICENSE, then src/index.ts. Use the " +
+      "read tool separately for each file; do not skip any.";
+    expect(classifyTrivial(smokePrompt, "fast", fullCfg)).toBe(false);
+  });
+
+  // --- zero-path recon holes: breadth that names no extensioned file ---
+
+  it("directory-level recon enumerating 3 subjects => false (enumeration gate)", () => {
+    // Names no file at all, so the path count cannot catch it.
+    expect(
+      classifyTrivial(
+        "search the src directory structure and report how router, guard and verify are organized",
+        "fast",
+        fullCfg,
+      ),
+    ).toBe(false);
+  });
+
+  it("extensionless real files count as paths => false", () => {
+    expect(
+      classifyTrivial(
+        "read Makefile, LICENSE and Dockerfile and summarize the build",
+        "fast",
+        fullCfg,
+      ),
+    ).toBe(false);
+  });
+
+  it("a single extensionless file is still trivial", () => {
+    expect(classifyTrivial("read Makefile and tell me the default target", "fast", fullCfg)).toBe(
+      true,
+    );
+  });
+
+  it("'license' as a prose word is not a path (case-sensitive gate)", () => {
+    expect(
+      classifyTrivial("read the license field in package.json", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("semicolon-chained greps => false (connector gate)", () => {
+    expect(
+      classifyTrivial("grep for foo; grep for bar", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("&&-chained greps => false (connector gate)", () => {
+    expect(
+      classifyTrivial("grep for foo && grep for bar", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'Step 1: ... Step 2: ...' => false (step marker with colon)", () => {
+    expect(
+      classifyTrivial("Step 1: read the config. Step 2: report the value", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("colon-numbered list at line start => false", () => {
+    expect(
+      classifyTrivial("read the following:\n1: the config\n2: the manifest", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("two imperative lines => false (prose task list)", () => {
+    expect(
+      classifyTrivial("search for the handler\nreport what it returns", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  // --- distributive breadth: "every"/"all" over a class of targets ---
+  // Bare fan-out phrasing with no comma, no connector, no second line, no named
+  // path and well under the length backstop. `each` and `for every` are already
+  // caught by the multi-step gate; these forms were the residual hole.
+
+  it("'every <collective>' => false (distributive gate)", () => {
+    expect(classifyTrivial("search every config file", "fast", fullCfg)).toBe(false);
+  });
+
+  it("'all <plural>' => false (distributive gate)", () => {
+    expect(
+      classifyTrivial("read all guard modules and tell me what they export", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'all the <plural>' => false (distributive gate)", () => {
+    expect(classifyTrivial("grep all the tests for the handler", "fast", fullCfg)).toBe(false);
+  });
+
+  it("'every line of <file>' stays trivial (depth over ONE file, not breadth)", () => {
+    expect(classifyTrivial("read every line of package.json", "fast", fullCfg)).toBe(true);
+  });
+
+  it("'all of <path>' stays trivial (quantifier scopes a single named file)", () => {
+    expect(classifyTrivial("read all of src/index.ts", "fast", fullCfg)).toBe(true);
+  });
+
+  it("'all this' is not a plural target (stays trivial)", () => {
+    // "this" ends in `s` but is singular -- the generic plural branch must not
+    // treat it as a class of targets.
+    expect(
+      classifyTrivial("read all this and tell me what it means in tiers.json", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("two-item comma phrase is not an enumeration (stays trivial)", () => {
+    // Only 3+ items signal breadth; two items are common in single-shot asks and
+    // a genuine two-file ask is already caught by the path count.
+    expect(classifyTrivial("grep for the handler, quickly", "fast", fullCfg)).toBe(true);
   });
 });
 

@@ -35,6 +35,54 @@ describe("proportional-downgrade integration", () => {
     ).resolves.toBeUndefined();
   });
 
+  // Regression: multi-file @fast recon used to classify TRIVIAL, which silently
+  // downgraded enforced -> advisory and made the read_budget guard unfireable on
+  // any @fast subagent. The dispatch text below is verbatim from
+  // test/smoke/guard-hardblock.smoke.test.ts, which is the real-session proof of
+  // the same behaviour; this is its deterministic in-process counterpart.
+  it("multi-file recon dispatch: self-script is hard-blocked (not trivial)", async () => {
+    await hooks["chat.message"](
+      { sessionID: "RECON", agent: "fast" },
+      {
+        parts: [
+          {
+            type: "text",
+            text:
+              "Read these files ONE AT A TIME using the read tool, in this exact order, " +
+              "and after each give a one-line summary: README.md, then package.json, then " +
+              "tsconfig.json, then tiers.json, then LICENSE, then src/index.ts. Use the " +
+              "read tool separately for each file; do not skip any.",
+          },
+        ],
+      },
+    );
+    await expect(
+      hooks["tool.execute.before"](
+        { sessionID: "RECON", tool: "bash", callID: "c3" },
+        { args: { command: 'node -e "console.log(1)"' } },
+      ),
+    ).rejects.toThrow();
+  });
+
+  // Opposite arm: the narrowing must not over-correct. A genuine single-shot
+  // lookup stays trivial and stays exempt (GA-6 proportionality).
+  it("single-shot one-file lookup: still trivial, not hard-blocked", async () => {
+    await hooks["chat.message"](
+      { sessionID: "LOOKUP", agent: "fast" },
+      {
+        parts: [
+          { type: "text", text: "read package.json and report the version field" },
+        ],
+      },
+    );
+    await expect(
+      hooks["tool.execute.before"](
+        { sessionID: "LOOKUP", tool: "bash", callID: "c4" },
+        { args: { command: 'node -e "console.log(1)"' } },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   it("non-trivial dispatch: self-script is hard-blocked", async () => {
     // Non-trivial text → isTrivial returns false → enforcement stays enforced → throws.
     await hooks["chat.message"](

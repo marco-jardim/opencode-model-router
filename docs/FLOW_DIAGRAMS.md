@@ -80,13 +80,14 @@
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ loadConfig() (lines 180-208)                                    │
-│                                                                 │
-│ Check: if (_cachedConfig && !_configDirty)                      │
-│   NO → Read tiers.json from disk                                │
-│ Merge: state from ~/.config/opencode/opencode-model-router... │
-│ Cache: _cachedConfig = cfg; _configDirty = false                │
-│ Return: RouterConfig                                            │
+│ loadConfig()  (src/router/config.ts)                            │
+│  if (_cachedConfig && !_configDirty) return cache               │
+│  else build effective config (lowest→highest priority):         │
+│    bundled tiers.json                                           │
+│    → global  ~/.config/opencode/opencode-model-router.overrides.jsonc     │
+│    → project <repo>/.opencode/opencode-model-router.overrides.jsonc       │
+│    → persisted state (active preset/mode/enforcement)           │
+│  cache it; _configDirty = false                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -200,7 +201,7 @@
 │ Builds multi-line string:                                       │
 │                                                                 │
 │ ## Model Delegation Protocol                                    │
-│ Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) ...       │
+│ Preset: anthropic. Tiers: @fast=claude-sonnet-5(1x) ...        │
 │ R: @fast→broader read-only exploration ... @medium→impl ...    │
 │ @heavy→arch ...                                                │
 │ Multi-phase: prefer explore(@fast)→execute(@medium) when sep... │
@@ -383,10 +384,10 @@ opencode-model-router/
 │           ├── experimental.chat.system.transform (lines 612-619)
 │           └── command.execute.before (lines 624-651)
 │
-├── ~/.config/opencode/
-│   └── opencode-model-router.state.json  # Runtime state
-│       ├── activePreset: "openai"  (user selection)
-│       └── activeMode: "budget"    (user selection)
+└── ~/.config/opencode/
+    ├── opencode-model-router.state.json   # active preset/mode/enforcement
+    └── opencode-model-router.overrides.jsonc        # optional global overrides (deep-merged)
+        # project overrides: <repo>/.opencode/opencode-model-router.overrides.jsonc
 ```
 
 ---

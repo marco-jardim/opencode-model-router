@@ -6,8 +6,34 @@ import {
   resolvePresetName,
   writeState,
   invalidateConfigCache,
+  overridePath,
+  localOverridePath,
+  findProjectOverride,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig } from "./router/config";
+import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
+import { selectTierPrompt } from "./router/prompts";
+import {
+  buildTiersOutput,
+  buildPresetList,
+  buildPresetSwitched,
+  buildUnknownPreset,
+  buildNoModes,
+  buildBudgetList,
+  buildBudgetSwitched,
+  buildUnknownMode,
+  buildBypassMessage,
+  buildEnforceSet,
+  buildEnforceStatus,
+  buildOverridesOutput,
+  buildRouterHelp,
+  buildModelsOutput,
+  formatModelIssues,
+} from "./commands/output";
+import {
+  resolveSubagentOverrides,
+  mergeSubagentOverride,
+} from "./router/subagents";
 import { fingerprintToolCall } from "./guard/fingerprint";
 import { detectNarration } from "./guard/narration";
 import {
@@ -20,6 +46,13 @@ import {
   assembleSystemPrompt,
 } from "./router/protocol";
 import { resolveEnforcementMode } from "./router/enforcement";
+import { createPluginLogger } from "./router/logger";
+import {
+  findOrphanedStrongPatterns,
+  normalizeCatalog,
+  validateModels,
+} from "./router/catalog";
+import type { Catalog } from "./router/catalog";
 import {
   createSessionStore,
   parseCapDirective,
@@ -30,8 +63,9 @@ import {
 import type { Cap, SubagentState } from "./router/sessions";
 import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
+import { createIdleTtlSweeper } from "./router/idle-sweep";
 import { guardBeforeCall, guardAfterCall, formatScorecard } from "./guard/enforce";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { exec as nodeExec } from "node:child_process";
@@ -39,7 +73,14 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept } from "./verify/gate";
-import { createMutexRegistry } from "./verify/deterministic";
+import { createVerificationWiring, extractAssistantText } from "./verify/wiring";
+import {
+  DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
+  DEFAULT_GATE_BUDGET_MS,
+  RouterTimeoutError,
+  timeoutMs,
+  withTimeout,
+} from "./verify/timeout";
 import {
   createChangedFileStore,
   parseTaskResult,
@@ -97,198 +138,75 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
   invalidateConfigCache();
 }
 
+/**
+ * `/router` dispatch. Decides and persists here; rendering lives in
+ * src/commands/output.ts.
+ */
 function buildRouterOutput(cfg: RouterConfig, args: string): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
+
   if (sub === "enforce") {
     const mode = (tokens[1] ?? "").toLowerCase();
     if (mode === "off" || mode === "advisory" || mode === "enforced") {
       saveEnforcementMode(mode);
-      const desc =
-        mode === "off"
-          ? "Hard-block guard disabled (default routing behaviour)."
-          : mode === "advisory"
-            ? "Guard evaluates and surfaces banners but never hard-blocks."
-            : "Guard hard-blocks subagent tool calls that violate budget / redundancy / self-script policy.";
-      return [
-        `Enforcement mode set to **${mode}** and persisted.`,
-        "",
-        desc,
-        "",
-        "Note: the `MODEL_ROUTER_ENFORCE` env var, when set to `0` or `1`, overrides this setting.",
-      ].join("\n");
+      return buildEnforceSet(mode);
     }
-    const current = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
-    return [
-      `Current enforcement mode: **${current}**`,
-      "",
-      "Usage: `/router enforce <off|advisory|enforced>`",
-    ].join("\n");
+    return buildEnforceStatus(
+      resolveEnforcementMode({ config: cfg, env: process.env }).mode,
+    );
   }
-  const current = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
-  return [
-    `# Model Router`,
-    `Enforcement: **${current}**`,
-    "",
-    "Commands:",
-    "- `/router enforce <off|advisory|enforced>` — set hard-block enforcement (persisted)",
-    "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
-  ].join("\n");
+
+  if (sub === "overrides") {
+    const globalPath = overridePath();
+    const foundLocal = findProjectOverride();
+    const localPath = foundLocal ?? localOverridePath();
+    return buildOverridesOutput({
+      globalPath,
+      globalPresent: existsSync(globalPath),
+      localPath,
+      localPresent: existsSync(localPath),
+      localFound: foundLocal !== undefined,
+      activePreset: cfg.activePreset,
+    });
+  }
+
+  return buildRouterHelp(
+    resolveEnforcementMode({ config: cfg, env: process.env }).mode,
+  );
 }
 
-// ---------------------------------------------------------------------------
-// Build agent options from tier config
-// ---------------------------------------------------------------------------
-
-function buildAgentOptions(tier: TierConfig): Record<string, unknown> {
-  const opts: Record<string, unknown> = {};
-
-  // Anthropic thinking config
-  if (tier.thinking) {
-    if (tier.thinking.budgetTokens) {
-      opts.budget_tokens = tier.thinking.budgetTokens;
-    }
-  }
-
-  // OpenAI reasoning config
-  if (tier.reasoning) {
-    if (tier.reasoning.effort) {
-      opts.reasoning_effort = tier.reasoning.effort;
-    }
-    if (tier.reasoning.summary) {
-      opts.reasoning_summary = tier.reasoning.summary;
-    }
-  }
-
-  return Object.keys(opts).length > 0 ? opts : {};
-}
-
-// ---------------------------------------------------------------------------
-// /tiers command output
-// ---------------------------------------------------------------------------
-
-function buildTiersOutput(cfg: RouterConfig): string {
-  const tiers = getActiveTiers(cfg);
-  const lines: string[] = [
-    `# Model Delegation Tiers`,
-    `Active preset: **${cfg.activePreset}**\n`,
-  ];
-
-  for (const [name, tier] of Object.entries(tiers)) {
-    const thinkingStr = tier.thinking
-      ? ` | thinking: ${tier.thinking.budgetTokens} tokens`
-      : tier.reasoning
-        ? ` | reasoning: effort=${tier.reasoning.effort}`
-        : "";
-    lines.push(`## @${name} -> \`${tier.model}\`${thinkingStr}`);
-    lines.push(tier.description);
-    lines.push(`Steps: ${tier.steps ?? "default"}`);
-    lines.push(`Use when: ${tier.whenToUse.join(", ")}\n`);
-  }
-
-  lines.push("## Delegation Rules");
-  cfg.rules.forEach((r) => lines.push(`- ${r}`));
-  lines.push(`\nDefault tier: @${cfg.defaultTier}`);
-  lines.push(`\nAvailable presets: ${Object.keys(cfg.presets).join(", ")}`);
-  lines.push(`Switch with: \`/preset <name>\``);
-  lines.push(`Edit \`tiers.json\` to customize.`);
-
-  return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// /budget command output
-// ---------------------------------------------------------------------------
-
+/** `/budget` dispatch. Persists the switch, then renders. */
 function buildBudgetOutput(cfg: RouterConfig, args: string): string {
   const modes = cfg.modes;
-  if (!modes || Object.keys(modes).length === 0) {
-    return 'No modes configured in tiers.json. Add a "modes" section to enable budget mode.';
-  }
+  if (!modes || Object.keys(modes).length === 0) return buildNoModes();
 
   const requested = args.trim().toLowerCase();
-  const currentMode = cfg.activeMode || "normal";
+  if (!requested) return buildBudgetList(cfg);
 
-  // No args: show current mode and available modes
-  if (!requested) {
-    const lines = ["# Routing Modes\n"];
-    for (const [name, mode] of Object.entries(modes)) {
-      const active = name === currentMode ? " <- active" : "";
-      lines.push(
-        `- **${name}**${active}: ${mode.description} (default tier: @${mode.defaultTier})`,
-      );
-    }
-    lines.push(`\nSwitch with: \`/budget <mode>\``);
-    return lines.join("\n");
-  }
-
-  // Switch mode
-  if (modes[requested]) {
+  const mode = modes[requested];
+  if (mode) {
     saveActiveMode(requested);
-    const mode = modes[requested];
-    return [
-      `Routing mode switched to **${requested}**.`,
-      "",
-      mode.description,
-      `Default tier: @${mode.defaultTier}`,
-      ...(mode.overrideRules?.length
-        ? ["", "Active rules:", ...mode.overrideRules.map((r) => `- ${r}`)]
-        : []),
-      "",
-      "Mode change takes effect immediately on the next message.",
-    ].join("\n");
+    return buildBudgetSwitched(mode, requested);
   }
 
-  return `Unknown mode: "${requested}". Available: ${Object.keys(modes).join(", ")}`;
+  return buildUnknownMode(modes, requested);
 }
 
-// ---------------------------------------------------------------------------
-// /preset command output
-// ---------------------------------------------------------------------------
-
+/** `/preset` dispatch. Persists the switch, then renders. */
 function buildPresetOutput(cfg: RouterConfig, args: string): string {
   const requestedPreset = args.trim();
+  if (!requestedPreset) return buildPresetList(cfg);
 
-  // No args: show available presets
-  if (!requestedPreset) {
-    const lines = ["# Available Presets\n"];
-    for (const [name, tiers] of Object.entries(cfg.presets)) {
-      const active = name === cfg.activePreset ? " <- active" : "";
-      const models = Object.entries(tiers)
-        .map(([tier, t]) => `${tier}: ${t.model.split("/").pop()}`)
-        .join(", ");
-      lines.push(`- **${name}**${active}: ${models}`);
-    }
-    lines.push(`\nSwitch with: \`/preset <name>\``);
-    return lines.join("\n");
-  }
-
-  // Switch preset
   const resolvedPreset = resolvePresetName(cfg, requestedPreset);
   if (resolvedPreset) {
     saveActivePreset(resolvedPreset);
     cfg.activePreset = resolvedPreset;
-    const tiers = cfg.presets[resolvedPreset]!;
-    const models = Object.entries(tiers)
-      .map(([tier, t]) => `  @${tier} -> ${t.model}`)
-      .join("\n");
-    return [
-      `Preset switched to **${resolvedPreset}**.`,
-      "",
-      models,
-      "",
-      "Selection is now persisted in ~/.config/opencode/opencode-model-router.state.json.",
-      "Restart OpenCode for subagent model registration to take effect.",
-      "System prompt delegation rules update immediately.",
-    ].join("\n");
+    return buildPresetSwitched(cfg, resolvedPreset);
   }
 
-  return `Unknown preset: "${requestedPreset}". Available: ${Object.keys(cfg.presets).join(", ")}`;
+  return buildUnknownPreset(cfg, requestedPreset);
 }
-
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
 
 const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   let cfg = loadConfig();
@@ -309,96 +227,27 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   const guardStore = createGuardStore();
 
   const changedFileStore = createChangedFileStore();
-  const graderSessions = new Set<string>();
 
-  // Layer-2 real adapters (live-only; every call site is fail-closed).
-  const execSeam = (
-    command: string,
-    opts?: { cwd?: string; timeoutMs?: number },
-  ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> =>
-    new Promise((resolve) => {
-      try {
-        nodeExec(
-          command,
-          {
-            cwd: opts?.cwd ?? ctx.directory,
-            timeout: opts?.timeoutMs ?? 120000,
-            maxBuffer: 10 * 1024 * 1024,
-            windowsHide: true,
-          },
-          (err: any, stdout: any, stderr: any) => {
-            const timedOut = !!(err && err.killed && err.signal === "SIGTERM");
-            const code =
-              err && typeof err.code === "number" ? err.code : err ? 1 : 0;
-            resolve({
-              code,
-              stdout: String(stdout ?? ""),
-              stderr: String(stderr ?? ""),
-              timedOut,
-            });
-          },
-        );
-      } catch {
-        resolve({ code: 1, stdout: "", stderr: "exec failed", timedOut: false });
-      }
+  // Idle-TTL maintenance for the four per-instance stores. No timer is
+  // scheduled: the sweeper is invoked opportunistically from chat.message and
+  // self-throttles, so a long-lived plugin instance cannot accumulate state for
+  // sessions that went away without a teardown hook.
+  const sweepIdleStores = createIdleTtlSweeper([
+    () => sessionStore.sweep(),
+    () => guardStore.sweep(),
+    () => trajectoryStore.sweep(),
+    () => changedFileStore.sweep(),
+  ]);
+
+  // Layer-2's impure corner: exec, fs, and the opencode client, built once and
+  // read back through getConfig so a reloaded cfg (from /preset, /budget or
+  // /router enforce) applies to graded work too.
+  const { graderSessions, dispatchGrader, buildGateDeps, disposeChildSession } =
+    createVerificationWiring({
+      client: ctx.client,
+      directory: ctx.directory,
+      getConfig: () => cfg,
     });
-  const fsSeam = {
-    async fileExists(p: string): Promise<boolean> {
-      try {
-        await access(isAbsolute(p) ? p : join(ctx.directory, p));
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    async readFile(p: string): Promise<string> {
-      return await fsReadFile(isAbsolute(p) ? p : join(ctx.directory, p), "utf-8");
-    },
-  };
-  const verifyMutex = createMutexRegistry();
-  const dispatchGrader = async (req: {
-    tier: string;
-    system: string;
-    prompt: string;
-  }): Promise<{ sessionID: string; text: string }> => {
-    const created: any = await ctx.client.session.create({});
-    const sid: string | undefined = created?.data?.id;
-    if (!sid) return { sessionID: "", text: "" };
-    graderSessions.add(sid);
-    try {
-      const model = tierModel(cfg, req.tier) ?? undefined;
-      const res: any = await ctx.client.session.prompt({
-        path: { id: sid },
-        body: {
-          ...(model ? { model } : {}),
-          system: req.system,
-          parts: [{ type: "text", text: req.prompt }],
-        },
-      });
-      const parts: any[] = res?.data?.parts ?? [];
-      const text = parts
-        .filter((p) => p?.type === "text" && typeof p.text === "string")
-        .map((p) => p.text)
-        .join("\n");
-      return { sessionID: sid, text };
-    } finally {
-      graderSessions.delete(sid);
-    }
-  };
-  const buildGateDeps = () => ({
-    deterministic: {
-      exec: execSeam,
-      fs: fsSeam,
-      cwd: ctx.directory,
-      mutex: verifyMutex,
-    },
-    checker: {
-      dispatchGrader,
-      ladder: ["fast", "medium", "heavy"],
-      minGraderTier: cfg.enforcement?.verify?.minGraderTier ?? null,
-    },
-    require: cfg.enforcement?.verify?.require,
-  });
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -422,11 +271,68 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
 
+  // Passive warnings go to opencode's log rather than stderr: console output
+  // from a plugin paints over the TUI. Falls back to console when the server
+  // has no /log endpoint. See src/router/logger.ts.
+  const logger = createPluginLogger(ctx.client);
+
+  // Fetch and normalize opencode's live provider/model catalog. Best-effort:
+  // returns null when the client call fails, e.g. the server is not ready yet.
+  // The pure analysis (validateModels) lives in src/router/catalog.ts.
+  const fetchCatalog = async (): Promise<Catalog | null> => {
+    try {
+      const res: any = await ctx.client.config.providers();
+      return normalizeCatalog(res?.data);
+    } catch {
+      return null;
+    }
+  };
+
+  // Deferred passive catalog check. The first orchestrator turn only STARTS the
+  // fetch (fire-and-forget, never awaited on the chat.message hot path) and
+  // parks the result in a local; the warning is emitted on the first LATER turn
+  // that finds the promise already settled — normally turn 2. Deliberate
+  // tradeoff: a report-only diagnostic showing up one turn late costs nothing,
+  // while awaiting a network round-trip in front of every session's first
+  // message costs every user every session. No timers (banned in src/), and the
+  // continuation writes to a local variable only — it never touches an
+  // output.parts of a message the hook has already returned.
+  //
+  // Command handlers deliberately keep their own fresh fetchCatalog() call, so a
+  // turn-1 failure (server not ready yet) is never cached into `/router models`.
+  let catalogFetchStarted = false;
+  /** undefined = not started or still in flight; null = the fetch failed. */
+  let deferredCatalog: Catalog | null | undefined;
+  // One-shot guard so the passive warnings run at most once per plugin
+  // lifetime; re-validate on demand with /router.
+  let catalogWarned = false;
+
+  const startCatalogFetch = (): void => {
+    if (catalogFetchStarted) return;
+    catalogFetchStarted = true;
+    // fetchCatalog already swallows its own errors; the .catch is belt-and-
+    // braces so this fire-and-forget promise can never reject unhandled.
+    void fetchCatalog()
+      .then((c) => {
+        deferredCatalog = c;
+      })
+      .catch(() => {
+        deferredCatalog = null;
+      });
+  };
+
   const enableDelegateTool =
     cfg.experimental?.verifiedDelegateTool === true ||
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
 
   return {
+    // Warnings post to /log fire-and-forget, which loses the message when the
+    // process is about to exit — `opencode run` and `opencode debug` are short
+    // enough for that to be the normal case. Verified against opencode 1.18.16
+    // that dispose is both called and awaited, so flushing here is enough.
+    dispose: async () => {
+      await logger.flush();
+    },
     tool: {
       ...(enableDelegateTool ? { delegate: tool({
         description:
@@ -445,12 +351,26 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             .describe(
               "Optional [acceptance]...[/acceptance] block defining the Definition of Done (check: / criteria: / deliverable: directives).",
             ),
+          cwd: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Optional working directory used to VERIFY the result: relative check paths resolve against it and the grader session runs in it. It does NOT scope the producer subagent, so the task text must still tell the producer where to work.",
+            ),
         },
-        async execute(args: {
-          task: string;
-          tier?: string;
-          acceptance?: string;
-        }): Promise<string> {
+        async execute(
+          args: {
+            task: string;
+            tier?: string;
+            acceptance?: string;
+            cwd?: string;
+          },
+          toolCtx?: { sessionID?: string },
+        ): Promise<string> {
+          // Every ladder iteration creates its own producer session. Tracked out
+          // here (not inside the try) so the finally below can dispose any that an
+          // early return or a throw skipped — otherwise each retry leaks another.
+          const producerSessions: string[] = [];
           try {
             let activeCfg = cfg;
             try {
@@ -482,23 +402,36 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             let producerText = "";
             let forcing: string | null = null;
 
-            while (true) {
-              if (safety++ > safetyMax) {
-                return (
-                  `[router status: unmet] delegation stopped by the safety net after ` +
-                  `${state.totalAttempts} attempt(s).\n\n${scrubText(producerText)}`
-                );
-              }
-              const tier = state.currentTier;
-              const taskText = forcing
-                ? `${scrubText(forcing)}\n\n${args.task}`
+            /**
+             * One turn of the escalation ladder: create a producer session, run
+             * the task on it, put the result through the acceptance gate, then
+             * tear the session down. Returns null when the backend refused to
+             * create a session, the one failure the caller cannot retry.
+             *
+             * Split out because the loop is about when to *stop* — safety net,
+             * attempt accounting, tier advancement — and a ninety-line attempt
+             * in the middle of it obscured both halves.
+             */
+            const runProducerAttempt = async (
+              tier: string,
+              forcingNote: string | null,
+            ): Promise<{
+              sessionID: string;
+              text: string;
+              gateRes: Awaited<ReturnType<typeof accept>>;
+            } | null> => {
+              const taskText = forcingNote
+                ? `${scrubText(forcingNote)}\n\n${args.task}`
                 : args.task;
 
-              const created: any = await ctx.client.session.create({});
+              const created: any = await ctx.client.session.create({
+                body: {
+                  ...(toolCtx?.sessionID ? { parentID: toolCtx.sessionID } : {}),
+                },
+              });
               const producerSid: string | undefined = created?.data?.id;
-              if (!producerSid) {
-                return "[router] delegate failed: could not create a producer session.";
-              }
+              if (!producerSid) return null;
+              producerSessions.push(producerSid);
               // Compose with Layer 1: guard the plugin-created producer session.
               try {
                 sessionStore.registerProducerSession(producerSid, tier, activeCfg);
@@ -507,29 +440,40 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               }
 
               const model = tierModel(activeCfg, tier) ?? undefined;
-              producerText = "";
+              let producerText = "";
               // Provider-failover vs quality-escalation precedence (Phase 3.3):
               // Provider-failover is advisory only — a text chain injected into the orchestrator
               // system prompt (buildFallbackInstructions). It is orthogonal to this runtime ladder.
-              // A transport/API error here is caught, yields an empty artefact, and is treated as
+              // A transport/API error here becomes an explicit failed attempt and is treated as
               // exactly ONE failed attempt by the quality-escalation ladder (no provider swap, no
               // double-counted attempt). API error => (advisory) provider failover; verification
               // FAIL => (runtime) quality escalation.
+              //
+              // The prompt is time-boxed: a model that never answers would
+              // otherwise hang the delegate forever. A timeout is folded into
+              // the same failed-attempt path as any other producer error — it
+              // is never an empty artefact that a lenient DoD could pass.
+              let producerError: string | null = null;
               try {
-                const res: any = await ctx.client.session.prompt({
-                  path: { id: producerSid },
-                  body: {
-                    ...(model ? { model } : {}),
-                    ...(tier ? { agent: tier } : {}),
-                    parts: [{ type: "text", text: taskText }],
-                  },
-                });
-                const parts: any[] = res?.data?.parts ?? [];
-                producerText = parts
-                  .filter((p) => p?.type === "text" && typeof p.text === "string")
-                  .map((p) => p.text)
-                  .join("\n");
-              } catch {
+                const res: any = await withTimeout(
+                  ctx.client.session.prompt({
+                    path: { id: producerSid },
+                    body: {
+                      ...(model ? { model } : {}),
+                      ...(tier ? { agent: tier } : {}),
+                      parts: [{ type: "text", text: taskText }],
+                    },
+                  }),
+                  timeoutMs(
+                    activeCfg.enforcement?.verify?.delegateTimeoutMs,
+                    DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
+                  ),
+                  "delegate producer prompt",
+                );
+                producerText = extractAssistantText(res);
+              } catch (error) {
+                producerError =
+                  error instanceof Error ? error.message : String(error);
                 producerText = "";
               }
 
@@ -541,20 +485,69 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerTier: tier,
               };
 
+              const gateBudgetMs = timeoutMs(
+                activeCfg.enforcement?.verify?.gateBudgetMs,
+                DEFAULT_GATE_BUDGET_MS,
+              );
+              // Grader sessions opened by THIS accept() call, and only those.
+              const gateGraderSessions = new Set<string>();
               let gateRes;
               try {
-                gateRes = await accept(
-                  { dod, trivial: false, mode: "modeA" },
-                  artefact,
-                  buildGateDeps(),
-                );
-              } catch {
+                gateRes = producerError
+                  ? {
+                      accepted: false,
+                      verdict: {
+                        pass: false,
+                        method: "none" as const,
+                        reasons: [`producer failed: ${producerError}`],
+                      },
+                      dodSource: dod.source,
+                    }
+                  : await withTimeout(
+                      accept(
+                        {
+                          dod,
+                          trivial: false,
+                          mode: "modeA",
+                          ...(args.cwd ? { cwd: args.cwd } : {}),
+                        },
+                        artefact,
+                        buildGateDeps(toolCtx?.sessionID, gateGraderSessions),
+                      ),
+                      gateBudgetMs,
+                      "verification gate",
+                    );
+              } catch (error) {
+                // A gate that ran out of budget is UNMET, never accepted: the
+                // one thing worse than a slow verifier is a fast fabricated
+                // pass. Abort any grader still in flight so the ceiling is a
+                // real cancellation and not just a stopped wait.
+                //
+                // Scoped to THIS gate invocation's graders. The wiring-global
+                // graderSessions set is shared by every concurrent delegation,
+                // so aborting it here would kill a healthy grader belonging to
+                // someone else's delegation — reachable with the shipped
+                // config, where a deterministic check may run a command for up
+                // to 120s against a 90s gate budget.
+                if (error instanceof RouterTimeoutError) {
+                  for (const gsid of gateGraderSessions) {
+                    try {
+                      await ctx.client.session.abort({ path: { id: gsid } });
+                    } catch {
+                      // best-effort: the gate result stands either way
+                    }
+                  }
+                }
                 gateRes = {
                   accepted: false,
                   verdict: {
                     pass: false,
                     method: "none" as const,
-                    reasons: ["verification failed (fail-closed)"],
+                    reasons: [
+                      error instanceof RouterTimeoutError
+                        ? `verification gate timed out after ${gateBudgetMs}ms`
+                        : "verification failed (fail-closed)",
+                    ],
                   },
                   dodSource: dod.source,
                 };
@@ -572,6 +565,28 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               } catch {
                 // non-fatal
               }
+              // Dispose this attempt's backend session before the next iteration
+              // so a long ladder never accumulates live sessions.
+              await disposeChildSession(producerSid);
+
+              return { sessionID: producerSid, text: producerText, gateRes };
+            };
+
+            while (true) {
+              if (safety++ > safetyMax) {
+                return (
+                  `[router status: unmet] delegation stopped by the safety net after ` +
+                  `${state.totalAttempts} attempt(s).\n\n${scrubText(producerText)}`
+                );
+              }
+              const tier = state.currentTier;
+              const attempt = await runProducerAttempt(tier, forcing);
+              if (!attempt) {
+                return "[router] delegate failed: could not create a producer session.";
+              }
+              producerText = attempt.text;
+              const producerSid = attempt.sessionID;
+              const gateRes = attempt.gateRes;
 
               const costRatio =
                 typeof tiersForCost?.[tier]?.costRatio === "number"
@@ -615,6 +630,14 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             }
           } catch {
             return "[router] delegate failed (fail-closed): the delegation or verification could not complete.";
+          } finally {
+            // Safety net for every exit path an end-of-iteration dispose cannot
+            // reach: accept/give-up returns, the safety-net return, and throws.
+            // disposeChildSession is fail-soft, so re-disposing an already
+            // disposed session is harmless.
+            for (const sid of producerSessions) {
+              await disposeChildSession(sid);
+            }
           }
         },
       }) } : {}),
@@ -641,7 +664,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     "chat.params": async (input: any, output: any) => {
       try {
         if (input?.sessionID && graderSessions.has(input.sessionID)) {
-          output.temperature = cfg.enforcement?.verify?.graderTemperature ?? 0;
+          const graderTemperature = cfg.enforcement?.verify?.graderTemperature;
+          if (graderTemperature !== undefined) {
+            output.temperature = graderTemperature;
+          }
         }
       } catch {
         // best-effort: never crash a real session
@@ -654,13 +680,94 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       try {
         cfg = loadConfig();
       } catch {}
+      try {
+        sweepIdleStores();
+      } catch {
+        // best-effort maintenance: never break a real turn
+      }
       const tierNames = Object.keys(getActiveTiers(cfg));
-      sessionStore.registerFromChatMessage(input, output, cfg, tierNames);
+      const sid = input?.sessionID;
+      try {
+        const registration = sessionStore.registerFromChatMessage(
+          input,
+          output,
+          cfg,
+          tierNames,
+        );
+        // A same-session same-tier re-registration is a resumed dispatch
+        // (how an opencode task_id resume reaches this hook): start a new
+        // per-dispatch guard round and count it in telemetry.
+        if (registration.resumed === true && typeof sid === "string") {
+          guardStore.beginDispatch(sid);
+          trajectoryStore.recordResume(sid, input?.agent ?? null);
+        }
+        // KNOWN RESIDUAL: a fresh registration over an EXISTING session (same
+        // sessionID, different tier) resets session cap state but leaves guard
+        // state alone, so the guard keeps counting from the old dispatch. The
+        // desync can only make the guard stricter, never laxer, and opencode
+        // assigns one agent per subagent session — so this is documented in
+        // docs/CONFIG_REFERENCE.md rather than fixed by clearing guard state,
+        // which would also drop deliverable and fingerprint history.
+      } catch {
+        // best-effort: never crash a real session during registration
+      }
 
       // Record-only: initialise a trajectory scorecard for tracked subagents.
-      const sid = input?.sessionID;
       if (sid && sessionStore.isSubagent(sid)) {
         trajectoryStore.ensure(sid, input?.agent ?? null);
+      }
+
+      // Once per lifetime, warn in the plugin log when the active preset points
+      // at models opencode's catalog says are missing or deprecated, or when a
+      // strong-model pattern matches nothing the configured providers serve.
+      // This is the whole point of the catalog: both failures are otherwise
+      // silent on every subagent dispatch. Orchestrator sessions only, never
+      // throws, and deferred (see startCatalogFetch): turn 1 starts the fetch,
+      // a later turn reports what it found.
+      if (sid && !sessionStore.isSubagent(sid)) {
+        try {
+          if (!catalogFetchStarted) {
+            // Turn 1: kick the fetch off and move on. NO await here.
+            startCatalogFetch();
+          } else if (!catalogWarned && deferredCatalog !== undefined) {
+            // A later turn found the turn-1 fetch already settled: report now.
+            catalogWarned = true;
+            const catalog = deferredCatalog;
+            if (catalog) {
+              // User-authored strong-model patterns matching nothing any
+              // configured provider serves. Shipped defaults are never reported
+              // (see findOrphanedStrongPatterns), so reaching here means the
+              // user wrote a claim about this environment that is false.
+              // Catalog-dependent, so it rides the same deferred path — it is
+              // NOT emitted on turn 1.
+              for (const p of findOrphanedStrongPatterns(cfg, catalog)) {
+                logger.warn(
+                  `strong-model pattern '${p}' from your modelGenerations.strong matches no model your providers serve, so it decides nothing — separator style is already ignored when matching`,
+                  { pattern: p },
+                );
+              }
+              for (const it of validateModels(cfg, catalog)) {
+                const hint =
+                  it.suggestions.length > 0
+                    ? ` — try ${it.suggestions.join(", ")}`
+                    : "";
+                // Fallback issues are keyed by the chain's provider, not a tier.
+                const where =
+                  it.scope === "fallback"
+                    ? `${it.tier}[${it.providerId}]`
+                    : `@${it.tier}`;
+                logger.warn(`${where} ${it.ref}: ${it.kind}${hint}`, {
+                  tier: it.tier,
+                  ref: it.ref,
+                  kind: it.kind,
+                  suggestions: it.suggestions,
+                });
+              }
+            }
+          }
+        } catch {
+          // best-effort: never disrupt a real session
+        }
       }
     },
 
@@ -676,6 +783,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (!sid || !sessionStore.isSubagent(sid) || typeof input?.tool !== "string") {
         return;
       }
+      // Start-of-call refresh: the idle TTL must cover the tool's runtime, not
+      // just the moment it finished.
+      sessionStore.touchIfTracked(sid);
       let res;
       try {
         res = guardBeforeCall({
@@ -776,8 +886,35 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             const trivial = childSessionID
               ? sessionStore.isTrivial(childSessionID)
               : false;
+
+            // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
+            // native Task() that changed no files is exploration, not implementation.
+            // There is nothing concrete to verify, so skip rather than grade the
+            // findings against the task's own summary, which otherwise appends false
+            // "not accepted" notes to legitimate read-only research delegations.
+            // Explicit [acceptance] blocks (source != "inferred") and inferred
+            // deterministic checks (dod.kind === "deterministic") still verify normally.
+            if (
+              dod.source === "inferred" &&
+              dod.kind === "checker" &&
+              artefact.changedFiles.length === 0
+            ) {
+              if (childSessionID) changedFileStore.clear(childSessionID);
+              return;
+            }
+
             const res = await accept(
-              { dod, trivial, mode: "modeA" },
+              {
+                dod,
+                trivial,
+                mode: "modeA",
+                // The built-in task tool declares no cwd of its own, but if a
+                // caller supplies one it scopes verification the same way the
+                // delegate tool's does.
+                ...(typeof input?.args?.cwd === "string" && input.args.cwd
+                  ? { cwd: input.args.cwd }
+                  : {}),
+              },
               artefact,
               buildGateDeps(),
             );
@@ -809,7 +946,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // post-hoc signal.
     // -----------------------------------------------------------------------
     "experimental.text.complete": async (input: any, output: any) => {
-      if (bypassed) return;
+      if (bypassed || !cfg.antiNarration) return;
       const text = output?.text;
       if (typeof text !== "string" || text.length < 20) return;
 
@@ -867,15 +1004,18 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       opencodeConfig.agent ??= {};
 
       for (const [name, tier] of Object.entries(activeTiers)) {
-        // Resolve prompt: per-tier override wins; otherwise fall back to global tierPrompts[name].
-        const resolvedPrompt = tier.prompt ?? cfg.tierPrompts?.[name];
+        // Resolve prompt: per-tier override wins; otherwise fall back to the
+        // style-appropriate default (goal-oriented or global tierPrompts[name]).
+        const resolvedPrompt = tier.prompt ?? selectTierPrompt(name, tier, cfg);
 
         // For Claude-backed tiers, prepend an adversarial opener that revokes
         // the cached "Claude Code exploratory agent" priming for this dispatch.
         // Detection is by model string, so hybrid presets get the override
         // only on their Claude-backed tiers.
         const claudePrefix = isClaudeModel(tier.model)
-          ? `${CLAUDE_TIER_PREFIX[name]}\n\n${CLAUDE_ANTI_NARRATION}`
+          ? cfg.antiNarration
+            ? `${CLAUDE_TIER_PREFIX[name]}\n\n${CLAUDE_ANTI_NARRATION}`
+            : CLAUDE_TIER_PREFIX[name]
           : undefined;
         const finalPrompt =
           claudePrefix && resolvedPrompt
@@ -885,7 +1025,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         const agentDef: Record<string, unknown> = {
           model: tier.model,
           mode: "subagent",
-          description: tier.description,
+          description: tier.description ?? `@${name} tier (${tier.model})`,
           maxSteps: tier.steps,
           prompt: finalPrompt,
           color: tier.color,
@@ -897,12 +1037,35 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         }
 
         // Apply provider-specific options
-        const opts = buildAgentOptions(tier);
+        const opts = buildAgentOptions(tier, name, logger);
         if (Object.keys(opts).length > 0) {
           agentDef.options = opts;
         }
+        if (typeof opts.effort === "string") {
+          warnAgentOptionsEffortOnce(
+            "anthropic-effort-dependency",
+            "effort on Anthropic models requires the opencode-anthropic-fix plugin (commit 307aea9+ for fable/mythos); non-adaptive Claude models (e.g. haiku) silently strip effort at the API layer, and without the plugin a top-level effort can break Claude-Code billing fingerprinting",
+            logger,
+          );
+        }
 
         opencodeConfig.agent[name] = agentDef;
+      }
+
+      // Repoint pre-existing subagents listed in `subagentTiers` at the active
+      // preset's models. Opt-in: with no map, nothing here runs and the agent
+      // record is left exactly as opencode built it. Runs after tier
+      // registration so the tier-name collision guard sees the real tiers.
+      const subagentOverrides = resolveSubagentOverrides({
+        subagentTiers: cfg.subagentTiers,
+        tiers: activeTiers,
+        existingAgents: opencodeConfig.agent,
+      });
+      for (const [agentName, override] of Object.entries(subagentOverrides)) {
+        opencodeConfig.agent[agentName] = mergeSubagentOverride(
+          opencodeConfig.agent[agentName],
+          override,
+        );
       }
 
       // Register commands
@@ -964,7 +1127,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       };
       opencodeConfig.command["router"] = {
         template: "$ARGUMENTS",
-        description: "Model-router controls (e.g., /router enforce off|advisory|enforced)",
+        description:
+          "Model-router controls (e.g., /router enforce off|advisory|enforced, /router overrides, /router models)",
       };
     },
 
@@ -1032,13 +1196,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         } else {
           bypassed = !bypassed;
         }
-        const status = bypassed ? "ON" : "OFF";
-        const desc = bypassed
-          ? "Model-router is **bypassed**. Delegation protocol, cap enforcement, and narration detection are disabled. The model will run without routing rules until you run `/bypass off` or restart OpenCode."
-          : "Model-router is **active**. Delegation protocol and all enforcement rules are in effect.";
         output.parts.push({
           type: "text" as const,
-          text: `# Bypass: ${status}\n\n${desc}`,
+          text: buildBypassMessage(bypassed),
         });
       }
 
@@ -1056,10 +1216,28 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         try {
           cfg = loadConfig();
         } catch {}
-        output.parts.push({
-          type: "text" as const,
-          text: buildRouterOutput(cfg, input.arguments ?? ""),
-        });
+        const args = (input.arguments ?? "").trim();
+        const parts = args.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] ?? "").toLowerCase();
+        let text: string;
+        if (sub === "models") {
+          const catalog = await fetchCatalog();
+          const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
+          text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
+        } else {
+          text = buildRouterOutput(cfg, args);
+          // On the bare status view, surface stale or missing models inline.
+          if (sub === "") {
+            const catalog = await fetchCatalog();
+            if (catalog) {
+              const issues = validateModels(cfg, catalog);
+              if (issues.length > 0) {
+                text += "\n\n" + formatModelIssues(issues);
+              }
+            }
+          }
+        }
+        output.parts.push({ type: "text" as const, text });
       }
     },
   };

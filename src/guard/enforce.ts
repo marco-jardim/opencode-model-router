@@ -19,6 +19,17 @@ import type { RouterConfig } from "../router/config";
  */
 export const DEFAULT_GUARD_BUDGET = 25;
 
+/**
+ * The cumulative ceiling spans resumed dispatches: it is this multiple of the
+ * effective per-dispatch budget (configured or default), giving resumed
+ * subagents bounded room without unbounded same-session loops.
+ */
+export const CUMULATIVE_BUDGET_MULTIPLIER = 3;
+
+/** Default-case cumulative budget, retained for imports/tests. */
+export const CUMULATIVE_GUARD_BUDGET =
+  DEFAULT_GUARD_BUDGET * CUMULATIVE_BUDGET_MULTIPLIER;
+
 export interface GuardStoreLike {
   ensure(sessionID: string, policy: GuardPolicy): GuardState;
   get(sessionID: string): GuardState | undefined;
@@ -31,8 +42,10 @@ export interface GuardStoreLike {
  * the deliverable-first clause — the honest common case (M5). */
 export function buildGuardPolicy(cfg: RouterConfig, tier: string | null): GuardPolicy {
   const g = cfg.enforcement?.guard ?? {};
+  const budget = g.budget ?? DEFAULT_GUARD_BUDGET;
   return {
-    budget: g.budget ?? DEFAULT_GUARD_BUDGET,
+    budget,
+    cumulativeBudget: budget * CUMULATIVE_BUDGET_MULTIPLIER,
     readDraftCap: g.readDraftCap ?? 3,
     sameOpRetryCap: g.sameOpRetryCap ?? 1,
     blockSelfScript: g.blockSelfScript ?? true,

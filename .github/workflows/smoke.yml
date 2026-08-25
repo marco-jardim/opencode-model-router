@@ -1,0 +1,159 @@
+name: smoke
+
+# Real-OpenCode smoke lane (test/smoke/**).
+#
+# This lane is NOT part of `test.yml`: every test here shells out to a real
+# `opencode run` against a live Anthropic model (~45s each, 185s per-test
+# vitest timeout), so it is too slow and too expensive to run per-push.
+# It runs weekly on a schedule and on demand via workflow_dispatch.
+#
+# SECRETLESS RUNS ARE GREEN BY DESIGN: the `gate` step below checks for the
+# ANTHROPIC_API_KEY and OPENCODE_API_KEY secrets and every later step is
+# conditioned on the result. Forks and secretless checkouts get a green run
+# with a ::notice, never a red one.
+#
+# EITHER CREDENTIAL WORKS. Anthropic is preferred when both are present.
+# With only OPENCODE_API_KEY the gate exports MODEL_ROUTER_SMOKE_MODEL, which
+# makes the smoke tests both pass `--model` AND write a project-level router
+# overrides file repointing the active preset's tiers — necessary because
+# `--model` moves only the orchestrator, while these tests assert on behaviour
+# inside a plugin-registered SUBAGENT whose model comes from the tier config.
+#
+# ASSUMPTIONS THAT CANNOT BE PROVEN LOCALLY (first scheduled run is the proof):
+#   1. AUTH (Anthropic arm only): opencode is assumed to pick up the Anthropic
+#      credential from the ANTHROPIC_API_KEY environment variable (no
+#      `opencode auth login` step). The smoke harness only spawns
+#      `opencode run ...` and forwards process.env, so the env-var path is the
+#      only mechanism available to it. If the first run fails with an auth
+#      error, replace the env var with an `opencode auth` step.
+#      The OPENCODE_API_KEY arm is NOT an assumption: it was proven locally on
+#      2026-08-19 by moving ~/.local/share/opencode/auth.json aside and running
+#      the lane green with only the env var set.
+#   2. CLI PACKAGE: the CLI is assumed to publish as `opencode-ai` on npm. The
+#      repo never names the install package anywhere, so this is inferred.
+#   3. PLUGIN DISCOVERY: replicated from the dev host by writing a *global*
+#      config at ~/.config/opencode/opencode.json pointing at the checkout.
+#      A repo-root opencode.json would be unreliable here because
+#      test/smoke/layer2-gate.smoke.test.ts writes and then unlinks its own
+#      repo-root opencode.json, which would delete a repo-root config out from
+#      under whichever smoke file vitest runs next.
+
+on:
+  schedule:
+    # 07:17 UTC every Monday — off-peak, and off the hour to dodge the
+    # GitHub scheduler's top-of-hour congestion.
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let a manual run overlap a scheduled one: these are live model calls.
+concurrency:
+  group: smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # 2 smoke tests x ~45s live model call, plus install/npm ci overhead.
+    # 20min leaves ample headroom for a slow model day without hanging a runner.
+    timeout-minutes: 20
+    steps:
+      - name: Check for smoke credentials
+        id: gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          # Either credential can drive the lane.  Anthropic wins when both are
+          # present: it is the proven-stable default and needs no tier override.
+          #
+          # smoke_model is the value exported as MODEL_ROUTER_SMOKE_MODEL:
+          #   empty  -> smoke tests use their built-in Anthropic default and
+          #             write no router overrides at all.
+          #   set    -> smoke tests ALSO write a project overrides file that
+          #             repoints the active preset's fast/medium/heavy tiers,
+          #             so the subagent runs on the same model as the
+          #             orchestrator (`--model` alone only moves the latter).
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "smoke_model=" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Smoke lane provider::Using ANTHROPIC_API_KEY (anthropic/claude-haiku-4-5)."
+          elif [ -n "$OPENCODE_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "smoke_model=opencode-go/qwen3.7-plus" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Smoke lane provider::Using OPENCODE_API_KEY (opencode-go/qwen3.7-plus)."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "smoke_model=" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Smoke lane skipped::Neither ANTHROPIC_API_KEY nor OPENCODE_API_KEY is configured for this repository/fork, so the live smoke lane was skipped. This is expected on forks and is not a failure."
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: steps.gate.outputs.enabled == 'true'
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        if: steps.gate.outputs.enabled == 'true'
+        run: npm ci
+
+      # Pinned to match smoke-keyless.yml. This lane already costs real model
+      # calls; letting the CLI float on top of that would make a failure
+      # ambiguous between three causes (us, opencode, the model) instead of two.
+      # smoke-upstream.yml is the lane that deliberately tracks @latest.
+      - name: Install opencode CLI
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          npm i -g opencode-ai@1.18.19
+          opencode --version
+
+      - name: Point opencode at the checked-out plugin
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          mkdir -p "$HOME/.config/opencode"
+          cat > "$HOME/.config/opencode/opencode.json" <<EOF
+          {
+            "\$schema": "https://opencode.ai/config.json",
+            "plugin": ["$GITHUB_WORKSPACE/src/index.ts"]
+          }
+          EOF
+          cat "$HOME/.config/opencode/opencode.json"
+
+      - name: Run smoke lane
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          SMOKE_MODEL: ${{ steps.gate.outputs.smoke_model }}
+        # `npm run smoke` == cross-env RUN_OC_SMOKE=1 vitest run
+        #   --config vitest.smoke.config.ts test/smoke
+        # (the tests set MODEL_ROUTER_ENFORCE=1 themselves when spawning opencode)
+        #
+        # MODEL_ROUTER_SMOKE_MODEL is exported ONLY when non-empty. Exporting it
+        # as "" would not fall back through `??` in the test files and would
+        # send `--model ""` to the CLI. The tests defend against that too, but
+        # not setting the variable at all keeps the Anthropic path identical to
+        # a plain local `npm run smoke`.
+        run: |
+          if [ -n "$SMOKE_MODEL" ]; then
+            export MODEL_ROUTER_SMOKE_MODEL="$SMOKE_MODEL"
+            echo "Smoke model override: $MODEL_ROUTER_SMOKE_MODEL"
+          else
+            echo "Smoke model override: none (Anthropic default)"
+          fi
+          npm run smoke
+
+      - name: Dump smoke evidence on failure
+        if: failure() && steps.gate.outputs.enabled == 'true'
+        run: |
+          for f in tmp/smoke/*.json; do
+            [ -e "$f" ] || continue
+            echo "===== $f (first 4000 bytes) ====="
+            head -c 4000 "$f"
+            echo
+          done

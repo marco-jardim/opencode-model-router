@@ -1,10 +1,13 @@
 // src/verify/deterministic.ts
 // Deterministic verifier: runs DoD checks using injected seams (no real fs/exec imports).
-// PURE: no Node built-ins; all I/O goes through DeterministicDeps seams.
+// PURE: no I/O-capable Node built-ins; all I/O goes through DeterministicDeps
+// seams. ./paths is pure path math (node:path only) and keeps that contract.
 
 import type { Check, DoD } from "./dod";
 import type { Verdict, DeterministicDeps, MutexRegistry, ExecResult } from "./types";
 import { scrubText } from "../guard/scrub";
+import { resolveAgainst } from "./paths";
+import { isAbsolute } from "node:path";
 
 // ---------------------------------------------------------------------------
 // MutexRegistry — per-key serialization via promise-chaining
@@ -113,9 +116,14 @@ interface CheckResult {
 async function runFileExists(check: Check, deps: DeterministicDeps): Promise<CheckResult> {
   try {
     if (!check.path) return { ok: false, reason: "fileExists check missing 'path'" };
-    const ok = await deps.fs.fileExists(check.path);
+    const resolved = resolveAgainst(deps.cwd, check.path);
+    const ok = await deps.fs.fileExists(resolved);
     if (ok) return { ok: true, evidence: `exists: ${check.path}` };
-    return { ok: false, reason: `file not found: ${check.path}` };
+    // An absolute check path ignores deps.cwd entirely, so claiming the file
+    // was missing "in <cwd>" would name a directory the check never looked in.
+    return isAbsolute(check.path)
+      ? { ok: false, reason: `file not found: ${resolved}` }
+      : { ok: false, reason: `file not found in ${deps.cwd}: ${check.path}` };
   } catch (err) {
     return { ok: false, reason: `fileExists check errored: ${scrubText(String(err))}` };
   }
@@ -214,7 +222,7 @@ async function runSchemaMatch(check: Check, deps: DeterministicDeps): Promise<Ch
       return { ok: false, reason: "schemaMatch requires 'path' and 'schema'" };
     }
 
-    const targetRaw = await deps.fs.readFile(check.path);
+    const targetRaw = await deps.fs.readFile(resolveAgainst(deps.cwd, check.path));
     let targetVal: unknown;
     try {
       targetVal = JSON.parse(targetRaw);
@@ -230,7 +238,7 @@ async function runSchemaMatch(check: Check, deps: DeterministicDeps): Promise<Ch
         return { ok: false, reason: "schema is not valid JSON" };
       }
     } else {
-      const schemaRaw = await deps.fs.readFile(check.schema);
+      const schemaRaw = await deps.fs.readFile(resolveAgainst(deps.cwd, check.schema));
       try {
         schemaVal = JSON.parse(schemaRaw);
       } catch {

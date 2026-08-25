@@ -1,0 +1,104 @@
+name: smoke-keyless
+
+# Credential-free smoke lane.
+#
+# WHY THIS EXISTS, and it is worth reading before deleting it:
+#
+# `opencode debug agent <name>` loads the plugin, runs the `config` hook,
+# resolves the override file and registers agents — with NO API key and no
+# model call. That makes an end-to-end check of plugin registration cost about
+# 40 seconds and nothing else, so unlike smoke.yml it can run on every push.
+#
+# It is not hypothetical coverage. Two real defects shipped past a fully green
+# 1345-test unit suite and were caught only by running a live process by hand:
+#
+#   1. The logger's SDK receiver was detached (`const log = client.app.log`),
+#      so `this._client` was undefined and EVERY post threw, was swallowed by
+#      the plugin's own try/catch, and fell back to console.warn. The feature
+#      shipped as a total no-op. Verified after the fact: restoring that
+#      version makes the `stderr` assertion in registration.smoke.test.ts fail
+#      with the warning text it is supposed to have suppressed.
+#   2. A sixth `warnAgentOptionsEffortOnce` call site in src/index.ts was never
+#      threaded through the logger, so one warning kept writing to stderr —
+#      the exact symptom the logging change existed to remove.
+#
+# Both are invisible to unit tests, which hand the plugin a stub client. Only
+# a real opencode process has a real SDK client, and only a real process has a
+# stderr worth asserting on.
+#
+# It also guards against a subtler rot. smoke.yml is gated on secrets, so on a
+# fork and on any secretless checkout it is a green no-op — which means the
+# only test covering the `config` hook had been asserting the pre-1.8.0 preset
+# models since the 1.8.0 refresh, and nobody found out, because it never ran.
+# A lane that cannot run cannot rot loudly.
+#
+# PROVEN, not assumed: that `opencode debug agent` needs no credential in a
+# container that has never seen opencode. The first run on ba93ace was green
+# on a cold ubuntu-latest with opencode-ai 1.18.19 — 7 passed, 0 skipped, in
+# 21s. Recorded here because the dev-host evidence (HOME repointed at a temp
+# dir, so ~/.local/share/opencode/auth.json was invisible) was suggestive but
+# not equivalent.
+#
+# If a future run ever fails on auth or on a cold model-catalog fetch, the
+# honest fix is to narrow what the test asserts, not to add a secret — the
+# moment this lane needs a credential it stops being able to run on forks,
+# which is the whole point of it.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Unlike smoke.yml, superseding a run is fine here: no live model call is in
+# flight, so cancelling costs nothing but CI minutes saved.
+concurrency:
+  group: smoke-keyless-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-keyless:
+    runs-on: ubuntu-latest
+    # Two files, ~40s total locally. 10min is generous headroom for a cold
+    # container plus a global npm install of the CLI.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # PINNED ON PURPOSE, and the pin is the point.
+      #
+      # This lane gates every push and every pull request, so it has to be
+      # deterministic. A floating `@latest` means an upstream release can turn
+      # a contributor's PR red for a reason they cannot see, reproduce, or fix,
+      # and a red build becomes ambiguous: did we break, or did opencode move?
+      # That is not hypothetical — opencode went 1.18.16 -> 1.18.19 inside a
+      # single afternoon.
+      #
+      # Upstream drift is still caught: smoke-upstream.yml runs these exact
+      # tests against @latest on a schedule, where a failure unambiguously
+      # means "opencode moved" and blocks nobody's PR. When that lane goes red,
+      # bump this pin deliberately rather than discovering the break here.
+      - name: Install opencode CLI
+        # Same inferred package name as smoke.yml: the repo never states it.
+        run: |
+          npm i -g opencode-ai@1.18.19
+          opencode --version
+
+      # No global plugin config step, deliberately. Unlike smoke.yml, these
+      # tests are self-contained: each writes its own project-level
+      # opencode.json registering the checkout, and repoints HOME at a temp
+      # dir so no ambient config or auth state can leak in. That isolation is
+      # what makes the lane meaningful on a machine that already runs the
+      # plugin globally.
+      - name: Run keyless smoke lane
+        run: npm run smoke:keyless

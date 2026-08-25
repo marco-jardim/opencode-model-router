@@ -149,11 +149,15 @@ describe("isClaudeModel", () => {
 });
 
 describe("assembleSystemPrompt", () => {
-  it("prepends Claude override + anti-narration for Claude orchestrators", () => {
+  it("prepends the Claude override for Claude orchestrators (anti-narration off by default)", () => {
     const out = assembleSystemPrompt(minimal, "anthropic/claude-haiku-4-5");
     expect(out).toContain("AUTHORITY OVERRIDE");
-    expect(out).toContain("ANTI-NARRATION");
+    expect(out).not.toContain("ANTI-NARRATION");
     expect(out).toContain("## Model Delegation Protocol");
+  });
+  it("adds the anti-narration clause only when antiNarration is enabled", () => {
+    const on = { ...minimal, antiNarration: true };
+    expect(assembleSystemPrompt(on, "anthropic/claude-haiku-4-5")).toContain("ANTI-NARRATION");
   });
   it("returns the bare protocol for non-Claude orchestrators", () => {
     const out = assembleSystemPrompt(minimal, "openai/gpt-5");

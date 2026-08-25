@@ -215,4 +215,41 @@ describe("Mode A end-to-end enforcement loop", () => {
     expect(out.output).toBe("<task_result>found it</task_result>");
     expect(counters.grader).toBe(0);
   });
+
+  // Read-only research delegation (non-trivial, no files changed) must NOT be
+  // graded: the auto-inferred criteria-only DoD is not a real acceptance target,
+  // and grading findings against the task summary produced false NOT-ACCEPTED
+  // notes on legitimate research delegations.
+  it("Mode A: non-trivial read-only research task is NOT verified (no forcing note, grader uncalled)", async () => {
+    const counters = { grader: 0 };
+    const hooks: any = await ModelRouterPlugin(
+      makeCtxWithQueues(dir, [], [], counters) as any,
+    );
+
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    invalidateConfigCache();
+
+    // CHILD_RO is untracked (never registered as a tier subagent), so it is
+    // non-trivial and has zero recorded file changes: a pure read-only research
+    // delegation, like the orchestrator dispatching to a custom "explorer" agent.
+    const findings =
+      "<task_result>Findings: the auth flow issues JWTs from service X.</task_result>";
+    const out: any = { output: findings, metadata: { sessionId: "CHILD_RO" } };
+
+    await hooks["tool.execute.after"](
+      {
+        tool: "task",
+        sessionID: "ORCH_RO",
+        args: {
+          subagent_type: "fast",
+          prompt:
+            "Research how the frontend build pipeline works and summarize the token flow",
+        },
+      },
+      out,
+    );
+
+    expect(out.output).toBe(findings); // unchanged: no "[router NOT ACCEPTED]" note
+    expect(counters.grader).toBe(0); // grader never dispatched
+  });
 });

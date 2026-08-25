@@ -47,9 +47,9 @@ With the default `anthropic` preset the tier cost ratios are:
 
 | tier   | model                       | costRatio |
 |--------|-----------------------------|-----------|
-| fast   | `claude-haiku-4-5`          | 1         |
-| medium | `claude-sonnet-4-6` (max)   | 5         |
-| heavy  | `claude-opus-4-8` (max)     | 20        |
+| fast   | `claude-sonnet-5`           | 1         |
+| medium | `claude-opus-5` (high)      | 5         |
+| heavy  | `claude-fable-5` (max)      | 20        |
 
 Because the cheapest tier has `costRatio = 1`, **a ladder that starts at `fast` with
 a small `multiple` is intentionally shallow**. Worked example with the default

@@ -2,6 +2,8 @@
 // Trajectory scorecard — pure module, no fs/network/SDK/process.env
 // ---------------------------------------------------------------------------
 
+import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
+
 export interface TrajectoryToolEvent {
   tool: string;
   readOnly: boolean;
@@ -34,6 +36,8 @@ export interface TrajectoryState {
   escalations: number;
   finalTier: string | null;
   costUnits: number;
+  /** Dispatch rounds seen for this session (1 on first dispatch). */
+  dispatches: number;
 }
 
 export function createTrajectory(
@@ -60,6 +64,7 @@ export function createTrajectory(
     escalations: 0,
     finalTier: null,
     costUnits: 0,
+    dispatches: 1,
   };
 }
 
@@ -128,6 +133,7 @@ export function trajectoryMetrics(
     escalations: state.escalations,
     final_tier: state.finalTier,
     cost_units: state.costUnits,
+    dispatches: state.dispatches,
   };
 }
 
@@ -139,10 +145,27 @@ export function dumpTrajectory(state: TrajectoryState): string {
 // Per-instance store factory — mirrors src/router/sessions.ts pattern
 // ---------------------------------------------------------------------------
 
-export function createTrajectoryStore() {
+export interface TrajectoryStoreOptions {
+  /** Injectable clock (tests). Defaults to Date.now. */
+  now?: () => number;
+}
+
+export function createTrajectoryStore(options: TrajectoryStoreOptions = {}) {
+  const now = options.now ?? Date.now;
   const store = new Map<string, TrajectoryState>();
+  const lastTouch = new Map<string, number>();
+
+  function touch(sessionID: string): void {
+    lastTouch.set(sessionID, now());
+  }
+
+  function evictState(sessionID: string): void {
+    store.delete(sessionID);
+    lastTouch.delete(sessionID);
+  }
 
   function ensureState(sessionID: string, tier?: string | null): TrajectoryState {
+    touch(sessionID);
     let s = store.get(sessionID);
     if (!s) {
       s = createTrajectory(sessionID, tier);
@@ -165,7 +188,19 @@ export function createTrajectoryStore() {
       recordToolEvent(s, event);
     },
 
+    /**
+     * Record a resumed dispatch into an existing session. Creates state when
+     * absent so a resume that outlived an idle-TTL sweep still reports a
+     * dispatch count rather than throwing.
+     */
+    recordResume(sessionID: string, tier?: string | null): void {
+      const s = ensureState(sessionID, tier);
+      s.dispatches += 1;
+      touch(sessionID);
+    },
+
     setStopReason(sessionID: string, reason: string): void {
+      touch(sessionID);
       const s = store.get(sessionID);
       if (!s) return;
       setStopReason(s, reason);
@@ -175,6 +210,18 @@ export function createTrajectoryStore() {
       const s = store.get(sessionID);
       if (!s) return null;
       return dumpTrajectory(s);
+    },
+
+    /** Drop a session's trajectory state. */
+    evict(sessionID: string): void {
+      evictState(sessionID);
+    },
+
+    /** Evict every session idle for >= ttlMs. Future stamps are never evicted. */
+    sweep(nowMs: number = now(), ttlMs: number = DEFAULT_IDLE_TTL_MS): void {
+      for (const [sessionID, stamp] of [...lastTouch.entries()]) {
+        if (nowMs - stamp >= ttlMs) evictState(sessionID);
+      }
     },
   };
 }
