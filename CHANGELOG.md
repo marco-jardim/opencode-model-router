@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Community health files.** `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, a
+  pull request template, and a bug report form. The contributing guide writes down the
+  parts that are easy to miss from outside: golden snapshots are parameterized over every
+  preset and must be regenerated, model refs are only format-validated so the provider id
+  has to be checked against the models.dev catalog, and a new preset also needs a
+  `fallback.global` chain plus the README and config-reference counts.
+
 ## [1.11.0] - 2026-08-24
 
 ### Added

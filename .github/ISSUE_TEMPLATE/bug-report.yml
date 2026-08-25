@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in the router behaves differently than documented
+labels: ["bug"]
+body:
+  - type: input
+    id: opencode-version
+    attributes:
+      label: opencode version
+      placeholder: "opencode --version"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: opencode-model-router version
+      placeholder: "1.11.0"
+    validations:
+      required: true
+
+  - type: input
+    id: preset
+    attributes:
+      label: Active preset
+      placeholder: "anthropic"
+    validations:
+      required: true
+
+  - type: textarea
+    id: router-output
+    attributes:
+      label: Output of /router
+      description: Run `/router` in opencode and paste the whole output.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: Overrides file or the edited part of `tiers.json`, if any.
+      render: json
+    validations:
+      required: false
