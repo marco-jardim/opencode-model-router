@@ -1160,7 +1160,13 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
 
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
-      output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
+       // OpenCode 1.18.29 represents injected system-prompt sections as named
+       // objects.  Pushing a bare string (the pre-1.18 shape) reaches
+       // SystemPrompt.environment, which reads `.name` from every section.
+       output.system.push({
+         name: "model-router",
+         content: assembleSystemPrompt(cfg, orchestratorModel, enfOn),
+       });
     },
 
     // -----------------------------------------------------------------------
