@@ -14,7 +14,7 @@ import type { PluginLogger } from "./logger";
  */
 import type { TierConfig } from "./config";
 import { EFFORT_LEVELS } from "./config";
-import { isClaudeModel } from "./protocol";
+import { isAdaptiveOnlyClaudeModel, isClaudeModel } from "./protocol";
 
 // ---------------------------------------------------------------------------
 // Warn-once
@@ -61,7 +61,13 @@ function isOpenAIModel(model: string): boolean {
  * Precedence, highest first: explicit `thinking` with a truthy `budgetTokens`
  * (Anthropic) or explicit `reasoning.effort` (OpenAI), then the
  * provider-agnostic `effort`. A `budgetTokens` of 0 asks for nothing and so
- * loses to `effort`, with a one-time notice per tier. A key is
+ * loses to `effort`, with a one-time notice per tier.
+ *
+ * Explicit fields are gated by model: a Claude model never receives
+ * `reasoning_effort` / `reasoning_summary`, and an adaptive-only Claude model
+ * (`isAdaptiveOnlyClaudeModel`) never receives `budget_tokens` — the budget is
+ * then ignored as if unset, so `effort` still applies. Each drop warns once
+ * per tier. A key is
  * only ever present when something asked for it — an unset `effort` leaves no
  * trace in the returned object.
  */
@@ -76,8 +82,19 @@ export function buildAgentOptions(
   // all, so it is neither emitted nor treated as an explicit thinking config
   // below — `hasThinkingBudget` is the single notion of "thinking was asked
   // for", shared by the emission and the effort precedence check.
-  const hasThinkingBudget = Boolean(tier.thinking?.budgetTokens);
-  if (hasThinkingBudget) {
+  // An adaptive-only Claude model rejects a manual budget outright, so the
+  // budget is dropped and — for the effort precedence below — treated as never
+  // having been set, which lets a sibling `effort` through.
+  const isClaude = isClaudeModel(tier.model);
+  let hasThinkingBudget = Boolean(tier.thinking?.budgetTokens);
+  if (hasThinkingBudget && isAdaptiveOnlyClaudeModel(tier.model)) {
+    hasThinkingBudget = false;
+    warnAgentOptionsEffortOnce(
+      `thinking-adaptive-only:${tierName}`,
+      `tier ${tierName}: model '${tier.model}' only accepts adaptive thinking and rejects a manual budget, so thinking.budgetTokens is ignored; use effort instead`,
+      logger,
+    );
+  } else if (hasThinkingBudget) {
     opts.budget_tokens = tier.thinking?.budgetTokens;
   } else if (tier.thinking?.budgetTokens === 0) {
     warnAgentOptionsEffortOnce(
@@ -87,8 +104,17 @@ export function buildAgentOptions(
     );
   }
 
-  // OpenAI reasoning config
-  if (tier.reasoning) {
+  // OpenAI reasoning config. Claude models have no such parameters, so they
+  // are dropped there rather than sent to a provider that cannot read them.
+  if (tier.reasoning && isClaude) {
+    if (tier.reasoning.effort || tier.reasoning.summary) {
+      warnAgentOptionsEffortOnce(
+        `reasoning-claude:${tierName}`,
+        `tier ${tierName}: reasoning.effort and reasoning.summary are OpenAI parameters and are ignored for Claude model '${tier.model}'; use effort instead`,
+        logger,
+      );
+    }
+  } else if (tier.reasoning) {
     if (tier.reasoning.effort) {
       opts.reasoning_effort = tier.reasoning.effort;
     }
@@ -107,7 +133,7 @@ export function buildAgentOptions(
         `invalid:${tierName}:${String(effort)}`,
         `tier ${tierName}: invalid effort '${String(effort)}' ignored`,
       );
-    } else if (isClaudeModel(tier.model)) {
+    } else if (isClaude) {
       if (hasThinkingBudget) {
         warnAgentOptionsEffortOnce(
           `anthropic-conflict:${tierName}`,

@@ -440,26 +440,38 @@ Detection is by model *family*, not by provider prefix: `isClaudeModel` matches 
 Warnings are emitted once per distinct problem (keyed by tier and, where it matters, by
 the offending value), because agent registration re-runs on every `config` hook.
 
-### Known issue: the provider matrix covers `effort` only
+### Provider gate for explicit `thinking` and `reasoning` fields
 
 The matrix above describes what happens to the **generic** `effort` field. The two
-explicit provider-specific fields are **not** gated by model family:
-`buildAgentOptions` emits `budget_tokens` whenever `thinking.budgetTokens` is truthy,
-and `reasoning_effort` / `reasoning_summary` whenever the matching `reasoning.*` field
-is set, without ever consulting `isClaudeModel` or `isOpenAIModel`
-(`src/router/agent-options.ts`). Only the `effort` branch checks the family.
+explicit provider-specific fields are gated too, but only for Claude models
+(`isClaudeModel`), in `buildAgentOptions` (`src/router/agent-options.ts`).
+“Claude” here is whatever `isClaudeModel` accepts, including proxied spellings such as
+`github-copilot/claude-…` and `openrouter/anthropic/claude-…`; on those tiers
+`reasoning.*` is dropped as well, matching how the `effort` matrix above already routes
+them to the Anthropic column.
 See [PER_TURN_EFFORT.md](./PER_TURN_EFFORT.md) for how this meets Claude Code 2.1.280's per-turn effort and the bundled `@medium` tier.
 
-Two consequences, both reachable from a valid `tiers.json`:
-
-| Configuration | What is registered | Result |
+| Configuration | What is registered | Warning (once per tier) |
 |---|---|---|
-| `thinking.budgetTokens` on a non-Anthropic tier | `options.budget_tokens` | Sent to a provider that has no such parameter. |
-| `reasoning.effort` / `reasoning.summary` on an Anthropic tier | `options.reasoning_effort` / `options.reasoning_summary` | Sent to a provider that has no such parameter. |
+| `thinking.budgetTokens` on an adaptive-only Claude model (below) | nothing — the budget is ignored as if unset, so a sibling `effort` is still registered | the model only accepts adaptive thinking and rejects a manual budget, so `thinking.budgetTokens` is ignored; use `effort` instead |
+| `thinking.budgetTokens` on any other Claude model | `options.budget_tokens` (unchanged) | none |
+| `reasoning.effort` / `reasoning.summary` on any Claude model | nothing — both are OpenAI parameters | `reasoning.effort` and `reasoning.summary` are ignored for the Claude model; use `effort` instead |
 
-The second one is the sharp edge, because of a **newer upstream constraint**. Anthropic's
-`claude-opus-5-5` has adaptive thinking always on and **rejects a manually supplied
-thinking budget with HTTP 400**; `{"type": "disabled"}` is rejected the same way. Effort
+The adaptive-only set is `isAdaptiveOnlyClaudeModel` in `src/router/protocol.ts`: the
+Anthropic models whose catalogue entry carries `rejects_disabled_thinking` in
+claude-code-wire-compat's 2.1.280 profile — `claude-opus-5-5`, `claude-fable-5`,
+`claude-fable-5-1` and `claude-mythos-5-1`. Neighbours are not in it: `claude-opus-5`
+and `claude-mythos-5` still register a budget. Matching is exact on the model name
+(after any provider prefix, with dots read as dashes), optionally followed by a date
+stamp (`-YYYYMMDD`, or the Vertex `@YYYYMMDD` form) and a bracketed tag such as `[1m]`.
+Any other suffix — `-preview`, `-latest`, a Bedrock `-v1:0` — is not matched, and such a
+tier keeps registering its budget as before: the gate fires only on a positive match.
+
+The reason for the budget rule is a **newer upstream constraint**. Anthropic's
+`claude-opus-5-5` has adaptive thinking always on: `{"type": "disabled"}` is rejected (the
+wire-compat catalogue records this as `rejects_disabled_thinking`), and a manually
+supplied thinking budget is **reported to be rejected with HTTP 400** — a report this
+repository has not reproduced (see [PER_TURN_EFFORT.md](./PER_TURN_EFFORT.md)). Effort
 on that model is expressed through `effort` / `output_config.effort`, never through a
 token budget. The bundled `anthropic` preset already points `@medium` at
 `anthropic/claude-opus-5-5`, so a tier written as:
@@ -477,22 +489,20 @@ token budget. The bundled `anthropic` preset already points `@medium` at
 }
 ```
 
-registers `budget_tokens` and every dispatch on that tier fails with a 400 — and,
-because `thinking.budgetTokens` outranks `effort` in the precedence list above, a tier
-that sets both silently loses the `effort` that *would* have worked.
+registers no `budget_tokens` and logs the adaptive-thinking warning once. The budget no
+longer outranks `effort` on these models: a tier that sets both registers its `effort`
+and warns only about the ignored budget, not about a conflict.
 
-The same applies to any other Anthropic model whose catalogue entry carries
-`rejects_disabled_thinking`: today `claude-opus-5-5`, `claude-fable-5`,
-`claude-fable-5-1` and `claude-mythos-5-1`.
+**Guidance:** on Anthropic tiers use `effort`, not `thinking.budgetTokens`. Reserve
+`thinking.budgetTokens` for older Anthropic models that still accept an explicit budget,
+and reserve `reasoning.*` for OpenAI tiers.
 
-**Guidance until this is gated:** on Anthropic tiers use `effort`, not
-`thinking.budgetTokens`. Reserve `thinking.budgetTokens` for older Anthropic models that
-still accept an explicit budget, and reserve `reasoning.*` for OpenAI tiers.
-
-A fix would gate both explicit branches by family, symmetrically with the `effort`
-branch, and warn rather than register when a tier names a field its provider cannot
-accept. That is a behaviour change to `buildAgentOptions`, so it moves golden snapshots
-for any preset that exercises it.
+**Remaining limitation:** the gate is Claude-only. On non-Claude tiers the explicit
+fields are still passed through unchecked — `thinking.budgetTokens` on an OpenAI or
+Google tier still registers `options.budget_tokens`, and `reasoning.*` on a Google tier
+still registers `options.reasoning_effort` / `options.reasoning_summary`, although those
+providers have no such parameter. A model id that `isClaudeModel` does not recognise
+(for example a dotted Bedrock namespace, `us.anthropic.claude-…`) is not gated either.
 
 ---
 

@@ -102,10 +102,12 @@ describe("per-tier effort agent options", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  // claude-opus-5 still accepts a manual budget; claude-fable-5 is adaptive-only
+  // and now drops it (covered in "provider gate for explicit fields" below).
   test("omits effort but keeps siblings when only thinking is set", () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const opts = buildAgentOptions(
-      tier("anthropic/claude-fable-5", { thinking: { budgetTokens: 4096 } }),
+      tier("anthropic/claude-opus-5", { thinking: { budgetTokens: 4096 } }),
     );
 
     expect(opts).toEqual({ budget_tokens: 4096 });
@@ -122,11 +124,21 @@ describe("per-tier effort agent options", () => {
     [
       "anthropic effort conflict",
       () =>
-        tier("anthropic/claude-fable-5", {
+        tier("anthropic/claude-opus-5", {
           effort: "medium",
           thinking: { budgetTokens: 4096 },
         }),
       { budget_tokens: 4096 },
+      true,
+    ],
+    [
+      "anthropic adaptive-only effort conflict",
+      () =>
+        tier("anthropic/claude-fable-5", {
+          effort: "medium",
+          thinking: { budgetTokens: 4096 },
+        }),
+      { effort: "medium" },
       true,
     ],
     ["anthropic absent", () => tier("anthropic/claude-fable-5"), {}, false],
@@ -236,7 +248,7 @@ describe("per-tier effort agent options", () => {
 
     expect(
       buildAgentOptions(
-        tier("anthropic/claude-fable-5", { effort: "low", thinking: { budgetTokens: 1 } }),
+        tier("anthropic/claude-opus-5", { effort: "low", thinking: { budgetTokens: 1 } }),
         "fast",
       ),
     ).toEqual({ budget_tokens: 1 });
@@ -256,6 +268,185 @@ describe("per-tier effort agent options", () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toContain("thinking.budgetTokens: 0 is ignored");
     expect(warn.mock.calls[0]?.[0]).not.toContain("effort");
+  });
+});
+
+describe("provider gate for explicit fields", () => {
+  beforeEach(() => {
+    resetAgentOptionsEffortWarnings();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test.each([
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-fable-5",
+    "anthropic/claude-fable-5-1",
+    "anthropic/claude-mythos-5-1",
+    "github-copilot/claude-fable-5-1",
+    "openrouter/anthropic/claude-opus-5-5",
+  ])("drops budget_tokens on adaptive-only %s with a warning", (model) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(tier(model, { thinking: { budgetTokens: 32000 } }), "medium"),
+    ).toEqual({});
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain("tier medium");
+    expect(message).toContain("only accepts adaptive thinking");
+    expect(message).toContain("thinking.budgetTokens is ignored");
+    expect(message).toContain("use effort instead");
+  });
+
+  test.each([
+    "anthropic/claude-opus-5",
+    "anthropic/claude-mythos-5",
+    "anthropic/claude-sonnet-4-6",
+    "github-copilot/claude-opus-4.8",
+  ])("keeps budget_tokens on Claude model %s that accepts a budget", (model) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(buildAgentOptions(tier(model, { thinking: { budgetTokens: 32000 } }))).toEqual({
+      budget_tokens: 32000,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test("keeps budget_tokens on non-Claude models", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(tier("openai/gpt-5.5-fast", { thinking: { budgetTokens: 4096 } })),
+    ).toEqual({ budget_tokens: 4096 });
+    expect(
+      buildAgentOptions(tier("google/gemini-3-pro", { thinking: { budgetTokens: 4096 } })),
+    ).toEqual({ budget_tokens: 4096 });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test("still emits effort on an adaptive-only tier that also sets a budget", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(
+        tier("anthropic/claude-opus-5-5", {
+          effort: "high",
+          thinking: { budgetTokens: 32000 },
+        }),
+        "medium",
+      ),
+    ).toEqual({ effort: "high" });
+
+    // The gated budget does not claim the effort conflict.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("only accepts adaptive thinking");
+    expect(warn.mock.calls[0]?.[0]).not.toContain("explicit thinking wins");
+  });
+
+  test.each([
+    "anthropic/claude-opus-5",
+    "anthropic/claude-opus-5-5",
+    "github-copilot/claude-sonnet-5",
+    "openrouter/anthropic/claude-opus-5-5",
+  ])("drops reasoning_* on Claude model %s with a warning", (model) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(
+        tier(model, { reasoning: { effort: "low", summary: "auto" } }),
+        "fast",
+      ),
+    ).toEqual({});
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain("tier fast");
+    expect(message).toContain("reasoning.effort and reasoning.summary are OpenAI parameters");
+    expect(message).toContain("use effort instead");
+  });
+
+  test("drops reasoning_* on a Claude tier but keeps its effort", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(
+        tier("anthropic/claude-opus-5", { effort: "high", reasoning: { effort: "low" } }),
+        "fast",
+      ),
+    ).toEqual({ effort: "high" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("are OpenAI parameters");
+  });
+
+  test("stays silent for an empty reasoning block on a Claude tier", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(rawTier("anthropic/claude-opus-5", { reasoning: {} }), "fast"),
+    ).toEqual({});
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test("drops a summary-only reasoning block on a Claude tier with a warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(tier("anthropic/claude-opus-5", { reasoning: { summary: "auto" } }), "fast"),
+    ).toEqual({});
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("are OpenAI parameters");
+  });
+
+  test("treats a zero budget on an adaptive-only tier as the zero-budget notice", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(
+        tier("anthropic/claude-opus-5-5", { thinking: { budgetTokens: 0 } }),
+        "medium",
+      ),
+    ).toEqual({});
+    // Branch order: the adaptive-only drop never fires on a zero budget.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("thinking.budgetTokens: 0 is ignored");
+    expect(warn.mock.calls[0]?.[0]).not.toContain("only accepts adaptive thinking");
+  });
+
+  test("keeps reasoning_* on non-Claude models", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(
+      buildAgentOptions(
+        tier("openai/gpt-5.5-fast", { reasoning: { effort: "low", summary: "auto" } }),
+      ),
+    ).toEqual({ reasoning_effort: "low", reasoning_summary: "auto" });
+    expect(
+      buildAgentOptions(tier("google/gemini-3-pro", { reasoning: { summary: "auto" } })),
+    ).toEqual({ reasoning_summary: "auto" });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test("routes the gate warnings through the logger when one is given", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const logger = { warn: vi.fn(), flush: async () => undefined };
+
+    buildAgentOptions(
+      tier("anthropic/claude-opus-5-5", {
+        thinking: { budgetTokens: 32000 },
+        reasoning: { effort: "low" },
+      }),
+      "medium",
+      logger,
+    );
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.warn.mock.calls.map((call) => call[1])).toEqual([
+      { key: "thinking-adaptive-only:medium" },
+      { key: "reasoning-claude:medium" },
+    ]);
   });
 });
 
@@ -301,6 +492,30 @@ describe("effort warn-once keying", () => {
 
     buildAgentOptions(tier("anthropic/claude-fable-5", zeroBudget), "medium");
     expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  test("warns once per tier for each provider-gate drop until reset", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const budget = tier("anthropic/claude-opus-5-5", { thinking: { budgetTokens: 32000 } });
+    const reasoning = tier("anthropic/claude-opus-5-5", { reasoning: { effort: "low" } });
+
+    buildAgentOptions(budget, "medium");
+    buildAgentOptions(budget, "medium");
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // Distinct keys: the reasoning drop is not suppressed by the budget drop,
+    // and neither suppresses the same drop on another tier.
+    buildAgentOptions(reasoning, "medium");
+    buildAgentOptions(reasoning, "medium");
+    expect(warn).toHaveBeenCalledTimes(2);
+    buildAgentOptions(budget, "heavy");
+    buildAgentOptions(reasoning, "heavy");
+    expect(warn).toHaveBeenCalledTimes(4);
+
+    resetAgentOptionsEffortWarnings();
+    buildAgentOptions(budget, "medium");
+    buildAgentOptions(reasoning, "medium");
+    expect(warn).toHaveBeenCalledTimes(6);
   });
 
   test("keys OpenAI downgrades by tier and by level", () => {

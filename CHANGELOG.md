@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Explicit `thinking` and `reasoning` fields are gated for Claude models.**
+  `buildAgentOptions` emitted `budget_tokens` and `reasoning_effort` /
+  `reasoning_summary` without consulting the model, so a tier on an adaptive-only
+  model — the bundled `anthropic` preset's `@medium` is `anthropic/claude-opus-5-5` —
+  that also set `thinking.budgetTokens` registered a manual thinking budget on a model
+  that only accepts adaptive thinking (the HTTP 400 this is said to cause is reported,
+  not reproduced here; see the provider gate in `docs/CONFIG_REFERENCE.md`), and the
+  budget outranked the `effort` that would have applied. A Claude tier now never
+  registers `reasoning_*` (OpenAI parameters), and a tier on a model whose wire-compat
+  catalogue entry carries `rejects_disabled_thinking` (`claude-opus-5-5`,
+  `claude-fable-5`, `claude-fable-5-1`, `claude-mythos-5-1`, matched by the new
+  `isAdaptiveOnlyClaudeModel`) never registers `budget_tokens`; the budget is then
+  treated as unset, so `effort` still applies. Each drop warns once per tier.
+  Non-Claude tiers are unchanged.
+
 ## [1.12.1] - 2026-09-23
 
 The delegate instruction filter introduced in 1.12.0 never removed anything in a live
