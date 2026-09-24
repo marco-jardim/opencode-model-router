@@ -132,6 +132,7 @@ export function buildAgentOptions(
       warnAgentOptionsEffortOnce(
         `invalid:${tierName}:${String(effort)}`,
         `tier ${tierName}: invalid effort '${String(effort)}' ignored`,
+        logger,
       );
     } else if (isClaude) {
       if (hasThinkingBudget) {

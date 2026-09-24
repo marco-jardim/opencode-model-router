@@ -448,6 +448,19 @@ describe("provider gate for explicit fields", () => {
       { key: "reasoning-claude:medium" },
     ]);
   });
+
+  test("routes the invalid-effort warning through the logger when one is given", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const logger = { warn: vi.fn(), flush: async () => undefined };
+
+    expect(
+      buildAgentOptions(rawTier("anthropic/claude-opus-5", { effort: "ultra" }), "fast", logger),
+    ).toEqual({});
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0]?.[1]).toEqual({ key: "invalid:fast:ultra" });
+  });
 });
 
 describe("effort warn-once keying", () => {
