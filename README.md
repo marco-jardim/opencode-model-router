@@ -765,7 +765,7 @@ Detection is by model string, not preset. A `hybrid` preset that mixes providers
 
 - `anthropic/<anything>` → Claude
 - `<provider>/claude-<anything>` (e.g. `github-copilot/claude-sonnet-4-6`) → Claude
-- `<provider>/<namespace>.claude-<anything>` (e.g. `bedrock/us.anthropic.claude-3-5-sonnet-...`) → Claude
+- `<provider>/<namespace>.claude-<anything>` (e.g. `bedrock/us.anthropic.claude-3-5-sonnet-...`) → **not** detected: the dot before `claude-` does not satisfy the rule, so such tiers are treated as non-Claude (no Claude prefix, no Anthropic `effort` routing, no provider gate)
 - Everything else → untouched
 
 No configuration is needed — the prefixes are always applied for Claude-backed tiers. If you want to disable them, override the tier's `prompt` field (per-tier overrides replace the whole prompt, including the prefix).
