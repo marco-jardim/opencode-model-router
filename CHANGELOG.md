@@ -5,9 +5,55 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.13.0] - 2026-09-24
+
+A forced delegation of a request that carries no task produced a `task` call with no
+prompt, which the harness rejected with a terse schema error. The router now repairs
+such calls or refuses them readably. This release also gives the orchestrator's
+read-only allowance a single consistent statement, and stops explicit thinking and
+reasoning fields from reaching Claude models that cannot use them.
+
+### Added
+
+- **`taskPromptRepair` fills in or refuses prompt-less `task` calls.** A forced
+  delegation of a request that carries no task — a bare greeting sent through an
+  explicit tier mention, say — made the model emit a `task` call with a description
+  and a tier but no prompt, and the harness rejected it with a bare schema error
+  naming the missing key. The `task` before-hook now repairs the call ahead of the
+  dispatch header: when `prompt` is absent, `null` or blank and `description` is a
+  non-empty string, the trimmed description becomes the prompt and the call proceeds
+  with the dispatch header applied normally. When there is no usable description the
+  call is refused with a `[router]` error saying that `task` needs a non-empty
+  `prompt`, and that a request carrying no task (a greeting, an acknowledgement)
+  should be answered directly rather than delegated. A prompt of a non-string type
+  is left for the harness, and frozen args that cannot be repaired are left alone.
+  The flag defaults to `true`; set `taskPromptRepair: false` to restore the previous
+  behaviour. Non-boolean values are rejected by `validateConfig`. See
+  `docs/CONFIG_REFERENCE.md`.
+
+### Changed
+
+- **The orchestrator's read-only allowance is stated as one mechanism.** The injected
+  protocol gave the same rule three incompatible readings: the orchestrator line said
+  information-gathering should be dispatched to @fast rather than run directly, then
+  capped direct read-only calls at about two per turn, and the rules array added a
+  separate licence for trivial single-call work that acknowledged neither. Dispatch
+  is now the stated default, and direct calls are a named allowance for lookups that
+  settle a question outright; the trivial-work rules in the shipped `tiers.json` now
+  spend that allowance instead of competing with it, and the per-mode overrides are
+  reconciled the same way. No cap number moved: the base allowance is still two,
+  budget mode is still one, and the dispatch baselines are unchanged. Only the
+  protocol prose changed, so the injected prompt and the README's measured
+  prompt-size figures move by the length of the new wording. The README's sample
+  rules line is regenerated from the shipped configuration; it had shown eight rules
+  where the shipped array has ten.
 
 ### Fixed
+
+- **The invalid-effort warning goes through the plugin logger.** Every other
+  `buildAgentOptions` warning passed the plugin logger, but an unrecognised `effort`
+  value always went to `console.warn`, even when a logger was supplied. It now uses
+  the logger like its siblings; without one the behaviour is unchanged.
 
 - **Explicit `thinking` and `reasoning` fields are gated for Claude models.**
   `buildAgentOptions` emitted `budget_tokens` and `reasoning_effort` /
@@ -22,7 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `claude-fable-5`, `claude-fable-5-1`, `claude-mythos-5-1`, matched by the new
   `isAdaptiveOnlyClaudeModel`) never registers `budget_tokens`; the budget is then
   treated as unset, so `effort` still applies. Each drop warns once per tier.
-  Non-Claude tiers are unchanged.
+  Non-Claude tiers are unchanged. Ids of the form
+  `<provider>/<namespace>.claude-…`, such as `bedrock/us.anthropic.claude-…`, are not
+  recognised as Claude, so they get no Claude prompt prefix, no Anthropic effort
+  routing and no gate; the README had claimed they were detected and now says so.
 
 ## [1.12.1] - 2026-09-23
 
