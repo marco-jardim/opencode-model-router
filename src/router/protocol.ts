@@ -153,6 +153,33 @@ export function isClaudeModel(modelID: string | undefined): boolean {
   return /\/claude-/.test(s) || /(^|[\/\-])claude-/.test(s);
 }
 
+/**
+ * Claude models that only accept adaptive thinking: a manually supplied
+ * thinking budget (and `{"type": "disabled"}`) is rejected. The list mirrors
+ * the catalogue entries carrying `rejects_disabled_thinking` in
+ * claude-code-wire-compat's 2.1.280 profile. Neighbours are deliberately not
+ * covered: `claude-opus-5` and `claude-mythos-5` still accept a budget.
+ */
+const ADAPTIVE_ONLY_CLAUDE_MODELS = [
+  "claude-opus-5-5",
+  "claude-fable-5",
+  "claude-fable-5-1",
+  "claude-mythos-5-1",
+];
+
+export function isAdaptiveOnlyClaudeModel(modelID: string | undefined): boolean {
+  if (!modelID || !isClaudeModel(modelID)) return false;
+  // Same family matching as isClaudeModel, plus dots folded to dashes so a
+  // provider re-spelling (`claude-fable-5.1`) lands on the catalogue id. The
+  // id must end at the model name, optionally followed by a date stamp
+  // (`-YYYYMMDD`, or the Vertex `@YYYYMMDD` form) and a bracketed tag (`[1m]`),
+  // so `claude-opus-5` never matches `claude-opus-5-5` and vice versa.
+  const s = modelID.toLowerCase().replace(/\./g, "-");
+  return ADAPTIVE_ONLY_CLAUDE_MODELS.some((id) =>
+    new RegExp(`(^|[\\/\\-])${id}([-@]\\d{8})?(\\[[^\\]]*\\])?$`).test(s),
+  );
+}
+
 /** Per-tier adversarial openers. @fast/@medium use Tom 2 (scoping); @heavy uses Tom 1 (override). */
 export const CLAUDE_TIER_PREFIX: Record<string, string> = {
   fast: [

@@ -10,6 +10,7 @@ import {
   buildDelegationProtocol,
   buildDoDProtocolSection,
   isClaudeModel,
+  isAdaptiveOnlyClaudeModel,
   assembleSystemPrompt,
 } from "../../src/router/protocol";
 import { validateConfig } from "../../src/router/config";
@@ -145,6 +146,48 @@ describe("isClaudeModel", () => {
     ["non-claude", "openai/gpt-5", false],
   ])("%s", (_label, model, expected) => {
     expect(isClaudeModel(model as string | undefined)).toBe(expected);
+  });
+});
+
+describe("isAdaptiveOnlyClaudeModel", () => {
+  it.each([
+    // The catalogue's rejects_disabled_thinking set, bare and prefixed.
+    ["claude-opus-5-5", true],
+    ["anthropic/claude-opus-5-5", true],
+    ["anthropic/claude-fable-5", true],
+    ["anthropic/claude-fable-5-1", true],
+    ["anthropic/claude-mythos-5-1", true],
+    ["github-copilot/claude-fable-5-1", true],
+    ["ANTHROPIC/Claude-Opus-5-5", true],
+    // Re-spellings and suffixes of a listed model.
+    ["github-copilot/claude-fable-5.1", true],
+    ["anthropic/claude-opus-5-5-20260901", true],
+    ["anthropic/claude-opus-5-5[1m]", true],
+    ["google-vertex/claude-opus-5-5@20260901", true],
+    ["anthropic/claude-opus-5-5-20260901[1m]", true],
+    // Proxied spellings isClaudeModel accepts.
+    ["openrouter/anthropic/claude-opus-5-5", true],
+    // Unknown suffixes fail open: the gate fires only on a positive match.
+    ["anthropic/claude-opus-5-5-latest", false],
+    // isClaudeModel needs `/` or `-` before `claude-`, so a dotted Bedrock
+    // namespace is not recognised as Claude at all; the gate inherits that.
+    ["bedrock/us.anthropic.claude-opus-5-5-v1:0", false],
+    // Neighbours that still accept a manual budget.
+    ["anthropic/claude-opus-5", false],
+    ["anthropic/claude-opus-5-20260901", false],
+    ["anthropic/claude-mythos-5", false],
+    ["anthropic/claude-sonnet-5", false],
+    ["anthropic/claude-opus-4-8", false],
+    ["anthropic/claude-opus-5-55", false],
+    ["anthropic/claude-fable-5-2", false],
+    ["anthropic/claude-mythos-5-1-preview", false],
+    // Not Claude at all.
+    ["openai/opus-5-5", false],
+    ["openai/gpt-5", false],
+    [undefined, false],
+    ["", false],
+  ])("%s -> %s", (model, expected) => {
+    expect(isAdaptiveOnlyClaudeModel(model as string | undefined)).toBe(expected);
   });
 });
 
