@@ -50,10 +50,10 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
-    "@vitest/coverage-v8": "^4.1.8",
+    "@vitest/coverage-v8": "^5.0.1",
     "cross-env": "^10.1.0",
     "istanbul-lib-coverage": "^3.2.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.8"
+    "vitest": "^5.0.1"
   }
 }
