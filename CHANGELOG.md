@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Setting `enforcement.verify.graderTemperature` to `null` now omits unsupported temperature
+  parameters. Grader response/API failures are reported as SDK errors with metadata-only details
+  before verdict parsing, rather than as misleading parse failures.
+
 ## [1.15.0] - 2026-09-28
 
 The acceptance gate no longer runs a test suite per delegation. `testsPass` now runs only

@@ -46,6 +46,13 @@ function fakeClient(over: Record<string, any> = {}) {
   };
 }
 
+function respondToPrompt(client: ReturnType<typeof fakeClient>, response: any): void {
+  client.session.prompt = async (args: any) => {
+    client.calls.push(["prompt", args]);
+    return response;
+  };
+}
+
 describe("extractAssistantText", () => {
   it("joins the text parts", () => {
     expect(
@@ -94,16 +101,223 @@ describe("dispatchGrader", () => {
 
   // The dispose lives in a finally; a failing prompt must not leak the session.
   it("still disposes when the prompt throws", async () => {
-    const client = fakeClient({
-      prompt: async () => {
-        throw new Error("boom");
-      },
-    });
+    const client = fakeClient();
+    client.session.prompt = async (args: any) => {
+      client.calls.push(["prompt", args]);
+      throw new Error("boom");
+    };
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
     await expect(
       w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }),
     ).rejects.toThrow("boom");
-    expect(client.calls.map((c) => c[0])).toContain("delete");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("reports a nested grader response error and disposes the session", async () => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: {
+        info: { error: { name: "APIError", data: { message: "api_key=supersecret Authorization: Basic dXNlcjpwYXNz password=anothersecret", statusCode: 400 } } },
+        parts: [],
+      },
+      response: { status: 200 },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    let message = "";
+    try {
+      await w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe("grader prompt failed (400): SDK error");
+    for (const credential of ["supersecret", "dXNlcjpwYXNz", "anothersecret"]) {
+      expect(message).not.toContain(credential);
+    }
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("reports a top-level grader response error with a failing HTTP status", async () => {
+    const client = fakeClient();
+    respondToPrompt(client, { error: { name: "UnknownError", message: "untrusted free-form text" }, response: { status: 500 } });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow("grader prompt failed (500): SDK error");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("rejects a failing HTTP response even when its text looks like a passing verdict", async () => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+      response: { status: 500 },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow("grader prompt failed (500): SDK error");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("prefers a failing HTTP status over a conflicting nested error status", async () => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { info: { error: { name: "APIError", data: { statusCode: 400, message: "request failed" } } }, parts: [] },
+      response: { status: 503 },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow("grader prompt failed (503): SDK error");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("uses a safe fallback for an invalid error name", async () => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      error: { name: "Bad Error\napi_key=supersecret", message: "Authorization: Basic dXNlcjpwYXNz" },
+      response: { status: 400 },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow(new Error("grader prompt failed (400): SDK error"));
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("never surfaces token-shaped error names", async () => {
+    for (const name of ["sk-ABCDEFGHIJKLMNOPQRSTU1234567890", "api_key=supersecret"]) {
+      const client = fakeClient();
+      respondToPrompt(client, { error: { name }, response: { status: 400 } });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed (400): SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    }
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    "omits non-finite nested error status %s",
+    async (statusCode) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { info: { error: { data: { statusCode } } }, parts: [] },
+        response: { status: 200 },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each([-1, 99, 200.5, 600])(
+    "omits out-of-domain nested error status %s",
+    async (statusCode) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { info: { error: { data: { statusCode } } }, parts: [] },
+        response: { status: 200 },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    "omits non-finite HTTP response status %s",
+    async (status) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { info: { error: { name: "APIError" } }, parts: [] },
+        response: { status },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects a status-only malformed HTTP response %s before accepting its text",
+    async (status) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+        response: { status },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each(["500", null])(
+    "rejects a status-only HTTP response with invalid status %s before accepting its text",
+    async (status) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+        response: { status },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each([0, -1, 99, 200.5, 600])(
+    "rejects out-of-domain HTTP status %s before accepting its text",
+    async (status) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+        response: { status },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each([200, 399])("accepts a valid non-failing HTTP status %s", async (status) => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+      response: { status },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .resolves.toEqual({ sessionID: "SID1", text: '{"pass":true,"reasons":[]}' });
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it.each([400, 500])("reports a valid failing HTTP status %s", async (status) => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+      response: { status },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow(new Error(`grader prompt failed (${status}): SDK error`));
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
   it("tracks the session as a grader only while it runs", async () => {

@@ -124,7 +124,7 @@ export interface EnforcementConfig {
   envGate?: string;
   perTier?: Record<string, "off" | "advisory" | "enforced">;
   guard?: { readDraftCap?: number; sameOpRetryCap?: number; blockSelfScript?: boolean; deliverableFirst?: boolean; budget?: number; blockScriptWrites?: boolean };
-  verify?: { require?: "never" | "whenDoDPresent" | "always"; requireExplicitDoD?: boolean; preferDeterministic?: boolean; graderPolicy?: "atLeastProducerTier"; graderTemperature?: number; minGraderTier?: string | null;
+  verify?: { require?: "never" | "whenDoDPresent" | "always"; requireExplicitDoD?: boolean; preferDeterministic?: boolean; graderPolicy?: "atLeastProducerTier"; graderTemperature?: number | null; minGraderTier?: string | null;
     /** Ceiling for one producer `session.prompt` turn, in ms. Default 600000. */
     delegateTimeoutMs?: number;
     /** Reject unavailable verification. Default false; never escalates it. */
@@ -769,14 +769,14 @@ function validateEnforcement(obj: Record<string, unknown>): void {
           "tiers.json: enforcement.verify.minGraderTier must be a string or null",
         );
       }
-      if (verify.graderTemperature !== undefined) {
+      if (verify.graderTemperature !== undefined && verify.graderTemperature !== null) {
         if (
           typeof verify.graderTemperature !== "number" ||
           !Number.isFinite(verify.graderTemperature) ||
           verify.graderTemperature < 0
         ) {
           throw new Error(
-            "tiers.json: enforcement.verify.graderTemperature must be a number >= 0",
+            "tiers.json: enforcement.verify.graderTemperature must be a number >= 0 or null",
           );
         }
       }

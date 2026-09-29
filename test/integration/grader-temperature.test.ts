@@ -4,9 +4,10 @@ import { invalidateConfigCache, loadConfig } from "../../src/router/config";
 // Keep this hook test independent of Git processes and background suite runs.
 vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => undefined }));
 
-async function captureGraderParams(): Promise<Record<string, unknown>> {
+async function captureGraderParams(
+  params: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
   let hooks: any;
-  const params: Record<string, unknown> = {};
   const graderSessionID = "grader-session";
 
   const ctx = {
@@ -59,12 +60,45 @@ describe("grader temperature hook", () => {
     await expect(captureGraderParams()).resolves.not.toHaveProperty("temperature");
   });
 
+  it("preserves a pre-existing temperature when graderTemperature is undefined", async () => {
+    const cfg = loadConfig();
+    delete cfg.enforcement?.verify?.graderTemperature;
+
+    await expect(captureGraderParams({ temperature: 0.8 })).resolves.toHaveProperty(
+      "temperature",
+      0.8,
+    );
+  });
+
+  it("omits temperature when graderTemperature is null", async () => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperature = null;
+
+    await expect(captureGraderParams()).resolves.not.toHaveProperty("temperature");
+  });
+
+  it("removes a pre-existing temperature when graderTemperature is null", async () => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperature = null;
+
+    await expect(
+      captureGraderParams({ temperature: 0.8 }),
+    ).resolves.not.toHaveProperty("temperature");
+  });
+
   it("keeps an explicitly configured zero grader temperature", async () => {
     const cfg = loadConfig();
     cfg.enforcement ??= {};
     cfg.enforcement.verify ??= {};
     cfg.enforcement.verify.graderTemperature = 0;
 
-    await expect(captureGraderParams()).resolves.toHaveProperty("temperature", 0);
+    await expect(captureGraderParams({ temperature: 0.8 })).resolves.toHaveProperty(
+      "temperature",
+      0,
+    );
   });
 });
