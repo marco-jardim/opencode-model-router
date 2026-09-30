@@ -10,6 +10,7 @@
     "test:coverage": "vitest run --coverage",
     "smoke": "cross-env RUN_OC_SMOKE=1 vitest run --config vitest.smoke.config.ts test/smoke",
     "smoke:keyless": "cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts test/smoke/deferred-catalog.smoke.test.ts",
+    "smoke:v2": "cross-env RUN_OC_SMOKE_V2=1 vitest run --config vitest.smoke.config.ts test/smoke/v2-registration.smoke.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "license": "GPL-3.0-only",
@@ -39,6 +40,7 @@
     "orchestration"
   ],
   "files": [
+    "server.ts",
     "src/",
     "tiers.json",
     "LICENSE",
@@ -49,6 +51,7 @@
     "@opencode-ai/plugin": ">=1.0.0 <2.0.0"
   },
   "devDependencies": {
+    "@opencode/plugin": "2.0.20",
     "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^4.1.8",
     "cross-env": "^10.1.0",

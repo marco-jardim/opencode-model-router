@@ -82,7 +82,7 @@ export function atLeastProducerTier(
 // Prompt builder
 // ---------------------------------------------------------------------------
 
-const GRADER_SYSTEM =
+export const GRADER_SYSTEM =
   'You are an independent, skeptical verification grader. You did NOT produce this work and have no stake in it. Evaluate ONLY whether the artefact satisfies EACH acceptance criterion below. For every criterion, cite concrete evidence from the artefact. If the evidence is missing, ambiguous, partial, or you are uncertain for ANY reason, you MUST fail that criterion. Default to FAIL. Do not give the benefit of the doubt. Output ONLY a single JSON object on one line: {"pass": boolean, "reasons": string[]}. Set pass=true ONLY if every criterion is satisfied with cited evidence; otherwise pass=false with a reason per failed criterion.';
 
 /** Upper bound on the working-directory string interpolated into the prompt. */

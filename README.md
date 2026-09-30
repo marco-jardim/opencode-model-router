@@ -250,6 +250,33 @@ Then install and configure model-router to handle the rest.
 
 ## Installation
 
+### OpenCode v2
+
+The v2 adapter is tested with OpenCode **2.0.20**. Use the v2 `plugins` key:
+
+```json
+{
+  "plugins": ["opencode-model-router"]
+}
+```
+
+For a local checkout, replace the package name with its absolute directory path.
+V2 loads the package's `server.ts` definition; v1 continues to load the original
+function from `src/index.ts`. Existing v1 configuration does not need to change.
+
+Routing, tool guards and verification use the same engine on both versions. V2
+uses its native `subagent` tool to create real child sessions, preserving the
+host's permissions and cancellation. There are a few host differences:
+
+- Delegations run in the foreground so verification receives a completed result.
+  The router's own deferred/background verification remains a separate setting.
+- V2 child sessions are interrupted during cleanup, but their history is retained:
+  its public plugin API does not expose session deletion.
+- Anti-narration warnings appear as separate synthetic transcript entries, because
+  completed v2 text events cannot be rewritten.
+
+See [the v2 compatibility notes](docs/OPENCODE_V2.md) for the API mapping and validation.
+
 ### From npm (recommended)
 ```bash
 # In your opencode project or globally

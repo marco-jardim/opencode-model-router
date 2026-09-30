@@ -40,6 +40,8 @@ describe("packaging: published tarball excludes tests and dev config (plan C4)",
 
     // MUST ship the runtime entry point and config.
     expect(paths).toContain("src/index.ts");
+    expect(paths).toContain("server.ts");
+    expect(paths).toContain("src/v2.ts");
     expect(paths).toContain("tiers.json");
   });
 });

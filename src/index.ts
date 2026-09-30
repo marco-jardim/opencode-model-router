@@ -1,4 +1,5 @@
-import type { Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Plugin } from "@opencode-ai/plugin";
+import type { RouterPluginInput } from "./compat/child-session";
 
 // Imports for internal use within this module
 import {
@@ -238,7 +239,7 @@ function warnSessionLookupFailedOnce(): void {
 const SESSION_ROOT_MEMO_MAX = 500;
 const SESSION_LOOKUP_RETRY_MS = 30_000;
 
-const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
+const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let cfg = loadConfig();
   const activeTiers = getActiveTiers(cfg);
 
@@ -369,6 +370,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     background,
   } = createVerificationWiring({
     client: ctx.client,
+    childRunner: ctx.routerChildRunner,
     directory: ctx.directory,
     getConfig: () => cfg,
     logger,
@@ -601,27 +603,33 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 ? `${scrubText(forcingNote)}\n\n${args.task}`
                 : args.task;
 
-              const created: any = await ctx.client.session.create({
-                body: {
-                  ...(toolCtx?.sessionID ? { parentID: toolCtx.sessionID } : {}),
-                },
-              });
-              const producerSid: string | undefined = created?.data?.id;
-              if (!producerSid) return null;
-              producerSessions.push(producerSid);
-              // Keep the ORIGINAL dispatch reference across retries/escalations:
-              // recapturing after a failed attempt would excuse its regression.
-              if (!baselineID) {
-                baselineID = producerSid;
-                // 2.4.2c: the directives come from the orchestrator's `task` argument only; the
-                // capture is awaited for at most VERIFY_WAIT and continues in the background.
-                dispatchStart = await startDispatch(changedFileStore, baselineID, args.cwd, dod, args.task, false);
-              }
-              // Compose with Layer 1: guard the plugin-created producer session.
-              try {
-                sessionStore.registerProducerSession(producerSid, tier, activeCfg);
-              } catch {
-                // non-fatal
+              let producerSid: string | undefined;
+              const registerProducer = async (sid: string) => {
+                producerSid = sid;
+                producerSessions.push(sid);
+                // Keep the ORIGINAL dispatch reference across retries/escalations:
+                // recapturing after a failed attempt would excuse its regression.
+                if (!baselineID) {
+                  baselineID = sid;
+                  // Capture before the child gets its first prompt, on either API.
+                  dispatchStart = await startDispatch(changedFileStore, baselineID, args.cwd, dod, args.task, false);
+                }
+                // Compose with Layer 1: guard the plugin-created producer session.
+                try {
+                  sessionStore.registerProducerSession(sid, tier, activeCfg);
+                } catch {
+                  // non-fatal
+                }
+              };
+              if (!ctx.routerChildRunner) {
+                const created: any = await ctx.client.session.create({
+                  body: {
+                    ...(toolCtx?.sessionID ? { parentID: toolCtx.sessionID } : {}),
+                  },
+                });
+                const sid: string | undefined = created?.data?.id;
+                if (!sid) return null;
+                await registerProducer(sid);
               }
 
               const model = tierModel(activeCfg, tier) ?? undefined;
@@ -639,10 +647,18 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // the same failed-attempt path as any other producer error — it
               // is never an empty artefact that a lenient DoD could pass.
               let producerError: string | null = null;
+              const childAbort = ctx.routerChildRunner ? new AbortController() : undefined;
               try {
-                const res: any = await withTimeout(
-                  ctx.client.session.prompt({
-                    path: { id: producerSid },
+                const res: any = await withTimeout<unknown>(
+                  ctx.routerChildRunner ? ctx.routerChildRunner.run({
+                    parentSessionID: toolCtx?.sessionID,
+                    agent: tier,
+                    model: model ? { ...model, variant: getActiveTiers(activeCfg)[tier]?.variant } : undefined,
+                    prompt: taskText,
+                    signal: childAbort!.signal,
+                    onCreated: registerProducer,
+                  }) : ctx.client.session.prompt({
+                    path: { id: producerSid! },
                     body: {
                       ...(model ? { model } : {}),
                       ...(tier ? { agent: tier } : {}),
@@ -655,12 +671,15 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                   ),
                   "delegate producer prompt",
                 );
-                producerText = extractAssistantText(res);
+                producerText = ctx.routerChildRunner ? res.text : extractAssistantText(res);
               } catch (error) {
                 producerError =
                   error instanceof Error ? error.message : String(error);
                 producerText = "";
+              } finally {
+                childAbort?.abort();
               }
+              if (!producerSid || !baselineID) return null;
               // pending.ts R11: the producer's changes landed by now.
               const returnedAt = Date.now();
 
