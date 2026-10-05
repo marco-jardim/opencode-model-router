@@ -11,7 +11,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
-import { TASK_VERIFICATION } from "../../src/compat/child-session";
+import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
+import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -75,6 +76,167 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  async function depthFixture(mode: "enforced" | "advisory", run?: (request: ChildSessionRequest) => Promise<{ sessionID: string; text: string }>) {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-depth-"));
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", mode === "enforced" ? "1" : "");
+    vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
+    invalidateConfigCache();
+    const f = fixture();
+    const get = vi.fn(async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }));
+    const hooks = await ModelRouterPlugin({
+      directory: home, worktree: home, routerHost: "v2",
+      client: { session: { get } },
+      ...(run ? { routerChildRunner: { run, dispose: async () => undefined } } : {}),
+    } as unknown as RouterPluginInput);
+    const lifecycle = vi.fn(async (input: Parameters<NonNullable<Hooks["event"]>>[0]) => { await hooks.event?.(input); });
+    await f.start({ ...hooks, event: lifecycle });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true }); });
+    f.emit({ type: "session.created", data: { sessionID: "root" } });
+    f.emit({ type: "session.created", data: { sessionID: "child", parentID: "root" } });
+    await vi.waitFor(() => expect(lifecycle).toHaveBeenCalledTimes(2));
+    return { ...f, get };
+  }
+
+  const depthCall = (id = "call") => ({ ...call, id, tool: "subagent", input: { agent: "fast", prompt: "Inspect the project" } });
+  const depthResult = (id = "call", status = "completed", text = "Done") => ({
+    ...depthCall(id), status: "completed",
+    result: { output: { status, output: text }, content: text },
+  });
+
+  it.each([{}, { background: true }, { sessionID: "previous" }])("propagates the real D5 refusal for dispatch options %j without mutating native input", async (options) => {
+    const f = await depthFixture("enforced");
+    const event = { ...depthCall(), input: { ...depthCall().input, ...options } };
+    const original = { ...event.input };
+    await expect(f.toolHooks["execute.before"](event)).rejects.toThrow(depthLimitMessage(1, 1));
+    expect(event.input).toEqual(original);
+    // These lifecycle facts, including parentID, seeded recordCreated: no backend lookup.
+    expect(f.get).not.toHaveBeenCalled();
+    const after = depthResult();
+    await f.toolHooks["execute.after"](after);
+    expect(after.result.output.output).toBe("Done");
+  });
+
+  it.each(["completed", "running"])("delivers the real advisory banner exactly once on a %s result", async (status) => {
+    const f = await depthFixture("advisory");
+    await f.toolHooks["execute.before"](depthCall());
+    const after = depthResult("call", status);
+    await f.toolHooks["execute.after"](after);
+    expect(after.result.output.output.match(/GUARD:delegation_depth/g)).toHaveLength(1);
+    expect(after.result.output.output).toContain(depthAdvisoryBanner(1, 1));
+    expect(JSON.stringify(after.result.content).match(/GUARD:delegation_depth/g)).toHaveLength(1);
+    await f.toolHooks["execute.after"](after);
+    expect(after.result.output.output.match(/GUARD:delegation_depth/g)).toHaveLength(1);
+    const replay = depthResult("call", status);
+    await f.toolHooks["execute.after"](replay);
+    expect(replay.result.output.output).toBe("Done");
+    expect(f.get).not.toHaveBeenCalled();
+  });
+
+  it.each(["failed", "error", "interrupted"])("drops the advisory banner after a %s event, including replay", async (status) => {
+    const f = await depthFixture("advisory");
+    await f.toolHooks["execute.before"](depthCall());
+    const failed = { ...depthResult(), status };
+    await f.toolHooks["execute.after"](failed);
+    expect(failed.result.output.output).toBe("Done");
+    const replay = depthResult();
+    await f.toolHooks["execute.after"](replay);
+    expect(replay.result.output.output).toBe("Done");
+    await f.toolHooks["execute.before"](depthCall("next"));
+    const next = depthResult("next");
+    await f.toolHooks["execute.after"](next);
+    expect(next.result.output.output.match(/GUARD:delegation_depth/g)).toHaveLength(1);
+  });
+
+  it.each(["enforced", "advisory"] as const)("judges a v2 childRunner grader's own task by its recorded depth in %s mode", async (mode) => {
+    let f: Awaited<ReturnType<typeof depthFixture>>;
+    let count = 0;
+    let graders = 0;
+    const run = vi.fn(async (request: ChildSessionRequest) => {
+      const sid = `grader-child-${count++}`;
+      await request.onCreated(sid);
+      if (request.system !== undefined) {
+        graders++;
+        const event = { ...depthCall("grader-task"), sessionID: sid };
+        if (mode === "enforced") await expect(f.toolHooks["execute.before"](event)).rejects.toThrow(depthLimitMessage(1, 1));
+        else {
+          await f.toolHooks["execute.before"](event);
+          const after = { ...depthResult("grader-task"), sessionID: sid };
+          await f.toolHooks["execute.after"](after);
+          expect(after.result.output.output.match(/GUARD:delegation_depth/g)).toHaveLength(1);
+        }
+        expect(f.get.mock.calls.some(([req]) => req.path.id === sid)).toBe(false);
+      }
+      return { sessionID: sid, text: '{"pass":true,"reasons":[]}' };
+    });
+    f = await depthFixture(mode, run);
+    const result = await f.tools.delegate.execute({ tier: "fast", task: "VERIFY:required\nDo the work", acceptance: "[acceptance]\ncriteria: correct\n[/acceptance]" }, {
+      ...call, sessionID: "root", signal: new AbortController().signal, progress: vi.fn(async () => undefined),
+    });
+    expect(graders).toBe(1);
+    expect(result.content).toContain("[router ✓ verified:");
+  });
+
+  it("evicts the oldest banner above 1000 pending calls and refreshes repeated IDs", async () => {
+    const f = fixture();
+    await f.start({ "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[DEPTH_BANNER] = "banner"; } });
+    for (let i = 0; i < 1000; i++) await f.toolHooks["execute.before"](depthCall(`call-${i}`));
+    await f.toolHooks["execute.before"](depthCall("call-0"));
+    await f.toolHooks["execute.before"](depthCall("call-1000"));
+    for (const [id, expected] of [["call-1", "Done"], ["call-0", "Done\n\nbanner"], ["call-1000", "Done\n\nbanner"]]) {
+      const after = depthResult(id);
+      await f.toolHooks["execute.after"](after);
+      expect(after.result.output.output).toBe(expected);
+    }
+  });
+
+  it("combines the verification notice and banner on a background acknowledgement without grading", async () => {
+    const f = fixture(); const afterHook = vi.fn();
+    await f.start({
+      "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => {
+        output[DEPTH_BANNER] = "banner"; output[TASK_VERIFICATION] = true;
+      },
+      "tool.execute.after": afterHook,
+    });
+    await f.toolHooks["execute.before"](depthCall());
+    const after = depthResult("call", "running");
+    await f.toolHooks["execute.after"](after);
+    expect(after.result.output.output).toContain("has not been verified");
+    expect(after.result.output.output.endsWith("\n\nbanner")).toBe(true);
+    expect(afterHook).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "retained Task(subagent_type=fast)  "])("appends a banner after legacy changes and preserves source text: %j", async (text) => {
+    const f = fixture();
+    await f.start({
+      "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[DEPTH_BANNER] = "banner"; },
+      "tool.execute.after": async (_: unknown, output: { output: string }) => {
+        expect(output.output).not.toContain("banner");
+        if (text) output.output += "\n[router] Use task_id next";
+      },
+    });
+    await f.toolHooks["execute.before"](depthCall());
+    const after = { ...depthCall(), status: "completed", result: { output: text, content: text } };
+    await f.toolHooks["execute.after"](after);
+    expect(after.result.output).toBe(text ? `${text}\n[router] Use sessionID next\n\nbanner` : "banner");
+  });
+
+  it.each([true, false])("preserves native registration option precedence (native keys present: %s)", async (native) => {
+    const f = fixture();
+    const thinking = { type: "disabled" };
+    const options = {
+      reasoning_effort: "high", reasoning_summary: "auto", budget_tokens: 2000,
+      ...(native ? { reasoningEffort: "low", reasoningSummary: "concise", thinking } : {}),
+    };
+    await f.start({ config: async (config: { agent: Record<string, unknown> }) => { config.agent.fast = { options }; } });
+    const event = { ...call, model: { providerID: "p", id: "m" }, options: {}, system: [] };
+    await f.sessionHooks.context(event);
+    expect(event.options).toEqual(native
+      ? { reasoningEffort: "low", reasoningSummary: "concise", thinking }
+      : { reasoningEffort: "high", reasoningSummary: "auto", thinking: { type: "enabled", budgetTokens: 2000 } });
+    expect(event.options).not.toHaveProperty("options");
+  });
+
   it("maps tier models, variants, prompts, limits and provider options while preserving existing permissions", async () => {
     const f = fixture();
     await f.start({ config: async (config: any) => {
@@ -439,6 +601,7 @@ describe("OpenCode 2 hook adapter", () => {
     const event = { ...call, agent: V2_GRADER_AGENT, model: { providerID: "openai", id }, options: { maxOutputTokens: 123 }, system: [] };
     await f.sessionHooks.context(event);
     expect(event.options).toEqual({ maxOutputTokens: 123, ...(retained ? { temperature } : {}) });
+    expect(event.options).not.toHaveProperty("options");
   });
 
   it.each([undefined, [], ["openai/model"]])("removes inherited grader temperature when null even with allowlist %j", async (models) => {
