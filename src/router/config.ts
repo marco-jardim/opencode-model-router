@@ -343,6 +343,47 @@ const REPO_MARKERS = [".git", ".hg", ".svn"] as const;
  */
 const MAX_WALK_DEPTH = 16;
 
+/** errno code of a thrown fs error, or "UNKNOWN" when it carries none. */
+function errnoCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : "UNKNOWN";
+}
+
+/**
+ * ENOENT (nothing there) and ENOTDIR (a path component is a file) both mean the
+ * path is gone. Every other errno (EACCES, EIO, ELOOP, …) means "cannot tell",
+ * which is NOT the same as "removed".
+ */
+function isGoneError(err: unknown): boolean {
+  const code = errnoCode(err);
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** A stat that failed for a reason other than the path being gone. */
+interface StatFailure {
+  code: string;
+  message: string;
+}
+
+/**
+ * Outcome of looking at a config source: it is there, it is definitely gone, or
+ * it could not be inspected. Unlike `existsSync` — which folds every error into
+ * `false` — this keeps "removed" and "unreachable" apart, so a transient I/O
+ * error or a directory that lost search permission is never mistaken for the
+ * user deleting the file.
+ */
+type StatKind = "present" | "missing" | StatFailure;
+
+function statKind(p: string): StatKind {
+  try {
+    statSync(p);
+    return "present";
+  } catch (err) {
+    if (isGoneError(err)) return "missing";
+    return { code: errnoCode(err), message: (err as Error).message };
+  }
+}
+
 /**
  * Locate the project-local overrides file by walking upward from the current
  * working directory, so the project config is found even when opencode is
@@ -360,6 +401,14 @@ const MAX_WALK_DEPTH = 16;
  * tree with no repo marker anywhere would otherwise be walked all the way to the
  * filesystem root, silently adopting an unrelated ancestor's override file.
  * Returns the resolved path, or undefined when no file applies.
+ *
+ * Only ENOENT/ENOTDIR count as "no file here". A candidate that cannot be
+ * inspected for any other reason (EACCES on a parent directory, a transient
+ * I/O error) is still returned and ends the walk — the nearest override wins,
+ * so it must not be skipped in favour of an ancestor's file — and the later
+ * read reports it as a failure instead of the source silently vanishing. A
+ * repo marker that cannot be inspected is likewise treated as present, so the
+ * walk never climbs past a project root it merely failed to stat.
  */
 export function findProjectOverride(): string | undefined {
   // Both sides of the $HOME comparison below have to be resolved the same way.
@@ -381,7 +430,7 @@ export function findProjectOverride(): string | undefined {
   let depth = 0;
 
   for (;;) {
-    const hasMarker = REPO_MARKERS.some((m) => existsSync(join(dir, m)));
+    const hasMarker = REPO_MARKERS.some((m) => statKind(join(dir, m)) !== "missing");
 
     // $HOME is not a project directory. Only look inside it when it is itself a
     // repo root (a dotfiles repo), otherwise `~/.opencode/…` would be picked up
@@ -389,7 +438,7 @@ export function findProjectOverride(): string | undefined {
     if (dir === home && !hasMarker) return undefined;
 
     const candidate = join(dir, ".opencode", OVERRIDE_FILENAME);
-    if (existsSync(candidate)) return candidate;
+    if (statKind(candidate) !== "missing") return candidate;
 
     if (hasMarker) return undefined; // reached the project root, no file
     if (dir === home) return undefined; // home was a repo root; never go above it
@@ -1203,9 +1252,16 @@ function readOverridesAt(
   op: string,
   failures?: SourceFailure[],
 ): Record<string, unknown> | undefined {
+  // Only ENOENT/ENOTDIR mean the file is absent. Any other stat error (EACCES on
+  // a parent directory, a transient I/O error) is a failure, never a removal —
+  // otherwise a reload would swap the last valid config for lower-priority
+  // defaults.
+  const kind = statKind(op);
+  if (kind === "missing") return undefined;
+
   let text: string;
   try {
-    if (!existsSync(op)) return undefined;
+    if (kind !== "present") throw new Error(kind.message);
     text = readFileSync(op, "utf-8");
   } catch (err) {
     // The file is there but unreadable (permissions, a dangling symlink, a
@@ -1311,7 +1367,10 @@ function sourcePaths(): Array<string | undefined> {
 /**
  * mtime/ctime/size fingerprint of every file that feeds loadConfig(). ctime is
  * included because restoring access to a previously unreadable file (chmod)
- * changes ctime but not mtime/size, and that must trigger a retry.
+ * changes ctime but not mtime/size, and that must trigger a retry. Only
+ * ENOENT/ENOTDIR map to `missing` (removal); any other stat error maps to
+ * `error:<code>`, a distinct marker, so losing access to a file is never
+ * fingerprinted — or reloaded — as if it had been deleted.
  */
 function sourceFingerprint(paths: Array<string | undefined>): string {
   return paths
@@ -1320,8 +1379,8 @@ function sourceFingerprint(paths: Array<string | undefined>): string {
       try {
         const st = statSync(p);
         return `${p}:${st.mtimeMs}:${st.ctimeMs}:${st.size}`;
-      } catch {
-        return `${p}:missing`;
+      } catch (err) {
+        return isGoneError(err) ? `${p}:missing` : `${p}:error:${errnoCode(err)}`;
       }
     })
     .join("|");
@@ -1459,7 +1518,12 @@ function buildConfig(failures: SourceFailure[]): RouterConfig {
   }
 
   try {
-    if (existsSync(statePath())) {
+    const stateKind = statKind(statePath());
+    if (stateKind !== "missing") {
+      // Present-but-uninspectable (EACCES, EIO, …) is a failure, not an absent
+      // state file: reverting the persisted preset on a transient error would
+      // be silent data loss.
+      if (stateKind !== "present") throw new Error(`cannot read it — ${stateKind.message}`);
       const state = JSON.parse(
         readFileSync(statePath(), "utf-8"),
       ) as RouterState;
