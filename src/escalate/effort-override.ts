@@ -38,6 +38,10 @@ export function createEffortOverrideStore(
   opts: { maxEntries?: number; logger?: Logger } = {},
 ): EffortOverrideStore {
   const logger = opts.logger ?? console;
+  const builderLogger = {
+    warn: (message: string) => warn(logger, message),
+    flush: () => Promise.resolve(),
+  };
   const requestedMax = opts.maxEntries ?? 1_000;
   const maxEntries = Number.isSafeInteger(requestedMax) && requestedMax > 0 ? requestedMax : 1_000;
   if (maxEntries !== requestedMax) warn(logger, "Invalid effort override maxEntries; using 1000");
@@ -61,7 +65,7 @@ export function createEffortOverrideStore(
           warn(logger, `Effort override for ${sessionID} exceeds the tier ceiling; override refused`);
           return;
         }
-        const options = buildAgentOptions({ ...tier, effort }, tierName);
+        const options = buildAgentOptions({ ...tier, effort }, tierName, builderLogger);
         const keys: Entry["keys"] = {};
         for (const key of EFFORT_OVERRIDE_KEYS) {
           if (Object.hasOwn(options, key)) keys[key] = options[key];

@@ -228,7 +228,21 @@ describe("per-session effort overrides", () => {
     expect(logger.warn).toHaveBeenCalledTimes(3);
   });
 
-  it("computes once, snapshots the tier, and re-setting replaces and refreshes age", () => {
+  it.each([
+    { model: "anthropic/claude-sonnet-4-5", effort: "low", reasoning: { summary: "auto" } },
+    { ...claude, thinking: { budgetTokens: 8000 } },
+    { model: "anthropic/claude-sonnet-4-5", effort: "low", thinking: { budgetTokens: 0 } },
+  ] satisfies TierConfig[])("routes builder warnings to the injected logger, once (%#)", (tier) => {
+    const consoleWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { store, logger } = setup();
+    store.set("producer", "fast", tier, "high");
+    store.set("producer", "fast", tier, "high");
+    expect(store.has("producer")).toBe(true);
+    expect(consoleWarning).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("tier fast:"));
+  });
+
+  it("computes once, snapshots the tier, and re-setting replaces and refreshes age", async () => {
     const { store, logger } = setup(2);
     const builder = vi.spyOn(agentOptions, "buildAgentOptions");
     const tier = { ...openai };
@@ -241,7 +255,10 @@ describe("per-session effort overrides", () => {
       expect(target).toEqual({ reasoningEffort: "high" });
     }
     expect(builder).toHaveBeenCalledTimes(2);
-    expect(builder).toHaveBeenLastCalledWith({ ...openai, effort: "high" }, "fast");
+    expect(builder).toHaveBeenLastCalledWith({ ...openai, effort: "high" }, "fast", {
+      warn: expect.any(Function), flush: expect.any(Function),
+    });
+    await builder.mock.calls.at(-1)?.[2]?.flush();
     store.set("third", "fast", openai, "medium");
     expect(store.has("second")).toBe(false);
     expect(store.has("producer")).toBe(true);
@@ -301,7 +318,7 @@ const fixtures = models.flatMap((model) => thinkingConfigs.flatMap((thinking) =>
 
 describe("native builder agreement", () => {
   it.each(fixtures)("applies exactly the builder effort keys (%#)", ({ tier, ceiling }) => {
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const consoleWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { store, logger } = setup();
     const separator = tier.model.indexOf("/");
     for (const effort of EFFORT_LEVELS.filter((level) => agentOptions.effortRank(level) <= agentOptions.effortRank(ceiling))) {
@@ -313,6 +330,6 @@ describe("native builder agreement", () => {
       expect(target).toEqual(keys);
       expect(Object.values(target)).toEqual([effort]);
     }
-    expect(logger.warn).not.toHaveBeenCalled();
+    expect(consoleWarning).not.toHaveBeenCalled();
   });
 });
