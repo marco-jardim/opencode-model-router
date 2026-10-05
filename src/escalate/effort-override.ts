@@ -107,9 +107,12 @@ export function applyEffortOverride(
     if (!entry || input.agent !== entry.tierName) return;
     if (input.model === null || typeof input.model !== "object") return;
     const model = input.model as { providerID?: unknown; modelID?: unknown; id?: unknown };
+    const providerID = model.providerID;
+    const modelID = model.modelID ?? model.id;
     const separator = entry.model.indexOf("/");
-    if (model.providerID !== entry.model.slice(0, separator)
-      || (model.modelID ?? model.id) !== entry.model.slice(separator + 1)) return;
+    if (typeof providerID !== "string" || typeof modelID !== "string"
+      || providerID.toLowerCase() !== entry.model.slice(0, separator).toLowerCase()
+      || modelID.toLowerCase() !== entry.model.slice(separator + 1).toLowerCase()) return;
     if (target === null || typeof target !== "object") {
       // Warning state lives with the bounded entry and is removed on clear/eviction.
       if (!entry.warnedMissingTarget) {

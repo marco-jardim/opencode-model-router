@@ -50,8 +50,10 @@ describe("per-session effort overrides", () => {
   it.each([
     {}, { ...producer, sessionID: 1 }, { ...producer, sessionID: "other" },
     { ...producer, agent: "title" }, { ...producer, agent: {} },
+    { ...producer, sessionID: "Producer" }, { ...producer, agent: "Fast" },
     { ...producer, model: undefined }, { ...producer, model: null }, { ...producer, model: "openai/gpt-5" },
     { ...producer, model: {} }, { ...producer, model: { providerID: "azure", id: "gpt-5" } },
+    { ...producer, model: { providerID: "openai", id: 5 } },
     { ...producer, model: { providerID: "openai", id: "gpt-4" } },
     { ...producer, model: { providerID: "openai", id: "gpt-5", modelID: "other" } },
   ])("leaves target unchanged for a non-producer input %j", (input) => {
@@ -75,6 +77,19 @@ describe("per-session effort overrides", () => {
     const target = {};
     applyEffortOverride(store, { ...producer, model }, target, logger);
     expect(target).toEqual({ reasoningEffort: "medium" });
+  });
+
+  it.each([
+    { providerID: "openai", id: "gpt-5" },
+    { providerID: "openai", modelID: "gpt-5" },
+    { providerID: "OPENAI", modelID: "GPT-5" },
+  ])("matches mixed-case tier identity against host model %j", (model) => {
+    const { store, logger } = setup();
+    store.set("producer", "fast", { ...openai, model: "OpenAI/GPT-5" }, "medium");
+    const target = {};
+    applyEffortOverride(store, { ...producer, model }, target, logger);
+    expect(target).toEqual({ reasoningEffort: "medium" });
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it("splits nested model identities only at the first slash", () => {
@@ -326,7 +341,7 @@ describe("native builder agreement", () => {
       const expected = agentOptions.buildAgentOptions({ ...tier, effort }, "fast");
       const keys = Object.fromEntries(EFFORT_OVERRIDE_KEYS.filter((key) => Object.hasOwn(expected, key)).map((key) => [key, expected[key]]));
       const target = {};
-      applyEffortOverride(store, { ...producer, model: { providerID: tier.model.slice(0, separator), id: tier.model.slice(separator + 1) } }, target, logger);
+      applyEffortOverride(store, { ...producer, model: { providerID: tier.model.slice(0, separator).toLowerCase(), id: tier.model.slice(separator + 1).toLowerCase() } }, target, logger);
       expect(target).toEqual(keys);
       expect(Object.values(target)).toEqual([effort]);
     }
