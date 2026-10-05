@@ -64,9 +64,12 @@ other keys keep their behaviour: unrelated descriptors and references are preser
 `test:174-191`), and `deepMerge` order is untouched. Edge cases outside JSON are in QA-1.1-4 and
 QA-1.1-5.
 
-**Amended during implementation:** none recorded. The diff does not touch the plan, and no
-deviation from 1.1.1–1.1.3 is declared. The `__proto__` rejection that 1.1.1.b requires was silently
-not implemented (QA-1.1-2).
+**Amended during implementation:** `maxDelegationDepth` is a safe integer from 1 to 32,
+or `null`, rather than an unbounded integer ≥ 1. The cap matches `MAX_DEPTH_HOPS` so a cycle
+or overlong chain refuses the next dispatch for every configured limit. Acceptance tests
+accept `32` and reject `33` and `100`. Recorded in plan §1.7 A13 on de/main (orchestrator),
+resolving QA-1.1-R2-1. The plan is not edited on this branch. The previously missing
+`__proto__` rejection (QA-1.1-2) was fixed in `6bfd03f`.
 
 **Adversarial checks with no finding:**
 - `-0` is rejected (`Number.isInteger(-0)` and `-0 < 1`), as are `1e400` (→ `Infinity`), `NaN`, a
@@ -139,10 +142,17 @@ Checks at `5fdc887`:
 
 | id | severity | file:line | description | resolution |
 |---|---|---|---|---|
-| QA-1.1-R2-1 | minor | plan `:359`, `:860`, `:880`, `:894`; this report `:67` | **The 32 cap is an unrecorded deviation from the plan.** `b106dd3` implements the orchestrator's decision (`maxDelegationDepth` ≤ 32 = `MAX_DEPTH_HOPS`, safe integer), but the plan text still says otherwise: <br>• §1.4 (`:359`) still says "integer ≥ 1, or `null`"; <br>• 1.1.1.b (`:860`) still says "integer ≥ 1 (`Number.isInteger`)"; <br>• the 1.1 test list (`:880`) still says "`1`, `2` and `100` accepted", while the test now rejects `100` (`["old unbounded limit", 100, "100"]`); <br>• the 1.1 acceptance (`:894`) requires validation "exactly as in §1.4". <br>This report says "**Amended during implementation:** none recorded" (`:67`). The plan has not changed on `de/p11` or `de/main` since `c11e7a8`. §0.7 (`:182`) requires an approved deviation to be recorded under `## Implementation notes` and marked *Amended during implementation*, and the plan is orchestrator-owned (`:729`). Until it is recorded, the 1.1 acceptance cannot be ticked against the plan. Fix: record the amendment in this report's Implementation notes and in the `de/main` plan's §1.4 row, 1.1.1.b and 1.1 test list. | open |
-| QA-1.1-R2-2 | minor | `src/router/config.ts:752-758` (and `:1142`) | **A key served only by a Proxy `get` trap now leaks the unvalidated input. This regresses from round 1** (not reachable from JSON; same class as QA-1.1-4). `withValidatedSnapshots` snapshots a key only if it is an own descriptor or passes `key in obj`. Since `87af99f` it also returns the input itself when nothing was snapshotted (`if (!changed) return obj`). So a Proxy that answers `get` but hides the key from both `ownKeys` and `has` is validated through `get`, then returned unchanged. Probe 1: an `enforcement` Proxy whose getter yields `2`, then `-7`. `resolveDepthLimit` returns `-7` at `HEAD` but `1` at `e0742fe`, where the copy dropped the virtual key. Probe 2: a root Proxy serving `enforcement` only through `get`, first `{maxDelegationDepth: 2}` and then `{maxDelegationDepth: -5, escalate: {effortBump: "yes", effortBumpMax: "ultra"}}`. `validateConfig` returns the input Proxy; `resolveDepthLimit` → `-5` and `resolveEffortBump` → `{enabled: "yes", max: "ultra"}`. The round-1 recommendation (own-or-`in`) missed this case. Fix: also snapshot when the validated value is defined (`value !== undefined \|\| Object.hasOwn(descriptors, key) \|\| key in obj`), and add both probes to the Proxy test. | open |
-| QA-1.1-R2-3 | nit | `src/router/config.ts:742` | **Truncation can split a surrogate pair.** `description.slice(0, 79)` cuts at a UTF-16 code unit, so a JSON-reachable string can leave a lone high surrogate before `…`. Probe: `effortBumpMax: "a" + "😀".repeat(100)` gives a description that ends in `\ud83d` followed by `…`, and `isWellFormed()` is `false`, so the warning prints U+FFFD. Fix: drop a trailing high surrogate before appending `…` (or slice by code points), and add the case to the `describeValue` test. | open |
-| QA-1.1-R2-4 | nit | `docs/CONFIG_REFERENCE.md:178-180` (pre-existing `:161`, `:604`); `src/router/enforcement.ts:29-46` | **The `perTier` precedence condition is incomplete.** The new sentence says a `perTier` entry overrides `mode` "when the env gate is unset/empty". `resolveEnforcementMode` also applies `perTier[tier]` when the gate holds any value other than `1` or `0`: it warns, then runs the same config path (`enforcement.ts:29-46`). The sentence copies the pre-existing `:161` wording, and the truth-table row `:604` ("config `mode` (fallback)") also omits `perTier`. Fix: at `:178-179`, say "overrides `mode` unless the env gate is `1` or `0`". Align `:161` and `:604` in the same commit, or hand them to 3.1. | open |
+| QA-1.1-R2-1 | minor | plan `:359`, `:860`, `:880`, `:894`; this report `:67` | **The 32 cap is an unrecorded deviation from the plan.** `b106dd3` implements the orchestrator's decision (`maxDelegationDepth` ≤ 32 = `MAX_DEPTH_HOPS`, safe integer), but the plan text still says otherwise: <br>• §1.4 (`:359`) still says "integer ≥ 1, or `null`"; <br>• 1.1.1.b (`:860`) still says "integer ≥ 1 (`Number.isInteger`)"; <br>• the 1.1 test list (`:880`) still says "`1`, `2` and `100` accepted", while the test now rejects `100` (`["old unbounded limit", 100, "100"]`); <br>• the 1.1 acceptance (`:894`) requires validation "exactly as in §1.4". <br>This report says "**Amended during implementation:** none recorded" (`:67`). The plan has not changed on `de/p11` or `de/main` since `c11e7a8`. §0.7 (`:182`) requires an approved deviation to be recorded under `## Implementation notes` and marked *Amended during implementation*, and the plan is orchestrator-owned (`:729`). Until it is recorded, the 1.1 acceptance cannot be ticked against the plan. Fix: record the amendment in this report's Implementation notes and in the `de/main` plan's §1.4 row, 1.1.1.b and 1.1 test list. | plan §1.7 A13 on de/main (orchestrator) |
+| QA-1.1-R2-2 | minor | `src/router/config.ts:752-758` (and `:1142`) | **A key served only by a Proxy `get` trap now leaks the unvalidated input. This regresses from round 1** (not reachable from JSON; same class as QA-1.1-4). `withValidatedSnapshots` snapshots a key only if it is an own descriptor or passes `key in obj`. Since `87af99f` it also returns the input itself when nothing was snapshotted (`if (!changed) return obj`). So a Proxy that answers `get` but hides the key from both `ownKeys` and `has` is validated through `get`, then returned unchanged. Probe 1: an `enforcement` Proxy whose getter yields `2`, then `-7`. `resolveDepthLimit` returns `-7` at `HEAD` but `1` at `e0742fe`, where the copy dropped the virtual key. Probe 2: a root Proxy serving `enforcement` only through `get`, first `{maxDelegationDepth: 2}` and then `{maxDelegationDepth: -5, escalate: {effortBump: "yes", effortBumpMax: "ultra"}}`. `validateConfig` returns the input Proxy; `resolveDepthLimit` → `-5` and `resolveEffortBump` → `{enabled: "yes", max: "ultra"}`. The round-1 recommendation (own-or-`in`) missed this case. Fix: also snapshot when the validated value is defined (`value !== undefined \|\| Object.hasOwn(descriptors, key) \|\| key in obj`), and add both probes to the Proxy test. | `2e35d8d` |
+| QA-1.1-R2-3 | nit | `src/router/config.ts:742` | **Truncation can split a surrogate pair.** `description.slice(0, 79)` cuts at a UTF-16 code unit, so a JSON-reachable string can leave a lone high surrogate before `…`. Probe: `effortBumpMax: "a" + "😀".repeat(100)` gives a description that ends in `\ud83d` followed by `…`, and `isWellFormed()` is `false`, so the warning prints U+FFFD. Fix: drop a trailing high surrogate before appending `…` (or slice by code points), and add the case to the `describeValue` test. | `e21aa24` |
+| QA-1.1-R2-4 | nit | `docs/CONFIG_REFERENCE.md:178-180` (pre-existing `:161`, `:604`); `src/router/enforcement.ts:29-46` | **The `perTier` precedence condition is incomplete.** The new sentence says a `perTier` entry overrides `mode` "when the env gate is unset/empty". `resolveEnforcementMode` also applies `perTier[tier]` when the gate holds any value other than `1` or `0`: it warns, then runs the same config path (`enforcement.ts:29-46`). The sentence copies the pre-existing `:161` wording, and the truth-table row `:604` ("config `mode` (fallback)") also omits `perTier`. Fix: at `:178-179`, say "overrides `mode` unless the env gate is `1` or `0`". Align `:161` and `:604` in the same commit, or hand them to 3.1. | `f8e40bc` |
+
+Round-2 fix verification at `f8e40bc`:
+- `npx vitest run test/unit/config-depth-effort.test.ts test/unit/config.validate.test.ts test/unit/docs-drift.test.ts test/unit/config --maxWorkers=50%`: **5 files, 281 tests passed**.
+- `npm run typecheck`: clean (`tsc --noEmit`, no diagnostics).
+- Regression tests cover get-only Proxy leaf and root values (one read, validated depth/effort
+  retained) and `"a" + "😀".repeat(100)` for all three invalid-value messages.
+- No full-suite run or further QA review was performed.
 
 Handoff added in round 2:
 - **To 1.2:** `MAX_DEPTH_HOPS` (plan `:930`, `src/router/depth.ts`) must equal
@@ -183,10 +193,4 @@ Handoff added in round 2:
 
 ## Verdict
 
-**Pending fixes.**
-- Round 1: all 9 findings are resolved.
-- Round 2: 4 findings are open: 2 minor (QA-1.1-R2-1, QA-1.1-R2-2) and 2 nit (QA-1.1-R2-3, QA-1.1-R2-4).
-  None is blocking, critical or major. None bricks startup, and no invalid value gets through
-  validation from a config file. R2-2 needs a hand-built Proxy.
-- Under §0.7, round-2 findings are all fixed. A further review of those fixes is round 3, which fixes
-  only `blocking`, `critical` and `major` findings.
+Open findings: 0 (every round-1 and round-2 finding fixed)
