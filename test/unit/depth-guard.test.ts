@@ -226,7 +226,9 @@ describe("delegation depth guard", () => {
         block: true, mode: "enforced", guard: DELEGATION_DEPTH_GUARD, message: depthLimitMessage(1, 1),
       });
     }
-    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("invalid delegation depth limit"));
+    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(
+      `[router] delegation depth: invalid delegation depth limit ${typeof max}: ${String(max)}; using effective limit 1.`,
+    );
     guard.depthOf.mockResolvedValue(0);
     expect((await guard.checkDispatch("root")).block).toBe(false);
   });
@@ -241,6 +243,34 @@ describe("delegation depth guard", () => {
     expect(guard.warn).toHaveBeenCalledTimes(1);
     expect(guard.depthOf).not.toHaveBeenCalled();
     expect(guard.resolveMode).toHaveBeenNthCalledWith(1, undefined);
+  });
+
+  it("warns once per distinct live invalid limit and refuses using the effective limit", async () => {
+    const guard = setup(1);
+    for (const max of [0, 2, 99, 0, 99]) {
+      guard.limit.mockReturnValue(max);
+      const result = await guard.checkDispatch("caller");
+      expect(result.block).toBe(max !== 2);
+      expect(result.message).toBe(max === 2 ? undefined : depthLimitMessage(1, 1));
+    }
+    expect(guard.warn.mock.calls).toStrictEqual([
+      ["[router] delegation depth: invalid delegation depth limit number: 0; using effective limit 1."],
+      ["[router] delegation depth: invalid delegation depth limit number: 99; using effective limit 1."],
+    ]);
+  });
+
+  it("bounds distinct invalid-limit warnings at 100, evicting the oldest", async () => {
+    const guard = setup(1);
+    for (let i = 0; i < 101; i++) {
+      guard.limit.mockReturnValue(-i);
+      await guard.checkDispatch("caller");
+    }
+    guard.limit.mockReturnValue(-1);
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(101);
+    guard.limit.mockReturnValue(0);
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(102);
   });
 
   it.each(["off", "null"])("short-circuits %s before validating the caller", async (disabled) => {

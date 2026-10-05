@@ -38,8 +38,8 @@ export function createDepthGuard(deps: {
   const warnedModeErrors = new Set<unknown>();
   const warnedLimitErrors = new Set<unknown>();
   const warnedDepths = new Set<unknown>();
+  const warnedLimits = new Set<unknown>();
   let warnedCaller = false;
-  let warnedLimit = false;
 
   function warn(message: string): boolean {
     try {
@@ -95,9 +95,7 @@ export function createDepthGuard(deps: {
       }
       if (max === null) return { block: false, mode };
       if (!Number.isInteger(max) || max < 1 || max > MAX_DELEGATION_DEPTH_LIMIT) {
-        if (!warnedLimit) {
-          warnedLimit = warn("invalid delegation depth limit; using 1.");
-        }
+        warnOnce(warnedLimits, max, `invalid delegation depth limit ${describe(max)}; using effective limit 1.`);
         max = 1;
       }
 
