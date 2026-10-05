@@ -800,7 +800,6 @@ Attacks that held in round 2 (no finding):
   - the A5 preset table;
   - A14;
   - the D11 limits, including `/bypass` (A11);
-  - F1;
   - N11.
 - **3.2:** 3.2.1(c)/(d) with the versioned `test\smoke\helpers\scripted-provider.ts`. The v2 legs are local
   evidence (A3).
@@ -818,7 +817,7 @@ Attacks that held in round 2 (no finding):
   - the `getParent` memo short-circuit (N4);
   - the unconditional D4 record (N3);
   - the pre-banner parse at `:1297` (N5).
-- **To 3.1:** F1, F2 and N11, plus the deferred items above.
+- **To 3.1:** F2 and N11, plus the deferred items above.
 - **To 3.2:** reuse the step-8 copy as the base of `scripted-provider.ts`.
 - **To 3.1 (from QA 2.3):**
   - **CHANGELOG `Fixed` (QA-2.3-R2-3):** On OpenCode 2, router-annotated/verified `subagent`
