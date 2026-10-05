@@ -117,7 +117,7 @@ describe("additional golden v2.0.0 cost coverage", () => {
       expect(entry.output.action).not.toHaveProperty("effort");
       expect(entry.output.advanced).not.toHaveProperty("currentEffort");
     }
-    const expected = readFileSync(fixtureUrl, "utf8");
+    const expected = readFileSync(fixtureUrl, "utf8").replace(/\r\n/g, "\n");
     expect(actual).toEqual(JSON.parse(expected));
     expect(`${JSON.stringify(actual, null, 2)}\n`).toBe(expected);
   });
@@ -1562,7 +1562,7 @@ describe("golden v2.0.0", () => {
       mkdirSync(new URL("./__fixtures__/", import.meta.url), { recursive: true });
       writeFileSync(fixtureUrl, serialized, "utf8");
     }
-    const expected = readFileSync(fixtureUrl, "utf8");
+    const expected = readFileSync(fixtureUrl, "utf8").replace(/\r\n/g, "\n");
     expect(actual).toEqual(JSON.parse(expected));
     expect(serialized).toBe(expected);
   });
@@ -1576,7 +1576,7 @@ describe("golden v2.0.0", () => {
       }
       for (const sequence of sequences) expect(sequence.initialState).not.toHaveProperty("currentEffort");
     }
-    const expected = readFileSync(fixtureUrl, "utf8");
+    const expected = readFileSync(fixtureUrl, "utf8").replace(/\r\n/g, "\n");
     expect(actual).toEqual(JSON.parse(expected));
     expect(`${JSON.stringify(actual, null, 2)}\n`).toBe(expected);
   });
