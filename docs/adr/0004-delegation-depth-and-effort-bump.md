@@ -240,9 +240,10 @@ that fixture setting into a cross-version recommendation.
   scenario/host combinations passing on those same versions, tested source
   `bc5205e48b990aded2030b9b2f9372b0c9cbdd23`. The evidence uses a scripted keyless provider
   against real OpenCode 1.18.19 and 2.0.22, recorded in
-  `docs/qa/depth-and-effort/phase-0P.md` and `phase-2.3.md`. The owner retains the rig
-  locally; the latter report records hashes, with `hashes.json` and `provenance.json`
-  documenting the rig and copied plugin/dependency provenance. Captures show
+  `docs/qa/depth-and-effort/phase-0P.md` and `phase-2.3.md`. The reports describe the
+  rig's provenance; the owner retains the rig and hash files with the local evidence.
+  The latter report describes `hashes.json` (rig-source SHA-256) and `provenance.json`
+  (copied plugin/dependency files), rather than publishing their hashes. Captures show
   producer `low → medium`, a failing then passing grader, no title/grader/orchestrator effort
   leakage, and `low → low` with the bump disabled. They also cover exact enforced refusals and
   single advisory banners for foreground, resume and v2 background results. Every accepted run
