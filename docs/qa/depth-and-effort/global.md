@@ -156,12 +156,12 @@ The full suite only adds coverage.
 
 | ID | Severity | File:line | Description | Resolution |
 |---|---|---|---|---|
-| QA-G-1 | nit | `docs/qa/depth-and-effort/run-log.md:56` | A blank line splits the "Full-suite runs" table. The `400f2d6` row (`:57`, which also records the typecheck failure and its `59096ad` fix) renders as a stray pipe-delimited paragraph, not as a table row. | open |
-| QA-G-2 | nit | `docs/adr/0004-delegation-depth-and-effort-bump.md:251–255` | The ADR's evidence section cites only the Phase 2.3 host proof and says the report records "**not a fresh host run** after those fixes". Phase 3.2 has since run the end-to-end host smoke (`test/smoke/depth-effort.smoke.test.ts`) on the final code at `400f2d6` (v1 17 passed / 11 skipped, v2 19 / 9, `phase-3.2.md`), and no user doc or the ADR cites it (grep `phase-3.2` / `depth-effort.smoke`: no match). The statement is accurate as scoped to `phase-2.3.md`, but understates the shipped evidence. | open |
+| QA-G-1 | nit | `docs/qa/depth-and-effort/run-log.md:56` | A blank line splits the "Full-suite runs" table. The `400f2d6` row (`:57`, which also records the typecheck failure and its `59096ad` fix) renders as a stray pipe-delimited paragraph, not as a table row. | resolved (`f041a26`, round 2) |
+| QA-G-2 | nit | `docs/adr/0004-delegation-depth-and-effort-bump.md:251–255` | The ADR's evidence section cites only the Phase 2.3 host proof and says the report records "**not a fresh host run** after those fixes". Phase 3.2 has since run the end-to-end host smoke (`test/smoke/depth-effort.smoke.test.ts`) on the final code at `400f2d6` (v1 17 passed / 11 skipped, v2 19 / 9, `phase-3.2.md`), and no user doc or the ADR cites it (grep `phase-3.2` / `depth-effort.smoke`: no match). The statement is accurate as scoped to `phase-2.3.md`, but understates the shipped evidence. | resolved (`f041a26`, round 2) |
 
 ## Verdict
 
-**No blocking, critical, major or minor finding; 2 nits open (QA-G-1, QA-G-2).**
+**Open findings: 0 (QA-G-1 and QA-G-2 were fixed in `f041a26` and confirmed in round 2; round 2 found nothing new).**
 
 - **G1–G5 hold** under every in-process attack attempted, with the accepted residuals that D2/F2/F6 and
   D11 already document.
@@ -177,4 +177,20 @@ are docs-only edits.
 
 - QA-G-1: the blank lines that split the run-log full-suite table were removed.
 - QA-G-2: ADR 0004's evidence section now cites the Phase 3.2 end-to-end smoke on the final code and its mutation check (`docs/qa/depth-and-effort/phase-3.2.md`).
+
+## Round 2
+
+Scope: only `f041a26`. `git diff e42b360..f041a26 --stat` lists three files: the ADR (+7), `run-log.md` (−2) and
+this file (+6). No code, test or other doc changed after round 1.
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-G-1 | resolved | Both blank lines are gone (after the 1.3 row and after the 2.3 row). `run-log.md:45–55` is now one contiguous table: a header, a separator and nine rows, with the `400f2d6` row at `:55`. |
+| QA-G-2 | resolved | ADR `:256–262` adds "End-to-end smoke on the final code", which matches `phase-3.2.md` on every point. **File names:** `:27`, `:30`, and both files exist. **Hosts:** 1.18.19 and 2.0.22 (`:80`, `:453`). **Coverage:** the three accepted config keys, enforced and advisory foreground/resume, and v2-only background (`:272–281`). **Mutation list:** `depth`/`bump`/`cap`, meaning `maxDelegationDepth: null`, `effortBump: false` and `effortBumpMax` omitted (`:285–300`, `:455–469`). The key names match `src/router/config.ts:126`, `:175` and `:177`. "The merged code" is backed by the `400f2d6` run-log row (`run-log.md:55`). |
+
+Observation, not a finding: ADR `:260` calls the bump "producer-only". On the hosts, that was captured as
+cross-session isolation. `phase-3.2.md:104` and `:281` leave the same-producer-session A3 gate to
+integration/unit proof, and the ADR already places that gate there (`:236–238`, `:266`). No edit is needed.
+
+New findings: none.
 
