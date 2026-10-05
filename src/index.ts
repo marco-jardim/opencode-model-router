@@ -609,7 +609,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
            */
           let deferredOwnsBaseline = false;
           const depth = bypassed ? undefined : await depthGuard.checkDispatch(toolCtx?.sessionID);
-          if (depth?.block) return depth.message!;
+          if (depth?.block) {
+            try {
+              if (typeof toolCtx?.sessionID === "string") {
+                trajectoryStore.recordToolEvent(toolCtx.sessionID, { tool: "delegate", readOnly: false, blocked: true });
+              }
+            } catch {
+              // Best-effort observation must never lose the depth refusal.
+            }
+            return depth.message!;
+          }
           const withDepthBanner = (text: string): string => {
             if (!depth?.banner) return text;
             const trimmed = text.trimEnd();

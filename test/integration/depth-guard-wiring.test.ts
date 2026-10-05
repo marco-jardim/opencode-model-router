@@ -411,6 +411,30 @@ describe("delegation depth plugin wiring", () => {
     });
   }
 
+  it("records a refused delegate after a fail-open transform so its hand-back is not a false refusal", async () => {
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
+    vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const ctx = makeCtx(dir);
+    ctx.client.session.get.mockRejectedValueOnce(new Error("transient"));
+    ctx.client.session.get.mockImplementation(async ({ path }) => ({ data: { id: path.id, parentID: path.id === "C" ? "O" : undefined } }));
+    const { hooks } = await setup(ctx);
+    const system = { system: [] as string[] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: "C", model: {} }, system);
+    expect(system.system.length).toBeGreaterThan(0);
+    expect(await hooks.tool.delegate.execute(delegateArgs, { sessionID: "C" })).toBe(depthLimitMessage(1, 1));
+    expect(ctx.client.session.create).not.toHaveBeenCalled();
+    expect(ctx.client.session.prompt).not.toHaveBeenCalled();
+    // Even the generic after-hook does not record this caller: the failed
+    // transform never marked it as a subagent, unlike a session.created event.
+    await hooks["tool.execute.after"]({ tool: "delegate", sessionID: "C", callID: "blocked" }, { output: depthLimitMessage(1, 1) });
+    for (const sid of ["C", "untouched"]) {
+      const out = { output: `task_id: ${sid}\n<task_result>NEED CONTEXT: I cannot dispatch; handing back because tools are unavailable.</task_result>`, metadata: { sessionId: sid } };
+      await hooks["tool.execute.after"](taskInput("O", `return-${sid}`), out);
+      expect(out.output.includes("FALSE-REFUSAL SUSPECT")).toBe(sid === "untouched");
+    }
+  });
+
   it.each(["deferred subagent", "v2 repair"])("refuses the %s fixture dispatch with the default limit before registering anything", async (shape) => {
     vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
     const ctx = makeCtx(dir);
