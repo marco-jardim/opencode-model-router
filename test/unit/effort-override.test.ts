@@ -375,13 +375,22 @@ describe("per-session effort overrides", () => {
     expect(logger.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("producer"));
   });
 
+  it("leaves service prefixes to the plugin logger", () => {
+    const consoleWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logger = { warn: (message: string) => console.warn(`[model-router] ${message}`) };
+    const store = createEffortOverrideStore({ maxEntries: 1, logger });
+    store.set("first", "fast", openai, "medium");
+    store.set("second", "fast", openai, "medium");
+    expect(consoleWarning).toHaveBeenCalledExactlyOnceWith("[model-router] Evicted oldest effort override for first");
+  });
+
   it("defaults to 1000 entries and console warnings", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const store = createEffortOverrideStore();
     for (let i = 0; i <= 1000; i++) store.set(String(i), "fast", openai, "medium");
     expect(store.size()).toBe(1000);
     expect(store.has("0")).toBe(false);
-    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning).toHaveBeenCalledExactlyOnceWith("Evicted oldest effort override for 0");
   });
 
   it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid capacity %s", (maxEntries) => {

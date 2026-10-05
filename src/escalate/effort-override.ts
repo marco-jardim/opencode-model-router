@@ -25,7 +25,7 @@ const entriesByStore = new WeakMap<EffortOverrideStore, Map<string, Entry>>();
 
 function warn(logger: Logger, message: string): void {
   try {
-    logger.warn(`[model-router] ${message}`);
+    logger.warn(message);
   } catch {
     // A failing logger must not turn a best-effort override into a hook failure.
     return;
