@@ -431,6 +431,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   } = createVerificationWiring({
     client: ctx.client,
     childRunner: ctx.routerChildRunner,
+    onChildSessionCreated: (sid, creator) => depthTracker.recordPluginChild(sid, creator),
     directory: ctx.directory,
     getConfig: () => cfg,
     logger,
@@ -1478,7 +1479,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             const gateGraderSessions = new Set<string>();
             const completedFailures: string[] = [];
-            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline);
+            // Keep the native grader unparented on the backend; only depth tracking uses its caller.
+            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
             gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
             let res;
             try {
