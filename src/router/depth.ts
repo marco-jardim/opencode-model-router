@@ -37,6 +37,7 @@ interface Lookup {
   promise: Promise<LookupResult>;
   detached: boolean;
   cancelled: boolean;
+  waiters: number; // walks currently awaiting this lookup
   cancel(): void;
 }
 interface Walk {
@@ -45,7 +46,9 @@ interface Walk {
   learned: Map<string, Node>;
   pending?: Lookup;
   cancelled: boolean;
-  cancel(): void;
+  waiters: number; // depthOf callers currently awaiting this walk
+  stopped: Promise<undefined>;
+  stop(): void;
 }
 interface Done {
   kind: "done";
@@ -91,6 +94,8 @@ export function createDepthTracker(
   const lookups = new Map<string, Lookup>();
   const failedAt = new Map<string, number>();
   const warned = new Map<string, number>();
+  const live = new Set<Walk>(); // every walk, cancelled or not, until it settles
+  const strays = new Map<string, Set<Lookup>>(); // detached lookups until they settle
   let lastNow = 0;
 
   // Seams are contained where they are called, so no state change is ever cut
@@ -280,7 +285,7 @@ export function createDepthTracker(
     const cancelled = new Promise<LookupResult>((resolve) => {
       cancel = () => resolve({ ok: false, reason: "forgotten" });
     });
-    const lookup: Lookup = { id, promise: cancelled, detached: false, cancelled: false, cancel };
+    const lookup: Lookup = { id, promise: cancelled, detached: false, cancelled: false, waiters: 0, cancel };
     lookups.set(id, lookup);
     function fail(reason: string): LookupResult {
       if (!lookup.detached && !lookup.cancelled) setFailed(id);
@@ -295,44 +300,80 @@ export function createDepthTracker(
     }, (e: unknown) => fail(describe(e)));
     lookup.promise = Promise.race([request, cancelled]).finally(() => {
       if (lookups.get(id) === lookup) lookups.delete(id);
+      const stray = strays.get(id);
+      if (stray?.delete(lookup) && stray.size === 0) strays.delete(id);
     });
     return lookup;
   }
 
+  // A lookup that no walk awaits any more is detached: the throttle starts now,
+  // a late success is still applied as evidence, and forget() can still cancel it.
+  function detach(lookup: Lookup): void {
+    if (lookups.get(lookup.id) !== lookup) return;
+    lookups.delete(lookup.id);
+    lookup.detached = true;
+    setFailed(lookup.id);
+    let stray = strays.get(lookup.id);
+    if (!stray) strays.set(lookup.id, stray = new Set());
+    stray.add(lookup);
+  }
+
+  function cancelLookup(lookup: Lookup): void {
+    lookup.cancelled = true;
+    lookup.cancel();
+  }
+
+  // A cancelled walk settles its callers with undefined and resumes at once, so
+  // its continuation can never issue another lookup. It stays in `live` (and so
+  // within reach of forget) until that continuation has returned.
+  function cancelWalk(walk: Walk, timedOut: boolean): void {
+    walk.cancelled = true;
+    if (walks.get(walk.id) === walk) walks.delete(walk.id);
+    const lookup = walk.pending;
+    walk.pending = undefined;
+    if (lookup && --lookup.waiters === 0 && timedOut) detach(lookup);
+    walk.stop();
+  }
+
   function startWalk(id: string): Walk {
-    let cancel!: () => void;
-    const cancelled = new Promise<undefined>((resolve) => { cancel = () => resolve(undefined); });
-    const learned = new Map<string, Node>();
-    const walk: Walk = { id, promise: cancelled, learned, cancelled: false, cancel };
+    let stop!: () => void;
+    const stopped = new Promise<undefined>((resolve) => { stop = () => resolve(undefined); });
+    const walk: Walk = { id, promise: stopped, learned: new Map(), cancelled: false, waiters: 0, stopped, stop };
     walks.set(id, walk);
-    async function run(): Promise<number | undefined> {
-      let fetches = 0;
-      try {
-        for (;;) {
-          const r = climb(id, learned, "exact")!;
-          if (r.kind === "done") {
-            memoize(r, learned);
-            return r.depth;
-          }
-          if (throttled(r.id) && !lookups.has(r.id)) return floor(id, learned, "throttled");
-          if (++fetches > FETCH_BUDGET) {
-            warn(id, "lookup", "fetch budget");
-            return MAX_DEPTH_HOPS;
-          }
-          const lookup = lookups.get(r.id) ?? startLookup(r.id);
-          walk.pending = lookup;
-          const result = await lookup.promise;
-          walk.pending = undefined;
-          if (walk.cancelled) return undefined;
-          if (!result.ok) return floor(id, learned, result.reason);
-          learned.set(r.id, nodes.get(r.id) ?? makeNode(result.parent, false));
-        }
-      } finally {
-        if (walks.get(id) === walk) walks.delete(id);
-      }
-    }
-    walk.promise = Promise.race([run(), cancelled]);
+    live.add(walk);
+    walk.promise = run(walk);
     return walk;
+  }
+
+  async function run(walk: Walk): Promise<number | undefined> {
+    const { id, learned } = walk;
+    let fetches = 0;
+    try {
+      for (;;) {
+        const r = climb(id, learned, "exact")!;
+        if (r.kind === "done") {
+          memoize(r, learned);
+          return r.depth;
+        }
+        if (throttled(r.id) && !lookups.has(r.id)) return floor(id, learned, "throttled");
+        if (++fetches > FETCH_BUDGET) {
+          warn(id, "lookup", "fetch budget");
+          return MAX_DEPTH_HOPS;
+        }
+        const lookup = lookups.get(r.id) ?? startLookup(r.id);
+        walk.pending = lookup;
+        lookup.waiters++;
+        const result = await Promise.race([lookup.promise, walk.stopped]);
+        if (walk.cancelled || result === undefined) return undefined;
+        walk.pending = undefined;
+        lookup.waiters--;
+        if (!result.ok) return floor(id, learned, result.reason);
+        learned.set(r.id, nodes.get(r.id) ?? makeNode(result.parent, false));
+      }
+    } finally {
+      live.delete(walk);
+      if (walks.get(id) === walk) walks.delete(id);
+    }
   }
 
   function record(id: string, link: string | null, source: Source): void {
@@ -362,6 +403,7 @@ export function createDepthTracker(
       }
       if (throttled(r.id) && !lookups.has(r.id)) return floor(id, learned, `throttled at ${r.id}`);
       const walk = walks.get(id) ?? startWalk(id);
+      walk.waiters++;
       const t = timeoutOf(options);
       const timeout = Symbol("timeout");
       let timer!: ReturnType<typeof setTimeout>;
@@ -371,16 +413,10 @@ export function createDepthTracker(
       });
       try {
         const result = await Promise.race([walk.promise, deadline]);
+        walk.waiters--;
         if (result !== timeout) return result;
-        if (walks.get(id) === walk) walks.delete(id);
-        const lookup = walk.pending;
-        if (lookup && !lookup.detached) {
-          lookup.detached = true;
-          if (lookups.get(lookup.id) === lookup) {
-            lookups.delete(lookup.id);
-            setFailed(lookup.id);
-          }
-        }
+        // Shared callers keep independent deadlines; the last one out cancels.
+        if (walk.waiters === 0 && !walk.cancelled) cancelWalk(walk, true);
         return floor(id, learned, `timed out after ${t} ms`);
       } finally {
         clearTimeout(timer);
@@ -392,19 +428,17 @@ export function createDepthTracker(
       failedAt.delete(id);
       warned.delete(`lookup:${id}`);
       warned.delete(`conflict:${id}`);
-      for (const active of walks.values()) active.learned.delete(id);
-      const walk = walks.get(id);
-      if (walk) {
-        walk.cancelled = true;
-        walk.cancel();
-        walks.delete(id);
+      for (const walk of live) {
+        walk.learned.delete(id);
+        if (walk.id === id) cancelWalk(walk, false);
       }
       const lookup = lookups.get(id);
       if (lookup) {
-        lookup.cancelled = true;
-        lookup.cancel();
+        cancelLookup(lookup);
         lookups.delete(id);
       }
+      for (const stray of strays.get(id) ?? []) cancelLookup(stray);
+      strays.delete(id);
     },
     sweep() {
       const now = clock();

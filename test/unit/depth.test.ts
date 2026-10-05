@@ -656,3 +656,77 @@ describe("QA-1.2-5: the failure blocklist is bounded", () => {
     expect(getParent).toHaveBeenCalledTimes(2_000);
   });
 });
+
+describe("QA-1.2-3: a timed-out walk is cancelled and stays reachable", () => {
+  function held() {
+    const { tracker, getParent, time } = fixture();
+    const answers = new Map<string, ReturnType<typeof deferred<string | null>>>();
+    getParent.mockImplementation((id) => {
+      const answer = deferred<string | null>();
+      answers.set(id, answer);
+      return answer.promise;
+    });
+    return { tracker, getParent, answers, time };
+  }
+
+  it("forget reaches the detached lookup: no resurrection and no orphan lookups", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, answers } = held();
+    const result = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await result).toBeUndefined();
+    tracker.forget("X");
+    expect(tracker.size()).toBe(0);
+    answers.get("X")!.resolve("P");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(0);
+    expect(getParent.mock.calls).toEqual([["X"]]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("without forget the late answer is applied, but the cancelled walk never continues", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, answers, time } = held();
+    const result = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await result).toBeUndefined();
+    answers.get("X")!.resolve("P");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(1);
+    expect(getParent.mock.calls).toEqual([["X"]]);
+    // One walk per session: the next walk is a fresh one, and only it asks for P.
+    time(DEPTH_LOOKUP_RETRY_MS);
+    const next = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getParent.mock.calls).toEqual([["X"], ["P"]]);
+    answers.get("P")!.resolve(null);
+    expect(await next).toBe(1);
+  });
+
+  it("an early caller's timeout does not cancel the walk other callers still await", async () => {
+    vi.useFakeTimers();
+    const { tracker, answers } = held();
+    const early = tracker.depthOf("X", { timeoutMs: 5 });
+    const late = tracker.depthOf("X", { timeoutMs: 50 });
+    await vi.advanceTimersByTimeAsync(5);
+    expect(await early).toBeUndefined();
+    answers.get("X")!.resolve(null);
+    expect(await late).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a lookup shared with a live walk stays attached when another walk times out", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, answers } = held();
+    tracker.recordCreated("X", "A");
+    tracker.recordCreated("Y", "A");
+    const x = tracker.depthOf("X", { timeoutMs: 5 });
+    const y = tracker.depthOf("Y", { timeoutMs: 50 });
+    await vi.advanceTimersByTimeAsync(5);
+    expect(await x).toBe(1);
+    answers.get("A")!.resolve(null);
+    expect(await y).toBe(1);
+    expect(await tracker.depthOf("X")).toBe(1);
+    expect(getParent.mock.calls).toEqual([["A"]]);
+  });
+});
