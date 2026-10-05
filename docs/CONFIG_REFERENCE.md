@@ -1107,23 +1107,27 @@ default to `true` / `"xhigh"` in `resolveEffortBump`.
 
 ### `mode` defaults to `advisory`, and what `enforced` would change
 
-With no `enforcement` block at all, the resolved mode is **`advisory`** — not `off`. In
-advisory mode every guard, ladder and verification rule is evaluated and reported in the
-scorecard, but nothing is ever blocked or retried.
+With no `enforcement` block at all, the resolved mode is **`advisory`** — not `off`.
+Advisory guards warn rather than block. Native `task` (v2: `subagent`) verification
+annotates completed results in both advisory and enforced modes; it cannot automatically
+retry a native call that has already finished. Enforcement `off` skips that native verification.
 
-Changing `mode` to `"enforced"` turns those same evaluations into actions:
+The optional **`delegate` tool's acceptance gate and automatic ladder are independent
+of enforcement mode**: they run in `off`, `advisory` and `enforced`, subject to the
+verification policy (including `verify.require: "never"` and deferred verification).
+Failed verification can retry and climb `escalate.ladder` in any of these modes,
+bounded by `maxAttemptsPerTier`, `maxTotalAttempts` and `costCeiling.multiple`.
+With `escalate.effortBump` enabled, an eligible same-tier retry raises effort up to
+`escalate.effortBumpMax` (further clamped per model), within those same limits.
+These retries spend tokens even in advisory mode. Deferred results do not retry,
+and unavailable verification does not trigger producer escalation.
+
+Changing the effective mode to `"enforced"` changes guard behaviour:
 
 - **Guards block.** A call that violates `readDraftCap`, `sameOpRetryCap`, `blockSelfScript`,
   `deliverableFirst`, `blockScriptWrites` or `budget` is refused instead of noted.
 - **The depth guard refuses.** Dispatches past `maxDelegationDepth` are refused
   instead of warned (`null` disables this guard).
-- **Verification gates acceptance.** A failed grader or deterministic check makes the
-  delegation `unmet` rather than accepted-with-a-note.
-- **The ladder escalates.** An `unmet` result retries and climbs `escalate.ladder`, bounded
-  by `maxAttemptsPerTier`, `maxTotalAttempts` and `costCeiling.multiple` — which costs real
-  tokens that advisory mode never spends. With `escalate.effortBump` enabled, an
-  eligible failed attempt first retries at higher effort up to `escalate.effortBumpMax`
-  (further clamped per model), within those same attempt and cost limits.
 - **`proportional.trivialBypass` starts mattering.** It only has an effect in `enforced`
   mode, where a task classified trivial is demoted back to advisory for that dispatch.
   The delegation-depth guard is explicitly exempt from this downgrade.
