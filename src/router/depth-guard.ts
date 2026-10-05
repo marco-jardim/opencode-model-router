@@ -41,29 +41,31 @@ export function createDepthGuard(deps: {
   let warnedCaller = false;
   let warnedLimit = false;
 
-  function warn(message: string): void {
+  function warn(message: string): boolean {
     try {
       deps.logger.warn(`[router] delegation depth: ${message}`);
+      return true;
     } catch {
       // A broken logger must not change an admission decision or reject a call.
-      return;
+      return false;
     }
   }
 
   function warnUnknown(caller: string): void {
     if (warnedCallers.has(caller)) return;
+    if (!warn(`cannot resolve depth for session ${caller}; allowing dispatch.`)) return;
     warnedCallers.add(caller);
     if (warnedCallers.size > MAX_WARNED_CALLERS) {
       warnedCallers.delete(warnedCallers.values().next().value!);
     }
-    warn(`cannot resolve depth for session ${caller}; allowing dispatch.`);
   }
 
   function warnOnce(causes: Set<unknown>, cause: unknown, message: string): void {
     if (causes.has(cause)) return;
+    // Remember only delivered warnings; a broken logger is retried next time.
+    if (!warn(message)) return;
     causes.add(cause);
     if (causes.size > MAX_WARNED_CAUSES) causes.delete(causes.values().next().value);
-    warn(message);
   }
 
   return {
@@ -94,16 +96,14 @@ export function createDepthGuard(deps: {
       if (max === null) return { block: false, mode };
       if (!Number.isInteger(max) || max < 1 || max > MAX_DELEGATION_DEPTH_LIMIT) {
         if (!warnedLimit) {
-          warnedLimit = true;
-          warn("invalid delegation depth limit; using 1.");
+          warnedLimit = warn("invalid delegation depth limit; using 1.");
         }
         max = 1;
       }
 
       if (typeof callerSessionID !== "string" || callerSessionID === "") {
         if (!warnedCaller) {
-          warnedCaller = true;
-          warn("missing or invalid caller session; allowing dispatch.");
+          warnedCaller = warn("missing or invalid caller session; allowing dispatch.");
         }
         return { block: false, mode, guard: null };
       }

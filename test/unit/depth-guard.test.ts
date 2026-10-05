@@ -308,4 +308,26 @@ describe("delegation depth guard", () => {
     guard.depthOf.mockRejectedValue(new Error("tracker unavailable"));
     await expect(guard.checkDispatch("unknown")).resolves.toStrictEqual({ block: false, mode: "enforced", guard: null });
   });
+
+  it.each(["caller", "tracker", "mode", "limit", "mode throw", "limit throw", "depth"])(
+    "retries an undelivered %s warning, then deduplicates after delivery", async (failure) => {
+      const guard = setup(1);
+      const caller = failure === "caller" ? undefined : "caller";
+      if (failure === "tracker") guard.depthOf.mockRejectedValue(new Error("offline"));
+      if (failure === "mode") guard.resolveMode.mockReturnValue("Enforced" as EnforcementMode);
+      if (failure === "limit") guard.limit.mockReturnValue(0);
+      if (failure === "mode throw") guard.resolveMode.mockImplementation(() => { throw new Error("mode unavailable"); });
+      if (failure === "limit throw") guard.limit.mockImplementation(() => { throw new Error("limit unavailable"); });
+      if (failure === "depth") guard.depthOf.mockResolvedValue(NaN);
+      const delivered = vi.fn();
+      guard.warn.mockImplementationOnce(() => { throw new Error("logger unavailable"); });
+      guard.warn.mockImplementation(delivered);
+      const first = await guard.checkDispatch(caller);
+      expect(delivered).not.toHaveBeenCalled();
+      expect(await guard.checkDispatch(caller)).toStrictEqual(first);
+      expect(await guard.checkDispatch(caller)).toStrictEqual(first);
+      expect(guard.warn).toHaveBeenCalledTimes(2);
+      expect(delivered).toHaveBeenCalledTimes(1);
+    },
+  );
 });
