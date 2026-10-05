@@ -1,0 +1,228 @@
+# Phase 0.P — Execution pre-flight
+
+Plan: `D:\git\opencode-model-router\docs\plans\delegation-depth-and-effort-bump-plan.md` (revision 3,
+amended in §1.7). Integration branch `de/main`, worktree `D:\git\omr-de-main`.
+
+## Pre-flight
+
+### 0.P.1 Baseline
+
+| Item | Result |
+|---|---|
+| `git -C D:\git\opencode-model-router status --porcelain` | only `?? docs/plans/delegation-depth-and-effort-bump-handover.md` and `?? docs/plans/delegation-depth-and-effort-bump-plan.md` |
+| `master` vs `origin/master` | both `46f443fa5fb73dab4b5b7fc8fde329062ed33493` |
+| `package.json` version | `2.0.0` |
+| `gh auth status` | logged in as `marco-jardim`, scopes `gist, read:org, repo, workflow` |
+| node / npm | `v24.21.0` / `12.0.2` |
+| Linear | **not used**: no `linear.app` URL and no Linear-like issue key in the repo or `.github` |
+| `de/main` | created from `origin/master`; worktree `D:\git\omr-de-main`; plan and handover committed in `174505d` (blobs `f6f69e11c34d7ba79aa5d8ac87e3aa9dd334f6a9` plan, `1640b9c2d97821c228ac1fc0f0ffe90a566aab30` handover; both equal the main-checkout copies) |
+| CI on `master` at `46f443f` | `Test` and `smoke-keyless` green |
+
+Baseline in `D:\git\omr-de-main` (0.P.1.c):
+
+| Command | Result |
+|---|---|
+| `npm ci` | exit 0 (350 packages; npm reports 1 high-severity advisory, pre-existing on `master`, see Deferred) |
+| `npm run typecheck` | exit 0 |
+| `npx vitest run --maxWorkers=2` | **101 files passed, 3 skipped; 3645 tests passed, 65 skipped** (211.5 s) |
+| `npm run smoke:keyless` (v1 1.18.19 first on `PATH`, after `d8a9a42`) | **3 files, 9 tests passed** |
+| `npm run smoke:v2` (`OPENCODE_V2_BIN` = OpenCode 2.0.22) | **1 file, 2 tests passed** |
+| Orphan `node`/`opencode` processes matching `*omr-*` | none |
+
+Local smoke environment (A10). The machine's `opencode` on `PATH` is the scoop OpenCode **2.0.22**
+(`C:\Users\Marquinho\scoop\apps\opencode2\current\opencode.exe`). The keyless lane targets the CI pin
+`opencode-ai@1.18.19`, installed privately (never globally):
+
+```powershell
+npm i --prefix C:\Users\Marquinho\AppData\Local\Temp\Claude\oc-v1 opencode-ai@1.18.19
+# keyless lane (v1 native exe first on PATH, for this call only)
+$env:PATH = "C:\Users\Marquinho\AppData\Local\Temp\Claude\oc-v1\node_modules\opencode-windows-x64\bin;" + $env:PATH ; npm run smoke:keyless
+# v2 lane
+$env:OPENCODE_V2_BIN = "C:\Users\Marquinho\scoop\apps\opencode2\current\opencode.exe" ; npm run smoke:v2
+```
+
+Before the fix, with v1 on `PATH`, 4 keyless tests failed (registration and subagent-tiers read the
+developer's real `opencode-model-router.state.json`): the fixtures set only `HOME`, but
+`src\router\config.ts:284` and ≈377–383 resolve the override and state files with `os.homedir()`,
+which reads `USERPROFILE` on Windows. Fixed in `d8a9a42`
+(`test(smoke): isolate USERPROFILE alongside HOME on Windows`).
+
+### 0.P.2 Unknowns
+
+- **a. Guard API.** `guardBeforeCall` (`src\guard\enforce.ts:77–121`) returns
+  `BeforeResult { block; message?; mode; guard? }` (`:58–63`). Called at `src\index.ts:1201–1210`;
+  on `res.block` it records `trajectoryStore.recordToolEvent(sid, { tool, readOnly, blocked: true,
+  selfScript })` and throws `new Error(res.message)` (`:1214–1221`). Mode:
+  `EnforcementMode = "off" | "advisory" | "enforced"` (`src\router\enforcement.ts:7`), resolved by
+  `resolveEnforcementMode` from `enforcement.mode` (default `"advisory"`), the env gate
+  (`MODEL_ROUTER_ENFORCE`: `"1"` enforced, `"0"` off) and `enforcement.perTier`
+  (`src\router\enforcement.ts:16–46`). Bundled `tiers.json:4–6`: `"mode": "advisory"`. Advisory
+  never blocks: it records the would-block and sets a pending note (`src\guard\enforce.ts:113–120`).
+  `guardBeforeCall` also downgrades enforced → advisory for trivial sessions (`:88–94`).
+  Order in the `task` before-hook today: verification `startDispatch` (`src\index.ts:1105–1121`) →
+  prompt repair / `promptRefusal` throw (`:1128–1153`) → `guardBeforeCall` (`:1196–1221`).
+- **b. `delegate` refusal form.** `execute(): Promise<string>`; every refusal and failure path
+  **returns** a `[router] …` string (`src\index.ts` ≈853–915, catch at ≈914–915). The tool is only
+  registered when `enableDelegateTool` is true (`:504`).
+- **c. Trajectory store.** `trajectoryStore.recordToolEvent(sessionID, event)`
+  (`src\telemetry\trajectory.ts:188–191`) increments `toolCallCount` for every event, blocked ones
+  included (`:73–81`); `toolCallCount(sessionID)` (`:193–194`) is what the false-refusal detector
+  reads for the child (`src\index.ts:1236–1245`). The after-hook records events only for
+  `sessionStore.isSubagent(sid)` sessions (`:1262–1279`).
+- **d. v2 bridge tests:** `D:\git\opencode-model-router\test\unit\v2-hooks.test.ts`.
+- **e. Ladder callers:** only the `delegate` tool, `src\index.ts:880` (`nextAction`) and `:912`
+  (`advance`). (`advance` in `src\verify\batch.ts` and `src\verify\wiring.ts` are unrelated locals.)
+- **f. Grader parent.** `dispatchGrader(req, parentSessionID?, inFlight?)`
+  (`src\verify\wiring.ts:1200–1239`). `delegate` path: `buildGateDeps(toolCtx?.sessionID, …)`
+  (`src\index.ts:755`) → the caller (orchestrator) session. Native `task` path: gate deps built with
+  `undefined` (`src\index.ts:1382`).
+- **g. Preset table** (`tiers.json`; `activePreset: "anthropic"` at `:2`; family per
+  `isClaudeModel` `src\router\protocol.ts:149–154`, `isOpenAIModel` `src\router\agent-options.ts`;
+  adaptive-only list `src\router\protocol.ts:163–168`):
+
+  | Preset | Tier | Model | Effort | Variant | Family | D7 bumpable | Bound |
+  |---|---|---|---|---|---|---|---|
+  | anthropic (active) | fast | anthropic/claude-sonnet-5-5 | low | low | claude | no (variant) | — |
+  | anthropic (active) | medium | anthropic/claude-sonnet-5-5 | medium | medium | claude | no (variant) | — |
+  | anthropic (active) | heavy | anthropic/claude-opus-5-5 | xhigh | xhigh | claude | no (variant) | — |
+  | openai | fast / medium / heavy | gpt-6-luna-fast / gpt-6.1-sol-fast / gpt-6-astra-fast | — | — / xhigh / max | openai | no (no effort) | — |
+  | github-copilot | fast / medium / heavy | claude-haiku-4.5 / claude-sonnet-5 / claude-fable-5-1 | — | — | claude | no (no effort) | — |
+  | google | all | gemini-* | — | — | other | no | — |
+  | zai | all | glm-* | — | — / — / max | other | no | — |
+  | hybrid | fast / medium | gpt-6-luna-fast / gpt-6-astra-fast | — | medium / high | openai | no | — |
+  | hybrid | heavy | anthropic/claude-opus-5-5 | xhigh | xhigh | claude | no (variant) | — |
+  | fable-effort | fast | anthropic/claude-fable-5-1 | low | — | claude (adaptive-only) | **yes** | xhigh |
+  | fable-effort | medium | anthropic/claude-fable-5-1 | high | — | claude (adaptive-only) | **yes** | xhigh |
+  | fable-effort | heavy | anthropic/claude-fable-5-1 | xhigh | — | claude (adaptive-only) | no (base = bound) | xhigh |
+
+  **Finding for 0.P.5:** the active preset has **zero** bumpable tiers; the bump is inert by default
+  and applies to `fable-effort` and user-configured tiers. No bundled tier sets `thinking.budgetTokens`
+  or `reasoning.effort`.
+- **h. Producer id before prompt.** v1 native path: `session.create` → `registerProducer(sid)` →
+  `session.prompt({ path: { id: producerSid } })` (`src\index.ts` ≈626–669). v2 `routerChildRunner`
+  (`src\v2.ts:19` → `src\compat\v2-client.ts:60–135`): `onCreated(sessionID)` is awaited inside the
+  native subagent's `progress` callback, which the native tool runs after creating the child and before
+  prompting it (`v2-client.ts:97–108`). Cleanup: per attempt ≈833–848; outer `finally` disposes every
+  producer (≈916–924).
+- **i. Smoke harness.** No keyless smoke captures provider requests or scripts a tool call: they spawn
+  real `opencode` (`debug agent`, `serve`) (`registration.smoke.test.ts:45,64`,
+  `vitest.smoke.config.ts:17–20`, `deferred-catalog.smoke.test.ts:70,193`). `smoke:v2` runs
+  `v2-registration.smoke.test.ts` with `OPENCODE_V2_BIN`; `smoke:v2:e2e` needs provider keys.
+  Therefore Spike B built its own capturing rig (below).
+
+### 0.P.3 Spike A — v2 refusal path
+
+Scratch test `D:\git\omr-de-main\test\scratch\spike-a.test.ts` (deleted; never committed) registered
+the real `registerV2Hooks` with `createV2Runtime(ctx).withToolContext` and a legacy
+`"tool.execute.before"` that throws `DEPTH-REFUSAL-SENTINEL`, then drove the captured `execute.before`
+with `subagent` events: foreground, `background: true`, and resume (`sessionID: "ses_child"`).
+`npx vitest run test/scratch/spike-a.test.ts --maxWorkers=2` → 3/3 passed.
+
+- The handler rejects with the **same** `Error` object in all three cases; zero `unhandledRejection`
+  events. No catch surrounds the legacy call (`src\compat\v2-hooks.ts:272–290`; `within` →
+  `withToolContext` uses `finally` only, `src\compat\v2-client.ts:149–161`).
+- The legacy hook received `input.sessionID = "ses_caller"` in all three cases; the resume target
+  appears only in `output.args.sessionID`/`task_id`.
+- One `execute.before` registration; no background or resume branch skips it. The router's own v2
+  `childRunner` calls the native `subagent` tool's `execute` directly (`v2-client.ts:74–117`), which
+  is covered by the `delegate` tool's own guard (D3), so it is not a bypass.
+- The installed v2 types (`node_modules\@opencode\plugin\dist\promise\tool.d.ts:29–37`) give the
+  event shape but no documented throw contract. How the host renders the rejection is the mechanism
+  the existing `enforced` guard already relies on for blocking on v2.
+
+### 0.P.4 Spike B — per-session effort via `chat.params`
+
+Rig outside the repo: `C:\Users\Marquinho\AppData\Local\Temp\Claude\spike-b\` (`REPORT.md`, sources,
+`captures.jsonl`, `isolation-captures.jsonl`, `extension-captures.jsonl`, hook logs, cleanup proofs).
+Real OpenCode **1.18.19** and **2.0.22**, isolated `HOME`/`USERPROFILE`/`XDG_*`/`APPDATA`, fake keys,
+providers `openai`/`anthropic` pointed at a loopback stub that records each request body and answers
+400. Models `openai/gpt-5`, `anthropic/claude-sonnet-4-5`, plus adaptive-only `claude-fable-5` and
+`claude-opus-4-7` controls.
+
+Primary scenarios (wire field: OpenAI `reasoning.effort`, Claude `output_config.effort`):
+
+| Scenario | v1 OpenAI | v2 OpenAI | v1 Claude | v2 Claude |
+|---|---|---|---|---|
+| S1 baseline | medium | medium | absent | absent |
+| S2 hook writes `reasoning_effort`/`effort` = high | **medium (dropped)** | **medium (dropped)** | high | high |
+| S3 agent registered with the same keys | **medium (dropped)** | high (bridge translates) | high | high |
+| S4 clean session after S2, same process | medium | medium | absent | absent |
+| S5 agent low + hook high | **medium** | **low** | high | high |
+| hook writes native `reasoningEffort` = high | high | high | — | — |
+| agent native `reasoningEffort` low + hook native high | high | high | — | — |
+
+Hook shapes: v1 `chat.params` `output` keys `temperature, topP, topK, maxOutputTokens, options`; v2
+`context` event keys `sessionID, model, system, messages, options, agent, tools`, and the bridge passes
+`event.options` itself as the legacy `output`. Same-process isolation (one `opencode serve` per version,
+distinct sessions): the override reaches only the marked session. Non-effort payload fields of S1 vs S2
+are identical after masking markers and ids.
+
+Extension — native keys, agent-registered (`v1 | v2` wire subtrees):
+
+| Registered options | v1 | v2 |
+|---|---|---|
+| `reasoningEffort: "high"` | `reasoning.effort: high` | same |
+| `reasoning_summary: "detailed"` | `reasoning.summary: auto` (**dropped**) | `detailed` (bridge) |
+| `reasoningSummary: "detailed"` | `detailed` | `detailed` |
+| `budget_tokens: 8000` | **absent (dropped)** | `thinking.budget_tokens: 8000` (bridge) |
+| `thinking: { type: "enabled", budgetTokens: 8000 }` | `thinking.budget_tokens: 8000` | same |
+| `effort: "high"` + `thinking` | both sent | both sent |
+| `effort: "xhigh"` (claude-fable-5, opus-4-7) | `output_config.effort: xhigh` | same |
+
+Title generation: v1 calls `chat.params` for the title with the **same** `sessionID`
+(`agent: "title"`, `model: openai/gpt-5.4-nano`); v2 uses a separate `title` hook (no `agent`), which
+the bridge does not forward.
+
+Fallback facts: v1 SDK `SessionPromptData` has no `variant`
+(`node_modules\@opencode-ai\sdk\dist\gen\types.gen.d.ts:2244–2269`); the v2 SDK declares
+`body.variant?` (`…\dist\v2\gen\types.gen.d.ts:8358–8383`); catalog variants: GPT-5
+`minimal, low, medium, high`; Claude Sonnet 4.5 `high, max` (thinking budgets 16000/31999, not effort).
+
+## Implementation notes
+
+0.P.5 verdicts (orchestrator, heavy tier) are written into the plan as §1.7 A1–A10 and the §2
+updates. Summary:
+
+- **D9:** primary mechanism confirmed on v1 and v2, **with provider-native keys** (`effort`,
+  `reasoningEffort`), a v1/v2 target seam (`output.options` vs flat `event.options`) and a
+  producer-only gate on agent + model identity (A3).
+- **D6 (owner decision 2026-10-05, follow D6 literally):** the depth guard uses the existing mode
+  resolution; the bundled default `advisory` warns instead of blocking. G1 and D12.1 amended (A1).
+- **Pre-existing bug (owner decision 2026-10-05, fix in 1.3):** `buildAgentOptions` emits snake-case
+  keys that OpenCode v1 drops, so OpenAI `effort`/`reasoning.*` and Claude `thinking.budgetTokens`
+  never reach the provider on v1. 1.3.2b switches to native keys; 2.3 adjusts the v2 bridge (A4).
+- **D4, D3, D10, M5 timing:** confirmed against the code (A2, A6–A8).
+- **D7 reach:** zero bumpable tiers in the active preset; not a stop (A5).
+- **§2:** placeholder resolved (`test\unit\v2-hooks.test.ts`); 1.3 gains
+  `test\integration\fable-effort-preset.test.ts` and `test\smoke\registration.smoke.test.ts`; 3.1
+  gains `docs\PER_TURN_EFFORT.md` and `docs\OPENCODE_V2.md`.
+
+Pre-flight fix applied: `d8a9a42` (smoke Windows isolation).
+
+## Findings
+
+QA findings are added below by the 0.P QA review.
+
+## Deferred by plan
+
+- Docs that name the snake-case option keys (`README.md:282,483,491`,
+  `docs\CONFIG_REFERENCE.md:606,626,632,652,687,697,698`, `docs\PER_TURN_EFFORT.md:94,95,109,137`,
+  `docs\OPENCODE_V2.md:48,49`) → Phase 3.1.
+- v2 bridge registration translation precedence (`src\compat\v2-hooks.ts:125–135`) → Phase 2.3.
+- The npm advisory reported by `npm ci` (1 high) and Dependabot alert #2 on `master` are pre-existing
+  and unrelated to this plan; dependency changes are out of scope (lockfile owner is 3.4, and the
+  previous handover forbids merging dependency bumps during execution).
+
+## Handoffs
+
+- **To 1.3:** A4 (native keys in `buildAgentOptions`, test updates).
+- **To 2.1:** A1 (mode resolution, advisory banner text, no trivial downgrade).
+- **To 2.2:** A3 (interface takes the target options object; producer-only gate; native keys).
+- **To 2.3:** A1 banner channel check, A2 recording, A3 v1/v2 seam, A4 bridge translation, A8 set/clear
+  points.
+- **To 3.1:** A1 documentation of advisory vs enforced, A4 `Fixed` entry and key-name docs, A5 preset
+  table.
+
+## Verdict
+
+Pending the 0.P QA review.

@@ -403,7 +403,8 @@ in `D:\git\opencode-model-router\src\router\config.ts`, which are pure and synch
   existing hard-block guard is active, and it uses that guard's mode semantics. If the guard has an
   advisory (warn-only) mode, a depth violation in that mode warns through the same channel instead
   of blocking. Phase 0.P resolves the switch and mode names. `maxDelegationDepth: null` disables only
-  the depth guard.
+  the depth guard. *Amended during implementation (0.P): resolved in §1.7 A1; the bundled default
+  mode is `advisory`, so the default limit warns rather than blocks.*
 - **D7 — Bump only when the plugin can reason about the result.** A tier is bumped only when it has
   an explicit `effort` and **no** `variant`.
   - Without a configured effort, the plugin cannot know the provider's default effort, and it must
@@ -440,7 +441,8 @@ in `D:\git\opencode-model-router\src\router\config.ts`, which are pure and synch
   `opencode` process through a shell tool, or session-creating tools registered by other plugins.
   Both are documented limits (§5, ADR), not bugs to chase in this plan.
 - **D12 — Owner decisions (2026-10-05).**
-  - `maxDelegationDepth` defaults to `1`.
+  - `maxDelegationDepth` defaults to `1`. *Amended during implementation (0.P, §1.7 A1): enforced only
+    when the mode resolves to `enforced`; advisory (the bundled default) warns.*
   - `effortBumpMax` defaults to `"xhigh"`.
   - The whole plan is approved for autonomous execution through the release (Phase 3.4: merge, tag,
     `npm publish`, local sync), under the §0 rules. There is no approval gate before the release.
@@ -460,6 +462,97 @@ delegate ladder, failed verdict on tier T (attempt k)
        │                              gate → unregister/dispose P → override.clear(P)
        └─ escalate to T+1 → producer at T+1's configured effort (no override)
 ```
+
+### 1.7 Amended during implementation (0.P, 2026-10-05)
+
+*Amended during implementation (0.P).* These amendments are binding and supersede the text they
+name. Evidence (file:line, spike sources and captures) is in
+`D:\git\opencode-model-router\docs\qa\depth-and-effort\phase-0P.md`.
+
+- **A1 — D6 resolved; G1 and D12 amended (owner decision, 2026-10-05: follow D6 literally).**
+  - Switch and mode = `resolveEnforcementMode({ config, tier: <caller tier>, env })`
+    (`src\router\enforcement.ts`): `enforcement.mode` (bundled default `"advisory"`, `tiers.json:5`),
+    the env gate `enforcement.envGate` (default `MODEL_ROUTER_ENFORCE`: `"1"` → `enforced`,
+    `"0"` → `off`) and `enforcement.perTier[<caller tier>]`.
+  - `off` → no check and no depth lookup.
+  - `advisory` (**the bundled default**) → the dispatch proceeds. The caller receives a banner through
+    the existing guard's advisory channel (`guardStore.setPendingNote`, appended after the call), guard
+    id `delegation_depth`, text:
+    `[⚠ GUARD:delegation_depth] this session is at delegation depth ${d}; enforcement.maxDelegationDepth is ${max}, so in enforced mode this dispatch would be refused. Do this part of the work yourself instead of dispatching another subagent.`
+    2.3.1 confirms that the channel reaches a depth ≥ 1 caller on both dispatch tools; where it does
+    not, 2.3 appends the banner to that call's output in `"tool.execute.after"`.
+  - `enforced` → refuse with the D5 text through the D4 path.
+  - The `trivial` downgrade of `guardBeforeCall` (enforced → advisory for trivial sessions) is **not**
+    applied: it relaxes read budgets on trivial tasks and says nothing about nesting.
+  - **G1 is amended:** the refusal holds when the caller's mode resolves to `enforced`. In the bundled
+    default (`advisory`), a dispatch past the limit proceeds with the banner. **D12.1 is amended
+    accordingly:** `maxDelegationDepth` defaults to `1`, and that limit is enforced only in `enforced`
+    mode. README, CONFIG_REFERENCE, the ADR and CHANGELOG state this and show how to enforce it
+    (`enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`).
+- **A2 — D4 resolved.**
+  - The guard result type is `BeforeResult` (`src\guard\enforce.ts:58–63`:
+    `{ block; message?; mode; guard? }`), produced by `guardBeforeCall`.
+  - A refused `task` call is recorded with
+    `trajectoryStore.recordToolEvent(sid, { tool, readOnly, blocked: true })`, exactly as the existing
+    block path does (`src\index.ts` ≈1214–1221). `recordToolEvent` increments `toolCallCount` for
+    blocked events (`src\telemetry\trajectory.ts:73–81`), which is what the false-refusal detector reads.
+  - The `delegate` tool reports refusals by **returning** a `[router] …` string (`src\index.ts`
+    ≈853–915). In enforced mode it returns the D5 text before any session is created.
+- **A3 — D9 decided: the primary mechanism (`chat.params`), with provider-native keys.**
+  - Spike B (real OpenCode 1.18.19 and 2.0.22 against a capturing stub): an option written in
+    `chat.params` reaches the HTTP body for that session only, wins over registered agent options, and
+    equals the agent-registered request **when the key is provider-native**: Claude `effort` →
+    `output_config.effort`; OpenAI `reasoningEffort` → `reasoning.effort`. The snake-case
+    `reasoning_effort` is silently dropped on v1 and in a v2 hook write.
+  - Shapes: v1 `output = { temperature, topP, topK, maxOutputTokens, options }` → write
+    `output.options`. The v2 bridge passes `event.options` itself as the legacy `output` → write it
+    flat. 2.3 implements an explicit version seam; no shape sniffing.
+  - **Producer-only gate.** v1 also calls `chat.params` for title generation with the producer's
+    `sessionID` (`agent: "title"`, a small model). The override applies only when `input.agent` equals
+    the registered tier name **and** the model identity (`providerID` + `modelID ?? id`) equals the
+    tier's `model`. v2 title calls use a separate `title` hook, which the bridge does not forward.
+  - **2.2.1 interface amended:** `applyEffortOverride(store, input: { sessionID?: string; agent?: unknown; model?: unknown }, target: Record<string, unknown>, logger)`
+    writes into the provider-options object it is given; the caller (v1 handler or v2 bridge) passes
+    the right object. The applied keys are the effort keys of `buildAgentOptions({ ...tier, effort })`
+    after A4 (`effort` or `reasoningEffort`).
+  - The fallback (per-prompt `variant`) is not used: the v1 SDK's `SessionPromptData` has no
+    `variant`, and the Claude catalog variants are thinking budgets, not effort levels.
+- **A4 — Owner decision (2026-10-05): fix the pre-existing v1 registration bug in Phase 1.3.**
+  - `buildAgentOptions` emits provider-native keys only: `reasoningEffort`, `reasoningSummary`,
+    `thinking: { type: "enabled", budgetTokens }` and `effort`, for the applicable family, with the
+    existing precedence rules and warnings unchanged. Today it emits `reasoning_effort`,
+    `reasoning_summary` and `budget_tokens`, which v1 drops silently (Spike B extension).
+  - 2.3 adjusts the v2 bridge's registration translation (`src\compat\v2-hooks.ts:125–135`):
+    native keys pass unchanged; the snake-case aliases stay normalized for option bags from other
+    sources, and an explicit native key wins over its alias.
+  - CHANGELOG gets a `Fixed` entry (3.1). The §1.2 protocol, golden-snapshot and agent-list
+    guarantees are unaffected (no snapshot contains these keys).
+  - §2 write-sets change as listed there.
+- **A5 — D7 reach measured (not a stop).** With the active preset `anthropic`, **no tier is bumpable**
+  (every tier sets a `variant`). In `fable-effort`, `fast` (low → bound `xhigh`) and `medium`
+  (high → bound `xhigh`) are bumpable and `heavy` (`xhigh`) is excluded; `hybrid.heavy` is excluded
+  (variant); the OpenAI, Copilot, Google and Z.ai presets set no `effort`. The `xhigh` risk of handover
+  §4.3 does not materialize for bundled presets: `fable-effort.heavy` already ships `effort: "xhigh"`
+  on the same model (`anthropic/claude-fable-5-1`), and both SDK stacks forward `xhigh` unchanged.
+  Real-provider acceptance cannot be shown keylessly.
+- **A6 — D10 confirmed.** `nextAction`/`advance` are called only by the `delegate` tool
+  (`src\index.ts:880`, `:912`). The bump scope is unchanged.
+- **A7 — D3 confirmed for graders.** On the `delegate` path the grader's `parentSessionID` is the
+  caller (`toolCtx.sessionID`, `src\index.ts:755`); on the native `task` path it is `undefined`
+  (`src\index.ts:1382`), so the grader is recorded at depth 1.
+- **A8 — M5 timing confirmed.** v1 native prompt path: create → `registerProducer` → prompt
+  (`src\index.ts` ≈626–669). v2 `routerChildRunner`: `onCreated` is awaited in the progress callback
+  before the child is prompted (`src\compat\v2-client.ts:97–108`). The override is set inside
+  `registerProducer` (both paths) and cleared with the per-attempt cleanup (≈833–848) and the outer
+  `finally` (≈916–924).
+- **A9 — Spike A.** The v2 bridge propagates a before-hook throw as the same `Error`, keeps the
+  caller's `sessionID` for foreground, background and resume dispatches, and leaks no unhandled
+  rejection. The router's own v2 `childRunner` calls the native `subagent` tool directly
+  (`src\compat\v2-client.ts:74–117`); that is not a bypass, because the `delegate` tool is guarded in
+  its own `execute` (D3).
+- **A10 — Local smoke environment.** `smoke:keyless` needs the CI-pinned v1 CLI (1.18.19) first on
+  `PATH`, and `smoke:v2` needs `OPENCODE_V2_BIN`; the machine's default `opencode` is 2.0.22. The
+  keyless fixtures now isolate `USERPROFILE` as well as `HOME` (`d8a9a42`). Commands in `phase-0P.md`.
 
 ---
 
@@ -494,7 +587,10 @@ commits the updated table.
 | `D:\git\opencode-model-router\test\integration\ladder-wiring.test.ts` | — | 2.3 | — |
 | `D:\git\opencode-model-router\test\integration\depth-guard-wiring.test.ts` *(new)* | — | 2.3 | — |
 | `D:\git\opencode-model-router\test\integration\ladder-effort-wiring.test.ts` *(new)* | — | 2.3 | — |
-| v2 hook-bridge test file `<resolved in 0.P>` | — | 2.3 | — |
+| `D:\git\opencode-model-router\test\unit\v2-hooks.test.ts` (v2 hook-bridge tests; resolved in 0.P) | — | 2.3 | — |
+| `D:\git\opencode-model-router\test\integration\fable-effort-preset.test.ts` (A4) | 1.3 | — | — |
+| `D:\git\opencode-model-router\test\smoke\registration.smoke.test.ts` (A4; 0.P fixed its Windows isolation in `d8a9a42`) | 1.3 | — | — |
+| `D:\git\opencode-model-router\docs\PER_TURN_EFFORT.md`, `D:\git\opencode-model-router\docs\OPENCODE_V2.md` (A4 key names) | — | — | 3.1 |
 | `D:\git\opencode-model-router\CHANGELOG.md` | — | — | 3.1 (then 3.4) |
 | `D:\git\opencode-model-router\README.md` | — | — | 3.1 |
 | `D:\git\opencode-model-router\docs\adr\0004-delegation-depth-and-effort-bump.md` *(new)* | — | — | 3.1 |
@@ -796,6 +892,14 @@ and the ladder emits bumped retries per D7/D8 while staying identical to `v2.0.0
   - `effortCeilingFor(tier: TierConfig): EffortLevel | null`, per M3/D7.
 
   Refactor nothing else. The family detection is reused, not duplicated.
+- **1.3.2b** `[tier:medium]` `VERIFY:required` *Amended during implementation (0.P, §1.7 A4).* In the
+  same file, make `buildAgentOptions` emit provider-native keys (`reasoningEffort`,
+  `reasoningSummary`, `thinking: { type: "enabled", budgetTokens }`, `effort`) instead of
+  `reasoning_effort`, `reasoning_summary` and `budget_tokens`, keeping every precedence rule and
+  warning. Update `D:\git\omr-de-p13\test\unit\effort.test.ts`,
+  `D:\git\omr-de-p13\test\integration\fable-effort-preset.test.ts` and
+  `D:\git\omr-de-p13\test\smoke\registration.smoke.test.ts` (≈165) to the native keys. Record a
+  handoff to 2.3 (the v2 bridge translation) and to 3.1 (docs and the CHANGELOG `Fixed` entry).
 - **1.3.3** `[tier:medium]` `VERIFY:required` In `D:\git\omr-de-p13\src\escalate\ladder.ts`:
   - 1.3.3.a New fields:
     - `EscalatePolicy.effortBump?: { perTier: Record<string, { base: EffortLevel; bound: EffortLevel }> } | null`;
@@ -1044,6 +1148,10 @@ solved in code.
   - Make sure v2 background dispatches pass the caller session id to the guard.
   - Make sure the bridged `chat.params` output shape lets `applyEffortOverride` reach the provider
     options, per Spike B.
+  - *Amended during implementation (0.P, §1.7 A3/A4):* the effort override reaches `event.options`
+    (flat) through an explicit v2 seam, gated by agent and model identity; the registration
+    translation (≈125–135) passes native keys unchanged and lets an explicit native key win over its
+    snake-case alias.
 - **2.3.5** `[tier:medium]` `VERIFY:required` Effort wiring in `D:\git\omr-de-p23\src\index.ts`:
   - 2.3.5.a One `EffortOverrideStore` per plugin instance.
   - 2.3.5.b `runProducerAttempt(tier, forcingNote, effort?)`: the ladder loop passes `action.effort`.
@@ -1279,7 +1387,10 @@ or worktrees; an AI-attribution line in the PR or the merge commit.
 
 ### 4.1 Global acceptance criteria
 
-- **G1 — Depth is enforced in code.** With the default config, no session at depth ≥ 1 can create a
+- **G1 — Depth is enforced in code.** *Amended during implementation (0.P, §1.7 A1): "with the
+  default config" below reads "with the default limit, when the caller's enforcement mode resolves to
+  `enforced`"; in `advisory` mode (the bundled default) the dispatch proceeds with the
+  `delegation_depth` banner, and in `off` the guard does nothing.* With the default config, no session at depth ≥ 1 can create a
   subagent through the native `task` tool (v1, v2, v2 background, `task_id` resume) or the `delegate`
   tool. The refusal carries the D5 text, leaves no dispatch, verification or reference state behind,
   and is not flagged as a false refusal. `maxDelegationDepth: N` allows only depths `< N` to dispatch;
