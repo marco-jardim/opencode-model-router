@@ -151,13 +151,19 @@ describe("validateEnforcement — shipped keys are type-checked", () => {
       "verify",
       "graderTemperature",
       "0",
-      /enforcement\.verify\.graderTemperature must be a number >= 0/,
+      /enforcement\.verify\.graderTemperature must be a number >= 0 or null/,
     ],
     [
       "verify",
       "graderTemperature",
       -1,
-      /enforcement\.verify\.graderTemperature must be a number >= 0/,
+      /enforcement\.verify\.graderTemperature must be a number >= 0 or null/,
+    ],
+    [
+      "verify",
+      "graderTemperature",
+      Infinity,
+      /enforcement\.verify\.graderTemperature must be a number >= 0 or null/,
     ],
     [
       "verify",
@@ -230,6 +236,12 @@ describe("validateEnforcement — shipped keys are type-checked", () => {
       );
     });
   }
+
+  it("accepts a null grader temperature", () => {
+    expect(() =>
+      validateConfig(withBadValue("verify", "graderTemperature", null)),
+    ).not.toThrow();
+  });
 
   it("still accepts every value the shipped block actually uses", () => {
     // Valid-but-different values must not be rejected by the new checks.

@@ -439,6 +439,19 @@ describe("OpenCode 2 hook adapter", () => {
     expect(event.options).toEqual({ maxOutputTokens: 123, ...(retained ? { temperature } : {}) });
   });
 
+  it.each([undefined, [], ["openai/model"]])("removes inherited grader temperature when null even with allowlist %j", async (models) => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperature = null;
+    cfg.enforcement.verify.graderTemperatureModels = models;
+    const f = fixture();
+    await f.start();
+    const event = { ...call, agent: V2_GRADER_AGENT, model: { providerID: "openai", id: "model" }, options: { temperature: 0.8, maxOutputTokens: 123 }, system: [] };
+    await f.sessionHooks.context(event);
+    expect(event.options).toEqual({ maxOutputTokens: 123 });
+  });
+
   it("leaves non-grader temperature and other options untouched", async () => {
     const f = fixture();
     await f.start();

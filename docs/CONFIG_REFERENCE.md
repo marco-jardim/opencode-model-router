@@ -186,7 +186,7 @@ may contain instruction text or paths.
 | `requireExplicitDoD` | `boolean` | `false` | When `true`, a task with no explicit Definition of Done is treated as failing verification. |
 | `preferDeterministic` | `boolean` | _(auto)_ | Defaults to `true` whenever the DoD contains runnable checks; omit to let the router decide. |
 | `graderPolicy` | `"atLeastProducerTier"` | `"atLeastProducerTier"` | **Only valid value.** Grader tier = `max(producerTier, minGraderTier)` along the ladder; never below the producer. A deterministic check uses no grader. |
-| `graderTemperature` | `number` | `0` | Grader sessions only. V1 skips it when the host marks the model as not supporting temperature; v2 sends it through the context hook only for listed models. |
+| `graderTemperature` | `number \| null` | `0` | Grader sessions only. Numeric values respect v1 host temperature capability and are sent on v2 only for listed models. Set `null` to remove any temperature value, including one set earlier or on a v2 listed model. |
 | `graderTemperatureModels` | `string[]` | absent | V2 only: exact `providerID/modelID` entries allowed to receive grader temperature. Absent means none. Override arrays replace, not concatenate; `[]` clears the list. |
 | `minGraderTier` | `string \| null` | `null` | Optional floor for the grader tier, independent of producer. `null` means no floor and is identical to omitting the key. |
 | `delegateTimeoutMs` | `integer ≥ 1` | `600000` (10 min) | Ceiling for **one** producer `session.prompt` turn in the `delegate` tool. Each ladder attempt gets its own budget. On expiry the child session is aborted and deleted, the attempt is recorded as failed with `producer failed: …`, and the ladder advances — the delegation never fabricates a pass. |
@@ -568,7 +568,7 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | `guard.readDraftCap` and `guard.sameOpRetryCap` must each be an integer ≥ 0. |
 | `guard.blockSelfScript` and `guard.deliverableFirst` must each be a boolean. |
 | `verify.minGraderTier` must be a string or `null`. |
-| `verify.graderTemperature` must be a number ≥ 0. |
+| `verify.graderTemperature` must be a number ≥ 0 or `null`. |
 | `verify.graderTemperatureModels` must be an array of non-empty `provider/model` strings, with non-empty provider and model parts; multi-segment model IDs are allowed. |
 | `verify.requireExplicitDoD` must be a boolean. |
 | `verify.delegateTimeoutMs`, `verify.graderTimeoutMs`, `verify.gateBudgetMs`, `verify.baselineTimeoutMs`, `verify.recheckTimeoutMs` and `verify.pendingTtlMs` must each be an integer ≥ 1 (milliseconds). `0` and negatives are rejected, not read as "no timeout". |

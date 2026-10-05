@@ -215,8 +215,10 @@ export async function registerV2Hooks(
         if (!(key in event.options)) event.options[key] = value;
       }
       await legacy["chat.params"]?.(input, event.options);
+      const verify = loadConfig().enforcement?.verify;
       if (event.agent === V2_GRADER_AGENT
-        && !(loadConfig().enforcement?.verify?.graderTemperatureModels ?? []).includes(`${event.model.providerID}/${event.model.id}`)) {
+        && (verify?.graderTemperature === null
+          || !(verify?.graderTemperatureModels ?? []).includes(`${event.model.providerID}/${event.model.id}`))) {
         delete event.options.temperature;
       }
       const original = new Map<string, SystemPart[]>();

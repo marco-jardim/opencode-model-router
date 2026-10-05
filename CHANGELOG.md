@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Setting `enforcement.verify.graderTemperature` to `null` removes any grader temperature,
+  including pre-existing values and v2 allowlisted models. Numeric values still respect
+  v1 model capabilities and the v2 allowlist. Grader response/API failures are reported as
+  SDK errors with metadata-only details before verdict parsing, rather than as parse failures.
 - Native `task` acceptance checks could run in the router directory instead of the producer's worktree: `[acceptance]` now supports `cwd:` (a supplied tool cwd wins), and the deterministic gate returns unverifiable without running checks when all changed paths are absolute and outside its base.
 - Windows e2e self-check waits for sampler snapshots instead of a fixed 2.5 s window (#61).
 - Parallel deferred finishes now share their gate-time tree snapshot, as dispatch

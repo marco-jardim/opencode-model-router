@@ -426,6 +426,16 @@ describe("loadConfig — global + project override hierarchy", () => {
     );
   });
 
+  it("lets a project-local null grader temperature replace the bundled number", () => {
+    expect(loadConfig().enforcement?.verify?.graderTemperature).toBeTypeOf("number");
+
+    writeLocal({ enforcement: { verify: { graderTemperature: null } } });
+    invalidateConfigCache();
+
+    expect(loadConfig().enforcement?.verify?.graderTemperature).toBeNull();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
   it("project-local wins over global for the same key", () => {
     writeGlobal({
       presets: { anthropic: { fast: { model: "anthropic/global-fast" } } },
