@@ -115,6 +115,43 @@ describe("depth and effort bump config — defaults and validation", () => {
 });
 
 describe("depth and effort bump config — regression cases", () => {
+  it.each([undefined, { maxDelegationDepth: 2 }])("preserves inherited root properties with enforcement %s", (enforcement) => {
+    const raw = validRaw({ enforcement });
+    const prototype = { rules: raw.rules, defaultTier: raw.defaultTier };
+    delete raw.rules;
+    delete raw.defaultTier;
+    Object.setPrototypeOf(raw, prototype);
+    const cfg = validateConfig(raw);
+    expect(Object.getPrototypeOf(cfg)).toBe(prototype);
+    expect(cfg.rules).toBe(prototype.rules);
+    expect(cfg.defaultTier).toBe(prototype.defaultTier);
+    expect(Object.hasOwn(cfg, "rules")).toBe(false);
+  });
+
+  it("keeps escalate arrays as arrays and validates their existing fields", () => {
+    const escalate = Object.assign([], { effortBump: false });
+    const cfg = validateConfig(validRaw({ enforcement: { escalate } }));
+    expect(Array.isArray(cfg.enforcement?.escalate)).toBe(true);
+    expect(cfg.enforcement?.escalate).toEqual(escalate);
+    const empty = validateConfig(validRaw({ enforcement: { escalate: [] } }));
+    expect(empty.enforcement?.escalate).toEqual([]);
+    expect(Array.isArray(empty.enforcement?.escalate)).toBe(true);
+    expect(() => validateConfig(validRaw({ enforcement: { escalate: Object.assign([], { maxTotalAttempts: 0 }) } })))
+      .toThrowError("enforcement.escalate.maxTotalAttempts must be an integer >= 1");
+  });
+
+  it.each([false, true])("preserves frozenness for copied objects and arrays (array=%s)", (array) => {
+    const escalate = array ? Object.assign([], { effortBump: false }) : { effortBump: false };
+    const raw = deepFreeze(validRaw({ enforcement: { maxDelegationDepth: 2, escalate } }));
+    const cfg = validateConfig(raw);
+    expect(cfg).not.toBe(raw);
+    expect(Object.isFrozen(cfg)).toBe(true);
+    expect(Object.isFrozen(cfg.enforcement)).toBe(true);
+    expect(Object.isFrozen(cfg.enforcement?.escalate)).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(cfg, "enforcement")?.writable).toBe(false);
+    expect(Array.isArray(cfg.enforcement?.escalate)).toBe(array);
+  });
+
   it.each([undefined, { maxDelegationDepth: 2 }])("reads the enforcement parent once, including %s", (first) => {
     let reads = 0;
     const raw = validRaw();

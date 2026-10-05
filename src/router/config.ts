@@ -756,8 +756,12 @@ function withValidatedSnapshots<T extends object>(
     }
   }
   if (!changed) return obj;
-  // The complete descriptor set preserves the input's shape.
-  return Object.defineProperties({}, descriptors) as T;
+  // Keep inherited config values and array identity, not just own descriptors.
+  const copy: object = Array.isArray(obj) ? [] : Object.create(Object.getPrototypeOf(obj));
+  if (Array.isArray(obj)) Object.setPrototypeOf(copy, Object.getPrototypeOf(obj));
+  Object.defineProperties(copy, descriptors);
+  if (Object.isFrozen(obj)) Object.freeze(copy);
+  return copy as T;
 }
 
 /** Reject keys that could reparent a later Object.assign copy. */
@@ -1099,6 +1103,9 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
  * Validate a raw parsed config. Strict and throwing by design: the bundled
  * tiers.json must be valid on its own, and loadConfig turns a throw from an
  * override layer into a warning plus a fallback rather than a crash.
+ * Returns a copy when enforcement is present (even an undefined accessor),
+ * snapshotting its depth/effort values without mutating the caller. Copies
+ * preserve prototypes, arrays, unrelated descriptors and source frozenness.
  *
  * Section order matters and is preserved from when this was one function: a
  * config with several problems reports the same first error it always did.
