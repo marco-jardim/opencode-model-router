@@ -284,6 +284,7 @@ No critical or major finding. No reachable bump lowers effort, goes past its bou
 ## Deferred by plan
 
 - **QA-1.3-1 — deferred by plan — 2.3.5.b.** Phase 2.3 passes `action.effort` into `runProducerAttempt`, making the scorecard reflect the effort actually applied. No early Phase 1.3 code change.
+- **QA-1.3-9 — deferred by plan — Phase 3.1 (Wave 3).** Correct the A4 native-key documentation in `README.md:282,483,491` and `docs/CONFIG_REFERENCE.md:668–760`; both files belong to Phase 3.1's write-set. They must describe `reasoningEffort` / `reasoningSummary` and `thinking`, not registration with the old snake-case keys.
 - 1.3.4 waits for Phase 1.1 (`resolveEffortBump`) to be merged into `de/p13`.
 - Phase 2.3 passes `action.effort` into `runProducerAttempt` and builds the options with `buildAgentOptions({ ...tier, effort })`; I4 is what makes the bump take effect. 2.3 also adjusts the v2 bridge.
 - The `set` refusal above `effortCeilingFor` (plan, defence in depth) comes in a later phase.
