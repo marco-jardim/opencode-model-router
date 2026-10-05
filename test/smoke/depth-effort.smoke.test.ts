@@ -296,6 +296,7 @@ for (const host of hosts) {
           const rootResults = f.provider.captures.filter(c => c.session === run.rootID && c.role === "orchestrator").flatMap(c => blocks(c.body)).filter(b => b.type === "tool_result");
           expect(rootResults.length).toBeGreaterThan(0);
           expect(rootResults.every(b => !b.is_error && !blockText(b.content).includes("DELEGATION DEPTH LIMIT"))).toBe(true);
+          expect(rootResults.every(b => !blockText(b.content).includes("[⚠ GUARD:delegation_depth]"))).toBe(true);
         }, 120_000);
       }
     }
