@@ -399,8 +399,8 @@ describe("eviction and bookkeeping", () => {
     expect(tracker.size()).toBeLessThanOrEqual(maxEntries);
   });
 
-  // Amended for QA-1.2-2: X carries a conflict, so it is pinned outside the
-  // one-slot LRU (size 2: the pinned X plus one LRU entry).
+  // Amended for QA-1.2-2, then for QA-1.2-R2-3: X carries a conflict, so it is
+  // pinned, and one cap covers both kinds of node (size 1: the pinned X; was 2).
   it("active walk snapshots preserve every conflicting parent across eviction", async () => {
     const { tracker, getParent } = fixture({ maxEntries: 1 });
     tracker.recordCreated("X", "P");
@@ -408,7 +408,7 @@ describe("eviction and bookkeeping", () => {
     getParent.mockImplementation(async (id) => id === "Q" ? "R" : null);
     expect(await tracker.depthOf("X")).toBe(2);
     expect(getParent.mock.calls).toEqual([["P"], ["Q"], ["R"]]);
-    expect(tracker.size()).toBe(2);
+    expect(tracker.size()).toBe(1);
   });
 
   // Amended for QA-1.2-2: the read leaf is no longer the first victim of its
@@ -790,9 +790,11 @@ describe("QA-1.2-1: a walk never loses evidence to a re-created node", () => {
   });
 
   // Pinning (QA-1.2-2) keeps X out of the LRU, so the TTL is what re-creates it here.
+  // Amended for QA-1.2-R2-3: 3 slots (was 2) hold the pinned X plus the two
+  // ordinary entries the old separate caps gave it, so C is not re-fetched.
   it("a plugin child re-created as a backend root keeps its plugin floor and creator link", async () => {
     vi.useFakeTimers();
-    const { tracker, getParent, time } = fixture({ maxEntries: 2, ttlMs: 100 });
+    const { tracker, getParent, time } = fixture({ maxEntries: 3, ttlMs: 100 });
     const creator = deferred<string | null>();
     getParent.mockImplementation(async (id) => id === "C" ? creator.promise : id === "Y" ? "X" : null);
     tracker.recordPluginChild("X", "C");
@@ -941,17 +943,20 @@ describe("QA-1.2-2: evidence the backend cannot reproduce is never lost to LRU p
     expect(getParent.mock.calls).toEqual([["A"]]);
   });
 
+  // Amended for QA-1.2-R2-3: under one cap an ordinary C is evicted before any
+  // pinned node can overflow, so a pinned overflow (the old trigger: Y and Z
+  // pushing X out) can no longer leave C tracked above a lost ancestor.
+  // Forgetting X leaves C on a frontier memo its links no longer prove, which
+  // still needs the pin.
   it("a floor above what the backend reconstructs is pinned on the descendant", async () => {
-    const { tracker, getParent, warn } = fixture({ maxEntries: 2 });
+    const { tracker, getParent } = fixture({ maxEntries: 2 });
     tracker.recordPluginChild("X", null);
     tracker.recordCreated("C", "X");
-    tracker.recordPluginChild("Y", null);
-    tracker.recordPluginChild("Z", null);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("dropping pinned evidence for session X"));
+    tracker.forget("X");
     expect(await tracker.depthOf("C")).toBe(2);
     for (let i = 0; i < 20; i++) tracker.recordRoot(`busy${i}`);
-    // C is pinned: never looked up itself, and its floor outlives the backend's
-    // answer for X (root, so a re-resolved C alone would be 1).
+    // C is pinned: never looked up itself, and it keeps the floor that X's
+    // forgotten evidence proved (re-resolved through the backend it reads lower).
     expect(await tracker.depthOf("C")).toBe(2);
     expect(getParent).not.toHaveBeenCalledWith("C");
   });
@@ -1098,5 +1103,41 @@ describe("QA-1.2-R2-2: detached lookups are bounded", () => {
     for (const answer of answers.get("X")!) answer.resolve(null);
     await vi.advanceTimersByTimeAsync(0);
     expect(tracker.size()).toBe(0);
+  });
+});
+
+describe("QA-1.2-R2-3: one maxEntries cap covers ordinary and pinned nodes", () => {
+  it("size() never exceeds maxEntries: ordinary nodes go first, pinned ones only on overflow", async () => {
+    const { tracker, getParent, warn } = fixture({ maxEntries: 3 });
+    for (let i = 0; i < 3; i++) tracker.recordPluginChild(`p${i}`, null);
+    for (let i = 0; i < 3; i++) {
+      tracker.recordRoot(`r${i}`);
+      expect(tracker.size()).toBe(3);
+    }
+    for (let i = 0; i < 3; i++) expect(await tracker.depthOf(`p${i}`)).toBe(1);
+    expect(getParent).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    tracker.recordPluginChild("p3", null);
+    expect(tracker.size()).toBe(3);
+    expect(warn.mock.calls).toEqual([[expect.stringContaining("dropping pinned evidence for session p0")]]);
+  });
+
+  it("holds while a walk is suspended and when a conflict pins an ordinary node", async () => {
+    const { tracker, getParent } = fixture({ maxEntries: 3 });
+    const pending = deferred<string | null>();
+    getParent.mockReturnValue(pending.promise);
+    const w = tracker.depthOf("W");
+    await started();
+    tracker.recordPluginChild("p", null);
+    chain(tracker, 1, "a");
+    tracker.recordCreated("a1", "p"); // a conflict moves a1 to the pinned side
+    expect(tracker.size()).toBe(3);
+    tracker.recordRoot("b");
+    expect(tracker.size()).toBe(3);
+    pending.resolve(null);
+    expect(await w).toBe(0);
+    expect(tracker.size()).toBe(3);
+    expect(await tracker.depthOf("a1")).toBe(2);
+    expect(tracker.size()).toBe(3);
   });
 });

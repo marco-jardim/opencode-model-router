@@ -190,16 +190,25 @@ export function createDepthTracker(
     invalidate(id);
   }
 
+  // The oldest entry other than `protect`, or `protect` when it is the only one.
   function victim(map: Map<string, Node>, protect: string): string {
     const keys = map.keys();
     const first = keys.next().value!;
-    return first === protect ? keys.next().value! : first;
+    if (first !== protect) return first;
+    const second = keys.next();
+    return second.done ? first : second.value;
   }
 
-  // The node a call has just recorded or read is never the victim of its own
-  // trim; its ancestors go first, and drop() makes it re-resolve them.
+  // One cap for every node (QA-1.2-R2-3): size() <= maxEntries. Ordinary nodes
+  // (backend-reproducible) go first, oldest first; the node a call has just
+  // recorded or read goes last of them, so its ancestors go before it and
+  // drop() makes it re-resolve them. It goes at all only when pinned nodes fill
+  // the cap, after its answer is computed. A pinned node is dropped, with a
+  // warning, only when pinned nodes alone exceed the cap (never the current
+  // one). Only adopt() adds a node, and every adopt() is followed by a trim in
+  // the same synchronous call; pin() moves a node between the maps.
   function trim(protect: string): void {
-    while (lru.size > maxEntries) drop(victim(lru, protect), true);
+    while (lru.size + pins.size > maxEntries && lru.size) drop(victim(lru, protect), true);
     while (pins.size > maxEntries) {
       const id = victim(pins, protect);
       warn(id, "evict", `more than ${maxEntries} pinned sessions`);
