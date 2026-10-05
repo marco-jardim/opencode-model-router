@@ -405,13 +405,25 @@ describe("per-session effort overrides", () => {
     expect(consoleWarning).toHaveBeenCalledExactlyOnceWith("[model-router] Evicted oldest effort override for first");
   });
 
-  it("defaults to 1000 entries and console warnings", () => {
+  it("prefixes builder and refusal warnings on the default console logger", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createEffortOverrideStore();
+    store.set("producer", "fast", { ...claude, reasoning: { summary: "auto" } }, "high");
+    expect(store.has("producer")).toBe(true);
+    expect(warning).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^\[model-router\] tier fast:/));
+    store.set("producer", "fast", openai, "max");
+    expect(store.has("producer")).toBe(false);
+    expect(warning).toHaveBeenCalledTimes(2);
+    expect(warning).toHaveBeenLastCalledWith("[model-router] Effort override for producer exceeds the tier ceiling; override refused");
+  });
+
+  it("defaults to 1000 entries and prefixed console warnings", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const store = createEffortOverrideStore();
     for (let i = 0; i <= 1000; i++) store.set(String(i), "fast", openai, "medium");
     expect(store.size()).toBe(1000);
     expect(store.has("0")).toBe(false);
-    expect(warning).toHaveBeenCalledExactlyOnceWith("Evicted oldest effort override for 0");
+    expect(warning).toHaveBeenCalledExactlyOnceWith("[model-router] Evicted oldest effort override for 0");
   });
 
   it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid capacity %s", (maxEntries) => {

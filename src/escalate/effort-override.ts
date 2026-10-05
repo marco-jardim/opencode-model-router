@@ -39,7 +39,7 @@ function nonempty(value: unknown): value is string {
 export function createEffortOverrideStore(
   opts: { maxEntries?: number; logger?: Logger } = {},
 ): EffortOverrideStore {
-  const logger = opts.logger ?? console;
+  const logger = opts.logger ?? { warn: (message: string) => console.warn(`[model-router] ${message}`) };
   const builderLogger = {
     warn: (message: string) => warn(logger, message),
     flush: () => Promise.resolve(),
