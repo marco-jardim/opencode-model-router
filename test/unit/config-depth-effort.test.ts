@@ -199,6 +199,40 @@ describe("depth and effort bump config — regression cases", () => {
     expect(reads).toBe(1);
   });
 
+  it.each(["maxDelegationDepth", "effortBump", "effortBumpMax"])("snapshots get-only Proxy %s without an own or inherited key", (key) => {
+    let reads = 0;
+    const first = key === "maxDelegationDepth" ? 2 : key === "effortBump" ? false : "high";
+    const proxy = new Proxy({}, {
+      get: (target, property, receiver) => property === key
+        ? (++reads === 1 ? first : -7)
+        : Reflect.get(target, property, receiver),
+    });
+    expect(Object.hasOwn(proxy, key)).toBe(false);
+    expect(key in proxy).toBe(false);
+    const enforcement = key === "maxDelegationDepth" ? proxy : { escalate: proxy };
+    const cfg = validateConfig(validRaw({ enforcement }));
+    expect(resolveDepthLimit(cfg)).toBe(key === "maxDelegationDepth" ? 2 : 1);
+    expect(resolveEffortBump(cfg)).toEqual({ enabled: key !== "effortBump", max: key === "effortBumpMax" ? "high" : "xhigh" });
+    expect(reads).toBe(1);
+  });
+
+  it("snapshots a get-only root Proxy enforcement value", () => {
+    let reads = 0;
+    const enforcement = { maxDelegationDepth: 2, escalate: { effortBump: false, effortBumpMax: "high" } };
+    const raw = new Proxy(validRaw(), {
+      get: (target, property, receiver) => property === "enforcement"
+        ? (++reads === 1 ? enforcement : { maxDelegationDepth: -7 })
+        : Reflect.get(target, property, receiver),
+    });
+    expect(Object.hasOwn(raw, "enforcement")).toBe(false);
+    expect("enforcement" in raw).toBe(false);
+    const cfg = validateConfig(raw);
+    expect(resolveDepthLimit(cfg)).toBe(2);
+    expect(resolveEffortBump(cfg)).toEqual({ enabled: false, max: "high" });
+    expect(cfg.enforcement).toEqual(enforcement);
+    expect(reads).toBe(1);
+  });
+
   it.each([
     [{ toString: 1 }, 'object {"toString":1}'],
     [Object.create(null), "object {}"],

@@ -742,7 +742,7 @@ function describeValue(value: unknown): string {
   return description.length > 80 ? `${description.slice(0, 79)}…` : description;
 }
 
-/** Copy without invoking accessors again; snapshot only keys already present. */
+/** Copy without invoking accessors again; include defined get-only Proxy values. */
 function withValidatedSnapshots<T extends object>(
   obj: T,
   snapshots: Record<string, unknown>,
@@ -750,7 +750,7 @@ function withValidatedSnapshots<T extends object>(
   const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(obj);
   let changed = false;
   for (const [key, value] of Object.entries(snapshots)) {
-    if (Object.hasOwn(descriptors, key) || key in obj) {
+    if (value !== undefined || Object.hasOwn(descriptors, key) || key in obj) {
       descriptors[key] = { value, writable: true, enumerable: true, configurable: true };
       changed = true;
     }
