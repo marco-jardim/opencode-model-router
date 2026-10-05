@@ -12,6 +12,7 @@ import { DEFAULT_DEPTH_TIMEOUT_MS } from "../../src/router/depth";
 const captured = vi.hoisted(() => ({
   pending: undefined as ReturnType<typeof import("../../src/verify/wiring").createVerificationWiring>["pending"] | undefined,
   trajectory: undefined as ReturnType<typeof import("../../src/telemetry/trajectory").createTrajectoryStore> | undefined,
+  depth: undefined as ReturnType<typeof import("../../src/router/depth").createDepthTracker> | undefined,
 }));
 const observed = vi.hoisted(() => ({
   startDispatch: vi.fn(), prepareVerification: vi.fn(),
@@ -47,6 +48,15 @@ vi.mock("../../src/verify/dispatch", async (importOriginal) => {
 });
 
 type Hook = (input: unknown, output?: unknown) => Promise<void>;
+vi.mock("../../src/router/depth", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../src/router/depth")>();
+  return { ...original, createDepthTracker: (...args: Parameters<typeof original.createDepthTracker>) => {
+    const tracker = original.createDepthTracker(...args);
+    captured.depth = tracker;
+    return tracker;
+  } };
+});
+
 vi.mock("../../src/telemetry/trajectory", async (importOriginal) => {
   const original = await importOriginal<typeof import("../../src/telemetry/trajectory")>();
   return { ...original, createTrajectoryStore: (...args: Parameters<typeof original.createTrajectoryStore>) => {
@@ -420,6 +430,34 @@ describe("delegation depth plugin wiring", () => {
       });
     });
   }
+
+  it.each([
+    ["banner storage", "advisory banner not stored"],
+    ["refusal record", "refusal not recorded"],
+    ["banner delivery", "advisory banner not delivered"],
+    ["session creation", "session creation not recorded"],
+  ])("safely formats unprintable errors in %s diagnostics", async (operation, diagnostic) => {
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", operation === "refusal record" ? "1" : "");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { hooks } = await setup({ ...makeCtx(dir), ...(operation === "banner storage" ? { routerHost: "v2" as const } : {}) });
+    await seed(hooks);
+    const fail = () => { throw Object.create(null); };
+    if (operation === "banner storage") {
+      const output = Object.defineProperty(taskOutput(), DEPTH_BANNER, { set: fail });
+      await expect(hooks["tool.execute.before"](taskInput(), output)).resolves.toBeUndefined();
+    } else if (operation === "refusal record") {
+      vi.spyOn(captured.trajectory!, "recordToolEvent").mockImplementation(fail);
+      await expect(hooks["tool.execute.before"](taskInput(), taskOutput())).rejects.toThrow(depthLimitMessage(1, 1));
+    } else if (operation === "banner delivery") {
+      await hooks["tool.execute.before"](taskInput(), taskOutput());
+      const output = Object.defineProperty({}, "output", { get: () => "done", set: fail });
+      await expect(hooks["tool.execute.after"](taskInput(), output)).resolves.toBeUndefined();
+    } else {
+      vi.spyOn(captured.depth!, "recordCreated").mockImplementation(fail);
+      await expect(created(hooks, "G", "C")).resolves.toBeUndefined();
+    }
+    expect(warn).toHaveBeenCalledWith(`[model-router] [router] delegation depth: ${diagnostic}`);
+  });
 
   it("counts a refused delegate from a known subagent once and preserves false-refusal detection", async () => {
     vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");

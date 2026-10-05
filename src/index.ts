@@ -428,7 +428,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         while (warnedNoCallID.size > 1000) warnedNoCallID.delete(warnedNoCallID.values().next().value!);
       }
     } catch (error) {
-      logger.warn("[router] delegation depth: advisory banner not stored", { error: scrubText(String(error)) });
+      logger.warn("[router] delegation depth: advisory banner not stored", { error: describeError(error) });
     }
   };
 
@@ -1227,7 +1227,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               });
             }
           } catch (error) {
-            logger.warn("[router] delegation depth: refusal not recorded", { error: scrubText(String(error)) });
+            logger.warn("[router] delegation depth: refusal not recorded", { error: describeError(error) });
           }
           throw new Error(depth.message);
         }
@@ -1405,7 +1405,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const text = typeof output.output === "string" ? output.output.trimEnd() : "";
             output.output = text ? `${text}\n\n${banner}` : banner;
           } catch (error) {
-            logger.warn("[router] delegation depth: advisory banner not delivered", { error: scrubText(String(error)) });
+            logger.warn("[router] delegation depth: advisory banner not delivered", { error: describeError(error) });
           }
         }
       }
@@ -1682,7 +1682,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               typeof info.parentID === "string" && info.parentID !== "" ? info.parentID : null);
           }
         } catch (error) {
-          logger.warn("[router] delegation depth: session creation not recorded", { error: scrubText(String(error)) });
+          logger.warn("[router] delegation depth: session creation not recorded", { error: describeError(error) });
         }
         if (
           typeof info?.id === "string" &&
