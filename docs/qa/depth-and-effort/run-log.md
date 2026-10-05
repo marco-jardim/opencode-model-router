@@ -27,7 +27,14 @@ serialized, plan §0.6.9) and every delegation takeover (plan §0.10.2).
   writes) go to `@medium`.
 - 0.P.2 follow-up: `@fast` returned `NEED MORE:` once with no file tools; the same session completed
   after the explicit instruction.
-- 0.P.5: verdicts written by the orchestrator (heavy tier itself, router rule 9), not a takeover.
+- Who ran what in 0.P: baseline commands, the smoke environment fix (`d8a9a42`), Spike A (scratch,
+  bridge level), Spike B, its extension and Spike A2 (about 100 OpenCode launches in total, all in
+  isolated temp homes under `C:\Users\Marquinho\AppData\Local\Temp\Claude\spike-b\`, cleanup verified
+  each time): `@medium`. Read-only gathering: `@fast`. QA: `@heavy`.
+- 0.P.5 verdicts and 0.P.6 (plan amendments, `phase-0P.md`, commits): written by the orchestrator
+  (heavy tier itself, router rule 9; the content was already in the orchestrator's context), not a
+  takeover of a failed delegation.
+- `router_verify pending: true` before the 0.P QA: "no unverified delegations in this session".
 - 0.P: two owner decisions requested and received (2026-10-05): follow D6 literally; fix the v1
   registration bug in Phase 1.3. Recorded in plan §1.7 A1 and A4.
 

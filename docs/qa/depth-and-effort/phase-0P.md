@@ -1,7 +1,9 @@
 # Phase 0.P — Execution pre-flight
 
-Plan: `D:\git\opencode-model-router\docs\plans\delegation-depth-and-effort-bump-plan.md` (revision 3,
-amended in §1.7). Integration branch `de/main`, worktree `D:\git\omr-de-main`.
+Plan: the `de/main` copy `D:\git\omr-de-main\docs\plans\delegation-depth-and-effort-bump-plan.md`
+(revision 4, amendments in §1.7). The untracked main-checkout copy is the unamended revision 3 (blob
+`f6f69e1`), kept only for the 3.4.5 hash check. Integration branch `de/main`, worktree
+`D:\git\omr-de-main`.
 
 ## Pre-flight
 
@@ -84,13 +86,14 @@ which reads `USERPROFILE` on Windows. Fixed in `d8a9a42`
   |---|---|---|---|---|---|---|---|
   | anthropic (active) | fast | anthropic/claude-sonnet-5-5 | low | low | claude | no (variant) | — |
   | anthropic (active) | medium | anthropic/claude-sonnet-5-5 | medium | medium | claude | no (variant) | — |
-  | anthropic (active) | heavy | anthropic/claude-opus-5-5 | xhigh | xhigh | claude | no (variant) | — |
+  | anthropic (active) | heavy | anthropic/claude-opus-5-5 | xhigh | xhigh | claude (adaptive-only) | no (variant) | — |
   | openai | fast / medium / heavy | gpt-6-luna-fast / gpt-6.1-sol-fast / gpt-6-astra-fast | — | — / xhigh / max | openai | no (no effort) | — |
-  | github-copilot | fast / medium / heavy | claude-haiku-4.5 / claude-sonnet-5 / claude-fable-5-1 | — | — | claude | no (no effort) | — |
+  | github-copilot | fast / medium | claude-haiku-4.5 / claude-sonnet-5 | — | — | claude | no (no effort) | — |
+  | github-copilot | heavy | claude-fable-5-1 | — | — | claude (adaptive-only) | no (no effort) | — |
   | google | all | gemini-* | — | — | other | no | — |
-  | zai | all | glm-* | — | — / — / max | other | no | — |
+  | zai | fast / medium / heavy | glm-4.7 / glm-5.3 / glm-5.3 | — | — / high / max | other | no | — |
   | hybrid | fast / medium | gpt-6-luna-fast / gpt-6-astra-fast | — | medium / high | openai | no | — |
-  | hybrid | heavy | anthropic/claude-opus-5-5 | xhigh | xhigh | claude | no (variant) | — |
+  | hybrid | heavy | anthropic/claude-opus-5-5 | xhigh | xhigh | claude (adaptive-only) | no (variant) | — |
   | fable-effort | fast | anthropic/claude-fable-5-1 | low | — | claude (adaptive-only) | **yes** | xhigh |
   | fable-effort | medium | anthropic/claude-fable-5-1 | high | — | claude (adaptive-only) | **yes** | xhigh |
   | fable-effort | heavy | anthropic/claude-fable-5-1 | xhigh | — | claude (adaptive-only) | no (base = bound) | xhigh |
@@ -111,6 +114,32 @@ which reads `USERPROFILE` on Windows. Fixed in `d8a9a42`
   Therefore Spike B built its own capturing rig (below).
 
 ### 0.P.3 Spike A — v2 refusal path
+
+**Superseded by Spike A2 (host level, below).** The original bridge-only run is kept for the record;
+QA-0.P-1 showed it cannot prove host behaviour (it supplied the caller id itself).
+
+#### Spike A2 — host level (authoritative)
+
+Rig: `C:\Users\Marquinho\AppData\Local\Temp\Claude\spike-b\spike-a2\` (sources `rig.mjs`,
+`observer-v1.mjs`, `observer-v2\`, `router-copy\` with provenance hashes, `captures.jsonl`,
+`scripted-responses.jsonl`, `v1-hooks.jsonl`, `v2-hooks.jsonl`, `runs.jsonl`, `report.mjs`,
+`cleanup.json`; section "Spike A2" of `..\REPORT.md`). Real OpenCode 1.18.19 and 2.0.22; a keyless
+Anthropic-Messages SSE stub scripts the model's tool calls; the observer plugin's before-hook throws
+`DEPTH-REFUSAL-SENTINEL` for a marked dispatch (v2: a native `{ id, setup }` plugin with
+`ctx.tool.hook("execute.before")`, not a bridge mock).
+
+| Scenario | v1 1.18.19 | v2 2.0.22 |
+|---|---|---|
+| R1 foreground refused | before-hook `sessionID` = root; next request carries `tool_result` `is_error: true`, content `DEPTH-REFUSAL-SENTINEL`; final `ok`; exit 0 | same (content `{"error":{"type":"unknown","message":"DEPTH-REFUSAL-SENTINEL"},…}`) |
+| R2 background refused | not applicable: v1 `task` has no `background` parameter | `background: true` seen; caller = root; `is_error: true`; final `ok`; exit 0 |
+| R3 resume refused | same root; `task_id` = existing child; `is_error: true`; final `ok`; exit 0 | same, native `sessionID` arg |
+| R4 child dispatches | caller = child, `parentID` = root, refused (needs `general.permission.task: "allow"`: v1's default `general` has no `task` tool) | caller = child, `parentID` = root, refused (default `general`) |
+| R5 real router `delegate` producer | `chat.params`: `agent: "fast"`, `model: { providerID: "anthropic", id: "claude-sonnet-4-5" }` (no `modelID`) | `context`: `agent: "fast"`, `model: { id: "claude-sonnet-4-5", providerID: "anthropic", variant: "default" }` |
+
+R5 loaded the real router from a hashed copy of the worktree's `src\` (the package has no build step;
+`main` is `./src/index.ts`), with `delegate` enabled, enforcement off and verification `never`.
+
+#### Original bridge-level run
 
 Scratch test `D:\git\omr-de-main\test\scratch\spike-a.test.ts` (deleted; never committed) registered
 the real `registerV2Hooks` with `createV2Runtime(ctx).withToolContext` and a legacy
@@ -146,16 +175,21 @@ Primary scenarios (wire field: OpenAI `reasoning.effort`, Claude `output_config.
 | S1 baseline | medium | medium | absent | absent |
 | S2 hook writes `reasoning_effort`/`effort` = high | **medium (dropped)** | **medium (dropped)** | high | high |
 | S3 agent registered with the same keys | **medium (dropped)** | high (bridge translates) | high | high |
-| S4 clean session after S2, same process | medium | medium | absent | absent |
+| S4 clean session (a separate `opencode run`) | medium | medium | absent | absent |
 | S5 agent low + hook high | **medium** | **low** | high | high |
 | hook writes native `reasoningEffort` = high | high | high | — | — |
 | agent native `reasoningEffort` low + hook native high | high | high | — | — |
 
 Hook shapes: v1 `chat.params` `output` keys `temperature, topP, topK, maxOutputTokens, options`; v2
 `context` event keys `sessionID, model, system, messages, options, agent, tools`, and the bridge passes
-`event.options` itself as the legacy `output`. Same-process isolation (one `opencode serve` per version,
-distinct sessions): the override reaches only the marked session. Non-effort payload fields of S1 vs S2
-are identical after masking markers and ids.
+`event.options` itself as the legacy `output`. Same-process isolation comes from `isolation.mjs` (one
+`opencode serve` per version, pids 65588 and 54512, distinct sessions): the override reaches only the
+marked session, for Claude `effort` and for OpenAI native `reasoningEffort`. Non-effort payload
+equality: S1 vs S2 holds for Claude; for OpenAI S1 vs S2 compares two unchanged requests (the
+snake-case key was dropped), so the meaningful OpenAI comparisons are native-key hook vs
+agent-registered (extension cases `a` vs `d`) and CLEAN vs CAMEL in the isolation run, both equal
+outside `reasoning` on v1 and v2 (checked by the 0.P QA reviewer). The v1 and v2 isolation hook logs
+mix three runs; only the final run maps to `isolation-run.log`.
 
 Extension — native keys, agent-registered (`v1 | v2` wire subtrees):
 
@@ -173,9 +207,11 @@ Title generation: v1 calls `chat.params` for the title with the **same** `sessio
 (`agent: "title"`, `model: openai/gpt-5.4-nano`); v2 uses a separate `title` hook (no `agent`), which
 the bridge does not forward.
 
-Fallback facts: v1 SDK `SessionPromptData` has no `variant`
-(`node_modules\@opencode-ai\sdk\dist\gen\types.gen.d.ts:2244–2269`); the v2 SDK declares
-`body.variant?` (`…\dist\v2\gen\types.gen.d.ts:8358–8383`); catalog variants: GPT-5
+Fallback facts (corrected per QA-0.P-9): the legacy SDK `SessionPromptData` has no `variant`
+(`node_modules\@opencode-ai\sdk\dist\gen\types.gen.d.ts:2244–2269`), but the v1 host's HTTP API does
+honour a per-message `variant` (isolation `v1-openai-same-VARIANT` sent `reasoning.effort: high`); the
+`body.variant?` at `…\@opencode-ai\sdk\dist\v2\gen\types.gen.d.ts:8358–8383` is the v1 host's newer
+SDK, not OpenCode 2, which has no per-message variant. Catalog variants: GPT-5
 `minimal, low, medium, high`; Claude Sonnet 4.5 `high, max` (thinking budgets 16000/31999, not effort).
 
 ## Implementation notes
@@ -201,7 +237,27 @@ Pre-flight fix applied: `d8a9a42` (smoke Windows isolation).
 
 ## Findings
 
-QA findings are added below by the 0.P QA review.
+Round 1 (heavy QA, adversarial). Resolution commit: the commit that adds this table (plan revision 4).
+
+| Id | Severity | Where | Finding | Resolution |
+|---|---|---|---|---|
+| QA-0.P-1 | critical | Spike A, A9 | Bridge-only spike could not prove host rendering, background/resume hook firing or caller id (circular) | Spike A2 on real 1.18.19/2.0.22 with a scripted stub; A9 rewritten; 3.2.1(c)/(d) mandatory |
+| QA-0.P-2 | major | A1 banner channel | `setPendingNote` is one slot, overwritten, `isSubagent`-gated, lost when the after-hook does not run | A1: own per-call channel (`delegate` return string; `task` by `callID` before the `isSubagent` branch; v2 background in the bridge; dropped on failure) + tests |
+| QA-0.P-3 | major | plan sections assuming block-by-default | 2.1.1, 2.3.6, 3.1.4, 3.2.1(c), M2, §1.6, §5, scope line | A1 "Superseded text" list; 2.1.1 signature and `DepthGuardResult`; 3.1.4 edited directly |
+| QA-0.P-4 | major | A3 seam | One legacy `chat.params` handler gets `event.options` on v2; v1 write would nest `options` | A3: explicit `routerHost: "v2"` from `src\v2.ts`; flat on v2, `output.options` on v1; no creation; bridge test |
+| QA-0.P-5 | major | A4 | v1 behaviour change not recorded | A4 risk list, grader-temperature/thinking check, CHANGELOG flag (3.1.4) |
+| QA-0.P-6 | major | A7, 2.3.3 | v2 grader creation point (`onCreated`) missed | A7 amended; both creation points; v2 grader test |
+| QA-0.P-7 | major | A3 gate | v2 producer identity unobserved | Spike A2 R5 observed it on both hosts; host-level proof added to 2.3 DoD |
+| QA-0.P-8 | minor | preset table | zai medium variant; adaptive-only marks | Table corrected |
+| QA-0.P-9 | minor | Spike B record | S4 label, OpenAI comparison, fallback facts, mixed logs | Record corrected; A3 fallback facts corrected |
+| QA-0.P-10 | minor | A1 trivial | Rationale weak; tier source unpinned | Orchestrator decision with the bypass rationale; tier = `sessionStore.getTier(callerSid)` |
+| QA-0.P-11 | minor | A1 banner text | After-the-fact banner invited redoing finished work | Reworded |
+| QA-0.P-12 | minor | before-hook order, `/bypass` | Order incomplete; `/bypass` disables the guard | A11: order corrected; depth guard first; `/bypass` decision documented under D11 |
+| QA-0.P-13 | minor | refs | `de/wave-1-base` missing | Tagged after QA closes (recorded under Verdict) |
+| QA-0.P-14 | minor | run log, plan header, §7 | Missing entries | Run log completed; plan revision 4 and §7 row |
+| QA-0.P-15 | nit | smoke isolation | Other env vars inherited | A12: 1.3 hardens both smoke files |
+| QA-0.P-16 | nit | A5 | Captured model ids not named | A5 names `claude-fable-5`, `claude-opus-4-7` |
+| QA-0.P-17 | nit | `src\router\config.ts:40` | Comment names `reasoning_effort` | Handoff to 1.1 (A4) |
 
 ## Deferred by plan
 
@@ -215,13 +271,18 @@ QA findings are added below by the 0.P QA review.
 
 ## Handoffs
 
-- **To 1.3:** A4 (native keys in `buildAgentOptions`, test updates).
-- **To 2.1:** A1 (mode resolution, advisory banner text, no trivial downgrade).
-- **To 2.2:** A3 (interface takes the target options object; producer-only gate; native keys).
-- **To 2.3:** A1 banner channel check, A2 recording, A3 v1/v2 seam, A4 bridge translation, A8 set/clear
-  points.
-- **To 3.1:** A1 documentation of advisory vs enforced, A4 `Fixed` entry and key-name docs, A5 preset
-  table.
+- **To 1.1:** the `reasoning_effort` comment at `src\router\config.ts:40` (A4, QA-0.P-17).
+- **To 1.3:** A4 (native keys in `buildAgentOptions`, test updates, grader-temperature/thinking check),
+  A12 (smoke isolation hardening).
+- **To 2.1:** A1 (mode per caller, `DepthGuardResult` with `banner`, banner text, no trivial
+  downgrade, both modes in tests).
+- **To 2.2:** A3 (target options object, no creation, producer-only gate, native keys).
+- **To 2.3:** A1 per-call banner channel and tests, A2 recording, A3 host seam (`src\v2.ts`) and bridge
+  test, A3 host-level proof (Spike A2 rig), A4 bridge translation, A7 both grader creation points, A8
+  explicit clear in the outer `finally`, A11 order and `/bypass`.
+- **To 3.1:** A1 documentation of advisory vs enforced, A4 `Fixed` entry (v1 behaviour change) and
+  key-name docs, A5 preset table, A11 `/bypass` under D11.
+- **To 3.2:** 3.2.1(c)/(d) mandatory with the scripted stub; both modes.
 
 ## Verdict
 
