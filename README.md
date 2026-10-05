@@ -279,9 +279,10 @@ host's permissions and cancellation. There are a few host differences:
   ([details](docs/OPENCODE_V2.md#grader-temperature-on-v2)).
 - Anti-narration warnings appear as separate synthetic transcript entries, because
   completed v2 text events cannot be rewritten.
-- Tier options (`effort`/`variant`/`reasoningEffort`/`reasoningSummary`/`thinking`) are
+- Tier options (`effort`/`reasoningEffort`/`reasoningSummary`/`thinking`) are
   applied per turn through the v2 `session` context hook, filling only keys not
   already present, because v2 does not read `Agent.Info.request.settings`.
+  A tier's `variant` is applied through its agent model reference at registration.
 
 **Smoke tests:** Set `OPENCODE_V2_BIN` to the absolute path of an OpenCode v2
 executable. `npm run smoke:v2` checks loading and registration without provider

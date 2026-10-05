@@ -47,9 +47,11 @@ are therefore applied through the context hook to `event.options`, filling only
 missing keys before the legacy `chat.params` hook runs. The router registers
 provider-native `reasoningEffort`, `reasoningSummary`, and
 `thinking: { type: "enabled", budgetTokens }` (or Claude `effort`), which the bridge
-passes unchanged. For option bags from other sources, it still normalizes legacy
-aliases (`reasoning_effort`, `reasoning_summary`, `budget_tokens`) only when the
+passes unchanged. For options merged into router-registered agents (only definitions
+the router's `config` hook changed), it still normalizes legacy aliases
+(`reasoning_effort`, `reasoning_summary`, `budget_tokens`) only when the
 corresponding native value is absent/`undefined`; an explicit native value wins.
+Unmodified agents are skipped, including their per-turn option merge.
 User-facing tier config keys (`reasoning.effort`, `reasoning.summary`,
 `thinking.budgetTokens`) are unchanged. The producer-only effort override then
 runs through `chat.params` directly on `event.options`, without adding a nested

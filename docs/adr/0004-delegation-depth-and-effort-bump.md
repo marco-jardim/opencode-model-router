@@ -183,8 +183,9 @@ registration clears an old entry instead of retaining stale effort (`src/escalat
 **A4 — Fix v1 registration as well as retries.** `buildAgentOptions` now emits native
 `reasoningEffort`, `reasoningSummary`, `thinking: { type: "enabled", budgetTokens }` and `effort`
 instead of the old snake-case registration keys. Spike B showed that v1 silently dropped the old
-keys. The v2 bridge already translated them; it still normalizes aliases from other sources, but
-an explicit native key wins. This intentional v1 behaviour change applies even with the bump off.
+keys. The v2 bridge already translated them; it still normalizes aliases in options merged into
+agent definitions the router's `config` hook changed, but an explicit native key wins.
+This intentional v1 behaviour change applies even with the bump off.
 Existing explicit-config precedence and warnings are preserved (`src/router/agent-options.ts`,
 `src/compat/v2-hooks.ts`).
 
