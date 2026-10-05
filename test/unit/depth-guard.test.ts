@@ -236,6 +236,47 @@ describe("delegation depth guard", () => {
     expect(guard.warn).toHaveBeenCalledTimes(2);
   });
 
+  it("deduplicates persistent seam failures and invalid depths over 100 checks", async () => {
+    const guard = setup(NaN);
+    guard.resolveMode.mockImplementation(() => { throw new Error("mode unavailable"); });
+    guard.limit.mockImplementation(() => { throw new Error("limit unavailable"); });
+    for (let i = 0; i < 100; i++) {
+      expect(await guard.checkDispatch("caller")).toStrictEqual({
+        block: false, mode: "advisory", guard: DELEGATION_DEPTH_GUARD, banner: depthAdvisoryBanner(MAX_DEPTH_HOPS, 1),
+      });
+    }
+    expect(guard.warn).toHaveBeenCalledTimes(3);
+  });
+
+  it("deduplicates throwing modes even when the limit disables the guard", async () => {
+    const guard = setup(1, null);
+    guard.resolveMode.mockImplementation(() => { throw new Error("mode unavailable"); });
+    for (let i = 0; i < 100; i++) {
+      expect(await guard.checkDispatch("caller")).toStrictEqual({ block: false, mode: "advisory" });
+    }
+    expect(guard.warn).toHaveBeenCalledTimes(1);
+    expect(guard.depthOf).not.toHaveBeenCalled();
+  });
+
+  it.each(["mode", "limit", "depth"])("bounds distinct %s failure causes at 100", async (seam) => {
+    const guard = setup(1);
+    function fail(cause: number) {
+      if (seam === "mode") guard.resolveMode.mockImplementation(() => { throw new Error(`cause-${cause}`); });
+      if (seam === "limit") guard.limit.mockImplementation(() => { throw new Error(`cause-${cause}`); });
+      if (seam === "depth") guard.depthOf.mockResolvedValue(-cause - 1);
+    }
+    for (let i = 0; i < 101; i++) {
+      fail(i);
+      await guard.checkDispatch("caller");
+    }
+    fail(1);
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(101);
+    fail(0);
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(102);
+  });
+
   it("a throwing logger never rejects or weakens a known-depth decision", async () => {
     const guard = setup(NaN);
     guard.warn.mockImplementation(() => { throw new Error("logger unavailable"); });

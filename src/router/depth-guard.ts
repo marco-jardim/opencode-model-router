@@ -35,6 +35,9 @@ export function createDepthGuard(deps: {
 }): { checkDispatch(callerSessionID: string | undefined): Promise<DepthGuardResult> } {
   const warnedCallers = new Set<string>();
   const warnedModes = new Set<unknown>();
+  const warnedModeErrors = new Set<unknown>();
+  const warnedLimitErrors = new Set<unknown>();
+  const warnedDepths = new Set<unknown>();
   let warnedCaller = false;
   let warnedLimit = false;
 
@@ -74,16 +77,18 @@ export function createDepthGuard(deps: {
         } else {
           warnOnce(warnedModes, resolved, `invalid enforcement mode ${describe(resolved)}; using advisory.`);
         }
-      } catch {
-        warn("cannot resolve enforcement mode; using advisory.");
+      } catch (error) {
+        const cause = describe(error);
+        warnOnce(warnedModeErrors, cause, `cannot resolve enforcement mode (${cause}); using advisory.`);
       }
       if (mode === "off") return { block: false, mode };
 
       let max: number | null;
       try {
         max = deps.limit();
-      } catch {
-        warn("cannot resolve delegation depth limit; using 1.");
+      } catch (error) {
+        const cause = describe(error);
+        warnOnce(warnedLimitErrors, cause, `cannot resolve delegation depth limit (${cause}); using 1.`);
         max = 1;
       }
       if (max === null) return { block: false, mode };
@@ -118,7 +123,9 @@ export function createDepthGuard(deps: {
         return { block: false, mode, guard: null };
       }
       if (!Number.isInteger(depth) || depth < 0) {
-        warn(`invalid depth for session ${callerSessionID}; using ${MAX_DEPTH_HOPS}.`);
+        const cause = describe(depth);
+        warnOnce(warnedDepths, JSON.stringify([callerSessionID, cause]),
+          `invalid depth ${cause} for session ${callerSessionID}; using ${MAX_DEPTH_HOPS}.`);
         depth = MAX_DEPTH_HOPS;
       }
 
