@@ -51,6 +51,7 @@ describe("per-session effort overrides", () => {
     {}, { ...producer, sessionID: 1 }, { ...producer, sessionID: "other" },
     { ...producer, agent: "title" }, { ...producer, agent: {} },
     { ...producer, sessionID: "Producer" }, { ...producer, agent: "Fast" },
+    { sessionID: producer.sessionID, model: { ...producer.model, modelID: "gpt-5", variant: "default" } },
     { ...producer, model: undefined }, { ...producer, model: null }, { ...producer, model: "openai/gpt-5" },
     { ...producer, model: {} }, { ...producer, model: { providerID: "azure", id: "gpt-5" } },
     { ...producer, model: { providerID: "openai", id: 5 } },
@@ -149,6 +150,27 @@ describe("per-session effort overrides", () => {
     store.set("producer", "fast", openai, "medium");
     expect(() => applyEffortOverride(store, producer, Object.freeze({}), logger)).not.toThrow();
     expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["__proto__", "constructor", "toString"])("sets, applies and clears prototype-key session and agent %s", (id) => {
+    const before = Object.getOwnPropertyDescriptors(Object.prototype);
+    const logger = { warn: vi.fn() };
+    const store = createEffortOverrideStore({ logger });
+    store.set(id, id, openai, "high");
+    expect(store.has(id)).toBe(true);
+    expect(store.size()).toBe(1);
+    const input = { ...producer, sessionID: id, agent: id };
+    const target = {};
+    applyEffortOverride(store, input, target, logger);
+    expect(target).toEqual({ reasoningEffort: "high" });
+    store.clear(id);
+    expect(store.has(id)).toBe(false);
+    expect(store.size()).toBe(0);
+    const clearedTarget = {};
+    applyEffortOverride(store, input, clearedTarget, logger);
+    expect(clearedTarget).toEqual({});
+    expect(Object.getOwnPropertyDescriptors(Object.prototype)).toEqual(before);
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it("clear removes overrides, and unknown ids and foreign stores are no-ops", () => {
