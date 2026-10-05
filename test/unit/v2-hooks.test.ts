@@ -159,7 +159,7 @@ describe("OpenCode 2 hook adapter", () => {
   const depthCall = (id = "call") => ({ ...call, id, tool: "subagent", input: { agent: "fast", prompt: "Inspect the project" } });
   const depthResult = (id = "call", status = "completed", text = "Done") => ({
     ...depthCall(id), status: "completed",
-    result: { output: { status, output: text }, content: text },
+    result: { output: { status, output: text }, content: `<subagent sessionID="leaf" state="${status}">\n${text}\n</subagent>` },
   });
 
   it.each([{}, { background: true }, { sessionID: "previous" }])("propagates the real D5 refusal for dispatch options %j without mutating native input", async (options) => {
@@ -179,7 +179,10 @@ describe("OpenCode 2 hook adapter", () => {
     const f = await depthFixture("advisory");
     await f.toolHooks["execute.before"](depthCall());
     const after = depthResult("call", status);
+    const hostText = after.result.content;
     await f.toolHooks["execute.after"](after);
+    expect(after.result.content).toContainEqual({ type: "text", text: hostText });
+    expect(JSON.stringify(after.result.content)).toContain('sessionID=\\"leaf\\"');
     expect(after.result.output.output.match(/GUARD:delegation_depth/g)).toHaveLength(1);
     expect(after.result.output.output).toContain(depthAdvisoryBanner(1, 1));
     expect(JSON.stringify(after.result.content).match(/GUARD:delegation_depth/g)).toHaveLength(1);
@@ -389,17 +392,30 @@ describe("OpenCode 2 hook adapter", () => {
     await expect(f.toolHooks["execute.before"]({ ...call, tool: "read", input: { filePath: "x" } })).rejects.toThrow("read budget exceeded");
   });
 
-  it("keeps attachments and structured subagent output when appending verification results", async () => {
+  it.each([false, true])("keeps the host envelope and attachments with verification changes (banner: %s)", async (banner) => {
     const f = fixture();
-    await f.start({ "tool.execute.after": async (input: any, output: any) => {
+    await f.start({
+      "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => {
+        if (banner) output[DEPTH_BANNER] = depthAdvisoryBanner(1, 1);
+        output[TASK_VERIFICATION] = true;
+      },
+      "tool.execute.after": async (input: any, output: any) => {
       expect(input).toMatchObject({ tool: "task", args: { subagent_type: "fast" }, callID: "call" });
-      expect(output.metadata.sessionID).toBe("child"); output.output += "\nVerified";
+      expect(output.metadata.sessionID).toBe("leaf");
+      output.output = "[router] Use task_id next\n" + output.output + "\nVerified";
     } });
     const file = { type: "file", uri: "file:///result", mime: "text/plain" };
-    const event = { ...call, tool: "subagent", input: { agent: "fast" }, status: "completed", result: { output: { sessionID: "child", status: "completed", output: "Result" }, content: [{ type: "text", text: "Result" }, file], metadata: { sessionID: "child" } } };
+    const host = { type: "text", text: '<subagent sessionID="leaf" state="completed">\nok\n</subagent>', metadata: { host: true } };
+    const extra = { type: "text", text: "Additional host context" };
+    await f.toolHooks["execute.before"](depthCall());
+    const event = { ...call, tool: "subagent", input: { agent: "fast" }, status: "completed", result: { output: { sessionID: "leaf", status: "completed", output: "ok" }, content: [host, file, extra], metadata: { sessionID: "leaf" } } };
     await f.toolHooks["execute.after"](event);
-    expect(event.result.output.output).toBe("Result\nVerified");
-    expect(event.result.content).toEqual([{ type: "text", text: "Result\nVerified" }, file]);
+    expect(event.result.output.output).toBe(`[router] Use sessionID next\nok\nVerified${banner ? "\n\n" + depthAdvisoryBanner(1, 1) : ""}`);
+    expect(event.result.content).toEqual([
+      { type: "text", text: "[router] Use sessionID next\n" }, host, file, extra,
+      { type: "text", text: `\nVerified${banner ? "\n\n" + depthAdvisoryBanner(1, 1) : ""}` },
+    ]);
+    expect((JSON.stringify(event.result.content).match(/GUARD:delegation_depth/g) ?? [])).toHaveLength(banner ? 1 : 0);
   });
 
   it("does not grade failed tool execution as a completed return", async () => {

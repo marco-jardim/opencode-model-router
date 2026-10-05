@@ -342,10 +342,28 @@ export async function registerV2Hooks(
       if (!changed && banner === undefined) return;
       const routed = changed ? translateAdded(text, output.output) : text;
       const final = banner === undefined ? routed : [routed.trimEnd(), banner].filter(Boolean).join("\n\n");
-      const content = Array.isArray(event.result.content) ? event.result.content.filter((part) => part.type !== "text") : [];
+      const content = Array.isArray(event.result.content) ? [...event.result.content]
+        : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
+      let visible;
+      if (event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string") {
+        // The host's visible text owns the session envelope (and resume handle).
+        // Legacy hooks see only the bare output; carry their additions around the
+        // original content instead of rebuilding that envelope from bare text.
+        const retained = text ? routed.indexOf(text) : -1;
+        const prefix = changed && retained >= 0 ? routed.slice(0, retained) : "";
+        const suffix = changed ? retained >= 0 ? routed.slice(retained + text.length) : routed : "";
+        const notices = [suffix, banner].filter((part) => part !== undefined && part !== "").join("\n\n");
+        visible = [
+          ...(prefix ? [{ type: "text" as const, text: prefix }] : []),
+          ...content,
+          ...(notices ? [{ type: "text" as const, text: notices }] : []),
+        ];
+      } else {
+        visible = [{ type: "text" as const, text: final }, ...content.filter((part) => part.type !== "text")];
+      }
       event.result = {
         ...event.result,
-        content: [{ type: "text", text: final }, ...content],
+        content: visible,
         metadata: output.metadata,
         ...(typeof structured === "string" ? { output: final }
           : structured && typeof structured === "object" && typeof structured.output === "string"
