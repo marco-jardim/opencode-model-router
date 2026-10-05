@@ -283,6 +283,7 @@ No critical or major finding. No reachable bump lowers effort, goes past its bou
 
 ## Deferred by plan
 
+- **QA-1.3-1 — deferred by plan — 2.3.5.b.** Phase 2.3 passes `action.effort` into `runProducerAttempt`, making the scorecard reflect the effort actually applied. No early Phase 1.3 code change.
 - 1.3.4 waits for Phase 1.1 (`resolveEffortBump`) to be merged into `de/p13`.
 - Phase 2.3 passes `action.effort` into `runProducerAttempt` and builds the options with `buildAgentOptions({ ...tier, effort })`; I4 is what makes the bump take effect. 2.3 also adjusts the v2 bridge.
 - The `set` refusal above `effortCeilingFor` (plan, defence in depth) comes in a later phase.
