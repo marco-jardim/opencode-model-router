@@ -66,6 +66,13 @@ describe("effort algebra (I1/I2)", () => {
 type Family = "openai" | "adaptive" | "manual" | "unknown";
 const models: { model: string; family: Family }[] = [
   { model: "openai/gpt-5", family: "openai" },
+  { model: "OpenAI/GPT-5", family: "openai" },
+  { model: "azure/gpt-5", family: "openai" },
+  { model: "github-copilot/gpt-5", family: "openai" },
+  { model: "github-copilot/claude-sonnet-5", family: "manual" },
+  { model: "openrouter/anthropic/claude-sonnet-4.5", family: "manual" },
+  { model: "Anthropic/Claude-Sonnet-4-5", family: "manual" },
+  { model: "anthropic/claude-fable-5.1", family: "adaptive" },
   { model: "gpt-5", family: "openai" },
   { model: "o3", family: "openai" },
   { model: "azure/o3", family: "openai" },
