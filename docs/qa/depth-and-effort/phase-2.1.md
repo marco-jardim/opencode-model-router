@@ -143,11 +143,11 @@ only. The decision path is the same as in round 1: no new early return, and noth
 
 | id | severity | file:line | description | resolution |
 |---|---|---|---|---|
-| QA-2.1-R2-1 | minor | `src/router/depth-guard.ts:37, 41, 80, 98`; `test/unit/depth-guard.test.ts:84-96` | **Invalid mode and limit warnings are deduplicated by value identity, so a non-primitive invalid value warns on every call.** `warnOnce(warnedModes, resolved, …)` (`:80`) and `warnOnce(warnedLimits, max, …)` (`:98`) key their sets by the raw value, while the message prints `describe(value)`. A seam that builds a fresh object on every call never matches the set. That shape is the wiring mistake QA-2.1-1 listed: `mode: (sid) => resolveEnforcementMode({…})` without `.mode`. **Failing inputs** (scratch, depth 1, limit 1, 100 calls each): <br>• mode `() => ({ mode: "enforced", warning: undefined })` → **100 warnings**, all with the same text (`invalid enforcement mode object: [object Object]; using advisory.`); <br>• `() => []` → 100; <br>• `() => Symbol("m")` → 100; <br>• limit `() => ({})` → **100 warnings**. Round 1 gave 1 warning per guard lifetime here, so this is a regression from `4f0bdba`. <br>Controls: the same object returned each time → 1; `NaN` → 1; `"Enforced"` → 1. The decisions stay correct: advisory, or a refusal with effective limit 1. The test passes the object through `mockReturnValue` (`test:87`), a single shared instance, so it cannot catch this. The path is reachable only through a cast or from JavaScript, since the seams are typed, which puts it in the same class as QA-2.1-3. **Fix:** key both sets by `describe(value)`, as the error and depth sets already are. Add fresh-value-per-call tests for both seams. Optionally quote the printed value (`JSON.stringify` for strings), because a state-file mode string is now logged raw, newlines included. | open |
-| QA-2.1-R2-2 | minor | `src/router/depth-guard.ts:116-121`; `src/router/depth.ts:712, 764-766, 781-784` | **`4dec0ca` leaves one unknown-depth path with zero warnings, against D2.** The guard no longer warns on `depth === undefined`. The real tracker returns `undefined` silently when `forget(caller)` cancels the caller's in-flight walk: `forget` → `cancelWalk` (`:784`) → `run` returns `undefined` (`:712`) → `depthOf` passes it on (`:764-766`). `forget` has also just cleared the caller's `warned` keys (`:781`). Round 1 named this path ("The guard's line cannot simply be dropped"). The resolution's "silent cancellation is accepted" re-opens D2 without an amendment. D2 (`plan:374-378`) requires one warning per caller session when the depth cannot be resolved, and it names "a session the backend no longer knows". **Failing inputs** (real tracker and guard on one logger, scratch): <br>(1) `getParent` hangs; `checkDispatch("S")`, then `forget("S")` 5 ms later → `{ block: false, mode: "enforced", guard: null }` and **0 warnings**. <br>(2) `recordCreated("S","P")` (event-proven floor 1), limit 1, enforced, P's lookup hangs, `forget("S")` mid-walk → **allowed, with 0 warnings**. The control without `forget` is **refused** at 2 000 ms with 1 warning (`cannot resolve session S: timed out after 2000 ms`). <br>The allow is D2's fail-open for a session that is gone, and the window is narrow: the caller's session must be deleted during its own before-hook. Only the warning is missing. **Fix, either:** <br>(a) In `depthOf`, when the walk settles `undefined` without a timeout, call `warn(id, "lookup", "forgotten")`. That emits exactly one line, deduplicated by the existing `lookup:<id>` key, and matches the message for a forgotten ancestor. It is a `depth.ts` change, so the orchestrator confirms §2 ownership. <br>(b) An owner amendment to D2 in §1.7 that records this residual. <br>Either way, update handoff 6 and pin the agreed count with a real-tracker test. | open |
+| QA-2.1-R2-1 | minor | `src/router/depth-guard.ts:37, 41, 80, 98`; `test/unit/depth-guard.test.ts:84-96` | **Invalid mode and limit warnings are deduplicated by value identity, so a non-primitive invalid value warns on every call.** `warnOnce(warnedModes, resolved, …)` (`:80`) and `warnOnce(warnedLimits, max, …)` (`:98`) key their sets by the raw value, while the message prints `describe(value)`. A seam that builds a fresh object on every call never matches the set. That shape is the wiring mistake QA-2.1-1 listed: `mode: (sid) => resolveEnforcementMode({…})` without `.mode`. **Failing inputs** (scratch, depth 1, limit 1, 100 calls each): <br>• mode `() => ({ mode: "enforced", warning: undefined })` → **100 warnings**, all with the same text (`invalid enforcement mode object: [object Object]; using advisory.`); <br>• `() => []` → 100; <br>• `() => Symbol("m")` → 100; <br>• limit `() => ({})` → **100 warnings**. Round 1 gave 1 warning per guard lifetime here, so this is a regression from `4f0bdba`. <br>Controls: the same object returned each time → 1; `NaN` → 1; `"Enforced"` → 1. The decisions stay correct: advisory, or a refusal with effective limit 1. The test passes the object through `mockReturnValue` (`test:87`), a single shared instance, so it cannot catch this. The path is reachable only through a cast or from JavaScript, since the seams are typed, which puts it in the same class as QA-2.1-3. **Fix:** key both sets by `describe(value)`, as the error and depth sets already are. Add fresh-value-per-call tests for both seams. Optionally quote the printed value (`JSON.stringify` for strings), because a state-file mode string is now logged raw, newlines included. | Resolved in `1a8b34b`: invalid mode/limit keys use a safe type-tagged printed form capped at 80 characters. Regression tests make 100 fresh object, array and Symbol mode values and 100 fresh object limits, with one warning per case. Additional coverage pins BigInt, null-prototype/circular values, truncation and distinct type tags. |
+| QA-2.1-R2-2 | minor | `src/router/depth-guard.ts:116-121`; `src/router/depth.ts:712, 764-766, 781-784` | **`4dec0ca` leaves one unknown-depth path with zero warnings, against D2.** The guard no longer warns on `depth === undefined`. The real tracker returns `undefined` silently when `forget(caller)` cancels the caller's in-flight walk: `forget` → `cancelWalk` (`:784`) → `run` returns `undefined` (`:712`) → `depthOf` passes it on (`:764-766`). `forget` has also just cleared the caller's `warned` keys (`:781`). Round 1 named this path ("The guard's line cannot simply be dropped"). The resolution's "silent cancellation is accepted" re-opens D2 without an amendment. D2 (`plan:374-378`) requires one warning per caller session when the depth cannot be resolved, and it names "a session the backend no longer knows". **Failing inputs** (real tracker and guard on one logger, scratch): <br>(1) `getParent` hangs; `checkDispatch("S")`, then `forget("S")` 5 ms later → `{ block: false, mode: "enforced", guard: null }` and **0 warnings**. <br>(2) `recordCreated("S","P")` (event-proven floor 1), limit 1, enforced, P's lookup hangs, `forget("S")` mid-walk → **allowed, with 0 warnings**. The control without `forget` is **refused** at 2 000 ms with 1 warning (`cannot resolve session S: timed out after 2000 ms`). <br>The allow is D2's fail-open for a session that is gone, and the window is narrow: the caller's session must be deleted during its own before-hook. Only the warning is missing. **Fix, either:** <br>(a) In `depthOf`, when the walk settles `undefined` without a timeout, call `warn(id, "lookup", "forgotten")`. That emits exactly one line, deduplicated by the existing `lookup:<id>` key, and matches the message for a forgotten ancestor. It is a `depth.ts` change, so the orchestrator confirms §2 ownership. <br>(b) An owner amendment to D2 in §1.7 that records this residual. <br>Either way, update handoff 6 and pin the agreed count with a real-tracker test. | Resolved in `5a87b5f` using orchestrator-approved option (a), with `depth.ts` assigned to Phase 2.1 for this change only. `depthOf` warns through the existing `lookup:<id>` key when a cancelled caller walk resolves undefined. Tracker and real-tracker/shared-logger guard tests each cover 100 concurrent calls, both direct and ancestor lookup cancellation: one warning, unchanged unknown/allow results, zero timers. A subsequent backend failure shares the warning key. |
 
-Round-2 summary: **6 of 6 round-1 findings resolved; 2 new minor findings (QA-2.1-R2-1, -R2-2), both open.** Under
-§0.7 every round-2 finding is fixed, whatever its severity.
+Round-2 summary: **6 of 6 round-1 findings resolved; both round-2 minor findings resolved.**
+The round-2 resolutions supersede the earlier acceptance of silent caller cancellation.
 
 ## Round-1 resolution verification
 
@@ -160,6 +160,24 @@ their warning behaviour. Changes are limited to the guard, its tests, and this r
   **100% statements (73/73), branches (44/44), functions (8/8), lines (66/66)**.
 - `npm run typecheck`: **clean**, no diagnostics.
 - `git diff --check abbcd9c..HEAD`: clean for the six fix commits. No full-suite run.
+
+## Round-2 resolution verification
+
+Verified at `5a87b5f`, with changes limited to `depth-guard.ts`, `depth.ts`, their two unit test files,
+and this report. The tracker change is warning-only; no admission or lifecycle behaviour is changed.
+
+- `npx vitest run test/unit/depth-guard.test.ts test/unit/depth.test.ts --maxWorkers=50%`:
+  **2 files, 255 tests passed** (138 guard + 117 tracker; 9 new regression cases).
+- Same scoped run with `--coverage.enabled=true --coverage.include=src/router/depth-guard.ts --coverage.include=src/router/depth.ts`:
+
+  | File | Statements | Branches | Functions | Lines |
+  |---|---:|---:|---:|---:|
+  | `depth-guard.ts` | 98.73% | 100% | 100% | 98.61% |
+  | `depth.ts` | 99.27% | 97.24% | 100% | 100% |
+
+  Every metric exceeds the 95% gate. Coverage run: **255 tests passed**.
+- `npm run typecheck`: **clean**, no diagnostics.
+- `git diff --check`: clean before each fix commit. No full-suite run.
 
 ## Deferred by plan
 
@@ -223,11 +241,13 @@ their warning behaviour. Changes are limited to the guard, its tests, and this r
 5. **Concurrency and cost:** the guard does not coalesce calls; the tracker does (50 concurrent calls → one walk,
    one `getParent` per hop). Assert this in 2.3.6 through the plugin factory, together with "a root `task` call →
    no backend call beyond the existing root lookup".
-6. **Warnings (QA-2.1-2 decision):** pass the **same plugin logger to tracker and guard**. The tracker owns
-   warnings when `depthOf(validCaller)` returns `undefined`; the guard adds none, including for silent
-   cancellation by `forget()`. The guard warns once total for missing/empty/non-string caller ids (which never
+6. **Warnings (QA-2.1-2 and QA-2.1-R2-2 decisions):** pass the **same plugin logger to tracker and guard**. The tracker owns
+   warnings when `depthOf(validCaller)` returns `undefined`; the guard adds none. Cancellation by
+   `forget(caller)` now warns once through the tracker's existing lookup-failure key, including shared walks.
+   The guard warns once total for missing/empty/non-string caller ids (which never
    reach the tracker), and once per caller for tracker throws/rejections (contract violations; FIFO cap 1000).
-   Real-tracker tests now pin one warning per caller for backend rejection and timeout. Phase 2.3.6 must
+   Real-tracker tests now pin one warning per caller for backend rejection, timeout and caller cancellation
+   during its own or an ancestor's lookup. Phase 2.3.6 must
    retain this assertion through the plugin factory, not introduce a second decision-layer warning.
 
 ## Original round-1 verdict (superseded by resolutions above)
@@ -249,10 +269,11 @@ Ready for independent QA re-review; this resolution record is not a new independ
 
 ## Verdict
 
-**Pending fixes (round 2).** All six round-1 findings are resolved. The decision core is unchanged:
+**Round-2 fixes complete.** All six round-1 findings and both round-2 findings are resolved. The decision core is unchanged:
 - no known depth is admitted past the limit in `enforced` mode;
 - `"off"` and a `null` limit make no lookup;
 - every warning set is bounded.
 
-Open findings: **2** (QA-2.1-R2-1 minor, QA-2.1-R2-2 minor). Both are round-2 findings, so §0.7 requires them fixed
-before the phase can report "Open findings: 0".
+Open findings: 0 (every round-1 and round-2 finding fixed)
+
+Scoped tests, coverage and typecheck pass. This resolution record is not a new independent QA verdict.
