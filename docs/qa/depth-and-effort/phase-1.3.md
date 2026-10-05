@@ -9,6 +9,22 @@
 - The golden policies come from `buildEscalatePolicy` on a config with `presets: {}` (`:874–895`). The existing `buildEscalatePolicy` tests also use `presets: {}` (`makeCfg`, `:571–579`). Matrix states are typed literals with 6 fields (`const state: LadderState = {…}`, `:943–950`).
 - The v2 bridge was verified at `src/compat/v2-hooks.ts:128–134`. It destructures `reasoning_effort`, `reasoning_summary` and `budget_tokens`, then sets `{ ...options, reasoningEffort?, reasoningSummary?, thinking: { type: "enabled", budgetTokens }? }`. It adds the native key only when the snake key is defined.
 
+### QA review run (@heavy, `de/p13` at `4136fe4`, 10 commits over `origin/de/main`)
+
+- **router_verify:** `vrf_8ecc…` pass. `vrf_ccd6…` came back unverifiable (attribution); the scoped run below re-checks it and passes.
+- **Scoped tests:** `npx vitest run test/unit/ladder.test.ts test/unit/effort-ceiling.test.ts test/unit/effort.test.ts test/integration/fable-effort-preset.test.ts test/unit/v2-hooks.test.ts --maxWorkers=50%` gave 5 files and 2,866 tests, all passing. Smoke tests were not run.
+- **Coverage** on `src/escalate/ladder.ts` and `src/router/agent-options.ts`: 100% statements (135/135), 100% branches (154/154), 100% functions (22/22) and 100% lines (121/121).
+- **`npm run typecheck`:** clean.
+- **Golden fixture:** unchanged since its commit `2927540` (`git diff --stat 2927540 HEAD` is empty). SHA-256 `F4FECEEC…E029A2`, the same as the memo.
+- **Throwaway differential tests** (`test/scratch/`, deleted before commit). They compared HEAD against `origin/de/main`'s `ladder.ts` and `agent-options.ts`:
+  - **Bump-off byte identity:** 7 shipped presets × 6 escalate variants (`{}`, `effortBump:false`, A=2, `effortBumpMax:"low"`, floor medium, A=0/T=7). Every policy without the `effortBump` key equals the old `buildEscalatePolicy` output in both `JSON.stringify` and `Object.keys` order. Each comparison builds fresh state objects and covers `nextAction`, `advance`, scorecard, `newLadderState` and 20-step sequences at shipped tier ratios. That is 41 configurations, all identical. Only `fable-effort` with defaults turns the bump on: `{"fast":{"base":"low","bound":"xhigh"},"medium":{"base":"high","bound":"xhigh"}}`.
+  - **Bump-on control flow:** 85,344 matrix states × `currentEffort` ∈ {absent, null, 5 levels} × 6 verdicts. With `effort`/`currentEffort`/`@level` stripped, every action, advanced state (key order included) and scorecard equals v2.0.0. An escalation always resets `currentEffort` to `null`.
+  - **Full loops:** 4,200 all-fail loops on `fable-effort` (A 0–3, T 1–8, multiple 1/2/4/8/100, every `effortBumpMax`, floor none/medium, every start tier). Attempts, tier sequences, cumulative cost and terminal reasons match v2.0.0. No reachable retry lowered effort, went past its bound or fell below its base.
+  - **Ceiling vs builder:** 35 extra ids × 7 efforts × 7 thinking × 5 reasoning × 4 variant shapes, with zero disagreements and no throw. The ids cover OpenRouter `openrouter/anthropic/claude-sonnet-4.5` (max), Copilot `github-copilot/gpt-5` (high) and `github-copilot/claude-sonnet-4.5` (max), Azure `azure/gpt-5` (high) and `azure/my-reasoning-deployment` (null), upper-case `Anthropic/Claude-Opus-5-5` (max) and `OpenAI/GPT-5` (high), dotted, Vertex `@date`, Bedrock `anthropic.`/`global.anthropic.` (null, F2), `ollama/gpt-oss:20b` (high), `""` (null), plus the thinking shapes `-1`, `NaN`, `"4096"` and `{}`, `reasoning: { effort: "" }`, and variants `""` and `0`.
+  - **v2 end-to-end:** both builders were run through `registerV2Hooks` → `sessionHooks.context`. That was 9 tiers (OpenAI reasoning/effort/downgrade/budget, Claude budget/adaptive/effort, unknown with budget and reasoning, Bedrock) × host option bags `{}`, `{reasoningEffort:"minimal",temperature:0.2}`, `{thinking:{type:"disabled"}}` and `{reasoningEffort:undefined}`. Every `event.options` was deep-equal, with no double translation and no lost key. Only the key order differs (QA-1.3-6).
+- **Live config reload:** `src/index.ts:549–566` reloads `activeCfg` and builds the policy once per `delegate` call. `tiersForCost` (`:568`), `tierModel` and `registerProducerSession` use the same snapshot. The policy is constant within a loop, and the next call picks up a new config.
+- **Other consumers of the old keys in `src`:** none. The only remaining ones are the bridge (`v2-hooks.ts:128–133`) and the `openai-downgrade` text (`agent-options.ts:184`). `src/commands/output.ts:28–31` renders tier config (`thinking.budgetTokens`, `reasoning.effort`), not builder output.
+
 ## Implementation notes
 
 ### 1. Effort algebra (1.3.2): new exports in `src/router/agent-options.ts`
@@ -249,6 +265,22 @@ Scorecard: `[router delegate scorecard | final_tier=medium@high | attempts=4 | e
 - **F5.** `getActiveTiers` returns `undefined` when `presets` is `{}`, despite its non-null assertion. `buildEffortBump` guards with `?? {}`, which the golden test and the existing tests depend on.
 - **F6.** Claude's ceiling of `"max"` reflects what the router emits, not what each model accepts. The remedy is `effortBumpMax: "high"`.
 
+### QA review (@heavy)
+
+No critical or major finding. No reachable bump lowers effort, goes past its bound or survives an escalation. Bump-off output is byte-identical to v2.0.0, key order included. The ceiling and the builder agree on every id tried. v2 `event.options` is deep-equal before and after A4. Attempt counts do not drift. Evidence is in Pre-flight, "QA review run".
+
+| ID | Severity | File:line | Description | Resolution |
+|---|---|---|---|---|
+| QA-1.3-1 | minor | `src/escalate/ladder.ts:246`, `src/index.ts:861` | **The scorecard reports an effort that was never applied.** `advance` records `action.effort`, and the scorecard prints `@effort`, but `runProducerAttempt(tier, forcing)` ignores the effort until 2.3. `effortBump` defaults to `true`. Failing input: active preset `fable-effort`, defaults, the first attempt fails and the second passes. `<sid>.delegate.log` then gets `final_tier=fast@medium … verdict=PASS`, but attempt 2 ran agent `fast` with its registered `effort: "low"`. Fix: ship 1.3 and 2.3 in the same release, or drop the `@` suffix until the effort is wired. Then add a test that the scorecard effort equals the effort that was applied. | open |
+| QA-1.3-2 | minor | `src/escalate/ladder.ts:164` | **`nextAction` steps from `state.currentEffort` without clamping it to `[base, bound]`.** Input: `perTier.fast = {base:"high", bound:"xhigh"}`, state `{currentTier:"fast", attemptsThisTier:0, totalAttempts:1, …, currentEffort:"low"}`, verdict fail. The result is `effort:"medium"`, below base, so the bump lowers effort. With `currentEffort:"max"` the result is `effort:"max"`, above the bound. Neither state can be reached through `newLadderState`/`advance` (4,200 loops and 85,344 states, none found), so this is not critical. It becomes reachable if 2.3 rebuilds the policy within a loop or seeds `currentEffort` from elsewhere. Fix: step from `max(currentEffort ?? base, base)` and clamp the result to the bound, or document the precondition and test it. | open |
+| QA-1.3-3 | minor | `test/unit/ladder.test.ts:746–752`; plan D8 (`delegation-depth-and-effort-bump-plan.md:426–428`) | **D8's "same four attempts" does not hold for the only bundled preset where the bump is active.** With shipped `fable-effort` and the default `costMultiple: 4`, v2.0.0 and HEAD both stop after 3 attempts: `fast@low → fast@medium → medium@high`, then `give_up "cost ceiling exceeded"` (cost 5 > 1×4). This behaviour predates the phase, and the bump does not change the attempt count. However, medium's bump (→ xhigh) can never run at defaults. The bumped fast retry is still charged ratio 1 (F4), so real spend rises under the same ceiling. The only fable trace test raises the multiple to 8, so the shipped-default path is not pinned. Fix: add a test for the default trace, and amend D8 and the ADR wording (3.1). | open |
+| QA-1.3-4 | minor | `test/unit/ladder.test.ts:1327–1331, 1361` | **The golden fixture covers the cost ceiling only as single matrix steps.** That is 120 entries, all in the `above` bucket, and `firstAttemptCost` is always 2. No golden sequence ends on the cost ceiling: `costPerAttempt` 1 cannot exceed 1×4 within `maxTotalAttempts` 4. `firstAttemptCost: null` and `costMultiple: null` are also absent. Bump-off identity on cost-ceiling sequences is proven only by this review's throwaway differential. Fix: add a committed, non-golden sequence test with heterogeneous ratios (for example 1/3/6) for bump off and bump on. Do not regenerate the golden. | open |
+| QA-1.3-5 | minor | `test/unit/effort-ceiling.test.ts:68–84` | **The I4 agreement fixture is missing OpenRouter-Anthropic, Copilot (`gpt-*` and `claude-*`), Azure `gpt-*`, upper-case and dotted ids**, which the plan's QA list names. Agreement holds by construction, and the scratch run found 0 disagreements, so this is a coverage gap only. Fix: add the ids listed in Pre-flight. | open |
+| QA-1.3-6 | nit | `src/router/agent-options.ts:125, 146–149, 187` vs `src/compat/v2-hooks.ts:129–134` | **v2 `event.options` key order changed for multi-key bags; the values are deep-equal.** `github-copilot/gpt-5` with effort `max` and `reasoning.summary` went from `reasoningEffort,reasoningSummary` to `reasoningSummary,reasoningEffort`. `azure/o3` with a budget and effort went from `reasoningEffort,thinking` to `thinking,reasoningEffort`. Key order does not matter for provider options. 2.3 tests should assert with `toEqual`, not key-order snapshots. | open |
+| QA-1.3-7 | nit | `docs/qa/depth-and-effort/phase-1.3.md:5–6, 154` | **The memo cites the pre-rebase sha `29e6a13`.** On `de/p13` the fixture commit is `2927540`, and the fixture is unchanged since then (the hash matches). The `git diff 29e6a13 -- …` gate therefore names a commit that is not on the branch. | open |
+| QA-1.3-8 | nit | `docs/qa/depth-and-effort/phase-1.3.md:181`; `src/escalate/ladder.ts:60–64` | **The memo §5 rationale "the initial tier may be off the ladder" is wrong.** `resolveStartTier` maps an off-ladder producer to `ladder[0]`, or to the floor, unless the ladder is empty. Including off-ladder tiers is harmless, but the stated reason is incorrect. | open |
+| QA-1.3-9 | nit | `README.md:282, 483, 491`; `docs/CONFIG_REFERENCE.md:668, 688, 694, 714, 749, 759–760` | **These docs still say the router registers `reasoning_effort`/`budget_tokens`.** That stopped being true at `788034d`. Plan §2 (`:727`) flags only `PER_TURN_EFFORT.md` and `OPENCODE_V2.md` for A4 key names. README and CONFIG_REFERENCE are in 3.1's write-set but are not tagged A4. Handed to 3.1. | open |
+
 ## Deferred by plan
 
 - 1.3.4 waits for Phase 1.1 (`resolveEffortBump`) to be merged into `de/p13`.
@@ -263,7 +295,37 @@ Scorecard: `[router delegate scorecard | final_tier=medium@high | attempts=4 | e
 - **1.3.3 (@medium):** §3 and §4. Covered by I7–I15 and I17. The fixture must not change.
 - **1.3.4 (@medium, after 1.1):** §5. Covered by I16 and I17, and I7 must be re-run.
 - **Owner:** whether to fix Bedrock Claude detection (F2), and whether to gate the thinking budget by family (F3).
+- **To 2.2:**
+  - `effortCeilingFor(tier)` is pure. It returns `null` for variant, unset, invalid or unknown-family tiers, for Claude with a winning budget, and for OpenAI with `reasoning.effort`.
+  - `buildAgentOptions` now emits native keys only: `effort` (Claude), `reasoningEffort` / `reasoningSummary` (OpenAI and non-Claude `reasoning.*`), and `thinking: { type: "enabled", budgetTokens }`, a new object per call.
+  - The ceiling and the builder agree by construction: same predicates, Claude checked before OpenAI. Any per-turn or per-session override must call `buildAgentOptions({ ...tier, effort })` and must never re-derive keys, or that agreement breaks.
+  - Bedrock Claude ids classify as unknown (F2).
+- **To 2.3:**
+  - **Wire the effort.** Pass `action.effort` into `runProducerAttempt` (`src/index.ts:861` is `runProducerAttempt(tier, forcing)` today). This closes QA-1.3-1. Add a test that the effort in the scorecard equals the effort applied.
+  - **Use one config snapshot.** Build every attempt's options from the same `activeCfg` snapshot as the policy (`:551`/`:566`). Never mix in the registration-time agent options from the config hook. A tiers.json edit or a `/preset` switch between registration and delegation would otherwise make the bump's base disagree with attempt 1, which lowers effort (QA-1.3-2) or crosses families. Never rebuild the policy inside a loop.
+  - **Bridge translation (A4).** With native builder output, the bridge's snake-key translation (`v2-hooks.ts:125–135`) is dead code for router bags. When 2.3 keeps the aliases for other bags, invert today's precedence. At present `{ ...options, …alias }` lets an alias override a native key: `{ reasoningEffort: "low", reasoning_effort: "high" }` → `"high"`. A4 requires the explicit native key to win.
+  - **Host option precedence.** The per-turn merge (`:214–215`) skips any key already present in `event.options`, including keys whose value is `undefined`. The per-turn effort override must decide its precedence against host options explicitly.
+  - **Key order** changed (QA-1.3-6). Assert with `toEqual`.
+- **To 3.1:**
+  - **CHANGELOG.** Add a `Fixed` entry for the v1 native-key change at `788034d`, flagged as a v1 behaviour change. Cases:
+    - OpenAI-regex families now receive `reasoningEffort`/`reasoningSummary`: Copilot, OpenRouter and Azure `gpt-*`; `gpt-oss` through Ollama or Groq; and false positives on `-o1`/`-o3` ids (for example `mistral/magistral-o1`, which counts as OpenAI).
+    - Claude tiers with a budget now send `thinking`.
+    - Unknown-family tiers (Bedrock Claude, Gemini) with `thinking.budgetTokens` or `reasoning.*` now send `thinking`/`reasoningEffort`/`reasoningSummary`. The provider effect is unverified.
+    - Remedy: remove `effort`, `reasoning.*` or `thinking` from the affected tier.
+  - **Preset table (A5, confirmed here):**
+    - `anthropic`: 0 bumpable tiers (all set a variant).
+    - `openai`, `github-copilot`, `google`, `zai`: 0 (no `effort`).
+    - `hybrid`: 0 (the OpenAI tiers have no `effort`; heavy sets a variant).
+    - `fable-effort`: fast low→xhigh and medium high→xhigh; heavy is excluded because its base equals its bound.
+    - At the default `costMultiple: 4`, `fable-effort` runs `fast@low → fast@medium → medium@high` and stops on the cost ceiling, so medium's bump never runs. Fix D8's "four attempts" wording (QA-1.3-3), and state in the ADR that a bumped retry is charged at the tier's ratio (F4).
+  - **Docs.** Update the drift listed in QA-1.3-9.
 
 ## Verdict
 
-Design complete; nothing is open for the implementers. Implementation and the heavy QA for Phase 1.3 are pending.
+**Pending fixes.** No critical or major findings. Nine findings are open (QA-1.3-1 to 1.3-5 minor, QA-1.3-6 to 1.3-9 nit). The phase's acceptance criteria hold on the evidence above:
+
+- bump off is identical to v2.0.0;
+- bump on follows D8;
+- the ceiling never yields a value that `buildAgentOptions` alters or warns about.
+
+DoD requires zero open findings in this file.
