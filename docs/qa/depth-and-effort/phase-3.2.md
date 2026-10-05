@@ -218,6 +218,12 @@ QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`.
 
 ## Deferred by plan
 
+- **QA-3.2-9 / A15:** the inherited `XDG_DATA_HOME` versus fixed HOME-based log lookup
+  in `deferred-catalog.smoke.test.ts` is an accepted **pre-existing test-isolation
+  limit**, outside the Phase 3.2 write-set (and not assigned to another phase's code
+  write-set). The workaround for these runs is a clean calling environment with
+  `XDG_*` and `OPENCODE_*` removed. This does not repair that older test for developers
+  who invoke the lane from an arbitrary shell; the new fixture is independently isolated.
 - Full suite and global QA are owned by the orchestrator/3.3; not run in this dispatch.
 - Package script and release changes belong to 3.4.
 - Live-provider acceptance, pricing and latency are not proven by this keyless fixture.
@@ -225,6 +231,10 @@ QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`.
 
 ## Handoffs
 
+- **To 3.3/3.4:** open a follow-up issue to make deferred-catalog's log lookup honor
+  `XDG_DATA_HOME`, or remove that variable in its child environment. Carry the clean-env
+  workaround until fixed. No issue was opened by this dispatch; this is an explicit
+  follow-up, not a claim that the earlier 2.3 isolation handoff was implemented.
 - **To 3.4:** append `test/smoke/depth-effort.smoke.test.ts` to `smoke:keyless`.
   Also append it to `smoke:v2`; its `RUN_OC_SMOKE_V2` gate enables only the v2 describe
   when `OPENCODE_V2_BIN` is configured. Do not make v1 proof depend on v2 availability.
