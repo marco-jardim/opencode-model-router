@@ -717,6 +717,12 @@ function validateTaskPatterns(obj: Record<string, unknown>): void {
  */
 const MAX_TIMER_MS = 2_147_483_647;
 
+/**
+ * Equals the depth tracker's MAX_DEPTH_HOPS (src/router/depth.ts, Phase 1.2),
+ * so a cycle or over-long chain counted as 32 is refused under every configured limit.
+ */
+export const MAX_DELEGATION_DEPTH_LIMIT = 32;
+
 /** Copy without invoking accessors again; snapshot only keys already present. */
 function withValidatedSnapshots<T extends object>(
   obj: T,
@@ -744,11 +750,12 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
       maxDelegationDepth !== undefined &&
       maxDelegationDepth !== null &&
       (typeof maxDelegationDepth !== "number" ||
-        !Number.isInteger(maxDelegationDepth) ||
-        maxDelegationDepth < 1)
+        !Number.isSafeInteger(maxDelegationDepth) ||
+        maxDelegationDepth < 1 ||
+        maxDelegationDepth > MAX_DELEGATION_DEPTH_LIMIT)
     ) {
       throw new Error(
-        `tiers.json: enforcement.maxDelegationDepth must be an integer >= 1 or null (got '${String(maxDelegationDepth)}')`,
+        `tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got '${String(maxDelegationDepth)}')`,
       );
     }
     if (enforcement.mode !== undefined) {

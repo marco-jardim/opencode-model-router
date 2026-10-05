@@ -156,7 +156,7 @@ may contain instruction text or paths.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` = no-op. `advisory` = log violations, never block. `enforced` = block/escalate on violations. |
-| `maxDelegationDepth` | `integer ≥ 1 \| null` | `1` | Deepest session a model-initiated dispatch may create; root/orchestrator = depth 0. `null` disables the depth guard. |
+| `maxDelegationDepth` | `integer 1–32 \| null` | `1` | Deepest session a model-initiated dispatch may create; root/orchestrator = depth 0. `null` disables the depth guard. |
 | `envGate` | `string` | `"MODEL_ROUTER_ENFORCE"` | Name of the env var that overrides mode at runtime. See env-gate truth table below. |
 | `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` when the env gate is unset/empty. |
 | `guard` | object | see below | Request-level hard guards (caps, script controls, budget). |
@@ -178,7 +178,8 @@ bundled default), with a `[⚠ GUARD:delegation_depth]` banner. It is **refused*
 The guard covers the native `task` tool (including `task_id` resume and OpenCode 2
 background dispatches) and the `delegate` tool. Unknown depth caused by a backend
 failure or timeout fails open with one warning. A cycle or a parent chain over
-32 hops counts as the maximum depth.
+32 hops counts as depth 32. Limits must be safe integers from 1 to 32 so such
+chains exceed every configured limit on their next dispatch.
 
 ```json
 {
@@ -606,7 +607,7 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | Rule |
 |---|
 | `mode` must be one of `off \| advisory \| enforced`. |
-| `maxDelegationDepth` must be an integer ≥ 1 or `null`. |
+| `maxDelegationDepth` must be a safe integer from 1 to 32 or `null`. |
 | `verify.graderPolicy` (when `verify` is an object) must be exactly `"atLeastProducerTier"`. |
 | `escalate.costCeiling.multiple` must be a number > 0. |
 | `escalate.ladder` must be an array of strings. |

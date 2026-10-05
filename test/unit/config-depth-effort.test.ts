@@ -75,7 +75,7 @@ describe("depth and effort bump config — defaults and validation", () => {
     expect(resolveEffortBump(cfg)).toEqual({ enabled: true, max: "xhigh" });
   });
 
-  it.each([null, 1, 2, 100])("accepts maxDelegationDepth %s", (maxDelegationDepth) => {
+  it.each([null, 1, 2, 32])("accepts maxDelegationDepth %s", (maxDelegationDepth) => {
     const cfg = validateConfig(validRaw({ enforcement: { maxDelegationDepth } }));
     expect(resolveDepthLimit(cfg)).toBe(maxDelegationDepth);
   });
@@ -86,9 +86,11 @@ describe("depth and effort bump config — defaults and validation", () => {
     ["Infinity", Infinity, "Infinity"], ["overflow", 1e400, "Infinity"],
     ["string", "1", "1"], ["boolean", true, "true"],
     ["array", [], ""], ["object", {}, "[object Object]"],
+    ["above limit", 33, "33"], ["old unbounded limit", 100, "100"],
+    ["huge integer", 1e300, "1e+300"], ["unsafe integer", 2 ** 53 + 2, "9007199254740994"],
   ])("rejects maxDelegationDepth %s with the exact received-value message", (_label, value, received) => {
     expect(() => validateConfig(validRaw({ enforcement: { maxDelegationDepth: value } })))
-      .toThrowError(new Error(`tiers.json: enforcement.maxDelegationDepth must be an integer >= 1 or null (got '${received}')`));
+      .toThrowError(new Error(`tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got '${received}')`));
   });
 
   it.each([true, false])("accepts effortBump %s", (effortBump) => {
@@ -250,7 +252,7 @@ describe("depth and effort bump config — overrides and purity", () => {
     {},
     { enforcement: {} },
     { enforcement: { maxDelegationDepth: null, escalate: { effortBump: false, effortBumpMax: "low" } } },
-    { enforcement: { maxDelegationDepth: 100, escalate: { effortBump: true, effortBumpMax: "max" } } },
+    { enforcement: { maxDelegationDepth: 32, escalate: { effortBump: true, effortBumpMax: "max" } } },
   ])("resolvers are deterministic and do not mutate deeply frozen config: %j", (extra) => {
     const cfg: RouterConfig = deepFreeze(validateConfig(deepFreeze(validRaw(extra))));
     const before = structuredClone(cfg);
