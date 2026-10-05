@@ -4,6 +4,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
@@ -266,6 +267,25 @@ export interface RouterState {
 
 let _cachedConfig: RouterConfig | null = null;
 let _configDirty = true;
+let _cachedFingerprint = "";
+/** Source locations (paths only, no mtimes) that produced `_cachedConfig`. */
+let _cachedSourceKey = "";
+/** Sources that were already failing when `_cachedConfig` was built (tolerated). */
+let _cachedTolerated = new Set<string>();
+/** Last hot-reload failure (null when the most recent rebuild succeeded). */
+let _configReloadError: string | null = null;
+/** Fingerprint a reload-failure warning was last emitted for (warn once each). */
+let _warnedFingerprint: string | null = null;
+
+/**
+ * Why the last config rebuild failed, or null when it succeeded. When a source
+ * (tiers.json, an overrides file, or the state file) becomes invalid after a
+ * successful load, loadConfig() keeps serving the last valid config and
+ * records the reason here instead of throwing or silently dropping layers.
+ */
+export function getConfigReloadError(): string | null {
+  return _configReloadError;
+}
 
 /** Mark config cache as stale so it is re-read on next access. */
 export function invalidateConfigCache(): void {
@@ -1179,7 +1199,10 @@ export function deepMerge(base: unknown, override: unknown): unknown {
  * overrides file can never brick opencode startup — but the user still gets a
  * visible reason why their override was ignored.
  */
-function readOverridesAt(op: string): Record<string, unknown> | undefined {
+function readOverridesAt(
+  op: string,
+  failures?: SourceFailure[],
+): Record<string, unknown> | undefined {
   let text: string;
   try {
     if (!existsSync(op)) return undefined;
@@ -1188,27 +1211,37 @@ function readOverridesAt(op: string): Record<string, unknown> | undefined {
     // The file is there but unreadable (permissions, a dangling symlink, a
     // race with a delete). Every other failure below says so; staying silent
     // here makes an unreadable override look exactly like an absent one.
-    console.warn(
-      `[model-router] ignoring ${op}: cannot read it — ${(err as Error).message}`,
-    );
+    const reason = `cannot read it — ${(err as Error).message}`;
+    console.warn(`[model-router] ignoring ${op}: ${reason}`);
+    failures?.push({ source: op, message: `${op}: ${reason}` });
     return undefined;
   }
 
   try {
     const parsed = parseJsonc(text) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      console.warn(
-        `[model-router] ignoring ${op}: expected a JSON object at root`,
-      );
+      const reason = "expected a JSON object at root";
+      console.warn(`[model-router] ignoring ${op}: ${reason}`);
+      failures?.push({ source: op, message: `${op}: ${reason}` });
       return undefined;
     }
     return parsed as Record<string, unknown>;
   } catch (err) {
-    console.warn(
-      `[model-router] ignoring ${op}: invalid JSONC — ${(err as Error).message}`,
-    );
+    const reason = `invalid JSONC — ${(err as Error).message}`;
+    console.warn(`[model-router] ignoring ${op}: ${reason}`);
+    failures?.push({ source: op, message: `${op}: ${reason}` });
     return undefined;
   }
+}
+
+/**
+ * A source that exists on disk but could not be used while building the
+ * config. `source` is a stable key (a file path, or the joined layer paths for
+ * a combined-merge failure); `message` is the user-facing reason.
+ */
+interface SourceFailure {
+  source: string;
+  message: string;
 }
 
 /**
@@ -1221,13 +1254,13 @@ export interface OverrideLayer {
   data: Record<string, unknown>;
 }
 
-function collectOverrideLayers(): OverrideLayer[] {
+function collectOverrideLayers(failures?: SourceFailure[]): OverrideLayer[] {
   const layers: OverrideLayer[] = [];
   // Lowest priority first: global, then project-local (found by upward search).
   const paths = [overridePath(), findProjectOverride()];
   for (const p of paths) {
     if (!p) continue;
-    const data = readOverridesAt(p);
+    const data = readOverridesAt(p, failures);
     if (data) layers.push({ path: p, data });
   }
   return layers;
@@ -1261,13 +1294,108 @@ function applyTierDefaults(cfg: RouterConfig): void {
   }
 }
 
+/** Every file location that feeds loadConfig() (undefined = none applicable). */
+function sourcePaths(): Array<string | undefined> {
+  return [configPath(), overridePath(), findProjectOverride(), statePath()];
+}
+
+/** mtime/size fingerprint of every file that feeds loadConfig(). */
+function sourceFingerprint(paths: Array<string | undefined>): string {
+  return paths
+    .map((p) => {
+      if (!p) return "none";
+      try {
+        const st = statSync(p);
+        return `${p}:${st.mtimeMs}:${st.size}`;
+      } catch {
+        return `${p}:missing`;
+      }
+    })
+    .join("|");
+}
+
 export function loadConfig(): RouterConfig {
-  if (_cachedConfig && !_configDirty) {
+  const paths = sourcePaths();
+  const fingerprint = sourceFingerprint(paths);
+  if (_cachedConfig && !_configDirty && fingerprint === _cachedFingerprint) {
     return _cachedConfig;
   }
 
+  // A previous config is only a valid fallback when it was built from the same
+  // source locations (a different HOME/project is a fresh first load).
+  const sourceKey = paths.map((p) => p ?? "none").join("|");
+  const previous =
+    _cachedConfig !== null && sourceKey === _cachedSourceKey ? _cachedConfig : null;
+
+  const failures: SourceFailure[] = [];
+  let cfg: RouterConfig;
+  try {
+    cfg = buildConfig(failures);
+  } catch (err) {
+    // First load: unchanged behaviour — throw. Reload: keep the last good one.
+    if (!previous) throw err;
+    return keepLastValidConfig(
+      previous,
+      fingerprint,
+      `${configPath()}: ${(err as Error).message}`,
+    );
+  }
+
+  if (previous) {
+    // Sources that were already failing when `previous` was built are an
+    // accepted state (e.g. a broken override at startup); only a source that
+    // newly broke counts as a failed reload.
+    const regressions = failures.filter((f) => !_cachedTolerated.has(f.source));
+    if (regressions.length > 0) {
+      return keepLastValidConfig(
+        previous,
+        fingerprint,
+        regressions.map((f) => f.message).join("\n"),
+      );
+    }
+  }
+
+  _cachedConfig = cfg;
+  _cachedFingerprint = fingerprint;
+  _cachedSourceKey = sourceKey;
+  _cachedTolerated = new Set(failures.map((f) => f.source));
+  _configDirty = false;
+  _configReloadError = null;
+  _warnedFingerprint = null;
+  return cfg;
+}
+
+/**
+ * Reload failed: keep serving `previous` (same object reference), remember the
+ * fingerprint so we do not retry on every message until a file changes (or
+ * invalidateConfigCache() is called), record the reason, and warn once per
+ * failed fingerprint.
+ */
+function keepLastValidConfig(
+  previous: RouterConfig,
+  fingerprint: string,
+  message: string,
+): RouterConfig {
+  _cachedFingerprint = fingerprint;
+  _configDirty = false;
+  _configReloadError = message;
+  if (_warnedFingerprint !== fingerprint) {
+    _warnedFingerprint = fingerprint;
+    console.warn(
+      `[model-router] config reload failed — keeping last valid config: ${message}`,
+    );
+  }
+  return previous;
+}
+
+/**
+ * Build a fresh config from tiers.json + override layers + persisted state.
+ * Throws only when tiers.json itself is unreadable/invalid. Override and state
+ * problems are warned about, skipped, and appended to `failures`.
+ */
+function buildConfig(failures: SourceFailure[]): RouterConfig {
   const base = JSON.parse(readFileSync(configPath(), "utf-8"));
-  const layers = collectOverrideLayers();
+  const layers = collectOverrideLayers(failures);
 
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
@@ -1287,6 +1415,11 @@ export function loadConfig(): RouterConfig {
       console.warn(
         `[model-router] combined overrides are invalid (${(err as Error).message}); dropping conflicting layer(s)`,
       );
+      const layerPaths = layers.map((l) => l.path).join(" + ");
+      failures.push({
+        source: layerPaths,
+        message: `${layerPaths}: combined overrides are invalid — ${(err as Error).message}`,
+      });
       for (let i = layers.length - 1; i >= 0; i--) {
         try {
           cfg = validateConfig(merge([layers[i]!]));
@@ -1300,6 +1433,10 @@ export function loadConfig(): RouterConfig {
           console.warn(
             `[model-router] ignoring ${layers[i]!.path}: ${(singleErr as Error).message}`,
           );
+          failures.push({
+            source: layers[i]!.path,
+            message: `${layers[i]!.path}: ${(singleErr as Error).message}`,
+          });
           cfg = validateConfig(base);
         }
       }
@@ -1324,14 +1461,17 @@ export function loadConfig(): RouterConfig {
         cfg.enforcement = { ...(cfg.enforcement ?? {}), mode: state.enforcementMode };
       }
     }
-  } catch {
-    // Ignore state read errors and keep tiers.json defaults
+  } catch (err) {
+    // State read errors never block startup: keep tiers.json defaults. They are
+    // recorded so a state file that breaks on a later reload is reported (and
+    // the last valid config kept) rather than silently reverting the preset.
+    failures.push({
+      source: statePath(),
+      message: `${statePath()}: ${(err as Error).message}`,
+    });
   }
 
   applyTierDefaults(cfg);
-
-  _cachedConfig = cfg;
-  _configDirty = false;
   return cfg;
 }
 

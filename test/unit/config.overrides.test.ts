@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, realpathSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
@@ -11,6 +11,9 @@ import {
   localOverridePath,
   findProjectOverride,
   writeState,
+  configPath,
+  statePath,
+  getConfigReloadError,
 } from "../../src/router/config";
 
 // Switch used by the "cannot be read" test below to make exactly one path fail
@@ -177,6 +180,32 @@ describe("loadConfig — user overrides file", () => {
     const cfg = loadConfig();
     expect(cfg.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns the identical object while no source file changed", () => {
+    writeOverride(JSON.stringify({ activePreset: "github-copilot" }));
+    expect(loadConfig()).toBe(loadConfig());
+  });
+
+  it("reloads on mtime/size change without an explicit invalidate", () => {
+    writeOverride(
+      JSON.stringify({ presets: { "github-copilot": { heavy: { model: "x/one" } } } }),
+    );
+    const first = loadConfig();
+    expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+
+    const p = overridePath();
+    writeFileSync(
+      p,
+      JSON.stringify({ presets: { "github-copilot": { heavy: { model: "x/two-longer" } } } }),
+      "utf-8",
+    );
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(p, later, later);
+
+    const second = loadConfig();
+    expect(second).not.toBe(first);
+    expect(second.presets["github-copilot"]!.heavy!.model).toBe("x/two-longer");
   });
 
   // activePreset is the likeliest key to typo in a hand-edited file. It used to
@@ -346,6 +375,155 @@ describe("loadConfig — user overrides file", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("must be 'provider/model' (got 'claude-sonnet-5')"),
     );
+  });
+
+  // Hot reload: once a config has loaded, a source that later turns invalid
+  // (a half-saved override, a corrupt state file, a broken tiers.json) must not
+  // throw or silently revert to the base tiers — the last valid config keeps
+  // serving and the reason is surfaced via getConfigReloadError().
+  describe("hot reload resilience", () => {
+    let bump = 0;
+
+    /** Rewrite the override in place and move its mtime forward. */
+    function rewriteOverride(content: string): void {
+      const p = overridePath();
+      writeFileSync(p, content, "utf-8");
+      bump += 60_000;
+      const later = new Date(Date.now() + bump);
+      utimesSync(p, later, later);
+    }
+
+    const goodOverride = (model: string): string =>
+      JSON.stringify({ presets: { "github-copilot": { heavy: { model } } } });
+
+    const reloadWarnings = (): number =>
+      warnSpy.mock.calls.filter((c: unknown[]) =>
+        String(c[0]).includes("config reload failed"),
+      ).length;
+
+    it("keeps the last valid config when the override becomes invalid JSONC, then recovers", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+      expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+      expect(getConfigReloadError()).toBeNull();
+
+      rewriteOverride('{ "presets": { "github-copilot": { "heavy": { "model": ');
+      const second = loadConfig();
+      expect(second).toBe(first);
+      expect(second.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+      const err = getConfigReloadError();
+      expect(err).not.toBeNull();
+      expect(err).toContain(overridePath());
+      expect(err).toContain("invalid JSONC");
+
+      // Fixing the file clears the error and picks up the new content.
+      rewriteOverride(goodOverride("x/fixed-model"));
+      const third = loadConfig();
+      expect(third).not.toBe(first);
+      expect(third.presets["github-copilot"]!.heavy!.model).toBe("x/fixed-model");
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("does not re-warn or rebuild after a failure until a file changes", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+
+      rewriteOverride("{ not json");
+      expect(loadConfig()).toBe(first);
+      expect(reloadWarnings()).toBe(1);
+      warnSpy.mockClear();
+
+      // Same fingerprint: served from cache, silently.
+      expect(loadConfig()).toBe(first);
+      expect(loadConfig()).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(getConfigReloadError()).toContain(overridePath());
+
+      // An explicit reload retries (the loader's own parse warning fires again)
+      // but the reload-failure warning is still emitted once per fingerprint.
+      invalidateConfigCache();
+      expect(loadConfig()).toBe(first);
+      expect(reloadWarnings()).toBe(0);
+      expect(getConfigReloadError()).toContain(overridePath());
+    });
+
+    it("keeps the last valid config when the override fails validation on reload", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+
+      // Parses fine but a provider-less model ref is rejected by validation.
+      rewriteOverride(goodOverride("no-provider"));
+      expect(loadConfig()).toBe(first);
+      expect(getConfigReloadError()).toContain(overridePath());
+      expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+
+      rewriteOverride(goodOverride("x/two"));
+      const fixed = loadConfig();
+      expect(fixed.presets["github-copilot"]!.heavy!.model).toBe("x/two");
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("keeps the last valid config when the state file becomes corrupt on reload", () => {
+      const first = loadConfig();
+      const sp = statePath();
+      mkdirSync(dirname(sp), { recursive: true });
+      writeFileSync(sp, "{ corrupt", "utf-8");
+      const later = new Date(Date.now() + 120_000);
+      utimesSync(sp, later, later);
+
+      expect(loadConfig()).toBe(first);
+      expect(getConfigReloadError()).toContain(sp);
+
+      writeFileSync(sp, JSON.stringify({ activeMode: "no-such-mode" }), "utf-8");
+      const later2 = new Date(Date.now() + 240_000);
+      utimesSync(sp, later2, later2);
+      expect(loadConfig()).not.toBe(first);
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("keeps the last valid config when tiers.json becomes unreadable on reload", () => {
+      const first = loadConfig();
+      try {
+        fsMock.unreadablePath = configPath();
+        invalidateConfigCache();
+        expect(loadConfig()).toBe(first);
+        expect(getConfigReloadError()).toContain(configPath());
+        expect(getConfigReloadError()).toContain("EACCES");
+      } finally {
+        fsMock.unreadablePath = null;
+      }
+
+      invalidateConfigCache();
+      const recovered = loadConfig();
+      expect(recovered).not.toBe(first);
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("on first load, still warns and skips a broken override instead of failing", () => {
+      writeOverride("{ not json");
+      const cfg = loadConfig();
+      expect(cfg.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
+      expect(getConfigReloadError()).toBeNull();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("invalid JSONC"));
+    });
+
+    it("does not let an override that was already broken at startup block later reloads", () => {
+      writeOverride("{ not json");
+      const first = loadConfig();
+
+      // e.g. /preset persists state and invalidates the cache; the pre-existing
+      // broken override must not stop the new state from taking effect.
+      const target = first.activePreset === "anthropic" ? "github-copilot" : "anthropic";
+      const sp = statePath();
+      mkdirSync(dirname(sp), { recursive: true });
+      writeFileSync(sp, JSON.stringify({ activePreset: target }), "utf-8");
+      invalidateConfigCache();
+
+      const second = loadConfig();
+      expect(second).not.toBe(first);
+      expect(second.activePreset).toBe(target);
+      expect(getConfigReloadError()).toBeNull();
+    });
   });
 });
 

@@ -44,8 +44,8 @@ function fixture() {
   let wake = () => {};
   const ctx = {
     location: { directory: "/project", project: { directory: "/project" } },
-    agent: { list: vi.fn(async () => ({ data: Object.values(agents) })), transform: vi.fn(async (cb: any) => { transforms.agent = cb; cb(editors.agent); return register(); }) },
-    command: { transform: vi.fn(async (cb: any) => { transforms.command = cb; cb(editors.command); return register(); }) },
+    agent: { reload: vi.fn(async () => {}), list: vi.fn(async () => ({ data: Object.values(agents) })), transform: vi.fn(async (cb: any) => { transforms.agent = cb; cb(editors.agent); return register(); }) },
+    command: { reload: vi.fn(async () => {}), transform: vi.fn(async (cb: any) => { transforms.command = cb; cb(editors.command); return register(); }) },
     tool: {
       transform: vi.fn(async (cb: any) => { transforms.tool = cb; cb(editors.tool); return register(); }),
       hook: vi.fn(async (name: string, cb: any) => { toolHooks[name] = cb; return register(); }),
@@ -332,6 +332,61 @@ describe("OpenCode 2 hook adapter", () => {
     });
     await f.commands.preset.execute({ sessionID: "root", prompt: { text: "openai", files: [{ uri: "file:///note" }] }, delivery: "steer" });
     expect(f.ctx.session.prompt).toHaveBeenCalledWith({ sessionID: "root", text: "openai\n\nSelected openai", files: [{ uri: "file:///note" }], delivery: "steer" });
+  });
+
+  it("router-reload answers synthetically, refreshes agents and never prompts", async () => {
+    const f = fixture();
+    await f.start({
+      config: async (config: any) => { config.command["router-reload"] = { template: "", description: "Reload" }; },
+      "command.execute.before": async (_: any, output: any) => { output.parts.push({ type: "text", text: "reloaded" }); },
+    });
+    await f.commands["router-reload"].execute({ sessionID: "root", prompt: { text: "" }, delivery: "steer" });
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
+    expect(f.ctx.command.reload).toHaveBeenCalledTimes(1);
+    expect(f.ctx.session.synthetic).toHaveBeenCalledWith({ sessionID: "root", text: "reloaded", description: "Model router config reload", resume: false });
+    expect(f.ctx.session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the agent registry after preset and still prompts", async () => {
+    const f = fixture();
+    await f.start({
+      config: async (config: any) => { config.command.preset = { template: "$ARGUMENTS", description: "Switch preset" }; },
+      "command.execute.before": async (_: any, output: any) => { output.parts.push({ type: "text", text: "Selected" }); },
+    });
+    await f.commands.preset.execute({ sessionID: "root", prompt: { text: "openai" }, delivery: "steer" });
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
+    expect(f.ctx.session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("rebuilds from the setup-time base seed instead of re-listing router-modified agents", async () => {
+    const f = fixture();
+    let model = "openai/first";
+    await f.start({
+      config: async (config: any) => {
+        config.agent.explore.model = model;
+        config.command["router-reload"] = { template: "", description: "Reload" };
+      },
+    });
+    expect(f.agents.explore.model).toMatchObject({ providerID: "openai", id: "first" });
+    model = "openai/second";
+    await f.commands["router-reload"].execute({ sessionID: "root", prompt: { text: "" }, delivery: "steer" });
+    f.transforms.agent(f.editors.agent);
+    expect(f.agents.explore.model).toMatchObject({ providerID: "openai", id: "second" });
+    expect(f.ctx.agent.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes from the prompt hook when loadConfig returns a new object", async () => {
+    const f = fixture();
+    const configHook = vi.fn(async () => {});
+    await f.start({ config: configHook });
+    const event = () => ({ ...call, prompt: { text: "hi" } });
+    await f.sessionHooks.prompt(event());
+    expect(f.ctx.agent.reload).not.toHaveBeenCalled();
+    invalidateConfigCache();
+    await f.sessionHooks.prompt(event());
+    expect(configHook).toHaveBeenCalledTimes(2);
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
+    expect(f.ctx.command.reload).toHaveBeenCalledTimes(1);
   });
 
   it("classifies prompt sessions by their actual agent and preserves prompt edits", async () => {
