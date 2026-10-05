@@ -167,7 +167,8 @@ may contain instruction text or paths.
 ### Delegation depth
 
 `enforcement.maxDelegationDepth` defaults to `1`: only orchestrators may
-dispatch. Set it to `2` to let a delegate dispatch one more level, or `null` to
+dispatch in `enforced` mode; in the default `advisory` mode, deeper dispatches
+are warned rather than blocked. Set it to `2` to let a delegate dispatch one more level, or `null` to
 disable the guard.
 
 A dispatch past the limit is **warned**, not blocked, in `advisory` mode (the
@@ -180,7 +181,7 @@ gate `MODEL_ROUTER_ENFORCE=1` overrides both.
 
 The guard covers the native `task` tool (including `task_id` resume and OpenCode 2
 background dispatches) and the `delegate` tool. Unknown depth caused by a backend
-failure or timeout fails open with one warning. A cycle or a parent chain over
+failure or timeout fails open with one warning per caller session. A cycle or a parent chain over
 32 hops counts as depth 32. Limits must be safe integers from 1 to 32 so such
 chains exceed every configured limit on their next dispatch.
 
