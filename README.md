@@ -279,9 +279,10 @@ host's permissions and cancellation. There are a few host differences:
   ([details](docs/OPENCODE_V2.md#grader-temperature-on-v2)).
 - Anti-narration warnings appear as separate synthetic transcript entries, because
   completed v2 text events cannot be rewritten.
-- Tier options (`effort`/`variant`/`reasoning_effort`, `budget_tokens`, etc.) are
+- Tier options (`effort`/`reasoningEffort`/`reasoningSummary`/`thinking`) are
   applied per turn through the v2 `session` context hook, filling only keys not
   already present, because v2 does not read `Agent.Info.request.settings`.
+  A tier's `variant` is applied through its agent model reference at registration.
 
 **Smoke tests:** Set `OPENCODE_V2_BIN` to the absolute path of an OpenCode v2
 executable. `npm run smoke:v2` checks loading and registration without provider
@@ -480,7 +481,11 @@ highest first:
    provider-specific setting always wins, and a one-time warning names the tier.
 2. `effort`.
 
-**Unset means unset**: no `effort` (and no `reasoning_effort`) key is registered at all.
+**Unset means unset**: without `effort` or an explicit `reasoning.effort`, neither
+`effort` nor `reasoningEffort` is registered. User config keys remain
+`reasoning.effort`, `reasoning.summary` and `thinking.budgetTokens`; registered
+provider options use `reasoningEffort`, `reasoningSummary` and
+`thinking: { type: "enabled", budgetTokens }` respectively.
 
 Explicit fields are gated by model family: Claude drops `reasoning.effort`/`reasoning.summary`; adaptive-only Claude also ignores `thinking.budgetTokens`, leaving `effort` applicable.
 Each drop warns once per tier; non-Claude explicit fields are unchanged. See the [provider gate](docs/CONFIG_REFERENCE.md#provider-gate-for-explicit-thinking-and-reasoning-fields).
@@ -488,7 +493,7 @@ Each drop warns once per tier; non-Claude explicit fields are unchanged. See the
 | Model family | Registered as | Caveats |
 |---|---|---|
 | Anthropic | `options.effort`, incl. `xhigh`/`max` | Requires the `opencode-anthropic-fix` plugin (commit `307aea9`+ for fable/mythos). Non-adaptive Claude models (e.g. haiku) silently strip `effort` at the API layer, and without the plugin a top-level `effort` can break Claude-Code billing fingerprinting. |
-| OpenAI | `options.reasoning_effort` | Supports only `low`/`medium`/`high`; `xhigh` and `max` are downgraded to `high` with a warning. |
+| OpenAI | `options.reasoningEffort` | Supports only `low`/`medium`/`high`; `xhigh` and `max` are downgraded to `high` with a warning. |
 | Other (Google, …) | nothing | Dropped with a warning — no known mapping. Detection is by model family, not provider prefix, so Copilot-proxied ids (`github-copilot/gpt-4o`, `github-copilot/claude-sonnet-4`) take their family's knob above. |
 
 An out-of-set value in `tiers.json` fails validation at load; one that arrives any other
@@ -932,6 +937,67 @@ That deferral is the v1.15.0 default (`enforcement.verify.defaultVerify: "deferr
 - **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed by the enforcement pipeline, verified according to the settings above, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
 - **Mode B — plan-annotated.** `/annotate-plan` emits `[tier:X]` plus an `[acceptance]` block per task; the enforcement loop is wired up at execution time based on those annotations.
 
+### Delegation depth guard
+
+The guard checks model-initiated dispatches through native `task` (OpenCode v1),
+`subagent` (OpenCode 2), and the router's optional `delegate` tool, including resumes.
+`enforcement.maxDelegationDepth` defaults to `1`: the root orchestrator is depth 0,
+so it may delegate, but its depth-1 children would exceed the limit by delegating again.
+
+- **`advisory` (bundled default):** allows the dispatch and warns with
+  `[⚠ GUARD:delegation_depth]` in its result; it does not refuse it.
+- **`enforced`:** refuses a dispatch past the limit before another subagent runs.
+  Set `enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1` to enforce it.
+  The caller tier's `enforcement.perTier` override applies unless the environment
+  gate overrides it.
+- **`off`:** skips the check. Set `enforcement.maxDelegationDepth: null` to disable
+  just this guard, or use an integer from 1 to 32 to change the depth limit.
+
+This is not a sandbox: shell-launched `opencode run` and other plugins' session
+tools are outside its scope. `/bypass on` also disables the depth guard. If the
+caller depth cannot be resolved, the guard fails open with a logged warning.
+OpenCode 2 has its own independent `experimental.subagent_depth` cap (default 1):
+raising or disabling the router limit does not lift that host cap. With both caps
+enforced, the lower one wins. V2's `general` agent also needs explicit `subagent`
+permission to dispatch. The Phase 2.3 host proof on OpenCode v1 1.18.19 likewise encountered
+a host cap and used top-level `subagent_depth: 4` to lift it; its default and upstream
+documentation are unverified. Raising only the router limit does not lift a host cap.
+These are observations from the [host-proof fixtures](docs/qa/depth-and-effort/phase-2.3.md#handoffs),
+not a documented cross-version default for v1.
+
+See the [configuration reference](docs/CONFIG_REFERENCE.md) and
+[design decisions and scope limits](docs/adr/0004-delegation-depth-and-effort-bump.md).
+
+### Effort bump before escalation
+
+The automatic escalation ladder uses its existing same-tier retry to try **one
+effort level higher** before moving to a more expensive tier. It adds no attempt.
+`enforcement.escalate.effortBump` defaults to `true`, and `effortBumpMax` defaults
+to `"xhigh"`, further capped by model family (OpenAI: `high`; Claude: `max`). Set
+`enforcement.escalate.effortBump: false` to restore the previous ladder behaviour.
+
+An eligible tier must set an explicit valid `effort`, have no `variant`, belong to
+a recognised Claude or OpenAI model family, and have room below the effective ceiling.
+A winning explicit provider setting
+(`reasoning.effort` or an applicable `thinking.budgetTokens`) prevents the bump.
+It changes only that retry producer's options, not the preset, titles or graders.
+The bump applies to the optional `delegate` tool's automatic ladder, not native
+`task`/`subagent` calls or manual retries; deferred verification does not retry.
+`/bypass` leaves the ladder and effort bump active; use `effortBump: false` to disable
+the bump.
+
+Among bundled presets, **only `fable-effort` fast and medium are eligible**
+(`low → medium` and `high → xhigh`). Its heavy tier is already at the default
+ceiling; all other presets either set a variant or omit `effort`. In particular,
+the default `anthropic` preset has no bumpable tier. Attempt and cost ceilings
+still apply: starting at fast with the default cost multiple of 4, `fable-effort`
+runs `fast@low → fast@medium → medium@high`, then stops on cost; medium's bump
+is not reached. Raise `enforcement.escalate.costCeiling.multiple` to allow it.
+
+See the [configuration reference](docs/CONFIG_REFERENCE.md) for eligibility and
+cost settings, and the [ADR](docs/adr/0004-delegation-depth-and-effort-bump.md) for
+trade-offs and host evidence (real-provider acceptance of bumped values is unverified).
+
 ### Tuning enforcement
 
 Advisory is the default. To change the level:
@@ -946,7 +1012,7 @@ Set `taskPromptRepair: false` to restore the previous behaviour; see [configurat
 For work outside the router directory (e.g. a git worktree), add `cwd: <dir>` inside the task's `[acceptance]` block; a non-empty tool `args.cwd` takes precedence.
 If every changed file is absolute and outside the verification base, deterministic checks return unverifiable instead of running in the wrong directory.
 
-**Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
+**Modes:** `off` — disables enforcement guards and skips native `task`/`subagent` verification (must be set explicitly, since `advisory` is the default); `advisory` (default) — warns on guard violations without blocking; `enforced` — blocks guard violations. Native-task verification annotates completed results in both advisory and enforced modes, subject to verification policy. Whenever the opt-in `delegate` tool is enabled, its produce → verify → accept/escalate pipeline runs in **every mode**, including retries and eligible effort bumps, subject to its verification policy and attempt/cost limits.
 
 > Enforcement applies to subagent/delegate sessions only. The orchestrator session is never hard-blocked.
 
