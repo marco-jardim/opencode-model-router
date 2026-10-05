@@ -13,6 +13,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { ScriptedProvider, blocks, blockText, type HostVersion, type Block } from "./helpers/scripted-provider";
+import { pickFetchSafePort } from "./helpers/fetch-safe-port";
 
 const ROOT = path.resolve(__dirname, "../..");
 const MODEL = "anthropic/claude-opus-4-7";
@@ -50,7 +51,7 @@ class Fixture {
   constructor(readonly host: typeof hosts[number], readonly root: string) { this.provider = new ScriptedProvider(host.version); }
 
   async init() {
-    for (const file of ["test/smoke/depth-effort.smoke.test.ts", "test/smoke/helpers/scripted-provider.ts", "test/smoke/helpers/scripted-provider.test.ts"]) {
+    for (const file of ["test/smoke/depth-effort.smoke.test.ts", "test/smoke/helpers/scripted-provider.ts", "test/smoke/helpers/scripted-provider.test.ts", "test/smoke/helpers/fetch-safe-port.ts"]) {
       this.sourceHashes[file] = createHash("sha256").update(await readFile(path.join(ROOT, file))).digest("hex");
     }
     this.env = { ...process.env };
@@ -207,7 +208,8 @@ for (const host of hosts) {
         // Router config is process-cwd scoped, not the HTTP location parameter.
         // A fresh process is essential: reusing serve across directories can
         // falsely pass inventory checks while never loading an invalid override.
-        const server = f.launch(directory, ["serve", "--hostname", "127.0.0.1", "--port", "0", "--print-logs"]);
+        const port = await pickFetchSafePort();
+        const server = f.launch(directory, ["serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs"]);
         const deadline = Date.now() + 30_000;
         let address: string | undefined;
         while (!(address = /server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(server.stdout + server.stderr)?.[1])) {
@@ -215,6 +217,9 @@ for (const host of hosts) {
           await delay(100);
         }
         const url = new URL(host.version === "v1" ? "/agent" : "/api/agent", address);
+        // Do not fetch a different host-selected port if a CLI stops honoring
+        // --port: in particular, never send a request to a Fetch-blocked port.
+        expect(Number(url.port), server.stdout + server.stderr).toBe(port);
         url.searchParams.set(host.version === "v1" ? "directory" : "location[directory]", directory);
         const headers: Record<string, string> = password ? { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } : {};
         async function get(target: URL) {

@@ -1,5 +1,7 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+import { createServer } from "node:net";
 import { ScriptedProvider } from "./scripted-provider";
+import { FETCH_BAD_PORTS, isFetchSafePort, listenOnFetchSafePort, pickFetchSafePort } from "./fetch-safe-port";
 
 const providers: ScriptedProvider[] = [];
 const controllers: AbortController[] = [];
@@ -12,8 +14,49 @@ afterEach(async () => {
 async function start(host: "v1" | "v2" = "v1") {
   const provider = new ScriptedProvider(host);
   providers.push(provider);
-  return { provider, url: `${await provider.start()}/messages` };
+  const url = `${await provider.start()}/messages`;
+  expect(isFetchSafePort(Number(new URL(url).port))).toBe(true);
+  return { provider, url };
 }
+
+it("rejects the observed blocked port 3659 before returning a free safe port", async () => {
+  const source = vi.fn<() => Promise<number>>().mockResolvedValueOnce(3659).mockResolvedValueOnce(49152);
+  expect(await pickFetchSafePort(source)).toBe(49152);
+  expect(source).toHaveBeenCalledTimes(2);
+});
+
+it("rejects every Fetch bad port and invalid destination before accepting a safe port", async () => {
+  const candidates = [0, -1, 65536, NaN, 1.5, ...FETCH_BAD_PORTS];
+  for (const port of candidates) expect(isFetchSafePort(port)).toBe(false);
+  const source = vi.fn<() => Promise<number>>();
+  for (const port of candidates) source.mockResolvedValueOnce(port);
+  source.mockResolvedValueOnce(49152);
+  expect(await pickFetchSafePort(source)).toBe(49152);
+  expect(source).toHaveBeenCalledTimes(candidates.length + 1);
+});
+
+it("bounds blocked-port retries without ever returning a blocked destination", async () => {
+  const source = vi.fn<() => Promise<number>>().mockResolvedValue(3659);
+  await expect(pickFetchSafePort(source)).rejects.toThrow("after 128 probes");
+  expect(source).toHaveBeenCalledTimes(128);
+});
+
+it("retries a safe port taken between probe and bind without retaining error listeners", async () => {
+  const occupied = createServer();
+  const server = createServer();
+  try {
+    const port = await listenOnFetchSafePort(occupied);
+    const source = vi.fn<() => Promise<number>>().mockResolvedValueOnce(port).mockImplementation(pickFetchSafePort);
+    const actual = await listenOnFetchSafePort(server, source);
+    expect(actual).not.toBe(port);
+    expect(isFetchSafePort(actual)).toBe(true);
+    expect(source).toHaveBeenCalledTimes(2);
+    expect(server.listenerCount("error")).toBe(0);
+    expect(server.listenerCount("listening")).toBe(0);
+  } finally {
+    await Promise.all([occupied, server].filter(s => s.listening).map(s => new Promise<void>((resolve, reject) => s.close(error => error ? reject(error) : resolve()))));
+  }
+});
 
 it("retains scripted tool calls and inputs in non-stream Anthropic messages", async () => {
   const { url } = await start();

@@ -2,7 +2,7 @@
  * Deliberately tests host lowering, not acceptance by the upstream provider.
  */
 import { createServer, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { listenOnFetchSafePort } from "./fetch-safe-port";
 
 export type HostVersion = "v1" | "v2";
 export interface Block {
@@ -115,8 +115,8 @@ export class ScriptedProvider {
   constructor(readonly host: HostVersion) {}
 
   async start(): Promise<string> {
-    await new Promise<void>((resolve, reject) => { this.server.once("error", reject); this.server.listen(0, "127.0.0.1", resolve); });
-    return `http://127.0.0.1:${(this.server.address() as AddressInfo).port}/v1`;
+    const port = await listenOnFetchSafePort(this.server);
+    return `http://127.0.0.1:${port}/v1`;
   }
 
   async stop(): Promise<void> {
