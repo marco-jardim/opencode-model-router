@@ -730,3 +730,26 @@ describe("QA-1.2-3: a timed-out walk is cancelled and stays reachable", () => {
     expect(getParent.mock.calls).toEqual([["A"]]);
   });
 });
+
+describe("QA-1.2-4: the timeout floor uses what the walk has learned", () => {
+  it("returns the proven floor of a walk whose start was evicted (one slot)", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent } = fixture({ maxEntries: 1 });
+    getParent.mockImplementation((id) => id === "X" ? Promise.resolve("P") : id === "P" ? Promise.resolve("Q") : new Promise(() => {}));
+    const result = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await result).toBe(2);
+    expect(getParent.mock.calls).toEqual([["X"], ["P"], ["Q"]]);
+  });
+
+  it("a joining caller's snapshot is shared with the walk it joins", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent } = fixture();
+    getParent.mockReturnValue(new Promise(() => {}));
+    tracker.recordCreated("X", "P");
+    const first = tracker.depthOf("X", { timeoutMs: 10 });
+    const second = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await Promise.all([first, second])).toEqual([1, 1]);
+  });
+});

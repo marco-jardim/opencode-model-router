@@ -335,10 +335,10 @@ export function createDepthTracker(
     walk.stop();
   }
 
-  function startWalk(id: string): Walk {
+  function startWalk(id: string, learned: Map<string, Node>): Walk {
     let stop!: () => void;
     const stopped = new Promise<undefined>((resolve) => { stop = () => resolve(undefined); });
-    const walk: Walk = { id, promise: stopped, learned: new Map(), cancelled: false, waiters: 0, stopped, stop };
+    const walk: Walk = { id, promise: stopped, learned, cancelled: false, waiters: 0, stopped, stop };
     walks.set(id, walk);
     live.add(walk);
     walk.promise = run(walk);
@@ -402,7 +402,9 @@ export function createDepthTracker(
         return r.depth;
       }
       if (throttled(r.id) && !lookups.has(r.id)) return floor(id, learned, `throttled at ${r.id}`);
-      const walk = walks.get(id) ?? startWalk(id);
+      let walk = walks.get(id);
+      if (!walk) walk = startWalk(id, learned);
+      else for (const [known, n] of learned) if (!walk.learned.has(known)) walk.learned.set(known, n);
       walk.waiters++;
       const t = timeoutOf(options);
       const timeout = Symbol("timeout");
@@ -417,7 +419,9 @@ export function createDepthTracker(
         if (result !== timeout) return result;
         // Shared callers keep independent deadlines; the last one out cancels.
         if (walk.waiters === 0 && !walk.cancelled) cancelWalk(walk, true);
-        return floor(id, learned, `timed out after ${t} ms`);
+        // F1 fallback: everything the walk has learned so far, not only the
+        // caller's starting snapshot.
+        return floor(id, walk.learned, `timed out after ${t} ms`);
       } finally {
         clearTimeout(timer);
       }
