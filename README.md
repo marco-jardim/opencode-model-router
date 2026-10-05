@@ -958,7 +958,12 @@ tools are outside its scope. `/bypass on` also disables the depth guard. If the
 caller depth cannot be resolved, the guard fails open with a logged warning.
 OpenCode 2 has its own independent `experimental.subagent_depth` cap (default 1):
 raising or disabling the router limit does not lift that host cap. With both caps
-enforced, the lower one wins.
+enforced, the lower one wins. V2's `general` agent also needs explicit `subagent`
+permission to dispatch. The OpenCode v1 1.18.19 spike fixtures likewise encountered
+a host cap and used top-level `subagent_depth: 4` to lift it; its default and upstream
+documentation are unverified. Raising only the router limit does not lift a host cap.
+These are observations from the [host-proof fixtures](docs/qa/depth-and-effort/phase-2.3.md#handoffs),
+not a documented cross-version default for v1.
 
 See the [configuration reference](docs/CONFIG_REFERENCE.md) and
 [design decisions and scope limits](docs/adr/0004-delegation-depth-and-effort-bump.md).

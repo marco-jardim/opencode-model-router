@@ -213,6 +213,15 @@ chains exceed every configured limit on their next dispatch.
 This is a dispatch guard, not a sandbox: shell-spawned `opencode` processes and
 other plugins' session-creation tools are outside its coverage.
 
+**OpenCode v1 host limits (observed in the spike fixtures):** the default `general`
+agent has no `task` tool, so nesting needs an agent with task permission; otherwise
+the host turns the attempted call into `invalid` (see [Spike A2](./qa/depth-and-effort/phase-0P.md)).
+The OpenCode 1.18.19 proof used top-level `subagent_depth: 4` to lift a host cap;
+the cap's default and upstream documentation are **unverified**. Raising only the
+router limit does not lift that cap. V1 native-path graders run on the default
+`build` agent, which has `task`; their depth is recorded at creator depth + 1,
+so their own dispatches are subject to the depth guard.
+
 **OpenCode 2 also has a host limit:** `experimental.subagent_depth` in the host's
 configuration defaults to `1`. When the router depth guard is enforced, the
 effective nesting limit is the **lower of the two limits**. Raising only
