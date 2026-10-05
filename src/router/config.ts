@@ -738,6 +738,15 @@ function withValidatedSnapshots<T extends object>(
   return Object.defineProperties({}, descriptors) as T;
 }
 
+/** Reject keys that could reparent a later Object.assign copy. */
+function rejectPrototypeKeys(obj: object, path: string): void {
+  for (const key of ["__proto__", "constructor", "prototype"] as const) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      throw new Error(`tiers.json: ${path} must not contain the key "${key}"`);
+    }
+  }
+}
+
 function validateEnforcement(obj: Record<string, unknown>): Record<string, unknown> | undefined {
   // Validate enforcement if present (optional — absent means no enforcement)
   if (obj.enforcement !== undefined) {
@@ -745,6 +754,7 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
       throw new Error("tiers.json: enforcement must be an object");
     }
     const enforcement = obj.enforcement as Record<string, unknown>;
+    rejectPrototypeKeys(enforcement, "enforcement");
     const maxDelegationDepth = enforcement.maxDelegationDepth;
     if (
       maxDelegationDepth !== undefined &&
@@ -779,13 +789,7 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
         throw new Error("tiers.json: enforcement.verify must be an object");
       }
       const verify = enforcement.verify as Record<string, unknown>;
-      // An own `__proto__`/`constructor`/`prototype` key is never read, but a
-      // later `Object.assign` copy would reparent through it; reject it here.
-      for (const key of ["__proto__", "constructor", "prototype"] as const) {
-        if (Object.prototype.hasOwnProperty.call(verify, key)) {
-          throw new Error(`tiers.json: enforcement.verify must not contain the key "${key}"`);
-        }
-      }
+      rejectPrototypeKeys(verify, "enforcement.verify");
       if (verify.testBaseline !== undefined && typeof verify.testBaseline !== "boolean") {
         throw new Error("tiers.json: enforcement.verify.testBaseline must be a boolean");
       }
@@ -917,6 +921,7 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
       enforcement.escalate !== null
     ) {
       const escalate = enforcement.escalate as Record<string, unknown>;
+      rejectPrototypeKeys(escalate, "enforcement.escalate");
       const effortBump = escalate.effortBump;
       if (effortBump !== undefined && typeof effortBump !== "boolean") {
         throw new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got '${String(effortBump)}')`);

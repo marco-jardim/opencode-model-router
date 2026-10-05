@@ -115,6 +115,15 @@ describe("depth and effort bump config — defaults and validation", () => {
 });
 
 describe("depth and effort bump config — regression cases", () => {
+  it.each(["__proto__", "constructor", "prototype"])("rejects own %s keys in enforcement containers", (key) => {
+    for (const path of ["enforcement", "enforcement.escalate"]) {
+      const dangerous: unknown = JSON.parse(`{"${key}":{"maxDelegationDepth":null,"effortBump":false}}`);
+      const enforcement = path === "enforcement" ? dangerous : { escalate: dangerous };
+      expect(() => validateConfig(validRaw({ enforcement })))
+        .toThrowError(`tiers.json: ${path} must not contain the key "${key}"`);
+    }
+  });
+
   it("reads maxDelegationDepth once and returns the validated snapshot", () => {
     let reads = 0;
     const enforcement = {
