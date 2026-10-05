@@ -2,8 +2,8 @@
 
 ## Pre-flight
 
-- Worktree `D:\git\omr-de-p13`, branch `de/p13` tracking `origin/de/p13`, clean at `29e6a13` when this memo was written.
-- Golden fixture committed in `29e6a13`: `test/unit/__fixtures__/ladder-v2.0.0-golden.json`. It holds 1,620 matrix entries and 27 sequences. SHA-256 `f4feceec…`. Branch counts: accept 549, give_up unverifiable 549, give_up maxTotalAttempts 186, give_up cost ceiling 120, retry 121, escalate 102, give_up no next tier 51.
+- Worktree `D:\git\omr-de-p13`, branch `de/p13` tracking `origin/de/p13`, clean at fixture commit `2927540` (the rebased commit on this branch).
+- Golden fixture committed in `2927540`: `test/unit/__fixtures__/ladder-v2.0.0-golden.json`. It holds 1,620 matrix entries and 27 sequences. SHA-256 `f4feceec…`. Branch counts: accept 549, give_up unverifiable 549, give_up maxTotalAttempts 186, give_up cost ceiling 120, retry 121, escalate 102, give_up no next tier 51.
 - Arithmetic cross-check (not re-run). Matrix = 3 verdicts × (A+2) × (T+2) × 3 costs × 3 tiers = 486 + 648 + 486 = 1,620. Sequences = 3 policies × 3 tiers × 3 streams = 27. The branch counts add up to 1,678, so they cover the matrix plus 58 sequence steps. For example, accept 549 = 540 pass entries + 9 fail-then-pass sequences.
 - The replay test compares twice, at `test/unit/ladder.test.ts:1022–1023`: `expect(actual).toEqual(JSON.parse(expected))` and `expect(serialized).toBe(expected)`. The second is a byte-exact match on the JSON for every policy, input state, action, advanced state, sequence `initialState` and scorecard. Adding any key with a non-`undefined` value fails it, `null` included. §4 follows from this.
 - The golden policies come from `buildEscalatePolicy` on a config with `presets: {}` (`:874–895`). The existing `buildEscalatePolicy` tests also use `presets: {}` (`makeCfg`, `:571–579`). Matrix states are typed literals with 6 fields (`const state: LadderState = {…}`, `:943–950`).
@@ -167,7 +167,7 @@ This holds for `effortBump` absent or `null`. Taking each artefact in the fixtur
 6. **Sequence states.** `recordAttempt`'s spread keeps the key absent; then items 3–4 apply.
 7. **Scorecards.** `currentEffort` is falsy, so the suffix is `""` and the string is the same.
 
-Never run `GOLDEN_WRITE=1` in this phase. `git diff 29e6a13 -- test/unit/__fixtures__/ladder-v2.0.0-golden.json` must stay empty.
+Never run `GOLDEN_WRITE=1` in this phase. `git diff 2927540 -- test/unit/__fixtures__/ladder-v2.0.0-golden.json` must stay empty.
 
 ### 5. `buildEscalatePolicy` perTier (1.3.4: rebase `de/p13` on merged 1.1 first)
 
@@ -223,7 +223,7 @@ The plan's test file is `test/unit/effort-ceiling.test.ts` (new). The ladder cas
 | I4 | **Agreement property** (below) | effort-ceiling: model ids from the §1 table × base effort {absent, `"ultra"`, `"High"`, 5 levels} × thinking {none, 0, 4096} × reasoning {none, `{effort:"low"}`, `{summary:"auto"}`} × variant {none, `"high"`} × L ∈ all 5 levels |
 | I5 | No snake keys are emitted; each branch emits the keys in §2 | effort.test.ts, fable-effort-preset, registration smoke |
 | I6 | Warning keys and texts are unchanged | existing effort.test.ts warning assertions, left as they are |
-| I7 | Golden equivalence: replay passes unmodified and the fixture is byte-unchanged | ladder.test.ts "golden v2.0.0" plus `git diff 29e6a13` empty |
+| I7 | Golden equivalence: replay passes unmodified and the fixture is byte-unchanged | ladder.test.ts "golden v2.0.0" plus fixture-scoped `git diff 2927540` empty |
 | I8 | Bump-off shape: with no `effortBump` (absent or `null`) there is no `currentEffort` and no `effort` key, and the scorecard is unchanged | ladder.test.ts: `"currentEffort" in s === false` |
 | I9 | D8 trace (S1, below) | ladder.test.ts |
 | I10 | Saturation: with A=2 and fast {high→xhigh}, both retries carry `xhigh` | ladder.test.ts |
