@@ -69,7 +69,7 @@ export class ScriptedProvider {
           input = this.host === "v1" ? { description: "Depth smoke dispatch", prompt, subagent_type: "general" } : { description: "Depth smoke dispatch", prompt, agent: "general", background: nested && marker.includes("NEST_BG") };
           if (nested && resume) input[this.host === "v1" ? "task_id" : "sessionID"] = resume;
           const caller = /RESUME_CALLER_ID=(ses_[A-Za-z0-9]+)/.exec(marker)?.[1];
-          if (!nested && caller) input.sessionID = caller;
+          if (!nested && caller) input[this.host === "v1" ? "task_id" : "sessionID"] = caller;
         } else if (marker.includes("CHILD_DONE")) text = "CHILD_DONE";
       }
       this.replies.push({ role, tool, input, text });

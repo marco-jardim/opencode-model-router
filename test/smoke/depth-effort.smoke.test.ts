@@ -250,7 +250,7 @@ for (const host of hosts) {
     }, 300_000);
 
     for (const mode of ["enforced", "advisory"] as const) {
-      for (const kind of (host.version === "v2" ? ["foreground", "background", "resume"] : ["foreground"])) {
+      for (const kind of (host.version === "v2" ? ["foreground", "background", "resume"] : ["foreground", "resume"])) {
         it(`${mode} ${kind}: root allowed; child ${mode === "enforced" ? "refused with exact D5" : "proceeds with exactly one banner"}`, async () => {
           const f = await fixture(host);
           const project = await f.project("project", scenarioConfig(mode));
@@ -268,7 +268,7 @@ for (const host of hosts) {
           expect(run.childID).toBeTruthy();
           const childBlocks = f.provider.captures.filter(c => c.session === run.childID).flatMap(c => blocks(c.body));
           const uses = childBlocks.filter(b => b.type === "tool_use" && b.name === (host.version === "v1" ? "task" : "subagent"));
-          const call = uses.find(b => kind !== "resume" || b.input?.sessionID === existing);
+          const call = uses.find(b => kind !== "resume" || b.input?.[host.version === "v1" ? "task_id" : "sessionID"] === existing);
           expect(call, JSON.stringify(childBlocks)).toBeDefined();
           if (kind === "background") expect(call?.input?.background).toBe(true);
           const result = childBlocks.find(b => b.type === "tool_result" && b.tool_use_id === call?.id);
