@@ -57,6 +57,26 @@ interface Done {
 type Climb = Done | { kind: "need"; id: string };
 type Source = "event" | "backend" | "plugin";
 const validId = (id: unknown): id is string => typeof id === "string" && id !== "";
+const MAX_TIMER_MS = 2_147_483_647;
+
+/** Rejection reasons come from the backend seam and may not be printable. */
+function describe(e: unknown): string {
+  try {
+    return e instanceof Error ? String(e.message) : String(e);
+  } catch {
+    return "unprintable rejection";
+  }
+}
+
+/** Options come from JavaScript callers; a throwing getter means "default". */
+function timeoutOf(options: { timeoutMs?: number } | undefined): number {
+  try {
+    const t = options?.timeoutMs;
+    return typeof t === "number" && Number.isFinite(t) && t > 0 ? Math.min(t, MAX_TIMER_MS) : DEFAULT_DEPTH_TIMEOUT_MS;
+  } catch {
+    return DEFAULT_DEPTH_TIMEOUT_MS;
+  }
+}
 
 /** Evidence and monotone floors are per tracker, never shared between plugins. */
 export function createDepthTracker(
@@ -71,13 +91,37 @@ export function createDepthTracker(
   const lookups = new Map<string, Lookup>();
   const failedAt = new Map<string, number>();
   const warned = new Map<string, number>();
+  let lastNow = 0;
+
+  // Seams are contained where they are called, so no state change is ever cut
+  // short by a throwing clock or logger and no public method throws or rejects.
+  function clock(): number {
+    try {
+      const t = seams.now();
+      if (typeof t === "number" && Number.isFinite(t)) lastNow = t;
+    } catch {
+      return lastNow;
+    }
+    return lastNow;
+  }
+
+  function say(message: string): boolean {
+    try {
+      seams.logger.warn(message);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   function warn(id: string, kind: "lookup" | "conflict", reason: string): void {
     const key = `${kind}:${id}`;
     if (warned.has(key)) return;
-    warned.set(key, seams.now());
+    warned.set(key, clock());
     while (warned.size > maxEntries) warned.delete(warned.keys().next().value!);
-    seams.logger.warn(`[router] depth: ${kind === "lookup" ? "cannot resolve" : "conflicting evidence for"} session ${id}: ${reason}`);
+    const message = `[router] depth: ${kind === "lookup" ? "cannot resolve" : "conflicting evidence for"} session ${id}: ${reason}`;
+    // An undelivered warning is not remembered, so a later occurrence retries it.
+    if (!say(message)) warned.delete(key);
   }
 
   function trimLRU(): void {
@@ -91,7 +135,7 @@ export function createDepthTracker(
       resolved: link === null,
       plugin,
       rootSeen: link === null && !plugin,
-      lastTouch: seams.now(),
+      lastTouch: clock(),
     };
   }
 
@@ -197,7 +241,7 @@ export function createDepthTracker(
       const n = nodes.get(id) ?? learned.get(id)!;
       n.depth = Math.max(n.depth, r.vals.get(id)!);
       if (r.complete.has(id)) n.resolved = true;
-      n.lastTouch = seams.now();
+      n.lastTouch = clock();
       nodes.delete(id);
       nodes.set(id, n);
     }
@@ -218,7 +262,7 @@ export function createDepthTracker(
   function throttled(id: string): boolean {
     const stamp = failedAt.get(id);
     if (stamp === undefined) return false;
-    const age = seams.now() - stamp;
+    const age = clock() - stamp;
     return age >= 0 && age < DEPTH_LOOKUP_RETRY_MS;
   }
 
@@ -230,7 +274,7 @@ export function createDepthTracker(
     const lookup: Lookup = { id, promise: cancelled, detached: false, cancelled: false, cancel };
     lookups.set(id, lookup);
     function fail(reason: string): LookupResult {
-      if (!lookup.detached && !lookup.cancelled) failedAt.set(id, seams.now());
+      if (!lookup.detached && !lookup.cancelled) failedAt.set(id, clock());
       return { ok: false, reason };
     }
     const request = Promise.resolve().then(() => seams.getParent(id)).then((raw): LookupResult => {
@@ -239,11 +283,7 @@ export function createDepthTracker(
       failedAt.delete(id);
       record(id, raw, "backend");
       return { ok: true, parent: raw };
-    }, (e: unknown) => fail(e instanceof Error ? e.message : String(e)))
-      .catch((e: unknown) => {
-        warn(id, "lookup", `internal lookup failure: ${String(e)}`);
-        return fail("internal");
-      });
+    }, (e: unknown) => fail(describe(e)));
     lookup.promise = Promise.race([request, cancelled]).finally(() => {
       if (lookups.get(id) === lookup) lookups.delete(id);
     });
@@ -278,9 +318,6 @@ export function createDepthTracker(
           if (!result.ok) return floor(id, learned, result.reason);
           learned.set(r.id, nodes.get(r.id) ?? makeNode(result.parent, false));
         }
-      } catch (e) {
-        warn(id, "lookup", `internal walk failure: ${String(e)}`);
-        return undefined;
       } finally {
         if (walks.get(id) === walk) walks.delete(id);
       }
@@ -316,8 +353,7 @@ export function createDepthTracker(
       }
       if (throttled(r.id) && !lookups.has(r.id)) return floor(id, learned, `throttled at ${r.id}`);
       const walk = walks.get(id) ?? startWalk(id);
-      const t = Number.isFinite(options?.timeoutMs) && options!.timeoutMs! > 0
-        ? options!.timeoutMs! : DEFAULT_DEPTH_TIMEOUT_MS;
+      const t = timeoutOf(options);
       const timeout = Symbol("timeout");
       let timer!: ReturnType<typeof setTimeout>;
       const deadline = new Promise<typeof timeout>((resolve) => {
@@ -333,7 +369,7 @@ export function createDepthTracker(
           lookup.detached = true;
           if (lookups.get(lookup.id) === lookup) {
             lookups.delete(lookup.id);
-            failedAt.set(lookup.id, seams.now());
+            failedAt.set(lookup.id, clock());
           }
         }
         return floor(id, learned, `timed out after ${t} ms`);
@@ -362,7 +398,7 @@ export function createDepthTracker(
       }
     },
     sweep() {
-      const now = seams.now();
+      const now = clock();
       for (const [id, n] of nodes) if (now - n.lastTouch >= ttlMs) nodes.delete(id);
       for (const id of failedAt.keys()) if (!throttled(id)) failedAt.delete(id);
       for (const [key, stamp] of warned) if (now - stamp >= ttlMs) warned.delete(key);

@@ -449,12 +449,14 @@ describe("eviction and bookkeeping", () => {
     expect(getParent).toHaveBeenCalledTimes(256);
   });
 
-  it("lookup internal failures are logged and settle without rejection", async () => {
+  // Amended for QA-1.2-6: a throwing clock is contained at the seam, so the
+  // lookup no longer fails; it used to settle as an "internal lookup failure".
+  it("a clock failure inside a lookup is contained and the answer is applied", async () => {
     const warn = vi.fn();
     const now = vi.fn().mockImplementationOnce(() => { throw new Error("clock unavailable"); }).mockReturnValue(0);
     const tracker = createDepthTracker({ now, logger: { warn }, getParent: async () => null });
-    expect(await tracker.depthOf("X")).toBeUndefined();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("internal lookup failure"));
+    expect(await tracker.depthOf("X")).toBe(0);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("a throttle established by a shared failing ancestor is respected inside another walk", async () => {
@@ -557,5 +559,77 @@ describe("eviction and bookkeeping", () => {
     expect(tracker.size()).toBe(0);
     for (let i = 0; i <= DEFAULT_DEPTH_MAX_ENTRIES; i++) tracker.recordRoot(String(i));
     expect(tracker.size()).toBe(DEFAULT_DEPTH_MAX_ENTRIES);
+  });
+});
+
+describe("QA-1.2-6: seams never escape", () => {
+  function brittle(now: () => number, warn: (msg: string) => void = vi.fn()) {
+    const getParent = vi.fn<(id: string) => Promise<string | null>>().mockResolvedValue(null);
+    return { tracker: createDepthTracker({ getParent, now, logger: { warn } }), getParent };
+  }
+  const broken = () => { throw new Error("clock"); };
+
+  it("a throwing clock on the timeout and failure paths resolves to the floor", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent } = brittle(broken);
+    getParent.mockReturnValue(new Promise(() => {}));
+    tracker.recordCreated("X", "P");
+    const result = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(result).resolves.toBe(1);
+    getParent.mockRejectedValue(new Error("offline"));
+    await expect(tracker.depthOf("Y")).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a throwing clock inside a backend record still yields the exact depth", async () => {
+    const { tracker, getParent } = brittle(broken);
+    getParent.mockImplementation(async (id) => id === "X" ? "P" : null);
+    await expect(tracker.depthOf("X")).resolves.toBe(1);
+    tracker.sweep();
+    expect(tracker.size()).toBe(2);
+  });
+
+  it("non-number clock readings fall back to the last good reading", async () => {
+    let reading: unknown = 5;
+    const { tracker } = brittle(() => reading as number);
+    tracker.recordRoot("R");
+    reading = Number.NaN;
+    tracker.recordCreated("C", "R");
+    reading = "later";
+    expect(await tracker.depthOf("C")).toBe(1);
+    expect(tracker.size()).toBe(2);
+  });
+
+  it("a throwing logger never makes a record call throw, and the warning is retried", async () => {
+    const warn = vi.fn(() => { throw new Error("logger down"); });
+    const { tracker } = brittle(() => 0, warn);
+    tracker.recordRoot("R");
+    expect(() => tracker.recordCreated("R", "P")).not.toThrow();
+    expect(() => tracker.recordCreated("R", "Q")).not.toThrow();
+    expect(warn).toHaveBeenCalledTimes(2);
+    await expect(tracker.depthOf("R")).resolves.toBe(1);
+  });
+
+  it.each([Object.create(null), { toString() { throw new Error("toString"); } }])("an unprintable rejection is described, not rethrown (%#)", async (reason) => {
+    const { tracker, getParent } = brittle(() => 0);
+    const warn = vi.fn();
+    const logged = createDepthTracker({ getParent, now: () => 0, logger: { warn } });
+    getParent.mockRejectedValue(reason);
+    await expect(logged.depthOf("X")).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("unprintable rejection"));
+    await expect(tracker.depthOf("X")).resolves.toBeUndefined();
+  });
+
+  it("a throwing timeoutMs getter falls back to the default timeout", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent } = brittle(() => 0);
+    getParent.mockReturnValue(new Promise(() => {}));
+    const options = { get timeoutMs(): number { throw new Error("getter"); } };
+    const result = tracker.depthOf("X", options);
+    await vi.advanceTimersByTimeAsync(DEFAULT_DEPTH_TIMEOUT_MS - 1);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toBeUndefined();
   });
 });
