@@ -69,9 +69,24 @@ function writeOverrides(body: Record<string, unknown>): void {
 
 /** Runs `opencode debug agent <name>` in the fixture and parses the JSON. */
 function debugAgent(name: string): Record<string, any> {
+  const env = { ...process.env };
+  for (const name of Object.keys(env)) {
+    if (/^OPENCODE_/i.test(name)) delete env[name];
+  }
+  for (const [name, dir] of Object.entries({
+    XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data",
+    XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state", APPDATA: "appdata",
+    LOCALAPPDATA: "localappdata",
+  })) {
+    env[name] = path.join(homeDir, dir);
+    fs.mkdirSync(env[name], { recursive: true });
+  }
   const result = spawnSync("opencode", ["debug", "agent", name], {
     cwd: projectDir,
-    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
+    env: {
+      ...env, HOME: homeDir, USERPROFILE: homeDir,
+      OPENCODE_DISABLE_MODELS_FETCH: "true",
+    },
     encoding: "utf8",
     timeout: 120_000,
   });
