@@ -1,13 +1,16 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   invalidateConfigCache,
   loadConfig,
+  localOverridePath,
   overridePath,
   resolveDepthLimit,
   resolveEffortBump,
   validateConfig,
+  writeState,
   type RouterConfig,
 } from "../../src/router/config";
 
@@ -30,9 +33,15 @@ function validRaw(extra: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
+const tempRoots: string[] = [];
+afterEach(() => {
+  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 function withOverrideFile(run: (path: string) => void): void {
   const savedCwd = process.cwd();
-  const root = mkdtempSync(join(savedCwd, ".depth-effort-"));
+  const root = mkdtempSync(join(tmpdir(), "depth-effort-"));
+  tempRoots.push(root);
   const home = join(root, "home");
   const project = join(root, "project");
   mkdirSync(home, { recursive: true });
@@ -49,7 +58,6 @@ function withOverrideFile(run: (path: string) => void): void {
     process.chdir(savedCwd);
     vi.unstubAllEnvs();
     invalidateConfigCache();
-    rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -337,6 +345,50 @@ describe("depth and effort bump config — regression cases", () => {
 });
 
 describe("depth and effort bump config — overrides and purity", () => {
+  it("merges global and project keys in order without discarding siblings", () => {
+    withOverrideFile((path) => {
+      writeFileSync(path, JSON.stringify({ enforcement: { maxDelegationDepth: 2, escalate: { effortBump: false } } }));
+      const projectPath = localOverridePath();
+      mkdirSync(dirname(projectPath), { recursive: true });
+      writeFileSync(projectPath, JSON.stringify({ enforcement: { maxDelegationDepth: 3, escalate: { effortBumpMax: "high" } } }));
+      const cfg = loadConfig();
+      expect(resolveDepthLimit(cfg)).toBe(3);
+      expect(resolveEffortBump(cfg)).toEqual({ enabled: false, max: "high" });
+    });
+  });
+
+  it("keeps a good global layer when the project layer is invalid", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      withOverrideFile((path) => {
+        writeFileSync(path, JSON.stringify({ enforcement: { maxDelegationDepth: 2, escalate: { effortBump: false, effortBumpMax: "low" } } }));
+        const projectPath = localOverridePath();
+        mkdirSync(dirname(projectPath), { recursive: true });
+        writeFileSync(projectPath, JSON.stringify({ enforcement: { maxDelegationDepth: 33, escalate: { effortBump: true } } }));
+        const cfg = loadConfig();
+        expect(resolveDepthLimit(cfg)).toBe(2);
+        expect(resolveEffortBump(cfg)).toEqual({ enabled: false, max: "low" });
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`ignoring ${projectPath}`));
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("keeps depth and effort snapshots through the state-file enforcementMode spread", () => {
+    withOverrideFile((path) => {
+      writeFileSync(path, JSON.stringify({ enforcement: { maxDelegationDepth: 2, escalate: { effortBump: false, effortBumpMax: "high" } } }));
+      writeState({ enforcementMode: "enforced" });
+      const cfg = loadConfig();
+      expect(cfg.enforcement?.mode).toBe("enforced");
+      expect(resolveDepthLimit(cfg)).toBe(2);
+      expect(resolveEffortBump(cfg)).toEqual({ enabled: false, max: "high" });
+      expect(Object.getOwnPropertyDescriptor(cfg.enforcement, "maxDelegationDepth")?.value).toBe(2);
+      expect(Object.getOwnPropertyDescriptor(cfg.enforcement?.escalate, "effortBump")?.value).toBe(false);
+      expect(Object.getOwnPropertyDescriptor(cfg.enforcement?.escalate, "effortBumpMax")?.value).toBe("high");
+    });
+  });
+
   it.each([
     [{ escalate: { effortBump: false } }, 1, { enabled: false, max: "xhigh" }],
     [{ maxDelegationDepth: 2 }, 2, { enabled: true, max: "xhigh" }],
