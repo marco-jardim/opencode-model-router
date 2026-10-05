@@ -517,7 +517,8 @@ ladder exactly. The attempt count, `maxTotalAttempts`, and cost ceiling are
 unchanged: a bumped attempt costs the tier's `costRatio`.
 
 `enforcement.escalate.effortBumpMax` caps bumped attempts and is further clamped
-per model: OpenAI tiers stop at `high`, while Claude tiers may reach `xhigh`.
+per model: OpenAI tiers stop at `high`, while Claude tiers may reach
+`effortBumpMax` (default `xhigh`; `max` if configured).
 Set it to `"high"` if a Claude model you use rejects `xhigh`.
 
 ```json
