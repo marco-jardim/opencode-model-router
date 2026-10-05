@@ -1,8 +1,13 @@
-import type { RouterConfig } from "../router/config";
+import { nextEffort } from "../router/agent-options";
+import type { EffortLevel, RouterConfig } from "../router/config";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+export interface EffortBumpPolicy {
+  perTier: Record<string, { base: EffortLevel; bound: EffortLevel }>;
+}
 
 export interface EscalatePolicy {
   ladder: string[];
@@ -10,6 +15,7 @@ export interface EscalatePolicy {
   maxAttemptsPerTier: number;
   maxTotalAttempts: number;
   costMultiple?: number | null;
+  effortBump?: EffortBumpPolicy | null;
 }
 
 export interface LadderState {
@@ -19,6 +25,7 @@ export interface LadderState {
   escalations: number;
   firstAttemptCost: number | null;
   cumulativeCost: number;
+  currentEffort?: EffortLevel | null;
 }
 
 export type LadderActionKind = "accept" | "retry" | "escalate" | "give_up";
@@ -28,6 +35,7 @@ export interface LadderAction {
   tier?: string;
   forcingMessage?: string;
   reason?: string;
+  effort?: EffortLevel;
 }
 
 export interface LadderVerdict {
@@ -59,7 +67,7 @@ export function newLadderState(
   producerTier: string,
   policy: EscalatePolicy,
 ): LadderState {
-  return {
+  const state: LadderState = {
     currentTier: resolveStartTier(producerTier, policy),
     attemptsThisTier: 0,
     totalAttempts: 0,
@@ -67,6 +75,8 @@ export function newLadderState(
     firstAttemptCost: null,
     cumulativeCost: 0,
   };
+  if (policy.effortBump) state.currentEffort = null;
+  return state;
 }
 
 export function recordAttempt(
@@ -141,11 +151,19 @@ export function nextAction(
 
   // (5) retry within tier
   if (state.attemptsThisTier < policy.maxAttemptsPerTier) {
-    return {
+    const action: LadderAction = {
       action: "retry",
       tier: state.currentTier,
       forcingMessage: buildLadderForcingMessage(verdict?.reasons ?? []),
     };
+    const perTier = policy.effortBump?.perTier;
+    const bump = perTier && Object.prototype.hasOwnProperty.call(perTier, state.currentTier)
+      ? perTier[state.currentTier] : undefined;
+    if (bump) {
+      const effort = nextEffort(state.currentEffort ?? bump.base, bump.bound) ?? state.currentEffort ?? undefined;
+      if (effort !== undefined) action.effort = effort;
+    }
+    return action;
   }
 
   // (6) escalate or give_up
@@ -165,15 +183,19 @@ export function nextAction(
 
 export function advance(state: LadderState, action: LadderAction): LadderState {
   if (action.action === "retry") {
-    return { ...state, attemptsThisTier: state.attemptsThisTier + 1 };
+    const next = { ...state, attemptsThisTier: state.attemptsThisTier + 1 };
+    if (action.effort !== undefined) next.currentEffort = action.effort;
+    return next;
   }
   if (action.action === "escalate") {
-    return {
+    const next = {
       ...state,
       currentTier: action.tier!,
       attemptsThisTier: 0,
       escalations: state.escalations + 1,
     };
+    if (next.currentEffort !== undefined) next.currentEffort = null;
+    return next;
   }
   // accept / give_up — terminal, return unchanged
   return state;
@@ -199,7 +221,7 @@ export function formatLadderScorecard(
   method: string,
 ): string {
   return (
-    `[router delegate scorecard | final_tier=${state.currentTier} | ` +
+    `[router delegate scorecard | final_tier=${state.currentTier}${state.currentEffort ? `@${state.currentEffort}` : ""} | ` +
     `attempts=${state.totalAttempts} | escalations=${state.escalations} | ` +
     `cost=${state.cumulativeCost} | verdict=${accepted ? "PASS" : "UNMET"} | ` +
     `method=${method}]`
