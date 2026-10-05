@@ -16,7 +16,7 @@ import {
   type LadderState,
   type LadderVerdict,
 } from "../../src/escalate/ladder";
-import type { RouterConfig } from "../../src/router/config";
+import type { EffortLevel, RouterConfig } from "../../src/router/config";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -774,6 +774,254 @@ describe("formatLadderScorecard", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Effort step — policies are hand-built until perTier construction lands.
+// ---------------------------------------------------------------------------
+
+describe("ladder effort step", () => {
+  const fail: LadderVerdict = { pass: false, outcome: "fail", reasons: ["check failed"] };
+
+  function bumpPolicy(overrides: Partial<EscalatePolicy> = {}): EscalatePolicy {
+    return makePolicy({
+      effortBump: {
+        perTier: {
+          fast: { base: "low", bound: "high" },
+          medium: { base: "medium", bound: "high" },
+        },
+      },
+      ...overrides,
+    });
+  }
+
+  it.each(["medium", "high", "xhigh"] as const)("replays the four-attempt D8 trace with fast bound %s", (bound) => {
+    const policy = bumpPolicy({
+      effortBump: { perTier: {
+        fast: { base: "low", bound },
+        medium: { base: "medium", bound: "high" },
+      } },
+    });
+    let state = newLadderState("fast", policy);
+    const trace = [
+      { tier: "fast", currentEffort: null, effective: "low", action: "retry", effort: "medium" },
+      { tier: "fast", currentEffort: "medium", effective: "medium", action: "escalate", effort: undefined },
+      { tier: "medium", currentEffort: null, effective: "medium", action: "retry", effort: "high" },
+      { tier: "medium", currentEffort: "high", effective: "high", action: "give_up", effort: undefined },
+    ];
+    const attempts: string[] = [];
+    for (const step of trace) {
+      expect(state.currentTier).toBe(step.tier);
+      expect(state.currentEffort).toBe(step.currentEffort);
+      const base = policy.effortBump!.perTier[state.currentTier]!.base;
+      expect(state.currentEffort ?? base).toBe(step.effective);
+      attempts.push(`${state.currentTier}@${state.currentEffort ?? base}`);
+      state = recordAttempt(state, 1);
+      expect(state.currentEffort).toBe(step.currentEffort);
+      const suffix = step.currentEffort ? `@${step.currentEffort}` : "";
+      expect(formatLadderScorecard(state, false, "trace")).toContain(`final_tier=${step.tier}${suffix} |`);
+      const action = nextAction(state, fail, policy);
+      expect(action.action).toBe(step.action);
+      expect(action.effort).toBe(step.effort);
+      if (step.effort === undefined) expect(action).not.toHaveProperty("effort");
+      if (action.action === "give_up") {
+        expect(action.reason).toBe("max total attempts (4) reached");
+        expect(advance(state, action)).toBe(state);
+      }
+      state = advance(state, action);
+      expect(state.currentEffort).toBe(
+        step.action === "escalate" ? null : step.effort ?? step.currentEffort,
+      );
+    }
+    expect(attempts).toEqual(["fast@low", "fast@medium", "medium@medium", "medium@high"]);
+    expect(formatLadderScorecard(state, false, "trace")).toBe(
+      "[router delegate scorecard | final_tier=medium@high | attempts=4 | escalations=1 | cost=4 | verdict=UNMET | method=trace]",
+    );
+  });
+
+  it("two retries reach high; a further permitted retry stays high", () => {
+    const policy = bumpPolicy({ maxAttemptsPerTier: 2, maxTotalAttempts: 10 });
+    let state = newLadderState("fast", policy);
+    expect(state.currentEffort).toBeNull(); // configured low
+    for (const effort of ["medium", "high"]) {
+      state = recordAttempt(state, 1);
+      const action = nextAction(state, fail, policy);
+      expect(action).toMatchObject({ action: "retry", tier: "fast", effort });
+      state = advance(state, action);
+      expect(state.currentEffort).toBe(effort);
+    }
+    state = recordAttempt(state, 1);
+    const escalation = nextAction(state, fail, policy);
+    expect(escalation).toMatchObject({ action: "escalate", tier: "medium" });
+    expect(escalation).not.toHaveProperty("effort");
+    expect(advance(state, escalation).currentEffort).toBeNull();
+    // A=2 exhausts the tier. Saturation applies only if another retry is allowed.
+    const retry = nextAction(state, fail, { ...policy, maxAttemptsPerTier: 3 });
+    expect(retry).toMatchObject({ action: "retry", effort: "high" });
+    expect(advance(state, retry).currentEffort).toBe("high");
+  });
+
+  it("saturates both retries at xhigh when the base is high", () => {
+    const policy = bumpPolicy({
+      maxAttemptsPerTier: 2,
+      effortBump: { perTier: { fast: { base: "high", bound: "xhigh" } } },
+    });
+    let state = newLadderState("fast", policy);
+    for (let retry = 0; retry < 2; retry++) {
+      state = recordAttempt(state, 1);
+      const action = nextAction(state, fail, policy);
+      expect(action).toMatchObject({ action: "retry", effort: "xhigh" });
+      state = advance(state, action);
+      expect(state.currentEffort).toBe("xhigh");
+    }
+  });
+
+  it("zero retries escalates directly without bumping", () => {
+    const policy = bumpPolicy({ maxAttemptsPerTier: 0 });
+    const state = recordAttempt(newLadderState("fast", policy), 1);
+    const action = nextAction(state, fail, policy);
+    expect(action).toMatchObject({ action: "escalate", tier: "medium" });
+    expect(action).not.toHaveProperty("effort");
+    expect(advance(state, action).currentEffort).toBeNull();
+  });
+
+  it("cost ceiling blocks bumped and plain retries with the same reason", () => {
+    const policy = bumpPolicy({ costMultiple: 2, maxTotalAttempts: 10, maxAttemptsPerTier: 3 });
+    const first = recordAttempt(newLadderState("fast", policy), 5);
+    const bumped = advance(first, nextAction(first, fail, policy));
+    const atCeiling = recordAttempt(bumped, 5);
+    expect(nextAction(atCeiling, fail, policy)).toMatchObject({ action: "retry", effort: "high" });
+    const aboveCeiling = recordAttempt(atCeiling, 1);
+    const action = nextAction(aboveCeiling, fail, policy);
+    expect(action).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+    expect(action).toEqual(nextAction(aboveCeiling, fail, { ...policy, effortBump: null }));
+    expect(action).not.toHaveProperty("effort");
+  });
+
+  it("keeps pass, unverifiable, total-attempt and cost checks ahead of the bump", () => {
+    const policy = bumpPolicy({ maxTotalAttempts: 1, costMultiple: 1 });
+    const state = makeState({ totalAttempts: 1, firstAttemptCost: 1, cumulativeCost: 2, currentEffort: "medium" });
+    for (const [verdict, expected] of [
+      [{ pass: true }, { action: "accept" }],
+      [{ pass: false, outcome: "unverifiable" }, { action: "give_up", reason: "verification unavailable; no producer escalation" }],
+      [fail, { action: "give_up", reason: "max total attempts (1) reached" }],
+    ] satisfies Array<[LadderVerdict, LadderAction]>) {
+      const action = nextAction(state, verdict, policy);
+      expect(action).toEqual(expected);
+      expect(action).not.toHaveProperty("effort");
+      expect(advance(state, action)).toBe(state);
+    }
+    const available = recordAttempt(newLadderState("fast", bumpPolicy()), 1);
+    expect(nextAction(available, { pass: false, outcome: "unverifiable" }, bumpPolicy())).toEqual({
+      action: "give_up", reason: "verification unavailable; no producer escalation",
+    });
+  });
+
+  it("starts at the floor and bumps that tier rather than the producer", () => {
+    const policy = bumpPolicy({ floorTier: "medium" });
+    const state = recordAttempt(newLadderState("fast", policy), 1);
+    expect(state).toMatchObject({ currentTier: "medium", currentEffort: null });
+    const action = nextAction(state, fail, policy);
+    expect(action).toMatchObject({ action: "retry", tier: "medium", effort: "high" });
+    expect(advance(state, action).currentEffort).toBe("high");
+  });
+
+  it.each([undefined, null] as const)("base equal to bound leaves an unbumped state (%s) plain", (currentEffort) => {
+    const policy = bumpPolicy({ effortBump: { perTier: { fast: { base: "high", bound: "high" } } } });
+    const state = currentEffort === undefined ? makeState() : makeState({ currentEffort });
+    const action = nextAction(state, fail, policy);
+    expect(action.action).toBe("retry");
+    expect(action).not.toHaveProperty("effort");
+    const advanced = advance(state, action);
+    expect(advanced).toEqual({ ...state, attemptsThisTier: 1 });
+    expect(formatLadderScorecard(advanced, false, "test")).toContain("final_tier=fast |");
+    if (currentEffort === undefined) expect(advanced).not.toHaveProperty("currentEffort");
+  });
+
+  it.each(["heavy", "constructor", "__proto__", "toString"])("missing own perTier entry for %s gives a plain retry", (tier) => {
+    const policy = bumpPolicy({ ladder: [tier] });
+    const state = recordAttempt(newLadderState(tier, policy), 1);
+    const action = nextAction(state, fail, policy);
+    expect(action).toMatchObject({ action: "retry", tier });
+    expect(action).not.toHaveProperty("effort");
+    expect(advance(state, action).currentEffort).toBeNull();
+    expect(formatLadderScorecard(advance(state, action), false, "test")).toContain(`final_tier=${tier} |`);
+    // A retry without an override preserves even an existing effort value.
+    expect(advance({ ...state, currentEffort: "high" }, action).currentEffort).toBe("high");
+  });
+
+  it("accepts a bumped retry and reports the final attempt's effort", () => {
+    const policy = bumpPolicy();
+    let state = recordAttempt(newLadderState("fast", policy), 1);
+    state = recordAttempt(advance(state, nextAction(state, fail, policy)), 1);
+    const action = nextAction(state, { pass: true }, policy);
+    expect(action).toEqual({ action: "accept" });
+    expect(advance(state, action)).toBe(state);
+    expect(formatLadderScorecard(state, true, "test")).toBe(
+      "[router delegate scorecard | final_tier=fast@medium | attempts=2 | escalations=0 | cost=2 | verdict=PASS | method=test]",
+    );
+  });
+
+  it("effort never decreases within a tier or exceeds its bound across all valid base/bound pairs", () => {
+    const levels: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    for (const [baseRank, base] of levels.entries()) {
+      for (const bound of levels.slice(baseRank)) {
+        const policy = bumpPolicy({
+          maxAttemptsPerTier: 6, maxTotalAttempts: 10,
+          effortBump: { perTier: { fast: { base, bound } } },
+        });
+        // Legacy states without currentEffort also start from the configured base.
+        let state = makeState();
+        let previousRank = baseRank;
+        for (let retry = 0; retry < 6; retry++) {
+          state = recordAttempt(state, 1);
+          const action = nextAction(state, fail, policy);
+          const expectedRank = Math.min(previousRank + 1, levels.indexOf(bound));
+          expect(action.action).toBe("retry");
+          expect(action.effort ?? base).toBe(levels[expectedRank]);
+          state = advance(state, action);
+          const rank = levels.indexOf(state.currentEffort ?? base);
+          expect(rank).toBe(expectedRank);
+          expect(rank).toBeGreaterThanOrEqual(previousRank);
+          expect(rank).toBeLessThanOrEqual(levels.indexOf(bound));
+          previousRank = rank;
+        }
+        const escalation = nextAction(state, fail, policy);
+        expect(escalation).toMatchObject({ action: "escalate", tier: "medium" });
+        expect(escalation).not.toHaveProperty("effort");
+        expect(advance(state, escalation).currentEffort ?? null).toBeNull();
+      }
+    }
+  });
+
+  it("does not mutate frozen policy, state, verdict or actions", () => {
+    const policy = bumpPolicy();
+    for (const entry of Object.values(policy.effortBump!.perTier)) Object.freeze(entry);
+    Object.freeze(policy.effortBump!.perTier);
+    Object.freeze(policy.effortBump);
+    Object.freeze(policy.ladder);
+    Object.freeze(policy);
+    const before = JSON.stringify(policy);
+    const reasons = ["check failed"];
+    Object.freeze(reasons);
+    const verdict = Object.freeze({ ...fail, reasons });
+    const initial = Object.freeze(newLadderState("fast", policy));
+    const state = Object.freeze(recordAttempt(initial, 1));
+    const stateBefore = JSON.stringify(state);
+    const retry = Object.freeze(nextAction(state, verdict, policy));
+    const retryBefore = JSON.stringify(retry);
+    expect(retry.effort).toBe("medium");
+    const bumped = Object.freeze(advance(state, retry));
+    const escalation = Object.freeze(nextAction(bumped, verdict, policy));
+    const escalationBefore = JSON.stringify(escalation);
+    expect(advance(bumped, escalation).currentEffort).toBeNull();
+    expect(bumped.currentEffort).toBe("medium");
+    expect(initial).toMatchObject({ totalAttempts: 0, currentEffort: null });
+    expect(JSON.stringify(state)).toBe(stateBefore);
+    expect(JSON.stringify(policy)).toBe(before);
+    expect(JSON.stringify(retry)).toBe(retryBefore);
+    expect(JSON.stringify(escalation)).toBe(escalationBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Property-based: termination guarantee
 // ---------------------------------------------------------------------------
 
@@ -920,10 +1168,11 @@ describe("golden v2.0.0", () => {
     return action.action === "give_up" ? `give_up: ${action.reason}` : action.action;
   }
 
-  function generateGoldenTable() {
+  function generateGoldenTable(explicitNull = false) {
     return {
       version: "2.0.0",
-      policies: policies.map(({ name, policy }) => {
+      policies: policies.map(({ name, policy: originalPolicy }) => {
+        const policy = explicitNull ? { ...originalPolicy, effortBump: null } : originalPolicy;
         const matrix: Array<ReturnType<typeof capture> & { id: string }> = [];
         const firstAttemptCost = 2;
         if (policy.costMultiple == null) throw new Error("Golden policies require a cost ceiling");
@@ -989,7 +1238,9 @@ describe("golden v2.0.0", () => {
             throw new Error(`Golden sequence did not terminate: ${name}/${producerTier}/${stream}`);
           }),
         );
-        return { name, policy, matrix, sequences };
+        // The fixture records the original policy; exercise explicit null only
+        // as an input, comparing every resulting state/action/scorecard verbatim.
+        return { name, policy: originalPolicy, matrix, sequences };
       }),
     };
   }
@@ -1021,5 +1272,19 @@ describe("golden v2.0.0", () => {
     const expected = readFileSync(fixtureUrl, "utf8");
     expect(actual).toEqual(JSON.parse(expected));
     expect(serialized).toBe(expected);
+  });
+
+  it("replays the same fixture byte-for-byte with effortBump explicitly null", () => {
+    const actual = generateGoldenTable(true);
+    for (const { matrix, sequences } of actual.policies) {
+      for (const entry of [...matrix, ...sequences.flatMap((sequence) => sequence.steps)]) {
+        expect(entry.output.nextAction).not.toHaveProperty("effort");
+        expect(entry.output.advance).not.toHaveProperty("currentEffort");
+      }
+      for (const sequence of sequences) expect(sequence.initialState).not.toHaveProperty("currentEffort");
+    }
+    const expected = readFileSync(fixtureUrl, "utf8");
+    expect(actual).toEqual(JSON.parse(expected));
+    expect(`${JSON.stringify(actual, null, 2)}\n`).toBe(expected);
   });
 });
