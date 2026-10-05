@@ -121,6 +121,56 @@ are submitted for the next independent QA pass, not a new acceptance verdict.
 - Docs only; no tests added, no full suite or real-provider smoke run. The original
   `## [Unreleased]` heading and credit wording remain unchanged.
 
+### Round 2 (2026-10-05, adversarial, `400dd7e..8ea4c5d`)
+
+Range: `b8668ce`, `5776e7e`, `386ca75`, `40196ec`, `0b355ba`, `065dcf2`, `601e6f6`, `de797d1`, `8ea4c5d`.
+Reviewer: adversarial senior QA (`[tier:heavy]`, CAP:none), not the author of the fixes. Every added or changed
+sentence was checked against `src/` and `tiers.json` at `8ea4c5d`. Host claims were checked against
+`phase-0P.md`, `phase-2.3.md` and the plan. No source, test or other doc was edited.
+
+| Check | Result |
+|---|---|
+| Scope | `git diff --stat 400dd7e..HEAD -- src tiers.json test` is empty. The nine commits touch only CHANGELOG, README, CONFIG_REFERENCE, OPENCODE_V2, ADR 0004 and this report. `HEAD` = `origin/de/p31` = `8ea4c5d`. `git diff 400dd7e..HEAD --check` is clean. |
+| docs-drift | `npx vitest run test/unit/docs-drift.test.ts --maxWorkers=50%`: **1 file, 6/6 passed**. |
+| D5 / A1 texts | Inline Node comparison (no file written) against `depthLimitMessage` / `depthAdvisoryBanner` (`src/router/depth-guard.ts:32–38`), after normalising `${d}` to `${depth}`. CONFIG_REFERENCE `:187` (A1) and `:193` (D5); ADR `:86` (D5) and `:109` (A1): **4/4 byte-exact**. |
+| Relative links | Inline Node checker, including GitHub heading anchors, over README, CHANGELOG, CONFIG_REFERENCE, OPENCODE_V2, PER_TURN_EFFORT, ADR 0004, `docs/plans/README.md` and this report: **57 links, 0 broken**. One extra regex match is the `o[134]` pattern in the QA-3.1-4 row, which is not a link. The three new links resolve: CONFIG_REFERENCE `:219` → `phase-0P.md`; README `:965` → `phase-2.3.md#handoffs` (`:830`); ADR `:141` → `CONFIG_REFERENCE.md#where-the-bump-applies-with-the-bundled-presets` (`:594`). |
+| AI attribution | The nine commit bodies carry only `Refs #66` / `Refs #67`, with no trailers. Added doc lines contain no attribution. `rg -F 'C:\Users'` over the six published docs finds only the generic, pre-existing 8.3 example at CONFIG_REFERENCE `:352`. |
+| Credit wording | `CHANGELOG.md:10` and ADR `:16` are unchanged and read exactly "Observations by @MetalbolicX in opencode-smart-router (#17); implementation written from scratch." ADR `:17` reads "No code from that project was used." |
+
+Round-1 findings re-checked:
+
+| ID | Status | Evidence (doc vs code) |
+|---|---|---|
+| QA-3.1-1 | **Resolved** for the cited block | CONFIG_REFERENCE `:1120–1143` matches the code. (1) "`delegate` … run in `off`, `advisory` and `enforced`": `delegate` is registered on `enableDelegateTool` alone (`src/index.ts:525–527`, `:576`). Its loop (`:952–1013`) and `nextAction` / `buildEscalatePolicy` (`src/escalate/ladder.ts:119–189`, `:211–223`) read no mode. (2) "`verify.require: "never"`": `src/verify/gate.ts:123–137`. (3) Deferred results do not retry: `src/index.ts:788–819`, `:965–969`. (4) "Unavailable verification does not trigger producer escalation": `ladder.ts:130–131`. (5) Native verification annotates in `advisory`/`enforced`, and `off` skips it: `shouldVerifyTask` (`src/verify/dispatch.ts:580–589`); it only annotates (`src/index.ts:1433–1435`, `:1590–1604`). The pre-existing "Verification gates acceptance" sentence (round-1 Deferred, `:1120–1121`) is gone. Summary lines elsewhere still contradict the rewrite (QA-3.1-R2-1). |
+| QA-3.1-2 | Resolved | README `:282–285` removes `variant` from the per-turn list and attributes it to the model reference at registration (`src/compat/v2-hooks.ts:146`, `modelRef(definition.model, definition.variant)`). The per-turn merge copies only `agentOptions` (`:214–216`), and `buildAgentOptions` emits no `variant` (`src/router/agent-options.ts:101–205`). |
+| QA-3.1-3 | Resolved | CHANGELOG `:33–38`. The env gate is checked first: `1` → enforced, `0` → off (`src/router/enforcement.ts:21–27`). Then the caller-tier `perTier` beats `mode` (`:39–46`), with the tier from `sessionStore.getTier` (`src/index.ts:397–401`). "`perTier: "off"` (unless the environment gate forces enforcement)" matches. |
+| QA-3.1-4 | Resolved | CHANGELOG `:57–65`. (a) An OpenAI tier with a truthy budget sends `thinking`, and non-Claude budgets are not gated: `agent-options.ts:116`, `:201–203`. (b) An explicit `reasoning.effort` becomes `reasoningEffort` (`:142–145`). A configured `effort` does too, downgraded above `high` (`:169–185`). (c) The regex `(^\|[/\-_])o[134]([/\-_]\|$)` runs on the lowercased full model string (`:53–56`): `o1`/`o3`/`o4`, `/`, `-`, `_` or string boundaries, bare IDs. |
+| QA-3.1-5 | Resolved (attribution nit: QA-3.1-R2-3) | CONFIG_REFERENCE `:217–224`; README `:961–966`. (a) v1 `general` has no `task` (`phase-0P.md:136`, R4). The `invalid` tool comes from plan `:653–654`. (b) Top-level `subagent_depth: 4` lifted the v1 1.18.19 cap, and the default and upstream docs are unverified (`phase-2.3.md:93–94`, `:857–858`). (c) v1 graders run on `build`, at creator depth + 1 (`phase-2.3.md:869–870`). The `task` before-hook has no grader exemption (`src/index.ts:1218–1233`), so "their own dispatches are subject to the depth guard" holds. (d) v2 `general` needs `subagent` permission (`phase-2.3.md:859–860`). |
+| QA-3.1-6 | Resolved | ADR `:137–142` against `tiers.json`. `activePreset` is `anthropic`, and all three of its tiers set `variant`, so `effortCeilingFor` returns `null` (`agent-options.ts:73`). `fable-effort` (`claude-fable-5-1`) sets fast `low`, medium `high`, heavy `xhigh` and no variant. Its bound is `min(max, xhigh)` = `xhigh`, so fast and medium bump and heavy is excluded (`ladder.ts:226–241`). `openai`, `github-copilot`, `google` and `zai` omit `effort`; `hybrid` sets a variant on every tier. The anchor resolves. |
+| QA-3.1-7 | Resolved for the cited paths (gap: QA-3.1-R2-2) | CONFIG_REFERENCE `:202–203` and ADR `:113–114` put the banner after the producer text and before the accepted suffix (`src/index.ts:992`) or the deferred footer (`:968`). |
+| QA-3.1-8 | Resolved | ADR `:118–121`. v2 deletes the banner entry and returns when `status !== "completed"` (`src/compat/v2-hooks.ts:309–312`). The v1 after-hook appends with no status check (`src/index.ts:1398–1411`). The v1 host expectation is marked unverified. |
+| QA-3.1-9 | Resolved | ADR `:268–270`: `DEFAULT_DEPTH_MAX_ENTRIES = 10_000` (`src/router/depth.ts:6`) and `DEFAULT_IDLE_TTL_MS = 60 * 60_000` (`src/router/idle-sweep.ts:1`). |
+| QA-3.1-10 | Resolved (wording nit: QA-3.1-R2-4) | ADR `:239–243` no longer has the absolute path, and no `C:\Users` path remains in the published docs. The host versions and the scripted keyless provider match `phase-0P.md:126–127` and `phase-2.3.md:55–57`. |
+| QA-3.1-11 | Resolved | OPENCODE_V2 `:50–54` and ADR `:196–197`. Only definitions whose JSON the router's `config` hook changed, and that carry `options`, are normalized (`v2-hooks.ts:124–135`). The per-turn merge reads only that map (`:214–216`). Unchanged agents are also skipped at registration (`:143–144`). |
+| QA-3.1-12 | Resolved | README `:979–987`; CHANGELOG `:22–25`. Recognised family: `effortCeilingFor` returns `null` for any other family (`agent-options.ts:72–83`). On `delegate`, `/bypass` skips only the depth check (`src/index.ts:620`). `chat.params` applies the override with no bypass check (`:1081–1112`); the bypass return is in `chat.message` (`:1115`). |
+
+New findings (round 2):
+
+| ID | Severity | File:line | Description | Resolution |
+|---|---|---|---|---|
+| QA-3.1-R2-1 | minor | `docs/CONFIG_REFERENCE.md:3`, `:158`; `README.md:1015` | **Mode summaries still contradict the QA-3.1-1 rewrite.** CONFIG_REFERENCE `:1125–1133` now says, correctly, that the `delegate` gate, ladder and effort bump run in `off`, `advisory` and `enforced`. Three summaries say otherwise. `:3`: "Setting `mode: "off"` (or `MODEL_ROUTER_ENFORCE=0`) is a strict no-op." `:158`: "`off` = no-op. … `enforced` = block/escalate on violations." README `:1015`: "`off` — no-op, byte-for-byte-unchanged routing …; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline." In code, an enabled `delegate` is registered whatever the mode (`src/index.ts:525–527`, `:576`), `router_verify` is registered in `off` when it is (`:536`), and the ladder reads no mode (`src/escalate/ladder.ts:119–189`). The README line reproduces the QA-3.1-1 harm: a reader concludes that escalation, and so the bump, needs `enforced`. The text predates this plan (`d8ecde27`) and round 1 did not cite it. The rewrite now puts both claims in the same file. Fix: qualify each summary, e.g. "except the opt-in `delegate` tool, whose gate and ladder run in every mode". If the owner rules this outside 3.1's write intent, defer it explicitly to 3.3. | open |
+| QA-3.1-R2-2 | nit | `docs/CONFIG_REFERENCE.md:202–203`; ADR `:113–114` | **The `delegate` banner position is right only for accepted and deferred returns.** On the unmet (`give_up`) return, `withDepthBanner` wraps the router's `[router status: unmet]` header, the producer text and the forcing note, so the banner is last, after router text (`src/index.ts:1002–1007`). The safety-net and failure returns do the same (`:954–957`, `:962`, `:1015`). "Precedes the verification suffix" does not hold there. Round 1's suggested wording ("precedes router suffixes/footers") had the same gap. Fix: "On accepted and deferred results it precedes the verification suffix or deferred footer; on unmet and failure returns it is appended last." | open |
+| QA-3.1-R2-3 | nit | `README.md:962–965`; `docs/CONFIG_REFERENCE.md:217–224` | **The host-limit evidence is credited to the wrong fixtures.** README says "The OpenCode v1 1.18.19 spike fixtures likewise encountered a host cap and used top-level `subagent_depth: 4`". `phase-0P.md` (the spikes) never mentions `subagent_depth`. The setting comes from the Phase 2.3 host-proof rig (`phase-2.3.md:93–94`, `:857–858`), and README's next sentence correctly calls these "host-proof fixtures". CONFIG_REFERENCE labels the whole paragraph "observed in the spike fixtures" and links only Spike A2. The label also covers the 1.18.19 proof cap and the `build` grader role (`phase-2.3.md:869–870`). The `invalid`-tool clause is in plan `:653–654`, not in `phase-0P.md`. Fix: write "spike and host-proof fixtures", and link `phase-2.3.md#handoffs` from the CONFIG_REFERENCE v1 paragraph. | open |
+| QA-3.1-R2-4 | nit | ADR `:242–243` | **"The latter report records hashes" is inaccurate.** `phase-2.3.md` contains no hash values. `rg` for SHA-256 or 64-hex strings finds only `:57` ("`hashes.json` records rig-source SHA-256") and the instruction at `:626`. The hashes live in `hashes.json` and `provenance.json`, which the owner keeps locally. The wording follows round 1's own imprecise suggestion ("with hashes in `phase-2.3.md`"). Fix: "the latter report describes the locally retained `hashes.json` (rig-source SHA-256) and `provenance.json` (copied plugin/dependency files)". | open |
+
+Round 2 handoffs:
+
+- **To 3.1 (fix round 2):** QA-3.1-R2-1 to QA-3.1-R2-4, docs only. Then re-run docs-drift, the D5/A1 byte comparison and
+  the link check.
+- **To 3.3:** this round has done the round-1 "To 3.3" item. QA-3.1-1's rewrite matches the `delegate` path in `off`,
+  `advisory` and `enforced`, and the `:1120–1121` sentence is gone. The only exception is QA-3.1-R2-1, if the owner
+  defers it.
+
 ## Deferred by plan
 
 - Real-provider acceptance of bumped values and of newly delivered v1 options (A5, `phase-2.2.md`). This cannot be
@@ -146,6 +196,19 @@ are submitted for the next independent QA pass, not a new acceptance verdict.
   check the pre-existing `:1120–1121` sentence noted above.
 
 ## Verdict
+
+**Not accepted in round 2.** All 12 round-1 findings are resolved; QA-3.1-1 and QA-3.1-7 are resolved for the cited
+text, and each has a residual gap filed as a new finding. Four new findings are open: **1 minor** (QA-3.1-R2-1)
+and **3 nit** (QA-3.1-R2-2 to -R2-4). None is blocking, critical or major. Under §0.7, all four must be fixed and
+re-checked in round 3.
+
+- The D5 refusal and A1 banner are still byte-exact (4/4). docs-drift passes 6/6. All 57 relative links resolve.
+- The credit wording is unchanged and exact, and the nine fix commits carry no AI attribution.
+- Every changed sentence about mode independence, enforcement precedence, native keys, the OpenAI regex, D7 reach,
+  bump eligibility, `/bypass`, v2 option scope, banner status handling and the F2 constants matches `src/` and
+  `tiers.json`.
+
+Round 1 (historical):
 
 **Not accepted in round 1.** Open findings: **12** (1 major: QA-3.1-1; 5 minor: QA-3.1-2 to -6; 6 nit:
 QA-3.1-7 to -12). No blocking or critical findings.
