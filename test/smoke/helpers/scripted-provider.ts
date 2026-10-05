@@ -79,8 +79,8 @@ export class ScriptedProvider {
       this.send(res, body, text, tool, input);
     } catch (error) {
       this.errors.push(String(error));
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: String(error) }));
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: String(error) } }));
     }
   });
 
@@ -101,12 +101,13 @@ export class ScriptedProvider {
     const message = { id: `msg_smoke_${n}`, type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } };
     if (!body.stream) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ...message, content: [{ type: "text", text }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } }));
+      res.end(JSON.stringify({ ...message, content: tool ? [{ type: "tool_use", id: `toolu_smoke_${n}`, name: tool, input }] : [{ type: "text", text }], stop_reason: tool ? "tool_use" : "end_turn", usage: { input_tokens: 10, output_tokens: 5 } }));
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     const event = (type: string, data: Record<string, unknown>) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
     event("message_start", { message });
+    event("ping", {});
     event("content_block_start", { index: 0, content_block: tool ? { type: "tool_use", id: `toolu_smoke_${n}`, name: tool, input: {} } : { type: "text", text: "" } });
     event("content_block_delta", { index: 0, delta: tool ? { type: "input_json_delta", partial_json: JSON.stringify(input) } : { type: "text_delta", text } });
     event("content_block_stop", { index: 0 });
