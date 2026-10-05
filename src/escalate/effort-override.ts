@@ -56,9 +56,14 @@ export function createEffortOverrideStore(
           warn(logger, "Invalid effort override arguments; override refused");
           return;
         }
-        // Read every tier field once; validation, ceiling and builder share this snapshot.
-        const snapshot = { ...tier };
-        const model = snapshot.model;
+        // Ordinary reads preserve inherited/non-enumerable fields, once per field.
+        // Validation, ceiling and builder all share this snapshot.
+        const model = tier.model;
+        const tierEffort = tier.effort;
+        const variant = tier.variant;
+        const thinking = tier.thinking;
+        const reasoning = tier.reasoning;
+        const snapshot = { model, effort: tierEffort, variant, thinking, reasoning };
         if (!nonempty(model) || !EFFORT_LEVELS.includes(effort)) {
           warn(logger, "Invalid effort override arguments; override refused");
           return;

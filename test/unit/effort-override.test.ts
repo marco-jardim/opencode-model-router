@@ -256,6 +256,27 @@ describe("per-session effort overrides", () => {
   });
 
   it.each([
+    Object.setPrototypeOf({ ...openai }, { reasoning: { effort: "low" } }),
+    Object.setPrototypeOf({ model: "anthropic/claude-sonnet-4-5", effort: "low" }, { thinking: { budgetTokens: 8000 } }),
+    Object.defineProperty({ ...openai }, "variant", { value: "high", enumerable: false }),
+    Object.defineProperty({ ...openai }, "reasoning", { value: { effort: "low" }, enumerable: false }),
+    Object.setPrototypeOf({ ...openai }, { variant: "high" }),
+  ] satisfies TierConfig[])("honours inherited and non-enumerable ceiling fields (%#)", (tier) => {
+    const { store, logger } = setup();
+    expect(agentOptions.effortCeilingFor(tier)).toBeNull();
+    store.set("producer", "fast", tier, "high");
+    expect(store.has("producer")).toBe(false);
+    expect(store.size()).toBe(0);
+    const target = {};
+    const separator = tier.model.indexOf("/");
+    applyEffortOverride(store, { ...producer, model: {
+      providerID: tier.model.slice(0, separator), id: tier.model.slice(separator + 1),
+    } }, target, logger);
+    expect(target).toEqual({});
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("exceeds the tier ceiling"));
+  });
+
+  it.each([
     { tier: { ...openai, reasoning: { effort: "low" } }, effort: "medium" },
     { tier: openai, effort: "xhigh" },
     { tier: { ...openai, model: "gpt-5" }, effort: "medium" },
@@ -425,6 +446,8 @@ describe("native builder agreement", () => {
     const consoleWarning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { store, logger } = setup();
     const separator = tier.model.indexOf("/");
+    // Registration consumes expected builder notices before steady-state bumps.
+    agentOptions.buildAgentOptions(tier, "fast", { warn: vi.fn(), flush: () => Promise.resolve() });
     for (const effort of EFFORT_LEVELS.filter((level) => agentOptions.effortRank(level) <= agentOptions.effortRank(ceiling))) {
       store.set("producer", "fast", tier, effort);
       const expected = agentOptions.buildAgentOptions({ ...tier, effort }, "fast");
@@ -435,5 +458,6 @@ describe("native builder agreement", () => {
       expect(Object.values(target)).toEqual([effort]);
     }
     expect(consoleWarning).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 });
