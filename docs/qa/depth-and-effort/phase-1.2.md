@@ -7,6 +7,24 @@
 - `DEFAULT_IDLE_TTL_MS` is exported from `src/router/idle-sweep.ts:1` (`60 * 60_000`). `sessions.ts`, `guard/store.ts` and `verify/*` all import it from there, so `depth.ts` does too (`import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep"`).
 - `SESSION_LOOKUP_RETRY_MS` is a private `const` in `src/index.ts:241`, so it can't be imported (the tracker must not depend on `index.ts`). `depth.ts` exports its own `DEPTH_LOOKUP_RETRY_MS = 30_000`.
 
+### QA review, round 1 (`0b1dc9f` implementation, `b591032` tests)
+
+- Scoped runs on `de/p12` at `b591032`:
+  - `npx vitest run test/unit/depth.test.ts --maxWorkers=50%`: 1 file, 68/68 passed.
+  - `npx vitest run --coverage --coverage.include=src/router/depth.ts test/unit/depth.test.ts`: statements 99.22 % (257/259), branches 98.29 % (173/176), functions 100 % (35/35), lines 99.04 % (208/210). Uncovered: `depth.ts:282–283` (the `run()` catch, see QA-1.2-6).
+  - `npm run typecheck`: clean.
+- Throwaway probes under `test/scratch/` (deleted, not committed) gave these results:
+  - Ids `__proto__`, `constructor`, `hasOwnProperty`, `toString`, `valueOf`: exact depths and no spurious lookups. Maps are used throughout.
+  - 100 concurrent `depthOf` for different ids sharing A→B→R: 103 `getParent` calls (one per leaf; A, B and R once each). This holds for both synchronous and staggered (0–6 ms) latencies.
+  - Hop cap with partly known chains (events n0..n10, backend above): 32 edges → 32; 33 and 40 edges → 32. There are no lookups beyond the needed ids and none on re-ask.
+  - Fake timers after the failure, throttle and timeout paths: `getTimerCount() === 0`. There were no `unhandledRejection` events, including with throwing seams.
+  - A TTL sweep during an in-flight walk with no re-creation gives the correct depth, and the walk re-inserts the retained nodes.
+- Implementer's reported deviations from §2–§6, as assessed:
+  - **Trim after the floor memoization** (`depth.ts:102–105`, `204`). This is sound: it keeps the known parent while the new child's floor is derived. A side effect: when `maxEntries` ≤ the chain length, a new node is evicted by its own `record*` call (QA-1.2-2).
+  - **Walk-local learned evidence keeps the visited nodes and their conflicting links** (`145–149`, `197`, `279`). This works only partly. It is defeated when `nodes` receives a re-created object for the same id (QA-1.2-1). `forget` clears only the `learned` maps of walks still registered in `walks` (QA-1.2-3).
+  - **Reverse post-order cap memoization** (`189–190`). Verified: the stack nodes are appended in reverse, which keeps the ancestor-recency order. Hop floors `33 − L` are ≤ truth, and only MAX is marked complete.
+  - **Explicit cancellation promises for `forget`** (`226–230`, `254–255`). Verified: awaiting callers settle promptly, no timers are involved, and there are no rejections. However, walks that were detached by a timeout cannot be reached by `forget` (QA-1.2-3).
+
 ## Implementation notes
 
 Task 1.2.1 design for `src/router/depth.ts`. The plan fixes the API; this section is the contract for 1.2.2 and the oracle for the 1.2.3 tests.
@@ -256,6 +274,18 @@ warnOnce(id, why): key "lookup:"+id; once per key; logger.warn(`[router] depth: 
 - **F4 (residual):** `forget(intermediate)` followed by a conflict above it leaves resolved descendants at their memo. Eviction cannot cause this, because of the ancestor-recency invariant. A clock going backwards could weaken TTL ordering; LRU ordering does not depend on the clock.
 - **F5:** `DEPTH_LOOKUP_RETRY_MS` duplicates the private `SESSION_LOOKUP_RETRY_MS`. Phase 2 can have `index.ts` import it.
 
+QA review, round 1 (adversarial, `0b1dc9f` + `b591032`). The repro sequences use the fixture's `getParent`, `now` and `logger` seams.
+
+| id | severity | file:line | description | resolution |
+|---|---|---|---|---|
+| QA-1.2-1 | critical | `src/router/depth.ts:144,149,197,279` | **A walk's retained evidence is replaced by a poorer re-created node, so an exact depth comes out below truth.** `visit` prefers `nodes.get(id)` over `learned.get(id)` and then overwrites `learned` (149); `memoize` does the same (197). The need path in `depthOf` does not touch the start. If the start or a visited node is evicted (LRU or TTL) during the walk, and another lookup or event re-creates that id, the new object drops the conflicting or plugin links that the walk was holding. The walk then returns, and memoizes, a *complete* depth below the truth. **Repro, default `maxEntries`, `ttlMs: 100`.** Backend: X→P, Y→X, P root, Q→Q1→Q2→root. Sequence: `recordCreated(X,P)`; `recordCreated(X,Q)`; t=99 `depthOf(X)` (`getParent(P)` held); t=100 `sweep()`; `depthOf(Y)` (re-creates X as `[P]`); release P → `depthOf(X) === 1`. Truth is 3, and the control run without the Y walk gives 3. Later reads stay at 1. **Plugin variant (`maxEntries: 2`).** `recordPluginChild(X,C)`; `depthOf(X)` (C held); `recordRoot(Z1)`; `recordRoot(Z2)`; `depthOf(Y)` with Y→X and X→null → `depthOf(X) === 0` for a plugin child. Fix hint: when both objects exist, merge them (links via the `applyLink` rules, max depth, `plugin`/`rootSeen`) rather than replacing; add a regression test. | open |
+| QA-1.2-2 | critical (extends accepted residual F2) | `src/router/depth.ts:83–85,196–204,292–298` | **Eviction drops non-backend evidence, and re-resolution through the backend then answers below truth.** This is wider than F2, which covers only the TTL path for a v1 child. It applies to LRU too, to evicted *ancestors* that carry conflicting event links, and to self-eviction: `memoize` touches the start first, so a new leaf is the first LRU victim of its own chain. (a) With `maxEntries: 2`: `recordRoot(R)`; `recordCreated(C,R)`; `recordPluginChild(X,C)` evicts X during its own record. `depthOf(X)` then calls `getParent(X)` → null → **0**, which also breaks I6 ("plugin children are never looked up"). (b) With `maxEntries: 4`, backend G→C→X→root: `recordRoot(X)`; C→X; G→C; `depthOf(G)`; then P0←P1←P2; `recordCreated(X,P2)` (X=3). `depthOf(G)` inserts G, which evicts X → **2** (truth 5). With the defaults this is reachable after ≥ 10 000 newer touches since the chain's last read, not only after 60 min idle. Either fix it (for example pin plugin-flagged and conflict-bearing nodes, or keep a bounded tombstone of non-backend floors), or have the owner re-accept F2 with the LRU and ancestor scope. | open |
+| QA-1.2-3 | major | `src/router/depth.ts:273–279,327–339,350–362,236–241` | **A timed-out walk keeps running untracked.** On timeout, `depthOf` removes the walk from `walks` and detaches only its *current* lookup. `run()` continues anyway: after the detached lookup settles it starts *new attached* lookups that no caller awaits. That makes a second concurrent walk for the session, against the acceptance criterion "never more than one backend walk per session concurrently". `forget` cannot reach it: it is absent from `walks`, and `forget` only clears the `learned` maps of registered walks. **Repro (fake timers):** `getParent(X)` and `getParent(P)` held; `depthOf(X,{timeoutMs:10})` → undefined; `forget(X)` → `size()===0`; release X="P" → X is resurrected by the detached lookup's late success (`size()===1`, despite §6 "the late answer is discarded") and `getParent(P)` is issued by the orphan walk; release P → `size()===2`. Fix hint: mark the walk cancelled when its last caller times out (or keep it reachable for `forget`), and drop late successes for forgotten ids. | open |
+| QA-1.2-4 | minor | `src/router/depth.ts:311,339` | **The timeout floor ignores what the walk has learned (F1).** `floor(id, learned, …)` uses the caller's local `learned` from the initial synchronous climb, not `walk.learned`. Under eviction it returns `undefined` or a weaker floor although the walk has already proven more. **Repro (`maxEntries: 1`):** backend X→P, P→Q, Q held; `depthOf(X,{timeoutMs:10})` → `undefined`, although X ≥ 2 was proven. Fix hint: use `walk.learned` (merged with the local map) on the timeout path. | open |
+| QA-1.2-5 | minor | `src/router/depth.ts:72,233,336,367` | **`failedAt` has no cap.** `warned` is FIFO-capped at `maxEntries`, but `failedAt` is bounded only by `sweep()`, which is wired in Phase 2.3 and runs hourly. **Repro (`maxEntries: 10`, backend down):** 1 000 distinct `depthOf` failures, then the backend recovers. All 1 000 ids stay throttled (0 retries), so the 1 000 entries are still held. Fix hint: cap it like `warned`, or drop expired entries on write. | open |
+| QA-1.2-6 | minor | `src/router/depth.ts:281–283,336,75–81` | **Throwing seams are not contained, and the `run()` catch path is untested** (lines 282–283 uncovered). `depthOf` *rejects* in two cases: when `now()` throws on the timeout path (`Error: clock`), and when `now()` throws inside `record` from a lookup (the catch's `warn` rethrows, so `run()` rejects). A throwing `logger.warn` makes `recordCreated(R,P)` after `recordRoot(R)` throw synchronously. There were no unhandled rejections, because `Promise.race` attaches handlers. This is low risk with `Date.now` and the plugin logger, but the suite's own throwing-`now()` test implies the contract. Fix hint: guard `warn` and the `depthOf` body, and cover 282–283. | open |
+| QA-1.2-7 | minor | `src/router/depth.ts:130–193,196–203` | **The cost per call is O(reachable ancestors), not "≤ 33 Map reads" (§1).** Every `record*` and every `depthOf` re-climbs, and then re-touches (`delete`+`set`), the whole reachable DAG. Measured: single-parent chains with 10 000 nodes, record + read all: 175 ms. A 300-wide, 32-layer DAG with 2 parents per node: 18 600 records in 1.8 s and 0.35 ms per read. The same DAG with 4 parents: 38 400 records in 12.0 s and 1.27 ms per read. This needs systematic conflicting parents, so the impact is low. Fix hint: correct the memo's claim, or skip the climb on record when the node is unchanged. | open |
+
 ## Deferred by plan
 
 - Wiring `sweep()` into `createIdleTtlSweeper` (Phase 2.3).
@@ -273,4 +303,7 @@ warnOnce(id, why): key "lookup:"+id; once per key; logger.warn(`[router] depth: 
 
 ## Verdict
 
-1.2.1 DESIGN READY. Implementation and verification are pending in 1.2.2 and 1.2.3.
+pending fixes
+
+- QA round 1 on `0b1dc9f` + `b591032`: 7 open findings (2 critical, 1 major, 4 minor). Tests, coverage and typecheck are green.
+- 1.2.1 was DESIGN READY. QA-1.2-2 needs an owner decision: fix it, or widen the accepted residual F2.
