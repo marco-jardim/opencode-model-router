@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Observations by @MetalbolicX in opencode-smart-router (#17); implementation written from scratch.
+
+### Added
+
+- Delegation depth guard (#66), configured by `enforcement.maxDelegationDepth`
+  (default `1`; `null` disables it).
+- Effort bump before escalation (#67), configured by
+  `enforcement.escalate.effortBump` (default `true`) and
+  `enforcement.escalate.effortBumpMax` (default `"xhigh"`, further capped per model).
+
+### Changed
+
+- The automatic ladder's existing same-tier retry now runs one effort level higher
+  by default on eligible tiers: explicit `effort`, no `variant`, no winning explicit
+  provider setting, and room below the effective ceiling. This adds no attempt and
+  still respects attempt and cost ceilings. It applies only to the optional
+  `delegate` tool's automatic ladder, not native `task`/`subagent` or manual retries.
+  Only `fable-effort` fast/medium are eligible among bundled presets; at the default
+  cost ceiling, a run starting at fast stops before medium's bump. Set
+  `enforcement.escalate.effortBump: false` to restore the previous retry behaviour.
+- Dispatches past `enforcement.maxDelegationDepth` (default `1`) are warned in
+  `advisory` mode (the bundled default) with `[⚠ GUARD:delegation_depth]` and refused
+  in `enforced` mode. Set `enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`
+  to enforce it; set `enforcement.maxDelegationDepth: null` to opt out of the guard.
+  Enforcement mode `off` and `/bypass on` also disable the check. OpenCode 2's own
+  `experimental.subagent_depth` cap remains independent.
+- On OpenCode 2, router-modified `subagent` results now keep the host's
+  `<subagent sessionID=…>` envelope part and append the router's text as a separate
+  part, preserving the resume handle instead of replacing the envelope with plain
+  text. This applies when host text exists and the router output starts with the
+  child's text after trimming trailing whitespace. Missing host text or a
+  non-suffix rewrite uses the full router output as one text part instead, retaining
+  non-text attachments without losing or duplicating the child's text. Structured
+  output and metadata handling are unchanged.
+
+### Fixed
+
+- **OpenCode v1 behaviour change:** tier `effort` (for OpenAI-family models),
+  `reasoning.*` and `thinking.budgetTokens` settings that v1 silently dropped now
+  reach requests through provider-native registered keys: `reasoningEffort`,
+  `reasoningSummary` and `thinking: { type: "enabled", budgetTokens }`. User config
+  keys and provider-specific precedence/gates are unchanged; Claude `effort` was
+  already registered with its native key.
+  - OpenAI-family detection is regex-based: Copilot/OpenRouter/Azure `gpt-*`,
+    `gpt-oss` through Ollama/Groq, and non-reasoning GPT models with configured
+    effort now receive `reasoningEffort` (and configured summaries use
+    `reasoningSummary`). IDs matching `-o1`/`-o3`, such as `mistral/magistral-o1`,
+    are also treated as OpenAI. Whether the SDK strips unsupported options for
+    non-reasoning models is unverified.
+  - Claude tiers with an applicable `thinking.budgetTokens` now send `thinking`;
+    adaptive-only Claude still drops manual budgets. Unknown-family tiers (such
+    as Bedrock Claude or Gemini) with explicit `thinking.budgetTokens` or
+    `reasoning.*` also receive the native keys; their provider effect is unverified.
+  - Latency/cost may rise, or a provider may reject newly delivered settings.
+    To restore the previous behaviour, remove `effort`, `reasoning.*` or `thinking`
+    from the affected tier. **Bundled presets are unaffected by this registration
+    fix:** none sets `reasoning` or `thinking`, and their explicit `effort` settings
+    are Claude's already-native key.
+
 ## [2.0.0] - 2026-10-04
 
 The router now runs on OpenCode v2 through a separate server entrypoint. **OpenCode v1
