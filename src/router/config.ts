@@ -723,6 +723,25 @@ const MAX_TIMER_MS = 2_147_483_647;
  */
 export const MAX_DELEGATION_DEPTH_LIMIT = 32;
 
+/** Total, typed and bounded rendering of an invalid config value. */
+function describeValue(value: unknown): string {
+  let description: string;
+  try {
+    if (typeof value === "string") description = JSON.stringify(value);
+    else if (typeof value === "number") description = Object.is(value, -0) ? "-0" : String(value);
+    else if (typeof value === "bigint") description = `${value}n`;
+    else if (value === null) description = "null";
+    else if (typeof value === "object") {
+      const tag = Array.isArray(value) ? "array" : "object";
+      description = `${tag} ${JSON.stringify(value) ?? "<unserializable>"}`;
+    } else if (typeof value === "function") description = "<function>";
+    else description = String(value);
+  } catch {
+    description = `<${typeof value}>`;
+  }
+  return description.length > 80 ? `${description.slice(0, 79)}…` : description;
+}
+
 /** Copy without invoking accessors again; snapshot only keys already present. */
 function withValidatedSnapshots<T extends object>(
   obj: T,
@@ -765,7 +784,7 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
         maxDelegationDepth > MAX_DELEGATION_DEPTH_LIMIT)
     ) {
       throw new Error(
-        `tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got '${String(maxDelegationDepth)}')`,
+        `tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got ${describeValue(maxDelegationDepth)})`,
       );
     }
     if (enforcement.mode !== undefined) {
@@ -924,7 +943,7 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
       rejectPrototypeKeys(escalate, "enforcement.escalate");
       const effortBump = escalate.effortBump;
       if (effortBump !== undefined && typeof effortBump !== "boolean") {
-        throw new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got '${String(effortBump)}')`);
+        throw new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got ${describeValue(effortBump)})`);
       }
       const effortBumpMax = escalate.effortBumpMax;
       if (
@@ -932,7 +951,7 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
         !EFFORT_LEVELS.some((level) => level === effortBumpMax)
       ) {
         throw new Error(
-          `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")} (got '${String(effortBumpMax)}')`,
+          `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")} (got ${describeValue(effortBumpMax)})`,
         );
       }
       snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax });
