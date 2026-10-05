@@ -194,7 +194,7 @@ function buildEffortBump(cfg: RouterConfig): EffortBumpPolicy | null {
 }
 ```
 
-- Iterate every tier in the active preset, not only the ladder: the initial tier may be off the ladder, and its retries can still be bumped.
+- Iterate every tier in the active preset, not only the ladder: an **empty ladder** makes `resolveStartTier` retain the producer tier, whose retries can still be bumped. With a nonempty ladder, an off-ladder producer is mapped to `ladder[0]` or the configured floor; it is not a reason to retain off-ladder entries by itself.
 - This assumes `Preset` is `Record<string, TierConfig>`. That is unverified; if `Preset` carries non-tier keys, skip any value that has no string `model`.
 
 | Tier (default max xhigh) | Ceiling | Bound | Included |
