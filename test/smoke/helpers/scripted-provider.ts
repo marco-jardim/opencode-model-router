@@ -38,6 +38,8 @@ export class ScriptedProvider {
   readonly captures: Capture[] = [];
   readonly replies: { role: Capture["role"]; tool?: string; input?: Record<string, unknown>; text: string }[] = [];
   readonly errors: string[] = [];
+  readonly barrierEvents: { parent: string; event: "armed" | "leaf-waiting" | "result-observed" | "leaf-released" }[] = [];
+  private background = new Map<string, { promise: Promise<void>; release: () => void; observed: boolean }>();
   private graders = 0;
   private sequence = 0;
   private server = createServer(async (req, res) => {
@@ -50,6 +52,14 @@ export class ScriptedProvider {
       const grader = JSON.stringify(body.system ?? "").includes("You are an independent, skeptical verification grader.");
       const role: Capture["role"] = grader ? "grader" : agent === "fast" ? "producer" : agent === "title" || header("x-proof-kind") === "title" ? "title" : agent === "build" ? "orchestrator" : "child";
       this.captures.push({ body, session: header("x-proof-session"), agent, role });
+      const parent = header("x-proof-session");
+      const gate = parent ? this.background.get(parent) : undefined;
+      const history = blocks(body);
+      if (gate && !gate.observed && history.some(b => b.type === "tool_result" && history.some(use => use.type === "tool_use" && use.id === b.tool_use_id && use.input?.background === true))) {
+        gate.observed = true;
+        this.barrierEvents.push({ parent: parent!, event: "result-observed" });
+        gate.release();
+      }
       const last = body.messages?.at(-1)?.content ?? [];
       const content: Block[] = typeof last === "string" ? [{ type: "text", text: last }] : last;
       const marker = content.filter(b => b.type === "text").map(b => b.text).join("\n");
@@ -70,12 +80,29 @@ export class ScriptedProvider {
           if (nested && resume) input[this.host === "v1" ? "task_id" : "sessionID"] = resume;
           const caller = /RESUME_CALLER_ID=(ses_[A-Za-z0-9]+)/.exec(marker)?.[1];
           if (!nested && caller) input[this.host === "v1" ? "task_id" : "sessionID"] = caller;
+          if (input.background === true) {
+            if (!parent) throw new Error("Background fixture requires the caller session header");
+            let release = () => {};
+            const promise = new Promise<void>(resolve => { release = resolve; });
+            this.background.set(parent, { promise, release, observed: false });
+            this.barrierEvents.push({ parent, event: "armed" });
+            input.prompt = `${prompt} WAIT_FOR_PARENT=${parent}`;
+          }
         } else if (marker.includes("CHILD_DONE")) text = "CHILD_DONE";
       }
       this.replies.push({ role, tool, input, text });
       if (tool && !body.tools?.some(t => t.name === tool)) throw new Error(`Fixture requested unavailable ${tool} (${agent})`);
-      // Keep the leaf alive long enough to distinguish the native running result.
-      if (marker.includes("LEAF_DONE") && !tool) await new Promise(resolve => setTimeout(resolve, 500));
+      // A background leaf cannot finish before the parent has sent its actual
+      // tool_result back to the provider. No wall-clock margin is assumed.
+      const waitingFor = /WAIT_FOR_PARENT=(\S+)/.exec(marker)?.[1];
+      if (waitingFor && marker.includes("LEAF_DONE") && !tool) {
+        const pending = this.background.get(waitingFor);
+        if (!pending) throw new Error("Background leaf has no armed parent barrier");
+        this.barrierEvents.push({ parent: waitingFor, event: "leaf-waiting" });
+        await pending.promise;
+        if (!pending.observed) { res.destroy(); return; } // teardown releases cancelled leaves
+        this.barrierEvents.push({ parent: waitingFor, event: "leaf-released" });
+      }
       this.send(res, body, text, tool, input);
     } catch (error) {
       this.errors.push(String(error));
@@ -92,6 +119,7 @@ export class ScriptedProvider {
   }
 
   async stop(): Promise<void> {
+    for (const gate of this.background.values()) gate.release();
     this.server.closeAllConnections();
     await new Promise<void>((resolve, reject) => this.server.close(error => error ? reject(error) : resolve()));
   }

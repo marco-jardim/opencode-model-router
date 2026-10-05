@@ -155,7 +155,7 @@ afterEach(async () => {
       await f.provider.stop();
       if (process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS) {
         await mkdir(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, { recursive: true });
-        await writeFile(path.join(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, `${f.host.version}-${path.basename(f.root)}.json`), JSON.stringify({ host: f.host.version, configs: f.configs, captures: f.provider.captures, replies: f.provider.replies, hooks: await f.hooks(), runs: f.runs, processes: f.processes.map(p => ({ pid: p.child.pid, exitCode: p.child.exitCode, signal: p.child.signalCode, stdout: p.stdout, stderr: p.stderr })) }, null, 2));
+        await writeFile(path.join(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, `${f.host.version}-${path.basename(f.root)}.json`), JSON.stringify({ host: f.host.version, configs: f.configs, captures: f.provider.captures, replies: f.provider.replies, barrierEvents: f.provider.barrierEvents, hooks: await f.hooks(), runs: f.runs, processes: f.processes.map(p => ({ pid: p.child.pid, exitCode: p.child.exitCode, signal: p.child.signalCode, stdout: p.stdout, stderr: p.stderr })) }, null, 2));
       }
     } finally {
       await rm(f.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
@@ -293,6 +293,10 @@ for (const host of hosts) {
                 expect(after?.result?.output?.status).toBe("running");
                 expect(after?.result?.metadata?.status).toBe("running");
                 expect(after?.result?.output?.output?.split("[⚠ GUARD:delegation_depth]")).toHaveLength(2);
+                const events = f.provider.barrierEvents.filter(e => e.parent === run.childID).map(e => e.event);
+                expect(events[0]).toBe("armed");
+                expect(events.filter(e => e === "result-observed")).toHaveLength(1);
+                expect(events.every((e, i) => e !== "leaf-released" || i > events.indexOf("result-observed"))).toBe(true);
               } else {
                 expect(text).toContain("<subagent sessionID=");
                 expect(after?.result?.output?.status).toBe("completed");

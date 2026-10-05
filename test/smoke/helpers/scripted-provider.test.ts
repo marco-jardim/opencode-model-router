@@ -3,8 +3,8 @@ import { ScriptedProvider } from "./scripted-provider";
 
 const providers: ScriptedProvider[] = [];
 afterEach(async () => { await Promise.all(providers.splice(0).map(p => p.stop())); });
-async function start() {
-  const provider = new ScriptedProvider("v1");
+async function start(host: "v1" | "v2" = "v1") {
+  const provider = new ScriptedProvider(host);
   providers.push(provider);
   return { provider, url: `${await provider.start()}/messages` };
 }
@@ -30,4 +30,21 @@ it("streams ordered Anthropic message events including ping", async () => {
   const response = await fetch(url, { method: "POST", body: JSON.stringify({ model: "fixture", stream: true, messages: [{ role: "user", content: "ok" }] }) });
   const events = (await response.text()).split("\n").filter(line => line.startsWith("event: "));
   expect(events).toEqual(["event: message_start", "event: ping", "event: content_block_start", "event: content_block_delta", "event: content_block_stop", "event: message_delta", "event: message_stop"]);
+});
+
+it("holds a background leaf until the captured parent tool result releases it", async () => {
+  const { provider, url } = await start("v2");
+  const post = (body: object, session: string) => fetch(url, { method: "POST", headers: { "x-proof-session": session }, body: JSON.stringify(body) });
+  const response = await post({ tools: [{ name: "subagent" }], messages: [{ role: "user", content: "NEST_BG" }] }, "parent");
+  const message: { content: { id: string; input: { prompt: string; background: boolean } }[] } = await response.json();
+  const call = message.content[0];
+  let answered = false;
+  const leaf = post({ messages: [{ role: "user", content: call.input.prompt }] }, "leaf").then(r => { answered = true; return r; });
+  const deadline = Date.now() + 5_000;
+  while (!provider.barrierEvents.some(e => e.event === "leaf-waiting") && Date.now() < deadline) await new Promise<void>(resolve => setImmediate(resolve));
+  expect(provider.barrierEvents.map(e => e.event)).toEqual(["armed", "leaf-waiting"]);
+  expect(answered).toBe(false);
+  await post({ messages: [{ role: "assistant", content: [{ type: "tool_use", ...call }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: "working in background" }] }] }, "parent");
+  expect((await leaf).status).toBe(200);
+  expect(provider.barrierEvents.map(e => e.event)).toEqual(["armed", "leaf-waiting", "result-observed", "leaf-released"]);
 });
