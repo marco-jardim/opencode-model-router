@@ -1,0 +1,178 @@
+import { describe, it, expect, vi } from "vitest";
+import {
+  createDepthGuard,
+  DELEGATION_DEPTH_GUARD,
+  depthAdvisoryBanner,
+  depthLimitMessage,
+} from "../../src/router/depth-guard";
+import { MAX_DELEGATION_DEPTH_LIMIT } from "../../src/router/config";
+import { MAX_DEPTH_HOPS } from "../../src/router/depth";
+import type { DepthTracker } from "../../src/router/depth";
+import type { EnforcementMode } from "../../src/router/enforcement";
+
+function setup(depth: number | undefined, max: number | null = 1, mode: EnforcementMode = "enforced") {
+  const depthOf = vi.fn<DepthTracker["depthOf"]>().mockResolvedValue(depth);
+  const limit = vi.fn(() => max);
+  const resolveMode = vi.fn<(caller: string | undefined) => EnforcementMode>(() => mode);
+  const warn = vi.fn<(message: string) => void>();
+  const guard = createDepthGuard({ tracker: { depthOf }, limit, mode: resolveMode, logger: { warn } });
+  return { ...guard, depthOf, limit, resolveMode, warn };
+}
+
+describe("delegation depth guard", () => {
+  const modes: EnforcementMode[] = ["off", "advisory", "enforced"];
+  const limits = [null, 1, 2, 32];
+  const depths = [0, 1, 2, 31, MAX_DEPTH_HOPS, undefined];
+  const cases = depths.flatMap((depth) => limits.flatMap((max) => modes.map((mode) => ({ depth, max, mode }))));
+
+  it.each(cases)("depth=$depth limit=$max mode=$mode", async ({ depth, max, mode }) => {
+    const guard = setup(depth, max, mode);
+    const result = await guard.checkDispatch("caller");
+    const active = mode !== "off" && max !== null;
+    const exceeded = active && depth !== undefined && depth + 1 > max;
+    const expected = !active
+      ? { block: false, mode }
+      : !exceeded
+        ? { block: false, mode, guard: null }
+        : mode === "enforced"
+          ? { block: true, mode, guard: DELEGATION_DEPTH_GUARD, message: depthLimitMessage(depth, max) }
+          : { block: false, mode, guard: DELEGATION_DEPTH_GUARD, banner: depthAdvisoryBanner(depth, max) };
+    expect(result).toStrictEqual(expected);
+    expect(result.message).toBe(exceeded && mode === "enforced" ? depthLimitMessage(depth, max) : undefined);
+    expect(result.banner).toBe(exceeded && mode === "advisory" ? depthAdvisoryBanner(depth, max) : undefined);
+    expect(guard.depthOf).toHaveBeenCalledTimes(active ? 1 : 0);
+    if (active) expect(guard.depthOf).toHaveBeenCalledWith("caller");
+    expect(guard.limit).toHaveBeenCalledTimes(mode === "off" ? 0 : 1);
+    expect(guard.resolveMode).toHaveBeenCalledExactlyOnceWith("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(active && depth === undefined ? 1 : 0);
+  });
+
+  it("pins the tracker saturation depth to the largest supported limit (A13)", () => {
+    expect(MAX_DEPTH_HOPS).toBe(MAX_DELEGATION_DEPTH_LIMIT);
+    expect(DELEGATION_DEPTH_GUARD).toBe("delegation_depth");
+  });
+
+  it("preserves the exact D5 refusal and A1 advisory text", () => {
+    expect(depthLimitMessage(1, 1)).toMatchInlineSnapshot(`"[router] DELEGATION DEPTH LIMIT — this session is at delegation depth 1; enforcement.maxDelegationDepth is 1, so it cannot dispatch another subagent. Do this part of the work yourself and report the result; do not retry the dispatch."`);
+    expect(depthAdvisoryBanner(1, 1)).toMatchInlineSnapshot(`"[⚠ GUARD:delegation_depth] this session is at delegation depth 1; enforcement.maxDelegationDepth is 1. In enforced mode this dispatch would have been refused. Do not dispatch further subagents from this session; do that work yourself."`);
+  });
+
+  it("honours a changed limit on the next call", async () => {
+    const guard = setup(1);
+    expect((await guard.checkDispatch("caller")).block).toBe(true);
+    guard.limit.mockReturnValue(2);
+    expect(await guard.checkDispatch("caller")).toStrictEqual({ block: false, mode: "enforced", guard: null });
+    guard.limit.mockReturnValue(null);
+    expect(await guard.checkDispatch("caller")).toStrictEqual({ block: false, mode: "enforced" });
+    expect(guard.depthOf).toHaveBeenCalledTimes(2);
+    expect(guard.limit).toHaveBeenCalledTimes(3);
+  });
+
+  it("resolves mode per caller and per call", async () => {
+    const guard = setup(1);
+    guard.resolveMode.mockImplementation((caller) => caller === "enforced" ? "enforced" : "advisory");
+    expect((await guard.checkDispatch("enforced")).block).toBe(true);
+    expect((await guard.checkDispatch("advisory")).banner).toBe(depthAdvisoryBanner(1, 1));
+    guard.resolveMode.mockReturnValue("off");
+    expect(await guard.checkDispatch("enforced")).toStrictEqual({ block: false, mode: "off" });
+    expect(guard.resolveMode.mock.calls).toEqual([["enforced"], ["advisory"], ["enforced"]]);
+    expect(guard.depthOf).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["reject", "throw", "undefined"])("allows tracker %s and warns once per caller", async (failure) => {
+    const guard = setup(undefined);
+    if (failure === "reject") guard.depthOf.mockRejectedValue(new Error("offline"));
+    if (failure === "throw") guard.depthOf.mockImplementation(() => { throw new Error("broken"); });
+    for (const caller of ["first", "first", "second", "second"]) {
+      await expect(guard.checkDispatch(caller)).resolves.toStrictEqual({ block: false, mode: "enforced", guard: null });
+    }
+    expect(guard.warn).toHaveBeenCalledTimes(2);
+    expect(guard.warn.mock.calls[0][0]).toContain("first");
+    expect(guard.warn.mock.calls[1][0]).toContain("second");
+  });
+
+  it("shares warning deduplication across all unknown-depth outcomes and concurrent calls", async () => {
+    const guard = setup(undefined);
+    guard.depthOf.mockRejectedValueOnce(new Error("offline"));
+    await Promise.all([guard.checkDispatch("caller"), guard.checkDispatch("caller")]);
+    guard.depthOf.mockImplementationOnce(() => { throw new Error("broken"); });
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps unknown-caller warnings at 1,000 entries, evicting the oldest", async () => {
+    const guard = setup(undefined);
+    for (let i = 0; i < 1_001; i++) await guard.checkDispatch(`caller-${i}`);
+    expect(guard.warn).toHaveBeenCalledTimes(1_001);
+    await guard.checkDispatch("caller-1");
+    expect(guard.warn).toHaveBeenCalledTimes(1_001);
+    await guard.checkDispatch("caller-0");
+    expect(guard.warn).toHaveBeenCalledTimes(1_002);
+  });
+
+  it.each([NaN, -1, 1.5, "2", Infinity, null, {}])("fails closed for invalid depth %j", async (depth) => {
+    const guard = setup(depth as unknown as number, 32);
+    expect(await guard.checkDispatch("caller")).toStrictEqual({
+      block: true, mode: "enforced", guard: DELEGATION_DEPTH_GUARD, message: depthLimitMessage(MAX_DEPTH_HOPS, 32),
+    });
+    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("invalid depth"));
+  });
+
+  it("retains advisory semantics for a malformed tracker depth", async () => {
+    const guard = setup(NaN, 32, "advisory");
+    expect(await guard.checkDispatch("caller")).toStrictEqual({
+      block: false, mode: "advisory", guard: DELEGATION_DEPTH_GUARD, banner: depthAdvisoryBanner(MAX_DEPTH_HOPS, 32),
+    });
+  });
+
+  it.each([NaN, -1, 0, 1.5, 33, Infinity, "2", undefined])("uses limit 1 and warns once for invalid limit %j", async (max) => {
+    const guard = setup(1, max as unknown as number);
+    // Set explicitly: undefined must not select the fixture's default argument.
+    guard.limit.mockReturnValue(max as unknown as number);
+    for (let i = 0; i < 2; i++) {
+      expect(await guard.checkDispatch("caller")).toStrictEqual({
+        block: true, mode: "enforced", guard: DELEGATION_DEPTH_GUARD, message: depthLimitMessage(1, 1),
+      });
+    }
+    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("invalid delegation depth limit"));
+    guard.depthOf.mockResolvedValue(0);
+    expect((await guard.checkDispatch("root")).block).toBe(false);
+  });
+
+  it("allows missing, empty, and non-string callers with one warning total", async () => {
+    const guard = setup(32);
+    for (const caller of [undefined, "", null, 2, {}, undefined]) {
+      await expect(guard.checkDispatch(caller as unknown as string | undefined)).resolves.toStrictEqual({
+        block: false, mode: "enforced", guard: null,
+      });
+    }
+    expect(guard.warn).toHaveBeenCalledTimes(1);
+    expect(guard.depthOf).not.toHaveBeenCalled();
+    expect(guard.resolveMode).toHaveBeenNthCalledWith(1, undefined);
+  });
+
+  it.each(["off", "null"])("short-circuits %s before validating the caller", async (disabled) => {
+    const guard = setup(32, disabled === "null" ? null : 1, disabled === "off" ? "off" : "enforced");
+    expect((await guard.checkDispatch(undefined)).block).toBe(false);
+    expect(guard.depthOf).not.toHaveBeenCalled();
+    expect(guard.warn).not.toHaveBeenCalled();
+  });
+
+  it("contains throwing mode and limit seams with logged defaults", async () => {
+    const guard = setup(1);
+    guard.resolveMode.mockImplementation(() => { throw new Error("mode unavailable"); });
+    guard.limit.mockImplementation(() => { throw new Error("limit unavailable"); });
+    await expect(guard.checkDispatch("caller")).resolves.toStrictEqual({
+      block: false, mode: "advisory", guard: DELEGATION_DEPTH_GUARD, banner: depthAdvisoryBanner(1, 1),
+    });
+    expect(guard.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("a throwing logger never rejects or weakens a known-depth decision", async () => {
+    const guard = setup(NaN);
+    guard.warn.mockImplementation(() => { throw new Error("logger unavailable"); });
+    await expect(guard.checkDispatch("caller")).resolves.toMatchObject({ block: true, mode: "enforced" });
+    guard.depthOf.mockRejectedValue(new Error("tracker unavailable"));
+    await expect(guard.checkDispatch("unknown")).resolves.toStrictEqual({ block: false, mode: "enforced", guard: null });
+  });
+});
