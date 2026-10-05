@@ -6,8 +6,8 @@ import {
   depthLimitMessage,
 } from "../../src/router/depth-guard";
 import { MAX_DELEGATION_DEPTH_LIMIT } from "../../src/router/config";
-import { MAX_DEPTH_HOPS } from "../../src/router/depth";
-import type { DepthTracker } from "../../src/router/depth";
+import { createDepthTracker, MAX_DEPTH_HOPS } from "../../src/router/depth";
+import type { DepthTracker, DepthTrackerSeams } from "../../src/router/depth";
 import type { EnforcementMode } from "../../src/router/enforcement";
 import { resolveEnforcementMode } from "../../src/router/enforcement";
 import type { RouterConfig } from "../../src/router/config";
@@ -46,7 +46,7 @@ describe("delegation depth guard", () => {
     if (active) expect(guard.depthOf).toHaveBeenCalledWith("caller");
     expect(guard.limit).toHaveBeenCalledTimes(mode === "off" ? 0 : 1);
     expect(guard.resolveMode).toHaveBeenCalledExactlyOnceWith("caller");
-    expect(guard.warn).toHaveBeenCalledTimes(active && depth === undefined ? 1 : 0);
+    expect(guard.warn).not.toHaveBeenCalled();
   });
 
   it("pins the tracker saturation depth to the largest supported limit (A13)", () => {
@@ -125,7 +125,7 @@ describe("delegation depth guard", () => {
     expect(guard.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("unprintable value"));
   });
 
-  it.each(["reject", "throw", "undefined"])("allows tracker %s and warns once per caller", async (failure) => {
+  it.each(["reject", "throw"])("allows tracker %s and warns once per caller", async (failure) => {
     const guard = setup(undefined);
     if (failure === "reject") guard.depthOf.mockRejectedValue(new Error("offline"));
     if (failure === "throw") guard.depthOf.mockImplementation(() => { throw new Error("broken"); });
@@ -137,7 +137,7 @@ describe("delegation depth guard", () => {
     expect(guard.warn.mock.calls[1][0]).toContain("second");
   });
 
-  it("shares warning deduplication across all unknown-depth outcomes and concurrent calls", async () => {
+  it("shares contract-violation warning deduplication across concurrent calls", async () => {
     const guard = setup(undefined);
     guard.depthOf.mockRejectedValueOnce(new Error("offline"));
     await Promise.all([guard.checkDispatch("caller"), guard.checkDispatch("caller")]);
@@ -148,12 +148,34 @@ describe("delegation depth guard", () => {
 
   it("caps unknown-caller warnings at 1,000 entries, evicting the oldest", async () => {
     const guard = setup(undefined);
+    guard.depthOf.mockRejectedValue(new Error("offline"));
     for (let i = 0; i < 1_001; i++) await guard.checkDispatch(`caller-${i}`);
     expect(guard.warn).toHaveBeenCalledTimes(1_001);
     await guard.checkDispatch("caller-1");
     expect(guard.warn).toHaveBeenCalledTimes(1_001);
     await guard.checkDispatch("caller-0");
     expect(guard.warn).toHaveBeenCalledTimes(1_002);
+  });
+
+  it("leaves undefined-depth warnings to the tracker", async () => {
+    const guard = setup(undefined);
+    await guard.checkDispatch("caller");
+    await guard.checkDispatch("caller");
+    expect(guard.warn).not.toHaveBeenCalled();
+  });
+
+  it("logs exactly once per unknown caller with the real tracker and shared logger", async () => {
+    const warn = vi.fn<(message: string) => void>();
+    const logger = { warn };
+    const getParent = vi.fn<DepthTrackerSeams["getParent"]>().mockRejectedValue(new Error("offline"));
+    const tracker = createDepthTracker({ getParent, now: Date.now, logger });
+    const guard = createDepthGuard({ tracker, limit: () => 1, mode: () => "enforced", logger });
+    for (const caller of ["first", "first", "second", "second"]) {
+      expect(await guard.checkDispatch(caller)).toStrictEqual({ block: false, mode: "enforced", guard: null });
+    }
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenNthCalledWith(1, expect.stringContaining("cannot resolve session first: offline"));
+    expect(warn).toHaveBeenNthCalledWith(2, expect.stringContaining("cannot resolve session second: offline"));
   });
 
   it.each([NaN, -1, 1.5, "2", Infinity, null, {}])("fails closed for invalid depth %j", async (depth) => {
