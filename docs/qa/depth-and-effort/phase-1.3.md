@@ -287,6 +287,68 @@ No critical or major finding. No reachable bump lowers effort, goes past its bou
 | QA-1.3-8 | nit | `docs/qa/depth-and-effort/phase-1.3.md:181`; `src/escalate/ladder.ts:60–64` | **The memo §5 rationale "the initial tier may be off the ladder" is wrong.** `resolveStartTier` maps an off-ladder producer to `ladder[0]`, or to the floor, unless the ladder is empty. Including off-ladder tiers is harmless, but the stated reason is incorrect. | fixed — rationale identifies empty-ladder fallback (`e72dce7`) |
 | QA-1.3-9 | nit | `README.md:282, 483, 491`; `docs/CONFIG_REFERENCE.md:668, 688, 694, 714, 749, 759–760` | **These docs still say the router registers `reasoning_effort`/`budget_tokens`.** That stopped being true at `788034d`. Plan §2 (`:727`) flags only `PER_TURN_EFFORT.md` and `OPENCODE_V2.md` for A4 key names. README and CONFIG_REFERENCE are in 3.1's write-set but are not tagged A4. Handed to 3.1. | deferred by plan — Phase 3.1, Wave 3 (`d72aff4`) |
 
+### Round 2 (@heavy, `de/p13` at `77fb039`; plan at `origin/de/main` `777a2d7`)
+
+Scope: `git diff 38efeb6..HEAD` (nine fix commits and the memo), plus plan §1.7 A14.
+
+**Run evidence**
+
+- **Scoped tests:** `npx vitest run test/unit/ladder.test.ts test/unit/effort-ceiling.test.ts test/unit/effort.test.ts test/integration/fable-effort-preset.test.ts test/unit/v2-hooks.test.ts --maxWorkers=50%` gave 5 files and 4,042 tests, all passing.
+- **Coverage:** the same run, restricted to `src/escalate/ladder.ts` and `src/router/agent-options.ts` with 95% thresholds. Statements, branches, functions and lines are all 100% (137/137, 161/161, 22/22 and 123/123).
+- **`npm run typecheck`:** clean. The full suite and smoke tests were not run.
+- **Original fixture:** `git diff --stat 2927540 HEAD -- test/unit/__fixtures__/ladder-v2.0.0-golden.json` is empty. SHA-256 `F4FECEEC…E029A2`.
+- **Throwaway differentials.** They ran in `test/scratch/`, with reference modules from `git show`; the temp modules went under `%TEMP%\Claude`. All were deleted.
+  - **Clamp (`200df90`).** I compared the `38efeb6` `nextAction`/`advance` against HEAD over 2,032,128 cases:
+    - `effortBump` absent, `null` or `{perTier:{}}`, or `fast` set to each of the 25 base × bound pairs (with `medium` low→high);
+    - × multiple null/4 × A 0–2 × tier fast/medium/heavy/`constructor` × attemptsThisTier 0–2 × totalAttempts 0/1/4/5 × first cost null/1 × cumulative 0/4/5;
+    - × `currentEffort` absent/null/5 levels × 6 verdicts.
+
+    Results:
+    - 47,520 cases differ. Every one has a non-null `currentEffort` outside `[base, bound]`.
+    - None differ with the bump off.
+    - With a valid bump, every HEAD `effort` is in `[base, bound]`.
+    - 21,504 full fail loops from `newLadderState` used the same policies × T 1/4/8 × multiple null/2/4/8 × floor none/medium × producer fast/medium/heavy/off-ladder × ratios 1/3/6 and 1/1/1. HEAD matches `38efeb6` for every valid bump (action, state and scorecard JSON), and with the bump off HEAD matches `v2.0.0`.
+    - The D8 S1 trace (I9) is unchanged: `retry fast@medium → escalate medium → retry medium@high → give_up "max total attempts (4) reached"`, scorecard `final_tier=medium@high`.
+  - **Cost golden (`d348d25`).**
+    - **Generator.** The write path takes only the five ladder functions from `git show v2.0.0:src/escalate/ladder.ts`; its single import is type-only and stripped. Policies and states are test-local literals with no `src` dependency. The replay passes HEAD's functions with `effortBump` absent and compares byte for byte.
+    - **Independent regeneration from the `v2.0.0` tag.** I used two transpile paths: a Vite/esbuild import of the extracted source, and `node:module` `stripTypeScriptTypes` into a temp dir. Both outputs are byte-identical to the committed file (SHA-256 `A5E4F074…C4013F`), and so is HEAD's output.
+    - **Matrix.** 576 entries: first cost null/1/2/5 × multiple null/4 × cumulative cost 0 / ceiling−1 / ceiling / ceiling+1. With multiple 4 and a non-null first cost, the "at ceiling" entries retry or escalate, and the "above" entries give up (6 per first cost). Null first cost and null multiple never give up on cost.
+    - **Sequences.** Six, and all end with "cost ceiling exceeded". Producer fast runs `fast(1) → fast(2) → medium(5)`. Producer medium runs `medium(3) → medium(6) → heavy(12, exactly at the ceiling, retries) → heavy(18)`. Both repeat at scales 1, 2 and 5.
+    - **No bump keys.** No `effortBump`, `currentEffort` or `effort` key appears anywhere.
+    - **Mutations of the v2.0.0 source:**
+      - `>` → `>=` changes 18 matrix entries and 3 sequences.
+      - Dropping the null-first-cost guard changes 18 matrix entries.
+      - Dropping the null-multiple guard changes 54 matrix entries.
+      - Overwriting the first cost on every attempt changes all 6 sequences.
+      - Swapping checks 3 and 4 is invisible to this fixture, because `totalAttempts` < `maxTotalAttempts` everywhere. The original golden has 60 matrix entries where both checks fire, so the check order stays pinned.
+  - **Key order (`3e79738`).**
+    - **Comparison.** I ran three builders over 29,106 tier shapes: `a68316b`, HEAD, and the `v2.0.0` builder followed by the v2.0.0 bridge translation (`v2-hooks.ts:128–134`, unchanged since `v2.0.0`).
+    - **Shapes.** 22 ids (the I4 ids, the QA-1.3-5 ids, Vertex, Bedrock, Gemini, `gpt-oss`, `magistral-o1` and `""`) × effort absent/`ultra`/`High`/null/5 levels × thinking none/0/4096/−1/NaN/`"4096"`/`{}` × reasoning none/`{effort:"low"}`/`{summary:"auto"}`/`{effort:"high",summary:"detailed"}`/`{effort:""}`/`{summary:""}`/`{}` × variant none/`"high"`/`""`.
+    - **Values and warnings.** `isDeepStrictEqual` values and the warning sequence (key and text, in order) are identical between `a68316b` and HEAD for every shape. Precedence is therefore unchanged.
+    - **Key order.** It changed in 5,319 shapes, all of them among the five multi-key shapes (for example `thinking,reasoningEffort,reasoningSummary` → `reasoningEffort,reasoningSummary,thinking`).
+    - **Against v2.0.0.** HEAD equals the v2.0.0 builder plus bridge in both values and key order for all 29,106 shapes, and the bridge leaves HEAD's bags unchanged.
+
+**Round-1 findings**
+
+| ID | Round-2 status | Evidence |
+|---|---|---|
+| QA-1.3-1 | resolved (deferred by plan) | Plan 2.3.5.b (`:1301`) passes `action.effort` into `runProducerAttempt` and sets the override before the prompt. 2.3.6 (`:1310, 1331–1341`) asserts the bumped attempt's `chat.params` options and the `tier@effort` scorecard. Phase 1.3 code is unchanged, as §0.7 requires. |
+| QA-1.3-2 | resolved | `ladder.ts:164–171`. The clamp differential above shows no change for reachable states or with the bump off. The hand-built `low`/`max` states step to `xhigh` (`ladder.test.ts:1157–1167`). |
+| QA-1.3-3 | resolved (test); A14 wording, see QA-1.3-R2-2 | `ladder.test.ts:847–878` pins the shipped default trace with the bump on and off: 3 attempts, cost 5, then "cost ceiling exceeded". A14 records the dependency on the cost ceiling. |
+| QA-1.3-4 | resolved | I regenerated the cost golden independently and it is byte-identical. Coverage and mutation sensitivity are above. The original golden is byte-unchanged. |
+| QA-1.3-5 | resolved | `effort-ceiling.test.ts:69–75`. Two ids are equivalents, not the literal round-1 ids: `github-copilot/claude-sonnet-5` for `…-4.5`, and `Anthropic/Claude-Sonnet-4-5` for `Anthropic/Claude-Opus-5-5`. Every requested id form (OpenRouter-Anthropic, Copilot GPT and Claude, Azure GPT, upper case, dotted) is covered. |
+| QA-1.3-6 | resolved | Key-order differential above. `effort.test.ts:78–102` pins `Object.keys`. |
+| QA-1.3-7 | resolved | The memo cites `2927540` (`:5–6`, `:176`). |
+| QA-1.3-8 | resolved | Memo §5 (`:203`) now matches `resolveStartTier` (`ladder.ts:56–65`). |
+| QA-1.3-9 | owner correct; handoff not picked up, see QA-1.3-R2-1 | README and CONFIG_REFERENCE are in 3.1's Wave 3 write-set (§2), so under §0.6.7 this is a handoff. But no 3.1 task names the drift, and 3.1's pre-flight does not read this file. |
+
+**Round-2 findings.** No new defect in the fix commits. Both findings are plan edits owned by the orchestrator.
+
+| ID | Severity | File:line | Description | Resolution |
+|---|---|---|---|---|
+| QA-1.3-R2-1 | minor | `docs/plans/delegation-depth-and-effort-bump-plan.md:1249, 1380–1381` (`de/main` `777a2d7`) | **No plan step picks up the handoffs recorded in this file.** Plan 1.3.2 (`:1046`) requires this phase to record handoffs to 2.3 and 3.1, and §0.6.7 says "the owner applies it". But neither consuming phase reads this report. QA-1.3-9 is resolved as "deferred by plan — Phase 3.1", yet 3.1's pre-flight collects only `phase-2.3.md` and the 0.P.2.g table, and 3.1.2/3.1.3 do not name the native-key lines (`README.md:282,483,491`, `CONFIG_REFERENCE.md:668–760`). 2.3's pre-flight applies only the "handoff to 2.3" items in `phase-2.1.md` and `phase-2.2.md`. That leaves this file's "To 2.3" notes (one config snapshot, host option precedence) unread. The only remaining route for the docs drift is 3.1's generic DoD claim check. Fix (orchestrator, plan amendment): have 2.3's pre-flight apply every "To 2.3" handoff in `phase-1.*.md`. Have 3.1's apply every "To 3.1" handoff in `phase-1.*.md` and `phase-2.*.md`, or name the QA-1.3-9 lines in 3.1.2/3.1.3. | open |
+| QA-1.3-R2-2 | nit | `docs/plans/delegation-depth-and-effort-bump-plan.md:681–687` (A14) | **A14 says v2.0.0 also bumps.** The text reads "both `v2.0.0` and this change stop after three attempts (`fast@low → fast@medium → medium@high` …)". v2.0.0 actually runs `fast@low → fast@low → medium@high` (pinned at `ladder.test.ts:873`). 3.1 copies A14 into the ADR and CONFIG_REFERENCE, so A14 should give both traces. | open |
+
 ## Deferred by plan
 
 - **QA-1.3-1 — deferred by plan — 2.3.5.b.** Phase 2.3 passes `action.effort` into `runProducerAttempt`, making the scorecard reflect the effort actually applied. No early Phase 1.3 code change.
@@ -330,13 +392,16 @@ No critical or major finding. No reachable bump lowers effort, goes past its bou
 
 ## Verdict
 
-**Round-1 resolutions implemented; ready for round-2 QA.** No open findings in this phase: QA-1.3-2 through QA-1.3-8 are fixed; QA-1.3-1 and QA-1.3-9 are explicitly deferred by plan. The plan §1.7 A14 wording for QA-1.3-3 remains the orchestrator's responsibility (not edited in this dispatch). The phase's acceptance criteria hold on the evidence above:
+**Round 2: the phase code is accepted, but two findings are open: QA-1.3-R2-1 (minor) and QA-1.3-R2-2 (nit).** Both are plan edits for the orchestrator on `de/main`. Neither needs a change on `de/p13`.
 
-- bump off is identical to v2.0.0;
-- bump on follows D8;
-- the ceiling never yields a value that `buildAgentOptions` alters or warns about.
+All nine round-1 findings are resolved; QA-1.3-1 and QA-1.3-9 are deferred, and R2-1 covers how QA-1.3-9's handoff reaches 3.1. The fix commits introduce no defect. The phase's acceptance criteria hold on the round-2 evidence:
 
-DoD requires zero open findings in this file.
+- Bump off is byte-identical to v2.0.0, now including the cost-ceiling paths.
+- Bump on follows D8 on every reachable state. The clamp changes only hand-built states that are out of range.
+- The builder's values, warnings and key order match v2.0.0's builder plus bridge.
+- The ceiling never yields a value that `buildAgentOptions` alters or warns about.
+
+Under §0.7, every round-2 finding must be fixed before DoD, which requires zero open findings in this file. A round 3 would re-review only blocking, critical and major fixes, and none is open.
 
 ### Round-1 resolution verification
 
