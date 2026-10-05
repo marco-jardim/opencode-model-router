@@ -821,6 +821,13 @@ Attacks that held in round 2 (no finding):
 - **To 3.1:** F1, F2 and N11, plus the deferred items above.
 - **To 3.2:** reuse the step-8 copy as the base of `scripted-provider.ts`.
 - **To 3.1 (from QA 2.3):**
+  - **CHANGELOG `Fixed` (QA-2.3-R2-3):** On OpenCode 2, router-annotated/verified `subagent`
+    results keep the host's `<subagent sessionID=…>` envelope part in `content` and append the router's
+    addition as a separate text part. Previously the whole text content was replaced by plain text,
+    losing the resume handle. Structured output and metadata are unchanged. This applies when host
+    text content exists and the router output starts with the child text after trimming trailing
+    whitespace; missing host text or a non-suffix rewrite uses the full router output as one text
+    part instead, retaining non-text attachments without losing or duplicating the child's text.
   - **Withdraw F1** (QA-2.3-3). Native-path graders keep the v2.0.0 backend parent (none on v1). Only the
     depth record uses the caller. There is no session-tree or title change to announce.
   - **The OpenCode 2 host has its own nesting cap**, `experimental.subagent_depth` (default 1), independent of
