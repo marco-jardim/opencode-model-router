@@ -146,7 +146,7 @@ export async function registerV2Hooks(
       config = next;
       originals = nextOriginals;
       agentOptions = nextOptions;
-      return loadConfig();
+      return loadConfig(ctx.location.directory);
     };
     lastConfig = await buildConfig();
     let refreshChain: Promise<void> = Promise.resolve();
@@ -246,7 +246,7 @@ export async function registerV2Hooks(
       const output = { message: { agent: session.agent }, parts: [{ type: "text", text: event.prompt.text }] };
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
-      if (loadConfig() !== lastConfig) await refresh();
+      if (loadConfig(ctx.location.directory) !== lastConfig) await refresh();
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };
@@ -255,7 +255,7 @@ export async function registerV2Hooks(
         if (!(key in event.options)) event.options[key] = value;
       }
       await legacy["chat.params"]?.(input, event.options);
-      const verify = loadConfig().enforcement?.verify;
+      const verify = loadConfig(ctx.location.directory).enforcement?.verify;
       if (event.agent === V2_GRADER_AGENT
         && (verify?.graderTemperature === null
           || !(verify?.graderTemperatureModels ?? []).includes(`${event.model.providerID}/${event.model.id}`))) {
@@ -296,7 +296,7 @@ export async function registerV2Hooks(
             const source = message.id ? attributed.get(message.id) : undefined;
             if (!source || source.type !== "synthetic") continue;
             const filtered = { system: [source.text] };
-            stripDelegateInstructions(filtered, loadConfig(), session.location?.directory ?? ctx.location.directory);
+            stripDelegateInstructions(filtered, loadConfig(ctx.location.directory), session.location?.directory ?? ctx.location.directory);
             const retained = filtered.system.join("");
             if (retained === source.text) continue;
             const index = event.messages.indexOf(message);
@@ -314,7 +314,7 @@ export async function registerV2Hooks(
       const original = args && typeof args === "object" ? { ...args } : args;
       const output = { args };
       if (event.tool === "subagent" && args && typeof args.agent === "string" && args.model === undefined) {
-        const cfg = loadConfig();
+        const cfg = loadConfig(ctx.location.directory);
         if (cfg.subagentTiers?.[args.agent]) {
           const actual = await ctx.agent.list();
           const overrides = actual.data.some((agent) => agent.id === args.agent) ? resolveSubagentOverrides({

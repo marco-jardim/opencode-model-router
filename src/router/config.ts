@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
@@ -265,31 +265,82 @@ export interface RouterState {
 // Config loader with caching
 // ---------------------------------------------------------------------------
 
-let _cachedConfig: RouterConfig | null = null;
-let _configDirty = true;
-let _cachedFingerprint = "";
-/** Source locations (paths only, no mtimes) that produced `_cachedConfig`. */
-let _cachedSourceKey = "";
-/** Sources that were already failing when `_cachedConfig` was built (tolerated). */
-let _cachedTolerated = new Set<string>();
-/** Last hot-reload failure (null when the most recent rebuild succeeded). */
-let _configReloadError: string | null = null;
-/** Fingerprint a reload-failure warning was last emitted for (warn once each). */
-let _warnedFingerprint: string | null = null;
-
 /**
- * Why the last config rebuild failed, or null when it succeeded. When a source
- * (tiers.json, an overrides file, or the state file) becomes invalid after a
- * successful load, loadConfig() keeps serving the last valid config and
- * records the reason here instead of throwing or silently dropping layers.
+ * Cache state for one project directory. Hosts such as OpenCode v2 run one
+ * plugin instance per project directory inside a single process, so the cache
+ * cannot be a single module-level slot: each directory has its own project
+ * override file and therefore its own config, fingerprint and last-good state.
  */
-export function getConfigReloadError(): string | null {
-  return _configReloadError;
+interface ConfigCacheEntry {
+  config: RouterConfig | null;
+  dirty: boolean;
+  fingerprint: string;
+  /** Source locations (paths only, no mtimes) that produced `config`. */
+  sourceKey: string;
+  /** Sources that were already failing when `config` was built (tolerated). */
+  tolerated: Set<string>;
+  /** Last hot-reload failure (null when the most recent rebuild succeeded). */
+  reloadError: string | null;
+  /** Fingerprint a reload-failure warning was last emitted for (warn once each). */
+  warnedFingerprint: string | null;
 }
 
-/** Mark config cache as stale so it is re-read on next access. */
+/** Keyed by {@link normalizeProjectDir}. */
+const _configCaches = new Map<string, ConfigCacheEntry>();
+
+function getCacheEntry(key: string): ConfigCacheEntry {
+  let entry = _configCaches.get(key);
+  if (!entry) {
+    entry = {
+      config: null,
+      dirty: true,
+      fingerprint: "",
+      sourceKey: "",
+      tolerated: new Set<string>(),
+      reloadError: null,
+      warnedFingerprint: null,
+    };
+    _configCaches.set(key, entry);
+  }
+  return entry;
+}
+
+/**
+ * `realpathSync` that fails soft: an unresolvable path is used as-is, which is
+ * no worse than not resolving at all.
+ */
+function realpathOrSelf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Canonical form of a project directory: absolute and symlink-resolved, so the
+ * same directory reached through different spellings shares one cache entry
+ * and compares equal to the (resolved) home directory. A missing or empty `dir`
+ * means "the process working directory at call time".
+ */
+function normalizeProjectDir(dir?: string): string {
+  return realpathOrSelf(dir ? resolvePath(dir) : process.cwd());
+}
+
+/**
+ * Why the last config rebuild failed for `dir` (default: the working
+ * directory), or null when it succeeded. When a source (tiers.json, an
+ * overrides file, or the state file) becomes invalid after a successful load,
+ * loadConfig() keeps serving the last valid config and records the reason here
+ * instead of throwing or silently dropping layers.
+ */
+export function getConfigReloadError(dir?: string): string | null {
+  return _configCaches.get(normalizeProjectDir(dir))?.reloadError ?? null;
+}
+
+/** Mark every directory's config cache as stale so it is re-read on next access. */
 export function invalidateConfigCache(): void {
-  _configDirty = true;
+  for (const entry of _configCaches.values()) entry.dirty = true;
 }
 
 function getPluginRoot(): string {
@@ -313,17 +364,17 @@ export function overridePath(): string {
 
 /**
  * Default location of the project-local overrides file
- * (`.opencode/opencode-model-router.overrides.jsonc` in the current working
- * directory). This is the path to *create* the file at; the actual lookup walks
- * upward — see {@link findProjectOverride}. Used for display when no project
- * file is found.
+ * (`.opencode/opencode-model-router.overrides.jsonc` in the project directory,
+ * or in the current working directory when `dir` is omitted). This is the path
+ * to *create* the file at; the actual lookup walks upward — see
+ * {@link findProjectOverride}. Used for display when no project file is found.
  *
  * The project file is deep-merged *after* (and therefore wins over) the global
  * overrides file, so a team can commit a shared file that unifies routing for
  * the project on top of each member's personal global file.
  */
-export function localOverridePath(): string {
-  return join(process.cwd(), ".opencode", OVERRIDE_FILENAME);
+export function localOverridePath(dir?: string): string {
+  return join(dir ? resolvePath(dir) : process.cwd(), ".opencode", OVERRIDE_FILENAME);
 }
 
 /**
@@ -385,9 +436,12 @@ function statKind(p: string): StatKind {
 }
 
 /**
- * Locate the project-local overrides file by walking upward from the current
- * working directory, so the project config is found even when opencode is
- * launched from a subdirectory.
+ * Locate the project-local overrides file by walking upward from `dir` (the
+ * host-provided project directory), so the project config is found even when
+ * opencode is launched from a subdirectory. When `dir` is omitted the walk
+ * starts at the process working directory; hosts that change the working
+ * directory away from the project (OpenCode v2 server mode chdirs to $HOME)
+ * must pass the project directory explicitly.
  *
  * The walk stops at the first of these, whichever comes first:
  *   - an ancestor containing a repo marker (`.git`, `.hg`, `.svn`), after
@@ -410,23 +464,21 @@ function statKind(p: string): StatKind {
  * repo marker that cannot be inspected is likewise treated as present, so the
  * walk never climbs past a project root it merely failed to stat.
  */
-export function findProjectOverride(): string | undefined {
+export function findProjectOverride(dir?: string): string | undefined {
+  return walkForProjectOverride(normalizeProjectDir(dir));
+}
+
+/** `startDir` must already be normalized (see {@link normalizeProjectDir}). */
+function walkForProjectOverride(startDir: string): string | undefined {
   // Both sides of the $HOME comparison below have to be resolved the same way.
   // process.cwd() returns a realpath, while homedir() returns $HOME verbatim, so
   // on any system where $HOME contains a symlinked component (macOS temp dirs,
   // containers, some NFS homes) a raw string compare never matches and the home
-  // boundary silently stops applying. Fail soft: an unresolvable path is used
-  // as-is, which is no worse than not comparing at all.
-  const resolve = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return p;
-    }
-  };
-
-  let dir = resolve(process.cwd());
-  const home = resolve(homedir());
+  // boundary silently stops applying. A host-provided project directory gets
+  // the same treatment (normalizeProjectDir). Fail soft: an unresolvable path
+  // is used as-is, which is no worse than not comparing at all.
+  let dir = startDir;
+  const home = realpathOrSelf(homedir());
   let depth = 0;
 
   for (;;) {
@@ -1310,10 +1362,11 @@ export interface OverrideLayer {
   data: Record<string, unknown>;
 }
 
-function collectOverrideLayers(failures?: SourceFailure[]): OverrideLayer[] {
+function collectOverrideLayers(dir: string, failures?: SourceFailure[]): OverrideLayer[] {
   const layers: OverrideLayer[] = [];
-  // Lowest priority first: global, then project-local (found by upward search).
-  const paths = [overridePath(), findProjectOverride()];
+  // Lowest priority first: global, then project-local (found by upward search
+  // from the project directory).
+  const paths = [overridePath(), walkForProjectOverride(dir)];
   for (const p of paths) {
     if (!p) continue;
     const data = readOverridesAt(p, failures);
@@ -1350,18 +1403,12 @@ function applyTierDefaults(cfg: RouterConfig): void {
   }
 }
 
-/** realpath for identity comparison; an unresolvable path is used as-is. */
-function realPathOrSame(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
-}
-
-/** Every file location that feeds loadConfig() (undefined = none applicable). */
-function sourcePaths(): Array<string | undefined> {
-  return [configPath(), overridePath(), findProjectOverride(), statePath()];
+/**
+ * Every file location that feeds loadConfig() for the (normalized) project
+ * directory `dir` (undefined = none applicable).
+ */
+function sourcePaths(dir: string): Array<string | undefined> {
+  return [configPath(), overridePath(), walkForProjectOverride(dir), statePath()];
 }
 
 /**
@@ -1386,29 +1433,39 @@ function sourceFingerprint(paths: Array<string | undefined>): string {
     .join("|");
 }
 
-export function loadConfig(): RouterConfig {
-  const paths = sourcePaths();
+/**
+ * Load the effective config for the project directory `dir` (the host-provided
+ * project dir; defaults to the process working directory). Each directory has
+ * its own cache entry, so several project instances sharing one process never
+ * see or overwrite each other's config.
+ */
+export function loadConfig(dir?: string): RouterConfig {
+  const projectDir = normalizeProjectDir(dir);
+  const entry = getCacheEntry(projectDir);
+  const paths = sourcePaths(projectDir);
   const fingerprint = sourceFingerprint(paths);
-  if (_cachedConfig && !_configDirty && fingerprint === _cachedFingerprint) {
-    return _cachedConfig;
+  if (entry.config && !entry.dirty && fingerprint === entry.fingerprint) {
+    return entry.config;
   }
 
   // A previous config is only a valid fallback when it was built for the same
-  // project identity (a different HOME/project is a fresh first load). The key
-  // is deliberately NOT the resolved override file paths: a project override
-  // created after startup must not turn a broken file into a "first load".
-  const sourceKey = [realPathOrSame(homedir()), realPathOrSame(process.cwd()), statePath()].join("|");
+  // project identity: HOME + the normalized project dir (the cache key) + the
+  // state path. Deliberately NOT the resolved override file paths: a project
+  // override created after startup must not turn a broken file into a
+  // tolerated "first load".
+  const sourceKey = [homedir(), projectDir, statePath()].join("|");
   const previous =
-    _cachedConfig !== null && sourceKey === _cachedSourceKey ? _cachedConfig : null;
+    entry.config !== null && sourceKey === entry.sourceKey ? entry.config : null;
 
   const failures: SourceFailure[] = [];
   let cfg: RouterConfig;
   try {
-    cfg = buildConfig(failures);
+    cfg = buildConfig(projectDir, failures);
   } catch (err) {
     // First load: unchanged behaviour — throw. Reload: keep the last good one.
     if (!previous) throw err;
     return keepLastValidConfig(
+      entry,
       previous,
       fingerprint,
       `${configPath()}: ${(err as Error).message}`,
@@ -1419,9 +1476,10 @@ export function loadConfig(): RouterConfig {
     // Sources that were already failing when `previous` was built are an
     // accepted state (e.g. a broken override at startup); only a source that
     // newly broke counts as a failed reload.
-    const regressions = failures.filter((f) => !_cachedTolerated.has(f.source));
+    const regressions = failures.filter((f) => !entry.tolerated.has(f.source));
     if (regressions.length > 0) {
       return keepLastValidConfig(
+        entry,
         previous,
         fingerprint,
         regressions.map((f) => f.message).join("\n"),
@@ -1429,13 +1487,13 @@ export function loadConfig(): RouterConfig {
     }
   }
 
-  _cachedConfig = cfg;
-  _cachedFingerprint = fingerprint;
-  _cachedSourceKey = sourceKey;
-  _cachedTolerated = new Set(failures.map((f) => f.source));
-  _configDirty = false;
-  _configReloadError = null;
-  _warnedFingerprint = null;
+  entry.config = cfg;
+  entry.fingerprint = fingerprint;
+  entry.sourceKey = sourceKey;
+  entry.tolerated = new Set(failures.map((f) => f.source));
+  entry.dirty = false;
+  entry.reloadError = null;
+  entry.warnedFingerprint = null;
   return cfg;
 }
 
@@ -1443,18 +1501,19 @@ export function loadConfig(): RouterConfig {
  * Reload failed: keep serving `previous` (same object reference), remember the
  * fingerprint so we do not retry on every message until a file changes (or
  * invalidateConfigCache() is called), record the reason, and warn once per
- * failed fingerprint.
+ * failed fingerprint. All state lives on the directory's own cache `entry`.
  */
 function keepLastValidConfig(
+  entry: ConfigCacheEntry,
   previous: RouterConfig,
   fingerprint: string,
   message: string,
 ): RouterConfig {
-  _cachedFingerprint = fingerprint;
-  _configDirty = false;
-  _configReloadError = message;
-  if (_warnedFingerprint !== fingerprint) {
-    _warnedFingerprint = fingerprint;
+  entry.fingerprint = fingerprint;
+  entry.dirty = false;
+  entry.reloadError = message;
+  if (entry.warnedFingerprint !== fingerprint) {
+    entry.warnedFingerprint = fingerprint;
     console.warn(
       `[model-router] config reload failed — keeping last valid config: ${message}`,
     );
@@ -1467,9 +1526,9 @@ function keepLastValidConfig(
  * Throws only when tiers.json itself is unreadable/invalid. Override and state
  * problems are warned about, skipped, and appended to `failures`.
  */
-function buildConfig(failures: SourceFailure[]): RouterConfig {
+function buildConfig(dir: string, failures: SourceFailure[]): RouterConfig {
   const base = JSON.parse(readFileSync(configPath(), "utf-8"));
-  const layers = collectOverrideLayers(failures);
+  const layers = collectOverrideLayers(dir, failures);
 
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
