@@ -311,7 +311,20 @@ for (const host of hosts) {
             const setup = await f.run(project, mode === "advisory" ? "ROOT_NEST_FG" : "ROOT_SETUP");
             existing = mode === "advisory" ? setup.grandchildID : setup.childID;
             expect(existing).toBeTruthy();
-            run = await f.run(project, `ROOT_NEST_RESUME RESUME_ID=${existing}${mode === "advisory" ? ` RESUME_CALLER_ID=${setup.childID}` : ""}`, setup.rootID);
+            // On v1, resume the existing caller in BOTH modes. The enforced
+            // nested call is refused before native resume; the root's successful
+            // resume still proves task_id was honored, not a fresh child opened.
+            run = await f.run(project, `ROOT_NEST_RESUME RESUME_ID=${existing}${mode === "advisory" || host.version === "v1" ? ` RESUME_CALLER_ID=${setup.childID}` : ""}`, setup.rootID);
+            if (host.version === "v1") {
+              expect(run.childID).toBe(setup.childID);
+              const rootBlocks = f.provider.captures.filter(c => c.session === run.rootID).flatMap(c => blocks(c.body));
+              const resumed = rootBlocks.find(b => b.type === "tool_use" && b.name === "task" && b.input?.task_id === setup.childID);
+              expect(resumed).toBeDefined();
+              const completed = rootBlocks.find(b => b.type === "tool_result" && b.tool_use_id === resumed?.id);
+              expect(completed).toBeDefined();
+              expect(completed?.is_error).not.toBe(true);
+              expect(blockText(completed?.content)).toContain(`<task id="${setup.childID}"`);
+            }
           } else run = await f.run(project, kind === "background" ? "ROOT_NEST_BG" : "ROOT_NEST_FG");
           expect(run.rootID).toBeTruthy();
           expect(run.childID).toBeTruthy();
@@ -331,6 +344,10 @@ for (const host of hosts) {
             expect(result?.is_error).not.toBe(true);
             expect(text.split("[⚠ GUARD:delegation_depth]")).toHaveLength(2);
             expect(text.trimEnd().endsWith(A1)).toBe(true);
+            if (host.version === "v1" && kind === "resume") {
+              expect(run.grandchildID).toBe(existing);
+              expect(text).toContain(`<task id="${existing}"`);
+            }
             if (host.version === "v2") {
               const after = (await f.hooks()).find(h => h.hook === "after" && h.callID === call?.id && h.sessionID === run.childID);
               if (kind === "background") {
