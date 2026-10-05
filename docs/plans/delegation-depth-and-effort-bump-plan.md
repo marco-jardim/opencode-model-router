@@ -678,6 +678,13 @@ name. Evidence (file:line, spike sources and captures) is in
   `MAX_DELEGATION_DEPTH_LIMIT = 32`, which must equal `MAX_DEPTH_HOPS` in `src\router\depth.ts` (2.1
   pins the equality with a test). §1.4 and the 1.1 test list are read with this: `100` is rejected,
   `32` is the largest accepted value.
+- **A14 — D8's "same four attempts" depends on the cost ceiling (QA-1.3-3).** The bump never adds an
+  attempt, but the default ladder only reaches four attempts when the cost ceiling allows it. With the
+  bundled `fable-effort` preset (`costRatio` 1 for `fast`, 3 for `medium`) and the default
+  `costCeiling.multiple` of 4, both `v2.0.0` and this change stop after three attempts
+  (`fast@low → fast@medium → medium@high`, then "cost ceiling exceeded"), so `medium`'s bump does not
+  run at defaults. This is pre-existing behaviour; 3.1 documents it (ADR, CONFIG_REFERENCE) with the
+  remedy (raise `enforcement.escalate.costCeiling.multiple`).
 - *Note on order:* A10 was written before A11 and A12 and sits above A11 in this list only by history
   of the edits; the numbering is the reference (QA-0.P-R2-12).
 - **A10 — Local smoke environment.** `smoke:keyless` needs the CI-pinned v1 CLI (1.18.19) first on
