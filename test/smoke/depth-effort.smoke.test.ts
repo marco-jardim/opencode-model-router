@@ -5,8 +5,8 @@
  * SMOKE_DEPTH_EFFORT_ARTIFACTS retains secret-free captures outside the checkout.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -40,6 +40,8 @@ const fixtures: Fixture[] = [];
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 class Fixture {
+  readonly revision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
+  sourceHashes: Record<string, string> = {};
   readonly provider: ScriptedProvider;
   readonly processes: ProcessHandle[] = [];
   readonly runs: Run[] = [];
@@ -49,6 +51,9 @@ class Fixture {
   constructor(readonly host: typeof hosts[number], readonly root: string) { this.provider = new ScriptedProvider(host.version); }
 
   async init() {
+    for (const file of ["test/smoke/depth-effort.smoke.test.ts", "test/smoke/helpers/scripted-provider.ts", "test/smoke/helpers/scripted-provider.test.ts"]) {
+      this.sourceHashes[file] = createHash("sha256").update(await readFile(path.join(ROOT, file))).digest("hex");
+    }
     this.env = { ...process.env };
     for (const key of Object.keys(this.env)) {
       if (/^(OPENCODE_|MODEL_ROUTER_|XDG_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|COPILOT_|GH_TOKEN$|GITHUB_TOKEN$)/.test(key)) delete this.env[key];
@@ -155,7 +160,7 @@ afterEach(async () => {
       await f.provider.stop();
       if (process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS) {
         await mkdir(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, { recursive: true });
-        await writeFile(path.join(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, `${f.host.version}-${path.basename(f.root)}.json`), JSON.stringify({ host: f.host.version, configs: f.configs, captures: f.provider.captures, replies: f.provider.replies, barrierEvents: f.provider.barrierEvents, hooks: await f.hooks(), runs: f.runs, processes: f.processes.map(p => ({ pid: p.child.pid, exitCode: p.child.exitCode, signal: p.child.signalCode, stdout: p.stdout, stderr: p.stderr })) }, null, 2));
+        await writeFile(path.join(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, `${f.host.version}-${path.basename(f.root)}.json`), JSON.stringify({ revision: f.revision, sourceHashes: f.sourceHashes, host: f.host.version, configs: f.configs, captures: f.provider.captures, replies: f.provider.replies, barrierEvents: f.provider.barrierEvents, hooks: await f.hooks(), runs: f.runs, processes: f.processes.map(p => ({ pid: p.child.pid, exitCode: p.child.exitCode, signal: p.child.signalCode, stdout: p.stdout, stderr: p.stderr })) }, null, 2));
       }
     } finally {
       await rm(f.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
