@@ -97,7 +97,7 @@ describe("per-tier effort agent options", () => {
     const opts = buildAgentOptions(tier("anthropic/claude-fable-5"));
 
     expect(opts).not.toHaveProperty("effort");
-    expect(opts).not.toHaveProperty("reasoning_effort");
+    expect(opts).not.toHaveProperty("reasoningEffort");
     expect(opts).toEqual({});
     expect(warn).not.toHaveBeenCalled();
   });
@@ -110,7 +110,7 @@ describe("per-tier effort agent options", () => {
       tier("anthropic/claude-opus-5", { thinking: { budgetTokens: 4096 } }),
     );
 
-    expect(opts).toEqual({ budget_tokens: 4096 });
+    expect(opts).toEqual({ thinking: { type: "enabled", budgetTokens: 4096 } });
     expect(opts).not.toHaveProperty("effort");
   });
 
@@ -128,7 +128,7 @@ describe("per-tier effort agent options", () => {
           effort: "medium",
           thinking: { budgetTokens: 4096 },
         }),
-      { budget_tokens: 4096 },
+      { thinking: { type: "enabled", budgetTokens: 4096 } },
       true,
     ],
     [
@@ -145,7 +145,7 @@ describe("per-tier effort agent options", () => {
     [
       "openai effort alone",
       () => tier("openai/gpt-5.5-fast", { effort: "medium" }),
-      { reasoning_effort: "medium" },
+      { reasoningEffort: "medium" },
       false,
     ],
     [
@@ -155,7 +155,7 @@ describe("per-tier effort agent options", () => {
           effort: "medium",
           reasoning: { effort: "low", summary: "auto" },
         }),
-      { reasoning_effort: "low", reasoning_summary: "auto" },
+      { reasoningEffort: "low", reasoningSummary: "auto" },
       true,
     ],
     ["openai absent", () => tier("openai/gpt-5.5-fast"), {}, false],
@@ -172,7 +172,7 @@ describe("per-tier effort agent options", () => {
           effort: "medium",
           thinking: { budgetTokens: 4096 },
         }),
-      { budget_tokens: 4096 },
+      { thinking: { type: "enabled", budgetTokens: 4096 } },
       true,
     ],
     ["unknown absent", () => tier("google/gemini-3-pro"), {}, false],
@@ -187,17 +187,17 @@ describe("per-tier effort agent options", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     expect(buildAgentOptions(tier("openai/gpt-5.5-fast", { effort: "xhigh" }))).toEqual({
-      reasoning_effort: "high",
+      reasoningEffort: "high",
     });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toContain("downgrading effort 'xhigh' to 'high'");
   });
 
-  test("downgrades max effort for OpenAI reasoning_effort", () => {
+  test("downgrades max effort for OpenAI reasoningEffort", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     expect(buildAgentOptions(tier("openai/gpt-5.5-fast", { effort: "max" }), "fast")).toEqual({
-      reasoning_effort: "high",
+      reasoningEffort: "high",
     });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toContain("downgrading");
@@ -251,7 +251,7 @@ describe("per-tier effort agent options", () => {
         tier("anthropic/claude-opus-5", { effort: "low", thinking: { budgetTokens: 1 } }),
         "fast",
       ),
-    ).toEqual({ budget_tokens: 1 });
+    ).toEqual({ thinking: { type: "enabled", budgetTokens: 1 } });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toContain("explicit thinking wins");
   });
@@ -287,7 +287,7 @@ describe("provider gate for explicit fields", () => {
     "anthropic/claude-mythos-5-1",
     "github-copilot/claude-fable-5-1",
     "openrouter/anthropic/claude-opus-5-5",
-  ])("drops budget_tokens on adaptive-only %s with a warning", (model) => {
+  ])("drops thinking on adaptive-only %s with a warning", (model) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     expect(
@@ -306,24 +306,24 @@ describe("provider gate for explicit fields", () => {
     "anthropic/claude-mythos-5",
     "anthropic/claude-sonnet-4-6",
     "github-copilot/claude-opus-4.8",
-  ])("keeps budget_tokens on Claude model %s that accepts a budget", (model) => {
+  ])("keeps thinking on Claude model %s that accepts a budget", (model) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     expect(buildAgentOptions(tier(model, { thinking: { budgetTokens: 32000 } }))).toEqual({
-      budget_tokens: 32000,
+      thinking: { type: "enabled", budgetTokens: 32000 },
     });
     expect(warn).not.toHaveBeenCalled();
   });
 
-  test("keeps budget_tokens on non-Claude models", () => {
+  test("keeps thinking on non-Claude models", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     expect(
       buildAgentOptions(tier("openai/gpt-5.5-fast", { thinking: { budgetTokens: 4096 } })),
-    ).toEqual({ budget_tokens: 4096 });
+    ).toEqual({ thinking: { type: "enabled", budgetTokens: 4096 } });
     expect(
       buildAgentOptions(tier("google/gemini-3-pro", { thinking: { budgetTokens: 4096 } })),
-    ).toEqual({ budget_tokens: 4096 });
+    ).toEqual({ thinking: { type: "enabled", budgetTokens: 4096 } });
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -421,10 +421,10 @@ describe("provider gate for explicit fields", () => {
       buildAgentOptions(
         tier("openai/gpt-5.5-fast", { reasoning: { effort: "low", summary: "auto" } }),
       ),
-    ).toEqual({ reasoning_effort: "low", reasoning_summary: "auto" });
+    ).toEqual({ reasoningEffort: "low", reasoningSummary: "auto" });
     expect(
       buildAgentOptions(tier("google/gemini-3-pro", { reasoning: { summary: "auto" } })),
-    ).toEqual({ reasoning_summary: "auto" });
+    ).toEqual({ reasoningSummary: "auto" });
     expect(warn).not.toHaveBeenCalled();
   });
 

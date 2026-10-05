@@ -5,7 +5,7 @@ import type { PluginLogger } from "./logger";
  * `src/index.ts` turns each tier of the active preset into an opencode agent
  * definition; this module owns the `options` bag on that definition. It is the
  * only place that knows how a tier's provider-agnostic `effort` maps onto the
- * provider-specific knob (`effort` for Anthropic, `reasoning_effort` for
+ * provider-specific knob (`effort` for Anthropic, `reasoningEffort` for
  * OpenAI) and what to do when a tier asks for something the provider cannot do.
  *
  * The display-path builder in `src/commands/output.ts` renders what a tier is
@@ -91,8 +91,8 @@ export function effortCeilingFor(tier: TierConfig): EffortLevel | null {
  * loses to `effort`, with a one-time notice per tier.
  *
  * Explicit fields are gated by model: a Claude model never receives
- * `reasoning_effort` / `reasoning_summary`, and an adaptive-only Claude model
- * (`isAdaptiveOnlyClaudeModel`) never receives `budget_tokens` — the budget is
+ * `reasoningEffort` / `reasoningSummary`, and an adaptive-only Claude model
+ * (`isAdaptiveOnlyClaudeModel`) never receives `thinking` — the budget is
  * then ignored as if unset, so `effort` still applies. Each drop warns once
  * per tier. A key is
  * only ever present when something asked for it — an unset `effort` leaves no
@@ -122,7 +122,7 @@ export function buildAgentOptions(
       logger,
     );
   } else if (hasThinkingBudget) {
-    opts.budget_tokens = tier.thinking?.budgetTokens;
+    opts.thinking = { type: "enabled", budgetTokens: tier.thinking?.budgetTokens };
   } else if (tier.thinking?.budgetTokens === 0) {
     warnAgentOptionsEffortOnce(
       `thinking-zero:${tierName}`,
@@ -143,10 +143,10 @@ export function buildAgentOptions(
     }
   } else if (tier.reasoning) {
     if (tier.reasoning.effort) {
-      opts.reasoning_effort = tier.reasoning.effort;
+      opts.reasoningEffort = tier.reasoning.effort;
     }
     if (tier.reasoning.summary) {
-      opts.reasoning_summary = tier.reasoning.summary;
+      opts.reasoningSummary = tier.reasoning.summary;
     }
   }
 
@@ -184,9 +184,9 @@ export function buildAgentOptions(
           `tier ${tierName}: downgrading effort '${effort}' to 'high' because OpenAI reasoning_effort only supports low, medium, or high`,
           logger,
         );
-        opts.reasoning_effort = "high";
+        opts.reasoningEffort = "high";
       } else {
-        opts.reasoning_effort = effort;
+        opts.reasoningEffort = effort;
       }
     } else {
       warnAgentOptionsEffortOnce(

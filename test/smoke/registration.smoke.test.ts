@@ -162,7 +162,7 @@ d("keyless registration smoke", () => {
       // xhigh -> high downgrade: OpenAI has no `xhigh` reasoning effort, so
       // the options builder must clamp it. Seeing `high` here proves the
       // config hook and override resolution ran inside a real opencode.
-      expect(agent.options?.reasoning_effort).toBe("high");
+      expect(agent.options?.reasoningEffort).toBe("high");
 
       // REGRESSION GUARD — this assertion is the point of this file.
       // A passive warning reaching stderr is the exact bug #35 fixed:
