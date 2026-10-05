@@ -344,18 +344,17 @@ export async function registerV2Hooks(
       const final = banner === undefined ? routed : [routed.trimEnd(), banner].filter(Boolean).join("\n\n");
       const content = Array.isArray(event.result.content) ? [...event.result.content]
         : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
+      const childText = text.trimEnd();
+      const routedText = routed.trimEnd();
       let visible;
       if (event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string"
-        && content.some((part) => part.type === "text")) {
+        && content.some((part) => part.type === "text") && routedText.startsWith(childText)) {
         // The host's visible text owns the session envelope (and resume handle).
-        // Legacy hooks see only the bare output; carry their additions around the
-        // original content instead of rebuilding that envelope from bare text.
-        const retained = text ? routed.indexOf(text) : -1;
-        const prefix = changed && retained >= 0 ? routed.slice(0, retained) : "";
-        const suffix = changed ? retained >= 0 ? routed.slice(retained + text.length) : routed : "";
+        // Footer helpers trim the bare output. Compare trimmed tails before taking
+        // only the router's suffix; other rewrites must replace, not repeat, it.
+        const suffix = changed ? routedText.slice(childText.length) : "";
         const notices = [suffix, banner].filter((part) => part !== undefined && part !== "").join("\n\n");
         visible = [
-          ...(prefix ? [{ type: "text" as const, text: prefix }] : []),
           ...content,
           ...(notices ? [{ type: "text" as const, text: notices }] : []),
         ];

@@ -14,6 +14,7 @@ import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
+import { appendRouterFooter } from "../../src/verify/pending";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -420,7 +421,7 @@ describe("OpenCode 2 hook adapter", () => {
       "tool.execute.after": async (input: any, output: any) => {
       expect(input).toMatchObject({ tool: "task", args: { subagent_type: "fast" }, callID: "call" });
       expect(output.metadata.sessionID).toBe("leaf");
-      output.output = "[router] Use task_id next\n" + output.output + "\nVerified";
+       output.output += "\n[router] Use task_id next\nVerified";
     } });
     const file = { type: "file", uri: "file:///result", mime: "text/plain" };
     const host = { type: "text", text: '<subagent sessionID="leaf" state="completed">\nok\n</subagent>', metadata: { host: true } };
@@ -428,12 +429,46 @@ describe("OpenCode 2 hook adapter", () => {
     await f.toolHooks["execute.before"](depthCall());
     const event = { ...call, tool: "subagent", input: { agent: "fast" }, status: "completed", result: { output: { sessionID: "leaf", status: "completed", output: "ok" }, content: [host, file, extra], metadata: { sessionID: "leaf" } } };
     await f.toolHooks["execute.after"](event);
-    expect(event.result.output.output).toBe(`[router] Use sessionID next\nok\nVerified${banner ? "\n\n" + depthAdvisoryBanner(1, 1) : ""}`);
+    expect(event.result.output.output).toBe(`ok\n[router] Use sessionID next\nVerified${banner ? "\n\n" + depthAdvisoryBanner(1, 1) : ""}`);
     expect(event.result.content).toEqual([
-      { type: "text", text: "[router] Use sessionID next\n" }, host, file, extra,
-      { type: "text", text: `\nVerified${banner ? "\n\n" + depthAdvisoryBanner(1, 1) : ""}` },
+      host, file, extra,
+      { type: "text", text: `\n[router] Use sessionID next\nVerified${banner ? "\n\n" + depthAdvisoryBanner(1, 1) : ""}` },
     ]);
     expect((JSON.stringify(event.result.content).match(/GUARD:delegation_depth/g) ?? [])).toHaveLength(banner ? 1 : 0);
+  });
+
+  it.each(["  ", "\r\n", "\n\n\n", "  \r\n\n\n"])("does not duplicate child text trimmed by a deferred footer: %j", async (tail) => {
+    const f = fixture();
+    const footer = "[router] unverified · vrf_example · risk";
+    await f.start({
+      "tool.execute.after": async (_: unknown, output: { output: string }) => {
+        output.output = appendRouterFooter(output.output, footer);
+      },
+    });
+    const event = depthResult("call", "completed", `CHILD_TEXT${tail}`);
+    const hostText = event.result.content;
+    await f.toolHooks["execute.after"](event);
+    expect(event.result.content).toEqual([
+      { type: "text", text: hostText }, { type: "text", text: `\n\n${footer}` },
+    ]);
+    expect(JSON.stringify(event.result.content).match(/CHILD_TEXT/g)).toHaveLength(1);
+    expect(event.result.output.output).toBe(`CHILD_TEXT\n\n${footer}`);
+  });
+
+  it.each(["[router] prefix\nCHILD_TEXT original\nVerified", "CHILD_TEXT rewritten"])("replaces host text when the router output does not start with the child text: %j", async (routed) => {
+    const f = fixture();
+    await f.start({
+      "tool.execute.after": async (_: unknown, output: { output: string }) => { output.output = routed; },
+    });
+    const file = { type: "file", uri: "file:///result", mime: "text/plain" };
+    const event = { ...depthResult(), result: {
+      output: { output: "CHILD_TEXT original" },
+      content: [{ type: "text", text: '<subagent sessionID="leaf">CHILD_TEXT original</subagent>' }, file],
+    } };
+    await f.toolHooks["execute.after"](event);
+    expect(event.result.content).toEqual([{ type: "text", text: routed }, file]);
+    expect(JSON.stringify(event.result.content).match(/CHILD_TEXT/g)).toHaveLength(1);
+    expect(event.result.output.output).toBe(routed);
   });
 
   it("does not grade failed tool execution as a completed return", async () => {
