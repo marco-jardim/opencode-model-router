@@ -178,6 +178,30 @@ describe("delegation depth guard", () => {
     expect(warn).toHaveBeenNthCalledWith(2, expect.stringContaining("cannot resolve session second: offline"));
   });
 
+  it("allows when the real tracker times out at 2000 ms, with one warning and no timers", async () => {
+    vi.useFakeTimers();
+    try {
+      const logger = { warn: vi.fn<(message: string) => void>() };
+      const getParent = vi.fn<DepthTrackerSeams["getParent"]>(() => new Promise(() => { /* backend hangs */ }));
+      const tracker = createDepthTracker({ getParent, now: Date.now, logger });
+      const guard = createDepthGuard({ tracker, limit: () => 1, mode: () => "enforced", logger });
+      const settled = vi.fn();
+      const pending = guard.checkDispatch("caller").then((result) => { settled(); return result; });
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(settled).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toStrictEqual({ block: false, mode: "enforced", guard: null });
+      expect(settled).toHaveBeenCalledTimes(1);
+      expect(await guard.checkDispatch("caller")).toStrictEqual({ block: false, mode: "enforced", guard: null });
+      expect(getParent).toHaveBeenCalledExactlyOnceWith("caller");
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("cannot resolve session caller"));
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([NaN, -1, 1.5, "2", Infinity, null, {}])("fails closed for invalid depth %j", async (depth) => {
     const guard = setup(depth as unknown as number, 32);
     expect(await guard.checkDispatch("caller")).toStrictEqual({
