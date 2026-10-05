@@ -458,6 +458,32 @@ describe("delegation depth plugin wiring", () => {
     expect(ctx.client.session.create).not.toHaveBeenCalled();
   });
 
+  it.each(["producer", "grader"] as const)("keeps the deferred footer after the banner for a surviving unparented %s", async (kind) => {
+    vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
+    const ctx = makeCtx(dir);
+    // Disposal can fail; cleanup unregisters the session but deliberately keeps
+    // its pinned depth for a later resume (N8).
+    ctx.client.session.delete.mockRejectedValue(new Error("session survived disposal"));
+    const { hooks } = await setup(ctx);
+    expect(await hooks.tool.delegate.execute(delegateArgs)).toContain("[router ✓ verified:");
+    const index = kind === "producer" ? 0 : 1;
+    expect(ctx.client.session.create.mock.calls[index][0].body).toEqual({});
+    const createdResult = await ctx.client.session.create.mock.results[index].value;
+    const sid = createdResult.data.id;
+    expect(sid).toBeDefined();
+    const input = taskInput(sid, "resumed-deferred");
+    const before = { args: { subagent_type: "fast", prompt: `VERIFY:deferred\nImplement it.\n[acceptance]\ncwd: ${dir}\ncheck: testsPass\ncheck: fileExists path=missing.ts\n[/acceptance]` } };
+    await hooks["tool.execute.before"](input, before);
+    const out = { output: "task_id: leaf\n<task_result>nested producer output</task_result>", metadata: { sessionId: "leaf" } };
+    await hooks["tool.execute.after"]({ ...input, args: before.args }, out);
+    expect(countBanners(out.output)).toBe(1);
+    expect(out.output).toContain(depthAdvisoryBanner(1, 1));
+    expect(out.output.match(/\[router\] unverified/g)).toHaveLength(1);
+    expect(out.output.indexOf("GUARD:delegation_depth")).toBeLessThan(out.output.indexOf("[router] unverified"));
+    expect(out.output.endsWith("before building on this work if the risk matters.")).toBe(true);
+    expect(captured.pending?.listUnverified(sid!)).toHaveLength(1);
+  });
+
   it("composes with the Layer-1 iteration budget on the same advisory task", async () => {
     configure({ guard: { budget: 1, sameOpRetryCap: 1 } });
     const { hooks } = await setup();

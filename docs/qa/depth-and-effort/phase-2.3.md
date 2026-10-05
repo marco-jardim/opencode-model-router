@@ -217,8 +217,11 @@ Context7 process whose parent PID matched an old host PID; it was not killed.
   - `delegate`: inserted after the producer text and before the accepted suffix or deferred footer; appended last
     on router-only returns.
   - v2: the bridge appends it after the legacy text, as A1 says literally (Findings F2).
-  - A banner and a deferred footer cannot co-occur: deferral needs `isProvenRootCaller`, and a banner needs
-    depth ≥ 1.
+  - A banner and a deferred footer can co-occur in advisory mode for router-created unparented sessions:
+    depth tracking retains their plugin pin (depth ≥ 1), while the backend can prove them root for deferral
+    once they are no longer registered as producers/graders. A surviving session resumed after failed
+    disposal is one such case. The v1 native-task result keeps the banner before the deferred footer,
+    which stays last. This pre-existing root-classification gap is not changed by Phase 2.3.
 - **N6 — Native-path grader creator.** The native-task gate uses
   `buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null)`
   (A7, QA-0.P-R2-9). The caller is used only as the depth creator. The native-path grader remains
@@ -665,8 +668,10 @@ All of these are design-time items. None is open.
 - **F2 — accepted.** The banner's position differs by host.
   - On v1 it comes before the verification text. On v2 it comes after it (the bridge appends, as A1 says
     literally).
-  - The banner is never graded on either host, and a deferred footer cannot co-occur with it (N5).
-  - Tests assert "exactly once", not the position.
+  - The banner is never graded on either host. It can co-occur with a deferred footer for router-created
+    unparented sessions in advisory mode (N5).
+  - Tests assert "exactly once"; the v1 unparented-session regression also pins banner-before-footer order
+    and the footer as the last text. V2 still appends its banner after legacy verification text.
 - **F3 — expected.** An unseeded task caller costs one `session.get` per session. Fake clients without `get`
   produce one warning. Step 2 gives the rule for adjusting fixtures.
 - **F4 — accepted.**
