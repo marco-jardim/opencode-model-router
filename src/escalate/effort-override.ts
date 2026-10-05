@@ -9,6 +9,8 @@ type Entry = {
   model: string;
   keys: Partial<Record<(typeof EFFORT_OVERRIDE_KEYS)[number], unknown>>;
   warnedMissingTarget: boolean;
+  warnedApplyFailure: boolean;
+  warnedAliasDeletion: boolean;
 };
 
 export interface EffortOverrideStore {
@@ -80,7 +82,10 @@ export function createEffortOverrideStore(
           warn(logger, `Effort override for ${sessionID} has no effort keys; override refused`);
           return;
         }
-        entries.set(sessionID, { tierName, model, keys, warnedMissingTarget: false });
+        entries.set(sessionID, {
+          tierName, model, keys, warnedMissingTarget: false,
+          warnedApplyFailure: false, warnedAliasDeletion: false,
+        });
         if (entries.size > maxEntries) {
           // A positive capacity and overflow guarantee a first entry.
           const oldest = entries.keys().next().value!;
@@ -107,9 +112,11 @@ export function applyEffortOverride(
   target: unknown,
   logger: Logger,
 ): void {
+  let entry: Entry | undefined;
   try {
-    if (typeof input.sessionID !== "string") return;
-    const entry = entriesByStore.get(store)?.get(input.sessionID);
+    const sessionID = input.sessionID;
+    if (typeof sessionID !== "string") return;
+    entry = entriesByStore.get(store)?.get(sessionID);
     if (!entry || input.agent !== entry.tierName) return;
     if (input.model === null || typeof input.model !== "object") return;
     const model = input.model as { providerID?: unknown; modelID?: unknown; id?: unknown };
@@ -123,7 +130,7 @@ export function applyEffortOverride(
       // Warning state lives with the bounded entry and is removed on clear/eviction.
       if (!entry.warnedMissingTarget) {
         entry.warnedMissingTarget = true;
-        warn(logger, `Missing provider-options target for effort override ${input.sessionID}`);
+        warn(logger, `Missing provider-options target for effort override ${sessionID}`);
       }
       return;
     }
@@ -131,10 +138,23 @@ export function applyEffortOverride(
     for (const key of EFFORT_OVERRIDE_KEYS) {
       if (Object.hasOwn(entry.keys, key)) {
         options[key] = entry.keys[key];
-        if (key === "reasoningEffort") delete options.reasoning_effort;
+        if (key === "reasoningEffort") {
+          try {
+            delete options.reasoning_effort;
+          } catch {
+            if (!entry.warnedAliasDeletion) {
+              entry.warnedAliasDeletion = true;
+              warn(logger, `Applied native effort override for ${sessionID}, but failed to remove reasoning_effort alias`);
+            }
+          }
+        }
       }
     }
   } catch {
-    warn(logger, "Failed to apply effort override");
+    // Session failure latches share the entry's capacity and clear/eviction lifetime.
+    if (!entry || !entry.warnedApplyFailure) {
+      if (entry) entry.warnedApplyFailure = true;
+      warn(logger, "Failed to apply effort override");
+    }
   }
 }

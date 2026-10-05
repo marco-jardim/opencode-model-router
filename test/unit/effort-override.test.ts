@@ -131,14 +131,50 @@ describe("per-session effort overrides", () => {
     Object.defineProperty({}, "reasoning_effort", { value: "low", configurable: false }),
   ])("logs unwritable targets without throwing (%#)", (target) => {
     const { store, logger } = setup();
-    expect(() => applyEffortOverride(store, producer, target, logger)).not.toThrow();
+    for (let i = 0; i < 10; i++) {
+      expect(() => applyEffortOverride(store, producer, target, logger)).not.toThrow();
+    }
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an applied native key with failed alias deletion distinctly, once", () => {
+    const { store, logger } = setup();
+    const target = Object.defineProperty({ reasoningEffort: "low" }, "reasoning_effort", {
+      value: "low", configurable: false, enumerable: true,
+    });
+    for (let i = 0; i < 10; i++) applyEffortOverride(store, producer, target, logger);
+    expect(target).toEqual({ reasoningEffort: "medium", reasoning_effort: "low" });
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(
+      "Applied native effort override for producer, but failed to remove reasoning_effort alias",
+    ));
+    for (let i = 0; i < 10; i++) applyEffortOverride(store, producer, Object.freeze({}), logger);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenLastCalledWith(expect.stringContaining("Failed to apply effort override"));
+  });
+
+  it("bounds failure warning latches to live entries and resets them after clear or eviction", () => {
+    const { store, logger } = setup(1);
+    const target = Object.freeze({});
+    for (const sessionID of ["producer", "other", "producer"]) {
+      store.set(sessionID, "fast", openai, "high");
+      logger.warn.mockClear();
+      for (let i = 0; i < 10; i++) applyEffortOverride(store, { ...producer, sessionID }, target, logger);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(store.size()).toBe(1);
+    }
+    store.clear("producer");
+    store.set("producer", "fast", openai, "high");
+    logger.warn.mockClear();
+    applyEffortOverride(store, producer, target, logger);
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
 
   it("catches throwing input getters and malformed input", () => {
     const { store, logger } = setup();
     const input = { ...producer, get model() { throw new Error("getter"); } };
-    expect(() => applyEffortOverride(store, input, {}, logger)).not.toThrow();
+    for (let i = 0; i < 10; i++) {
+      expect(() => applyEffortOverride(store, input, {}, logger)).not.toThrow();
+    }
     expect(() => applyEffortOverride(store, null as unknown as typeof producer, {}, logger)).not.toThrow();
     expect(logger.warn).toHaveBeenCalledTimes(2);
   });
