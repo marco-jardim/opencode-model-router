@@ -1,5 +1,6 @@
-import { nextEffort } from "../router/agent-options";
-import type { EffortLevel, RouterConfig } from "../router/config";
+import { effortCeilingFor, effortRank, minEffort, nextEffort } from "../router/agent-options";
+import { resolveEffortBump, type EffortLevel, type RouterConfig } from "../router/config";
+import { getActiveTiers } from "../router/protocol";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -203,13 +204,34 @@ export function advance(state: LadderState, action: LadderAction): LadderState {
 
 export function buildEscalatePolicy(cfg: RouterConfig): EscalatePolicy {
   const esc = cfg.enforcement?.escalate;
-  return {
+  const policy: EscalatePolicy = {
     ladder: esc?.ladder ?? ["fast", "medium", "heavy"],
     floorTier: esc?.floorTier ?? null,
     maxAttemptsPerTier: esc?.maxAttemptsPerTier ?? 1,
     maxTotalAttempts: esc?.maxTotalAttempts ?? 4,
     costMultiple: esc?.costCeiling?.multiple ?? 4,
   };
+  const effortBump = buildEffortBump(cfg);
+  // Keep bump-off policies byte-identical to the original golden fixture.
+  if (effortBump) policy.effortBump = effortBump;
+  return policy;
+}
+
+function buildEffortBump(cfg: RouterConfig): EffortBumpPolicy | null {
+  const { enabled, max } = resolveEffortBump(cfg);
+  if (!enabled) return null;
+  const entries: Array<[string, { base: EffortLevel; bound: EffortLevel }]> = [];
+  for (const [name, tier] of Object.entries(getActiveTiers(cfg) ?? {})) {
+    if (typeof tier?.model !== "string") continue;
+    const ceiling = effortCeilingFor(tier);
+    // A non-null ceiling also validates the configured effort (D7).
+    if (ceiling === null || tier.effort === undefined) continue;
+    const base = tier.effort;
+    const bound = minEffort(ceiling, max);
+    if (effortRank(bound) <= effortRank(base)) continue;
+    entries.push([name, { base, bound }]);
+  }
+  return entries.length > 0 ? { perTier: Object.fromEntries(entries) } : null;
 }
 
 /**
