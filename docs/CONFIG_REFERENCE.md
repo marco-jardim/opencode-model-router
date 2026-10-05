@@ -1,6 +1,6 @@
 # Enforcement Configuration Reference
 
-The `enforcement` block in `tiers.json`. Every field is optional; each one falls back to the default listed below, and the bundled `tiers.json` now **ships those defaults explicitly** so they are visible in the file rather than implicit in code — see [What the bundled `tiers.json` ships](#what-the-bundled-tiersjson-ships). Setting `mode: "off"` (or `MODEL_ROUTER_ENFORCE=0`) is a strict no-op.
+The `enforcement` block in `tiers.json`. Every field is optional; each one falls back to the default listed below, and the bundled `tiers.json` now **ships those defaults explicitly** so they are visible in the file rather than implicit in code — see [What the bundled `tiers.json` ships](#what-the-bundled-tiersjson-ships). Effective mode `off` disables enforcement guards and skips native-task verification; `MODEL_ROUTER_ENFORCE=0` forces that mode. It does not disable the opt-in `delegate` tool: whenever enabled, its produce → verify → accept/escalate pipeline runs in every mode, subject to its verification policy and attempt/cost limits.
 
 > These settings (like anything in `tiers.json`) can also be placed in an overrides file — `~/.config/opencode/opencode-model-router.overrides.jsonc` (global) or `<repo>/.opencode/opencode-model-router.overrides.jsonc` (project) — and are deep-merged over the bundled defaults, so you don't have to edit the cached `tiers.json`. See the **Configuration** section of the README.
 
@@ -155,13 +155,95 @@ may contain instruction text or paths.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` = no-op. `advisory` = log violations, never block. `enforced` = block/escalate on violations. |
+| `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` disables enforcement guards and skips native-task verification. `advisory` warns on guard violations without blocking; `enforced` blocks them. Native-task verification annotates results in both advisory and enforced modes, subject to verification policy. The enabled `delegate` tool's gate, retries, escalation and effort bump run independently of this mode. |
+| `maxDelegationDepth` | `integer 1–32 \| null` | `1` | Deepest session a model-initiated dispatch may create; root/orchestrator = depth 0. `null` disables the depth guard. |
 | `envGate` | `string` | `"MODEL_ROUTER_ENFORCE"` | Name of the env var that overrides mode at runtime. See env-gate truth table below. |
-| `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` when the env gate is unset/empty. |
+| `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` whenever the env gate is not `"1"` or `"0"` (unset, empty, or any other value). |
 | `guard` | object | see below | Request-level hard guards (caps, script controls, budget). |
 | `verify` | object | see below | Verification / grading policy. |
 | `escalate` | object | see below | Escalation ladder and cost ceiling. |
 | `proportional` | object | see below | Trivial-task bypass logic. |
+
+### Delegation depth
+
+`enforcement.maxDelegationDepth` defaults to `1`: only orchestrators may
+dispatch in `enforced` mode; in the default `advisory` mode, deeper dispatches
+are warned rather than blocked. Set it to `2` to let a delegate dispatch one more level, or `null` to
+disable the guard.
+
+A dispatch past the limit is **warned**, not blocked, in `advisory` mode (the
+bundled default), with a `[⚠ GUARD:delegation_depth]` banner. It is **refused** in
+`enforced` mode and ignored in `off`. To enforce the limit, set
+`enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`.
+An `enforcement.perTier` entry for the caller's tier overrides `mode` when the
+env gate is not `"1"` or `"0"` (unset, empty, or any other value); an `advisory`
+entry keeps that tier warn-only. Other non-empty values produce a warning and
+fall through to config resolution. The env gate `MODEL_ROUTER_ENFORCE=1`
+overrides both to `enforced`, and `MODEL_ROUTER_ENFORCE=0` overrides both to `off`.
+
+For caller depth `d` and limit `max`, the advisory banner is:
+
+```text
+[⚠ GUARD:delegation_depth] this session is at delegation depth ${d}; enforcement.maxDelegationDepth is ${max}. In enforced mode this dispatch would have been refused. Do not dispatch further subagents from this session; do that work yourself.
+```
+
+The enforced refusal is:
+
+```text
+[router] DELEGATION DEPTH LIMIT — this session is at delegation depth ${d}; enforcement.maxDelegationDepth is ${max}, so it cannot dispatch another subagent. Do this part of the work yourself and report the result; do not retry the dispatch.
+```
+
+`delegate` returns this refusal as a normal tool result; native `task` (v2:
+`subagent`) reports it as a tool error. The depth guard does **not** apply the
+`proportional.trivialBypass` downgrade. A caller-tier `perTier: "off"` disables
+the guard unless the env gate forces enforcement; `/bypass` disables it on both
+dispatch paths.
+
+For accepted and deferred `delegate` results, the depth banner follows the producer
+text and precedes the verification suffix or deferred footer. On unmet, safety-net
+and failure returns, it is appended last, after the router text and any forcing note.
+For native dispatch results, it precedes verification text on v1
+and follows it on v2. It is delivered once and is not part of the text graded by
+the verifier. V2 retains the host envelope when appending it (see
+[OpenCode v2 compatibility](./OPENCODE_V2.md#child-sessions-cancellation-and-verification)).
+
+The guard covers the native `task` tool (including `task_id` resume and OpenCode 2
+background dispatches) and the `delegate` tool. Unknown depth caused by a backend
+failure or timeout fails open with one warning per caller session. A cycle or a parent chain over
+32 hops counts as depth 32. Limits must be safe integers from 1 to 32 so such
+chains exceed every configured limit on their next dispatch.
+
+This is a dispatch guard, not a sandbox: shell-spawned `opencode` processes and
+other plugins' session-creation tools are outside its coverage.
+
+**OpenCode v1 host limits (spike and host-proof evidence):** the default `general`
+agent has no `task` tool, so nesting needs an agent with task permission (see
+[Spike A2, R4](./qa/depth-and-effort/phase-0P.md)). The
+[plan §1.7 A9](./plans/delegation-depth-and-effort-bump-plan.md) records that the
+host otherwise turns the attempted call into its `invalid` tool.
+The [Phase 2.3 host proof](./qa/depth-and-effort/phase-2.3.md#handoffs) on OpenCode
+1.18.19 used top-level `subagent_depth: 4` to lift a host cap; the cap's default
+and upstream documentation are **unverified**. Raising only the router limit does
+not lift that cap. The same host proof records that v1 native-path graders run on
+the default `build` agent, which has `task`; their depth is recorded at creator
+depth + 1, so their own dispatches are subject to the depth guard.
+
+**OpenCode 2 also has a host limit:** `experimental.subagent_depth` in the host's
+configuration defaults to `1`. When the router depth guard is enforced, the
+effective nesting limit is the **lower of the two limits**. Raising only
+`enforcement.maxDelegationDepth` does not lift the host cap, and a top-level
+`subagent_depth` is not the v2 setting. The host cap still applies when the router
+only warns or is disabled. V2's `general` agent also needs an explicit `subagent`
+permission to dispatch at all. See the [host-proof handoff](./qa/depth-and-effort/phase-2.3.md#handoffs).
+
+```json
+{
+  "enforcement": {
+    "mode": "enforced",
+    "maxDelegationDepth": 2
+  }
+}
+```
 
 ---
 
@@ -471,13 +553,80 @@ produces no notice. `background` and `pendingTtlMs` are read at plugin start, so
 |---|---|---|---|
 | `floorTier` | `string \| null` | `null` | Pin the minimum starting tier; skips cheaper rungs. Must be string or `null`. |
 | `ladder` | `string[]` | `["fast","medium","heavy"]` | Ordered list of tier names to escalate through. Must be an array of strings. |
-| `maxAttemptsPerTier` | `number` | `1` | Max attempts at each rung before advancing. Must be integer ≥ 0. |
+| `maxAttemptsPerTier` | `number` | `1` | Same-tier retries after the initial attempt at each rung. Must be integer ≥ 0. |
 | `maxTotalAttempts` | `number` | `4` | Hard ceiling across all tiers and retries. Must be integer ≥ 1. |
+| `effortBump` | `boolean` | `true` | Retry a failed router-ladder attempt on the same tier one effort level higher before escalating. `false` restores the previous ladder exactly. |
+| `effortBumpMax` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"xhigh"` | Upper bound for bumped attempts, further clamped per model. |
 | `costCeiling.base` | `string` | `"firstAttemptCostUnits"` | Reference point for cost ceiling. `"firstAttemptCostUnits"` = cost of the first producing attempt. |
-| `costCeiling.multiple` | `number` | `4` | Ceiling = `base × multiple`. Must be > 0. Escalation halts when cumulative cost would exceed this. |
+| `costCeiling.multiple` | `number` | `4` | Ceiling = first-attempt cost × multiple. Must be > 0. Further retries/escalation halt once recorded cumulative cost exceeds this. |
 
 > **`floorTier`** is useful when a task is known non-trivial: set `floorTier: "medium"` to skip `fast` entirely.  
-> **`costCeiling`** is evaluated before each escalation step; the attempt is not started if it would breach the ceiling.
+> **`costCeiling`** checks cost already recorded after an attempt, not the projected
+> cost of the next attempt. An attempt can therefore take cumulative cost over the
+> ceiling; the ladder then stops rather than starting another retry or escalation.
+
+### Effort bump before escalation
+
+`enforcement.escalate.effortBump` applies only to the `delegate` tool's automatic
+ladder, not native `task` / v2 `subagent` calls or manual re-dispatches. Eligibility
+requires all of the following:
+
+- an explicit valid `effort` and no `variant`;
+- a recognised Claude or OpenAI model family;
+- no explicit setting that wins over `effort`: a truthy `thinking.budgetTokens`
+  on a non-adaptive-only Claude model, or `reasoning.effort` on an OpenAI model;
+- a base effort below the effective bound (the lower of the model ceiling and
+  `effortBumpMax`). A budget dropped by the adaptive-only Claude gate does not
+  disqualify the tier.
+
+A failed attempt's existing same-tier retry moves one step through
+`low → medium → high → xhigh → max`, up to the bound, before tier escalation.
+It adds no retries: `maxAttemptsPerTier`, `maxTotalAttempts`, and the cost ceiling
+still apply. Set `effortBump: false` to restore the previous ladder exactly.
+Cost remains **ratio-based**, not measured tokens: a bumped attempt is charged
+the same tier `costRatio`, even if its actual token use rises. `/bypass` does not
+disable the `delegate` ladder or its effort override; use `effortBump: false` to
+disable the bump.
+
+`enforcement.escalate.effortBumpMax` caps bumped attempts and is further clamped
+per model: OpenAI tiers stop at `high`, while Claude tiers may reach
+`effortBumpMax` (default `xhigh`; `max` if configured).
+Set it to `"high"` if a Claude model you use rejects `xhigh`.
+These are router-side ceilings, not a guarantee of provider acceptance for every
+model or proxy. The keyless host proofs establish forwarding, not live-provider
+acceptance.
+
+### Where the bump applies with the bundled presets
+
+With the default `effortBumpMax: "xhigh"`:
+
+| Preset | Eligible tiers / effort range | Exclusions |
+|---|---|---|
+| `anthropic` (active by default) | None | Every tier sets a `variant`. |
+| `fable-effort` | `fast`: `low → xhigh`; `medium`: `high → xhigh` | `heavy` starts at `xhigh`, already at the bound. |
+| `hybrid` | None | OpenAI tiers have no `effort`; `heavy` sets a `variant`. |
+| `openai`, `github-copilot`, `google`, `zai` | None | No tier sets `effort`. |
+
+These ranges describe eligibility, not a promise to reach the bound. In the
+bundled `fable-effort` preset, `fast` costs 1 and `medium` costs 3. With the default
+`enforcement.escalate.costCeiling.multiple: 4`, a failing ladder starting at `fast`
+runs only **three attempts**: `fast@low → fast@medium → medium@high`, then stops
+with `cost ceiling exceeded` (cumulative cost 5 > 4). With the bump disabled the
+trace is `fast@low → fast@low → medium@high`, also three attempts. **Medium's bump
+does not run at defaults.** Raise `enforcement.escalate.costCeiling.multiple` to
+allow it (for example, `5` allows the fourth attempt under the default attempt
+limits). The bump does not itself expand those limits.
+
+```json
+{
+  "enforcement": {
+    "escalate": {
+      "effortBump": true,
+      "effortBumpMax": "high"
+    }
+  }
+}
+```
 
 ---
 
@@ -542,9 +691,9 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | Env var value | Resolved mode | Notes |
 |---|---|---|
 | `"1"` | `"enforced"` | Hard override. Ignores `mode` **and** `perTier`. |
-| `"0"` | `"off"` | Hard override. Ignores `mode`. |
+| `"0"` | `"off"` | Hard override. Ignores `mode` **and** `perTier`. |
 | unset or `""` | config `mode`, with `perTier[tier]` taking precedence when present | Normal path. |
-| any other value | config `mode` (fallback) | Emits one-time warning: `<gate>="<value>" is not "1" or "0"; ignoring env gate and using config.` |
+| any other value | config `mode`, with `perTier[tier]` taking precedence when present | Returns warning: `<gate>="<value>" is not "1" or "0"; ignoring env gate and using config.` |
 
 ---
 
@@ -555,12 +704,15 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | Rule |
 |---|
 | `mode` must be one of `off \| advisory \| enforced`. |
+| `maxDelegationDepth` must be a safe integer from 1 to 32 or `null`. |
 | `verify.graderPolicy` (when `verify` is an object) must be exactly `"atLeastProducerTier"`. |
 | `escalate.costCeiling.multiple` must be a number > 0. |
 | `escalate.ladder` must be an array of strings. |
 | `escalate.maxAttemptsPerTier` must be an integer ≥ 0. |
 | `escalate.maxTotalAttempts` must be an integer ≥ 1. |
 | `escalate.floorTier` must be string or `null`. |
+| `escalate.effortBump` must be a boolean. |
+| `escalate.effortBumpMax` must be one of `low \| medium \| high \| xhigh \| max`. |
 | `perTier` values must each be `off \| advisory \| enforced`. |
 | `guard.budget` must be a number ≥ 1. |
 | `guard.blockScriptWrites` must be a boolean. |
@@ -589,22 +741,22 @@ overrides file is reported via `console.warn` and that override layer is dropped
 `effort` is an optional, provider-agnostic tier field: one of `low`, `medium`, `high`,
 `xhigh`, `max`. It lets one preset run the *same model* at three different reasoning
 depths — that is what the bundled `fable-effort` preset does (`@fast`=`low`,
-`@medium`=`high`, `@heavy`=`xhigh`, all on `anthropic/claude-fable-5`), which keeps the
+`@medium`=`high`, `@heavy`=`xhigh`, all on `anthropic/claude-fable-5-1`), which keeps the
 prompt cache warm across tiers because the model string never changes.
 
 ```jsonc
 {
   "presets": {
     "fable-effort": {
-      "fast": { "model": "anthropic/claude-fable-5", "effort": "low" }
+      "fast": { "model": "anthropic/claude-fable-5-1", "effort": "low" }
     }
   }
 }
 ```
 
-**When unset, nothing is registered.** The agent's `options` bag simply has no `effort`
-(and no `reasoning_effort`) key — there is no implicit default and no "normal" value
-written on your behalf.
+**When `effort` is unset, it registers nothing.** There is no implicit default or
+"normal" value written to the agent's `options.effort` / `options.reasoningEffort`.
+Explicit `reasoning.*` or `thinking` fields can still register their own options.
 
 ### Precedence
 
@@ -623,17 +775,26 @@ knob (`low | medium | high` only) and it is also what `/tiers` renders.
 | Model family | What is registered | Caveats |
 |---|---|---|
 | Anthropic (`isClaudeModel`) | `options.effort` verbatim, including `xhigh` and `max`. | Requires the `opencode-anthropic-fix` plugin (commit `307aea9`+ for fable/mythos). Non-adaptive Claude models (e.g. haiku) silently strip `effort` at the API layer, and without that plugin a top-level `effort` can break Claude-Code billing fingerprinting. |
-| OpenAI (`openai/…`, `gpt-…`, `o1`/`o3`/`o4`) | `options.reasoning_effort`. | `reasoning_effort` only supports `low`, `medium`, `high`. `xhigh` and `max` are **downgraded to `high`** with a one-time warning per tier+level. |
+| OpenAI (`openai/…`, `gpt-…`, `o1`/`o3`/`o4`) | `options.reasoningEffort`. | The router emits `low`, `medium`, or `high`: `xhigh` and `max` are **downgraded to `high`** with a one-time warning per tier+level. |
 | Anything else (Google, …) | nothing. | `effort` is dropped with a one-time warning naming the model — the field has no known mapping there. |
 
 Detection is by model *family*, not by provider prefix: `isClaudeModel` matches any
 `/claude-` segment and `isOpenAIModel` matches `\bgpt-` (plus `openai/…` and
 `o1`/`o3`/`o4`). Copilot-proxied ids therefore land in the rows above —
-`github-copilot/gpt-4o` gets `reasoning_effort`, `github-copilot/claude-sonnet-4` gets
+`github-copilot/gpt-4o` gets `reasoningEffort`, `github-copilot/claude-sonnet-4` gets
 `effort`. Only a model matching no family pattern at all falls through to the last row.
 
 Warnings are emitted once per distinct problem (keyed by tier and, where it matters, by
 the offending value), because agent registration re-runs on every `config` hook.
+
+**V1 behaviour change:** registration now uses provider-native `reasoningEffort`,
+`reasoningSummary`, and `thinking: { type: "enabled", budgetTokens }`. Previously
+the snake-case registration keys were silently dropped on v1; configured reasoning
+or thinking may now increase cost/latency or expose provider incompatibilities,
+including on proxied or unrecognised model families. Remove `effort`, `reasoning.*`
+or `thinking` from an affected tier if necessary. User-facing `reasoning.effort`,
+`reasoning.summary`, and `thinking.budgetTokens` are unchanged. See the
+[CHANGELOG](../CHANGELOG.md) for the registration fix and affected cases.
 
 ### Provider gate for explicit `thinking` and `reasoning` fields
 
@@ -644,12 +805,12 @@ explicit provider-specific fields are gated too, but only for Claude models
 `github-copilot/claude-…` and `openrouter/anthropic/claude-…`; on those tiers
 `reasoning.*` is dropped as well, matching how the `effort` matrix above already routes
 them to the Anthropic column.
-See [PER_TURN_EFFORT.md](./PER_TURN_EFFORT.md) for how this meets Claude Code 2.1.280's per-turn effort and the bundled `@medium` tier.
+See [PER_TURN_EFFORT.md](./PER_TURN_EFFORT.md) for how this meets Claude Code 2.1.280's per-turn effort and the bundled `@heavy` tier.
 
 | Configuration | What is registered | Warning (once per tier) |
 |---|---|---|
 | `thinking.budgetTokens` on an adaptive-only Claude model (below) | nothing — the budget is ignored as if unset, so a sibling `effort` is still registered | the model only accepts adaptive thinking and rejects a manual budget, so `thinking.budgetTokens` is ignored; use `effort` instead |
-| `thinking.budgetTokens` on any other Claude model | `options.budget_tokens` (unchanged) | none |
+| Truthy `thinking.budgetTokens` on any other Claude model | `options.thinking = { type: "enabled", budgetTokens }` | none |
 | `reasoning.effort` / `reasoning.summary` on any Claude model | nothing — both are OpenAI parameters | `reasoning.effort` and `reasoning.summary` are ignored for the Claude model; use `effort` instead |
 
 The adaptive-only set is `isAdaptiveOnlyClaudeModel` in `src/router/protocol.ts`: the
@@ -668,14 +829,14 @@ wire-compat catalogue records this as `rejects_disabled_thinking`), and a manual
 supplied thinking budget is **reported to be rejected with HTTP 400** — a report this
 repository has not reproduced (see [PER_TURN_EFFORT.md](./PER_TURN_EFFORT.md)). Effort
 on that model is expressed through `effort` / `output_config.effort`, never through a
-token budget. The bundled `anthropic` preset already points `@medium` at
+token budget. The bundled `anthropic` preset already points `@heavy` at
 `anthropic/claude-opus-5-5`, so a tier written as:
 
 ```jsonc
 {
   "presets": {
     "anthropic": {
-      "medium": {
+      "heavy": {
         "model": "anthropic/claude-opus-5-5",
         "thinking": { "budgetTokens": 32000 }
       }
@@ -684,7 +845,7 @@ token budget. The bundled `anthropic` preset already points `@medium` at
 }
 ```
 
-registers no `budget_tokens` and logs the adaptive-thinking warning once. The budget no
+registers no `thinking` option and logs the adaptive-thinking warning once. The budget no
 longer outranks `effort` on these models: a tier that sets both registers its `effort`
 and warns only about the ignored budget, not about a conflict.
 
@@ -694,9 +855,10 @@ and reserve `reasoning.*` for OpenAI tiers.
 
 **Remaining limitation:** the gate is Claude-only. On non-Claude tiers the explicit
 fields are still passed through unchecked — `thinking.budgetTokens` on an OpenAI or
-Google tier still registers `options.budget_tokens`, and `reasoning.*` on a Google tier
-still registers `options.reasoning_effort` / `options.reasoning_summary`, although those
-providers have no such parameter. A model id that `isClaudeModel` does not recognise
+Google tier still registers `options.thinking = { type: "enabled", budgetTokens }`, and
+`reasoning.*` on a Google tier still registers `options.reasoningEffort` /
+`options.reasoningSummary`. Provider acceptance of those options is unverified.
+A model id that `isClaudeModel` does not recognise
 (for example a dotted Bedrock namespace, `us.anthropic.claude-…`) is not gated either.
 
 ---
@@ -924,6 +1086,9 @@ pins this: it resolves the real policies from the shipped file and from the same
 | Field | Shipped value | Applied by |
 |---|---|---|
 | `mode` | `"advisory"` | `src/router/enforcement.ts` — violations are logged, never blocked |
+| `maxDelegationDepth` | not shipped; code default `1` | `src/router/config.ts` (`resolveDepthLimit`) |
+| `escalate.effortBump` | not shipped; code default `true` | `src/router/config.ts` (`resolveEffortBump`) |
+| `escalate.effortBumpMax` | not shipped; code default `"xhigh"` | `src/router/config.ts` (`resolveEffortBump`) |
 | `envGate` | `"MODEL_ROUTER_ENFORCE"` | `src/router/enforcement.ts` (`DEFAULT_ENV_GATE`) |
 | `guard.budget` | `25` | `src/guard/enforce.ts` (`DEFAULT_GUARD_BUDGET`) — per dispatch; the cumulative ceiling across resumes is `budget × 3` |
 | `guard.readDraftCap` | `3` | `src/guard/enforce.ts` |
@@ -951,24 +1116,36 @@ would document a fiction: `verify.require` (no default — see above), `verify.g
 `escalate.costCeiling.base`. These are validated when present but never consumed.
 `verify.gateBudgetMs` was removed from the bundled file; its in-code default (`90000`)
 still applies, as do the defaults of the other §1.4 `verify` keys (see the `verify` table).
+Also not shipped, but resolved by code rather than unread: `maxDelegationDepth`
+defaults to `1` in `resolveDepthLimit`, and `escalate.effortBump` / `escalate.effortBumpMax`
+default to `true` / `"xhigh"` in `resolveEffortBump`.
 
 ### `mode` defaults to `advisory`, and what `enforced` would change
 
-With no `enforcement` block at all, the resolved mode is **`advisory`** — not `off`. In
-advisory mode every guard, ladder and verification rule is evaluated and reported in the
-scorecard, but nothing is ever blocked or retried.
+With no `enforcement` block at all, the resolved mode is **`advisory`** — not `off`.
+Advisory guards warn rather than block. Native `task` (v2: `subagent`) verification
+annotates completed results in both advisory and enforced modes; it cannot automatically
+retry a native call that has already finished. Enforcement `off` skips that native verification.
 
-Changing `mode` to `"enforced"` turns those same evaluations into actions:
+The optional **`delegate` tool's acceptance gate and automatic ladder are independent
+of enforcement mode**: they run in `off`, `advisory` and `enforced`, subject to the
+verification policy (including `verify.require: "never"` and deferred verification).
+Failed verification can retry and climb `escalate.ladder` in any of these modes,
+bounded by `maxAttemptsPerTier`, `maxTotalAttempts` and `costCeiling.multiple`.
+With `escalate.effortBump` enabled, an eligible same-tier retry raises effort up to
+`escalate.effortBumpMax` (further clamped per model), within those same limits.
+These retries spend tokens even in advisory mode. Deferred results do not retry,
+and unavailable verification does not trigger producer escalation.
+
+Changing the effective mode to `"enforced"` changes guard behaviour:
 
 - **Guards block.** A call that violates `readDraftCap`, `sameOpRetryCap`, `blockSelfScript`,
   `deliverableFirst`, `blockScriptWrites` or `budget` is refused instead of noted.
-- **Verification gates acceptance.** A failed grader or deterministic check makes the
-  delegation `unmet` rather than accepted-with-a-note.
-- **The ladder escalates.** An `unmet` result retries and climbs `escalate.ladder`, bounded
-  by `maxAttemptsPerTier`, `maxTotalAttempts` and `costCeiling.multiple` — which costs real
-  tokens that advisory mode never spends.
+- **The depth guard refuses.** Dispatches past `maxDelegationDepth` are refused
+  instead of warned (`null` disables this guard).
 - **`proportional.trivialBypass` starts mattering.** It only has an effect in `enforced`
   mode, where a task classified trivial is demoted back to advisory for that dispatch.
+  The delegation-depth guard is explicitly exempt from this downgrade.
 
 `MODEL_ROUTER_ENFORCE=1` produces the same effect at runtime without editing the file, and
 `=0` forces `off`.

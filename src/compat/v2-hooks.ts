@@ -5,7 +5,7 @@ import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
-import { TASK_VERIFICATION } from "./child-session";
+import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
 import { isAbsolute, resolve } from "node:path";
 import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
@@ -87,6 +87,7 @@ export async function registerV2Hooks(
   const registrations: Array<{ dispose(): Promise<void> }> = [];
   const abort = new AbortController();
   const verifyingCalls = new Set<string>();
+  const depthBanners = new Map<string, string>();
   let eventTask: Promise<void> | undefined;
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
@@ -126,12 +127,11 @@ export async function registerV2Hooks(
     for (const [name, definition] of Object.entries(config.agent)) {
       if (originals.get(name) === JSON.stringify(definition) || !definition.options) continue;
       const { reasoning_effort, reasoning_summary, budget_tokens, ...options } = definition.options;
-      agentOptions.set(name, {
-        ...options,
-        ...(reasoning_effort === undefined ? {} : { reasoningEffort: reasoning_effort }),
-        ...(reasoning_summary === undefined ? {} : { reasoningSummary: reasoning_summary }),
-        ...(budget_tokens === undefined ? {} : { thinking: { type: "enabled", budgetTokens: budget_tokens } }),
-      });
+      const normalized = { ...options };
+      if (reasoning_effort !== undefined && normalized.reasoningEffort === undefined) normalized.reasoningEffort = reasoning_effort;
+      if (reasoning_summary !== undefined && normalized.reasoningSummary === undefined) normalized.reasoningSummary = reasoning_summary;
+      if (budget_tokens !== undefined && normalized.thinking === undefined) normalized.thinking = { type: "enabled", budgetTokens: budget_tokens };
+      agentOptions.set(name, normalized);
     }
     registrations.push(await ctx.agent.transform((editor) => {
       if (runtime) editor.update(V2_GRADER_AGENT, (agent) => {
@@ -289,6 +289,12 @@ export async function registerV2Hooks(
         await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
       });
       const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
+      const banner = (output as Record<PropertyKey, unknown>)[DEPTH_BANNER];
+      if (typeof banner === "string") {
+        depthBanners.delete(event.id);
+        depthBanners.set(event.id, banner);
+        while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+      }
       if (verifying) {
         verifyingCalls.add(event.id);
         while (verifyingCalls.size > 1000) verifyingCalls.delete(verifyingCalls.values().next().value!);
@@ -300,14 +306,20 @@ export async function registerV2Hooks(
       event.input = nativeArgs(event.tool, output.args, original, verifying);
     }));
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
+      const banner = depthBanners.get(event.id);
+      depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
       if (event.status !== "completed") return;
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That
       // acknowledgement is not a final result and must never enter acceptance.
       if (event.tool === "subagent" && structured?.status === "running") {
-        if (!verifying) return;
-        const notice = "[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return.";
+        const notices = [
+          ...(verifying ? ["[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return."] : []),
+          ...(banner === undefined ? [] : [banner]),
+        ];
+        if (!notices.length) return;
+        const notice = notices.join("\n\n");
         const content = Array.isArray(event.result.content) ? [...event.result.content]
           : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
         event.result = {
@@ -326,15 +338,36 @@ export async function registerV2Hooks(
           callID: event.id, args: await scopedArgs(event),
         }, output);
       });
-      if (output.output === text) return;
-      const content = Array.isArray(event.result.content) ? event.result.content.filter((part) => part.type !== "text") : [];
+      const changed = output.output !== text;
+      if (!changed && banner === undefined) return;
+      const routed = changed ? translateAdded(text, output.output) : text;
+      const final = banner === undefined ? routed : [routed.trimEnd(), banner].filter(Boolean).join("\n\n");
+      const content = Array.isArray(event.result.content) ? [...event.result.content]
+        : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
+      const childText = text.trimEnd();
+      const routedText = routed.trimEnd();
+      let visible;
+      if (event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string"
+        && content.some((part) => part.type === "text") && routedText.startsWith(childText)) {
+        // The host's visible text owns the session envelope (and resume handle).
+        // Footer helpers trim the bare output. Compare trimmed tails before taking
+        // only the router's suffix; other rewrites must replace, not repeat, it.
+        const suffix = changed ? routedText.slice(childText.length) : "";
+        const notices = [suffix, banner].filter((part) => part !== undefined && part !== "").join("\n\n");
+        visible = [
+          ...content,
+          ...(notices ? [{ type: "text" as const, text: notices }] : []),
+        ];
+      } else {
+        visible = [{ type: "text" as const, text: final }, ...content.filter((part) => part.type !== "text")];
+      }
       event.result = {
         ...event.result,
-        content: [{ type: "text", text: translateAdded(text, output.output) }, ...content],
+        content: visible,
         metadata: output.metadata,
-        ...(typeof structured === "string" ? { output: translateAdded(text, output.output) }
+        ...(typeof structured === "string" ? { output: final }
           : structured && typeof structured === "object" && typeof structured.output === "string"
-            ? { output: { ...structured, output: translateAdded(text, output.output) } } : {}),
+            ? { output: { ...structured, output: final } } : {}),
       };
     }));
 

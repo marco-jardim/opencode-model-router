@@ -44,9 +44,18 @@ v1 hooks from `setup` would register nothing.
 
 Agent `request.settings` is not consumed by the v2 request pipeline. Tier options
 are therefore applied through the context hook to `event.options`, filling only
-missing keys before the legacy `chat.params` hook runs. Provider option mappings
-are preserved (`reasoning_effort` → `reasoningEffort`, `reasoning_summary` →
-`reasoningSummary`, `budget_tokens` → `thinking: { type: "enabled", budgetTokens }`).
+missing keys before the legacy `chat.params` hook runs. The router registers
+provider-native `reasoningEffort`, `reasoningSummary`, and
+`thinking: { type: "enabled", budgetTokens }` (or Claude `effort`), which the bridge
+passes unchanged. For options merged into router-registered agents (only definitions
+the router's `config` hook changed), it still normalizes legacy aliases
+(`reasoning_effort`, `reasoning_summary`, `budget_tokens`) only when the
+corresponding native value is absent/`undefined`; an explicit native value wins.
+Unmodified agents are skipped, including their per-turn option merge.
+User-facing tier config keys (`reasoning.effort`, `reasoning.summary`,
+`thinking.budgetTokens`) are unchanged. The producer-only effort override then
+runs through `chat.params` directly on `event.options`, without adding a nested
+`options` bag.
 
 ## Grader temperature on v2
 
@@ -100,6 +109,16 @@ artifacts as before.
 If a user backgrounds an already-running verified native job, its pending response is
 explicitly marked unverified. It is never sent to the acceptance gate as if it
 were a completed artifact.
+
+Router-annotated/verified `subagent` results now keep the host's
+`<subagent sessionID=…>` envelope part in `content`, preserving the resume handle,
+and append router notes as a separate text part. This changes the visible layout
+from the old plain-text replacement; it does not change the structured-output or
+metadata semantics. Envelope preservation applies when host text exists and the
+router output starts with the child's text after trimming trailing whitespace.
+Missing host text or a non-suffix rewrite instead uses the full router output as
+one text part, retaining non-text attachments without duplicating the child text.
+See [CHANGELOG](../CHANGELOG.md).
 
 ## Validation
 

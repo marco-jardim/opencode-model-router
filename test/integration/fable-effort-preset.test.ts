@@ -98,11 +98,11 @@ test("registers each anthropic tier's effort as `effort`", async () => {
     await hooks.config(ocCfg);
 
     // The bundled anthropic preset sets `effort` on all three tiers. All use
-    // Anthropic models, so they map onto `effort` (not `reasoning_effort`).
+    // Anthropic models, so they map onto `effort` (not `reasoningEffort`).
     for (const [name, effort] of [["fast", "low"], ["medium", "medium"], ["heavy", "xhigh"]]) {
       const options = ocCfg.agent[name].options;
       expect(options.effort).toBe(effort);
-      expect(options).not.toHaveProperty("reasoning_effort");
+      expect(options).not.toHaveProperty("reasoningEffort");
     }
   } finally {
     if (prevHome === undefined) delete process.env.HOME;

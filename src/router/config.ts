@@ -37,8 +37,9 @@ export interface ReasoningConfig {
  * Provider-agnostic reasoning effort for a tier.
  *
  * `xhigh` and `max` exist because Anthropic's adaptive models accept them;
- * OpenAI's `reasoning_effort` stops at `high`, so the registration path
- * downgrades those two with a warning (see `src/router/agent-options.ts`).
+ * OpenAI's reasoning effort parameter (`reasoningEffort`) stops at `high`, so
+ * the registration path downgrades those two with a warning (see
+ * `src/router/agent-options.ts`).
  */
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
@@ -121,6 +122,8 @@ export interface ModeConfig {
 
 export interface EnforcementConfig {
   mode?: "off" | "advisory" | "enforced";
+  /** Default 1; warned in "advisory" mode (bundled default), refused in "enforced" mode, ignored in "off"; null disables. */
+  maxDelegationDepth?: number | null;
   envGate?: string;
   perTier?: Record<string, "off" | "advisory" | "enforced">;
   guard?: { readDraftCap?: number; sameOpRetryCap?: number; blockSelfScript?: boolean; deliverableFirst?: boolean; budget?: number; blockScriptWrites?: boolean };
@@ -167,7 +170,11 @@ export interface EnforcementConfig {
     failureRecheck?: boolean;
     /** Budget for the reference re-run, in ms (integer >= 1). Default 60000. */
     recheckTimeoutMs?: number };
-  escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number } };
+  escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number };
+    /** Bump reasoning effort before escalating tiers. Default true. */
+    effortBump?: boolean;
+    /** Maximum reasoning effort for a bump. Default "xhigh". */
+    effortBumpMax?: EffortLevel };
   proportional?: { trivialBypass?: boolean; trivialClassifier?: string };
 }
 
@@ -710,13 +717,86 @@ function validateTaskPatterns(obj: Record<string, unknown>): void {
  */
 const MAX_TIMER_MS = 2_147_483_647;
 
-function validateEnforcement(obj: Record<string, unknown>): void {
+/**
+ * Equals the depth tracker's MAX_DEPTH_HOPS (src/router/depth.ts, Phase 1.2),
+ * so a cycle or over-long chain counted as 32 is refused under every configured limit.
+ */
+export const MAX_DELEGATION_DEPTH_LIMIT = 32;
+
+/** Total, typed and bounded rendering of an invalid config value. */
+function describeValue(value: unknown): string {
+  let description: string;
+  try {
+    if (typeof value === "string") description = JSON.stringify(value);
+    else if (typeof value === "number") description = Object.is(value, -0) ? "-0" : String(value);
+    else if (typeof value === "bigint") description = `${value}n`;
+    else if (value === null) description = "null";
+    else if (typeof value === "object") {
+      const tag = Array.isArray(value) ? "array" : "object";
+      description = `${tag} ${JSON.stringify(value) ?? "<unserializable>"}`;
+    } else if (typeof value === "function") description = "<function>";
+    else description = String(value);
+  } catch {
+    description = `<${typeof value}>`;
+  }
+  if (description.length <= 80) return description;
+  // Keep the 80-code-unit bound without splitting a surrogate pair.
+  const end = /[\uD800-\uDBFF]/.test(description[78]!) && /[\uDC00-\uDFFF]/.test(description[79]!) ? 78 : 79;
+  return `${description.slice(0, end)}…`;
+}
+
+/** Copy without invoking accessors again; include defined get-only Proxy values. */
+function withValidatedSnapshots<T extends object>(
+  obj: T,
+  snapshots: Record<string, unknown>,
+): T {
+  const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(obj);
+  let changed = false;
+  for (const [key, value] of Object.entries(snapshots)) {
+    if (value !== undefined || Object.hasOwn(descriptors, key) || key in obj) {
+      descriptors[key] = { value, writable: true, enumerable: true, configurable: true };
+      changed = true;
+    }
+  }
+  if (!changed) return obj;
+  // Keep inherited config values and array identity, not just own descriptors.
+  const copy: object = Array.isArray(obj) ? [] : Object.create(Object.getPrototypeOf(obj));
+  if (Array.isArray(obj)) Object.setPrototypeOf(copy, Object.getPrototypeOf(obj));
+  Object.defineProperties(copy, descriptors);
+  if (Object.isFrozen(obj)) Object.freeze(copy);
+  return copy as T;
+}
+
+/** Reject keys that could reparent a later Object.assign copy. */
+function rejectPrototypeKeys(obj: object, path: string): void {
+  for (const key of ["__proto__", "constructor", "prototype"] as const) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      throw new Error(`tiers.json: ${path} must not contain the key "${key}"`);
+    }
+  }
+}
+
+function validateEnforcement(value: unknown): Record<string, unknown> | undefined {
   // Validate enforcement if present (optional — absent means no enforcement)
-  if (obj.enforcement !== undefined) {
-    if (!isPlainObject(obj.enforcement)) {
+  if (value !== undefined) {
+    if (!isPlainObject(value)) {
       throw new Error("tiers.json: enforcement must be an object");
     }
-    const enforcement = obj.enforcement as Record<string, unknown>;
+    const enforcement = value as Record<string, unknown>;
+    rejectPrototypeKeys(enforcement, "enforcement");
+    const maxDelegationDepth = enforcement.maxDelegationDepth;
+    if (
+      maxDelegationDepth !== undefined &&
+      maxDelegationDepth !== null &&
+      (typeof maxDelegationDepth !== "number" ||
+        !Number.isSafeInteger(maxDelegationDepth) ||
+        maxDelegationDepth < 1 ||
+        maxDelegationDepth > MAX_DELEGATION_DEPTH_LIMIT)
+    ) {
+      throw new Error(
+        `tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got ${describeValue(maxDelegationDepth)})`,
+      );
+    }
     if (enforcement.mode !== undefined) {
       if (!["off", "advisory", "enforced"].includes(enforcement.mode as string)) {
         throw new Error(
@@ -738,13 +818,7 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         throw new Error("tiers.json: enforcement.verify must be an object");
       }
       const verify = enforcement.verify as Record<string, unknown>;
-      // An own `__proto__`/`constructor`/`prototype` key is never read, but a
-      // later `Object.assign` copy would reparent through it; reject it here.
-      for (const key of ["__proto__", "constructor", "prototype"] as const) {
-        if (Object.prototype.hasOwnProperty.call(verify, key)) {
-          throw new Error(`tiers.json: enforcement.verify must not contain the key "${key}"`);
-        }
-      }
+      rejectPrototypeKeys(verify, "enforcement.verify");
       if (verify.testBaseline !== undefined && typeof verify.testBaseline !== "boolean") {
         throw new Error("tiers.json: enforcement.verify.testBaseline must be a boolean");
       }
@@ -869,12 +943,29 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         );
       }
     }
+    const escalateValue = enforcement.escalate;
+    const snapshots: Record<string, unknown> = { maxDelegationDepth, escalate: escalateValue };
     if (
-      enforcement.escalate !== undefined &&
-      typeof enforcement.escalate === "object" &&
-      enforcement.escalate !== null
+      escalateValue !== undefined &&
+      typeof escalateValue === "object" &&
+      escalateValue !== null
     ) {
-      const escalate = enforcement.escalate as Record<string, unknown>;
+      const escalate = escalateValue as Record<string, unknown>;
+      rejectPrototypeKeys(escalate, "enforcement.escalate");
+      const effortBump = escalate.effortBump;
+      if (effortBump !== undefined && typeof effortBump !== "boolean") {
+        throw new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got ${describeValue(effortBump)})`);
+      }
+      const effortBumpMax = escalate.effortBumpMax;
+      if (
+        effortBumpMax !== undefined &&
+        !EFFORT_LEVELS.some((level) => level === effortBumpMax)
+      ) {
+        throw new Error(
+          `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")} (got ${describeValue(effortBumpMax)})`,
+        );
+      }
+      snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax });
       if (
         escalate.costCeiling !== undefined &&
         typeof escalate.costCeiling === "object" &&
@@ -1007,6 +1098,7 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         );
       }
     }
+    return withValidatedSnapshots(enforcement, snapshots);
   }
 }
 
@@ -1014,6 +1106,9 @@ function validateEnforcement(obj: Record<string, unknown>): void {
  * Validate a raw parsed config. Strict and throwing by design: the bundled
  * tiers.json must be valid on its own, and loadConfig turns a throw from an
  * override layer into a warning plus a fallback rather than a crash.
+ * Returns a copy when enforcement is present (even an undefined accessor),
+ * snapshotting its depth/effort values without mutating the caller. Copies
+ * preserve prototypes, arrays, unrelated descriptors and source frozenness.
  *
  * Section order matters and is preserved from when this was one function: a
  * config with several problems reports the same first error it always did.
@@ -1040,13 +1135,14 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateModelGenerations(obj);
   validateTaskPatterns(obj);
   validateSubagentTiers(obj);
-  validateEnforcement(obj);
+  const enforcement = validateEnforcement(obj.enforcement);
   validateDelegateInstructions(obj);
   validateDispatchHeader(obj);
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
 
-  return raw as RouterConfig;
+  const cfg = raw as RouterConfig;
+  return withValidatedSnapshots(cfg, { enforcement });
 }
 
 /**
@@ -1268,6 +1364,21 @@ export function writeState(patch: Partial<RouterState>): void {
 // ---------------------------------------------------------------------------
 // Enforcement helpers
 // ---------------------------------------------------------------------------
+
+/** The single place the delegation-depth default is applied; null disables it. */
+export function resolveDepthLimit(cfg: RouterConfig): number | null {
+  const depth = cfg.enforcement?.maxDelegationDepth;
+  return depth === undefined ? 1 : depth;
+}
+
+/** The single place effort-bump defaults are applied, without mutating config. */
+export function resolveEffortBump(cfg: RouterConfig): { enabled: boolean; max: EffortLevel } {
+  const escalate = cfg.enforcement?.escalate;
+  return {
+    enabled: escalate?.effortBump ?? true,
+    max: escalate?.effortBumpMax ?? "xhigh",
+  };
+}
 
 /** Returns the effective enforcement mode. Missing enforcement ⇒ mode:"advisory". */
 export function normalizeEnforcement(

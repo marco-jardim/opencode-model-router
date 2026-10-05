@@ -10,7 +10,7 @@
  * stderr, and a warning call site that was never routed through the logger
  * at all.
  *
- * Determinism: opencode is spawned with HOME pointed at a temp dir so the
+ * Determinism: opencode is spawned with HOME/USERPROFILE pointed at a temp dir so the
  * developer's global `~/.config/opencode/opencode.json` (which registers this
  * same plugin) and their `opencode-model-router.state.json` (which overlays
  * activePreset and outranks the override file) cannot bleed into the fixture.
@@ -61,9 +61,24 @@ function debugAgent(
   name: string,
   extraEnv: NodeJS.ProcessEnv = {},
 ): DebugAgentResult {
+  const env = { ...process.env };
+  for (const name of Object.keys(env)) {
+    if (/^OPENCODE_/i.test(name)) delete env[name];
+  }
+  for (const [name, dir] of Object.entries({
+    XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data",
+    XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state", APPDATA: "appdata",
+    LOCALAPPDATA: "localappdata",
+  })) {
+    env[name] = path.join(homeDir, dir);
+    fs.mkdirSync(env[name], { recursive: true });
+  }
   const result = spawnSync("opencode", ["debug", "agent", name], {
     cwd: projectDir,
-    env: { ...process.env, HOME: homeDir, ...extraEnv },
+    env: {
+      ...env, HOME: homeDir, USERPROFILE: homeDir,
+      OPENCODE_DISABLE_MODELS_FETCH: "true", ...extraEnv,
+    },
     encoding: "utf8",
     timeout: 120_000,
   });
@@ -162,7 +177,7 @@ d("keyless registration smoke", () => {
       // xhigh -> high downgrade: OpenAI has no `xhigh` reasoning effort, so
       // the options builder must clamp it. Seeing `high` here proves the
       // config hook and override resolution ran inside a real opencode.
-      expect(agent.options?.reasoning_effort).toBe("high");
+      expect(agent.options?.reasoningEffort).toBe("high");
 
       // REGRESSION GUARD — this assertion is the point of this file.
       // A passive warning reaching stderr is the exact bug #35 fixed:

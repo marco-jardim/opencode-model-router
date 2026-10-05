@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import type { RouterPluginInput } from "./compat/child-session";
-import { TASK_VERIFICATION } from "./compat/child-session";
+import { DEPTH_BANNER, TASK_VERIFICATION } from "./compat/child-session";
 
 // Imports for internal use within this module
 import {
@@ -12,9 +12,10 @@ import {
   localOverridePath,
   findProjectOverride,
   resolveVerifyBudget,
+  resolveDepthLimit,
   warnDeprecatedVerifyKeys,
 } from "./router/config";
-import type { RouterConfig, TierConfig, Preset, ModeConfig } from "./router/config";
+import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
@@ -99,6 +100,9 @@ import {
   buildAcceptedSuffix,
 } from "./verify/dispatch";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard } from "./escalate/ladder";
+import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
+import { createDepthGuard } from "./router/depth-guard";
+import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -113,6 +117,15 @@ export type { Cap, SubagentState };
 export type { TrajectoryState, TrajectoryToolEvent } from "./telemetry/trajectory";
 export type { EnforcementMode } from "./router/enforcement";
 export type { GuardPolicy, GuardState, GuardCall, GuardDecision } from "./guard/guards";
+
+/** Diagnostics must also tolerate thrown values without primitive conversion. */
+function describeError(error: unknown): string {
+  try {
+    return scrubText(String(error));
+  } catch {
+    return "unprintable error";
+  }
+}
 
 function saveActivePreset(presetName: string): void {
   const cfg = loadConfig();
@@ -238,7 +251,7 @@ function warnSessionLookupFailedOnce(): void {
 }
 
 const SESSION_ROOT_MEMO_MAX = 500;
-const SESSION_LOOKUP_RETRY_MS = 30_000;
+const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
 
 const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let cfg = loadConfig();
@@ -290,6 +303,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const memo = sessionRootMemo.get(sessionID);
     if (memo !== undefined) {
       if (!memo) sessionStore.markChildSession(sessionID);
+      else depthTracker.recordRoot(sessionID);
       return memo;
     }
     const failedAt = sessionLookupFailedAt.get(sessionID);
@@ -311,6 +325,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         sessionRootMemo.delete(oldest);
       }
       if (!isRoot) sessionStore.markChildSession(sessionID);
+      if (isRoot) depthTracker.recordRoot(sessionID);
+      else depthTracker.recordCreated(sessionID, parentID as string);
       return isRoot;
     } catch {
       sessionLookupFailedAt.set(sessionID, Date.now());
@@ -346,6 +362,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     () => guardStore.sweep(),
     () => trajectoryStore.sweep(),
     () => changedFileStore.sweep(),
+    () => depthTracker.sweep(),
     // 2.2.3: the S5 batch coordinator's defensive eviction (batch.ts B11). Declared below; the
     // sweeper only runs from chat.message, long after this factory has returned.
     () => { sweepVerification(); },
@@ -360,6 +377,60 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // from a plugin paints over the TUI. Falls back to console when the server
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
+  const routerWarn = { warn: (message: string) => logger.warn(message) };
+  const depthTracker = createDepthTracker({
+    async getParent(id) {
+      if (sessionRootMemo.get(id) === true) return null;
+      const res = await ctx.client.session.get({ path: { id } });
+      if (!res || (res as { error?: unknown }).error || !res.data) {
+        throw new Error("session.get returned no session data");
+      }
+      const parentID = res.data.parentID;
+      return typeof parentID === "string" && parentID !== "" ? parentID : null;
+    },
+    now: () => Date.now(),
+    logger: routerWarn,
+  });
+  const depthGuard = createDepthGuard({
+    tracker: depthTracker,
+    limit: () => resolveDepthLimit(cfg),
+    mode: (sid) => resolveEnforcementMode({
+      config: cfg,
+      tier: (typeof sid === "string" ? sessionStore.getTier(sid) : null) ?? undefined,
+      env: process.env,
+    }).mode,
+    logger: routerWarn,
+  });
+  const effortOverrides = createEffortOverrideStore({ logger: routerWarn });
+  let warnedGraderParams = false;
+  const depthBanners = new Map<string, string>();
+  const warnedNoCallID = new Set<string>();
+  const stashDepthBanner = (
+    input: { sessionID?: string; callID?: string },
+    output: Record<PropertyKey, unknown>,
+    banner: string,
+  ): void => {
+    try {
+      if (ctx.routerHost === "v2") {
+        output[DEPTH_BANNER] = banner;
+        return;
+      }
+      if (typeof input.callID === "string" && input.callID !== "") {
+        const key = `${input.sessionID}:${input.callID}`;
+        depthBanners.delete(key);
+        depthBanners.set(key, banner);
+        while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+      } else {
+        const sid = String(input.sessionID);
+        if (warnedNoCallID.has(sid)) return;
+        logger.warn(`[router] delegation depth: task call without callID in session ${sid}; advisory banner not delivered`);
+        warnedNoCallID.add(sid);
+        while (warnedNoCallID.size > 1000) warnedNoCallID.delete(warnedNoCallID.values().next().value!);
+      }
+    } catch (error) {
+      logger.warn("[router] delegation depth: advisory banner not stored", { error: describeError(error) });
+    }
+  };
 
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
@@ -372,6 +443,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   } = createVerificationWiring({
     client: ctx.client,
     childRunner: ctx.routerChildRunner,
+    onChildSessionCreated: (sid, creator) => depthTracker.recordPluginChild(sid, creator),
     directory: ctx.directory,
     getConfig: () => cfg,
     logger,
@@ -545,6 +617,24 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
            * settled; clearing it in the finally below would abort a capture still in flight.
            */
           let deferredOwnsBaseline = false;
+          const depth = bypassed ? undefined : await depthGuard.checkDispatch(toolCtx?.sessionID);
+          if (depth?.block) {
+            try {
+              // Known subagents are counted by the normal after-hook: delegate
+              // returns a refusal rather than throwing (unlike native task).
+              if (typeof toolCtx?.sessionID === "string" && !sessionStore.isSubagent(toolCtx.sessionID)) {
+                trajectoryStore.recordToolEvent(toolCtx.sessionID, { tool: "delegate", readOnly: false, blocked: true });
+              }
+            } catch {
+              // Best-effort observation must never lose the depth refusal.
+            }
+            return depth.message!;
+          }
+          const withDepthBanner = (text: string): string => {
+            if (!depth?.banner) return text;
+            const trimmed = text.trimEnd();
+            return trimmed ? `${trimmed}\n\n${depth.banner}` : depth.banner;
+          };
           try {
             let activeCfg = cfg;
             try {
@@ -577,6 +667,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             let producerText = "";
             let forcing: string | null = null;
+            let effort: EffortLevel | undefined;
 
             /**
              * One turn of the escalation ladder: create a producer session, run
@@ -591,6 +682,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const runProducerAttempt = async (
               tier: string,
               forcingNote: string | null,
+              effort?: EffortLevel,
             ): Promise<{
               sessionID: string;
               text: string;
@@ -609,6 +701,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const registerProducer = async (sid: string) => {
                 producerSid = sid;
                 producerSessions.push(sid);
+                depthTracker.recordPluginChild(sid, toolCtx?.sessionID ?? null);
+                if (effort !== undefined) {
+                  const tierCfg = getActiveTiers(activeCfg)[tier];
+                  if (tierCfg) effortOverrides.set(sid, tier, tierCfg, effort);
+                }
                 // Keep the ORIGINAL dispatch reference across retries/escalations:
                 // recapturing after a failed attempt would excuse its regression.
                 if (!baselineID) {
@@ -717,6 +814,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 } catch {
                   // non-fatal
                 }
+                effortOverrides.clear(producerSid);
                 await disposeChildSession(producerSid);
                 return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
               }
@@ -845,6 +943,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
               // Dispose this attempt's backend session before the next iteration
               // so a long ladder never accumulates live sessions.
+              effortOverrides.clear(producerSid);
               await disposeChildSession(producerSid);
 
               return { sessionID: producerSid, text: producerText, gateRes };
@@ -852,21 +951,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             while (true) {
               if (safety++ > safetyMax) {
-                return (
+                return withDepthBanner(
                   `[router status: unmet] delegation stopped by the safety net after ` +
                   `${state.totalAttempts} attempt(s).\n\n${scrubText(producerText)}`
                 );
               }
               const tier = state.currentTier;
-              const attempt = await runProducerAttempt(tier, forcing);
+              const attempt = await runProducerAttempt(tier, forcing, effort);
               if (!attempt) {
-                return "[router] delegate failed: could not create a producer session.";
+                return withDepthBanner("[router] delegate failed: could not create a producer session.");
               }
               producerText = attempt.text;
               if ("deferredFooter" in attempt) {
                 // Section 1.5-16: the result unchanged plus the footer, appended last. Never
                 // labelled accepted or verified, and never retried or escalated.
-                return appendRouterFooter(producerText, attempt.deferredFooter);
+                return appendRouterFooter(withDepthBanner(producerText), attempt.deferredFooter);
               }
               const producerSid = attempt.sessionID;
               const gateRes = attempt.gateRes;
@@ -890,7 +989,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   true,
                   gateRes.verdict.method,
                 );
-                return producerText + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.outcome, gateRes.verdict.caveats, gateRes.verdict.notes);
+                return withDepthBanner(producerText) + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.outcome, gateRes.verdict.caveats, gateRes.verdict.notes);
               }
               if (action.action === "give_up") {
                 dumpDelegateScorecard(
@@ -900,7 +999,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   gateRes.verdict.method,
                 );
                 const note = scrubText(buildForcingNote(gateRes.verdict.reasons));
-                return (
+                return withDepthBanner(
                   `[router status: unmet] The delegated result was not accepted after ` +
                   `${state.totalAttempts} attempt(s) across ${state.escalations} escalation(s) ` +
                   `(final tier ${state.currentTier}; ${action.reason ?? "verification failed"}).\n\n` +
@@ -909,10 +1008,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
               // retry or escalate
               forcing = action.forcingMessage ?? null;
+              effort = action.effort;
               state = advance(state, action);
             }
           } catch {
-            return "[router] delegate failed (fail-closed): the delegation or verification could not complete.";
+            return withDepthBanner("[router] delegate failed (fail-closed): the delegation or verification could not complete.");
           } finally {
             // Safety net for every exit path an end-of-iteration dispose cannot
             // reach: accept/give-up returns, the safety-net return, and throws.
@@ -920,6 +1020,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // disposed session is harmless.
             for (const sid of producerSessions) {
               if (!(deferredOwnsBaseline && sid === baselineID)) changedFileStore.clear(sid);
+              effortOverrides.clear(sid);
               await disposeChildSession(sid);
             }
           }
@@ -987,8 +1088,26 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             output.temperature = graderTemperature;
           }
         }
-      } catch {
-        // best-effort: never crash a real session
+      } catch (error) {
+        if (!warnedGraderParams) {
+          warnedGraderParams = true;
+          try {
+            logger.warn("[verify] grader temperature not applied", { error: describeError(error) });
+          } catch {
+            // Even a failed diagnostic sink must not interrupt chat.params.
+          }
+        }
+      }
+      try {
+        if (input && typeof input === "object") {
+          applyEffortOverride(effortOverrides, input, ctx.routerHost === "v2" ? output : output?.options, routerWarn);
+        }
+      } catch (error) {
+        try {
+          logger.warn("[router] effort override not applied", { error: describeError(error) });
+        } catch {
+          // Host accessors and diagnostic sinks are both best-effort here.
+        }
       }
     },
 
@@ -1098,6 +1217,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // -----------------------------------------------------------------------
     "tool.execute.before": async (input: any, output: any) => {
       if (bypassed) return;
+      if (input?.tool === "task") {
+        const depth = await depthGuard.checkDispatch(input.sessionID);
+        if (depth.block) {
+          try {
+            if (typeof input.sessionID === "string") {
+              trajectoryStore.recordToolEvent(input.sessionID, {
+                tool: input.tool, readOnly: READ_ONLY_TOOLS.has(input.tool), blocked: true,
+              });
+            }
+          } catch (error) {
+            logger.warn("[router] delegation depth: refusal not recorded", { error: describeError(error) });
+          }
+          throw new Error(depth.message);
+        }
+        if (depth.banner) stashDepthBanner(input, output, depth.banner);
+      }
       // Observe before execution too: an in-flight edit must contaminate a
       // capture even if the test finishes before the edit's after-hook fires.
       if (typeof input?.tool === "string") changedFileStore.observeEdit(input.tool,
@@ -1259,6 +1394,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         changedFileStore.record(sid, input.tool, input?.args);
       }
 
+      let unbannered: { output: unknown } | undefined;
+      if (input?.tool === "task") {
+        const key = `${sid}:${input.callID}`;
+        const banner = depthBanners.get(key);
+        depthBanners.delete(key);
+        if (banner !== undefined) {
+          try {
+            unbannered = { output: output.output };
+            const text = typeof output.output === "string" ? output.output.trimEnd() : "";
+            output.output = text ? `${text}\n\n${banner}` : banner;
+          } catch (error) {
+            logger.warn("[router] delegation depth: advisory banner not delivered", { error: describeError(error) });
+          }
+        }
+      }
+
       if (sid && sessionStore.isSubagent(sid) && typeof input?.tool === "string") {
         trajectoryStore.recordToolEvent(sid, {
           tool: input.tool,
@@ -1294,7 +1445,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           try {
             // pending.ts R11: the producer's changes landed by now.
             const returnedAt = Date.now();
-            const { finalReturnText, childSessionID } = parseTaskResult(output);
+            const { finalReturnText, childSessionID } = parseTaskResult(unbannered ? { ...output, output: unbannered.output } : output);
             const producerTier =
               typeof input?.args?.subagent_type === "string"
                 ? input.args.subagent_type
@@ -1379,7 +1530,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             const gateGraderSessions = new Set<string>();
             const completedFailures: string[] = [];
-            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline);
+            // Keep the native grader unparented on the backend; only depth tracking uses its caller.
+            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
             gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
             let res;
             try {
@@ -1497,6 +1649,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
+            effortOverrides.clear(id);
+            depthTracker.forget(id);
+            for (const key of depthBanners.keys()) {
+              if (key.startsWith(`${id}:`)) depthBanners.delete(key);
+            }
+            warnedNoCallID.delete(id);
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);
@@ -1518,6 +1676,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // subagent that has no task tool, and the subagent refused the work.
       if (event?.type === "session.created") {
         const info = event?.properties?.info;
+        try {
+          if (typeof info?.id === "string") {
+            depthTracker.recordCreated(info.id,
+              typeof info.parentID === "string" && info.parentID !== "" ? info.parentID : null);
+          }
+        } catch (error) {
+          logger.warn("[router] delegation depth: session creation not recorded", { error: describeError(error) });
+        }
         if (
           typeof info?.id === "string" &&
           typeof info?.parentID === "string" &&
