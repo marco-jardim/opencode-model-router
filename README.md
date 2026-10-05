@@ -1012,7 +1012,7 @@ Set `taskPromptRepair: false` to restore the previous behaviour; see [configurat
 For work outside the router directory (e.g. a git worktree), add `cwd: <dir>` inside the task's `[acceptance]` block; a non-empty tool `args.cwd` takes precedence.
 If every changed file is absolute and outside the verification base, deterministic checks return unverifiable instead of running in the wrong directory.
 
-**Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
+**Modes:** `off` — disables enforcement guards and skips native `task`/`subagent` verification (must be set explicitly, since `advisory` is the default); `advisory` (default) — warns on guard violations without blocking; `enforced` — blocks guard violations. Native-task verification annotates completed results in both advisory and enforced modes, subject to verification policy. Whenever the opt-in `delegate` tool is enabled, its produce → verify → accept/escalate pipeline runs in **every mode**, including retries and eligible effort bumps, subject to its verification policy and attempt/cost limits.
 
 > Enforcement applies to subagent/delegate sessions only. The orchestrator session is never hard-blocked.
 

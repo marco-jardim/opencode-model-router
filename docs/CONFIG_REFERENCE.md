@@ -1,6 +1,6 @@
 # Enforcement Configuration Reference
 
-The `enforcement` block in `tiers.json`. Every field is optional; each one falls back to the default listed below, and the bundled `tiers.json` now **ships those defaults explicitly** so they are visible in the file rather than implicit in code — see [What the bundled `tiers.json` ships](#what-the-bundled-tiersjson-ships). Setting `mode: "off"` (or `MODEL_ROUTER_ENFORCE=0`) is a strict no-op.
+The `enforcement` block in `tiers.json`. Every field is optional; each one falls back to the default listed below, and the bundled `tiers.json` now **ships those defaults explicitly** so they are visible in the file rather than implicit in code — see [What the bundled `tiers.json` ships](#what-the-bundled-tiersjson-ships). Effective mode `off` disables enforcement guards and skips native-task verification; `MODEL_ROUTER_ENFORCE=0` forces that mode. It does not disable the opt-in `delegate` tool: whenever enabled, its produce → verify → accept/escalate pipeline runs in every mode, subject to its verification policy and attempt/cost limits.
 
 > These settings (like anything in `tiers.json`) can also be placed in an overrides file — `~/.config/opencode/opencode-model-router.overrides.jsonc` (global) or `<repo>/.opencode/opencode-model-router.overrides.jsonc` (project) — and are deep-merged over the bundled defaults, so you don't have to edit the cached `tiers.json`. See the **Configuration** section of the README.
 
@@ -155,7 +155,7 @@ may contain instruction text or paths.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` = no-op. `advisory` = log violations, never block. `enforced` = block/escalate on violations. |
+| `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` disables enforcement guards and skips native-task verification. `advisory` warns on guard violations without blocking; `enforced` blocks them. Native-task verification annotates results in both advisory and enforced modes, subject to verification policy. The enabled `delegate` tool's gate, retries, escalation and effort bump run independently of this mode. |
 | `maxDelegationDepth` | `integer 1–32 \| null` | `1` | Deepest session a model-initiated dispatch may create; root/orchestrator = depth 0. `null` disables the depth guard. |
 | `envGate` | `string` | `"MODEL_ROUTER_ENFORCE"` | Name of the env var that overrides mode at runtime. See env-gate truth table below. |
 | `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` whenever the env gate is not `"1"` or `"0"` (unset, empty, or any other value). |
