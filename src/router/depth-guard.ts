@@ -8,6 +8,15 @@ export const DELEGATION_DEPTH_GUARD = "delegation_depth";
 export type DepthGuardResult = BeforeResult & { banner?: string };
 
 const MAX_WARNED_CALLERS = 1_000;
+const MAX_WARNED_CAUSES = 100;
+
+function describe(value: unknown): string {
+  try {
+    return value instanceof Error ? `${value.name}: ${value.message}` : `${typeof value}: ${String(value)}`;
+  } catch {
+    return "unprintable value";
+  }
+}
 
 export function depthLimitMessage(depth: number, max: number): string {
   return `[router] DELEGATION DEPTH LIMIT — this session is at delegation depth ${depth}; enforcement.maxDelegationDepth is ${max}, so it cannot dispatch another subagent. Do this part of the work yourself and report the result; do not retry the dispatch.`;
@@ -25,6 +34,7 @@ export function createDepthGuard(deps: {
   logger: { warn(msg: string): void };
 }): { checkDispatch(callerSessionID: string | undefined): Promise<DepthGuardResult> } {
   const warnedCallers = new Set<string>();
+  const warnedModes = new Set<unknown>();
   let warnedCaller = false;
   let warnedLimit = false;
 
@@ -46,12 +56,24 @@ export function createDepthGuard(deps: {
     warn(`cannot resolve depth for session ${caller}; allowing dispatch.`);
   }
 
+  function warnOnce(causes: Set<unknown>, cause: unknown, message: string): void {
+    if (causes.has(cause)) return;
+    causes.add(cause);
+    if (causes.size > MAX_WARNED_CAUSES) causes.delete(causes.values().next().value);
+    warn(message);
+  }
+
   return {
     async checkDispatch(callerSessionID) {
       // Read both seams on every call so live config and caller-tier changes apply.
       let mode: EnforcementMode = "advisory";
       try {
-        mode = deps.mode(callerSessionID);
+        const resolved = deps.mode(callerSessionID);
+        if (resolved === "off" || resolved === "advisory" || resolved === "enforced") {
+          mode = resolved;
+        } else {
+          warnOnce(warnedModes, resolved, `invalid enforcement mode ${describe(resolved)}; using advisory.`);
+        }
       } catch {
         warn("cannot resolve enforcement mode; using advisory.");
       }

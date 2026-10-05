@@ -9,6 +9,8 @@ import { MAX_DELEGATION_DEPTH_LIMIT } from "../../src/router/config";
 import { MAX_DEPTH_HOPS } from "../../src/router/depth";
 import type { DepthTracker } from "../../src/router/depth";
 import type { EnforcementMode } from "../../src/router/enforcement";
+import { resolveEnforcementMode } from "../../src/router/enforcement";
+import type { RouterConfig } from "../../src/router/config";
 
 function setup(depth: number | undefined, max: number | null = 1, mode: EnforcementMode = "enforced") {
   const depthOf = vi.fn<DepthTracker["depthOf"]>().mockResolvedValue(depth);
@@ -77,6 +79,50 @@ describe("delegation depth guard", () => {
     expect(await guard.checkDispatch("enforced")).toStrictEqual({ block: false, mode: "off" });
     expect(guard.resolveMode.mock.calls).toEqual([["enforced"], ["advisory"], ["enforced"]]);
     expect(guard.depthOf).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["Enforced", "ENFORCED", "enforce", "on", "", 1, null, undefined, { mode: "enforced" }, "Off"])(
+    "validates malformed mode %j as advisory, with one warning", async (mode) => {
+      const guard = setup(1);
+      guard.resolveMode.mockReturnValue(mode as EnforcementMode);
+      for (let i = 0; i < 2; i++) {
+        expect(await guard.checkDispatch("caller")).toStrictEqual({
+          block: false, mode: "advisory", guard: DELEGATION_DEPTH_GUARD, banner: depthAdvisoryBanner(1, 1),
+        });
+      }
+      expect(guard.depthOf).toHaveBeenCalledTimes(2);
+      expect(guard.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("invalid enforcement mode"));
+    },
+  );
+
+  it("validates an unrecognised state-file mode passed through the real resolver", async () => {
+    const guard = setup(1);
+    guard.resolveMode.mockImplementation(() => resolveEnforcementMode({
+      config: { enforcement: { mode: "Enforced" } } as unknown as RouterConfig, env: {},
+    }).mode);
+    expect((await guard.checkDispatch("caller")).mode).toBe("advisory");
+    expect(guard.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds distinct invalid-mode warnings at 100, evicting the oldest", async () => {
+    const guard = setup(1);
+    for (let i = 0; i < 101; i++) {
+      guard.resolveMode.mockReturnValue(`invalid-${i}` as EnforcementMode);
+      await guard.checkDispatch("caller");
+    }
+    guard.resolveMode.mockReturnValue("invalid-1" as EnforcementMode);
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(101);
+    guard.resolveMode.mockReturnValue("invalid-0" as EnforcementMode);
+    await guard.checkDispatch("caller");
+    expect(guard.warn).toHaveBeenCalledTimes(102);
+  });
+
+  it("contains an invalid mode that cannot be printed", async () => {
+    const guard = setup(1);
+    guard.resolveMode.mockReturnValue({ toString() { throw new Error("unprintable"); } } as unknown as EnforcementMode);
+    expect((await guard.checkDispatch("caller")).mode).toBe("advisory");
+    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("unprintable value"));
   });
 
   it.each(["reject", "throw", "undefined"])("allows tracker %s and warns once per caller", async (failure) => {
