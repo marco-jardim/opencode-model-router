@@ -50,6 +50,13 @@ All capped (`--maxWorkers=2`) and serialized (one at a time across worktrees).
 | after merging 1.2 | `D:\git\omr-de-main` (`15caba2`) | `npx vitest run --maxWorkers=2` | 103 passed, 3 skipped; 3857 passed, 65 skipped |
 | after merging 1.3 | `D:\git\omr-de-main` (`f929a91`) | `npx vitest run --maxWorkers=2` (+ `smoke:keyless` 9/9 with v1 1.18.19, `smoke:v2` 2/2) | 104 passed, 3 skipped; 7649 passed, 65 skipped |
 
+| after merging 2.1 | `D:\git\omr-de-main` (`b18eab5`, `de/wave-2-base`) | `npx vitest run --maxWorkers=2` | 105 passed, 3 skipped; 7789 passed, 65 skipped |
+| after merging 2.2 | `D:\git\omr-de-main` (`b318faa`) | `npx vitest run --maxWorkers=2` | 106 passed, 3 skipped; 8959 passed, 65 skipped |
+| after merging 2.3 | `D:\git\omr-de-main` (`45b40f9`) | `npx vitest run --maxWorkers=2` (+ `smoke:keyless` 9/9 clean env, `smoke:v2` 2/2) | 108 passed, 3 skipped; 9084 passed, 65 skipped |
+
+Pre-flight full suites of 2.2 and 2.3: the identical trees were the post-merge runs above (`b318faa`
+for 2.3; `b18eab5` for 2.2).
+
 ## Wave notes
 
 - 2.1 started before Wave 1 closed (from `15caba2`, after 1.1 and 1.2 merged): the §3 graph gives 2.1
@@ -60,3 +67,16 @@ All capped (`--maxWorkers=2`) and serialized (one at a time across worktrees).
   `depth.ts` edited in 2.1 (§2 row updated); F6 (event-vs-backend disagreement) accepted as a
   documented residual.
 - Plan edits: A13 (`12a050c`), A14 (`777a2d7`), A15 and the A14 traces (`d894a6c`).
+- 2.2: the router's grader reported "could not parse grader verdict" on the QA dispatch; the review
+  commit `afa9ccf` was intact and was used. No takeover.
+- 2.3: the first heavy design dispatch for 1.2's fixes returned no text and no changes; the same
+  session completed after the explicit re-dispatch (no takeover). 2.3 orchestrator correction: the
+  native-path grader's backend `parentID` stays as in v2.0.0 (the memo's N6 proposed parenting it);
+  only the tracker records the caller (QA-0.P-R2-9). The two existing tests that exercised enforced
+  subagent dispatches had only their fixture config changed (`maxDelegationDepth: null`), with
+  counterpart tests added. The `deferred-catalog` keyless smoke failure seen during the 2.3 host proof
+  was the executor's inherited `XDG_DATA_HOME`; it fails identically on `de/main` without 2.3 and
+  passes with a clean environment.
+- 2.3 host-level proof (A3 gate): 14/14 scenarios on real OpenCode 1.18.19 and 2.0.22,
+  `C:\Users\Marquinho\AppData\Local\Temp\Claude\p23-host-proof\`. OpenCode 2 has its own nesting cap
+  (`experimental.subagent_depth`, default 1).
