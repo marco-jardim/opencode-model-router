@@ -641,17 +641,19 @@ export function createDepthTracker(
     if (set?.delete(lookup) && set.size === 0) strays.delete(lookup.id);
   }
 
-  // A lookup that no walk awaits any more is detached: the throttle starts now,
-  // a late success is still applied as evidence, and forget() can still cancel it.
+  // A lookup that no walk awaits any more is detached: a late success is still
+  // applied as evidence, and forget() can still cancel it. The throttle starts
+  // now only if its last walk timed out; one released by forget() leaves no
+  // throttle, so the next walk that needs the id starts a fresh lookup.
   // Strays are FIFO-capped (QA-1.2-R2-2): the oldest is cancelled, so its late
   // answer (backend evidence a later lookup reproduces) is discarded rather than
   // left beyond forget()'s reach. Strays never gate admission: a new lookup for
   // the same id waits only for its throttle, so dropping one admits nothing.
-  function detach(lookup: Lookup): void {
+  function detach(lookup: Lookup, throttle: boolean): void {
     if (lookups.get(lookup.id) !== lookup) return;
     lookups.delete(lookup.id);
     lookup.detached = true;
-    setFailed(lookup.id);
+    if (throttle) setFailed(lookup.id);
     let stray = strays.get(lookup.id);
     if (!stray) strays.set(lookup.id, stray = new Set());
     stray.add(lookup);
@@ -670,13 +672,15 @@ export function createDepthTracker(
 
   // A cancelled walk settles its callers with undefined and resumes at once, so
   // its continuation can never issue another lookup. It stays in `live` (and so
-  // within reach of forget) until that continuation has returned.
+  // within reach of forget) until that continuation has returned. Whatever the
+  // cause, it releases its lookup: the last walk out detaches it, so no lookup
+  // stays in `lookups` without a walk awaiting it.
   function cancelWalk(walk: Walk, timedOut: boolean): void {
     walk.cancelled = true;
     if (walks.get(walk.id) === walk) walks.delete(walk.id);
     const lookup = walk.pending;
     walk.pending = undefined;
-    if (lookup && --lookup.waiters === 0 && timedOut) detach(lookup);
+    if (lookup && --lookup.waiters === 0) detach(lookup, timedOut);
     walk.stop();
   }
 
@@ -782,14 +786,15 @@ export function createDepthTracker(
       unbury(id);
       failedAt.delete(id);
       for (const kind of Object.keys(WARNINGS)) warned.delete(`${kind}:${id}`);
-      for (const walk of live) {
-        walk.learned.delete(id);
-        if (walk.id === id) cancelWalk(walk, false);
-      }
+      // Cancelled before the walks, so releasing them below never strays it.
       const lookup = lookups.get(id);
       if (lookup) {
         cancelLookup(lookup);
         lookups.delete(id);
+      }
+      for (const walk of live) {
+        walk.learned.delete(id);
+        if (walk.id === id) cancelWalk(walk, false);
       }
       for (const stray of [...strays.get(id) ?? []]) {
         unstray(stray);
