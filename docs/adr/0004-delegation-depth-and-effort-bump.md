@@ -131,6 +131,13 @@ bound. An excluded tier keeps its ordinary retry: the router does not guess a pr
 override variant/explicit-option precedence. These are builder-based ceilings, not a claim that
 every live Claude endpoint accepts `xhigh`; users can lower the bound to `high`.
 
+**D7 reach with bundled presets (A5):** the active/default `anthropic` preset has
+no bumpable tier because every tier sets a variant. Only `fable-effort` fast and
+medium are eligible at the default bump bound (`low → medium`, `high → xhigh`);
+its heavy tier is already at that bound. Other bundled presets set a variant or
+omit `effort`. See the [preset table](../CONFIG_REFERENCE.md#where-the-bump-applies-with-the-bundled-presets)
+for the complete breakdown and D8 below for the separate cost-ceiling constraint.
+
 ### D8 — Replace retry settings, never add an attempt
 
 `src/escalate/ladder.ts` moves one step through `low → medium → high → xhigh → max` on each

@@ -976,12 +976,15 @@ effort level higher** before moving to a more expensive tier. It adds no attempt
 to `"xhigh"`, further capped by model family (OpenAI: `high`; Claude: `max`). Set
 `enforcement.escalate.effortBump: false` to restore the previous ladder behaviour.
 
-An eligible tier must set an explicit `effort`, have no `variant`, and have room
-below the effective ceiling. A winning explicit provider setting
+An eligible tier must set an explicit valid `effort`, have no `variant`, belong to
+a recognised Claude or OpenAI model family, and have room below the effective ceiling.
+A winning explicit provider setting
 (`reasoning.effort` or an applicable `thinking.budgetTokens`) prevents the bump.
 It changes only that retry producer's options, not the preset, titles or graders.
 The bump applies to the optional `delegate` tool's automatic ladder, not native
 `task`/`subagent` calls or manual retries; deferred verification does not retry.
+`/bypass` leaves the ladder and effort bump active; use `effortBump: false` to disable
+the bump.
 
 Among bundled presets, **only `fable-effort` fast and medium are eligible**
 (`low → medium` and `high → xhigh`). Its heavy tier is already at the default

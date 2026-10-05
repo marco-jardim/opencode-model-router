@@ -20,8 +20,9 @@ Observations by @MetalbolicX in opencode-smart-router (#17); implementation writ
 ### Changed
 
 - The automatic ladder's existing same-tier retry now runs one effort level higher
-  by default on eligible tiers: explicit `effort`, no `variant`, no winning explicit
-  provider setting, and room below the effective ceiling. This adds no attempt and
+  by default on eligible tiers: explicit valid `effort`, no `variant`, a recognised
+  Claude or OpenAI model family, no winning explicit provider setting, and room
+  below the effective ceiling. This adds no attempt and
   still respects attempt and cost ceilings. It applies only to the optional
   `delegate` tool's automatic ladder, not native `task`/`subagent` or manual retries.
   Only `fable-effort` fast/medium are eligible among bundled presets; at the default
