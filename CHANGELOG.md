@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-05
+
 ### Added
 
 - Config hot reload: the router re-reads `tiers.json`, the global and project
