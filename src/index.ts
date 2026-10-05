@@ -8,6 +8,7 @@ import {
   resolvePresetName,
   writeState,
   invalidateConfigCache,
+  getConfigReloadError,
   overridePath,
   localOverridePath,
   findProjectOverride,
@@ -255,7 +256,7 @@ const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
 
 const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let cfg = loadConfig();
-  const activeTiers = getActiveTiers(cfg);
+  let activeTiers = getActiveTiers(cfg);
 
   // Per-plugin-instance session store: owns subagentSessionIDs and subagentCapState.
   const sessionStore = createSessionStore();
@@ -1734,6 +1735,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     config: async (opencodeConfig: any) => {
       opencodeConfig.agent ??= {};
 
+      // Re-read so re-running this hook (v2 refresh) yields the current preset.
+      cfg = loadConfig();
+      activeTiers = getActiveTiers(cfg);
+
       for (const [name, tier] of Object.entries(activeTiers)) {
         // Resolve prompt: per-tier override wins; otherwise fall back to the
         // style-appropriate default (goal-oriented or global tierPrompts[name]).
@@ -1869,6 +1874,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         description:
           "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
       };
+      opencodeConfig.command["router-reload"] = {
+        template: "",
+        description:
+          ctx.routerHost === "v2"
+            ? "Reload model-router config (tiers.json, overrides, state) without restarting"
+            : "Reload model-router config (tiers.json, overrides, state); subagent models apply after an opencode restart",
+      };
       opencodeConfig.command["router"] = {
         template: "$ARGUMENTS",
         description:
@@ -1981,6 +1993,38 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         output.parts.push({
           type: "text" as const,
           text: buildTiersOutput(cfg),
+        });
+      }
+
+      if (input.command === "router-reload") {
+        invalidateConfigCache();
+        cfg = loadConfig();
+        activeTiers = getActiveTiers(cfg);
+        const mapping = Object.entries(activeTiers)
+          .map(([name, tier]) => `  ${name} -> ${tier.model}`)
+          .join("\n");
+        const reloadError = getConfigReloadError();
+        output.parts.push({
+          type: "text" as const,
+          text: [
+            ...(reloadError
+              ? [
+                  `Config reload FAILED — keeping last valid config:\n${reloadError}`,
+                  "Model router is still using the last valid config.",
+                ]
+              : ["Model router config reloaded."]),
+            `Preset: ${cfg.activePreset}`,
+            `Mode: ${cfg.activeMode ?? "normal"}`,
+            "Tiers:",
+            mapping,
+            // opencode v1 builds its agent registry once at startup; only the v2
+            // adapter re-runs the config hook + agent reload after /router-reload.
+            ...(ctx.routerHost === "v2"
+              ? []
+              : [
+                  "Note: opencode v1 keeps subagent (task) models from startup; restart opencode to apply tier model changes to subagents. Routing and protocol already use the new config.",
+                ]),
+          ].join("\n"),
         });
       }
 

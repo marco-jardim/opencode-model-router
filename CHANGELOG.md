@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Config hot reload: the router re-reads `tiers.json`, the global and project
+  overrides files and the state file when their mtime/ctime/size fingerprint changes,
+  with no restart. A source that turns invalid or unreachable keeps the last valid
+  config (the reason is surfaced by `getConfigReloadError()`); only ENOENT/ENOTDIR
+  count as a removed file. `/router-reload` forces a reload, and on OpenCode 2 the
+  agent and command registry is refreshed on reload and after `/preset`.
+- `hybrid-2` preset: `@fast` → `openai/gpt-6-luna-fast` (medium), `@medium` →
+  `anthropic/claude-sonnet-5-5` (xhigh), `@heavy` → `anthropic/claude-opus-5-5`
+  (xhigh).
+
 ## [2.1.0] - 2026-10-05
 
 Observations by @MetalbolicX in opencode-smart-router (#17); implementation written from scratch.

@@ -288,6 +288,49 @@
         ]
       }
     },
+    "hybrid-2": {
+      "fast": {
+        "model": "openai/gpt-6-luna-fast",
+        "variant": "medium",
+        "costRatio": 1,
+        "description": "GPT 6 Luna (medium) for exploration, search, and simple reads",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
+        "costRatio": 5,
+        "description": "Claude Sonnet (xhigh) for implementation and standard coding",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
+        "costRatio": 20,
+        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
     "fable-effort": {
       "fast": {
         "model": "anthropic/claude-fable-5-1",

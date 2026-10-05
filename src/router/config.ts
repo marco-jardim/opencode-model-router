@@ -4,6 +4,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
@@ -266,6 +267,25 @@ export interface RouterState {
 
 let _cachedConfig: RouterConfig | null = null;
 let _configDirty = true;
+let _cachedFingerprint = "";
+/** Source locations (paths only, no mtimes) that produced `_cachedConfig`. */
+let _cachedSourceKey = "";
+/** Sources that were already failing when `_cachedConfig` was built (tolerated). */
+let _cachedTolerated = new Set<string>();
+/** Last hot-reload failure (null when the most recent rebuild succeeded). */
+let _configReloadError: string | null = null;
+/** Fingerprint a reload-failure warning was last emitted for (warn once each). */
+let _warnedFingerprint: string | null = null;
+
+/**
+ * Why the last config rebuild failed, or null when it succeeded. When a source
+ * (tiers.json, an overrides file, or the state file) becomes invalid after a
+ * successful load, loadConfig() keeps serving the last valid config and
+ * records the reason here instead of throwing or silently dropping layers.
+ */
+export function getConfigReloadError(): string | null {
+  return _configReloadError;
+}
 
 /** Mark config cache as stale so it is re-read on next access. */
 export function invalidateConfigCache(): void {
@@ -323,6 +343,47 @@ const REPO_MARKERS = [".git", ".hg", ".svn"] as const;
  */
 const MAX_WALK_DEPTH = 16;
 
+/** errno code of a thrown fs error, or "UNKNOWN" when it carries none. */
+function errnoCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : "UNKNOWN";
+}
+
+/**
+ * ENOENT (nothing there) and ENOTDIR (a path component is a file) both mean the
+ * path is gone. Every other errno (EACCES, EIO, ELOOP, …) means "cannot tell",
+ * which is NOT the same as "removed".
+ */
+function isGoneError(err: unknown): boolean {
+  const code = errnoCode(err);
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** A stat that failed for a reason other than the path being gone. */
+interface StatFailure {
+  code: string;
+  message: string;
+}
+
+/**
+ * Outcome of looking at a config source: it is there, it is definitely gone, or
+ * it could not be inspected. Unlike `existsSync` — which folds every error into
+ * `false` — this keeps "removed" and "unreachable" apart, so a transient I/O
+ * error or a directory that lost search permission is never mistaken for the
+ * user deleting the file.
+ */
+type StatKind = "present" | "missing" | StatFailure;
+
+function statKind(p: string): StatKind {
+  try {
+    statSync(p);
+    return "present";
+  } catch (err) {
+    if (isGoneError(err)) return "missing";
+    return { code: errnoCode(err), message: (err as Error).message };
+  }
+}
+
 /**
  * Locate the project-local overrides file by walking upward from the current
  * working directory, so the project config is found even when opencode is
@@ -340,6 +401,14 @@ const MAX_WALK_DEPTH = 16;
  * tree with no repo marker anywhere would otherwise be walked all the way to the
  * filesystem root, silently adopting an unrelated ancestor's override file.
  * Returns the resolved path, or undefined when no file applies.
+ *
+ * Only ENOENT/ENOTDIR count as "no file here". A candidate that cannot be
+ * inspected for any other reason (EACCES on a parent directory, a transient
+ * I/O error) is still returned and ends the walk — the nearest override wins,
+ * so it must not be skipped in favour of an ancestor's file — and the later
+ * read reports it as a failure instead of the source silently vanishing. A
+ * repo marker that cannot be inspected is likewise treated as present, so the
+ * walk never climbs past a project root it merely failed to stat.
  */
 export function findProjectOverride(): string | undefined {
   // Both sides of the $HOME comparison below have to be resolved the same way.
@@ -361,7 +430,7 @@ export function findProjectOverride(): string | undefined {
   let depth = 0;
 
   for (;;) {
-    const hasMarker = REPO_MARKERS.some((m) => existsSync(join(dir, m)));
+    const hasMarker = REPO_MARKERS.some((m) => statKind(join(dir, m)) !== "missing");
 
     // $HOME is not a project directory. Only look inside it when it is itself a
     // repo root (a dotfiles repo), otherwise `~/.opencode/…` would be picked up
@@ -369,7 +438,7 @@ export function findProjectOverride(): string | undefined {
     if (dir === home && !hasMarker) return undefined;
 
     const candidate = join(dir, ".opencode", OVERRIDE_FILENAME);
-    if (existsSync(candidate)) return candidate;
+    if (statKind(candidate) !== "missing") return candidate;
 
     if (hasMarker) return undefined; // reached the project root, no file
     if (dir === home) return undefined; // home was a repo root; never go above it
@@ -1179,36 +1248,56 @@ export function deepMerge(base: unknown, override: unknown): unknown {
  * overrides file can never brick opencode startup — but the user still gets a
  * visible reason why their override was ignored.
  */
-function readOverridesAt(op: string): Record<string, unknown> | undefined {
+function readOverridesAt(
+  op: string,
+  failures?: SourceFailure[],
+): Record<string, unknown> | undefined {
+  // Only ENOENT/ENOTDIR mean the file is absent. Any other stat error (EACCES on
+  // a parent directory, a transient I/O error) is a failure, never a removal —
+  // otherwise a reload would swap the last valid config for lower-priority
+  // defaults.
+  const kind = statKind(op);
+  if (kind === "missing") return undefined;
+
   let text: string;
   try {
-    if (!existsSync(op)) return undefined;
+    if (kind !== "present") throw new Error(kind.message);
     text = readFileSync(op, "utf-8");
   } catch (err) {
     // The file is there but unreadable (permissions, a dangling symlink, a
     // race with a delete). Every other failure below says so; staying silent
     // here makes an unreadable override look exactly like an absent one.
-    console.warn(
-      `[model-router] ignoring ${op}: cannot read it — ${(err as Error).message}`,
-    );
+    const reason = `cannot read it — ${(err as Error).message}`;
+    console.warn(`[model-router] ignoring ${op}: ${reason}`);
+    failures?.push({ source: op, message: `${op}: ${reason}` });
     return undefined;
   }
 
   try {
     const parsed = parseJsonc(text) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      console.warn(
-        `[model-router] ignoring ${op}: expected a JSON object at root`,
-      );
+      const reason = "expected a JSON object at root";
+      console.warn(`[model-router] ignoring ${op}: ${reason}`);
+      failures?.push({ source: op, message: `${op}: ${reason}` });
       return undefined;
     }
     return parsed as Record<string, unknown>;
   } catch (err) {
-    console.warn(
-      `[model-router] ignoring ${op}: invalid JSONC — ${(err as Error).message}`,
-    );
+    const reason = `invalid JSONC — ${(err as Error).message}`;
+    console.warn(`[model-router] ignoring ${op}: ${reason}`);
+    failures?.push({ source: op, message: `${op}: ${reason}` });
     return undefined;
   }
+}
+
+/**
+ * A source that exists on disk but could not be used while building the
+ * config. `source` is a stable key (a file path, or the joined layer paths for
+ * a combined-merge failure); `message` is the user-facing reason.
+ */
+interface SourceFailure {
+  source: string;
+  message: string;
 }
 
 /**
@@ -1221,13 +1310,13 @@ export interface OverrideLayer {
   data: Record<string, unknown>;
 }
 
-function collectOverrideLayers(): OverrideLayer[] {
+function collectOverrideLayers(failures?: SourceFailure[]): OverrideLayer[] {
   const layers: OverrideLayer[] = [];
   // Lowest priority first: global, then project-local (found by upward search).
   const paths = [overridePath(), findProjectOverride()];
   for (const p of paths) {
     if (!p) continue;
-    const data = readOverridesAt(p);
+    const data = readOverridesAt(p, failures);
     if (data) layers.push({ path: p, data });
   }
   return layers;
@@ -1261,13 +1350,126 @@ function applyTierDefaults(cfg: RouterConfig): void {
   }
 }
 
+/** realpath for identity comparison; an unresolvable path is used as-is. */
+function realPathOrSame(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/** Every file location that feeds loadConfig() (undefined = none applicable). */
+function sourcePaths(): Array<string | undefined> {
+  return [configPath(), overridePath(), findProjectOverride(), statePath()];
+}
+
+/**
+ * mtime/ctime/size fingerprint of every file that feeds loadConfig(). ctime is
+ * included because restoring access to a previously unreadable file (chmod)
+ * changes ctime but not mtime/size, and that must trigger a retry. Only
+ * ENOENT/ENOTDIR map to `missing` (removal); any other stat error maps to
+ * `error:<code>`, a distinct marker, so losing access to a file is never
+ * fingerprinted — or reloaded — as if it had been deleted.
+ */
+function sourceFingerprint(paths: Array<string | undefined>): string {
+  return paths
+    .map((p) => {
+      if (!p) return "none";
+      try {
+        const st = statSync(p);
+        return `${p}:${st.mtimeMs}:${st.ctimeMs}:${st.size}`;
+      } catch (err) {
+        return isGoneError(err) ? `${p}:missing` : `${p}:error:${errnoCode(err)}`;
+      }
+    })
+    .join("|");
+}
+
 export function loadConfig(): RouterConfig {
-  if (_cachedConfig && !_configDirty) {
+  const paths = sourcePaths();
+  const fingerprint = sourceFingerprint(paths);
+  if (_cachedConfig && !_configDirty && fingerprint === _cachedFingerprint) {
     return _cachedConfig;
   }
 
+  // A previous config is only a valid fallback when it was built for the same
+  // project identity (a different HOME/project is a fresh first load). The key
+  // is deliberately NOT the resolved override file paths: a project override
+  // created after startup must not turn a broken file into a "first load".
+  const sourceKey = [realPathOrSame(homedir()), realPathOrSame(process.cwd()), statePath()].join("|");
+  const previous =
+    _cachedConfig !== null && sourceKey === _cachedSourceKey ? _cachedConfig : null;
+
+  const failures: SourceFailure[] = [];
+  let cfg: RouterConfig;
+  try {
+    cfg = buildConfig(failures);
+  } catch (err) {
+    // First load: unchanged behaviour — throw. Reload: keep the last good one.
+    if (!previous) throw err;
+    return keepLastValidConfig(
+      previous,
+      fingerprint,
+      `${configPath()}: ${(err as Error).message}`,
+    );
+  }
+
+  if (previous) {
+    // Sources that were already failing when `previous` was built are an
+    // accepted state (e.g. a broken override at startup); only a source that
+    // newly broke counts as a failed reload.
+    const regressions = failures.filter((f) => !_cachedTolerated.has(f.source));
+    if (regressions.length > 0) {
+      return keepLastValidConfig(
+        previous,
+        fingerprint,
+        regressions.map((f) => f.message).join("\n"),
+      );
+    }
+  }
+
+  _cachedConfig = cfg;
+  _cachedFingerprint = fingerprint;
+  _cachedSourceKey = sourceKey;
+  _cachedTolerated = new Set(failures.map((f) => f.source));
+  _configDirty = false;
+  _configReloadError = null;
+  _warnedFingerprint = null;
+  return cfg;
+}
+
+/**
+ * Reload failed: keep serving `previous` (same object reference), remember the
+ * fingerprint so we do not retry on every message until a file changes (or
+ * invalidateConfigCache() is called), record the reason, and warn once per
+ * failed fingerprint.
+ */
+function keepLastValidConfig(
+  previous: RouterConfig,
+  fingerprint: string,
+  message: string,
+): RouterConfig {
+  _cachedFingerprint = fingerprint;
+  _configDirty = false;
+  _configReloadError = message;
+  if (_warnedFingerprint !== fingerprint) {
+    _warnedFingerprint = fingerprint;
+    console.warn(
+      `[model-router] config reload failed — keeping last valid config: ${message}`,
+    );
+  }
+  return previous;
+}
+
+/**
+ * Build a fresh config from tiers.json + override layers + persisted state.
+ * Throws only when tiers.json itself is unreadable/invalid. Override and state
+ * problems are warned about, skipped, and appended to `failures`.
+ */
+function buildConfig(failures: SourceFailure[]): RouterConfig {
   const base = JSON.parse(readFileSync(configPath(), "utf-8"));
-  const layers = collectOverrideLayers();
+  const layers = collectOverrideLayers(failures);
 
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
@@ -1287,6 +1489,11 @@ export function loadConfig(): RouterConfig {
       console.warn(
         `[model-router] combined overrides are invalid (${(err as Error).message}); dropping conflicting layer(s)`,
       );
+      const layerPaths = layers.map((l) => l.path).join(" + ");
+      failures.push({
+        source: layerPaths,
+        message: `${layerPaths}: combined overrides are invalid — ${(err as Error).message}`,
+      });
       for (let i = layers.length - 1; i >= 0; i--) {
         try {
           cfg = validateConfig(merge([layers[i]!]));
@@ -1300,6 +1507,10 @@ export function loadConfig(): RouterConfig {
           console.warn(
             `[model-router] ignoring ${layers[i]!.path}: ${(singleErr as Error).message}`,
           );
+          failures.push({
+            source: layers[i]!.path,
+            message: `${layers[i]!.path}: ${(singleErr as Error).message}`,
+          });
           cfg = validateConfig(base);
         }
       }
@@ -1307,7 +1518,12 @@ export function loadConfig(): RouterConfig {
   }
 
   try {
-    if (existsSync(statePath())) {
+    const stateKind = statKind(statePath());
+    if (stateKind !== "missing") {
+      // Present-but-uninspectable (EACCES, EIO, …) is a failure, not an absent
+      // state file: reverting the persisted preset on a transient error would
+      // be silent data loss.
+      if (stateKind !== "present") throw new Error(`cannot read it — ${stateKind.message}`);
       const state = JSON.parse(
         readFileSync(statePath(), "utf-8"),
       ) as RouterState;
@@ -1324,14 +1540,17 @@ export function loadConfig(): RouterConfig {
         cfg.enforcement = { ...(cfg.enforcement ?? {}), mode: state.enforcementMode };
       }
     }
-  } catch {
-    // Ignore state read errors and keep tiers.json defaults
+  } catch (err) {
+    // State read errors never block startup: keep tiers.json defaults. They are
+    // recorded so a state file that breaks on a later reload is reported (and
+    // the last valid config kept) rather than silently reverting the preset.
+    failures.push({
+      source: statePath(),
+      message: `${statePath()}: ${(err as Error).message}`,
+    });
   }
 
   applyTierDefaults(cfg);
-
-  _cachedConfig = cfg;
-  _configDirty = false;
   return cfg;
 }
 

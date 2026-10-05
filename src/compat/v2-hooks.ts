@@ -114,25 +114,55 @@ export async function registerV2Hooks(
   };
 
   try {
+    // Captured once: after our own transform, ctx.agent.list() returns
+    // router-modified agents, which would defeat the originals diff on refresh.
     const agents = await ctx.agent.list();
-    const config: LegacyConfig = { agent: {}, command: {} };
-    for (const agent of agents.data) config.agent[agent.id] = {
+    const baseSeed: Record<string, LegacyAgent> = {};
+    for (const agent of agents.data) baseSeed[agent.id] = {
       mode: agent.mode,
       model: agent.model && `${agent.model.providerID}/${agent.model.id}`,
       variant: agent.model?.variant,
     };
-    const originals = new Map(Object.entries(config.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
-    await hooks.config?.(config);
-    const agentOptions = new Map<string, Record<string, unknown>>();
-    for (const [name, definition] of Object.entries(config.agent)) {
-      if (originals.get(name) === JSON.stringify(definition) || !definition.options) continue;
-      const { reasoning_effort, reasoning_summary, budget_tokens, ...options } = definition.options;
-      const normalized = { ...options };
-      if (reasoning_effort !== undefined && normalized.reasoningEffort === undefined) normalized.reasoningEffort = reasoning_effort;
-      if (reasoning_summary !== undefined && normalized.reasoningSummary === undefined) normalized.reasoningSummary = reasoning_summary;
-      if (budget_tokens !== undefined && normalized.thinking === undefined) normalized.thinking = { type: "enabled", budgetTokens: budget_tokens };
-      agentOptions.set(name, normalized);
-    }
+    let config: LegacyConfig = { agent: {}, command: {} };
+    let originals = new Map<string, string>();
+    let agentOptions = new Map<string, Record<string, unknown>>();
+    let lastConfig: unknown;
+    // Returns the router config the registry state was built from; the caller
+    // advances `lastConfig` only once the host registries have reloaded from it.
+    const buildConfig = async (): Promise<unknown> => {
+      const next: LegacyConfig = { agent: JSON.parse(JSON.stringify(baseSeed)), command: {} };
+      const nextOriginals = new Map(Object.entries(next.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
+      await hooks.config?.(next);
+      const nextOptions = new Map<string, Record<string, unknown>>();
+      for (const [name, definition] of Object.entries(next.agent)) {
+        if (nextOriginals.get(name) === JSON.stringify(definition) || !definition.options) continue;
+        const { reasoning_effort, reasoning_summary, budget_tokens, ...options } = definition.options;
+        const normalized = { ...options };
+        if (reasoning_effort !== undefined && normalized.reasoningEffort === undefined) normalized.reasoningEffort = reasoning_effort;
+        if (reasoning_summary !== undefined && normalized.reasoningSummary === undefined) normalized.reasoningSummary = reasoning_summary;
+        if (budget_tokens !== undefined && normalized.thinking === undefined) normalized.thinking = { type: "enabled", budgetTokens: budget_tokens };
+        nextOptions.set(name, normalized);
+      }
+      config = next;
+      originals = nextOriginals;
+      agentOptions = nextOptions;
+      return loadConfig();
+    };
+    lastConfig = await buildConfig();
+    let refreshChain: Promise<void> = Promise.resolve();
+    const refresh = (): Promise<void> => {
+      const run = refreshChain.then(async () => {
+        if (disposed) return;
+        const built = await buildConfig();
+        await ctx.agent.reload();
+        await ctx.command.reload();
+        // Only after both registries reloaded: a rejected reload leaves
+        // `lastConfig` stale so the next prompt retries the refresh.
+        lastConfig = built;
+      });
+      refreshChain = run.catch(() => {});
+      return run;
+    };
     registrations.push(await ctx.agent.transform((editor) => {
       if (runtime) editor.update(V2_GRADER_AGENT, (agent) => {
         agent.mode = "subagent";
@@ -163,6 +193,15 @@ export async function registerV2Hooks(
           await legacy["command.execute.before"]?.({
             command: name, arguments: invocation.prompt.text, sessionID: invocation.sessionID,
           }, output);
+          if (name === "router-reload") {
+            const reloadText = output.parts.map((part) => v2Instructions(part.text)).join("\n\n");
+            await refresh();
+            await ctx.session.synthetic({
+              sessionID: invocation.sessionID, text: reloadText, description: "Model router config reload", resume: false,
+            });
+            return;
+          }
+          if (name === "preset") await refresh();
           await ctx.session.prompt({
             ...invocation.prompt,
             sessionID: invocation.sessionID,
@@ -207,6 +246,7 @@ export async function registerV2Hooks(
       const output = { message: { agent: session.agent }, parts: [{ type: "text", text: event.prompt.text }] };
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
+      if (loadConfig() !== lastConfig) await refresh();
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };
