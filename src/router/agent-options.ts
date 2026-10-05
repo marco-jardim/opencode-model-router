@@ -12,7 +12,7 @@ import type { PluginLogger } from "./logger";
  * configured with; this one decides what is actually sent. They are kept apart
  * on purpose: `/tiers` should not warn, downgrade or drop keys.
  */
-import type { TierConfig } from "./config";
+import type { EffortLevel, TierConfig } from "./config";
 import { EFFORT_LEVELS } from "./config";
 import { isAdaptiveOnlyClaudeModel, isClaudeModel } from "./protocol";
 
@@ -53,6 +53,33 @@ function isEffortLevel(value: unknown): value is (typeof EFFORT_LEVELS)[number] 
 function isOpenAIModel(model: string): boolean {
   const s = model.toLowerCase();
   return s.startsWith("openai/") || /\bgpt-/.test(s) || /(^|[/\-_])o[134]([/\-_]|$)/.test(s);
+}
+
+export function effortRank(level: EffortLevel): number {
+  return EFFORT_LEVELS.indexOf(level);
+}
+
+export function nextEffort(current: EffortLevel, bound: EffortLevel): EffortLevel | null {
+  return effortRank(current) < effortRank(bound)
+    ? EFFORT_LEVELS[effortRank(current) + 1]!
+    : null;
+}
+
+export function minEffort(a: EffortLevel, b: EffortLevel): EffortLevel {
+  return effortRank(a) <= effortRank(b) ? a : b;
+}
+
+export function effortCeilingFor(tier: TierConfig): EffortLevel | null {
+  if (tier.variant || tier.effort === undefined || !isEffortLevel(tier.effort)) return null;
+  if (isClaudeModel(tier.model)) {
+    if (Boolean(tier.thinking?.budgetTokens) && !isAdaptiveOnlyClaudeModel(tier.model)) return null;
+    return "max";
+  }
+  if (isOpenAIModel(tier.model)) {
+    if (tier.reasoning?.effort) return null;
+    return "high";
+  }
+  return null;
 }
 
 /**
