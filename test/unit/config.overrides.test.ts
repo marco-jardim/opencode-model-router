@@ -940,6 +940,274 @@ describe("findProjectOverride — upward search", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Host-provided project directory (GitHub #70). OpenCode v2 runs one plugin
+// instance per project directory inside a single server process and chdirs that
+// process to $HOME, so the project override must be resolved from the directory
+// the host hands the plugin, with a config cache that is kept per directory.
+// ---------------------------------------------------------------------------
+
+describe("loadConfig — host-provided project directory", () => {
+  const FILE = "opencode-model-router.overrides.jsonc";
+  let tmpRoot: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let savedCwd: string;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let bump = 0;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    savedCwd = process.cwd();
+    tmpRoot = join(
+      tmpdir(),
+      `oc-mr-dir-${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`,
+    );
+    mkdirSync(tmpRoot, { recursive: true });
+    // $HOME is the temp root and the process cwd is $HOME, exactly like the
+    // OpenCode v2 server after process.chdir(home).
+    process.env.HOME = tmpRoot;
+    process.env.USERPROFILE = tmpRoot;
+    process.chdir(tmpRoot);
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    process.chdir(savedCwd);
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    try {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+    invalidateConfigCache();
+  });
+
+  const fastModel = (dir: string): string | undefined =>
+    loadConfig(dir).presets.anthropic!.fast!.model;
+
+  const overrideFor = (model: string): string =>
+    JSON.stringify({ presets: { anthropic: { fast: { model } } } });
+
+  /** A repo-rooted project directory carrying its own override file. */
+  function makeProject(name: string, model: string): string {
+    const project = join(tmpRoot, name);
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(join(project, ".opencode"), { recursive: true });
+    writeFileSync(join(project, ".opencode", FILE), overrideFor(model), "utf-8");
+    return project;
+  }
+
+  /** Rewrite an override in place and move its mtime forward. */
+  function rewrite(file: string, content: string): void {
+    writeFileSync(file, content, "utf-8");
+    bump += 60_000;
+    const later = new Date(Date.now() + bump);
+    utimesSync(file, later, later);
+  }
+
+  it("finds the project override via loadConfig(dir) while process.cwd() is $HOME", () => {
+    const project = makeProject("repo", "anthropic/from-dir");
+    const file = join(project, ".opencode", FILE);
+
+    // The v2 server's view: cwd is $HOME, which has no project file.
+    expect(findProjectOverride()).toBeUndefined();
+    expect(fastModel(tmpRoot)).not.toBe("anthropic/from-dir");
+
+    expect(findProjectOverride(project)).toBe(realpathSync(file));
+    expect(fastModel(project)).toBe("anthropic/from-dir");
+    // Omitting the dir keeps today's cwd semantics.
+    expect(loadConfig().presets.anthropic!.fast!.model).not.toBe(
+      "anthropic/from-dir",
+    );
+  });
+
+  it("localOverridePath(dir) points into the given directory", () => {
+    const project = join(tmpRoot, "elsewhere");
+    expect(localOverridePath(project)).toBe(join(project, ".opencode", FILE));
+    expect(localOverridePath()).toBe(join(process.cwd(), ".opencode", FILE));
+  });
+
+  it("findProjectOverride(dir) walks upward from a nested subdirectory", () => {
+    const project = makeProject("repo", "anthropic/from-nested");
+    const deep = join(project, "src", "feature", "deep");
+    mkdirSync(deep, { recursive: true });
+
+    expect(findProjectOverride(deep)).toBe(
+      realpathSync(join(project, ".opencode", FILE)),
+    );
+    expect(fastModel(deep)).toBe("anthropic/from-nested");
+  });
+
+  it("findProjectOverride(dir) honours the repo-root and $HOME boundaries", () => {
+    // An override above the repo root must not be adopted.
+    mkdirSync(join(tmpRoot, ".opencode"), { recursive: true });
+    writeFileSync(join(tmpRoot, ".opencode", FILE), overrideFor("anthropic/above"), "utf-8");
+    const project = join(tmpRoot, "repo");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const sub = join(project, "sub");
+    mkdirSync(sub, { recursive: true });
+    expect(findProjectOverride(sub)).toBeUndefined();
+
+    // $HOME itself is not a project directory (no repo marker).
+    expect(findProjectOverride(tmpRoot)).toBeUndefined();
+  });
+
+  it("serves different configs for different project dirs, with stable identity per dir", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+    expect(a1.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+    expect(b1.presets.anthropic!.fast!.model).toBe("anthropic/proj-b-fast");
+    expect(a1).not.toBe(b1);
+
+    // Interleaved reads never evict or share the other directory's cache.
+    expect(loadConfig(projectA)).toBe(a1);
+    expect(loadConfig(projectB)).toBe(b1);
+    expect(loadConfig(projectA)).toBe(a1);
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("treats the same directory spelled differently as one cache entry", () => {
+    const project = makeProject("repo", "anthropic/one-entry");
+    const first = loadConfig(project);
+    expect(loadConfig(join(project, "src", ".."))).toBe(first);
+    expect(loadConfig(`${project}/`)).toBe(first);
+  });
+
+  it("hot-reloading one dir's override leaves the other dir's cached config untouched", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    rewrite(join(projectA, ".opencode", FILE), overrideFor("anthropic/proj-a-v2"));
+
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-v2");
+    expect(loadConfig(projectB)).toBe(b1);
+    expect(b1.presets.anthropic!.fast!.model).toBe("anthropic/proj-b-fast");
+    expect(loadConfig(projectA)).toBe(a2);
+  });
+
+  it("keeps last-good config and the reload error per directory", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const fileA = join(projectA, ".opencode", FILE);
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    rewrite(fileA, '{ "presets": { "anthropic": { "fast": { "model": ');
+
+    expect(loadConfig(projectA)).toBe(a1);
+    expect(getConfigReloadError(projectA)).toContain(findProjectOverride(projectA)!);
+    expect(getConfigReloadError(projectA)).toContain("invalid JSONC");
+    // The sibling directory and the cwd-keyed entry see no failure.
+    expect(loadConfig(projectB)).toBe(b1);
+    expect(getConfigReloadError(projectB)).toBeNull();
+    expect(getConfigReloadError()).toBeNull();
+
+    rewrite(fileA, overrideFor("anthropic/proj-a-fixed"));
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fixed");
+    expect(getConfigReloadError(projectA)).toBeNull();
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("treats a malformed project override created after startup as a failed reload for that directory", () => {
+    // Project loaded with no override file at all.
+    const project = join(tmpRoot, "proj-late");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const first = loadConfig(project);
+    expect(getConfigReloadError(project)).toBeNull();
+
+    // A half-saved override then appears. The source identity (HOME + project
+    // dir + state path) is unchanged, so `first` stays the valid fallback.
+    mkdirSync(join(project, ".opencode"), { recursive: true });
+    const file = join(project, ".opencode", FILE);
+    rewrite(file, '{ "presets": { "anthropic": { "fast": { "model": ');
+
+    expect(loadConfig(project)).toBe(first);
+    expect(getConfigReloadError(project)).toContain(findProjectOverride(project)!);
+    expect(getConfigReloadError(project)).toContain("invalid JSONC");
+    expect(getConfigReloadError()).toBeNull();
+  });
+
+  it("keeps last-good config per directory when a project override becomes unreachable (EACCES), then recovers", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const fileA = findProjectOverride(projectA)!;
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    try {
+      fsMock.unstatablePath = fileA;
+      // Not a removal: the unreachable candidate still ends the walk instead of
+      // vanishing, and the failure is recorded against this directory only.
+      expect(findProjectOverride(projectA)).toBe(fileA);
+      expect(loadConfig(projectA)).toBe(a1);
+      expect(a1.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+      expect(getConfigReloadError(projectA)).toContain(fileA);
+      expect(getConfigReloadError(projectA)).toContain("EACCES");
+      // The sibling directory and the cwd-keyed entry are unaffected.
+      expect(loadConfig(projectB)).toBe(b1);
+      expect(getConfigReloadError(projectB)).toBeNull();
+      expect(getConfigReloadError()).toBeNull();
+    } finally {
+      fsMock.unstatablePath = null;
+    }
+
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+    expect(getConfigReloadError(projectA)).toBeNull();
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("applies the lower-priority config, without an error, when one directory's override is removed (ENOENT)", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    rmSync(join(projectA, ".opencode", FILE));
+
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).not.toBe("anthropic/proj-a-fast");
+    expect(getConfigReloadError(projectA)).toBeNull();
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("invalidateConfigCache() marks every directory stale", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    invalidateConfigCache();
+
+    const a2 = loadConfig(projectA);
+    const b2 = loadConfig(projectB);
+    expect(a2).not.toBe(a1);
+    expect(b2).not.toBe(b1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+    expect(b2.presets.anthropic!.fast!.model).toBe("anthropic/proj-b-fast");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // findProjectOverride — walk boundaries. Without a repo marker the walk used to
 // run to the filesystem root and silently adopt an unrelated ancestor's file.
 // HOME is deliberately parked on a SIBLING directory here so these tests pin the

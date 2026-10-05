@@ -128,8 +128,8 @@ function describeError(error: unknown): string {
   }
 }
 
-function saveActivePreset(presetName: string): void {
-  const cfg = loadConfig();
+function saveActivePreset(presetName: string, projectDir?: string): void {
+  const cfg = loadConfig(projectDir);
   const resolved = resolvePresetName(cfg, presetName);
   if (!resolved) {
     return;
@@ -144,8 +144,8 @@ function saveActivePreset(presetName: string): void {
   invalidateConfigCache();
 }
 
-function saveActiveMode(modeName: string): void {
-  const cfg = loadConfig();
+function saveActiveMode(modeName: string, projectDir?: string): void {
+  const cfg = loadConfig(projectDir);
   if (!cfg.modes?.[modeName]) {
     return;
   }
@@ -164,7 +164,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -181,8 +181,8 @@ function buildRouterOutput(cfg: RouterConfig, args: string): string {
 
   if (sub === "overrides") {
     const globalPath = overridePath();
-    const foundLocal = findProjectOverride();
-    const localPath = foundLocal ?? localOverridePath();
+    const foundLocal = findProjectOverride(projectDir);
+    const localPath = foundLocal ?? localOverridePath(projectDir);
     return buildOverridesOutput({
       globalPath,
       globalPresent: existsSync(globalPath),
@@ -199,7 +199,7 @@ function buildRouterOutput(cfg: RouterConfig, args: string): string {
 }
 
 /** `/budget` dispatch. Persists the switch, then renders. */
-function buildBudgetOutput(cfg: RouterConfig, args: string): string {
+function buildBudgetOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
   const modes = cfg.modes;
   if (!modes || Object.keys(modes).length === 0) return buildNoModes();
 
@@ -208,7 +208,7 @@ function buildBudgetOutput(cfg: RouterConfig, args: string): string {
 
   const mode = modes[requested];
   if (mode) {
-    saveActiveMode(requested);
+    saveActiveMode(requested, projectDir);
     return buildBudgetSwitched(mode, requested);
   }
 
@@ -216,13 +216,13 @@ function buildBudgetOutput(cfg: RouterConfig, args: string): string {
 }
 
 /** `/preset` dispatch. Persists the switch, then renders. */
-function buildPresetOutput(cfg: RouterConfig, args: string): string {
+function buildPresetOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
   const requestedPreset = args.trim();
   if (!requestedPreset) return buildPresetList(cfg);
 
   const resolvedPreset = resolvePresetName(cfg, requestedPreset);
   if (resolvedPreset) {
-    saveActivePreset(resolvedPreset);
+    saveActivePreset(resolvedPreset, projectDir);
     cfg.activePreset = resolvedPreset;
     return buildPresetSwitched(cfg, resolvedPreset);
   }
@@ -255,7 +255,11 @@ const SESSION_ROOT_MEMO_MAX = 500;
 const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
 
 const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
-  let cfg = loadConfig();
+  // Project directory this plugin instance serves. Hosts that run several
+  // projects in one process (OpenCode v2) may also move process.cwd() away from
+  // it, so config/override lookup must use this and never the working directory.
+  const projectDir: string | undefined = ctx.directory || ctx.worktree || undefined;
+  let cfg = loadConfig(projectDir);
   let activeTiers = getActiveTiers(cfg);
 
   // Per-plugin-instance session store: owns subagentSessionIDs and subagentCapState.
@@ -639,7 +643,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           try {
             let activeCfg = cfg;
             try {
-              activeCfg = loadConfig();
+              activeCfg = loadConfig(projectDir);
               warnDeprecatedVerifyKeys(activeCfg, logger);
             } catch {
               activeCfg = cfg;
@@ -1116,7 +1120,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (bypassed) return;
       // Re-read cfg so /preset switches take effect without restart
       try {
-        cfg = loadConfig();
+        cfg = loadConfig(projectDir);
         warnDeprecatedVerifyKeys(cfg, logger);
       } catch {}
       try {
@@ -1736,7 +1740,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       opencodeConfig.agent ??= {};
 
       // Re-read so re-running this hook (v2 refresh) yields the current preset.
-      cfg = loadConfig();
+      cfg = loadConfig(projectDir);
       activeTiers = getActiveTiers(cfg);
 
       for (const [name, tier] of Object.entries(activeTiers)) {
@@ -1897,7 +1901,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     "experimental.chat.system.transform": async (_input: any, output: any) => {
       if (bypassed) return;
       try {
-        cfg = loadConfig(); // Returns cache unless invalidated
+        cfg = loadConfig(projectDir); // Returns cache unless invalidated
         warnDeprecatedVerifyKeys(cfg, logger);
       } catch {
         // Use last known config if file read fails
@@ -1987,7 +1991,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     "command.execute.before": async (input: any, output: any) => {
       if (input.command === "tiers") {
         try {
-          cfg = loadConfig();
+          cfg = loadConfig(projectDir);
           warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
@@ -1998,12 +2002,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       if (input.command === "router-reload") {
         invalidateConfigCache();
-        cfg = loadConfig();
+        cfg = loadConfig(projectDir);
         activeTiers = getActiveTiers(cfg);
         const mapping = Object.entries(activeTiers)
           .map(([name, tier]) => `  ${name} -> ${tier.model}`)
           .join("\n");
-        const reloadError = getConfigReloadError();
+        const reloadError = getConfigReloadError(projectDir);
         output.parts.push({
           type: "text" as const,
           text: [
@@ -2030,12 +2034,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       if (input.command === "preset") {
         try {
-          cfg = loadConfig();
+          cfg = loadConfig(projectDir);
           warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
-          text: buildPresetOutput(cfg, input.arguments ?? ""),
+          text: buildPresetOutput(cfg, input.arguments ?? "", projectDir),
         });
       }
 
@@ -2056,18 +2060,18 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       if (input.command === "budget") {
         try {
-          cfg = loadConfig();
+          cfg = loadConfig(projectDir);
           warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
-          text: buildBudgetOutput(cfg, input.arguments ?? ""),
+          text: buildBudgetOutput(cfg, input.arguments ?? "", projectDir),
         });
       }
 
       if (input.command === "router") {
         try {
-          cfg = loadConfig();
+          cfg = loadConfig(projectDir);
           warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         const args = (input.arguments ?? "").trim();
@@ -2079,7 +2083,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
           text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
         } else {
-          text = buildRouterOutput(cfg, args);
+          text = buildRouterOutput(cfg, args, projectDir);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             const catalog = await fetchCatalog();

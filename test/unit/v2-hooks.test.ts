@@ -818,11 +818,11 @@ describe("OpenCode 2 hook adapter", () => {
     { models: ["other/model"], id: "model", temperature: 0.65, retained: false },
     { models: ["openai/org/model"], id: "org/model", temperature: 0.65, retained: true },
   ])("filters grader temperature for $id with allowlist $models", async ({ models, id, temperature, retained }) => {
-    const cfg = loadConfig();
+    const f = fixture();
+    const cfg = loadConfig(f.ctx.location.directory);
     cfg.enforcement ??= {};
     cfg.enforcement.verify ??= {};
     cfg.enforcement.verify.graderTemperatureModels = models;
-    const f = fixture();
     await f.start({ "chat.params": async (_: unknown, options: Record<string, unknown>) => { options.temperature = temperature; } });
     const event = { ...call, agent: V2_GRADER_AGENT, model: { providerID: "openai", id }, options: { maxOutputTokens: 123 }, system: [] };
     await f.sessionHooks.context(event);
@@ -831,12 +831,12 @@ describe("OpenCode 2 hook adapter", () => {
   });
 
   it.each([undefined, [], ["openai/model"]])("removes inherited grader temperature when null even with allowlist %j", async (models) => {
-    const cfg = loadConfig();
+    const f = fixture();
+    const cfg = loadConfig(f.ctx.location.directory);
     cfg.enforcement ??= {};
     cfg.enforcement.verify ??= {};
     cfg.enforcement.verify.graderTemperature = null;
     cfg.enforcement.verify.graderTemperatureModels = models;
-    const f = fixture();
     await f.start();
     const event = { ...call, agent: V2_GRADER_AGENT, model: { providerID: "openai", id: "model" }, options: { temperature: 0.8, maxOutputTokens: 123 }, system: [] };
     await f.sessionHooks.context(event);
@@ -855,10 +855,10 @@ describe("OpenCode 2 hook adapter", () => {
     const root = mkdtempSync(join(tmpdir(), "router-v2-instructions-"));
     try {
       vi.stubEnv("HOME", root); vi.stubEnv("USERPROFILE", root); invalidateConfigCache();
-      loadConfig().delegateInstructions = "strip-all";
+      const f = fixture();
+      loadConfig(f.ctx.location.directory).delegateInstructions = "strip-all";
       const path = join(root, "AGENTS.md"); writeFileSync(path, "Delegate everything.");
       const text = `Instructions from: ${path}\nDelegate everything.`;
-      const f = fixture();
       f.ctx.session.context.mockResolvedValue([{ id: "synthetic", type: "synthetic", text, metadata: { instruction: { paths: [path] } } }]);
       await f.start();
       const attachment = { type: "media", media: { source: "preserve" } };
@@ -875,8 +875,9 @@ describe("OpenCode 2 hook adapter", () => {
   it("uses post-configuration subagent tiers at dispatch without overriding explicit models or primary agents", async () => {
     const home = join(tmpdir(), `router-v2-mapping-${randomUUID()}`);
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home); invalidateConfigCache();
-    const cfg = loadConfig(); cfg.subagentTiers = { custom: "fast", build: "fast", missing: "fast" };
-    const f = fixture(); await f.start();
+    const f = fixture();
+    const cfg = loadConfig(f.ctx.location.directory); cfg.subagentTiers = { custom: "fast", build: "fast", missing: "fast" };
+    await f.start();
     f.agents.custom = { id: "custom", mode: "subagent" };
     const custom = { ...call, tool: "subagent", input: { agent: "custom", prompt: "work" } as any };
     await f.toolHooks["execute.before"](custom);
@@ -888,6 +889,46 @@ describe("OpenCode 2 hook adapter", () => {
       const event = { ...call, tool: "subagent", input: { agent, prompt: "work" } as any };
       await f.toolHooks["execute.before"](event);
       expect(event.input.model).toBeUndefined();
+    }
+  });
+
+  it("loads router config for ctx.location.directory even when the host chdirs to $HOME (#70)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-dir-"));
+    const project = join(home, "work", "repo");
+    const savedCwd = process.cwd();
+    try {
+      vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home); invalidateConfigCache();
+      mkdirSync(join(project, ".git"), { recursive: true });
+      mkdirSync(join(project, ".opencode"), { recursive: true });
+      writeFileSync(
+        join(project, ".opencode", "opencode-model-router.overrides.jsonc"),
+        JSON.stringify({ subagentTiers: { custom: "fast" } }),
+      );
+      // OpenCode 2 server mode: the process cwd is $HOME, never the project.
+      process.chdir(home);
+      expect(loadConfig().subagentTiers?.custom).toBeUndefined();
+      expect(loadConfig(project).subagentTiers).toMatchObject({ custom: "fast" });
+
+      const f = fixture();
+      f.ctx.location.directory = project;
+      await f.start();
+      f.agents.custom = { id: "custom", mode: "subagent" };
+      const mapped = { ...call, tool: "subagent", input: { agent: "custom", prompt: "work" } as any };
+      await f.toolHooks["execute.before"](mapped);
+      expect(mapped.input.model).toMatch(/\//);
+
+      // Another instance in the same process, for a directory without the
+      // project file, must not see the first instance's override.
+      const other = fixture();
+      other.ctx.location.directory = join(home, "other");
+      await other.start();
+      other.agents.custom = { id: "custom", mode: "subagent" };
+      const unmapped = { ...call, tool: "subagent", input: { agent: "custom", prompt: "work" } as any };
+      await other.toolHooks["execute.before"](unmapped);
+      expect(unmapped.input.model).toBeUndefined();
+    } finally {
+      process.chdir(savedCwd);
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });
