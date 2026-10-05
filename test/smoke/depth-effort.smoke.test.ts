@@ -1,7 +1,7 @@
 /** Real-host, keyless proof of depth enforcement and per-producer effort.
  * RUN_OC_SMOKE_KEYLESS=1 (or RUN_OC_SMOKE=1) enables v1 on PATH.
  * RUN_OC_SMOKE_V2=1 with OPENCODE_V2_BIN enables v2 (independently of v1).
- * SMOKE_DEPTH_EFFORT_MUTATION=depth|bump changes CONFIG ONLY for proof mutation.
+ * SMOKE_DEPTH_EFFORT_MUTATION=depth|bump|cap changes CONFIG ONLY for proof mutation.
  * SMOKE_DEPTH_EFFORT_ARTIFACTS retains secret-free captures outside the checkout.
  */
 import { afterEach, describe, expect, it } from "vitest";
@@ -181,7 +181,9 @@ function scenarioConfig(mode: "enforced" | "advisory", effort = false, bump = tr
     enforcement: {
       mode, maxDelegationDepth: mutation === "depth" ? null : options.maxDepth ?? 1,
       verify: { require: effort ? "always" : "never", defaultVerify: "required", minGraderTier: "heavy", preferDeterministic: false, background: false },
-      escalate: { effortBump: mutation === "bump" ? false : bump, effortBumpMax: options.effortBumpMax, maxAttemptsPerTier: options.maxAttemptsPerTier ?? 1, maxTotalAttempts: 3, costCeiling: { base: "medium", multiple: 10 } },
+      // Undefined is omitted when the fixture is serialized: cap changes ONLY
+      // the config, leaving the medium-cap expectation unchanged.
+      escalate: { effortBump: mutation === "bump" ? false : bump, effortBumpMax: mutation === "cap" ? undefined : options.effortBumpMax, maxAttemptsPerTier: options.maxAttemptsPerTier ?? 1, maxTotalAttempts: 3, costCeiling: { base: "medium", multiple: 10 } },
     },
   };
 }
