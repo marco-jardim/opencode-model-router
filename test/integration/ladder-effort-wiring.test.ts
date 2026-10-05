@@ -153,14 +153,16 @@ describe("effort bump plugin wiring", () => {
       assertCleared(f.producers);
     });
 
-    it(`${host}: logs a grader-params error once without skipping the independent effort override`, async () => {
+    it.each(["error", "unprintable", "failed logger"])(`${host}: contains a grader-params %s without skipping the independent effort override`, async (failure) => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      if (failure === "failed logger") warn.mockImplementation(() => { throw new Error("logger unavailable"); });
+      const error: unknown = failure === "error" ? new Error("params unavailable") : Object.create(null);
       const outputs: Record<string, unknown>[] = [];
       const f = await setup(host, [false, true], undefined, async (hooks, sid, agent, model, attempt) => {
         if (attempt !== 2) return;
         for (let call = 0; call < 2; call++) {
           let reads = 0;
-          const input = { get sessionID() { if (reads++ === 0) throw new Error("params unavailable"); return sid; }, agent, model };
+          const input = { get sessionID() { if (reads++ === 0) throw error; return sid; }, agent, model };
           const options: Record<string, unknown> = {};
           await hooks["chat.params"](input, host === "v1" ? { options } : options);
           outputs.push(options);

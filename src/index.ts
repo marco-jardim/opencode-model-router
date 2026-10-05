@@ -118,6 +118,15 @@ export type { TrajectoryState, TrajectoryToolEvent } from "./telemetry/trajector
 export type { EnforcementMode } from "./router/enforcement";
 export type { GuardPolicy, GuardState, GuardCall, GuardDecision } from "./guard/guards";
 
+/** Diagnostics must also tolerate thrown values without primitive conversion. */
+function describeError(error: unknown): string {
+  try {
+    return scrubText(String(error));
+  } catch {
+    return "unprintable error";
+  }
+}
+
 function saveActivePreset(presetName: string): void {
   const cfg = loadConfig();
   const resolved = resolvePresetName(cfg, presetName);
@@ -1080,7 +1089,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       } catch (error) {
         if (!warnedGraderParams) {
           warnedGraderParams = true;
-          logger.warn("[verify] grader temperature not applied", { error: scrubText(String(error)) });
+          try {
+            logger.warn("[verify] grader temperature not applied", { error: describeError(error) });
+          } catch {
+            // Even a failed diagnostic sink must not interrupt chat.params.
+          }
         }
       }
       try {
@@ -1088,7 +1101,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           applyEffortOverride(effortOverrides, input, ctx.routerHost === "v2" ? output : output?.options, routerWarn);
         }
       } catch (error) {
-        logger.warn("[router] effort override not applied", { error: scrubText(String(error)) });
+        try {
+          logger.warn("[router] effort override not applied", { error: describeError(error) });
+        } catch {
+          // Host accessors and diagnostic sinks are both best-effort here.
+        }
       }
     },
 
