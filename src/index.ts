@@ -99,6 +99,7 @@ import {
   buildAcceptedSuffix,
 } from "./verify/dispatch";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard } from "./escalate/ladder";
+import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -238,7 +239,7 @@ function warnSessionLookupFailedOnce(): void {
 }
 
 const SESSION_ROOT_MEMO_MAX = 500;
-const SESSION_LOOKUP_RETRY_MS = 30_000;
+const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
 
 const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let cfg = loadConfig();
@@ -290,6 +291,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const memo = sessionRootMemo.get(sessionID);
     if (memo !== undefined) {
       if (!memo) sessionStore.markChildSession(sessionID);
+      else depthTracker.recordRoot(sessionID);
       return memo;
     }
     const failedAt = sessionLookupFailedAt.get(sessionID);
@@ -311,6 +313,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         sessionRootMemo.delete(oldest);
       }
       if (!isRoot) sessionStore.markChildSession(sessionID);
+      if (isRoot) depthTracker.recordRoot(sessionID);
+      else depthTracker.recordCreated(sessionID, parentID as string);
       return isRoot;
     } catch {
       sessionLookupFailedAt.set(sessionID, Date.now());
@@ -346,6 +350,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     () => guardStore.sweep(),
     () => trajectoryStore.sweep(),
     () => changedFileStore.sweep(),
+    () => depthTracker.sweep(),
     // 2.2.3: the S5 batch coordinator's defensive eviction (batch.ts B11). Declared below; the
     // sweeper only runs from chat.message, long after this factory has returned.
     () => { sweepVerification(); },
@@ -360,6 +365,20 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // from a plugin paints over the TUI. Falls back to console when the server
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
+  const routerWarn = { warn: (message: string) => logger.warn(message) };
+  const depthTracker = createDepthTracker({
+    async getParent(id) {
+      if (sessionRootMemo.get(id) === true) return null;
+      const res = await ctx.client.session.get({ path: { id } });
+      if (!res || (res as { error?: unknown }).error || !res.data) {
+        throw new Error("session.get returned no session data");
+      }
+      const parentID = res.data.parentID;
+      return typeof parentID === "string" && parentID !== "" ? parentID : null;
+    },
+    now: () => Date.now(),
+    logger: routerWarn,
+  });
 
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
@@ -1497,6 +1516,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
+            depthTracker.forget(id);
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);
@@ -1518,6 +1538,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // subagent that has no task tool, and the subagent refused the work.
       if (event?.type === "session.created") {
         const info = event?.properties?.info;
+        try {
+          if (typeof info?.id === "string") {
+            depthTracker.recordCreated(info.id,
+              typeof info.parentID === "string" && info.parentID !== "" ? info.parentID : null);
+          }
+        } catch (error) {
+          logger.warn("[router] delegation depth: session creation not recorded", { error: scrubText(String(error)) });
+        }
         if (
           typeof info?.id === "string" &&
           typeof info?.parentID === "string" &&

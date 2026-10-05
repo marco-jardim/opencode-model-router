@@ -17,6 +17,7 @@ export default {
       worktree: ctx.location.project.directory,
       client: runtime.client,
       routerChildRunner: runtime.childRunner,
+      routerHost: "v2" as const,
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     return registerV2Hooks(ctx, hooks, runtime);
