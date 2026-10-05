@@ -789,9 +789,10 @@ describe("QA-1.2-1: a walk never loses evidence to a re-created node", () => {
     expect(getParent).not.toHaveBeenCalledWith("P", expect.anything());
   });
 
+  // Pinning (QA-1.2-2) keeps X out of the LRU, so the TTL is what re-creates it here.
   it("a plugin child re-created as a backend root keeps its plugin floor and creator link", async () => {
     vi.useFakeTimers();
-    const { tracker, getParent } = fixture({ maxEntries: 2, ttlMs: 100 });
+    const { tracker, getParent, time } = fixture({ maxEntries: 2, ttlMs: 100 });
     const creator = deferred<string | null>();
     getParent.mockImplementation(async (id) => id === "C" ? creator.promise : id === "Y" ? "X" : null);
     tracker.recordPluginChild("X", "C");
@@ -799,7 +800,9 @@ describe("QA-1.2-1: a walk never loses evidence to a re-created node", () => {
     await started();
     tracker.recordRoot("Z1");
     tracker.recordRoot("Z2");
+    time(100);
     tracker.sweep();
+    expect(tracker.size()).toBe(0);
     const y = tracker.depthOf("Y");
     await vi.advanceTimersByTimeAsync(0);
     const probe = tracker.depthOf("X", { timeoutMs: 10 });
@@ -809,6 +812,30 @@ describe("QA-1.2-1: a walk never loses evidence to a re-created node", () => {
     expect(await x).toBe(1);
     expect(await y).toBe(2);
     expect(await tracker.depthOf("X")).toBe(1);
+    expect(getParent.mock.calls.map(([id]) => id)).toEqual(["C", "Y", "X"]);
+  });
+
+  it("a retained copy's higher floor survives re-creation as a backend root", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, time } = fixture({ ttlMs: 100 });
+    const missing = deferred<string | null>();
+    getParent.mockImplementation((id) => id === "M" ? missing.promise : Promise.resolve(id === "Y" ? "X" : null));
+    chain(tracker, 2);
+    tracker.recordCreated("X", "n2");
+    tracker.recordCreated("X", "M");
+    time(99);
+    const x = tracker.depthOf("X");
+    await started();
+    time(100);
+    tracker.sweep();
+    const y = tracker.depthOf("Y");
+    await vi.advanceTimersByTimeAsync(0);
+    const probe = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await probe).toBe(3);
+    missing.resolve(null);
+    expect(await x).toBe(3);
+    expect(await y).toBe(4);
   });
 
   it("an event re-creating a root keeps the walk's link, and a re-created link keeps the walk's root", async () => {
@@ -939,5 +966,46 @@ describe("QA-1.2-2: evidence the backend cannot reproduce is never lost to LRU p
     time(100);
     tracker.sweep();
     expect(tracker.size()).toBe(0);
+  });
+});
+
+describe("QA-1.2-7: per-call cost is bounded", () => {
+  const W = 300;
+  const L = 32;
+  const id = (layer: number, i: number) => `${layer}:${(i + W) % W}`;
+  function link(tracker: DepthTracker, layer: number) {
+    for (let i = 0; i < W; i++) for (let k = 0; k < 4; k++) tracker.recordCreated(id(layer, i), id(layer - 1, i + k));
+  }
+
+  it.each(["top-down", "bottom-up"])("a %s 300x32 DAG with 4 parents per node records and reads in < 2 s", async (order) => {
+    const { tracker, getParent } = fixture();
+    const started = performance.now();
+    if (order === "top-down") {
+      for (let i = 0; i < W; i++) tracker.recordRoot(id(0, i));
+      for (let layer = 1; layer < L; layer++) link(tracker, layer);
+    } else {
+      for (let layer = L - 1; layer >= 1; layer--) link(tracker, layer);
+      for (let i = 0; i < W; i++) tracker.recordRoot(id(0, i));
+    }
+    let wrong = 0;
+    for (let layer = L - 1; layer >= 0; layer--) {
+      for (let i = 0; i < W; i++) if (await tracker.depthOf(id(layer, i)) !== layer) wrong++;
+    }
+    const elapsed = performance.now() - started;
+    expect(wrong).toBe(0);
+    expect(getParent).not.toHaveBeenCalled();
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  it("an evidence change above a wide DAG is seen by every descendant", async () => {
+    const { tracker } = fixture();
+    for (let i = 0; i < W; i++) tracker.recordRoot(id(0, i));
+    for (let layer = 1; layer < 8; layer++) link(tracker, layer);
+    expect(await tracker.depthOf(id(7, 0))).toBe(7);
+    chain(tracker, 5, "c");
+    tracker.recordCreated(id(0, 2), "c5");
+    expect(await tracker.depthOf(id(0, 2))).toBe(6);
+    expect(await tracker.depthOf(id(7, 0))).toBe(13);
+    expect(await tracker.depthOf(id(7, 100))).toBe(7);
   });
 });

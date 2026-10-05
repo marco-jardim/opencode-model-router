@@ -30,6 +30,9 @@ interface Node {
   plugin: boolean;
   rootSeen: boolean;
   pinned: boolean; // carries evidence a backend walk cannot reproduce: never LRU-evicted
+  fresh: boolean; // memo is current: no evidence above it changed since it was computed
+  gap?: string; // fresh and incomplete: a missing ancestor to fetch
+  via?: string; // the parent that gave the depth (the path a read keeps warm)
   lastTouch: number;
 }
 type LookupResult = { ok: true; node: Node } | { ok: false; reason: string };
@@ -59,6 +62,9 @@ interface Done {
   order: string[];
   start: string;
   excess: Set<string>; // complete, with a floor above what its links now derive
+  fresh: Set<string>; // finished normally: their values are level-independent
+  gaps: Map<string, string>;
+  vias: Map<string, string>;
 }
 type Climb = Done | { kind: "need"; id: string };
 type Source = "event" | "backend" | "plugin";
@@ -157,7 +163,30 @@ export function createDepthTracker(
       set.delete(id);
       if (set.size === 0) kids.delete(p);
     }
+    n.fresh = false; // a walk may still hold this object
     if (unresolveKids) for (const kid of kids.get(id) ?? []) get(kid)!.resolved = false;
+    invalidate(id);
+  }
+
+  // Marks every tracked descendant of `id` stale. Invariant: a stale node has
+  // only stale tracked children, so the walk stops at the first stale node.
+  function invalidate(id: string): void {
+    const queue = [id];
+    for (let i = 0; i < queue.length; i++) {
+      for (const kid of kids.get(queue[i]) ?? []) {
+        const k = get(kid)!;
+        if (!k.fresh) continue;
+        k.fresh = false;
+        queue.push(kid);
+      }
+    }
+  }
+
+  // Evidence on `n` changed in a way that can raise it: its memo and every
+  // descendant's memo are stale.
+  function changed(id: string, n: Node): void {
+    n.fresh = false;
+    invalidate(id);
   }
 
   function victim(map: Map<string, Node>, protect: string): string {
@@ -196,6 +225,7 @@ export function createDepthTracker(
       plugin,
       rootSeen: link === null && !plugin,
       pinned: plugin,
+      fresh: false,
       lastTouch: clock(),
     };
   }
@@ -207,6 +237,7 @@ export function createDepthTracker(
       n.depth = MAX_DEPTH_HOPS;
       n.resolved = true;
       conflict(id, n, "parent link overflow");
+      changed(id, n);
       return;
     }
     if (!n.plugin && (n.rootSeen || n.parents.length)) conflict(id, n, "new parent");
@@ -214,6 +245,7 @@ export function createDepthTracker(
     if (get(id) === n) linkKid(link, id);
     n.resolved = false;
     n.depth = Math.max(n.depth, 1);
+    changed(id, n);
   }
 
   function addRoot(id: string, n: Node): void {
@@ -229,10 +261,14 @@ export function createDepthTracker(
       into.plugin = true;
       pin(id, into);
       into.depth = Math.max(into.depth, 1);
+      changed(id, into);
     }
     if (from.rootSeen) addRoot(id, into);
     for (const p of from.parents) addLink(id, into, p);
-    into.depth = Math.max(into.depth, from.depth);
+    if (from.depth > into.depth) {
+      into.depth = from.depth;
+      changed(id, into);
+    }
     into.lastTouch = Math.max(into.lastTouch, from.lastTouch);
   }
 
@@ -247,6 +283,7 @@ export function createDepthTracker(
   function adopt(id: string, n: Node): void {
     (n.pinned ? pins : lru).set(id, n);
     for (const p of n.parents) linkKid(p, id);
+    invalidate(id); // children holding `id` as a gap or frontier must re-climb
     for (const walk of live) {
       const copy = walk.learned.get(id);
       if (copy === undefined || copy === n) continue;
@@ -255,14 +292,15 @@ export function createDepthTracker(
     }
   }
 
-  // The tracked object for `id`, merged with this climb's retained copy.
-  function node(id: string, learned: Map<string, Node>): Node | undefined {
+  // The tracked object for `id`, merged with this climb's retained copy (an
+  // untracked id is only ever known through that copy: adopt() unifies copies).
+  function node(id: string, learned: Map<string, Node>): Node {
     const tracked = get(id);
     const copy = learned.get(id);
-    if (tracked && copy && tracked !== copy) absorb(id, tracked, copy);
-    const n = tracked ?? copy;
-    if (n) learned.set(id, n);
-    return n;
+    if (!tracked) return copy!;
+    if (copy && copy !== tracked) absorb(id, tracked, copy);
+    learned.set(id, tracked);
+    return tracked;
   }
 
   function applyLink(id: string, link: string | null, source: Source): Node {
@@ -275,72 +313,116 @@ export function createDepthTracker(
       adopt(id, created);
       return created;
     }
-    if (plugin) {
+    if (plugin && !n.plugin) {
       n.plugin = true;
       pin(id, n);
-      if (link === null) n.depth = Math.max(n.depth, 1);
+      n.depth = Math.max(n.depth, 1);
+      changed(id, n);
     }
     if (link !== null) addLink(id, n, link);
     else if (!plugin) addRoot(id, n);
     return n;
   }
 
-  // Each climb is synchronous: no event can interleave with its snapshot.
+  // Each climb is synchronous: no event can interleave with its snapshot. It
+  // recurses only into stale nodes and stops at fresh memos (and terminals), so
+  // a read whose ancestry is unchanged costs O(links of the start).
+  function climb(start: string, learned: Map<string, Node>, mode: "floor"): Done | undefined;
+  function climb(start: string, learned: Map<string, Node>, mode: "exact"): Climb;
   function climb(start: string, learned: Map<string, Node>, mode: "exact" | "floor"): Climb | undefined {
     const known = (id: string) => has(id) || learned.has(id);
     if (!known(start)) return mode === "exact" ? { kind: "need", id: start } : undefined;
+    // A memo cannot see evidence held only by this walk (an evicted copy), so
+    // memos are trusted only while every retained node is still tracked.
+    let shortcuts = true;
+    for (const id of learned.keys()) if (!has(id)) shortcuts = false;
     const vals = new Map<string, number>();
     const complete = new Set<string>();
     const order: string[] = [];
     const excess = new Set<string>();
+    const fresh = new Set<string>();
+    const gaps = new Map<string, string>();
+    const vias = new Map<string, string>();
     const stack: string[] = [];
+    const onStack = new Set<string>();
     let stop: { kind: "need"; id: string } | { kind: "cap"; cycle: boolean } | undefined;
     function visit(id: string, level: number): number {
-      if (vals.has(id)) return vals.get(id)!;
-      if (stack.includes(id) || level > MAX_DEPTH_HOPS) {
-        stop = { kind: "cap", cycle: stack.includes(id) };
+      const seen = vals.get(id);
+      if (seen !== undefined) return seen;
+      if (onStack.has(id) || level > MAX_DEPTH_HOPS) {
+        stop = { kind: "cap", cycle: onStack.has(id) };
         return MAX_DEPTH_HOPS;
       }
       // Retain visited evidence for the duration of this walk. Backend inserts
       // can evict the start (even with a one-entry cache); that must not turn
       // an event-proven child into a fresh backend root. Node references also
       // retain all conflicting links, not merely the last parent answer.
-      const n = node(id, learned)!;
-      let d = n.depth;
-      if (d >= MAX_DEPTH_HOPS) {
+      const n = node(id, learned);
+      if (n.depth >= MAX_DEPTH_HOPS) {
         vals.set(id, MAX_DEPTH_HOPS);
         complete.add(id);
+        fresh.add(id);
         order.push(id);
         return MAX_DEPTH_HOPS;
       }
+      // A walk (exact mode) climbs through incomplete memos rather than jumping to
+      // their gap, so it retains every node it depends on (QA-1.2-1).
+      if (shortcuts && n.fresh && (n.gap === undefined || mode === "floor")) {
+        vals.set(id, n.depth);
+        fresh.add(id);
+        order.push(id);
+        if (n.via !== undefined) vias.set(id, n.via);
+        if (n.gap === undefined) complete.add(id);
+        else gaps.set(id, n.gap);
+        return n.depth;
+      }
       stack.push(id);
+      onStack.add(id);
+      let d = n.depth;
       let ok = true;
+      let gap: string | undefined;
+      let best = -1;
       let derived = n.parents.length || n.plugin ? 1 : 0; // what the links alone prove
       for (const p of n.parents) {
         if (!known(p)) {
-          if (n.resolved) continue; // Absolute memo at an evicted frontier.
+          if (n.resolved) continue; // Absolute memo at a forgotten frontier (F4).
           if (mode === "exact") {
             stop = { kind: "need", id: p };
             return d;
           }
           ok = false;
+          gap ??= p;
           continue;
         }
         const via = visit(p, level + 1) + 1;
         if (stop) return d;
+        if (via > best) {
+          best = via;
+          vias.set(id, p);
+        }
         derived = Math.max(derived, via);
         d = Math.max(d, via);
-        ok = ok && complete.has(p);
+        if (!complete.has(p)) {
+          ok = false;
+          gap ??= gaps.get(p);
+        }
       }
       stack.pop();
+      onStack.delete(id);
       const floor0 = n.depth;
       d = Math.min(d, MAX_DEPTH_HOPS);
       vals.set(id, d);
-      if (ok) complete.add(id);
-      // The stored floor exceeds what the (now complete) links prove: it came
-      // from evidence no longer tracked, which a backend walk cannot reproduce.
-      if (ok && floor0 > Math.min(derived, MAX_DEPTH_HOPS)) excess.add(id);
       order.push(id);
+      if (ok) {
+        complete.add(id);
+        fresh.add(id);
+        // The stored floor exceeds what the (now complete) links prove: it came
+        // from evidence no longer tracked, which a backend walk cannot reproduce.
+        if (floor0 > Math.min(derived, MAX_DEPTH_HOPS)) excess.add(id);
+      } else if (gap !== undefined) {
+        gaps.set(id, gap);
+        fresh.add(id);
+      }
       return d;
     }
     let depth = visit(start, 0);
@@ -355,28 +437,45 @@ export function createDepthTracker(
       // Preserve reverse post-order touching even when a climb hits the cap.
       order.push(...stack.slice().reverse());
     }
-    return { kind: "done", depth, vals, complete, order, start, excess };
+    return { kind: "done", depth, vals, complete, order, start, excess, fresh, gaps, vias };
+  }
+
+  function touch(id: string, stamp: number): boolean {
+    const n = get(id);
+    if (!n) return false;
+    n.lastTouch = stamp;
+    const map = n.pinned ? pins : lru;
+    map.delete(id);
+    map.set(id, n);
+    return true;
   }
 
   function memoize(r: Done, learned: Map<string, Node>): void {
     const stamp = clock();
-    for (const id of r.order.slice().reverse()) {
-      const n = node(id, learned)!;
-      if (!has(id)) adopt(id, n);
+    for (const id of r.order) if (!has(id)) adopt(id, node(id, learned));
+    for (const id of r.order) {
+      const n = get(id)!;
       n.depth = Math.max(n.depth, r.vals.get(id)!);
       if (r.complete.has(id)) n.resolved = true;
+      if (r.fresh.has(id)) {
+        n.fresh = true;
+        n.gap = r.gaps.get(id);
+        n.via = r.vias.get(id);
+      } else changed(id, n); // a hop-cap floor depends on the level it was seen at
       if (r.excess.has(id)) pin(id, n);
-      n.lastTouch = stamp;
-      const map = n.pinned ? pins : lru;
-      map.delete(id);
-      map.set(id, n);
     }
+    // Reverse post-order: the start first, ancestors after it; then the start's
+    // max path to the root, so a read keeps its whole critical ancestry warm in
+    // O(MAX_DEPTH_HOPS) without touching every ancestor.
+    for (let i = r.order.length - 1; i >= 0; i--) touch(r.order[i], stamp);
+    let next = get(r.start)!.via;
+    for (let hop = 0; next !== undefined && hop < MAX_DEPTH_HOPS && touch(next, stamp); hop++) next = get(next)!.via;
     trim(r.start);
   }
 
   function floor(id: string, learned: Map<string, Node>, reason: string): number | undefined {
     const r = climb(id, learned, "floor");
-    if (!r || r.kind !== "done") {
+    if (!r) {
       warn(id, "lookup", reason);
       return undefined;
     }
@@ -470,7 +569,7 @@ export function createDepthTracker(
     let fetches = 0;
     try {
       for (;;) {
-        const r = climb(id, learned, "exact")!;
+        const r = climb(id, learned, "exact");
         if (r.kind === "done") {
           memoize(r, learned);
           return r.depth;
@@ -499,7 +598,7 @@ export function createDepthTracker(
   function record(id: string, link: string | null, source: Source): Node {
     const n = applyLink(id, link, source);
     const learned = new Map<string, Node>([[id, n]]);
-    memoize(climb(id, learned, "floor") as Done, learned);
+    memoize(climb(id, learned, "floor")!, learned);
     return n;
   }
 
@@ -518,7 +617,7 @@ export function createDepthTracker(
     async depthOf(id, options) {
       if (!validId(id)) return undefined;
       const learned = new Map<string, Node>();
-      const r = climb(id, learned, "exact")!;
+      const r = climb(id, learned, "exact");
       if (r.kind === "done") {
         memoize(r, learned);
         return r.depth;
