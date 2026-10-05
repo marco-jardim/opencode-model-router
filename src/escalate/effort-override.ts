@@ -45,6 +45,7 @@ export function createEffortOverrideStore(
   const store: EffortOverrideStore = {
     set(sessionID, tierName, tier, effort) {
       try {
+        entries.delete(sessionID);
         if (!nonempty(sessionID) || !nonempty(tierName) || !tier || typeof tier !== "object"
           || !nonempty(tier.model) || !EFFORT_LEVELS.includes(effort)) {
           warn(logger, "Invalid effort override arguments; override refused");
@@ -69,7 +70,6 @@ export function createEffortOverrideStore(
           warn(logger, `Effort override for ${sessionID} has no effort keys; override refused`);
           return;
         }
-        entries.delete(sessionID);
         entries.set(sessionID, { tierName, model: tier.model, keys, warnedMissingTarget: false });
         if (entries.size > maxEntries) {
           // A positive capacity and overflow guarantee a first entry.
@@ -78,6 +78,7 @@ export function createEffortOverrideStore(
           warn(logger, `Evicted oldest effort override for ${oldest}`);
         }
       } catch {
+        entries.delete(sessionID);
         warn(logger, "Failed to register effort override");
       }
     },

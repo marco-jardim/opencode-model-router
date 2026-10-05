@@ -182,6 +182,40 @@ describe("per-session effort overrides", () => {
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { tier: { ...openai, reasoning: { effort: "low" } }, effort: "medium" },
+    { tier: openai, effort: "xhigh" },
+    { tier: { ...openai, model: "gpt-5" }, effort: "medium" },
+    { tier: openai, effort: "ultra" },
+  ])("clears a previous override when a re-set is refused (%#)", ({ tier, effort }) => {
+    const { store, logger } = setup();
+    store.set("producer", "fast", openai, "high");
+    store.set("producer", "fast", tier as TierConfig, effort as EffortLevel);
+    expect(store.has("producer")).toBe(false);
+    const target = { reasoningEffort: "low" };
+    applyEffortOverride(store, producer, target, logger);
+    expect(target).toEqual({ reasoningEffort: "low" });
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a previous override when the builder throws or returns no effort keys", () => {
+    const { store, logger } = setup();
+    const builder = vi.spyOn(agentOptions, "buildAgentOptions").mockImplementation(() => {
+      throw new Error("builder");
+    });
+    store.set("producer", "fast", openai, "high");
+    expect(store.has("producer")).toBe(false);
+    builder.mockRestore();
+    store.set("producer", "fast", openai, "high");
+    vi.spyOn(agentOptions, "buildAgentOptions").mockReturnValue({});
+    store.set("producer", "fast", openai, "medium");
+    expect(store.has("producer")).toBe(false);
+    const target = { reasoningEffort: "low" };
+    applyEffortOverride(store, producer, target, logger);
+    expect(target).toEqual({ reasoningEffort: "low" });
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
   it("refuses empty builder output and catches builder/getter failures", () => {
     const { store, logger } = setup();
     const builder = vi.spyOn(agentOptions, "buildAgentOptions").mockReturnValue({ reasoningSummary: "auto" });
