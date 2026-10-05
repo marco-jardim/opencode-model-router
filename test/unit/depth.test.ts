@@ -414,6 +414,80 @@ describe("lookup lifetimes", () => {
   });
 });
 
+describe("PR #69 review: a forgotten walk releases the ancestor lookup it awaits", () => {
+  function hung(maxEntries: number) {
+    const { tracker, getParent } = fixture({ maxEntries });
+    const answers = new Map<string, ReturnType<typeof deferred<string | null>>>();
+    getParent.mockImplementation((id) => {
+      const answer = deferred<string | null>();
+      answers.set(id, answer);
+      return answer.promise;
+    });
+    // Forgets `id` while its walk awaits a lookup (of `id` itself or of its unknown parent).
+    async function forgetWhileAwaiting(id: string) {
+      const read = tracker.depthOf(id);
+      await started();
+      tracker.forget(id);
+      expect(await read).toBeUndefined();
+    }
+    return { tracker, getParent, answers, forgetWhileAwaiting };
+  }
+
+  it("a later walk for the ancestor starts a fresh, unthrottled lookup and pays no stale timeout", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent } = fixture();
+    getParent.mockReturnValueOnce(new Promise(() => {})).mockResolvedValue("R");
+    tracker.recordRoot("R");
+    tracker.recordCreated("X", "A");
+    tracker.recordCreated("Y", "A");
+    const x = tracker.depthOf("X");
+    await started();
+    tracker.forget("X");
+    expect(await x).toBeUndefined();
+    const y = tracker.depthOf("Y", { timeoutMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getParent.mock.calls).toEqual([["A"], ["A"]]);
+    expect(await y).toBe(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("repeated forgets awaiting distinct hung ancestors hold at most maxEntries lookups", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, answers, forgetWhileAwaiting } = hung(2);
+    for (const i of [1, 2, 3]) {
+      tracker.recordCreated(`X${i}`, `A${i}`);
+      await forgetWhileAwaiting(`X${i}`);
+    }
+    expect(tracker.size()).toBe(0);
+    // Past the cap the oldest released lookup is cancelled: its late answer is discarded.
+    answers.get("A1")!.resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(0);
+    // The newer ones are kept, and their late answers are still evidence.
+    answers.get("A2")!.resolve(null);
+    answers.get("A3")!.resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(2);
+    expect(getParent.mock.calls).toEqual([["A1"], ["A2"], ["A3"]]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("forgetting a walk's own target does not push another session's stray out of the cap", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, answers, forgetWhileAwaiting } = hung(1);
+    const z = tracker.depthOf("Z", { timeoutMs: 1 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await z).toBeUndefined();
+    await forgetWhileAwaiting("X");
+    answers.get("X")!.resolve("P");
+    answers.get("Z")!.resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(1);
+    expect(await tracker.depthOf("Z")).toBe(0);
+    expect(getParent.mock.calls).toEqual([["Z"], ["X"]]);
+  });
+});
+
 describe("eviction and bookkeeping", () => {
   it.each([1, 3])("an active walk retains event evidence across backend insertion with %i slots", async (maxEntries) => {
     const { tracker, getParent } = fixture({ maxEntries });
