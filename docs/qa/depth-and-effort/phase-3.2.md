@@ -515,9 +515,9 @@ The unsuccessful v2 attempt is not hidden or counted as a pass. Its baseline ser
 announced `http://127.0.0.1:3659`; Node fetch rejected it with `TypeError: fetch failed`,
 caused by `Error: bad port`, before inventory assertions. This is the Fetch restricted
 port case exposed by a host-assigned port. A single fresh full-v2 invocation on the
-**same code and config** passed 11/11. No port-selection product/test change was made;
-retain this independent harness limitation for follow-up rather than attributing it
-to the five round-2 fixes.
+**same code and config** passed 11/11. No port-selection change was part of those five
+round-2 fixes. The subsequent orchestrator-requested fix below addresses this harness
+limitation; the original failed attempt remains retained.
 
 Targeted strict TypeScript checking passed (`typecheck.log`), with the same two test
 entrypoints and compiler options recorded for round 1. No full suite, integration
@@ -527,6 +527,41 @@ Cleanup (`cleanup.json`) checked **53 recorded host processes and 34 stub ports*
 including the unsuccessful attempt: no remaining recorded hosts, matching rig
 processes, unrecorded scenario candidates, or listeners. The additional fault-control
 port check is in `barrier-fault/result.json`. Unrelated services were left untouched.
+
+### Post-round-2 fix — Fetch-safe ports
+
+Orchestrator-requested flakiness fix, tested commit
+**`0e91738520308ceadaca5496d26b85a3c11004ac`**. The new
+`test/smoke/helpers/fetch-safe-port.ts` copies Undici's Fetch bad-port list
+([source](https://github.com/nodejs/undici/blob/main/lib/web/fetch/constants.js),
+retrieved 2026-10-05; [Fetch spec](https://fetch.spec.whatwg.org/#port-blocking)).
+It probes free loopback ports, rejects blocked/invalid candidates with bounded
+retries, and closes every probe. Both v1 and v2 `serve` receive an explicit safe
+`--port`; the smoke asserts that the announced port matches before fetching it.
+The scripted provider uses the same picker and retries `EADDRINUSE` if another
+process takes a candidate between probe and bind. No production source changes.
+
+Four added helper tests cover **3659 first**, every copied blocked port plus invalid
+values, bounded exhaustion, and an occupied-port bind retry without leaked listeners.
+The existing four provider tests also assert their actual URL ports are Fetch-safe.
+
+Clean-env reruns, with v1's native bin first on PATH and `OPENCODE_V2_BIN` set for v2,
+each ran **once**, with no retries:
+
+| Run | Result | Duration | Output under evidence root |
+|---|---|---|---|
+| v1 1.18.19 depth/effort | **9 passed**, 11 v2 skipped | 211.16 s | `new-v1/output.log` |
+| v2 2.0.22 depth/effort | **11 passed**, 9 v1 skipped | 41.92 s | `new-v2/output.log` |
+| Helper tests | **8 passed** | 327 ms | `protocol/output.log` |
+
+Evidence: **`C:\Users\Marquinho\AppData\Local\Temp\Claude\p32-port-fix\`** contains
+runners, outputs, configs/captures, tested SHA/hashes, `summary.json` and `cleanup.json`.
+All **20 host artifacts** match that SHA and all four source hashes (including the
+new picker). All observed **20 stub ports and 14 serve ports** pass the pinned
+bad-port check. Cleanup checked **36 recorded host processes** and those ports:
+no remaining fixture processes or listeners. Targeted strict TypeScript checking
+passed. No full suite or mutation rerun was performed; earlier evidence is retained.
+The follow-up report commit changes documentation only.
 
 ## Deferred by plan
 
@@ -577,8 +612,9 @@ port check is in `barrier-fault/result.json`. Unrelated services were left untou
   and final-revision verification above. The report-only resolution commit changes
   no tested code. This is scoped finding closure, not a claim of a full-suite or
   live-provider run.
-- Existing deferred isolation/CI handoffs and the retained restricted-port attempt
-  remain explicit limitations; none is silently presented as repaired by these fixes.
+- Existing deferred isolation/CI handoffs remain explicit. The restricted-port failure
+  is retained as historical evidence and is addressed by the post-round-2 fix above,
+  not silently attributed to the original five round-2 fixes.
 
 History: the round-1 verdict was **changes required** (1 major, 8 minor, 3 nit), retained in `8441cae`.
 
