@@ -399,6 +399,8 @@ describe("eviction and bookkeeping", () => {
     expect(tracker.size()).toBeLessThanOrEqual(maxEntries);
   });
 
+  // Amended for QA-1.2-2: X carries a conflict, so it is pinned outside the
+  // one-slot LRU (size 2: the pinned X plus one LRU entry).
   it("active walk snapshots preserve every conflicting parent across eviction", async () => {
     const { tracker, getParent } = fixture({ maxEntries: 1 });
     tracker.recordCreated("X", "P");
@@ -406,9 +408,11 @@ describe("eviction and bookkeeping", () => {
     getParent.mockImplementation(async (id) => id === "Q" ? "R" : null);
     expect(await tracker.depthOf("X")).toBe(2);
     expect(getParent.mock.calls).toEqual([["P"], ["Q"], ["R"]]);
-    expect(tracker.size()).toBe(1);
+    expect(tracker.size()).toBe(2);
   });
 
+  // Amended for QA-1.2-2: the read leaf is no longer the first victim of its
+  // own chain; it stays tracked and only its five ancestors are re-fetched (11, not 12).
   it("backend walks retain learned links across LRU eviction, even with one slot", async () => {
     const { tracker, getParent } = fixture({ maxEntries: 1 });
     getParent.mockImplementation(async (id) => Number(id) === 0 ? null : String(Number(id) - 1));
@@ -417,7 +421,8 @@ describe("eviction and bookkeeping", () => {
     expect(getParent).toHaveBeenCalledTimes(6);
     expect(await tracker.depthOf("5")).toBe(5);
     expect(tracker.size()).toBe(1);
-    expect(getParent).toHaveBeenCalledTimes(12);
+    expect(getParent).toHaveBeenCalledTimes(11);
+    expect(getParent.mock.calls.slice(6).map(([id]) => id)).toEqual(["4", "3", "2", "1", "0"]);
     expect(await tracker.depthOf("0")).toBe(0);
   });
 
@@ -471,15 +476,18 @@ describe("eviction and bookkeeping", () => {
     expect(getParent.mock.calls).toEqual([["X"], ["P"]]);
   });
 
+  // Amended for QA-1.2-2: a new leaf is no longer evicted by its own record, so
+  // with three slots and a three-node chain an ancestor would go; four slots keep
+  // the original intent (older leaves go before ancestors, reads do not grow size).
   it("T-lru / T-absolute: leaves go before ancestors; evicted leaves are looked up, never inferred roots", async () => {
-    const { tracker, getParent } = fixture({ maxEntries: 3 });
+    const { tracker, getParent } = fixture({ maxEntries: 4 });
     chain(tracker, 2);
     expect(tracker.size()).toBe(3);
     for (let i = 0; i < 20; i++) {
       tracker.recordCreated(`leaf${i}`, "n2");
-      expect(tracker.size()).toBe(3);
+      expect(tracker.size()).toBe(4);
       expect(await tracker.depthOf("n2")).toBe(2);
-      expect(tracker.size()).toBe(3);
+      expect(tracker.size()).toBe(4);
     }
     expect(getParent).not.toHaveBeenCalled();
     getParent.mockRejectedValueOnce("gone");
@@ -835,5 +843,101 @@ describe("QA-1.2-1: a walk never loses evidence to a re-created node", () => {
       expect.stringContaining("session A: new parent"),
       expect.stringContaining("session X: root after parent"),
     ]);
+  });
+});
+
+describe("QA-1.2-2: evidence the backend cannot reproduce is never lost to LRU pressure", () => {
+  it("(a) a plugin child survives its own record and is never looked up", async () => {
+    const { tracker, getParent } = fixture({ maxEntries: 2 });
+    tracker.recordRoot("R");
+    tracker.recordCreated("C", "R");
+    tracker.recordPluginChild("X", "C");
+    for (let i = 0; i < 50; i++) tracker.recordRoot(`busy${i}`);
+    expect(await tracker.depthOf("X")).toBe(2);
+    expect(getParent).not.toHaveBeenCalledWith("X");
+  });
+
+  it("(b) an evicted ancestor carrying a conflict is pinned; re-resolution reaches it", async () => {
+    const { tracker, getParent } = fixture({ maxEntries: 4 });
+    const backend: Record<string, string | null> = { G: "C", C: "X", X: null, P2: "P1", P1: "P0", P0: null };
+    getParent.mockImplementation(async (id) => backend[id]);
+    tracker.recordRoot("X");
+    tracker.recordCreated("C", "X");
+    tracker.recordCreated("G", "C");
+    expect(await tracker.depthOf("G")).toBe(2);
+    tracker.recordRoot("P0");
+    tracker.recordCreated("P1", "P0");
+    tracker.recordCreated("P2", "P1");
+    tracker.recordCreated("X", "P2");
+    expect(await tracker.depthOf("G")).toBe(5);
+    expect(await tracker.depthOf("G")).toBe(5);
+    expect(getParent).not.toHaveBeenCalledWith("X");
+  });
+
+  it("a new leaf is not the first victim of its own chain and re-resolves only its ancestors", async () => {
+    const { tracker, getParent } = fixture({ maxEntries: 2 });
+    getParent.mockImplementation(async (id) => id === "C" ? "R" : null);
+    tracker.recordRoot("R");
+    tracker.recordCreated("C", "R");
+    tracker.recordCreated("X", "C");
+    expect(tracker.size()).toBe(2);
+    expect(await tracker.depthOf("X")).toBe(2);
+    expect(getParent.mock.calls).toEqual([["C"]]);
+    expect(tracker.size()).toBe(2);
+  });
+
+  it("an evicted ancestor no longer hides a later conflict from a pinned child", async () => {
+    const { tracker, getParent } = fixture({ maxEntries: 2 });
+    const backend: Record<string, string | null> = { C: "R", R: null };
+    getParent.mockImplementation(async (id) => backend[id]);
+    tracker.recordRoot("R");
+    tracker.recordCreated("C", "R");
+    tracker.recordPluginChild("X", "C");
+    expect(await tracker.depthOf("X")).toBe(2);
+    tracker.recordRoot("Z1");
+    tracker.recordRoot("Z2");
+    chain(tracker, 4, "q");
+    tracker.recordCreated("R", "q4");
+    backend.R = "q4";
+    expect(await tracker.depthOf("X")).toBe(7);
+  });
+
+  it("a pinned overflow is the only loss path, and it is logged", async () => {
+    const { tracker, getParent, warn } = fixture({ maxEntries: 2 });
+    tracker.recordPluginChild("A", null);
+    tracker.recordPluginChild("B", null);
+    tracker.recordPluginChild("C", null);
+    expect(tracker.size()).toBe(2);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("dropping pinned evidence for session A"));
+    expect(await tracker.depthOf("B")).toBe(1);
+    expect(await tracker.depthOf("A")).toBe(0);
+    expect(getParent.mock.calls).toEqual([["A"]]);
+  });
+
+  it("a floor above what the backend reconstructs is pinned on the descendant", async () => {
+    const { tracker, getParent, warn } = fixture({ maxEntries: 2 });
+    tracker.recordPluginChild("X", null);
+    tracker.recordCreated("C", "X");
+    tracker.recordPluginChild("Y", null);
+    tracker.recordPluginChild("Z", null);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("dropping pinned evidence for session X"));
+    expect(await tracker.depthOf("C")).toBe(2);
+    for (let i = 0; i < 20; i++) tracker.recordRoot(`busy${i}`);
+    // C is pinned: never looked up itself, and its floor outlives the backend's
+    // answer for X (root, so a re-resolved C alone would be 1).
+    expect(await tracker.depthOf("C")).toBe(2);
+    expect(getParent).not.toHaveBeenCalledWith("C");
+  });
+
+  it("pinned nodes still expire after the idle TTL (accepted residual F2)", () => {
+    const { tracker, time } = fixture({ ttlMs: 100 });
+    tracker.recordPluginChild("X", null);
+    tracker.recordCreated("C", "X");
+    time(99);
+    tracker.sweep();
+    expect(tracker.size()).toBe(2);
+    time(100);
+    tracker.sweep();
+    expect(tracker.size()).toBe(0);
   });
 });

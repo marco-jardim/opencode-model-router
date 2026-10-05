@@ -29,6 +29,7 @@ interface Node {
   resolved: boolean;
   plugin: boolean;
   rootSeen: boolean;
+  pinned: boolean; // carries evidence a backend walk cannot reproduce: never LRU-evicted
   lastTouch: number;
 }
 type LookupResult = { ok: true; node: Node } | { ok: false; reason: string };
@@ -56,6 +57,8 @@ interface Done {
   vals: Map<string, number>;
   complete: Set<string>;
   order: string[];
+  start: string;
+  excess: Set<string>; // complete, with a floor above what its links now derive
 }
 type Climb = Done | { kind: "need"; id: string };
 type Source = "event" | "backend" | "plugin";
@@ -89,7 +92,11 @@ export function createDepthTracker(
   const ttlMs = Number.isFinite(opts.ttlMs) && opts.ttlMs! > 0 ? opts.ttlMs! : DEFAULT_IDLE_TTL_MS;
   const maxEntries = Number.isInteger(opts.maxEntries) && opts.maxEntries! >= 1
     ? opts.maxEntries! : DEFAULT_DEPTH_MAX_ENTRIES;
-  const nodes = new Map<string, Node>();
+  const lru = new Map<string, Node>(); // Map order IS the LRU list (oldest first)
+  const pins = new Map<string, Node>(); // pinned nodes, same recency order, own cap
+  const kids = new Map<string, Set<string>>(); // parent id -> tracked nodes linking to it
+  const get = (id: string): Node | undefined => lru.get(id) ?? pins.get(id);
+  const has = (id: string): boolean => lru.has(id) || pins.has(id);
   const walks = new Map<string, Walk>();
   const lookups = new Map<string, Lookup>();
   const failedAt = new Map<string, number>();
@@ -119,18 +126,66 @@ export function createDepthTracker(
     }
   }
 
-  function warn(id: string, kind: "lookup" | "conflict", reason: string): void {
+  const WARNINGS = { lookup: "cannot resolve", conflict: "conflicting evidence for", evict: "dropping pinned evidence for" };
+
+  function warn(id: string, kind: keyof typeof WARNINGS, reason: string): void {
     const key = `${kind}:${id}`;
     if (warned.has(key)) return;
     warned.set(key, clock());
     while (warned.size > maxEntries) warned.delete(warned.keys().next().value!);
-    const message = `[router] depth: ${kind === "lookup" ? "cannot resolve" : "conflicting evidence for"} session ${id}: ${reason}`;
+    const message = `[router] depth: ${WARNINGS[kind]} session ${id}: ${reason}`;
     // An undelivered warning is not remembered, so a later occurrence retries it.
     if (!say(message)) warned.delete(key);
   }
 
-  function trimLRU(): void {
-    while (nodes.size > maxEntries) nodes.delete(nodes.keys().next().value!);
+  function linkKid(parent: string, kid: string): void {
+    let set = kids.get(parent);
+    if (!set) kids.set(parent, set = new Set());
+    set.add(kid);
+  }
+
+  // Untracks a node. Its children keep their links and floors; after an eviction
+  // (unlike forget, F4) they lose the frontier memo and so re-resolve the evicted
+  // id through the backend instead of trusting a memo that can no longer see
+  // conflicts recorded above it.
+  function drop(id: string, unresolveKids: boolean): void {
+    const n = get(id)!;
+    lru.delete(id);
+    pins.delete(id);
+    for (const p of n.parents) {
+      const set = kids.get(p)!;
+      set.delete(id);
+      if (set.size === 0) kids.delete(p);
+    }
+    if (unresolveKids) for (const kid of kids.get(id) ?? []) get(kid)!.resolved = false;
+  }
+
+  function victim(map: Map<string, Node>, protect: string): string {
+    const keys = map.keys();
+    const first = keys.next().value!;
+    return first === protect ? keys.next().value! : first;
+  }
+
+  // The node a call has just recorded or read is never the victim of its own
+  // trim; its ancestors go first, and drop() makes it re-resolve them.
+  function trim(protect: string): void {
+    while (lru.size > maxEntries) drop(victim(lru, protect), true);
+    while (pins.size > maxEntries) {
+      const id = victim(pins, protect);
+      warn(id, "evict", `more than ${maxEntries} pinned sessions`);
+      drop(id, true);
+    }
+  }
+
+  function pin(id: string, n: Node): void {
+    if (n.pinned) return;
+    n.pinned = true;
+    if (lru.delete(id)) pins.set(id, n);
+  }
+
+  function conflict(id: string, n: Node, reason: string): void {
+    warn(id, "conflict", reason);
+    pin(id, n);
   }
 
   function makeNode(link: string | null, plugin: boolean): Node {
@@ -140,6 +195,7 @@ export function createDepthTracker(
       resolved: link === null,
       plugin,
       rootSeen: link === null && !plugin,
+      pinned: plugin,
       lastTouch: clock(),
     };
   }
@@ -150,18 +206,19 @@ export function createDepthTracker(
     if (n.parents.length >= MAX_PARENT_LINKS) {
       n.depth = MAX_DEPTH_HOPS;
       n.resolved = true;
-      warn(id, "conflict", "parent link overflow");
+      conflict(id, n, "parent link overflow");
       return;
     }
-    if (!n.plugin && (n.rootSeen || n.parents.length)) warn(id, "conflict", "new parent");
+    if (!n.plugin && (n.rootSeen || n.parents.length)) conflict(id, n, "new parent");
     n.parents.push(link);
+    if (get(id) === n) linkKid(link, id);
     n.resolved = false;
     n.depth = Math.max(n.depth, 1);
   }
 
   function addRoot(id: string, n: Node): void {
     if (n.plugin) return; // v1 producers have no parentID: root evidence is moot
-    if (n.parents.length) warn(id, "conflict", "root after parent");
+    if (n.parents.length) conflict(id, n, "root after parent");
     else n.rootSeen = true;
   }
 
@@ -170,6 +227,7 @@ export function createDepthTracker(
   function absorb(id: string, into: Node, from: Node): void {
     if (from.plugin && !into.plugin) {
       into.plugin = true;
+      pin(id, into);
       into.depth = Math.max(into.depth, 1);
     }
     if (from.rootSeen) addRoot(id, into);
@@ -187,7 +245,8 @@ export function createDepthTracker(
   // A node entering the map takes over every copy a live walk still holds, so
   // neither side can lose evidence and later readers see the union at once.
   function adopt(id: string, n: Node): void {
-    nodes.set(id, n);
+    (n.pinned ? pins : lru).set(id, n);
+    for (const p of n.parents) linkKid(p, id);
     for (const walk of live) {
       const copy = walk.learned.get(id);
       if (copy === undefined || copy === n) continue;
@@ -198,7 +257,7 @@ export function createDepthTracker(
 
   // The tracked object for `id`, merged with this climb's retained copy.
   function node(id: string, learned: Map<string, Node>): Node | undefined {
-    const tracked = nodes.get(id);
+    const tracked = get(id);
     const copy = learned.get(id);
     if (tracked && copy && tracked !== copy) absorb(id, tracked, copy);
     const n = tracked ?? copy;
@@ -208,7 +267,7 @@ export function createDepthTracker(
 
   function applyLink(id: string, link: string | null, source: Source): Node {
     const plugin = source === "plugin";
-    const n = nodes.get(id);
+    const n = get(id);
     if (!n) {
       // Trim only after the floor climb touches this node's ancestors. Trimming
       // here could evict its known parent before deriving the new child's floor.
@@ -218,6 +277,7 @@ export function createDepthTracker(
     }
     if (plugin) {
       n.plugin = true;
+      pin(id, n);
       if (link === null) n.depth = Math.max(n.depth, 1);
     }
     if (link !== null) addLink(id, n, link);
@@ -227,11 +287,12 @@ export function createDepthTracker(
 
   // Each climb is synchronous: no event can interleave with its snapshot.
   function climb(start: string, learned: Map<string, Node>, mode: "exact" | "floor"): Climb | undefined {
-    const known = (id: string) => nodes.has(id) || learned.has(id);
+    const known = (id: string) => has(id) || learned.has(id);
     if (!known(start)) return mode === "exact" ? { kind: "need", id: start } : undefined;
     const vals = new Map<string, number>();
     const complete = new Set<string>();
     const order: string[] = [];
+    const excess = new Set<string>();
     const stack: string[] = [];
     let stop: { kind: "need"; id: string } | { kind: "cap"; cycle: boolean } | undefined;
     function visit(id: string, level: number): number {
@@ -254,6 +315,7 @@ export function createDepthTracker(
       }
       stack.push(id);
       let ok = true;
+      let derived = n.parents.length || n.plugin ? 1 : 0; // what the links alone prove
       for (const p of n.parents) {
         if (!known(p)) {
           if (n.resolved) continue; // Absolute memo at an evicted frontier.
@@ -264,14 +326,20 @@ export function createDepthTracker(
           ok = false;
           continue;
         }
-        d = Math.max(d, visit(p, level + 1) + 1);
+        const via = visit(p, level + 1) + 1;
         if (stop) return d;
+        derived = Math.max(derived, via);
+        d = Math.max(d, via);
         ok = ok && complete.has(p);
       }
       stack.pop();
+      const floor0 = n.depth;
       d = Math.min(d, MAX_DEPTH_HOPS);
       vals.set(id, d);
       if (ok) complete.add(id);
+      // The stored floor exceeds what the (now complete) links prove: it came
+      // from evidence no longer tracked, which a backend walk cannot reproduce.
+      if (ok && floor0 > Math.min(derived, MAX_DEPTH_HOPS)) excess.add(id);
       order.push(id);
       return d;
     }
@@ -287,20 +355,23 @@ export function createDepthTracker(
       // Preserve reverse post-order touching even when a climb hits the cap.
       order.push(...stack.slice().reverse());
     }
-    return { kind: "done", depth, vals, complete, order };
+    return { kind: "done", depth, vals, complete, order, start, excess };
   }
 
   function memoize(r: Done, learned: Map<string, Node>): void {
+    const stamp = clock();
     for (const id of r.order.slice().reverse()) {
       const n = node(id, learned)!;
-      if (!nodes.has(id)) adopt(id, n);
+      if (!has(id)) adopt(id, n);
       n.depth = Math.max(n.depth, r.vals.get(id)!);
       if (r.complete.has(id)) n.resolved = true;
-      n.lastTouch = clock();
-      nodes.delete(id);
-      nodes.set(id, n);
+      if (r.excess.has(id)) pin(id, n);
+      n.lastTouch = stamp;
+      const map = n.pinned ? pins : lru;
+      map.delete(id);
+      map.set(id, n);
     }
-    trimLRU();
+    trim(r.start);
   }
 
   function floor(id: string, learned: Map<string, Node>, reason: string): number | undefined {
@@ -479,10 +550,9 @@ export function createDepthTracker(
     },
     forget(id) {
       if (!validId(id)) return;
-      nodes.delete(id);
+      if (has(id)) drop(id, false);
       failedAt.delete(id);
-      warned.delete(`lookup:${id}`);
-      warned.delete(`conflict:${id}`);
+      for (const kind of Object.keys(WARNINGS)) warned.delete(`${kind}:${id}`);
       for (const walk of live) {
         walk.learned.delete(id);
         if (walk.id === id) cancelWalk(walk, false);
@@ -497,10 +567,11 @@ export function createDepthTracker(
     },
     sweep() {
       const now = clock();
-      for (const [id, n] of nodes) if (now - n.lastTouch >= ttlMs) nodes.delete(id);
+      // Pinned nodes too, after the idle TTL only (accepted residual F2).
+      for (const map of [lru, pins]) for (const [id, n] of map) if (now - n.lastTouch >= ttlMs) drop(id, true);
       for (const id of failedAt.keys()) throttled(id); // drops every expired entry
       for (const [key, stamp] of warned) if (now - stamp >= ttlMs) warned.delete(key);
     },
-    size: () => nodes.size,
+    size: () => lru.size + pins.size,
   };
 }
