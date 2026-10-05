@@ -108,7 +108,8 @@ export function createDepthTracker(
   const failedAt = new Map<string, number>();
   const warned = new Map<string, number>();
   const live = new Set<Walk>(); // every walk, cancelled or not, until it settles
-  const strays = new Map<string, Set<Lookup>>(); // detached lookups until they settle
+  const strays = new Map<string, Set<Lookup>>(); // detached lookups until they settle, by id
+  const strayOrder = new Set<Lookup>(); // the same lookups, oldest first: FIFO-capped at maxEntries
   let lastNow = 0;
 
   // Seams are contained where they are called, so no state change is ever cut
@@ -519,14 +520,23 @@ export function createDepthTracker(
     }, (e: unknown) => fail(describe(e)));
     lookup.promise = Promise.race([request, cancelled]).finally(() => {
       if (lookups.get(id) === lookup) lookups.delete(id);
-      const stray = strays.get(id);
-      if (stray?.delete(lookup) && stray.size === 0) strays.delete(id);
+      unstray(lookup);
     });
     return lookup;
   }
 
+  function unstray(lookup: Lookup): void {
+    strayOrder.delete(lookup);
+    const set = strays.get(lookup.id);
+    if (set?.delete(lookup) && set.size === 0) strays.delete(lookup.id);
+  }
+
   // A lookup that no walk awaits any more is detached: the throttle starts now,
   // a late success is still applied as evidence, and forget() can still cancel it.
+  // Strays are FIFO-capped (QA-1.2-R2-2): the oldest is cancelled, so its late
+  // answer (backend evidence a later lookup reproduces) is discarded rather than
+  // left beyond forget()'s reach. Strays never gate admission: a new lookup for
+  // the same id waits only for its throttle, so dropping one admits nothing.
   function detach(lookup: Lookup): void {
     if (lookups.get(lookup.id) !== lookup) return;
     lookups.delete(lookup.id);
@@ -535,6 +545,12 @@ export function createDepthTracker(
     let stray = strays.get(lookup.id);
     if (!stray) strays.set(lookup.id, stray = new Set());
     stray.add(lookup);
+    strayOrder.add(lookup);
+    while (strayOrder.size > maxEntries) {
+      const oldest = strayOrder.values().next().value!;
+      unstray(oldest);
+      cancelLookup(oldest);
+    }
   }
 
   function cancelLookup(lookup: Lookup): void {
@@ -661,8 +677,10 @@ export function createDepthTracker(
         cancelLookup(lookup);
         lookups.delete(id);
       }
-      for (const stray of strays.get(id) ?? []) cancelLookup(stray);
-      strays.delete(id);
+      for (const stray of [...strays.get(id) ?? []]) {
+        unstray(stray);
+        cancelLookup(stray);
+      }
     },
     sweep() {
       const now = clock();

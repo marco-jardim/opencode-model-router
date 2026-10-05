@@ -1050,3 +1050,53 @@ describe("QA-1.2-R2-1: no ancestor of a live node expires", () => {
     expect(tracker.size()).toBe(0);
   });
 });
+
+describe("QA-1.2-R2-2: detached lookups are bounded", () => {
+  function hung(maxEntries: number) {
+    const { tracker, getParent, time } = fixture({ maxEntries });
+    const answers = new Map<string, ReturnType<typeof deferred<string | null>>[]>();
+    getParent.mockImplementation((id) => {
+      const answer = deferred<string | null>();
+      answers.set(id, [...answers.get(id) ?? [], answer]);
+      return answer.promise;
+    });
+    async function timeOut(id: string) {
+      const result = tracker.depthOf(id, { timeoutMs: 1 });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toBeUndefined();
+    }
+    return { tracker, getParent, time, answers, timeOut };
+  }
+
+  it("keeps the newest maxEntries strays; the oldest is cancelled and its late answer discarded", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, answers, timeOut } = hung(2);
+    for (const id of ["X", "Y", "Z"]) await timeOut(id);
+    answers.get("X")![0].resolve("P");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(0);
+    answers.get("Y")![0].resolve(null);
+    answers.get("Z")![0].resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(2);
+    expect(getParent.mock.calls).toEqual([["X"], ["Y"], ["Z"]]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("strays never gate admission: a lapsed throttle admits one new lookup per window", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, time, answers, timeOut } = hung(10);
+    await timeOut("X");
+    time(DEPTH_LOOKUP_RETRY_MS - 1);
+    await timeOut("X");
+    expect(getParent).toHaveBeenCalledTimes(1);
+    time(DEPTH_LOOKUP_RETRY_MS);
+    await timeOut("X");
+    expect(getParent).toHaveBeenCalledTimes(2);
+    // Both strays of X stay reachable: forget discards both late answers.
+    tracker.forget("X");
+    for (const answer of answers.get("X")!) answer.resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tracker.size()).toBe(0);
+  });
+});
