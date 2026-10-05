@@ -717,7 +717,22 @@ function validateTaskPatterns(obj: Record<string, unknown>): void {
  */
 const MAX_TIMER_MS = 2_147_483_647;
 
-function validateEnforcement(obj: Record<string, unknown>): void {
+/** Copy without invoking accessors again; snapshot only keys already present. */
+function withValidatedSnapshots<T extends object>(
+  obj: T,
+  snapshots: Record<string, unknown>,
+): T {
+  const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(obj);
+  for (const [key, value] of Object.entries(snapshots)) {
+    if (key in obj) {
+      descriptors[key] = { value, writable: true, enumerable: true, configurable: true };
+    }
+  }
+  // The complete descriptor set preserves the input's shape.
+  return Object.defineProperties({}, descriptors) as T;
+}
+
+function validateEnforcement(obj: Record<string, unknown>): Record<string, unknown> | undefined {
   // Validate enforcement if present (optional — absent means no enforcement)
   if (obj.enforcement !== undefined) {
     if (!isPlainObject(obj.enforcement)) {
@@ -733,7 +748,7 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         maxDelegationDepth < 1)
     ) {
       throw new Error(
-        "tiers.json: enforcement.maxDelegationDepth must be an integer >= 1 or null",
+        `tiers.json: enforcement.maxDelegationDepth must be an integer >= 1 or null (got '${String(maxDelegationDepth)}')`,
       );
     }
     if (enforcement.mode !== undefined) {
@@ -888,6 +903,7 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         );
       }
     }
+    const snapshots: Record<string, unknown> = { maxDelegationDepth };
     if (
       enforcement.escalate !== undefined &&
       typeof enforcement.escalate === "object" &&
@@ -896,7 +912,7 @@ function validateEnforcement(obj: Record<string, unknown>): void {
       const escalate = enforcement.escalate as Record<string, unknown>;
       const effortBump = escalate.effortBump;
       if (effortBump !== undefined && typeof effortBump !== "boolean") {
-        throw new Error("tiers.json: enforcement.escalate.effortBump must be a boolean");
+        throw new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got '${String(effortBump)}')`);
       }
       const effortBumpMax = escalate.effortBumpMax;
       if (
@@ -904,9 +920,10 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         !EFFORT_LEVELS.some((level) => level === effortBumpMax)
       ) {
         throw new Error(
-          `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")}`,
+          `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")} (got '${String(effortBumpMax)}')`,
         );
       }
+      snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax });
       if (
         escalate.costCeiling !== undefined &&
         typeof escalate.costCeiling === "object" &&
@@ -1039,6 +1056,7 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         );
       }
     }
+    return withValidatedSnapshots(enforcement, snapshots);
   }
 }
 
@@ -1072,13 +1090,14 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateModelGenerations(obj);
   validateTaskPatterns(obj);
   validateSubagentTiers(obj);
-  validateEnforcement(obj);
+  const enforcement = validateEnforcement(obj);
   validateDelegateInstructions(obj);
   validateDispatchHeader(obj);
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
 
-  return raw as RouterConfig;
+  const cfg = raw as RouterConfig;
+  return enforcement === undefined ? cfg : withValidatedSnapshots(cfg, { enforcement });
 }
 
 /**
