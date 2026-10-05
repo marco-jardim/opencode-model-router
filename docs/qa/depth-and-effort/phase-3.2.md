@@ -198,6 +198,20 @@ used to claim that the same-session identity-gate mutation was killed at host le
 
 ## Findings
 
+### Round-1 mutation expansion (QA-3.2-3)
+
+The final-revision rerun uses `SMOKE_DEPTH_EFFORT_MUTATION=depth` with filter
+`enforced|advisory|accepts maxDelegationDepth`, not `foreground` alone. It exercises
+v1 foreground/resume and v2 foreground/background/resume in **both** modes, plus
+the accepted depth-two boundary. The v2 enforced-resume off-control may still be a
+native error because it targets an existing sibling; the kill must therefore be at
+the **exact D5 message** assertion, not merely `is_error`. Captures and failure names
+are retained per test and tabulated in the final-revision results below.
+
+The bump mutation selects `bumps only|accepts effortBumpMax`, proving both the first
+bump and the new repeated-retry bound assertion are sensitive to bump-off config.
+The original four config-only integration mutations are repeated and restored too.
+
 QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`. Line numbers refer to
 `8c7ec2c`.
 
