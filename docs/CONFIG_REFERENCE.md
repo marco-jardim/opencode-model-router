@@ -158,7 +158,7 @@ may contain instruction text or paths.
 | `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` = no-op. `advisory` = log violations, never block. `enforced` = block/escalate on violations. |
 | `maxDelegationDepth` | `integer 1–32 \| null` | `1` | Deepest session a model-initiated dispatch may create; root/orchestrator = depth 0. `null` disables the depth guard. |
 | `envGate` | `string` | `"MODEL_ROUTER_ENFORCE"` | Name of the env var that overrides mode at runtime. See env-gate truth table below. |
-| `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` when the env gate is unset/empty. |
+| `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` whenever the env gate is not `"1"` or `"0"` (unset, empty, or any other value). |
 | `guard` | object | see below | Request-level hard guards (caps, script controls, budget). |
 | `verify` | object | see below | Verification / grading policy. |
 | `escalate` | object | see below | Escalation ladder and cost ceiling. |
@@ -176,8 +176,10 @@ bundled default), with a `[⚠ GUARD:delegation_depth]` banner. It is **refused*
 `enforced` mode and ignored in `off`. To enforce the limit, set
 `enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`.
 An `enforcement.perTier` entry for the caller's tier overrides `mode` when the
-env gate is unset/empty; an `advisory` entry keeps that tier warn-only. The env
-gate `MODEL_ROUTER_ENFORCE=1` overrides both.
+env gate is not `"1"` or `"0"` (unset, empty, or any other value); an `advisory`
+entry keeps that tier warn-only. Other non-empty values produce a warning and
+fall through to config resolution. The env gate `MODEL_ROUTER_ENFORCE=1`
+overrides both to `enforced`, and `MODEL_ROUTER_ENFORCE=0` overrides both to `off`.
 
 The guard covers the native `task` tool (including `task_id` resume and OpenCode 2
 background dispatches) and the `delegate` tool. Unknown depth caused by a backend
@@ -599,9 +601,9 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | Env var value | Resolved mode | Notes |
 |---|---|---|
 | `"1"` | `"enforced"` | Hard override. Ignores `mode` **and** `perTier`. |
-| `"0"` | `"off"` | Hard override. Ignores `mode`. |
+| `"0"` | `"off"` | Hard override. Ignores `mode` **and** `perTier`. |
 | unset or `""` | config `mode`, with `perTier[tier]` taking precedence when present | Normal path. |
-| any other value | config `mode` (fallback) | Emits one-time warning: `<gate>="<value>" is not "1" or "0"; ignoring env gate and using config.` |
+| any other value | config `mode`, with `perTier[tier]` taking precedence when present | Returns warning: `<gate>="<value>" is not "1" or "0"; ignoring env gate and using config.` |
 
 ---
 
