@@ -93,7 +93,7 @@ it("holds a background leaf until the captured parent tool result releases it", 
     return request;
   };
   const response = await post({ tools: [{ name: "subagent" }], messages: [{ role: "user", content: "NEST_BG" }] }, "parent");
-  const message: { content: { id: string; input: { prompt: string; background: boolean } }[] } = await response.json();
+  const message = (await response.json()) as { content: { id: string; input: { prompt: string; background: boolean } }[] };
   const call = message.content[0];
   let answered = false;
   const leaf = post({ messages: [{ role: "user", content: call.input.prompt }] }, "leaf").then(
