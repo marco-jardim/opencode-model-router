@@ -19,7 +19,7 @@ gets any of them wrong.
 |---|---|---|---|
 | `activePreset` | `string` | `"anthropic"` | Names the entry of `presets` the router routes with. `validateConfig` rejects a name that is not a defined preset; matching is case-insensitive and trimmed. `/router preset <name>` rewrites it at runtime and persists the choice to the router's state file. Read by `getActiveTiers` in `src/router/protocol.ts`, which falls back to the first defined preset, and by the fallback-chain builder. |
 | `activeMode` | `string` (optional) | `"normal"` | Names the entry of `modes` layered over the preset. Omit it — or point it at nothing — and no mode is applied. `/router mode <name>` rewrites it at runtime, rejecting a name that `modes` does not define, and persists it. Read by `getActiveMode` in `src/router/protocol.ts`. |
-| `presets` | `Record<string, Preset>` | seven presets: `anthropic`, `openai`, `github-copilot`, `google`, `hybrid`, `fable-effort`, `zai` | Each preset maps a tier name (`fast`/`medium`/`heavy`) to its `TierConfig` — `model`, `costRatio`, `steps`, `effort`, and the optional per-tier `prompt`. |
+| `presets` | `Record<string, Preset>` | eight presets: `anthropic`, `openai`, `github-copilot`, `google`, `hybrid`, `hybrid-2`, `fable-effort`, `zai` | Each preset maps a tier name (`fast`/`medium`/`heavy`) to its `TierConfig` — `model`, `costRatio`, `steps`, `effort`, and the optional per-tier `prompt`. |
 | `rules` | `string[]` | 10 rules | The numbered routing rules rendered verbatim into the `Rules:` line of the delegation protocol. Order is significant: they are emitted `1.`…`N.` in array order. |
 | `defaultTier` | `string` | `"medium"` | The tier used when nothing else selects one — no `[tier:X]` tag, no task-pattern match, no mode `defaultTier`. A mode's own `defaultTier` wins over this one; `src/index.ts` falls back to `"medium"` if the key is somehow absent. `validateConfig` requires it to be a string. |
 | `taskPatterns` | `Record<string, string[]>` (optional) | `fast`/`medium`/`heavy` keyword lists | Per-tier keyword lists that teach the orchestrator which work belongs to which tier. `buildTaskTaxonomy` in `src/router/protocol.ts` renders them into the protocol's `R:` line, joining each tier's keywords with `/`; an empty or absent object drops that line entirely. |
@@ -605,6 +605,7 @@ With the default `effortBumpMax: "xhigh"`:
 | `anthropic` (active by default) | None | Every tier sets a `variant`. |
 | `fable-effort` | `fast`: `low → xhigh`; `medium`: `high → xhigh` | `heavy` starts at `xhigh`, already at the bound. |
 | `hybrid` | None | OpenAI tiers have no `effort`; `heavy` sets a `variant`. |
+| `hybrid-2` | None | Every tier sets a `variant`. |
 | `openai`, `github-copilot`, `google`, `zai` | None | No tier sets `effort`. |
 
 These ranges describe eligibility, not a promise to reach the bound. In the
@@ -932,7 +933,7 @@ pinned to an explicit style the pattern list decides nothing.
 ### Which shipped presets are affected
 
 No bundled preset sets `promptStyle`, so every tier resolves through `auto`. Against the
-shipped `tiers.json` that is **seven tiers** now receiving the goal-oriented prompt:
+shipped `tiers.json` that is **eight tiers** now receiving the goal-oriented prompt:
 
 | Preset / tier | Model | Resolved style |
 |---|---|---|
@@ -940,6 +941,7 @@ shipped `tiers.json` that is **seven tiers** now receiving the goal-oriented pro
 | `anthropic.heavy` | `anthropic/claude-fable-5` | `goal-oriented` |
 | `github-copilot.heavy` | `github-copilot/claude-fable-5` | `goal-oriented` |
 | `hybrid.heavy` | `anthropic/claude-opus-5` | `goal-oriented` |
+| `hybrid-2.heavy` | `anthropic/claude-opus-5-5` | `goal-oriented` |
 | `fable-effort.fast` | `anthropic/claude-fable-5` | `goal-oriented` |
 | `fable-effort.medium` | `anthropic/claude-fable-5` | `goal-oriented` |
 | `fable-effort.heavy` | `anthropic/claude-fable-5` | `goal-oriented` |
