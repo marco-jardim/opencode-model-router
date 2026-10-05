@@ -76,7 +76,8 @@ describe("effort bump plugin wiring", () => {
     invalidateConfigCache();
   }
 
-  async function setup(host: "v1" | "v2", results = [false, true], fault?: "abort" | "timeout") {
+  async function setup(host: "v1" | "v2", results = [false, true], fault?: "abort" | "timeout",
+    onProducer?: (hooks: TestHooks, sid: string, agent: string, model: Model | undefined, attempt: number) => Promise<void>) {
     let hooks: TestHooks;
     const producers: Array<{ sid: string; agent: string; model: Model | undefined; options: Record<string, unknown>; text: string }> = [];
     const excluded: Record<string, unknown>[] = [];
@@ -97,6 +98,7 @@ describe("effort bump plugin wiring", () => {
       }
       producers.push({ sid, agent, model, options, text });
       excluded.push(await params(sid, "title", model), await params("orchestrator", "build", model));
+      await onProducer?.(hooks, sid, agent, model, producers.length);
       if (producers.length === 2 && fault === "abort") throw new DOMException("producer aborted", "AbortError");
       if (producers.length === 2 && fault === "timeout") return new Promise<string>(() => undefined);
       return "producer output";
@@ -140,6 +142,54 @@ describe("effort bump plugin wiring", () => {
   }
 
   for (const host of ["v1", "v2"] as const) {
+    it(`${host}: keeps the effort policy, model and override on the same config snapshot`, async () => {
+      const f = await setup(host, [false, true], undefined, async (_hooks, _sid, _agent, _model, attempt) => {
+        if (attempt === 1) configure("anthropic");
+      });
+      expect(await f.run()).toContain("[router ✓ verified:");
+      expect(f.producers[1].options).toEqual({ effort: "medium" });
+      expect(f.producers[1].model).toEqual(f.producers[0].model);
+      expect(captured.stores[0].set).toHaveBeenCalledWith(f.producers[1].sid, "fast", f.fast, "medium");
+      assertCleared(f.producers);
+    });
+
+    it(`${host}: logs a grader-params error once without skipping the independent effort override`, async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const outputs: Record<string, unknown>[] = [];
+      const f = await setup(host, [false, true], undefined, async (hooks, sid, agent, model, attempt) => {
+        if (attempt !== 2) return;
+        for (let call = 0; call < 2; call++) {
+          let reads = 0;
+          const input = { get sessionID() { if (reads++ === 0) throw new Error("params unavailable"); return sid; }, agent, model };
+          const options: Record<string, unknown> = {};
+          await hooks["chat.params"](input, host === "v1" ? { options } : options);
+          outputs.push(options);
+        }
+      });
+      expect(await f.run()).toContain("[router ✓ verified:");
+      expect(outputs).toEqual([{ effort: "medium" }, { effort: "medium" }]);
+      expect(warn.mock.calls.filter(([text]) => String(text).includes("grader temperature not applied"))).toHaveLength(1);
+      assertCleared(f.producers);
+    });
+
+    it(`${host}: session.deleted clears a live bumped producer before normal cleanup`, async () => {
+      const sizes: number[] = [];
+      const after: Record<string, unknown>[] = [];
+      const f = await setup(host, [false, true], undefined, async (hooks, sid, agent, model, attempt) => {
+        if (attempt !== 2) return;
+        sizes.push(captured.stores[0].size());
+        await hooks.event({ event: { type: "session.deleted", properties: { info: { id: sid } } } });
+        sizes.push(captured.stores[0].size());
+        const options: Record<string, unknown> = {};
+        await hooks["chat.params"]({ sessionID: sid, agent, model }, host === "v1" ? { options } : options);
+        after.push(options);
+      });
+      expect(await f.run()).toContain("[router ✓ verified:");
+      expect(sizes).toEqual([1, 0]);
+      expect(after).toEqual([{}]);
+      assertCleared(f.producers);
+    });
+
     it(`${host}: applies medium only to the retry, reports fast@medium, and clears on success`, async () => {
       vi.stubEnv("MODEL_ROUTER_TRAJECTORY_DEBUG", "1");
       const f = await setup(host);

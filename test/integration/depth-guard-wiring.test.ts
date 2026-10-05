@@ -7,6 +7,7 @@ import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/ch
 import { DEPTH_BANNER, TASK_VERIFICATION } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
+import { DEFAULT_DEPTH_TIMEOUT_MS } from "../../src/router/depth";
 
 const captured = vi.hoisted(() => ({
   pending: undefined as ReturnType<typeof import("../../src/verify/wiring").createVerificationWiring>["pending"] | undefined,
@@ -75,6 +76,7 @@ describe("delegation depth plugin wiring", () => {
 
   afterEach(async () => {
     for (const hooks of instances.splice(0)) await hooks.dispose();
+    vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
     invalidateConfigCache();
@@ -193,6 +195,39 @@ describe("delegation depth plugin wiring", () => {
         ctx.client.session.get.mockRejectedValue(new Error("backend unavailable"));
         const { hooks } = await setup(ctx);
         for (const callID of ["one", "two"]) await hooks["tool.execute.before"](taskInput("C", callID), taskOutput());
+        expect(warn.mock.calls.filter(([text]) => String(text).includes("cannot resolve"))).toHaveLength(1);
+      });
+
+      it("shares one two-session walk across 50 concurrent task calls", async () => {
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockImplementation(async ({ path }) => ({ data: { id: path.id, parentID: path.id === "C" ? "O" : undefined } }));
+        const { hooks, get } = await setup(ctx);
+        await Promise.all(Array.from({ length: 50 }, (_, i) => dispatch(hooks, "C", 1, 1, `concurrent-${i}`)));
+        expect(get.mock.calls.map(([request]) => request.path.id)).toEqual(["C", "O"]);
+      });
+
+      it("fails open on a never-settling lookup and warns once", async () => {
+        vi.useFakeTimers();
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockImplementation(() => new Promise(() => undefined));
+        const { hooks, get } = await setup(ctx);
+        const calls = Promise.all(["one", "two"].map(callID => hooks["tool.execute.before"](taskInput("C", callID), taskOutput())));
+        await vi.advanceTimersByTimeAsync(DEFAULT_DEPTH_TIMEOUT_MS + 1);
+        await expect(calls).resolves.toEqual([undefined, undefined]);
+        expect(get).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls.filter(([text]) => String(text).includes("cannot resolve"))).toHaveLength(1);
+      });
+
+      it("fails open when session.deleted cancels the pending lookup and warns once", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockImplementation(() => new Promise(() => undefined));
+        const { hooks, get } = await setup(ctx);
+        const calls = Promise.all(["one", "two"].map(callID => hooks["tool.execute.before"](taskInput("C", callID), taskOutput())));
+        await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+        await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "C" } } } });
+        await expect(calls).resolves.toEqual([undefined, undefined]);
         expect(warn.mock.calls.filter(([text]) => String(text).includes("cannot resolve"))).toHaveLength(1);
       });
 
