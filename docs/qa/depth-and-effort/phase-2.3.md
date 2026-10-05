@@ -23,7 +23,7 @@ A15 requires every handoff addressed to 2.3 in `phase-0P.md` and `phase-1.*`/`ph
 | P10 | 1.1 Deferred | "the v2 key translation is 2.3" | Applied in step 5 (same as P9) |
 | P11 | 1.1 → 1.2/2.1 | `resolveDepthLimit` read per call; the state-file mode is not validated | Applied in step 2 (per-call seam, N2). An invalid mode is already handled by the guard (2.1) |
 | P12 | 1.2 Handoffs | Phase 2 owner: F2 (a lost plugin child re-resolves as root) | Accepted residual, no change (Findings F5) |
-| P13 | 1.2 | F3: a grader's `parentID` may differ from its creator | Applied in step 4: the creator equals the host parent on every path; tests assert no conflict warning |
+| P13 | 1.2 | F3: a grader's `parentID` may differ from its creator | Applied in step 4: the depth creator is separate from the backend parent; native-path graders stay unparented (N6) |
 | P14 | 1.2 | F5: `DEPTH_LOOKUP_RETRY_MS` duplicates `SESSION_LOOKUP_RETRY_MS` | Applied in step 1 |
 | P15 | 1.2 Deferred | sweep in `createIdleTtlSweeper`; `recordRoot` from backend answers; `session.created` → `recordCreated`; producer/grader → `recordPluginChild`; `forget` on deletion | Applied in steps 1, 3 and 4 |
 | P16 | 1.3 To 2.3 | Wire `action.effort`; test that the scorecard effort equals the applied effort (QA-1.3-1) | Applied in step 6 |
@@ -219,10 +219,11 @@ Context7 process whose parent PID matched an old host PID; it was not killed.
   - v2: the bridge appends it after the legacy text, as A1 says literally (Findings F2).
   - A banner and a deferred footer cannot co-occur: deferral needs `isProvenRootCaller`, and a banner needs
     depth ≥ 1.
-- **N6 — Native-path grader creator.** `index.ts:1382` becomes `buildGateDeps(orchestratorSessionID || undefined, …)`
-  (A7, QA-0.P-R2-9). The v1 native-path grader is then created with `parentID` = caller, like the
-  delegate-path graders (`:755`), the `router_verify` graders (`wiring.ts:1821`) and every v2 grader
-  (Findings F1).
+- **N6 — Native-path grader creator.** The native-task gate uses
+  `buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null)`
+  (A7, QA-0.P-R2-9). The caller is used only as the depth creator. The native-path grader remains
+  unparented at the backend, preserving v2.0.0 behaviour on both hosts. Delegate-path and `router_verify`
+  graders retain their existing parent arguments; depth tracking does not change backend parentage (F1).
 - **N7 — `/bypass`.**
   - The before-hook keeps `if (bypassed) return;` first (A11).
   - `delegate` skips only the depth guard when bypassed (A11, QA-0.P-R2-8); the ladder still runs.
@@ -430,24 +431,26 @@ and add `session.get` and `vi.fn` counters. Pin:
 
 - **`wiring.ts`**
   - In the deps type, after `logger?:` (`:971`), add
-    `/** 2.3.3 (A7): each grader id, before its first prompt. */ onChildSessionCreated?: (sessionID: string, parentSessionID: string | undefined) => void;`.
+    `/** 2.3.3 (A7): each grader id, before its first prompt. */ onChildSessionCreated?: (sessionID: string, creatorSessionID: string | null) => void;`.
   - Add a helper next to `disposeChildSession`:
-    `const notifyChildCreated = (sid, parent) => { try { deps.onChildSessionCreated?.(sid, parent); } catch (error) { logger.warn("[verify] child-session hook failed", { error: errorText(error) }); } };`.
-  - Call it after `inFlight?.add(sessionID);` in the `childRunner` `onCreated` (`:1220`) and after
-    `inFlight?.add(sid);` on the native path (`:1244`).
+    `const notifyChildCreated = (sid, creator) => { try { deps.onChildSessionCreated?.(sid, creator); } catch (error) { logger.warn("[verify] child-session hook failed", { error: errorText(error) }); } };`.
+  - Call it with the separate depth creator after `inFlight?.add(sessionID);` in the `childRunner` `onCreated`
+    and after `inFlight?.add(sid);` on the native path. `dispatchGrader` defaults that creator to
+    `parentSessionID ?? null`; `buildGateDeps` can supply the caller independently of its backend parent.
 - **`index.ts`**
   - In the `createVerificationWiring` deps (`:372–378`), add
-    `onChildSessionCreated: (sid, parent) => depthTracker.recordPluginChild(sid, parent ?? null),`.
-  - At `:1382`, `buildGateDeps(undefined, …)` becomes `buildGateDeps(orchestratorSessionID || undefined, …)` (N6).
+    `onChildSessionCreated: (sid, creator) => depthTracker.recordPluginChild(sid, creator),`.
+  - The native-task gate keeps `undefined` as the backend parent and passes `orchestratorSessionID || null`
+    as the separate depth creator (N6).
 
 **Tests** (`depth-guard-wiring.test.ts`, both modes):
 
 - Delegate path: the fake grader prompt calls `task` from the grader sid. It is refused or bannered with no
   `session.get` for the grader.
 - Native path with `maxDelegationDepth: 2`: C (depth 1) dispatches `task`, which is allowed. During the gate, its
-  grader's `task` is refused or bannered (depth 2: QA-0.P-R2-9). The grader's `session.create` carried
-  `body.parentID === C`.
-- No `conflicting evidence` warning when `session.created(grader, C)` also arrives (F3).
+  grader's `task` is refused or bannered (depth 2: QA-0.P-R2-9). The grader's `session.create` carries
+  `body: {}` with no `parentID`; depth uses C without changing the host session tree.
+- Host lifecycle facts do not replace pinned plugin depth, even when the backend parent is absent (F3).
 
 ### Step 5 — `feat(compat): deliver depth refusals and banners through the v2 bridge` (Refs #66 #67)
 
@@ -654,13 +657,11 @@ Every depth row runs in `enforced` and `advisory` (A1).
 All of these are design-time items. None is open.
 
 - **F1 — decided (N6).**
-  - **Change:** v1 native-path graders become host children of the caller.
-  - **Effects:**
-    - `session.created` marks them as children, so Layer-1 guards see their tool calls in advisory and enforced
-      mode, as for delegate-path, `router_verify` and v2 graders today;
-    - they appear under the caller in the v1 session tree;
-    - per Spike A2 R5, a parented session gets no title request.
-  - **Handoff:** to 3.1 (CHANGELOG).
+  - **Change:** native-path graders are pinned at the caller's depth plus one, but stay unparented at the
+    backend as in v2.0.0. This applies to native-task verification on either host.
+  - **Effects:** no backend-parent change, so no new claims about session-tree placement, Layer-1 visibility
+    through `session.created`, or title-request suppression.
+  - **Handoff withdrawn:** no parentage change to announce in the 3.1 CHANGELOG.
 - **F2 — accepted.** The banner's position differs by host.
   - On v1 it comes before the verification text. On v2 it comes after it (the bridge appends, as A1 says
     literally).
@@ -673,9 +674,12 @@ All of these are design-time items. None is open.
     bounded by FIFO 1 000, purged on `session.deleted`, and keyed per `callID`, so it can never reach another
     call.
   - On v2 the bridge drops it on any non-completed status.
-- **F5 — accepted residual (1.2 F2).** Pinned plugin evidence expires with the idle TTL. A v1 producer without a
-  `parentID` that is resumed after the TTL re-resolves as a root. Producers are disposed per attempt, so this
-  needs both a failed disposal and a late resume.
+- **F5 — accepted residual (1.2 F2).** Pinned plugin evidence expires with the idle TTL. A plugin child without
+  a backend `parentID` can then re-resolve as a root. This includes producers created without a caller and
+  the usual native-path graders (N6), not only producers. Producers are disposed per attempt; graders are
+  disposed after their prompt and bounded by `graderTimeoutMs`, far below the 60-minute
+  `DEFAULT_IDLE_TTL_MS`. Normal live grading therefore stays within the pin's lifetime; a surviving grader
+  or producer resumed after idle expiry still has the residual risk (for example after failed disposal).
 
 ### QA 2.3 review (2026-10-05, adversarial, `origin/de/main..6601202`)
 
