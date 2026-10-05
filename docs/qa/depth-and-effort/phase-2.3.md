@@ -677,6 +677,39 @@ All of these are design-time items. None is open.
   `parentID` that is resumed after the TTL re-resolves as a root. Producers are disposed per attempt, so this
   needs both a failed disposal and a late resume.
 
+### QA 2.3 review (2026-10-05, adversarial, `origin/de/main..6601202`)
+
+Reviewed `744ef0d`…`6601202`. Scoped suites: 12 files / 207 tests pass, `vitest related src/index.ts`
+29 files / 514 tests pass, `npm run typecheck` clean. Scratch tests for QA-2.3-1 and QA-2.3-2 were run
+under `test\scratch\` and deleted; their failure output is quoted below.
+
+| ID | Severity | File:line | Description | Resolution |
+|---|---|---|---|---|
+| QA-2.3-1 | major | `src\compat\v2-hooks.ts:332–353` | **On v2, a bannered completed `subagent` result loses the host's envelope and its session id.** For `subagent` the bridge takes `text` from `structured.output` (`:332–333`). With a banner and an unchanged legacy output it no longer returns early. It rebuilds `content` as `structured.output + banner` (`:341–348`) and drops the host's text part. Host evidence (`p23-host-proof\hooks.jsonl`, scenario `v2-E3-fg`): the root's unbannered result keeps `content: "<subagent sessionID=\"ses_ef4613dc6ffeUhO45A8djOxFd7\" state=\"completed\">\nok\n</subagent>"`. The caller's bannered result (call `toolu_proof_1791196316260`) reaches the model as `"ok\n\n[⚠ GUARD:delegation_depth] …"` (`captures.jsonl`; also `v2-E3-resume-setup` and `v2-E3-resume`). Scratch reproduction with that host shape: `expected 'ok\n\n[⚠ GUARD:delegation_depth] this…' to contain 'sessionID="leaf"'`. With the bundled default (advisory), every completed nested dispatch on v2 hides the child's session id, which is the resume handle, and its completion state. The proof did not see this because its resume fixture scripts the id from captures, and the unit fixture sets `content` equal to the structured output (`test\unit\v2-hooks.test.ts:160–163`). Verification-changed outputs take the same rebuild path. That predates 2.3 (inferred from code, not host-verified). Fix direction: when `!changed`, append the banner as an extra text part to the original `content`, as the running branch does (`:323–327`), and to `structured.output`. Add a unit case with host-shaped content. | open |
+| QA-2.3-2 | minor | `src\index.ts:611–612`, `:1385` | **A `delegate` refusal is not D4-recorded, so the hand-back after it can be flagged as a false refusal.** The task path records every depth block unconditionally (N3, `:1194–1203`). The `delegate` path returns the D5 text, and only the generic after-hook records a tool event, and only for `isSubagent` callers (`:1385`). Scenario (enforced): C's transform lookup fails (fail-open: C gets the protocol and is not marked as a child). Later, `session.get(C)` returns `parentID: O`. C's `delegate` is refused, and C hands back. O's task after-hook then prepends `FALSE-REFUSAL SUSPECT`. Scratch: `expected '[router] FALSE-REFUSAL SUSPECT — this…' not to contain 'FALSE-REFUSAL SUSPECT'`. This needs a transient backend failure followed by recovery; the task path is covered. Fix direction: record `{ tool: "delegate", readOnly: false, blocked: true }` for `toolCtx.sessionID` inside a `try` before returning the D5 text. A double count for `isSubagent` callers is harmless, because the detector only tests for 0. | open |
+| QA-2.3-3 | minor | `docs\qa\depth-and-effort\phase-2.3.md:222–225, 441, 447–449, 656–663` | **The design memo contradicts the shipped grader correction.** N6, step 4, the step-4 test text (`body.parentID === C`) and F1 all say the v1 native-path grader becomes a backend child of the caller. F1 also hands the effects (session tree, Layer-1 visibility, title request) to the 3.1 CHANGELOG. The code keeps it unparented and passes the caller only as the depth creator (`src\index.ts:1505–1506`, `src\verify\wiring.ts:1214, 1250, 1257`), and the test asserts this (`test\integration\depth-guard-wiring.test.ts:483–496`). The code conforms to plan A7 (creator only) and keeps the v2.0.0 backend `parentID`, so the correction holds. The memo is stale. Consequence for F5: native graders are now the usual plugin child without a backend parent, so F5's premise ("producers are disposed per attempt") does not cover them. The exposure is still bounded: `graderTimeoutMs` is far below `DEFAULT_IDLE_TTL_MS` (60 min, `src\router\idle-sweep.ts:1`). Fix: amend N6, step 4, F1 and F5, and withdraw F1 from the 3.1 handoff. | open |
+| QA-2.3-4 | nit | `src\index.ts:1071–1075` (and `:1081–1082`) | **The grader-temperature `catch` can now throw into a session.** It was empty and could not throw. It now evaluates `scrubText(String(error))` and calls `logger.warn`. A thrown value with no primitive conversion (for example `Object.create(null)`) makes `String(error)` throw out of `chat.params`. This is contrived, because the `try` touches only host objects. The second `catch` is unreachable, because `applyEffortOverride` never throws. Fix: use a non-throwing describe helper (as `src\router\depth-guard.ts:13–19` does), or guard the log. | open |
+| QA-2.3-5 | nit | `docs\qa\depth-and-effort\phase-2.3.md:220–221`; `src\index.ts:1441` | **N5's claim "a banner and a deferred footer cannot co-occur" is false for plugin children without a backend parent.** For these, the tracker holds depth ≥ 1 (`recordPluginChild`), while `isProvenRootCaller` trusts the backend's missing `parentID` and returns true. Examples: a v1 producer created without `toolCtx.sessionID`, or a v1 native-path grader (agent `build`, with a `task` tool, per the host-proof roles) dispatching a deferred `task` in advisory. The footer stays last, so the output is still well formed. Deferral for a depth-1 caller is itself a pre-2.3 classification gap. Code reading only, no test. | open |
+
+Attacks that held (no finding):
+
+- **Enforced refusal from depth ≥ 1:** v1/v2 foreground, v2 background, `task_id`/`sessionID` resume, a producer
+  without `parentID` (plugin pin), graders (both creation points), an out-of-order `session.created`, a
+  fail-open root (never seeded), a session forgotten mid-walk and a hung lookup (fail-open by D2).
+- **Exemptions by design (A1, A11):** `/bypass` and a caller tier with `perTier: "off"` disable the guard.
+- **Refusal side effects:** a refusal leaves no `startDispatch`, `TASK_VERIFICATION`, prompt repair, header,
+  `observeEdit`, `verifyingCalls` or banner entry.
+- **G2:** a root is seeded by its transform and its memo hit re-seeds it for free (`getParent` short-circuits
+  `sessionRootMemo === true`), so a dispatching orchestrator pays no lookup. Concurrent `task` calls share one
+  walk.
+- **Effort override scope:** keyed by producer sid, `agent === tierName` and model identity. The title, grader,
+  orchestrator and other producers are untouched. It is cleared on every exit, including a `startDispatch`
+  throw inside `registerProducer` on both hosts, the deferred path and the outer `finally`, and it is never set
+  when `effortBump` is false.
+- **v2 bridge:** A4 native-over-alias precedence holds. The banner is never delivered twice, is dropped on
+  non-completed results and is FIFO-bounded.
+- **Memory:** every new map and set is bounded (1 000 or 10 000) and purged on `session.deleted`.
+
 ## Deferred by plan
 
 - **3.1 (docs):**
@@ -705,7 +738,60 @@ All of these are design-time items. None is open.
   - the pre-banner parse at `:1297` (N5).
 - **To 3.1:** F1, F2 and N11, plus the deferred items above.
 - **To 3.2:** reuse the step-8 copy as the base of `scripted-provider.ts`.
+- **To 3.1 (from QA 2.3):**
+  - **Withdraw F1** (QA-2.3-3). Native-path graders keep the v2.0.0 backend parent (none on v1). Only the
+    depth record uses the caller. There is no session-tree or title change to announce.
+  - **The OpenCode 2 host has its own nesting cap**, `experimental.subagent_depth` (default 1), independent of
+    the router. Captured error: `Subagent depth limit reached (1). Increase "experimental.subagent_depth" to
+    allow nested subagents.`
+    - On v2 the effective nesting limit is the lower of that cap and `enforcement.maxDelegationDepth`.
+      Raising only the router key, or only a top-level `subagent_depth`, does not allow nested dispatch on v2.
+    - The proof rig also set top-level `subagent_depth: 4` to lift a v1 1.18.19 host cap (`REPORT.md`). Its
+      default and its documentation upstream are unverified.
+    - v2's `general` agent needs an explicit `subagent` permission to dispatch at all (`No tool named
+      "subagent" is currently available`).
+    - v2 resumes only a direct child of the caller.
+  - **Exemptions:**
+    - the caller tier's `enforcement.perTier` value applies to the depth guard (A1). `perTier: "off"` disables
+      it for that caller, as `MODEL_ROUTER_ENFORCE=0` disables it everywhere.
+    - `/bypass` disables it on both paths (A11).
+    - the effort bump ignores `/bypass` (N11).
+  - **Refusal shapes:** a refused `delegate` returns the D5 text as a normal tool result; a refused `task` is
+    an `is_error` tool result.
+  - **v1 graders** run on the default `build` agent, which has `task` (host-proof roles). They are
+    depth-limited at creator depth + 1.
+- **To 3.2 (from QA 2.3):**
+  - **Smoke:**
+    - Assert the model-visible v2 envelope on a bannered completed result: the HTTP `tool_result` must still
+      contain `<subagent sessionID=` (QA-2.3-1).
+    - Use host-shaped fixtures, where `content` (the envelope) differs from `result.output.output`.
+    - v2 background results carry `status: "running"` in `result.output`/`metadata`, not an XML attribute.
+    - The v2 fixture needs `experimental.subagent_depth` plus an explicit `general` `subagent` permission;
+      the v1 fixture needs top-level `subagent_depth`.
+    - `deferred-catalog.smoke.test.ts:102–121` reads `<home>/.local/share/opencode/log`, but its child
+      inherits `XDG_DATA_HOME` (`:197`). Either honour that variable or unset it in the test (A12 isolation).
+  - **Mutation candidates** (suggested, not executed in this review):
+    - Expected killed by the current suites:
+      - removing `effortOverrides.clear` from the outer `finally` (ladder-effort `size() === 0` after a
+        `prepareVerification` throw);
+      - swapping the v1/v2 `chat.params` target;
+      - parsing the bannered output at `index.ts:1420`;
+      - removing the bridge's `depthBanners.delete`;
+      - removing the `getParent` memo short-circuit (G2 counts).
+    - Expected to survive today:
+      - rebuilding instead of appending in the bridge's banner-only completed branch (QA-2.3-1);
+      - any `delegate`-path D4 change (QA-2.3-2).
 
 ## Verdict
 
 Design complete. It is ready for step 1. The host-level proof (step 8) is pending.
+
+**QA 2.3 (2026-10-05): pending fixes.** QA-2.3-1 (major), QA-2.3-2 (minor), QA-2.3-3 (minor, docs),
+QA-2.3-4 (nit) and QA-2.3-5 (nit) are open. No critical finding:
+
+- no enforced-mode bypass was found for a known-deep caller;
+- the override reached no wrong session;
+- a refusal left no dispatch state;
+- the golden and prompt-measurement suites, and every suite related to `src\index.ts`, pass with no `-u`.
+
+The host-level proof above stands. QA-2.3-1 was found in its own retained captures.
