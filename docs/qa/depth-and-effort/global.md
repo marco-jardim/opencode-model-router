@@ -172,3 +172,9 @@ The full suite only adds coverage.
 
 Under §0.7, round 1 fixes every finding whatever its severity, so 3.3.2 owns QA-G-1 and QA-G-2. Both
 are docs-only edits.
+
+## Round 1 resolutions (3.3.2, orchestrator in `D:\git\omr-de-main`)
+
+- QA-G-1: the blank lines that split the run-log full-suite table were removed.
+- QA-G-2: ADR 0004's evidence section now cites the Phase 3.2 end-to-end smoke on the final code and its mutation check (`docs/qa/depth-and-effort/phase-3.2.md`).
+

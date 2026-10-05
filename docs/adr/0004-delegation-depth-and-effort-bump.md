@@ -253,6 +253,13 @@ that fixture setting into a cross-version recommendation.
   retained captures and fixed it along with refusal counting and edge cases. The report records
   later unit/integration verification and host-shaped capture replays, **not a fresh host run**
   after those fixes. The 14/14 result must not be read as an end-to-end rerun of every final fix.
+- **End-to-end smoke on the final code:** Phase 3.2 versioned the scripted provider as
+  `test/smoke/depth-effort.smoke.test.ts` (with `test/smoke/helpers/scripted-provider.ts`) and ran
+  it on real OpenCode 1.18.19 and 2.0.22 against the merged code: the three config keys, the
+  unchanged agent list, enforced refusals and single advisory banners (foreground, resume, and v2
+  background), and the producer-only effort bump. A config-only mutation check (depth guard off,
+  bump off, `effortBumpMax` removed) failed the corresponding assertions. See
+  `docs/qa/depth-and-effort/phase-3.2.md`.
 - **Trace and residual review:** `docs/qa/depth-and-effort/phase-1.1.md` establishes the 32 cap;
   `phase-1.2.md` records tracker residuals F2/F6; `phase-1.3.md` records the ratio ceiling and
   separate v2.0.0/new default traces; `phase-2.1.md` records mode/warning decisions; and

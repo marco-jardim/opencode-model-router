@@ -49,11 +49,9 @@ All capped (`--maxWorkers=2`) and serialized (one at a time across worktrees).
 | after merging 1.1 | `D:\git\omr-de-main` (`edb114e`) | `npx vitest run --maxWorkers=2` | 102 passed, 3 skipped; 3742 passed, 65 skipped |
 | after merging 1.2 | `D:\git\omr-de-main` (`15caba2`) | `npx vitest run --maxWorkers=2` | 103 passed, 3 skipped; 3857 passed, 65 skipped |
 | after merging 1.3 | `D:\git\omr-de-main` (`f929a91`) | `npx vitest run --maxWorkers=2` (+ `smoke:keyless` 9/9 with v1 1.18.19, `smoke:v2` 2/2) | 104 passed, 3 skipped; 7649 passed, 65 skipped |
-
 | after merging 2.1 | `D:\git\omr-de-main` (`b18eab5`, `de/wave-2-base`) | `npx vitest run --maxWorkers=2` | 105 passed, 3 skipped; 7789 passed, 65 skipped |
 | after merging 2.2 | `D:\git\omr-de-main` (`b318faa`) | `npx vitest run --maxWorkers=2` | 106 passed, 3 skipped; 8959 passed, 65 skipped |
 | after merging 2.3 | `D:\git\omr-de-main` (`45b40f9`) | `npx vitest run --maxWorkers=2` (+ `smoke:keyless` 9/9 clean env, `smoke:v2` 2/2) | 108 passed, 3 skipped; 9084 passed, 65 skipped |
-
 | after merging 3.1 and 3.2 | `D:\git\omr-de-main` (`400f2d6`) | `npx vitest run --maxWorkers=2` (+ `smoke:keyless` 9/9, `smoke:v2` 2/2, `depth-effort` + helper: v1 17 passed / 11 skipped, v2 19 passed / 9 skipped) | 108 passed, 3 skipped; 9084 passed, 65 skipped; **typecheck failed** in `test\smoke\helpers\scripted-provider.test.ts:96` (`response.json()` is `unknown`), fixed by the orchestrator directly on `de/main` (a one-line typed assertion; typecheck clean, helper 8/8) |
 
 Pre-flight full suites of 2.2 and 2.3: the identical trees were the post-merge runs above (`b318faa`
