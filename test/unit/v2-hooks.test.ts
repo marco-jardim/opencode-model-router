@@ -392,6 +392,24 @@ describe("OpenCode 2 hook adapter", () => {
     await expect(f.toolHooks["execute.before"]({ ...call, tool: "read", input: { filePath: "x" } })).rejects.toThrow("read budget exceeded");
   });
 
+  it.each([undefined, [], [{ type: "file", uri: "file:///result", mime: "text/plain" }]])(
+    "keeps the full child output when content has no text: %j", async (content) => {
+      const f = fixture();
+      await f.start({
+        "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[DEPTH_BANNER] = "banner"; },
+        "tool.execute.after": async (_: unknown, output: { output: string }) => { output.output += "\n\n[router ✓ verified: checker]"; },
+      });
+      await f.toolHooks["execute.before"](depthCall());
+      const event = { ...depthResult(), result: { output: { output: "CHILD_TEXT" }, content } };
+      await f.toolHooks["execute.after"](event);
+      expect(event.result.content).toEqual([
+        { type: "text", text: "CHILD_TEXT\n\n[router ✓ verified: checker]\n\nbanner" },
+        ...(content ?? []),
+      ]);
+      expect(event.result.output.output).toBe("CHILD_TEXT\n\n[router ✓ verified: checker]\n\nbanner");
+    },
+  );
+
   it.each([false, true])("keeps the host envelope and attachments with verification changes (banner: %s)", async (banner) => {
     const f = fixture();
     await f.start({

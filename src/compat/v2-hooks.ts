@@ -345,7 +345,8 @@ export async function registerV2Hooks(
       const content = Array.isArray(event.result.content) ? [...event.result.content]
         : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
       let visible;
-      if (event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string") {
+      if (event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string"
+        && content.some((part) => part.type === "text")) {
         // The host's visible text owns the session envelope (and resume handle).
         // Legacy hooks see only the bare output; carry their additions around the
         // original content instead of rebuilding that envelope from bare text.
