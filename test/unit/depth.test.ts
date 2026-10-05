@@ -1009,3 +1009,44 @@ describe("QA-1.2-7: per-call cost is bounded", () => {
     expect(await tracker.depthOf(id(7, 100))).toBe(7);
   });
 });
+
+describe("QA-1.2-R2-1: no ancestor of a live node expires", () => {
+  it("a pinned conflict off the critical path outlives the TTL while its descendants are read", async () => {
+    const { tracker, getParent, warn, time } = fixture({ ttlMs: 100 });
+    tracker.recordRoot("Q");
+    tracker.recordRoot("A");
+    tracker.recordCreated("A", "Q"); // A is a pinned conflict
+    chain(tracker, 4, "b");
+    tracker.recordCreated("X", "b4");
+    tracker.recordCreated("X", "A"); // X = 5, via b4: A is not on the critical path
+    for (const t of [60, 120]) {
+      time(t);
+      expect(await tracker.depthOf("X")).toBe(5);
+      expect(await tracker.depthOf("Q")).toBe(0);
+    }
+    time(160);
+    tracker.sweep();
+    chain(tracker, 9, "c");
+    tracker.recordCreated("Q", "c9"); // Q = 10, so A = 11 and X = 12
+    expect(await tracker.depthOf("X")).toBe(12);
+    expect(await tracker.depthOf("A")).toBe(11);
+    expect(getParent).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map(([m]) => m).filter((m) => !m.includes("conflicting"))).toEqual([]);
+  });
+
+  it("keeps ancestors within MAX_DEPTH_HOPS of a survivor, and only while one survives", async () => {
+    const { tracker, getParent, time } = fixture({ ttlMs: 100 });
+    chain(tracker, 40);
+    time(60);
+    tracker.recordCreated("L", "n40"); // touches L and n40 only: n40 is terminal
+    time(100);
+    tracker.sweep();
+    // n40 survives on its own; n8..n39 lie within 32 hops of it, n0..n7 do not.
+    expect(tracker.size()).toBe(34);
+    expect(await tracker.depthOf("L")).toBe(MAX_DEPTH_HOPS);
+    expect(getParent).not.toHaveBeenCalled();
+    time(300);
+    tracker.sweep();
+    expect(tracker.size()).toBe(0);
+  });
+});

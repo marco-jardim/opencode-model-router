@@ -666,8 +666,26 @@ export function createDepthTracker(
     },
     sweep() {
       const now = clock();
-      // Pinned nodes too, after the idle TTL only (accepted residual F2).
-      for (const map of [lru, pins]) for (const [id, n] of map) if (now - n.lastTouch >= ttlMs) drop(id, true);
+      // A node idle for the TTL expires (pinned ones too: accepted residual F2)
+      // unless it is an ancestor, within MAX_DEPTH_HOPS, of a node that did not
+      // expire. A read touches only its critical path, so this keeps every
+      // ancestor whose evidence a live node's depth depends on (an ancestor
+      // further away can only confirm MAX), at O(nodes + links) per sweep and no
+      // cost per read (QA-1.2-R2-1). Multi-source BFS: the first visit is the
+      // shortest distance to a survivor.
+      const hops = new Map<string, number>();
+      for (const map of [lru, pins]) for (const [id, n] of map) if (now - n.lastTouch < ttlMs) hops.set(id, 0);
+      const queue = [...hops.keys()];
+      for (let i = 0; i < queue.length; i++) {
+        const level = hops.get(queue[i])!;
+        if (level === MAX_DEPTH_HOPS) continue;
+        for (const p of get(queue[i])!.parents) {
+          if (hops.has(p) || !has(p)) continue;
+          hops.set(p, level + 1);
+          queue.push(p);
+        }
+      }
+      for (const map of [lru, pins]) for (const id of map.keys()) if (!hops.has(id)) drop(id, true);
       for (const id of failedAt.keys()) throttled(id); // drops every expired entry
       for (const [key, stamp] of warned) if (now - stamp >= ttlMs) warned.delete(key);
     },
