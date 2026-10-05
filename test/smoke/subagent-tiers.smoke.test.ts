@@ -7,7 +7,7 @@
  * unit tests cover the pure resolution in src/router/subagents.ts, but the
  * hook itself is only exercised by a real plugin load.
  *
- * Determinism: opencode is spawned with HOME pointed at a temp dir so the
+ * Determinism: opencode is spawned with HOME/USERPROFILE pointed at a temp dir so the
  * developer's `opencode-model-router.state.json` (which overlays activePreset
  * and outranks the override file) cannot change which preset is active.
  *
@@ -71,7 +71,7 @@ function writeOverrides(body: Record<string, unknown>): void {
 function debugAgent(name: string): Record<string, any> {
   const result = spawnSync("opencode", ["debug", "agent", name], {
     cwd: projectDir,
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
     encoding: "utf8",
     timeout: 120_000,
   });
