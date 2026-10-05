@@ -739,7 +739,10 @@ function describeValue(value: unknown): string {
   } catch {
     description = `<${typeof value}>`;
   }
-  return description.length > 80 ? `${description.slice(0, 79)}…` : description;
+  if (description.length <= 80) return description;
+  // Keep the 80-code-unit bound without splitting a surrogate pair.
+  const end = /[\uD800-\uDBFF]/.test(description[78]!) && /[\uDC00-\uDFFF]/.test(description[79]!) ? 78 : 79;
+  return `${description.slice(0, end)}…`;
 }
 
 /** Copy without invoking accessors again; include defined get-only Proxy values. */

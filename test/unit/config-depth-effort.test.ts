@@ -244,6 +244,7 @@ describe("depth and effort bump config — regression cases", () => {
     ["", '""'],
     ["true", '"true"'],
     ["x".repeat(5000), `"${"x".repeat(78)}…`],
+    ["a" + "😀".repeat(100), `"a${"😀".repeat(38)}…`],
   ])("safely describes invalid values for all three keys: %s", (value, description) => {
     for (const key of ["maxDelegationDepth", "effortBump", "effortBumpMax"]) {
       const enforcement = key === "maxDelegationDepth" ? { [key]: value } : { escalate: { [key]: value } };
