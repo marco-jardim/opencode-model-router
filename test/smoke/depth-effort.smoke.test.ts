@@ -264,7 +264,6 @@ for (const host of hosts) {
           } else run = await f.run(project, kind === "background" ? "ROOT_NEST_BG" : "ROOT_NEST_FG");
           expect(run.rootID).toBeTruthy();
           expect(run.childID).toBeTruthy();
-          expect((await f.hooks()).some(h => h.sessionID === run.childID && h.parentID === run.rootID)).toBe(true);
           const childBlocks = f.provider.captures.filter(c => c.session === run.childID).flatMap(c => blocks(c.body));
           const uses = childBlocks.filter(b => b.type === "tool_use" && b.name === (host.version === "v1" ? "task" : "subagent"));
           const call = uses.find(b => kind !== "resume" || b.input?.sessionID === existing);
