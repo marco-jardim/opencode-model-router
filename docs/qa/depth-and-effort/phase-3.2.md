@@ -93,7 +93,7 @@ Final assertion coverage (the new file's 14 tests include these grouped checks):
 | (c) Advisory background | Not in v1 matrix | PASS | Wire banner once; native output and metadata both `running`; structured output also has banner once |
 | (c) Advisory resume | Not in v1 matrix | PASS | Existing direct child resumed; banner once; completed session envelope/handle retained |
 | (d) Bump enabled | PASS | PASS | Two distinct producer sessions: `output_config.effort` low → medium; scripted graders fail then pass; verified delegate output |
-| (d) No auxiliary/session leak | PASS | PASS | Title, graders and orchestrator all actually requested and have no effort; last request is the orchestrator's |
+| (d) Cross-session isolation only | PASS | PASS | Root-session title, separate graders and orchestrator have no effort; does not exercise A3 on the producer's own session |
 | (d) Bump disabled | PASS | PASS | Two producer attempts both carry low |
 
 Representative final stdout summaries:
@@ -174,6 +174,28 @@ with `SMOKE_DEPTH_EFFORT_MUTATION=depth` or `bump`. Logs/captures:
 `new-v2-bump-filtered/`. The outer runner clears the switch before restored runs.
 The v1 restored assertions pass 3/3; the final whole-file v2 run is also unmutated.
 
+### A3 evidence boundary (QA-3.2-4)
+
+The host fixture dispatches parented producers through the real delegate. Neither
+pinned host emits a title/auxiliary request on those producers' own sessions. The
+captured title belongs to the root; graders have separate sessions. Accordingly the
+smoke proves **cross-session isolation only**, not sensitivity to removing the A3
+agent/model gate. No observer-generated hook call is presented as host evidence.
+
+Same-session gate evidence is deliberately at the integration/unit layer:
+
+- `test/integration/ladder-effort-wiring.test.ts`, both `v1: applies medium only to
+  the retry, reports fast@medium, and clears on success` and the equivalent `v2:`
+  test: the fixture calls `params(producerSid, "title", producerModel)` during each
+  producer attempt, including the live bumped attempt; `f.excluded` must remain
+  `[{}, {}, {}, {}]`. This exercises the plugin's same-session agent gate.
+- `test/unit/effort-override.test.ts`, `leaves target unchanged for a non-producer
+  input %j`: cases retain the producer session but change agent, provider, model ID,
+  or supply conflicting `id`/`modelID`. These pin the identity checks themselves.
+
+These named tests are re-run on the final test revision; host PASS rows must not be
+used to claim that the same-session identity-gate mutation was killed at host level.
+
 ## Findings
 
 QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`. Line numbers refer to
@@ -208,8 +230,9 @@ QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`.
   when `OPENCODE_V2_BIN` is configured. Do not make v1 proof depend on v2 availability.
 - **To 3.1:** document independent host nesting limits and dispatch permissions;
   v2 resumes direct children only; advisory results preserve the v2 session envelope.
-  Effort bumps are verified on producer requests only; titles, graders and the next
-  orchestrator request retain their own options. This is not live-provider acceptance.
+  Captured root titles, separate graders and the next orchestrator request have no
+  bumped effort (cross-session isolation). The same-producer-session A3 identity gate
+  is integration/unit evidence, not a host claim. This is not live-provider acceptance.
 - **To QA:** inspect mutation sensitivity, full registry equality, native envelope
   preservation and the fact that observer plugins do not implement either feature.
 

@@ -359,6 +359,9 @@ for (const host of hosts) {
         const producers = f.provider.captures.filter(c => c.role === "producer");
         expect(producers.map(c => c.body.output_config?.effort)).toEqual(["low", bump ? "medium" : "low"]);
         expect(new Set(producers.map(c => c.session)).size).toBe(2);
+        // Parented delegate producers do not generate a same-session title on
+        // these hosts. This checks cross-session isolation, not the A3 identity
+        // gate; same-session title/model exclusions are integration/unit proof.
         for (const role of ["title", "grader", "orchestrator"] as const) {
           const requests = f.provider.captures.filter(c => c.role === role);
           expect(requests.length, `${role} must actually be exercised`).toBeGreaterThan(0);
