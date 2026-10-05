@@ -81,32 +81,35 @@ This section is **not** covered by the upstream-mechanism section above.
 
 ### Facts read from this repository
 
-The bundled `anthropic` preset points `@medium` at `claude-opus-5-5`. From `tiers.json`:
+The bundled `anthropic` preset points `@heavy` at `claude-opus-5-5`. From `tiers.json`:
 
 ```jsonc
-"medium": {
+"heavy": {
   "model": "anthropic/claude-opus-5-5",
-  "variant": "high",
-  "effort": "high",
+  "variant": "xhigh",
+  "effort": "xhigh",
 ```
 
 `buildAgentOptions` in `src/router/agent-options.ts` gates the explicit fields for Claude
-models: it never registers `reasoning_effort` / `reasoning_summary` on a Claude model, and
-never registers `budget_tokens` on an adaptive-only Claude model (`isAdaptiveOnlyClaudeModel`
-in `src/router/protocol.ts`, which lists the 2.1.280 catalogue entries carrying
+models: it never registers `reasoningEffort` / `reasoningSummary` on a Claude model, and
+never registers `thinking: { type: "enabled", budgetTokens }` on an adaptive-only
+Claude model (`isAdaptiveOnlyClaudeModel` in `src/router/protocol.ts`, which lists
+the 2.1.280 catalogue entries carrying
 `rejects_disabled_thinking`: `claude-opus-5-5`, `claude-fable-5`, `claude-fable-5-1` and
 `claude-mythos-5-1`).
 Each drop warns once per tier. Non-Claude tiers are still passed through unchecked. See
 [CONFIG_REFERENCE.md — Provider gate for explicit `thinking` and `reasoning` fields](./CONFIG_REFERENCE.md#provider-gate-for-explicit-thinking-and-reasoning-fields).
 
 Nothing in `buildAgentOptions` emits a per-turn `outputConfig` or either beta identifier
-above. A tier's `effort` is a registration-time value on the agent's `options`, fixed for
-the life of that agent.
+above. A tier's `effort` is a registration-time value on the agent's `options`.
+The router's `delegate` ladder can override it for an eligible retry producer through
+`chat.params`; this is a request-option override, not Claude Code's per-message
+`outputConfig` mechanism. See [effort bump before escalation](./CONFIG_REFERENCE.md#effort-bump-before-escalation).
 
 ### The consequence (rests on the unsourced HTTP 400 claim, not observed here)
 
-With the tier exactly as shipped, `@medium` sets `effort: "high"` and no `thinking` block, so
-`buildAgentOptions` registers `effort: "high"` and **no** `budget_tokens`. The shipped
+With the tier exactly as shipped, `@heavy` sets `effort: "xhigh"` and no `thinking` block, so
+`buildAgentOptions` registers `effort: "xhigh"` and **no** `thinking` option. The shipped
 default does not, by itself, send a manual thinking budget.
 
 When a `claude-opus-5-5` tier also sets `thinking.budgetTokens` — in an overrides file or
@@ -123,7 +126,7 @@ No test and no live request in this repository has produced that 400, and the up
 analysis does not state it. It rests solely on the unsourced statement in
 `CONFIG_REFERENCE.md`.
 
-Not verified here: whether opencode turns the tier's `variant: "high"` into a thinking
+Not verified here: whether opencode turns the tier's `variant: "xhigh"` into a thinking
 budget further down the stack. That mapping lives outside this repository.
 
 ---
@@ -134,7 +137,7 @@ budget further down the stack. That mapping lives outside this repository.
    Anthropic models listed in the provider gate) set `effort`, never
    `thinking.budgetTokens`. The router now ignores the budget there with a warning, but
    the tier reads more honestly without it.
-2. **Code — implemented:** the `budget_tokens` and `reasoning_*` branches of
+2. **Code — implemented:** the `thinking` and `reasoningEffort` / `reasoningSummary` branches of
    `buildAgentOptions` are gated for Claude models and warn instead of registering (see
    [the provider gate](./CONFIG_REFERENCE.md#provider-gate-for-explicit-thinking-and-reasoning-fields)).
    The budget half rests on the `rejects_disabled_thinking` catalogue flag; the HTTP 400
