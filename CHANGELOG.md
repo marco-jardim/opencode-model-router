@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `anthropic/claude-sonnet-5-5` (xhigh), `@heavy` → `anthropic/claude-opus-5-5`
   (xhigh).
 
+### Fixed
+
+- Project overrides are found again on opencode v2 service mode (#70): the override
+  lookup and the config cache are now keyed by the host-provided project directory
+  instead of `process.cwd()` (which the v2 server moves to `$HOME`), so several
+  projects in one process each keep their own config, reload state and error.
+
 ## [2.1.0] - 2026-10-05
 
 Observations by @MetalbolicX in opencode-smart-router (#17); implementation written from scratch.
