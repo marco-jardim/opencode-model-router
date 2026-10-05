@@ -105,6 +105,52 @@ not implemented (QA-1.1-2).
 | QA-1.1-8 | minor | `docs/CONFIG_REFERENCE.md:176-177, 978-1028` | **The reference is incomplete where it enumerates defaults and effects.** (a) The "Shipped value \| Applied by" table and the "not shipped" paragraph omit the three keys. They are neither shipped nor unread; they are code defaults applied by `resolveDepthLimit`/`resolveEffortBump`. (b) The "Changing `mode` to `enforced`" list omits "the depth guard refuses dispatches past `maxDelegationDepth`". (c) "To enforce the limit, set `enforcement.mode: "enforced"`" ignores `perTier[<caller tier>]`, which takes precedence over `mode` (`:161`, `:597`, A1): a `perTier` `"advisory"` entry keeps that tier's delegates warn-only. This may be closed by moving it into the 3.1 handoff if the orchestrator agrees. | `6aa8c74` |
 | QA-1.1-9 | nit | `docs/CONFIG_REFERENCE.md:169-170, 179-180` | "fails open with one warning" should read "one warning per caller session" (D2). "only orchestrators may dispatch" states the enforced meaning without the advisory qualifier in the same sentence; the next paragraph qualifies it. | `bd89c95` |
 
+### Round 2
+
+This round re-reviews the round-1 fixes in `18bea52..5fdc887`:
+- the fix commits `b106dd3`, `6bfd03f`, `14c0ddd`, `486cf2e`, `87af99f`, `d190f5b`, `86311a9`, `6aa8c74` and `bd89c95`;
+- the resolution record `5fdc887`.
+
+The changes cover `src/router/config.ts`, `test/unit/config-depth-effort.test.ts` and
+`docs/CONFIG_REFERENCE.md`. Reviewer: adversarial senior QA (`[tier:heavy]`, CAP:none).
+
+Checks at `5fdc887`:
+- `npm run typecheck`: clean.
+- Scoped run, same command as the pre-flight: **5 files, 276 tests passed** on win32.
+- After the run, `git status` was clean and `%TEMP%` held no `depth-effort-*` directory.
+- Runtime probes were read-only and wrote no files. They used Node 24.21 type stripping and a resolve
+  hook. For the round-1 comparison, a load hook served `git show e0742fe:src/router/config.ts` from memory.
+
+**Round-1 findings**
+
+| id | status | evidence |
+|---|---|---|
+| QA-1.1-1 | **Resolved** in code and reference. The plan amendment is not recorded (QA-1.1-R2-1). | `config.ts:724`: `MAX_DELEGATION_DEPTH_LIMIT = 32`. `:789-791`: `Number.isSafeInteger` and the range 1–32. The tests accept `32` and reject `33`, `100`, `1e300` and `2**53+2`. For every limit ≤ 32, a chain counted as 32 gives `32 + 1 > max`, so D2's "any configured limit refuses it" now holds. `CONFIG_REFERENCE.md:159, 184-186, 615` match the code. |
+| QA-1.1-2 | **Resolved** | `rejectPrototypeKeys` (`:768-774`) is now also the helper `verify` uses (`:818`), and the message is unchanged. It runs on `enforcement` (`:783`) and `escalate` (`:951`) and covers `__proto__`, `constructor` and `prototype`. The direct `validateConfig` tests use own keys parsed by `JSON.parse`. Through `loadConfig`, `deepMerge` still strips `__proto__` and `constructor`. Probe: an override's `prototype` in `enforcement` or `escalate` is now rejected and the layer dropped, just as `enforcement.verify.prototype` already was. |
+| QA-1.1-3 | **Resolved**, with a nit (QA-1.1-R2-3) | `describeValue` (`:727-743`) never threw on the probed inputs (results below), and every result was ≤ 80 characters. JSON-reachable `{"toString":1}` → `object {"toString":1}`. Null-prototype objects are covered. Circular objects and throwing `toJSON` → `<object>`, without leaking the error text. A revoked Proxy → `<object>`. A `toJSON` that returns `undefined` → `object <unserializable>`. `"a\nb"` is escaped. These pairs are now distinguishable: `-0`/`0`, `2n`/`2`, `new Number(2)`/`2`, `[]`/`""`, `"true"`/`true`. |
+| QA-1.1-4 | **Resolved** for the stated cases. A further Proxy variant regressed (QA-1.1-R2-2). | Each parent is read once into a local (`:943`, `:1135`) and snapshotted even when that read returned `undefined`. `Object.hasOwn(descriptors, key)` (`:753`) defeats a Proxy whose `has` trap hides a key. The tests pin `reads === 1` and check that the copy holds no getter. |
+| QA-1.1-5 | **Resolved** | `:759-763` keep the prototype, array identity and frozenness. The JSDoc states the contract (`:1106-1108`). Probes for configs without the new keys: with no `enforcement`, the input is returned by identity; `enforcement` with no new key and no `escalate` → identity; `escalate` with no new key → identity; key order is unchanged. An inherited root `enforcement` resolves (depth 3) and the prototype is kept. Sealed or non-extensible inputs that are not frozen still give an extensible copy. That is no finding: the JSDoc promises only frozenness, and no `src` caller seals a config (the only `validateConfig` callers are in `config.ts`). |
+| QA-1.1-6 | **Resolved** | New tests: (1) two layers merge: a global `effortBump:false` plus a project `effortBumpMax:"high"` keep both, and the project depth `3` wins; (2) a bad project layer over a good global layer keeps the global layer, and the warning names the project path; (3) the state-file `enforcementMode` spread keeps the snapshots as own data properties; (4) the QA-1.1-3 and QA-1.1-4 inputs. Windows temp-dir handling: (a) the temp root is `mkdtempSync(join(tmpdir(), "depth-effort-"))`; (b) it is removed in `afterEach`, after the `finally` has restored the cwd, so Windows can delete it; (c) `project/.git` stops the `findProjectOverride` walk at the temp project; (d) `USERPROFILE` is stubbed alongside `HOME`, so `homedir()` follows on win32. |
+| QA-1.1-7 | **Resolved** | `CONFIG_REFERENCE.md:523-526`. |
+| QA-1.1-8 | **Resolved**, with a nit (QA-1.1-R2-4) | (a) `:987-989` and `:1017-1019`. `tiers.json` ships none of the three keys (grep), and the defaults live in `config.ts:1366-1378`. (b) `:1031-1032`. The bump bullet (`:1037-1039`) agrees with D7/D8: the same attempt and cost limits, and the ladder acts only in `enforced`. (c) `:178-180` matches `resolveEnforcementMode` (`enforcement.ts:21-46`) for an unset, empty or `1` gate; see R2-4. |
+| QA-1.1-9 | **Resolved** | `:169-171`, `:184`. |
+
+**New findings**
+
+| id | severity | file:line | description | resolution |
+|---|---|---|---|---|
+| QA-1.1-R2-1 | minor | plan `:359`, `:860`, `:880`, `:894`; this report `:67` | **The 32 cap is an unrecorded deviation from the plan.** `b106dd3` implements the orchestrator's decision (`maxDelegationDepth` ≤ 32 = `MAX_DEPTH_HOPS`, safe integer), but the plan text still says otherwise: <br>• §1.4 (`:359`) still says "integer ≥ 1, or `null`"; <br>• 1.1.1.b (`:860`) still says "integer ≥ 1 (`Number.isInteger`)"; <br>• the 1.1 test list (`:880`) still says "`1`, `2` and `100` accepted", while the test now rejects `100` (`["old unbounded limit", 100, "100"]`); <br>• the 1.1 acceptance (`:894`) requires validation "exactly as in §1.4". <br>This report says "**Amended during implementation:** none recorded" (`:67`). The plan has not changed on `de/p11` or `de/main` since `c11e7a8`. §0.7 (`:182`) requires an approved deviation to be recorded under `## Implementation notes` and marked *Amended during implementation*, and the plan is orchestrator-owned (`:729`). Until it is recorded, the 1.1 acceptance cannot be ticked against the plan. Fix: record the amendment in this report's Implementation notes and in the `de/main` plan's §1.4 row, 1.1.1.b and 1.1 test list. | open |
+| QA-1.1-R2-2 | minor | `src/router/config.ts:752-758` (and `:1142`) | **A key served only by a Proxy `get` trap now leaks the unvalidated input. This regresses from round 1** (not reachable from JSON; same class as QA-1.1-4). `withValidatedSnapshots` snapshots a key only if it is an own descriptor or passes `key in obj`. Since `87af99f` it also returns the input itself when nothing was snapshotted (`if (!changed) return obj`). So a Proxy that answers `get` but hides the key from both `ownKeys` and `has` is validated through `get`, then returned unchanged. Probe 1: an `enforcement` Proxy whose getter yields `2`, then `-7`. `resolveDepthLimit` returns `-7` at `HEAD` but `1` at `e0742fe`, where the copy dropped the virtual key. Probe 2: a root Proxy serving `enforcement` only through `get`, first `{maxDelegationDepth: 2}` and then `{maxDelegationDepth: -5, escalate: {effortBump: "yes", effortBumpMax: "ultra"}}`. `validateConfig` returns the input Proxy; `resolveDepthLimit` → `-5` and `resolveEffortBump` → `{enabled: "yes", max: "ultra"}`. The round-1 recommendation (own-or-`in`) missed this case. Fix: also snapshot when the validated value is defined (`value !== undefined \|\| Object.hasOwn(descriptors, key) \|\| key in obj`), and add both probes to the Proxy test. | open |
+| QA-1.1-R2-3 | nit | `src/router/config.ts:742` | **Truncation can split a surrogate pair.** `description.slice(0, 79)` cuts at a UTF-16 code unit, so a JSON-reachable string can leave a lone high surrogate before `…`. Probe: `effortBumpMax: "a" + "😀".repeat(100)` gives a description that ends in `\ud83d` followed by `…`, and `isWellFormed()` is `false`, so the warning prints U+FFFD. Fix: drop a trailing high surrogate before appending `…` (or slice by code points), and add the case to the `describeValue` test. | open |
+| QA-1.1-R2-4 | nit | `docs/CONFIG_REFERENCE.md:178-180` (pre-existing `:161`, `:604`); `src/router/enforcement.ts:29-46` | **The `perTier` precedence condition is incomplete.** The new sentence says a `perTier` entry overrides `mode` "when the env gate is unset/empty". `resolveEnforcementMode` also applies `perTier[tier]` when the gate holds any value other than `1` or `0`: it warns, then runs the same config path (`enforcement.ts:29-46`). The sentence copies the pre-existing `:161` wording, and the truth-table row `:604` ("config `mode` (fallback)") also omits `perTier`. Fix: at `:178-179`, say "overrides `mode` unless the env gate is `1` or `0`". Align `:161` and `:604` in the same commit, or hand them to 3.1. | open |
+
+Handoff added in round 2:
+- **To 1.2:** `MAX_DEPTH_HOPS` (plan `:930`, `src/router/depth.ts`) must equal
+  `MAX_DELEGATION_DEPTH_LIMIT` (`config.ts:724`, exported).
+  - Derive one from the other, or pin them equal in a test.
+  - The validation message hard-codes `1 to 32`, and the tests pin that text, so a change to the
+    constant alone fails CI.
+
 ## Deferred by plan
 
 - The depth tracker and `MAX_DEPTH_HOPS` are Phase 1.2. The guard, the banner and the D5/A1 texts are Phase 2.1.
@@ -137,6 +183,10 @@ not implemented (QA-1.1-2).
 
 ## Verdict
 
-**Pending fixes.** 9 findings are open: 2 major (QA-1.1-1, QA-1.1-2), 6 minor (QA-1.1-3 … QA-1.1-8)
-and 1 nit (QA-1.1-9). None bricks startup, and no invalid depth gets through validation from a config
-file. QA-1.1-1 needs an orchestrator decision on D2 or §1.4 before 1.2 and 2.1 build on it.
+**Pending fixes.**
+- Round 1: all 9 findings are resolved.
+- Round 2: 4 findings are open: 2 minor (QA-1.1-R2-1, QA-1.1-R2-2) and 2 nit (QA-1.1-R2-3, QA-1.1-R2-4).
+  None is blocking, critical or major. None bricks startup, and no invalid value gets through
+  validation from a config file. R2-2 needs a hand-built Proxy.
+- Under §0.7, round-2 findings are all fixed. A further review of those fixes is round 3, which fixes
+  only `blocking`, `critical` and `major` findings.
