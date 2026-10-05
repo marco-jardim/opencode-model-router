@@ -199,8 +199,10 @@ The enforced refusal is:
 the guard unless the env gate forces enforcement; `/bypass` disables it on both
 dispatch paths.
 
-For `delegate`, the depth banner follows the producer text and precedes the
-verification suffix or deferred footer. For native dispatch results, it precedes verification text on v1
+For accepted and deferred `delegate` results, the depth banner follows the producer
+text and precedes the verification suffix or deferred footer. On unmet, safety-net
+and failure returns, it is appended last, after the router text and any forcing note.
+For native dispatch results, it precedes verification text on v1
 and follows it on v2. It is delivered once and is not part of the text graded by
 the verifier. V2 retains the host envelope when appending it (see
 [OpenCode v2 compatibility](./OPENCODE_V2.md#child-sessions-cancellation-and-verification)).

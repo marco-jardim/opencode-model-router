@@ -110,8 +110,10 @@ The exact `depthAdvisoryBanner` template in `src/router/depth-guard.ts` is:
 ```
 
 Banner delivery is per call, independent of Layer-1 guard state and `isSubagent`.
-On `delegate`, it follows the producer text and precedes the verification suffix or
-deferred footer. V1 `task` uses the session/call-ID map in `src/index.ts`;
+On accepted and deferred `delegate` results, it follows the producer text and precedes
+the verification suffix or deferred footer. On unmet, safety-net and failure returns,
+it is appended last, after the router text and any forcing note (`src/index.ts`).
+V1 `task` uses the session/call-ID map in `src/index.ts`;
 the v2 bridge owns delivery for v2, including a background `running` acknowledgement. Maps are
 bounded at 1,000 entries. The banner is never graded or delivered twice. On v1 it precedes
 verification text; on v2 it follows it (`src/compat/v2-hooks.ts`). A v1 task without a call ID
