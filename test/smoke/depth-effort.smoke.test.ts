@@ -21,7 +21,6 @@ const D5 = "[router] DELEGATION DEPTH LIMIT — this session is at delegation de
 const A1 = "[⚠ GUARD:delegation_depth] this session is at delegation depth 1; enforcement.maxDelegationDepth is 1. In enforced mode this dispatch would have been refused. Do not dispatch further subagents from this session; do that work yourself.";
 const KEYLESS = process.env.RUN_OC_SMOKE_KEYLESS === "1" || process.env.RUN_OC_SMOKE === "1";
 const V2 = process.env.RUN_OC_SMOKE_V2 === "1";
-if (V2 && !process.env.OPENCODE_V2_BIN) throw new Error("Set OPENCODE_V2_BIN to the OpenCode 2 executable when RUN_OC_SMOKE_V2=1");
 const hosts: { version: HostVersion; executable: string; enabled: boolean }[] = [
   { version: "v1", executable: "opencode", enabled: KEYLESS },
   { version: "v2", executable: process.env.OPENCODE_V2_BIN ?? "", enabled: V2 },
@@ -191,6 +190,14 @@ function scenarioConfig(mode: "enforced" | "advisory", effort = false, bump = tr
 for (const host of hosts) {
   const d = host.enabled ? describe : describe.skip;
   d(`depth/effort real host ${host.version}${host.version === "v2" && !V2 ? " (set RUN_OC_SMOKE_V2=1 and OPENCODE_V2_BIN to run)" : ""}`, () => {
+    if (host.version === "v2" && host.enabled && !host.executable) {
+      // Fail this describe at test execution, not collection: a requested v1
+      // describe must still run even when v2 is explicitly misconfigured.
+      it("requires OPENCODE_V2_BIN when v2 is requested", () => {
+        throw new Error("Set OPENCODE_V2_BIN to the OpenCode 2 executable when RUN_OC_SMOKE_V2=1");
+      });
+      return;
+    }
     it("loads set/unset/invalid keys without adding agents; invalid config warns but starts", async () => {
       const f = await fixture(host);
       const project = await f.project("baseline", {}, false);

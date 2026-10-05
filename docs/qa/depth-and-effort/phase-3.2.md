@@ -29,9 +29,11 @@ Final round-1 test revision: `85d5c180f75aa4c5267ba3c78c7b436dab70ab2f`.
   delegate calls, deterministic failing-then-passing grader replies, start/stop.
 - `test/smoke/depth-effort.smoke.test.ts`: v1 on PATH under `RUN_OC_SMOKE_KEYLESS=1`
   or `RUN_OC_SMOKE=1`; v2 independently requires `RUN_OC_SMOKE_V2=1` and
-  `OPENCODE_V2_BIN`. Explicitly requesting v2 without its binary fails collection.
+  `OPENCODE_V2_BIN`. Explicitly requesting v2 without its binary fails a configuration
+  test inside the v2 describe, not collection: any enabled v1 tests still execute.
   With the flag unset, the skipped describe is named `(set RUN_OC_SMOKE_V2=1 and
-  OPENCODE_V2_BIN to run)` (shown by the verbose reporter). Neither condition gates v1.
+  OPENCODE_V2_BIN to run)` (shown by the verbose reporter). Neither condition prevents
+  v1 execution, though a requested, misconfigured v2 leg makes the overall run fail.
 - `test/smoke/helpers/scripted-provider.test.ts`: four protocol/barrier tests pin
   non-stream tool calls, non-retryable Anthropic-shaped errors, SSE ping/order, and
   background leaf release only after the parent tool result is captured.
@@ -448,8 +450,10 @@ New round-2 findings:
   workaround until fixed. No issue was opened by this dispatch; this is an explicit
   follow-up, not a claim that the earlier 2.3 isolation handoff was implemented.
 - **To 3.4:** append `test/smoke/depth-effort.smoke.test.ts` to `smoke:keyless`.
-  Also append it to `smoke:v2`; its `RUN_OC_SMOKE_V2` gate enables only the v2 describe
-  when `OPENCODE_V2_BIN` is configured. Do not make v1 proof depend on v2 availability.
+  Also append it to `smoke:v2`; that script sets `RUN_OC_SMOKE_V2=1`, so it requires
+  `OPENCODE_V2_BIN`. Without it, the v2 describe fails its configuration test, but
+  enabled v1 tests are still collected and executed. An inherited v2 opt-in without
+  the binary makes the overall keyless run red, not skipped. Do not gate v1 on v2.
 - **To 3.1:** document independent host nesting limits and dispatch permissions;
   v2 resumes direct children only; advisory results preserve the v2 session envelope.
   Captured root titles, separate graders and the next orchestrator request have no
