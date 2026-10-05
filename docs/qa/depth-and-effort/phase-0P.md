@@ -259,6 +259,27 @@ Round 1 (heavy QA, adversarial). Resolution commit: the commit that adds this ta
 | QA-0.P-16 | nit | A5 | Captured model ids not named | A5 names `claude-fable-5`, `claude-opus-4-7` |
 | QA-0.P-17 | nit | `src\router\config.ts:40` | Comment names `reasoning_effort` | Handoff to 1.1 (A4) |
 
+Round 2 (re-review of `d17fb66`; the reviewer checked the Spike A2 raw captures, hook logs, run
+summaries and stdout, and confirmed R1–R5). All fixed in the commit that adds this table.
+
+| Id | Severity | Where | Finding | Resolution |
+|---|---|---|---|---|
+| QA-0.P-R2-1 | major | §1.4, D1, 1.1.3, 1.1 acceptance | Still described blocking as the default meaning; 1.1 would document it | Amended in place; added to A1's superseded list |
+| QA-0.P-R2-2 | minor | A1 `task` banner key | `callID` alone can collide; no-`callID` case unspecified | Key `${sessionID}:${callID}`; no `callID` → no banner, one warning |
+| QA-0.P-R2-3 | minor | A1 v2 delivery | Contradiction for non-completed results; no precedent; double delivery risk | Failed/non-completed → no banner; v2: symbol on `output`, bridge map by `event.id`, sole deliverer; no-double-delivery assertion |
+| QA-0.P-R2-4 | minor | A3 seam typing | `RouterPluginInput` lives in an unowned file | `src\compat\child-session.ts` (type only) added to 2.3's write-set |
+| QA-0.P-R2-5 | minor | A4 grader bullet | Graders never get tier options (no `agent`), so the test was moot | Bullet replaced with the fact and evidence; test dropped |
+| QA-0.P-R2-6 | minor | A9 | Router-bridge async throw and v2 `running` banner not observed on a host | Made explicit requirements of 3.2.1(c) |
+| QA-0.P-R2-7 | minor | 2.3 gate, 3.2.1, §4.2 | Gate relied on an unversioned temp rig; CI cannot run v2 | 2.3 uses a hashed copy; 3.2 versions `test\smoke\helpers\scripted-provider.ts`; v1 legs in CI via `smoke:keyless`; v2 legs local evidence; §4.2 amended |
+| QA-0.P-R2-8 | minor | A11 `/bypass` | `delegate.execute` does not check `bypassed` | 2.3.2.d checks it too; 2.3.6 tests both paths |
+| QA-0.P-R2-9 | nit | A7 | Native-path grader recorded at 1 though the caller is known | Pass `orchestratorSessionID` as creator |
+| QA-0.P-R2-10 | nit | A12 | Isolated cache forces models.dev fetches | `OPENCODE_DISABLE_MODELS_FETCH=true`; run on Windows and CI before merge |
+| QA-0.P-R2-11 | nit | A3 gate rationale | Title leak scope overstated | Rationale scoped |
+| QA-0.P-R2-12 | nit | §1.7 order | A10 out of order | Note added (numbering is the reference) |
+
+Per §0.7, no further review round: the round-2 fixes are text amendments, and the only major one
+(R2-1) is a direct in-place amendment checked by the orchestrator.
+
 ## Deferred by plan
 
 - Docs that name the snake-case option keys (`README.md:282,483,491`,
@@ -286,4 +307,5 @@ Round 1 (heavy QA, adversarial). Resolution commit: the commit that adds this ta
 
 ## Verdict
 
-Pending the 0.P QA review.
+Open findings: **0** (no blocking, critical or major open; every round-1 and round-2 finding fixed).
+`de/wave-1-base` is tagged on the commit that adds this verdict (sha recorded in `run-log.md`).

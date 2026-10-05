@@ -356,7 +356,7 @@ with that record. If heavy's approach also fails, it is a blocking problem under
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enforcement.maxDelegationDepth` | integer ≥ 1, or `null` | `1` | M2. The deepest session that a model-initiated dispatch may create. `1` means only root sessions (orchestrators) may dispatch; `2` lets a delegate dispatch one more level; `null` disables the guard. |
+| `enforcement.maxDelegationDepth` | integer ≥ 1, or `null` | `1` | M2. The deepest session that a model-initiated dispatch may create. `1` means only root sessions (orchestrators) may dispatch; `2` lets a delegate dispatch one more level; `null` disables the guard. *Amended during implementation (0.P, §1.7 A1):* a dispatch past the limit is **warned** in `advisory` mode (the bundled default) and **refused** in `enforced` mode; `off` disables it. |
 | `enforcement.escalate.effortBump` | boolean | `true` | M4/M5. `false` restores the `v2.0.0` ladder exactly. |
 | `enforcement.escalate.effortBumpMax` | one of `EFFORT_LEVELS` | `"xhigh"` | M4. Upper bound for bumped attempts, further clamped per model by M3. |
 
@@ -368,7 +368,9 @@ in `D:\git\opencode-model-router\src\router\config.ts`, which are pure and synch
 - **D1 — Depth semantics.** Root (no `parentID`) = 0, child = parent + 1. The guard judges the
   **child that the dispatch would create**: refuse when `callerDepth + 1 > max`. With the default
   `max = 1`, orchestrators dispatch and delegates cannot. This matches the delegate rule the protocol
-  already states ("do not sub-delegate"), so the protocol text stays unchanged.
+  already states ("do not sub-delegate"), so the protocol text stays unchanged. *Amended during
+  implementation (0.P, §1.7 A1): "cannot" holds in `enforced` mode; in `advisory` mode (the bundled
+  default) the delegate's dispatch proceeds with the `delegation_depth` banner.*
 - **D2 — Unknown depth fails open; conflicting evidence fails closed.**
   - When the caller's depth cannot be resolved (backend error, lookup timeout of 2 s, a session the
     backend no longer knows), the dispatch is allowed, and one warning per caller session goes
@@ -490,13 +492,18 @@ name. Evidence (file:line, spike sources and captures) is in
     `guardBeforeCall` on the same call, and delivered only for `isSubagent` sessions with guard state
     (`src\guard\enforce.ts:113–120,138–147`, `src\guard\store.ts:49–56`, `src\index.ts:1262–1279`).
     - `delegate`: appended to that call's returned string on every return path.
-    - `task` (v1, and v2 foreground): stored by `callID` in a bounded map (≤ 1 000, oldest evicted) in
-      the before-hook; in `"tool.execute.after"`, **before** the `isSubagent` branch, appended to that
-      call's output and deleted.
-    - v2 background (`status: "running"`) and non-completed results, where the bridge returns early
-      (`src\compat\v2-hooks.ts` ≈304–319): the bridge delivers the banner the way it delivers the
-      existing still-running notice.
-    - A call that fails: the entry is deleted (or evicted); it never attaches to another call.
+    - `task` on v1: stored in a bounded map (≤ 1 000, oldest evicted) keyed
+      `${input.sessionID}:${input.callID}` (the existing dispatch-key convention, `src\index.ts:1116`)
+      in the before-hook; in `"tool.execute.after"`, **before** the `isSubagent` branch, appended to that
+      call's output and deleted. A call without a `callID` gets no banner (one logged warning per
+      session), as the existing task branch skips it (`src\index.ts:1105`).
+    - `task` on v2 (`routerHost === "v2"`, A3): the before-hook does not use the map. It marks its
+      `output` with a symbol carrying the banner (the `TASK_VERIFICATION` precedent,
+      `src\index.ts:1108` → `src\compat\v2-hooks.ts:291`). The bridge keeps its own bounded map keyed by
+      `event.id` and is the **only** deliverer on v2: it appends the banner for a completed result and
+      in the completed → `running` (background) branch (≈308–318).
+    - A failed or non-completed call gets **no** banner, and its entry is dropped (v1 map or bridge
+      map). A banner is never delivered twice; 2.3.6 asserts it.
   - **G1 is amended:** the refusal holds when the caller's mode resolves to `enforced`. In the bundled
     default (`advisory`), a dispatch past the limit proceeds with the banner. **D12.1 is amended
     accordingly:** `maxDelegationDepth` defaults to `1`, and that limit is enforced only in `enforced`
@@ -515,7 +522,11 @@ name. Evidence (file:line, spike sources and captures) is in
       caller that is not `isSubagent`;
     - 3.1.4 CHANGELOG wording: "dispatches past `enforcement.maxDelegationDepth` (default `1`) are
       warned in `advisory` mode (the bundled default) and refused in `enforced` mode";
-    - 3.2.1(c): runs in both modes;
+    - 3.2.1(c): runs in both modes, and covers (QA-0.P-R2-6) an `enforced` refusal **through the loaded
+      router** on v2 (the bridge's async rejection to the host) for foreground, background and resume
+      dispatches, plus an `advisory`-mode allowed v2 background dispatch whose `running` result shows
+      the banner;
+    - §1.4 row `maxDelegationDepth`, D1, 1.1.3 and the 1.1 acceptance (amended in place);
     - §5, first risk row: the default warns; enforced mode is what affects users of nested delegation.
 - **A2 — D4 resolved.**
   - The guard result type is `BeforeResult` (`src\guard\enforce.ts:58–63`:
@@ -536,7 +547,9 @@ name. Evidence (file:line, spike sources and captures) is in
     `output.options`. The v2 bridge passes `event.options` itself as the legacy `output` → write it
     flat.
   - **Explicit host seam (QA-0.P-4).** `src\v2.ts` passes `routerHost: "v2"` in the plugin input next to
-    `routerChildRunner` (`src\v2.ts:15–21`; 2.3 owns `src\v2.ts` in Wave 2); absent means v1. The
+    `routerChildRunner` (`src\v2.ts:15–21`); absent means v1. The field is declared on
+    `RouterPluginInput` in `src\compat\child-session.ts:25–27` (no cast). 2.3 owns `src\v2.ts` and that
+    type in Wave 2. The
     single legacy `chat.params` handler writes the effort keys flat into `output` when
     `routerHost === "v2"` and into `output.options` on v1, never both. v1 always supplies
     `output.options` (every Spike B hook log); if it is absent or not an object on v1, the handler logs
@@ -547,7 +560,9 @@ name. Evidence (file:line, spike sources and captures) is in
     the registered tier name **and** the model identity (`providerID` + `modelID ?? id`) equals the
     tier's `model`; the host's `variant` is ignored (D7 excludes variant tiers; v2 reports
     `variant: "default"`). v2 title calls use a separate `title` hook, which the bridge does not
-    forward. **Confirmed on real hosts (Spike A2 R5, QA-0.P-7):** the router's own `delegate` producer
+    forward. Scope of the leak the gate closes (QA-0.P-R2-11): Spike A2 R5 shows no title request for
+    a parented producer on either host; the v1 title call shares the session only for producers created
+    without `parentID` (`toolCtx.sessionID` absent) and for other auxiliary agents. The gate stays. **Confirmed on real hosts (Spike A2 R5, QA-0.P-7):** the router's own `delegate` producer
     shows `agent: "fast"`, `providerID: "anthropic"`, `id: "claude-sonnet-4-5"` on v1 (`chat.params`,
     no `modelID`) and on v2 (`context`, plus `variant: "default"`).
   - **2.2.1 interface amended:** `applyEffortOverride(store, input: { sessionID?: string; agent?: unknown; model?: unknown }, target: Record<string, unknown>, logger)`
@@ -555,12 +570,17 @@ name. Evidence (file:line, spike sources and captures) is in
     host seam. An absent or non-object `target` → warning, no-op (2.2.1's "creates `output.options`
     when it is absent" and the matching test are superseded). The applied keys are the effort keys of
     `buildAgentOptions({ ...tier, effort })` after A4 (`effort` or `reasoningEffort`).
-  - **Host-level proof is a gate (QA-0.P-7).** 2.3's DoD adds a run of the Spike A2 rig
-    (`C:\Users\Marquinho\AppData\Local\Temp\Claude\spike-b\spike-a2\`, scripted keyless stub, real
-    1.18.19 and 2.0.22, the plugin loaded from the phase worktree) with a scripted failing first
-    attempt on a bumpable tier: the retry producer's captured request carries the bumped effort; the
-    first attempt's, the title's and the grader's requests do not. 3.2.1(c) and (d) are **mandatory**
-    and use the same scripted stub (keyless request capture exists now).
+  - **Host-level proof is a gate (QA-0.P-7, -R2-7).** 2.3's DoD adds a run of a copy of the Spike A2
+    rig (`C:\Users\Marquinho\AppData\Local\Temp\Claude\spike-b\spike-a2\`, scripted keyless stub, real
+    1.18.19 and 2.0.22, the plugin loaded from the phase worktree), with the copy's file hashes
+    recorded in `phase-2.3.md`, and a scripted failing first attempt on a bumpable tier: the retry
+    producer's captured request carries the bumped effort; the first attempt's, the title's and the
+    grader's requests do not. 3.2.1(c) and (d) are **mandatory** and use a **versioned** scripted stub:
+    3.2 owns the new helper `test\smoke\helpers\scripted-provider.ts` (§2). The v1 legs run in CI
+    through `npm run smoke:keyless` (the lane installs v1 1.18.19; adding the file to that script is the
+    existing 3.2 → 3.4 `package.json` handoff, no workflow edit). The v2 legs cannot run in CI (no
+    OpenCode 2 binary there) and are recorded as local evidence in `phase-3.2.md`; §4.2 is amended
+    accordingly.
   - The fallback (per-prompt `variant`) is not used, because the primary works on both hosts and the
     Claude catalog variants are thinking budgets, not effort levels. Corrected facts (QA-0.P-9): the
     v1 HTTP API does honour a per-message `variant` (Spike B isolation `v1-openai-same-VARIANT` sent
@@ -584,11 +604,12 @@ name. Evidence (file:line, spike sources and captures) is in
       `gpt-*` models, and non-reasoning GPT models, with a configured `effort` or `reasoning.*` now
       receive `reasoningEffort`/`reasoningSummary`. Whether the AI SDK strips them for non-reasoning
       models is **unverified**.
-    - Claude tiers with `thinking.budgetTokens` now send `thinking`; Anthropic rejects thinking with a
-      temperature other than 1, and the grader temperature is pinned (`graderTemperature: 0`). 1.3
-      checks which agent and options a grader session uses on v1, and 1.3/2.3 add a test that a grader
-      session never combines the temperature pin with a thinking budget (or the conflict is resolved
-      and documented).
+    - Claude tiers with `thinking.budgetTokens` now send `thinking`. Graders are not affected
+      (QA-0.P-R2-5): the v1 grader prompt sends `model` and `system` but no `agent`
+      (`src\verify\wiring.ts:1262–1268`), so it runs on the default agent and never receives a tier's
+      registered options; on v2 the grader agent gets no tier options either, and the bridge strips the
+      temperature unless pinned (`src\compat\v2-hooks.ts:219–223`). The temperature pin therefore
+      never meets a tier thinking budget; no test is needed.
     - Latency and cost rise wherever a budget or effort was silently ignored before.
 
     The CHANGELOG `Fixed` entry (3.1) is flagged as a v1 behaviour change, lists these cases, and gives
@@ -612,7 +633,9 @@ name. Evidence (file:line, spike sources and captures) is in
   the grader under the active tool context's session, so the host parent is the caller even when
   `parentSessionID` is undefined, and the creation point is the `onCreated` callback (≈1217–1221).
   **2.3.3 is amended:** `onChildSessionCreated` is called at both creation points (≈1217–1221 and
-  ≈1241–1243), and the 2.3.6 grader test covers v2.
+  ≈1241–1243), and the 2.3.6 grader test covers v2. For native-path graders the caller is known at the
+  gate (`orchestratorSessionID`, `src\index.ts:1307`) and is passed as the creator, so the grader is
+  recorded at caller depth + 1 rather than 1 (QA-0.P-R2-9); 2.3 owns that line of `src\index.ts`.
 - **A8 — M5 timing confirmed.** v1 native prompt path: create → `registerProducer` → prompt
   (`src\index.ts` ≈626–669). v2 `routerChildRunner`: `onCreated` is awaited in the progress callback
   before the child is prompted (`src\compat\v2-client.ts:97–108`). The override is set inside
@@ -638,11 +661,18 @@ name. Evidence (file:line, spike sources and captures) is in
   (≈1128–1153) → dispatch-header rewrite (≈1156–1191) → `guardBeforeCall` (≈1196–1221). The depth
   guard runs first for dispatch calls, before `observeEdit`. *Orchestrator decision (0.P):* the hook
   returns early when the plugin is bypassed (`/bypass`, `src\index.ts:404`, ≈1835–1839); the
-  user's explicit plugin-wide toggle also disables the depth guard. This is listed with the D11 limits
-  in the ADR and the README.
-- **A12 — Smoke isolation hardening (QA-0.P-15).** 1.3 also isolates `XDG_*`, `APPDATA`,
+  user's explicit plugin-wide toggle also disables the depth guard. The `delegate` tool's `execute`
+  does not check `bypassed` today (QA-0.P-R2-8), so 2.3.2.d checks it there as well and skips the depth
+  guard when bypassed, keeping both dispatch paths consistent; 2.3.6 tests `/bypass` on both. This is
+  listed with the D11 limits in the ADR and the README.
+- **A12 — Smoke isolation hardening (QA-0.P-15, -R2-10).** 1.3 also isolates `XDG_*`, `APPDATA`,
   `LOCALAPPDATA` and `OPENCODE_*` in `test\smoke\registration.smoke.test.ts` and
-  `test\smoke\subagent-tiers.smoke.test.ts`, as the v2 smoke and the Spike rigs do.
+  `test\smoke\subagent-tiers.smoke.test.ts`, as the v2 smoke and the Spike rigs do, and sets
+  `OPENCODE_DISABLE_MODELS_FETCH=true` (or keeps a cache directory) so an isolated cache does not force
+  a models.dev fetch per spawn. The lane is run on Windows (v1 1.18.19 first on `PATH`) before 1.3
+  merges, and CI's `smoke-keyless` must be green on the PR.
+- *Note on order:* A10 was written before A11 and A12 and sits above A11 in this list only by history
+  of the edits; the numbering is the reference (QA-0.P-R2-12).
 - **A10 — Local smoke environment.** `smoke:keyless` needs the CI-pinned v1 CLI (1.18.19) first on
   `PATH`, and `smoke:v2` needs `OPENCODE_V2_BIN`; the machine's default `opencode` is 2.0.22. The
   keyless fixtures now isolate `USERPROFILE` as well as `HOME` (`d8a9a42`). Commands in `phase-0P.md`.
@@ -685,6 +715,8 @@ commits the updated table.
 | `D:\git\opencode-model-router\test\smoke\registration.smoke.test.ts` (A4, A12; 0.P fixed its Windows isolation in `d8a9a42`) | 1.3 | — | — |
 | `D:\git\opencode-model-router\test\smoke\subagent-tiers.smoke.test.ts` (A12) | 1.3 | — | — |
 | `D:\git\opencode-model-router\src\v2.ts` (A3 host seam) | — | 2.3 | — |
+| `D:\git\opencode-model-router\src\compat\child-session.ts` (`RouterPluginInput` type only, A3) | — | 2.3 | — |
+| `D:\git\opencode-model-router\test\smoke\helpers\scripted-provider.ts` *(new; versioned scripted stub, A3)* | — | — | 3.2 |
 | `D:\git\opencode-model-router\docs\PER_TURN_EFFORT.md`, `D:\git\opencode-model-router\docs\OPENCODE_V2.md` (A4 key names) | — | — | 3.1 |
 | `D:\git\opencode-model-router\CHANGELOG.md` | — | — | 3.1 (then 3.4) |
 | `D:\git\opencode-model-router\README.md` | — | — | 3.1 |
@@ -835,7 +867,10 @@ complete? Are D6 and D7 amendments consistent with the code?
   extend `D:\git\omr-de-p11\test\unit\config.validate.test.ts` only where existing tables need the new
   keys.
 - **1.1.3** `[tier:medium]` Document the three keys in `D:\git\omr-de-p11\docs\CONFIG_REFERENCE.md`
-  (type, default, meaning, the D2/D7 notes, an example). Extend
+  (type, default, meaning, the D2/D7 notes, an example). *Amended during implementation (0.P, §1.7
+  A1):* the `maxDelegationDepth` entry states that a dispatch past the limit is warned in `advisory`
+  mode (the bundled default), refused in `enforced` mode, and ignored in `off` mode, and how to
+  enforce it. The 1.1 acceptance "exactly as in §1.4" means the amended §1.4 row. Extend
   `D:\git\omr-de-p11\test\unit\docs-drift.test.ts` so it also asserts that the three nested key paths
   appear in `CONFIG_REFERENCE.md`.
 
@@ -1520,7 +1555,9 @@ or worktrees; an AI-attribution line in the PR or the merge commit.
 
 - [ ] All phases meet their DoD; every phase QA report and `global.md` show zero open findings.
 - [ ] G1–G6 are demonstrated by tests that run in CI, and the 3.2.3 mutation check shows each proof
-      fails when its feature is off.
+      fails when its feature is off. *Amended during implementation (0.P, §1.7 A3):* except the v2
+      host-level legs of 3.2.1(c)/(d), which CI cannot run (no OpenCode 2 binary) and which are recorded
+      as local evidence in `phase-3.2.md`.
 - [ ] Coverage is ≥ 95% lines and branches for `src\router\depth.ts`, `src\router\depth-guard.ts` and
       `src\escalate\effort-override.ts`, and for the new code in `src\escalate\ladder.ts`,
       `src\router\agent-options.ts` and `src\router\config.ts`.
