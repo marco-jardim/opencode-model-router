@@ -95,6 +95,47 @@ describe("delegation depth guard", () => {
     },
   );
 
+  it.each([
+    ["object", () => ({ mode: "enforced" }), "object: [object Object]"],
+    ["array", () => [], "object: "],
+    ["symbol", () => Symbol("x"), "symbol: Symbol(x)"],
+  ] as const)("QA-2.1-R2-1: deduplicates 100 fresh %s modes by printed form", async (_name, fresh, printed) => {
+    const guard = setup(1);
+    guard.resolveMode.mockImplementation(() => fresh() as unknown as EnforcementMode);
+    for (let i = 0; i < 100; i++) {
+      expect((await guard.checkDispatch("caller")).mode).toBe("advisory");
+    }
+    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(
+      `[router] delegation depth: invalid enforcement mode ${printed}; using advisory.`,
+    );
+  });
+
+  it("QA-2.1-R2-1: deduplicates 100 fresh object limits by printed form", async () => {
+    const guard = setup(1);
+    guard.limit.mockImplementation(() => ({}) as unknown as number);
+    for (let i = 0; i < 100; i++) expect((await guard.checkDispatch("caller")).block).toBe(true);
+    expect(guard.warn).toHaveBeenCalledExactlyOnceWith(
+      "[router] delegation depth: invalid delegation depth limit object: [object Object]; using effective limit 1.",
+    );
+  });
+
+  it("safely bounds printed seam values and preserves their type tags", async () => {
+    const guard = setup(1);
+    const circular: unknown[] = [];
+    circular.push(circular);
+    const values: unknown[] = [Symbol("x"), 2n, Object.create(null), circular, "x".repeat(100), 2, "2"];
+    for (const value of values) {
+      guard.resolveMode.mockReturnValue(value as EnforcementMode);
+      await guard.checkDispatch("caller");
+    }
+    expect(guard.warn.mock.calls.map(([message]) => message.replace(
+      "[router] delegation depth: invalid enforcement mode ", "",
+    ).replace("; using advisory.", ""))).toEqual([
+      "symbol: Symbol(x)", "bigint: 2", "object: unprintable value", "object: ",
+      `string: ${"x".repeat(72)}`, "number: 2", "string: 2",
+    ]);
+  });
+
   it("validates an unrecognised state-file mode passed through the real resolver", async () => {
     const guard = setup(1);
     guard.resolveMode.mockImplementation(() => resolveEnforcementMode({

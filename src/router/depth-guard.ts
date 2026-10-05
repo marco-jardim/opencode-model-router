@@ -18,6 +18,17 @@ function describe(value: unknown): string {
   }
 }
 
+/** Runtime seam values are keyed by their bounded printed form, never identity. */
+function describeValue(value: unknown): string {
+  let printed: string;
+  try {
+    printed = String(value);
+  } catch {
+    printed = "unprintable value";
+  }
+  return `${typeof value}: ${printed}`.slice(0, 80);
+}
+
 export function depthLimitMessage(depth: number, max: number): string {
   return `[router] DELEGATION DEPTH LIMIT — this session is at delegation depth ${depth}; enforcement.maxDelegationDepth is ${max}, so it cannot dispatch another subagent. Do this part of the work yourself and report the result; do not retry the dispatch.`;
 }
@@ -77,7 +88,8 @@ export function createDepthGuard(deps: {
         if (resolved === "off" || resolved === "advisory" || resolved === "enforced") {
           mode = resolved;
         } else {
-          warnOnce(warnedModes, resolved, `invalid enforcement mode ${describe(resolved)}; using advisory.`);
+          const cause = describeValue(resolved);
+          warnOnce(warnedModes, cause, `invalid enforcement mode ${cause}; using advisory.`);
         }
       } catch (error) {
         const cause = describe(error);
@@ -95,7 +107,8 @@ export function createDepthGuard(deps: {
       }
       if (max === null) return { block: false, mode };
       if (!Number.isInteger(max) || max < 1 || max > MAX_DELEGATION_DEPTH_LIMIT) {
-        warnOnce(warnedLimits, max, `invalid delegation depth limit ${describe(max)}; using effective limit 1.`);
+        const cause = describeValue(max);
+        warnOnce(warnedLimits, cause, `invalid delegation depth limit ${cause}; using effective limit 1.`);
         max = 1;
       }
 
