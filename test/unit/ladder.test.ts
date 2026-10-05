@@ -1020,6 +1020,18 @@ describe("ladder effort step", () => {
     }
   });
 
+  it.each(["low", "max"] as const)("clamps hand-built currentEffort %s before stepping", (currentEffort) => {
+    const policy = bumpPolicy({
+      effortBump: { perTier: { fast: { base: "high", bound: "xhigh" } } },
+    });
+    const state = makeState({ totalAttempts: 1, currentEffort });
+    const before = structuredClone(state);
+    const action = nextAction(state, fail, policy);
+    expect(action).toMatchObject({ action: "retry", tier: "fast", effort: "xhigh" });
+    expect(advance(state, action).currentEffort).toBe("xhigh");
+    expect(state).toEqual(before);
+  });
+
   it("zero retries escalates directly without bumping", () => {
     const policy = bumpPolicy({ maxAttemptsPerTier: 0 });
     const state = recordAttempt(newLadderState("fast", policy), 1);

@@ -161,7 +161,13 @@ export function nextAction(
     const bump = perTier && Object.prototype.hasOwnProperty.call(perTier, state.currentTier)
       ? perTier[state.currentTier] : undefined;
     if (bump) {
-      const effort = nextEffort(state.currentEffort ?? bump.base, bump.bound) ?? state.currentEffort ?? undefined;
+      const current = state.currentEffort ?? bump.base;
+      const startingEffort = minEffort(
+        effortRank(current) < effortRank(bump.base) ? bump.base : current,
+        bump.bound,
+      );
+      const effort = nextEffort(startingEffort, bump.bound)
+        ?? (state.currentEffort == null ? undefined : startingEffort);
       if (effort !== undefined) action.effort = effort;
     }
     return action;
