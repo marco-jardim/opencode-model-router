@@ -1,6 +1,6 @@
 /** Real-host, keyless proof of depth enforcement and per-producer effort.
  * RUN_OC_SMOKE_KEYLESS=1 (or RUN_OC_SMOKE=1) enables v1 on PATH.
- * OPENCODE_V2_BIN additionally enables v2; RUN_OC_SMOKE_V2=1 enables v2 alone.
+ * RUN_OC_SMOKE_V2=1 with OPENCODE_V2_BIN enables v2 (independently of v1).
  * SMOKE_DEPTH_EFFORT_MUTATION=depth|bump changes CONFIG ONLY for proof mutation.
  * SMOKE_DEPTH_EFFORT_ARTIFACTS retains secret-free captures outside the checkout.
  */
@@ -17,9 +17,11 @@ import { ScriptedProvider, blocks, blockText, type HostVersion, type Block } fro
 const ROOT = path.resolve(__dirname, "../..");
 const MODEL = "anthropic/claude-opus-4-7";
 const KEYLESS = process.env.RUN_OC_SMOKE_KEYLESS === "1" || process.env.RUN_OC_SMOKE === "1";
+const V2 = process.env.RUN_OC_SMOKE_V2 === "1";
+if (V2 && !process.env.OPENCODE_V2_BIN) throw new Error("Set OPENCODE_V2_BIN to the OpenCode 2 executable when RUN_OC_SMOKE_V2=1");
 const hosts: { version: HostVersion; executable: string; enabled: boolean }[] = [
   { version: "v1", executable: "opencode", enabled: KEYLESS },
-  { version: "v2", executable: process.env.OPENCODE_V2_BIN ?? "", enabled: Boolean(process.env.OPENCODE_V2_BIN) && (KEYLESS || process.env.RUN_OC_SMOKE_V2 === "1") },
+  { version: "v2", executable: process.env.OPENCODE_V2_BIN ?? "", enabled: V2 },
 ];
 interface HookRecord {
   hook: string;
@@ -177,7 +179,7 @@ function scenarioConfig(mode: "enforced" | "advisory", effort = false, bump = tr
 
 for (const host of hosts) {
   const d = host.enabled ? describe : describe.skip;
-  d(`depth/effort real host ${host.version}`, () => {
+  d(`depth/effort real host ${host.version}${host.version === "v2" && !V2 ? " (set RUN_OC_SMOKE_V2=1 and OPENCODE_V2_BIN to run)" : ""}`, () => {
     it("loads set/unset/invalid keys without adding agents; invalid config warns but starts", async () => {
       const f = await fixture(host);
       const project = await f.project("baseline", {}, false);
