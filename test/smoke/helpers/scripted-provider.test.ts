@@ -69,9 +69,18 @@ it("reports fixture faults as non-retryable Anthropic errors", async () => {
   const { provider, url } = await start();
   const response = await fetch(url, { method: "POST", body: JSON.stringify({ tools: [{ name: "task" }], messages: [{ role: "user", content: "CALL_DELEGATE" }] }) });
   expect(response.status).toBe(400);
-  expect(await response.json()).toMatchObject({ type: "error", error: { type: "invalid_request_error", message: expect.stringContaining("unavailable delegate") } });
-  expect(provider.errors).toHaveLength(1);
+  expect(await response.json()).toEqual({ type: "error", error: { type: "invalid_request_error", message: "scripted provider error" } });
+  expect(provider.errors).toEqual(["Error: Fixture requested unavailable delegate (undefined)"]);
   expect(provider.captures).toHaveLength(1);
+});
+
+it("keeps malformed request diagnostics in memory instead of the HTTP response", async () => {
+  const { provider, url } = await start();
+  const response = await fetch(url, { method: "POST", body: "not-json-private-request" });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({ type: "error", error: { type: "invalid_request_error", message: "scripted provider error" } });
+  expect(provider.errors).toEqual([expect.stringContaining("SyntaxError")]);
+  expect(provider.captures).toHaveLength(0);
 });
 
 it("streams ordered Anthropic message events including ping", async () => {

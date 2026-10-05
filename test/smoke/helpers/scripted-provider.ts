@@ -108,7 +108,7 @@ export class ScriptedProvider {
     } catch (error) {
       this.errors.push(String(error));
       res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: String(error) } }));
+      res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "scripted provider error" } }));
     }
   });
 
