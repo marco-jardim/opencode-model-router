@@ -50,6 +50,128 @@ A15 requires every handoff addressed to 2.3 in `phase-0P.md` and `phase-1.*`/`ph
 | P37 | 2.2 Deferred | Provider acceptance unverified; no variant fallback; key docs | Deferred by plan (see Deferred) |
 | P38 | Plan, 2.3 pre-flight | Re-run Spike A's assertion against the current bridge | Applied in step 5 (unit test) and step 8 (E2 on real hosts) |
 
+### Host-level proof — PASS (2026-10-05)
+
+Tested source: `bc5205e48b990aded2030b9b2f9372b0c9cbdd23`; binaries: v1 **1.18.19**,
+v2 **2.0.22**. Retained rig: `C:\Users\Marquinho\AppData\Local\Temp\Claude\p23-host-proof\`.
+`hashes.json` records rig-source SHA-256; `provenance.json` records all **31,448** copied
+plugin/dependency files against the worktree, with **zero differences** before the proof run.
+A recheck after the smoke comparison found only the source worktree's mutable
+`node_modules/.vite/vitest/.../results.json` had changed; all plugin source and runtime
+dependencies still matched. See `provenance-recheck.json` and `provenance-recheck.log`.
+The original Spike A2 directory was not modified. Initial copy anomalies and unsuccessful
+fixture runs remain archived. All requests used an isolated project, fake keys and a local
+scripted Anthropic Messages stub; this does not establish upstream provider acceptance.
+
+| Scenario | v1 | v2 | Captured evidence |
+|---|---|---|---|
+| E1 effort bump | PASS | PASS | Producer `output_config.effort`: `low` → `medium`; two grader calls, first fails and second passes; title/grader/orchestrator effort absent |
+| E2 enforced foreground | PASS | PASS | Child's next request contains exact D5 error, `is_error: true`; root continues to `ok`, exit 0 |
+| E2 enforced background | Not applicable | PASS | Native `subagent` input `background: true`; exact D5 error and continued turn |
+| E2 enforced resume | PASS | PASS | Captured `task_id` / `sessionID` matches a previously created child; exact D5 error and continued turn |
+| E3 advisory foreground | PASS | PASS | Nested dispatch completed; full guard banner exactly once at the end of the captured tool result |
+| E3 advisory background | Not applicable | PASS | Native input `background: true`; result output/metadata `status: "running"`; full banner exactly once in HTTP tool-result content and structured output |
+| E3 advisory resume | PASS | PASS | Resumed existing child; full banner exactly once for the resume call; v2 resumes the caller's own child |
+| E4 bump disabled | PASS | PASS | Producer effort `low` → `low` on both hosts |
+
+E1 debug scorecards on both hosts: `final_tier=fast@medium`, `attempts=2`,
+`escalations=0`, `verdict=PASS`, `method=checker`. Model-visible delegate output was
+`CHILD_DONE` followed by `[router ✓ verified: checker]`, without a scorecard.
+`scorecards.json` retains the debug text and paths. Both E4 scorecards report
+`final_tier=fast`, `attempts=2`, `escalations=0`, `verdict=PASS`.
+
+V2 E3 foreground first returned `No tool named "subagent" is currently available.`
+Adding explicit `general` subagent permission enabled the tool but revealed a separate
+host cap. The second captured child tool result was:
+
+```json
+{"error":{"type":"tool.execution","message":"Subagent depth limit reached (1). Increase \"experimental.subagent_depth\" to allow nested subagents."},"content":[]}
+```
+
+It had `is_error: true` and no advisory banner. Root session:
+`ses_ef46743cbffeCodsMuxQtKMSx8`; child: `ses_ef46740bbffeoLe4wWnzVyWJm2`;
+call: `toolu_proof_1791195922290`. The fixture used top-level `subagent_depth: 4`,
+which lifted v1's cap but did not lift v2's `experimental.subagent_depth` cap.
+The follow-up sets **`experimental.subagent_depth: 4` on v2**, plus an explicit
+`general` agent permission allowing `subagent`. The router's own
+`enforcement.maxDelegationDepth` remains **1**. On OpenCode 2, nested dispatches are
+additionally limited by the host's `experimental.subagent_depth` (default 1);
+raising only the router limit or the v1 top-level key does not lift that host cap.
+These unsuccessful fixture attempts are retained, not counted as product defects.
+
+Two additional fixture corrections were needed in the follow-up:
+
+- V2 background results expose `status: "running"` in `result.output` and
+  `result.metadata`, not an XML `state="running"` attribute. The report checks those
+  linked after-hook fields and the captured HTTP content; both output channels have
+  the full banner exactly once. Call: `toolu_proof_1791196319166`.
+- V2 only permits resuming a direct child of the caller. The initial sibling-resume
+  attempt is archived under `v2-sibling-resume-attempt/`. The accepted fixture first
+  creates root → caller → leaf, then resumes the same caller to resume its leaf.
+  Caller: `ses_ef45fe746ffeci3QQddNXnl6RS`; leaf:
+  `ses_ef45fe70cffexaflSar7DiFGen`; resume call: `toolu_proof_1791196406666`.
+  Parent IDs and the reused session ID are asserted, not inferred from the banner.
+
+Assertions and raw evidence: `report.mjs`, `final-verdicts.json`, `REPORT.md`,
+`captures.jsonl`, `hooks.jsonl`, per-scenario stdout/stderr and archived attempts.
+`node report.mjs` and `node finalize.mjs` re-evaluated all retained accepted captures:
+**14/14 scenario/host combinations passed**, with exit 0 and a final `ok` on every run.
+Earlier verdicts, including the XML-shaped background assertion failure, remain archived.
+
+Requested smoke commands were run from this worktree with isolated environment:
+
+- `npm run smoke:keyless`, v1 bin directory first on PATH: **FAIL**, 8 passed / 1 failed.
+  `deferred-catalog.smoke.test.ts:305`: `'ghost-model-9' never appeared in the opencode log.`;
+  `turn statuses: 500, 500`; log and stderr fields empty. Registration and subagent-tier
+  files passed. Full output: `smoke-keyless.log`.
+- `npm run smoke:v2`, `OPENCODE_V2_BIN` set to the requested 2.0.22 binary:
+  **PASS**, 2/2 tests. Full output: `smoke-v2.log`.
+
+#### Smoke regression check — not a Phase 2.3 regression
+
+Ran **only** `test/smoke/deferred-catalog.smoke.test.ts`, using
+`RUN_OC_SMOKE_KEYLESS=1`, `--config vitest.smoke.config.ts`, and v1 **1.18.19** first
+on PATH. Each branch was tested twice under the original isolated wrapper, then twice
+with only `XDG_DATA_HOME` unset (other isolated environment paths retained).
+
+| Source | Original wrapper, rounds 1 / 2 | Log-path control, rounds 1 / 2 |
+|---|---|---|
+| `de/main` — `b318faa515891ca1f1d66400e9137bf6f014f277` | FAIL / FAIL | PASS / PASS |
+| `de/p23` — `bc5205e48b990aded2030b9b2f9372b0c9cbdd23` | FAIL / FAIL | PASS / PASS |
+
+**Cause:** the test reads `<homeDir>/.local/share/opencode/log` (lines 102–121),
+but its child inherits `XDG_DATA_HOME` (line 197). The scratch smoke wrapper had set
+that variable, redirecting the real log to `<case>/data/opencode/log/opencode.log`.
+All four failing comparison runs actually contain the expected `level=WARN`
+`ghost-model-9` entry at line 25 of that real log. The original p23 lane's log also
+contains it at line 26 of `smoke-env/data/opencode/log/opencode.log`.
+Thus the warning was emitted; the test was looking in a different directory.
+
+The server-side 500 is the test's deliberately nonexistent model, which the test
+explicitly does not assert (lines 263–282), not a Phase 2.3 hook exception:
+
+```text
+ProviderModelNotFoundError: Model not found: no-such-provider/no-such-model.
+    at <anonymous> (B:/~BUN/root/chunk-yxwqt1sp.js:439:90378)
+    at SessionPrompt.getModel (B:/~BUN/root/chunk-mp12mgys.js:1096:11490)
+    at SessionPrompt.getModel (definition) (B:/~BUN/root/chunk-mp12mgys.js:1096:908)
+    at SessionPrompt.run (B:/~BUN/root/chunk-mp12mgys.js:1096:15306)
+```
+
+No responsible Phase 2.3 commit or new throwing router path was found; no commit bisect
+was needed because the failure reproduces before Phase 2.3 and disappears on both
+branches with the environment-only control. No repository code or tests were changed.
+Evidence: `smoke-comparison/summary.json`, `smoke-logpath-control/summary.json`,
+per-case `vitest.log`, retained actual server logs, `smoke-diagnosis.json` and
+`SMOKE-DIAGNOSIS.md` (full original error stack included).
+
+The **host-level proof gate is satisfied**. The original keyless lane's 8/9 result is
+retained above rather than rewritten as a fresh 9/9 run; its sole failing file now
+passes twice on p23 with the corrected wrapper environment. The v2 lane remains 2/2.
+Cleanup at `2026-10-05T07:33:31.5420501-03:00` found no rig processes, v1 smoke servers,
+or listeners on the five recorded stub ports. `cleanup.json` records an unrelated
+Context7 process whose parent PID matched an old host PID; it was not killed.
+
 ## Implementation notes
 
 ### Decisions (binding for 2.3.2–2.3.6)
