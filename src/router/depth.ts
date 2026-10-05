@@ -169,8 +169,10 @@ export function createDepthTracker(
     invalidate(id);
   }
 
-  // Marks every tracked descendant of `id` stale. Invariant: a stale node has
-  // only stale tracked children, so the walk stops at the first stale node.
+  // Marks every tracked descendant of `id` stale. Invariant: a stale node has no
+  // fresh non-terminal tracked child, so the walk stops at the first stale node.
+  // A fresh terminal (MAX) child can sit under a stale parent: its value can no
+  // longer change, so it needs no invalidation.
   function invalidate(id: string): void {
     const queue = [id];
     for (let i = 0; i < queue.length; i++) {

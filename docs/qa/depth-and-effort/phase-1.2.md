@@ -66,6 +66,8 @@ failedAt: Map<string, number> // throttle, keyed by the id whose getParent faile
 warned: Map<string, number>   // keys "lookup:<id>" | "conflict:<id>" → stamp; capped at maxEntries (FIFO)
 ```
 
+*Amended (QA-1.2-2, QA-1.2-7, QA-1.2-R2-2, QA-1.2-R2-3):* `nodes` is now two maps, `lru` and `pins`, under one `maxEntries` cap. Nodes also carry the memo fields `pinned`, `fresh`, `gap` and `via`. `strays` (FIFO-capped) holds the detached lookups. See §6.
+
 **Complete nodes vs placeholders (G2, vi, vii).**
 - Every entry in `nodes` is *complete*: its own links are known from root evidence, a parentID, a backend answer, or a plugin anchor.
 - A **placeholder** is an id that only appears in someone's `parents`. It is not a node, it is not counted by `size()`, it is never assumed to be a root, and it adds nothing until it is looked up.
@@ -219,25 +221,37 @@ warnOnce(id, why): key "lookup:"+id; once per key; logger.warn(`[router] depth: 
 
 ### 6. Eviction, touch, forget
 
-- *Amended by QA-1.2-2 (`4c9e0d1`) and QA-1.2-7 (`e48fd26`):*
-  - Plugin children, nodes with a recorded conflict and nodes whose floor exceeds what their complete links prove (`excess`) are **pinned**: a separate recency-ordered map outside the LRU, capped at `maxEntries`. A pinned overflow drops the oldest pinned node (never the current one) with a `dropping pinned evidence` warning; it is the only non-TTL loss path. `size()` counts both maps.
-  - Evicting or TTL-dropping a node clears the frontier memo (`resolved`) of its tracked children and marks its descendants stale, so they re-resolve the dropped id through the backend instead of trusting a memo that cannot see later conflicts above it. `forget` keeps the frontier (F4).
-  - `trim(protect)` never evicts the node the current call recorded or read; its ancestors go first and it re-resolves them.
-  - `memoize` touches the visited nodes in reverse post-order and then the start's critical path (`via` chain, ≤ `MAX_DEPTH_HOPS`), not every ancestor. Non-critical ancestors may age out first; that costs a re-lookup, never a lower answer.
-  - The ancestor-recency invariant below is therefore an efficiency property, not a correctness one.
+*Rewritten for QA-1.2-R2-4. This section describes the code after QA-1.2-2 (`4c9e0d1`), QA-1.2-7 (`e48fd26`), QA-1.2-R2-1 (`50c4491`), QA-1.2-R2-2 (`b1d8d7b`) and QA-1.2-R2-3 (`198d205`).*
+
+- **Two maps, one cap:**
+  - Nodes live in two recency-ordered maps (oldest first).
+    - `lru` holds *ordinary* nodes. A backend walk can reproduce their evidence, given the shared-source assumption of F6.
+    - `pins` holds *pinned* nodes: plugin children, nodes with a recorded conflict, and nodes whose floor exceeds what their complete links prove (`excess`). Their evidence cannot be reproduced from the backend.
+  - `size()` counts both maps, and a single `maxEntries` cap covers them, so `size() ≤ maxEntries` after every public call (I13, plan 1.2.2.e). Only `adopt` adds a node, and every `adopt` is trimmed within the same synchronous call. `pin` moves a node between the maps without changing the total, so the cap is never overshot between calls.
+  - `trim(protect)` evicts ordinary nodes first, oldest first. `protect` is the node the current call has just recorded or read, and it goes last among them: its ancestors are evicted before it, and it re-resolves them later. It is evicted itself only when pinned nodes fill the whole cap, and only after its answer has been computed.
+  - A pinned node is dropped only when pinned nodes alone exceed the cap. The victim is the oldest-touched pinned node other than `protect`, and a `dropping pinned evidence` warning is logged. This logged overflow is the only loss path besides the TTL. Reads touch only their critical path, so the victim can be a non-critical ancestor of a live node.
+  - Evicting a node (LRU, TTL or overflow) clears the frontier memo (`resolved`) of its tracked children and marks its descendants stale. They then re-resolve the dropped id through the backend instead of trusting a memo that cannot see later conflicts above it. `forget` keeps the frontier (F4).
 - **Touch rules (v):**
-  - `touch(x)` sets `lastTouch = now()` and does `nodes.delete(x); nodes.set(x, n)`. It is called only by `memoize`.
-  - `memoize` runs on every read (`depthOf`, including the fast and failure paths) and every write (`record*`).
-  - It touches in reverse post-order: the start first, ancestors after it, roots last.
-  - `trimLRU()` evicts `nodes.keys().next()` while `size > maxEntries`.
-  - No other counter exists, so accounting cannot drift. Placeholders, lookups, walks, `failedAt` and `warned` are not nodes. A failed lookup of an unknown id creates no node.
-- **Ancestor-recency invariant:** after every public call, each tracked link `C → P` has `P` later in the LRU order than `C`, and `P.lastTouch ≥ C.lastTouch`. As a result:
-  - LRU and TTL evict descendants no later than their ancestors.
-  - An intermediate node is never evicted while a descendant that climbs through it is still tracked, except via `forget`, cycles, or a non-monotone `now()` (F4).
-- **`sweep()`:**
-  - Deletes nodes with `now - lastTouch >= ttlMs`. Future stamps give a negative difference and are kept.
-  - Drops `failedAt` entries that are no longer throttling, and `warned` entries older than `ttlMs`.
-  - Defaults: `ttlMs = DEFAULT_IDLE_TTL_MS`, `maxEntries = 10_000`. Invalid option values fall back to the defaults: `ttlMs` must be finite and > 0; `maxEntries` must be an integer ≥ 1.
+  - `touch(x)` sets `lastTouch = now()` and moves `x` to the end of its map. Only `memoize` calls it, and `memoize` runs on every read (`depthOf`, including the fast and failure paths) and every write (`record*`).
+  - `memoize` touches the visited nodes in reverse post-order (start first), then the start's critical path (the `via` chain, ≤ `MAX_DEPTH_HOPS`). It does not touch every ancestor. A climb that stops at fresh memos visits only the start, so non-critical ancestors keep older stamps:
+    - the LRU may evict an ordinary one, which costs a re-lookup but never gives a lower answer;
+    - the TTL keeps every one of them while a descendant is live (`sweep()` below).
+  - No other counter exists, so the accounting cannot drift. Placeholders, lookups, walks, strays, `failedAt` and `warned` are not nodes, and a failed lookup of an unknown id creates no node.
+- **Ancestor recency is an efficiency property only.** Before QA-1.2-7 it was the correctness argument. Now a read keeps its critical path warm, so a re-read seldom needs a re-lookup. Correctness rests on three rules:
+  - pinned nodes are never LRU-evicted;
+  - `drop` un-resolves the dropped node's children;
+  - `sweep` keeps the ancestors of live nodes.
+- **`sweep()`** (QA-1.2-R2-1):
+  - A node *survives* if `now - lastTouch < ttlMs`. A future stamp gives a negative difference, so it survives.
+  - The sweep keeps every survivor and every tracked ancestor within `MAX_DEPTH_HOPS` hops of a survivor, whatever that ancestor's own stamp. It finds them with a multi-source BFS over the recorded links, where the first visit gives the shortest distance. Every other node is dropped, pinned nodes included (F2).
+  - The bound is safe because a survivor's depth depends only on ancestors within 32 hops. Any longer path makes it ≥ 33, which is MAX, and the kept ancestor at hop 32 still has its link, so its floor of ≥ 1 keeps it there.
+  - Cost: O(nodes + links) per sweep, which is ≤ `maxEntries × (1 + MAX_PARENT_LINKS)`, and nothing per read. The rejected alternative, refreshing every pinned ancestor on every read, would bring back the O(reachable ancestors) read cost that QA-1.2-7 removed.
+  - The sweep also drops `failedAt` entries that no longer throttle, and `warned` entries older than `ttlMs`.
+  - Defaults: `ttlMs = DEFAULT_IDLE_TTL_MS`, `maxEntries = 10_000`. Invalid option values fall back to the defaults: `ttlMs` must be finite and > 0, and `maxEntries` must be an integer ≥ 1.
+- **Bounded side maps** (QA-1.2-5, QA-1.2-R2-2): `warned`, `failedAt` and the detached lookups (`strays`) are each FIFO-capped at `maxEntries`.
+  - A stray beyond the cap is cancelled and its late answer discarded. That answer is backend evidence, so a later lookup reproduces it, and no late answer escapes `forget`.
+  - Strays never decide whether a new lookup may start (admission). Per id, at most one *attached* lookup is in flight. If an id still has a stray pending at the backend, a new lookup for it starts only once its throttle lapses: `DEPTH_LOOKUP_RETRY_MS` after the detach, or sooner if `maxEntries` newer failures push it out of the `failedAt` FIFO.
+  - So while the backend hangs, one more call per id can start each time its throttle lapses. The seam has no abort, so a cancelled stray's call may stay pending in the backend, but the tracker holds at most `maxEntries` strays.
 - **Memoized depth is absolute:**
   - Evicting or forgetting an ancestor leaves a *resolved* descendant's answer unchanged, with no lookup (frontier rule).
   - An *unresolved* descendant looks the missing ancestor up again, as a new lifetime, and keeps its floor if that fails.
@@ -245,7 +259,7 @@ warnOnce(id, why): key "lookup:"+id; once per key; logger.warn(`[router] depth: 
 - **`forget(id)`:**
   - Deletes the node, `failedAt[id]` and both `warned` keys.
   - Cancels and removes `walks[id]`: awaiting callers get `undefined`, and `id` is not re-memoized.
-  - Cancels and removes `lookups[id]`: the late answer is discarded, and other walks awaiting it settle at their floor with no throttle recorded.
+  - Cancels and removes `lookups[id]` and every stray of `id`: the late answers are discarded, and other walks awaiting the attached lookup settle at their floor with no throttle recorded.
   - Descendants keep their links to `id` and their floors.
   - `forget` is not a tombstone: later evidence re-creates the node.
 
@@ -276,10 +290,21 @@ warnOnce(id, why): key "lookup:"+id; once per key; logger.warn(`[router] depth: 
 ## Findings
 
 - **F1 (decision):** on failure, timeout or throttle, `depthOf` returns the known floor and returns `undefined` only when nothing is known. The plan text says "undefined". The floor is ≤ truth and never more permissive than `undefined`. QA should assert against this memo.
-- **F2 (residual, v1):** a v1 plugin child that stays idle ≥ `DEFAULT_IDLE_TTL_MS` (60 min) is evicted. *Scope after QA-1.2-2:* pinned nodes (plugin children, conflict nodes, excess floors) are never LRU-evicted; they are lost only to this idle TTL or to a logged pinned-cap overflow. The backend then reports it as a root, so it gets depth 0 although the truth is ≥ 1. This comes from bounded memory combined with v1 having no parentID. The real fix belongs in Phase 2: pass `toolCtx.sessionID` when creating v1 sessions.
+- **F2 (residual, v1):** a v1 plugin child that is lost to the tracker gets re-resolved through the backend, which reports it as a root. It then reads depth 0, although the truth is ≥ 1. The same applies to every pinned node (conflicts, excess floors), because the backend cannot reproduce its evidence. *Scope after QA-1.2-2, QA-1.2-R2-1 and QA-1.2-R2-3:* a pinned node is never LRU-evicted. It is lost in exactly two ways:
+  - (a) **Idle TTL:** neither the node nor any descendant within `MAX_DEPTH_HOPS` hops was touched for `DEFAULT_IDLE_TTL_MS` (60 min). Since R2-1, `sweep` keeps every ancestor of a live node, so a pinned node whose descendants are still read no longer expires.
+  - (b) **Logged overflow:** more than `maxEntries` pinned nodes.
+
+  This comes from bounded memory combined with v1 having no parentID. The real fix belongs in Phase 2: pass `toolCtx.sessionID` when creating v1 sessions.
 - **F3 (open):** a grader's `parentID` may differ from its creator. Both links are kept and the larger depth wins, without a warning. Spike A2 covered producers only, so graders need confirmation in Phase 2.
-- **F4 (residual):** `forget(intermediate)` followed by a conflict above it leaves resolved descendants at their memo. Eviction cannot cause this, because of the ancestor-recency invariant. A clock going backwards could weaken TTL ordering; LRU ordering does not depend on the clock.
+- **F4 (residual):** `forget(intermediate)` followed by a conflict above it leaves resolved descendants at their memo (the frontier rule). This is deliberate: `forget` keeps the frontier, so the descendants of a deleted session keep their depth without a lookup.
+  - Eviction cannot cause this. `drop()` clears the tracked children's `resolved` on every eviction (LRU, TTL, pinned overflow) and marks the descendants stale, so they re-resolve the dropped id through the backend. The round-2 fuzz found no frontier memo created by eviction.
+  - Before QA-1.2-7 this relied on the ancestor-recency invariant, which is now only an efficiency property (§6).
+  - The clock cannot cause it either: TTL retention keeps ancestors because their descendants survive, not because of the ancestors' own stamps, and LRU order does not use the clock.
 - **F5:** `DEPTH_LOOKUP_RETRY_MS` duplicates the private `SESSION_LOOKUP_RETRY_MS`. Phase 2 can have `index.ts` import it.
+- **F6 (residual, accepted — event-vs-backend disagreement, QA-1.2-R2-4):** a conflict is pinned only if the tracker holds both sides at once.
+  - If the first side was evicted before the contradicting evidence arrives, the new evidence creates or extends an *ordinary* node. Examples of a first side: a backend root, an event root, or an event link.
+  - The node's next eviction leaves only the backend's answer, which may be lower.
+  - OpenCode's session events and session.get both read the same session record, and a session's parentID is immutable, so the two sources cannot legitimately disagree; a disagreement is only protected while the tracker holds both sides. Accepted by the orchestrator (0.P rules) as a documented limit.
 
 QA review, round 1 (adversarial, `0b1dc9f` + `b591032`). The repro sequences use the fixture's `getParent`, `now` and `logger` seams.
 
@@ -345,6 +370,7 @@ QA review, round 2 (adversarial re-review of `80afc33`, `4c9e0d1`, `be82886`, `1
 - 1.2.2 (@medium): implement `src/router/depth.ts` exactly as in §2–§6. No design decisions are left open.
 - 1.2.3 (QA): T-* tests per §7. Attack I3, I6, I10–I12 and I15 first.
 - Phase 2 owner: F2, F3, F5.
+- Phase 2.1: `MAX_DEPTH_HOPS` (32, `depth.ts`) must equal Phase 1.1's `MAX_DELEGATION_DEPTH_LIMIT` (32, `src/router/config.ts`, not merged here). The tracker does not import it (I19). Phase 2.1 pins the equality with a test after both branches merge.
 
 ## Verdict
 
