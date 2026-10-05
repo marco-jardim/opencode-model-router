@@ -620,7 +620,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           const depth = bypassed ? undefined : await depthGuard.checkDispatch(toolCtx?.sessionID);
           if (depth?.block) {
             try {
-              if (typeof toolCtx?.sessionID === "string") {
+              // Known subagents are counted by the normal after-hook: delegate
+              // returns a refusal rather than throwing (unlike native task).
+              if (typeof toolCtx?.sessionID === "string" && !sessionStore.isSubagent(toolCtx.sessionID)) {
                 trajectoryStore.recordToolEvent(toolCtx.sessionID, { tool: "delegate", readOnly: false, blocked: true });
               }
             } catch {

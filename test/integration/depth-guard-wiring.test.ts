@@ -11,6 +11,7 @@ import { DEFAULT_DEPTH_TIMEOUT_MS } from "../../src/router/depth";
 
 const captured = vi.hoisted(() => ({
   pending: undefined as ReturnType<typeof import("../../src/verify/wiring").createVerificationWiring>["pending"] | undefined,
+  trajectory: undefined as ReturnType<typeof import("../../src/telemetry/trajectory").createTrajectoryStore> | undefined,
 }));
 const observed = vi.hoisted(() => ({
   startDispatch: vi.fn(), prepareVerification: vi.fn(),
@@ -46,6 +47,15 @@ vi.mock("../../src/verify/dispatch", async (importOriginal) => {
 });
 
 type Hook = (input: unknown, output?: unknown) => Promise<void>;
+vi.mock("../../src/telemetry/trajectory", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../src/telemetry/trajectory")>();
+  return { ...original, createTrajectoryStore: (...args: Parameters<typeof original.createTrajectoryStore>) => {
+    const store = original.createTrajectoryStore(...args);
+    captured.trajectory = store;
+    return store;
+  } };
+});
+
 type TestHooks = Record<string, Hook> & {
   dispose(): Promise<void>;
   tool: { delegate: { execute(args: { task: string; tier?: string; acceptance?: string }, ctx?: { sessionID?: string }): Promise<string> } };
@@ -411,6 +421,22 @@ describe("delegation depth plugin wiring", () => {
     });
   }
 
+  it("counts a refused delegate from a known subagent once and preserves false-refusal detection", async () => {
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
+    vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
+    const { hooks } = await setup();
+    await seed(hooks);
+    const result = await hooks.tool.delegate.execute(delegateArgs, { sessionID: "C" });
+    expect(result).toBe(depthLimitMessage(1, 1));
+    await hooks["tool.execute.after"]({ tool: "delegate", sessionID: "C", callID: "blocked" }, { output: result });
+    expect(captured.trajectory?.toolCallCount("C")).toBe(1);
+    for (const sid of ["C", "untouched"]) {
+      const out = { output: `task_id: ${sid}\n<task_result>NEED CONTEXT: I cannot dispatch; handing back because tools are unavailable.</task_result>`, metadata: { sessionId: sid } };
+      await hooks["tool.execute.after"](taskInput("O", `return-${sid}`), out);
+      expect(out.output.includes("FALSE-REFUSAL SUSPECT")).toBe(sid === "untouched");
+    }
+  });
+
   it("records a refused delegate after a fail-open transform so its hand-back is not a false refusal", async () => {
     vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
     vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
@@ -428,6 +454,7 @@ describe("delegation depth plugin wiring", () => {
     // Even the generic after-hook does not record this caller: the failed
     // transform never marked it as a subagent, unlike a session.created event.
     await hooks["tool.execute.after"]({ tool: "delegate", sessionID: "C", callID: "blocked" }, { output: depthLimitMessage(1, 1) });
+    expect(captured.trajectory?.toolCallCount("C")).toBe(1);
     for (const sid of ["C", "untouched"]) {
       const out = { output: `task_id: ${sid}\n<task_result>NEED CONTEXT: I cannot dispatch; handing back because tools are unavailable.</task_result>`, metadata: { sessionId: sid } };
       await hooks["tool.execute.after"](taskInput("O", `return-${sid}`), out);
