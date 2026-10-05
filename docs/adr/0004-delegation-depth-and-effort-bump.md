@@ -236,9 +236,11 @@ that fixture setting into a cross-version recommendation.
   producer's session ID; a session-ID-only override is therefore insufficient.
 - **Loaded-router host proof:** `docs/qa/depth-and-effort/phase-2.3.md` records **14/14**
   scenario/host combinations passing on those same versions, tested source
-  `bc5205e48b990aded2030b9b2f9372b0c9cbdd23`. The retained rig is
-  `C:\Users\Marquinho\AppData\Local\Temp\Claude\p23-host-proof\`; `hashes.json` and
-  `provenance.json` record the rig and copied plugin/dependency provenance. Captures show
+  `bc5205e48b990aded2030b9b2f9372b0c9cbdd23`. The evidence uses a scripted keyless provider
+  against real OpenCode 1.18.19 and 2.0.22, recorded in
+  `docs/qa/depth-and-effort/phase-0P.md` and `phase-2.3.md`. The owner retains the rig
+  locally; the latter report records hashes, with `hashes.json` and `provenance.json`
+  documenting the rig and copied plugin/dependency provenance. Captures show
   producer `low → medium`, a failing then passing grader, no title/grader/orchestrator effort
   leakage, and `low → low` with the bump disabled. They also cover exact enforced refusals and
   single advisory banners for foreground, resume and v2 background results. Every accepted run
@@ -263,8 +265,9 @@ that fixture setting into a cross-version recommendation.
 - **F2 — bounded retention can lose non-backend evidence.** Plugin-child pins, conflicts and
   excess depth floors are not ordinary LRU victims, but idle TTL expiry or logged pinned/held-ghost
   overflow can discard evidence the backend cannot reproduce (`src/router/depth.ts`,
-  `docs/qa/depth-and-effort/phase-1.2.md`). The default is 10,000 tracked nodes and a 60-minute
-  idle TTL (`src/router/idle-sweep.ts`). Sweep retains ancestors within 32 hops of live descendants,
+  `docs/qa/depth-and-effort/phase-1.2.md`). The defaults are 10,000 tracked nodes
+  (`DEFAULT_DEPTH_MAX_ENTRIES` in `src/router/depth.ts`) and a 60-minute idle TTL
+  (`src/router/idle-sweep.ts`). Sweep retains ancestors within 32 hops of live descendants,
   including links remembered as ghosts, but a path already forgotten, expired or dropped from
   the ghost cap cannot protect an ancestor until re-fetched. A surviving unparented producer or
   native-path grader resumed after its pin expires can re-resolve as depth 0. Normal per-attempt
