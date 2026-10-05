@@ -174,6 +174,9 @@ A dispatch past the limit is **warned**, not blocked, in `advisory` mode (the
 bundled default), with a `[⚠ GUARD:delegation_depth]` banner. It is **refused** in
 `enforced` mode and ignored in `off`. To enforce the limit, set
 `enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`.
+An `enforcement.perTier` entry for the caller's tier overrides `mode` when the
+env gate is unset/empty; an `advisory` entry keeps that tier warn-only. The env
+gate `MODEL_ROUTER_ENFORCE=1` overrides both.
 
 The guard covers the native `task` tool (including `task_id` resume and OpenCode 2
 background dispatches) and the `delegate` tool. Unknown depth caused by a backend
@@ -980,6 +983,9 @@ pins this: it resolves the real policies from the shipped file and from the same
 | Field | Shipped value | Applied by |
 |---|---|---|
 | `mode` | `"advisory"` | `src/router/enforcement.ts` — violations are logged, never blocked |
+| `maxDelegationDepth` | not shipped; code default `1` | `src/router/config.ts` (`resolveDepthLimit`) |
+| `escalate.effortBump` | not shipped; code default `true` | `src/router/config.ts` (`resolveEffortBump`) |
+| `escalate.effortBumpMax` | not shipped; code default `"xhigh"` | `src/router/config.ts` (`resolveEffortBump`) |
 | `envGate` | `"MODEL_ROUTER_ENFORCE"` | `src/router/enforcement.ts` (`DEFAULT_ENV_GATE`) |
 | `guard.budget` | `25` | `src/guard/enforce.ts` (`DEFAULT_GUARD_BUDGET`) — per dispatch; the cumulative ceiling across resumes is `budget × 3` |
 | `guard.readDraftCap` | `3` | `src/guard/enforce.ts` |
@@ -1007,6 +1013,9 @@ would document a fiction: `verify.require` (no default — see above), `verify.g
 `escalate.costCeiling.base`. These are validated when present but never consumed.
 `verify.gateBudgetMs` was removed from the bundled file; its in-code default (`90000`)
 still applies, as do the defaults of the other §1.4 `verify` keys (see the `verify` table).
+Also not shipped, but resolved by code rather than unread: `maxDelegationDepth`
+defaults to `1` in `resolveDepthLimit`, and `escalate.effortBump` / `escalate.effortBumpMax`
+default to `true` / `"xhigh"` in `resolveEffortBump`.
 
 ### `mode` defaults to `advisory`, and what `enforced` would change
 
@@ -1018,11 +1027,15 @@ Changing `mode` to `"enforced"` turns those same evaluations into actions:
 
 - **Guards block.** A call that violates `readDraftCap`, `sameOpRetryCap`, `blockSelfScript`,
   `deliverableFirst`, `blockScriptWrites` or `budget` is refused instead of noted.
+- **The depth guard refuses.** Dispatches past `maxDelegationDepth` are refused
+  instead of warned (`null` disables this guard).
 - **Verification gates acceptance.** A failed grader or deterministic check makes the
   delegation `unmet` rather than accepted-with-a-note.
 - **The ladder escalates.** An `unmet` result retries and climbs `escalate.ladder`, bounded
   by `maxAttemptsPerTier`, `maxTotalAttempts` and `costCeiling.multiple` — which costs real
-  tokens that advisory mode never spends.
+  tokens that advisory mode never spends. With `escalate.effortBump` enabled, an
+  eligible failed attempt first retries at higher effort up to `escalate.effortBumpMax`
+  (further clamped per model), within those same attempt and cost limits.
 - **`proportional.trivialBypass` starts mattering.** It only has an effect in `enforced`
   mode, where a task classified trivial is demoted back to advisory for that dispatch.
 
