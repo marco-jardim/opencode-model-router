@@ -340,6 +340,31 @@ describe("lookup lifetimes", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("QA-2.1-R2-2: a forgotten caller warns once for 100 shared reads (ancestor lookup: %s)", async (ancestor) => {
+    vi.useFakeTimers();
+    const { tracker, getParent, warn } = fixture();
+    const pending = deferred<string | null>();
+    getParent.mockReturnValueOnce(pending.promise).mockRejectedValue(new Error("offline"));
+    if (ancestor) tracker.recordCreated("X", "P");
+    const reads = Array.from({ length: 100 }, () => tracker.depthOf("X"));
+    await started();
+    expect(getParent).toHaveBeenCalledExactlyOnceWith(ancestor ? "P" : "X");
+    expect(warn).not.toHaveBeenCalled();
+    tracker.forget("X");
+    expect(await Promise.all(reads)).toEqual(Array(100).fill(undefined));
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "[router] depth: cannot resolve session X: lookup was cancelled because the session was forgotten; treating its depth as unknown",
+    );
+    expect(vi.getTimerCount()).toBe(0);
+    pending.resolve(null);
+    await vi.advanceTimersByTimeAsync(0);
+    // Cancellation and backend failure share the lookup warning key.
+    expect(await tracker.depthOf("X")).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(await tracker.depthOf("Y")).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
   it("T-forget: cancels a hung queried lookup promptly and discards its late answer", async () => {
     vi.useFakeTimers();
     const { tracker, getParent } = fixture();
