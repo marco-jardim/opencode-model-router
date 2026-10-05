@@ -219,6 +219,34 @@ describe("delegation depth guard", () => {
     expect(warn).toHaveBeenNthCalledWith(2, expect.stringContaining("cannot resolve session second: offline"));
   });
 
+  it.each([false, true])("QA-2.1-R2-2: allows a forgotten caller with exactly one shared-logger warning (ancestor lookup: %s)", async (ancestor) => {
+    vi.useFakeTimers();
+    try {
+      const logger = { warn: vi.fn<(message: string) => void>() };
+      let resolve!: (parent: string | null) => void;
+      const pending = new Promise<string | null>((done) => { resolve = done; });
+      const getParent = vi.fn<DepthTrackerSeams["getParent"]>().mockReturnValue(pending);
+      const tracker = createDepthTracker({ getParent, now: Date.now, logger });
+      const guard = createDepthGuard({ tracker, limit: () => 1, mode: () => "enforced", logger });
+      if (ancestor) tracker.recordCreated("caller", "parent");
+      const checks = Array.from({ length: 100 }, () => guard.checkDispatch("caller"));
+      await vi.advanceTimersByTimeAsync(5);
+      expect(getParent).toHaveBeenCalledExactlyOnceWith(ancestor ? "parent" : "caller");
+      expect(logger.warn).not.toHaveBeenCalled();
+      tracker.forget("caller");
+      expect(await Promise.all(checks)).toEqual(Array(100).fill({ block: false, mode: "enforced", guard: null }));
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+        "[router] depth: cannot resolve session caller: lookup was cancelled because the session was forgotten; treating its depth as unknown",
+      );
+      expect(vi.getTimerCount()).toBe(0);
+      resolve(null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("allows when the real tracker times out at 2000 ms, with one warning and no timers", async () => {
     vi.useFakeTimers();
     try {

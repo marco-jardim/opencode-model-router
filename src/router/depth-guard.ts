@@ -129,7 +129,7 @@ export function createDepthGuard(deps: {
       if (depth === undefined) {
         // The tracker owns unknown-depth warnings (including failure/timeout).
         // Phase 2.3 must pass the same plugin logger to tracker and guard: D2
-        // requires one warning, not one per layer. Cancellation may be silent.
+        // requires one warning, not one per layer, including forgotten callers.
         // Only invalid callers and tracker contract violations are ours to log.
         return { block: false, mode, guard: null };
       }

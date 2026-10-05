@@ -763,7 +763,10 @@ export function createDepthTracker(
       try {
         const result = await Promise.race([walk.promise, deadline]);
         walk.waiters--;
-        if (result !== timeout) return result;
+        if (result !== timeout) {
+          if (result === undefined) warn(id, "lookup", "lookup was cancelled because the session was forgotten; treating its depth as unknown");
+          return result;
+        }
         // Shared callers keep independent deadlines; the last one out cancels.
         if (walk.waiters === 0 && !walk.cancelled) cancelWalk(walk, true);
         // F1 fallback: everything the walk has learned so far, not only the
