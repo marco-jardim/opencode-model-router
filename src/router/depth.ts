@@ -31,7 +31,7 @@ interface Node {
   rootSeen: boolean;
   lastTouch: number;
 }
-type LookupResult = { ok: true; parent: string | null } | { ok: false; reason: string };
+type LookupResult = { ok: true; node: Node } | { ok: false; reason: string };
 interface Lookup {
   id: string;
   promise: Promise<LookupResult>;
@@ -144,26 +144,10 @@ export function createDepthTracker(
     };
   }
 
-  function applyLink(id: string, link: string | null, source: Source): void {
-    const n = nodes.get(id);
-    const plugin = source === "plugin";
-    if (!n) {
-      // Trim only after the floor climb touches this node's ancestors. Trimming
-      // here could evict its known parent before deriving the new child's floor.
-      nodes.set(id, makeNode(link, plugin));
-      return;
-    }
-    if (plugin) n.plugin = true;
-    if (link === null) {
-      if (plugin) n.depth = Math.max(n.depth, 1);
-      else if (!n.plugin) {
-        if (n.parents.length) warn(id, "conflict", "root after parent");
-        else n.rootSeen = true;
-      }
-      return;
-    }
+  // Adds one parent link under the §3 rules.
+  function addLink(id: string, n: Node, link: string): void {
     if (n.parents.includes(link)) return;
-    if (n.parents.length === MAX_PARENT_LINKS) {
+    if (n.parents.length >= MAX_PARENT_LINKS) {
       n.depth = MAX_DEPTH_HOPS;
       n.resolved = true;
       warn(id, "conflict", "parent link overflow");
@@ -173,6 +157,72 @@ export function createDepthTracker(
     n.parents.push(link);
     n.resolved = false;
     n.depth = Math.max(n.depth, 1);
+  }
+
+  function addRoot(id: string, n: Node): void {
+    if (n.plugin) return; // v1 producers have no parentID: root evidence is moot
+    if (n.parents.length) warn(id, "conflict", "root after parent");
+    else n.rootSeen = true;
+  }
+
+  // Two objects for one id (a walk's retained copy and a node re-created after
+  // eviction) are merged, never replaced: union of links, max of floors, flags.
+  function absorb(id: string, into: Node, from: Node): void {
+    if (from.plugin && !into.plugin) {
+      into.plugin = true;
+      into.depth = Math.max(into.depth, 1);
+    }
+    if (from.rootSeen) addRoot(id, into);
+    for (const p of from.parents) addLink(id, into, p);
+    into.depth = Math.max(into.depth, from.depth);
+    into.lastTouch = Math.max(into.lastTouch, from.lastTouch);
+  }
+
+  function mergeInto(map: Map<string, Node>, id: string, n: Node): void {
+    const mine = map.get(id);
+    if (!mine) map.set(id, n);
+    else if (mine !== n) absorb(id, mine, n);
+  }
+
+  // A node entering the map takes over every copy a live walk still holds, so
+  // neither side can lose evidence and later readers see the union at once.
+  function adopt(id: string, n: Node): void {
+    nodes.set(id, n);
+    for (const walk of live) {
+      const copy = walk.learned.get(id);
+      if (copy === undefined || copy === n) continue;
+      absorb(id, n, copy);
+      walk.learned.set(id, n);
+    }
+  }
+
+  // The tracked object for `id`, merged with this climb's retained copy.
+  function node(id: string, learned: Map<string, Node>): Node | undefined {
+    const tracked = nodes.get(id);
+    const copy = learned.get(id);
+    if (tracked && copy && tracked !== copy) absorb(id, tracked, copy);
+    const n = tracked ?? copy;
+    if (n) learned.set(id, n);
+    return n;
+  }
+
+  function applyLink(id: string, link: string | null, source: Source): Node {
+    const plugin = source === "plugin";
+    const n = nodes.get(id);
+    if (!n) {
+      // Trim only after the floor climb touches this node's ancestors. Trimming
+      // here could evict its known parent before deriving the new child's floor.
+      const created = makeNode(link, plugin);
+      adopt(id, created);
+      return created;
+    }
+    if (plugin) {
+      n.plugin = true;
+      if (link === null) n.depth = Math.max(n.depth, 1);
+    }
+    if (link !== null) addLink(id, n, link);
+    else if (!plugin) addRoot(id, n);
+    return n;
   }
 
   // Each climb is synchronous: no event can interleave with its snapshot.
@@ -190,12 +240,11 @@ export function createDepthTracker(
         stop = { kind: "cap", cycle: stack.includes(id) };
         return MAX_DEPTH_HOPS;
       }
-      const n = nodes.get(id) ?? learned.get(id)!;
       // Retain visited evidence for the duration of this walk. Backend inserts
       // can evict the start (even with a one-entry cache); that must not turn
       // an event-proven child into a fresh backend root. Node references also
       // retain all conflicting links, not merely the last parent answer.
-      learned.set(id, n);
+      const n = node(id, learned)!;
       let d = n.depth;
       if (d >= MAX_DEPTH_HOPS) {
         vals.set(id, MAX_DEPTH_HOPS);
@@ -243,7 +292,8 @@ export function createDepthTracker(
 
   function memoize(r: Done, learned: Map<string, Node>): void {
     for (const id of r.order.slice().reverse()) {
-      const n = nodes.get(id) ?? learned.get(id)!;
+      const n = node(id, learned)!;
+      if (!nodes.has(id)) adopt(id, n);
       n.depth = Math.max(n.depth, r.vals.get(id)!);
       if (r.complete.has(id)) n.resolved = true;
       n.lastTouch = clock();
@@ -295,8 +345,7 @@ export function createDepthTracker(
       if (lookup.cancelled) return fail("forgotten");
       if (raw !== null && !validId(raw)) return fail("malformed answer");
       failedAt.delete(id);
-      record(id, raw, "backend");
-      return { ok: true, parent: raw };
+      return { ok: true, node: record(id, raw, "backend") };
     }, (e: unknown) => fail(describe(e)));
     lookup.promise = Promise.race([request, cancelled]).finally(() => {
       if (lookups.get(id) === lookup) lookups.delete(id);
@@ -368,7 +417,7 @@ export function createDepthTracker(
         walk.pending = undefined;
         lookup.waiters--;
         if (!result.ok) return floor(id, learned, result.reason);
-        learned.set(r.id, nodes.get(r.id) ?? makeNode(result.parent, false));
+        mergeInto(learned, r.id, result.node);
       }
     } finally {
       live.delete(walk);
@@ -376,22 +425,24 @@ export function createDepthTracker(
     }
   }
 
-  function record(id: string, link: string | null, source: Source): void {
-    if (!validId(id)) return;
-    applyLink(id, link, source);
-    const learned = new Map<string, Node>();
-    const r = climb(id, learned, "floor");
-    if (r?.kind === "done") memoize(r, learned);
+  function record(id: string, link: string | null, source: Source): Node {
+    const n = applyLink(id, link, source);
+    const learned = new Map<string, Node>([[id, n]]);
+    memoize(climb(id, learned, "floor") as Done, learned);
+    return n;
   }
 
   return {
-    recordRoot(id) { record(id, null, "event"); },
+    recordRoot(id) {
+      if (validId(id)) record(id, null, "event");
+    },
     recordCreated(id, parent) {
+      if (!validId(id)) return;
       if (parent == null || parent === "") record(id, null, "event");
       else if (validId(parent)) record(id, parent, "event");
     },
     recordPluginChild(id, creator) {
-      record(id, validId(creator) && creator !== id ? creator : null, "plugin");
+      if (validId(id)) record(id, validId(creator) && creator !== id ? creator : null, "plugin");
     },
     async depthOf(id, options) {
       if (!validId(id)) return undefined;
@@ -404,7 +455,7 @@ export function createDepthTracker(
       if (throttled(r.id) && !lookups.has(r.id)) return floor(id, learned, `throttled at ${r.id}`);
       let walk = walks.get(id);
       if (!walk) walk = startWalk(id, learned);
-      else for (const [known, n] of learned) if (!walk.learned.has(known)) walk.learned.set(known, n);
+      else for (const [known, n] of learned) mergeInto(walk.learned, known, n);
       walk.waiters++;
       const t = timeoutOf(options);
       const timeout = Symbol("timeout");

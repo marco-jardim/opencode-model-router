@@ -753,3 +753,87 @@ describe("QA-1.2-4: the timeout floor uses what the walk has learned", () => {
     expect(await Promise.all([first, second])).toEqual([1, 1]);
   });
 });
+
+describe("QA-1.2-1: a walk never loses evidence to a re-created node", () => {
+  function backend(answers: Record<string, string | null>, heldId: string) {
+    const fx = fixture({ ttlMs: 100 });
+    const held = deferred<string | null>();
+    fx.getParent.mockImplementation(async (id) => id === heldId ? held.promise : answers[id]);
+    return { ...fx, held };
+  }
+  const answers = { X: "P", Y: "X", P: null, Q: "Q1", Q1: "Q2", Q2: null };
+
+  it.each([false, true])("evicted mid-walk and re-created by another walk keeps all links (re-created: %s)", async (recreate) => {
+    const { tracker, getParent, held, time } = backend(answers, "P");
+    tracker.recordCreated("X", "P");
+    tracker.recordCreated("X", "Q");
+    time(99);
+    const x = tracker.depthOf("X");
+    await started();
+    time(100);
+    tracker.sweep();
+    const y = recreate ? tracker.depthOf("Y") : undefined; // false = control run
+    await started(); await started(); await started(); await started();
+    held.resolve(null);
+    expect(await x).toBe(3);
+    expect(await tracker.depthOf("X")).toBe(3);
+    if (y) expect([await y, await tracker.depthOf("Y")]).toEqual([4, 4]);
+    expect(getParent).not.toHaveBeenCalledWith("P", expect.anything());
+  });
+
+  it("a plugin child re-created as a backend root keeps its plugin floor and creator link", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent } = fixture({ maxEntries: 2, ttlMs: 100 });
+    const creator = deferred<string | null>();
+    getParent.mockImplementation(async (id) => id === "C" ? creator.promise : id === "Y" ? "X" : null);
+    tracker.recordPluginChild("X", "C");
+    const x = tracker.depthOf("X");
+    await started();
+    tracker.recordRoot("Z1");
+    tracker.recordRoot("Z2");
+    tracker.sweep();
+    const y = tracker.depthOf("Y");
+    await vi.advanceTimersByTimeAsync(0);
+    const probe = tracker.depthOf("X", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await probe).toBe(1);
+    creator.resolve(null);
+    expect(await x).toBe(1);
+    expect(await y).toBe(2);
+    expect(await tracker.depthOf("X")).toBe(1);
+  });
+
+  it("an event re-creating a root keeps the walk's link, and a re-created link keeps the walk's root", async () => {
+    vi.useFakeTimers();
+    const { tracker, getParent, warn, time } = fixture({ ttlMs: 100 });
+    const held = deferred<string | null>();
+    getParent.mockImplementation((id) => id === "P" ? held.promise : Promise.resolve(null));
+    tracker.recordRoot("X");
+    tracker.recordCreated("S", "X");
+    tracker.recordCreated("S", "P");
+    tracker.recordCreated("A", "P");
+    time(99);
+    const s = tracker.depthOf("S");
+    const a = tracker.depthOf("A");
+    await started();
+    time(100);
+    tracker.sweep();
+    expect(tracker.size()).toBe(0);
+    tracker.recordRoot("A");
+    tracker.recordRoot("Q0");
+    tracker.recordCreated("Q1", "Q0");
+    tracker.recordCreated("X", "Q1");
+    const probe = tracker.depthOf("A", { timeoutMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await probe).toBe(1);
+    expect(await tracker.depthOf("X")).toBe(2);
+    held.resolve(null);
+    expect(await s).toBe(3);
+    expect(await a).toBe(1);
+    expect(warn.mock.calls.map(([m]) => m).filter((m) => m.includes("conflicting"))).toEqual([
+      expect.stringContaining("session S: new parent"),
+      expect.stringContaining("session A: new parent"),
+      expect.stringContaining("session X: root after parent"),
+    ]);
+  });
+});
