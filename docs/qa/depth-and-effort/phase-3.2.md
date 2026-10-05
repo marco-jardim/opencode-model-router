@@ -321,8 +321,8 @@ and `listeners` were empty. Unrelated managed services/TUI sessions were left al
 
 QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`.
 Original detailed findings and line references remain in review commit `8441cae`.
-The table below records implementation resolutions, **pending QA re-review**;
-it does not self-accept the phase.
+The table below records the round-1 implementation resolutions. The round-2 review
+below accepted all 12, with residual gaps tracked separately as R2-1 and R2-2.
 
 | ID | Severity | Location | Finding | Resolution |
 |---|---|---|---|---|
@@ -340,6 +340,10 @@ it does not self-accept the phase.
 | QA-3.2-12 | nit | Comments / wire contract | Unset comment wrong; imported expectations follow product wording changes. | `986340e`: `{}` comment corrected; independent literal D5/A1 strings pin wire text and are checked against imported formatters; host tests pass. |
 
 ### Round 2
+
+The review observations below describe the pre-fix revision `60c851c` and its retained
+round-1 evidence. Subsequent fixes and host reruns have their own revision/evidence
+section below; historical artifact counts and line references are not current claims.
 
 QA round 2 (adversarial re-review, `[tier:heavy]`, 2026-10-05) of the round-1 fixes, diff
 `8441cae..60c851c`: `65df3cb`, `2d427e5`, `73a9ef4`, `21f7642`, `986340e`, `bbc69d6`,
@@ -427,15 +431,102 @@ Round-1 resolution status:
 | QA-3.2-11 | resolved | 400 Anthropic error shape, non-stream `tool_use`, `ping`; helper tests 1–3 pass. |
 | QA-3.2-12 | resolved | `{}` comment `:243`; literal D5/A1 `:20-21`, cross-checked against the formatters at `:302-303`. |
 
-New round-2 findings:
+Round-2 findings and implementation resolutions (original review: `3e4530e`):
 
 | ID | Severity | file:line | Description | Resolution |
 |---|---|---|---|---|
-| QA-3.2-R2-1 | minor | `test/smoke/depth-effort.smoke.test.ts:308-347` | **The v1 resume legs never assert that a resume happened.** v1 does not check `task_id` ownership, and the only target assertion (`after.result.output.sessionID === existing`, `:347`) is v2-only. If v1 1.18.x ignored `task_id` and opened a fresh session, both v1 resume legs would still pass. The test would then prove only that "a `task` call carrying `task_id` is guarded", not resume. The advisory caller-resume (run-2 `childID === setup.childID`) is not asserted either. On v2 it is implied, because a fresh caller would be refused natively. The evidence shows it does resume on 1.18.19: restored-v1 `TSZUzm` has run-2 child = setup child `…P4PsqD`, and the nested result is `<task id="ses_ef3f7bc2cffeIfJ8jmK5PB301j" state="completed">`, which is the existing grandchild. But the leg that runs in CI does not pin this. Fix hint: on v1, assert that the result contains `<task id="${existing}"`, and assert `run.childID === setup.childID` for the advisory caller. | open |
-| QA-3.2-R2-2 | minor | `test/smoke/depth-effort.smoke.test.ts:287-297`; `phase-3.2.md` per-host row "Accepted `effortBumpMax`", kill row "Bump false / repeated bounded retry" | **The effortBumpMax leg has no discriminating control.** The expected low → medium → medium differs from the unset result only by source inference. `resolveEffortBump` defaults `max` to `"xhigh"` (`src/router/config.ts:1379`), and the ladder steps once per retry (`nextEffort`, `src/escalate/ladder.ts:169`), so the uncapped run should give low → medium → high. No run shows that the host actually sends `high` without the cap. The only recorded kill of this test is bump-off (low → low → low), which proves sensitivity to `effortBump`, not to `effortBumpMax`. A product bug that ignored the cap, or host-side clamping of `high`, is not excluded by evidence. This is the same inference-versus-evidence standard as QA-3.2-3. Fix hint: add a config-only mutation that drops `effortBumpMax` and record the expected kill (low → medium → high) on both hosts, or record the unset control as a passing assertion. | open |
-| QA-3.2-R2-3 | nit | `test/smoke/depth-effort.smoke.test.ts:24`; `phase-3.2.md` "Versioned fixtures" bullet ("Neither condition gates v1") and "Handoffs" → "To 3.4" | **The report understates what the explicit v2 gate does.** The missing-binary throw is at module scope. So `RUN_OC_SMOKE_V2=1` without `OPENCODE_V2_BIN` fails collection of the whole file, v1 describe included. "Neither condition gates v1" is therefore not accurate. The 3.4 handoff says the gate "enables only the v2 describe when `OPENCODE_V2_BIN` is configured", but `smoke:v2` hard-codes `RUN_OC_SMOKE_V2=1`, so after 3.4 that lane fails without the binary. An inherited `RUN_OC_SMOKE_V2=1` also turns `smoke:keyless` red. The behaviour is intended and matches `v2-registration.smoke.test.ts:33-35`, and CI is unaffected. Fix hint: correct both sentences. | open |
-| QA-3.2-R2-4 | nit | `test/smoke/helpers/scripted-provider.test.ts:43-44` | **The barrier test's own deadline can never fire first.** The poll's 5 s deadline starts after the first POST. `vitest.smoke.config.ts` sets no `testTimeout`, so Vitest's default 5 s test timeout is reached before it. A barrier regression would surface as "Test timed out" rather than the event-sequence diff. The pending `leaf` fetch is also rejected after `stop()` destroys it, and has no handler, so it becomes an unhandled rejection. Every wait is still bounded; the problem is that the failure is not diagnostic. Fix hint: use a deadline well under the test timeout (or raise the test timeout), and attach a rejection handler to `leaf`. | open |
-| QA-3.2-R2-5 | nit | `phase-3.2.md` "Final run outputs" (helper-test lane note), "Deferred by plan" (v2/CI bullet), "Handoffs" → "To 3.4", and the "CI v1 leg" observation under "Verdict"; `package.json` `smoke`; `vitest.smoke.config.ts` `include` | **The CI analysis misses an existing lane.** `npm run smoke` is `RUN_OC_SMOKE=1 … test/smoke`, run by `smoke.yml` (20 min, secrets-gated). It already collects this file, and `RUN_OC_SMOKE=1` enables the v1 describe. Through `test/smoke/**/*.test.ts` it also collects the four ungated helper tests. The report says the v1 leg "should run once 3.4 appends" it, and that the helper tests "need inclusion in a targeted lane". It never states that both already run in the credentialed lane, which now carries about 217 s more of v1 time. Isolation holds there: HOME/XDG are repointed, `MODEL_ROUTER_*` and provider keys are stripped, and the projects are outside the repo, so `layer2-gate`'s root `opencode.json` is not read. Fix hint: record this in the CI notes and the 3.4 handoff. | open |
+| QA-3.2-R2-1 | minor | v1 resume assertions | A guarded call carrying `task_id` did not prove the host resumed an existing session. | `2195bf4`: both v1 modes resume the setup caller and assert identical child ID plus its completed `<task id="…"` result; advisory also asserts the nested grandchild ID and existing task envelope. Enforced nested resume remains refused, not falsely claimed as completed. |
+| QA-3.2-R2-2 | minor | Medium-cap fixture and evidence | Bump-off proves sensitivity to bumping, not to the cap itself. | `3dfabb7`: `SMOKE_DEPTH_EFFORT_MUTATION=cap` omits only `effortBumpMax` from serialized config, preserving the low → medium → medium assertion. Both-host uncapped controls are recorded below. |
+| QA-3.2-R2-3 | nit | Missing-binary gate / report | Module-scope throw prevents v1 collection too; handoff understated overall failure. | `41feb40`: missing binary is a failing test within the v2 describe; enabled v1 still executes. Versioned-fixture and 3.4 notes distinguish v1 execution from the overall red run. |
+| QA-3.2-R2-4 | nit | Barrier helper test | Default timeout precedes its own deadline; pending leaf can reject unhandled on failure. | `a45be03`: explicit 10 s test timeout above 5 s poll deadline; requests have immediate rejection handlers, leaf rejection is a settled outcome, and teardown aborts and settles all tracked requests before stopping providers. |
+| QA-3.2-R2-5 | nit | CI notes / 3.4 handoff | Credentialed `smoke.yml` already collects these v1 and helper tests. | `a0ce7ec`: documents existing broad `npm run smoke` selection, secrets gate, runtime and isolation; remaining keyless additions are both files, plus runtime-comment update/follow-up. No package/workflow edits here. |
+
+### Round-2 fix verification — tested revision and cap control
+
+Test revision: **`a0ce7ec5a15c489ca571d5043dfd23a96d915a1f`**. The later resolution
+report commit changes documentation only. Evidence is retained separately from the
+round-1 artifacts in **`C:\Users\Marquinho\AppData\Local\Temp\Claude\p32-r2\`**:
+`run.ps1`, `hosts.ps1`, `tested-revision.txt`, `tested-hashes.json`, `versions.json`,
+per-lane `result.json`/`output.log` and host `artifacts/`. The runner uses a clean
+environment per invocation, isolated HOME/profile/appdata/temp directories, v1's
+native bin first on PATH, and `OPENCODE_V2_BIN` only for explicitly selected v2 lanes.
+Versions were rechecked: v1 **1.18.19**, v2 **2.0.22**.
+
+R2-2 adds a distinct config-only control, not another bump-off run:
+
+```text
+SMOKE_DEPTH_EFFORT_MUTATION=cap
+npx vitest run --config vitest.smoke.config.ts test/smoke/depth-effort.smoke.test.ts -t "accepts effortBumpMax"
+```
+
+The runner enables each host separately. Both captured override objects **omit**
+`effortBumpMax`, retain `effortBump: true`, `maxAttemptsPerTier: 2` and
+`maxTotalAttempts: 3`, and both host turns exit 0. The unchanged assertion expects
+low → medium → medium; captured producer requests instead carry
+**low → medium → high on both v1 and v2**, killing the cap assertion. Logs and
+captures are in `new-v1-cap-filtered/` and `new-v2-cap-filtered/`. This directly
+discriminates the medium cap from the unset configuration at the wire, rather than
+inferring it from source or relying on the earlier bump-off mutation.
+
+#### Round-2 final run outputs
+
+All repository test runs below used **`a0ce7ec5a15c489ca571d5043dfd23a96d915a1f`**.
+`summary.json` validates the expected outcomes and all **34 host artifacts'** revision
+and source hashes, including the retained failed v2 attempt. It also compares each
+uncapped override to the passing capped override and verifies that deleting only
+`effortBumpMax` makes the objects identical. The original depth/bump-off mutation
+results remain round-1 evidence on `85d5c18`; they were not rerun in this dispatch.
+
+| Output under `p32-r2/` | Result | Duration |
+|---|---|---|
+| `restored-v1/output.log` | **9 passed**, 11 v2 skipped; both v1 resume identity/envelope assertions pass | **214.34 s** |
+| `restored-v2/output.log` | **11 passed**, 9 v1 skipped; unchanged revision rerun after the port failure below | **46.13 s** |
+| `protocol/output.log` | **4 passed**, no unhandled errors reported | **320 ms** |
+| `new-v1-cap-filtered/output.log` | **1 expected kill**, 19 skipped; received low → medium → high instead of low → medium → medium | 18.74 s |
+| `new-v2-cap-filtered/output.log` | **1 expected kill**, 19 skipped; same wire mismatch | 3.34 s |
+| `mixed-missing-v2-filtered/output.log` | **1 v1 passed**, 1 expected v2 failure, 8 skipped; proves v1 executes rather than collection being blocked | 22.37 s |
+| `gating/output.log` | 20 skipped; verbose v2 name contains both opt-in variables | 326 ms |
+| `restored-v2-bad-port-attempt/output.log` | Retained unsuccessful attempt: 10 passed, 1 inventory failure, 9 skipped | 30.86 s |
+
+R2-1: both v1 resume legs now have a successful **root-to-existing-caller** resume,
+with the same child ID and a matching completed `<task id="…"` result. Advisory also
+asserts that the nested task resumes the existing grandchild and returns its exact
+task ID. In enforced mode the nested resume is correctly refused with D5; that
+refused dispatch is not claimed to have completed a native resume.
+
+R2-3: the mixed-gate run sets both v1 and v2 opt-ins but omits `OPENCODE_V2_BIN`,
+selecting `enforced resume|requires OPENCODE_V2_BIN`. The v1 resume test passes;
+only the v2 configuration test fails with `Set OPENCODE_V2_BIN to the OpenCode 2
+executable when RUN_OC_SMOKE_V2=1`. The overall exit is intentionally 1, not a
+claim that a misconfigured combined lane is green.
+
+R2-4 failure-path control: `barrier-fault/` retains an **external copy** of the final
+helper test/provider, a minimal Vitest config and `output.log`/`result.json`. Only
+that copy's poll/expected event was changed to unreachable, plus port logging;
+the repository test was not modified. It deliberately left the leaf waiting at
+the five-second deadline. Result: **1 expected assertion failure, 3 passed** in
+**5.27 s**; the barrier test's event-sequence diff appeared at 5.013 s, not a test
+timeout. No unhandled rejection/error was reported, and the recorded failure-control
+port **1240** had no listener afterward. This is a teardown fault-injection control,
+separate from the config-only cap mutations and from the unmodified 4/4 helper run.
+The temporary dependency junction was removed; the fault-copy evidence remains.
+
+The unsuccessful v2 attempt is not hidden or counted as a pass. Its baseline server
+announced `http://127.0.0.1:3659`; Node fetch rejected it with `TypeError: fetch failed`,
+caused by `Error: bad port`, before inventory assertions. This is the Fetch restricted
+port case exposed by a host-assigned port. A single fresh full-v2 invocation on the
+**same code and config** passed 11/11. No port-selection product/test change was made;
+retain this independent harness limitation for follow-up rather than attributing it
+to the five round-2 fixes.
+
+Targeted strict TypeScript checking passed (`typecheck.log`), with the same two test
+entrypoints and compiler options recorded for round 1. No full suite, integration
+rerun, live-provider lane, or Linux CI run was performed in this dispatch.
+
+Cleanup (`cleanup.json`) checked **53 recorded host processes and 34 stub ports**,
+including the unsuccessful attempt: no remaining recorded hosts, matching rig
+processes, unrecorded scenario candidates, or listeners. The additional fault-control
+port check is in `barrier-fault/result.json`. Unrelated services were left untouched.
 
 ## Deferred by plan
 
@@ -478,13 +569,16 @@ New round-2 findings:
 
 ## Verdict
 
-**Changes required (QA round 2).**
+**Open findings: 0 (every round-1 and round-2 finding fixed)**
 
-- All 12 round-1 findings are **resolved**. QA-3.2-1 and QA-3.2-7 each leave a residual gap, recorded as QA-3.2-R2-2 and QA-3.2-R2-1.
-- Round 2 raised **5 new findings, all open**: 0 blocking, 0 critical, 0 major, 2 minor (R2-1, R2-2) and 3 nit (R2-3, R2-4, R2-5).
-- §0.7 says round-2 findings are fixed whatever their severity. "Zero open findings" therefore does not hold yet, and the phase is not accepted.
-- None of the five is blocking, critical or major. A further QA round, if the orchestrator schedules one, would under §0.7 re-review only blocking, critical or major fixes.
-- No regression was found in the barrier, the explicit v2 gate (the keyless CI lane stays green and v2 is skipped), the 400 error shape or the mutation kill table. These checks are in "Round 2" above.
+- All 12 round-1 findings were resolved in the round-2 review. The residual resume
+  and cap-control gaps are now closed by R2-1 and R2-2 fixes and host evidence.
+- All five round-2 findings have finding-specific commits, filled resolution entries,
+  and final-revision verification above. The report-only resolution commit changes
+  no tested code. This is scoped finding closure, not a claim of a full-suite or
+  live-provider run.
+- Existing deferred isolation/CI handoffs and the retained restricted-port attempt
+  remain explicit limitations; none is silently presented as repaired by these fixes.
 
 History: the round-1 verdict was **changes required** (1 major, 8 minor, 3 nit), retained in `8441cae`.
 
