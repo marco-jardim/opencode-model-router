@@ -730,6 +730,68 @@ Attacks that held (no finding):
   non-completed results and is FIFO-bounded.
 - **Memory:** every new map and set is bounded (1 000 or 10 000) and purged on `session.deleted`.
 
+### Round 2 (2026-10-05, adversarial, `5bec6d2..53fc132`)
+
+Re-reviewed `593dfe4`, `6f757a6`, `5df60e1`, `2b480f3`, `60e45c9` and `53fc132` against the round-1
+findings and the retained host captures (`p23-host-proof\hooks.jsonl`, `captures.jsonl`). Line numbers
+refer to `53fc132`.
+
+**Runs.** Requested scoped run: 12 files / 215 tests pass. `vitest related src/index.ts
+src/compat/v2-hooks.ts`: 29 files pass, 3 skipped; 522 tests pass, 55 skipped. `npm run typecheck`
+exits 0. Three scratch files under `test\scratch\` (25 tests) were run and then deleted. They replay
+real host events through both the `v2.0.0` bridge (`git show v2.0.0:src/compat/v2-hooks.ts`) and
+HEAD, and wrap the trajectory store. `git status` is clean afterwards. These are not full-suite runs.
+
+#### Round-1 findings re-checked
+
+| ID | Status | Evidence |
+|---|---|---|
+| QA-2.3-1 | **Resolved for the observed host shape** (new edge cases: R2-1, R2-2; behaviour note: R2-3) | Real factory (`routerHost: "v2"`, advisory). Input: the pre-router event of `toolu_proof_1791196316260`, rebuilt from its unbannered sibling captures. Output: `content[0]` deep-equals the host part `<subagent sessionID="ses_ef4613d90ffe4SvFewAXro5MBU" state="completed">\nok\n</subagent>`, and `content[1]` is the banner, exactly once. `result.output` and `result.metadata` are JSON byte-identical to the values captured in the proof. The host already sends two text parts as an array of `tool_result` text blocks (`captures.jsonl`, `toolu_proof_1791196319166`). |
+| QA-2.3-2 | **Resolved** (new nit: R2-4) | Wrapped trajectory store: a refused `delegate` records exactly one `{ tool: "delegate", blocked: true }`. Nothing is recorded in advisory mode, under `/bypass`, for a root caller, or without `toolCtx`. A thrown `Object.create(null)` from the record still returns the exact D5 text. |
+| QA-2.3-3 | **Resolved, with a stale residue** (R2-5) | P13, N6, step 4 and its test text, F1 and F5 are corrected, and `Handoffs` withdraws F1. |
+| QA-2.3-4 | **Resolved** | `describeError` (`src\index.ts:121–128`) cannot throw: its only statement is inside `try`, and its `catch` returns a literal. Both `chat.params` catches (`:1089–1109`) wrap `logger.warn` in a `try` whose `catch` is empty. `warnedGraderParams` is still set before the log, and neither `try` body changed. The `error`, `unprintable` and `failed logger` cases pass on v1 and v2. |
+| QA-2.3-5 | **Resolved** | N5 and F2 are corrected. `keeps the deferred footer after the banner for a surviving unparented producer/grader` passes in the scoped run. |
+
+**v2.0.0 comparison for non-bannered, router-modified results.** The two unchanged real captures
+(`toolu_proof_1791196316192`, `toolu_proof_1791195789037`) went through both bridges with identical
+legacy mutations: accepted suffix, forcing note, false-refusal prefix, deferred footer and guard
+note. A real-factory `FALSE-REFUSAL SUSPECT` run was added.
+
+- `result.output` and `result.metadata` are byte-identical to `v2.0.0`.
+- An unmodified result is identical to the capture on both bridges (early return).
+- Non-`subagent` results are byte-identical to `v2.0.0` for every mutation, both for the `delegate`
+  capture `toolu_proof_1791195786449` and for string content.
+- `content` is **not** byte-identical. For example, `v2.0.0` gives
+  `[{text:"ok\n\n[router ✓ verified: checker]"}]`, and HEAD gives `[<host envelope part>,
+  {text:"\n\n[router ✓ verified: checker]"}]`. The false-refusal prefix becomes its own part before
+  the envelope.
+
+This is an improvement, because the resume handle survives. It is still a change from `v2.0.0` (R2-3).
+
+| ID | Severity | File:line | Description | Resolution |
+|---|---|---|---|---|
+| QA-2.3-R2-1 | minor | `src\compat\v2-hooks.ts:345–360` | **A `subagent` result whose `content` is absent or has no text part loses the child's text from `content`.** The new branch keeps `content` and adds only `prefix`/`notices`. The child's text was only ever in a host text part. `Tool.Result.content` is optional (`node_modules\@opencode\schema\dist\tool.d.ts:68`: `readonly content?: string \| ReadonlyArray<Content>`). Scratch, absent content plus accepted suffix: HEAD gives `[{"type":"text","text":"\n\n[router ✓ verified: checker]"}]`, and `v2.0.0` gives `[{"type":"text","text":"CHILD_TEXT\n\n[router ✓ verified: checker]"}]`. With a banner only, HEAD gives `[{"type":"text","text":"[BANNER]"}]`. A file-only `content` behaves the same way, with the file kept and the text gone. Not seen on 2.0.22: all 12 captured v2 `subagent` after-events carry the envelope text part. Fix direction: use the envelope-preserving layout only when `content` has a text part, and otherwise fall back to `[{ text: final }, ...non-text]`. Add a unit case for absent and file-only content. | open |
+| QA-2.3-R2-2 | minor | `src\compat\v2-hooks.ts:352–354`; `src\verify\pending.ts:1739–1742` | **If the legacy output does not contain the bare text verbatim, the child's output appears twice.** When `routed.indexOf(text) < 0`, `suffix` becomes the whole `routed`, and it is appended after the kept envelope, which already holds `text`. The deferred path (`src\index.ts:1481`) uses `appendRouterFooter`, which runs `trimEnd()` on the output. So any `structured.output` ending in whitespace that is not a prefix of `"\n\n"` hits this case, for example trailing spaces, `"\r\n"` or `"\n\n\n"`. Scratch, output `"child said this  \n\n\n"` plus the deferred footer: HEAD gives `[<envelope with "child said this">, {text:"child said this\n\n[router] unverified · h · risk"}]`, so the text appears twice. `v2.0.0` has it once. Whether the host trims a subagent's final text is unverified, because the proof stub replied `ok`. Fix direction: also try `text.trimEnd()` as the anchor, and if neither matches, fall back to replacing the text parts (the `v2.0.0` layout) instead of keeping both. | open |
+| QA-2.3-R2-3 | nit | `src\compat\v2-hooks.ts:348–360`; this file `## Handoffs` | **Undocumented change from `v2.0.0` for non-bannered verified results on v2.** The `content` layout changed as shown above. `result.output` and `metadata` did not change. The model now sees the envelope (`sessionID`, `state`), plus router text in separate parts, and a suffix part keeps its leading `"\n\n"`. Round 1 called this path pre-existing, and `593dfe4` changed it without a 3.1 handoff. Fix: add a 3.1 CHANGELOG handoff ("v2: verified/annotated `subagent` results keep the host envelope; router notes are separate text parts"). Optionally drop the leading separator from a part that stands alone. | open |
+| QA-2.3-R2-4 | nit | `src\index.ts:621–630`, `:1411–1415` | **A refused `delegate` is counted twice for an `isSubagent` caller.** The new blocked record is followed by the generic after-hook's record for the same call. Scratch, enforced, C seeded by `session.created(C, O)`: `toolCallCount("C") === 2`, with one blocked event. A refused `task` from the same caller counts 1, because the throw skips the after-hook. Only the debug trajectory dump (`tool_call_count`, `read_exec_ratio`, `ttfa`) is affected. The false-refusal detector only tests for 0. Fix: record only when `!sessionStore.isSubagent(sid)`, or have the after-hook skip a call that was already recorded as blocked. Pin the count in a test. | open |
+| QA-2.3-R2-5 | nit | `docs\qa\depth-and-effort\phase-2.3.md:741`, `:759` | **F1 is withdrawn but still handed to 3.1.** `Deferred by plan → 3.1` still lists "F1", and `Handoffs` still says "To 3.1: F1, F2 and N11". Both `Withdraw F1` (QA-2.3-3) and F1's own text contradict this. Fix: remove F1 from both lists. | open |
+
+Attacks that held in round 2 (no finding):
+
+- **Prefix split.** `indexOf` could match inside a router prefix, but the only prefixing mutation is
+  `FALSE-REFUSAL SUSPECT`. It fires only when the child's text starts with `ESCALATE:`, `NEED MORE:`,
+  `NEED CONTEXT:`, `SCOPE GROWTH:` or `BLOCKED:` (`src\router\false-refusal.ts:22`). None of those
+  occurs in the prefix, so this cannot happen today. The real-factory run splits correctly.
+- **No double delivery.** The bridge banner is taken before the legacy call and deleted in every
+  branch. In the replay, a running or completed result still carries it exactly once.
+- **No other behaviour change.** The source diff touches only the v2 completed `subagent` branch, the
+  refused `delegate` return, and the two `chat.params` catches. Protocol, sessions, tiers, golden and
+  prompt-measurement files are unchanged, and those suites pass with no `-u`.
+- **Observation, not filed.** Four other 2.3 catches still log `scrubText(String(error))` without the
+  safe formatter: `src\index.ts:431`, `:1228`, `:1406` and `:1683`. Each would need a thrown value
+  with no primitive conversion from a `Map` operation or the logger. That is as contrived as
+  QA-2.3-4, and outside that finding's scope. At `:1228` the refusal still throws.
+
 ## Deferred by plan
 
 - **3.1 (docs):**
@@ -815,3 +877,15 @@ QA-2.3-4 (nit) and QA-2.3-5 (nit) are open. No critical finding:
 - the golden and prompt-measurement suites, and every suite related to `src\index.ts`, pass with no `-u`.
 
 The host-level proof above stands. QA-2.3-1 was found in its own retained captures.
+
+**QA 2.3 round 2 (2026-10-05): pending fixes. Open findings: 5.**
+
+- **Round 1:** QA-2.3-1, QA-2.3-2, QA-2.3-4 and QA-2.3-5 are resolved. QA-2.3-3 is resolved except for
+  the stale handoff text tracked as R2-5.
+- **Round 2 opens:** QA-2.3-R2-1 and QA-2.3-R2-2 (minor, v2 `content` edge cases of the `593dfe4`
+  rewrite), and QA-2.3-R2-3, QA-2.3-R2-4 and QA-2.3-R2-5 (nit).
+- No `blocking`, `critical` or `major` finding.
+- Under §0.7, round 2 fixes every finding, whatever its severity. "Open findings: 0" requires all
+  five to be fixed.
+- On the real 2.0.22 host shape, a bannered `subagent` result keeps `<subagent sessionID=…>`.
+  Structured output and metadata stay byte-identical to the proof and to `v2.0.0`.
