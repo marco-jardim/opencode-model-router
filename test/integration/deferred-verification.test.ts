@@ -17,7 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { resolve } from "node:path";
 import ModelRouterPlugin from "../../src/index";
-import { invalidateConfigCache } from "../../src/router/config";
+import { invalidateConfigCache, loadConfig } from "../../src/router/config";
 import {
   canonicalTier,
   createVerificationWiring,
@@ -852,6 +852,8 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("QA-2.4-2: a subagent's (or an unknown session's) dispatch is gated synchronously and registers nothing", async () => {
+      // Depth guard disabled: this test covers synchronous verification; the depth limit is covered by depth-guard-wiring.test.ts (#66).
+      (loadConfig().enforcement ??= {}).maxDelegationDepth = null;
       const h = await makePlugin(home, { parents: { sub: "orch" }, lookupFails: ["flaky"] });
       producerChanges();
       // A tracked tier subagent too (chat.message registers it), whatever session.get says.

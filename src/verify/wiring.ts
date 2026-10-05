@@ -914,7 +914,7 @@ export interface VerificationWiring {
    * the changed files are "unavailable" and the reference is the untracked default. `deadline`
    * bounds every testsPass step (T3); without it each testsPass check owns one of gateBudgetMs.
    */
-  buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline): GateDeps;
+  buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline, forceLowPriority?: boolean, creatorSessionID?: string | null): GateDeps;
   /**
    * 2.2.3: the idle-TTL sweep's hook into the plugin's one S5 batch coordinator (batch.ts B11):
    * evicts windows with no live member and batches whose seam hung past BATCH_STALE_GRACE_MS.
@@ -969,6 +969,8 @@ export function createVerificationWiring(deps: {
   getConfig: () => RouterConfig;
   /** Default: console.warn, no debug output. */
   logger?: WiringLogger;
+  /** Record each grader's creator before its first prompt, independently of its backend parent. */
+  onChildSessionCreated?: (sid: string, creatorSid: string | null) => void;
   /** Test seams of the S5 batch coordinator (clock, timers, platform, maximum window size). */
   batch?: Omit<BatchCoordinatorOptions, "logger">;
   /** Test seams of the pending registry (clock, random source). */
@@ -1197,10 +1199,19 @@ export function createVerificationWiring(deps: {
     }
   };
 
+  const notifyChildCreated = (sid: string, creatorSid: string | null): void => {
+    try {
+      deps.onChildSessionCreated?.(sid, creatorSid);
+    } catch (error) {
+      logger.warn("[verify] child-session hook failed", { error: errorText(error) });
+    }
+  };
+
   const dispatchGrader = async (
     req: GraderRequest,
     parentSessionID?: string,
     inFlight?: Set<string>,
+    creatorSessionID: string | null = parentSessionID ?? null,
   ): Promise<{ sessionID: string; text: string }> => {
     if (deps.childRunner) {
       const cfg = getConfig();
@@ -1218,6 +1229,7 @@ export function createVerificationWiring(deps: {
             sid = sessionID;
             graderSessions.add(sessionID);
             inFlight?.add(sessionID);
+            notifyChildCreated(sessionID, creatorSessionID);
           },
         }), graderTimeoutMs(req.tier, cfg.enforcement?.verify?.graderTimeoutMs), "grader prompt");
       } finally {
@@ -1242,6 +1254,7 @@ export function createVerificationWiring(deps: {
     if (!sid) return { sessionID: "", text: "" };
     graderSessions.add(sid);
     inFlight?.add(sid);
+    notifyChildCreated(sid, creatorSessionID);
     try {
       const cfg = getConfig();
       const model = tierModel(cfg, req.tier) ?? undefined;
@@ -1315,6 +1328,7 @@ export function createVerificationWiring(deps: {
     prepared?: PreparedVerification,
     deadline?: Deadline,
     forceLowPriority = false,
+    creatorSessionID: string | null = parentSessionID ?? null,
   ): GateDeps => {
     const cfg = getConfig();
     const resolved = resolveVerifyBudget(cfg);
@@ -1393,7 +1407,7 @@ export function createVerificationWiring(deps: {
       },
       checker: {
         dispatchGrader: (req: GraderRequest) =>
-          dispatchGrader(req, parentSessionID, inFlight),
+          dispatchGrader(req, parentSessionID, inFlight, creatorSessionID),
         ladder: ["fast", "medium", "heavy"],
         minGraderTier: cfg.enforcement?.verify?.minGraderTier ?? null,
       },
