@@ -16,6 +16,9 @@ import { ScriptedProvider, blocks, blockText, type HostVersion, type Block } fro
 
 const ROOT = path.resolve(__dirname, "../..");
 const MODEL = "anthropic/claude-opus-4-7";
+// Wire contracts are pinned independently of the production formatters.
+const D5 = "[router] DELEGATION DEPTH LIMIT — this session is at delegation depth 1; enforcement.maxDelegationDepth is 1, so it cannot dispatch another subagent. Do this part of the work yourself and report the result; do not retry the dispatch.";
+const A1 = "[⚠ GUARD:delegation_depth] this session is at delegation depth 1; enforcement.maxDelegationDepth is 1. In enforced mode this dispatch would have been refused. Do not dispatch further subagents from this session; do that work yourself.";
 const KEYLESS = process.env.RUN_OC_SMOKE_KEYLESS === "1" || process.env.RUN_OC_SMOKE === "1";
 const V2 = process.env.RUN_OC_SMOKE_V2 === "1";
 if (V2 && !process.env.OPENCODE_V2_BIN) throw new Error("Set OPENCODE_V2_BIN to the OpenCode 2 executable when RUN_OC_SMOKE_V2=1");
@@ -231,7 +234,7 @@ for (const host of hosts) {
       }
       const baseline = (await inventory(project)).agents;
       expect(baseline).toEqual(expect.arrayContaining(["fast", "medium", "heavy"]));
-      // Empty enforcement is the unset control for each key; compare FULL host inventories.
+      // The empty override object ({}) is the unset control for all three keys.
       for (const [key, valid, invalid] of [["maxDelegationDepth", 2, -1], ["effortBump", false, "yes"], ["effortBumpMax", "high", "bogus"]] as const) {
         for (const [label, value] of [["set", valid], ["invalid", invalid]] as const) {
           const enforcement = key === "maxDelegationDepth" ? { [key]: value } : { escalate: { [key]: value } };
@@ -252,6 +255,8 @@ for (const host of hosts) {
     for (const mode of ["enforced", "advisory"] as const) {
       for (const kind of (host.version === "v2" ? ["foreground", "background", "resume"] : ["foreground", "resume"])) {
         it(`${mode} ${kind}: root allowed; child ${mode === "enforced" ? "refused with exact D5" : "proceeds with exactly one banner"}`, async () => {
+          expect(depthLimitMessage(1, 1)).toBe(D5);
+          expect(depthAdvisoryBanner(1, 1)).toBe(A1);
           const f = await fixture(host);
           const project = await f.project("project", scenarioConfig(mode));
           let run: Run;
@@ -277,11 +282,11 @@ for (const host of hosts) {
           if (mode === "enforced") {
             expect(result?.is_error).toBe(true);
             const message = host.version === "v2" ? (JSON.parse(text) as { error: { message: string } }).error.message : text;
-            expect(message).toBe(depthLimitMessage(1, 1));
+            expect(message).toBe(D5);
           } else {
             expect(result?.is_error).not.toBe(true);
             expect(text.split("[⚠ GUARD:delegation_depth]")).toHaveLength(2);
-            expect(text.trimEnd().endsWith(depthAdvisoryBanner(1, 1))).toBe(true);
+            expect(text.trimEnd().endsWith(A1)).toBe(true);
             if (host.version === "v2") {
               const after = (await f.hooks()).find(h => h.hook === "after" && h.callID === call?.id && h.sessionID === run.childID);
               if (kind === "background") {
