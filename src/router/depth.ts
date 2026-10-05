@@ -20,6 +20,9 @@ export interface DepthTracker {
   depthOf(sessionID: string, opts?: { timeoutMs?: number }): Promise<number | undefined>;
   forget(sessionID: string): void;
   sweep(): void;
+  /** Tracked sessions, at most `maxEntries`. Ghosts (the remembered links of
+   *  evicted sessions, at most `maxEntries` more) are not sessions and are not
+   *  counted. */
   size(): number;
 }
 
@@ -34,6 +37,11 @@ interface Node {
   gap?: string; // fresh and incomplete: a missing ancestor to fetch
   via?: string; // the parent that gave the depth (the path a read keeps warm)
   lastTouch: number;
+}
+// An evicted node's links, kept so the sweep can cross it (QA-1.2-R3-1).
+interface Ghost {
+  parents: string[];
+  lastTouch: number; // the node's last touch: a ghost expires like a node
 }
 type LookupResult = { ok: true; node: Node } | { ok: false; reason: string };
 interface Lookup {
@@ -103,6 +111,15 @@ export function createDepthTracker(
   const kids = new Map<string, Set<string>>(); // parent id -> tracked nodes linking to it
   const get = (id: string): Node | undefined => lru.get(id) ?? pins.get(id);
   const has = (id: string): boolean => lru.has(id) || pins.has(id);
+  // Ghosts (QA-1.2-R3-1): the links of evicted nodes, for the sweep only. Climbs
+  // never read them, so they cause no lookup and prove no depth. `held` ghosts
+  // have a tracked or ghost child; `loose` ones have none and are dropped first
+  // when the ghosts together exceed maxEntries. Each map is oldest first.
+  const held = new Map<string, Ghost>();
+  const loose = new Map<string, Ghost>();
+  const ghostKids = new Map<string, Set<string>>(); // parent id -> ghosts linking to it
+  const ghostOf = (id: string): Ghost | undefined => held.get(id) ?? loose.get(id);
+  const remembered = (id: string): boolean => has(id) || held.has(id) || loose.has(id);
   const walks = new Map<string, Walk>();
   const lookups = new Map<string, Lookup>();
   const failedAt = new Map<string, number>();
@@ -133,7 +150,12 @@ export function createDepthTracker(
     }
   }
 
-  const WARNINGS = { lookup: "cannot resolve", conflict: "conflicting evidence for", evict: "dropping pinned evidence for" };
+  const WARNINGS = {
+    lookup: "cannot resolve",
+    conflict: "conflicting evidence for",
+    evict: "dropping pinned evidence for",
+    unlink: "dropping the evicted links of",
+  };
 
   function warn(id: string, kind: keyof typeof WARNINGS, reason: string): void {
     const key = `${kind}:${id}`;
@@ -145,28 +167,104 @@ export function createDepthTracker(
     if (!say(message)) warned.delete(key);
   }
 
-  function linkKid(parent: string, kid: string): void {
-    let set = kids.get(parent);
-    if (!set) kids.set(parent, set = new Set());
+  // `kids` and `ghostKids` map a parent id to the nodes or ghosts linking to it;
+  // a ghost moves between `held` and `loose` as its first child comes or its
+  // last one goes.
+  function index(map: Map<string, Set<string>>, parent: string, kid: string): void {
+    let set = map.get(parent);
+    if (!set) map.set(parent, set = new Set());
     set.add(kid);
+    regroup(parent);
   }
 
+  function unindex(map: Map<string, Set<string>>, parent: string, kid: string): void {
+    const set = map.get(parent)!;
+    set.delete(kid);
+    if (set.size === 0) map.delete(parent);
+    regroup(parent);
+  }
+
+  function regroup(id: string): void {
+    const g = ghostOf(id);
+    if (g === undefined) return;
+    const [to, from] = kids.has(id) || ghostKids.has(id) ? [held, loose] : [loose, held];
+    if (to.has(id)) return;
+    from.delete(id);
+    to.set(id, g);
+  }
+
+  const linkKid = (parent: string, kid: string): void => index(kids, parent, kid);
+
   // Untracks a node. Its children keep their links and floors; after an eviction
-  // (unlike forget, F4) they lose the frontier memo and so re-resolve the evicted
-  // id through the backend instead of trusting a memo that can no longer see
-  // conflicts recorded above it.
-  function drop(id: string, unresolveKids: boolean): void {
+  // or expiry (unlike forget, F4) they lose the frontier memo and so re-resolve
+  // the dropped id through the backend instead of trusting a memo that can no
+  // longer see conflicts recorded above it. An evicted node with links leaves a
+  // ghost; an expired one does not (the sweep found nothing live below it).
+  function drop(id: string, why: "evict" | "expire" | "forget"): void {
     const n = get(id)!;
     lru.delete(id);
     pins.delete(id);
-    for (const p of n.parents) {
-      const set = kids.get(p)!;
-      set.delete(id);
-      if (set.size === 0) kids.delete(p);
-    }
+    if (why === "evict" && n.parents.length) bury(id, n);
+    for (const p of n.parents) unindex(kids, p, id);
     n.fresh = false; // a walk may still hold this object
-    if (unresolveKids) for (const kid of kids.get(id) ?? []) get(kid)!.resolved = false;
+    if (why !== "forget") for (const kid of kids.get(id) ?? []) get(kid)!.resolved = false;
     invalidate(id);
+  }
+
+  // Remembers an evicted node's links, so that the sweep keeps the ancestors of
+  // a live node across it (QA-1.2-R3-1). Ghosts are FIFO-capped at maxEntries,
+  // loose ones first: no tracked node depends on them. Dropping a held ghost is
+  // logged when a pinned node may lie above it: unless an exact read re-fetches
+  // the evicted id first, that pinned evidence can then expire while a tracked
+  // descendant is still live.
+  function bury(id: string, n: Node): void {
+    const g: Ghost = { parents: [...n.parents], lastTouch: n.lastTouch }; // a walk may grow n.parents
+    loose.set(id, g);
+    for (const p of g.parents) index(ghostKids, p, id);
+    regroup(id);
+    while (held.size + loose.size > maxEntries) {
+      const old = (loose.size ? loose : held).keys().next().value!;
+      const above = held.has(old) ? pinnedAbove(ghostOf(old)!.parents) : undefined;
+      if (above !== undefined) warn(old, "unlink", `more than ${maxEntries} evicted sessions; ${above} may expire`);
+      unbury(old);
+    }
+  }
+
+  // Forgets a ghost: its id is tracked again (its own links take over), was
+  // forgotten, expired, or was pushed out of the cap.
+  function unbury(id: string): void {
+    const g = ghostOf(id);
+    if (g === undefined) return;
+    held.delete(id);
+    loose.delete(id);
+    for (const p of g.parents) unindex(ghostKids, p, id);
+  }
+
+  // Multi-source BFS over tracked and ghost links, up to MAX_DEPTH_HOPS hops:
+  // `hops` (id -> distance, seeded by the caller) gains each remembered ancestor
+  // once, at its shortest distance (Map iteration visits entries added during it,
+  // in order). Stops early at the first id `stop` accepts.
+  function ancestry(hops: Map<string, number>, stop: (id: string) => boolean = () => false): void {
+    for (const [id, level] of hops) {
+      if (stop(id)) return;
+      if (level === MAX_DEPTH_HOPS) continue;
+      for (const p of get(id)?.parents ?? ghostOf(id)!.parents) if (!hops.has(p) && remembered(p)) hops.set(p, level + 1);
+    }
+  }
+
+  // A pinned node within MAX_DEPTH_HOPS above `links`. The probe visits at most
+  // PROBE_BUDGET remembered ids (a bounded cost per dropped ghost); past that it
+  // reports a pinned node it could not rule out.
+  const PROBE_BUDGET = Math.min(FETCH_BUDGET, maxEntries);
+  function pinnedAbove(links: string[]): string | undefined {
+    let visited = 0;
+    let found: string | undefined;
+    ancestry(new Map(links.filter(remembered).map((p): [string, number] => [p, 1])), (id) => {
+      if (visited++ === PROBE_BUDGET) found = `a pinned session beyond ${PROBE_BUDGET} probed ancestors`;
+      else if (get(id)?.pinned) found = `pinned session ${id}`;
+      return found !== undefined;
+    });
+    return found;
   }
 
   // Marks every tracked descendant of `id` stale. Invariant: a stale node has no
@@ -210,11 +308,11 @@ export function createDepthTracker(
   // one). Only adopt() adds a node, and every adopt() is followed by a trim in
   // the same synchronous call; pin() moves a node between the maps.
   function trim(protect: string): void {
-    while (lru.size + pins.size > maxEntries && lru.size) drop(victim(lru, protect), true);
+    while (lru.size + pins.size > maxEntries && lru.size) drop(victim(lru, protect), "evict");
     while (pins.size > maxEntries) {
       const id = victim(pins, protect);
       warn(id, "evict", `more than ${maxEntries} pinned sessions`);
-      drop(id, true);
+      drop(id, "evict");
     }
   }
 
@@ -295,6 +393,7 @@ export function createDepthTracker(
   function adopt(id: string, n: Node): void {
     (n.pinned ? pins : lru).set(id, n);
     for (const p of n.parents) linkKid(p, id);
+    unbury(id); // tracked again: its own links replace the ghost's
     invalidate(id); // children holding `id` as a gap or frontier must re-climb
     for (const walk of live) {
       const copy = walk.learned.get(id);
@@ -676,7 +775,8 @@ export function createDepthTracker(
     },
     forget(id) {
       if (!validId(id)) return;
-      if (has(id)) drop(id, false);
+      if (has(id)) drop(id, "forget");
+      unbury(id);
       failedAt.delete(id);
       for (const kind of Object.keys(WARNINGS)) warned.delete(`${kind}:${id}`);
       for (const walk of live) {
@@ -699,22 +799,17 @@ export function createDepthTracker(
       // unless it is an ancestor, within MAX_DEPTH_HOPS, of a node that did not
       // expire. A read touches only its critical path, so this keeps every
       // ancestor whose evidence a live node's depth depends on (an ancestor
-      // further away can only confirm MAX), at O(nodes + links) per sweep and no
-      // cost per read (QA-1.2-R2-1). Multi-source BFS: the first visit is the
-      // shortest distance to a survivor.
+      // further away can only confirm MAX), at O(nodes + ghosts + links) per
+      // sweep and no cost per read (QA-1.2-R2-1). Ghosts follow the same rule,
+      // and the BFS crosses them, so an evicted intermediate does not cut a live
+      // node off from its pinned ancestors (QA-1.2-R3-1).
       const hops = new Map<string, number>();
-      for (const map of [lru, pins]) for (const [id, n] of map) if (now - n.lastTouch < ttlMs) hops.set(id, 0);
-      const queue = [...hops.keys()];
-      for (let i = 0; i < queue.length; i++) {
-        const level = hops.get(queue[i])!;
-        if (level === MAX_DEPTH_HOPS) continue;
-        for (const p of get(queue[i])!.parents) {
-          if (hops.has(p) || !has(p)) continue;
-          hops.set(p, level + 1);
-          queue.push(p);
-        }
+      for (const map of [lru, pins, held, loose]) {
+        for (const [id, x] of map) if (now - x.lastTouch < ttlMs) hops.set(id, 0);
       }
-      for (const map of [lru, pins]) for (const id of map.keys()) if (!hops.has(id)) drop(id, true);
+      ancestry(hops);
+      for (const map of [lru, pins]) for (const id of map.keys()) if (!hops.has(id)) drop(id, "expire");
+      for (const id of [...held.keys(), ...loose.keys()]) if (!hops.has(id)) unbury(id);
       for (const id of failedAt.keys()) throttled(id); // drops every expired entry
       for (const [key, stamp] of warned) if (now - stamp >= ttlMs) warned.delete(key);
     },

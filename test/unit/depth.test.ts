@@ -1141,3 +1141,161 @@ describe("QA-1.2-R2-3: one maxEntries cap covers ordinary and pinned nodes", () 
     expect(tracker.size()).toBe(3);
   });
 });
+
+describe("QA-1.2-R3-1: the sweep keeps ancestors across evicted links", () => {
+  const others = (warn: ReturnType<typeof fixture>["warn"]) =>
+    warn.mock.calls.map(([m]) => String(m)).filter((m) => !m.includes("conflicting"));
+
+  it.each([false, true])("(A) a pinned conflict above an LRU-evicted intermediate outlives the TTL (evicted: %s)", async (evict) => {
+    const { tracker, getParent, warn, time } = fixture({ ttlMs: 100, maxEntries: 30 });
+    getParent.mockImplementation(async (id) => id === "M" ? "A" : /^b[1-9]$/.test(id) ? `b${Number(id.slice(1)) - 1}` : null);
+    tracker.recordRoot("Q");
+    tracker.recordRoot("A");
+    tracker.recordCreated("A", "Q"); // A is a pinned conflict
+    tracker.recordCreated("M", "A");
+    chain(tracker, 4, "b");
+    tracker.recordCreated("X", "b4");
+    tracker.recordCreated("X", "M"); // X = 5, via b4: M and A are off the critical path
+    time(60);
+    expect(await tracker.depthOf("X")).toBe(5);
+    expect(await tracker.depthOf("Q")).toBe(0);
+    if (evict) for (let i = 0; i < 22; i++) tracker.recordRoot(`Z${i}`); // evicts M and nothing else
+    expect(tracker.size()).toBe(evict ? 30 : 9);
+    time(120);
+    expect(await tracker.depthOf("Q")).toBe(0);
+    time(150);
+    tracker.sweep(); // pre-fix: the evicted M cut the sweep, so A expired
+    const kept = tracker.size();
+    tracker.recordCreated("Q", "b4"); // Q = 5, so A = 6, M = 7 and X = 8
+    expect(await tracker.depthOf("X")).toBe(8);
+    expect(await tracker.depthOf("M")).toBe(7);
+    expect(await tracker.depthOf("A")).toBe(6);
+    expect(kept).toBe(evict ? 30 : 9);
+    expect(getParent.mock.calls).toEqual(evict ? [["M"]] : []);
+    expect(others(warn)).toEqual([]);
+  });
+
+  it.each([false, true])("(B) plugin evidence above LRU-evicted intermediates outlives the TTL (evicted: %s)", async (evict) => {
+    const { tracker, getParent, warn, time } = fixture({ ttlMs: 100, maxEntries: 7 });
+    const backend: Record<string, string> = { C: "U", U: "V", M: "P", K: "S" };
+    getParent.mockImplementation(async (id) => backend[id] ?? null);
+    tracker.recordCreated("C", "U"); // C has floor 1, U is unresolved
+    tracker.recordPluginChild("P", "C");
+    tracker.recordCreated("M", "P");
+    tracker.recordPluginChild("S", "M");
+    if (evict) for (let i = 0; i < 4; i++) tracker.recordRoot(`Z${i}`); // evicts M
+    time(60);
+    tracker.recordCreated("K", "S"); // touches only K and S (and, evicted, evicts C)
+    time(150);
+    tracker.sweep(); // pre-fix: drops P, whose plugin evidence the backend cannot reproduce
+    expect(await tracker.depthOf("K")).toBe(6);
+    expect(await tracker.depthOf("S")).toBe(5);
+    expect(await tracker.depthOf("M")).toBe(4);
+    expect(await tracker.depthOf("P")).toBe(3);
+    expect(getParent.mock.calls.map(([id]) => id)).toEqual(evict ? ["M", "C", "U", "V"] : ["U", "V"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("a child recorded under an intermediate evicted before it keeps the pinned ancestor above it", async () => {
+    const { tracker, getParent, warn, time } = fixture({ ttlMs: 100, maxEntries: 8 });
+    getParent.mockImplementation(async (id) => id === "M" ? "A" : null);
+    tracker.recordRoot("Q");
+    tracker.recordRoot("A");
+    tracker.recordCreated("A", "Q"); // A is a pinned conflict
+    tracker.recordCreated("M", "A"); // a leaf when it is evicted
+    for (let i = 0; i < 6; i++) tracker.recordRoot(`Z${i}`); // evicts M
+    expect(await tracker.depthOf("Q")).toBe(0);
+    time(60);
+    tracker.recordCreated("S", "M"); // floor 1: touches S only
+    time(150);
+    tracker.sweep(); // S survives, and its link crosses M's ghost to A
+    expect(tracker.size()).toBe(3);
+    chain(tracker, 2, "c");
+    tracker.recordCreated("Q", "c2"); // Q = 3, so A = 4, M = 5 and S = 6
+    expect(await tracker.depthOf("S")).toBe(6);
+    expect(getParent.mock.calls).toEqual([["M"]]);
+    expect(others(warn)).toEqual([]);
+  });
+
+  // M is touched while its parent P is already evicted (a record reads it at its
+  // floor), so A is not: the ghost of a recently touched M keeps A as M itself
+  // would, and expires like M once M has been idle for the TTL (F2).
+  it.each([[150, 5, 4], [170, 0, 2]])("a ghost survives a sweep at t=%i like a node: size %i, M = %i", async (at, kept, m) => {
+    const { tracker, getParent, warn, time } = fixture({ ttlMs: 100, maxEntries: 5 });
+    const backend: Record<string, string> = { M: "P", P: "A" };
+    getParent.mockImplementation(async (id) => backend[id] ?? null);
+    tracker.recordRoot("Q");
+    tracker.recordRoot("A");
+    tracker.recordCreated("A", "Q"); // A is a pinned conflict
+    tracker.recordCreated("P", "A");
+    for (let i = 0; i < 3; i++) tracker.recordRoot(`Z${i}`); // evicts P
+    expect(await tracker.depthOf("Q")).toBe(0);
+    time(60);
+    tracker.recordCreated("M", "P"); // touches M only
+    for (const id of ["Z1", "Z2", "Q"]) expect(await tracker.depthOf(id)).toBe(0);
+    tracker.recordRoot("Z3"); // evicts M: no node links to it any more
+    time(at);
+    tracker.sweep();
+    expect(tracker.size()).toBe(kept);
+    tracker.recordCreated("Q", "Z1"); // Q = 1, so A = 2, P = 3 and M = 4
+    expect(await tracker.depthOf("M")).toBe(m);
+    expect(getParent.mock.calls.map(([id]) => id)).toEqual(at === 150 ? ["M", "P"] : ["M", "P", "A"]);
+    expect(others(warn)).toEqual([]);
+  });
+
+  // With pinned nodes at the cap, each ordinary record is evicted by its own call.
+  it.each([["A", true], ["R", false]])("ghosts are capped: loose ones go silently, a held one is logged above a pinned node (top %s)", async (top, logged) => {
+    const { tracker, warn, time } = fixture({ ttlMs: 100, maxEntries: 3 });
+    tracker.recordPluginChild("A", null);
+    tracker.recordPluginChild("P0", null);
+    tracker.recordCreated("G4", top);
+    tracker.recordCreated("G3", "G4"); // evicts G4, held by G3
+    tracker.recordCreated("G2", "G3"); // evicts G3, held by G4's child G3
+    tracker.recordCreated("G1", "G2"); // evicts G2: three held ghosts
+    expect(warn).not.toHaveBeenCalled();
+    tracker.recordPluginChild("X", "G1"); // evicts G1, held by X: G4 is the oldest held ghost
+    const unlink = [expect.stringContaining("dropping the evicted links of session G4: more than 3 evicted sessions; pinned session A may expire")];
+    expect(warn.mock.calls.map(([m]) => m)).toEqual(logged ? unlink : []);
+    tracker.recordCreated("L", "P0"); // evicts L at once: the loose L goes first, silently
+    expect(warn.mock.calls.map(([m]) => m)).toEqual(logged ? unlink : []);
+    expect(tracker.size()).toBe(3);
+    time(60);
+    tracker.recordPluginChild("X", "G1"); // touches X only
+    time(150);
+    tracker.sweep(); // X keeps G1..G3; G4's link is gone, so A expires (logged above)
+    expect(tracker.size()).toBe(1);
+  });
+
+  it("the pinned-ancestor probe is bounded: past its budget it assumes a pinned node", async () => {
+    const { tracker, getParent, warn } = fixture({ maxEntries: 2 });
+    const backend: Record<string, string> = { V: "g1", g1: "g2", g2: "T" };
+    getParent.mockImplementation(async (id) => backend[id] ?? null);
+    tracker.recordPluginChild("X", "V");
+    // The walk evicts V, then g1, then g2, each held by the one below; dropping V
+    // probes g1, g2 and T (three ids, budget min(FETCH_BUDGET, 2) = 2).
+    expect(await tracker.depthOf("X")).toBe(4);
+    expect(warn.mock.calls.map(([m]) => m)).toContainEqual(
+      expect.stringContaining("dropping the evicted links of session V: more than 2 evicted sessions; a pinned session beyond 2 probed ancestors may expire"),
+    );
+    expect(getParent.mock.calls.map(([id]) => id)).toEqual(["V", "g1", "g2", "T"]);
+  });
+
+  it.each([false, true])("forget drops a ghost: the sweep no longer crosses the forgotten session (forget: %s)", async (forget) => {
+    const { tracker, time } = fixture({ ttlMs: 100, maxEntries: 4 });
+    tracker.recordPluginChild("A", null);
+    tracker.recordCreated("M", "A");
+    tracker.recordPluginChild("X", "M");
+    tracker.recordRoot("Z0");
+    tracker.recordRoot("Z1"); // evicts M, held by X
+    time(60);
+    tracker.recordPluginChild("X", "M"); // touches X only
+    time(150);
+    tracker.sweep();
+    expect(tracker.size()).toBe(2); // X and, across M's ghost, A
+    if (forget) tracker.forget("M");
+    time(250);
+    tracker.recordPluginChild("X", "M");
+    tracker.sweep();
+    expect(tracker.size()).toBe(forget ? 1 : 2);
+  });
+});
