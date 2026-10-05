@@ -15,7 +15,7 @@ import {
   resolveDepthLimit,
   warnDeprecatedVerifyKeys,
 } from "./router/config";
-import type { RouterConfig, TierConfig, Preset, ModeConfig } from "./router/config";
+import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
@@ -102,6 +102,7 @@ import {
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard } from "./escalate/ladder";
 import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
 import { createDepthGuard } from "./router/depth-guard";
+import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -391,6 +392,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }).mode,
     logger: routerWarn,
   });
+  const effortOverrides = createEffortOverrideStore({ logger: routerWarn });
+  let warnedGraderParams = false;
   const depthBanners = new Map<string, string>();
   const warnedNoCallID = new Set<string>();
   const stashDepthBanner = (
@@ -644,6 +647,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             let producerText = "";
             let forcing: string | null = null;
+            let effort: EffortLevel | undefined;
 
             /**
              * One turn of the escalation ladder: create a producer session, run
@@ -658,6 +662,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const runProducerAttempt = async (
               tier: string,
               forcingNote: string | null,
+              effort?: EffortLevel,
             ): Promise<{
               sessionID: string;
               text: string;
@@ -677,6 +682,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 producerSid = sid;
                 producerSessions.push(sid);
                 depthTracker.recordPluginChild(sid, toolCtx?.sessionID ?? null);
+                if (effort !== undefined) {
+                  const tierCfg = getActiveTiers(activeCfg)[tier];
+                  if (tierCfg) effortOverrides.set(sid, tier, tierCfg, effort);
+                }
                 // Keep the ORIGINAL dispatch reference across retries/escalations:
                 // recapturing after a failed attempt would excuse its regression.
                 if (!baselineID) {
@@ -785,6 +794,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 } catch {
                   // non-fatal
                 }
+                effortOverrides.clear(producerSid);
                 await disposeChildSession(producerSid);
                 return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
               }
@@ -913,6 +923,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
               // Dispose this attempt's backend session before the next iteration
               // so a long ladder never accumulates live sessions.
+              effortOverrides.clear(producerSid);
               await disposeChildSession(producerSid);
 
               return { sessionID: producerSid, text: producerText, gateRes };
@@ -926,7 +937,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 );
               }
               const tier = state.currentTier;
-              const attempt = await runProducerAttempt(tier, forcing);
+              const attempt = await runProducerAttempt(tier, forcing, effort);
               if (!attempt) {
                 return withDepthBanner("[router] delegate failed: could not create a producer session.");
               }
@@ -977,6 +988,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
               // retry or escalate
               forcing = action.forcingMessage ?? null;
+              effort = action.effort;
               state = advance(state, action);
             }
           } catch {
@@ -988,6 +1000,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // disposed session is harmless.
             for (const sid of producerSessions) {
               if (!(deferredOwnsBaseline && sid === baselineID)) changedFileStore.clear(sid);
+              effortOverrides.clear(sid);
               await disposeChildSession(sid);
             }
           }
@@ -1055,8 +1068,18 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             output.temperature = graderTemperature;
           }
         }
-      } catch {
-        // best-effort: never crash a real session
+      } catch (error) {
+        if (!warnedGraderParams) {
+          warnedGraderParams = true;
+          logger.warn("[verify] grader temperature not applied", { error: scrubText(String(error)) });
+        }
+      }
+      try {
+        if (input && typeof input === "object") {
+          applyEffortOverride(effortOverrides, input, ctx.routerHost === "v2" ? output : output?.options, routerWarn);
+        }
+      } catch (error) {
+        logger.warn("[router] effort override not applied", { error: scrubText(String(error)) });
       }
     },
 
@@ -1598,6 +1621,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
+            effortOverrides.clear(id);
             depthTracker.forget(id);
             for (const key of depthBanners.keys()) {
               if (key.startsWith(`${id}:`)) depthBanners.delete(key);

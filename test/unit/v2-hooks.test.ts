@@ -4,11 +4,12 @@ import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
-import { invalidateConfigCache, loadConfig } from "../../src/router/config";
+import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
+import { getActiveTiers } from "../../src/router/protocol";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
@@ -76,6 +77,63 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  it("applies the real ladder retry's effort through context without nesting options or changing grader temperature", async () => {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-effort-"));
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort" }));
+    invalidateConfigCache();
+    const tiers = getActiveTiers(loadConfig());
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", enforcement: { verify: {
+      graderTemperature: 0.25, graderTemperatureModels: Object.values(tiers).map(t => t.model),
+    } } }));
+    invalidateConfigCache();
+    const f = fixture();
+    const producers: Array<{ sid: string; options: Record<string, unknown> }> = [];
+    const graders: Record<string, unknown>[] = [];
+    let counter = 0;
+    const run = async (request: ChildSessionRequest) => {
+      const sessionID = `bridge-effort-${counter++}`;
+      await request.onCreated(sessionID);
+      const event = { sessionID, agent: request.agent ?? V2_GRADER_AGENT,
+        model: { providerID: request.model!.providerID, id: request.model!.modelID },
+        options: {} as Record<string, unknown>, system: [], messages: [],
+      };
+      await f.sessionHooks.context(event);
+      if (request.system !== undefined) {
+        graders.push(event.options);
+        return { sessionID, text: JSON.stringify({ pass: graders.length > 1, reasons: ["scripted verdict"] }) };
+      }
+      producers.push({ sid: sessionID, options: event.options });
+      return { sessionID, text: "producer output" };
+    };
+    const hooks = await ModelRouterPlugin({
+      directory: home, worktree: home, routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      routerChildRunner: { run, dispose: async () => undefined },
+    } as unknown as RouterPluginInput);
+    await f.start(hooks);
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true }); });
+    const result = await f.tools.delegate.execute({ tier: "fast", task: "VERIFY:required\nDo the work", acceptance: "[acceptance]\ncriteria: correct\n[/acceptance]" }, {
+      ...call, sessionID: "root", signal: new AbortController().signal, progress: vi.fn(async () => undefined),
+    });
+    expect(result.content).toContain("[router ✓ verified:");
+    expect(producers.map(p => p.options.effort)).toEqual(["low", "medium"]);
+    for (const { options } of producers) expect("options" in options).toBe(false);
+    expect(graders).toHaveLength(2);
+    for (const options of graders) {
+      expect(options.temperature).toBe(0.25);
+      expect(options.effort).toBeUndefined();
+      expect("options" in options).toBe(false);
+    }
+    const [providerID, ...modelParts] = tiers.fast.model.split("/");
+    const after = { sessionID: producers[1].sid, agent: "fast", model: { providerID, id: modelParts.join("/") }, options: {} as Record<string, unknown>, system: [], messages: [] };
+    await f.sessionHooks.context(after);
+    expect(after.options.effort).toBe("low");
+  });
+
   async function depthFixture(mode: "enforced" | "advisory", run?: (request: ChildSessionRequest) => Promise<{ sessionID: string; text: string }>) {
     const home = mkdtempSync(join(tmpdir(), "router-v2-depth-"));
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
