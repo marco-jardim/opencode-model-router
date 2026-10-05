@@ -156,12 +156,38 @@ may contain instruction text or paths.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `mode` | `"off" \| "advisory" \| "enforced"` | `"advisory"` | Global enforcement mode. `off` = no-op. `advisory` = log violations, never block. `enforced` = block/escalate on violations. |
+| `maxDelegationDepth` | `integer ≥ 1 \| null` | `1` | Deepest session a model-initiated dispatch may create; root/orchestrator = depth 0. `null` disables the depth guard. |
 | `envGate` | `string` | `"MODEL_ROUTER_ENFORCE"` | Name of the env var that overrides mode at runtime. See env-gate truth table below. |
 | `perTier` | `Record<string, "off" \| "advisory" \| "enforced">` | `{}` | Per-tier mode overrides. Keyed by tier name. Overrides base `mode` when the env gate is unset/empty. |
 | `guard` | object | see below | Request-level hard guards (caps, script controls, budget). |
 | `verify` | object | see below | Verification / grading policy. |
 | `escalate` | object | see below | Escalation ladder and cost ceiling. |
 | `proportional` | object | see below | Trivial-task bypass logic. |
+
+### Delegation depth
+
+`enforcement.maxDelegationDepth` defaults to `1`: only orchestrators may
+dispatch. Set it to `2` to let a delegate dispatch one more level, or `null` to
+disable the guard.
+
+A dispatch past the limit is **warned**, not blocked, in `advisory` mode (the
+bundled default), with a `[⚠ GUARD:delegation_depth]` banner. It is **refused** in
+`enforced` mode and ignored in `off`. To enforce the limit, set
+`enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`.
+
+The guard covers the native `task` tool (including `task_id` resume and OpenCode 2
+background dispatches) and the `delegate` tool. Unknown depth caused by a backend
+failure or timeout fails open with one warning. A cycle or a parent chain over
+32 hops counts as the maximum depth.
+
+```json
+{
+  "enforcement": {
+    "mode": "enforced",
+    "maxDelegationDepth": 2
+  }
+}
+```
 
 ---
 
@@ -473,11 +499,36 @@ produces no notice. `background` and `pendingTtlMs` are read at plugin start, so
 | `ladder` | `string[]` | `["fast","medium","heavy"]` | Ordered list of tier names to escalate through. Must be an array of strings. |
 | `maxAttemptsPerTier` | `number` | `1` | Max attempts at each rung before advancing. Must be integer ≥ 0. |
 | `maxTotalAttempts` | `number` | `4` | Hard ceiling across all tiers and retries. Must be integer ≥ 1. |
+| `effortBump` | `boolean` | `true` | Retry a failed router-ladder attempt on the same tier one effort level higher before escalating. `false` restores the previous ladder exactly. |
+| `effortBumpMax` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"xhigh"` | Upper bound for bumped attempts, further clamped per model. |
 | `costCeiling.base` | `string` | `"firstAttemptCostUnits"` | Reference point for cost ceiling. `"firstAttemptCostUnits"` = cost of the first producing attempt. |
 | `costCeiling.multiple` | `number` | `4` | Ceiling = `base × multiple`. Must be > 0. Escalation halts when cumulative cost would exceed this. |
 
 > **`floorTier`** is useful when a task is known non-trivial: set `floorTier: "medium"` to skip `fast` entirely.  
 > **`costCeiling`** is evaluated before each escalation step; the attempt is not started if it would breach the ceiling.
+
+### Effort bump before escalation
+
+`enforcement.escalate.effortBump` applies only to tiers with an explicit `effort`
+and no `variant`. A failed router-ladder attempt is retried on the same tier one
+effort level higher before escalating; set it to `false` to restore the previous
+ladder exactly. The attempt count, `maxTotalAttempts`, and cost ceiling are
+unchanged: a bumped attempt costs the tier's `costRatio`.
+
+`enforcement.escalate.effortBumpMax` caps bumped attempts and is further clamped
+per model: OpenAI tiers stop at `high`, while Claude tiers may reach `xhigh`.
+Set it to `"high"` if a Claude model you use rejects `xhigh`.
+
+```json
+{
+  "enforcement": {
+    "escalate": {
+      "effortBump": true,
+      "effortBumpMax": "high"
+    }
+  }
+}
+```
 
 ---
 
@@ -555,12 +606,15 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | Rule |
 |---|
 | `mode` must be one of `off \| advisory \| enforced`. |
+| `maxDelegationDepth` must be an integer ≥ 1 or `null`. |
 | `verify.graderPolicy` (when `verify` is an object) must be exactly `"atLeastProducerTier"`. |
 | `escalate.costCeiling.multiple` must be a number > 0. |
 | `escalate.ladder` must be an array of strings. |
 | `escalate.maxAttemptsPerTier` must be an integer ≥ 0. |
 | `escalate.maxTotalAttempts` must be an integer ≥ 1. |
 | `escalate.floorTier` must be string or `null`. |
+| `escalate.effortBump` must be a boolean. |
+| `escalate.effortBumpMax` must be one of `low \| medium \| high \| xhigh \| max`. |
 | `perTier` values must each be `off \| advisory \| enforced`. |
 | `guard.budget` must be a number ≥ 1. |
 | `guard.blockScriptWrites` must be a boolean. |

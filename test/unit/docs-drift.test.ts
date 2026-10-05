@@ -12,7 +12,8 @@ import type { RouterConfig } from "../../src/index";
  * Documentation-drift guards.
  *
  * These assert that two things the docs claim stay true of the shipped code:
- * every top-level key of `tiers.json` is described in the config reference, and
+ * every top-level key of `tiers.json` and selected nested enforcement keys are
+ * described in the config reference, and
  * the README quotes the prompt sizes that the golden snapshots actually produce.
  *
  * Both fail on ADDITION, which is the point. Adding a config key or growing the
@@ -22,6 +23,13 @@ import type { RouterConfig } from "../../src/index";
 
 const root = process.cwd();
 const read = (p: string) => readFileSync(join(root, p), "utf-8");
+const undocumentedKeys = (doc: string, keys: readonly string[]) =>
+  keys.filter((key) => !doc.includes(`\`${key}\``));
+const nestedEnforcementKeys = [
+  "enforcement.maxDelegationDepth",
+  "enforcement.escalate.effortBump",
+  "enforcement.escalate.effortBumpMax",
+];
 
 describe("docs drift", () => {
   it("documents every tiers.json top-level key in CONFIG_REFERENCE.md", () => {
@@ -32,8 +40,22 @@ describe("docs drift", () => {
     // Sanity: a tiers.json that parsed to nothing would make this vacuously green.
     expect(keys.length).toBeGreaterThan(0);
 
-    const undocumented = keys.filter((key) => !doc.includes(`\`${key}\``));
+    const undocumented = undocumentedKeys(doc, keys);
     expect(undocumented).toEqual([]);
+  });
+
+  it("documents depth and effort bump key paths in CONFIG_REFERENCE.md", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md");
+    expect(undocumentedKeys(doc, nestedEnforcementKeys)).toEqual([]);
+  });
+
+  it.each(nestedEnforcementKeys)("detects missing nested key %s", (missingKey) => {
+    const fixture = nestedEnforcementKeys
+      .filter((key) => key !== missingKey)
+      .map((key) => `\`${key}\``)
+      .join("\n");
+
+    expect(undocumentedKeys(fixture, nestedEnforcementKeys)).toEqual([missingKey]);
   });
 
   // 30s timeout: this test recomputes the assembled prompts live, which can
