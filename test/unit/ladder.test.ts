@@ -16,7 +16,7 @@ import {
   type LadderState,
   type LadderVerdict,
 } from "../../src/escalate/ladder";
-import type { EffortLevel, RouterConfig } from "../../src/router/config";
+import type { EffortLevel, Preset, RouterConfig, TierConfig } from "../../src/router/config";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -627,6 +627,153 @@ describe("buildEscalatePolicy", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Per-tier effort bump policy construction
+// ---------------------------------------------------------------------------
+
+describe("buildEscalatePolicy effort bump", () => {
+  function makeCfg(
+    tiers: Preset,
+    escalate: NonNullable<RouterConfig["enforcement"]>["escalate"] = {},
+  ): RouterConfig {
+    return {
+      activePreset: "test",
+      presets: { test: tiers },
+      rules: [],
+      defaultTier: "fast",
+      enforcement: { escalate },
+    };
+  }
+
+  function shippedCfg(activePreset: string): RouterConfig {
+    const cfg: RouterConfig = JSON.parse(readFileSync(new URL("../../tiers.json", import.meta.url), "utf8"));
+    return { ...cfg, activePreset };
+  }
+
+  const claude = { model: "anthropic/claude-sonnet-4-5", effort: "high" } satisfies TierConfig;
+  const openai = { model: "openai/gpt-5", effort: "medium" } satisfies TierConfig;
+
+  it.each([
+    ["no effort", { model: claude.model }],
+    ["variant", { ...claude, variant: "high" }],
+    ["unknown provider", { model: "other/model", effort: "low" }],
+    ["winning thinking budget", { ...claude, thinking: { budgetTokens: 4096 } }],
+    ["winning reasoning effort", { ...openai, reasoning: { effort: "low" } }],
+    ["Claude at default max", { ...claude, effort: "xhigh" }],
+    ["OpenAI at its ceiling", { ...openai, effort: "high" }],
+  ] satisfies Array<[string, TierConfig]>)("excludes a tier with %s", (_name, tier) => {
+    expect(buildEscalatePolicy(makeCfg({ fast: tier }))).not.toHaveProperty("effortBump");
+  });
+
+  it.each([
+    ["invalid effort", { ...claude, effort: "ultra" }],
+    ["wrong-case effort", { ...claude, effort: "High" }],
+    ["null effort", { ...claude, effort: null }],
+    ["missing model", { effort: "low" }],
+    ["non-string model", { model: 42, effort: "low" }],
+    ["null entry", null],
+  ])("skips malformed runtime config: %s", (_name, tier) => {
+    const cfg: RouterConfig = JSON.parse(JSON.stringify({
+      ...makeCfg({}), presets: { test: { fast: tier } },
+    }));
+    expect(buildEscalatePolicy(cfg)).not.toHaveProperty("effortBump");
+  });
+
+  it("bounds OpenAI medium at high and Claude high at the default xhigh", () => {
+    expect(buildEscalatePolicy(makeCfg({ fast: openai, medium: claude })).effortBump).toEqual({
+      perTier: {
+        fast: { base: "medium", bound: "high" },
+        medium: { base: "high", bound: "xhigh" },
+      },
+    });
+  });
+
+  it("omits the key when disabled even with eligible tiers", () => {
+    expect(buildEscalatePolicy(makeCfg({ fast: openai, medium: claude }, { effortBump: false })))
+      .not.toHaveProperty("effortBump");
+  });
+
+  it("max low disables every tier, including one starting at low", () => {
+    const cfg = makeCfg({ fast: { ...claude, effort: "low" }, medium: openai, heavy: claude }, { effortBumpMax: "low" });
+    expect(buildEscalatePolicy(cfg)).not.toHaveProperty("effortBump");
+  });
+
+  it("max high excludes Claude high but still bumps OpenAI medium", () => {
+    expect(buildEscalatePolicy(makeCfg({ fast: openai, medium: claude }, { effortBumpMax: "high" })).effortBump)
+      .toEqual({ perTier: { fast: { base: "medium", bound: "high" } } });
+  });
+
+  it("max max allows Claude high through max, without raising the OpenAI ceiling", () => {
+    expect(buildEscalatePolicy(makeCfg({ fast: openai, medium: claude }, { effortBumpMax: "max" })).effortBump)
+      .toEqual({ perTier: {
+        fast: { base: "medium", bound: "high" },
+        medium: { base: "high", bound: "max" },
+      } });
+  });
+
+  it("includes off-ladder tiers and stores prototype-named tiers as safe own entries", () => {
+    const names = ["custom", "__proto__", "constructor", "toString"];
+    const cfg = makeCfg(Object.fromEntries(names.map((name) => [name, claude])));
+    const before = JSON.stringify(cfg);
+    const perTier = buildEscalatePolicy(cfg).effortBump!.perTier;
+    expect(Object.keys(perTier)).toEqual(names);
+    expect(Object.getPrototypeOf(perTier)).toBe(Object.prototype);
+    for (const name of names) {
+      expect(Object.prototype.hasOwnProperty.call(perTier, name)).toBe(true);
+      expect(perTier[name]).toEqual({ base: "high", bound: "xhigh" });
+    }
+    expect(JSON.stringify(cfg)).toBe(before);
+  });
+
+  it("omits the key for empty presets without crashing", () => {
+    expect(buildEscalatePolicy({ ...makeCfg({}), presets: {} })).not.toHaveProperty("effortBump");
+  });
+
+  it("shipped anthropic preset has no eligible tiers because all have variants", () => {
+    const cfg = shippedCfg("anthropic");
+    expect(Object.values(cfg.presets.anthropic!).every((tier) => Boolean(tier.variant))).toBe(true);
+    expect(buildEscalatePolicy(cfg)).not.toHaveProperty("effortBump");
+  });
+
+  it("shipped fable-effort preset bumps fast and medium but excludes heavy", () => {
+    expect(buildEscalatePolicy(shippedCfg("fable-effort")).effortBump).toEqual({
+      perTier: {
+        fast: { base: "low", bound: "xhigh" },
+        medium: { base: "high", bound: "xhigh" },
+      },
+    });
+  });
+
+  it("runs the fable-effort fail stream with recorded tier costs and a final scorecard", () => {
+    const cfg = shippedCfg("fable-effort");
+    // Allow four attempts at the shipped ratios (1, 1, 3, 3); the default
+    // multiple of four would stop after the first medium attempt costs five.
+    cfg.enforcement = { ...cfg.enforcement, escalate: {
+      ...cfg.enforcement?.escalate, costCeiling: { multiple: 8 },
+    } };
+    const policy = buildEscalatePolicy(cfg);
+    const tiers = cfg.presets["fable-effort"]!;
+    let state = newLadderState("fast", policy);
+    const attempts: string[] = [];
+    const actions: string[] = [];
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const tier = tiers[state.currentTier]!;
+      attempts.push(`${state.currentTier}@${state.currentEffort ?? tier.effort}`);
+      state = recordAttempt(state, tier.costRatio);
+      const action = nextAction(state, { pass: false, outcome: "fail", reasons: ["check failed"] }, policy);
+      actions.push(action.action);
+      if (attempt === 3) expect(action).toEqual({ action: "give_up", reason: "max total attempts (4) reached" });
+      state = advance(state, action);
+    }
+    expect(attempts).toEqual(["fast@low", "fast@medium", "medium@high", "medium@xhigh"]);
+    expect(actions).toEqual(["retry", "escalate", "retry", "give_up"]);
+    expect(state.firstAttemptCost).toBe(1);
+    expect(formatLadderScorecard(state, false, "trace")).toBe(
+      "[router delegate scorecard | final_tier=medium@xhigh | attempts=4 | escalations=1 | cost=8 | verdict=UNMET | method=trace]",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Edge-case integration scenarios
 // ---------------------------------------------------------------------------
 
@@ -774,7 +921,7 @@ describe("formatLadderScorecard", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Effort step — policies are hand-built until perTier construction lands.
+// Effort step — hand-built policies isolate the state machine from construction.
 // ---------------------------------------------------------------------------
 
 describe("ladder effort step", () => {
