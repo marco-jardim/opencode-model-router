@@ -303,6 +303,28 @@ describe("per-session effort overrides", () => {
     expect(logger.warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("second"));
   });
 
+  it("reads each tier field once and keeps accessor model identity coherent", () => {
+    const { store, logger } = setup();
+    const reads = new Map<PropertyKey, number>();
+    const tier = new Proxy<TierConfig>({ ...claude, variant: undefined, thinking: undefined, reasoning: undefined }, {
+      get(target, key, receiver): unknown {
+        const count = (reads.get(key) ?? 0) + 1;
+        reads.set(key, count);
+        if (key === "model") return count === 1 ? claude.model : openai.model;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    store.set("producer", "fast", tier, "max");
+    expect(Object.fromEntries(reads)).toEqual({ model: 1, effort: 1, variant: 1, thinking: 1, reasoning: 1 });
+    const target = {};
+    applyEffortOverride(store, { ...producer, model: { providerID: "anthropic", id: "claude-fable-5-1" } }, target, logger);
+    expect(target).toEqual({ effort: "max" });
+    const foreignTarget = {};
+    applyEffortOverride(store, producer, foreignTarget, logger);
+    expect(foreignTarget).toEqual({});
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it("evicts the oldest on overflow", () => {
     const { store, logger } = setup(2);
     store.set("second", "fast", openai, "medium");

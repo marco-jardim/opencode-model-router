@@ -50,22 +50,28 @@ export function createEffortOverrideStore(
     set(sessionID, tierName, tier, effort) {
       try {
         entries.delete(sessionID);
-        if (!nonempty(sessionID) || !nonempty(tierName) || !tier || typeof tier !== "object"
-          || !nonempty(tier.model) || !EFFORT_LEVELS.includes(effort)) {
+        if (!nonempty(sessionID) || !nonempty(tierName) || !tier || typeof tier !== "object") {
           warn(logger, "Invalid effort override arguments; override refused");
           return;
         }
-        const separator = tier.model.indexOf("/");
-        if (separator <= 0 || separator === tier.model.length - 1) {
+        // Read every tier field once; validation, ceiling and builder share this snapshot.
+        const snapshot = { ...tier };
+        const model = snapshot.model;
+        if (!nonempty(model) || !EFFORT_LEVELS.includes(effort)) {
+          warn(logger, "Invalid effort override arguments; override refused");
+          return;
+        }
+        const separator = model.indexOf("/");
+        if (separator <= 0 || separator === model.length - 1) {
           warn(logger, "Effort override requires a provider/model identity; override refused");
           return;
         }
-        const ceiling = effortCeilingFor(tier);
+        const ceiling = effortCeilingFor(snapshot);
         if (ceiling === null || effortRank(effort) > effortRank(ceiling)) {
           warn(logger, `Effort override for ${sessionID} exceeds the tier ceiling; override refused`);
           return;
         }
-        const options = buildAgentOptions({ ...tier, effort }, tierName, builderLogger);
+        const options = buildAgentOptions({ ...snapshot, effort }, tierName, builderLogger);
         const keys: Entry["keys"] = {};
         for (const key of EFFORT_OVERRIDE_KEYS) {
           if (Object.hasOwn(options, key)) keys[key] = options[key];
@@ -74,7 +80,7 @@ export function createEffortOverrideStore(
           warn(logger, `Effort override for ${sessionID} has no effort keys; override refused`);
           return;
         }
-        entries.set(sessionID, { tierName, model: tier.model, keys, warnedMissingTarget: false });
+        entries.set(sessionID, { tierName, model, keys, warnedMissingTarget: false });
         if (entries.size > maxEntries) {
           // A positive capacity and overflow guarantee a first entry.
           const oldest = entries.keys().next().value!;
