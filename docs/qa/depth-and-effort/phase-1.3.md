@@ -411,3 +411,7 @@ Under §0.7, every round-2 finding must be fixed before DoD, which requires zero
 - Original fixture: `git diff 2927540 -- test/unit/__fixtures__/ladder-v2.0.0-golden.json` empty; SHA-256 `F4FECEECF459375273AE850419FF4CED877DB83311BCA4CABBE5211F60E029A2`. `GOLDEN_WRITE` was never set.
 - New cost fixture: generated with `GOLDEN_WRITE_COST=1` from `git show v2.0.0:src/escalate/ladder.ts`, extracted to an external temporary module and type-stripped without changing its implementation. Only the new JSON and gated generator/replay code are committed; the temporary reference is removed. Read-only replay passed with the flag unset. Covers null first cost, null multiplier, first costs 1/2/5, below/at/above ceilings, and six heterogeneous-cost sequences ending on the cost ceiling.
 - Focused checks before commits: QA-1.3-2 ladder 177 tests; QA-1.3-3 ladder 178; QA-1.3-4 ladder 179 (generation and read-only replay); QA-1.3-5 effort-ceiling 3,742; QA-1.3-6 effort/ceiling/v2-hooks 3,858. The seven new model ids add 1,169 cases; the clamp, shipped trace, cost replay and key-order tests add seven more (4,042 total versus 2,866 before).
+
+Resolution of round 2 (orchestrator, on `de/main`): QA-1.3-R2-1 → plan §1.7 A15 (every phase applies the handoffs addressed to it; names the QA-1.3-9 lines for 3.1); QA-1.3-R2-2 → A14 now gives both traces. Commit `d894a6c`.
+
+**Open findings: 0** (every round-1 and round-2 finding fixed or deferred by plan: QA-1.3-1 → 2.3.5.b, QA-1.3-9 → 3.1). Merged into `de/main` in `03949d2`.
