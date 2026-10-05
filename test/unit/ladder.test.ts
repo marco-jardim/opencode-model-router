@@ -743,6 +743,39 @@ describe("buildEscalatePolicy effort bump", () => {
     });
   });
 
+  it("shipped fable-effort defaults stop after three attempts just as with the bump disabled", () => {
+    const cfg = shippedCfg("fable-effort");
+    const tiers = cfg.presets["fable-effort"]!;
+    const policy = buildEscalatePolicy(cfg);
+    const plainPolicy = buildEscalatePolicy({
+      ...cfg,
+      enforcement: { ...cfg.enforcement, escalate: { ...cfg.enforcement?.escalate, effortBump: false } },
+    });
+    expect(policy.costMultiple).toBe(4);
+    expect(plainPolicy).not.toHaveProperty("effortBump");
+    const run = (p: EscalatePolicy) => {
+      let state = newLadderState("fast", p);
+      const attempts: string[] = [];
+      for (let attempt = 0; attempt < p.maxTotalAttempts; attempt++) {
+        const tier = tiers[state.currentTier]!;
+        attempts.push(`${state.currentTier}@${state.currentEffort ?? tier.effort}`);
+        state = recordAttempt(state, tier.costRatio);
+        const action = nextAction(state, { pass: false }, p);
+        if (action.action === "give_up") return { attempts, state, action };
+        state = advance(state, action);
+      }
+      throw new Error("Expected default cost ceiling to terminate the sequence");
+    };
+    const bumped = run(policy);
+    const plain = run(plainPolicy);
+    expect(bumped.attempts).toEqual(["fast@low", "fast@medium", "medium@high"]);
+    expect(plain.attempts).toEqual(["fast@low", "fast@low", "medium@high"]);
+    for (const result of [bumped, plain]) {
+      expect(result.state).toMatchObject({ totalAttempts: 3, firstAttemptCost: 1, cumulativeCost: 5 });
+      expect(result.action).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+    }
+  });
+
   it("runs the fable-effort fail stream with recorded tier costs and a final scorecard", () => {
     const cfg = shippedCfg("fable-effort");
     // Allow four attempts at the shipped ratios (1, 1, 3, 3); the default
