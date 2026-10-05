@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   tierRank,
   resolveStartTier,
@@ -21,6 +25,103 @@ import type { EffortLevel, Preset, RouterConfig, TierConfig } from "../../src/ro
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Additional cost goldens are generated ONLY from the tagged v2.0.0 source,
+// never from the imported implementation under test. GOLDEN_WRITE_COST=1
+// extracts that source to a temporary directory, transpiles away its type-only
+// import, and uses it as the oracle. The original golden fixture is untouched.
+type CostGoldenLadder = Pick<typeof import("../../src/escalate/ladder"),
+  "newLadderState" | "recordAttempt" | "nextAction" | "advance" | "formatLadderScorecard">;
+
+function generateCostGolden(api: CostGoldenLadder) {
+  const verdicts: LadderVerdict[] = [
+    { pass: false, outcome: "fail", reasons: ["cost golden failure"] },
+    { pass: true, outcome: "pass" },
+    { pass: false, outcome: "unverifiable" },
+  ];
+  function capture(state: LadderState, verdict: LadderVerdict, policy: EscalatePolicy) {
+    const action = api.nextAction(state, verdict, policy);
+    const advanced = api.advance(state, action);
+    return {
+      input: { state, verdict, policy },
+      output: { action, advanced, scorecard: api.formatLadderScorecard(advanced, action.action === "accept", "golden-cost-v2.0.0") },
+    };
+  }
+  const matrix: ReturnType<typeof capture>[] = [];
+  for (const firstAttemptCost of [null, 1, 2, 5]) {
+    for (const costMultiple of [null, 4]) {
+      const policy = makePolicy({ costMultiple, maxTotalAttempts: 10 });
+      // Null cases use the same cost probes, but must not enforce a ceiling.
+      const ceiling = (firstAttemptCost ?? 1) * 4;
+      for (const cumulativeCost of [0, ceiling - 1, ceiling, ceiling + 1]) {
+        for (const [escalations, currentTier] of policy.ladder.entries()) {
+          for (const attemptsThisTier of [0, 1]) {
+            for (const verdict of verdicts) {
+              matrix.push(capture(makeState({
+                currentTier, attemptsThisTier, totalAttempts: 2,
+                escalations, firstAttemptCost, cumulativeCost,
+              }), verdict, policy));
+            }
+          }
+        }
+      }
+    }
+  }
+  const sequences = [1, 2, 5].flatMap((scale) => ["fast", "medium"].map((producerTier) => {
+    const policy = makePolicy({ costMultiple: 4, maxTotalAttempts: 10 });
+    const tierCosts: Record<string, number> = { fast: scale, medium: 3 * scale, heavy: 6 * scale };
+    const initialState = api.newLadderState(producerTier, policy);
+    let state = initialState;
+    const steps: ReturnType<typeof capture>[] = [];
+    for (let attempt = 0; attempt < policy.maxTotalAttempts; attempt++) {
+      state = api.recordAttempt(state, tierCosts[state.currentTier]!);
+      const step = capture(state, verdicts[0]!, policy);
+      steps.push(step);
+      state = step.output.advanced;
+      if (step.output.action.action === "give_up") {
+        return { producerTier, tierCosts, initialState, steps };
+      }
+    }
+    throw new Error("Cost golden sequence did not terminate");
+  }));
+  return { version: "2.0.0", source: "v2.0.0:src/escalate/ladder.ts", matrix, sequences };
+}
+
+describe("additional golden v2.0.0 cost coverage", () => {
+  it("replays null and boundary costs plus heterogeneous cost-ceiling sequences byte-for-byte", async () => {
+    const fixtureUrl = new URL("./__fixtures__/ladder-v2.0.0-golden-cost.json", import.meta.url);
+    if (process.env.GOLDEN_WRITE_COST === "1") {
+      const source = execFileSync("git", ["show", "v2.0.0:src/escalate/ladder.ts"], { encoding: "utf8" });
+      const directory = mkdtempSync(join(tmpdir(), "ladder-v2.0.0-reference-"));
+      try {
+        writeFileSync(join(directory, "ladder-v2.0.0.ts"), source, "utf8");
+        const { stripTypeScriptTypes } = await import("node:module");
+        const compiled = stripTypeScriptTypes(source);
+        const modulePath = join(directory, "ladder-v2.0.0.mjs");
+        writeFileSync(modulePath, compiled, "utf8");
+        const reference: CostGoldenLadder = await import(/* @vite-ignore */ pathToFileURL(modulePath).href);
+        writeFileSync(fixtureUrl, `${JSON.stringify(generateCostGolden(reference), null, 2)}\n`, "utf8");
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+    const actual = generateCostGolden({ newLadderState, recordAttempt, nextAction, advance, formatLadderScorecard });
+    expect(actual.matrix).toHaveLength(576);
+    expect(actual.sequences).toHaveLength(6);
+    for (const sequence of actual.sequences) {
+      expect(sequence.steps.at(-1)!.output.action).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+      expect(sequence.initialState).not.toHaveProperty("currentEffort");
+    }
+    for (const entry of [...actual.matrix, ...actual.sequences.flatMap((sequence) => sequence.steps)]) {
+      expect(entry.input.policy).not.toHaveProperty("effortBump");
+      expect(entry.output.action).not.toHaveProperty("effort");
+      expect(entry.output.advanced).not.toHaveProperty("currentEffort");
+    }
+    const expected = readFileSync(fixtureUrl, "utf8");
+    expect(actual).toEqual(JSON.parse(expected));
+    expect(`${JSON.stringify(actual, null, 2)}\n`).toBe(expected);
+  });
+});
 
 function mulberry32(seed: number) {
   return function () {
