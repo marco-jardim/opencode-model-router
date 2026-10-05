@@ -55,10 +55,13 @@ Observations by @MetalbolicX in opencode-smart-router (#17); implementation writ
   already registered with its native key.
   - OpenAI-family detection is regex-based: Copilot/OpenRouter/Azure `gpt-*`,
     `gpt-oss` through Ollama/Groq, and non-reasoning GPT models with configured
-    effort now receive `reasoningEffort` (and configured summaries use
-    `reasoningSummary`). IDs matching `-o1`/`-o3`, such as `mistral/magistral-o1`,
-    are also treated as OpenAI. Whether the SDK strips unsupported options for
-    non-reasoning models is unverified.
+    `effort` or explicit `reasoning.effort` now receive `reasoningEffort` (and
+    configured summaries use `reasoningSummary`). IDs containing `o1`/`o3`/`o4`
+    delimited by `/`, `-` or `_` (or the start/end of the ID), including bare IDs
+    and false positives such as `mistral/magistral-o1`, are also treated as OpenAI.
+    OpenAI-family tiers with a truthy `thinking.budgetTokens` now also send
+    `thinking: { type: "enabled", budgetTokens }`; non-Claude budgets are not gated.
+    Whether the SDK strips unsupported options for non-reasoning models is unverified.
   - Claude tiers with an applicable `thinking.budgetTokens` now send `thinking`;
     adaptive-only Claude still drops manual budgets. Unknown-family tiers (such
     as Bedrock Claude or Gemini) with explicit `thinking.budgetTokens` or
