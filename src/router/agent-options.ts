@@ -121,8 +121,6 @@ export function buildAgentOptions(
       `tier ${tierName}: model '${tier.model}' only accepts adaptive thinking and rejects a manual budget, so thinking.budgetTokens is ignored; use effort instead`,
       logger,
     );
-  } else if (hasThinkingBudget) {
-    opts.thinking = { type: "enabled", budgetTokens: tier.thinking?.budgetTokens };
   } else if (tier.thinking?.budgetTokens === 0) {
     warnAgentOptionsEffortOnce(
       `thinking-zero:${tierName}`,
@@ -144,9 +142,6 @@ export function buildAgentOptions(
   } else if (tier.reasoning) {
     if (tier.reasoning.effort) {
       opts.reasoningEffort = tier.reasoning.effort;
-    }
-    if (tier.reasoning.summary) {
-      opts.reasoningSummary = tier.reasoning.summary;
     }
   }
 
@@ -197,5 +192,14 @@ export function buildAgentOptions(
     }
   }
 
+  // Preserve the v2.0.0 bridge's insertion order: ordinary options, then
+  // reasoningEffort, reasoningSummary, thinking. Only emission moves; the
+  // family checks, warning order and explicit-config precedence stay intact.
+  if (!isClaude && tier.reasoning?.summary) {
+    opts.reasoningSummary = tier.reasoning.summary;
+  }
+  if (hasThinkingBudget) {
+    opts.thinking = { type: "enabled", budgetTokens: tier.thinking?.budgetTokens };
+  }
   return opts;
 }

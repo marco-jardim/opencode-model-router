@@ -75,6 +75,32 @@ describe("per-tier effort agent options", () => {
     vi.restoreAllMocks();
   });
 
+  test.each([
+    {
+      model: "github-copilot/gpt-5",
+      extras: { effort: "max", reasoning: { summary: "auto" }, thinking: { budgetTokens: 4096 } },
+      options: { reasoningEffort: "high", reasoningSummary: "auto", thinking: { type: "enabled", budgetTokens: 4096 } },
+      keys: ["reasoningEffort", "reasoningSummary", "thinking"],
+    },
+    {
+      model: "anthropic/claude-sonnet-4-5",
+      extras: { effort: "high", thinking: { budgetTokens: 4096 }, reasoning: { summary: "auto" } },
+      options: { thinking: { type: "enabled", budgetTokens: 4096 } },
+      keys: ["thinking"],
+    },
+    {
+      model: "anthropic/claude-fable-5-1",
+      extras: { effort: "high", thinking: { budgetTokens: 4096 } },
+      options: { effort: "high" },
+      keys: ["effort"],
+    },
+  ])("preserves v2 bridge key order and values for $model", ({ model, extras, options, keys }) => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const actual = buildAgentOptions(rawTier(model, extras));
+    expect(actual).toEqual(options);
+    expect(Object.keys(actual)).toEqual(keys);
+  });
+
   test.each(["low", "xhigh", "max"])("accepts valid anthropic effort %s", (effort) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
