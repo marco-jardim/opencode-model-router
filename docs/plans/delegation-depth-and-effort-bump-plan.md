@@ -714,7 +714,7 @@ commits the updated table.
 | `D:\git\opencode-model-router\test\unit\config-depth-effort.test.ts` *(new)* | 1.1 | — | — |
 | `D:\git\opencode-model-router\test\unit\docs-drift.test.ts` | 1.1 | — | — |
 | `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md` | 1.1 | — | 3.1 |
-| `D:\git\opencode-model-router\src\router\depth.ts` *(new)* | 1.2 | — | — |
+| `D:\git\opencode-model-router\src\router\depth.ts` *(new)* | 1.2 | 2.1 (QA-2.1-R2-2 warning only; orchestrator decision) | — |
 | `D:\git\opencode-model-router\test\unit\depth.test.ts` *(new)* | 1.2 | — | — |
 | `D:\git\opencode-model-router\src\router\agent-options.ts` | 1.3 | — | — |
 | `D:\git\opencode-model-router\src\escalate\ladder.ts` | 1.3 | — | — |

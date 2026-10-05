@@ -45,3 +45,18 @@ All capped (`--maxWorkers=2`) and serialized (one at a time across worktrees).
 | When | Worktree | Command | Result |
 |---|---|---|---|
 | 0.P.1.c | `D:\git\omr-de-main` (`174505d`) | `npx vitest run --maxWorkers=2` | 101 files passed, 3 skipped; 3645 tests passed, 65 skipped |
+| Wave 1 pre-flight (one run for p11/p12/p13: identical tree `c646b39`) | `D:\git\omr-de-p11` (`c11e7a8`) | `npx vitest run --maxWorkers=2` | 101 files passed, 3 skipped; 3645 tests passed, 65 skipped |
+| after merging 1.1 | `D:\git\omr-de-main` (`edb114e`) | `npx vitest run --maxWorkers=2` | 102 passed, 3 skipped; 3742 passed, 65 skipped |
+| after merging 1.2 | `D:\git\omr-de-main` (`15caba2`) | `npx vitest run --maxWorkers=2` | 103 passed, 3 skipped; 3857 passed, 65 skipped |
+| after merging 1.3 | `D:\git\omr-de-main` (`f929a91`) | `npx vitest run --maxWorkers=2` (+ `smoke:keyless` 9/9 with v1 1.18.19, `smoke:v2` 2/2) | 104 passed, 3 skipped; 7649 passed, 65 skipped |
+
+## Wave notes
+
+- 2.1 started before Wave 1 closed (from `15caba2`, after 1.1 and 1.2 merged): the §3 graph gives 2.1
+  edges only to 1.1 and 1.2, and its write-set is disjoint from 1.3's. Its pre-flight full suite is the
+  `15caba2` run above (identical tree).
+- Orchestrator decisions in Wave 1/2: QA-1.1-1 cap at 32 (A13); QA-1.2-2 fix, not accept; QA-1.2-R3-1
+  fix; QA-1.3-1 and -9 deferred by plan; QA-2.1-2 the tracker owns undefined-depth warnings; QA-2.1-R2-2
+  `depth.ts` edited in 2.1 (§2 row updated); F6 (event-vs-backend disagreement) accepted as a
+  documented residual.
+- Plan edits: A13 (`12a050c`), A14 (`777a2d7`), A15 and the A14 traces (`d894a6c`).
