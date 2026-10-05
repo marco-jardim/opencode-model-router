@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import {
   tierRank,
   resolveStartTier,
@@ -11,6 +12,7 @@ import {
   buildEscalatePolicy,
   formatLadderScorecard,
   type EscalatePolicy,
+  type LadderAction,
   type LadderState,
   type LadderVerdict,
 } from "../../src/escalate/ladder";
@@ -858,4 +860,166 @@ describe("property-based: termination", () => {
       expect(cycles).toBeLessThanOrEqual(maxTotalAttempts);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Golden v2.0.0: regenerate ONLY against the unmodified v2.0.0 ladder with
+// GOLDEN_WRITE=1 npx vitest run test/unit/ladder.test.ts --maxWorkers=50%
+// Otherwise this is a read-only replay, including byte-exact scorecard strings.
+// All costs/counters/order are fixed; the ladder does not read the clock.
+// ---------------------------------------------------------------------------
+
+describe("golden v2.0.0", () => {
+  const fixtureUrl = new URL("./__fixtures__/ladder-v2.0.0-golden.json", import.meta.url);
+  const config: RouterConfig = {
+    activePreset: "default",
+    presets: {},
+    rules: [],
+    defaultTier: "fast",
+  };
+  const policies = [
+    { name: "default", policy: buildEscalatePolicy(config) },
+    {
+      name: "two-attempts-per-tier",
+      policy: buildEscalatePolicy({
+        ...config,
+        enforcement: { escalate: { maxAttemptsPerTier: 2 } },
+      }),
+    },
+    {
+      name: "floor-medium",
+      policy: buildEscalatePolicy({
+        ...config,
+        enforcement: { escalate: { floorTier: "medium" } },
+      }),
+    },
+  ];
+  const verdicts = {
+    pass: { pass: true, outcome: "pass", reasons: [] },
+    fail: { pass: false, outcome: "fail", reasons: ["check A failed", "check B failed"] },
+    unverifiable: { pass: false, outcome: "unverifiable", reasons: ["check unavailable"] },
+  } satisfies Record<string, LadderVerdict>;
+
+  function capture(state: LadderState, verdict: LadderVerdict, policy: EscalatePolicy) {
+    const action = nextAction(state, verdict, policy);
+    const advanced = advance(state, action);
+    const accepted = action.action === "accept";
+    const method = "golden-v2.0.0";
+    return {
+      input: { state, verdict, accepted, method },
+      output: {
+        nextAction: action,
+        advance: advanced,
+        // The scorecard takes the advanced state and the recorded accepted/method.
+        formatLadderScorecard: formatLadderScorecard(advanced, accepted, method),
+      },
+    };
+  }
+
+  function branch(action: LadderAction): string {
+    return action.action === "give_up" ? `give_up: ${action.reason}` : action.action;
+  }
+
+  function generateGoldenTable() {
+    return {
+      version: "2.0.0",
+      policies: policies.map(({ name, policy }) => {
+        const matrix: Array<ReturnType<typeof capture> & { id: string }> = [];
+        const firstAttemptCost = 2;
+        if (policy.costMultiple == null) throw new Error("Golden policies require a cost ceiling");
+        const ceiling = firstAttemptCost * policy.costMultiple;
+        const costs = [
+          { name: "below", value: ceiling - 1 },
+          { name: "at", value: ceiling },
+          { name: "above", value: ceiling + 1 },
+        ];
+        // Deliberately include unreachable counter combinations: independently
+        // crossing both counters exposes priority at/over every boundary.
+        for (const [outcome, verdict] of Object.entries(verdicts)) {
+          for (let attemptsThisTier = 0; attemptsThisTier <= policy.maxAttemptsPerTier + 1; attemptsThisTier++) {
+            for (let totalAttempts = 0; totalAttempts <= policy.maxTotalAttempts + 1; totalAttempts++) {
+              for (const cost of costs) {
+                for (const [position, currentTier] of policy.ladder.entries()) {
+                  const state: LadderState = {
+                    currentTier,
+                    attemptsThisTier,
+                    totalAttempts,
+                    escalations: position,
+                    firstAttemptCost,
+                    cumulativeCost: cost.value,
+                  };
+                  matrix.push({
+                    id: `${outcome}/${attemptsThisTier}/${totalAttempts}/${cost.name}/${currentTier}`,
+                    ...capture(state, verdict, policy),
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        const sequences = policy.ladder.flatMap((producerTier) =>
+          (["all-fail", "fail-then-pass", "unverifiable"] as const).map((stream) => {
+            const initialState = newLadderState(producerTier, policy);
+            let state = initialState;
+            const steps: Array<ReturnType<typeof capture>> = [];
+            const costPerAttempt = 1;
+            for (let attempt = 0; attempt <= policy.maxTotalAttempts; attempt++) {
+              state = recordAttempt(state, costPerAttempt);
+              const verdict = stream === "unverifiable"
+                ? verdicts.unverifiable
+                : stream === "fail-then-pass" && attempt > 0
+                  ? verdicts.pass
+                  : verdicts.fail;
+              const step = capture(state, verdict, policy);
+              steps.push(step);
+              state = step.output.advance;
+              const action = step.output.nextAction.action;
+              if (action === "accept" || action === "give_up") {
+                return {
+                  producerTier,
+                  stream,
+                  costPerAttempt,
+                  initialState,
+                  steps,
+                  finalScorecard: step.output.formatLadderScorecard,
+                };
+              }
+            }
+            throw new Error(`Golden sequence did not terminate: ${name}/${producerTier}/${stream}`);
+          }),
+        );
+        return { name, policy, matrix, sequences };
+      }),
+    };
+  }
+
+  it("replays the complete action/state/scorecard table and terminating sequences", () => {
+    const actual = generateGoldenTable();
+    for (const { policy, matrix, sequences } of actual.policies) {
+      expect(matrix).toHaveLength(
+        3 * (policy.maxAttemptsPerTier + 2) * (policy.maxTotalAttempts + 2) * 3 * policy.ladder.length,
+      );
+      expect(new Set(matrix.map((entry) => entry.id)).size).toBe(matrix.length);
+      expect(new Set(matrix.map((entry) => branch(entry.output.nextAction)))).toEqual(new Set([
+        "accept",
+        "give_up: verification unavailable; no producer escalation",
+        `give_up: max total attempts (${policy.maxTotalAttempts}) reached`,
+        "give_up: cost ceiling exceeded",
+        "retry",
+        "escalate",
+        "give_up: no higher tier (already at top of ladder)",
+      ]));
+      expect(sequences).toHaveLength(3 * policy.ladder.length);
+    }
+
+    const serialized = `${JSON.stringify(actual, null, 2)}\n`;
+    if (process.env.GOLDEN_WRITE === "1") {
+      mkdirSync(new URL("./__fixtures__/", import.meta.url), { recursive: true });
+      writeFileSync(fixtureUrl, serialized, "utf8");
+    }
+    const expected = readFileSync(fixtureUrl, "utf8");
+    expect(actual).toEqual(JSON.parse(expected));
+    expect(serialized).toBe(expected);
+  });
 });
