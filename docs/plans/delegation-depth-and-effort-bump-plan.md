@@ -681,10 +681,18 @@ name. Evidence (file:line, spike sources and captures) is in
 - **A14 — D8's "same four attempts" depends on the cost ceiling (QA-1.3-3).** The bump never adds an
   attempt, but the default ladder only reaches four attempts when the cost ceiling allows it. With the
   bundled `fable-effort` preset (`costRatio` 1 for `fast`, 3 for `medium`) and the default
-  `costCeiling.multiple` of 4, both `v2.0.0` and this change stop after three attempts
-  (`fast@low → fast@medium → medium@high`, then "cost ceiling exceeded"), so `medium`'s bump does not
-  run at defaults. This is pre-existing behaviour; 3.1 documents it (ADR, CONFIG_REFERENCE) with the
+  `costCeiling.multiple` of 4, both stop after three attempts, then "cost ceiling exceeded":
+  `v2.0.0` runs `fast@low → fast@low → medium@high`, and this change runs
+  `fast@low → fast@medium → medium@high`. So `medium`'s bump does not run at defaults. This is pre-existing behaviour; 3.1 documents it (ADR, CONFIG_REFERENCE) with the
   remedy (raise `enforcement.escalate.costCeiling.multiple`).
+- **A15 — Every phase applies the handoffs addressed to it (QA-1.3-R2-1).** The pre-flight of every
+  phase from 2.1 on lists and applies **every** handoff addressed to it in any earlier report
+  (`phase-0P.md`, `phase-1.*.md`, `phase-2.*.md`, `phase-3.*.md`), not only the reports its
+  pre-flight names, and records each one as applied or as deferred-by-plan. In particular: 2.3 applies
+  the `phase-1.3.md` "To 2.3" notes (`action.effort` into `runProducerAttempt`; each attempt's options
+  built from the same config snapshot as the policy; explicit precedence against host option keys) and
+  the `phase-2.1.md` notes; 3.1.2 and 3.1.3 fix the snake-case key references deferred by QA-1.3-9
+  (`README.md:282,483,491`, `docs\CONFIG_REFERENCE.md:668–760`) and document A14.
 - *Note on order:* A10 was written before A11 and A12 and sits above A11 in this list only by history
   of the edits; the numbering is the reference (QA-0.P-R2-12).
 - **A10 — Local smoke environment.** `smoke:keyless` needs the CI-pinned v1 CLI (1.18.19) first on
