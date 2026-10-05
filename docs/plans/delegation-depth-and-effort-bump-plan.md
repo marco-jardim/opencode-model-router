@@ -356,7 +356,7 @@ with that record. If heavy's approach also fails, it is a blocking problem under
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enforcement.maxDelegationDepth` | integer ≥ 1, or `null` | `1` | M2. The deepest session that a model-initiated dispatch may create. `1` means only root sessions (orchestrators) may dispatch; `2` lets a delegate dispatch one more level; `null` disables the guard. *Amended during implementation (0.P, §1.7 A1):* a dispatch past the limit is **warned** in `advisory` mode (the bundled default) and **refused** in `enforced` mode; `off` disables it. |
+| `enforcement.maxDelegationDepth` | integer 1–32 (§1.7 A13), or `null` | `1` | M2. The deepest session that a model-initiated dispatch may create. `1` means only root sessions (orchestrators) may dispatch; `2` lets a delegate dispatch one more level; `null` disables the guard. *Amended during implementation (0.P, §1.7 A1):* a dispatch past the limit is **warned** in `advisory` mode (the bundled default) and **refused** in `enforced` mode; `off` disables it. |
 | `enforcement.escalate.effortBump` | boolean | `true` | M4/M5. `false` restores the `v2.0.0` ladder exactly. |
 | `enforcement.escalate.effortBumpMax` | one of `EFFORT_LEVELS` | `"xhigh"` | M4. Upper bound for bumped attempts, further clamped per model by M3. |
 
@@ -671,6 +671,13 @@ name. Evidence (file:line, spike sources and captures) is in
   `OPENCODE_DISABLE_MODELS_FETCH=true` (or keeps a cache directory) so an isolated cache does not force
   a models.dev fetch per spawn. The lane is run on Windows (v1 1.18.19 first on `PATH`) before 1.3
   merges, and CI's `smoke-keyless` must be green on the PR.
+- **A13 — `maxDelegationDepth` is capped at 32 (Phase 1.1, QA-1.1-1 and -R2-1).** *Orchestrator
+  decision (1.1).* A cycle or a chain longer than `MAX_DEPTH_HOPS` counts as depth 32 (D2), so any limit
+  of 33 or more would let it through and make D2's "any configured limit refuses it" false. The key is
+  therefore `null` or a safe integer from 1 to 32; `src\router\config.ts` exports
+  `MAX_DELEGATION_DEPTH_LIMIT = 32`, which must equal `MAX_DEPTH_HOPS` in `src\router\depth.ts` (2.1
+  pins the equality with a test). §1.4 and the 1.1 test list are read with this: `100` is rejected,
+  `32` is the largest accepted value.
 - *Note on order:* A10 was written before A11 and A12 and sits above A11 in this list only by history
   of the edits; the numbering is the reference (QA-0.P-R2-12).
 - **A10 — Local smoke environment.** `smoke:keyless` needs the CI-pinned v1 CLI (1.18.19) first on
