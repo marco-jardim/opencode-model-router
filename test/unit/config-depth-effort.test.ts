@@ -115,6 +115,45 @@ describe("depth and effort bump config — defaults and validation", () => {
 });
 
 describe("depth and effort bump config — regression cases", () => {
+  it.each([undefined, { maxDelegationDepth: 2 }])("reads the enforcement parent once, including %s", (first) => {
+    let reads = 0;
+    const raw = validRaw();
+    Object.defineProperty(raw, "enforcement", {
+      enumerable: true,
+      get: () => ++reads === 1 ? first : { maxDelegationDepth: -5 },
+    });
+    const cfg = validateConfig(raw);
+    expect(resolveDepthLimit(cfg)).toBe(first?.maxDelegationDepth ?? 1);
+    expect(reads).toBe(1);
+    expect(Object.getOwnPropertyDescriptor(cfg, "enforcement")?.get).toBeUndefined();
+  });
+
+  it.each([undefined, { effortBump: false, effortBumpMax: "high" }])("reads the escalate parent once, including %s", (first) => {
+    let reads = 0;
+    const enforcement = {
+      get escalate() { return ++reads === 1 ? first : { effortBump: "yes", effortBumpMax: "ultra" }; },
+    };
+    const cfg = validateConfig(validRaw({ enforcement }));
+    expect(resolveEffortBump(cfg)).toEqual({ enabled: first?.effortBump ?? true, max: first?.effortBumpMax ?? "xhigh" });
+    expect(reads).toBe(1);
+    expect(Object.getOwnPropertyDescriptor(cfg.enforcement, "escalate")?.get).toBeUndefined();
+  });
+
+  it.each(["maxDelegationDepth", "effortBump", "effortBumpMax"])("snapshots own %s even when a Proxy hides it from in", (key) => {
+    let reads = 0;
+    const first = key === "maxDelegationDepth" ? 2 : key === "effortBump" ? false : "high";
+    const target = Object.defineProperty({}, key, {
+      configurable: true, enumerable: true,
+      get: () => ++reads === 1 ? first : -7,
+    });
+    const proxy = new Proxy(target, { has: () => false });
+    const enforcement = key === "maxDelegationDepth" ? proxy : { escalate: proxy };
+    const cfg = validateConfig(validRaw({ enforcement }));
+    expect(resolveDepthLimit(cfg)).toBe(key === "maxDelegationDepth" ? 2 : 1);
+    expect(resolveEffortBump(cfg)).toEqual({ enabled: key !== "effortBump", max: key === "effortBumpMax" ? "high" : "xhigh" });
+    expect(reads).toBe(1);
+  });
+
   it.each([
     [{ toString: 1 }, 'object {"toString":1}'],
     [Object.create(null), "object {}"],

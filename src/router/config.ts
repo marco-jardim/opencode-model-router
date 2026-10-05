@@ -748,11 +748,14 @@ function withValidatedSnapshots<T extends object>(
   snapshots: Record<string, unknown>,
 ): T {
   const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(obj);
+  let changed = false;
   for (const [key, value] of Object.entries(snapshots)) {
-    if (key in obj) {
+    if (Object.hasOwn(descriptors, key) || key in obj) {
       descriptors[key] = { value, writable: true, enumerable: true, configurable: true };
+      changed = true;
     }
   }
+  if (!changed) return obj;
   // The complete descriptor set preserves the input's shape.
   return Object.defineProperties({}, descriptors) as T;
 }
@@ -766,13 +769,13 @@ function rejectPrototypeKeys(obj: object, path: string): void {
   }
 }
 
-function validateEnforcement(obj: Record<string, unknown>): Record<string, unknown> | undefined {
+function validateEnforcement(value: unknown): Record<string, unknown> | undefined {
   // Validate enforcement if present (optional — absent means no enforcement)
-  if (obj.enforcement !== undefined) {
-    if (!isPlainObject(obj.enforcement)) {
+  if (value !== undefined) {
+    if (!isPlainObject(value)) {
       throw new Error("tiers.json: enforcement must be an object");
     }
-    const enforcement = obj.enforcement as Record<string, unknown>;
+    const enforcement = value as Record<string, unknown>;
     rejectPrototypeKeys(enforcement, "enforcement");
     const maxDelegationDepth = enforcement.maxDelegationDepth;
     if (
@@ -933,13 +936,14 @@ function validateEnforcement(obj: Record<string, unknown>): Record<string, unkno
         );
       }
     }
-    const snapshots: Record<string, unknown> = { maxDelegationDepth };
+    const escalateValue = enforcement.escalate;
+    const snapshots: Record<string, unknown> = { maxDelegationDepth, escalate: escalateValue };
     if (
-      enforcement.escalate !== undefined &&
-      typeof enforcement.escalate === "object" &&
-      enforcement.escalate !== null
+      escalateValue !== undefined &&
+      typeof escalateValue === "object" &&
+      escalateValue !== null
     ) {
-      const escalate = enforcement.escalate as Record<string, unknown>;
+      const escalate = escalateValue as Record<string, unknown>;
       rejectPrototypeKeys(escalate, "enforcement.escalate");
       const effortBump = escalate.effortBump;
       if (effortBump !== undefined && typeof effortBump !== "boolean") {
@@ -1121,14 +1125,14 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateModelGenerations(obj);
   validateTaskPatterns(obj);
   validateSubagentTiers(obj);
-  const enforcement = validateEnforcement(obj);
+  const enforcement = validateEnforcement(obj.enforcement);
   validateDelegateInstructions(obj);
   validateDispatchHeader(obj);
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
 
   const cfg = raw as RouterConfig;
-  return enforcement === undefined ? cfg : withValidatedSnapshots(cfg, { enforcement });
+  return withValidatedSnapshots(cfg, { enforcement });
 }
 
 /**
