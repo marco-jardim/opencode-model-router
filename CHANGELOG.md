@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-04
+
+The router now runs on OpenCode v2 through a separate server entrypoint. **OpenCode v1
+remains supported**: the callable v1 entrypoint and every config key are unchanged. The
+major version marks the new host support and the updated bundled preset defaults. See
+[the compatibility notes](docs/OPENCODE_V2.md).
+
 ### Added
 
 - OpenCode v2 compatibility through a separate server entrypoint, fixing the
