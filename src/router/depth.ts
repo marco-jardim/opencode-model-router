@@ -263,7 +263,16 @@ export function createDepthTracker(
     const stamp = failedAt.get(id);
     if (stamp === undefined) return false;
     const age = clock() - stamp;
-    return age >= 0 && age < DEPTH_LOOKUP_RETRY_MS;
+    if (age >= 0 && age < DEPTH_LOOKUP_RETRY_MS) return true;
+    failedAt.delete(id); // Expired entries go at lookup time, not only on sweep().
+    return false;
+  }
+
+  // The blocklist is FIFO-capped like `warned`: the oldest throttle goes first.
+  function setFailed(id: string): void {
+    failedAt.delete(id);
+    failedAt.set(id, clock());
+    while (failedAt.size > maxEntries) failedAt.delete(failedAt.keys().next().value!);
   }
 
   function startLookup(id: string): Lookup {
@@ -274,7 +283,7 @@ export function createDepthTracker(
     const lookup: Lookup = { id, promise: cancelled, detached: false, cancelled: false, cancel };
     lookups.set(id, lookup);
     function fail(reason: string): LookupResult {
-      if (!lookup.detached && !lookup.cancelled) failedAt.set(id, clock());
+      if (!lookup.detached && !lookup.cancelled) setFailed(id);
       return { ok: false, reason };
     }
     const request = Promise.resolve().then(() => seams.getParent(id)).then((raw): LookupResult => {
@@ -369,7 +378,7 @@ export function createDepthTracker(
           lookup.detached = true;
           if (lookups.get(lookup.id) === lookup) {
             lookups.delete(lookup.id);
-            failedAt.set(lookup.id, clock());
+            setFailed(lookup.id);
           }
         }
         return floor(id, learned, `timed out after ${t} ms`);
@@ -400,7 +409,7 @@ export function createDepthTracker(
     sweep() {
       const now = clock();
       for (const [id, n] of nodes) if (now - n.lastTouch >= ttlMs) nodes.delete(id);
-      for (const id of failedAt.keys()) if (!throttled(id)) failedAt.delete(id);
+      for (const id of failedAt.keys()) throttled(id); // drops every expired entry
       for (const [key, stamp] of warned) if (now - stamp >= ttlMs) warned.delete(key);
     },
     size: () => nodes.size,

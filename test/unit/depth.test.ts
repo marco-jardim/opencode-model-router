@@ -527,13 +527,16 @@ describe("eviction and bookkeeping", () => {
     expect(tracker.size()).toBe(0);
   });
 
-  it("T-warn: FIFO warning bound, forget reset, and TTL expiration", async () => {
+  // Amended for QA-1.2-5: the failure blocklist shares the `maxEntries` FIFO cap,
+  // so B's failure evicts A's throttle and A is retried (4 and 5 lookups, not 3 and 4).
+  it("T-warn: FIFO warning and throttle bounds, forget reset, and TTL expiration", async () => {
     const { tracker, getParent, warn, time } = fixture({ ttlMs: 10, maxEntries: 1 });
     getParent.mockRejectedValue("offline");
     await tracker.depthOf("A");
     await tracker.depthOf("B");
     await tracker.depthOf("A");
     expect(warn).toHaveBeenCalledTimes(3);
+    expect(getParent).toHaveBeenCalledTimes(3);
     tracker.forget("A");
     await tracker.depthOf("A");
     expect(warn).toHaveBeenCalledTimes(4);
@@ -541,11 +544,11 @@ describe("eviction and bookkeeping", () => {
     tracker.sweep();
     await tracker.depthOf("A");
     expect(warn).toHaveBeenCalledTimes(5);
-    expect(getParent).toHaveBeenCalledTimes(3);
+    expect(getParent).toHaveBeenCalledTimes(4);
     time(DEPTH_LOOKUP_RETRY_MS + 10);
     tracker.sweep();
     await tracker.depthOf("A");
-    expect(getParent).toHaveBeenCalledTimes(4);
+    expect(getParent).toHaveBeenCalledTimes(5);
   });
 
   it.each([{ ttlMs: 0, maxEntries: 0 }, { ttlMs: Infinity, maxEntries: 1.5 }, { ttlMs: NaN, maxEntries: NaN }])("invalid options %j fall back to defaults", ({ ttlMs, maxEntries }) => {
@@ -631,5 +634,25 @@ describe("QA-1.2-6: seams never escape", () => {
     expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     await expect(result).resolves.toBeUndefined();
+  });
+});
+
+describe("QA-1.2-5: the failure blocklist is bounded", () => {
+  it("keeps only the newest maxEntries throttles, and entries expire at lookup time", async () => {
+    const { tracker, getParent, time } = fixture({ maxEntries: 10 });
+    getParent.mockRejectedValue("down");
+    for (let i = 0; i < 1_000; i++) expect(await tracker.depthOf(`s${i}`)).toBeUndefined();
+    expect(getParent).toHaveBeenCalledTimes(1_000);
+    getParent.mockResolvedValue(null);
+    // The 990 oldest throttles were evicted: the recovered backend is asked again.
+    for (let i = 0; i < 990; i++) expect(await tracker.depthOf(`s${i}`)).toBe(0);
+    expect(getParent).toHaveBeenCalledTimes(1_990);
+    // The 10 newest are still inside their window...
+    for (let i = 990; i < 1_000; i++) expect(await tracker.depthOf(`s${i}`)).toBeUndefined();
+    expect(getParent).toHaveBeenCalledTimes(1_990);
+    // ...and expire on their own, without sweep().
+    time(DEPTH_LOOKUP_RETRY_MS);
+    for (let i = 990; i < 1_000; i++) expect(await tracker.depthOf(`s${i}`)).toBe(0);
+    expect(getParent).toHaveBeenCalledTimes(2_000);
   });
 });
