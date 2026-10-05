@@ -347,6 +347,27 @@ describe("OpenCode 2 hook adapter", () => {
     expect(f.ctx.session.prompt).not.toHaveBeenCalled();
   });
 
+  it("router-reload on the v2 adapter reloads the registries and omits the v1 restart note", async () => {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-reload-note-"));
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    invalidateConfigCache();
+    const f = fixture();
+    const hooks = await ModelRouterPlugin({
+      directory: home, worktree: home, routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+    } as unknown as RouterPluginInput);
+    await f.start(hooks);
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true }); });
+    await f.commands["router-reload"].execute({ sessionID: "root", prompt: { text: "" }, delivery: "steer" });
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
+    expect(f.ctx.session.synthetic).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("Model router config reloaded."),
+    }));
+    expect(f.ctx.session.synthetic).not.toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("restart opencode"),
+    }));
+  });
+
   it("refreshes the agent registry after preset and still prompts", async () => {
     const f = fixture();
     await f.start({
@@ -387,6 +408,29 @@ describe("OpenCode 2 hook adapter", () => {
     expect(configHook).toHaveBeenCalledTimes(2);
     expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
     expect(f.ctx.command.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the refresh on the next prompt when a registry reload rejected", async () => {
+    const f = fixture();
+    const configHook = vi.fn(async () => {});
+    await f.start({ config: configHook });
+    const event = () => ({ ...call, prompt: { text: "hi" } });
+    f.ctx.agent.reload.mockRejectedValueOnce(new Error("reload boom"));
+    invalidateConfigCache();
+    await expect(f.sessionHooks.prompt(event())).rejects.toThrow("reload boom");
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
+    expect(f.ctx.command.reload).not.toHaveBeenCalled();
+
+    // Same loadConfig() object as the failed refresh built from: it must still
+    // be considered stale because the host registries never reloaded.
+    await f.sessionHooks.prompt(event());
+    expect(configHook).toHaveBeenCalledTimes(3);
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(2);
+    expect(f.ctx.command.reload).toHaveBeenCalledTimes(1);
+
+    // Now it succeeded, so the config counts as applied and nothing refreshes.
+    await f.sessionHooks.prompt(event());
+    expect(f.ctx.agent.reload).toHaveBeenCalledTimes(2);
   });
 
   it("classifies prompt sessions by their actual agent and preserves prompt edits", async () => {

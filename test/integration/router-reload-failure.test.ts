@@ -97,4 +97,15 @@ describe("router-reload — failed reload keeps the last valid config", () => {
     expect(fixed.parts[0].text).not.toContain("FAILED");
     expect(getConfigReloadError()).toBeNull();
   });
+
+  it("on opencode v1 tells the user subagent models need a restart", async () => {
+    const out = { parts: [] as Array<{ text: string }> };
+    await hooks["command.execute.before"]({ command: "router-reload", arguments: "" }, out);
+    const text: string = out.parts[0].text;
+    expect(text.startsWith("Model router config reloaded.")).toBe(true);
+    expect(text).toContain(
+      "Note: opencode v1 keeps subagent (task) models from startup; restart opencode to apply tier model changes to subagents.",
+    );
+    expect(text).toContain("Routing and protocol already use the new config.");
+  });
 });

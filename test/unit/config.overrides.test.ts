@@ -588,6 +588,23 @@ describe("loadConfig — global + project override hierarchy", () => {
     writeFileSync(p, JSON.stringify(obj), "utf-8");
   }
 
+  it("a malformed project override created after startup is a failed reload, not a first load", () => {
+    // Startup without any project override...
+    const first = loadConfig();
+    expect(getConfigReloadError()).toBeNull();
+
+    // ...then a half-saved one appears. The source identity (HOME + project +
+    // state) is unchanged, so the previous config stays the valid fallback.
+    const p = localOverridePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, "{ not json", "utf-8");
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(p, later, later);
+
+    expect(loadConfig()).toBe(first);
+    expect(getConfigReloadError()).toContain("opencode-model-router.overrides.jsonc");
+  });
+
   it("localOverridePath resolves to <cwd>/.opencode/opencode-model-router.overrides.jsonc", () => {
     expect(localOverridePath()).toBe(
       join(process.cwd(), ".opencode", "opencode-model-router.overrides.jsonc"),

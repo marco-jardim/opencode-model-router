@@ -1294,19 +1294,32 @@ function applyTierDefaults(cfg: RouterConfig): void {
   }
 }
 
+/** realpath for identity comparison; an unresolvable path is used as-is. */
+function realPathOrSame(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 /** Every file location that feeds loadConfig() (undefined = none applicable). */
 function sourcePaths(): Array<string | undefined> {
   return [configPath(), overridePath(), findProjectOverride(), statePath()];
 }
 
-/** mtime/size fingerprint of every file that feeds loadConfig(). */
+/**
+ * mtime/ctime/size fingerprint of every file that feeds loadConfig(). ctime is
+ * included because restoring access to a previously unreadable file (chmod)
+ * changes ctime but not mtime/size, and that must trigger a retry.
+ */
 function sourceFingerprint(paths: Array<string | undefined>): string {
   return paths
     .map((p) => {
       if (!p) return "none";
       try {
         const st = statSync(p);
-        return `${p}:${st.mtimeMs}:${st.size}`;
+        return `${p}:${st.mtimeMs}:${st.ctimeMs}:${st.size}`;
       } catch {
         return `${p}:missing`;
       }
@@ -1321,9 +1334,11 @@ export function loadConfig(): RouterConfig {
     return _cachedConfig;
   }
 
-  // A previous config is only a valid fallback when it was built from the same
-  // source locations (a different HOME/project is a fresh first load).
-  const sourceKey = paths.map((p) => p ?? "none").join("|");
+  // A previous config is only a valid fallback when it was built for the same
+  // project identity (a different HOME/project is a fresh first load). The key
+  // is deliberately NOT the resolved override file paths: a project override
+  // created after startup must not turn a broken file into a "first load".
+  const sourceKey = [realPathOrSame(homedir()), realPathOrSame(process.cwd()), statePath()].join("|");
   const previous =
     _cachedConfig !== null && sourceKey === _cachedSourceKey ? _cachedConfig : null;
 

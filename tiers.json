@@ -305,6 +305,7 @@
       "medium": {
         "model": "anthropic/claude-sonnet-5-5",
         "variant": "xhigh",
+        "effort": "xhigh",
         "costRatio": 5,
         "description": "Claude Sonnet (xhigh) for implementation and standard coding",
         "steps": 50,

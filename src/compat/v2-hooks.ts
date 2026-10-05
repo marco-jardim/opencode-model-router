@@ -127,7 +127,9 @@ export async function registerV2Hooks(
     let originals = new Map<string, string>();
     let agentOptions = new Map<string, Record<string, unknown>>();
     let lastConfig: unknown;
-    const buildConfig = async (): Promise<void> => {
+    // Returns the router config the registry state was built from; the caller
+    // advances `lastConfig` only once the host registries have reloaded from it.
+    const buildConfig = async (): Promise<unknown> => {
       const next: LegacyConfig = { agent: JSON.parse(JSON.stringify(baseSeed)), command: {} };
       const nextOriginals = new Map(Object.entries(next.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
       await hooks.config?.(next);
@@ -144,16 +146,19 @@ export async function registerV2Hooks(
       config = next;
       originals = nextOriginals;
       agentOptions = nextOptions;
-      lastConfig = loadConfig();
+      return loadConfig();
     };
-    await buildConfig();
+    lastConfig = await buildConfig();
     let refreshChain: Promise<void> = Promise.resolve();
     const refresh = (): Promise<void> => {
       const run = refreshChain.then(async () => {
         if (disposed) return;
-        await buildConfig();
+        const built = await buildConfig();
         await ctx.agent.reload();
         await ctx.command.reload();
+        // Only after both registries reloaded: a rejected reload leaves
+        // `lastConfig` stale so the next prompt retries the refresh.
+        lastConfig = built;
       });
       refreshChain = run.catch(() => {});
       return run;

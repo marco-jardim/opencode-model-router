@@ -1877,7 +1877,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       opencodeConfig.command["router-reload"] = {
         template: "",
         description:
-          "Reload model-router config (tiers.json, overrides, state) without restarting",
+          ctx.routerHost === "v2"
+            ? "Reload model-router config (tiers.json, overrides, state) without restarting"
+            : "Reload model-router config (tiers.json, overrides, state); subagent models apply after an opencode restart",
       };
       opencodeConfig.command["router"] = {
         template: "$ARGUMENTS",
@@ -2015,6 +2017,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             `Mode: ${cfg.activeMode ?? "normal"}`,
             "Tiers:",
             mapping,
+            // opencode v1 builds its agent registry once at startup; only the v2
+            // adapter re-runs the config hook + agent reload after /router-reload.
+            ...(ctx.routerHost === "v2"
+              ? []
+              : [
+                  "Note: opencode v1 keeps subagent (task) models from startup; restart opencode to apply tier model changes to subagents. Routing and protocol already use the new config.",
+                ]),
           ].join("\n"),
         });
       }
