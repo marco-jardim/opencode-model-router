@@ -169,14 +169,35 @@ commit. No host and no full suite were run.
 
 | id | severity | file:line | description | resolution |
 |---|---|---|---|---|
-| QA-2.2-R2-1 | minor | `src/escalate/effort-override.ts:60, 71, 76` | **The `{ ...tier }` snapshot from `f9208c8` copies only own enumerable properties, so a `null` ceiling that the pre-fix store refused is now accepted.** `effortCeilingFor` and `buildAgentOptions` read through the prototype chain and see non-enumerable properties, and so do registration and the ladder (`ladder.ts:232`). The snapshot does not. If a tier's `reasoning`, `variant` or `thinking` is inherited or non-enumerable, the store computes a non-null ceiling, accepts the `set`, and apply writes the bump over the explicit configuration. **Failing inputs** (scratch r2b; "old" is `afa9ccf`, "new" is `HEAD`): <br>(a) `openai/gpt-5`, `effort: "low"`, with an inherited `reasoning: { effort: "low" }`, `set(…, "high")`. `effortCeilingFor(tier)` is `null` but `effortCeilingFor({ ...tier })` is `"high"`. Registration sends `{ reasoningEffort: "low" }`. Old: refused, override `{}`. New: accepted, override **`{ reasoningEffort: "high" }`**. <br>(b) The same with a non-enumerable own `reasoning`: same result. <br>(c) An inherited `variant: "high"`: same result. <br>(d) `anthropic/claude-sonnet-4-5` with an inherited `thinking: { budgetTokens: 8000 }`. Registration sends `{ thinking: { type: "enabled", budgetTokens: 8000 } }`. Old: refused. New: override **`{ effort: "high" }`**, sent alongside the explicit budget. <br>This is the class that round 1 called critical: an override against a `null` ceiling, regressed here from refused to accepted. It is **latent**. Tiers are built by `JSON.parse` and the spreading `deepMerge` (`config.ts:1154-1173, 1269-1281`), which produce own enumerable properties only. The ladder computes the bump from the real tier (`ladder.ts:232`), so the planned wiring would never request this bump. Hence minor. An inherited `model` now fails safe: the `set` is refused. **Fix:** replace the spread with one ordinary read per field that the ceiling and the builder use: `{ model: tier.model, effort: tier.effort, variant: tier.variant, thinking: tier.thinking, reasoning: tier.reasoning }`. In scratch, that snapshot gives a `null` ceiling for (a)–(d). It keeps one read per field, so `test:342` still holds. Pin (a) and (b). | open |
-| QA-2.2-R2-2 | nit | `src/escalate/effort-override.ts:42-46`; `test/unit/effort-override.test.ts:393` | **A store built without `logger` now writes unattributed lines to stderr.** `aac9447` routes every builder warning through the store's logger, so the default store bypasses the builder's own console prefix (`agent-options.ts:42`: ``console.warn(`[model-router] ${message}`)``). `b614909` removed the store's own prefix. **Input** (scratch W4, default store, `maxEntries: 1`: a Claude tier with `reasoning.summary`, then an eviction, then an above-ceiling `set`). Old: `"[model-router] tier fast: reasoning.effort and reasoning.summary are OpenAI parameters…"`, `"[model-router] Evicted oldest effort override for a"`, `"[model-router] Effort override for c exceeds the tier ceiling; override refused"`. New: the same three lines with no prefix. Every other console fallback in the plugin prefixes (`agent-options.ts:42`, `logger.ts:106, 119`). QA-2.2-7 allowed "never" for the store's own lines, but that option predates `aac9447` moving the builder's lines onto the same channel. Production is unaffected, because 2.3 injects the plugin logger (handoff 1) and that logger prefixes its own fallback. **Fix:** when `opts.logger` is absent, default to ``{ warn: (m) => console.warn(`[model-router] ${m}`) }``, and change the pin at `test:393` to the prefixed line. `test:378` is unaffected. | open |
+| QA-2.2-R2-1 | minor | `src/escalate/effort-override.ts:60, 71, 76` | **The `{ ...tier }` snapshot from `f9208c8` copies only own enumerable properties, so a `null` ceiling that the pre-fix store refused is now accepted.** `effortCeilingFor` and `buildAgentOptions` read through the prototype chain and see non-enumerable properties, and so do registration and the ladder (`ladder.ts:232`). The snapshot does not. If a tier's `reasoning`, `variant` or `thinking` is inherited or non-enumerable, the store computes a non-null ceiling, accepts the `set`, and apply writes the bump over the explicit configuration. **Failing inputs** (scratch r2b; "old" is `afa9ccf`, "new" is `HEAD`): <br>(a) `openai/gpt-5`, `effort: "low"`, with an inherited `reasoning: { effort: "low" }`, `set(…, "high")`. `effortCeilingFor(tier)` is `null` but `effortCeilingFor({ ...tier })` is `"high"`. Registration sends `{ reasoningEffort: "low" }`. Old: refused, override `{}`. New: accepted, override **`{ reasoningEffort: "high" }`**. <br>(b) The same with a non-enumerable own `reasoning`: same result. <br>(c) An inherited `variant: "high"`: same result. <br>(d) `anthropic/claude-sonnet-4-5` with an inherited `thinking: { budgetTokens: 8000 }`. Registration sends `{ thinking: { type: "enabled", budgetTokens: 8000 } }`. Old: refused. New: override **`{ effort: "high" }`**, sent alongside the explicit budget. <br>This is the class that round 1 called critical: an override against a `null` ceiling, regressed here from refused to accepted. It is **latent**. Tiers are built by `JSON.parse` and the spreading `deepMerge` (`config.ts:1154-1173, 1269-1281`), which produce own enumerable properties only. The ladder computes the bump from the real tier (`ladder.ts:232`), so the planned wiring would never request this bump. Hence minor. An inherited `model` now fails safe: the `set` is refused. **Fix:** replace the spread with one ordinary read per field that the ceiling and the builder use: `{ model: tier.model, effort: tier.effort, variant: tier.variant, thinking: tier.thinking, reasoning: tier.reasoning }`. In scratch, that snapshot gives a `null` ceiling for (a)–(d). It keeps one read per field, so `test:342` still holds. Pin (a) and (b). | Resolved in `08e7c35`: read model, effort, variant, thinking and reasoning once into locals, then build the shared snapshot. Five regressions cover inherited reasoning/thinking/variant and non-enumerable reasoning/variant; all refuse and clear the prior override. The existing one-read-per-field regression still passes. |
+| QA-2.2-R2-2 | nit | `src/escalate/effort-override.ts:42-46`; `test/unit/effort-override.test.ts:393` | **A store built without `logger` now writes unattributed lines to stderr.** `aac9447` routes every builder warning through the store's logger, so the default store bypasses the builder's own console prefix (`agent-options.ts:42`: ``console.warn(`[model-router] ${message}`)``). `b614909` removed the store's own prefix. **Input** (scratch W4, default store, `maxEntries: 1`: a Claude tier with `reasoning.summary`, then an eviction, then an above-ceiling `set`). Old: `"[model-router] tier fast: reasoning.effort and reasoning.summary are OpenAI parameters…"`, `"[model-router] Evicted oldest effort override for a"`, `"[model-router] Effort override for c exceeds the tier ceiling; override refused"`. New: the same three lines with no prefix. Every other console fallback in the plugin prefixes (`agent-options.ts:42`, `logger.ts:106, 119`). QA-2.2-7 allowed "never" for the store's own lines, but that option predates `aac9447` moving the builder's lines onto the same channel. Production is unaffected, because 2.3 injects the plugin logger (handoff 1) and that logger prefixes its own fallback. **Fix:** when `opts.logger` is absent, default to ``{ warn: (m) => console.warn(`[model-router] ${m}`) }``, and change the pin at `test:393` to the prefixed line. `test:378` is unaffected. | Resolved in `7f7b916`: the default console adapter adds `[model-router] `; injected loggers still receive unprefixed messages. Regressions pin attributed builder, refusal and eviction warnings, while the plugin-style logger test still pins exactly one prefix. |
 
 Test observation, not a finding: the agreement sweep (`test:437`) now asserts console silence instead of `logger.warn`
 silence. Store-level warnings in the sweep are therefore no longer asserted absent. A refusal would still fail the target
 assertions on the two lines above it.
 
 Severity summary, round 2: **7 of 7 round-1 findings resolved; new: 0 critical, 0 major, 1 minor, 1 nit; 2 open.**
+
+### Round 2 resolution verification
+
+Verified on code commit `7f7b916`. **Both round-2 findings resolved; 0 open across both rounds.**
+The round-2 descriptions and severity summary above are retained as review history.
+
+- `08e7c35` also restores the agreement sweep's `logger.warn` silence assertion alongside console silence.
+  Each fixture first runs registration through a separate logger, consuming expected builder notices before
+  steady-state bumps; all bumpable fixtures must then produce no store-logger warnings.
+- Red/green evidence: all five inherited/non-enumerable regressions failed before R2-1 with
+  `expected true to be false` for `store.has("producer")`. Both console-prefix tests failed before R2-2
+  because the emitted messages lacked `[model-router] `. All pass after the fixes.
+
+| Check | Result |
+|---|---|
+| `npx vitest run test/unit/effort-override.test.ts test/unit/effort-ceiling.test.ts --maxWorkers=50%` | **2 files, 4912 tests passed** (1170 override, 3742 ceiling; 6 added cases) |
+| Same scoped run with `--coverage.enabled=true --coverage.include=src/escalate/effort-override.ts` | **4912 passed; 100%** statements (93/93), branches (73/73), functions (11/11), lines (86/86) |
+| `npm run typecheck` | Clean (`tsc --noEmit`, no diagnostics) |
+| `git diff --check` before each fix commit | Clean |
+
+No full suite or live-host run was performed. Phase 2.3 wiring and host proof remain deferred.
 
 ## Deferred by plan
 
@@ -261,7 +282,7 @@ have not been performed by this fix pass.
 
 ## Verdict
 
-**Pending fixes (round 2).** Open findings: 2 (QA-2.2-R2-1 minor, QA-2.2-R2-2 nit).
+Open findings: 0 (every round-1 and round-2 finding fixed)
 
 The independent re-review confirms all seven round-1 findings resolved:
 - a refused re-set now clears the entry;
@@ -272,9 +293,8 @@ The independent re-review confirms all seven round-1 findings resolved:
 - failure latches are bounded by entry lifetime;
 - the plugin-logger path carries a single prefix.
 
-Two regressions were introduced by the fixes:
-- the `f9208c8` spread snapshot accepts a `null`-ceiling tier whose explicit field is inherited or non-enumerable (latent,
-  because JSON-loaded tiers cannot have such fields and the ladder guards first);
-- the default-console store lost its `[model-router]` attribution.
+Both regressions introduced by the round-1 fixes are now resolved:
+- explicit one-time field reads preserve inherited and non-enumerable ceiling constraints (`08e7c35`);
+- the default-console store restores `[model-router]` attribution without duplicating injected-logger prefixes (`7f7b916`).
 
 The phase DoD requires zero open findings. Phase 2.3 wiring and the host-level proof remain deferred by plan.
