@@ -216,3 +216,9 @@ merged PR #69 description.
   `gh pr edit 69`, which this review was not authorised to make. QA-3.4-4 (the `tiers.json`
   deviation) and QA-3.4-5 (the locked empty directory) are owner-sanctioned residuals.
 - After the restart, the owner should delete `D:\git\omr-de-p23`.
+
+## Resolution of QA-3.4-1 and QA-3.4-2
+
+The PR #69 description was edited after this review: every document link now points at `v2.1.0` (`../blob/v2.1.0/…`, `../tree/v2.1.0/…`; the ADR and the QA folder return HTTP 200), the CHANGELOG link points at `#210---2026-10-05`, the OpenCode 2 `<subagent sessionID=…>` envelope change is listed, and the v1 key line now names the snake-case keys that v1 dropped (`reasoning_effort`, `reasoning_summary`, `budget_tokens`) and notes that Claude `effort` was already native. Both findings are resolved.
+
+**Open findings: 0** (QA-3.4-1 and QA-3.4-2 resolved by the PR edit; QA-3.4-3 to QA-3.4-6 closed as recorded). Phase 3.4 is done.
