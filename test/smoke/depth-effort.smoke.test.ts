@@ -163,7 +163,8 @@ afterEach(async () => {
   }
 }, 30_000);
 
-function scenarioConfig(mode: "enforced" | "advisory", effort = false, bump = true) {
+function scenarioConfig(mode: "enforced" | "advisory", effort = false, bump = true,
+  options: { maxDepth?: number; effortBumpMax?: "medium"; maxAttemptsPerTier?: number } = {}) {
   const mutation = process.env.SMOKE_DEPTH_EFFORT_MUTATION;
   return {
     activePreset: "smoke", defaultTier: "fast", experimental: { verifiedDelegateTool: true },
@@ -173,9 +174,9 @@ function scenarioConfig(mode: "enforced" | "advisory", effort = false, bump = tr
       heavy: { model: MODEL, costRatio: 1, whenToUse: ["smoke"] },
     } },
     enforcement: {
-      mode, maxDelegationDepth: mutation === "depth" ? null : 1,
+      mode, maxDelegationDepth: mutation === "depth" ? null : options.maxDepth ?? 1,
       verify: { require: effort ? "always" : "never", defaultVerify: "required", minGraderTier: "heavy", preferDeterministic: false, background: false },
-      escalate: { effortBump: mutation === "bump" ? false : bump, maxAttemptsPerTier: 1, maxTotalAttempts: 3, costCeiling: { base: "medium", multiple: 10 } },
+      escalate: { effortBump: mutation === "bump" ? false : bump, effortBumpMax: options.effortBumpMax, maxAttemptsPerTier: options.maxAttemptsPerTier ?? 1, maxTotalAttempts: 3, costCeiling: { base: "medium", multiple: 10 } },
     },
   };
 }
@@ -235,7 +236,7 @@ for (const host of hosts) {
       const baseline = (await inventory(project)).agents;
       expect(baseline).toEqual(expect.arrayContaining(["fast", "medium", "heavy"]));
       // The empty override object ({}) is the unset control for all three keys.
-      for (const [key, valid, invalid] of [["maxDelegationDepth", 2, -1], ["effortBump", false, "yes"], ["effortBumpMax", "high", "bogus"]] as const) {
+      for (const [key, valid, invalid] of [["maxDelegationDepth", 2, -1], ["effortBump", false, "yes"], ["effortBumpMax", "medium", "bogus"]] as const) {
         for (const [label, value] of [["set", valid], ["invalid", invalid]] as const) {
           const enforcement = key === "maxDelegationDepth" ? { [key]: value } : { escalate: { [key]: value } };
           const dir = await f.project(`${key}-${label}`, { enforcement }, false);
@@ -246,11 +247,49 @@ for (const host of hosts) {
             const warning = actual.log.split(/\r?\n/).find(line => line.includes(key) && line.includes("must be"));
             expect(warning, `${key} must warn, not silently accept invalid config\n${actual.log}`).toBeDefined();
             expect(warning).toMatch(/ignoring|invalid|dropp/i);
+          } else {
+            expect(actual.log, `${key} valid value must be accepted, not dropped`).not.toMatch(/must be|dropping conflicting layer|dropped override layer|ignoring .*overrides\.jsonc|combined overrides are invalid/i);
           }
         }
       }
       expect(f.provider.captures).toHaveLength(0);
     }, 300_000);
+
+    it("accepts maxDelegationDepth 2: depth one allowed, depth two refused", async () => {
+      const f = await fixture(host);
+      const project = await f.project("project", scenarioConfig("enforced", false, true, { maxDepth: 2 }));
+      const run = await f.run(project, "ROOT_NEST_DEEP");
+      expect(run.childID).toBeTruthy();
+      expect(run.grandchildID).toBeTruthy();
+      function dispatchResult(session: string | undefined) {
+        const content = f.provider.captures.filter(c => c.session === session).flatMap(c => blocks(c.body));
+        const call = content.find(b => b.type === "tool_use" && b.name === (host.version === "v1" ? "task" : "subagent"));
+        expect(call).toBeDefined();
+        const result = content.find(b => b.type === "tool_result" && b.tool_use_id === call?.id);
+        expect(result).toBeDefined();
+        return result;
+      }
+      const allowed = dispatchResult(run.childID);
+      expect(allowed?.is_error).not.toBe(true);
+      expect(blockText(allowed?.content)).not.toContain("[⚠ GUARD:delegation_depth]");
+      const refused = dispatchResult(run.grandchildID);
+      expect(refused?.is_error).toBe(true);
+      const text = blockText(refused?.content);
+      const message = host.version === "v2" ? (JSON.parse(text) as { error: { message: string } }).error.message : text;
+      expect(message).toBe(D5.replace("depth 1;", "depth 2;").replace("is 1,", "is 2,"));
+    }, 120_000);
+
+    it("accepts effortBumpMax medium: a second retry stays at the bound", async () => {
+      const f = await fixture(host);
+      f.provider.graderFailures = 2;
+      const project = await f.project("project", scenarioConfig("advisory", true, true, { effortBumpMax: "medium", maxAttemptsPerTier: 2 }));
+      const run = await f.run(project, "CALL_DELEGATE");
+      const producers = f.provider.captures.filter(c => c.role === "producer");
+      expect(producers.map(c => c.body.output_config?.effort)).toEqual(["low", "medium", "medium"]);
+      expect(new Set(producers.map(c => c.session)).size).toBe(3);
+      expect(f.provider.replies.filter(r => r.role === "grader").map(r => JSON.parse(r.text).pass)).toEqual([false, false, true]);
+      expect(run.stdout).toContain("[router ✓ verified: checker]");
+    }, 120_000);
 
     for (const mode of ["enforced", "advisory"] as const) {
       for (const kind of (host.version === "v2" ? ["foreground", "background", "resume"] : ["foreground", "resume"])) {

@@ -38,6 +38,7 @@ export class ScriptedProvider {
   readonly captures: Capture[] = [];
   readonly replies: { role: Capture["role"]; tool?: string; input?: Record<string, unknown>; text: string }[] = [];
   readonly errors: string[] = [];
+  graderFailures = 1;
   readonly barrierEvents: { parent: string; event: "armed" | "leaf-waiting" | "result-observed" | "leaf-released" }[] = [];
   private background = new Map<string, { promise: Promise<void>; release: () => void; observed: boolean }>();
   private graders = 0;
@@ -66,16 +67,16 @@ export class ScriptedProvider {
       let tool: string | undefined;
       let input: Record<string, unknown> | undefined;
       let text = "ok";
-      if (grader) text = JSON.stringify({ pass: ++this.graders > 1, reasons: [this.graders === 1 ? "scripted first-attempt failure" : "CHILD_DONE observed"] });
+      if (grader) text = JSON.stringify({ pass: ++this.graders > this.graderFailures, reasons: [this.graders <= this.graderFailures ? "scripted verification failure" : "CHILD_DONE observed"] });
       else if (body.tools?.length && !content.some(b => b.type === "tool_result")) {
         if (marker.includes("CALL_DELEGATE")) {
           tool = "delegate";
           input = { tier: "fast", task: "VERIFY:required\nCHILD_DONE", acceptance: "[acceptance]\ncriteria: the reply says CHILD_DONE\n[/acceptance]" };
-        } else if (marker.includes("ROOT_SETUP") || marker.includes("ROOT_NEST_") || /\bNEST_(FG|BG|RESUME)\b/.test(marker)) {
+        } else if (marker.includes("ROOT_SETUP") || marker.includes("ROOT_NEST_") || /\bNEST_(FG|BG|RESUME|DEEP)\b/.test(marker)) {
           tool = this.host === "v1" ? "task" : "subagent";
           const resume = /RESUME_ID=(ses_[A-Za-z0-9]+)/.exec(marker)?.[1];
           const nested = !marker.includes("ROOT_");
-          const prompt = marker.includes("ROOT_SETUP") ? "LEAF_DONE" : marker.includes("ROOT_NEST_") ? marker.includes("ROOT_NEST_BG") ? "NEST_BG" : marker.includes("ROOT_NEST_RESUME") ? `NEST_RESUME RESUME_ID=${resume}` : "NEST_FG" : "LEAF_DONE";
+          const prompt = marker.includes("ROOT_NEST_DEEP") ? "NEST_DEEP" : marker.includes("NEST_DEEP") ? "NEST_FG" : marker.includes("ROOT_SETUP") ? "LEAF_DONE" : marker.includes("ROOT_NEST_") ? marker.includes("ROOT_NEST_BG") ? "NEST_BG" : marker.includes("ROOT_NEST_RESUME") ? `NEST_RESUME RESUME_ID=${resume}` : "NEST_FG" : "LEAF_DONE";
           input = this.host === "v1" ? { description: "Depth smoke dispatch", prompt, subagent_type: "general" } : { description: "Depth smoke dispatch", prompt, agent: "general", background: nested && marker.includes("NEST_BG") };
           if (nested && resume) input[this.host === "v1" ? "task_id" : "sessionID"] = resume;
           const caller = /RESUME_CALLER_ID=(ses_[A-Za-z0-9]+)/.exec(marker)?.[1];
