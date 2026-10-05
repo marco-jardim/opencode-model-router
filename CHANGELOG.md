@@ -29,9 +29,12 @@ Observations by @MetalbolicX in opencode-smart-router (#17); implementation writ
   `enforcement.escalate.effortBump: false` to restore the previous retry behaviour.
 - Dispatches past `enforcement.maxDelegationDepth` (default `1`) are warned in
   `advisory` mode (the bundled default) with `[⚠ GUARD:delegation_depth]` and refused
-  in `enforced` mode. Set `enforcement.mode: "enforced"` or `MODEL_ROUTER_ENFORCE=1`
-  to enforce it; set `enforcement.maxDelegationDepth: null` to opt out of the guard.
-  Enforcement mode `off` and `/bypass on` also disable the check. OpenCode 2's own
+  in `enforced` mode. Set `enforcement.mode: "enforced"` to enforce it unless the
+  caller tier's `enforcement.perTier` entry overrides `mode`; `MODEL_ROUTER_ENFORCE=1`
+  overrides both and forces enforcement. Set `enforcement.maxDelegationDepth: null`
+  to opt out of the guard. Enforcement mode `off`, a caller-tier `perTier: "off"`
+  (unless the environment gate forces enforcement), and `/bypass on` also disable
+  the check. OpenCode 2's own
   `experimental.subagent_depth` cap remains independent.
 - On OpenCode 2, router-modified `subagent` results now keep the host's
   `<subagent sessionID=…>` envelope part and append the router's text as a separate
