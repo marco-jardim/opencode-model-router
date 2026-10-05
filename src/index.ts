@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import type { RouterPluginInput } from "./compat/child-session";
-import { TASK_VERIFICATION } from "./compat/child-session";
+import { DEPTH_BANNER, TASK_VERIFICATION } from "./compat/child-session";
 
 // Imports for internal use within this module
 import {
@@ -12,6 +12,7 @@ import {
   localOverridePath,
   findProjectOverride,
   resolveVerifyBudget,
+  resolveDepthLimit,
   warnDeprecatedVerifyKeys,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig } from "./router/config";
@@ -100,6 +101,7 @@ import {
 } from "./verify/dispatch";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard } from "./escalate/ladder";
 import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
+import { createDepthGuard } from "./router/depth-guard";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -379,6 +381,44 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     now: () => Date.now(),
     logger: routerWarn,
   });
+  const depthGuard = createDepthGuard({
+    tracker: depthTracker,
+    limit: () => resolveDepthLimit(cfg),
+    mode: (sid) => resolveEnforcementMode({
+      config: cfg,
+      tier: (typeof sid === "string" ? sessionStore.getTier(sid) : null) ?? undefined,
+      env: process.env,
+    }).mode,
+    logger: routerWarn,
+  });
+  const depthBanners = new Map<string, string>();
+  const warnedNoCallID = new Set<string>();
+  const stashDepthBanner = (
+    input: { sessionID?: string; callID?: string },
+    output: Record<PropertyKey, unknown>,
+    banner: string,
+  ): void => {
+    try {
+      if (ctx.routerHost === "v2") {
+        output[DEPTH_BANNER] = banner;
+        return;
+      }
+      if (typeof input.callID === "string" && input.callID !== "") {
+        const key = `${input.sessionID}:${input.callID}`;
+        depthBanners.delete(key);
+        depthBanners.set(key, banner);
+        while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+      } else {
+        const sid = String(input.sessionID);
+        if (warnedNoCallID.has(sid)) return;
+        logger.warn(`[router] delegation depth: task call without callID in session ${sid}; advisory banner not delivered`);
+        warnedNoCallID.add(sid);
+        while (warnedNoCallID.size > 1000) warnedNoCallID.delete(warnedNoCallID.values().next().value!);
+      }
+    } catch (error) {
+      logger.warn("[router] delegation depth: advisory banner not stored", { error: scrubText(String(error)) });
+    }
+  };
 
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
@@ -1117,6 +1157,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // -----------------------------------------------------------------------
     "tool.execute.before": async (input: any, output: any) => {
       if (bypassed) return;
+      if (input?.tool === "task") {
+        const depth = await depthGuard.checkDispatch(input.sessionID);
+        if (depth.block) {
+          try {
+            if (typeof input.sessionID === "string") {
+              trajectoryStore.recordToolEvent(input.sessionID, {
+                tool: input.tool, readOnly: READ_ONLY_TOOLS.has(input.tool), blocked: true,
+              });
+            }
+          } catch (error) {
+            logger.warn("[router] delegation depth: refusal not recorded", { error: scrubText(String(error)) });
+          }
+          throw new Error(depth.message);
+        }
+        if (depth.banner) stashDepthBanner(input, output, depth.banner);
+      }
       // Observe before execution too: an in-flight edit must contaminate a
       // capture even if the test finishes before the edit's after-hook fires.
       if (typeof input?.tool === "string") changedFileStore.observeEdit(input.tool,
@@ -1278,6 +1334,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         changedFileStore.record(sid, input.tool, input?.args);
       }
 
+      let unbannered: { output: unknown } | undefined;
+      if (input?.tool === "task") {
+        const key = `${sid}:${input.callID}`;
+        const banner = depthBanners.get(key);
+        depthBanners.delete(key);
+        if (banner !== undefined) {
+          try {
+            unbannered = { output: output.output };
+            const text = typeof output.output === "string" ? output.output.trimEnd() : "";
+            output.output = text ? `${text}\n\n${banner}` : banner;
+          } catch (error) {
+            logger.warn("[router] delegation depth: advisory banner not delivered", { error: scrubText(String(error)) });
+          }
+        }
+      }
+
       if (sid && sessionStore.isSubagent(sid) && typeof input?.tool === "string") {
         trajectoryStore.recordToolEvent(sid, {
           tool: input.tool,
@@ -1313,7 +1385,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           try {
             // pending.ts R11: the producer's changes landed by now.
             const returnedAt = Date.now();
-            const { finalReturnText, childSessionID } = parseTaskResult(output);
+            const { finalReturnText, childSessionID } = parseTaskResult(unbannered ? { ...output, output: unbannered.output } : output);
             const producerTier =
               typeof input?.args?.subagent_type === "string"
                 ? input.args.subagent_type
@@ -1517,6 +1589,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
             depthTracker.forget(id);
+            for (const key of depthBanners.keys()) {
+              if (key.startsWith(`${id}:`)) depthBanners.delete(key);
+            }
+            warnedNoCallID.delete(id);
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);

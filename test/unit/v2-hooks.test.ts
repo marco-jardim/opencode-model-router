@@ -371,6 +371,8 @@ describe("OpenCode 2 hook adapter", () => {
     invalidateConfigCache();
     const cfg = loadConfig();
     cfg.enforcement ??= {}; cfg.enforcement.guard ??= {}; cfg.enforcement.verify ??= {};
+    // Depth guard disabled: this test covers dispatch repair and budget enforcement; the depth limit is covered by depth-guard-wiring.test.ts (#66).
+    cfg.enforcement.maxDelegationDepth = null;
     cfg.enforcement.guard.budget = 1;
     cfg.enforcement.verify.require = "never";
     cfg.tierCaps = { ...cfg.tierCaps, fast: 1 };

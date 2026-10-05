@@ -1,17 +1,60 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
-import { invalidateConfigCache } from "../../src/router/config";
+import { DEPTH_BANNER, TASK_VERIFICATION } from "../../src/compat/child-session";
+import { invalidateConfigCache, overridePath } from "../../src/router/config";
+import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
+
+const captured = vi.hoisted(() => ({
+  pending: undefined as ReturnType<typeof import("../../src/verify/wiring").createVerificationWiring>["pending"] | undefined,
+}));
+const observed = vi.hoisted(() => ({
+  startDispatch: vi.fn(), prepareVerification: vi.fn(),
+  observeEdit: vi.fn(), record: vi.fn(), clear: vi.fn(),
+}));
+vi.mock("../../src/verify/wiring", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../src/verify/wiring")>();
+  return { ...original, createVerificationWiring: (...args: Parameters<typeof original.createVerificationWiring>) => {
+    const wiring = original.createVerificationWiring(...args);
+    captured.pending = wiring.pending;
+    return { ...wiring,
+      startDispatch: (...params: Parameters<typeof wiring.startDispatch>) => {
+        observed.startDispatch();
+        return wiring.startDispatch(...params);
+      },
+      prepareVerification: (...params: Parameters<typeof wiring.prepareVerification>) => {
+        observed.prepareVerification();
+        return wiring.prepareVerification(...params);
+      },
+    };
+  } };
+});
+vi.mock("../../src/verify/dispatch", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../src/verify/dispatch")>();
+  return { ...original, createChangedFileStore: (...args: Parameters<typeof original.createChangedFileStore>) => {
+    const store = original.createChangedFileStore(...args);
+    return { ...store,
+      observeEdit: (...params: Parameters<typeof store.observeEdit>) => { observed.observeEdit(); return store.observeEdit(...params); },
+      record: (...params: Parameters<typeof store.record>) => { observed.record(); return store.record(...params); },
+      clear: (...params: Parameters<typeof store.clear>) => { observed.clear(); return store.clear(...params); },
+    };
+  } };
+});
 
 type Hook = (input: unknown, output?: unknown) => Promise<void>;
 type TestHooks = Record<string, Hook> & { dispose(): Promise<void> };
 
 function makeCtx(dir: string) {
   const get = vi.fn(async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: undefined as string | undefined } }));
-  return { directory: dir, worktree: dir, client: { session: { get } } };
+  let counter = 0;
+  const create = vi.fn(async (_opts: { body?: { parentID?: string } }) => ({ data: { id: `producer-${counter++}` } }));
+  const prompt = vi.fn(async (_opts: { path: { id: string }; body: { system?: string; parts?: { text?: string }[] } }) => ({
+    data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+  }));
+  return { directory: dir, worktree: dir, client: { session: { get, create, prompt, delete: vi.fn(async () => ({})) } } };
 }
 
 describe("delegation depth plugin wiring", () => {
@@ -23,6 +66,7 @@ describe("delegation depth plugin wiring", () => {
     vi.stubEnv("HOME", dir);
     vi.stubEnv("USERPROFILE", dir);
     vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
+    vi.clearAllMocks();
     invalidateConfigCache();
   });
 
@@ -39,6 +83,268 @@ describe("delegation depth plugin wiring", () => {
     instances.push(hooks);
     return { hooks, get: ctx.client.session.get };
   }
+
+  function configure(enforcement: Record<string, unknown>) {
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify({ enforcement }));
+    invalidateConfigCache();
+  }
+
+  async function created(hooks: TestHooks, id: string, parentID?: string) {
+    await hooks.event({ event: { type: "session.created", properties: { info: { id, parentID } } } });
+  }
+
+  async function seed(hooks: TestHooks) {
+    await hooks["experimental.chat.system.transform"]({ sessionID: "O", model: {} }, { system: [] });
+    await created(hooks, "C", "O");
+  }
+
+  const taskInput = (sessionID = "C", callID: string | undefined = "call") => ({ tool: "task", sessionID, callID });
+  const taskOutput = () => ({ args: { prompt: "inspect the project", subagent_type: "fast" } });
+  const countBanners = (text: string) => (text.match(/GUARD:delegation_depth/g) ?? []).length;
+
+  for (const mode of ["enforced", "advisory"] as const) {
+    describe(mode, () => {
+      beforeEach(() => { vi.stubEnv("MODEL_ROUTER_ENFORCE", mode === "enforced" ? "1" : ""); });
+
+      async function dispatch(hooks: TestHooks, sid = "C", depth = 1, max = 1, callID = "call", args = taskOutput().args) {
+        const input = taskInput(sid, callID);
+        const before = { args };
+        if (mode === "enforced") {
+          const unchanged = { ...args };
+          await expect(hooks["tool.execute.before"](input, before)).rejects.toThrow(depthLimitMessage(depth, max));
+          expect(before.args).toEqual(unchanged);
+          expect(TASK_VERIFICATION in before).toBe(false);
+        } else {
+          await hooks["tool.execute.before"](input, before);
+          const after = { output: "producer output" };
+          await hooks["tool.execute.after"]({ ...input, args: before.args }, after);
+          expect(countBanners(after.output)).toBe(1);
+          expect(after.output).toContain(depthAdvisoryBanner(depth, max));
+        }
+      }
+
+      it("allows a seeded root without a second backend lookup", async () => {
+        const { hooks, get } = await setup();
+        await seed(hooks);
+        const input = taskInput("O");
+        await hooks["tool.execute.before"](input, taskOutput());
+        const out = { output: "done" };
+        await hooks["tool.execute.after"](input, out);
+        expect(countBanners(out.output)).toBe(0);
+        expect(get).toHaveBeenCalledTimes(1);
+      });
+
+      it("guards a created child before verification, prompt edits or file-store writes", async () => {
+        const { hooks } = await setup();
+        await seed(hooks);
+        vi.clearAllMocks();
+        await dispatch(hooks);
+        if (mode === "enforced") {
+          for (const spy of Object.values(observed)) expect(spy).not.toHaveBeenCalled();
+        }
+      });
+
+      it("records refused attempts even when the caller is known only to the backend", async () => {
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockImplementation(async ({ path }) => ({ data: { id: path.id, parentID: path.id === "C" ? "O" : undefined } }));
+        const { hooks } = await setup(ctx);
+        await dispatch(hooks);
+        const handback = (sid: string) => ({ output: `task_id: ${sid}\n<task_result>NEED CONTEXT: I cannot dispatch; handing back because tools are unavailable.</task_result>`, metadata: { sessionId: sid } });
+        const out = handback("C");
+        await hooks["tool.execute.after"](taskInput("O", "return"), out);
+        // Advisory's after-hook is not tracked for this backend-only caller; D4 applies to blocks.
+        if (mode === "enforced") expect(out.output).not.toContain("FALSE-REFUSAL SUSPECT");
+        const control = handback("untouched");
+        await hooks["tool.execute.after"](taskInput("O", "control"), control);
+        expect(control.output).toContain("FALSE-REFUSAL SUSPECT");
+      });
+
+      it("allows depth one at limit two and guards depth two", async () => {
+        configure({ maxDelegationDepth: 2 });
+        const { hooks } = await setup();
+        await seed(hooks);
+        await created(hooks, "G", "C");
+        await hooks["tool.execute.before"](taskInput(), taskOutput());
+        const out = { output: "done" };
+        await hooks["tool.execute.after"](taskInput(), out);
+        expect(countBanners(out.output)).toBe(0);
+        await dispatch(hooks, "G", 2, 2);
+      });
+
+      it.each(["null", "off"])("%s skips depth lookup and banner delivery", async (disabled) => {
+        if (disabled === "null") configure({ maxDelegationDepth: null });
+        else vi.stubEnv("MODEL_ROUTER_ENFORCE", "0");
+        const { hooks, get } = await setup();
+        await hooks["tool.execute.before"](taskInput(), taskOutput());
+        const out = { output: "done" };
+        await hooks["tool.execute.after"](taskInput(), out);
+        expect(get).not.toHaveBeenCalled();
+        expect(countBanners(out.output)).toBe(0);
+      });
+
+      it("fails open and warns once when the backend rejects", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockRejectedValue(new Error("backend unavailable"));
+        const { hooks } = await setup(ctx);
+        for (const callID of ["one", "two"]) await hooks["tool.execute.before"](taskInput("C", callID), taskOutput());
+        expect(warn.mock.calls.filter(([text]) => String(text).includes("cannot resolve"))).toHaveLength(1);
+      });
+
+      it("resolves an out-of-order child and accepts the later event without conflict", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockImplementation(async ({ path }) => ({ data: { id: path.id, parentID: path.id === "C" ? "O" : undefined } }));
+        const { hooks, get } = await setup(ctx);
+        await dispatch(hooks);
+        expect(get).toHaveBeenCalledTimes(2);
+        await created(hooks, "C", "O");
+        expect(warn.mock.calls.flat().join(" ")).not.toContain("conflicting evidence");
+        await dispatch(hooks, "C", 1, 1, "later");
+        expect(get).toHaveBeenCalledTimes(2);
+      });
+
+      it("does not seed a failed transform lookup as a root", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const ctx = makeCtx(dir);
+        ctx.client.session.get.mockRejectedValueOnce(new Error("transient"));
+        ctx.client.session.get.mockImplementation(async ({ path }) => ({ data: { id: path.id, parentID: path.id === "C" ? "O" : undefined } }));
+        const { hooks } = await setup(ctx);
+        const system = { system: [] as string[] };
+        await hooks["experimental.chat.system.transform"]({ sessionID: "C", model: {} }, system);
+        expect(system.system.length).toBeGreaterThan(0);
+        await dispatch(hooks);
+      });
+
+      it("guards task_id resumes from a child but allows the root", async () => {
+        const { hooks } = await setup();
+        await seed(hooks);
+        const args = { ...taskOutput().args, task_id: "existing" };
+        await dispatch(hooks, "C", 1, 1, "resume", args);
+        await expect(hooks["tool.execute.before"](taskInput("O"), { args })).resolves.toBeUndefined();
+      });
+
+      it("bypass skips the guard and its backend lookup", async () => {
+        const { hooks, get } = await setup();
+        await hooks["command.execute.before"]({ command: "bypass", arguments: "on" }, { parts: [] });
+        const before = taskOutput();
+        await hooks["tool.execute.before"](taskInput(), before);
+        const after = { output: "unchanged" };
+        await hooks["tool.execute.after"](taskInput(), after);
+        expect(after.output).toBe("unchanged");
+        expect(get).not.toHaveBeenCalled();
+      });
+
+      it("forgets a deleted child's depth", async () => {
+        const { hooks, get } = await setup();
+        await seed(hooks);
+        await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "C" } } } });
+        await hooks["tool.execute.before"](taskInput(), taskOutput());
+        const out = { output: "done" };
+        await hooks["tool.execute.after"](taskInput(), out);
+        expect(get).toHaveBeenCalledWith({ path: { id: "C" } });
+        expect(countBanners(out.output)).toBe(0);
+      });
+    });
+  }
+
+  it.each(["deferred subagent", "v2 repair"])("refuses the %s fixture dispatch with the default limit before registering anything", async (shape) => {
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
+    const ctx = makeCtx(dir);
+    const sid = shape === "deferred subagent" ? "sub" : "root";
+    ctx.client.session.get.mockImplementation(async ({ path }) => ({ data: {
+      id: path.id,
+      // Match the v2 fixture's unconditional parent: even root points to itself.
+      parentID: shape === "v2 repair" ? "root" : path.id === "sub" ? "orch" : undefined,
+    } }));
+    const { hooks } = await setup(ctx);
+    const args = shape === "deferred subagent"
+      ? { subagent_type: "fast", prompt: "VERIFY:deferred\nImplement it.\n[acceptance]\ncheck: testsPass\ncheck: fileExists path=missing.ts\n[/acceptance]", description: "the work" }
+      : { subagent_type: "fast", description: "Investigate every source file" };
+    const before = { args: { ...args } };
+    await expect(hooks["tool.execute.before"]({ ...taskInput(sid), args }, before))
+      .rejects.toThrow(depthLimitMessage(shape === "v2 repair" ? 32 : 1, 1));
+    expect(before.args).toEqual(args);
+    expect(TASK_VERIFICATION in before).toBe(false);
+    for (const spy of Object.values(observed)) expect(spy).not.toHaveBeenCalled();
+    expect(captured.pending?.listUnverified(sid)).toEqual([]);
+    expect(ctx.client.session.create).not.toHaveBeenCalled();
+  });
+
+  it("composes with the Layer-1 iteration budget on the same advisory task", async () => {
+    configure({ guard: { budget: 1, sameOpRetryCap: 1 } });
+    const { hooks } = await setup();
+    await seed(hooks);
+    await hooks["chat.message"]({ sessionID: "C", agent: "fast" }, { parts: [] });
+    for (const callID of ["first", "second"]) {
+      const input = taskInput("C", callID);
+      const before = taskOutput();
+      await hooks["tool.execute.before"](input, before);
+      const out = { output: "done" };
+      await hooks["tool.execute.after"]({ ...input, args: before.args }, out);
+      expect(countBanners(out.output)).toBe(1);
+      if (callID === "second") expect(out.output.match(/GUARD:iteration_cap/g)).toHaveLength(1);
+    }
+  });
+
+  it("delivers per-call banners once, isolates abandoned calls and purges deleted sessions", async () => {
+    const { hooks } = await setup();
+    await seed(hooks);
+    await hooks["tool.execute.before"](taskInput("C", "abandoned"), taskOutput());
+    await hooks["tool.execute.before"](taskInput("C", "live"), taskOutput());
+    for (const count of [1, 0]) {
+      const out = { output: "done" };
+      await hooks["tool.execute.after"](taskInput("C", "live"), out);
+      expect(countBanners(out.output)).toBe(count);
+    }
+    await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "C" } } } });
+    const out = { output: "done" };
+    await hooks["tool.execute.after"](taskInput("C", "abandoned"), out);
+    expect(countBanners(out.output)).toBe(0);
+  });
+
+  it("warns once per session without a callID and delivers no banner", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { hooks } = await setup();
+    await seed(hooks);
+    for (let n = 0; n < 2; n++) {
+      const input = { tool: "task", sessionID: "C" };
+      await hooks["tool.execute.before"](input, taskOutput());
+      const out = { output: "done" };
+      await hooks["tool.execute.after"](input, out);
+      expect(countBanners(out.output)).toBe(0);
+    }
+    expect(warn.mock.calls.filter(([text]) => String(text).includes("without callID"))).toHaveLength(1);
+  });
+
+  it("never sends the depth banner to the native-path grader or changes its parentID", async () => {
+    const ctx = makeCtx(dir);
+    const { hooks } = await setup(ctx);
+    await seed(hooks);
+    const input = taskInput();
+    const before = { args: { prompt: "[acceptance]\ncriteria: correct\n[/acceptance]", subagent_type: "fast" } };
+    await hooks["tool.execute.before"](input, before);
+    const out = { output: "unwrapped producer output" };
+    await hooks["tool.execute.after"]({ ...input, args: before.args }, out);
+    expect(countBanners(out.output)).toBe(1);
+    const graders = ctx.client.session.prompt.mock.calls.filter(([opts]) => opts.body.system !== undefined);
+    expect(graders).toHaveLength(1);
+    expect(JSON.stringify(graders)).not.toContain("GUARD:delegation_depth");
+    expect(ctx.client.session.create.mock.calls[0][0].body?.parentID).toBeUndefined();
+  });
+
+  it("uses the v2 symbol channel without also stashing a v1 banner", async () => {
+    const ctx = { ...makeCtx(dir), routerHost: "v2" as const };
+    const { hooks } = await setup(ctx);
+    await seed(hooks);
+    const before: Record<PropertyKey, unknown> = taskOutput();
+    await hooks["tool.execute.before"](taskInput(), before);
+    expect(before[DEPTH_BANNER]).toBe(depthAdvisoryBanner(1, 1));
+    const out = { output: "done" };
+    await hooks["tool.execute.after"](taskInput(), out);
+    expect(countBanners(out.output)).toBe(0);
+  });
 
   it("starts without lookups and seeds a root with only its transform lookup", async () => {
     const { hooks, get } = await setup();
