@@ -37,8 +37,9 @@ export interface ReasoningConfig {
  * Provider-agnostic reasoning effort for a tier.
  *
  * `xhigh` and `max` exist because Anthropic's adaptive models accept them;
- * OpenAI's `reasoning_effort` stops at `high`, so the registration path
- * downgrades those two with a warning (see `src/router/agent-options.ts`).
+ * OpenAI's reasoning effort parameter (`reasoningEffort`) stops at `high`, so
+ * the registration path downgrades those two with a warning (see
+ * `src/router/agent-options.ts`).
  */
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
@@ -121,6 +122,8 @@ export interface ModeConfig {
 
 export interface EnforcementConfig {
   mode?: "off" | "advisory" | "enforced";
+  /** Default 1; warned in "advisory" mode (bundled default), refused in "enforced" mode, ignored in "off"; null disables. */
+  maxDelegationDepth?: number | null;
   envGate?: string;
   perTier?: Record<string, "off" | "advisory" | "enforced">;
   guard?: { readDraftCap?: number; sameOpRetryCap?: number; blockSelfScript?: boolean; deliverableFirst?: boolean; budget?: number; blockScriptWrites?: boolean };
@@ -167,7 +170,11 @@ export interface EnforcementConfig {
     failureRecheck?: boolean;
     /** Budget for the reference re-run, in ms (integer >= 1). Default 60000. */
     recheckTimeoutMs?: number };
-  escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number } };
+  escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number };
+    /** Bump reasoning effort before escalating tiers. Default true. */
+    effortBump?: boolean;
+    /** Maximum reasoning effort for a bump. Default "xhigh". */
+    effortBumpMax?: EffortLevel };
   proportional?: { trivialBypass?: boolean; trivialClassifier?: string };
 }
 
@@ -717,6 +724,18 @@ function validateEnforcement(obj: Record<string, unknown>): void {
       throw new Error("tiers.json: enforcement must be an object");
     }
     const enforcement = obj.enforcement as Record<string, unknown>;
+    const maxDelegationDepth = enforcement.maxDelegationDepth;
+    if (
+      maxDelegationDepth !== undefined &&
+      maxDelegationDepth !== null &&
+      (typeof maxDelegationDepth !== "number" ||
+        !Number.isInteger(maxDelegationDepth) ||
+        maxDelegationDepth < 1)
+    ) {
+      throw new Error(
+        "tiers.json: enforcement.maxDelegationDepth must be an integer >= 1 or null",
+      );
+    }
     if (enforcement.mode !== undefined) {
       if (!["off", "advisory", "enforced"].includes(enforcement.mode as string)) {
         throw new Error(
@@ -875,6 +894,19 @@ function validateEnforcement(obj: Record<string, unknown>): void {
       enforcement.escalate !== null
     ) {
       const escalate = enforcement.escalate as Record<string, unknown>;
+      const effortBump = escalate.effortBump;
+      if (effortBump !== undefined && typeof effortBump !== "boolean") {
+        throw new Error("tiers.json: enforcement.escalate.effortBump must be a boolean");
+      }
+      const effortBumpMax = escalate.effortBumpMax;
+      if (
+        effortBumpMax !== undefined &&
+        !EFFORT_LEVELS.some((level) => level === effortBumpMax)
+      ) {
+        throw new Error(
+          `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")}`,
+        );
+      }
       if (
         escalate.costCeiling !== undefined &&
         typeof escalate.costCeiling === "object" &&
@@ -1268,6 +1300,21 @@ export function writeState(patch: Partial<RouterState>): void {
 // ---------------------------------------------------------------------------
 // Enforcement helpers
 // ---------------------------------------------------------------------------
+
+/** The single place the delegation-depth default is applied; null disables it. */
+export function resolveDepthLimit(cfg: RouterConfig): number | null {
+  const depth = cfg.enforcement?.maxDelegationDepth;
+  return depth === undefined ? 1 : depth;
+}
+
+/** The single place effort-bump defaults are applied, without mutating config. */
+export function resolveEffortBump(cfg: RouterConfig): { enabled: boolean; max: EffortLevel } {
+  const escalate = cfg.enforcement?.escalate;
+  return {
+    enabled: escalate?.effortBump ?? true,
+    max: escalate?.effortBumpMax ?? "xhigh",
+  };
+}
 
 /** Returns the effective enforcement mode. Missing enforcement ⇒ mode:"advisory". */
 export function normalizeEnforcement(
