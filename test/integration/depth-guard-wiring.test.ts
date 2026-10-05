@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
-import type { RouterPluginInput } from "../../src/compat/child-session";
+import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/child-session";
 import { DEPTH_BANNER, TASK_VERIFICATION } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
@@ -45,12 +45,15 @@ vi.mock("../../src/verify/dispatch", async (importOriginal) => {
 });
 
 type Hook = (input: unknown, output?: unknown) => Promise<void>;
-type TestHooks = Record<string, Hook> & { dispose(): Promise<void> };
+type TestHooks = Record<string, Hook> & {
+  dispose(): Promise<void>;
+  tool: { delegate: { execute(args: { task: string; tier?: string; acceptance?: string }, ctx?: { sessionID?: string }): Promise<string> } };
+};
 
 function makeCtx(dir: string) {
   const get = vi.fn(async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: undefined as string | undefined } }));
   let counter = 0;
-  const create = vi.fn(async (_opts: { body?: { parentID?: string } }) => ({ data: { id: `producer-${counter++}` } }));
+  const create = vi.fn(async (_opts: { body?: { parentID?: string } }): Promise<{ data: { id?: string } }> => ({ data: { id: `producer-${counter++}` } }));
   const prompt = vi.fn(async (_opts: { path: { id: string }; body: { system?: string; parts?: { text?: string }[] } }) => ({
     data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
   }));
@@ -78,7 +81,7 @@ describe("delegation depth plugin wiring", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  async function setup(ctx = makeCtx(dir)) {
+  async function setup(ctx: ReturnType<typeof makeCtx> & Pick<RouterPluginInput, "routerChildRunner" | "routerHost"> = makeCtx(dir)) {
     const hooks = await ModelRouterPlugin(ctx as unknown as RouterPluginInput) as unknown as TestHooks;
     instances.push(hooks);
     return { hooks, get: ctx.client.session.get };
@@ -102,6 +105,7 @@ describe("delegation depth plugin wiring", () => {
   const taskInput = (sessionID = "C", callID: string | undefined = "call") => ({ tool: "task", sessionID, callID });
   const taskOutput = () => ({ args: { prompt: "inspect the project", subagent_type: "fast" } });
   const countBanners = (text: string) => (text.match(/GUARD:delegation_depth/g) ?? []).length;
+  const delegateArgs = { task: "VERIFY:required\nDo the work", tier: "fast", acceptance: "[acceptance]\ncriteria: correct\n[/acceptance]" };
 
   for (const mode of ["enforced", "advisory"] as const) {
     describe(mode, () => {
@@ -245,6 +249,107 @@ describe("delegation depth plugin wiring", () => {
         await hooks["tool.execute.after"](taskInput(), out);
         expect(get).toHaveBeenCalledWith({ path: { id: "C" } });
         expect(countBanners(out.output)).toBe(0);
+      });
+
+      describe("delegate", () => {
+        beforeEach(() => { vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1"); });
+
+        it.each(["accepted", "unmet", "fail-closed", "create-failed"] as const)("guards a child before the %s return path", async (outcome) => {
+          const ctx = makeCtx(dir);
+          if (outcome === "unmet") ctx.client.session.prompt.mockResolvedValue({ data: { parts: [{ type: "text", text: '{"pass":false,"reasons":["incorrect"]}' }] } });
+          if (outcome === "fail-closed") ctx.client.session.create.mockRejectedValue(new Error("cannot create"));
+          if (outcome === "create-failed") ctx.client.session.create.mockResolvedValue({ data: {} });
+          const { hooks } = await setup(ctx);
+          await seed(hooks);
+          vi.clearAllMocks();
+          const result = await hooks.tool.delegate.execute(delegateArgs, { sessionID: "C" });
+          if (mode === "enforced") {
+            expect(result).toBe(depthLimitMessage(1, 1));
+            expect(ctx.client.session.create).not.toHaveBeenCalled();
+            expect(ctx.client.session.prompt).not.toHaveBeenCalled();
+            for (const spy of Object.values(observed)) expect(spy).not.toHaveBeenCalled();
+            expect(captured.pending?.listUnverified("C")).toEqual([]);
+          } else {
+            expect(countBanners(result)).toBe(1);
+            expect(result).toContain(depthAdvisoryBanner(1, 1));
+            const marker = { accepted: "[router ✓ verified:", unmet: "[router status: unmet]", "fail-closed": "delegate failed (fail-closed)", "create-failed": "could not create a producer session" }[outcome];
+            expect(result).toContain(marker);
+            if (outcome === "accepted") expect(result.indexOf("GUARD:delegation_depth")).toBeLessThan(result.indexOf(marker));
+            else expect(result.endsWith(depthAdvisoryBanner(1, 1))).toBe(true);
+            const graders = ctx.client.session.prompt.mock.calls.filter(([opts]) => opts.body.system !== undefined);
+            expect(JSON.stringify(graders)).not.toContain("GUARD:delegation_depth");
+          }
+        });
+
+        it("keeps a root result byte-identical to disabling the depth guard", async () => {
+          const { hooks } = await setup();
+          await seed(hooks);
+          const guarded = await hooks.tool.delegate.execute(delegateArgs, { sessionID: "O" });
+          configure({ maxDelegationDepth: null });
+          const disabled = await setup();
+          const unguarded = await disabled.hooks.tool.delegate.execute(delegateArgs, { sessionID: "O" });
+          expect(guarded).toContain("[router ✓ verified:");
+          expect(guarded).toBe(unguarded);
+          expect(countBanners(guarded)).toBe(0);
+        });
+
+        it.each(["v1", "v2"] as const)("records %s producers with and without a caller before their first prompt", async (host) => {
+          for (const caller of [undefined, "O"]) {
+            const ctx = makeCtx(dir);
+            let hooks: TestHooks;
+            let nestedCalls = 0;
+            const checkProducer = async (sid: string) => {
+              nestedCalls++;
+              const before: Record<PropertyKey, unknown> = taskOutput();
+              if (mode === "enforced") {
+                await expect(hooks["tool.execute.before"](taskInput(sid, "nested"), before)).rejects.toThrow(depthLimitMessage(1, 1));
+              } else {
+                await hooks["tool.execute.before"](taskInput(sid, "nested"), before);
+                if (host === "v2") expect(before[DEPTH_BANNER]).toBe(depthAdvisoryBanner(1, 1));
+                else {
+                  const after = { output: "nested output" };
+                  await hooks["tool.execute.after"](taskInput(sid, "nested"), after);
+                  expect(countBanners(after.output)).toBe(1);
+                }
+              }
+              expect(ctx.client.session.get.mock.calls.some(([req]) => req.path.id === sid)).toBe(false);
+            };
+            ctx.client.session.prompt.mockImplementation(async (opts) => {
+              if (opts.body.system === undefined) await checkProducer(opts.path.id);
+              return { data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] } };
+            });
+            let childCounter = 0;
+            const run = vi.fn(async (request: ChildSessionRequest) => {
+              const sid = `host-child-${childCounter++}`;
+              await request.onCreated(sid);
+              if (request.system === undefined) await checkProducer(sid);
+              return { sessionID: sid, text: '{"pass":true,"reasons":[]}' };
+            });
+            ({ hooks } = await setup(host === "v2" ? { ...ctx, routerHost: "v2", routerChildRunner: { run, dispose: vi.fn(async () => undefined) } } : ctx));
+            if (caller) await seed(hooks);
+            const result = await hooks.tool.delegate.execute(delegateArgs, caller ? { sessionID: caller } : undefined);
+            expect(result).toContain("[router ✓ verified:");
+            expect(nestedCalls).toBe(1);
+            if (host === "v1") expect(ctx.client.session.create.mock.calls[0][0].body).toEqual(caller ? { parentID: caller } : {});
+            else {
+              expect(run.mock.calls[0][0].parentSessionID).toBe(caller);
+              expect(ctx.client.session.create).not.toHaveBeenCalled();
+            }
+          }
+        });
+
+        it("bypass lets a child's delegate run the ladder without depth lookups or banners", async () => {
+          const ctx = makeCtx(dir);
+          const { hooks } = await setup(ctx);
+          await seed(hooks);
+          await hooks["command.execute.before"]({ command: "bypass", arguments: "on" }, { parts: [] });
+          vi.clearAllMocks();
+          const result = await hooks.tool.delegate.execute(delegateArgs, { sessionID: "C" });
+          expect(result).toContain("[router ✓ verified:");
+          expect(countBanners(result)).toBe(0);
+          expect(ctx.client.session.create).toHaveBeenCalled();
+          expect(ctx.client.session.get).not.toHaveBeenCalled();
+        });
       });
     });
   }

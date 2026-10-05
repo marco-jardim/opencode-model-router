@@ -604,6 +604,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
            * settled; clearing it in the finally below would abort a capture still in flight.
            */
           let deferredOwnsBaseline = false;
+          const depth = bypassed ? undefined : await depthGuard.checkDispatch(toolCtx?.sessionID);
+          if (depth?.block) return depth.message!;
+          const withDepthBanner = (text: string): string => {
+            if (!depth?.banner) return text;
+            const trimmed = text.trimEnd();
+            return trimmed ? `${trimmed}\n\n${depth.banner}` : depth.banner;
+          };
           try {
             let activeCfg = cfg;
             try {
@@ -668,6 +675,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const registerProducer = async (sid: string) => {
                 producerSid = sid;
                 producerSessions.push(sid);
+                depthTracker.recordPluginChild(sid, toolCtx?.sessionID ?? null);
                 // Keep the ORIGINAL dispatch reference across retries/escalations:
                 // recapturing after a failed attempt would excuse its regression.
                 if (!baselineID) {
@@ -911,7 +919,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             while (true) {
               if (safety++ > safetyMax) {
-                return (
+                return withDepthBanner(
                   `[router status: unmet] delegation stopped by the safety net after ` +
                   `${state.totalAttempts} attempt(s).\n\n${scrubText(producerText)}`
                 );
@@ -919,13 +927,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const tier = state.currentTier;
               const attempt = await runProducerAttempt(tier, forcing);
               if (!attempt) {
-                return "[router] delegate failed: could not create a producer session.";
+                return withDepthBanner("[router] delegate failed: could not create a producer session.");
               }
               producerText = attempt.text;
               if ("deferredFooter" in attempt) {
                 // Section 1.5-16: the result unchanged plus the footer, appended last. Never
                 // labelled accepted or verified, and never retried or escalated.
-                return appendRouterFooter(producerText, attempt.deferredFooter);
+                return appendRouterFooter(withDepthBanner(producerText), attempt.deferredFooter);
               }
               const producerSid = attempt.sessionID;
               const gateRes = attempt.gateRes;
@@ -949,7 +957,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   true,
                   gateRes.verdict.method,
                 );
-                return producerText + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.outcome, gateRes.verdict.caveats, gateRes.verdict.notes);
+                return withDepthBanner(producerText) + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.outcome, gateRes.verdict.caveats, gateRes.verdict.notes);
               }
               if (action.action === "give_up") {
                 dumpDelegateScorecard(
@@ -959,7 +967,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   gateRes.verdict.method,
                 );
                 const note = scrubText(buildForcingNote(gateRes.verdict.reasons));
-                return (
+                return withDepthBanner(
                   `[router status: unmet] The delegated result was not accepted after ` +
                   `${state.totalAttempts} attempt(s) across ${state.escalations} escalation(s) ` +
                   `(final tier ${state.currentTier}; ${action.reason ?? "verification failed"}).\n\n` +
@@ -971,7 +979,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               state = advance(state, action);
             }
           } catch {
-            return "[router] delegate failed (fail-closed): the delegation or verification could not complete.";
+            return withDepthBanner("[router] delegate failed (fail-closed): the delegation or verification could not complete.");
           } finally {
             // Safety net for every exit path an end-of-iteration dispose cannot
             // reach: accept/give-up returns, the safety-net return, and throws.
