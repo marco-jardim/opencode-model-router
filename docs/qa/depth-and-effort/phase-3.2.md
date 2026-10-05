@@ -21,15 +21,20 @@
 
 ### Versioned fixtures
 
-Test/helper commit: `8c7ec2c2b9587986ab421f1bcae949994a23edb9`.
+Initial test/helper commit: `8c7ec2c2b9587986ab421f1bcae949994a23edb9`.
+Final round-1 test revision: `85d5c180f75aa4c5267ba3c78c7b436dab70ab2f`.
 
 - `test/smoke/helpers/scripted-provider.ts`: local-only keyless Anthropic Messages
   server, SSE and non-stream replies, request capture, marker-driven native tool and
   delegate calls, deterministic failing-then-passing grader replies, start/stop.
 - `test/smoke/depth-effort.smoke.test.ts`: v1 on PATH under `RUN_OC_SMOKE_KEYLESS=1`
-  or `RUN_OC_SMOKE=1`; v2 additionally when `OPENCODE_V2_BIN` is set. The v2-only lane
-  uses `RUN_OC_SMOKE_V2=1`. Missing v2 binary is a visible skipped describe, not a
-  credential-dependent omission of the v1 proof.
+  or `RUN_OC_SMOKE=1`; v2 independently requires `RUN_OC_SMOKE_V2=1` and
+  `OPENCODE_V2_BIN`. Explicitly requesting v2 without its binary fails collection.
+  With the flag unset, the skipped describe is named `(set RUN_OC_SMOKE_V2=1 and
+  OPENCODE_V2_BIN to run)` (shown by the verbose reporter). Neither condition gates v1.
+- `test/smoke/helpers/scripted-provider.test.ts`: four protocol/barrier tests pin
+  non-stream tool calls, non-retryable Anthropic-shaped errors, SSE ping/order, and
+  background leaf release only after the parent tool result is captured.
 - The config/inventory matrix requires a fresh `serve` process per variant: router
   config is process-CWD-scoped, so reusing one server with different HTTP directory
   parameters does not load each project's router overrides. Processes are stopped
@@ -47,14 +52,15 @@ Test/helper commit: `8c7ec2c2b9587986ab421f1bcae949994a23edb9`.
   They do not enforce depth, modify tool output, register tier agents or set effort.
 - Native host caps are lifted separately: v1 `subagent_depth: 4`, v2
   `experimental.subagent_depth: 4`, plus explicit general-agent dispatch permission.
-  The router still has `maxDelegationDepth: 1`. V2 advisory resume uses the caller's
+  The router has `maxDelegationDepth: 1` (2 in the explicit accepted-bound test).
+  V1 resume uses native `task_id`. V2 advisory resume uses the caller's
   own existing child, not a sibling. Completed v2 results must retain the model-visible
   `<subagent sessionID=` envelope; background results must carry structured `running`.
 - Optional `SMOKE_DEPTH_EFFORT_ARTIFACTS` retains secret-free evidence. Processes and
   stub sockets are closed and exact allocated fixture directories removed even after
   assertion failures. `SMOKE_DEPTH_EFFORT_MUTATION=depth|bump` alters fixture config only.
 
-### Verification runs
+### Initial verification runs (historical; superseded by round-1 reruns below)
 
 Commands were run in `D:\git\omr-de-p32`. The outer PowerShell runner removes
 inherited `XDG_*`, `OPENCODE_*`, router and provider variables before setting the
@@ -81,7 +87,7 @@ Pinned binaries were checked with `--version`: v1 **1.18.19**, v2 **2.0.22**
 | `npm run smoke:keyless` | 3 files, 9 passed | 57.67 s | `keyless/output.log` |
 | `npm run smoke:v2` | 1 file, 2 passed | 3.13 s | `v2/output.log` |
 
-Final assertion coverage (the new file's 14 tests include these grouped checks):
+Initial assertion coverage (the original file's 14 tests included these grouped checks):
 
 | Assertion | v1 1.18.19 | v2 2.0.22 | Captured/observed evidence |
 |---|---|---|---|
@@ -96,7 +102,7 @@ Final assertion coverage (the new file's 14 tests include these grouped checks):
 | (d) Cross-session isolation only | PASS | PASS | Root-session title, separate graders and orchestrator have no effort; does not exercise A3 on the producer's own session |
 | (d) Bump disabled | PASS | PASS | Two producer attempts both carry low |
 
-Representative final stdout summaries:
+Representative initial stdout summaries:
 
 ```text
 new-v1:     Test Files 1 passed; Tests 5 passed | 9 skipped (14)
@@ -196,8 +202,6 @@ Same-session gate evidence is deliberately at the integration/unit layer:
 These named tests are re-run on the final test revision; host PASS rows must not be
 used to claim that the same-session identity-gate mutation was killed at host level.
 
-## Findings
-
 ### Round-1 mutation expansion (QA-3.2-3)
 
 The final-revision rerun uses `SMOKE_DEPTH_EFFORT_MUTATION=depth` with filter
@@ -212,23 +216,119 @@ The bump mutation selects `bumps only|accepts effortBumpMax`, proving both the f
 bump and the new repeated-retry bound assertion are sensitive to bump-off config.
 The original four config-only integration mutations are repeated and restored too.
 
-QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`. Line numbers refer to
-`8c7ec2c`.
+## Round-1 final-revision verification (2026-10-05)
+
+All results in this section were run against committed test revision
+**`85d5c180f75aa4c5267ba3c78c7b436dab70ab2f`**. This report-only follow-up does not
+change those test bytes. Unlike the historical initial results above, every host
+artifact includes the revision and SHA-256 hashes of all three test/helper files.
+`summarize.mjs` validated all **47 artifacts**, expected lane exit codes, mutation
+kill counts, config values, successful host turns, and captured effort sequences.
+No product source or expectations were mutated; the two integration fixtures were
+temporarily config-mutated, then restored byte-equivalently in Git. No full suite ran.
+
+Evidence root: **`C:\Users\Marquinho\AppData\Local\Temp\Claude\p32-r1\`**.
+It retains `run.ps1`, `hosts.ps1`, `tested-revision.txt`, `tested-hashes.json`,
+`versions.json`, `summary.json`, `cleanup.json`, and each lane's `result.json`,
+`output.log`, and host `artifacts/`. Each invocation clears inherited XDG, OpenCode,
+router and provider variables; v1's native bin is first on PATH, and only explicit
+v2 lanes receive `OPENCODE_V2_BIN`. Binaries report **1.18.19** and **2.0.22**.
+Prior attempt evidence under `p32-smoke/` and QA evidence under `p32-qa/` remain intact.
+
+### Final run outputs
+
+| Lane / output under evidence root | Result | Duration |
+|---|---|---|
+| `new-v2/output.log` | 11 passed, 9 v1 skipped | 42.75 s |
+| `restored-v1/output.log` | **9 passed**, 11 v2 skipped | **216.75 s** |
+| `restored-v2/output.log` | **11 passed**, 9 v1 skipped | **38.38 s** |
+| `integration/output.log` | **1,261 passed** across the two wiring files (91) and effort-override unit file (1,170), including named A3 exclusions | 8.29 s |
+| `protocol/output.log` | **4 passed** | 262 ms |
+| `missing-v2/output.log` | Expected collection failure: `Set OPENCODE_V2_BIN to the OpenCode 2 executable when RUN_OC_SMOKE_V2=1` | 275 ms |
+| `gating/output.log` | 20 skipped; verbose v2 describe includes the opt-in instructions | 280 ms |
+
+Targeted strict TypeScript checking passed for `depth-effort.smoke.test.ts` and
+`helpers/scripted-provider.test.ts` (which imports the provider helper), using
+`tsc --ignoreConfig --noEmit --strict --skipLibCheck --module ESNext
+--moduleResolution Bundler --target ES2022 --types node` before freezing the revision.
+The unchanged package lanes' historical results above are not claimed as reruns here;
+3.4 still owns their script integration. The four new helper tests also need inclusion
+in a targeted lane there if the lane continues using explicit file paths.
+
+### Final per-host assertion table
+
+| Assertion | v1 1.18.19 | v2 2.0.22 | Evidence |
+|---|---|---|---|
+| Set/unset/invalid configuration and unchanged full inventory | PASS | PASS | Seven starts; valid values emit no validation/layer-drop warning; invalid values warn and still start; full sorted catalogs equal baseline |
+| Accepted depth 2 has an effect | PASS | PASS | Depth-1 child dispatch succeeds without banner; depth-2 grandchild gets exact D5 for limit 2 |
+| Accepted `effortBump: false` has an effect | PASS | PASS | Both producer requests remain low |
+| Accepted `effortBumpMax: "medium"` bounds repeated retries | PASS | PASS | Base low; two failed grades then pass; three producers send low → medium → medium with `maxAttemptsPerTier: 2` |
+| Enforced foreground | PASS | PASS | Root succeeds; child gets exact literal D5; turn continues |
+| Enforced resume | PASS (`task_id`) | PASS (`sessionID`) | Existing target handle exercised; exact literal D5 |
+| Enforced background | Not supported by host | PASS | Native background input; exact D5 |
+| Advisory foreground and resume | PASS | PASS | Child succeeds; exact literal A1 once; root has **no** delegation-depth banner; v2 completed envelope retained |
+| Advisory background | Not supported by host | PASS | Wire/structured banner once; native `running` output/metadata; parent-result-controlled barrier replaces sleep |
+| Bump enabled and cross-session isolation | PASS | PASS | Producer low → medium; root title, separate graders and later orchestrator have no bumped effort |
+| Same-producer-session A3 identity gate | Integration/unit proof | Integration/unit proof | Not claimed as host coverage; named cases in A3 section pass in the 1,261-test targeted run |
+
+### Final mutation kill table
+
+Depth lanes use filter `enforced|advisory|accepts maxDelegationDepth`; bump lanes use
+`bumps only|accepts effortBumpMax`. All smoke mutations use only
+`SMOKE_DEPTH_EFFORT_MUTATION=depth|bump`. Recorded host turns exit 0; the failures
+below are assertion kills, not startup/provider failures.
+
+| Config mutation / assertion | v1 | v2 | Failure observed |
+|---|---|---|---|
+| Depth null / accepted depth-two boundary | KILLED | KILLED | `expected undefined to be true` at refused `is_error` |
+| Depth null / enforced foreground | KILLED | KILLED | `expected undefined to be true` |
+| Depth null / enforced resume | KILLED | KILLED | v1: missing `is_error`; v2: exact D5 replaced by native `Session … is not a child of the current session` |
+| Depth null / enforced background | N/A | KILLED | `expected undefined to be true` |
+| Depth null / advisory foreground | KILLED | KILLED | Banner split length 1, expected 2 |
+| Depth null / advisory resume | KILLED | KILLED | Banner split length 1, expected 2 |
+| Depth null / advisory background | N/A | KILLED | Banner split length 1, expected 2 |
+| Bump false / first retry | KILLED | KILLED | Received low → low, expected low → medium |
+| Bump false / repeated bounded retry | KILLED | KILLED | Received low → low → low, expected low → medium → medium |
+
+| Mutation output | Expected failed / skipped | Duration |
+|---|---|---|
+| `new-v1-depth-filtered/output.log` | 5 / 15 | 77.94 s |
+| `new-v2-depth-filtered/output.log` | 7 / 13 | 22.49 s |
+| `new-v1-bump-filtered/output.log` | 2 / 18 | 29.57 s |
+| `new-v2-bump-filtered/output.log` | 2 / 18 | 6.14 s |
+| `integration-both-filtered/output.log` | 4 / 1,257 | 1.77 s |
+
+The integration filter `guards a created child|keeps the effort policy` repeats the
+four original config-only kills: enforced promise resolved instead of rejecting;
+advisory banner count 0 instead of 1; v1 and v2 `{}` instead of `{ effort: "medium" }`.
+Restored integration and both complete host legs are green as shown above. Total:
+**16 smoke kills + 4 integration kills** on the frozen revision.
+
+Cleanup rechecked **75 recorded host processes** and **47 stub ports**. All of
+`remainingRecordedHosts`, `matchingRigProcesses`, `unrecordedScenarioCandidates`,
+and `listeners` were empty. Unrelated managed services/TUI sessions were left alone.
+
+## Findings
+
+QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`.
+Original detailed findings and line references remain in review commit `8441cae`.
+The table below records implementation resolutions, **pending QA re-review**;
+it does not self-accept the phase.
 
 | ID | Severity | Location | Finding | Resolution |
 |---|---|---|---|---|
-| QA-3.2-1 | major | `test/smoke/depth-effort.smoke.test.ts:233-245` | The "set" leg of (a) cannot fail if a valid value is rejected. An invalid value makes the router drop the **whole** override layer: `ignoring …overrides.jsonc: … must be …` / `dropping conflicting layer(s)` (`new-v1` artifact `49Zvn5`, processes 2/4/6). None of the three keys changes agent registration, so the inventory equality at :238 is identical for accepted and rejected values. The only check that tells them apart, the `must be` warning, runs only when `label === "invalid"` (:239). A validator that rejected `maxDelegationDepth: 2`, `effortBump: false` or `effortBumpMax: "high"` would still pass. `effortBumpMax` appears in no provider scenario, so no host-level evidence shows its accepted value works. | open |
-| QA-3.2-2 | minor | `phase-3.2.md:77-79,163-175` | The v1 PASS row and all four smoke mutation kills come from an earlier test revision, not `8c7ec2c`. The mutation failure frames point at `:252:38`, `:257:62` and `:285:66`; in `8c7ec2c` those assertions are at :277, :282 and :310. The v2 Basic-auth and readiness edits (:184-223) came after the v1 full run (08:32-08:35) and after the mutation lanes (08:35-08:36). The 08:36:58 attempt still got 401, and the readiness attempt failed at old :209, which is now :231. The quoted assertion bodies match, so the kills very likely carry over, but the report presents them as evidence for this commit. QA rerun of `8c7ec2c`, unmutated: v1 5 passed / 9 skipped in 208.25 s; v2 9 passed / 5 skipped in 41.69 s (`C:\Users\Marquinho\AppData\Local\Temp\Claude\p32-qa\v1.log`, `v2.log`). | open |
-| QA-3.2-3 | minor | `phase-3.2.md:163-175`; test `:251-300` | The smoke mutation ran only with `-t foreground`. The four v2 background/resume depth tests have no recorded kill, although A1 makes them mandatory (QA-0.P-R2-6). Reading the code: in enforced resume, only the exact-message check at :279 would catch the guard being off. With the guard off, v2 rejects the sibling resume natively, so `is_error: true` (:277) still holds, as the comment at :258-259 says. The other three should fail at :277, :282 or :289. This is inference, not evidence; plan 3.2.3 asks for evidence. | open |
-| QA-3.2-4 | minor | test `:312-316`; `phase-3.2.md:96,196-197` | The "no auxiliary leak" claim goes further than the test shows. In every bump artifact the title request is in the **root** session (v1 `SUDpyp`: `title` and `build` both on `…IXfjMn`; v2 `DQj9k8`: both on `…EriSiR`). Graders run in their own sessions (v1 agent `build`, v2 `model-router-grader`). No auxiliary request shares a producer session, so these checks can only catch a cross-session leak. They cannot catch removal of the A3 producer-only agent+model gate, which exists for the same-session v1 title call; parented producers get no title request on either host (A3, QA-0.P-R2-11). The report and the 3.1 handoff still say titles "retain their own options" as if the gate were proven at host level. | open |
-| QA-3.2-5 | minor | test `:297-299` | The "root allowed" check only asserts `!is_error` and the absence of the D5 substring. D5 appears only in enforced mode, so in advisory mode a depth-0 caller that wrongly gets the `delegation_depth` banner (a G2 regression) would still pass. Root results are never checked for `[⚠ GUARD:delegation_depth]`. | open |
-| QA-3.2-6 | minor | test `:20-23,179`; `phase-3.2.md:30-32,191-193` | The v2 skip is silent. With `RUN_OC_SMOKE_V2=1` and no `OPENCODE_V2_BIN`, the file reports 14 skipped and exits 0, while `v2-registration.smoke.test.ts:33-35` throws in the same case. After the 3.4 handoff to `smoke:v2`, only that other file makes the lane fail. In the keyless/CI lane the default reporter prints only "9 skipped", with no leg names and no reason (QA rerun, `gating.log`). "Visible skipped describe" overstates this. | open |
-| QA-3.2-7 | minor | test `:251`; helper `:70,72` | The v1 matrix is foreground-only. G1 lists `task_id` resume, and Spike A9 showed that a v1 resume reaches the before-hook. Only the v1 legs run in CI, so the host proof that runs in CI has no resume leg. The report says why v1 background is missing (v1 has no such parameter) but gives no reason for resume. The helper's v1 `task_id` branch (:70) is dead code. The caller-resume branch (:72) writes the v2 `sessionID` key even on v1, a latent bug once a v1 leg is added. | open |
-| QA-3.2-8 | minor | helper `:78`; test `:286-289` | Fixed-sleep timing. The v2 advisory-background `running` assertions depend on a hard-coded 500 ms delay in every `LEAF_DONE` reply; the comment says this delay is what keeps the native result `running`. Nothing measures the margin and no host signal sets it, so a slow host can change the outcome. The same sleep slows every leaf reply on both hosts. This is local evidence only, because v2 is not in CI. | open |
-| QA-3.2-9 | minor | `phase-3.2.md:44-45`; `test/smoke/deferred-catalog.smoke.test.ts:102-121,197` | The phase-2.3 "To 3.2" handoff was neither applied nor recorded as deferred-by-plan (A15). It says the deferred-catalog log lookup ignores the `XDG_DATA_HOME` its child inherits. The report only works around it in the outer runner. Once 3.4 adds the new file to `smoke:keyless`, a developer whose shell sets `XDG_DATA_HOME` still gets a false deferred-catalog failure. The new file is not affected: it sets XDG_* per fixture (:51) and reads the `--print-logs` output. | open |
-| QA-3.2-10 | nit | test `:267` | Tautology. `run.childID` is defined (:127) as the `sessionID` of a hook whose `parentID === run.rootID`, so this `.some(...)` is always true once :266 passes. | open |
-| QA-3.2-11 | nit | helper `:80-84,102-105` | The SSE event order matches the Anthropic Messages stream: `message_start`, `content_block_start` (tool_use with `input: {}`), `input_json_delta`/`text_delta`, `content_block_stop`, `message_delta` with stop reason and usage, `message_stop`. There are three deviations. Errors are HTTP 500 `{error: string}`, not the `{type:"error",error:{type,message}}` shape; because the SDK retries 5xx, a fixture fault can be re-captured before `errors` reports it. The non-stream branch silently drops a scripted `tool`/`input`. There are no `ping` events. Every captured request was streamed, so the current results are unaffected. | open |
-| QA-3.2-12 | nit | test `:14,183,232,279` | The comment at :232 says "Empty enforcement is the unset control", but the baseline override is `{}` (:183). The expected D5 and banner texts are imported from `src` (:14), so this e2e follows any wording change rather than pinning it. Pinning presumably lives in the unit/golden tests (not verified here). | open |
+| QA-3.2-1 | major | Config acceptance matrix | Inventory equality alone cannot prove valid config was accepted or took effect. | `5a185ba`: no valid-value validation/layer-drop warnings; behavioral depth-2, bump-off, and medium-cap repeated-retry proofs pass on both hosts. |
+| QA-3.2-2 | minor | Revision provenance | Initial v1 and mutation evidence predates final fixture edits. | `85d5c18`: embedded revision/source hashes; both full hosts and all mutation lanes rerun on this SHA, verified across 47 artifacts; outputs above. |
+| QA-3.2-3 | minor | Mutation matrix | Missing v2 background/resume kills, particularly exact D5 on enforced resume. | `612277f`: expanded protocol; final runs kill all six v2 dispatch legs, depth-2 boundary, both effort assertions, and the four integration assertions. |
+| QA-3.2-4 | minor | A3 evidence scope | Host title requests do not share a producer session; no host proof of same-session identity gate. | `174eac2`: claims corrected to cross-session isolation; named same-session integration/unit cases pass in final targeted run. Host-gate mutation coverage explicitly not claimed. |
+| QA-3.2-5 | minor | Root dispatch assertions | Advisory root could carry an erroneous depth banner unnoticed. | `2d427e5`: every root dispatch result must exclude the delegation-depth banner; both host matrices pass. |
+| QA-3.2-6 | minor | Native v2 gate | Explicit v2 request without binary silently skips; describe lacks opt-in instructions. | `73a9ef4`: missing-binary request fails explicitly; disabled describe names both flags. `missing-v2/` and verbose `gating/` verify both paths. |
+| QA-3.2-7 | minor | Native v1 resume | No CI resume leg; helper writes v2 key in caller-resume branch. | `21f7642`: native `task_id` branch fixed; enforced/advisory v1 resume pass and both are mutation-killed. |
+| QA-3.2-8 | minor | Background timing | Fixed 500 ms leaf delay makes native running-state assertion timing-dependent. | `bd839d1`: parent-tool-result barrier replaces sleep; host native running checks and helper synchronization test pass. |
+| QA-3.2-9 | minor | Deferred catalog isolation | Earlier XDG log-path limitation neither fixed nor formally deferred. | `c47a3b2`: accepted pre-existing limit and clean-env workaround recorded; 3.3/3.4 follow-up issue handoff, not a source fix. |
+| QA-3.2-10 | nit | Parent assertion | Assertion merely repeats child-ID derivation. | `65df3cb`: tautology removed; both final hosts pass. |
+| QA-3.2-11 | nit | Scripted provider protocol | Non-Anthropic/retryable errors; non-stream tool loss; no ping. | `bbc69d6`: HTTP 400 Anthropic error shape, retained non-stream tool calls, SSE ping; protocol regression tests pass. |
+| QA-3.2-12 | nit | Comments / wire contract | Unset comment wrong; imported expectations follow product wording changes. | `986340e`: `{}` comment corrected; independent literal D5/A1 strings pin wire text and are checked against imported formatters; host tests pass. |
 
 ## Deferred by plan
 
@@ -262,10 +362,12 @@ QA round 1 (adversarial, `[tier:heavy]`, 2026-10-05) of `8c7ec2c` and `e067225`.
 
 ## Verdict
 
-**QA 3.2 round 1 (2026-10-05): changes required.** Open findings: 12 (1 major, 8 minor, 3 nit).
-The DoD needs zero open findings, so this phase is not accepted yet.
+**pending QA** — all 12 round-1 findings have implementation resolutions and final-revision
+verification above. QA must re-review and accept those resolutions; this dispatch does
+not declare zero QA-open findings or accept the phase. The original round-1 verdict was
+**changes required** (1 major, 8 minor, 3 nit), retained in `8441cae`.
 
-What holds:
+Original QA observations (historical, supplemented by the final-revision results above):
 
 - **Core proofs.** Bump on gives producer efforts low → medium and bump off gives low → low. Foreground
   depth gives the exact D5 text and exactly one banner. Each of these assertions failed under a
