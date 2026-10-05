@@ -60,7 +60,7 @@ Final round-1 test revision: `85d5c180f75aa4c5267ba3c78c7b436dab70ab2f`.
   `<subagent sessionID=` envelope; background results must carry structured `running`.
 - Optional `SMOKE_DEPTH_EFFORT_ARTIFACTS` retains secret-free evidence. Processes and
   stub sockets are closed and exact allocated fixture directories removed even after
-  assertion failures. `SMOKE_DEPTH_EFFORT_MUTATION=depth|bump` alters fixture config only.
+  assertion failures. `SMOKE_DEPTH_EFFORT_MUTATION=depth|bump|cap` alters fixture config only.
 
 ### Initial verification runs (historical; superseded by round-1 reruns below)
 
@@ -253,9 +253,16 @@ Targeted strict TypeScript checking passed for `depth-effort.smoke.test.ts` and
 `helpers/scripted-provider.test.ts` (which imports the provider helper), using
 `tsc --ignoreConfig --noEmit --strict --skipLibCheck --module ESNext
 --moduleResolution Bundler --target ES2022 --types node` before freezing the revision.
-The unchanged package lanes' historical results above are not claimed as reruns here;
-3.4 still owns their script integration. The four new helper tests also need inclusion
-in a targeted lane there if the lane continues using explicit file paths.
+The unchanged package lanes' historical results above are not claimed as reruns here.
+`npm run smoke` already sets `RUN_OC_SMOKE=1` and selects all of `test/smoke`;
+`vitest.smoke.config.ts` includes `test/smoke/**/*.test.ts`. Thus the credentialed
+`smoke.yml` lane (secrets-gated, 20-minute job, pinned v1) **already collects the v1
+depth/effort tests and all four ungated helper tests**. It now carries approximately
+217 seconds of additional local v1 runtime; Linux runtime has not been measured here.
+The fixture still isolates HOME/XDG, strips provider/router settings, and writes
+projects outside this checkout, so neither credentials nor `layer2-gate`'s repo-root
+config are used. The remaining v1 CI script change for 3.4 is adding both files to
+the explicit `smoke:keyless` list, not enabling them for the credentialed lane.
 
 ### Final per-host assertion table
 
@@ -441,7 +448,9 @@ New round-2 findings:
 - Full suite and global QA are owned by the orchestrator/3.3; not run in this dispatch.
 - Package script and release changes belong to 3.4.
 - Live-provider acceptance, pricing and latency are not proven by this keyless fixture.
-- V2 host legs remain local evidence: the CI lane has the pinned v1 binary, not v2.
+- V2 host legs remain local evidence: both `smoke.yml` (credentialed) and
+  `smoke-keyless.yml` install pinned v1, not v2. The credentialed lane already selects
+  these v1/helper tests; keyless needs the explicit file-list additions in 3.4.
 
 ## Handoffs
 
@@ -449,7 +458,12 @@ New round-2 findings:
   `XDG_DATA_HOME`, or remove that variable in its child environment. Carry the clean-env
   workaround until fixed. No issue was opened by this dispatch; this is an explicit
   follow-up, not a claim that the earlier 2.3 isolation handoff was implemented.
-- **To 3.4:** append `test/smoke/depth-effort.smoke.test.ts` to `smoke:keyless`.
+- **To 3.4:** append `test/smoke/depth-effort.smoke.test.ts` **and**
+  `test/smoke/helpers/scripted-provider.test.ts` to `smoke:keyless`. No addition to
+  `npm run smoke`/`smoke.yml` is needed: that credentialed lane already selects both.
+  Update the keyless workflow's obsolete "Two files, ~40s" runtime comment if its
+  write-set permits; otherwise carry it as an explicit follow-up. Local added v1
+  time is about 217 s; the 10-minute keyless budget still needs Linux CI confirmation.
   Also append it to `smoke:v2`; that script sets `RUN_OC_SMOKE_V2=1`, so it requires
   `OPENCODE_V2_BIN`. Without it, the v2 describe fails its configuration test, but
   enabled v1 tests are still collected and executed. An inherited v2 opt-in without
@@ -484,15 +498,19 @@ Original QA observations (historical, supplemented by the final-revision results
 - **Observers.** The observer plugins only log and add headers. They implement neither feature.
 - **Isolation.** The fixtures strip `OPENCODE_*`, `XDG_*`, `MODEL_ROUTER_*` and provider variables, and
   repoint HOME, USERPROFILE, XDG_*, APPDATA, LOCALAPPDATA and the temp directories.
-- **CI v1 leg.** It should run once 3.4 appends the file to `smoke:keyless`:
+- **CI v1 leg (corrected in R2-5).** It already runs in secrets-enabled `smoke.yml`
+  via `npm run smoke` and `RUN_OC_SMOKE=1`, along with the four ungated helper tests.
+  Adding both files to `smoke:keyless` in 3.4 extends that coverage to secretless CI:
   - same `RUN_OC_SMOKE_KEYLESS` gate and the same `opencode` on PATH as `registration`/`deferred-catalog`;
   - the opencode-ai 1.18.19 postinstall links the native binary into the npm bin, so SIGKILL reaches the
     real process, not a Node wrapper;
   - the plugin loads from `main: ./src/index.ts`, with no build step;
   - the v1 child gets `subagent_depth: 4` and `general` `task: allow`, as the spikes needed.
 
-  Not verified: a run on Linux. Locally the v1 leg takes 181-208 s, which fits the 10-minute job, but the
-  workflow's "~40s" comment will be stale (3.4).
+  Not verified: a run on Linux or the credentialed workflow itself in this dispatch.
+  The round-1 local v1 leg took 217 s. Account for this in the credentialed lane's
+  20-minute budget and the keyless lane's 10-minute budget; update the keyless runtime
+  comment in 3.4 if owned there, or track the comment as a follow-up.
 - **Cleanup after the QA reruns.** No process had `omr-`, `p32` or `depth-effort` in its command line, no
   `omr-depth-effort-*` temp directory was left, and the set of OpenCode processes matched the set before
   the runs. The pre-existing OpenCode 2 service and the TUI sessions were left untouched.
