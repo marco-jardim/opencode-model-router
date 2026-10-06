@@ -65,6 +65,8 @@ import type { Ingest } from "./routing/outcomes/ingest";
 import { verdictOf } from "./routing/outcomes/types";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
+import type { HostAgentInfo } from "./routing/engine/types";
 import { createEngineRuntime } from "./routing/wire/runtime";
 import type { EngineRuntime } from "./routing/wire/runtime";
 import {
@@ -576,6 +578,23 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       logger,
     });
     return annotateRuntime;
+  };
+  // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()`, bounded, cached for a minute and
+  // never fetched unless `routing.roles` is set explicitly. A failure is logged and the line stays as it is without roles.
+  const V1_AGENTS_TTL_MS = 60_000;
+  let v1Agents: { at: number; infos: HostAgentInfo[] | null } | null = null;
+  const loadV1Agents = async (): Promise<HostAgentInfo[] | null> => {
+    if (v1Agents !== null && Date.now() - v1Agents.at < V1_AGENTS_TTL_MS) return v1Agents.infos;
+    let infos: HostAgentInfo[] | null = null;
+    try {
+      const res = await withTimeout(Promise.resolve(ctx.client.app.agents()), 2_000, "v1 agent list");
+      const data: unknown = (res as { data?: unknown } | undefined)?.data;
+      infos = Array.isArray(data) ? v1AgentInfos(data) : null;
+    } catch (error) {
+      logger.warn("[router] routing.roles: the host's agent list is unavailable; the R: line stays without roles", { error: describeError(error) });
+    }
+    v1Agents = { at: Date.now(), infos };
+    return infos;
   };
   /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
   const buildCostDoctorLines = async (): Promise<string[]> => {
@@ -2246,7 +2265,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
-      output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
+      let systemPrompt = assembleSystemPrompt(cfg, orchestratorModel, enfOn);
+      // A28 (D1): on v1 only, and only with an explicit `routing.roles`, the `R:` line lists those agents as destinations (prose; no model
+      // override). Anything else leaves `systemPrompt` the very string it is: the v1 protocol stays byte-identical.
+      if (ctx.routerHost !== "v2" && hasExplicitV1Roles(cfg)) systemPrompt = applyV1Roles(systemPrompt, cfg, await loadV1Agents());
+      output.system.push(systemPrompt);
 
       // 2.4.3: the cost doctor's throttled notice. `poll` is O(1) when nothing is due and never throws; in advise/enforce a notice that
       // is ready is appended here (once per `routing.advisor.noticeIntervalHours`, across restarts), in static/shadow it is logged.
