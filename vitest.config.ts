@@ -42,6 +42,8 @@ export default defineConfig({
     // A14): os.homedir() is mocked to the test's own HOME/USERPROFILE redirect or a
     // private temp dir, in any pool. Never run vitest with --pool=threads anyway.
     setupFiles: ["test/setup/home-guard.ts"],
+    // QA-2.1-R2-6: tags the run and removes the private temp dirs its workers created (skipped files included).
+    globalSetup: ["test/setup/global-guard.ts"],
     server: {
       deps: {
         inline: ["@opencode-ai/plugin"],

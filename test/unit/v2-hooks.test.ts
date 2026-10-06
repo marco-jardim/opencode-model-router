@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync 
 import v2Plugin from "../../src/v2";
 import type { Plugin } from "@opencode/plugin";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
-import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, makeKey } from "../../src/routing/outcomes";
+import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
@@ -944,7 +944,8 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
   const logger = { warn: vi.fn() };
 
   /** HOME redirected to a temp dir; `routing` (when given) is written to the global override layer. */
-  function routingHome(routing?: Record<string, unknown>) {
+  /** `routing: null` writes no routing block at all (QA-2.1-R2-5). */
+  function routingHome(routing?: Record<string, unknown> | null) {
     const home = mkdtempSync(join(tmpdir(), "router-v2-ingest-"));
     const outcomes = join(home, "outcomes");
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
@@ -952,7 +953,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     // assert it stays empty. A routing block without `engine` is static.
     mkdirSync(outcomes, { recursive: true });
     mkdirSync(dirname(overridePath()), { recursive: true });
-    writeFileSync(overridePath(), JSON.stringify({ routing: { outcomes: { path: outcomes }, ...(routing ?? {}) } }));
+    writeFileSync(overridePath(), JSON.stringify(routing === null ? {} : { routing: { outcomes: { path: outcomes }, ...(routing ?? {}) } }));
     invalidateConfigCache();
     return { home, outcomes };
   }
@@ -1047,6 +1048,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
   });
 
   it.each([
+    { name: "no routing block at all", routing: null },
     { name: "a routing block without an engine", routing: {} },
     { name: "engine static", routing: { engine: "static" } },
   ])("$name (static): nothing is written to the explicit outcomes directory and the catalog is never read", async ({ routing }) => {
@@ -1060,6 +1062,10 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier");
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
+    // tmpdir() is private to this file (QA-2.1-4), but earlier tests of the file leave scorecards in its default directory:
+    // what must not appear there is an outcome store or a decision log.
+    const defaultDir = join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME);
+    expect(existsSync(defaultDir) ? readdirSync(defaultDir).filter((name) => /^(outcomes|decisions)/.test(name)) : []).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
     rmSync(home, { recursive: true, force: true });
   });

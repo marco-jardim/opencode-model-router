@@ -53,6 +53,8 @@ const guard = vi.hoisted(() => ({
 const TMP_ENV = process.platform === "win32" ? (["TEMP", "TMP"] as const) : (["TMPDIR", "TMP", "TEMP"] as const);
 /** Holds the real temp dir for the whole process, so a later test file of the same process still knows it. */
 export const REAL_TMPDIR_ENV = "OMR_TEST_REAL_TMPDIR";
+/** Set by test/setup/global-guard.ts for the workers of one run. */
+export const RUN_ID_ENV = "OMR_TEST_RUN_ID";
 
 const WINDOWS = process.platform === "win32";
 
@@ -164,8 +166,11 @@ guard.original = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE 
 // The real temp dir is read once per process: after the first file the environment already points at a private dir.
 guard.realTmp = process.env[REAL_TMPDIR_ENV] ?? realOs.tmpdir();
 process.env[REAL_TMPDIR_ENV] = guard.realTmp;
-guard.isolatedHome = mkdtempSync(join(guard.realTmp, "omr-home-guard-"));
-guard.isolatedTmp = mkdtempSync(join(guard.realTmp, "omr-tmp-guard-"));
+// Tagged with the run id the global setup (test/setup/global-guard.ts) put in the environment, so its teardown can remove
+// this run's directories, skipped test files included. Without it (a runner that skips globalSetup) the tag is empty.
+const runTag = process.env[RUN_ID_ENV] === undefined || process.env[RUN_ID_ENV] === "" ? "" : `${process.env[RUN_ID_ENV]}-`;
+guard.isolatedHome = mkdtempSync(join(guard.realTmp, `omr-home-guard-${runTag}`));
+guard.isolatedTmp = mkdtempSync(join(guard.realTmp, `omr-tmp-guard-${runTag}`));
 for (const name of ["TEMP", "TMP", "TMPDIR"]) {
   guard.originalTmp[name] = process.env[name];
   process.env[name] = guard.isolatedTmp;
@@ -180,9 +185,10 @@ beforeEach(async () => {
 });
 
 // A skipped test file never runs `afterAll` and its worker is not always given the chance to exit cleanly, but its setup
-// file did create these dirs. Remove what an earlier run left: only EMPTY guard dirs (`rmdir` refuses anything else)
-// that are old enough not to belong to a worker that is starting right now.
-const STALE_GUARD_DIR_MS = 10 * 60_000;
+// file did create these dirs; the global teardown removes the ones of its own run. This sweep is only for what a run
+// that never reached its teardown (a crash, a kill) left behind: EMPTY guard dirs (`rmdir` refuses anything else) that
+// are a day old, so they cannot belong to a run that is still going on.
+const STALE_GUARD_DIR_MS = 24 * 60 * 60_000;
 for (const name of readdirSync(guard.realTmp)) {
   if (!/^omr-(home|tmp)-guard-/.test(name)) continue;
   const path = join(guard.realTmp, name);

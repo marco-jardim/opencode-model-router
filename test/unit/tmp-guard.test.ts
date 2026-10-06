@@ -3,10 +3,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import os, { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { DEFAULT_OUTCOMES_DIRNAME } from "../../src/routing/outcomes/types";
 import { resolveOutcomesDir } from "../../src/routing/outcomes/persist";
-import { assertTmpIsGuarded, guardedTmpdir, REAL_TMPDIR_ENV, sameDir } from "../setup/home-guard";
+import { assertTmpIsGuarded, guardedTmpdir, REAL_TMPDIR_ENV, RUN_ID_ENV, sameDir } from "../setup/home-guard";
+import { removeRunGuardDirs } from "../setup/global-guard";
 
 const realTmp = (): string => {
   const value = process.env[REAL_TMPDIR_ENV];
@@ -50,5 +51,48 @@ describe("temp directory guard", () => {
     expect(() => assertTmpIsGuarded(tmpdir)).not.toThrow();
     expect(() => assertTmpIsGuarded(() => `${realTmp()}${process.platform === "win32" ? "\\" : "/"}`)).toThrow(/real temp directory/);
     expect(() => assertTmpIsGuarded(() => join(realTmp(), "..", "Temp"))).toThrow(/real temp directory/);
+  });
+});
+
+describe("global guard teardown (QA-2.1-R2-6)", () => {
+  it("this run''s workers tag their guard directories with the run id the global setup chose", () => {
+    const runId = process.env[RUN_ID_ENV];
+    expect(runId).toBeTruthy();
+    expect(tmpdir().split(/[\\/]/).pop()).toContain(`omr-tmp-guard-${runId}-`);
+  });
+
+  it("removes the directories of one run, empty or not, and nothing else", () => {
+    const root = mkdtempSync(join(tmpdir(), "omr-gg-test-"));
+    try {
+      for (const name of ["omr-home-guard-RUN1-aaaaaa", "omr-tmp-guard-RUN1-bbbbbb", "omr-tmp-guard-RUN2-cccccc", "omr-home-guard-dddddd", "unrelated"]) mkdirSync(join(root, name));
+      mkdirSync(join(root, "omr-tmp-guard-RUN1-eeeeee", "inner"), { recursive: true });
+      const logs: string[] = [];
+      expect(removeRunGuardDirs(root, "RUN1", (message) => logs.push(message))).toBe(3);
+      expect(readdirSync(root).sort()).toEqual(["omr-home-guard-dddddd", "omr-tmp-guard-RUN2-cccccc", "unrelated"]);
+      expect(logs).toEqual([]);
+      expect(removeRunGuardDirs(root, "")).toBe(0); // no run id: never guess
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("logs, and does not throw, when a directory cannot be removed or the root cannot be listed", () => {
+    const root = mkdtempSync(join(tmpdir(), "omr-gg-test-"));
+    try {
+      mkdirSync(join(root, "omr-tmp-guard-RUN1-aaaaaa"));
+      mkdirSync(join(root, "omr-home-guard-RUN1-bbbbbb"));
+      const logs: string[] = [];
+      const removed = removeRunGuardDirs(root, "RUN1", (message) => logs.push(message), (path) => {
+        if (path.endsWith("aaaaaa")) throw new Error("EBUSY: resource busy");
+      });
+      expect(removed).toBe(1);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatch(/cannot remove .*aaaaaa: EBUSY/);
+      const missing: string[] = [];
+      expect(removeRunGuardDirs(join(root, "nope"), "RUN1", (message) => missing.push(message))).toBe(0);
+      expect(missing[0]).toMatch(/cannot list/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

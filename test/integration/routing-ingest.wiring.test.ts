@@ -1,14 +1,14 @@
 // Phase 2.1 (M6): the plugin's verdict and false-refusal call sites feed the outcome store, on v2 and only
 // when routing.engine != static. Temp directories only (HOME is redirected; outcomes path is injected).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
-import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, makeKey } from "../../src/routing/outcomes";
+import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { snapshotTree } from "../../src/verify/tree";
 
@@ -25,7 +25,8 @@ let home: string;
 let outcomes: string;
 const hooksToDispose: Array<{ dispose?: () => Promise<void> }> = [];
 
-function setup(routing?: Record<string, unknown>): void {
+/** `routing: null` writes no routing block at all (QA-2.1-R2-5). */
+function setup(routing?: Record<string, unknown> | null): void {
   home = mkdtempSync(join(tmpdir(), "router-ingest-wiring-"));
   outcomes = join(home, "outcomes");
   vi.stubEnv("HOME", home);
@@ -37,7 +38,7 @@ function setup(routing?: Record<string, unknown>): void {
   mkdirSync(dirname(overridePath()), { recursive: true });
   writeFileSync(overridePath(), JSON.stringify({
     enforcement: { verify: { testBaseline: false } },
-    routing: { outcomes: { path: outcomes }, ...(routing ?? {}) },
+    ...(routing === null ? {} : { routing: { outcomes: { path: outcomes }, ...(routing ?? {}) } }),
   }));
   invalidateConfigCache();
 }
@@ -138,6 +139,16 @@ describe("false-refusal call site", () => {
     setup({ engine: "shadow" });
     const hooks = await plugin("v2");
     expect(await refusal(hooks, "unregistered")).toContain("FALSE-REFUSAL SUSPECT");
+    expect(readdirSync(outcomes)).toEqual([]);
+  });
+
+  it("v2 with NO routing block at all: nothing is recorded, and not even the default outcomes directory appears", async () => {
+    setup(null);
+    const hooks = await plugin("v2");
+    register("refusal-child");
+    expect(await refusal(hooks, "refusal-child")).toContain("FALSE-REFUSAL SUSPECT");
+    await hooks.dispose();
+    expect(existsSync(join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME))).toBe(false); // the guard makes tmpdir() private to this file
     expect(readdirSync(outcomes)).toEqual([]);
   });
 
