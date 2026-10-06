@@ -90,12 +90,27 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     const cfg = loadConfig(home);
     return assembleSystemPrompt(cfg, "anthropic/claude-sonnet-5-5", resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off");
   };
+  /** Turn until the background refresh has landed and the prompt carries the roles line (or fail after 3 s). */
+  const withRoles = async (hooks: Hooks, sessionID = "root-1"): Promise<string> => {
+    const end = Date.now() + 3_000;
+    let prompt = (await turn(hooks, sessionID))[0]!;
+    while (!prompt.includes("by class:") && Date.now() < end) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      prompt = (await turn(hooks, sessionID))[0]!;
+    }
+    return prompt;
+  };
+  async function until(condition: () => boolean, ms = 3_000): Promise<void> {
+    const end = Date.now() + ms;
+    while (!condition() && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(condition()).toBe(true);
+  }
   const rLine = (prompt: string): string => prompt.split("\n").find((line) => line.startsWith("R:")) ?? "";
   const sha = (text: string): string => createHash("sha256").update(text).digest("hex");
 
   it("with routing.roles set explicitly, the R: line lists the available agents per class (snapshot), and nothing else changes", async () => {
     const { hooks } = await plugin({ roles: { search: ["explore"], implement: ["general", "reviewer"], review: ["reviewer"], debug: ["ghost", "build", "missing", "fast"], design: [] } });
-    const [prompt] = await turn(hooks);
+    const prompt = await withRoles(hooks);
     const before = baseline();
     expect(prompt).not.toBe(before);
     expect(rLine(prompt)).toMatchInlineSnapshot(`"R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca | by class: search→@explore implement→@general/@reviewer review→@reviewer"`);
@@ -107,7 +122,7 @@ describe("v1: the text-only roles line (A28, D1)", () => {
 
   it("extends a taxonomy line that already exists: `<base> | by class: …`", async () => {
     const { hooks } = await plugin({ roles: { search: ["explore"] } });
-    const [prompt] = await turn(hooks);
+    const prompt = await withRoles(hooks);
     const base = buildTaskTaxonomy(loadConfig(home));
     expect(base).not.toBe(""); // the shipped taskPatterns give a base line
     expect(rLine(prompt)).toBe(`${base} | by class: search→@explore`);
@@ -125,24 +140,74 @@ describe("v1: the text-only roles line (A28, D1)", () => {
   });
 
   it("a configured class whose agents are all unusable leaves the line as shipped", async () => {
-    const { hooks } = await plugin({ roles: { search: ["build", "missing", "ghost", "fast"], debug: ["title", "compaction"] } });
-    const [prompt] = await turn(hooks);
-    expect(prompt).toBe(baseline());
+    const { hooks, agentsCall } = await plugin({ roles: { search: ["build", "missing", "ghost", "fast"], debug: ["title", "compaction"] } });
+    await turn(hooks);
+    await until(() => agentsCall.mock.calls.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 30)); // let the background refresh land
+    expect((await turn(hooks))[0]).toBe(baseline());
   });
 
-  it("an unavailable agent list is logged and the prompt stays the baseline; the list is cached between turns", async () => {
-    const failing = await plugin({ roles: { search: ["explore"] } }, async () => { throw new Error("agents endpoint down"); });
-    const [prompt] = await turn(failing.hooks);
-    expect(prompt).toBe(baseline());
-    expect(failing.logs.some((m) => m.includes("agent list is unavailable"))).toBe(true);
+  it("QA-2.4-13: a turn never waits for the agent list: the first turn is the baseline, even when the list never arrives", async () => {
+    const { hooks, agentsCall } = await plugin({ roles: { search: ["explore"] } }, () => new Promise<never>(() => undefined));
+    const first = await Promise.race([turn(hooks), new Promise<"waited">((resolve) => setTimeout(() => resolve("waited"), 1_000))]);
+    expect(first).not.toBe("waited"); // the turn finished without the list
+    expect((first as string[])[0]).toBe(baseline());
+    expect(agentsCall).toHaveBeenCalledTimes(1); // the refresh was started in the background
+    expect((await turn(hooks))[0]).toBe(baseline()); // still pending: still the baseline, still not waiting
+    expect(agentsCall).toHaveBeenCalledTimes(1); // and not started a second time while one is in flight
+  });
+
+  it("QA-2.4-13: the first list arrives in the background and the next turn has the roles; the list is cached between turns", async () => {
     const working = await plugin({ roles: { search: ["explore"] } });
-    await turn(working.hooks, "a");
+    expect((await turn(working.hooks, "a"))[0]).toBe(baseline()); // the first turn has no list yet
+    const prompt = await withRoles(working.hooks);
+    expect(rLine(prompt)).toContain("by class: search→@explore");
     await turn(working.hooks, "b");
     expect(working.agentsCall).toHaveBeenCalledTimes(1);
   });
 
+  it("QA-2.4-13: a stale list keeps being served while the refresh is under way, and a failed refresh keeps it", async () => {
+    let clock = 1_000_000;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      let mode: "list" | "hang" | "fail" = "list";
+      const { hooks, agentsCall } = await plugin({ roles: { search: ["explore"] } }, () => (mode === "hang" ? new Promise<never>(() => undefined) : mode === "fail" ? Promise.reject(new Error("endpoint down")) : Promise.resolve({ data: AGENTS })));
+      await turn(hooks);
+      const withList = await withRoles(hooks);
+      expect(rLine(withList)).toContain("search→@explore");
+      mode = "hang";
+      clock += 61_000; // due: a refresh starts, the old list is served at once
+      const during = await Promise.race([turn(hooks), new Promise<"waited">((resolve) => setTimeout(() => resolve("waited"), 1_000))]);
+      expect(during).not.toBe("waited");
+      expect((during as string[])[0]).toBe(withList);
+      expect(agentsCall).toHaveBeenCalledTimes(2);
+      // a failing refresh (after the hanging one is abandoned by its own timeout) keeps the list too
+      const failing = await plugin({ roles: { search: ["explore"] } }, () => (mode === "fail" ? Promise.reject(new Error("endpoint down")) : Promise.resolve({ data: AGENTS })));
+      mode = "list";
+      await turn(failing.hooks);
+      expect(rLine(await withRoles(failing.hooks))).toContain("search→@explore");
+      mode = "fail";
+      clock += 61_000;
+      await turn(failing.hooks); // starts the refresh that fails
+      await until(() => failing.logs.some((m) => m.includes("agent list is unavailable")));
+      expect(rLine((await turn(failing.hooks))[0]!)).toContain("search→@explore"); // the last list survives the failure
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("an unavailable agent list is logged and the prompt stays the baseline", async () => {
+    const failing = await plugin({ roles: { search: ["explore"] } }, async () => { throw new Error("agents endpoint down"); });
+    await turn(failing.hooks);
+    await until(() => failing.logs.some((m) => m.includes("agent list is unavailable")));
+    expect((await turn(failing.hooks))[0]).toBe(baseline());
+  });
+
   it("a malformed agent list (no data array) leaves the baseline", async () => {
-    const { hooks } = await plugin({ roles: { search: ["explore"] } }, async () => ({ data: "nope" }));
+    const { hooks, agentsCall } = await plugin({ roles: { search: ["explore"] } }, async () => ({ data: "nope" }));
+    await turn(hooks);
+    await until(() => agentsCall.mock.calls.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
     expect((await turn(hooks))[0]).toBe(baseline());
   });
 

@@ -595,24 +595,34 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     });
     return annotateRuntime;
   };
-  // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()`, bounded, cached for a minute and
-  // never fetched unless `routing.roles` is set explicitly. A failure is logged and the line stays as it is without roles.
+  // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()` and never fetched unless
+  // `routing.roles` is set explicitly. It is refreshed IN THE BACKGROUND (QA-2.4-13): a turn never waits for it. The first turn after start
+  // has no list yet and gets the baseline prompt; later turns use the last list, stale while the next one is fetched (every minute). A
+  // failed refresh keeps the last list and is logged; a list that was never fetched leaves the line as it is without roles.
   const V1_AGENTS_TTL_MS = 60_000;
   let v1Agents: { at: number; infos: HostAgentInfo[] | null } | null = null;
-  const loadV1Agents = async (): Promise<HostAgentInfo[] | null> => {
-    if (v1Agents !== null && Date.now() - v1Agents.at < V1_AGENTS_TTL_MS) return v1Agents.infos;
-    let infos: HostAgentInfo[] | null = null;
-    try {
-      const res = await withTimeout(Promise.resolve(ctx.client.app.agents()), 2_000, "v1 agent list");
-      const data: unknown = (res as { data?: unknown } | undefined)?.data;
-      infos = Array.isArray(data) ? v1AgentInfos(data) : null;
-    } catch (error) {
-      logger.warn("[router] routing.roles: the host's agent list is unavailable; the R: line stays without roles", { error: describeError(error) });
-    }
-    v1Agents = { at: Date.now(), infos };
-    return infos;
+  let v1AgentsRefresh: Promise<void> | null = null;
+  const refreshV1Agents = (): void => {
+    if (v1AgentsRefresh !== null) return;
+    const run = (async (): Promise<void> => {
+      try {
+        const res = await withTimeout(Promise.resolve(ctx.client.app.agents()), 2_000, "v1 agent list");
+        const data: unknown = (res as { data?: unknown } | undefined)?.data;
+        v1Agents = { at: Date.now(), infos: Array.isArray(data) ? v1AgentInfos(data) : (v1Agents?.infos ?? null) };
+      } catch (error) {
+        logger.warn("[router] routing.roles: the host's agent list is unavailable; the R: line keeps the last list, or stays without roles", { error: describeError(error) });
+        v1Agents = { at: Date.now(), infos: v1Agents?.infos ?? null }; // keep serving the stale list; try again after the interval
+      }
+    })().finally(() => {
+      if (v1AgentsRefresh === run) v1AgentsRefresh = null;
+    });
+    v1AgentsRefresh = run;
   };
-  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
+  /** The last known v1 agent list (possibly stale, possibly `null`), starting a background refresh when it is due. Synchronous. */
+  const v1AgentsNow = (): HostAgentInfo[] | null => {
+    if (v1Agents === null || Date.now() - v1Agents.at >= V1_AGENTS_TTL_MS) refreshV1Agents();
+    return v1Agents?.infos ?? null;
+  };  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
   const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
     const routing = resolveRouting(cfg, "v2");
     if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
@@ -2309,7 +2319,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       let systemPrompt = assembleSystemPrompt(cfg, orchestratorModel, enfOn);
       // A28 (D1): on v1 only, and only with an explicit `routing.roles`, the `R:` line lists those agents as destinations (prose; no model
       // override). Anything else leaves `systemPrompt` the very string it is: the v1 protocol stays byte-identical.
-      if (ctx.routerHost !== "v2" && hasExplicitV1Roles(cfg)) systemPrompt = applyV1Roles(systemPrompt, cfg, await loadV1Agents());
+      // Any failure leaves the baseline prompt (QA-2.4-13): the line is an extra, never a reason to lose the protocol.
+      if (ctx.routerHost !== "v2") {
+        const baseline = systemPrompt;
+        try {
+          if (hasExplicitV1Roles(cfg)) systemPrompt = applyV1Roles(baseline, cfg, v1AgentsNow());
+        } catch (error) {
+          systemPrompt = baseline;
+          logger.warn("[router] routing.roles: the R: line could not be extended; the protocol is unchanged", { error: describeError(error) });
+        }
+      }
       output.system.push(systemPrompt);
 
       // 2.4.3: the cost doctor's throttled check. `poll` is O(1) when nothing is due and never throws. In static/shadow a notice is logged
