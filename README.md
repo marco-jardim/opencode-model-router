@@ -1091,7 +1091,7 @@ By default the router picks a tier from the taxonomy in the protocol text and a 
 | `static` (default) | Nothing is decided or recorded; the protocol text and `R:` line are unchanged. |
 | `shadow` | Every dispatch is decided and logged; nothing about it changes. |
 | `advise` | As `shadow`, and the orchestrator also receives the generated `R:` line and a one-line `Route hint`; it still decides. |
-| `enforce` | As `advise`, and the engine reroutes a dispatch when the expected cost is lower by more than `margin` and the evidence, permission and floor rules allow it. A dispatch carrying `[route … pin]` is never rerouted. |
+| `enforce` | As `advise`, and the engine reroutes a dispatch when its expected cost is lower by more than `margin`, the class is trusted, the target has at least 5 effective outcomes (or ranks above the orchestrator's pick) and the permission and floor rules allow it. A dispatch carrying `[route … pin]` is never rerouted. |
 
 Start in `shadow`, read `/router stats`, then raise the mode. A mode is a config-only change (hot reloaded); `static` is the instant kill switch. Put it in the global override file, `~/.config/opencode/opencode-model-router.overrides.jsonc`:
 
@@ -1123,7 +1123,7 @@ OpenCode v1 is unchanged: the `routing` block is validated and `engine` is force
 | `/router models [provider]` | List valid model ids from your configured providers (with defaults and deprecated flags) |
 | `/router enforce <off\|advisory\|enforced>` | Set delegation-enforcement mode (persisted) |
 | `/router stats [--since <ISO>] [--until <ISO>] [--json]` | Routing engine statistics for a time window (dispatches, agreement, switches, savings estimate, verdict and false-refusal rates per key); same table as `npm run routing:stats` in a clone |
-| `/router` | With no subcommand — or an unrecognized one — prints the `/router` help, the current enforcement mode and, on v2, the applied routing engine and the cost doctor's findings |
+| `/router` | With no subcommand — or an unrecognized one — prints the `/router` help and the current enforcement mode; on v2 also the line `router: engine=<mode> build=<version>+<sha7>` (the engine in force and the build of the running code) and, with a `routing` block, the cost doctor's findings |
 | `/bypass [on\|off]` | Toggle the router off/on for the session |
 
 ## Plan annotation

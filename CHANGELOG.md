@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision kept in code, and TypeSafe supported as an optional classifier backend.
   - `routing.engine`: `static` (default), `shadow` (decide and record), `advise`
     (generated `R:` line and a per-turn `Route hint`) and `enforce` (reroute under
-    a strict margin, an evidence gate of 5 recorded outcomes, permission and
+    a strict margin, an evidence gate of 5 effective (decayed) outcomes on the
+    candidate's own key, permission and
     floor rules; a dispatch carrying `[route … pin]` is never rerouted).
   - A task classifier (rules, an optional first-line `[route …]` directive, and
     optional `host`, `openai-compatible` and `typesafe` backends; `host` is
@@ -38,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A cost doctor: findings in `/router` (title model, unpriced and missing
     models, impossible variants, subscription pricing) and at most one notice,
     delivered as a synthetic transcript entry, throttled per project.
-  - `/router stats` and `npm run routing:stats` (the script needs Node 22.18 or
+  - `/router stats` and `npm run routing:stats` (the script needs Node 22.18 / 23.6 or
     newer and is not part of the package); `/annotate-plan` emits `[route …]`
     lines and pins `[tier:heavy]` steps when the engine is live; the bare
     `/router` view prints `router: engine=<mode> build=<version>+<sha7>`.
