@@ -13,6 +13,8 @@ import {
   priorForRankOffset,
   sanitizeTuning,
 } from "../../src/routing/outcomes/beta";
+import { createOutcomeStore } from "../../src/routing/outcomes/store";
+import { makeKey } from "../../src/routing/outcomes/types";
 import type { BetaState, OutcomeTuning } from "../../src/routing/outcomes/types";
 
 const TUNING: OutcomeTuning = { halfLifeDays: 14, maxEffectiveSamples: 50 };
@@ -356,5 +358,106 @@ describe("mergeBeta", () => {
     const a: BetaState = { alpha: 3, beta: 1, updatedAt: T0 };
     const b: BetaState = { alpha: 1, beta: 3, updatedAt: T0 };
     expect(mergeBeta(a, b, Number.NaN, TUNING)).toEqual({ alpha: 4, beta: 4, updatedAt: T0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Through the store (added with store.ts): D4 observations, no-op rules, read purity, drift.
+// ---------------------------------------------------------------------------
+
+describe("beta evidence through the outcome store", () => {
+  const KEY = makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5");
+  const sig = (attemptID: string) => ({ attemptID, step: "dispatch" as const });
+
+  function fakeClock(start = T0) {
+    let t = start;
+    return { now: () => t, set: (v: number) => void (t = v) };
+  }
+
+  it("pass, fail and refusal move the posterior in the expected directions", () => {
+    const store = createOutcomeStore({ now: fakeClock().now });
+    const prior = store.posterior(KEY).mean;
+    store.recordVerdict(KEY, "pass", sig("a"));
+    const afterPass = store.posterior(KEY).mean;
+    store.recordVerdict(KEY, "fail", sig("b"));
+    const afterFail = store.posterior(KEY).mean;
+    store.recordFalseRefusal(KEY, sig("c"));
+    const afterRefusal = store.posterior(KEY).mean;
+    expect(afterPass).toBeGreaterThan(prior);
+    expect(afterFail).toBeLessThan(afterPass);
+    expect(afterRefusal).toBeLessThan(afterFail);
+    expect(store.posterior(KEY).n).toBe(3);
+  });
+
+  it("unverifiable is a no-op: returns false, revision unchanged, snapshot deep-equal", () => {
+    const store = createOutcomeStore({ now: fakeClock().now });
+    store.recordVerdict(KEY, "pass", sig("a"));
+    const before = store.snapshot();
+    const revision = store.revision;
+    expect(store.recordVerdict(KEY, "unverifiable", sig("b"))).toBe(false);
+    expect(store.revision).toBe(revision);
+    expect(store.snapshot()).toEqual(before);
+  });
+
+  it("reads never change the revision or the snapshot (no decay drift)", () => {
+    const c = fakeClock();
+    const store = createOutcomeStore({ now: c.now });
+    store.recordVerdict(KEY, "pass", sig("a"));
+    const revision = store.revision;
+    const snapshot = JSON.stringify(store.snapshot());
+    for (const days of [1, 7, 14, 28, 365]) {
+      c.set(T0 + days * DAY_MS);
+      store.posterior(KEY);
+    }
+    expect(store.revision).toBe(revision);
+    expect(JSON.stringify(store.snapshot())).toBe(snapshot);
+  });
+
+  it("writes at t1 then t2 equal one write at t2 within 1e-12", () => {
+    const c = fakeClock();
+    const store = createOutcomeStore({ now: c.now });
+    store.recordVerdict(KEY, "pass", sig("a"));
+    c.set(T0 + 2 * DAY_MS);
+    store.recordVerdict(KEY, "fail", sig("b"));
+    c.set(T0 + 5 * DAY_MS);
+    store.recordVerdict(KEY, "pass", sig("c"));
+    const beta = store.snapshot().entries[KEY]?.beta;
+    const f5 = 2 ** (-5 / 14);
+    const f3 = 2 ** (-3 / 14);
+    expect(Math.abs((beta?.alpha ?? Number.NaN) - (f5 + 1))).toBeLessThan(1e-12);
+    expect(Math.abs((beta?.beta ?? Number.NaN) - f3)).toBeLessThan(1e-12);
+    expect(beta?.updatedAt).toBe(T0 + 5 * DAY_MS);
+  });
+
+  it("400 verdicts at M = 50 keep evidence ≤ 50 and the mean within 1e-9 of the exact recurrence", () => {
+    const store = createOutcomeStore({ now: fakeClock().now, maxEffectiveSamples: 50 });
+    let a = 0;
+    let b = 0;
+    for (let i = 0; i < 400; i++) {
+      const pass = i % 5 !== 0;
+      store.recordVerdict(KEY, pass ? "pass" : "fail", sig(`v${i}`));
+      if (pass) a += 1;
+      else b += 1;
+      if (a + b > 50) {
+        const s = 50 / (a + b);
+        a *= s;
+        b *= s;
+      }
+    }
+    const p = store.posterior(KEY);
+    expect(p.n).toBeLessThanOrEqual(50 + 1e-9);
+    expect(Math.abs(p.mean - (4 + a) / (5 + a + b))).toBeLessThan(1e-9);
+  });
+
+  it("a NaN clock never decays and never poisons the stored evidence", () => {
+    const c = fakeClock();
+    const store = createOutcomeStore({ now: c.now });
+    store.recordVerdict(KEY, "pass", sig("a"));
+    c.set(Number.NaN);
+    store.recordVerdict(KEY, "pass", sig("b"));
+    const p = store.posterior(KEY);
+    expect(Number.isFinite(p.mean)).toBe(true);
+    expect(p.n).toBe(2);
+    expect(Number.isFinite(store.snapshot().entries[KEY]?.beta.updatedAt ?? Number.NaN)).toBe(true);
   });
 });

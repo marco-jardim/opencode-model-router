@@ -20,12 +20,14 @@ import {
   updateMean,
   updateTokenMeans,
 } from "../../src/routing/outcomes/cost";
+import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import type {
   CostStats,
   ModelPriceEntry,
   ModelPricing,
   OpenAttempt,
   OutcomeKey,
+  StepSample,
   TokenMeans,
   TokenSample,
   UnitCandidate,
@@ -497,5 +499,57 @@ describe("taxUSD (D8)", () => {
     expect(taxUSD({ mean: 500, n: 1 }, -3, ORCH, 0)).toBe(0);
     expect(taxUSD({ mean: 500, n: 1 }, Number.NaN, ORCH, 0)).toBe(0);
     expect(taxUSD({ mean: 500, n: 1 }, 5, { input: 1, output: 1 }, 0)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Through the store (added with store.ts): D6/A1 exclusion and the final-message separation.
+// ---------------------------------------------------------------------------
+
+describe("cost accounting through the outcome store", () => {
+  const sample = (attemptID: string, partial: Partial<StepSample> = {}): StepSample => ({
+    attemptID,
+    cost: 0.1,
+    pricing: "priced",
+    tokens: tokens({ input: 100, output: 10 }),
+    final: false,
+    ...partial,
+  });
+
+  it("cost == 0 with empty pricing is null: excluded from the means, tokens still counted", () => {
+    const store = createOutcomeStore({ now: () => 0 });
+    store.recordStep(KEY, sample("a", { cost: 0, pricing: pricingState([]), final: true }));
+    store.recordStep(KEY, sample("b", { cost: 0.4, pricing: "priced", final: true }));
+    const c = store.cost(KEY);
+    expect(c.measuredUSD).toEqual({ mean: 0.4, n: 1 });
+    expect(c.unpricedAttempts).toBe(1);
+    expect(c.tokens.n).toBe(2);
+  });
+
+  it("token means per field over attempts", () => {
+    const store = createOutcomeStore({ now: () => 0 });
+    store.recordStep(KEY, sample("a", { tokens: tokens({ input: 100, output: 20, reasoning: 4, cacheRead: 10, cacheWrite: 2 }), final: true }));
+    store.recordStep(KEY, sample("b", { tokens: tokens({ input: 300, output: 40, reasoning: 8, cacheRead: 30, cacheWrite: 6 }), final: true }));
+    expect(store.cost(KEY).tokens).toEqual({ n: 2, input: 200, output: 30, reasoning: 6, cacheRead: 20, cacheWrite: 4 });
+  });
+
+  it("finalMessageTokens only takes the final step; closeAttempt without a final step leaves it unchanged", () => {
+    const store = createOutcomeStore({ now: () => 0 });
+    store.recordStep(KEY, sample("a", { tokens: tokens({ output: 500 }) }));
+    store.recordStep(KEY, sample("a", { tokens: tokens({ output: 80 }), final: true }));
+    expect(store.cost(KEY).finalMessageTokens).toEqual({ mean: 80, n: 1 });
+    expect(store.cost(KEY).tokens.output).toBe(580);
+    store.recordStep(KEY, sample("b", { tokens: tokens({ output: 900 }) }));
+    store.closeAttempt("b");
+    expect(store.cost(KEY).finalMessageTokens).toEqual({ mean: 80, n: 1 });
+    expect(store.cost(KEY).tokens.n).toBe(2);
+  });
+
+  it("expectedAttemptUSD prices a store-built profile at the catalog entry", () => {
+    const store = createOutcomeStore({ now: () => 0 });
+    store.recordStep(KEY, sample("a", { cost: 0, pricing: "unpriced", tokens: tokens({ input: 1_000_000, output: 100_000 }), final: true }));
+    const usd = expectedAttemptUSD(store.cost(KEY), BASE, store.classTokenProfile("implement"));
+    expect(usd).toBeCloseTo(3 + 1.5, 12);
+    expect(expectedAttemptUSD(store.cost(KEY), undefined, store.classTokenProfile("implement"))).toBeNull();
   });
 });
