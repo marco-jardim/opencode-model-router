@@ -879,6 +879,91 @@ describe("attempt lifecycle (QA-2.1-6)", () => {
   });
 });
 
+describe("hung catalog through the ingest (QA-2.1-R2-4)", () => {
+  it("one list() call, one bounded wait, then later steps take no time at all", async () => {
+    const h = harness();
+    let lists = 0;
+    const pricing = createCatalogPricing(() => { lists += 1; return new Promise<never>(() => {}); }, { now: () => h.clock.t, loadTimeoutMs: 25 });
+    const ingest = h.make({ pricing });
+    for (let i = 0; i < 4; i++) dispatch(`c${i}`);
+    const first = performance.now();
+    await ingest.onStepEnded(step("s0", "c0", { finish: "tool-calls" }));
+    expect(performance.now() - first).toBeGreaterThanOrEqual(20);
+    h.clock.t += 120_000;
+    const later = performance.now();
+    for (let i = 1; i < 4; i++) await ingest.onStepEnded(step(`s${i}`, `c${i}`, { finish: "tool-calls", cost: 0.01 }));
+    expect(performance.now() - later).toBeLessThan(15);
+    expect(lists).toBe(1);
+    // the steps were recorded, as unpriced
+    for (let i = 0; i < 4; i++) ingest.onExecutionEnded(`c${i}`);
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(4);
+  });
+});
+
+describe("shared held steps (QA-2.1-R2-1, QA-2.1-R2-8)", () => {
+  const heldScenario = async (otherSettings: IngestSettings | null) => {
+    const h = harness();
+    const a = h.make({ pricing: PRICED });
+    const other = h.make({ pricing: PRICED, settings: () => otherSettings });
+    dispatch("c1");
+    await a.onStepEnded(step("e1", "c1", { finish: "tool-calls", cost: 0.01, output: 10 }));
+    await a.onStepEnded(step("e2", "c1", { finish: "stop", cost: 0.02, output: 300 }));
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(0);
+    h.clock.t = T0 + 31 * 60_000; // the held step is idle long enough for any sweep
+    touchDispatch("c1", h.clock.t);
+    other.sweep();
+    return { h, a, other };
+  };
+
+  it.each([
+    { name: "a static instance", settings: () => null },
+    { name: "an instance that writes to another directory", settings: () => ({ engine: "shadow", minClassConfidence: 0.7, outcomesDir: join(tmpdir(), "omr-ingest-elsewhere-never-created"), tuning: DEFAULT_OUTCOME_TUNING, routerAgentIds: new Set(["medium"]) } satisfies IngestSettings) },
+  ])("$name sweeping does not drop or settle another instance's held final step", async ({ settings }) => {
+    const { h, a } = await heldScenario(settings());
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(0); // still held, not settled by the stranger
+    a.onExecutionEnded("c1"); // the owner ends the attempt: nothing was lost
+    const cost = h.store().cost(MEDIUM_KEY);
+    expect(cost.steps).toMatchObject({ n: 1, mean: 2 });
+    expect(cost.finalMessageTokens).toMatchObject({ n: 1, mean: 300 });
+  });
+
+  it("an instance that can reach the store settles it at the idle limit; the owner then finds nothing left and folds nothing twice", async () => {
+    const h = harness();
+    const a = h.make({ pricing: PRICED });
+    const b = h.make({ pricing: PRICED }); // same directory
+    dispatch("c1");
+    await a.onStepEnded(step("e1", "c1", { finish: "stop", cost: 0.02, output: 300 }));
+    h.clock.t = T0 + 31 * 60_000;
+    touchDispatch("c1", h.clock.t);
+    b.sweep();
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+    a.sweep(); // stale ownership keys are dropped, nothing is recorded again
+    await a.dispose();
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+  });
+});
+
+describe("a registration that changes while its step waits for pricing (QA-2.1-R2-11)", () => {
+  it("skips the step instead of giving it to the new attempt", async () => {
+    const h = harness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ingest = h.make({ pricing: async () => { await gate; return [{ input: 3, output: 15 }]; } });
+    dispatch("c1");
+    const waiting = ingest.onStepEnded(step("e1", "c1", { finish: "stop", cost: 0.05 }));
+    dispatch("c1"); // resumed while the old attempt's last step is still waiting
+    release();
+    await waiting;
+    ingest.onExecutionEnded("c1");
+    expect(h.bundles).toHaveLength(0); // nothing was recorded for either attempt, and no bundle was needed
+    // the new attempt records normally
+    await ingest.onStepEnded(step("e2", "c1", { finish: "stop", cost: 0.02 }));
+    ingest.onExecutionEnded("c1");
+    expect(h.store().cost(MEDIUM_KEY)).toMatchObject({ steps: { n: 1, mean: 1 } });
+    expect(h.store().cost(MEDIUM_KEY).measuredUSD.mean).toBeCloseTo(0.02, 9);
+  });
+});
+
 describe("ingestion switched off at runtime (QA-2.1-11)", () => {
   it.each(["sweep", "requestFlush"] as const)("%s releases the bundle once the settings resolve to null, and the data is flushed", async (trigger) => {
     const h = harness();
@@ -1037,9 +1122,36 @@ describe("catalog pricing lookup", () => {
     expect(performance.now() - second).toBeLessThan(15);
     expect(loads).toBe(1);
     expect(warnings).toHaveLength(1);
-    // after the back-off a hung load is replaced
+    // QA-2.1-R2-4: the hung load stays pending; no second list() starts behind it, whatever the back-off says, and
+    // nobody waits for it again
+    clock.t += 60_000;
+    const third = performance.now();
+    expect(await lookup("p", "m")).toBeUndefined();
+    expect(performance.now() - third).toBeLessThan(15);
+    expect(loads).toBe(1);
+  });
+
+  it("QA-2.1-R2-4: after one timeout no lookup waits again until a load succeeds, even when later loads are slow too", async () => {
+    const clock = { t: T0 };
+    let loads = 0;
+    let resolveSecond!: (models: Array<{ providerID: string; id: string; cost: unknown }>) => void;
+    const lookup = createCatalogPricing(() => {
+      loads += 1;
+      if (loads === 1) return Promise.reject(new Error("first load fails"));
+      return new Promise((resolve) => { resolveSecond = resolve; });
+    }, { now: () => clock.t, loadTimeoutMs: 20, retryMs: 5000 });
+    expect(await lookup("p", "m")).toBeUndefined(); // the first load fails at once
     clock.t += 5000;
-    await lookup("p", "m");
+    const slow = performance.now();
+    expect(await lookup("p", "m")).toBeUndefined(); // a second load starts and is slow: this waits once, up to the timeout
+    expect(performance.now() - slow).toBeGreaterThanOrEqual(15);
+    expect(loads).toBe(2);
+    clock.t += 60_000;
+    const after = performance.now();
+    expect(await lookup("p", "m")).toBeUndefined();
+    expect(performance.now() - after).toBeLessThan(15);
+    resolveSecond([{ providerID: "p", id: "m", cost: [{ input: 1, output: 2 }] }]);
+    await vi.waitFor(async () => { expect(await lookup("p", "m")).toEqual([{ input: 1, output: 2 }]); });
     expect(loads).toBe(2);
   });
 

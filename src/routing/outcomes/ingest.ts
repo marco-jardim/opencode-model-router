@@ -136,7 +136,7 @@ export interface CatalogPricingOptions {
 interface CatalogLoad {
   readonly promise: Promise<void>;
   readonly startedAt: number;
-  /** A lookup stopped waiting for it (timeout): later lookups do not wait for it again. */
+  /** A lookup stopped waiting for it (timeout). It stays pending: no other load starts while it does (QA-2.1-R2-4). */
   abandoned: boolean;
 }
 
@@ -145,6 +145,8 @@ interface CatalogState {
   loadedAt: number | null;
   failedAt: number | null;
   loading: CatalogLoad | null;
+  /** A lookup has timed out once: none waits again, however many loads follow, until one has succeeded (QA-2.1-R2-4). */
+  timedOut: boolean;
 }
 
 const sharedCatalogs = new Map<string, CatalogState>();
@@ -165,7 +167,9 @@ function asPricing(value: unknown): ModelPricing {
  *
  * It never blocks the serial event loop for long (QA-2.1-5): once a table has loaded it is served immediately, stale
  * after the TTL while it reloads in the background; only the first lookup of a cold catalog waits, for at most
- * `loadTimeoutMs` and never past `signal`; a failed or timed-out load backs off for `retryMs`. Never rejects.
+ * `loadTimeoutMs` and never past `signal`. After one timeout nobody waits again until a load has succeeded, and a load
+ * that timed out stays pending: no second `list()` starts behind it (QA-2.1-R2-4). A failed load backs off for
+ * `retryMs`. Never rejects.
  */
 export function createCatalogPricing(
   list: () => Promise<readonly CatalogModel[]>,
@@ -178,7 +182,7 @@ export function createCatalogPricing(
   const { signal, logger } = options;
   let state: CatalogState | undefined = options.cacheKey === undefined ? undefined : sharedCatalogs.get(options.cacheKey);
   if (state === undefined) {
-    state = { table: new Map(), loadedAt: null, failedAt: null, loading: null };
+    state = { table: new Map(), loadedAt: null, failedAt: null, loading: null, timedOut: false };
     if (options.cacheKey !== undefined) sharedCatalogs.set(options.cacheKey, state);
   }
   const shared = state;
@@ -192,6 +196,7 @@ export function createCatalogPricing(
         shared.table = next;
         shared.loadedAt = safeNow(now);
         shared.failedAt = null;
+        shared.timedOut = false;
       } catch (error) {
         shared.failedAt = safeNow(now);
         logger?.warn("[router] outcome ingestion: model catalog unavailable; step costs treated as unpriced", {
@@ -233,13 +238,12 @@ export function createCatalogPricing(
     if (!fresh) {
       const backingOff = shared.failedAt !== null && t - shared.failedAt < retryMs;
       let load = shared.loading;
-      // A load that hung is replaced once the back-off has passed.
-      if (load !== null && load.abandoned && t - load.startedAt >= retryMs) load = null;
       if (load === null && !backingOff) load = startLoad(t);
-      if (shared.loadedAt === null && load !== null && !load.abandoned) {
+      if (shared.loadedAt === null && load !== null && !load.abandoned && !shared.timedOut) {
         const outcome = await waitFor(load);
         if (outcome === "timeout" && shared.loadedAt === null) {
           load.abandoned = true;
+          shared.timedOut = true;
           shared.failedAt = safeNow(now);
           logger?.warn("[router] outcome ingestion: model catalog is slow; step costs treated as unpriced", { loadTimeoutMs });
         }
@@ -466,6 +470,7 @@ export function createIngest(deps: IngestDeps): Ingest {
       return held.bundle;
     }
     const previous = held;
+    if (previous !== null) settleOwned(); // while `held` still names the old directory
     held = null;
     if (previous !== null) {
       void previous.bundle.release().catch((error: unknown) => warn("releasing the previous outcomes directory failed", error));
@@ -534,9 +539,13 @@ export function createIngest(deps: IngestDeps): Ingest {
     const heldKey = scopeKey(dir, attemptId);
     const pending = heldFinals.get(heldKey);
     if (pending === undefined) return;
+    // The held step is shared by every instance of the process (QA-2.1-R2-1): when this one cannot reach the store of
+    // `dir` (it is off, disposed or writes elsewhere) the step stays for the instance that can.
+    const store = storeOf(dir);
+    if (store === null) return;
     heldFinals.delete(heldKey);
     ownedHeld.delete(heldKey);
-    storeOf(dir)?.recordStep(pending.key, asFinal ? pending.sample : { ...pending.sample, final: false });
+    store.recordStep(pending.key, asFinal ? pending.sample : { ...pending.sample, final: false });
   };
 
   /** Fold an attempt that is over: its held final step first, then whatever is still open. */
@@ -598,6 +607,10 @@ export function createIngest(deps: IngestDeps): Ingest {
         const target = targetOf(sessionID);
         if (target === null) return;
         const { record, settings, key } = target;
+        // The pricing above belongs to the registration read before the await. A child that was registered again
+        // meanwhile (a new attempt, perhaps another model) must not receive a step of the previous one
+        // (QA-2.1-R2-11).
+        if (record.attemptId !== first.record.attemptId) return;
         // Dedupe only a step that is about to be recorded: an instance whose own settings are static must not
         // consume the event another instance (another location, another config) will record. The directory is
         // part of the key (QA-2.1-8): a store in another directory is a different recording.
@@ -732,16 +745,24 @@ export function createIngest(deps: IngestDeps): Ingest {
         dropIfOff();
         const t = safeNow(now);
         sweepDispatches(t);
-        // A child that was swept away can no longer end its attempt: fold it.
-        for (const [mapKey, last] of [...lastAttemptByChild]) {
-          const child = mapKey.slice(last.dir.length + 1);
-          if (lookupDispatch(child) !== undefined) continue;
-          lastAttemptByChild.delete(mapKey);
-          endAttempt(last.dir, last.attempt);
+        // Only what belongs to this instance's own directory: another instance (or another directory) owns the rest
+        // (QA-2.1-R2-1).
+        const dir = currentDir();
+        if (dir !== null) {
+          // A child that was swept away can no longer end its attempt: fold it.
+          for (const [mapKey, last] of [...lastAttemptByChild]) {
+            if (last.dir !== dir) continue;
+            const child = mapKey.slice(last.dir.length + 1);
+            if (lookupDispatch(child) !== undefined) continue;
+            lastAttemptByChild.delete(mapKey);
+            endAttempt(last.dir, last.attempt);
+          }
+          for (const pending of [...heldFinals.values()]) {
+            if (pending.dir === dir && t - pending.at >= HELD_FINAL_IDLE_MS) settle(pending.dir, pending.attempt, true);
+          }
         }
-        for (const pending of [...heldFinals.values()]) {
-          if (t - pending.at >= HELD_FINAL_IDLE_MS) settle(pending.dir, pending.attempt, true);
-        }
+        // Keys of held steps that someone else settled (QA-2.1-R2-8).
+        for (const heldKey of [...ownedHeld]) if (!heldFinals.has(heldKey)) ownedHeld.delete(heldKey);
         held?.bundle.store.sweepAttempts();
       } catch (error) {
         warn("sweep failed", error);
