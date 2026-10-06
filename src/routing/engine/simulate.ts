@@ -20,6 +20,7 @@ import {
   recordAttempt,
   startCostRatio,
   type EscalatePolicy,
+  type LadderState,
   type LadderVerdict,
 } from "../../escalate/ladder";
 import { DEFAULT_VARIANT } from "../../escalate/variants";
@@ -51,15 +52,16 @@ function ownVariantInfo(policy: EscalatePolicy, tier: string) {
 
 /**
  * Rungs the runner runs when it is started on `start` and every attempt fails with a detected failure, in
- * order (the first is `start` itself, unless `floorTier` lifts the start tier). Ends when the runner gives
- * up, when it would enter a tier the preset does not define, or after {@link MAX_SIMULATED_ATTEMPTS}.
+ * order (the first is `start` itself, unless `floorTier` lifts the start tier: QA-1.4-17, the first attempt is
+ * then the floor tier's base). Ends when the runner gives up, when it would enter a tier the preset does not
+ * define, or after {@link MAX_SIMULATED_ATTEMPTS}.
  *
  * A start on a rung other than the tier's base is modelled as a delegation that already stepped there (its
  * variant is recorded as tried, so the ladder never re-runs it).
  */
 export function simulateRunner(policy: EscalatePolicy, tierBase: TierBase, start: RunnerRung): RunnerRung[] {
   let state = newLadderState(start.tier, policy);
-  let current: RunnerRung;
+  let first: RunnerRung;
   if (state.currentTier === start.tier) {
     const info = ownVariantInfo(policy, start.tier);
     const variant = start.variant ?? DEFAULT_VARIANT;
@@ -73,24 +75,79 @@ export function simulateRunner(policy: EscalatePolicy, tierBase: TierBase, start
         rung: { model: info.model, variant },
       });
     }
-    current = start;
+    first = start;
   } else {
     // floorTier lifts the start: the first attempt runs the floor tier's base, whatever rung was asked for.
     const base = tierBase(state.currentTier);
     if (base === undefined) return [];
-    current = { ...base, costRatio: startCostRatio(policy, state) ?? base.costRatio };
+    first = { ...base, costRatio: startCostRatio(policy, state) ?? base.costRatio };
   }
+  return walk(policy, tierBase, state, first);
+}
 
+/**
+ * QA-1.4-16: the rungs the runner runs AFTER a native agent has already made `seed.attempts` (its own-model
+ * rung and the owning tier's rungs) on tier `seed.tier`. The escalation out of a role chain continues the same
+ * delegation, so the attempts and the cost already spent count against `maxTotalAttempts` and the cost
+ * ceiling, the chain's tier has used its per-tier retries, and the models the chain ran are recorded as tried
+ * (a later tier on one of them is skipped like any covered tier). Returns the continuation only.
+ */
+export function simulateAfter(
+  policy: EscalatePolicy,
+  tierBase: TierBase,
+  seed: { readonly tier: string; readonly attempts: readonly RunnerRung[] },
+): RunnerRung[] {
+  if (seed.attempts.length === 0) return [];
+  const spent = seed.attempts.reduce((sum, rung) => sum + rung.costRatio, 0);
+  let state = newLadderState(seed.tier, policy);
+  const info = ownVariantInfo(policy, seed.tier);
+  if (info !== undefined && !info.effortConfigured) {
+    // Record every rung the chain ran (raises `triedByModel`); `advance` of a variant step does exactly that.
+    for (const rung of seed.attempts) {
+      const variant = rung.variant ?? DEFAULT_VARIANT;
+      state = advance(state, {
+        action: "retry",
+        tier: seed.tier,
+        variantStep: true,
+        model: rung.model,
+        variant,
+        rung: { model: rung.model, variant },
+      });
+    }
+    const lastOwn = [...seed.attempts].reverse().find((rung) => rung.model === info.model);
+    state = { ...state, currentVariant: lastOwn === undefined ? null : (lastOwn.variant ?? DEFAULT_VARIANT) };
+  }
+  state = {
+    ...state,
+    currentTier: seed.tier,
+    // The chain was this tier's retries: only a variant step or an escalation is left.
+    attemptsThisTier: Math.max(policy.maxAttemptsPerTier, state.attemptsThisTier),
+    totalAttempts: seed.attempts.length,
+    cumulativeCost: spent,
+    firstAttemptCost: seed.attempts[0]!.costRatio,
+  };
+  return walk(policy, tierBase, state, null);
+}
+
+/**
+ * The shared loop: record the attempt just made (`current`; none for a seeded state), ask `nextAction` what
+ * the runner does after a detected failure, advance, and read the rung it lands on.
+ */
+function walk(policy: EscalatePolicy, tierBase: TierBase, start: LadderState, first: RunnerRung | null): RunnerRung[] {
+  let state = start;
+  let current = first;
   const rungs: RunnerRung[] = [];
   for (let attempt = 0; attempt < MAX_SIMULATED_ATTEMPTS; attempt++) {
-    rungs.push(current);
-    state = recordAttempt(state, current.costRatio);
+    if (current !== null) {
+      rungs.push(current);
+      state = recordAttempt(state, current.costRatio);
+    }
     const action = nextAction(state, FAILED, policy);
     if (action.action !== "retry" && action.action !== "escalate") break;
     state = advance(state, action);
     const base = tierBase(state.currentTier);
     if (base === undefined) break;
-    if (action.action === "retry" && action.variantStep !== true && state.currentVariant === undefined) {
+    if (current !== null && action.action === "retry" && action.variantStep !== true && state.currentVariant === undefined) {
       // No variant info in the policy: a plain retry re-runs the rung it just ran (the runner still charges
       // the tier's own ratio, A17).
       current = { ...current, costRatio: action.costRatio ?? base.costRatio };

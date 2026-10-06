@@ -29,7 +29,7 @@ import { CLASS_STATIC_TIER, NEEDS, type Need, type TaskFacts } from "../classify
 import { classifyAgentOrigin, normalizeVariant, splitModelRef } from "../outcomes/types";
 import type { AgentRef, ModelPricing } from "../outcomes/types";
 import { coversNeeds } from "./kernel";
-import { simulateRunner, type RunnerRung } from "./simulate";
+import { simulateAfter, simulateRunner, type RunnerRung } from "./simulate";
 import type {
   Candidate,
   ChosenDispatch,
@@ -359,6 +359,9 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     return out;
   };
   const roleIds = ownRoles(input.routing.roles, facts.class);
+  /** Role chains laid out so far, and the in-chain successor of each of their rungs (QA-1.4-16). */
+  const roleChains: { readonly start: number; readonly length: number; readonly tier: string }[] = [];
+  const chainNext = new Map<number, number | null>();
   const tierRungs = owningTier !== null && owningRank !== null ? modelledRungs(cfg, owningTier).kept : [];
   const firstTierRung = tierRungs[0];
   for (const id of roleIds) {
@@ -428,8 +431,10 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     for (let position = 0; position < chain.length; position++) {
       const k = candidates[chainStart + position]!;
       const inChain = firstUncovered(cfg, k, indexes(chainStart + position + 1, chainStart + chain.length), candidates);
+      chainNext.set(chainStart + position, inChain);
       next.push(inChain ?? firstUncovered(cfg, k, above, candidates, policy.variants != null));
     }
+    roleChains.push({ start: chainStart, length: chain.length, tier: owningTier });
   }
 
   // --- simulated runner paths (A25) --------------------------------------------------------------------
@@ -472,6 +477,26 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     }
     // A router rung is priced through its path; its `next` stays null (a path is not a pointer chain).
     paths[k] = path.length > 0 ? path : null;
+  }
+  // A role rung's path: the rest of its chain (the same coverage-skipping walk as `next` inside the chain),
+  // then the runner continuing the SAME delegation from the tier that owns the class, with the chain's attempts
+  // and cost already spent (QA-1.4-16), so a native agent's cascade is not given a fresh budget.
+  for (const chain of roleChains) {
+    for (let at = chain.start; at < chain.start + chain.length; at++) {
+      const members: number[] = [];
+      for (let m: number | null = at; m !== null && !members.includes(m); m = chainNext.get(m) ?? null) members.push(m);
+      const spent: RunnerRung[] = members.map((m) => {
+        const c = candidates[m]!;
+        return { tier: chain.tier, model: c.model, variant: c.variant, costRatio: c.costRatio };
+      });
+      const path = [...members];
+      for (const attempt of simulateAfter(policy, tierBase, { tier: chain.tier, attempts: spent })) {
+        const j = indexOfRung(attempt);
+        if (j === null) break;
+        path.push(j);
+      }
+      paths[at] = path;
+    }
   }
 
   return {

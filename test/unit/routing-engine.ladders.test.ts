@@ -669,9 +669,76 @@ describe("QA-1.4-15: only a strictly higher rank is ungated (A24 amended) — th
       routing: { profile: "safe", margin: 0.1, minClassConfidence: 0.7, detection },
       chosen: resolveChosen({ cfg, agents, agent: "fast" })!,
     });
-    expect(decision.best?.agent).toBe("explore");
+    // QA-1.4-16: the native agent's cascade no longer gets a fresh budget at its exit, so on equal priors and
+    // prices explore@haiku is NOT cheaper than fast (it used to be, which is what made it the argmin).
+    const own = ladder.candidates.find((c) => c.source === "role-own-model")!;
+    const ownCost = decision.costs[candidateKey("search", own)]!;
+    const fastCost = decision.costs[decision.chosen.key]!;
+    expect(ownCost).toBeGreaterThanOrEqual(fastCost - 1e-9);
     expect(decision.switched).toBe(false);
+    expect(decision.reasonCode).toBe("kept:best-is-chosen");
+  });
+
+  it("E4 with evidence still cannot be moved sideways by priors: even when explore is the argmin it needs 5 outcomes", () => {
+    const agents = [...routerAgents(), EXPLORE];
+    const cfg = plainCfg();
+    const f = { class: "search", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+    const ladder = buildLadder({ cfg, routing: { roles: { search: ["explore"] } }, facts: f, agents });
+    const store = createOutcomeStore({ now: () => 1_000 });
+    const fastKey = candidateKey("search", ladder.candidates[0]!);
+    for (let i = 0; i < 4; i++) store.recordVerdict(fastKey, "fail", { attemptID: `f${i}`, step: "dispatch" });
+    const decision = decide({
+      facts: f, ladder, store, detection: "deterministic", pin: false,
+      routing: { profile: "safe", margin: 0.1, minClassConfidence: 0.7, detection },
+      chosen: resolveChosen({ cfg, agents, agent: "fast" })!,
+    });
+    expect(decision.best?.agent).toBe("explore");
     expect(decision.reasonCode).toBe("kept:evidence");
+  });
+});
+describe("QA-1.4-16: a role chain's attempts and cost carry into its exit into the router block", () => {
+  /** `agent:tier#variant` of every attempt of candidate `k`'s path (`~` = a rung only the runner reaches). */
+  function roleLabels(ladder: Ladder, k: number): string[] {
+    return (ladder.paths?.[k] ?? []).map((index) => {
+      const reachable = index >= ladder.candidates.length;
+      const c = reachable ? ladder.reachable![index - ladder.candidates.length]! : ladder.candidates[index]!;
+      return `${reachable ? "~" : ""}${c.agent.id}:${c.model.split("/")[1]}#${c.variant ?? "default"}`;
+    });
+  }
+  const agents = [...routerAgents(), EXPLORE];
+  const roles = { search: ["explore"] };
+  const SEARCH = facts("search");
+  const exploreOwn = (ladder: Ladder): number => ladder.candidates.findIndex((c) => c.source === "role-own-model");
+
+  it("the exit continues the same delegation: two chain attempts leave less budget than a fresh dispatch", () => {
+    const base = { routing: { roles }, facts: SEARCH, agents } as const;
+    // Default policy: ceiling 4×, 4 attempts. The chain (haiku, then fast's sonnet#low) spends 2 of the 4 and 2 units.
+    const ladder = buildLadder({ ...base, cfg: plainCfg() });
+    expect(roleLabels(ladder, exploreOwn(ladder))).toEqual(["explore:claude-haiku-4-5#default", "explore:claude-sonnet-5-5#low", "medium:claude-sonnet-5-5#medium"]);
+    // fast's own cascade is the same shape: fast, fast, medium (the E4 comparison is no longer biased).
+    expect(roleLabels(ladder, 0)).toEqual(["fast:claude-sonnet-5-5#low", "fast:claude-sonnet-5-5#low", "medium:claude-sonnet-5-5#medium"]);
+    // maxTotalAttempts 2 is used up by the chain itself: nothing is left for the router tiers.
+    const two = buildLadder({ ...base, cfg: plainCfg({ enforcement: { escalate: { maxTotalAttempts: 2 } } }) });
+    expect(roleLabels(two, exploreOwn(two))).toEqual(["explore:claude-haiku-4-5#default", "explore:claude-sonnet-5-5#low"]);
+    // The chain's cost counts against the ceiling too: 1 + 1 > 1.5 × 1.
+    const ceiling = buildLadder({ ...base, cfg: plainCfg({ enforcement: { escalate: { costCeiling: { multiple: 1.5 } } } }) });
+    expect(roleLabels(ceiling, exploreOwn(ceiling))).toEqual(["explore:claude-haiku-4-5#default", "explore:claude-sonnet-5-5#low"]);
+  });
+
+  it("a chain started on a later rung only carries what it has run", () => {
+    const ladder = buildLadder({ cfg: plainCfg({ enforcement: { escalate: { maxTotalAttempts: 3 } } }), routing: { roles }, facts: SEARCH, agents });
+    const tierRung = ladder.candidates.findIndex((c) => c.source === "role-tier-rung");
+    // One chain attempt spent of 3: two left → medium, then give up at the cap.
+    expect(roleLabels(ladder, tierRung)).toEqual(["explore:claude-sonnet-5-5#low", "medium:claude-sonnet-5-5#medium"]);
+  });
+
+  it("with variant info the models the chain ran are covered: a tier on that model is not entered again", () => {
+    // `general` on sonnet#xhigh serving `implement` (owner medium, sonnet#medium): the chain already ran the top
+    // variant of sonnet, so the medium tier adds nothing and the runner goes straight on to heavy.
+    const session = { host: "v2", catalog } satisfies LadderSessionPolicyInput;
+    const general = nativeAgent("general", `${SONNET}#xhigh`, ["shell", "web", "edit", "network"]);
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: { implement: ["general"] } }, facts: facts("implement", ["edit"]), agents: [...routerAgents(), general], session });
+    expect(roleLabels(ladder, exploreOwn(ladder))).toEqual(["general:claude-sonnet-5-5#xhigh", "heavy:claude-opus-5-5#xhigh"]);
   });
 });
 describe("QA-1.4-3: router tier rungs honour permitted, hidden and mode", () => {
@@ -989,7 +1056,10 @@ describe("buildLadder — acyclic by construction (property, 500 seeded random l
           for (const a of path!) expect(Number.isInteger(a) && a >= 0 && a < total, `${label} path index ${k}→${a}`).toBe(true);
           return;
         }
-        expect(path, `${label} role rungs have no path ${k}`).toBeNull();
+        // A role rung is priced through the rest of its chain, then the runner continuing the same delegation.
+        expect(path, `${label} role rung path ${k}`).not.toBeNull();
+        expect(path![0], `${label} role path starts at ${k}`).toBe(k);
+        for (const a of path!) expect(Number.isInteger(a) && a >= 0 && a < total, `${label} role path index ${k}→${a}`).toBe(true);
         if (target === null) return;
         expect(Number.isInteger(target) && target >= 0 && target < n, `${label} range ${k}→${target}`).toBe(true);
         if (target < routerCount) {
