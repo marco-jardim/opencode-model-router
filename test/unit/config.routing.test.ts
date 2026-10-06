@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync }
 import { spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { existsSync, readdirSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import {
   DEFAULT_V2_ROLES,
@@ -38,6 +38,7 @@ import {
   readPackageVersion,
 } from "../../src/router/build-info";
 import { parseJsonc } from "../../src/router/jsonc";
+import { assertHomeIsGuarded, guardedHomedir, sameDir } from "../setup/home-guard";
 import { readFileSync } from "node:fs";
 
 const ROOT = resolve(__dirname, "..", "..");
@@ -1514,6 +1515,57 @@ describe("home guard (test/setup/home-guard.ts)", () => {
     expect(existsSync(isolated)).toBe(true);
     expect(readdirSync(isolated)).toEqual([]);
     expect(overridePath().startsWith(isolated)).toBe(true);
+  });
+
+  it("is the very homedir this file and the code under test see (one module instance)", () => {
+    expect(homedir).toBe(guardedHomedir);
+  });
+
+  describe("the per-test check (QA-1.1-22)", () => {
+    it("passes for the guarded homedir", () => {
+      expect(() => assertHomeIsGuarded(guardedHomedir)).not.toThrow();
+      expect(() => assertHomeIsGuarded(() => tmpHome)).not.toThrow();
+    });
+
+    it("fails a file whose own node:os mock lets homedir() resolve the real home", () => {
+      // What a `vi.mock("node:os", …)` without `homedir: guardedHomedir` leaves behind.
+      expect(() => assertHomeIsGuarded(() => REAL_HOME)).toThrow(
+        /home-guard: os\.homedir\(\) resolves the real home directory .* must include `homedir: guardedHomedir`/,
+      );
+    });
+
+    it.each([
+      ["a trailing slash", () => `${REAL_HOME}/`],
+      ["a doubled trailing separator", () => `${REAL_HOME}//`],
+      ["a `..` segment", () => join(REAL_HOME, "..", basename(REAL_HOME))],
+      ["a `.` segment", () => join(REAL_HOME, ".")],
+    ])("is not fooled by %s", (_label, spelled) => {
+      expect(() => assertHomeIsGuarded(spelled)).toThrow(/home-guard/);
+    });
+
+    it.skipIf(process.platform !== "win32")("is not fooled by a different case on Windows", () => {
+      expect(() => assertHomeIsGuarded(() => REAL_HOME.toUpperCase())).toThrow(/home-guard/);
+      expect(() => assertHomeIsGuarded(() => REAL_HOME.toLowerCase())).toThrow(/home-guard/);
+    });
+
+    it("lets any other directory through", () => {
+      expect(() => assertHomeIsGuarded(() => tmpdir())).not.toThrow();
+      expect(() => assertHomeIsGuarded(() => join(REAL_HOME, "sub"))).not.toThrow();
+    });
+  });
+
+  describe("sameDir", () => {
+    it("compares directories by what they are, not by how they are spelled", () => {
+      expect(sameDir(tmpHome, `${tmpHome}/`)).toBe(true);
+      expect(sameDir(tmpHome, join(tmpHome, "x", ".."))).toBe(true);
+      expect(sameDir(tmpHome, tmpdir())).toBe(false);
+    });
+
+    it("falls back to a normalized comparison for a path that is not on disk", () => {
+      const missing = join(tmpHome, "not", "there");
+      expect(sameDir(missing, join(missing, "..", "there"))).toBe(true);
+      expect(sameDir(missing, join(tmpHome, "not", "elsewhere"))).toBe(false);
+    });
   });
 
   it("throws, before anything can be written, when a test resolves the real home", () => {
