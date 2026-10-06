@@ -619,6 +619,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let runnerCatalogLoad: Promise<CatalogLookup | undefined> | undefined;
   /** When the outstanding `routerCatalog()` call started; it may outlive its timeout. */
   let runnerCatalogCallAt: number | undefined;
+  /** Id of the latest call (QA-2.3-R2-6): an abandoned call that settles late must not clear the state of a newer one. */
+  let runnerCatalogCallId = 0;
   let runnerCatalogFailing = false;
   const runnerCatalogFailed = (error: unknown): undefined => {
     runnerCatalog = { at: Date.now(), lookup: undefined };
@@ -640,15 +642,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       return Promise.resolve(undefined);
     }
     runnerCatalogCallAt = nowMs;
+    const callId = ++runnerCatalogCallId;
     const answer = Promise.resolve().then(() => list()).then(
       (models) => {
-        runnerCatalogCallAt = undefined;
+        // A late answer is still a catalog, whichever call it answers; only the latest call owns the marker.
+        if (callId === runnerCatalogCallId) runnerCatalogCallAt = undefined;
         const lookup = createCatalogLookup(models);
         runnerCatalog = { at: Date.now(), lookup };
         runnerCatalogFailing = false;
         return lookup;
       },
       (error: unknown) => {
+        // A failure of an abandoned call says nothing about the newer one: leave its marker and the cache alone.
+        if (callId !== runnerCatalogCallId) return undefined;
         runnerCatalogCallAt = undefined;
         return runnerCatalogFailed(error);
       },
