@@ -10,6 +10,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import v2Plugin from "../../src/v2";
+import type { Plugin } from "@opencode/plugin";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, makeKey } from "../../src/routing/outcomes";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
@@ -966,6 +968,22 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     return { cleanup, forgetSession };
   }
 
+  /**
+   * The wiring of `src/v2.ts`: the plugin instance creates its own telemetry ingest (settings from its live config,
+   * pricing from the catalog) and hands it to the adapter (QA-2.1-7).
+   */
+  async function startPlugin(f: ReturnType<typeof fixture>, model: ReturnType<typeof catalog>, home: string, wrap: (hooks: Hooks) => Hooks = (hooks) => hooks) {
+    let ingest: Ingest | undefined;
+    const hooks = await ModelRouterPlugin({
+      directory: home, worktree: home, routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      routerCatalog: async () => (await model.list()).data,
+      routerOnIngest: (created: Ingest) => { ingest = created; },
+    } as unknown as RouterPluginInput);
+    expect(ingest).toBeDefined();
+    return start(f, model, wrap(hooks), { ingest });
+  }
+
   /** Events are handled in order: once the barrier session's deletion is seen, everything before it was handled. */
   async function barrier(f: ReturnType<typeof fixture>, forgetSession: ReturnType<typeof vi.fn>, name: string) {
     f.emit({ id: `barrier-${name}`, type: "session.deleted", data: { sessionID: name } });
@@ -990,7 +1008,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const f = fixture();
     const model = catalog();
-    const { cleanup, forgetSession } = await start(f, model);
+    const { cleanup, forgetSession } = await startPlugin(f, model, home);
     register("child-1");
     f.emit(stepEvent("e1", "child-1", { finish: "tool-calls", cost: 0.01 }));
     f.emit(stepEvent("e2", "child-1", { finish: "stop", cost: 0.02 }));
@@ -1015,7 +1033,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const f = fixture();
     const model = catalog();
-    const { cleanup, forgetSession } = await start(f, model);
+    const { cleanup, forgetSession } = await startPlugin(f, model, home);
     f.emit(stepEvent("e1", "orchestrator"));
     f.emit({ id: "e2", type: "session.step.ended", data: { assistantMessageID: "no-session" } });
     await barrier(f, forgetSession, "barrier");
@@ -1029,7 +1047,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const { home, outcomes } = routingHome();
     const f = fixture();
     const model = catalog();
-    const { cleanup, forgetSession } = await start(f, model);
+    const { cleanup, forgetSession } = await startPlugin(f, model, home);
     register("child-1");
     f.emit(stepEvent("e1", "child-1", { finish: "stop" }));
     f.emit({ id: "i1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
@@ -1043,7 +1061,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
   it("records nothing under a class below routing.minClassConfidence", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow", minClassConfidence: 0.7 });
     const f = fixture();
-    const { cleanup, forgetSession } = await start(f, catalog());
+    const { cleanup, forgetSession } = await startPlugin(f, catalog(), home);
     register("child-low", { facts: { ...FACTS, confidence: 0.69 } });
     f.emit(stepEvent("e1", "child-low", { finish: "stop" }));
     await barrier(f, forgetSession, "barrier");
@@ -1056,8 +1074,8 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const a = fixture();
     const b = fixture();
-    const first = await start(a, catalog());
-    const second = await start(b, catalog());
+    const first = await startPlugin(a, catalog(), home);
+    const second = await startPlugin(b, catalog(), home);
     register("child-1");
     const event = stepEvent("same-id", "child-1", { finish: "stop", cost: 0.02 });
     a.emit(event);
@@ -1081,7 +1099,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const { home } = routingHome({ engine: "shadow" });
     const f = fixture();
     const legacyEvent = vi.fn(async () => {});
-    const { forgetSession } = await start(f, catalog(), { event: legacyEvent });
+    const { forgetSession } = await startPlugin(f, catalog(), home, (hooks) => ({ ...hooks, event: legacyEvent }));
     register("child-1");
     f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-1" } });
     await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith("child-1"));
@@ -1089,6 +1107,45 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const { lookupDispatch } = await import("../../src/router/sessions");
     expect(lookupDispatch("child-1")).toBeUndefined();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  describe("src/v2.ts setup (the real wiring)", () => {
+    it("feeds the plugin's own ingest from the adapter: steps, execution end and pricing", async () => {
+      const { home, outcomes } = routingHome({ engine: "shadow" });
+      const f = fixture();
+      const model = catalog();
+      const cleanup = await v2Plugin.setup({ ...f.ctx, model } as unknown as Plugin.Context);
+      cleanups.push(cleanup);
+      register("child-1");
+      f.emit(stepEvent("e1", "child-1", { finish: "stop", cost: 0 }));
+      f.emit({ id: "x1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+      const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+      try {
+        await vi.waitFor(() => expect(peek.store.cost(KEY).steps.n).toBe(1));
+        // priced by the catalog the adapter read: a priced model's zero is a measurement
+        expect(peek.store.cost(KEY).measuredUSD).toMatchObject({ n: 1, mean: 0 });
+        expect(model.list).toHaveBeenCalledTimes(1);
+      } finally {
+        await peek.release();
+      }
+      await cleanup();
+      rmSync(home, { recursive: true, force: true });
+    });
+
+    it("QA-2.1-5: disposing does not wait for a model catalog that never answers", async () => {
+      const { home } = routingHome({ engine: "shadow" });
+      const f = fixture();
+      const model = { list: vi.fn(() => new Promise<never>(() => {})) };
+      const cleanup = await v2Plugin.setup({ ...f.ctx, model } as unknown as Plugin.Context);
+      cleanups.push(cleanup);
+      register("child-1");
+      f.emit(stepEvent("e1", "child-1", { finish: "tool-calls" }));
+      await vi.waitFor(() => expect(model.list).toHaveBeenCalledTimes(1)); // the step handler is now waiting for the catalog
+      const started = performance.now();
+      await cleanup();
+      expect(performance.now() - started).toBeLessThan(1000); // the catalog wait itself is bounded by 2 s
+      rmSync(home, { recursive: true, force: true });
+    });
   });
 
   describe("with an injected ingest", () => {

@@ -13,7 +13,7 @@ import { resolveSubagentOverrides } from "../router/subagents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
-import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, createCatalogPricing, createIngest, ingestSettings } from "../routing/outcomes/ingest";
+import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -83,7 +83,7 @@ export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
   runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession">>,
-  /** `ingest`: telemetry ingestion (M6); defaults to one over the host catalog. Injected by tests. */
+  /** `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing. */
   options: { ingest?: Ingest } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -93,17 +93,10 @@ export async function registerV2Hooks(
   const abort = new AbortController();
   const verifyingCalls = new Set<string>();
   const depthBanners = new Map<string, string>();
-  // M6 (2.1.3): child-session outcomes and costs reach the outcome store only from here on v2, and only when
-  // routing.engine != static (ingestSettings is null otherwise: no bundle, no files).
+  // M6 (2.1.3): child-session outcomes and costs reach the outcome store through the plugin instance's ingest, which
+  // does nothing unless routing.engine != static (its settings are null otherwise: no bundle, no files).
   const ingestLogger = createPluginLogger();
-  const ingest: Ingest = options.ingest ?? createIngest({
-    settings: () => ingestSettings(loadConfig(ctx.location.directory), "v2"),
-    logger: ingestLogger,
-    pricing: createCatalogPricing(
-      async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
-      { logger: ingestLogger, cacheKey: ctx.location.directory, signal: abort.signal },
-    ),
-  });
+  const ingest: Ingest = options.ingest ?? NOOP_INGEST;
   // An ingestion error is logged and the loop carries on: it must never cost the router an event.
   const ingesting = async (what: string, run: () => void | Promise<void>): Promise<void> => {
     try {
@@ -132,8 +125,9 @@ export async function registerV2Hooks(
     disposed = true;
     abort.abort();
     await runtime?.dispose?.();
-    await eventTask;
+    // Before the event task: disposing releases a step handler that waits for the model catalog (QA-2.1-5).
     await ingest.dispose();
+    await eventTask;
     await Promise.allSettled(registrations.map((registration) => registration.dispose()));
     await hooks.dispose?.();
   };

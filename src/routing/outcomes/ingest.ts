@@ -403,6 +403,18 @@ export interface Ingest {
 }
 
 /** Event types after which the router flushes (v2's equivalents of `session.idle`, plus the idle/deleted events). */
+/** An ingest that does nothing (a v2 adapter started without the plugin's own). */
+export const NOOP_INGEST: Ingest = Object.freeze({
+  onStepEnded: () => Promise.resolve(),
+  onExecutionEnded: () => undefined,
+  onVerdict: () => undefined,
+  onFalseRefusal: () => undefined,
+  onSessionGone: () => undefined,
+  requestFlush: () => undefined,
+  sweep: () => undefined,
+  dispose: () => Promise.resolve(),
+});
+
 /** The v2 events that end a session's execution (the adapter maps them to `session.idle`). */
 export const EXECUTION_END_TYPES: ReadonlySet<string> = new Set([
   "session.execution.succeeded",

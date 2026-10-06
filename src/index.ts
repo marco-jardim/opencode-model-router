@@ -59,7 +59,8 @@ import {
 } from "./router/protocol";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
-import { createIngest, ingestSettings } from "./routing/outcomes/ingest";
+import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
+import type { Ingest } from "./routing/outcomes/ingest";
 import { verdictOf } from "./routing/outcomes/types";
 import {
   findOrphanedStrongPatterns,
@@ -389,9 +390,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
   const routerWarn = { warn: (message: string) => logger.warn(message) };
-  // M6 (2.1.3): verdicts and false refusals of registered child dispatches feed the outcome store. v2 only (D1),
-  // and every call is a no-op unless routing.engine != static; the step events are ingested by the v2 adapter.
-  const ingest = ctx.routerHost === "v2" ? createIngest({ settings: () => ingestSettings(cfg, "v2"), logger }) : undefined;
+  // M6 (2.1.3, QA-2.1-7): the one telemetry ingest of this plugin instance. v2 only (D1); every call is a no-op unless
+  // routing.engine != static. Verdicts and false refusals come from the hooks below; the v2 adapter receives this same
+  // instance through `routerOnIngest` and feeds it the step and session events, so there is a single settings source.
+  const ingestAbort = new AbortController();
+  const ingest: Ingest | undefined = ctx.routerHost === "v2" ? (() => {
+    const core = createIngest({
+      settings: () => ingestSettings(cfg, "v2"),
+      logger,
+      ...(ctx.routerCatalog
+        ? { pricing: createCatalogPricing(ctx.routerCatalog, { logger, cacheKey: ctx.directory, signal: ingestAbort.signal }) }
+        : {}),
+    });
+    // Disposing also releases any lookup still waiting for the catalog (QA-2.1-5): shutdown never waits for it.
+    return { ...core, dispose: async () => { ingestAbort.abort(); await core.dispose(); } };
+  })() : undefined;
+  if (ingest) ctx.routerOnIngest?.(ingest);
   resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
   const depthTracker = createDepthTracker({
     async getParent(id) {
