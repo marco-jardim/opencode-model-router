@@ -1196,7 +1196,20 @@ describe("state scrub (QA-1.2-1)", () => {
   });
 
   it("a long run of name characters is linear (no quadratic backtracking)", () => {
-    for (const text of ["a".repeat(20_000), "a-".repeat(10_000), "A_".repeat(10_000), "token".repeat(4_000)]) {
+    for (const text of [
+      "a".repeat(20_000),
+      "a-".repeat(10_000),
+      "A_".repeat(10_000),
+      "token".repeat(4_000),
+      "a@".repeat(10_000),
+      "a+".repeat(10_000),
+      "http://".repeat(2_800),
+      "mysql ".repeat(3_300),
+      "MASTER_KEY".repeat(2_000),
+      "the key is ".repeat(1_800),
+      "-----BEGIN A-----".repeat(1_100),
+      "ab12".repeat(5_000),
+    ]) {
       const started = performance.now();
       scrubState(text);
       expect(performance.now() - started).toBeLessThan(100);

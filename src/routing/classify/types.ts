@@ -984,8 +984,8 @@ export const HIGH_RISK_TERMS: readonly RegExp[] = [
   /\brm\s+-rf\b/i,
   // Destructive commands and operations (QA-1.2-3): never a cheap, confident `mechanical` label.
   /\brm\s+-[a-z]*[rf]/i,
-  /\bRemove-Item\b[^\n]*-(?:Recurse|Force)\b/i,
-  /\bgit\s+push\b[^\n]*\s(?:-f|--force)\b/i,
+  /\bRemove-Item\b[^\n]{0,200}-(?:Recurse|Force)\b/i,
+  /\bgit\s+push\b[^\n]{0,200}\s(?:-f|--force)\b/i,
   /\bgit\s+clean\s+-/i,
   /\bgit\s+(?:checkout|restore)\s+(?:--\s+)?\.(?=\s|$|[\\/])/i,
   /\bgit\s+(?:rebase|filter-branch|filter-repo)\b/i,

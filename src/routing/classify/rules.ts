@@ -133,7 +133,7 @@ const PATHLIKE_RES: readonly RegExp[] = [
   globalCopy(WINDOWS_ABS_PATH_RE),
   /(?<![\w:/.~-])\/[\w.@+-]+(?:\/[\w.@+-]*)*/g,
   /(?<!\w)~[\\/][^\s"'`]*/g,
-  /(?<![\w:/\\.~-])[\w.@+-]+(?:[\\/][\w.@+-]*)+/g,
+  /(?<![\w:/\\.~@+-])[\w.@+-]+(?:[\\/][\w.@+-]*)+/g,
 ];
 
 function withoutPaths(text: string): string {
