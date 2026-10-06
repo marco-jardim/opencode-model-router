@@ -11,3 +11,4 @@ Delegation incidents, take-overs (§0.10.2), restarts and sync incidents, in tim
 | ≈01:35 | 0.P.4 | Heavy verdicts issued by the orchestrator (Opus) per router rule 9 ("if self is opus: skip-@heavy") | Logged as a take-over of a `[tier:heavy]` task; QA stays a separate `@heavy` dispatch. |
 | ≈01:45 | 0.P QA round 1 | `@heavy` QA: 1 critical, 8 major, 11 minor, 5 nit | All addressed (harness `5113977`, docs `1409f3a`). |
 | ≈02:10 | 0.P QA round 2 | `@heavy` re-review: 20 resolved, 5 partial; new: 3 major, 7 minor, 2 nit | All addressed (harness `d9e2358`, docs/plan/handover in the following commit). |
+| 2026-10-06T11:41:54Z | DF1 | Host restart for the DF1 code sync (A8) | Liveness probe `/router` → `engine=static build=2.2.0+8ce54f2`; resumed with Phase 2.1. |

@@ -55,8 +55,8 @@ directives, which are binding and override your defaults. The rules that matter 
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **DF1 sync done, restart pending** (handover revision 3). Wave 1 merged; `master` = `car/main` = `88847cb` + the DF1 docs commit |
-| **Next task id** | **DF1 liveness probe** (after the human restarts OpenCode v2 and types `/router`): output must contain `router: engine=static build=2.2.0+<sha7 of master>`; confirm the live protocol/`R:` line equals 0.P.3 (v2 form); record restart time lost in `dogfood.md` `## DF1` and `run-log.md`. If stale → blocking (§0.1.3). Then **Phase 2.1** (telemetry ingestion): worktree `D:\git\omr-car-p21` on `car/p21` from `car/main`, first task **2.1.1**; tag `car/wave-2-base` first. |
+| Checkpoint reached | **DF1 complete** (liveness probe passed: `build=2.2.0+8ce54f2`); Wave 2 in progress |
+| **Next task id** | **Phase 2.1** (telemetry ingestion) in `D:\git\omr-car-p21` on `car/p21` (from `car/main`, tag `car/wave-2-base`), first task 2.1.1. Then 2.2 (after 1.4 + 2.1 merged) and 2.3 (after 1.5 + 2.1 merged), then DF2 after 2.2. |
 | `master` | fast-forwarded to `car/main` at DF1 (rollback tag `car/sync-1-prev` = `3b3dba4`) |
 | `car/main` | Wave 1 merged (`88847cb`) + DF1 docs commit |
 | Base directory | `D:\git\opencode-model-router` (branch `master`); the session alias `D:\git\Claude-model-router` is the same repository — always use the `D:\git\opencode-model-router` form in dispatches |
@@ -73,7 +73,7 @@ directives, which are binding and override your defaults. The rules that matter 
 | Spike evidence hygiene | Any spike re-run that is not meant to replace the evidence: `git -C <worktree> checkout -- docs/qa/cost-aware-routing/spikes` afterwards (QA-0P-42) |
 | Liveness probe / slash commands | The orchestrator has no tool to type `/router` or `/annotate-plan`; at DF1 find the host API route that runs a session command (host source at the pinned sha) or ask the human to type it |
 | Last `routing:stats` | n/a (script arrives in Phase 1.3); DF0 baseline from scorecards |
-| Sentence for the human | "Sync DF1 concluído; o código novo não está ativo na sessão. Reinicie o OpenCode v2, digite `/router` e depois diga 'retomar'." |
+| Sentence for the human | n/a (no restart pending) |
 
 ---
 
