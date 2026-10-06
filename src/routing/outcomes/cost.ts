@@ -295,8 +295,8 @@ export function expectedAttemptUSD(
 
 /**
  * D8 `tax`: USD the orchestrator pays to re-read the child's final message on each remaining turn
- * (cache-read price). `null` until a final message was measured, or when the orchestrator model is
- * unpriced; the kernel maps `null` to 0.
+ * (cache-read price, else the input price: QA-1.3-14). `null` until a final message was measured, or
+ * when the orchestrator model is unpriced; the kernel maps `null` to 0.
  */
 export function taxUSD(
   finalMessageTokens: MeanStat,
@@ -308,5 +308,6 @@ export function taxUSD(
   const entry = selectPriceEntry(orchestratorPricing, orchestratorContextTokens);
   if (entry === null) return null;
   const turns = Number.isFinite(remainingTurns) && remainingTurns > 0 ? remainingTurns : 0;
-  return (finalMessageTokens.mean * turns * (entry.cache?.read ?? 0)) / PER_MILLION;
+  // Re-reading the message costs the cache-read price; a model without one is billed at its input price.
+  return (finalMessageTokens.mean * turns * (entry.cache?.read ?? entry.input)) / PER_MILLION;
 }

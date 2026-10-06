@@ -495,10 +495,17 @@ describe("taxUSD (D8)", () => {
     expect(taxUSD({ mean: 1000, n: 1 }, 1, tiered, 250_000)).toBeCloseTo((1000 * 0.6) / 1e6, 15);
   });
 
-  it("negative or non-finite remaining turns count as 0 and a missing cache price as 0", () => {
+  it("negative or non-finite remaining turns count as 0", () => {
     expect(taxUSD({ mean: 500, n: 1 }, -3, ORCH, 0)).toBe(0);
     expect(taxUSD({ mean: 500, n: 1 }, Number.NaN, ORCH, 0)).toBe(0);
-    expect(taxUSD({ mean: 500, n: 1 }, 5, { input: 1, output: 1 }, 0)).toBe(0);
+  });
+
+  it("QA-1.3-14: a model without a cache-read price re-reads at its input price", () => {
+    expect(taxUSD({ mean: 500, n: 1 }, 5, { input: 2, output: 8 }, 0)).toBeCloseTo((500 * 5 * 2) / 1e6, 15);
+    expect(taxUSD({ mean: 500, n: 1 }, 5, { input: 2, output: 8, cache: { write: 3 } }, 0)).toBeCloseTo((500 * 5 * 2) / 1e6, 15);
+    // an explicit cache-read price (even 0) wins over the input price
+    expect(taxUSD({ mean: 500, n: 1 }, 5, { input: 2, output: 8, cache: { read: 0.2 } }, 0)).toBeCloseTo((500 * 5 * 0.2) / 1e6, 15);
+    expect(taxUSD({ mean: 500, n: 1 }, 5, { input: 2, output: 8, cache: { read: 0 } }, 0)).toBe(0);
   });
 });
 
