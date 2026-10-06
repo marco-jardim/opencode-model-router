@@ -244,6 +244,17 @@ function sessionFields(
   return { resume: resumeBasis.resume, resumeBasis };
 }
 
+/** Ladder tiers above `tier` (A17's H); 0 when the tier is not on the ladder. */
+function tiersAbove(policy: EscalatePolicy, tier: string): number {
+  const index = tierRank(tier, policy.ladder);
+  return index < 0 ? 0 : policy.ladder.length - 1 - index;
+}
+
+/** A17: `maxTotalAttempts − totalAttempts − 1 ≥ H`, so every ladder tier above keeps at least one attempt. */
+function reserveAllows(policy: EscalatePolicy, state: LadderState): boolean {
+  return policy.maxTotalAttempts - state.totalAttempts - 1 >= tiersAbove(policy, state.currentTier);
+}
+
 /** D10 "escalate the model": skip next tiers on the same model whose base the current tier already covered. */
 function skipCoveredTiers(
   next: string | null,
@@ -302,10 +313,14 @@ export function nextAction(
 
   const variants = policy.variants ?? null;
   const info = variants ? ownTierInfo(policy, state.currentTier) : undefined;
+  // A17 budget reserve: on a tier with variant info, spending another attempt here (variant step
+  // or plain retry) must leave one attempt for each ladder tier above; otherwise escalate now.
+  // Tiers without variant info are untouched.
+  const mayStay = !info || reserveAllows(policy, state);
 
   // (5V) variant step (D10): not gated by attemptsThisTier; steps 3 and 4 above
   // already bound it by maxTotalAttempts and the cost ceiling.
-  if (variants && info) {
+  if (variants && info && mayStay) {
     const variant = nextVariant(info.ladder, state.currentVariant ?? info.base);
     if (variant !== null) {
       const forcingMessage = buildLadderForcingMessage(verdict?.reasons ?? []);
@@ -322,7 +337,7 @@ export function nextAction(
   }
 
   // (5) retry within tier
-  if (state.attemptsThisTier < policy.maxAttemptsPerTier) {
+  if (mayStay && state.attemptsThisTier < policy.maxAttemptsPerTier) {
     const action: LadderAction = {
       action: "retry",
       tier: state.currentTier,

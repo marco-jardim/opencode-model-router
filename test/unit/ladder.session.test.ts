@@ -21,6 +21,7 @@ import {
   HOST_EFFORT_ORDER,
   catalogVariantIds,
   estimateTokensFromChars,
+  modelRef,
   resumeDecision,
   type CatalogModel,
 } from "../../src/escalate/variants";
@@ -34,6 +35,7 @@ const SONNET = "anthropic/claude-sonnet-5-5";
 const OPUS = "anthropic/claude-opus-5-5";
 const HAIKU = "anthropic/claude-haiku-4-5";
 const PLAIN = "anthropic/no-variants";
+const LUNA_FAST = "openai/gpt-6-luna-fast";
 
 const entry = (variants: string[], limit?: CatalogModel["limit"]): CatalogModel => ({
   variants: variants.map((id) => ({ id })),
@@ -47,6 +49,7 @@ const CATALOG: Record<string, CatalogModel> = {
   [OPUS]: entry(["low", "medium", "high", "xhigh", "max"], { context: 1_000_000, output: 200_000 }),
   [HAIKU]: entry(["high", "max"], { input: 200_000 }),
   [PLAIN]: { limit: { input: 100_000 } },
+  [LUNA_FAST]: entry(["none", "low", "medium", "high", "xhigh", "max"], { input: 272_000 }),
 };
 const lookup = (model: string): CatalogModel | undefined => (Object.hasOwn(CATALOG, model) ? CATALOG[model] : undefined);
 const V2: LadderSessionPolicyInput = { host: "v2", catalog: lookup };
@@ -65,6 +68,13 @@ function makeConfig(tiers: Record<string, TierConfig>, escalate: EnforcementConf
 const OWNER: Record<string, TierConfig> = {
   fast: { model: SONNET, variant: "low", costRatio: 1 },
   medium: { model: SONNET, variant: "medium", costRatio: 5 },
+  heavy: { model: OPUS, variant: "xhigh", costRatio: 20 },
+};
+
+// The live `hybrid-2` preset (plan §1.5 owner traces).
+const HYBRID2: Record<string, TierConfig> = {
+  fast: { model: LUNA_FAST, variant: "medium", costRatio: 1 },
+  medium: { model: SONNET, variant: "xhigh", costRatio: 5 },
   heavy: { model: OPUS, variant: "xhigh", costRatio: 20 },
 };
 
@@ -145,6 +155,17 @@ function runLoop(
     state = advance(state, action);
   }
   throw new Error("loop did not terminate");
+}
+
+/** The `model#variant` each attempt of a runLoop run executes: the start tier's base, then every action. */
+function attemptTrace(policy: EscalatePolicy, run: ReturnType<typeof runLoop>): string[] {
+  const start = run.states[0]!;
+  const first = policy.variants!.perTier[start.currentTier]!;
+  const rungs = [modelRef(first.model, first.base)];
+  for (const action of run.actions) {
+    if (action.action === "retry" || action.action === "escalate") rungs.push(modelRef(action.model!, action.variant));
+  }
+  return rungs;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +495,7 @@ describe("nextAction variant steps (5V)", () => {
   });
 
   it("stops after one variant step when maxTotalAttempts is 2", () => {
-    const policy = handPolicy({ fast: info(SONNET, "low", ["low", "medium", "high", "xhigh"]) }, { maxTotalAttempts: 2 });
+    const policy = handPolicy({ fast: info(SONNET, "low", ["low", "medium", "high", "xhigh"]) }, { maxTotalAttempts: 2, ladder: ["fast"] });
     const run = runLoop(policy);
     expect(run.actions.map((a) => a.action)).toEqual(["retry", "give_up"]);
     expect(run.actions[0]).toMatchObject({ variantStep: true, variant: "medium" });
@@ -559,10 +580,11 @@ describe("attempt accounting", () => {
   it("counts variant steps toward the total in the real loop and ends within maxTotalAttempts", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
     const run = runLoop(policy);
+    // A17: fast#low, fast#medium (variant step), then the reserve forces the escalation to heavy, which retries once.
     expect(run.state.totalAttempts).toBe(4);
-    expect(run.state.variantSteps).toBe(3);
-    expect(run.state.attemptsThisTier).toBe(0);
-    expect(run.state.escalations).toBe(0);
+    expect(run.state.variantSteps).toBe(1);
+    expect(run.state.attemptsThisTier).toBe(1);
+    expect(run.state.escalations).toBe(1);
   });
 });
 
@@ -870,23 +892,23 @@ describe("skipCoveredTiers (F4)", () => {
 // ---------------------------------------------------------------------------
 
 describe("owner preset trace", () => {
-  it("spends the default budget on fast#low, #medium, #high, #xhigh, then gives up", () => {
+  it("anthropic preset, default budget: sonnet#low, sonnet#medium, then the reserve escalates to opus#xhigh twice", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
     expect(policy.maxTotalAttempts).toBe(4);
     expect(policy.costMultiple).toBe(4);
     const run = runLoop(policy);
-    expect(run.states.map((s) => s.currentVariant)).toEqual([null, "medium", "high", "xhigh"]);
-    expect(run.states.map((s) => s.currentTier)).toEqual(["fast", "fast", "fast", "fast"]);
-    expect(run.actions.slice(0, 3).map((a) => [a.action, a.variantStep, a.variant, a.model])).toEqual([
-      ["retry", true, "medium", SONNET],
-      ["retry", true, "high", SONNET],
-      ["retry", true, "xhigh", SONNET],
+    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${OPUS}#xhigh`, `${OPUS}#xhigh`]);
+    expect(run.actions.map((a) => [a.action, a.tier, a.variantStep === true])).toEqual([
+      ["retry", "fast", true],
+      ["escalate", "heavy", false],
+      ["retry", "heavy", false],
+      ["give_up", undefined, false],
     ]);
     expect(run.actions[3]).toEqual({ action: "give_up", reason: "max total attempts (4) reached" });
-    expect(formatLadderScorecard(run.state, false, "owner")).toContain("final_tier=fast#xhigh");
+    expect(formatLadderScorecard(run.state, false, "owner")).toContain("final_tier=heavy |");
   });
 
-  it("with a larger budget the escalation skips medium (covered) and lands on heavy", () => {
+  it("anthropic preset, larger budget: all of fast's variants first, then the covered medium is skipped for heavy", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER, { maxTotalAttempts: 10, costCeiling: { multiple: 40 } }), V2);
     const costRatio = (state: LadderState) => OWNER[state.currentTier]!.costRatio!;
     const run = runLoop(policy, { cost: costRatio });
@@ -911,8 +933,64 @@ describe("owner preset trace", () => {
     expect(run.state.currentTier).toBe("heavy");
     expect(run.state.currentVariant).toBeNull();
   });
+
+  it("hybrid-2 preset (luna-fast#medium, sonnet#xhigh, opus#xhigh), default budget", () => {
+    const policy = buildEscalatePolicy(makeConfig(HYBRID2), V2);
+    expect(policy.variants!.perTier.fast!.ladder.variants).toEqual(["none", "low", "medium", "high", "xhigh"]);
+    const run = runLoop(policy);
+    expect(attemptTrace(policy, run)).toEqual([`${LUNA_FAST}#medium`, `${LUNA_FAST}#high`, `${SONNET}#xhigh`, `${OPUS}#xhigh`]);
+    expect(run.actions.map((a) => a.action)).toEqual(["retry", "escalate", "escalate", "give_up"]);
+    expect(run.actions[3]).toEqual({ action: "give_up", reason: "max total attempts (4) reached" });
+  });
 });
 
+describe("A17 budget reserve", () => {
+  const perTier = { fast: info(SONNET, "low", ["low", "medium", "high", "xhigh"]), medium: info(OPUS, "medium", ["medium", "high"]) };
+
+  it("steps only while maxTotalAttempts − totalAttempts − 1 ≥ the number of ladder tiers above (H)", () => {
+    // ladder [fast, medium, heavy]: H(fast) = 2, H(medium) = 1, H(heavy) = 0.
+    const policy = handPolicy(perTier, { maxTotalAttempts: 5 });
+    expect(nextAction(sessionState({ totalAttempts: 2 }), fail, policy)).toMatchObject({ action: "retry", variantStep: true }); // 5-2-1 = 2 ≥ 2
+    const escalated = nextAction(sessionState({ totalAttempts: 3 }), fail, policy); // 5-3-1 = 1 < 2
+    expect(escalated).toMatchObject({ action: "escalate", tier: "medium", agent: "medium", model: OPUS, variant: "medium" });
+    expect(escalated).not.toHaveProperty("variantStep");
+    expect(nextAction(sessionState({ currentTier: "medium", totalAttempts: 3 }), fail, policy))
+      .toMatchObject({ action: "retry", variantStep: true, variant: "high" }); // 5-3-1 = 1 ≥ 1
+    expect(nextAction(sessionState({ currentTier: "medium", totalAttempts: 4 }), fail, policy))
+      .toMatchObject({ action: "escalate", tier: "heavy" }); // 5-4-1 = 0 < 1
+  });
+
+  it("gates the plain retry too, and leaves the top tier unconstrained", () => {
+    const policy = handPolicy({ fast: info(SONNET, "high", ["high"]), heavy: info(OPUS, "xhigh", ["xhigh"]) }, { maxTotalAttempts: 3 });
+    // fast has no variant step left, attemptsThisTier 0 < 1, but 3-2-1 = 0 < 2: escalate.
+    expect(nextAction(sessionState({ totalAttempts: 2 }), fail, policy)).toMatchObject({ action: "escalate", tier: "medium" });
+    // heavy: H = 0, so the last allowed attempt may still retry.
+    expect(nextAction(sessionState({ currentTier: "heavy", totalAttempts: 2 }), fail, policy)).toMatchObject({ action: "retry", tier: "heavy" });
+    expect(nextAction(sessionState({ currentTier: "heavy", totalAttempts: 3 }), fail, policy)).toMatchObject({ action: "give_up" });
+  });
+
+  it("treats a tier that is not on the ladder as H = 0", () => {
+    const policy = handPolicy({ fast: info(SONNET, "low", ["low", "medium"]) }, { ladder: ["medium", "heavy"], maxTotalAttempts: 2 });
+    expect(nextAction(sessionState({ currentTier: "fast", totalAttempts: 1 }), fail, policy)).toMatchObject({ action: "retry", variantStep: true });
+  });
+
+  it("does not touch tiers without variant info", () => {
+    const policy = handPolicy({ medium: info(OPUS, "medium", ["medium", "high"]) }, { maxTotalAttempts: 2 });
+    const action = nextAction(sessionState({ totalAttempts: 1 }), fail, policy);
+    expect(action).toMatchObject({ action: "retry", tier: "fast" }); // plain retry although 2-1-1 = 0 < 2
+    expect(action).not.toHaveProperty("model");
+    expect(action).not.toHaveProperty("variantStep");
+  });
+
+  it("never gives up early on a tier with variant info while total attempts remain and a higher tier exists", () => {
+    for (let maxTotalAttempts = 1; maxTotalAttempts <= 8; maxTotalAttempts++) {
+      const policy = handPolicy(perTier, { maxTotalAttempts, maxAttemptsPerTier: 2 });
+      const run = runLoop(policy);
+      expect(run.state.totalAttempts).toBeLessThanOrEqual(maxTotalAttempts);
+      if (maxTotalAttempts >= 3) expect(run.state.escalations).toBeGreaterThanOrEqual(1); // the reserve reaches a higher tier
+    }
+  });
+});
 // ---------------------------------------------------------------------------
 // Scorecard (§10) and purity
 // ---------------------------------------------------------------------------
@@ -1046,6 +1124,11 @@ describe("property-based: session-aware loop", () => {
           expect(action.action).not.toBe("escalate");
         }
         if (verdict.pass) expect(action.action).toBe("accept");
+        // A17: a retry on a tier with variant info always leaves one attempt for every tier above it.
+        if (action.action === "retry" && policy.variants?.perTier[state.currentTier]) {
+          const above = policy.ladder.length - 1 - policy.ladder.indexOf(state.currentTier);
+          expect(maxTotalAttempts - state.totalAttempts - 1).toBeGreaterThanOrEqual(above);
+        }
 
         if (action.variant !== undefined) {
           expect(action.variant).not.toBe(DEFAULT_VARIANT);
