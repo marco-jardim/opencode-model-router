@@ -1426,6 +1426,20 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
  * name: no empty id, no whitespace, no `#`.
  */
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./-]*$/;
+
+/**
+ * An agent id: {@link AGENT_ID_PATTERN}, and nothing path-like beyond a plain
+ * `a/b`: no empty, `.` or `..` segment (`a//b`, `a/../b`, `a/./b`) and no
+ * trailing `/` or `.` (QA-1.1-27).
+ */
+function isAgentId(id: string): boolean {
+  return (
+    AGENT_ID_PATTERN.test(id) &&
+    !id.endsWith("/") &&
+    !id.endsWith(".") &&
+    !id.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  );
+}
 /** Environment variable names (`classifier.apiKeyEnv`). */
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** A variant id: non-empty, no whitespace, no `#` (the ref separator). */
@@ -1512,9 +1526,17 @@ function readBlock(
   return value;
 }
 
-/** An absolute path, or `~` / `~/…` / `~\...` (the home directory; expanded by resolveRouting). */
+/**
+ * An absolute path, or `~` / `~/…` / `~\...` (the home directory; expanded by
+ * resolveRouting). On Windows "absolute" means a drive letter (`C:\x`, `C:/x`) or
+ * a UNC path (`\\server\share`): a rooted path without a drive (`\x`, `/x`) is
+ * relative to the current drive and so to wherever the process happens to run
+ * (QA-1.1-27).
+ */
 function isAbsoluteOrHomePath(value: string): boolean {
-  return isAbsolute(value) || value === "~" || /^~[\\/]/.test(value);
+  if (value === "~" || /^~[\\/]/.test(value)) return true;
+  if (!isAbsolute(value)) return false;
+  return process.platform !== "win32" || /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(value);
 }
 
 /** `provider/model` or `provider/model#variant` (a catalog reference). */
@@ -1668,9 +1690,9 @@ function validateRoles(routing: Record<string, unknown>): Record<string, string[
     }
     const ids: string[] = [];
     for (const agent of agents as unknown[]) {
-      if (typeof agent !== "string" || !AGENT_ID_PATTERN.test(agent)) {
+      if (typeof agent !== "string" || !isAgentId(agent)) {
         throw new Error(
-          `tiers.json: routing.roles.'${taskClass}' entries must be agent ids matching ${AGENT_ID_PATTERN.source} (got ${describeValue(agent)})`,
+          `tiers.json: routing.roles.'${taskClass}' entries must be agent ids matching ${AGENT_ID_PATTERN.source}, without '.' or '..' segments and not ending in '/' or '.' (got ${describeValue(agent)})`,
         );
       }
       ids.push(agent);

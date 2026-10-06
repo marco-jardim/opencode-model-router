@@ -1204,3 +1204,31 @@ describe("validateConfig — tier variant and per-preset costRatio (QA-1.1-26, Q
     ).not.toThrow();
   });
 });
+describe("validateConfig — agent ids and outcomes.path edge cases (QA-1.1-27)", () => {
+  it.each(["a.b", "team/helper", "team/sub-team/helper_2", "v1.2/agent", "a-b.c"])("accepts the agent id %s", (agent) => {
+    expect(validateConfig(withRouting({ roles: { search: [agent] } })).routing?.roles?.search).toEqual([agent]);
+  });
+
+  it.each(["a/../b", "a/./b", "a//b", "a/..", "a/.", "a/", "a.", "team/helper/", "team/helper.", "a/b/../../c"])(
+    "rejects the path-like agent id %s",
+    (agent) => {
+      expect(() => validateConfig(withRouting({ roles: { search: [agent] } }))).toThrow(
+        /routing\.roles\.'search' entries must be agent ids matching .*, without '\.' or '\.\.' segments and not ending in '\/' or '\.'/,
+      );
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")("on Windows, outcomes.path needs a drive letter or a UNC prefix", () => {
+    for (const path of ["C:\\data\\omr", "C:/data/omr", "d:\\x", "\\\\server\\share\\omr", "//server/share/omr"]) {
+      expect(validateConfig(withRouting({ outcomes: { path } })).routing?.outcomes?.path).toBe(path);
+    }
+    for (const path of ["\\data\\omr", "/data/omr", "C:data", "\\\\", "//", "\\"]) {
+      expect(() => validateConfig(withRouting({ outcomes: { path } }))).toThrow(/routing\.outcomes\.path must be null or an absolute path/);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("on POSIX, a rooted path is absolute", () => {
+    expect(validateConfig(withRouting({ outcomes: { path: "/data/omr" } })).routing?.outcomes?.path).toBe("/data/omr");
+    expect(() => validateConfig(withRouting({ outcomes: { path: "data/omr" } }))).toThrow(/absolute path/);
+  });
+});
