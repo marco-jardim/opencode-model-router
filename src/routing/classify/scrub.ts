@@ -33,9 +33,24 @@ const ASSIGNMENT_RE = new RegExp(
   "gi",
 );
 
-/** "password is hunter2", "the token was abc123". Group 1 = words up to the value. */
+/**
+ * Upper-case env-style names ending in `_KEY` (`OPENAI_KEY`, `MASTER_KEY`,
+ * `ENCRYPTION_KEY`; QA-1.2-24). Case-sensitive on purpose: a lower-case `key` is
+ * an ordinary word, `_KEY` in capitals is a configuration name. Same group
+ * layout as ASSIGNMENT_RE.
+ */
+const ENV_KEY_ASSIGNMENT_RE =
+  /(\b[A-Z][A-Z0-9_]{0,48}_KEY["']?\s*[:=]\s*)(\[REDACTED\]|"(?:[^"\\\n]|\\.)*"|'[^'\n]*'|\S+)/g;
+
+/** The name alone, without a value (`set OPENAI_KEY before running`): a credential mention. */
+const ENV_KEY_NAME_RE = /\b[A-Z][A-Z0-9_]{0,48}_KEY\b/;
+
+/** "password is hunter2", "the key is hunter2", "the token was abc123". Group 1 = words up to the value. */
 const SPOKEN_RE =
-  /\b((?:pass(?:word|wd|phrase)|secret|token|api[_ -]?key|access[_ -]?key|credentials?|pin)\s+(?:is|are|was|were|=)\s+)["'`]?[^\s"'`]+["'`]?/gi;
+  /\b((?:pass(?:word|wd|phrase)|secret|token|(?:api|access|private|signing|ssh|master|encryption)[_ -]?key|key|credentials?|pin)\s+(?:is|are|was|were|=)\s+)["'`]?[^\s"'`]+["'`]?/gi;
+
+/** `mysql -u root -pSecret` (the password is glued to `-p`; a bare `-p` prompts and carries none). */
+const MYSQL_PASSWORD_RE = /(\b(?:mysql|mysqladmin|mysqldump)\b[^\n]{0,200}?\s)-p\S+/gi;
 
 /** `scheme://user:pass@host` and `scheme://token@host`. */
 const URL_USER_PASS_RE = /\b([a-z][a-z0-9+.-]{0,31}:\/\/[^\s/:@]+:)[^\s/]+@/gi;
@@ -65,6 +80,13 @@ const TOKEN_RES: readonly RegExp[] = [
   /\bgithub_pat_[A-Za-z0-9_]{16,}/g, // GitHub fine-grained
 ];
 
+/**
+ * A hex run of 32+ characters is a key, token or hash whatever its entropy
+ * (QA-1.2-24: `a1b2c3d4` repeated has low entropy and is still a 128-bit key).
+ * It needs both a letter and a digit, so a run of zeros or a plain number stays.
+ */
+const HEX_RUN_RE = /(?<![0-9A-Za-z])[0-9A-Fa-f]{32,}(?![0-9A-Za-z])/g;
+
 /** A run this long that looks random is a key, hash or blob, not prose. */
 const HIGH_ENTROPY_RUN_RE = /[A-Za-z0-9+/_=-]{32,}/g;
 const MIN_ENTROPY_BITS = 3.5;
@@ -85,23 +107,37 @@ function looksRandom(run: string): boolean {
   return shannonEntropy(run) >= MIN_ENTROPY_BITS;
 }
 
+export interface ScrubOptions {
+  /**
+   * Also redact bare hex and high-entropy runs (default true). These are the
+   * guesses of the scrubber: a commit hash or a minified blob looks the same as a
+   * key. Everything else it redacts is a named or shaped secret.
+   */
+  readonly entropy?: boolean;
+}
+
 /**
  * Redact every secret shape known to the classifier. Idempotent
  * (`scrubState(scrubState(x)) === scrubState(x)`).
  */
-export function scrubState(input: string): string {
+export function scrubState(input: string, options: ScrubOptions = {}): string {
   if (typeof input !== "string" || input.length === 0) return input;
   let out = input;
   out = out.replace(PEM_RE, `${REDACTED} (PEM block)`);
   out = out.replace(URL_USER_PASS_RE, `$1${REDACTED}@`);
   out = out.replace(URL_USER_ONLY_RE, `$1${REDACTED}@`);
   out = out.replace(CURL_USER_RE, `$1${REDACTED}`);
+  out = out.replace(MYSQL_PASSWORD_RE, `$1-p${REDACTED}`);
   out = out.replace(AUTH_HEADER_RE, `$1${REDACTED}`);
   out = out.replace(ASSIGNMENT_RE, `$1${REDACTED}`);
+  out = out.replace(ENV_KEY_ASSIGNMENT_RE, `$1${REDACTED}`);
   out = out.replace(SPOKEN_RE, `$1${REDACTED}`);
   for (const re of TOKEN_RES) out = out.replace(re, REDACTED);
   out = scrubText(out);
-  out = out.replace(HIGH_ENTROPY_RUN_RE, (run) => (looksRandom(run) ? REDACTED : run));
+  if (options.entropy !== false) {
+    out = out.replace(HEX_RUN_RE, (run) => (/\d/.test(run) && /[A-Fa-f]/.test(run) ? REDACTED : run));
+    out = out.replace(HIGH_ENTROPY_RUN_RE, (run) => (looksRandom(run) ? REDACTED : run));
+  }
   return out;
 }
 
@@ -114,12 +150,15 @@ const CREDENTIAL_WORD_RE =
   /\b(?:passwords?|passwd|passphrases?|secrets?|credentials?|api[_ -]?keys?|access[_ -]?keys?|private[_ -]?keys?|ssh[_ -]?keys?|signing[_ -]?keys?|tokens?|bearer|authorization|oauth)\b|[A-Za-z0-9]_(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)\b|-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)|(?<![\w])\.env\b/i;
 
 /**
- * Policy gate (QA-1.2-1): no backend is consulted for a task that names a
- * credential or contains something the scrubber had to redact. The rules facts
- * stand; nothing leaves the machine.
+ * Policy gate (QA-1.2-1, QA-1.2-26): no backend is consulted for a task that
+ * names a credential (a credential word or an env-style `*_KEY` name) or
+ * contains a named or shaped secret the scrubber had to redact. The rules facts
+ * stand; nothing leaves the machine. A redaction that is only the scrubber's
+ * entropy guess (a commit hash, a long identifier) does NOT skip the backend:
+ * the redacted state is sent.
  */
 export function hasCredentialSignal(text: string): boolean {
   if (typeof text !== "string" || text.length === 0) return false;
-  if (CREDENTIAL_WORD_RE.test(text)) return true;
-  return scrubState(text) !== text;
+  if (CREDENTIAL_WORD_RE.test(text) || ENV_KEY_NAME_RE.test(text)) return true;
+  return scrubState(text, { entropy: false }) !== text;
 }

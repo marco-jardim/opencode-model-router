@@ -1094,6 +1094,8 @@ const STRIPE_KEY = ["sk", "live", "51HxYzAbCdEfGhIjKlMnOpQrSt"].join("_");
 const HF_TOKEN = ["hf", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"].join("_");
 const GITLAB_TOKEN = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
 const NPM_TOKEN = ["npm", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"].join("_");
+// 32 hex characters of LOW entropy (four distinct symbol pairs): a real 128-bit key can look like this.
+const HEX_KEY = "a1b2c3d4".repeat(4);
 
 describe("state scrub (QA-1.2-1)", () => {
   /** [label, text, every fragment that must not survive]. */
@@ -1118,6 +1120,14 @@ describe("state scrub (QA-1.2-1)", () => {
       ["MIIEpAIBAAKCAQEA7bq98", "xyz0123456789ABCDEF"],
     ],
     ["secret with base64 punctuation", "secret=abcdef+ghijk/lmnopq==", ["abcdef", "ghijk", "lmnopq"]],
+    // QA-1.2-24: `_KEY` names, "the key is", mysql -p, low-entropy hex keys.
+    ["env-style OPENAI_KEY", "export OPENAI_KEY=abcd1234wxyz", ["abcd1234wxyz"]],
+    ["MASTER_KEY", "MASTER_KEY=hunter2hunter2", ["hunter2hunter2"]],
+    ["ENCRYPTION_KEY with a colon", "ENCRYPTION_KEY: correcthorsebatterystaple", ["correcthorsebatterystaple"]],
+    ["spoken key", "the key is hunter2hunter2", ["hunter2hunter2"]],
+    ["mysql -p glued password", "mysql -u root -pHunter2xyz", ["Hunter2xyz"]],
+    ["mysqldump -p", "mysqldump --single-transaction -u backup -pS3cretDump db > out.sql", ["S3cretDump"]],
+    ["32-hex key in prose", `rotate it: the material is ${HEX_KEY} for now`, [HEX_KEY, "a1b2c3d4a1b2"]],
     [
       "own: Authorization header",
       "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' https://api.example.com",
@@ -1204,10 +1214,11 @@ describe("hasCredentialSignal (QA-1.2-1 policy gate)", () => {
       "copy .env to the server",
       "use Bearer abc",
       `see ${STRIPE_KEY}`,
-      "run with Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0",
     ]) {
       expect(hasCredentialSignal(text), text).toBe(true);
     }
+    // A bare random-looking run is the scrubber's own guess (QA-1.2-26): redacted, but not a reason to skip.
+    expect(hasCredentialSignal("run with Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0")).toBe(false);
   });
 
   it("stays quiet on ordinary tasks", () => {
@@ -1578,5 +1589,41 @@ describe("state: fences, truncation and long blobs (QA-1.2-11, QA-1.2-12)", () =
       buildClassifierState({ prompt }, 4000);
       expect(performance.now() - started).toBeLessThan(250);
     }
+  });
+});
+describe("QA-1.2-24 probes and the credential gate", () => {
+  it("a bare `-p` (mysql prompts for the password) carries no secret and is left alone", () => {
+    expect(scrubState("mysql -u root -p mydb")).toBe("mysql -u root -p mydb");
+    expect(scrubState("mysql --protocol=tcp -u root")).toBe("mysql --protocol=tcp -u root");
+  });
+
+  it("the _KEY rule is case-sensitive: an ordinary lower-case key is prose, a CONFIG_KEY is not", () => {
+    expect(scrubState("the sort key: name")).toBe("the sort key: name");
+    expect(scrubState("sort_key = name")).toBe("sort_key = name");
+    expect(scrubState("SORT_KEY=name")).toBe("SORT_KEY=[REDACTED]");
+  });
+
+  it("named secrets skip the backend; a bare hex key is redacted but does not", () => {
+    for (const text of [
+      "export OPENAI_KEY=abcd1234wxyz",
+      "MASTER_KEY=hunter2hunter2",
+      "ENCRYPTION_KEY: correcthorsebatterystaple",
+      "the key is hunter2hunter2",
+      "mysql -u root -pHunter2xyz",
+      "rotate the ENCRYPTION_KEY",
+    ]) {
+      expect(hasCredentialSignal(text), text).toBe(true);
+    }
+    const prose = `rotate it: the material is ${HEX_KEY} for now`;
+    expect(scrubState(prose)).not.toContain(HEX_KEY);
+    expect(hasCredentialSignal(prose)).toBe(false);
+  });
+
+  it("a hex run needs both a letter and a digit; short ones stay", () => {
+    expect(scrubState("0".repeat(40))).toBe("0".repeat(40));
+    expect(scrubState("deadbeef".repeat(4))).toBe("deadbeef".repeat(4));
+    expect(scrubState("1234567890".repeat(4))).toBe("1234567890".repeat(4));
+    expect(scrubState("a1b2c3d4".repeat(3))).toBe("a1b2c3d4".repeat(3)); // 24 chars
+    expect(scrubState("a1b2c3d4".repeat(5))).toBe("[REDACTED]"); // a 40-char commit hash is redacted too
   });
 });
