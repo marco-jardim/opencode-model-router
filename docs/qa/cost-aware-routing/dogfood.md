@@ -137,3 +137,22 @@ Window: 2026-10-06T15:28:34.000Z → open
 _Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._
 
 ```
+
+### Classifier credential check (A4/A13)
+
+**Override used (2026-10-06, set by the orchestrator, global file):** `{"routing":{"engine":"advise","classifier":{"backend":"host","model":"opencode-go/deepseek-v4.1-flash","timeoutMs":10000}}}` (the model the owner named, A13). **Restored to `{"routing":{"engine":"advise"}}` at ≈20:35Z** (read back afterwards: the file holds exactly that; last written 2026-10-06T20:34:58Z).
+
+**Probe:** a dispatch to `fast` from session `ses_ef09ca71effe2FoiBgxxJuCg6W`, description `DF3 classifier probe 2`, prompt `Which word is longer, "alpha" or "omega"? Reply with one word only, no tools.` The rows of that session in `decisions.jsonl`:
+
+| Time (UTC) | Row |
+|---|---|
+| 20:32:57.803Z (probe 1) | `mode=advise`, `search`, confidence 0.8, `source=rules`, `trace.backend=null`, no `backendSkipped`. At or above `minClassConfidence` (0.7): no backend is consulted by design. |
+| **20:34:08.917Z (probe 2)** | `mode=advise`, `other` / `medium` / `single` / no needs, confidence 0.2, `source=rules`, **`trace.backend={"id":"host","status":"ok","latencyMs":1688,"label":"other"}`**, no `backendSkipped`. Below 0.7, so the backend was consulted, and it answered. |
+
+**Correction to the first reading.** The first reading took the rows at 20:34:26.940Z and 20:34:35.001Z as the probe's (`class` `design` / `implement`, confidence 0.5, `trace.backend=null`, `trace.backendSkipped="credentials"`) and concluded a credential-gate false positive. They are not the probe's. They belong to session `ses_ef099b1e0ffe7BcoD9Trb0TpTm`, which wrote three consecutive rows at 20:34:13Z, 20:34:26Z and 20:34:35Z (`design`/`heavy`, `design`/`heavy`, `implement`/`medium`; `risk=high`, `scope=multi`, needs `shell`/`edit`…): long task briefs, not a one-line probe. `decisions.jsonl` is one file for every host session (D15), so reading its tail mixes sessions. The probe's own facts (`other`/`medium`/`single`/no needs/0.2) are reproduced exactly by the rules on the probe inputs in a unit test; a one-line prompt cannot produce `design`/`high`/`multi`.
+
+**Result:** the credential gate did **not** block the probe and there is **no false positive on it**. The gate skipped the other session's briefs because it found a credential signal in their text (D14, working as designed); the rows store no prompt text, so which word fired cannot be re-read. The host backend **was consulted live once** with `opencode-go/deepseek-v4.1-flash` through `ctx.generate.text` (A4): `status=ok` in 1688 ms, label `other`. It was **not** verified in the form the plan's pass criterion asks for: `facts.source` stays `rules` because a backend answer of `other` never changes the rules facts (`mergeBackend`), and `/annotate-plan` on a two-step sample (the batched `classifyMany` path, F3) was not run. **`source: "host"` for both steps was not observed, so `host` stays documented as *experimental* (A4) until that run is done; the single-call path is live-verified, the batched path is not.**
+
+**Root cause and fix:** no defect in the gate. The patterns and the scrubber do not match the probe, the adapter passes `args.prompt` unchanged (`route()` runs before the legacy hook; `taskArgs` spreads the input), and the earlier `search` probe was simply above the threshold. Fix commit: `e99330c` `test(routing): pin the credential gate on the DF3 probe, ordinary prompts and real secrets` (regression tests, plus a comment in `scrub.ts` stating the rule). Details and the ten-prompt judgement: `docs/qa/cost-aware-routing/phase-df3-credential-gate.md`.
+
+**Liveness after the DF3 restart (inferred, not observed):** the host logged `cli starting` at 2026-10-06T20:32:23Z, after the sync at 18:41:27Z, so the synced code is what loaded; the first row with `mode=advise` is at 20:32:57Z (confirmed in `decisions.jsonl`). The `/router` marker line (`engine=… build=…`) was not read, so liveness rests on the restart timing and on that first `advise` row. The `cli starting` time is as recorded by the orchestrator; `opencode.log` was not re-read here.
