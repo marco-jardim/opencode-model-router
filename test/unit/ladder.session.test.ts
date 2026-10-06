@@ -123,6 +123,8 @@ function sessionState(over: Partial<LadderState> = {}): LadderState {
 }
 
 const fail: LadderVerdict = { pass: false, outcome: "fail", reasons: ["check failed"] };
+const TOP_REASON = "no higher tier (already at top of ladder)";
+const COVERED_REASON = "no higher tier left to try (the remaining tiers only repeat rungs already tried)";
 
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -1018,7 +1020,7 @@ describe("skipCoveredTiers (F4)", () => {
   it("gives up when every later tier is covered", () => {
     const covered = { fast: sameModel.fast, medium: sameModel.medium, heavy: info(SONNET, "high", ["low", "medium", "high", "xhigh"]) };
     const action = nextAction(sessionState({ attemptsThisTier: 1, currentVariant: "xhigh" }), fail, handPolicy(covered));
-    expect(action).toEqual({ action: "give_up", reason: "no higher tier (already at top of ladder)" });
+    expect(action).toEqual({ action: "give_up", reason: COVERED_REASON });
   });
 
   it("treats a default-based same-model tier as covered by default", () => {
@@ -1034,7 +1036,7 @@ describe("skipCoveredTiers (F4)", () => {
   it("terminates with give_up on a duplicate-ladder [fast, fast] with a covered tier", () => {
     const policy = handPolicy({ fast: info(SONNET, "low", ["low", "medium"]) }, { ladder: ["fast", "fast"] });
     const action = nextAction(sessionState({ attemptsThisTier: 1, currentVariant: "medium" }), fail, policy);
-    expect(action).toEqual({ action: "give_up", reason: "no higher tier (already at top of ladder)" });
+    expect(action).toEqual({ action: "give_up", reason: COVERED_REASON });
     const larger = handPolicy({ fast: info(SONNET, "low", ["low", "medium"]) }, { ladder: ["fast", "fast", "fast", "fast"] });
     expect(nextAction(sessionState({ attemptsThisTier: 1, currentVariant: "medium" }), fail, larger)).toMatchObject({ action: "give_up" });
   });
@@ -1342,6 +1344,65 @@ describe("triedByModel (A17a, QA-1.5-17)", () => {
       expect(policy.variants!.perTier.medium!.ladder.variants).toContain(action.variant);
       expect(action.costRatio).toBe(policy.variants!.perTier.medium!.costRatios[action.variant!]);
     }
+  });
+});
+describe("reserve fallback when no tier above can run (QA-1.5-19)", () => {
+  // Every tier is on sonnet, so once fast has reached xhigh the later tiers only repeat tried rungs.
+  const covered = {
+    fast: info(SONNET, "high", ["high", "xhigh"]),
+    medium: info(SONNET, "medium", ["medium"]),
+    heavy: info(SONNET, "high", ["high"]),
+  };
+  const policyFor = (over: Partial<EscalatePolicy>) => handPolicy(covered, { maxAttemptsPerTier: 5, maxTotalAttempts: 6, ...over });
+
+  it("spends the withheld attempts on the current tier instead of giving up with budget left", () => {
+    const policy = policyFor({});
+    // 6 - 4 - 1 = 1 < H = 2: the reserve forces the escalation, but medium and heavy only repeat tried rungs
+    const state = sessionState({ totalAttempts: 4, attemptsThisTier: 2, currentVariant: "xhigh", triedByModel: { [SONNET]: "xhigh" } });
+    const action = nextAction(state, fail, policy);
+    expect(action).toMatchObject({ action: "retry", tier: "fast", model: SONNET, variant: "xhigh" });
+    expect(action).not.toHaveProperty("variantStep");
+    const run = runLoop(policy);
+    expect(run.state.totalAttempts).toBe(6);
+    expect(run.actions.map((a) => a.action)).toEqual(["retry", "retry", "retry", "retry", "retry", "give_up"]);
+    expect(run.actions.at(-1)).toEqual({ action: "give_up", reason: "max total attempts (6) reached" });
+    expect(run.states.map((s) => s.currentTier)).toEqual(Array(6).fill("fast"));
+    expect(run.actions.some((a) => a.action === "escalate")).toBe(false);
+  });
+
+  it("falls back to a variant step when one is left", () => {
+    const policy = handPolicy(
+      { fast: info(SONNET, "low", ["low", "medium", "high"]), medium: info(SONNET, "medium", ["low", "medium"]), heavy: info(SONNET, "high", ["high"]) },
+      { maxAttemptsPerTier: 5, maxTotalAttempts: 4 },
+    );
+    // fast reached medium and 4 - 3 - 1 = 0 < 2 forces the exit. heavy (base high) is above the tried
+    // medium, so it is entered and there is no fallback.
+    const entered = nextAction(sessionState({ totalAttempts: 3, currentVariant: "medium", triedByModel: { [SONNET]: "medium" } }), fail, policy);
+    expect(entered).toMatchObject({ action: "escalate", tier: "heavy" }); // a tier above can still run: no fallback
+    // Here medium and heavy (bases medium and low) are both covered by the tried medium and offer nothing
+    // above it, so the withheld attempt is spent on fast as a variant step.
+    const stuck = handPolicy(
+      { fast: info(SONNET, "low", ["low", "medium", "high"]), medium: info(SONNET, "medium", ["medium"]), heavy: info(SONNET, "low", ["low"]) },
+      { maxAttemptsPerTier: 5, maxTotalAttempts: 4 },
+    );
+    const state = sessionState({ totalAttempts: 3, currentVariant: "medium", triedByModel: { [SONNET]: "medium" } });
+    expect(nextAction(state, fail, stuck)).toMatchObject({ action: "retry", variantStep: true, tier: "fast", variant: "high" });
+  });
+
+  it("keeps the escalation when a tier above can still run", () => {
+    const policy = handPolicy({ ...covered, heavy: info(OPUS, "xhigh", ["xhigh"], 800_000) }, { maxAttemptsPerTier: 5, maxTotalAttempts: 6 });
+    const state = sessionState({ totalAttempts: 4, attemptsThisTier: 2, currentVariant: "xhigh", triedByModel: { [SONNET]: "xhigh" } });
+    expect(nextAction(state, fail, policy)).toMatchObject({ action: "escalate", tier: "heavy", model: OPUS });
+  });
+
+  it("gives up with the covered reason when nothing is left to spend, and keeps the top-of-ladder text at the top", () => {
+    const state = sessionState({ totalAttempts: 4, attemptsThisTier: 5, currentVariant: "xhigh", triedByModel: { [SONNET]: "xhigh" } });
+    expect(nextAction(state, fail, policyFor({}))).toEqual({ action: "give_up", reason: COVERED_REASON });
+    const top = handPolicy({ fast: info(SONNET, "high", ["high", "xhigh"]) }, { ladder: ["fast"], maxAttemptsPerTier: 1 });
+    expect(nextAction(sessionState({ attemptsThisTier: 1, currentVariant: "xhigh" }), fail, top)).toEqual({ action: "give_up", reason: TOP_REASON });
+    // without policy.variants the 2.2.0 text is untouched
+    const plain: EscalatePolicy = { ladder: ["fast"], maxAttemptsPerTier: 1, maxTotalAttempts: 4, costMultiple: null };
+    expect(nextAction({ ...sessionState({ attemptsThisTier: 1 }) }, fail, plain)).toEqual({ action: "give_up", reason: TOP_REASON });
   });
 });
 // ---------------------------------------------------------------------------

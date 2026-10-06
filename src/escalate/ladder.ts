@@ -405,28 +405,29 @@ export function nextAction(
   // `policy.variants` the ladder is exactly the 2.2.0 one.
   const mayStay = !variants || reserveAllows(policy, state);
 
-  // (5V) variant step (D10): not gated by attemptsThisTier; steps 3 and 4 above
-  // already bound it by maxTotalAttempts and the cost ceiling.
-  if (variants && info && mayStay) {
+  // (5V) variant step (D10): not gated by attemptsThisTier; steps 3 and 4 above already bound it by
+  // maxTotalAttempts and the cost ceiling.
+  const variantStep = (): LadderAction | null => {
+    if (!variants || !info) return null;
     const variant = nextVariant(info.ladder, state.currentVariant ?? info.base);
-    if (variant !== null) {
-      const forcingMessage = buildLadderForcingMessage(verdict?.reasons ?? []);
-      return {
-        action: "retry",
-        tier: state.currentTier,
-        forcingMessage,
-        variantStep: true,
-        model: info.model,
-        variant,
-        ...costFields(info, variant),
-        rung: { model: info.model, variant },
-        ...sessionFields(state, variants, info, forcingMessage, session),
-      };
-    }
-  }
+    if (variant === null) return null;
+    const forcingMessage = buildLadderForcingMessage(verdict?.reasons ?? []);
+    return {
+      action: "retry",
+      tier: state.currentTier,
+      forcingMessage,
+      variantStep: true,
+      model: info.model,
+      variant,
+      ...costFields(info, variant),
+      ...(info.effortConfigured ? {} : { rung: { model: info.model, variant } }),
+      ...sessionFields(state, variants, info, forcingMessage, session),
+    };
+  };
 
   // (5) retry within tier
-  if (mayStay && state.attemptsThisTier < policy.maxAttemptsPerTier) {
+  const plainRetry = (): LadderAction | null => {
+    if (state.attemptsThisTier >= policy.maxAttemptsPerTier) return null;
     const action: LadderAction = {
       action: "retry",
       tier: state.currentTier,
@@ -455,16 +456,30 @@ export function nextAction(
       Object.assign(action, sessionFields(state, variants, info, action.forcingMessage!, session));
     }
     return action;
+  };
+
+  if (mayStay) {
+    const stay = variantStep() ?? plainRetry();
+    if (stay) return stay;
   }
 
   // (6) escalate or give_up
   let next = nextTierAfter(state.currentTier, policy);
+  const tierAbove = next != null;
   let entry: string | undefined;
   if (variants && info) ({ tier: next, variant: entry } = skipCoveredTiers(next, state, policy, info));
   if (next == null) {
+    // QA-1.5-19: the reserve withheld these attempts for tiers above, but none is left to run (every
+    // one only repeats a rung already tried), so spend them here instead of giving up with budget left.
+    if (!mayStay) {
+      const spend = variantStep() ?? plainRetry();
+      if (spend) return spend;
+    }
     return {
       action: "give_up",
-      reason: "no higher tier (already at top of ladder)",
+      reason: tierAbove
+        ? "no higher tier left to try (the remaining tiers only repeat rungs already tried)"
+        : "no higher tier (already at top of ladder)",
     };
   }
   const action: LadderAction = {
@@ -491,7 +506,6 @@ export function nextAction(
   }
   return action;
 }
-
 /** Records the rung an action starts into `triedByModel`; a no-op on states without it. */
 function applyRung(next: LadderState, action: LadderAction): void {
   if (next.triedByModel === undefined || action.rung === undefined) return;
