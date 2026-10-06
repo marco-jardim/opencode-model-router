@@ -212,7 +212,7 @@ fast:   third (medium)  8.000
 
 Otherwise the orchestrator's choice stands and the row records `kept` with the reason.
 
-**Floor lifts.** Independently of the engine, in `enforce` a native `subagent` dispatch below `enforcement.escalate.floorTier` is lifted to the floor tier's base rung (today only the `delegate` tool honoured the floor). The lift happens only if the parent may start that agent and its evaluated permissions cover the task's needs; otherwise it is skipped. A lifted row has `switched: true` and a reason starting `lift:floor`. That is **policy, not an engine decision on evidence**: `routing:stats` counts lifts on their own `Floor lifts` line and leaves them out of the enforced-switch, failed and verified counts, and the dogfood rule that picks the final mode (D17: "no switched dispatch ended in a `fail` verdict") does not count them.
+**Floor lifts.** Independently of the engine's cost decision, in `enforce` a native `subagent` dispatch below `enforcement.escalate.floorTier` is lifted to the floor tier's base rung (today only the `delegate` tool honoured the floor). The lift happens only if the parent may start that agent and its evaluated permissions cover the task's needs; otherwise it is skipped. Two more conditions: **a pinned dispatch (`[route … pin]`) is never lifted** (the lift sits behind the `enforce && not pinned` branch, and only runs when the engine did not switch the dispatch itself; a pinned resume is likewise left as named), and **the lift needs the host's agent list**: the floor tier's agent must be found in it (and be permitted, not primary and not hidden), so when the list is unavailable the dispatch is not lifted. A lifted row has `switched: true` and a reason starting `lift:floor`. That is **policy, not an engine decision on evidence**: `routing:stats` counts lifts on their own `Floor lifts` line and leaves them out of the enforced-switch, failed and verified counts, and the dogfood rule that picks the final mode (D17: "no switched dispatch ended in a `fail` verdict") does not count them.
 
 ## The classifier and its backends
 
@@ -341,7 +341,7 @@ What a classifier backend may send off your machine is bounded by D14, and by tr
 
 ## The session-aware ladder
 
-The ladder is what happens **after** a failed verification of a `delegate` dispatch. It runs on OpenCode v2 when a `routing` block exists (A15) and `enforcement.escalate.variantSteps` is not `none`.
+The ladder is what happens **after** a failed verification of a `delegate` dispatch (the `delegate` tool is opt-in, `experimental.verifiedDelegateTool`). The escalation ladder itself (retry, then escalate, within `maxTotalAttempts` and the cost ceiling) **always runs**, with or without a `routing` block, on v1 and on v2: that is the `2.2.0` ladder, unchanged. What a `routing` block adds on OpenCode v2 is **variant steps and session resume**: they are on only when `enforcement.escalate.variantSteps` resolves to `auto`, which is its default with a `routing` block and `none` without one (A15); on v1 it is always `none`.
 
 **Order of decisions** (the `2.2.0` code order, which the golden tests pin): accept → give up on `unverifiable` → max total attempts → cost ceiling → **variant step** → retry within the tier → escalate.
 
@@ -420,12 +420,12 @@ The cost doctor looks for money and reliability problems **outside** the routing
 
 | Id | Severity | Fires when |
 |---|---|---|
-| `title-model-unset` | saving | `agents.title.model` is unset **and** the host finds no small model of the session's provider (the host picks the title model as `agents.title.model`, else a small model of the session's provider, else the session's own model). The suggestion is the cheapest priced model the host would accept, from your catalog. There is no `summary` finding: no consumer of a `summary` model was found in the host. |
-| `model-not-in-catalog` | warning | A rung's model, or a tier's, is not in the live catalog. |
+| `title-model-unset` | saving | All of these hold: the host's agent list and the model catalog are known; the `title` agent has no model (`agents.title.model` unset); **the session's model is known** (the last root-session turn's provider; before the first turn the check is skipped); the host finds no small model of that provider (the host picks the title model as `agents.title.model`, else a small model of the session's provider, else the session's own model); a priced, title-eligible model exists in the catalog; and **when the session's own model is priced, that candidate is cheaper than it** (when the session's own model is unpriced the finding still fires, without a price comparison). The suggestion is the cheapest priced model the host would accept, from your catalog. There is no `summary` finding: no consumer of a `summary` model was found in the host. |
+| `model-not-in-catalog` | warning | A rung's model, or a tier's, is not in the live catalog, **or is there but not usable**: its `enabled` is not true or its status is `deprecated`. |
 | `no-tool-support` | warning | A rung's model does not support tool calls. |
 | `variant-not-offered` | warning | A configured variant is not offered by the model. |
 | `effort-not-offered` | info | A tier's `effort` is not among the catalog's variant ids. |
-| `variant-effort` | warning | A tier has `variant` together with `effort`/`thinking`/`reasoning` (A20): its variant ladder is empty. |
+| `variant-effort` | warning | A tier has `variant` together with `effort`/`thinking`/`reasoning` (A20): its variant ladder is empty. Fires only when `variantSteps` resolves to `auto` (a `routing` block and no explicit `none`): with variant steps off the finding does not apply. |
 | `rejected-candidates` | warning | Candidate variants are ignored: not offered by the catalog, unranked, or not above the previous rung. |
 | `foreign-candidates` | info | Candidate rungs on other models, which variant steps never walk (the engine prices them as dispatch options only). |
 | `covered-tier` | info | A tier is skipped on escalation because an earlier tier on the same model already covers its base. |

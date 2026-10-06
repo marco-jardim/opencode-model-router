@@ -83,7 +83,7 @@ No adversarial QA has reviewed this phase yet (the plan assigns it to a separate
 | QA-3.1-1 | major | `docs\ROUTING_ENGINE.md`, `docs\adr\0005-cost-aware-routing-engine.md`, `docs\CONFIG_REFERENCE.md` | A wrong claim from the dispatch brief (the credential gate "blocked" the `host` backend and a gate fix was in progress) was written into the docs | `dc1c40f` (see Implementation notes) |
 | QA-3.1-2 | minor | `docs\ROUTING_ENGINE.md` | TypeSafe `apiKeyEnv` described as required at load | `93de093` |
 
-Round 1 (heavy adversarial QA, 17 findings: QA-3.1-3 to QA-3.1-19, plus one code side note) is answered in [Round 1 fixes](#round-1-fixes). **Open: QA-3.1-13, -14, -15 and -16** (their text was not in the round-1 dispatches, which said "as the report states"; see the table).
+Round 1 (heavy adversarial QA, 17 findings: QA-3.1-3 to QA-3.1-19, plus one code side note) is answered in [Round 1 fixes](#round-1-fixes). None open (QA-3.1-13 to -16 were sent separately and are fixed; see the table).
 
 ## Round 1 fixes
 
@@ -101,10 +101,10 @@ Commits are on `car/p31`; "guide" is `docs\ROUTING_ENGINE.md`, "ADR" is `docs\ad
 | QA-3.1-10 | A30 stated without its exception | A floor-lifted resume in `enforce` is `switched: true`, reason `lift:floor` (guide, ADR D9 and the amendment index) | `8fd01ac`, `50e3836` |
 | QA-3.1-11 | `/router stats` on v1 | It reads only what an earlier v2 run left, with no flush (listed only with a `routing` block) | `8fd01ac` |
 | QA-3.1-12 | Plugin-input additions incomplete | `routerCatalog` and `routerOnIngest` (and `routerHost`) listed with `routerAgents`, `routerGenerate`, `routerSynthetic` | `8fd01ac` |
-| QA-3.1-13 | not in the dispatch | **Not addressed**: the dispatches said "as the report states" and did not include the text | — |
-| QA-3.1-14 | not in the dispatch | **Not addressed** (same) | — |
-| QA-3.1-15 | not in the dispatch | **Not addressed** (same) | — |
-| QA-3.1-16 | not in the dispatch | **Not addressed** (same) | — |
+| QA-3.1-13 | minor: "The ladder … runs on v2 when a `routing` block exists" was wrong | The escalation ladder always runs (the `2.2.0` ladder, v1 and v2, with or without a `routing` block); only variant steps and session resume need the block, through `variantSteps` resolving to `auto` (A15; `none` on v1). Checked against `resolveVariantSteps` in `config.ts` and the `policy.variants` switch in `nextAction` (`ladder.ts`) | `docs(routing): address QA-3.1-13..16` |
+| QA-3.1-14 | minor: the floor-lift text omitted two conditions | A pinned dispatch is never lifted (both lifts are inside `mode === "enforce" && !decision.pinned`, `dispatch.ts:501` and the resume branch above it; the fresh-dispatch lift also runs only when the engine did not switch), and the lift needs the host's agent list (`dispatch.ts:396-397`: no list, no agent info, no lift) | `docs(routing): address QA-3.1-13..16` |
+| QA-3.1-15 | minor: doctor-table rows left out conditions | `title-model-unset`: agent list and catalog known, `title` agent without a model, the session's model known, no host small model, a priced title-eligible candidate exists, and cheaper than the session's model when that is priced (`findings.ts:261-273`; an unpriced session model still fires, without a price). `variant-effort`: only when `variantSteps` resolves to `auto` (`:361`). `model-not-in-catalog`: also for a model whose `enabled` is not true or whose status is `deprecated` (`:300`, `usable` at `:155`) | `docs(routing): address QA-3.1-13..16` |
+| QA-3.1-16 | minor: ADR said "at most `maxStateChars` characters of the prompt head" | The whole state (description, acceptance block, prompt head) is cut to `maxStateChars` (`state.ts:129`); the acceptance block is whole or left out and only when it fits in half of what the description leaves (`state.ts:119`). ADR D14 and the CONFIG_REFERENCE row reworded; the guide already said "in total" | `docs(routing): address QA-3.1-13..16` |
 | QA-3.1-17 | Divergence table incomplete | #2/#4 relabelled as plan amendments (A15, A16) in a separate table; added A2 (text-in/out `Model.small` check vs tool calls), D5 "priced needs a token profile" and the F4 attempts premise (A33); the doctor's `summary`/notice rows are now **A31** and **A32**, recorded in plan §1.5 with **A33**; the ADR amendment index lists A31–A33 and says A1–A33 | `efa77e2`, `50e3836`, this report's commit |
 | QA-3.1-18 | Drift tests too weak | Example engine equals the written engine; Default column checked against `resolveRouting`; documented ranges checked against `validateConfig` boundaries; ADR `### D1`–`### D18` headings; finding id and severity table against `findings.ts`; real-kernel worked example | `b1fe560` |
 | QA-3.1-19 | Nits | CHANGELOG "22.18 / 23.6"; README `/router` row and `enforce` row wording; the marker (`router: engine=… build=…`) described with its `unknown` case; `subagent` added to `explore`'s tool list. "README engine-line wording" was read as the `/router` marker line and the `enforce` row; if it meant something else it is open | `8fd01ac`, `a1543f2` |
@@ -151,7 +151,7 @@ Commits are on `car/p31`; "guide" is `docs\ROUTING_ENGINE.md`, "ADR" is `docs\ad
 
 ## Verdict
 
-Round 1 fixes are in and green **except QA-3.1-13 to QA-3.1-16, which are open because their text never reached this worker**: the orchestrator must send the four findings (or the QA report) for a further round. Everything else of QA-3.1-3 to QA-3.1-19, the code side note and A31–A33 is done. Branch `car/p31` pushed.
+Round 1 fixes are in and green: QA-3.1-3 to QA-3.1-19, the code side note and A31–A33 are done (QA-3.1-13 to -16 arrived in a follow-up dispatch and are fixed in the last docs commit). Branch `car/p31` pushed.
 
 Verification on the final tree (default pool, no `--pool=threads`, no full suite):
 
