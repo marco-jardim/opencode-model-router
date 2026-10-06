@@ -658,6 +658,29 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     expect(pinnedRow!.reason).not.toContain("sent to @medium");
     expect(pinnedRow!.reason).not.toContain("kept:resume:running");
   });
+
+  it("a pinned resume is not rewritten, and its row does not claim it was sent to the running agent (QA-3.1 side note)", async () => {
+    const world = await makeWorld({ engine: "enforce" }, FLOOR("medium"));
+    await world.start();
+    await hostStart(world, "child-pin-row", { agent: "fast", prompt: SEARCH }); // lifted to medium, picked fast
+    const pinned = await hostResume(world, "child-pin-row", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it." });
+    expect(pinned.args).toMatchObject({ agent: "fast" }); // the arguments really are untouched
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, pinned: true, chosen: { agent: "fast" } });
+    expect(row!.reason.startsWith("kept:resume:pinned: ")).toBe(true); // QA-3.2-12: its own prefix, still a kept:resume row
+    expect(row!.reason).toContain("pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast)");
+    expect(row!.reason).not.toMatch(/; sent to @medium/);
+    expect(row!.reason).not.toContain("kept:resume:running");
+    expect(row!.reason).not.toMatch(/\b(?:kept|switched): (?:kept|switched): /); // the engine decision's own prefix is not doubled
+    // the unpinned resume of the same shape still says it was sent
+    await hostStart(world, "child-unpinned-row", { agent: "fast", prompt: SEARCH });
+    const unpinned = await hostResume(world, "child-unpinned-row", { agent: "fast", prompt: SEARCH });
+    expect(unpinned.args).toMatchObject({ agent: "medium" });
+    const last = (await resumeRows(world)).at(-1)!;
+    expect(last.reason).toMatch(/; sent to @medium so the host does not switch it back/);
+    expect(last.reason.startsWith("kept:resume:running: ")).toBe(true);
+    expect(last.reason).not.toMatch(/\b(?:kept|switched): (?:kept|switched): /);
+  });
 });
 describe("advise: input untouched, protocol and hint through the context hook", () => {
   async function adviseWorld(withEvidence: boolean) {

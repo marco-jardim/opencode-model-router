@@ -1075,10 +1075,39 @@ Full field notes are in [docs/CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md).
 - `docs/ENFORCEMENT.md` — architecture, hook wiring, session lifecycle
 - `docs/VERIFICATION.md` — DoD schema, deterministic checks, grader dispatch
 - `docs/ESCALATION.md` — escalation ladder configuration and cost ceilings
-- `docs/CONFIG_REFERENCE.md` — full `enforcement` block schema
+- `docs/CONFIG_REFERENCE.md` — full `enforcement` and `routing` block schema
 - `docs/ENFORCEMENT_PRESETS.md` — ready-to-paste enforcement presets
+- `docs/ROUTING_ENGINE.md` — the cost-aware routing engine: modes, formula, classifier backends, session-aware ladder, cost doctor, privacy
+- `docs/adr/0005-cost-aware-routing-engine.md` — the decisions behind the routing engine
 
 > These files are not included in the npm tarball. This section is the self-contained summary; the docs are available in the repository for contributors and advanced users.
+
+## Cost-aware routing (opt-in, OpenCode v2)
+
+By default the router picks a tier from the taxonomy in the protocol text and a fixed model per tier. The **routing engine** (issue #74, inspired by #73) can instead pick the `(agent, model#variant, retry path)` of each dispatch from an expected-cost formula fed by two things the plugin already produces: typed facts about the task, decided in code, and a scoreboard of **verified outcomes** (verification verdicts, false refusals, measured cost) per `(task class × agent × model#variant)`. It is off unless you add a `routing` block, and with no `routing` block the plugin behaves exactly as `2.2.0`.
+
+| `routing.engine` | What happens |
+|---|---|
+| `static` (default) | Nothing is decided or recorded; the protocol text and `R:` line are unchanged. |
+| `shadow` | Every dispatch is decided and logged; nothing about it changes. |
+| `advise` | As `shadow`, and the orchestrator also receives the generated `R:` line and a one-line `Route hint`; it still decides. |
+| `enforce` | As `advise`, and the engine reroutes a dispatch when its expected cost is lower by more than `margin`, the class is trusted, the target has at least 5 effective outcomes (or ranks above the orchestrator's pick) and the permission and floor rules allow it. A dispatch carrying `[route … pin]` is never rerouted. |
+
+Start in `shadow`, read `/router stats`, then raise the mode. A mode is a config-only change (hot reloaded); `static` is the instant kill switch. Put it in the global override file, `~/.config/opencode/opencode-model-router.overrides.jsonc`:
+
+```jsonc
+{ "routing": { "engine": "shadow" } }
+```
+
+What else ships with it:
+
+- **Same-session variant steps.** On OpenCode v2 a failed verification retries on the same model's next variant, resuming the child session (history kept), before paying for a bigger model.
+- **Native agents as candidates.** `explore` and `general` can be chosen for `search`, `implement`, `debug` and `review` work (`routing.roles`; `roles: {}` turns this off).
+- **A cost doctor.** `/router` reports waste outside the router (an unset title model on an expensive session model, unpriced models, variants the catalog does not offer) and sends at most one short notice.
+- **Observability.** A decision log and an outcome store under the trajectory directory, `/router stats`, and `npm run routing:stats` in a clone.
+- **Classifier backends** for uncertain task classes: `rules` (default, local), `openai-compatible` (Ollama, any OpenAI-style server), `typesafe`, and `host` (**experimental**). Backends receive at most a bounded, scrubbed excerpt of the task, are only configurable from the global override, and never block a dispatch.
+
+OpenCode v1 is unchanged: the `routing` block is validated and `engine` is forced to `static`; the only effect is an opt-in prose line when you set `routing.roles`. Every key and default is in [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md#routing--cost-aware-routing-engine-74); the full guide is [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md) and the decision record is [`docs/adr/0005-cost-aware-routing-engine.md`](docs/adr/0005-cost-aware-routing-engine.md).
 
 ## Commands
 
@@ -1089,11 +1118,12 @@ Full field notes are in [docs/CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md).
 | `/preset <name>` | Switch preset (e.g., `/preset openai`) |
 | `/budget` | Show available modes and which is active |
 | `/budget <mode>` | Switch routing mode (`normal`, `budget`, `quality`, `deep`) |
-| `/annotate-plan [path]` | Annotate a plan file with `[tier:X]` tags for each step |
+| `/annotate-plan [path]` | Annotate a plan file with `[tier:X]` tags for each step (and `[route …]` lines when the routing engine is live on v2) |
 | `/router overrides` | Show the global + project override file paths and merge precedence |
 | `/router models [provider]` | List valid model ids from your configured providers (with defaults and deprecated flags) |
 | `/router enforce <off\|advisory\|enforced>` | Set delegation-enforcement mode (persisted) |
-| `/router` | With no subcommand — or an unrecognized one — prints the `/router` help and the current enforcement mode |
+| `/router stats [--since <ISO>] [--until <ISO>] [--json]` | Routing engine statistics for a time window (dispatches, agreement, switches, savings estimate, verdict and false-refusal rates per key); same table as `npm run routing:stats` in a clone |
+| `/router` | With no subcommand — or an unrecognized one — prints the `/router` help and the current enforcement mode, plus the line `router: engine=<mode> build=<version>+<sha7>` (the engine in force and the build of the running code; on v1 it also prints, always as `engine=static`) and, on v2 with a `routing` block, the cost doctor's findings |
 | `/bypass [on\|off]` | Toggle the router off/on for the session |
 
 ## Plan annotation
@@ -1117,6 +1147,8 @@ After `/annotate-plan`:
 3. [tier:medium] Write integration tests for rate limiting
 4. [tier:heavy] Design a token bucket algorithm for advanced rate limiting
 ```
+
+With the [routing engine](#cost-aware-routing-opt-in-opencode-v2) live on OpenCode v2, `/annotate-plan` also emits a `[route class=… risk=… d=…]` line per step, and pins (`pin`) every step whose final tag is `[tier:heavy]`, so the engine never reroutes it. A step that **starts with a code block** is skipped and reported (the command says which line and what to add by hand); the command never edits the file itself. Details: [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md#annotate-plan).
 
 ## Token overhead
 

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cost-aware routing engine (#74), OpenCode v2, opt-in.** A `routing` block
+  turns on a decision engine that picks the `(agent, model#variant, retry path)`
+  of each dispatch from an expected-cost formula fed by typed task facts decided
+  in code and a scoreboard of verified outcomes per `(task class × agent ×
+  model#variant)`. With no `routing` block the plugin behaves exactly as 2.2.0.
+  Suggested in #73 by @javizuurc (giving custom agents and the context of the work
+  to a routing step that decides who does it); implemented from scratch with the
+  decision kept in code, and TypeSafe supported as an optional classifier backend.
+  - `routing.engine`: `static` (default), `shadow` (decide and record), `advise`
+    (generated `R:` line and a per-turn `Route hint`) and `enforce` (reroute under
+    a strict margin, an evidence gate of 5 effective (decayed) outcomes on the
+    candidate's own key, permission and
+    floor rules; a dispatch carrying `[route … pin]` is never rerouted).
+  - A task classifier (rules, an optional first-line `[route …]` directive, and
+    optional `host`, `openai-compatible` and `typesafe` backends; `host` is
+    experimental). Backends see a bounded, scrubbed excerpt only, never a task
+    that names a credential, and are configurable only from the global override.
+  - An outcome store and a decision log under the trajectory directory, with
+    cost units that never mix USD and `costRatio` and a zero cost for an unpriced
+    model treated as unknown.
+  - Same-session variant steps: a failed verification retries on the same
+    model's next variant, resuming the child session, before the ladder pays for
+    a bigger model (`enforcement.escalate.variantSteps`, `tiers.<t>.candidates`,
+    `routing.sessionReuse`).
+  - Native agents (`explore`, `general`) as default candidates on v2
+    (`routing.roles`; `roles: {}` disables them). The plugin never raises
+    `subagent_depth`.
+  - A cost doctor: findings in `/router` (title model, unpriced and missing
+    models, impossible variants, subscription pricing) and at most one notice,
+    delivered as a synthetic transcript entry, throttled per project.
+  - `/router stats` and `npm run routing:stats` (the script needs Node 22.18 / 23.6 or
+    newer and is not part of the package); `/annotate-plan` emits `[route …]`
+    lines and pins `[tier:heavy]` steps when the engine is live; the bare
+    `/router` view prints `router: engine=<mode> build=<version>+<sha7>`.
+  - Documentation: `docs/ROUTING_ENGINE.md`, `docs/adr/0005-cost-aware-routing-engine.md`
+    and the `routing` section of `docs/CONFIG_REFERENCE.md`.
+
+### Changed
+
+- With a `routing` block, `enforcement.escalate.variantSteps` defaults to `auto`
+  on OpenCode v2 (without one it stays `none`, so the 2.2.0 ladder is
+  unchanged); `enforcement.escalate.effortBumpMax` also caps the variant ladders
+  read from the model catalog.
+- OpenCode v1: the `routing` block is validated and `routing.engine` is forced
+  to `static` with one log line; setting `routing.roles` explicitly adds a
+  prose-only destination suffix to the `R:` line.
+
 ## [2.2.0] - 2026-10-05
 
 ### Added
