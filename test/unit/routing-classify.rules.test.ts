@@ -675,3 +675,41 @@ describe("needs are path-aware (QA-1.2-5)", () => {
     expect(classifyByRules("open ~/notes.txt", cfg).needs).toEqual(["external_dir"]);
   });
 });
+describe("edit needs are imperative, not participles or nouns (QA-1.2-6)", () => {
+  it.each([
+    ["Find where the session is created", "search"],
+    ["Find where the config is written", "search"],
+    ["List the files added in the last commit", "search"],
+    ["Review commit 83401ca", "review"],
+    ["Find the implementation of normTaskKw", "search"],
+  ] as const)("%s -> %s, no edit need", (text, expected) => {
+    const facts = classifyByRules(text, cfg);
+    expect(facts.class).toBe(expected);
+    expect(facts.needs).not.toContain("edit");
+  });
+
+  it("the imperative and progressive forms still need edit", () => {
+    for (const text of [
+      "create the file a.ts",
+      "write the report to out.md",
+      "adding a field to the schema",
+      "add a flag",
+      "implement the parser",
+      "implementing the parser now",
+      "fix the crash",
+      "updating the docs",
+    ]) {
+      expect(classifyByRules(text, cfg).needs, text).toContain("edit");
+    }
+  });
+
+  it("'implementation' is not an implement class hit (impl-feature has no -ation form)", () => {
+    expect(analyzeRules("look at the implementation of parseLabel", cfg).anchors).not.toContain("impl-feature");
+    expect(analyzeRules("implement parseLabel", cfg).anchors).toContain("impl-feature");
+  });
+
+  it("'commit' alone is a shell mention, not an edit", () => {
+    const facts = classifyByRules("show the last commit message", cfg);
+    expect(facts.needs).toEqual(["shell"]);
+  });
+});
