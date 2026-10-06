@@ -334,4 +334,17 @@ QA-1.4 round 1 (heavy): 1 critical, 8 major, 2 minor, 3 nit — all fixed (see "
 
 ## Verdict
 
-1.4.1 and 1.4.2 implemented; QA-1.4 rounds 1 and 2 fixed (20 findings, none open); pending round 3.
+**PASS — open findings: 0.** QA-1.4 closed after 3 rounds (`@heavy`).
+
+- Round 1: 1 critical, 8 major, 2 minor, 3 nit — all fixed (`2b1996a`…`9a90675`) and re-verified in round 2.
+- Round 2: 1 major (QA-1.4-15), 3 minor, 2 nit — all fixed (`66dc966`…`fc3c4c1`); QA-1.4-15 re-verified in round 3 (E2/E3 sideways switches to unproven rungs → `kept:evidence`; E4 0 priors-only sideways switches over 54 cells; 27-cell runner replay exact, 0 flips).
+- Accepted minors/nits (fixed by the producer, not re-reviewed per §0.7): QA-1.4-16, -17, -18, -19, -20.
+- Binding amendments: A23, A24 (amended: only a strictly higher rank is ungated), A25, A26.
+- Evidence: 6 engine test files, 275 tests, default pool (A14); typecheck green; `decide` + `buildLadder` ≤ 0.23 ms for 17 rungs with a catalog session.
+
+Residuals by design: natives without a matching preset rung inherit the owning tier's rank and price (D7/E4) — a move to one from a lower-ranked pick is "up" and ungated; role chains assume the 2.3 runner continues the same delegation after the chain.
+
+Handoffs:
+- **2.2:** per dispatch `classify` → `resolveChosen` → `buildLadder({ …, session, parentModel, pricing, logger })` → `decide`; `enforce` writes `target` only when `switched`; supply `HostAgentInfo` for router tiers too (`permitted`/`hidden`/`mode`/`grants`); `grantsFromTools` only from unconditionally allowed tools; apply `floorTier` to the dispatch itself; swap the `R:` line with a function replacer and insert it when `buildTaskTaxonomy` is empty; it changes only under `advise`/`enforce`.
+- **2.3:** keep the runner consistent with `simulate.ts` (plain retry re-runs the last rung; a start on a non-base rung counts as stepped there; the floor lifts the first attempt; after a native chain the same delegation continues from the owning tier with its retries used up and spent attempts/cost carried over) or update `simulate.ts`.
+- **2.4:** advisor reports natives whose own model has no preset rung; `/annotate-plan` shows `pinnedCount` and `routeEdited`; engine-assigned `[tier:heavy]` is pinned (A26); `[route …]` lines never inside fenced blocks.
