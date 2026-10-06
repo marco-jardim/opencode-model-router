@@ -5,7 +5,7 @@
  * the logging helpers. Randomness is always injected.
  */
 
-import { scrubState } from "../scrub";
+import { scrubAndCut } from "../scrub";
 import {
   BACKEND_PROMPT,
   BREAKER_COOLDOWN_MS,
@@ -456,11 +456,11 @@ export function reasonOf(error: unknown): string {
   } catch {
     text = "unprintable error";
   }
-  return scrubState(text).slice(0, 200);
+  return scrubAndCut(text, 200);
 }
 
 export function cutRaw(text: string): string {
-  return scrubState(text).slice(0, RAW_ANSWER_MAX_CHARS);
+  return scrubAndCut(text, RAW_ANSWER_MAX_CHARS);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildClassifierState } from "../../src/routing/classify/state";
-import { hasCredentialSignal, scrubState } from "../../src/routing/classify/scrub";
+import { hasCredentialSignal, scrubAndCut, scrubState } from "../../src/routing/classify/scrub";
 import {
   cutRaw,
   makeNonce,
@@ -1760,5 +1760,49 @@ describe("redirects are never followed (QA-1.2-31)", () => {
     } finally {
       globalThis.fetch = real;
     }
+  });
+});
+describe("scrub a longer slice, then cut (QA-1.2-32)", () => {
+  it("a secret that starts inside the kept part and runs past the cut never survives as a fragment", () => {
+    const secret = "s3cr3tvalue".repeat(40); // 440 characters
+    const text = `${"x".repeat(190)} password=${secret}`;
+    for (const max of [195, 200, 205, 1000]) {
+      const cut = scrubAndCut(text, max);
+      expect(cut.length).toBeLessThanOrEqual(max);
+      expect(cut, `max ${max}`).not.toContain("s3cr3t");
+    }
+    expect(reasonOf(new Error(text))).not.toContain("s3cr3t");
+    expect(cutRaw(text.repeat(5))).not.toContain("s3cr3t");
+  });
+
+  it("a hex key straddling the cut is gone, whole or partial", () => {
+    const text = `${"y".repeat(180)} ${HEX_KEY} tail`;
+    const cut = scrubAndCut(text, 200);
+    expect(cut).not.toContain("a1b2c3d4");
+    expect(cut.length).toBeLessThanOrEqual(200);
+  });
+
+  it("a PEM block that starts before the cut and is truncated is redacted to the end of the slice", () => {
+    const text = `${"z".repeat(100)}\n-----BEGIN PRIVATE KEY-----\n${"MIIEvQIBADANBgkq".repeat(60)}`;
+    const cut = scrubAndCut(text, 200);
+    expect(cut).not.toContain("MIIEvQ");
+    expect(cut).toContain("[REDACTED]");
+  });
+
+  it("does not scrub the whole of a huge input to keep a thousand characters", () => {
+    const huge = "a b ".repeat(2_000_000); // 8 MB
+    const started = performance.now();
+    const cut = cutRaw(huge);
+    expect(performance.now() - started).toBeLessThan(100);
+    expect(cut.length).toBe(1000);
+    const started2 = performance.now();
+    reasonOf(new Error(huge));
+    expect(performance.now() - started2).toBeLessThan(100);
+  });
+
+  it("short inputs are scrubbed whole and unchanged when clean; non-strings give an empty string", () => {
+    expect(scrubAndCut("plain words", 200)).toBe("plain words");
+    expect(scrubAndCut("password=abc123def", 200)).toBe("password=[REDACTED]");
+    expect(scrubAndCut(undefined as unknown as string, 10)).toBe("");
   });
 });

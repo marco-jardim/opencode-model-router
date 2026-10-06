@@ -165,6 +165,26 @@ export function scrubState(input: string, options: ScrubOptions = {}): string {
 }
 
 /**
+ * How much more than the cut a slice is scrubbed (QA-1.2-32). It must exceed the
+ * longest minimum a pattern needs to recognise a secret (a 32-character hex or
+ * entropy run, a 20-character token body), so a secret that starts inside the
+ * kept part and runs past the cut is still seen as a secret in the slice.
+ */
+const CUT_MARGIN_CHARS = 256;
+
+/**
+ * Scrub, then keep the first `max` characters. The scrubbing sees `max` plus a
+ * margin, never only the kept part (a secret cut in half would no longer match
+ * its pattern) and never the whole input (a megabyte answer would cost a megabyte
+ * of regex work to keep a thousand characters).
+ */
+export function scrubAndCut(text: string, max: number, options: ScrubOptions = {}): string {
+  if (typeof text !== "string") return "";
+  const slice = text.length > max + CUT_MARGIN_CHARS ? text.slice(0, max + CUT_MARGIN_CHARS) : text;
+  return scrubState(slice, options).slice(0, max);
+}
+
+/**
  * Words and shapes that mean the text is about, or contains, a credential.
  * Whole words only ("tokenizer" is not a hit); env-style names such as
  * `GITHUB_TOKEN` are.
