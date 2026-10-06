@@ -9,6 +9,7 @@ import {
   nextAction,
   recordAttempt,
   resumeDecision as ladderResumeDecision,
+  startCostRatio,
   type EscalatePolicy,
   type LadderAction,
   type LadderSessionPolicyInput,
@@ -1554,6 +1555,34 @@ describe("costRatio of the rung an action runs (A17)", () => {
     expect(nextAction(sessionState(), fail, plain)).not.toHaveProperty("costRatio");
   });
 
+  it("startCostRatio prices the first attempt's rung, which no action carries (QA-1.5-20)", () => {
+    const tiers: Record<string, TierConfig> = {
+      fast: {
+        model: SONNET,
+        variant: "low",
+        costRatio: 1,
+        ...{ candidates: [{ variant: "low", costRatio: 2 }, { variant: "medium", costRatio: 3 }] },
+      },
+      medium: { model: OPUS, costRatio: 5 },
+      heavy: { model: HAIKU },
+    };
+    const policy = buildEscalatePolicy(makeConfig(tiers), V2);
+    const start = newLadderState("fast", policy);
+    expect(startCostRatio(policy, start)).toBe(2); // the candidate's ratio for sonnet#low, not the tier's 1
+    expect(startCostRatio(policy, { ...start, currentVariant: "medium" })).toBe(3);
+    expect(startCostRatio(policy, { ...start, currentVariant: "turbo" })).toBeUndefined();
+    expect(startCostRatio(policy, newLadderState("medium", policy))).toBe(5); // default rung, the tier's ratio
+    expect(startCostRatio(policy, newLadderState("heavy", policy))).toBeUndefined(); // no ratio anywhere
+    expect(startCostRatio(policy, { ...start, currentTier: "unknown" })).toBeUndefined();
+    const withoutVariants = buildEscalatePolicy(makeConfig(tiers));
+    expect(startCostRatio(withoutVariants, newLadderState("fast", withoutVariants))).toBeUndefined();
+    // the loop charge the runner applies: attempt 1 uses startCostRatio, later attempts use action.costRatio
+    const run = runLoop(buildEscalatePolicy(makeConfig(tiers, { ladder: ["fast"], maxTotalAttempts: 4, costCeiling: { multiple: 1000 } }), V2), {
+      charge: ({ tier, action }) => (action === null ? startCostRatio(policy, newLadderState(tier, policy)) : action.costRatio) ?? tiers[tier]!.costRatio!,
+    });
+    expect(run.states[0]!.firstAttemptCost).toBeNull();
+    expect(run.state.firstAttemptCost).toBe(2); // not the tier's 1
+  });
   it("charges the action's ratio over the tier's in the real loop", () => {
     const tiers: Record<string, TierConfig> = {
       fast: {

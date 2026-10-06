@@ -292,6 +292,18 @@ function costRatioOf(info: TierVariantInfo, variant: string | undefined): number
   return ratios && Object.prototype.hasOwnProperty.call(ratios, key) ? ratios[key] : undefined;
 }
 
+/**
+ * QA-1.5-20: the costRatio of the rung the attempt about to run uses, from the state alone. For the
+ * first attempt (a state from `newLadderState`) that is the start tier's base rung, which no action
+ * carries; the runner charges `startCostRatio(policy, state) ?? tier.costRatio` for it, and
+ * `action.costRatio ?? tier.costRatio` for every later attempt. `undefined` without `policy.variants`,
+ * for a tier without variant info, or when the rung has no known ratio.
+ */
+export function startCostRatio(policy: EscalatePolicy, state: LadderState): number | undefined {
+  const info = ownTierInfo(policy, state.currentTier);
+  return info ? costRatioOf(info, state.currentVariant ?? info.base) : undefined;
+}
+
 /** D11: the resume decision and both numbers for the attempt this action leads to. */
 function sessionFields(
   state: LadderState,
