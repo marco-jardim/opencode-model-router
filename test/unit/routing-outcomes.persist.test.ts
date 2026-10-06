@@ -399,13 +399,15 @@ describe("persister: saveSnapshot (atomic write)", () => {
     expect(await persister.appendRows([verdictRow(1)])).toEqual({ ok: false, error: "denied", code: "EACCES" });
   });
 
-  it("a non-finite clock is reported as a failed write, not thrown", async () => {
+  it("QA-1.3-7: a non-finite clock falls back to Date.now() instead of failing the write", async () => {
     const { deps, dir, c, mem } = setup();
     const persister = createPersister(dir, deps);
     c.set(Number.NaN);
-    const result = await persister.saveSnapshot(snapshotOf("pass"));
-    expect(result.ok).toBe(false);
-    expect([...mem.files.keys()]).toEqual([]);
+    const before = Date.now();
+    expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: true });
+    const saved = JSON.parse(mem.files.get(join(dir, OUTCOMES_FILE))?.text ?? "null") as { savedAt: string };
+    expect(Date.parse(saved.savedAt)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(saved.savedAt)).toBeLessThanOrEqual(Date.now());
   });
 });
 

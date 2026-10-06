@@ -661,6 +661,41 @@ describe("snapshot / fromSnapshot / parseSnapshot", () => {
     expect(store.cost(K()).tokens.n).toBe(0);
   });
 
+  it("QA-1.3-7: evidence stamped after now is re-stamped at now on load and merge (counts untouched)", () => {
+    const writer = createOutcomeStore({ now: clock(T0 + 30 * DAY_MS).now }); // a clock that was a month ahead
+    for (let i = 0; i < 3; i++) writer.recordVerdict(K(), "pass", signal(`f${i}`));
+    const future = writer.snapshot();
+    expect(future.entries[K()]?.beta.updatedAt).toBe(T0 + 30 * DAY_MS);
+
+    const replaced = createOutcomeStore({ now: clock().now });
+    replaced.fromSnapshot(future);
+    expect(replaced.snapshot().entries[K()]?.beta).toEqual({ alpha: 3, beta: 0, updatedAt: T0 });
+
+    const merged = createOutcomeStore({ now: clock().now });
+    merged.recordVerdict(K(), "pass", signal("live"));
+    merged.fromSnapshot(future, { mode: "merge" });
+    expect(merged.snapshot().entries[K()]?.beta).toEqual({ alpha: 4, beta: 0, updatedAt: T0 });
+    // a key that is not live yet is taken as is, also re-stamped
+    const fresh = createOutcomeStore({ now: clock().now });
+    fresh.fromSnapshot(future, { mode: "merge" });
+    expect(fresh.snapshot().entries[K()]?.beta.updatedAt).toBe(T0);
+  });
+
+  it("QA-1.3-7: a non-finite clock reading means Date.now() everywhere in the store", () => {
+    const store = createOutcomeStore({ now: () => Number.NaN });
+    const before = Date.now();
+    store.recordVerdict(K(), "pass", signal("a"));
+    store.recordStep(K(), step("s", { final: true }));
+    const updatedAt = store.snapshot().entries[K()]?.beta.updatedAt ?? Number.NaN;
+    expect(updatedAt).toBeGreaterThanOrEqual(before);
+    expect(updatedAt).toBeLessThanOrEqual(Date.now());
+    expect(Number.isFinite(store.posterior(K()).mean)).toBe(true);
+    expect(store.sweepAttempts()).toBe(0);
+    const infinite = createOutcomeStore({ now: () => Number.POSITIVE_INFINITY });
+    infinite.recordVerdict(K(), "fail", signal("b"));
+    expect(Number.isFinite(infinite.snapshot().entries[K()]?.beta.updatedAt ?? Number.NaN)).toBe(true);
+  });
+
   it("replace (default) swaps the persisted state, keeps open attempts, and bumps the revision", () => {
     const { store, a } = populated();
     store.recordStep(a, step("still-open", { tokens: tokens({ input: 5 }) }));

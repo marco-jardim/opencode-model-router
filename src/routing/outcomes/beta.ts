@@ -68,10 +68,14 @@ export function decayFactor(dtMs: number, halfLifeDays: number): number {
 
 /**
  * Express `state` at `now`. Pure and multiplicative (materialising at t1 then t2 equals materialising at
- * t2 directly). `updatedAt` never moves backwards; a NaN `now` means "no time passed".
+ * t2 directly). `updatedAt` never moves backwards by less than a day (clock jitter); further back it is
+ * re-stamped at `now` with the counts untouched (QA-1.3-7). A NaN `now` means "no time passed".
  */
 export function decayTo(state: BetaState, now: number, tuning: OutcomeTuning): BetaState {
   const t = Number.isFinite(now) ? now : state.updatedAt;
+  // QA-1.3-7: more than a day behind the stored instant is a clock correction, not jitter: re-stamp the
+  // evidence at `t` (counts untouched, so nothing inflates) instead of leaving it frozen in the "future".
+  if (t < state.updatedAt - DAY_MS) return { alpha: state.alpha, beta: state.beta, updatedAt: t };
   const f = decayFactor(t - state.updatedAt, tuning.halfLifeDays);
   let alpha = state.alpha * f;
   let beta = state.beta * f;
@@ -127,7 +131,9 @@ export function posteriorOf(
  * instant `max(a.updatedAt, b.updatedAt, now)` (forward only), summed, and capped.
  */
 export function mergeBeta(a: BetaState, b: BetaState, now: number, tuning: OutcomeTuning): BetaState {
-  const t = Math.max(a.updatedAt, b.updatedAt, Number.isFinite(now) ? now : Number.NEGATIVE_INFINITY);
+  const newest = Math.max(a.updatedAt, b.updatedAt);
+  // A clock more than a day behind both states is a correction (QA-1.3-7): express the sum at `now`.
+  const t = !Number.isFinite(now) ? newest : newest - now > DAY_MS ? now : Math.max(newest, now);
   const da = decayTo(a, t, tuning);
   const db = decayTo(b, t, tuning);
   const sum: BetaState = { alpha: da.alpha + db.alpha, beta: da.beta + db.beta, updatedAt: t };

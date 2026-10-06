@@ -54,6 +54,7 @@ import {
   RENAME_RETRY_DELAYS_MS,
   STALE_TMP_MS,
   parseKey,
+  safeNow,
 } from "./types";
 import { parseSnapshot } from "./store";
 
@@ -372,7 +373,8 @@ function rotatedNames(names: readonly string[]): string[] {
 // ---------------------------------------------------------------------------
 
 export function createPersister(dir: string, deps: PersistDeps, options: PersisterOptions = {}): Persister {
-  const { fs, now, sleep, logger, pid } = deps;
+  const { fs, sleep, logger, pid } = deps;
+  const now = (): number => safeNow(deps.now);
   const outcomesPath = join(dir, OUTCOMES_FILE);
   const corruptPath = join(dir, OUTCOMES_CORRUPT_FILE);
   const decisionsPath = join(dir, DECISIONS_FILE);

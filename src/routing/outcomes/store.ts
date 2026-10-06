@@ -25,7 +25,7 @@ import type {
   TokenMeans,
   Verdict,
 } from "./types";
-import { OUTCOMES_SCHEMA_ID, OUTCOMES_SCHEMA_VERSION, parseKey } from "./types";
+import { OUTCOMES_SCHEMA_ID, OUTCOMES_SCHEMA_VERSION, parseKey, safeNow } from "./types";
 import { SAME_RANK_PRIOR, capEvidence, decayFactor, decayTo, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
 import {
   addTokens,
@@ -228,6 +228,8 @@ export function parseSnapshot(json: unknown): ParseSnapshotResult {
 
 export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeStore {
   const now = options.now ?? Date.now;
+  /** One reading of the clock; a non-finite reading falls back to Date.now() (QA-1.3-7). */
+  const clockNow = (): number => safeNow(now);
   const maxOpen = Math.max(1, Math.floor(options.maxOpenAttempts ?? DEFAULT_MAX_OPEN_ATTEMPTS));
   const maxScored = Math.max(1, Math.floor(options.maxScoredAttempts ?? DEFAULT_MAX_SCORED_ATTEMPTS));
   let tuning: OutcomeTuning = sanitizeTuning(options);
@@ -246,7 +248,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     if (parts === null) return null;
     const created: Entry = {
       cls: parts.cls,
-      beta: { alpha: 0, beta: 0, updatedAt: now() },
+      beta: { alpha: 0, beta: 0, updatedAt: clockNow() },
       counts: ZERO_COUNTS,
       cost: EMPTY_COST,
     };
@@ -296,7 +298,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       if (entry === null) return false;
       const pass = verdict === "pass";
       const variant = signal.step === "variant";
-      const t = now();
+      const t = clockNow();
       entry.beta = observe(entry.beta, pass, t, tuning);
       const c = entry.counts;
       entry.counts = {
@@ -316,7 +318,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       if (entry === null) return false;
       const previous = scored.get(signal.attemptID);
       const c = entry.counts;
-      const t = now();
+      const t = clockNow();
       revision += 1; // the lifetime counter below always changes
       if (previous === undefined) {
         // First terminal signal of the attempt: a failure.
@@ -363,7 +365,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
         acc = undefined;
       }
       const usd = stepUSD(step.cost, step.pricing);
-      const t = now();
+      const t = clockNow();
       const base: OpenAttempt = acc ?? {
         key,
         attemptID: step.attemptID,
@@ -403,7 +405,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     },
 
     sweepAttempts(maxIdleMs: number = DEFAULT_MAX_IDLE_MS): number {
-      const t = now();
+      const t = clockNow();
       const idle: string[] = [];
       for (const [id, attempt] of open) {
         const age = t - attempt.lastStepAt;
@@ -414,7 +416,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     },
 
     posterior(key: OutcomeKey, prior: BetaPrior = SAME_RANK_PRIOR) {
-      return posteriorOf(entries.get(key)?.beta, prior, now(), tuning);
+      return posteriorOf(entries.get(key)?.beta, prior, clockNow(), tuning);
     },
 
     cost(key: OutcomeKey): CostStats {
@@ -474,8 +476,10 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       }
       const hadEntries = entries.size > 0;
       if (mode === "replace") entries.clear();
-      const t = now();
+      const t = clockNow();
       for (const [key, disk] of accepted) {
+        // QA-1.3-7: evidence stamped after "now" (a clock that was ahead when it was written) is re-stamped.
+        if (disk.beta.updatedAt > t) disk.beta = { alpha: disk.beta.alpha, beta: disk.beta.beta, updatedAt: t };
         const live = mode === "merge" ? entries.get(key) : undefined;
         if (live === undefined) {
           entries.set(key, disk);

@@ -18,6 +18,12 @@ import type { Verdict as VerificationVerdict } from "../../verify/types";
 /** Injected clock: epoch milliseconds. Defaults to `Date.now` in the implementations. */
 export type Clock = () => number;
 
+/** One reading of an injected clock; a non-finite reading (NaN, ±Infinity) falls back to `Date.now()` (QA-1.3-7). */
+export function safeNow(clock: Clock): number {
+  const t = clock();
+  return Number.isFinite(t) ? t : Date.now();
+}
+
 /** D5: the unit every candidate of one decision is compared in. Never mixed. */
 export type CostUnit = "usd" | "ratio";
 

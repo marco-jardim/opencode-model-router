@@ -264,8 +264,22 @@ describe("posteriorOf (read-only)", () => {
     const atT = posteriorOf(state, SAME_RANK_PRIOR, T0, TUNING);
     const back = posteriorOf(state, SAME_RANK_PRIOR, T0 - DAY_MS, TUNING);
     expect(back).toEqual(atT);
-    expect(decayTo(state, T0 - DAY_MS, TUNING)).toEqual(state);
-    expect(decayTo(state, T0 - 1e15, TUNING).updatedAt).toBe(T0);
+    expect(decayTo(state, T0 - DAY_MS, TUNING)).toEqual(state); // a day of jitter keeps the stamp
+  });
+
+  it("QA-1.3-7: more than a day behind is a clock correction: re-stamped at now, counts untouched", () => {
+    const state: BetaState = { alpha: 12, beta: 4, updatedAt: T0 };
+    const corrected = decayTo(state, T0 - DAY_MS - 1, TUNING);
+    expect(corrected).toEqual({ alpha: 12, beta: 4, updatedAt: T0 - DAY_MS - 1 });
+    expect(decayTo(state, T0 - 30 * DAY_MS, TUNING)).toEqual({ alpha: 12, beta: 4, updatedAt: T0 - 30 * DAY_MS });
+    // a state stamped 30 days in the future (a clock that was ahead) heals instead of staying frozen
+    const future: BetaState = { alpha: 10, beta: 0, updatedAt: T0 + 30 * DAY_MS };
+    const healed = observe(future, true, T0, TUNING);
+    expect(healed).toEqual({ alpha: 11, beta: 0, updatedAt: T0 });
+    expect(posteriorOf(healed, SAME_RANK_PRIOR, T0 + HALF_MS, { halfLifeDays: 14, maxEffectiveSamples: 1000 }).n).toBe(5.5);
+    // reads never write: the stored state is not touched by a read in the past
+    expect(posteriorOf(future, SAME_RANK_PRIOR, T0, TUNING).n).toBe(10);
+    expect(future.updatedAt).toBe(T0 + 30 * DAY_MS);
   });
 
   it("after a backwards read a later forward read is exactly half after one half-life", () => {
@@ -345,13 +359,20 @@ describe("mergeBeta", () => {
     expect(merged.alpha).toBeCloseTo(25, 12);
   });
 
-  it("a clock before either state never inflates and keeps updatedAt at the newest state", () => {
+  it("a clock slightly before the states never inflates and keeps updatedAt at the newest state", () => {
     const a: BetaState = { alpha: 6, beta: 2, updatedAt: T0 };
     const b: BetaState = { alpha: 2, beta: 6, updatedAt: T0 - DAY_MS };
-    const merged = mergeBeta(a, b, T0 - 10 * DAY_MS, TUNING);
+    const merged = mergeBeta(a, b, T0 - DAY_MS / 2, TUNING);
     expect(merged.updatedAt).toBe(T0);
     expect(merged.alpha + merged.beta).toBeLessThanOrEqual(16);
     expect(merged.alpha).toBeGreaterThanOrEqual(6);
+  });
+
+  it("QA-1.3-7: a clock more than a day before both states re-stamps the sum at now without inflating", () => {
+    const a: BetaState = { alpha: 6, beta: 2, updatedAt: T0 };
+    const b: BetaState = { alpha: 2, beta: 6, updatedAt: T0 - DAY_MS };
+    const merged = mergeBeta(a, b, T0 - 10 * DAY_MS, TUNING);
+    expect(merged).toEqual({ alpha: 8, beta: 8, updatedAt: T0 - 10 * DAY_MS });
   });
 
   it("a NaN clock merges at the newest stored instant", () => {
@@ -457,7 +478,9 @@ describe("beta evidence through the outcome store", () => {
     store.recordVerdict(KEY, "pass", sig("b"));
     const p = store.posterior(KEY);
     expect(Number.isFinite(p.mean)).toBe(true);
-    expect(p.n).toBe(2);
+    // QA-1.3-7: a non-finite reading means Date.now(), so the evidence may have decayed a little but never grows
+    expect(p.n).toBeGreaterThan(0.9);
+    expect(p.n).toBeLessThanOrEqual(2);
     expect(Number.isFinite(store.snapshot().entries[KEY]?.beta.updatedAt ?? Number.NaN)).toBe(true);
   });
 });
