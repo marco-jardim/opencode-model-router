@@ -151,7 +151,7 @@ export function makeKey(
   return `${c}|${agent.origin}:${a}|${p}/${m}#${v}` as OutcomeKey;
 }
 
-/** Inverse of {@link makeKey}; `null` for anything makeKey cannot produce. */
+/** Inverse of {@link makeKey}; `null` unless `makeKey(parts) === key` (anything makeKey cannot produce). */
 export function parseKey(key: string): OutcomeKeyParts | null {
   const segments = key.split("|");
   if (segments.length !== 3) return null;
@@ -174,7 +174,10 @@ export function parseKey(key: string): OutcomeKeyParts | null {
   const model = unescapePart(providerModel.slice(slash + 1));
   const variant = unescapePart(modelSeg.slice(hash + 1));
   if (!cls || !id || !provider || !model || !variant) return null;
-  return { cls, agent: { origin, id }, provider, model, variant };
+  const parts: OutcomeKeyParts = { cls, agent: { origin, id }, provider, model, variant };
+  // Canonical form only (QA-1.3-12): a key that makeKey would not have produced (an unescaped `:`/`/` in
+  // a strict part, lowercase `%7c`, ...) would otherwise alias a canonical key in the store.
+  return makeKey(cls, parts.agent, provider, model, variant) === key ? parts : null;
 }
 
 /** `"provider/model"` or `"provider/model#variant"` (host `subagent` model syntax) → parts; `null` when malformed. */

@@ -136,6 +136,29 @@ describe("outcome keys (store-facing)", () => {
     }
   });
 
+  it("QA-1.3-12: parseKey accepts only canonical keys (makeKey(parts) === key)", () => {
+    const canonical = "implement|router:medium|anthropic/claude:beta/x#default";
+    const parts = parseKey(canonical);
+    expect(parts).not.toBeNull(); // `:` and `/` stay readable inside the model segment
+    if (parts) expect(makeKey(parts.cls, parts.agent, parts.provider, parts.model, parts.variant)).toBe(canonical);
+
+    const aliases = [
+      "imp:lement|router:medium|anthropic/m#default", // unescaped `:` in the class
+      "implement|router:a/b|anthropic/m#default", // unescaped `/` in the agent id
+      "implement|router:medium|anth:ropic/m#default", // unescaped `:` in the provider
+      "implement|router:medium|anthropic/m#de:fault", // unescaped `:` in the variant
+      "implement|router:medium|anthropic/m#de/fault", // unescaped `/` in the variant
+      "implement|router:me%7cdium|anthropic/m#default", // lowercase escape
+      "imp%3alement|router:medium|anthropic/m#default", // lowercase escape
+      "implement|router:medium|anthropic/m%41#default", // unknown escape
+    ];
+    for (const alias of aliases) expect(parseKey(alias), alias).toBeNull();
+
+    // an alias can no longer smuggle itself into the store as a second key for the same evidence
+    const store = createOutcomeStore({ now: clock().now });
+    expect(store.recordVerdict(aliases[1] as OutcomeKey, "pass", signal("x"))).toBe(false);
+    expect(store.keys()).toEqual([]);
+  });
   it("keys() sorts by code unit, not by locale", () => {
     const store = createOutcomeStore({ now: clock().now });
     const lower = K("a");
