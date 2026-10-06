@@ -123,7 +123,18 @@ export function createV2Runtime(ctx: Plugin.Context) {
           async progress(metadata) {
             const sessionID = metadata.sessionID;
             if (typeof sessionID === "string" && sessionID !== childID) {
-              if (childID) throw new Error("[model-router] native subagent changed its child session ID");
+              if (childID) {
+                // The host started another child than the one this call is about (a resume that did not resume, or a
+                // second child): no caller knows its id, so it is stopped and removed here before the error, or it
+                // would live until the host is restarted (QA-2.3-5). The original child is interrupted below.
+                let cleanup = "";
+                try {
+                  await childRunner.dispose(sessionID);
+                } catch (error) {
+                  cleanup = `; removing it failed (${error instanceof Error ? error.message : String(error)})`;
+                }
+                throw new Error(`[model-router] native subagent changed its child session ID (${childID} -> ${sessionID}${cleanup})`);
+              }
               childID = sessionID;
               activeChildren.set(sessionID, controller);
               if (request.system) childSystems.set(sessionID, request.system);

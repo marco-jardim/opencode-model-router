@@ -448,8 +448,37 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
     });
     await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
       prompt: "go", resumeSessionID: "child", onCreated: async () => {},
-    }))).rejects.toThrow("changed its child session ID");
+    }))).rejects.toThrow("changed its child session ID (child -> another)");
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+    // QA-2.3-5: the child the host started instead is stopped and removed too, not left running
+    expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "another" }, undefined);
+    expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "another" });
+  });
+
+  it("a foreign child that cannot be removed is named in the error instead of being swallowed", async () => {
+    const { runtime, toolContext, execute, context } = fixture();
+    execute.mockImplementationOnce(async (_input, childContext) => {
+      await childContext.progress({ sessionID: "another", status: "running" });
+      return { output: { sessionID: "another", status: "completed", output: "x" } };
+    });
+    context.session.remove.mockRejectedValueOnce(new Error("session is busy"));
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "go", resumeSessionID: "child", onCreated: async () => {},
+    }))).rejects.toThrow("removing it failed (session is busy)");
+    expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+  });
+
+  it("a created child that changes its id is handled the same way (not only a resume)", async () => {
+    const { runtime, toolContext, execute, context } = fixture();
+    execute.mockImplementationOnce(async (_input, childContext) => {
+      await childContext.progress({ sessionID: "first", status: "running" });
+      await childContext.progress({ sessionID: "second", status: "running" });
+      return { output: { sessionID: "second", status: "completed", output: "x" } };
+    });
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({ prompt: "go", onCreated: async () => {} })))
+      .rejects.toThrow("changed its child session ID (first -> second)");
+    expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "second" });
+    expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "first" });
   });
 
   it("a deadline or cancellation interrupts the resumed child", async () => {
