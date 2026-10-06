@@ -741,6 +741,34 @@ describe("QA-1.4-16: a role chain's attempts and cost carry into its exit into t
     expect(roleLabels(ladder, exploreOwn(ladder))).toEqual(["general:claude-sonnet-5-5#xhigh", "heavy:claude-opus-5-5#xhigh"]);
   });
 });
+describe("QA-1.4-17: a pick below floorTier is priced as the floor path and the reason says so", () => {
+  const cfg = plainCfg({ enforcement: { escalate: { floorTier: "medium" } } });
+  const f = { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+  const run = (agent: string) => {
+    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: f, agents: routerAgents() });
+    const decision = decide({
+      facts: f, ladder, store: createOutcomeStore({ now: () => 1_000 }), detection: "deterministic", pin: false, floorRank: floorRankOf(cfg),
+      routing: { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection: { deterministic: 0.95, grader: 0.7, none: 0.3 } },
+      chosen: resolveChosen({ cfg, agents: routerAgents(), agent })!,
+    });
+    return { ladder, decision };
+  };
+
+  it("fast under a medium floor costs what the floor path costs, and the reason mentions floor", () => {
+    const { ladder, decision } = run("fast");
+    const costOf = (index: number) => decision.costs[candidateKey("search", ladder.candidates[index]!)]!;
+    expect(ladder.paths![0]![0]).not.toBe(0); // the runner starts on medium, not on fast
+    expect(costOf(0)).toBeCloseTo(costOf(1), 12);
+    expect(decision.reason).toContain("below floorTier (rank 0 < 1)");
+    expect(decision.reason).toContain("floor path the runner starts on");
+    expect(decision.ineligible[decision.chosen.key]).toBeUndefined(); // the pick itself stays the status quo
+  });
+
+  it("a pick at or above the floor carries no floor note", () => {
+    expect(run("medium").decision.reason).not.toContain("floor");
+    expect(run("heavy").decision.reason).not.toContain("floor");
+  });
+});
 describe("QA-1.4-3: router tier rungs honour permitted, hidden and mode", () => {
   const unavailable: ReadonlyArray<readonly [string, Partial<HostAgentInfo>]> = [
     ["not permitted", { permitted: false }],

@@ -768,6 +768,16 @@ describe("A25 simulated runner paths (QA-1.4-2)", () => {
     expect(first.ineligible[keyOf(MEDIUM)]).toBe("invalid-cost");
   });
 
+  it("QA-1.4-17: a pick below the floor says so; it is priced as the floor path only when its path starts elsewhere", () => {
+    const lifted = decide(input({ ladder: pathLadder([[1, 1, 2], [1, 1, 2], [2, 2]]), chosen: chosenOf(FAST), floorRank: 1, detection: "deterministic" }));
+    expect(lifted.costs[keyOf(FAST)]).toBeCloseTo(lifted.costs[keyOf(MEDIUM)]!, 12);
+    expect(lifted.reason).toContain("below floorTier (rank 0 < 1)");
+    expect(lifted.reason).toContain("floor path the runner starts on");
+    const asDispatched = decide(input({ ladder: routerLadder(), chosen: chosenOf(FAST), floorRank: 1, detection: "deterministic" }));
+    expect(asDispatched.reason).toContain("priced as dispatched");
+    expect(decide(input({ ladder: routerLadder(), chosen: chosenOf(MEDIUM), floorRank: 1 })).reason).not.toContain("floor");
+    expect(decide(input({ ladder: routerLadder(), chosen: chosenOf(FAST) })).reason).not.toContain("floor");
+  });
   it("paths price in USD like candidates: one unit for the whole decision, reachable rungs included", () => {
     const F = { ...FAST, pricing: PRICED };
     const M = { ...MEDIUM, pricing: PRICED };

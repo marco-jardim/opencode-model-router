@@ -444,6 +444,14 @@ export function decide(input: DecisionInput): Decision {
     reason = `switched: C(best)=${fmt(bestCost)} < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
   }
 
+  // QA-1.4-17: a pick below `floorTier` is not what the runner would start on; say so, and say what was priced.
+  if (floorRank !== null && chosenRank !== null && chosenRank < floorRank) {
+    const lifted = chosenIndex >= 0 && pathCache[chosenIndex] !== null && pathCache[chosenIndex]![0] !== chosenIndex;
+    reason += ` [the pick is below floorTier (rank ${chosenRank} < ${floorRank}); ${lifted
+      ? "its cost is that of the floor path the runner starts on"
+      : "it is priced as dispatched"}]`;
+  }
+
   const bestEvidence = bestIndex === null ? 0 : evidence[bestIndex]!;
   const confidence = bestIndex === null
     ? 0
