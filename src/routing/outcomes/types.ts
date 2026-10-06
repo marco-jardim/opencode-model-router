@@ -470,6 +470,13 @@ export const LOG_ROW_VERSION = 1;
  */
 export const FLOOR_LIFT_REASON = "lift:floor";
 
+/**
+ * Reason prefix of a decision row whose dispatch resumed an existing child (`task_id`/`sessionID`): the engine never switches such a
+ * dispatch in any mode (plan amendment A30), so `switched` is false and the kernel's own decision is only logged. `routing:stats` keeps
+ * these rows out of every routing metric and reports them on their own line.
+ */
+export const RESUME_REASON = "kept:resume";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */

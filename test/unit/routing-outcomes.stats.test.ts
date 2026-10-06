@@ -212,9 +212,9 @@ describe("summarize", () => {
   it("columns: dispatches, pinned, by class (sorted), resume vs fresh", () => {
     const table = summarize(null, scenario(), WINDOW);
     expect(table.pinned).toBe(1);
+    // D5 resumes a child (QA-2.4-R2-3, A30): it is not a routing dispatch, so its class (`review`) has no row here
     expect(table.byClass).toEqual([
       { class: "implement", dispatches: 2 },
-      { class: "review", dispatches: 1 },
       { class: "search", dispatches: 1 },
     ]);
     expect(table.resumeVsFresh).toEqual([
@@ -242,7 +242,8 @@ describe("summarize", () => {
       refusalRate: rate(1, 3),
       measuredUSD: { mean: expect.closeTo(0.2, 12) as unknown as number, n: 3 },
     });
-    expect(row(B)).toMatchObject({ dispatches: 2, attempts: 2, pass: 1, fail: 0, passRate: rate(1, 1), falseRefusals: 0, refusalRate: rate(0, 2), measuredUSD: null });
+    // B ran twice (D3 fresh, D5 a resume): one dispatch for routing, two attempts for the outcomes
+    expect(row(B)).toMatchObject({ dispatches: 1, attempts: 2, pass: 1, fail: 0, passRate: rate(1, 1), falseRefusals: 0, refusalRate: rate(0, 2), measuredUSD: null });
     // D4 was switched to C; its fail verdict lands after `until`, so C has no windowed verdicts
     expect(row(C)).toMatchObject({ dispatches: 1, attempts: 1, pass: 0, fail: 0, passRate: rate(0, 0), measuredUSD: null });
   });
@@ -579,8 +580,8 @@ describe("renderMarkdown", () => {
     "| Estimated savings (ratio) | 1.50 over 3 rows |",
     "| Estimated savings (usd) | $0.0123 over 2 rows |",
     "| Variant steps | 3 taken; pass 1/2 (50.0%) |",
-    "| Orchestrator resumes (task_id / sessionID; not a ladder step) | 1 of 7 routed dispatches |",
-    "| Kept for lack of evidence (A27) | 3 of 7 routed dispatches |",
+    "| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 1 of 7 routed dispatches |",
+    "| Kept for lack of evidence (A27, fresh dispatches) | 3 of 6 fresh routed dispatches |",
     "",
     "### By class",
     "",
@@ -648,8 +649,8 @@ describe("renderMarkdown", () => {
         "| Switched | 0 of 0 non-pinned routed (n/a); enforced 0; failed 0 (verified 0 of 0 enforced) |",
         "| Estimated savings | n/a |",
         "| Variant steps | 0 taken; pass n/a |",
-        "| Orchestrator resumes (task_id / sessionID; not a ladder step) | 0 of 0 routed dispatches |",
-        "| Kept for lack of evidence (A27) | 0 of 0 routed dispatches |",
+        "| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 0 of 0 routed dispatches |",
+        "| Kept for lack of evidence (A27, fresh dispatches) | 0 of 0 fresh routed dispatches |",
         "",
         "### By class",
         "",
@@ -1263,7 +1264,7 @@ describe("summarize: the 2.4 additions (orchestrator resumes, the evidence gate)
     expect(table.orchestratorResumes).toEqual({ resumed: 2, total: 3 });
     // the D11 table still counts the dispatch row (data) and the variant step apart from it
     expect(table.resumeVsFresh.find((r) => r.step === "variant")).toEqual({ step: "variant", resume: 1, fresh: 0 });
-    expect(renderMarkdown(table)).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step) | 2 of 3 routed dispatches |");
+    expect(renderMarkdown(table)).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 2 of 3 routed dispatches |");
   });
 
   it("counts kept:evidence rows and the trace.argmin keys, most frequent first, ties by key", () => {
@@ -1282,7 +1283,7 @@ describe("summarize: the 2.4 additions (orchestrator resumes, the evidence gate)
       { key: C, count: 2 },
     ].sort((a, b) => b.count - a.count || (a.key < b.key ? -1 : 1)));
     const out = renderMarkdown(table);
-    expect(out).toContain("| Kept for lack of evidence (A27) | 3 of 5 routed dispatches |");
+    expect(out).toContain("| Kept for lack of evidence (A27, fresh dispatches) | 3 of 5 fresh routed dispatches |");
     expect(out).toContain("### Gated by evidence (trace.argmin)");
     expect(out).toContain("| Cheapest key held back | Rows |");
   });
@@ -1295,5 +1296,44 @@ describe("summarize: the 2.4 additions (orchestrator resumes, the evidence gate)
     const table = summarize(null, rows, { since: Date.parse("2026-10-06T00:00:00.000Z"), until: null });
     expect(table.gate).toEqual({ keptEvidence: 1, argmin: [{ key: C, count: 1 }] });
     expect(table.orchestratorResumes).toEqual({ resumed: 0, total: 1 });
+  });
+});
+
+describe("summarize: resumes are outside every routing metric (QA-2.4-R2-3, A30)", () => {
+  const all = { since: null, until: null };
+  const argmin = { routeLines: { count: 0, conflict: false, edgeOnly: true }, backend: null, argmin: choice(C) };
+
+  it("a resume row where best differs from chosen counts in no agreement, switched, savings, class, key or gate figure, only on its own line", () => {
+    const fresh = decision("F1", "2026-10-06T10:00:00.000Z", { chosen: choice(A), best: choice(A), costs: { [A]: 5 } });
+    const resumed = decision("R1", "2026-10-06T10:01:00.000Z", {
+      resume: true, childSessionID: "child-9", mode: "enforce", switched: true, chosen: choice(A), best: choice(C), costs: { [A]: 20, [C]: 1 },
+      reason: "kept:evidence: would have moved to a cheaper key", trace: argmin,
+    });
+    const without = summarize(null, [fresh], all);
+    const withResume = summarize(null, [fresh, resumed], all);
+    // everything routing-related is exactly what it is without the resume row
+    for (const field of ["agreement", "switched", "savings", "byClass", "gate"] as const) expect(withResume[field], field).toEqual(without[field]);
+    expect(withResume.byKey.find((r) => r.key === A)?.dispatches).toBe(1);
+    // an old log may hold a resume that WAS switched (before A30): the attempt ran on C, but it is no routing dispatch of C
+    expect(withResume.byKey.find((r) => r.key === C)?.dispatches ?? 0).toBe(0);
+    expect(withResume.gate).toEqual({ keptEvidence: 0, argmin: [] });
+    // and it is reported on its own line
+    expect(withResume.orchestratorResumes).toEqual({ resumed: 1, total: 2 });
+    expect(withResume.dispatches).toBe(2);
+    expect(renderMarkdown(withResume)).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 1 of 2 routed dispatches |");
+    expect(renderMarkdown(withResume)).toContain("| Kept for lack of evidence (A27, fresh dispatches) | 0 of 1 fresh routed dispatches |");
+  });
+
+  it("a resume's verdict still counts for the key it ran on (the outcome happened), and a pinned resume stays out of the pinned-free denominators", () => {
+    const rows: LogRow[] = [
+      decision("R2", "2026-10-06T10:00:00.000Z", { resume: true, chosen: choice(A), best: choice(A) }),
+      verdict("R2", "2026-10-06T10:05:00.000Z", A, "pass"),
+      decision("R3", "2026-10-06T10:01:00.000Z", { resume: true, pinned: true, chosen: choice(B), best: choice(B) }),
+    ];
+    const table = summarize(null, rows, all);
+    expect(table.byKey.find((r) => r.key === A)).toMatchObject({ dispatches: 0, attempts: 1, pass: 1 });
+    expect(table.agreement).toEqual({ num: 0, den: 0, rate: null });
+    expect(table.switched.share).toEqual({ num: 0, den: 0, rate: null });
+    expect(table.orchestratorResumes).toEqual({ resumed: 2, total: 2 });
   });
 });

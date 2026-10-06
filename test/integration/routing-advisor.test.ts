@@ -611,8 +611,8 @@ describe("/router stats and the checkpoint line", () => {
     const text = await ask(hooks, `stats --since ${since}`);
     expect(`${text}\n`).toBe(reference.stdout);
     expect(text).toContain("| Dispatches | 2 |"); // D0 is outside the window
-    expect(text).toContain("| Kept for lack of evidence (A27) | 1 of 2 routed dispatches |");
-    expect(text).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step) | 1 of 2 routed dispatches |");
+    expect(text).toContain("| Kept for lack of evidence (A27, fresh dispatches) | 1 of 1 fresh routed dispatches |"); // D2 resumes a child (A30): outside the figure
+    expect(text).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 1 of 2 routed dispatches |");
     expect(text).toContain(`| ${KEY_EXPLORE.replace(/\|/g, "\\|")} | 1 |`); // the trace.argmin table (A27, DF3)
     expect(text).toContain("cover trusted classes only"); // QA-2.1-10
     // no window: all three rows; and the JSON form is the script's too

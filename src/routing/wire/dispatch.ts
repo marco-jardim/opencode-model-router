@@ -49,6 +49,7 @@ import {
 import { resolve as resolvePath, sep } from "node:path";
 import {
   FLOOR_LIFT_REASON,
+  RESUME_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -445,13 +446,19 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         facts, chosen, ladder, detection, pin, routing: prepared.routing, store: prepared.store, floorRank: floorRankOf(prepared.cfg),
       });
       argmin = decision.argmin !== null && decision.argmin.key !== decision.best?.key ? decision.argmin : null;
+      // A30 (QA-2.4-R2-3): a dispatch that resumes an existing child (`task_id`/`sessionID`) is never switched by the engine, in any mode:
+      // the kernel's decision is still logged (best, costs, its own reason), but `switched` is false and the reason code is `kept:resume`.
+      const resuming = resumeID !== null;
       row = {
-        chosen: decision.chosen, best: decision.best, switched: decision.switched, pinned: decision.pinned,
-        unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence, reason: `${decision.reasonCode}: ${decision.reason}`,
+        chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
+        unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
+        reason: resuming
+          ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
+          : `${decision.reasonCode}: ${decision.reason}`,
       };
       final = { agent, model: chosen.model, variant: chosen.variant };
 
-      if (mode === "enforce" && !decision.pinned) {
+      if (mode === "enforce" && !decision.pinned && !resuming) {
         if (decision.switched && decision.target !== null) {
           const target = decision.target;
           outcome = { ...outcome, agent: target.agent.id, model: refOf(target.model, target.variant) };

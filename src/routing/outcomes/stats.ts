@@ -99,11 +99,15 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     else refusals.push(row);
   }
   const dispatchRows = decisions.filter((r) => r.step === "dispatch");
-  const nonPinned = dispatchRows.filter((r) => !r.pinned);
+  // QA-2.4-R2-3 / A30: a dispatch that resumes an existing child (`task_id`/`sessionID`) is never switched by the engine, so it says nothing
+  // about routing: every routing metric below (class and key dispatch counts, agreement, switched, savings, the evidence gate) is over the
+  // FRESH dispatches only. Resumes are reported on their own line (`orchestratorResumes`).
+  const freshRows = dispatchRows.filter((r) => !r.resume);
+  const nonPinned = freshRows.filter((r) => !r.pinned);
 
   // By class.
   const classCounts = new Map<string, number>();
-  for (const r of dispatchRows) classCounts.set(r.facts.class, (classCounts.get(r.facts.class) ?? 0) + 1);
+  for (const r of freshRows) classCounts.set(r.facts.class, (classCounts.get(r.facts.class) ?? 0) + 1);
   const byClass: ClassStatsRow[] = [...classCounts.keys()]
     .sort(compareCodeUnits)
     .map((cls) => ({ class: cls, dispatches: classCounts.get(cls) ?? 0 }));
@@ -121,7 +125,7 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   for (const r of decisions) {
     const acc = slot(dispatchedKey(r));
     acc.attempts += 1;
-    if (r.step === "dispatch") acc.dispatches += 1;
+    if (r.step === "dispatch" && !r.resume) acc.dispatches += 1;
   }
   // A refusal belongs to this window's refusal rate only when its decision row is in the window too
   // (QA-1.3-13); otherwise `falseRefusals / attempts` could pass 100 %. Refusals without a decision id stay.
@@ -236,9 +240,10 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   });
 
   // 2.4: the orchestrator's own resumes (2.2 `task_id`/`sessionID`) and the A27 evidence gate, over the routed dispatch rows.
-  const routedDispatches = dispatchRows.filter((r) => !isDelegateAttempt(r));
+  const routedDispatches = dispatchRows.filter((r) => !isDelegateAttempt(r)); // fresh and resumed: the resume line's denominator
+  const routedFresh = routedDispatches.filter((r) => !r.resume);
   const argminCounts = new Map<OutcomeKey, number>();
-  for (const r of routedDispatches) {
+  for (const r of routedFresh) {
     const key = r.trace?.argmin?.key;
     if (key !== undefined) argminCounts.set(key, (argminCounts.get(key) ?? 0) + 1);
   }
@@ -271,7 +276,7 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     },
     resumeVsFresh,
     orchestratorResumes: { resumed: routedDispatches.filter((r) => r.resume).length, total: routedDispatches.length },
-    gate: { keptEvidence: routedDispatches.filter((r) => r.reason.startsWith("kept:evidence")).length, argmin },
+    gate: { keptEvidence: routedFresh.filter((r) => r.reason.startsWith("kept:evidence")).length, argmin },
   };
 }
 
@@ -328,8 +333,8 @@ export function renderMarkdown(table: StatsTable): string {
         )),
     `| Variant steps | ${table.variantSteps.taken} taken; pass ${fmtRatio(table.variantSteps.passRate)} |`,
     // 2.4: not ladder decisions, so they are not rows of the D11 table below (QA-2.3-7).
-    `| Orchestrator resumes (task_id / sessionID; not a ladder step) | ${table.orchestratorResumes.resumed} of ${table.orchestratorResumes.total} routed dispatches |`,
-    `| Kept for lack of evidence (A27) | ${table.gate.keptEvidence} of ${table.routed} routed dispatches |`,
+    `| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | ${table.orchestratorResumes.resumed} of ${table.orchestratorResumes.total} routed dispatches |`,
+    `| Kept for lack of evidence (A27, fresh dispatches) | ${table.gate.keptEvidence} of ${table.orchestratorResumes.total - table.orchestratorResumes.resumed} fresh routed dispatches |`,
   ];
 
   const classTable =
