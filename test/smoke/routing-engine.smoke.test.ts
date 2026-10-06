@@ -21,7 +21,7 @@ import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
 import {
-  MODELS, ROOT, RoutingHost, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
+  MODELS, ROOT, RoutingHost, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, type HookRecord, type ModelRef, type Obj, type Rule, type Seed, type WireRequest,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -507,7 +507,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
   it("H6 resume: floor lift, kept:resume:running, an honoured agent switch, a pinned resume, a non-child resume and a denied agent (A30 amended)", async () => {
     const host = await RoutingHost.start("resume", { routing: { engine: "enforce" }, overrides: { enforcement: { escalate: { floorTier: "medium" } } } });
     try {
-      await runScenario("H6-resume-rules-on-the-host", "On a real host with escalate.floorTier=medium in enforce: (1) a fast dispatch is lifted to medium and the host's child runs medium/sonnet#medium; (2) a resume naming the original pick `fast` is rewritten to `medium` (row reason kept:resume:running) and the host's child STAYS medium; (3) a resume naming `heavy` on purpose is honoured: the host's switchAgent moves the child to heavy AND to heavy's model; (4) a resume naming `fast` is lifted to the floor (medium), never below it; (5) a PINNED resume naming `fast` is not rewritten and the host moves the child to fast/sonnet#low (the behaviour the rule protects against); (6) what the host does with a resume of a session that is not a child of the caller, and with an agent the session's permissions deny, is recorded.", async s => {
+      await runScenario("H6-resume-rules-on-the-host", "On a real host with escalate.floorTier=medium in enforce: (1) a fast dispatch is lifted to medium and the host's child runs medium/sonnet#medium; (2) a resume naming the original pick `fast` is rewritten to `medium` (row reason kept:resume:running) and the host's child STAYS medium; (3) a resume naming `heavy` on purpose is honoured: the host's switchAgent moves the child to heavy AND to heavy's model; (4) a resume naming `fast` is lifted to the floor (medium), never below it; (5) a resume of another root's child is rejected by the host AFTER the plugin's hooks ran, and the next resume naming the pick is still corrected (R2-1: the rejected call did not take the registration); a PINNED resume naming `fast` is not rewritten and the host moves the child to fast/sonnet#low (the behaviour the rule protects against); (6) an agent the session's permissions deny is refused by the host (`Subagent denied`) and the child stays where it was.", async s => {
         const rootID = await host.newRoot("resume root");
         const state = async (childID: string) => { const c = await host.client.session.get({ sessionID: childID }); return { agent: c.agent, model: c.model ? ref(c.model) : undefined, parentID: c.parentID }; };
         const steps: Obj[] = [];
@@ -522,19 +522,20 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const keep = await record("2 resume naming the original pick", { agent: "fast", prompt: SEARCH_PROMPT }, childID);
         const up = await record("3 resume naming heavy on purpose", { agent: "heavy", prompt: SEARCH_PROMPT }, childID);
         const down = await record("4 resume naming fast after heavy", { agent: "fast", prompt: SEARCH_PROMPT }, childID);
-        const pinned = await record("5 pinned resume naming fast", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it again." }, childID);
-        // a session that is not a child of the caller
+        // a session that is not a child of the caller: the host rejects it AFTER the plugin's hooks ran (R2-1)
         const otherRoot = await host.newRoot("resume root 2");
         const foreign = await host.call(otherRoot, "subagent", { agent: "medium", description: "H6 foreign resume", prompt: SEARCH_PROMPT, sessionID: childID, background: false });
         const afterForeign = await state(childID);
-        steps.push({ name: "6a resume of another root's child", status: foreign.after.status, error: foreign.after.error, resultSessionID: foreign.childID, hostChildAfter: afterForeign });
-        // an agent the session's permissions deny
+        steps.push({ name: "5a resume of another root's child (rejected by the host)", status: foreign.after.status, error: foreign.after.error, resultSessionID: foreign.childID, hostChildAfter: afterForeign });
+        // R2-1: the rejected call must not have taken the child's registration away from its own orchestrator: the next resume naming the pick is still corrected
+        const again = await record("5b resume naming fast after the rejected foreign resume (R2-1)", { agent: "fast", prompt: SEARCH_PROMPT }, childID);
+        const pinned = await record("5c pinned resume naming fast", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it again." }, childID);        // an agent the session's permissions deny
         const denyRoot = await host.newRoot("resume root 3", undefined, undefined, [{ action: "*", resource: "*", effect: "allow" }, { action: "subagent", resource: "heavy", effect: "deny" }]);
         const denyFirst = await host.dispatch(denyRoot, { agent: "fast", description: "H6 deny start", prompt: SEARCH_PROMPT, background: false });
         const denied = await host.call(denyRoot, "subagent", { agent: "heavy", description: "H6 deny resume", prompt: SEARCH_PROMPT, sessionID: denyFirst.childID, background: false });
         const afterDenied = await state(denyFirst.childID);
-        steps.push({ name: "6b resume naming an agent the session denies", status: denied.after.status, error: denied.after.error, hookInput: { agent: obj(denied.before.input).agent, model: obj(denied.before.input).model }, hostChildAfter: afterDenied });
-        const rows = await host.waitForRows("every decision row", r => r.length >= 8, 90_000);
+        steps.push({ name: "6 resume naming an agent the session denies", status: denied.after.status, error: denied.after.error, hookInput: { agent: obj(denied.before.input).agent, model: obj(denied.before.input).model }, hostChildAfter: afterDenied });
+        const rows = await host.waitForRows("every decision row", r => r.length >= 9, 90_000);
         s.observed.steps = steps;
         s.observed.rows = rows.map(r => ({ session: r.sessionID === rootID ? "root1" : r.sessionID === otherRoot ? "root2" : "root3", resume: r.resume, childSessionID: r.childSessionID === childID ? "child1" : r.childSessionID, chosen: r.chosen.agent, best: r.best?.agent, switched: r.switched, pinned: r.pinned, reason: r.reason.slice(0, 260) }));
         s.observed.hostErrors = host.errorLines();
@@ -545,7 +546,10 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           && keep.after.agent === "medium" && keep.after.model === medium && obj(keep.d.before.input).agent === "medium" && rootRows[1]?.reason.startsWith(RESUME_RUNNING_REASON) === true
           && up.after.agent === "heavy" && up.after.model === `${MODELS.opus}#xhigh`
           && down.after.agent === "medium" && down.after.model === medium && rootRows[3]?.reason.startsWith(FLOOR_LIFT_REASON) === true
-          && pinned.after.agent === "fast" && pinned.after.model === `${MODELS.sonnet}#low` && rootRows[4]?.pinned === true && rootRows[4]?.reason.startsWith(RESUME_RUNNING_REASON) === true && rootRows[4]?.reason.includes("NOT rewritten") === true && !rootRows[4]?.reason.includes("sent to @medium")
+          && foreign.after.status === "error" && String(obj(foreign.after.error).string).includes("is not a child of the current session") && afterForeign.agent === "medium"
+          && again.after.agent === "medium" && again.after.model === medium && obj(again.d.before.input).agent === "medium" && rootRows[4]?.reason.startsWith(RESUME_RUNNING_REASON) === true && rootRows[4]?.reason.includes("sent to @medium") === true
+          && pinned.after.agent === "fast" && pinned.after.model === `${MODELS.sonnet}#low` && rootRows[5]?.pinned === true && rootRows[5]?.reason.startsWith(RESUME_RUNNING_REASON) === true && rootRows[5]?.reason.includes("NOT rewritten") === true && !rootRows[5]?.reason.includes("sent to @medium")
+          && String(obj(denied.after.error).string).includes("Subagent denied: heavy") && afterDenied.agent === "medium"
           && host.errorLines().length === 0;
         s.verdict(ok, `fresh fast -> ${first.after.agent}; resume naming fast -> ${keep.after.agent}; resume naming heavy -> ${up.after.agent}/${up.after.model}; resume naming fast after heavy -> ${down.after.agent}; pinned resume naming fast -> ${pinned.after.agent}/${pinned.after.model}; foreign resume status ${String(foreign.after.status)}; denied resume status ${String(denied.after.status)}`);
       });
@@ -554,6 +558,36 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
   }, 400_000);
+  it("H9 permissions: enforce with the host's native permission rules (no allow-all) swaps only to agents the session may start", async () => {
+    const host = await RoutingHost.start("permissions", { routing: { engine: "enforce" }, seed: SEARCH_SEED });
+    try {
+      await runScenario("H9-enforce-real-permission-set", "With a root session that only carries `subagent * allow` (so the native `build` agent's own rules decide everything else) the heavy -> fast swap still happens; with `subagent fast` denied for the session the engine does NOT swap to fast (the host would refuse the dispatch): the child runs a permitted agent and no `Subagent denied` error occurs. The host's evaluated permissions of build/fast/heavy/explore are recorded.", async s => {
+        const narrow: Rule[] = [{ action: "subagent", resource: "*", effect: "allow" }];
+        const open = await host.newRoot("permissions root (subagent allow only)", undefined, undefined, narrow);
+        const swapped = await host.dispatch(open, { agent: "heavy", description: "Find usages", prompt: SEARCH_PROMPT, background: false });
+        const swappedChild = await host.client.session.get({ sessionID: swapped.childID });
+        const closed = await host.newRoot("permissions root (fast denied)", undefined, undefined, [...narrow, { action: "subagent", resource: "fast", effect: "deny" }]);
+        const denied = await host.call(closed, "subagent", { agent: "heavy", description: "Find usages, fast denied", prompt: SEARCH_PROMPT, background: false });
+        const deniedChild = denied.childID === undefined ? undefined : await host.client.session.get({ sessionID: denied.childID });
+        const records = (await host.client.agent.list()).data.filter(a => ["build", "fast", "medium", "heavy", "explore"].includes(a.id));
+        const rows = await host.waitForRows("both decision rows", r => r.length >= 2, 70_000);
+        s.observed.agentPermissions = records.map(a => ({ id: a.id, mode: a.mode, permissions: a.permissions }));
+        s.observed.openSession = { rootID: open, rules: narrow, childID: swapped.childID, hostChild: { agent: swappedChild.agent, model: swappedChild.model ? ref(swappedChild.model) : undefined } };
+        s.observed.deniedSession = { rootID: closed, status: denied.after.status, error: denied.after.error, hookInput: { agent: obj(denied.before.input).agent, model: obj(denied.before.input).model }, childID: denied.childID, hostChild: deniedChild && { agent: deniedChild.agent, model: deniedChild.model ? ref(deniedChild.model) : undefined } };
+        s.observed.rows = rows.map(r => ({ session: r.sessionID === open ? "open" : "fast-denied", chosen: r.chosen.agent, best: r.best?.agent, switched: r.switched, reason: r.reason.slice(0, 220) }));
+        s.observed.hostErrors = host.errorLines();
+        s.observed.routerLogLines = host.routerLogLines();
+        const deniedRow = rows.find(r => r.sessionID === closed);
+        const ok = swappedChild.agent === "fast" && sameModel(swappedChild.model, SONNET, "low")
+          && denied.after.status === "completed" && deniedChild !== undefined && deniedChild.agent !== "fast" && obj(denied.before.input).agent !== "fast"
+          && deniedRow !== undefined && deniedRow.switched === false && host.errorLines().length === 0 && host.routerLogLines().length === 0;
+        s.verdict(ok, `subagent-allow-only session: heavy -> ${swappedChild.agent}/${swappedChild.model ? ref(swappedChild.model) : "?"}; fast-denied session: dispatch ${String(denied.after.status)}, child agent ${String(deniedChild?.agent)}, row switched=${String(deniedRow?.switched)} (${deniedRow?.reason.slice(0, 80)})`);
+      });
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 300_000);
   it("H7 effort: bare-model resume (R1), the effort options of a resumed child after an agent switch (QA-1.5-22) and a default -> high step (F9) on the Anthropic route", async () => {
     const effortPreset = {
       fast: { ...SMOKE_PRESET.fast, effort: "low" },
