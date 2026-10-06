@@ -2848,11 +2848,12 @@ export function resolveCandidates(tierName: string, cfg: RouterConfig): readonly
   const rung = (model: string, variant: string | undefined, costRatio: number): ResolvedCandidate =>
     Object.freeze(variant === undefined ? { model, costRatio } : { model, variant, costRatio });
 
-  if (!hasExplicitCandidates(tier)) {
+  const listed = tier.candidates;
+  if (listed === undefined || !hasExplicitCandidates(tier)) {
     return Object.freeze([rung(tier.model, tier.variant, tierCostRatio)]);
   }
   return Object.freeze(
-    (tier.candidates ?? []).map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
+    listed.map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
   );
 }
 /**

@@ -664,6 +664,10 @@ describe("the shipped tiers.json (no routing block: behaviour unchanged)", () =>
 });
 
 describe("findUnknownRoutingKeys / collectRoutingNotices (QA-1.1-10, -14, -18)", () => {
+  it("has no notices for a directory whose config was never loaded", () => {
+    expect(getConfigNotices(join(tmpdir(), "oc-mr-never-loaded-dir"))).toEqual([]);
+  });
+
   it("lists the path of every unknown key, at every level", () => {
     expect(
       findUnknownRoutingKeys({
@@ -683,6 +687,12 @@ describe("findUnknownRoutingKeys / collectRoutingNotices (QA-1.1-10, -14, -18)",
       "routing.sessionReuse.max",
       "routing.advisor.enable",
       "routing.classifier.presets.anthropic.modle",
+    ]);
+  });
+
+  it("skips a classifier.presets entry that is not an object (validation reports that, not the notice)", () => {
+    expect(findUnknownRoutingKeys({ classifier: { presets: { a: "host", b: null, c: { modle: "x/y" } } } })).toEqual([
+      "routing.classifier.presets.c.modle",
     ]);
   });
 
@@ -964,6 +974,15 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(warned("ignoring unknown routing key")).toHaveLength(2);
     });
 
+    it("keeps warning correctly across hundreds of distinct configs (the reported-notice set is bounded)", () => {
+      for (let i = 0; i < 260; i++) {
+        editOverride({ routing: { [`typo${i}`]: 1 } });
+        loadConfig();
+      }
+      expect(warned("ignoring unknown routing key: routing.typo")).toHaveLength(260);
+      expect(noticeMessages()).toEqual(["ignoring unknown routing key: routing.typo259"]);
+    });
+
     it("drops the notice once the typo is fixed", () => {
       editOverride({ routing: { margn: 0.5 } });
       loadConfig();
@@ -1085,6 +1104,15 @@ describe("hot reload of the global override file with a routing block", () => {
         apiKeyEnv: "GLOBAL_KEY",
       });
       expect(resolved.outcomes.path).toBe(resolve(tmpdir(), "global-outcomes"));
+    });
+
+    it("has nothing to strip, and nothing to say, when the project layer has no routing block", () => {
+      writeProject({ tierCaps: { fast: 9 } });
+      expect(loadConfig(project).tierCaps?.fast).toBe(9);
+      writeProject({ routing: "not an object" });
+      expect(getConfigReloadError(project)).toBeNull();
+      loadConfig(project); // the layer is invalid as a whole and is dropped; the strip must not throw first
+      expect(projectWarnings()).toHaveLength(0);
     });
 
     it("says nothing about a project layer that does not set them", () => {
@@ -1340,6 +1368,12 @@ describe("build-info", () => {
       setup();
       expect(() => readGitSha(dir)).not.toThrow();
       expect(readGitSha(dir)).toBe("unknown");
+    });
+
+    it("never throws for a root that is not even a string", () => {
+      const notAString = undefined as unknown as string;
+      expect(() => readGitSha(notAString)).not.toThrow();
+      expect(readGitSha(notAString)).toBe("unknown");
     });
 
     it.each([
