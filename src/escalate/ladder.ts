@@ -1,5 +1,5 @@
 import { effortCeilingFor, effortRank, minEffort, nextEffort } from "../router/agent-options";
-import { resolveEffortBump, type EffortLevel, type RouterConfig } from "../router/config";
+import { resolveEffortBump, type EffortLevel, type RouterConfig, type TierConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import {
   DEFAULT_VARIANT,
@@ -37,6 +37,12 @@ export interface TierVariantInfo {
   ladder: VariantLadder;
   /** inputBudget(catalogEntry.limit) (A5/A10). */
   inputBudget: number | null;
+  /**
+   * Rung -> costRatio (A17): the matching candidate's own `costRatio` when the tier configures one,
+   * else the tier's `costRatio`. Keyed by variant id; `default` for the bare model. A missing key
+   * means the ratio is unknown and the runner charges the tier's `costRatio`.
+   */
+  costRatios: Record<string, number>;
 }
 
 export interface VariantPolicy {
@@ -91,6 +97,11 @@ export interface LadderAction {
   model?: string;
   /** Catalog-validated target variant; absent = default / leave unchanged. */
   variant?: string;
+  /**
+   * A17: costRatio of the rung this action runs (`model` + `variant`), on variant steps, plain
+   * retries and escalations when it is known. The runner charges `action.costRatio ?? tier.costRatio`.
+   */
+  costRatio?: number;
   /** Present on every retry/escalate when policy.variants is set. */
   resume?: boolean;
   /** D11 "decision and both numbers are logged"; present iff resume is. */
@@ -222,6 +233,18 @@ function emittable(info: TierVariantInfo, v: string): string | undefined {
   return v !== DEFAULT_VARIANT && (v === info.base || info.ladder.variants.includes(v)) ? v : undefined;
 }
 
+/** A17: costRatio of the rung `variant` (default when absent) of a tier; `undefined` when unknown. */
+function costFields(info: TierVariantInfo, variant: string | undefined): Pick<LadderAction, "costRatio"> {
+  const costRatio = costRatioOf(info, variant);
+  return costRatio === undefined ? {} : { costRatio };
+}
+
+function costRatioOf(info: TierVariantInfo, variant: string | undefined): number | undefined {
+  const ratios = info.costRatios;
+  const key = variant ?? DEFAULT_VARIANT;
+  return ratios && Object.prototype.hasOwnProperty.call(ratios, key) ? ratios[key] : undefined;
+}
+
 /** D11: the resume decision and both numbers for the attempt this action leads to. */
 function sessionFields(
   state: LadderState,
@@ -331,6 +354,7 @@ export function nextAction(
         variantStep: true,
         model: info.model,
         variant,
+        ...costFields(info, variant),
         ...sessionFields(state, variants, info, forcingMessage, session),
       };
     }
@@ -361,6 +385,7 @@ export function nextAction(
         action.model = info.model;
         const v = emittable(info, state.currentVariant ?? info.base);
         if (v !== undefined) action.variant = v; // keeps the reached variant on a fresh retry
+        Object.assign(action, costFields(info, action.variant));
       }
       Object.assign(action, sessionFields(state, variants, info, action.forcingMessage!, session));
     }
@@ -388,6 +413,7 @@ export function nextAction(
       action.model = target.model;
       const v = emittable(target, target.base);
       if (v !== undefined) action.variant = v;
+      Object.assign(action, costFields(target, action.variant));
     }
     Object.assign(action, sessionFields(state, variants, target, action.forcingMessage!, session));
   }
@@ -452,6 +478,42 @@ export function buildEscalatePolicy(
   return policy;
 }
 
+/** costRatio as 1.1 validates it: a finite number above 0. */
+function validCostRatio(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * A17: the costRatio of every rung a tier can run (its base and its ladder): a candidate of the same
+ * model naming that variant (no variant = `default`) with its own `costRatio`, else the tier's.
+ * Rungs without any ratio are omitted, so the runner falls back to the tier's `costRatio`.
+ */
+function rungCostRatios(
+  tier: TierConfig,
+  rawCandidates: unknown,
+  base: string,
+  ladder: VariantLadder,
+): Record<string, number> {
+  const tierRatio = validCostRatio(tier.costRatio);
+  const own = new Map<string, number>();
+  if (Array.isArray(rawCandidates)) {
+    for (const candidate of rawCandidates) {
+      if (candidate === null || typeof candidate !== "object") continue;
+      const model = typeof candidate.model === "string" && candidate.model.length > 0 ? candidate.model : tier.model;
+      const ratio = validCostRatio(candidate.costRatio);
+      if (model !== tier.model || ratio === undefined) continue;
+      const rung = typeof candidate.variant === "string" && candidate.variant.length > 0 ? candidate.variant : DEFAULT_VARIANT;
+      if (!own.has(rung)) own.set(rung, ratio);
+    }
+  }
+  const entries: Array<[string, number]> = [];
+  for (const rung of new Set([base, ...ladder.variants])) {
+    const ratio = own.get(rung) ?? tierRatio;
+    if (ratio !== undefined) entries.push([rung, ratio]);
+  }
+  return Object.fromEntries(entries);
+}
+
 function buildVariantPolicy(
   cfg: RouterConfig,
   session?: LadderSessionPolicyInput,
@@ -469,16 +531,19 @@ function buildVariantPolicy(
     if (ids === null) continue; // no catalog: today's behaviour for this tier
     if (configured !== null && !ids.includes(configured)) continue; // invalid configured variant: never resume-switch it
     const raw = (tier as { candidates?: unknown }).candidates; // raw config, never resolveCandidates() (F11)
+    const base = configured ?? DEFAULT_VARIANT;
+    const ladder = buildVariantLadder({
+      model: tier.model,
+      catalog: entry,
+      candidates: Array.isArray(raw) ? raw : undefined,
+      maxEffort: max,
+    });
     entries.push([name, {
       model: tier.model,
-      base: configured ?? DEFAULT_VARIANT,
-      ladder: buildVariantLadder({
-        model: tier.model,
-        catalog: entry,
-        candidates: Array.isArray(raw) ? raw : undefined,
-        maxEffort: max,
-      }),
+      base,
+      ladder,
       inputBudget: inputBudget(entry?.limit),
+      costRatios: rungCostRatios(tier, raw, base, ladder),
     }]);
   }
   if (entries.length === 0) return null;

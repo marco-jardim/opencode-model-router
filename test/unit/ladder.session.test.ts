@@ -78,8 +78,14 @@ const HYBRID2: Record<string, TierConfig> = {
   heavy: { model: OPUS, variant: "xhigh", costRatio: 20 },
 };
 
-function info(model: string, base: string, variants: string[], budget: number | null = 1_000_000): TierVariantInfo {
-  return { model, base, ladder: { model, variants, source: "catalog", rejected: [] }, inputBudget: budget };
+function info(
+  model: string,
+  base: string,
+  variants: string[],
+  budget: number | null = 1_000_000,
+  costRatios: Record<string, number> = {},
+): TierVariantInfo {
+  return { model, base, ladder: { model, variants, source: "catalog", rejected: [] }, inputBudget: budget, costRatios };
 }
 
 function handPolicy(
@@ -136,16 +142,26 @@ function mulberry32(seed: number) {
 }
 
 /** Drives the real loop: record an attempt (with a child), ask for the next action, advance. */
+/** What the runner charges for the next attempt (A17): the action's rung ratio, else the tier's own. */
+const chargeBy = (tiers: Record<string, TierConfig>) => (rung: { tier: string; action: LadderAction | null }): number =>
+  rung.action?.costRatio ?? tiers[rung.tier]!.costRatio!;
+
 function runLoop(
   policy: EscalatePolicy,
-  options: { producer?: string; cost?: (state: LadderState) => number; tokens?: number | null; promptChars?: number } = {},
+  options: {
+    producer?: string;
+    charge?: (rung: { tier: string; action: LadderAction | null }) => number;
+    tokens?: number | null;
+    promptChars?: number;
+  } = {},
 ) {
   let state = newLadderState(options.producer ?? policy.ladder[0]!, policy);
   const actions: LadderAction[] = [];
   const states: LadderState[] = [];
+  let previous: LadderAction | null = null;
   for (let attempt = 0; attempt < 50; attempt++) {
     states.push(state);
-    state = recordAttempt(state, options.cost?.(state) ?? 1, {
+    state = recordAttempt(state, options.charge?.({ tier: state.currentTier, action: previous }) ?? 1, {
       sessionID: `ses_${attempt + 1}`,
       lastStepTokens: options.tokens === undefined ? 1000 : options.tokens,
     });
@@ -153,6 +169,7 @@ function runLoop(
     actions.push(action);
     if (action.action === "give_up" || action.action === "accept") return { state, actions, states };
     state = advance(state, action);
+    previous = action;
   }
   throw new Error("loop did not terminate");
 }
@@ -892,11 +909,28 @@ describe("skipCoveredTiers (F4)", () => {
 // ---------------------------------------------------------------------------
 
 describe("owner preset trace", () => {
-  it("anthropic preset, default budget: sonnet#low, sonnet#medium, then the reserve escalates to opus#xhigh twice", () => {
+  const ratios = (tiers: Record<string, TierConfig>) => ({ charge: chargeBy(tiers) });
+  const GENEROUS = { costCeiling: { multiple: 1000 } };
+
+  it("anthropic preset, default budget and real ratios: sonnet#low, sonnet#medium, opus#xhigh, then the ceiling stops it", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
     expect(policy.maxTotalAttempts).toBe(4);
     expect(policy.costMultiple).toBe(4);
-    const run = runLoop(policy);
+    const run = runLoop(policy, ratios(OWNER));
+    // fast's variants are charged at fast's ratio 1; the escalation to heavy charges 20 (> 1 × 4).
+    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${OPUS}#xhigh`]);
+    expect(run.actions.map((a) => [a.action, a.tier, a.variantStep === true, a.costRatio])).toEqual([
+      ["retry", "fast", true, 1],
+      ["escalate", "heavy", false, 20],
+      ["give_up", undefined, false, undefined],
+    ]);
+    expect(run.actions[2]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+    expect(run.state.cumulativeCost).toBe(22);
+  });
+
+  it("anthropic preset, default budget without the cost ceiling: sonnet#low, sonnet#medium, opus#xhigh, opus#xhigh", () => {
+    const policy = buildEscalatePolicy(makeConfig(OWNER, GENEROUS), V2);
+    const run = runLoop(policy, ratios(OWNER));
     expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${OPUS}#xhigh`, `${OPUS}#xhigh`]);
     expect(run.actions.map((a) => [a.action, a.tier, a.variantStep === true])).toEqual([
       ["retry", "fast", true],
@@ -910,8 +944,7 @@ describe("owner preset trace", () => {
 
   it("anthropic preset, larger budget: all of fast's variants first, then the covered medium is skipped for heavy", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER, { maxTotalAttempts: 10, costCeiling: { multiple: 40 } }), V2);
-    const costRatio = (state: LadderState) => OWNER[state.currentTier]!.costRatio!;
-    const run = runLoop(policy, { cost: costRatio });
+    const run = runLoop(policy, ratios(OWNER));
     const summary = run.actions.map((a) => [a.action, a.tier, a.variant, a.variantStep === true]);
     expect(summary.slice(0, 5)).toEqual([
       ["retry", "fast", "medium", true],
@@ -921,11 +954,11 @@ describe("owner preset trace", () => {
       ["escalate", "heavy", "xhigh", false],
     ]);
     const escalation = run.actions[4]!;
-    expect(escalation).toMatchObject({ agent: "heavy", model: OPUS });
+    expect(escalation).toMatchObject({ agent: "heavy", model: OPUS, costRatio: 20 });
     // heavy sits at its base (the top of the capped catalog ladder), so it only retries once; that second
     // heavy attempt costs 20 and the cumulative cost (5 + 20 + 20 = 45) crosses the ×40 ceiling.
     expect(run.actions.slice(5).map((a) => a.action)).toEqual(["retry", "give_up"]);
-    expect(run.actions[5]).toMatchObject({ tier: "heavy", model: OPUS, variant: "xhigh" });
+    expect(run.actions[5]).toMatchObject({ tier: "heavy", model: OPUS, variant: "xhigh", costRatio: 20 });
     expect(run.actions[5]).not.toHaveProperty("variantStep");
     expect(run.actions[6]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
     expect(run.state.cumulativeCost).toBe(45);
@@ -934,16 +967,98 @@ describe("owner preset trace", () => {
     expect(run.state.currentVariant).toBeNull();
   });
 
-  it("hybrid-2 preset (luna-fast#medium, sonnet#xhigh, opus#xhigh), default budget", () => {
+  it("hybrid-2 preset (luna-fast#medium, sonnet#xhigh, opus#xhigh), real ratios: the ceiling stops it after sonnet#xhigh", () => {
     const policy = buildEscalatePolicy(makeConfig(HYBRID2), V2);
     expect(policy.variants!.perTier.fast!.ladder.variants).toEqual(["none", "low", "medium", "high", "xhigh"]);
-    const run = runLoop(policy);
+    const run = runLoop(policy, ratios(HYBRID2));
+    // 1 + 1 + 5 = 7 > 1 × 4 after the third attempt.
+    expect(attemptTrace(policy, run)).toEqual([`${LUNA_FAST}#medium`, `${LUNA_FAST}#high`, `${SONNET}#xhigh`]);
+    expect(run.actions.map((a) => a.action)).toEqual(["retry", "escalate", "give_up"]);
+    expect(run.actions[2]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+    expect(run.state.cumulativeCost).toBe(7);
+  });
+
+  it("hybrid-2 preset without the cost ceiling: luna#medium, luna#high, sonnet#xhigh, opus#xhigh", () => {
+    const policy = buildEscalatePolicy(makeConfig(HYBRID2, GENEROUS), V2);
+    const run = runLoop(policy, ratios(HYBRID2));
     expect(attemptTrace(policy, run)).toEqual([`${LUNA_FAST}#medium`, `${LUNA_FAST}#high`, `${SONNET}#xhigh`, `${OPUS}#xhigh`]);
     expect(run.actions.map((a) => a.action)).toEqual(["retry", "escalate", "escalate", "give_up"]);
     expect(run.actions[3]).toEqual({ action: "give_up", reason: "max total attempts (4) reached" });
   });
 });
 
+describe("costRatio of the rung an action runs (A17)", () => {
+  it("builds costRatios from the tier's ratio, overridden by a candidate's own costRatio", () => {
+    const withCandidates = {
+      model: SONNET,
+      variant: "low",
+      costRatio: 1,
+      candidates: [
+        { variant: "low" },
+        { variant: "medium", costRatio: 2 },
+        { variant: "xhigh", costRatio: 6 },
+        { model: OPUS, variant: "high", costRatio: 40 },
+        { variant: "max", costRatio: -3 },
+      ],
+    };
+    const policy = buildEscalatePolicy(makeConfig({ fast: withCandidates, medium: { model: SONNET, costRatio: 5 }, heavy: { model: OPUS } }), V2);
+    const { fast, medium, heavy } = policy.variants!.perTier;
+    // `max` is named by a candidate whose ratio is invalid: it stays on the ladder and charges the tier's ratio.
+    expect(fast!.ladder.variants).toEqual(["low", "medium", "xhigh", "max"]);
+    expect(fast!.costRatios).toEqual({ low: 1, medium: 2, xhigh: 6, max: 1 });
+    // a tier without candidates charges its own ratio on every rung, default included
+    expect(medium!.costRatios).toEqual({ default: 5, low: 5, medium: 5, high: 5, xhigh: 5 });
+    // no ratio anywhere: nothing to report, the runner falls back to the tier
+    expect(heavy!.costRatios).toEqual({});
+  });
+
+  it("carries the rung's ratio on variant steps, plain retries and escalations", () => {
+    const policy = handPolicy(
+      {
+        fast: info(SONNET, "low", ["low", "medium", "xhigh"], 1_000_000, { low: 1, medium: 2, xhigh: 6 }),
+        medium: info(OPUS, "high", ["high"], 800_000, { high: 9, default: 3 }),
+        heavy: info(HAIKU, DEFAULT_VARIANT, [], 200_000, { default: 3 }),
+      },
+      { maxAttemptsPerTier: 1 },
+    );
+    expect(nextAction(sessionState(), fail, policy)).toMatchObject({ variantStep: true, variant: "medium", costRatio: 2 });
+    expect(nextAction(sessionState({ currentVariant: "medium" }), fail, policy)).toMatchObject({ variantStep: true, variant: "xhigh", costRatio: 6 });
+    const plain = nextAction(sessionState({ currentVariant: "xhigh" }), fail, policy);
+    expect(plain).toMatchObject({ action: "retry", variant: "xhigh", costRatio: 6 });
+    expect(plain).not.toHaveProperty("variantStep");
+    expect(nextAction(sessionState({ currentVariant: "xhigh", attemptsThisTier: 1 }), fail, policy))
+      .toMatchObject({ action: "escalate", tier: "medium", variant: "high", costRatio: 9 });
+    // a default-based rung is keyed `default`
+    expect(nextAction(sessionState({ currentTier: "medium", attemptsThisTier: 1, currentVariant: "high" }), fail, policy))
+      .toMatchObject({ action: "escalate", tier: "heavy", costRatio: 3 });
+    expect(nextAction(sessionState({ currentTier: "heavy" }), fail, policy)).toMatchObject({ action: "retry", tier: "heavy", costRatio: 3 });
+  });
+
+  it("omits costRatio when the rung is unknown, on a tier without info, and without a variant policy", () => {
+    const policy = handPolicy({ fast: info(SONNET, "low", ["low", "medium"], 1_000_000, { low: 1 }) });
+    const step = nextAction(sessionState(), fail, policy); // medium has no ratio
+    expect(step).toMatchObject({ variantStep: true, variant: "medium" });
+    expect(step).not.toHaveProperty("costRatio");
+    expect(nextAction(sessionState({ attemptsThisTier: 1, currentVariant: "medium" }), fail, policy)).not.toHaveProperty("costRatio");
+    const plain: EscalatePolicy = { ladder: ["fast", "medium"], maxAttemptsPerTier: 0, maxTotalAttempts: 4, costMultiple: null };
+    expect(nextAction(sessionState(), fail, plain)).not.toHaveProperty("costRatio");
+  });
+
+  it("charges the action's ratio over the tier's in the real loop", () => {
+    const tiers: Record<string, TierConfig> = {
+      fast: {
+        model: SONNET,
+        variant: "low",
+        costRatio: 1,
+        ...{ candidates: [{ variant: "low", costRatio: 1 }, { variant: "medium", costRatio: 3 }, { variant: "high", costRatio: 9 }] },
+      },
+    };
+    const policy = buildEscalatePolicy(makeConfig(tiers, { maxTotalAttempts: 4, ladder: ["fast"], costCeiling: { multiple: 100 } }), V2);
+    const run = runLoop(policy, { charge: chargeBy(tiers) });
+    expect(run.actions.map((a) => a.costRatio)).toEqual([3, 9, 9, undefined]); // the plain retry runs high again
+    expect(run.state.cumulativeCost).toBe(1 + 3 + 9 + 9);
+  });
+});
 describe("A17 budget reserve", () => {
   const perTier = { fast: info(SONNET, "low", ["low", "medium", "high", "xhigh"]), medium: info(OPUS, "medium", ["medium", "high"]) };
 
@@ -1130,6 +1245,7 @@ describe("property-based: session-aware loop", () => {
           expect(maxTotalAttempts - state.totalAttempts - 1).toBeGreaterThanOrEqual(above);
         }
 
+        if (action.costRatio !== undefined) expect(action.costRatio).toBeGreaterThan(0);
         if (action.variant !== undefined) {
           expect(action.variant).not.toBe(DEFAULT_VARIANT);
           expect(action.model).toBeDefined();
