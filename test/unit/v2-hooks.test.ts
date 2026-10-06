@@ -9,7 +9,12 @@ import { getActiveTiers } from "../../src/router/protocol";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import v2Plugin from "../../src/v2";
+import type { Plugin } from "@opencode/plugin";
+import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
+import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
@@ -930,5 +935,305 @@ describe("OpenCode 2 hook adapter", () => {
       process.chdir(savedCwd);
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
+  const KEY = makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "medium");
+  const FACTS = { class: "implement", risk: "medium", scope: "file", needs: [] as string[], confidence: 0.9, source: "rules" };
+  const logger = { warn: vi.fn() };
+
+  /** HOME redirected to a temp dir; `routing` (when given) is written to the global override layer. */
+  /** `routing: null` writes no routing block at all (QA-2.1-R2-5). */
+  function routingHome(routing?: Record<string, unknown> | null) {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-ingest-"));
+    const outcomes = join(home, "outcomes");
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    // QA-2.1-4: every config, the static ones included, names an explicit empty outcomes directory, and the tests
+    // assert it stays empty. A routing block without `engine` is static.
+    mkdirSync(outcomes, { recursive: true });
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify(routing === null ? {} : { routing: { outcomes: { path: outcomes }, ...(routing ?? {}) } }));
+    invalidateConfigCache();
+    return { home, outcomes };
+  }
+
+  function catalog() {
+    return { list: vi.fn(async () => ({ data: [{ providerID: "anthropic", id: "claude-sonnet-5-5", cost: [{ input: 3, output: 15 }] }] })) };
+  }
+
+  /** Start the adapter over a fixture whose ctx also has the model catalog. */
+  async function start(f: ReturnType<typeof fixture>, model: ReturnType<typeof catalog>, hooks: Record<string, any> = {}, options?: { ingest?: Ingest }) {
+    const forgetSession = vi.fn();
+    const runtime = { withToolContext: async (_context: unknown, operation: () => Promise<any>) => operation(), applyChildSystem: vi.fn(), forgetSession };
+    const ctx = { ...f.ctx, model };
+    const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, runtime, options);
+    cleanups.push(cleanup);
+    return { cleanup, forgetSession };
+  }
+
+  /**
+   * The wiring of `src/v2.ts`: the plugin instance creates its own telemetry ingest (settings from its live config,
+   * pricing from the catalog) and hands it to the adapter (QA-2.1-7).
+   */
+  async function startPlugin(f: ReturnType<typeof fixture>, model: ReturnType<typeof catalog>, home: string, wrap: (hooks: Hooks) => Hooks = (hooks) => hooks) {
+    let ingest: Ingest | undefined;
+    const hooks = await ModelRouterPlugin({
+      directory: home, worktree: home, routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      routerCatalog: async () => (await model.list()).data,
+      routerOnIngest: (created: Ingest) => { ingest = created; },
+    } as unknown as RouterPluginInput);
+    expect(ingest).toBeDefined();
+    return start(f, model, wrap(hooks), { ingest });
+  }
+
+  /** Events are handled in order: once the barrier session's deletion is seen, everything before it was handled. */
+  async function barrier(f: ReturnType<typeof fixture>, forgetSession: ReturnType<typeof vi.fn>, name: string) {
+    f.emit({ id: `barrier-${name}`, type: "session.deleted", data: { sessionID: name } });
+    await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith(name));
+  }
+
+  const stepEvent = (id: string, sessionID: string, over: { finish?: string; cost?: number } = {}) => ({
+    id, type: "session.step.ended",
+    data: {
+      sessionID, assistantMessageID: `m-${id}`, finish: over.finish ?? "tool-calls", rawFinish: "stop", cost: over.cost ?? 0.01,
+      tokens: { input: 1000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  });
+
+  const register = (child: string, over: Partial<Parameters<typeof rememberDispatch>[1]> = {}) => rememberDispatch(child, {
+    facts: FACTS, agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", tier: "medium", parentSessionID: "root", ...over,
+  });
+
+  afterEach(() => { resetDispatchRegistry(); resetIngestState(); logger.warn.mockReset(); });
+
+  it("records a registered child's steps, with catalog pricing, when engine != static", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow" });
+    const f = fixture();
+    const model = catalog();
+    const { cleanup, forgetSession } = await startPlugin(f, model, home);
+    register("child-1");
+    f.emit(stepEvent("e1", "child-1", { finish: "tool-calls", cost: 0.01 }));
+    f.emit(stepEvent("e2", "child-1", { finish: "stop", cost: 0.02 }));
+    f.emit({ id: "x1", type: "session.execution.succeeded", data: { sessionID: "child-1" } }); // the attempt folds here
+    await barrier(f, forgetSession, "barrier");
+    const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+    try {
+      const cost = peek.store.cost(KEY);
+      expect(cost.measuredUSD.n).toBe(1);
+      expect(cost.measuredUSD.mean).toBeCloseTo(0.03, 9);
+      expect(cost.tokens).toMatchObject({ n: 1, input: 2000, output: 200 });
+      expect(model.list).toHaveBeenCalledTimes(1);
+    } finally {
+      await peek.release();
+    }
+    await cleanup(); // flushes through the D15 flusher on dispose
+    expect(existsSync(join(outcomes, "outcomes.json"))).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("ignores step events of sessions that are not registered children", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow" });
+    const f = fixture();
+    const model = catalog();
+    const { cleanup, forgetSession } = await startPlugin(f, model, home);
+    f.emit(stepEvent("e1", "orchestrator"));
+    f.emit({ id: "e2", type: "session.step.ended", data: { assistantMessageID: "no-session" } });
+    await barrier(f, forgetSession, "barrier");
+    await cleanup();
+    expect(readdirSync(outcomes)).toEqual([]);
+    expect(model.list).not.toHaveBeenCalled();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it.each([
+    { name: "no routing block at all", routing: null },
+    { name: "a routing block without an engine", routing: {} },
+    { name: "engine static", routing: { engine: "static" } },
+  ])("$name (static): nothing is written to the explicit outcomes directory and the catalog is never read", async ({ routing }) => {
+    const { home, outcomes } = routingHome(routing);
+    const f = fixture();
+    const model = catalog();
+    const { cleanup, forgetSession } = await startPlugin(f, model, home);
+    register("child-1");
+    f.emit(stepEvent("e1", "child-1", { finish: "stop" }));
+    f.emit({ id: "i1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+    await barrier(f, forgetSession, "barrier");
+    await cleanup();
+    expect(readdirSync(outcomes)).toEqual([]);
+    // tmpdir() is private to this file (QA-2.1-4), but earlier tests of the file leave scorecards in its default directory:
+    // what must not appear there is an outcome store or a decision log.
+    const defaultDir = join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME);
+    expect(existsSync(defaultDir) ? readdirSync(defaultDir).filter((name) => /^(outcomes|decisions)/.test(name)) : []).toEqual([]);
+    expect(model.list).not.toHaveBeenCalled();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("records nothing under a class below routing.minClassConfidence", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow", minClassConfidence: 0.7 });
+    const f = fixture();
+    const { cleanup, forgetSession } = await startPlugin(f, catalog(), home);
+    register("child-low", { facts: { ...FACTS, confidence: 0.69 } });
+    f.emit(stepEvent("e1", "child-low", { finish: "stop" }));
+    await barrier(f, forgetSession, "barrier");
+    await cleanup();
+    expect(readdirSync(outcomes)).toEqual([]);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("counts a step once when the same event id reaches two plugin instances (A3)", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow" });
+    const a = fixture();
+    const b = fixture();
+    const first = await startPlugin(a, catalog(), home);
+    const second = await startPlugin(b, catalog(), home);
+    register("child-1");
+    const event = stepEvent("same-id", "child-1", { finish: "stop", cost: 0.02 });
+    a.emit(event);
+    b.emit(event);
+    a.emit({ id: "x-a", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+    await barrier(a, first.forgetSession, "barrier-a");
+    await barrier(b, second.forgetSession, "barrier-b");
+    const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+    try {
+      expect(peek.store.cost(KEY).steps.n).toBe(1);
+      expect(peek.store.cost(KEY).measuredUSD.mean).toBeCloseTo(0.02, 9);
+    } finally {
+      await peek.release();
+    }
+    await first.cleanup();
+    await second.cleanup();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("session.deleted drops the child's registration and still reaches the legacy event hook", async () => {
+    const { home } = routingHome({ engine: "shadow" });
+    const f = fixture();
+    const legacyEvent = vi.fn(async () => {});
+    const { forgetSession } = await startPlugin(f, catalog(), home, (hooks) => ({ ...hooks, event: legacyEvent }));
+    register("child-1");
+    f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-1" } });
+    await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith("child-1"));
+    await vi.waitFor(() => expect(legacyEvent).toHaveBeenCalledWith({ event: { type: "session.deleted", properties: { info: { id: "child-1" } } } }, undefined));
+    const { lookupDispatch } = await import("../../src/router/sessions");
+    expect(lookupDispatch("child-1")).toBeUndefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  describe("src/v2.ts setup (the real wiring)", () => {
+    it("feeds the plugin's own ingest from the adapter: steps, execution end and pricing", async () => {
+      const { home, outcomes } = routingHome({ engine: "shadow" });
+      const f = fixture();
+      const model = catalog();
+      const cleanup = await v2Plugin.setup({ ...f.ctx, model } as unknown as Plugin.Context);
+      cleanups.push(cleanup);
+      register("child-1");
+      f.emit(stepEvent("e1", "child-1", { finish: "stop", cost: 0 }));
+      f.emit({ id: "x1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+      const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+      try {
+        await vi.waitFor(() => expect(peek.store.cost(KEY).steps.n).toBe(1));
+        // priced by the catalog the adapter read: a priced model's zero is a measurement
+        expect(peek.store.cost(KEY).measuredUSD).toMatchObject({ n: 1, mean: 0 });
+        expect(model.list).toHaveBeenCalledTimes(1);
+      } finally {
+        await peek.release();
+      }
+      await cleanup();
+      rmSync(home, { recursive: true, force: true });
+    });
+
+    it("QA-2.1-5: disposing does not wait for a model catalog that never answers", async () => {
+      const { home } = routingHome({ engine: "shadow" });
+      const f = fixture();
+      const model = { list: vi.fn(() => new Promise<never>(() => {})) };
+      const cleanup = await v2Plugin.setup({ ...f.ctx, model } as unknown as Plugin.Context);
+      cleanups.push(cleanup);
+      register("child-1");
+      f.emit(stepEvent("e1", "child-1", { finish: "tool-calls" }));
+      await vi.waitFor(() => expect(model.list).toHaveBeenCalledTimes(1)); // the step handler is now waiting for the catalog
+      const started = performance.now();
+      await cleanup();
+      expect(performance.now() - started).toBeLessThan(1000); // the catalog wait itself is bounded by 2 s
+      rmSync(home, { recursive: true, force: true });
+    });
+  });
+
+  describe("with an injected ingest", () => {
+    const fake = () => ({
+      onStepEnded: vi.fn(async () => {}), onExecutionEnded: vi.fn(), onVerdict: vi.fn(), onFalseRefusal: vi.fn(), onSessionGone: vi.fn(),
+      requestFlush: vi.fn(), sweep: vi.fn(), dispose: vi.fn(async () => {}),
+    } satisfies Ingest);
+
+    it("survives a throwing handler: it is logged and the next event is still handled", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const ingest = fake();
+        ingest.onStepEnded.mockRejectedValueOnce(new Error("handler exploded"));
+        const f = fixture();
+        const legacyEvent = vi.fn(async () => {});
+        const { forgetSession } = await start(f, catalog(), { event: legacyEvent }, { ingest });
+        f.emit(stepEvent("e1", "child-1"));
+        f.emit(stepEvent("e2", "child-1"));
+        f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-2" } });
+        await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith("child-2"));
+        expect(ingest.onStepEnded).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls.some((args) => String(args[0]).includes("telemetry ingestion") && String(args[0]).includes("session.step.ended"))).toBe(true);
+        // the deletion after the failure still ran both the ingest cleanup and the legacy translation
+        expect(ingest.onSessionGone).toHaveBeenCalledWith("child-2");
+        expect(legacyEvent).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("a throwing session cleanup does not stop the legacy event translation", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const ingest = fake();
+        ingest.onSessionGone.mockImplementationOnce(() => { throw new Error("cleanup exploded"); });
+        const f = fixture();
+        const legacyEvent = vi.fn(async () => {});
+        await start(f, catalog(), { event: legacyEvent }, { ingest });
+        f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-1" } });
+        await vi.waitFor(() => expect(legacyEvent).toHaveBeenCalledTimes(1));
+        expect(warn.mock.calls.some((args) => String(args[0]).includes("cleanup") || String(args[0]).includes("session.deleted"))).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("QA-2.1-6: routes failed steps to ingest like finished ones", async () => {
+      const ingest = fake();
+      const f = fixture();
+      const { forgetSession } = await start(f, catalog(), {}, { ingest });
+      f.emit({ id: "f1", type: "session.step.failed", data: { sessionID: "child-1", cost: 0.01 } });
+      await barrier(f, forgetSession, "barrier");
+      expect(ingest.onStepEnded).toHaveBeenCalledTimes(1);
+      expect(ingest.onStepEnded).toHaveBeenCalledWith(expect.objectContaining({ type: "session.step.failed" }));
+    });
+
+    it("flushes and sweeps on the idle equivalents, not on unrelated events, and disposes on cleanup", async () => {
+      const ingest = fake();
+      const f = fixture();
+      const { cleanup, forgetSession } = await start(f, catalog(), {}, { ingest });
+      for (const type of ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"]) {
+        f.emit({ id: type, type, data: { sessionID: "s" } });
+      }
+      f.emit({ id: "t1", type: "session.text.ended", data: { sessionID: "s", text: "hello" } });
+      f.emit({ id: "c1", type: "session.created", data: { sessionID: "s" } });
+      await barrier(f, forgetSession, "barrier");
+      expect(ingest.requestFlush).toHaveBeenCalledTimes(4);
+      expect(ingest.sweep).toHaveBeenCalledTimes(4);
+      // QA-2.1-6: the three execution-end events (not the literal idle) end the child's attempt
+      expect(ingest.onExecutionEnded).toHaveBeenCalledTimes(3);
+      expect(ingest.onExecutionEnded).toHaveBeenCalledWith("s");
+      expect(ingest.onStepEnded).not.toHaveBeenCalled();
+      expect(ingest.dispose).not.toHaveBeenCalled();
+      await cleanup();
+      await cleanup();
+      expect(ingest.dispose).toHaveBeenCalledTimes(1);
+    });
   });
 });

@@ -11,7 +11,10 @@ import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { resolveSubagentOverrides } from "../router/subagents";
 import { stripDelegateInstructions } from "../router/instructions";
+import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
+import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
+import type { Ingest } from "../routing/outcomes/ingest";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -80,6 +83,8 @@ export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
   runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession">>,
+  /** `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing. */
+  options: { ingest?: Ingest } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
   // casts confined to this adapter, rather than weakening the v2 event types.
@@ -88,6 +93,18 @@ export async function registerV2Hooks(
   const abort = new AbortController();
   const verifyingCalls = new Set<string>();
   const depthBanners = new Map<string, string>();
+  // M6 (2.1.3): child-session outcomes and costs reach the outcome store through the plugin instance's ingest, which
+  // does nothing unless routing.engine != static (its settings are null otherwise: no bundle, no files).
+  const ingestLogger = createPluginLogger();
+  const ingest: Ingest = options.ingest ?? NOOP_INGEST;
+  // An ingestion error is logged and the loop carries on: it must never cost the router an event.
+  const ingesting = async (what: string, run: () => void | Promise<void>): Promise<void> => {
+    try {
+      await run();
+    } catch (error) {
+      if (!abort.signal.aborted) ingestLogger.warn(`[router] telemetry ingestion: ${what} failed`, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
   let eventTask: Promise<void> | undefined;
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
@@ -108,6 +125,8 @@ export async function registerV2Hooks(
     disposed = true;
     abort.abort();
     await runtime?.dispose?.();
+    // Before the event task: disposing releases a step handler that waits for the model catalog (QA-2.1-5).
+    await ingest.dispose();
     await eventTask;
     await Promise.allSettled(registrations.map((registration) => registration.dispose()));
     await hooks.dispose?.();
@@ -418,7 +437,23 @@ export async function registerV2Hooks(
         if (abort.signal.aborted) break;
         try {
           const data = event.data as Record<string, any>;
-          if (event.type === "session.deleted") runtime?.forgetSession?.(data.sessionID);
+          if (event.type === "session.step.ended" || event.type === "session.step.failed") {
+            // Cost and tokens of a registered child dispatch (ingest ignores every other session).
+            await ingesting(event.type, () => ingest.onStepEnded(event));
+            continue;
+          }
+          if (event.type === "session.deleted") {
+            runtime?.forgetSession?.(data.sessionID);
+            await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
+          } else if (FLUSH_EVENT_TYPES.has(event.type)) {
+            // The v2 equivalents of session.idle: coalesced, throttled flush (D15); never awaited.
+            await ingesting(event.type, () => {
+              // The child's attempt is over: fold it before the flush that persists it.
+              if (EXECUTION_END_TYPES.has(event.type)) ingest.onExecutionEnded(data.sessionID);
+              ingest.sweep();
+              ingest.requestFlush();
+            });
+          }
           if (event.type === "session.text.ended") {
             const output = { text: data.text };
             await legacy["experimental.text.complete"]?.({ sessionID: data.sessionID, messageID: data.assistantMessageID }, output);

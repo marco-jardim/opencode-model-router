@@ -1,4 +1,5 @@
 import type { PluginInput } from "@opencode-ai/plugin";
+import type { CatalogModel, Ingest } from "../routing/outcomes/ingest";
 
 /** Marks the legacy tool.execute.before output bag when verification starts for
  * that task call. V1 hosts read only output.args, so this symbol is invisible. */
@@ -29,4 +30,8 @@ export type RouterPluginInput = PluginInput & {
   routerChildRunner?: ChildSessionRunner;
   /** Set only by src/v2.ts; absent = v1 host (A3). */
   routerHost?: "v2";
+  /** Set only by src/v2.ts: the host model catalog (`ctx.model.list`), used to price child steps (A1). */
+  routerCatalog?: () => Promise<readonly CatalogModel[]>;
+  /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */
+  routerOnIngest?: (ingest: Ingest) => void;
 };

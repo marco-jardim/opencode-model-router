@@ -289,7 +289,10 @@ export function parseLogLine(line: string): LogRow | null {
     if (decisionID !== null && typeof decisionID !== "string") return null;
     if (typeof childSessionID !== "string" || typeof attemptID !== "string" || !isOutcomeKey(key)) return null;
     if (kind === "refusal") {
-      const row: RefusalRow = { v: LOG_ROW_VERSION, kind, ts, sessionID, decisionID, childSessionID, attemptID, key, step };
+      const row: RefusalRow = {
+        v: LOG_ROW_VERSION, kind, ts, sessionID, decisionID, childSessionID, attemptID, key, step,
+        ...(json.overrides === "pass" ? { overrides: "pass" as const } : {}),
+      };
       return row;
     }
     const verdict = json.verdict;

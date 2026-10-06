@@ -933,6 +933,9 @@ describe("parseLogLine", () => {
   it("accepts a decision with a null best and a refusal with a null decisionID", () => {
     expect(parseLogLine(mutate(base, (r) => void (r.best = null)))).not.toBeNull();
     expect(roundTrip(refusalRow(1))).toEqual(refusalRow(1));
+    // QA-2.1-3: the optional marker survives; anything but "pass" is dropped
+    expect(roundTrip({ ...refusalRow(1), overrides: "pass" })).toEqual({ ...refusalRow(1), overrides: "pass" });
+    expect(parseLogLine(JSON.stringify({ ...refusalRow(1), overrides: "fail" }))).toEqual(refusalRow(1));
   });
 });
 
