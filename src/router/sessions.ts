@@ -684,11 +684,11 @@ export function forgetDispatch(childSessionID: string): boolean {
   return dispatchRegistry.delete(childSessionID);
 }
 
-/** Remove every child dispatched by `parentSessionID` (the orchestrator went away); returns how many. */
-export function forgetDispatchesOf(parentSessionID: string): number {
-  let removed = 0;
+/** Remove every child dispatched by `parentSessionID` (the orchestrator went away); returns what was removed. */
+export function forgetDispatchesOf(parentSessionID: string): DispatchRecord[] {
+  const removed: DispatchRecord[] = [];
   for (const [id, slot] of [...dispatchRegistry]) {
-    if (slot.record.parentSessionID === parentSessionID && dispatchRegistry.delete(id)) removed += 1;
+    if (slot.record.parentSessionID === parentSessionID && dispatchRegistry.delete(id)) removed.push(slot.record);
   }
   return removed;
 }
