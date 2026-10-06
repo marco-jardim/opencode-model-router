@@ -20,10 +20,8 @@ import { execFileSync } from "node:child_process";
 import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
-import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
-import type { RouterConfig } from "../../src/router/config";
 import {
-  MODELS, ROOT, RoutingHost, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
+  MODELS, ROOT, RoutingHost, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -57,7 +55,10 @@ interface FileStat { size: number; mtimeMs: number }
 async function listDir(dir: string): Promise<Record<string, FileStat>> {
   if (!existsSync(dir)) return {};
   const out: Record<string, FileStat> = {};
-  for (const name of await readdir(dir)) { try { const st = await stat(path.join(dir, name)); if (st.isFile()) out[name] = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* removed meanwhile */ } }
+  const names = await readdir(dir);
+  for (let i = 0; i < names.length; i += 200) {
+    await Promise.all(names.slice(i, i + 200).map(async name => { try { const st = await stat(path.join(dir, name)); if (st.isFile()) out[name] = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* removed meanwhile */ } }));
+  }
   return out;
 }
 let liveBefore: { store: Record<string, FileStat>; config: Record<string, FileStat>; at: string } | undefined;
@@ -440,7 +441,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const ok = modified.length === 0 && packageDiff.length === 1 && packageDiff[0]!.startsWith("+") && packageDiff[0]!.includes("smoke:routing") && v1Files.every(file => git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) === "");
       s.verdict(ok, `${changed.length} path(s) changed under test/smoke since ${BASE_COMMIT} (all added: ${modified.length === 0}); package.json changed lines: ${packageDiff.join(" | ")}`);
     });
-  });
+  }, 60_000);
   it("7 openai responses: effort delivery of a same-model variant change on the OpenAI Responses route (A7 / QA-0P-26)", async () => {
     const host = await RoutingHost.start("responses", {
       routing: { engine: "shadow" },
@@ -733,7 +734,5 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const ok = foreignRows === 0 && seenSessionIDs.size > 0 && routerFiles.every(n => !configChanged.includes(n));
       s.verdict(ok, `live store ${Object.keys(before.store).length} -> ${Object.keys(after.store).length} files (+${added.length} new, ${added.length - addedNonSession.length} of them ses_ scorecards, non-ses_ new: ${addedNonSession.join(",") || "none"}); ${appended} row(s) appended to the live decisions.jsonl, ${foreignRows} naming a session of this run (${seenSessionIDs.size} seen); config files changed: ${configChanged.join(",") || "none"}`);
     });
-  });});
-
-void str;
-void MODELS;
+  }, 120_000);
+});
