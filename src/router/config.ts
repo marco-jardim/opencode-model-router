@@ -718,6 +718,7 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
       throw new Error(`tiers.json: preset '${presetName}' must be an object`);
     }
     const tiers = preset as Record<string, unknown>;
+    const presetRungs: PresetRung[] = [];
     for (const [tierName, tier] of Object.entries(tiers)) {
       if (typeof tier !== "object" || tier === null) {
         throw new Error(
@@ -776,8 +777,40 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
           `tiers.json: preset '${presetName}' tier '${tierName}': promptStyle must be one of ${PROMPT_STYLES.join("|")}`,
         );
       }
-      validateTierCandidates(t, `${presetName}.${tierName}`, tierName);
+      // The tier's own variant is what a candidates list is matched against.
+      if (t.variant !== undefined && (typeof t.variant !== "string" || !VARIANT_ID_PATTERN.test(t.variant))) {
+        throw new Error(
+          `tiers.json: '${presetName}.${tierName}.variant' must be a non-empty string without whitespace or '#' (got ${describeValue(t.variant)})`,
+        );
+      }
+      const candidates = validateTierCandidates(t, `${presetName}.${tierName}`, tierName);
+      const tierVariant = typeof t.variant === "string" ? t.variant : undefined;
+      const tierCostRatio = tierCostRatioOf(tierName, t.costRatio);
+      if (
+        candidates !== undefined &&
+        candidates.length > 0 &&
+        ownRungProblem(t.model, tierVariant, tierCostRatio, candidates) === undefined
+      ) {
+        candidates.forEach((c, i) =>
+          presetRungs.push({
+            model: c.model ?? t.model as string,
+            variant: c.variant,
+            costRatio: c.costRatio ?? tierCostRatio,
+            source: `${tierName}.candidates[${i}]`,
+            explicit: true,
+          }),
+        );
+      } else {
+        presetRungs.push({
+          model: t.model,
+          variant: tierVariant,
+          costRatio: tierCostRatio,
+          source: `${tierName} (own rung)`,
+          explicit: false,
+        });
+      }
     }
+    assertConsistentRungCosts(presetName, presetRungs);
   }
 
   return presets;
@@ -1747,36 +1780,80 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   return out;
 }
 
+/** A `candidates` entry after validation (every key optional, see {@link TierCandidate}). */
+type CandidateSpec = TierCandidate;
+
+/** The identity of a rung: its model and variant (an omitted variant is the default variant). */
+function rungKey(model: string, variant: string | undefined): string {
+  return `${model}\u0000${variant ?? ""}`;
+}
+
+/** A tier's own costRatio: the one it states, else the conventional default of its name. */
+function tierCostRatioOf(tierName: string, costRatio: unknown): number {
+  return typeof costRatio === "number" && Number.isFinite(costRatio) && costRatio > 0
+    ? costRatio
+    : tierDefaultsFor(tierName).costRatio;
+}
+
+/**
+ * Why a non-empty `candidates` list cannot be used next to the tier's own rung,
+ * or `undefined` when it can (QA-1.1-3, made non-fatal by QA-1.1-25):
+ *
+ * - it must contain the tier's own effective `(model, variant)`: the static choice
+ *   has to be one of the rungs, or the engine's degenerate case (D2) would have
+ *   nothing to start from;
+ * - that rung's `costRatio` is the tier's own, so it must equal it or be omitted.
+ *
+ * It is a *problem*, not a validation error: a plugin update that changes a
+ * bundled tier's variant would otherwise make a user's override file invalid and
+ * drop the whole layer. The list is ignored instead (the ladder is the tier's own
+ * rung) and the reason is noticed at load.
+ */
+function ownRungProblem(
+  tierModel: string,
+  tierVariant: string | undefined,
+  tierCostRatio: number,
+  candidates: readonly CandidateSpec[],
+): string | undefined {
+  if (candidates.length === 0) return undefined;
+  const ownKey = rungKey(tierModel, tierVariant);
+  const index = candidates.findIndex((c) => rungKey(c.model ?? tierModel, c.variant) === ownKey);
+  if (index === -1) {
+    return `it does not contain the tier's own rung (model ${tierModel}, variant ${tierVariant ?? "default"})`;
+  }
+  const declared = candidates[index]!.costRatio;
+  if (declared !== undefined && declared !== tierCostRatio) {
+    return `its own rung (candidates[${index}]) has costRatio ${declared}, not the tier's ${tierCostRatio}`;
+  }
+  return undefined;
+}
+
 /**
  * `tiers.<t>.candidates`: ordered rungs of a tier's ladder, in escalation order.
+ * Throws for anything malformed; returns the validated entries.
  *
  * - `model` falls back to the tier's own; an omitted `variant` is the model's
  *   default variant; an omitted `costRatio` is the tier's.
  * - No two rungs may name the same effective `(model, variant)`.
- * - A non-empty list must contain the tier's own effective `(model, variant)`
- *   (QA-1.1-3): the static choice must be one of the rungs, or the engine's
- *   degenerate case (D2) would have nothing to start from. That rung's
- *   `costRatio` is the tier's own, so it must equal it or be omitted.
  * - Effective `costRatio` must not decrease along the list (QA-1.1-12): the list
  *   is walked upward on failure, and a cheaper later rung is not an escalation.
+ *
+ * The own-rung rules are NOT enforced here: see {@link ownRungProblem}.
  */
 function validateTierCandidates(
   tier: Record<string, unknown>,
   label: string,
   tierName: string,
-): void {
+): CandidateSpec[] | undefined {
   const candidates = tier.candidates;
-  if (candidates === undefined) return;
+  if (candidates === undefined) return undefined;
   if (!Array.isArray(candidates)) {
     throw new Error(`tiers.json: '${label}.candidates' must be an array`);
   }
   const seen = new Map<string, number>();
-  const tierCostRatio =
-    typeof tier.costRatio === "number" && Number.isFinite(tier.costRatio) && tier.costRatio > 0
-      ? tier.costRatio
-      : tierDefaultsFor(tierName).costRatio;
+  const tierCostRatio = tierCostRatioOf(tierName, tier.costRatio);
+  const specs: CandidateSpec[] = [];
   const effectiveCosts: number[] = [];
-  const declaredCosts: Array<number | undefined> = [];
   for (let i = 0; i < candidates.length; i++) {
     const entry: unknown = candidates[i];
     const where = `${label}.candidates[${i}]`;
@@ -1806,7 +1883,7 @@ function validateTierCandidates(
       );
     }
     const effectiveModel = typeof model === "string" ? model : String(tier.model);
-    const key = `${effectiveModel}\u0000${typeof variant === "string" ? variant : ""}`;
+    const key = rungKey(effectiveModel, typeof variant === "string" ? variant : undefined);
     const first = seen.get(key);
     if (first !== undefined) {
       throw new Error(
@@ -1814,23 +1891,12 @@ function validateTierCandidates(
       );
     }
     seen.set(key, i);
-    declaredCosts.push(typeof costRatio === "number" ? costRatio : undefined);
-    effectiveCosts.push(typeof costRatio === "number" ? costRatio : tierCostRatio);
-  }
-  if (candidates.length === 0) return;
-
-  const ownVariant = typeof tier.variant === "string" ? tier.variant : "";
-  const ownIndex = seen.get(`${String(tier.model)}\u0000${ownVariant}`);
-  if (ownIndex === undefined) {
-    throw new Error(
-      `tiers.json: '${label}.candidates' must include the tier's own rung (model ${String(tier.model)}, variant ${ownVariant === "" ? "default" : ownVariant}): the static choice has to be one of the candidates`,
-    );
-  }
-  const ownCost = declaredCosts[ownIndex];
-  if (ownCost !== undefined && ownCost !== tierCostRatio) {
-    throw new Error(
-      `tiers.json: '${label}.candidates[${ownIndex}].costRatio' (${ownCost}) must equal the tier's costRatio (${tierCostRatio}) because it is the tier's own rung, or be omitted`,
-    );
+    const spec: CandidateSpec = {};
+    if (typeof model === "string") spec.model = model;
+    if (typeof variant === "string") spec.variant = variant;
+    if (typeof costRatio === "number") spec.costRatio = costRatio;
+    specs.push(spec);
+    effectiveCosts.push(spec.costRatio ?? tierCostRatio);
   }
   for (let i = 1; i < effectiveCosts.length; i++) {
     if (effectiveCosts[i]! < effectiveCosts[i - 1]!) {
@@ -1839,11 +1905,56 @@ function validateTierCandidates(
       );
     }
   }
+  return specs;
 }
 
+/** One rung of a tier as the validator sees it, for the per-preset costRatio check. */
+interface PresetRung {
+  model: string;
+  variant: string | undefined;
+  costRatio: number;
+  /** Where it was written, for the error message. */
+  source: string;
+  /** True for a rung of an explicit `candidates` list (the tier's own implicit rung is not). */
+  explicit: boolean;
+}
+
+/**
+ * Within one preset a `(model, variant)` has ONE costRatio (QA-1.1-26): the
+ * engine prices a candidate by that pair, so two tiers (or a tier and a
+ * candidate list) quoting different ratios for the same pair would make the
+ * choice depend on which tier asked. Only pairs involving an explicit
+ * `candidates` entry are checked: several bundled tiers legitimately share one
+ * model at different effort levels and ratios, and say nothing about variants.
+ */
+function assertConsistentRungCosts(presetName: string, rungs: readonly PresetRung[]): void {
+  const first = new Map<string, PresetRung>();
+  for (const rung of rungs) {
+    const key = rungKey(rung.model, rung.variant);
+    const prior = first.get(key);
+    if (prior === undefined) {
+      first.set(key, rung);
+    } else if (prior.costRatio !== rung.costRatio && (prior.explicit || rung.explicit)) {
+      throw new Error(
+        `tiers.json: preset '${presetName}': (model, variant) = (${rung.model}, ${rung.variant ?? "default"}) has costRatio ${rung.costRatio} in '${rung.source}' but ${prior.costRatio} in '${prior.source}'; within a preset one (model, variant) has one costRatio`,
+      );
+    }
+  }
+}
 /** True when the tier lists at least one explicit candidate (an empty list counts as none). */
 export function hasExplicitCandidates(tier: TierConfig): boolean {
   return Array.isArray(tier.candidates) && tier.candidates.length > 0;
+}
+
+/**
+ * Why the tier's `candidates` are ignored (the ladder is then the tier's own
+ * rung), or `undefined` when they are used or there are none (QA-1.1-25):
+ * the list lacks the tier's own `(model, variant)`, or states another
+ * `costRatio` for it. Loading reports it as a config notice.
+ */
+export function candidatesProblem(tierName: string, tier: TierConfig): string | undefined {
+  if (!hasExplicitCandidates(tier)) return undefined;
+  return ownRungProblem(tier.model, tier.variant, tierCostRatioOf(tierName, tier.costRatio), tier.candidates ?? []);
 }
 
 /**
@@ -2325,6 +2436,16 @@ export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): s
       if (ROUTING_RESERVED_AGENTS.some((reserved) => reserved === agent)) {
         messages.push(
           `routing.roles.'${taskClass}' names '${agent}', an OpenCode primary/internal agent that cannot be a subagent; it will be skipped`,
+        );
+      }
+    }
+  }
+  for (const [presetName, preset] of Object.entries(cfg.presets)) {
+    for (const [tierName, tier] of Object.entries(preset)) {
+      const problem = candidatesProblem(tierName, tier);
+      if (problem !== undefined) {
+        messages.push(
+          `presets.${presetName}.${tierName}.candidates are ignored, the tier's ladder is its own rung: ${problem}`,
         );
       }
     }
@@ -2881,7 +3002,7 @@ export function resolveCandidates(tierName: string, cfg: RouterConfig): readonly
     Object.freeze(variant === undefined ? { model, costRatio } : { model, variant, costRatio });
 
   const listed = tier.candidates;
-  if (listed === undefined || !hasExplicitCandidates(tier)) {
+  if (listed === undefined || candidatesProblem(tierName, tier) !== undefined || !hasExplicitCandidates(tier)) {
     return Object.freeze([rung(tier.model, tier.variant, tierCostRatio)]);
   }
   return Object.freeze(

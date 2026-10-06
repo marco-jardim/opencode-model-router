@@ -15,6 +15,7 @@ import {
   deepMerge,
   findUnknownRoutingKeys,
   getConfigNotices,
+  candidatesProblem,
   getConfigReloadError,
   hasExplicitCandidates,
   warnConfigNotices,
@@ -615,6 +616,32 @@ describe("resolveCandidates", () => {
     expect(resolveCandidates("toString", cfg)).toEqual([]);
   });
 
+  it("ignores candidates that lack the tier's own rung: the ladder is the tier's own rung (QA-1.1-25)", () => {
+    const cfg = cfgOf({
+      presets: {
+        anthropic: {
+          medium: { model: "anthropic/claude-sonnet-5-5", variant: "xhigh", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+        },
+      },
+    });
+    expect(resolveCandidates("medium", cfg)).toEqual([{ model: "anthropic/claude-sonnet-5-5", variant: "xhigh", costRatio: 5 }]);
+    expect(candidatesProblem("medium", cfg.presets.anthropic!.medium!)).toMatch(/does not contain the tier's own rung \(model anthropic\/claude-sonnet-5-5, variant xhigh\)/);
+  });
+
+  it("ignores candidates whose own rung states another costRatio (QA-1.1-25)", () => {
+    const cfg = cfgOf({
+      presets: {
+        anthropic: {
+          medium: { model: "anthropic/claude-sonnet-5-5", variant: "medium", costRatio: 5, candidates: [{ variant: "medium", costRatio: 6 }, { variant: "high", costRatio: 8 }] },
+        },
+      },
+    });
+    expect(resolveCandidates("medium", cfg)).toEqual([{ model: "anthropic/claude-sonnet-5-5", variant: "medium", costRatio: 5 }]);
+    expect(collectRoutingNotices(undefined, cfg)).toEqual([
+      "presets.anthropic.medium.candidates are ignored, the tier's ladder is its own rung: its own rung (candidates[0]) has costRatio 6, not the tier's 5",
+    ]);
+  });
+
   it("does not treat Object.prototype members as conventional tier names (QA-1.1-19)", () => {
     const cfg = cfgOf({
       presets: { anthropic: { constructor: { model: "a/c" }, toString: { model: "a/t" }, fast: { model: "a/f" } } },
@@ -852,6 +879,39 @@ describe("hot reload of the global override file with a routing block", () => {
       { model: tier.model, ...own, costRatio: tier.costRatio },
       { model: tier.model, variant: "high", costRatio: 9 },
     ]);
+  });
+
+  it("keeps an override that sets candidates when the tier's variant later changes: candidates ignored with a notice, the rest of the layer applies (QA-1.1-25)", () => {
+    const first = loadConfig();
+    const presetName = first.activePreset;
+    const tier = first.presets[presetName]!.medium!;
+    const own = tier.variant === undefined ? {} : { variant: tier.variant };
+    const candidates = [own, { variant: "high", costRatio: 9 }];
+    editOverride({ presets: { [presetName]: { medium: { candidates } } }, routing: { engine: "shadow" } });
+    reload();
+    expect(resolveCandidates("medium", loadConfig())).toHaveLength(2);
+    expect(getConfigNotices().map((n) => n.message)).toEqual([]);
+
+    // The bundled tier's variant moves (here: the override moves it, as a plugin update would):
+    // the list no longer contains the tier's own rung.
+    editOverride({ presets: { [presetName]: { medium: { variant: "moved-variant", candidates } } }, routing: { engine: "shadow" } });
+    const next = reload();
+    expect(getConfigReloadError()).toBeNull();
+    expect(resolveRouting(next, "v2").engine).toBe("shadow"); // the layer was not dropped
+    expect(resolveCandidates("medium", next)).toEqual([{ model: tier.model, variant: "moved-variant", costRatio: tier.costRatio }]);
+    expect(getConfigNotices().map((n) => n.message)).toEqual([
+      `presets.${presetName}.medium.candidates are ignored, the tier's ladder is its own rung: it does not contain the tier's own rung (model ${tier.model}, variant moved-variant)`,
+    ]);
+    expect(logged("candidates are ignored")).toHaveLength(1);
+  });
+
+  it("still drops a layer whose candidates are malformed (a malformed entry is an error, not a notice)", () => {
+    const first = loadConfig();
+    const presetName = first.activePreset;
+    editOverride({ presets: { [presetName]: { medium: { candidates: [{ variant: "high", costRatio: "x" }] } } }, routing: { engine: "shadow" } });
+    const next = loadConfig();
+    expect(next.routing).toBeUndefined(); // the whole layer was dropped
+    expect(warnSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes("costRatio"))).toBe(true);
   });
 
   it("merges the project layer over the global one key by key", () => {

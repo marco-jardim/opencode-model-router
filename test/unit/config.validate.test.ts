@@ -389,6 +389,7 @@ describe("validateConfig — subagentTiers", () => {
 // ---------------------------------------------------------------------------
 
 import { resolve } from "node:path";
+import { candidatesProblem } from "../../src/router/config";
 
 /** A raw config carrying the given `routing` block. */
 function withRouting(routing: unknown): Record<string, unknown> {
@@ -997,19 +998,26 @@ describe("validateConfig — tiers.<t>.candidates: own rung and escalation order
     validRaw({ presets: { anthropic: { [name]: tier } } });
   const SONNET = "anthropic/claude-sonnet-5-5";
 
-  it("rejects a non-empty list that lacks the tier's own (model, variant), naming the key", () => {
-    expect(() => validateConfig(withCandidates([{ variant: "high" }]))).toThrow(
-      /'anthropic\.fast\.candidates' must include the tier's own rung \(model anthropic\/claude-haiku-4-5, variant default\)/,
+  /** The reason a loaded tier's candidates would be ignored (QA-1.1-25), through the real validator. */
+  const problemOf = (name: string, tier: Record<string, unknown>): string | undefined => {
+    const cfg = validateConfig(withTier(name, tier));
+    return candidatesProblem(name, cfg.presets.anthropic![name]!);
+  };
+
+  it("does not reject, but flags, a non-empty list that lacks the tier's own (model, variant) (QA-1.1-3, -25)", () => {
+    expect(() => validateConfig(withCandidates([{ variant: "high" }]))).not.toThrow();
+    expect(problemOf("fast", { model: "anthropic/claude-haiku-4-5", candidates: [{ variant: "high" }] })).toBe(
+      "it does not contain the tier's own rung (model anthropic/claude-haiku-4-5, variant default)",
     );
-    expect(() =>
-      validateConfig(withTier("medium", { model: SONNET, variant: "medium", candidates: [{ variant: "high" }] })),
-    ).toThrow(/'anthropic\.medium\.candidates' must include the tier's own rung \(model anthropic\/claude-sonnet-5-5, variant medium\)/);
+    expect(problemOf("medium", { model: SONNET, variant: "medium", candidates: [{ variant: "high" }] })).toBe(
+      "it does not contain the tier's own rung (model anthropic/claude-sonnet-5-5, variant medium)",
+    );
   });
 
-  it("rejects a list whose rungs are all on another model", () => {
-    expect(() =>
-      validateConfig(withTier("medium", { model: SONNET, variant: "medium", candidates: [{ model: "openai/gpt-6-luna", variant: "medium" }] })),
-    ).toThrow(/must include the tier's own rung/);
+  it("flags a list whose rungs are all on another model", () => {
+    expect(
+      problemOf("medium", { model: SONNET, variant: "medium", candidates: [{ model: "openai/gpt-6-luna", variant: "medium" }] }),
+    ).toMatch(/does not contain the tier's own rung/);
   });
 
   it("accepts the own rung written implicitly, explicitly, anywhere in the list", () => {
@@ -1020,42 +1028,45 @@ describe("validateConfig — tiers.<t>.candidates: own rung and escalation order
       [{ variant: "low", costRatio: 3 }, { variant: "medium" }, { variant: "high", costRatio: 8 }],
     ]) {
       expect(() => validateConfig(withTier("medium", { ...tier, candidates }))).not.toThrow();
+      expect(problemOf("medium", { ...tier, candidates })).toBeUndefined();
     }
   });
 
-  it("does not require the own rung of an empty list (an empty list means no candidates)", () => {
-    expect(() => validateConfig(withTier("medium", { model: SONNET, variant: "medium", candidates: [] }))).not.toThrow();
+  it("has no problem with an empty list (an empty list means no candidates)", () => {
+    expect(problemOf("medium", { model: SONNET, variant: "medium", candidates: [] })).toBeUndefined();
+    expect(problemOf("medium", { model: SONNET, variant: "medium" })).toBeUndefined();
   });
 
   it("treats a variant-less tier's own rung as the variant-less entry of its model", () => {
-    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{}, { variant: "high" }] }))).not.toThrow();
-    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{ variant: "high" }] }))).toThrow(
-      /variant default/,
-    );
+    expect(problemOf("medium", { model: SONNET, candidates: [{}, { variant: "high" }] })).toBeUndefined();
+    expect(problemOf("medium", { model: SONNET, candidates: [{ variant: "high" }] })).toMatch(/variant default/);
   });
 
-  it("rejects an own rung whose costRatio differs from the tier's, accepts equal or omitted", () => {
+  it("flags an own rung whose costRatio differs from the tier's, accepts equal or omitted", () => {
     const tier = { model: SONNET, variant: "medium", costRatio: 5 };
-    expect(() =>
-      validateConfig(withTier("medium", { ...tier, candidates: [{ variant: "medium", costRatio: 6 }, { variant: "high", costRatio: 8 }] })),
-    ).toThrow(/'anthropic\.medium\.candidates\[0\]\.costRatio' \(6\) must equal the tier's costRatio \(5\)/);
+    expect(
+      problemOf("medium", { ...tier, candidates: [{ variant: "medium", costRatio: 6 }, { variant: "high", costRatio: 8 }] }),
+    ).toBe("its own rung (candidates[0]) has costRatio 6, not the tier's 5");
     for (const own of [{ variant: "medium", costRatio: 5 }, { variant: "medium" }]) {
-      expect(() => validateConfig(withTier("medium", { ...tier, candidates: [own, { variant: "high", costRatio: 8 }] }))).not.toThrow();
+      expect(problemOf("medium", { ...tier, candidates: [own, { variant: "high", costRatio: 8 }] })).toBeUndefined();
     }
   });
 
   it("uses the conventional costRatio of the tier name when the tier states none", () => {
     // `medium` defaults to 5, `fast` to 1, `heavy` to 20, any other name to 1.
-    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{ costRatio: 5 }] }))).not.toThrow();
-    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{ costRatio: 1 }] }))).toThrow(
-      /\(1\) must equal the tier's costRatio \(5\)/,
-    );
-    expect(() => validateConfig(withTier("heavy", { model: SONNET, candidates: [{ costRatio: 20 }] }))).not.toThrow();
-    expect(() => validateConfig(withTier("custom", { model: SONNET, candidates: [{ costRatio: 1 }] }))).not.toThrow();
+    expect(problemOf("medium", { model: SONNET, candidates: [{ costRatio: 5 }] })).toBeUndefined();
+    expect(problemOf("medium", { model: SONNET, candidates: [{ costRatio: 1 }] })).toMatch(/has costRatio 1, not the tier's 5/);
+    expect(problemOf("heavy", { model: SONNET, candidates: [{ costRatio: 20 }] })).toBeUndefined();
+    expect(problemOf("custom", { model: SONNET, candidates: [{ costRatio: 1 }] })).toBeUndefined();
     // A name that is an Object.prototype member is not a conventional tier (QA-1.1-19).
-    expect(() => validateConfig(withTier("constructor", { model: SONNET, candidates: [{ costRatio: 1 }] }))).not.toThrow();
+    expect(problemOf("constructor", { model: SONNET, candidates: [{ costRatio: 1 }] })).toBeUndefined();
   });
 
+  it("still throws for malformed entries and ordering, even next to an own-rung problem", () => {
+    expect(() => validateConfig(withCandidates([{ variant: "high", costRatio: "x" }]))).toThrow(/costRatio' must be a number > 0/);
+    expect(() => validateConfig(withCandidates([{ variant: "a" }, { variant: "a" }]))).toThrow(/repeats/);
+    expect(() => validateConfig(withCandidates([{ variant: "a", costRatio: 3 }, { variant: "b", costRatio: 2 }]))).toThrow(/must not decrease/);
+  });
   it("rejects a costRatio that decreases along the list, naming both positions", () => {
     expect(() =>
       validateConfig(withCandidates([{}, { variant: "high", costRatio: 3 }, { variant: "max", costRatio: 2 }])),
@@ -1099,5 +1110,97 @@ describe("validateConfig — routing.detection order (QA-1.1-13)", () => {
     expect(() => validateConfig(withRouting({ detection: { none: 0.8 } }))).toThrow(/grader 0\.7, none 0\.8/);
     // raising deterministic alone keeps the order
     expect(() => validateConfig(withRouting({ detection: { deterministic: 1 } }))).not.toThrow();
+  });
+});
+describe("validateConfig — tier variant and per-preset costRatio (QA-1.1-26, QA-1.1-28)", () => {
+  const SONNET = "anthropic/claude-sonnet-5-5";
+  const presetWith = (tiers: Record<string, unknown>): Record<string, unknown> => validRaw({ presets: { anthropic: tiers } });
+
+  it.each(["low", "xhigh", "max", "v1.5", "a-b_c"])("accepts the tier variant %s", (variant) => {
+    expect(() => validateConfig(presetWith({ fast: { model: SONNET, variant } }))).not.toThrow();
+  });
+
+  it.each(["", "a b", "a#b", " high", "high ", 5, null, true, []])("rejects the tier variant %j", (variant) => {
+    expect(() => validateConfig(presetWith({ fast: { model: SONNET, variant } }))).toThrow(
+      /'anthropic\.fast\.variant' must be a non-empty string without whitespace or '#'/,
+    );
+  });
+
+  it("accepts a tier without a variant", () => {
+    expect(() => validateConfig(presetWith({ fast: { model: SONNET } }))).not.toThrow();
+  });
+
+  it("rejects the same (model, variant) quoted at two costRatios by a candidates list and another tier's own rung", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+          heavy: { model: SONNET, variant: "high", costRatio: 20 },
+        }),
+      ),
+    ).toThrow(
+      /preset 'anthropic': \(model, variant\) = \(anthropic\/claude-sonnet-5-5, high\) has costRatio 20 in 'heavy \(own rung\)' but 8 in 'medium\.candidates\[1\]'; within a preset one \(model, variant\) has one costRatio/,
+    );
+  });
+
+  it("rejects it in either order, and between two candidates lists", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          fast: { model: SONNET, variant: "high", costRatio: 1 },
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 5 }] },
+        }),
+      ),
+    ).toThrow(/has costRatio 5 in 'medium\.candidates\[1\]' but 1 in 'fast \(own rung\)'/);
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+          heavy: { model: "openai/gpt-6-luna", variant: "high", costRatio: 2, candidates: [{ variant: "high" }, { model: SONNET, variant: "high", costRatio: 9 }] },
+        }),
+      ),
+    ).toThrow(/\(anthropic\/claude-sonnet-5-5, high\) has costRatio 9 in 'heavy\.candidates\[1\]' but 8 in 'medium\.candidates\[1\]'/);
+  });
+
+  it("accepts the same (model, variant) at the same costRatio, and different variants at different ones", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+          heavy: { model: SONNET, variant: "high", costRatio: 8 },
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("does not compare two tiers' own rungs: shipped presets share a model across tiers at different ratios", () => {
+    expect(() =>
+      validateConfig(presetWith({ fast: { model: SONNET, costRatio: 1 }, medium: { model: SONNET, costRatio: 5 }, heavy: { model: SONNET, costRatio: 20 } })),
+    ).not.toThrow();
+  });
+
+  it("does not count the rungs of a candidates list that is ignored for lacking the tier's own rung", () => {
+    // medium's list has no own rung (ignored); its stray (SONNET, high) at 8 must not clash with heavy's own at 20.
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "high", costRatio: 8 }] },
+          heavy: { model: SONNET, variant: "high", costRatio: 20 },
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("checks each preset on its own", () => {
+    expect(() =>
+      validateConfig(
+        validRaw({
+          presets: {
+            anthropic: { medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] } },
+            other: { heavy: { model: SONNET, variant: "high", costRatio: 20 } },
+          },
+        }),
+      ),
+    ).not.toThrow();
   });
 });
