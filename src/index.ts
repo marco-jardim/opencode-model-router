@@ -59,6 +59,8 @@ import {
 } from "./router/protocol";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
+import { createIngest, ingestSettings } from "./routing/outcomes/ingest";
+import { verdictOf } from "./routing/outcomes/types";
 import {
   findOrphanedStrongPatterns,
   normalizeCatalog,
@@ -375,6 +377,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     () => { sweepVerification(); },
     // 2.4.2b: TTL eviction and reaping of the pending registry (pending.ts R7; no timer of its own).
     () => { pending.sweep(); },
+    // 2.1.2: expired dispatch registrations and idle open outcome attempts (v2 only; `ingest` is declared below).
+    () => { ingest?.sweep(); },
   ]);
 
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
@@ -385,6 +389,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
   const routerWarn = { warn: (message: string) => logger.warn(message) };
+  // M6 (2.1.3): verdicts and false refusals of registered child dispatches feed the outcome store. v2 only (D1),
+  // and every call is a no-op unless routing.engine != static; the step events are ingested by the v2 adapter.
+  const ingest = ctx.routerHost === "v2" ? createIngest({ settings: () => ingestSettings(cfg, "v2"), logger }) : undefined;
   resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
   const depthTracker = createDepthTracker({
     async getParent(id) {
@@ -578,6 +585,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       pending.dispose();
       // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
       await disposeVerification();
+      // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
+      await ingest?.dispose();
       await logger.flush();
     },
     tool: {
@@ -1386,6 +1395,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             if (detectFalseRefusal({ toolCalls: calls, resultText: text }).suspected) {
               output.output = `[router] FALSE-REFUSAL SUSPECT — this delegate returned a hand-back after 0 tool calls. No tool call was observed for this child, so the capability claim in its answer is untested rather than demonstrated. Re-dispatch the same work with task_id="${childSessionID}" and an instruction to attempt it, or do it yourself; do not escalate a tier on this result.\n\n${output.output}`;
               trajectoryStore.recordFalseRefusal(childSessionID);
+              ingest?.onFalseRefusal(childSessionID);
             }
           }
         }
@@ -1595,6 +1605,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             });
             // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
             res = applyDispatchCaveats(res, verification);
+            // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
+            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict));
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);

@@ -335,10 +335,12 @@ export function createIngest(deps: IngestDeps): Ingest {
 
   /** Registered, trusted and keyable? Otherwise nothing may be recorded for the child. */
   const targetOf = (childSessionID: string): Target | null => {
-    const settings = deps.settings();
-    if (settings === null) return null;
+    // Registry first: most `session.step.ended` events belong to sessions that are not registered children
+    // (the orchestrator's own), and the settings may cost a config fingerprint check.
     const record = lookupDispatch(childSessionID);
     if (record === undefined) return null;
+    const settings = deps.settings();
+    if (settings === null) return null;
     const confidence = record.facts.confidence;
     // Phase 1.2 handoff (QA-1.2-27): a class below the threshold is "unknown" for learning, not a class of
     // its own. No fallback class, no store call, no row.
