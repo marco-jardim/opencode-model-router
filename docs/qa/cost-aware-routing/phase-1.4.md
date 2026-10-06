@@ -251,10 +251,52 @@ Implemented exactly per §3–§7 on top of the committed `types.ts` / `kernel.t
 
 For QA-1.4: the plan file's §1.5 list should still receive E1–E7 (orchestrator, see Handoffs); items 1–13 above are the only places 1.4.2 interpreted the design.
 
+### Round 1 fixes (QA-1.4)
+
+Binding amendments in `car/main`: **A24** (evidence gate), **A25** (runner-simulated pricing, own-model rank, parent-model rung). One commit per finding group, all `Refs #74`, pushed.
+
+| # | Sev | Finding | Fix | Commit | Pinned by |
+|---|---|---|---|---|---|
+| QA-1.4-1 | critical | A role agent on the fast tier's model inherited the owning tier's rank, so a cheap fast-ranked rung looked like a same-rank candidate and switched on priors (also defeated `floorTier` and never-down) | Own-model rung takes price **and** rank from the matching preset rung: `min(owningRank, matched.rank)` (its `tier` follows the rank); the inherited rank applies only without a match (A25) | `2b1996a` | ladders: "QA-1.4-1" (rank rule, probe risk high / d none / empty store → not switched and `never-down`, floor tier → `floor`, priors alone → `kept:evidence`) |
+| QA-1.4-2 | major | Router rungs were priced through a fixed `next(k)` chain that ignored retries, `maxTotalAttempts`, the cost ceiling, variant steps and covered-tier skips | `buildLadder` builds `buildEscalatePolicy(cfg, session)` and replays `newLadderState`/`recordAttempt`/`nextAction`/`advance` from every router rung (`simulate.ts`); `Ladder.paths` holds the attempts, `Ladder.reachable` the rungs only the runner reaches (variant steps), the kernel prices the path; other-model `candidates` rungs are dropped (`excluded: not-modelled`); `LadderBuildInput.session` carries the runner's session input | `3e549c8` | ladders: shipped config (1/5/20, ceiling 4 → fast, fast retry, medium, give up), A→B→A probe (heavy not modelled), covered-tier skip, effort-configured tiers, floor lift, `maxTotalAttempts` / ceiling, no-session behaviour, 500-seed property over random policies and catalogs; kernel: path valuation, reachable rungs, truncation |
+| QA-1.4-3 | major | Router tier rungs ignored `permitted`, `hidden`, `mode` | A tier agent that is `primary`, hidden or not permitted is excluded (`agent-unavailable`), never best; its rung still prices own-model matches and may sit on a simulated path | `2b1996a` | ladders: "QA-1.4-3" (3 variants, absent tier stays) |
+| QA-1.4-4 | major | A role agent without a configured model got no rung, so `chosen` on the parent's model was `kept:chosen-not-candidate` | `LadderBuildInput.parentModel`: such an agent gets an own-model rung on it (price/rank per QA-1.4-1); `resolveChosen` already used the same precedence | `2b1996a` | ladders: "QA-1.4-4" (chosen `general` on opus#xhigh resolves to a candidate) |
+| QA-1.4-5 | major | The `R:` line moved under `static`/`shadow` | `generateTaxonomy` returns `buildTaskTaxonomy` unless the resolved engine is `advise`/`enforce`; v1 keeps its explicit-roles opt-in (D1) | `af930a9` | protocol-line: engine matrix, D2 matrix now also runs `enforce` |
+| QA-1.4-6 | major | Priors alone could move a dispatch down | Kernel evidence gate (A24): a switch to a rung that is cheaper to attempt or lower ranked needs ≥ 5 effective outcomes on its own key, else `kept:evidence`; switches up are ungated; `hasMinEvidence` forgives only float jitter (1e-6) | `6c55313` | kernel: "A24 evidence gate" (empty store → `kept:evidence`, 5 outcomes → `switched`, 4 → kept, up ungated, lower rank counts as down, margin first) |
+| QA-1.4-7 | major | A `[tier:heavy]` / QA step with an existing route line lacking `pin` stayed unpinned | ` pin` appended to that line (`pin=false` → `pin`), nothing else touched, reported as `routeEdited` / `changed` | `dfcaf81` | plan: "QA-1.4-7 / QA-1.4-8" |
+| QA-1.4-8 | major | An untagged QA step kept its class tier | QA step ⇒ `heavy` (else the default tier) + pin; an explicit tag still wins; never moves on evidence | `dfcaf81` | plan: same describe |
+| QA-1.4-9 | major | Tags, route lines and the task line ignored fences; annotation was not idempotent | `fenceMask` from the route-line module: nothing inside a fence is a tag, route line, fence-marker task line or description; a step that ends on `heavy` is pinned so re-annotation changes nothing | `dfcaf81` | plan: "QA-1.4-9" (fence cases, 12-step corpus annotated 3× byte-identical) |
+| QA-1.4-10 | minor | A throwing `pricing` callback broke the decision | Wrapped: failure ⇒ unpriced (A1), logged through the injected `logger` when present, otherwise silent; a throwing logger is swallowed (no empty catch) | `2b1996a` | ladders: "QA-1.4-10" |
+| QA-1.4-11 | minor | `protocol.replace(base, line)` expands `$` in agent ids; a bare `R:` base produced `R: \| by class:` | `base === "R:"` ⇒ `R: by class: …`; handoff + tests use a function replacer; insert the line when the base is empty | `af930a9` | protocol-line: "QA-1.4-11" |
+| QA-1.4-12 | nit | Recursive cascade | Iterative cascade (explicit stack) | `3e549c8` | kernel: 20 000-rung chain and a 20 000-attempt path |
+| QA-1.4-13 | nit | `\bQA\b` pinned any mention of QA | A QA step starts with the `QA` word (after list/heading/emphasis markers) or names a QA activity (`QA review/round/pass/sign-off/gate/cycle/phase`); case-sensitive; false positives force heavy, false negatives only leave the normal choice | `dfcaf81` | plan: "QA-1.4-13" |
+| QA-1.4-14 | nit | USD scaling, grants and line endings undocumented | Kernel header documents the USD anchor caveat (`3e549c8`); `grantsFromTools` handoff: pass only unconditionally allowed tools; `dispatchPrompt` keeps the step's own line ending (`dfcaf81`) | `3e549c8`, `dfcaf81` | plan: CRLF test |
+
+**Re-checked worked examples** (`p = (0.6, 0.9, 0.95)` for fast / medium / heavy, `U = 100` = safe/high, tiers 1 / 5 / 20; `ladders.test.ts` "A25 worked examples", `kernel.test.ts` "A25 simulated runner paths"):
+
+| Policy | d | C(fast) | C(medium) | C(heavy) | best |
+|---|---|---|---|---|---|
+| plain cascade (`maxAttemptsPerTier: 0`, `costCeiling.multiple: 1000`) — the plan's setup | 1 | 4 | 7.5 | 25 | fast (switches, 10 outcomes on its key) |
+| same | 0.5 | 23.25 | 11.25 | 25 | medium |
+| shipped (`maxAttemptsPerTier: 1`, ceiling 4×): paths f,f,m · m,m,h · h,h | 1 | 3.8 | 5.75 | 21.25 | fast |
+| same | 0.5 | 25.8 | 10.5625 | 23.125 | medium |
+
+The plan's numbers still hold exactly under a policy that allows the plain fast → medium → heavy cascade; the shipped policy prices the retries and stops fast's cascade after medium (cost ceiling), so heavy is not on fast's path.
+
+**Speed** (`performance.now()`, median of 500 runs, 12 router rungs = 3 tiers × 4 variants, v2 catalog session, real `createOutcomeStore`): `decide` p50 0.056 ms (p95 0.075 ms); `buildLadder` with session p50 0.103 ms (p95 0.221 ms), without session p50 0.046 ms. The tests assert < 2 ms.
+
+**Design changes that supersede §2/§3 text above:** (a) router rungs are priced through `Ladder.paths`/`reachable` (their `next` is `null`); role chains still use `next`, and a chain that exits into the router block continues with that rung's path as a fresh dispatch (the chain's runner state is not carried over); (b) router tier rungs of unavailable agents and other-model `candidates` rungs are `excluded`; (c) deviation 5 now also skips fenced lines, deviation 8's "cheaper rung with no data" is refused by the kernel for down switches (`kept:evidence`) and by the plan/`R:` gate for up switches; (d) a plan step that ends on `heavy` is pinned.
+
+**Handoffs added by round 1 (to 2.2 / 2.3 / 2.4):**
+- 2.2 passes the runner's own session input as `session` (and `parentModel`, `pricing`, `logger`) to `buildLadder` / `generateTaxonomy` / `annotateSteps`; without `session` the simulated runner has no variant steps (v1, no catalog) exactly like the real one.
+- 2.2 substitutes the generated `R:` line with a function replacer (`protocol.replace(base, () => line)`) and inserts it when `buildTaskTaxonomy(cfg)` is empty and the line is not.
+- 2.2 calls `grantsFromTools` only with tools whose evaluated permission is an unconditional `allow` (`ask`, `deny` and pattern-limited permissions grant nothing).
+- 2.3: the simulation assumes a plain retry re-runs the rung it just ran, a non-base dispatch behaves like a delegation that already stepped to that variant, and a floor tier lifts the first attempt; keep the runner that way or update `simulate.ts`.
+- 2.4: `annotateSteps` returns `routeEdited` / `changed`; show an edited route line (` pin` added) to the user.
+
 ## Findings
 
-None yet — 1.4 QA has not run.
-
+QA-1.4 round 1 (heavy): 1 critical, 8 major, 2 minor, 3 nit — all fixed above (see "Round 1 fixes"); none open. Round 2 pending.
 ## Deferred by plan
 
 - The `protocol.ts` seam that swaps in the generated `R:` line, the hint text and the decision-log rows → Phase 2.2 (`src\router\protocol.ts` is 2.2's).
@@ -267,8 +309,8 @@ None yet — 1.4 QA has not run.
 - **to 2.2** — per `subagent` call: `classify` → `resolveChosen` → `buildLadder` → `decide({ …, store: bundle.store, floorRank: floorRankOf(cfg), detection: result.detection ?? detectionOf(prompt), pin: result.pin })`; `enforce` writes `decision.target.agent.id` and `modelRef(target.model, target.variant)` only when `decision.switched`; the row's `chosen`/`best`/`costs`/`unit`/`confidence`/`reason`/`pinned`/`switched` come straight from the `Decision` (`reasonCode` is useful in `reason`). Supply `HostAgentInfo` for router tier agents too (otherwise their `grants` are `null` and they can never be `best` for a task with needs). The `R:` swap must keep the D2 invariant tested in §4 (`generateTaxonomy === buildTaskTaxonomy` with no evidence; raw and v2-adapted hashes unchanged).
 - **to 2.4** — advisor finding: a role agent whose own model has no `(model, variant)` rung in the preset is priced at the owning tier's first-rung ratio (E4); report it with a `candidates` suggestion. `/annotate-plan` uses `annotateSteps` and must keep `[route …]` out of fenced blocks.
 - **to the orchestrator** — record E1–E7 under §1.5 "Amended during implementation" (the plan file is outside this write-set).
-- **to QA-1.4** — focus: infinite escalation (kernel cycle guard, ladder acyclicity), unit mixing (any path that returns `usd` with a null estimate), `generateTaxonomy` whitespace vs `buildTaskTaxonomy`, never-down on high risk, store reads under an untrusted class.
+- **to QA-1.4 round 2** — focus: the simulated paths against `nextAction` (every router rung, with and without a catalog), the A24 gate on up/down classification, evidence of reachable rungs, plan idempotence on fenced/CRLF input; round 1 asked for: infinite escalation (kernel cycle guard, ladder acyclicity), unit mixing (any path that returns `usd` with a null estimate), `generateTaxonomy` whitespace vs `buildTaskTaxonomy`, never-down on high risk, store reads under an untrusted class.
 
 ## Verdict
 
-1.4.1 and 1.4.2 implemented; pending QA-1.4 (open findings: n/a).
+1.4.1 and 1.4.2 implemented; QA-1.4 round 1 fixed (14 findings, none open); pending round 2.
