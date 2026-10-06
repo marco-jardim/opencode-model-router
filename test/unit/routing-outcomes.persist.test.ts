@@ -1643,6 +1643,33 @@ describe("foreign writers (QA-1.3-4)", () => {
     expect(cost?.tokens.input).toBeCloseTo(100, 12);
   });
 
+  it("QA-1.3-17: past the cap, A 100 × $1 and B 40 × $0.10 end at ≈ 0.50 (the delta is combined in one step, not clamped first)", async () => {
+    const { a, b, c, onDisk } = twoProcesses();
+    const tokens = { ...emptyTokenSample(), input: 100, output: 10 };
+    const attempt = (who: typeof a, id: string, cost: number) => who.store.recordStep(KEY, { attemptID: id, cost, pricing: "priced", tokens, final: true });
+    await a.persister.load();
+    for (let i = 0; i < 100; i++) attempt(a, `a${i}`, 1);
+    await a.flusher.flushNow();
+    expect((await onDisk())?.cost.measuredUSD).toEqual({ mean: 1, n: 100 });
+
+    c.advance(1000);
+    const loadedB = await b.persister.load(); // B starts from A's file…
+    b.store.fromSnapshot(loadedB.snapshot, { mode: "merge" });
+    for (let i = 0; i < 40; i++) attempt(b, `b${i}`, 0.1); // …and adds 40 cheap attempts: EWMA, n = 140
+    await b.flusher.flushNow();
+    const diskMean = 0.1 + 0.9 * 0.98 ** 40;
+    expect((await onDisk())?.cost.measuredUSD.mean).toBeCloseTo(diskMean, 9);
+
+    c.advance(1000);
+    a.record("pass"); // A is dirty again, with no new cost samples
+    await a.flusher.flushNow();
+    const cost = (await onDisk())?.cost.measuredUSD;
+    expect(cost?.n).toBe(140);
+    expect(cost?.mean).toBeCloseTo(diskMean, 9);
+    expect(cost?.mean).toBeGreaterThan(0.49);
+    expect(cost?.mean).toBeLessThan(0.51); // the old clamp-then-merge gave 0.714
+  });
+
   it("an unchanged file is not read: no merge, no warning, one write per dirty flush", async () => {
     const { a, mem, logger, c } = twoProcesses();
     await a.persister.load();

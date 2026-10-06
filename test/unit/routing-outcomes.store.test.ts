@@ -994,6 +994,62 @@ describe("mergeForeign (QA-1.3-4)", () => {
     expect(c.snapshot().entries[K()]?.counts.pass).toBe(3 + 2);
   });
 
+  it("QA-1.3-17: means combine in one step, also past the effective-sample cap (no clamp before the arithmetic)", () => {
+    const attempt = (store: ReturnType<typeof createOutcomeStore>, id: string, cost: number) =>
+      store.recordStep(K(), step(id, { cost, tokens: tokens({ input: cost * 1000, output: 10 }), final: true }));
+    const origin = createOutcomeStore({ now: clock().now, maxEffectiveSamples: 50 });
+    for (let i = 0; i < 100; i++) attempt(origin, `o${i}`, 1); // n = 100 (past the cap), mean 1
+    const baseline = origin.snapshot();
+    expect(baseline.entries[K()]?.cost.measuredUSD).toEqual({ mean: 1, n: 100 });
+
+    const foreign = createOutcomeStore({ now: clock().now, maxEffectiveSamples: 50 });
+    foreign.fromSnapshot(baseline);
+    for (let i = 0; i < 40; i++) attempt(foreign, `f${i}`, 0.1); // EWMA: n = 140, mean 0.1 + 0.9 · 0.98^40
+    const diskMean = 0.1 + 0.9 * 0.98 ** 40;
+    expect(foreign.snapshot().entries[K()]?.cost.measuredUSD.n).toBe(140);
+    expect(foreign.snapshot().entries[K()]?.cost.measuredUSD.mean).toBeCloseTo(diskMean, 12);
+
+    // this process did nothing to the cost stats: the merged result IS the other writer's state
+    const idle = createOutcomeStore({ now: clock().now, maxEffectiveSamples: 50 });
+    idle.fromSnapshot(baseline);
+    idle.mergeForeign(foreign.snapshot(), baseline);
+    const merged = idle.snapshot().entries[K()]?.cost;
+    expect(merged?.measuredUSD.n).toBe(140);
+    expect(merged?.measuredUSD.mean).toBeCloseTo(diskMean, 12); // ≈ 0.50; clamping the delta first would have given 0.714
+    expect(merged?.measuredUSD.mean).toBeGreaterThan(0.49);
+    expect(merged?.measuredUSD.mean).toBeLessThan(0.51);
+    expect(merged?.tokens.input).toBeCloseTo(diskMean * 1000, 9);
+
+    // …and with work of its own on top: exactly (live·n_l + disk·n_d − base·n_b) / (n_l + n_d − n_b)
+    const busy = createOutcomeStore({ now: clock().now, maxEffectiveSamples: 50 });
+    busy.fromSnapshot(baseline);
+    for (let i = 0; i < 10; i++) attempt(busy, `b${i}`, 2);
+    const live = busy.snapshot().entries[K()]?.cost.measuredUSD;
+    busy.mergeForeign(foreign.snapshot(), baseline);
+    const expectedN = (live?.n ?? 0) + 140 - 100;
+    const expectedMean = ((live?.mean ?? 0) * (live?.n ?? 0) + diskMean * 140 - 1 * 100) / expectedN;
+    expect(busy.snapshot().entries[K()]?.cost.measuredUSD.n).toBe(expectedN);
+    expect(busy.snapshot().entries[K()]?.cost.measuredUSD.mean).toBeCloseTo(expectedMean, 9);
+  });
+
+  it("QA-1.3-17: only the combined result is clamped at 0", () => {
+    const baseOrigin = createOutcomeStore({ now: clock().now });
+    baseOrigin.recordStep(K(), step("b0", { cost: 5, final: true }));
+    const baseline = baseOrigin.snapshot(); // n = 1, mean 5
+    const foreign = createOutcomeStore({ now: clock().now });
+    foreign.fromSnapshot(baseline);
+    foreign.recordStep(K(), step("f0", { cost: 0, final: true }));
+    foreign.recordStep(K(), step("f1", { cost: 0, final: true })); // n = 3, mean 5/3
+    const mine = createOutcomeStore({ now: clock().now });
+    mine.recordStep(K(), step("m0", { cost: 0, final: true })); // n = 1, mean 0; (0·1 + 5 − 5)/3 = 0 ≥ 0 anyway
+    mine.mergeForeign(foreign.snapshot(), baseline);
+    const cost = mine.snapshot().entries[K()]?.cost.measuredUSD;
+    expect(cost?.n).toBe(1 + 3 - 1);
+    expect(cost?.mean).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(cost?.mean ?? Number.NaN)).toBe(true);
+    expect(cost?.mean).toBeCloseTo(((5 / 3) * 3) / 3 - 5 / 3, 9); // (0·1 + (5/3)·3 − 5·1) / 3 = 0
+  });
+
   it("invalid disk entries are dropped and counted", () => {
     const baseline = sharedStart();
     const mine = loaded(baseline);

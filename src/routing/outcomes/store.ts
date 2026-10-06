@@ -182,67 +182,77 @@ function addCounts(a: OutcomeCounts, b: OutcomeCounts): OutcomeCounts {
 }
 
 // ---------------------------------------------------------------------------
-// Foreign-writer deltas (QA-1.3-4): disk − baseline, per entry
+// Foreign-writer merge (QA-1.3-4, 16, 17): live + (disk − baseline), per entry
 // ---------------------------------------------------------------------------
 
-/** `disk − base` of a running mean: exact arithmetic while neither side has passed the effective-sample cap. */
-function subMean(disk: MeanStat, base: MeanStat): MeanStat {
-  const n = disk.n - base.n;
+/** `live + disk − base` of a running mean in ONE step (QA-1.3-17); only the result is clamped, never the parts. */
+function mergeMean(live: MeanStat, disk: MeanStat, base: MeanStat): MeanStat {
+  const n = live.n + disk.n - base.n;
   if (n <= 0) return { mean: 0, n: 0 };
-  return { mean: Math.max(0, (disk.mean * disk.n - base.mean * base.n) / n), n };
+  return { mean: Math.max(0, (live.mean * live.n + disk.mean * disk.n - base.mean * base.n) / n), n };
 }
 
-function subTokenMeans(disk: TokenMeans, base: TokenMeans): TokenMeans {
-  const n = disk.n - base.n;
+function mergeTokens(live: TokenMeans, disk: TokenMeans, base: TokenMeans): TokenMeans {
+  const n = live.n + disk.n - base.n;
   if (n <= 0) return { n: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
-  const part = (d: number, b: number): number => Math.max(0, (d * disk.n - b * base.n) / n);
+  const part = (l: number, d: number, b: number): number => Math.max(0, (l * live.n + d * disk.n - b * base.n) / n);
   return {
     n,
-    input: part(disk.input, base.input),
-    output: part(disk.output, base.output),
-    reasoning: part(disk.reasoning, base.reasoning),
-    cacheRead: part(disk.cacheRead, base.cacheRead),
-    cacheWrite: part(disk.cacheWrite, base.cacheWrite),
+    input: part(live.input, disk.input, base.input),
+    output: part(live.output, disk.output, base.output),
+    reasoning: part(live.reasoning, disk.reasoning, base.reasoning),
+    cacheRead: part(live.cacheRead, disk.cacheRead, base.cacheRead),
+    cacheWrite: part(live.cacheWrite, disk.cacheWrite, base.cacheWrite),
   };
 }
 
+const NO_BETA: BetaState = Object.freeze({ alpha: 0, beta: 0, updatedAt: 0 });
+
 /**
- * What another writer added to an entry since `base` was synced: counters and attempt-weighted means
- * subtract exactly (means while n ≤ maxEffectiveSamples, then they are EWMAs and the delta is approximate);
- * the Beta evidence is subtracted at a common instant and floored at 0.
+ * `live + (disk − base)` for an entry whose disk copy descends from the baseline: what another writer added
+ * since this process last synced, added on top of everything this process holds now. Each quantity is combined
+ * in one step, so nothing is clamped before the arithmetic is done (QA-1.3-17): counters and attempt-weighted
+ * means come out exact while no mean has passed the effective-sample cap, and stay consistent past it (a mean
+ * that is an EWMA is combined by the same n-weighted rule as every other merge). The Beta evidence is combined
+ * at a common instant and floored at 0.
  */
-function subtractEntry(disk: Entry, base: Entry, tuning: OutcomeTuning): Entry {
-  const t = Math.max(disk.beta.updatedAt, base.beta.updatedAt);
-  const d = decayTo(disk.beta, t, tuning);
-  const b = decayTo(base.beta, t, tuning);
-  let alpha = Math.max(0, d.alpha - b.alpha);
-  let beta = Math.max(0, d.beta - b.beta);
+function mergeDescendant(live: Entry | undefined, disk: Entry, base: Entry, now: number, tuning: OutcomeTuning): Entry {
+  const l = live?.beta ?? NO_BETA;
+  const newest = Math.max(l.updatedAt, disk.beta.updatedAt, base.beta.updatedAt);
+  // A clock more than a day behind every stamp is a correction (QA-1.3-7): express the sum at `now`.
+  const at = newest - now > DAY_MS ? now : Math.max(newest, now);
+  const dl = live === undefined ? { alpha: 0, beta: 0, updatedAt: at } : decayTo(l, at, tuning);
+  const dd = decayTo(disk.beta, at, tuning);
+  const db = decayTo(base.beta, at, tuning);
+  let alpha = Math.max(0, dl.alpha + dd.alpha - db.alpha);
+  let beta = Math.max(0, dl.beta + dd.beta - db.beta);
   if (alpha + beta < MIN_TINY) {
     alpha = 0;
     beta = 0;
   }
+  const lc = live?.counts ?? ZERO_COUNTS;
   const dc = disk.counts;
   const bc = base.counts;
+  const lk = live?.cost ?? EMPTY_COST;
   return {
     cls: disk.cls,
-    beta: { alpha, beta, updatedAt: t },
+    beta: capEvidence({ alpha, beta, updatedAt: at }, tuning.maxEffectiveSamples),
     counts: {
-      pass: Math.max(0, dc.pass - bc.pass),
-      fail: Math.max(0, dc.fail - bc.fail),
-      falseRefusals: Math.max(0, dc.falseRefusals - bc.falseRefusals),
-      variantPass: Math.max(0, dc.variantPass - bc.variantPass),
-      variantFail: Math.max(0, dc.variantFail - bc.variantFail),
+      pass: Math.max(0, lc.pass + dc.pass - bc.pass),
+      fail: Math.max(0, lc.fail + dc.fail - bc.fail),
+      falseRefusals: Math.max(0, lc.falseRefusals + dc.falseRefusals - bc.falseRefusals),
+      variantPass: Math.max(0, lc.variantPass + dc.variantPass - bc.variantPass),
+      variantFail: Math.max(0, lc.variantFail + dc.variantFail - bc.variantFail),
     },
     cost: {
-      measuredUSD: subMean(disk.cost.measuredUSD, base.cost.measuredUSD),
-      unpricedAttempts: Math.max(0, disk.cost.unpricedAttempts - base.cost.unpricedAttempts),
-      tokens: subTokenMeans(disk.cost.tokens, base.cost.tokens),
-      steps: subMean(disk.cost.steps, base.cost.steps),
-      finalMessageTokens: subMean(disk.cost.finalMessageTokens, base.cost.finalMessageTokens),
+      measuredUSD: mergeMean(lk.measuredUSD, disk.cost.measuredUSD, base.cost.measuredUSD),
+      unpricedAttempts: Math.max(0, lk.unpricedAttempts + disk.cost.unpricedAttempts - base.cost.unpricedAttempts),
+      tokens: mergeTokens(lk.tokens, disk.cost.tokens, base.cost.tokens),
+      steps: mergeMean(lk.steps, disk.cost.steps, base.cost.steps),
+      finalMessageTokens: mergeMean(lk.finalMessageTokens, disk.cost.finalMessageTokens, base.cost.finalMessageTokens),
     },
   };
 }
-
 /**
  * QA-1.3-16: can `disk` be a later state of the lineage that `base` belongs to? Every counter and every
  * sample count only ever grows, so one that is *lower* on disk means the file was reset or replaced (deleted
@@ -266,17 +276,23 @@ function descendsFrom(disk: Entry, base: Entry): boolean {
   );
 }
 
-function isEmptyEntry(e: Entry): boolean {
-  const c = e.counts;
-  const k = e.cost;
+/** Did the other writer add anything (given that `disk` descends from `base`)? Counters and sample counts only grow. */
+function grewSince(disk: Entry, base: Entry): boolean {
+  const d = disk.counts;
+  const b = base.counts;
   return (
-    e.beta.alpha + e.beta.beta === 0 &&
-    c.pass + c.fail + c.falseRefusals + c.variantPass + c.variantFail === 0 &&
-    k.unpricedAttempts === 0 &&
-    k.measuredUSD.n + k.tokens.n + k.steps.n + k.finalMessageTokens.n === 0
+    d.pass !== b.pass ||
+    d.fail !== b.fail ||
+    d.falseRefusals !== b.falseRefusals ||
+    d.variantPass !== b.variantPass ||
+    d.variantFail !== b.variantFail ||
+    disk.cost.unpricedAttempts !== base.cost.unpricedAttempts ||
+    disk.cost.measuredUSD.n !== base.cost.measuredUSD.n ||
+    disk.cost.tokens.n !== base.cost.tokens.n ||
+    disk.cost.steps.n !== base.cost.steps.n ||
+    disk.cost.finalMessageTokens.n !== base.cost.finalMessageTokens.n
   );
 }
-
 export type ParseSnapshotResult =
   | { readonly ok: true; readonly snapshot: OutcomeSnapshot; readonly dropped: number }
   | { readonly ok: false; readonly reason: "unsupported-version" | "corrupt"; readonly message: string };
@@ -619,9 +635,13 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
           continue;
         }
         const base = key in baseEntries ? readEntry(key, baseEntries[key]) : null;
-        const delta = base === null || !descendsFrom(current, base) ? current : subtractEntry(current, base, tuning);
-        if (isEmptyEntry(delta)) continue;
-        absorb(key as OutcomeKey, delta, t);
+        if (base === null || !descendsFrom(current, base)) {
+          absorb(key as OutcomeKey, current, t); // new key, or a new lineage (QA-1.3-16): taken whole
+        } else if (grewSince(current, base)) {
+          entries.set(key as OutcomeKey, mergeDescendant(entries.get(key as OutcomeKey), current, base, t, tuning));
+        } else {
+          continue; // the other writer added nothing to this key
+        }
         accepted += 1;
       }
       if (accepted > 0) revision += 1;
