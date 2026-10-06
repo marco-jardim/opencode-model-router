@@ -112,6 +112,16 @@ function isMember<T extends string>(values: readonly T[], value: unknown): value
   return typeof value === "string" && (values as readonly string[]).includes(value);
 }
 
+/**
+ * QA-1.4-20: a `[tier:X]` inside an inline code span is documentation, not a tag. A span opens with a run of
+ * backticks and closes with a run of the SAME length (CommonMark); an unclosed run is plain text.
+ */
+const INLINE_CODE_RE = /(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g;
+
+function withoutInlineCode(line: string): string {
+  return line.includes("`") ? line.replace(INLINE_CODE_RE, " ") : line;
+}
+
 function isQaLine(line: string): boolean {
   return QA_LEADING_RE.test(line) || QA_PHRASE_RE.test(line) || QA_VERB_RE.test(line) || QA_CONTEXT_RE.test(line);
 }
@@ -193,7 +203,7 @@ function scanStep(text: string): Scan {
       return;
     }
     if (taskAt < 0 && line.trim() !== "") taskAt = index;
-    if (tierTag === null) tierTag = TIER_TAG_RE.exec(line)?.[1] ?? null;
+    if (tierTag === null) tierTag = TIER_TAG_RE.exec(withoutInlineCode(line))?.[1] ?? null;
   });
   return { lines, terminators, eol: terminators[0] ?? "\n", routeAt, taskAt, tierTag };
 }

@@ -551,6 +551,43 @@ describe("QA-1.4-13: the QA match is narrow", () => {
   });
 });
 
+describe("QA-1.4-20: a tier tag inside an inline code span is not a tag", () => {
+  const stubSearch = () => facts("search", { risk: "low" });
+
+  it("Document the `[tier:heavy]` tag syntax: no existing tag, no pin, the engine tags the step", async () => {
+    const out = await annotateSteps([step("a", "Document the `[tier:heavy]` tag syntax")], stubDeps(stubSearch));
+    const a = out[0]!;
+    expect(a.tierSource).toBe("engine");
+    expect(a.tier).toBe("fast");
+    expect(a.pin).toBe(false);
+    expect(a.text.split("\n")[0]).toBe("Document the `[tier:heavy]` tag syntax [tier:fast]");
+    // The appended tag is the real one: annotating again changes nothing.
+    const again = await annotateSteps([step("a", a.text)], stubDeps(stubSearch));
+    expect(again[0]!.text).toBe(a.text);
+    expect(again[0]!.tierSource).toBe("existing");
+    expect(again[0]!.tier).toBe("fast");
+  });
+
+  it("longer backtick runs, several spans and a real tag after a span", async () => {
+    const out = await annotateSteps(
+      [
+        step("double", "Explain ``[tier:heavy]`` and ```[tier:medium]``` here"),
+        step("real", "Explain `[tier:heavy]` then tag it [tier:medium]"),
+        step("two", "Use `a` and `[tier:heavy]` and `b`"),
+      ],
+      stubDeps(stubSearch),
+    );
+    expect(out.map((a) => [a.tierSource, a.tier])).toEqual([["engine", "fast"], ["existing", "medium"], ["engine", "fast"]]);
+    expect(out.map((a) => a.pin)).toEqual([false, false, false]);
+  });
+
+  it("an unclosed backtick is plain text: the tag after it still counts", async () => {
+    const out = await annotateSteps([step("a", "Mind the ` tick [tier:heavy]")], stubDeps(stubSearch));
+    expect(out[0]!.tierSource).toBe("existing");
+    expect(out[0]!.tier).toBe("heavy");
+    expect(out[0]!.pin).toBe(true);
+  });
+});
 describe("QA-1.4-19 (A26): the result reports how many steps the annotation pinned", () => {
   const plan = [
     step("design", "Design the new engine"), // engine-chosen heavy → pinned
