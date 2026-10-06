@@ -388,10 +388,15 @@ const variantWithEffort: Check = ({ cfg, byRef }) => {
  * QA-3.2 (O-32-5, measured on the real OpenCode 2.0.22 host in Phase 3.2): a tier that sets `variant` AND a different `effort` runs the EFFORT
  * on the wire (the agent's effort option wins over the stored variant: the child is stored `#medium` while the request carries `xhigh`), but
  * the outcome keys, the decision rows and `routing:stats` name the VARIANT. The evidence is then filed under a rung that is not what ran.
- * Only while the engine records anything (`routing.engine` is not `static`). `variant-effort` is a different finding (the tier has no variant steps).
+Only while the engine records anything (`routing.engine` is not `static`).
+ * QA-3.2-R2-1: when variant steps are on (`auto`) `variant-effort` already fires for EVERY tier that sets `variant` together with an effort setting, and its fix
+ * (drop the effort setting, list the variants as candidates) removes this mismatch too; one warning per tier, not two, so this one only speaks while variant
+ * steps are off (`escalate.variantSteps: "none"`), where `variant-effort` is silent and the keys-versus-wire problem is all that is left.
+ * Measured on Anthropic Messages (the OpenAI Responses route was not measured for this).
  */
 const effortVariantMismatch: Check = ({ cfg, byRef }) => {
   if (resolveRouting(cfg, "v2").engine === "static") return [];
+  if (resolveVariantSteps(cfg, "v2") === "auto") return []; // `variant-effort` covers these tiers and says the same fix
   const findings: RawFinding[] = [];
   for (const [name, tier] of activeTierEntries(cfg)) {
     if (typeof tier.variant !== "string" || tier.variant === "" || typeof tier.effort !== "string" || tier.effort === tier.variant) continue;
@@ -402,7 +407,7 @@ const effortVariantMismatch: Check = ({ cfg, byRef }) => {
       id: "effort-variant-mismatch",
       severity: "warning",
       subject: name,
-      message: `Tier ${name} sets variant ${tier.variant} but effort ${tier.effort}: the request runs effort ${tier.effort} (the agent's effort option wins over the stored variant), while the outcome keys, the decision rows and routing:stats name ${tier.model}#${tier.variant}, so what this tier learns is filed under a rung that is not what runs. Make them agree: ${
+      message: `Tier ${name} sets variant ${tier.variant} but effort ${tier.effort}: the request runs effort ${tier.effort} (the agent's effort option wins over the stored variant; measured on Anthropic Messages), while the outcome keys, the decision rows and routing:stats name ${tier.model}#${tier.variant}, so what this tier learns is filed under a rung that is not what runs. Make them agree: ${
         offered ? `set variant to ${tier.effort} (snippet), or ` : ""
       }drop the effort setting.`,
       snippet: offered ? json({ presets: { [cfg.activePreset]: { [name]: { variant: tier.effort } } } }) : null,

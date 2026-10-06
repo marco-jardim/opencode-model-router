@@ -61,8 +61,9 @@ export interface AttemptModel {
  *   host-to-provider boundary only, and PROVIDER ACCEPTANCE of in-band effort is unverified. Re-decide after a real-provider check.
  * - `effort-path` (1.5 QA-1.5-22): an escalation (agent switch) across a tier that configures
  *   `effort`/`thinking`/`reasoning`. MEASURED on 2.0.22 in Phase 3.2 (H7, H7b): after an agent switch on resume the request carries the
- *   TARGET agent's effort option once and never the previous agent's (on a same-model switch the top level keeps the previous agent's
- *   effort and the target's travels in-band), and the agent's `effort` option wins over the stored variant. The guard stays: provider
+ *   TARGET agent's effort option once and never the previous agent's, delivered as follows: on a model change at the top level; on a same-model
+ *   switch the previous agent's effort stays at the top level and the target's goes in-band, taking effect only if the provider honours
+ *   in-band effort. The agent's `effort` option wins over the stored variant. The guard stays: provider
  *   acceptance of in-band effort is unverified, so the least trusted path still starts fresh. Re-decide after a real-provider check.
  */
 export type FreshReason = "invalid-variant" | "bare-model-after-variant" | "effort-path";

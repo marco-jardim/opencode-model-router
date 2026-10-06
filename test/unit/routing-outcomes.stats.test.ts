@@ -292,7 +292,7 @@ describe("summarize", () => {
     const rows: LogRow[] = [
       decision("p1", SINCE, { mode: "enforce", switched: true, chosen: choice(A), best: choice(C) }),
       decision("p2", SINCE, { mode: "enforce", chosen: choice(A), best: choice(A) }),
-      decision("p3", SINCE, { mode: "enforce", chosen: choice(A), best: null, reason: "kept: the dispatched agent resolves to no model" }),
+      decision("p3", SINCE, { mode: "enforce", chosen: choice(A), best: null, reason: "kept:unresolved: the dispatched agent resolves to no model" }),
       delegate("1"),
       delegate("2"),
       delegate("3"),

@@ -1,13 +1,13 @@
 {
   "scenario": "H8b-annotate-plan-live-engine",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
-  "recordedAt": "2026-10-06T23:31:09.603Z",
+  "runId": "f4083c26-705d-4070-8558-9326793a280c",
+  "recordedAt": "2026-10-06T23:53:03.141Z",
   "harness": {
-    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "headSha": "2979423676eee1df3da15005d0b661b1eddeec73",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
-      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+      "test/smoke/routing-engine.smoke.test.ts": "126867764c605441b797450582c1e63125a36027",
+      "test/smoke/helpers/routing-host.ts": "4a6e339cb1ba4dfafef27b4cf440c37caffdd5b6"
     },
     "uncommittedChanges": false
   },
@@ -37,7 +37,7 @@
       "For each NON-TRIVIAL task, append an acceptance block immediately after the step so the router can verify the work:",
       "Prefer deterministic checks (testsPass/buildPasses/fileExists). testsPass means the tests affected by the producer's changes pass (the full suite is CI's job), so prefer it over a hand-written full-suite run command. Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
       "## Router route lines (model-router, engine=advise)",
-      "Computed by the router for <home>\\AppData\\Local\\Temp\\omr-p32-notice-GBf8BR\\project\\plan.md: 3 steps found, 3 need an addition, 1 pinned by this annotation (a `[tier:heavy]` or QA step is never moved by the engine).",
+      "Computed by the router for <home>\\AppData\\Local\\Temp\\omr-p32-notice-nZmGUe\\project\\plan.md: 3 steps found, 3 need an addition, 1 pinned by this annotation (a `[tier:heavy]` or QA step is never moved by the engine).",
       "Make exactly these changes, keeping every other line as it is. Line numbers are those of the file now: apply the list from the last step to the first (or find each line by its quoted text) so earlier insertions do not move the later ones. Each quoted string is the complete line to write. Where a tier tag is listed it replaces the template's tag rule for that step (it is already at the start, as the template says); never write a `[route …]` line inside a fenced code block, and do not invent others.",
       "- line 3 \"1. Find every usage of parseThing in the repository and list the files.\": rewrite line 3 as \"1. [tier:fast] Find every usage of parseThing in the repository and list the files.\"; insert directly below line 3 (outside any code fence) the line \"[route class=recon risk=low scope=multi d=none]\" [facts source: rules]",
       "- line 4 \"2. Implement the retry logic in src/client.ts with unit tests.\": rewrite line 4 as \"2. [tier:medium] Implement the retry logic in src/client.ts with unit tests.\"; insert directly below line 4 (outside any code fence) the line \"[route class=implement risk=medium scope=multi needs=edit d=none]\" [facts source: rules]",

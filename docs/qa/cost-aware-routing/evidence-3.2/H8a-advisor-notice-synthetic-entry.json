@@ -1,13 +1,13 @@
 {
   "scenario": "H8a-advisor-notice-synthetic-entry",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
-  "recordedAt": "2026-10-06T23:31:09.497Z",
+  "runId": "f4083c26-705d-4070-8558-9326793a280c",
+  "recordedAt": "2026-10-06T23:53:02.956Z",
   "harness": {
-    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "headSha": "2979423676eee1df3da15005d0b661b1eddeec73",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
-      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+      "test/smoke/routing-engine.smoke.test.ts": "126867764c605441b797450582c1e63125a36027",
+      "test/smoke/helpers/routing-host.ts": "4a6e339cb1ba4dfafef27b4cf440c37caffdd5b6"
     },
     "uncommittedChanges": false
   },
@@ -92,12 +92,22 @@
     ],
     "storeFiles": [
       {
-        "name": "advisor-notice.55e1f2af2bd7.json",
+        "name": "advisor-notice.c74ef1598755.json",
         "size": 261
       }
     ],
-    "hostErrors": []
+    "hostErrors": [],
+    "noticeNameControl": {
+      "projectDirs": 2,
+      "expectedNames": [
+        "advisor-notice.c74ef1598755.json",
+        "advisor-notice.4053f8c90eef.json"
+      ],
+      "written": [
+        "advisor-notice.c74ef1598755.json"
+      ]
+    }
   },
-  "assertionResult": "PASS: 1 synthetic cost-doctor entry after 4 turns (at index 3 of 13); notice state files: advisor-notice.55e1f2af2bd7.json",
+  "assertionResult": "PASS: 1 synthetic cost-doctor entry after 4 turns (at index 3 of 13); notice state files: advisor-notice.c74ef1598755.json",
   "notes": []
 }

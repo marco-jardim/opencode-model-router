@@ -1,13 +1,13 @@
 {
   "scenario": "H2-tool-hooks-per-instance",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
-  "recordedAt": "2026-10-06T23:28:18.963Z",
+  "runId": "f4083c26-705d-4070-8558-9326793a280c",
+  "recordedAt": "2026-10-06T23:52:53.754Z",
   "harness": {
-    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "headSha": "2979423676eee1df3da15005d0b661b1eddeec73",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
-      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+      "test/smoke/routing-engine.smoke.test.ts": "126867764c605441b797450582c1e63125a36027",
+      "test/smoke/helpers/routing-host.ts": "4a6e339cb1ba4dfafef27b4cf440c37caffdd5b6"
     },
     "uncommittedChanges": false
   },
@@ -20,46 +20,46 @@
       "heavyAttempts": 0,
       "firstSnapshotN": 3
     },
-    "baseLocation": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\config\\opencode",
+    "baseLocation": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\config\\opencode",
     "liveLocations": [
       {
-        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project"
+        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\project"
       },
       {
-        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\config\\opencode"
+        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\config\\opencode"
       }
     ],
     "projectSession": {
-      "rootID": "ses_eec75083effe8wdXzANLhzXyyD",
+      "rootID": "ses_eec5e86a5ffelnDzyQ70zUo975",
       "beforeHookInstances": [
-        "ml6u8d"
+        "wtpirl"
       ],
       "afterHookInstances": [
-        "ml6u8d"
+        "wtpirl"
       ],
       "hookInstanceDirectories": [
-        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project"
+        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\project"
       ]
     },
     "stepEndedLinesPerInstance": [
       {
-        "id": "evt_1138af8980019X1B393Ana35gz",
-        "iid": "ml6u8d",
-        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project"
+        "id": "evt_113a17a50001T9vqKg0y6KVsLo",
+        "iid": "wtpirl",
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\project"
       },
       {
-        "id": "evt_1138af8980019X1B393Ana35gz",
-        "iid": "r9sl9j",
-        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\config\\opencode"
+        "id": "evt_113a17a50001T9vqKg0y6KVsLo",
+        "iid": "qq6bmw",
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\config\\opencode"
       }
     ],
     "baseSession": {
-      "rootID": "ses_eec7498d2ffe5NAWxnJ7IGxt4q",
+      "rootID": "ses_eec5e1736ffeQKbZ22wGvJZuYd",
       "beforeHookInstances": [
-        "r9sl9j"
+        "qq6bmw"
       ],
       "hookInstanceDirectories": [
-        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\config\\opencode"
+        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\config\\opencode"
       ],
       "child": {
         "agent": "fast",
@@ -77,12 +77,12 @@
     },
     "rowsOfTheTwoDispatches": [
       {
-        "sessionID": "ses_eec75083effe8wdXzANLhzXyyD",
+        "sessionID": "ses_eec5e86a5ffelnDzyQ70zUo975",
         "mode": "enforce",
         "switched": true
       },
       {
-        "sessionID": "ses_eec7498d2ffe5NAWxnJ7IGxt4q",
+        "sessionID": "ses_eec5e1736ffeQKbZ22wGvJZuYd",
         "mode": "enforce",
         "switched": true
       }
