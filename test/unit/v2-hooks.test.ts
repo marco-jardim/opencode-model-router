@@ -9,7 +9,10 @@ import { getActiveTiers } from "../../src/router/protocol";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, makeKey } from "../../src/routing/outcomes";
+import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
@@ -932,3 +935,225 @@ describe("OpenCode 2 hook adapter", () => {
     }
   });
 });
+
+describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
+  const KEY = makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "medium");
+  const FACTS = { class: "implement", risk: "medium", scope: "file", needs: [] as string[], confidence: 0.9, source: "rules" };
+  const logger = { warn: vi.fn() };
+
+  /** HOME redirected to a temp dir; `routing` (when given) is written to the global override layer. */
+  function routingHome(routing?: Record<string, unknown>) {
+    const home = mkdtempSync(join(tmpdir(), "router-v2-ingest-"));
+    const outcomes = join(home, "outcomes");
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    if (routing) writeFileSync(overridePath(), JSON.stringify({ routing: { outcomes: { path: outcomes }, ...routing } }));
+    invalidateConfigCache();
+    return { home, outcomes };
+  }
+
+  function catalog() {
+    return { list: vi.fn(async () => ({ data: [{ providerID: "anthropic", id: "claude-sonnet-5-5", cost: [{ input: 3, output: 15 }] }] })) };
+  }
+
+  /** Start the adapter over a fixture whose ctx also has the model catalog. */
+  async function start(f: ReturnType<typeof fixture>, model: ReturnType<typeof catalog>, hooks: Record<string, any> = {}, options?: { ingest?: Ingest }) {
+    const forgetSession = vi.fn();
+    const runtime = { withToolContext: async (_context: unknown, operation: () => Promise<any>) => operation(), applyChildSystem: vi.fn(), forgetSession };
+    const ctx = { ...f.ctx, model };
+    const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, runtime, options);
+    cleanups.push(cleanup);
+    return { cleanup, forgetSession };
+  }
+
+  /** Events are handled in order: once the barrier session's deletion is seen, everything before it was handled. */
+  async function barrier(f: ReturnType<typeof fixture>, forgetSession: ReturnType<typeof vi.fn>, name: string) {
+    f.emit({ id: `barrier-${name}`, type: "session.deleted", data: { sessionID: name } });
+    await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith(name));
+  }
+
+  const stepEvent = (id: string, sessionID: string, over: { finish?: string; cost?: number } = {}) => ({
+    id, type: "session.step.ended",
+    data: {
+      sessionID, assistantMessageID: `m-${id}`, finish: over.finish ?? "tool-calls", rawFinish: "stop", cost: over.cost ?? 0.01,
+      tokens: { input: 1000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  });
+
+  const register = (child: string, over: Partial<Parameters<typeof rememberDispatch>[1]> = {}) => rememberDispatch(child, {
+    facts: FACTS, agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", tier: "medium", parentSessionID: "root", ...over,
+  });
+
+  afterEach(() => { resetDispatchRegistry(); resetIngestState(); logger.warn.mockReset(); });
+
+  it("records a registered child's steps, with catalog pricing, when engine != static", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow" });
+    const f = fixture();
+    const model = catalog();
+    const { cleanup, forgetSession } = await start(f, model);
+    register("child-1");
+    f.emit(stepEvent("e1", "child-1", { finish: "tool-calls", cost: 0.01 }));
+    f.emit(stepEvent("e2", "child-1", { finish: "stop", cost: 0.02 }));
+    await barrier(f, forgetSession, "barrier");
+    const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+    try {
+      const cost = peek.store.cost(KEY);
+      expect(cost.measuredUSD.n).toBe(1);
+      expect(cost.measuredUSD.mean).toBeCloseTo(0.03, 9);
+      expect(cost.tokens).toMatchObject({ n: 1, input: 2000, output: 200 });
+      expect(model.list).toHaveBeenCalledTimes(1);
+    } finally {
+      await peek.release();
+    }
+    await cleanup(); // flushes through the D15 flusher on dispose
+    expect(existsSync(join(outcomes, "outcomes.json"))).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("ignores step events of sessions that are not registered children", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow" });
+    const f = fixture();
+    const model = catalog();
+    const { cleanup, forgetSession } = await start(f, model);
+    f.emit(stepEvent("e1", "orchestrator"));
+    f.emit({ id: "e2", type: "session.step.ended", data: { assistantMessageID: "no-session" } });
+    await barrier(f, forgetSession, "barrier");
+    await cleanup();
+    expect(existsSync(outcomes)).toBe(false);
+    expect(model.list).not.toHaveBeenCalled();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("with no routing block (engine static) nothing is written and the catalog is never read", async () => {
+    const { home, outcomes } = routingHome();
+    const f = fixture();
+    const model = catalog();
+    const { cleanup, forgetSession } = await start(f, model);
+    register("child-1");
+    f.emit(stepEvent("e1", "child-1", { finish: "stop" }));
+    f.emit({ id: "i1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+    await barrier(f, forgetSession, "barrier");
+    await cleanup();
+    expect(existsSync(outcomes)).toBe(false);
+    expect(model.list).not.toHaveBeenCalled();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("records nothing under a class below routing.minClassConfidence", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow", minClassConfidence: 0.7 });
+    const f = fixture();
+    const { cleanup, forgetSession } = await start(f, catalog());
+    register("child-low", { facts: { ...FACTS, confidence: 0.69 } });
+    f.emit(stepEvent("e1", "child-low", { finish: "stop" }));
+    await barrier(f, forgetSession, "barrier");
+    await cleanup();
+    expect(existsSync(outcomes)).toBe(false);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("counts a step once when the same event id reaches two plugin instances (A3)", async () => {
+    const { home, outcomes } = routingHome({ engine: "shadow" });
+    const a = fixture();
+    const b = fixture();
+    const first = await start(a, catalog());
+    const second = await start(b, catalog());
+    register("child-1");
+    const event = stepEvent("same-id", "child-1", { finish: "stop", cost: 0.02 });
+    a.emit(event);
+    b.emit(event);
+    await barrier(a, first.forgetSession, "barrier-a");
+    await barrier(b, second.forgetSession, "barrier-b");
+    const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+    try {
+      expect(peek.store.cost(KEY).steps.n).toBe(1);
+      expect(peek.store.cost(KEY).measuredUSD.mean).toBeCloseTo(0.02, 9);
+    } finally {
+      await peek.release();
+    }
+    await first.cleanup();
+    await second.cleanup();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("session.deleted drops the child's registration and still reaches the legacy event hook", async () => {
+    const { home } = routingHome({ engine: "shadow" });
+    const f = fixture();
+    const legacyEvent = vi.fn(async () => {});
+    const { forgetSession } = await start(f, catalog(), { event: legacyEvent });
+    register("child-1");
+    f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-1" } });
+    await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith("child-1"));
+    await vi.waitFor(() => expect(legacyEvent).toHaveBeenCalledWith({ event: { type: "session.deleted", properties: { info: { id: "child-1" } } } }, undefined));
+    const { lookupDispatch } = await import("../../src/router/sessions");
+    expect(lookupDispatch("child-1")).toBeUndefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  describe("with an injected ingest", () => {
+    const fake = () => ({
+      onStepEnded: vi.fn(async () => {}), onVerdict: vi.fn(), onFalseRefusal: vi.fn(), onSessionGone: vi.fn(),
+      requestFlush: vi.fn(), sweep: vi.fn(), dispose: vi.fn(async () => {}),
+    } satisfies Ingest);
+
+    it("survives a throwing handler: it is logged and the next event is still handled", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const ingest = fake();
+        ingest.onStepEnded.mockRejectedValueOnce(new Error("handler exploded"));
+        const f = fixture();
+        const legacyEvent = vi.fn(async () => {});
+        const { forgetSession } = await start(f, catalog(), { event: legacyEvent }, { ingest });
+        f.emit(stepEvent("e1", "child-1"));
+        f.emit(stepEvent("e2", "child-1"));
+        f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-2" } });
+        await vi.waitFor(() => expect(forgetSession).toHaveBeenCalledWith("child-2"));
+        expect(ingest.onStepEnded).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls.some((args) => String(args[0]).includes("telemetry ingestion") && String(args[0]).includes("session.step.ended"))).toBe(true);
+        // the deletion after the failure still ran both the ingest cleanup and the legacy translation
+        expect(ingest.onSessionGone).toHaveBeenCalledWith("child-2");
+        expect(legacyEvent).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("a throwing session cleanup does not stop the legacy event translation", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const ingest = fake();
+        ingest.onSessionGone.mockImplementationOnce(() => { throw new Error("cleanup exploded"); });
+        const f = fixture();
+        const legacyEvent = vi.fn(async () => {});
+        await start(f, catalog(), { event: legacyEvent }, { ingest });
+        f.emit({ id: "d1", type: "session.deleted", data: { sessionID: "child-1" } });
+        await vi.waitFor(() => expect(legacyEvent).toHaveBeenCalledTimes(1));
+        expect(warn.mock.calls.some((args) => String(args[0]).includes("cleanup") || String(args[0]).includes("session.deleted"))).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("flushes and sweeps on the idle equivalents, not on unrelated events, and disposes on cleanup", async () => {
+      const ingest = fake();
+      const f = fixture();
+      const { cleanup, forgetSession } = await start(f, catalog(), {}, { ingest });
+      for (const type of ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"]) {
+        f.emit({ id: type, type, data: { sessionID: "s" } });
+      }
+      f.emit({ id: "t1", type: "session.text.ended", data: { sessionID: "s", text: "hello" } });
+      f.emit({ id: "c1", type: "session.created", data: { sessionID: "s" } });
+      await barrier(f, forgetSession, "barrier");
+      expect(ingest.requestFlush).toHaveBeenCalledTimes(4);
+      expect(ingest.sweep).toHaveBeenCalledTimes(4);
+      expect(ingest.onStepEnded).not.toHaveBeenCalled();
+      expect(ingest.dispose).not.toHaveBeenCalled();
+      await cleanup();
+      await cleanup();
+      expect(ingest.dispose).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+function readdirSyncSafe(dir: string): string[] {
+  try { return readdirSync(dir); } catch { return []; }
+}
