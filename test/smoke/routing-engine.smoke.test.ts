@@ -729,7 +729,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       s.observed.snapshotTakenAt = before.at;
       s.observed.liveStore = { dir: "<tmpdir>/opencode-model-router-trajectory", filesBefore: Object.keys(before.store).length, filesAfter: Object.keys(after.store).length, bytesBefore: Object.values(before.store).reduce((n, f) => n + f.size, 0), bytesAfter: Object.values(after.store).reduce((n, f) => n + f.size, 0), added: added.length, addedNonSession, removed, grownFiles: grown.filter(n => !/^ses_/.test(n)), grownSessionFiles: grown.filter(n => /^ses_/.test(n)).length };
       s.observed.liveDecisionsLog = { appendedRows: appended, rowsNamingASessionOfThisRun: foreignRows, sessionsOfThisRunSeen: seenSessionIDs.size };
-      s.observed.liveConfig = { dir: "~/.config/opencode", files: Object.keys(after.config), changedSinceSnapshot: configChanged, routerFilesUnchanged: routerFiles.filter(n => !configChanged.includes(n)) };
+      s.observed.liveConfig = { dir: "~/.config/opencode", fileCount: Object.keys(after.config).length, changedSinceSnapshot: configChanged, routerFilesUnchanged: routerFiles.filter(n => !configChanged.includes(n)) };
       const ok = foreignRows === 0 && seenSessionIDs.size > 0 && routerFiles.every(n => !configChanged.includes(n));
       s.verdict(ok, `live store ${Object.keys(before.store).length} -> ${Object.keys(after.store).length} files (+${added.length} new, ${added.length - addedNonSession.length} of them ses_ scorecards, non-ses_ new: ${addedNonSession.join(",") || "none"}); ${appended} row(s) appended to the live decisions.jsonl, ${foreignRows} naming a session of this run (${seenSessionIDs.size} seen); config files changed: ${configChanged.join(",") || "none"}`);
     });
