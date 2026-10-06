@@ -136,7 +136,7 @@ The decisions above rest on spikes run against OpenCode `2.0.22` before any code
 - **The scoreboard only sees what is dispatched.** There is no exploration: an unevidenced cheaper rung gets its first outcomes only when something puts work there. Exploration is future work.
 - **Blind spots.** Deferred verification and `router_verify` verdicts are not recorded. Below-threshold dispatches record no outcomes, so with the rules classifier a share of dispatches never teaches the scoreboard.
 - **The rules classifier is crude on long briefs.** Backends (`host`, `openai-compatible`, `typesafe`) can help but send bounded task text off the machine.
-- **The `host` backend is experimental.** Its live check at the DF3 checkpoint could not verify it: the credential policy gate blocked the backend; a fix is in progress on `car/pcred`. Effort delivery on non-Anthropic routes (A7) is also unverified.
+- **The `host` backend is experimental.** The live criterion of the DF3 checkpoint (`source: "host"` for both steps of a batched `/annotate-plan` sample) was not observed. The backend was consulted live (status `ok`, label `other`, no `backendSkipped`), but an answer that only confirms `other` does not change the rules' facts, so the run proves the transport, not the benefit. The credential policy gate (D14) skips the backend for credential words, including `token`, by design. Effort delivery on non-Anthropic routes (A7) is also unverified.
 - **v2 only.** v1 users get one prose line and nothing else.
 - **A code change needs a host restart** (the plugin is loaded once per process); a configuration change does not.
 - **The docs are not in the npm tarball.** This ADR and the guide live in the repository.
