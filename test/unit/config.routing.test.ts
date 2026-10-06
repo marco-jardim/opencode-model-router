@@ -12,6 +12,7 @@ import {
   deepMerge,
   getConfigNotices,
   getConfigReloadError,
+  hasExplicitCandidates,
   invalidateConfigCache,
   loadConfig,
   overridePath,
@@ -508,8 +509,8 @@ describe("resolveCandidates", () => {
             candidates: [
               { variant: "medium", costRatio: 5 },
               { variant: "high" },
-              { model: "openai/gpt-6-luna", variant: "high", costRatio: 9 },
               {},
+              { model: "openai/gpt-6-luna", variant: "high", costRatio: 9 },
             ],
           },
         },
@@ -518,8 +519,8 @@ describe("resolveCandidates", () => {
     expect(resolveCandidates("medium", cfg)).toEqual([
       { model: "anthropic/claude-sonnet-5-5", variant: "medium", costRatio: 5 },
       { model: "anthropic/claude-sonnet-5-5", variant: "high", costRatio: 5 },
-      { model: "openai/gpt-6-luna", variant: "high", costRatio: 9 },
       { model: "anthropic/claude-sonnet-5-5", costRatio: 5 },
+      { model: "openai/gpt-6-luna", variant: "high", costRatio: 9 },
     ]);
   });
 
@@ -550,6 +551,14 @@ describe("resolveCandidates", () => {
     expect(resolveCandidates("", cfg)).toEqual([]);
     expect(resolveCandidates("constructor", cfg)).toEqual([]);
     expect(resolveCandidates("toString", cfg)).toEqual([]);
+  });
+
+  it("does not treat Object.prototype members as conventional tier names (QA-1.1-19)", () => {
+    const cfg = cfgOf({
+      presets: { anthropic: { constructor: { model: "a/c" }, toString: { model: "a/t" }, fast: { model: "a/f" } } },
+    });
+    expect(resolveCandidates("constructor", cfg)).toEqual([{ model: "a/c", costRatio: 1 }]);
+    expect(resolveCandidates("toString", cfg)).toEqual([{ model: "a/t", costRatio: 1 }]);
   });
 
   it("returns an empty ladder when the active preset is unknown", () => {
@@ -595,6 +604,22 @@ describe("the shipped tiers.json (no routing block: behaviour unchanged)", () =>
   });
 });
 
+describe("hasExplicitCandidates (QA-1.1-11)", () => {
+  it("is true only for a non-empty candidates array", () => {
+    expect(hasExplicitCandidates({ model: "a/b" })).toBe(false);
+    expect(hasExplicitCandidates({ model: "a/b", candidates: [] })).toBe(false);
+    expect(hasExplicitCandidates({ model: "a/b", candidates: [{}] })).toBe(true);
+    expect(hasExplicitCandidates({ model: "a/b", candidates: [{ variant: "high" }, {}] })).toBe(true);
+  });
+
+  it("agrees with resolveCandidates on the shipped example and on a plain tier", () => {
+    const cfg = cfgOf();
+    expect(hasExplicitCandidates(cfg.presets.anthropic!.medium!)).toBe(true);
+    expect(resolveCandidates("medium", cfg).length).toBeGreaterThan(1);
+    expect(hasExplicitCandidates(cfg.presets.anthropic!.plain!)).toBe(false);
+    expect(resolveCandidates("plain", cfg)).toHaveLength(1);
+  });
+});
 // ---------------------------------------------------------------------------
 // Hot reload (1.1.4; phase 0.P handoff "to 1.1", amendment A6): the global
 // override file is where the dogfood checkpoints edit `routing.*`.
@@ -656,16 +681,19 @@ describe("hot reload of the global override file with a routing block", () => {
   it("returns candidates and variantSteps from the override layer too", () => {
     const first = loadConfig();
     const presetName = first.activePreset;
+    const tier = first.presets[presetName]!.medium!;
+    const own = tier.variant === undefined ? {} : { variant: tier.variant };
     editOverride({
-      presets: { [presetName]: { medium: { candidates: [{ variant: "high", costRatio: 9 }] } } },
+      presets: { [presetName]: { medium: { candidates: [own, { variant: "high", costRatio: 9 }] } } },
       enforcement: { escalate: { variantSteps: "none" } },
     });
     const next = loadConfig();
     expect(next).not.toBe(first);
+    expect(getConfigReloadError()).toBeNull();
     expect(resolveVariantSteps(next, "v2")).toBe("none");
-    const ladder = resolveCandidates("medium", next);
-    expect(ladder).toEqual([
-      { model: next.presets[presetName]!.medium!.model, variant: "high", costRatio: 9 },
+    expect(resolveCandidates("medium", next)).toEqual([
+      { model: tier.model, ...own, costRatio: tier.costRatio },
+      { model: tier.model, variant: "high", costRatio: 9 },
     ]);
   });
 

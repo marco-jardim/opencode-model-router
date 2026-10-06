@@ -866,8 +866,9 @@ describe("validateConfig — tiers.<t>.candidates", () => {
   });
 
   it("accepts entries that omit model (inherited), variant and costRatio", () => {
+    // `{}` is the tier's own rung (its model, default variant, its costRatio 1).
     expect(() =>
-      validateConfig(withCandidates([{ variant: "medium", costRatio: 5 }, { variant: "high" }, {}])),
+      validateConfig(withCandidates([{}, { variant: "high" }, { variant: "max", costRatio: 4 }])),
     ).not.toThrow();
   });
 
@@ -875,6 +876,7 @@ describe("validateConfig — tiers.<t>.candidates", () => {
     expect(() =>
       validateConfig(
         withCandidates([
+          {},
           { variant: "high" },
           { model: "openai/gpt-6-luna", variant: "high" },
           { model: "openai/gpt-6-luna", variant: "low" },
@@ -910,7 +912,7 @@ describe("validateConfig — tiers.<t>.candidates", () => {
   });
 
   it("accepts a fractional costRatio", () => {
-    expect(() => validateConfig(withCandidates([{ costRatio: 0.5 }]))).not.toThrow();
+    expect(() => validateConfig(withCandidates([{}, { variant: "high", costRatio: 1.5 }]))).not.toThrow();
   });
 
   it.each(["gpt", "/gpt", "openai/", 5, null])("rejects candidate model %j", (model) => {
@@ -954,5 +956,91 @@ describe("validateConfig — enforcement.escalate.variantSteps", () => {
   it("is optional: absent leaves escalate exactly as written", () => {
     const cfg = validateConfig(validRaw({ enforcement: { escalate: { maxTotalAttempts: 3 } } }));
     expect(cfg.enforcement?.escalate).toEqual({ maxTotalAttempts: 3 });
+  });
+});
+
+describe("validateConfig — tiers.<t>.candidates: own rung and escalation order (QA-1.1-3, QA-1.1-12)", () => {
+  /** One tier named `name` in the only preset. */
+  const withTier = (name: string, tier: Record<string, unknown>): Record<string, unknown> =>
+    validRaw({ presets: { anthropic: { [name]: tier } } });
+  const SONNET = "anthropic/claude-sonnet-5-5";
+
+  it("rejects a non-empty list that lacks the tier's own (model, variant), naming the key", () => {
+    expect(() => validateConfig(withCandidates([{ variant: "high" }]))).toThrow(
+      /'anthropic\.fast\.candidates' must include the tier's own rung \(model anthropic\/claude-haiku-4-5, variant default\)/,
+    );
+    expect(() =>
+      validateConfig(withTier("medium", { model: SONNET, variant: "medium", candidates: [{ variant: "high" }] })),
+    ).toThrow(/'anthropic\.medium\.candidates' must include the tier's own rung \(model anthropic\/claude-sonnet-5-5, variant medium\)/);
+  });
+
+  it("rejects a list whose rungs are all on another model", () => {
+    expect(() =>
+      validateConfig(withTier("medium", { model: SONNET, variant: "medium", candidates: [{ model: "openai/gpt-6-luna", variant: "medium" }] })),
+    ).toThrow(/must include the tier's own rung/);
+  });
+
+  it("accepts the own rung written implicitly, explicitly, anywhere in the list", () => {
+    const tier = { model: SONNET, variant: "medium", costRatio: 5 };
+    for (const candidates of [
+      [{ variant: "medium" }, { variant: "high" }],
+      [{ model: SONNET, variant: "medium" }, { variant: "high" }],
+      [{ variant: "low", costRatio: 3 }, { variant: "medium" }, { variant: "high", costRatio: 8 }],
+    ]) {
+      expect(() => validateConfig(withTier("medium", { ...tier, candidates }))).not.toThrow();
+    }
+  });
+
+  it("does not require the own rung of an empty list (an empty list means no candidates)", () => {
+    expect(() => validateConfig(withTier("medium", { model: SONNET, variant: "medium", candidates: [] }))).not.toThrow();
+  });
+
+  it("treats a variant-less tier's own rung as the variant-less entry of its model", () => {
+    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{}, { variant: "high" }] }))).not.toThrow();
+    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{ variant: "high" }] }))).toThrow(
+      /variant default/,
+    );
+  });
+
+  it("rejects an own rung whose costRatio differs from the tier's, accepts equal or omitted", () => {
+    const tier = { model: SONNET, variant: "medium", costRatio: 5 };
+    expect(() =>
+      validateConfig(withTier("medium", { ...tier, candidates: [{ variant: "medium", costRatio: 6 }, { variant: "high", costRatio: 8 }] })),
+    ).toThrow(/'anthropic\.medium\.candidates\[0\]\.costRatio' \(6\) must equal the tier's costRatio \(5\)/);
+    for (const own of [{ variant: "medium", costRatio: 5 }, { variant: "medium" }]) {
+      expect(() => validateConfig(withTier("medium", { ...tier, candidates: [own, { variant: "high", costRatio: 8 }] }))).not.toThrow();
+    }
+  });
+
+  it("uses the conventional costRatio of the tier name when the tier states none", () => {
+    // `medium` defaults to 5, `fast` to 1, `heavy` to 20, any other name to 1.
+    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{ costRatio: 5 }] }))).not.toThrow();
+    expect(() => validateConfig(withTier("medium", { model: SONNET, candidates: [{ costRatio: 1 }] }))).toThrow(
+      /\(1\) must equal the tier's costRatio \(5\)/,
+    );
+    expect(() => validateConfig(withTier("heavy", { model: SONNET, candidates: [{ costRatio: 20 }] }))).not.toThrow();
+    expect(() => validateConfig(withTier("custom", { model: SONNET, candidates: [{ costRatio: 1 }] }))).not.toThrow();
+    // A name that is an Object.prototype member is not a conventional tier (QA-1.1-19).
+    expect(() => validateConfig(withTier("constructor", { model: SONNET, candidates: [{ costRatio: 1 }] }))).not.toThrow();
+  });
+
+  it("rejects a costRatio that decreases along the list, naming both positions", () => {
+    expect(() =>
+      validateConfig(withCandidates([{}, { variant: "high", costRatio: 3 }, { variant: "max", costRatio: 2 }])),
+    ).toThrow(/'anthropic\.fast\.candidates\[2\]' has costRatio 2, lower than candidates\[1\] \(3\)/);
+  });
+
+  it("compares the effective costRatio: an omitted one is the tier's", () => {
+    const tier = { model: SONNET, variant: "medium", costRatio: 5 };
+    expect(() =>
+      validateConfig(withTier("medium", { ...tier, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }, { variant: "max" }] })),
+    ).toThrow(/candidates\[2\]' has costRatio 5, lower than candidates\[1\] \(8\)/);
+    expect(() =>
+      validateConfig(withTier("medium", { ...tier, candidates: [{ variant: "low", costRatio: 6 }, { variant: "medium" }] })),
+    ).toThrow(/candidates\[1\]' has costRatio 5, lower than candidates\[0\] \(6\)/);
+  });
+
+  it("accepts equal costRatios (non-decreasing, not strictly increasing)", () => {
+    expect(() => validateConfig(withCandidates([{}, { variant: "high", costRatio: 1 }, { variant: "max", costRatio: 1 }]))).not.toThrow();
   });
 });

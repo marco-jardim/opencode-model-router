@@ -856,9 +856,9 @@ A tier may list the `(model, variant, costRatio)` rungs the engine can use for i
 | `costRatio` | `number` | the tier's `costRatio` (or its conventional default: `fast` 1, `medium` 5, `heavy` 20, other 1) | Must be `> 0`. |
 
 - Without `candidates`, or with `candidates: []`, the tier's ladder is exactly one rung: its own `(model, variant, costRatio)`.
-- With `candidates` the ladder is those rungs, in order. List the tier's own rung first if you want it in the ladder; it is not added for you.
+- With `candidates` the ladder is those rungs, **in escalation order**: a failed attempt moves to the next rung. The list **must contain the tier's own rung** (the tier's `model` and `variant`, a variant-less tier being the variant-less entry of its model), because the static choice has to be one of the candidates; that rung's `costRatio` must equal the tier's or be omitted. The effective `costRatio` (an omitted one is the tier's) **must not decrease** along the list; equal ratios are fine, and rungs cheaper than the own rung may precede it.
 - No two rungs may name the same effective `(model, variant)` once the omitted `model` is filled in from the tier; two variant-less rungs of one model count as the same rung.
-- `resolveCandidates(tierName, cfg)` returns the resolved ladder for the active preset (an unknown tier yields `[]`).
+- `resolveCandidates(tierName, cfg)` returns the resolved ladder for the active preset (an unknown tier yields `[]`); `hasExplicitCandidates(tier)` says whether a tier lists any (an empty list counts as none).
 
 ### `escalate.variantSteps`
 
@@ -902,7 +902,7 @@ A tier may list the `(model, variant, costRatio)` rungs the engine can use for i
 | `proportional.trivialBypass` must be a boolean. |
 | A tier's `effort` (when present) must be one of `low \| medium \| high \| xhigh \| max`. Error: `tiers.json: preset '<preset>' tier '<tier>': effort must be one of low, medium, high, xhigh, max`. |
 | `escalate.variantSteps` must be `auto` or `none`. |
-| A tier's `candidates` (when present) must be an array of objects; `model` (when present) must be `provider/model`, `variant` a non-empty string without whitespace or `#`, `costRatio` a number > 0; no two entries may share an effective `(model, variant)`. |
+| A tier's `candidates` (when present) must be an array of objects; `model` (when present) must be `provider/model`, `variant` a non-empty string without whitespace or `#`, `costRatio` a number > 0; no two entries may share an effective `(model, variant)`; a non-empty list must contain the tier's own `(model, variant)` with its `costRatio` equal to the tier's or omitted; the effective `costRatio` must not decrease along the list. |
 | `routing` must be an object; every key of the [`routing` table](#keys) must be of its type and within its range, and a classifier backend other than `rules` needs a `provider/model[#variant]` model (plus an `http(s)` `baseUrl` for `openai-compatible` and `typesafe`) — for the top level and for every `classifier.presets` entry. `roles` classes and agent ids must match `^[a-z0-9_-]+$` and every class needs a non-empty array. |
 
 An invalid value in the bundled `tiers.json` throws at load; the same value in an

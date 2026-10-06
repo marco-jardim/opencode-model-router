@@ -759,7 +759,7 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
           `tiers.json: preset '${presetName}' tier '${tierName}': promptStyle must be one of ${PROMPT_STYLES.join("|")}`,
         );
       }
-      validateTierCandidates(t, `${presetName}.${tierName}`);
+      validateTierCandidates(t, `${presetName}.${tierName}`, tierName);
     }
   }
 
@@ -1707,17 +1707,35 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
 }
 
 /**
- * `tiers.<t>.candidates`: ordered rungs of a tier's ladder. `model` falls back
- * to the tier's own, and no two rungs may name the same effective
- * `(model, variant)` (an omitted variant is the model's default variant).
+ * `tiers.<t>.candidates`: ordered rungs of a tier's ladder, in escalation order.
+ *
+ * - `model` falls back to the tier's own; an omitted `variant` is the model's
+ *   default variant; an omitted `costRatio` is the tier's.
+ * - No two rungs may name the same effective `(model, variant)`.
+ * - A non-empty list must contain the tier's own effective `(model, variant)`
+ *   (QA-1.1-3): the static choice must be one of the rungs, or the engine's
+ *   degenerate case (D2) would have nothing to start from. That rung's
+ *   `costRatio` is the tier's own, so it must equal it or be omitted.
+ * - Effective `costRatio` must not decrease along the list (QA-1.1-12): the list
+ *   is walked upward on failure, and a cheaper later rung is not an escalation.
  */
-function validateTierCandidates(tier: Record<string, unknown>, label: string): void {
+function validateTierCandidates(
+  tier: Record<string, unknown>,
+  label: string,
+  tierName: string,
+): void {
   const candidates = tier.candidates;
   if (candidates === undefined) return;
   if (!Array.isArray(candidates)) {
     throw new Error(`tiers.json: '${label}.candidates' must be an array`);
   }
   const seen = new Map<string, number>();
+  const tierCostRatio =
+    typeof tier.costRatio === "number" && Number.isFinite(tier.costRatio) && tier.costRatio > 0
+      ? tier.costRatio
+      : tierDefaultsFor(tierName).costRatio;
+  const effectiveCosts: number[] = [];
+  const declaredCosts: Array<number | undefined> = [];
   for (let i = 0; i < candidates.length; i++) {
     const entry: unknown = candidates[i];
     const where = `${label}.candidates[${i}]`;
@@ -1755,7 +1773,36 @@ function validateTierCandidates(tier: Record<string, unknown>, label: string): v
       );
     }
     seen.set(key, i);
+    declaredCosts.push(typeof costRatio === "number" ? costRatio : undefined);
+    effectiveCosts.push(typeof costRatio === "number" ? costRatio : tierCostRatio);
   }
+  if (candidates.length === 0) return;
+
+  const ownVariant = typeof tier.variant === "string" ? tier.variant : "";
+  const ownIndex = seen.get(`${String(tier.model)}\u0000${ownVariant}`);
+  if (ownIndex === undefined) {
+    throw new Error(
+      `tiers.json: '${label}.candidates' must include the tier's own rung (model ${String(tier.model)}, variant ${ownVariant === "" ? "default" : ownVariant}): the static choice has to be one of the candidates`,
+    );
+  }
+  const ownCost = declaredCosts[ownIndex];
+  if (ownCost !== undefined && ownCost !== tierCostRatio) {
+    throw new Error(
+      `tiers.json: '${label}.candidates[${ownIndex}].costRatio' (${ownCost}) must equal the tier's costRatio (${tierCostRatio}) because it is the tier's own rung, or be omitted`,
+    );
+  }
+  for (let i = 1; i < effectiveCosts.length; i++) {
+    if (effectiveCosts[i]! < effectiveCosts[i - 1]!) {
+      throw new Error(
+        `tiers.json: '${label}.candidates[${i}]' has costRatio ${effectiveCosts[i]}, lower than candidates[${i - 1}] (${effectiveCosts[i - 1]}): candidates are listed in escalation order, so costRatio must not decrease`,
+      );
+    }
+  }
+}
+
+/** True when the tier lists at least one explicit candidate (an empty list counts as none). */
+export function hasExplicitCandidates(tier: TierConfig): boolean {
+  return Array.isArray(tier.candidates) && tier.candidates.length > 0;
 }
 
 /**
@@ -1987,6 +2034,11 @@ const TIER_DEFAULTS: Record<string, { costRatio: number; steps: number }> = {
 };
 const FALLBACK_TIER_DEFAULTS = { costRatio: 1, steps: 50 };
 
+/** Defaults of a tier by name; own keys only, so `constructor` or `toString` are not tiers (QA-1.1-19). */
+function tierDefaultsFor(tierName: string): { costRatio: number; steps: number } {
+  return Object.hasOwn(TIER_DEFAULTS, tierName) ? TIER_DEFAULTS[tierName]! : FALLBACK_TIER_DEFAULTS;
+}
+
 /**
  * Fill in `costRatio`/`steps` for any tier that omits them, by tier name. Runs
  * after merge so override-defined presets behave well without restating the
@@ -1996,7 +2048,7 @@ const FALLBACK_TIER_DEFAULTS = { costRatio: 1, steps: 50 };
 function applyTierDefaults(cfg: RouterConfig): void {
   for (const preset of Object.values(cfg.presets)) {
     for (const [tierName, tier] of Object.entries(preset)) {
-      const d = TIER_DEFAULTS[tierName] ?? FALLBACK_TIER_DEFAULTS;
+      const d = tierDefaultsFor(tierName);
       if (tier.costRatio === undefined) tier.costRatio = d.costRatio;
       if (tier.steps === undefined) tier.steps = d.steps;
     }
@@ -2604,15 +2656,14 @@ export function resolveCandidates(tierName: string, cfg: RouterConfig): readonly
   const tier = preset !== undefined && Object.hasOwn(preset, tierName) ? preset[tierName] : undefined;
   if (tier === undefined) return NO_CANDIDATES;
 
-  const tierCostRatio = tier.costRatio ?? (TIER_DEFAULTS[tierName] ?? FALLBACK_TIER_DEFAULTS).costRatio;
+  const tierCostRatio = tier.costRatio ?? tierDefaultsFor(tierName).costRatio;
   const rung = (model: string, variant: string | undefined, costRatio: number): ResolvedCandidate =>
     Object.freeze(variant === undefined ? { model, costRatio } : { model, variant, costRatio });
 
-  const listed = tier.candidates;
-  if (listed === undefined || listed.length === 0) {
+  if (!hasExplicitCandidates(tier)) {
     return Object.freeze([rung(tier.model, tier.variant, tierCostRatio)]);
   }
   return Object.freeze(
-    listed.map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
+    (tier.candidates ?? []).map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
   );
 }
