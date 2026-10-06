@@ -638,7 +638,7 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     const [row] = await resumeRows(world);
     expect(row).toMatchObject({ resume: true, switched: false, pinned: true, chosen: { agent: "fast" } });
     expect(row!.reason.startsWith("kept:resume:running: ")).toBe(true);
-    expect(row!.reason).toContain("would be sent to @medium (not applied to a pinned dispatch)");
+    expect(row!.reason).toContain("pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast)");
     expect(row!.reason).not.toMatch(/; sent to @medium/);
     // the unpinned resume of the same shape still says it was sent
     await hostStart(world, "child-unpinned-row", { agent: "fast", prompt: SEARCH });
