@@ -14,10 +14,9 @@ import {
   findProjectOverride,
   resolveVerifyBudget,
   resolveDepthLimit,
-  resolveRouting,
+  routerStatusLines,
   warnDeprecatedVerifyKeys,
 } from "./router/config";
-import { formatRouterLine } from "./router/build-info";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
@@ -2088,7 +2087,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           text = buildRouterOutput(cfg, args, projectDir);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
-            text += "\n" + formatRouterLine(resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger).engine);
+            text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
             const catalog = await fetchCatalog();
             if (catalog) {
               const issues = validateModels(cfg, catalog);

@@ -9,8 +9,11 @@ import {
   DEFAULT_V2_ROLES,
   ROUTING_DEFAULTS,
   ROUTING_ENGINE_IGNORED_ON_V1,
+  ROUTING_RESERVED_AGENTS,
   ROUTING_TASK_CLASSES,
+  collectRoutingNotices,
   deepMerge,
+  findUnknownRoutingKeys,
   getConfigNotices,
   getConfigReloadError,
   hasExplicitCandidates,
@@ -447,13 +450,28 @@ describe("resolveClassifierForPreset", () => {
     expect(resolveClassifierForPreset(classifier, "local").model).toBeNull();
   });
 
-  it("matches preset names exactly and never through the prototype", () => {
-    const classifier = classifierOf({ backend: "host", model: "a/b", presets: { Other: { model: "c/d" } } });
-    expect(resolveClassifierForPreset(classifier, "other")).toBe(classifier);
-    expect(resolveClassifierForPreset(classifier, "constructor")).toBe(classifier);
-    expect(resolveClassifierForPreset(classifier, "toString")).toBe(classifier);
+  it("matches preset names like /preset does: exact first, then case-insensitive and trimmed (QA-1.1-14)", () => {
+    const classifier = classifierOf({ backend: "host", model: "a/b", presets: { Other: { model: "c/d" }, exact: { model: "e/f" } } });
+    expect(resolveClassifierForPreset(classifier, "other").model).toBe("c/d");
+    expect(resolveClassifierForPreset(classifier, "OTHER").model).toBe("c/d");
+    expect(resolveClassifierForPreset(classifier, "  other ").model).toBe("c/d");
+    expect(resolveClassifierForPreset(classifier, "exact").model).toBe("e/f");
+    expect(resolveClassifierForPreset(classifier, "nothing")).toBe(classifier);
+    expect(resolveClassifierForPreset(classifier, "")).toBe(classifier);
   });
 
+  it("prefers an exact key over a case-insensitive one", () => {
+    const classifier = classifierOf({ backend: "host", model: "a/b", presets: { other: { model: "lower/x" }, Other: { model: "upper/x" } } });
+    expect(resolveClassifierForPreset(classifier, "Other").model).toBe("upper/x");
+    expect(resolveClassifierForPreset(classifier, "other").model).toBe("lower/x");
+  });
+
+  it("never matches through the prototype", () => {
+    const classifier = classifierOf({ backend: "host", model: "a/b", presets: { Other: { model: "c/d" } } });
+    expect(resolveClassifierForPreset(classifier, "constructor")).toBe(classifier);
+    expect(resolveClassifierForPreset(classifier, "toString")).toBe(classifier);
+    expect(resolveClassifierForPreset(classifier, "__proto__")).toBe(classifier);
+  });
   it("returns a frozen result", () => {
     const classifier = classifierOf({ backend: "host", model: "a/b", presets: { other: { model: "c/d" } } });
     expect(Object.isFrozen(resolveClassifierForPreset(classifier, "other"))).toBe(true);
@@ -634,6 +652,79 @@ describe("the shipped tiers.json (no routing block: behaviour unchanged)", () =>
   });
 });
 
+describe("findUnknownRoutingKeys / collectRoutingNotices (QA-1.1-10, -14, -18)", () => {
+  it("lists the path of every unknown key, at every level", () => {
+    expect(
+      findUnknownRoutingKeys({
+        engine: "shadow",
+        margn: 0.5,
+        detection: { det: 1, grader: 0.5 },
+        classifier: { bakend: "host", presets: { anthropic: { modle: "a/b", model: "c/d" } } },
+        outcomes: { pth: "x" },
+        sessionReuse: { max: 1 },
+        advisor: { enable: false },
+      }),
+    ).toEqual([
+      "routing.margn",
+      "routing.detection.det",
+      "routing.classifier.bakend",
+      "routing.outcomes.pth",
+      "routing.sessionReuse.max",
+      "routing.advisor.enable",
+      "routing.classifier.presets.anthropic.modle",
+    ]);
+  });
+
+  it("finds none in a clean block, an absent block, or a block of the wrong type", () => {
+    expect(findUnknownRoutingKeys(undefined)).toEqual([]);
+    expect(findUnknownRoutingKeys(null)).toEqual([]);
+    expect(findUnknownRoutingKeys("shadow")).toEqual([]);
+    expect(findUnknownRoutingKeys([])).toEqual([]);
+    expect(findUnknownRoutingKeys({ engine: "static", roles: { anything: [] }, classifier: { presets: {} } })).toEqual([]);
+  });
+
+  it("reports unknown keys in one notice, singular or plural", () => {
+    const cfg = cfgOf();
+    expect(collectRoutingNotices({ margn: 1 }, cfg)).toEqual(["ignoring unknown routing key: routing.margn"]);
+    expect(collectRoutingNotices({ margn: 1, profil: "x" }, cfg)).toEqual([
+      "ignoring unknown routing keys: routing.margn, routing.profil",
+    ]);
+  });
+
+  it("notices roles that name the built-in primary/internal agents, and accepts them", () => {
+    expect([...ROUTING_RESERVED_AGENTS]).toEqual(["build", "plan", "title", "summary", "compaction"]);
+    const cfg = cfgOf({
+      routing: { roles: { search: ["explore", "build"], implement: ["plan", "general"], review: ["title", "summary", "compaction"] } },
+    });
+    const messages = collectRoutingNotices(cfg.routing, cfg);
+    expect(messages).toHaveLength(5);
+    for (const name of ["build", "plan", "title", "summary", "compaction"]) {
+      expect(messages.some((m) => m.includes(`names '${name}'`))).toBe(true);
+    }
+    expect(messages[0]).toMatch(/^routing\.roles\.'search' names 'build', an OpenCode primary\/internal agent that cannot be a subagent; it will be skipped$/);
+    expect(resolveRouting(cfg, "v2").roles.search).toEqual(["explore", "build"]); // the engine skips it
+  });
+
+  it("does not notice ordinary agents, including look-alikes", () => {
+    const cfg = cfgOf({ routing: { roles: { search: ["explore", "builder", "Build", "planner"] } } });
+    expect(collectRoutingNotices(cfg.routing, cfg)).toEqual([]);
+  });
+
+  it("notices a per-preset classifier override that matches no preset, matching names like /preset does", () => {
+    const cfg = cfgOf({
+      routing: {
+        classifier: { backend: "host", model: "a/b", presets: { ANTHROPIC: { model: "c/d" }, nosuch: { model: "e/f" } } },
+      },
+    });
+    expect(collectRoutingNotices(cfg.routing, cfg)).toEqual([
+      "routing.classifier.presets.'nosuch' matches no preset (defined: anthropic, other); the override is unused",
+    ]);
+  });
+
+  it("has nothing to say about a config without routing", () => {
+    expect(collectRoutingNotices(undefined, cfgOf())).toEqual([]);
+  });
+});
 describe("hasExplicitCandidates (QA-1.1-11)", () => {
   it("is true only for a non-empty candidates array", () => {
     expect(hasExplicitCandidates({ model: "a/b" })).toBe(false);
@@ -832,6 +923,69 @@ describe("hot reload of the global override file with a routing block", () => {
     expect(getConfigReloadError()).toBeNull();
   });
 
+  describe("config notices through loadConfig (QA-1.1-10, -14, -18)", () => {
+    const noticeMessages = (): string[] => getConfigNotices().map((n) => n.message);
+    const warned = (needle: string): string[] =>
+      warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes(needle));
+
+    it("loads a config with unknown routing keys, lists them, and warns once", () => {
+      editOverride({ routing: { engine: "shadow", margn: 0.5, classifier: { bakend: "host" }, outcomes: { pth: "x" } } });
+      const cfg = loadConfig();
+      expect(resolveRouting(cfg, "v2").engine).toBe("shadow");
+      expect(getConfigReloadError()).toBeNull();
+      expect(noticeMessages()).toEqual([
+        "ignoring unknown routing keys: routing.margn, routing.classifier.bakend, routing.outcomes.pth",
+      ]);
+      expect(warned("ignoring unknown routing keys")).toEqual([
+        "[model-router] ignoring unknown routing keys: routing.margn, routing.classifier.bakend, routing.outcomes.pth",
+      ]);
+      // Same files, rebuilt: one warning per config fingerprint.
+      invalidateConfigCache();
+      loadConfig();
+      expect(warned("ignoring unknown routing keys")).toHaveLength(1);
+    });
+
+    it("warns again when the file changes and the typo is still there", () => {
+      editOverride({ routing: { margn: 0.5 } });
+      loadConfig();
+      editOverride({ routing: { margn: 0.5, engine: "advise" } });
+      loadConfig();
+      expect(warned("ignoring unknown routing key")).toHaveLength(2);
+    });
+
+    it("drops the notice once the typo is fixed", () => {
+      editOverride({ routing: { margn: 0.5 } });
+      loadConfig();
+      expect(noticeMessages()).toHaveLength(1);
+      editOverride({ routing: { margin: 0.5 } });
+      expect(loadConfig().routing?.margin).toBe(0.5);
+      expect(noticeMessages()).toEqual([]);
+    });
+
+    it("notices roles naming primary agents and classifier presets matching no preset; resolves a preset key case-insensitively", () => {
+      editOverride({
+        routing: {
+          roles: { search: ["build"] },
+          classifier: { backend: "host", model: "a/b", presets: { nosuch: { model: "c/d" }, ANTHROPIC: { model: "e/f" } } },
+        },
+      });
+      const cfg = loadConfig();
+      const messages = noticeMessages();
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toContain("routing.roles.'search' names 'build'");
+      expect(messages[1]).toContain("routing.classifier.presets.'nosuch' matches no preset");
+      const classifier = resolveRouting(cfg, "v2").classifier;
+      expect(resolveClassifierForPreset(classifier, cfg.activePreset).model).toBe("e/f");
+    });
+
+    it("keeps the notices of the last good build when a reload fails", () => {
+      editOverride({ routing: { margn: 0.5 } });
+      const good = loadConfig();
+      editOverride({ routing: { margin: 7 } });
+      expect(loadConfig()).toBe(good);
+      expect(noticeMessages()).toEqual(["ignoring unknown routing key: routing.margn"]);
+    });
+  });
   describe("project layer trust (A18, QA-1.1-2)", () => {
     let project: string;
     const projectFile = (): string => join(project, ".opencode", "opencode-model-router.overrides.jsonc");
@@ -960,6 +1114,20 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(lines).toHaveLength(1);
       expect(lines[0]).toMatch(MARKER);
       expect(lines[0]).toBe(formatRouterLine("static"));
+    });
+
+    it("lists the config notices under the marker, and only the marker line starts with `router: engine=`", async () => {
+      editOverride({ routing: { engine: "advise", margn: 0.5 } });
+      const text = await runRouter("v2");
+      expect(markerLines(text)).toEqual([formatRouterLine("advise")]);
+      const lines = text.split("\n");
+      const at = lines.indexOf(formatRouterLine("advise"));
+      expect(lines[at + 1]).toBe("router: config notice: ignoring unknown routing key: routing.margn");
+    });
+
+    it("lists no notice lines for a clean config", async () => {
+      editOverride({ routing: { engine: "advise" } });
+      expect((await runRouter("v2")).split("\n").filter((l) => l.startsWith("router: config notice:"))).toEqual([]);
     });
 
     it("does not add the line to the other /router views", async () => {

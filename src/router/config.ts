@@ -10,6 +10,7 @@ import {
 import { availableParallelism, homedir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
 import type { PluginLogger } from "./logger";
@@ -2198,6 +2199,95 @@ function keepLastValidConfig(
   return previous;
 }
 
+/** Keys each `routing` block understands; anything else is ignored (and noticed). */
+const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
+  routing: [
+    "engine",
+    "profile",
+    "margin",
+    "minClassConfidence",
+    "detection",
+    "classifier",
+    "roles",
+    "outcomes",
+    "sessionReuse",
+    "advisor",
+  ],
+  detection: ["deterministic", "grader", "none"],
+  classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
+  preset: ["backend", "model"],
+  outcomes: ["path", "halfLifeDays", "maxEffectiveSamples"],
+  sessionReuse: ["maxContextFraction"],
+  advisor: ["enabled", "noticeIntervalHours"],
+};
+
+/**
+ * Paths of the keys inside a raw `routing` block that nothing reads
+ * (`routing.margn`, `routing.classifier.bakend`, …). Validation ignores them, as
+ * it does everywhere in this file; this makes the typo visible (QA-1.1-10).
+ */
+export function findUnknownRoutingKeys(routing: unknown): string[] {
+  if (!isPlainObject(routing)) return [];
+  const unknown: string[] = [];
+  const check = (obj: Record<string, unknown>, known: readonly string[], path: string): void => {
+    for (const key of Object.keys(obj)) {
+      if (!known.includes(key)) unknown.push(`${path}.${key}`);
+    }
+  };
+  check(routing, ROUTING_KNOWN_KEYS.routing!, "routing");
+  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor"] as const) {
+    const value = routing[block];
+    if (isPlainObject(value)) check(value, ROUTING_KNOWN_KEYS[block]!, `routing.${block}`);
+  }
+  const classifier = routing.classifier;
+  const presets = isPlainObject(classifier) ? classifier.presets : undefined;
+  if (isPlainObject(presets)) {
+    for (const [name, entry] of Object.entries(presets)) {
+      if (isPlainObject(entry)) check(entry, ROUTING_KNOWN_KEYS.preset!, `routing.classifier.presets.${name}`);
+    }
+  }
+  return unknown;
+}
+
+/**
+ * OpenCode's built-in primary and internal agents. None of them can be a
+ * subagent candidate, so `routing.roles` naming one is useless (QA-1.1-18); it is
+ * accepted (the host's agent set is not known at load) but noticed, and the
+ * engine must skip it.
+ */
+export const ROUTING_RESERVED_AGENTS = ["build", "plan", "title", "summary", "compaction"] as const;
+
+/**
+ * Findings about a routing block that loaded fine but probably is not what the
+ * author meant: unknown keys, `roles` naming reserved agents, per-preset
+ * classifier overrides naming no preset. `rawRouting` is the merged block as
+ * written (validation drops unknown keys from the snapshot); `cfg` is the
+ * validated config.
+ */
+export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): string[] {
+  const messages: string[] = [];
+  const unknown = findUnknownRoutingKeys(rawRouting);
+  if (unknown.length > 0) {
+    messages.push(`ignoring unknown routing key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
+  }
+  for (const [taskClass, agents] of Object.entries(cfg.routing?.roles ?? {})) {
+    for (const agent of agents) {
+      if (ROUTING_RESERVED_AGENTS.some((reserved) => reserved === agent)) {
+        messages.push(
+          `routing.roles.'${taskClass}' names '${agent}', an OpenCode primary/internal agent that cannot be a subagent; it will be skipped`,
+        );
+      }
+    }
+  }
+  for (const name of Object.keys(cfg.routing?.classifier?.presets ?? {})) {
+    if (resolvePresetName(cfg, name) === undefined) {
+      messages.push(
+        `routing.classifier.presets.'${name}' matches no preset (defined: ${Object.keys(cfg.presets).join(", ")}); the override is unused`,
+      );
+    }
+  }
+  return messages;
+}
 /**
  * `routing.roles` is replaced wholesale by the highest-priority layer that sets
  * it, not merged class by class (QA-1.1-7): the default is replaced as a whole
@@ -2231,6 +2321,7 @@ function buildConfig(
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
   let cfg = validateConfig(base);
+  let rawUsed: unknown = base;
 
   if (layers.length > 0) {
     const merge = (ls: OverrideLayer[]): unknown =>
@@ -2240,7 +2331,9 @@ function buildConfig(
       );
 
     try {
-      cfg = validateConfig(merge(layers));
+      const merged = merge(layers);
+      cfg = validateConfig(merged);
+      rawUsed = merged;
     } catch (err) {
       // A bad override must never brick startup, and one broken file must not
       // discard a good one. Fall back to the highest-priority layer that
@@ -2256,7 +2349,9 @@ function buildConfig(
       });
       for (let i = layers.length - 1; i >= 0; i--) {
         try {
-          cfg = validateConfig(merge([layers[i]!]));
+          const single = merge([layers[i]!]);
+          cfg = validateConfig(single);
+          rawUsed = single;
           for (let j = 0; j < layers.length; j++) {
             if (j !== i) {
               console.warn(`[model-router] dropped override layer ${layers[j]!.path}`);
@@ -2272,6 +2367,7 @@ function buildConfig(
             message: `${layers[i]!.path}: ${(singleErr as Error).message}`,
           });
           cfg = validateConfig(base);
+          rawUsed = base;
         }
       }
     }
@@ -2311,6 +2407,8 @@ function buildConfig(
   }
 
   applyTierDefaults(cfg);
+  const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
+  for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
   return cfg;
 }
 
@@ -2645,17 +2743,33 @@ export function resolveRouting(
 }
 
 /**
+ * The key of `presets` that names `presetName`: an exact match, else a
+ * case-insensitive, trimmed one, like {@link resolvePresetName} (what `/preset`
+ * uses), so `Anthropic` and `anthropic` are the same preset (QA-1.1-14).
+ * Own keys only.
+ */
+function findPresetOverrideKey(
+  presets: Readonly<Record<string, unknown>>,
+  presetName: string,
+): string | undefined {
+  if (Object.hasOwn(presets, presetName)) return presetName;
+  const normalized = presetName.trim().toLowerCase();
+  if (normalized === "") return undefined;
+  return Object.keys(presets).find((key) => key.trim().toLowerCase() === normalized);
+}
+
+/**
  * The classifier settings that apply while `presetName` is the active preset:
  * the top-level block with that preset's `backend` / `model` override on top.
- * Preset names match exactly, as written under `routing.classifier.presets`.
+ * The preset name is matched like `/preset` matches it (exact, then
+ * case-insensitive); a `presets` key that matches no preset is noticed at load.
  */
 export function resolveClassifierForPreset(
   classifier: ResolvedClassifier,
   presetName: string,
 ): ResolvedClassifier {
-  const override = Object.hasOwn(classifier.presets, presetName)
-    ? classifier.presets[presetName]
-    : undefined;
+  const key = findPresetOverrideKey(classifier.presets, presetName);
+  const override = key === undefined ? undefined : classifier.presets[key];
   if (override === undefined) return classifier;
   return Object.freeze({
     ...classifier,
@@ -2715,4 +2829,23 @@ export function resolveCandidates(tierName: string, cfg: RouterConfig): readonly
   return Object.freeze(
     (tier.candidates ?? []).map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
   );
+}
+/**
+ * The extra lines of the bare `/router` status view: the marker
+ * `router: engine=<mode> build=<version>+<sha7>` (the engine is the one
+ * *applied* on `host`, so always `static` on v1) followed by one
+ * `router: config notice: …` line per notice of the config last loaded for `dir`
+ * (QA-1.1-10). Passing `logger` makes the once-per-process v1 notice go through
+ * the plugin logger.
+ */
+export function routerStatusLines(
+  cfg: RouterConfig,
+  host: RouterHost,
+  logger?: Pick<PluginLogger, "warn">,
+  dir?: string,
+): string[] {
+  return [
+    formatRouterLine(resolveRouting(cfg, host, logger).engine),
+    ...getConfigNotices(dir).map((notice) => `router: config notice: ${notice.message}`),
+  ];
 }
