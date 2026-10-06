@@ -10,6 +10,7 @@ import {
   nextVariant,
   resumeDecision,
   variantCovered,
+  variantRange,
   type CatalogModel,
   type ResumeDecision,
   type VariantLadder,
@@ -89,6 +90,13 @@ export interface LadderState {
    * decision uses the budget of the target tier, which `sessionFields` puts into a probe state.
    */
   nextModelContext?: number | null;
+  /**
+   * A17a (QA-1.5-17): the highest rung run per model in this delegation, `model -> variant`
+   * (`default` for the bare model). Session-aware states only. Variant steps and escalations raise it
+   * (plain retries repeat a rung and do not); an escalation into a tier whose base it covers enters
+   * above it or skips the tier, so the ladder never re-runs a `(model, variant)` that already failed.
+   */
+  triedByModel?: Record<string, string>;
 }
 
 export type LadderActionKind = "accept" | "retry" | "escalate" | "give_up";
@@ -107,8 +115,16 @@ export interface LadderAction {
   model?: string;
   /** Catalog-validated target variant; absent = default / leave unchanged. */
   variant?: string;
-  /** Escalate only: the target tier continues from `variant` (the reached one) instead of its base; advance seeds currentVariant. */
+  /**
+   * Escalate only: the target tier is covered by a rung already tried on its model (A17a), so it is
+   * entered at `variant`, the first rung above that one, instead of at its base; advance seeds currentVariant.
+   */
   carryVariant?: true;
+  /**
+   * The `(model, variant)` rung this action starts, recorded by `advance` into `triedByModel`
+   * (`default` for the bare model). On variant steps and escalations only, never on plain retries.
+   */
+  rung?: { model: string; variant: string };
   /**
    * A17: costRatio of the rung this action runs (`model` + `variant`), on variant steps, plain
    * retries and escalations when it is known. The runner charges `action.costRatio ?? tier.costRatio`.
@@ -188,7 +204,9 @@ export function newLadderState(
     state.childSessionID = null;
     state.lastStepTokens = null;
     // Budget of the start tier (after floorTier).
-    state.nextModelContext = ownTierInfo(policy, state.currentTier)?.inputBudget ?? null; // telemetry only
+    const start = ownTierInfo(policy, state.currentTier);
+    state.nextModelContext = start?.inputBudget ?? null; // telemetry only
+    state.triedByModel = start ? { [start.model]: start.base } : {}; // the first attempt runs the start tier's base
   }
   return state;
 }
@@ -242,6 +260,20 @@ export function buildLadderForcingMessage(reasons: string[]): string {
   );
 }
 
+/**
+ * Record a rung in `triedByModel`, keeping the entry with the higher guaranteed effort (the lowest
+ * effort the rung can have, so a `default` rung never outranks a ranked one). Pure: never mutates.
+ */
+function raiseTried(tried: Record<string, string> | undefined, model: string, variant: string): Record<string, string> {
+  const current = tried ?? {};
+  if (Object.prototype.hasOwnProperty.call(current, model)) {
+    const known = variantRange(current[model]);
+    const next = variantRange(variant);
+    if (next === null || (known !== null && next.low <= known.low)) return current;
+  }
+  return { ...current, [model]: variant };
+}
+
 /** A variant may be emitted only when it is the tier's validated base or a ladder member, never default. */
 function emittable(info: TierVariantInfo, v: string): string | undefined {
   return v !== DEFAULT_VARIANT && (v === info.base || info.ladder.variants.includes(v)) ? v : undefined;
@@ -292,17 +324,18 @@ function reserveAllows(policy: EscalatePolicy, state: LadderState): boolean {
   return policy.maxTotalAttempts - state.totalAttempts - 1 >= tiersAbove(policy, state.currentTier);
 }
 
-/** Where an escalation lands; `covered` = a same-model tier whose base the current tier already reached. */
+/** Where an escalation lands. `variant` is set when the target tier is covered but has rungs above (A17a). */
 interface EscalationTarget {
   tier: string | null;
-  covered: boolean;
+  variant?: string;
 }
 
 /**
- * D10 "escalate the model": pass over next tiers on the same model whose base the current tier already
- * covered (QA-1.5-3: `default` is a range, see `variantCovered`), unless such a tier still has a variant
- * above the reached one (QA-1.5-4). That tier is kept and flagged `covered`, so the escalation runs at
- * the reached variant and the tier's own steps continue upwards from it.
+ * A17a (QA-1.5-17, QA-1.5-4): the ladder never re-runs a `(model, variant)` that already failed. For each
+ * next tier, `reached` is the highest rung tried on THAT tier's model (`triedByModel`, plus the rung the
+ * failed attempt just ran), whichever tier ran it. If the tier's base is not covered by `reached` (QA-1.5-3:
+ * `default` is a range, see `variantCovered`), it is entered at its base. If it is covered, it is entered at
+ * `nextVariant(to.ladder, reached)`, the first rung above `reached`, or skipped when there is none.
  */
 function skipCoveredTiers(
   next: string | null,
@@ -310,16 +343,18 @@ function skipCoveredTiers(
   policy: EscalatePolicy,
   from: TierVariantInfo,
 ): EscalationTarget {
-  const reached = state.currentVariant ?? from.base;
+  const tried = raiseTried(state.triedByModel, from.model, state.currentVariant ?? from.base);
   let hops = 0;
   while (next != null) {
     const to = ownTierInfo(policy, next);
-    if (!to || to.model !== from.model || !variantCovered(to.base, reached)) return { tier: next, covered: false };
-    if (nextVariant(to.ladder, reached) !== null) return { tier: next, covered: true };
-    if (++hops >= policy.ladder.length) return { tier: null, covered: false }; // guard: duplicate ladder entries cannot spin
+    const reached = to && Object.prototype.hasOwnProperty.call(tried, to.model) ? tried[to.model] : undefined;
+    if (!to || reached === undefined || !variantCovered(to.base, reached)) return { tier: next };
+    const entry = nextVariant(to.ladder, reached);
+    if (entry !== null) return { tier: next, variant: entry };
+    if (++hops >= policy.ladder.length) return { tier: null }; // guard: duplicate ladder entries cannot spin
     next = nextTierAfter(next, policy);
   }
-  return { tier: null, covered: false };
+  return { tier: null };
 }
 export function nextAction(
   state: LadderState,
@@ -378,6 +413,7 @@ export function nextAction(
         model: info.model,
         variant,
         ...costFields(info, variant),
+        rung: { model: info.model, variant },
         ...sessionFields(state, variants, info, forcingMessage, session),
       };
     }
@@ -417,8 +453,8 @@ export function nextAction(
 
   // (6) escalate or give_up
   let next = nextTierAfter(state.currentTier, policy);
-  let covered = false;
-  if (variants && info) ({ tier: next, covered } = skipCoveredTiers(next, state, policy, info));
+  let entry: string | undefined;
+  if (variants && info) ({ tier: next, variant: entry } = skipCoveredTiers(next, state, policy, info));
   if (next == null) {
     return {
       action: "give_up",
@@ -435,17 +471,25 @@ export function nextAction(
     action.agent = next; // D11: the role changes on escalation
     if (target) {
       action.model = target.model;
-      // A covered tier keeps the reached variant (QA-1.5-4) instead of dropping to its lower base.
-      const v = covered && info ? emittable(info, state.currentVariant ?? info.base) : emittable(target, target.base);
+      // A covered tier is entered above the rung already tried on its model (A17a), always a member of
+      // its own ladder; any other tier at its base.
+      const v = entry ?? emittable(target, target.base);
       if (v !== undefined) {
         action.variant = v;
-        if (v !== target.base) action.carryVariant = true;
+        if (entry !== undefined) action.carryVariant = true;
       }
       Object.assign(action, costFields(target, action.variant));
+      action.rung = { model: target.model, variant: action.variant ?? DEFAULT_VARIANT };
     }
     Object.assign(action, sessionFields(state, variants, target, action.forcingMessage!, session));
   }
   return action;
+}
+
+/** Records the rung an action starts into `triedByModel`; a no-op on states without it. */
+function applyRung(next: LadderState, action: LadderAction): void {
+  if (next.triedByModel === undefined || action.rung === undefined) return;
+  next.triedByModel = raiseTried(next.triedByModel, action.rung.model, action.rung.variant);
 }
 
 /** Session bookkeeping of an advance; a no-op on states that are not session-aware. */
@@ -466,6 +510,7 @@ export function advance(state: LadderState, action: LadderAction): LadderState {
       next.attemptsThisTier = state.attemptsThisTier + 1;
     }
     if (action.effort !== undefined) next.currentEffort = action.effort;
+    applyRung(next, action);
     applySession(next, action);
     return next;
   }
@@ -477,8 +522,9 @@ export function advance(state: LadderState, action: LadderAction): LadderState {
       escalations: state.escalations + 1,
     };
     if (next.currentEffort !== undefined) next.currentEffort = null;
-    // A new tier starts at its base, unless it continues from the reached variant (QA-1.5-4).
+    // A new tier starts at its base, unless it is entered above a rung already tried on its model (A17a).
     if (next.currentVariant !== undefined) next.currentVariant = action.carryVariant === true ? (action.variant ?? null) : null;
+    applyRung(next, action);
     applySession(next, action);
     return next;
   }

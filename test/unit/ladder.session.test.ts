@@ -23,6 +23,7 @@ import {
   estimateTokensFromChars,
   modelRef,
   resumeDecision,
+  variantCovered,
   type CatalogModel,
 } from "../../src/escalate/variants";
 import { EFFORT_LEVELS, type EnforcementConfig, type RouterConfig, type TierConfig } from "../../src/router/config";
@@ -457,7 +458,7 @@ describe("buildEscalatePolicy with session input", () => {
 // ---------------------------------------------------------------------------
 
 describe("newLadderState and recordAttempt on a session-aware policy", () => {
-  it("initialises the five session fields", () => {
+  it("initialises the session fields, with the start tier's base in triedByModel", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
     expect(newLadderState("fast", policy)).toEqual({
       currentTier: "fast",
@@ -471,6 +472,7 @@ describe("newLadderState and recordAttempt on a session-aware policy", () => {
       childSessionID: null,
       lastStepTokens: null,
       nextModelContext: 1_000_000,
+      triedByModel: { [SONNET]: "low" },
     });
   });
 
@@ -479,6 +481,7 @@ describe("newLadderState and recordAttempt on a session-aware policy", () => {
     const state = newLadderState("fast", policy);
     expect(state.currentTier).toBe("heavy");
     expect(state.nextModelContext).toBe(800_000);
+    expect(state.triedByModel).toEqual({ [OPUS]: "xhigh" });
   });
 
   it("uses a null budget when the start tier has no catalog entry", () => {
@@ -1092,20 +1095,20 @@ describe("covered tiers (QA-1.5-3, QA-1.5-4)", () => {
     heavy: { model: OPUS, variant: "xhigh" },
   };
 
-  it("QA-1.5-4 probe: a covered tier whose ladder still reaches max is tried, at the reached variant, and steps on to max", () => {
+  it("QA-1.5-4 probe: a covered tier whose ladder still reaches max is entered at max, the first rung above the tried one", () => {
     const policy = buildEscalatePolicy(makeConfig(probeTiers, GENEROUS), V2);
     expect(policy.variants!.perTier.medium!.ladder).toMatchObject({ variants: ["low", "max"], source: "candidates" });
     const run = runLoop(policy);
-    expect(run.actions.slice(0, 3).map((a) => [a.action, a.tier, a.variant, a.variantStep === true, a.carryVariant === true])).toEqual([
+    expect(run.actions.slice(0, 2).map((a) => [a.action, a.tier, a.variant, a.variantStep === true, a.carryVariant === true])).toEqual([
       ["retry", "fast", "xhigh", false, false], // fast is at the top of its capped ladder: a plain retry
-      ["escalate", "medium", "xhigh", false, true], // covered (low <= xhigh) but max is above: kept, at the reached variant
-      ["retry", "medium", "max", true, false], // the tier's own step continues upwards from the reached variant
+      ["escalate", "medium", "max", false, true], // covered (low <= xhigh) but max is above: entered at max, not at xhigh again
     ]);
-    expect(attemptTrace(policy, run).slice(0, 4)).toEqual([`${SONNET}#xhigh`, `${SONNET}#xhigh`, `${SONNET}#xhigh`, `${SONNET}#max`]);
-    expect(run.states[2]).toMatchObject({ currentTier: "medium", currentVariant: "xhigh" }); // seeded by advance
-    expect(formatLadderScorecard(run.states[2]!, false, "m")).toContain("final_tier=medium#xhigh |");
+    expect(run.actions[1]).toMatchObject({ rung: { model: SONNET, variant: "max" }, carryVariant: true });
+    expect(attemptTrace(policy, run).slice(0, 3)).toEqual([`${SONNET}#xhigh`, `${SONNET}#xhigh`, `${SONNET}#max`]);
+    expect(run.states[2]).toMatchObject({ currentTier: "medium", currentVariant: "max" }); // seeded by advance
+    expect(run.states[2]!.triedByModel).toEqual({ [SONNET]: "max" });
+    expect(formatLadderScorecard(run.states[2]!, false, "m")).toContain("final_tier=medium#max |");
   });
-
   it("seeds currentVariant on a carried escalation and on nothing else", () => {
     const state = sessionState({ attemptsThisTier: 1, currentVariant: "xhigh", childSessionID: "ses_a" });
     const carried = advance(state, { action: "escalate", tier: "medium", variant: "xhigh", carryVariant: true, resume: true });
@@ -1139,6 +1142,132 @@ describe("covered tiers (QA-1.5-3, QA-1.5-4)", () => {
     expect(action).not.toHaveProperty("carryVariant");
   });
 });
+describe("triedByModel (A17a, QA-1.5-17)", () => {
+  const GENEROUS = { maxTotalAttempts: 12, costCeiling: { multiple: 1000 } };
+  const withTried = (triedByModel: Record<string, string>) => sessionState({ triedByModel });
+  const stepTo = (model: string, variant: string): LadderAction => ({
+    action: "retry", tier: "fast", variantStep: true, model, variant, rung: { model, variant },
+  });
+
+  it("records the rung of variant steps and escalations and leaves plain retries alone", () => {
+    const policy = buildEscalatePolicy(makeConfig(OWNER, { maxTotalAttempts: 10, costCeiling: { multiple: 1000 } }), V2);
+    let state = newLadderState("fast", policy);
+    expect(state.triedByModel).toEqual({ [SONNET]: "low" });
+    state = recordAttempt(state, 1);
+    const step = nextAction(state, fail, policy);
+    expect(step).toMatchObject({ variantStep: true, rung: { model: SONNET, variant: "medium" } });
+    state = advance(state, step);
+    expect(state.triedByModel).toEqual({ [SONNET]: "medium" });
+    // a plain retry carries no rung and repeats the tried one
+    const retry: LadderAction = { action: "retry", tier: "fast", model: SONNET, variant: "medium", resume: false };
+    expect(advance(state, retry).triedByModel).toEqual({ [SONNET]: "medium" });
+    expect(advance(state, retry).triedByModel).toBe(state.triedByModel);
+    const toOpus: LadderAction = { action: "escalate", tier: "heavy", model: OPUS, variant: "xhigh", rung: { model: OPUS, variant: "xhigh" } };
+    expect(advance(state, toOpus).triedByModel).toEqual({ [SONNET]: "medium", [OPUS]: "xhigh" });
+    // the bare model is recorded as default
+    const bare: LadderAction = { action: "escalate", tier: "heavy", model: HAIKU, rung: { model: HAIKU, variant: DEFAULT_VARIANT } };
+    expect(advance(state, bare).triedByModel).toMatchObject({ [HAIKU]: DEFAULT_VARIANT });
+  });
+
+  it("keeps the rung with the higher guaranteed effort per model", () => {
+    const after = (tried: Record<string, string>, variant: string) => advance(withTried(tried), stepTo(SONNET, variant)).triedByModel![SONNET];
+    expect(after({ [SONNET]: "medium" }, "high")).toBe("high");
+    expect(after({ [SONNET]: "medium" }, "low")).toBe("medium"); // a lower rung never lowers it
+    expect(after({ [SONNET]: "medium" }, DEFAULT_VARIANT)).toBe("medium"); // default can be anywhere up to high: it guarantees nothing
+    expect(after({ [SONNET]: DEFAULT_VARIANT }, "none")).toBe("none"); // any ranked rung guarantees more than default
+    expect(after({ [SONNET]: "medium" }, "turbo")).toBe("medium"); // an unranked rung cannot be placed
+    expect(after({ [SONNET]: "turbo" }, "low")).toBe("low");
+  });
+
+  it("exists only on session-aware states and is never created by advance", () => {
+    const plain: LadderState = {
+      currentTier: "fast", attemptsThisTier: 0, totalAttempts: 1, escalations: 0, firstAttemptCost: 1, cumulativeCost: 1,
+    };
+    expect(advance(plain, stepTo(SONNET, "high"))).not.toHaveProperty("triedByModel");
+    const withoutPolicy = newLadderState("fast", buildEscalatePolicy(makeConfig(OWNER)));
+    expect(withoutPolicy).not.toHaveProperty("triedByModel");
+    // an effort-less tier without info starts with an empty record
+    const noInfo = buildEscalatePolicy(makeConfig({ fast: { model: "x/unknown" }, medium: { model: SONNET } }), V2);
+    expect(newLadderState("fast", noInfo).triedByModel).toEqual({});
+  });
+
+  it("is never mutated, and prototype-named models are own entries", () => {
+    const tried = deepFreeze({ [SONNET]: "low" });
+    const state = deepFreeze(withTried(tried));
+    const next = advance(state, stepTo(SONNET, "high"));
+    expect(tried).toEqual({ [SONNET]: "low" });
+    expect(next.triedByModel).toEqual({ [SONNET]: "high" });
+    const proto = advance(state, stepTo("__proto__", "high")).triedByModel!;
+    expect(Object.prototype.hasOwnProperty.call(proto, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(proto)).toBe(Object.prototype);
+    // a hand-built policy naming that model does not read Object.prototype
+    const policy = handPolicy({ fast: info("constructor", "low", ["low"]), medium: info("toString", "medium", ["medium"]) });
+    expect(nextAction(sessionState({ attemptsThisTier: 1, triedByModel: {} }), fail, policy)).toMatchObject({ action: "escalate", tier: "medium", variant: "medium" });
+  });
+
+  it("probe: a covered tier is skipped when it is not adjacent, so heavy never repeats sonnet#xhigh", () => {
+    const tiers: Record<string, TierConfig> = {
+      fast: { model: SONNET, variant: "low" },
+      medium: { model: LUNA_FAST, variant: "medium" },
+      heavy: { model: SONNET, variant: "xhigh" },
+    };
+    const policy = buildEscalatePolicy(makeConfig(tiers, GENEROUS), V2);
+    const run = runLoop(policy);
+    expect(attemptTrace(policy, run)).toEqual([
+      `${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#high`, `${SONNET}#xhigh`, `${SONNET}#xhigh`, // fast: variant steps, then a plain retry
+      `${LUNA_FAST}#medium`, `${LUNA_FAST}#high`, `${LUNA_FAST}#xhigh`, `${LUNA_FAST}#xhigh`, // medium: its own ladder, then a plain retry
+    ]);
+    expect(run.states.map((s) => s.currentTier)).not.toContain("heavy");
+    const last = run.actions.at(-1)!;
+    expect(last.action).toBe("give_up");
+    // every rung that was stepped or escalated into is new on its model
+    const rungs = run.actions.filter((a) => a.rung !== undefined).map((a) => `${a.rung!.model}#${a.rung!.variant}`);
+    expect(new Set(rungs).size).toBe(rungs.length);
+  });
+
+  it("probe: a non-adjacent covered tier is entered above the highest rung tried on its model", () => {
+    const tiers: Record<string, TierConfig> = {
+      fast: { model: SONNET, variant: "low" },
+      medium: { model: LUNA_FAST, variant: "medium" },
+      heavy: { model: SONNET, variant: "medium", ...{ candidates: [{ variant: "medium" }, { variant: "max" }] } },
+    };
+    const policy = buildEscalatePolicy(makeConfig(tiers, { ...GENEROUS, effortBumpMax: "high" }), V2);
+    const run = runLoop(policy);
+    const trace = attemptTrace(policy, run);
+    expect(trace.slice(0, 4)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#high`, `${SONNET}#high`]);
+    // heavy's base (medium) is covered by the tried high, its ladder [medium, max] has max above: entered at max
+    expect(trace).toContain(`${SONNET}#max`);
+    expect(trace.filter((rung) => rung === `${SONNET}#medium`)).toHaveLength(1);
+    const entry = run.actions.find((a) => a.action === "escalate" && a.tier === "heavy")!;
+    expect(entry).toMatchObject({ model: SONNET, variant: "max", carryVariant: true, rung: { model: SONNET, variant: "max" } });
+  });
+
+  it("QA-1.5-2: a carried escalation lands on the target's ladder and carries that rung's ratio", () => {
+    const build = (candidateRatio: number | undefined) =>
+      buildEscalatePolicy(
+        makeConfig(
+          {
+            fast: { model: SONNET, variant: "xhigh", costRatio: 1 },
+            medium: {
+              model: SONNET,
+              variant: "low",
+              costRatio: 5,
+              ...{ candidates: [{ variant: "low" }, candidateRatio === undefined ? { variant: "max" } : { variant: "max", costRatio: candidateRatio }] },
+            },
+          },
+          { ladder: ["fast", "medium"], maxTotalAttempts: 10, costCeiling: { multiple: 1000 } },
+        ),
+        V2,
+      );
+    for (const [candidateRatio, expected] of [[11, 11], [undefined, 5]] as const) {
+      const policy = build(candidateRatio);
+      const action = nextAction(sessionState({ attemptsThisTier: 1, triedByModel: { [SONNET]: "xhigh" } }), fail, policy);
+      expect(action).toMatchObject({ action: "escalate", tier: "medium", variant: "max", carryVariant: true, costRatio: expected });
+      expect(policy.variants!.perTier.medium!.ladder.variants).toContain(action.variant);
+      expect(action.costRatio).toBe(policy.variants!.perTier.medium!.costRatios[action.variant!]);
+    }
+  });
+});
 // ---------------------------------------------------------------------------
 // Owner preset trace (plan §3 1.5 "owner preset trace", F5)
 // ---------------------------------------------------------------------------
@@ -1147,28 +1276,30 @@ describe("owner preset trace", () => {
   const ratios = (tiers: Record<string, TierConfig>) => ({ charge: chargeBy(tiers) });
   const GENEROUS = { costCeiling: { multiple: 1000 } };
 
-  it("anthropic preset, default budget and real ratios: sonnet#low, sonnet#medium, sonnet#medium (medium role), then the ceiling stops it", () => {
+  it("anthropic preset, default budget and real ratios: sonnet#low, sonnet#medium, sonnet#high (medium role), then the ceiling stops it", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
     expect(policy.maxTotalAttempts).toBe(4);
     expect(policy.costMultiple).toBe(4);
     const run = runLoop(policy, ratios(OWNER));
-    // The reserve (A17) escalates after fast#medium. The medium tier is the same model and its base is the
-    // reached variant, but its ladder still has high/xhigh above it (QA-1.5-4), so it is tried, at the reached
-    // variant, under the medium role. Its ratio 5 takes the cumulative cost to 1 + 1 + 5 = 7 > 1 × 4.
-    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#medium`]);
+    // The reserve (A17) escalates after fast#medium. The medium tier is the same model and its base is the rung
+    // already tried, but its ladder has rungs above it, so it is entered at the first one above the tried rung
+    // (A17a, QA-1.5-17): sonnet#high, never sonnet#medium again. Its ratio 5 takes the cumulative cost to
+    // 1 + 1 + 5 = 7 > 1 × 4.
+    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#high`]);
     expect(run.actions.map((a) => [a.action, a.tier, a.variantStep === true, a.costRatio])).toEqual([
       ["retry", "fast", true, 1],
       ["escalate", "medium", false, 5],
       ["give_up", undefined, false, undefined],
     ]);
+    expect(run.actions[1]).toMatchObject({ variant: "high", carryVariant: true, rung: { model: SONNET, variant: "high" } });
     expect(run.actions[2]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
     expect(run.state.cumulativeCost).toBe(7);
   });
 
-  it("anthropic preset, default budget without the cost ceiling: sonnet#low, sonnet#medium, sonnet#medium, opus#xhigh", () => {
+  it("anthropic preset, default budget without the cost ceiling: sonnet#low, sonnet#medium, sonnet#high, opus#xhigh", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER, GENEROUS), V2);
     const run = runLoop(policy, ratios(OWNER));
-    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#medium`, `${OPUS}#xhigh`]);
+    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#high`, `${OPUS}#xhigh`]);
     expect(run.actions.map((a) => [a.action, a.tier, a.variantStep === true])).toEqual([
       ["retry", "fast", true],
       ["escalate", "medium", false],
@@ -1176,6 +1307,12 @@ describe("owner preset trace", () => {
       ["give_up", undefined, false],
     ]);
     expect(run.actions[3]).toEqual({ action: "give_up", reason: "max total attempts (4) reached" });
+    expect(run.states.map((s) => s.triedByModel)).toEqual([
+      { [SONNET]: "low" },
+      { [SONNET]: "medium" },
+      { [SONNET]: "high" },
+      { [SONNET]: "high", [OPUS]: "xhigh" },
+    ]);
     expect(formatLadderScorecard(run.state, false, "owner")).toContain("final_tier=heavy |");
   });
   it("anthropic preset, larger budget: all of fast's variants first, then the covered medium is skipped for heavy", () => {
@@ -1453,7 +1590,7 @@ describe("property-based: session-aware loop", () => {
       for (const name of names) {
         const model = pick(MODELS);
         const ids = catalogVariantIds(catalogLookup(model)) ?? [];
-        const tier: TierConfig & { candidates?: unknown } = { model };
+        const tier: TierConfig & { candidates?: unknown } = { model, costRatio: 1 + Math.floor(rng() * 20) };
         const roll = rng();
         if (roll < 0.4 && ids.length > 0) tier.variant = pick(ids);
         else if (roll < 0.5) tier.effort = "low";
@@ -1519,6 +1656,19 @@ describe("property-based: session-aware loop", () => {
         if (action.carryVariant === true) {
           expect(action.action).toBe("escalate");
           expect(action.variant).toBeDefined();
+          // QA-1.5-2/17: the entry rung is always on the target's own ladder and priced when the tier is
+          expect(policy.variants!.perTier[action.tier!]!.ladder.variants).toContain(action.variant);
+        }
+        if (action.rung !== undefined && state.triedByModel !== undefined) {
+          // A17a: a stepped or escalated-into rung is never covered by what was already tried on its model
+          const known = Object.prototype.hasOwnProperty.call(state.triedByModel, action.rung.model)
+            ? state.triedByModel[action.rung.model]
+            : undefined;
+          if (known !== undefined) expect(variantCovered(action.rung.variant, known)).toBe(false);
+        }
+        if (action.variant !== undefined && action.model !== undefined && (action.action === "escalate" || action.variantStep === true)) {
+          const target = policy.variants!.perTier[action.tier!]!;
+          if (target.costRatios[action.variant] !== undefined) expect(action.costRatio).toBe(target.costRatios[action.variant]);
         }
         if (action.variant !== undefined) {
           expect(action.variant).not.toBe(DEFAULT_VARIANT);
