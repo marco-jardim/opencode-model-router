@@ -1225,20 +1225,20 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
   });
 });
 
-describe("cost doctor: effort-variant-mismatch (QA-3.2, O-32-5)", () => {
+describe("cost doctor: effort-variant-mismatch (QA-3.2, O-32-5; QA-3.2-R2-1, R2-8)", () => {
   const SHADOW = { engine: "shadow" } as const;
-  const mismatched = (): RouterConfig => cfgOf({
-    preset: "tst",
-    presets: { tst: { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } },
-    routing: SHADOW,
-  });
+  const TIERS = { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } as const;
+  // variant steps off: `variant-effort` is silent there, so the mismatch is the only thing left to say about the tier
+  const mismatched = (): RouterConfig => cfgOf({ preset: "tst", presets: { tst: TIERS }, routing: SHADOW, escalate: { variantSteps: "none" } });
+  const warningsOf = (findings: readonly Finding[], subject: string) => findings.filter((f) => f.severity === "warning" && f.subject === subject && (f.id === "variant-effort" || f.id === "effort-variant-mismatch"));
 
-  it("fires for a tier whose effort differs from its variant, and says the wire runs the effort while keys and stats name the variant", () => {
+  it("fires for a tier whose effort differs from its variant while variant steps are off, and says the wire runs the effort while keys and stats name the variant", () => {
     const found = find(runAdvisor(mismatched(), noHost, CATALOG), "effort-variant-mismatch", "medium");
     expect(found?.severity).toBe("warning");
     expect(found?.target).toBe("router");
     expect(found?.message).toContain("sets variant medium but effort xhigh");
     expect(found?.message).toContain("the request runs effort xhigh");
+    expect(found?.message).toContain("measured on Anthropic Messages"); // R2-8: what was measured, not a general claim
     expect(found?.message).toContain(`${SONNET}#medium`);
     expect(found?.message).toContain("routing:stats");
     expect(JSON.parse(found?.snippet ?? "null")).toEqual({ presets: { tst: { medium: { variant: "xhigh" } } } });
@@ -1248,14 +1248,28 @@ describe("cost doctor: effort-variant-mismatch (QA-3.2, O-32-5)", () => {
     expect(runAdvisor(mismatched(), noHost, CATALOG).filter((f) => f.id === "effort-variant-mismatch").map((f) => f.subject)).toEqual(["medium"]);
   });
 
+  it("R2-1: with variant steps on, the same tier gets ONE warning (variant-effort), not two", () => {
+    const steps = cfgOf({ preset: "tst", presets: { tst: TIERS }, routing: SHADOW }); // routing block, variantSteps auto
+    const findings = runAdvisor(steps, noHost, CATALOG);
+    expect(find(findings, "variant-effort", "medium")?.severity).toBe("warning");
+    expect(find(findings, "effort-variant-mismatch")).toBeUndefined();
+    expect(warningsOf(findings, "medium")).toHaveLength(1);
+    // and with them off it is the other way round: still one
+    const off = runAdvisor(mismatched(), noHost, CATALOG);
+    expect(find(off, "variant-effort", "medium")).toBeUndefined();
+    expect(warningsOf(off, "medium")).toHaveLength(1);
+    expect(warningsOf(off, "medium")[0]!.id).toBe("effort-variant-mismatch");
+  });
+
   it("is silent when effort and variant agree (the shipped anthropic preset), when only one is set, and while the engine is static", () => {
-    expect(find(runAdvisor(cfgOf({ preset: "anthropic", routing: SHADOW }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
-    expect(find(runAdvisor(cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: SHADOW }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
-    const effortOnly = cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, effort: "xhigh", costRatio: 5 } } }, routing: SHADOW });
+    const off = { variantSteps: "none" } as const;
+    expect(find(runAdvisor(cfgOf({ preset: "anthropic", routing: SHADOW, escalate: off }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
+    expect(find(runAdvisor(cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: SHADOW, escalate: off }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
+    const effortOnly = cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, effort: "xhigh", costRatio: 5 } } }, routing: SHADOW, escalate: off });
     expect(find(runAdvisor(effortOnly, noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
-    const stat = cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } }, routing: { engine: "static" } });
+    const stat = cfgOf({ preset: "tst", presets: { tst: TIERS }, routing: { engine: "static" }, escalate: off });
     expect(find(runAdvisor(stat, noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
-    expect(find(runAdvisor(cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } } }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined(); // no routing block
+    expect(find(runAdvisor(cfgOf({ preset: "tst", presets: { tst: TIERS }, escalate: off }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined(); // no routing block
   });
 
   it("offers no variant snippet when the catalog does not offer the effort as a variant of the model", () => {
@@ -1266,12 +1280,12 @@ describe("cost doctor: effort-variant-mismatch (QA-3.2, O-32-5)", () => {
     expect(found?.message).toContain("drop the effort setting");
   });
 
-  it("on an unmodified tier of a bundled preset it is listed but never notifies (a configuration finding)", () => {
+  it("on a tier the user changed it notifies; an unmodified bundled tier has no mismatch at all", () => {
     const modified = structuredClone(shipped.presets as Record<string, Record<string, Partial<TierConfig>>>).anthropic!;
-    const bundled = cfgOf({ preset: "anthropic", routing: SHADOW });
+    const bundled = cfgOf({ preset: "anthropic", routing: SHADOW, escalate: { variantSteps: "none" } });
     expect(runAdvisor(bundled, noHost, CATALOG).filter((f) => f.id === "effort-variant-mismatch")).toEqual([]);
     modified.medium = { ...modified.medium!, effort: "high" }; // the user's change: now variant medium, effort high
-    const changed = runAdvisor(cfgOf({ preset: "anthropic", presets: { anthropic: modified }, routing: SHADOW }), noHost, CATALOG);
+    const changed = runAdvisor(cfgOf({ preset: "anthropic", presets: { anthropic: modified }, routing: SHADOW, escalate: { variantSteps: "none" } }), noHost, CATALOG);
     expect(find(changed, "effort-variant-mismatch", "medium")).toMatchObject({ severity: "warning", notify: true, bundledTier: false });
     expect(formatFindings(changed).some((l) => l.includes("[warning] effort-variant-mismatch (medium)"))).toBe(true);
   });
