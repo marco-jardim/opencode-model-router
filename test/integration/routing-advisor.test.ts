@@ -355,10 +355,26 @@ describe("cost doctor: variant ladders", () => {
     expect(message).toContain("re-runs the same rung once in a fresh child, then escalates");
     expect(message).toContain("variant steps would retry a higher variant on the same session");
     expect(message).not.toContain("escalates straight");
+    expect(message).toContain("on tiers without effort/thinking/reasoning");
     const twice = cfgOf({ preset: "tst", presets: { tst: OWNER }, escalate: { variantSteps: "none", maxAttemptsPerTier: 2 } });
     expect(find(runAdvisor(twice, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
     const auto = cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: {} });
     expect(find(runAdvisor(auto, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
+  });
+
+  it("attempts-without-variants is silent when every ladder tier sets effort (the bundled anthropic preset), and fires when one does not (QA-3.1-R2-5)", () => {
+    const off = { variantSteps: "none", maxAttemptsPerTier: 1 } as const;
+    // anthropic: fast `low`, medium `medium`, heavy `xhigh` effort on every tier: variant steps would change nothing there (A20).
+    const anthropic = cfgOf({ escalate: off });
+    expect(Object.values(anthropic.presets.anthropic!).every((tier) => tier.effort !== undefined)).toBe(true);
+    expect(find(runAdvisor(anthropic, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
+    // hybrid-2: only `fast` has no effort, so variant steps help on that tier and the finding stands.
+    const hybrid = cfgOf({ preset: "hybrid-2", escalate: off });
+    expect(hybrid.presets["hybrid-2"]!.fast!.effort).toBeUndefined();
+    expect(find(runAdvisor(hybrid, noHost, CATALOG), "attempts-without-variants")?.message).toContain("on tiers without effort/thinking/reasoning");
+    // a custom ladder naming only effort tiers is silent too, and one naming the effort-free tier fires
+    const onlyEffort = cfgOf({ preset: "hybrid-2", escalate: { ...off, ladder: ["medium", "heavy"] } });
+    expect(find(runAdvisor(onlyEffort, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
   });
 });
 

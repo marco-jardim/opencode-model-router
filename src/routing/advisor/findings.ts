@@ -464,11 +464,16 @@ const attemptsWithoutVariants: Check = ({ cfg }) => {
   if (esc === undefined || esc === null) return [];
   const perTier = esc.maxAttemptsPerTier ?? 1;
   if (resolveVariantSteps(cfg, "v2") !== "none" || perTier !== 1) return [];
+  // QA-3.1-R2-5 (A20): variant steps exist only on tiers without effort/thinking/reasoning. When every ladder tier of the active preset
+  // sets one of those, turning variant steps on would change nothing, so the suggestion would be wrong.
+  const tiers = new Map(activeTierEntries(cfg));
+  const ladderTiers = buildEscalatePolicy(cfg).ladder.filter((name) => tiers.has(name)).map((name) => tiers.get(name) as TierConfig);
+  if (ladderTiers.length > 0 && ladderTiers.every(isEffortConfigured)) return [];
   return [{
     id: "attempts-without-variants",
     severity: "info",
     subject: "",
-    message: "enforcement.escalate.maxAttemptsPerTier is 1 and variantSteps is none: a failed verification re-runs the same rung once in a fresh child, then escalates to the next, more expensive tier; variant steps would retry a higher variant on the same session first. Turn variant steps on (a `routing` block makes the default `auto`) or allow another attempt per tier.",
+    message: "enforcement.escalate.maxAttemptsPerTier is 1 and variantSteps is none: a failed verification re-runs the same rung once in a fresh child, then escalates to the next, more expensive tier; variant steps would retry a higher variant on the same session first, on tiers without effort/thinking/reasoning (a tier that sets one of those keeps the effort-bump path). Turn variant steps on (a `routing` block makes the default `auto`) or allow another attempt per tier.",
     snippet: json({ enforcement: { escalate: { variantSteps: "auto" } } }),
   }];
 };
