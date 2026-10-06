@@ -9,6 +9,7 @@ import {
   DEFAULT_V2_ROLES,
   ROUTING_DEFAULTS,
   ROUTING_ENGINE_IGNORED_ON_V1,
+  ROUTING_TASK_CLASSES,
   deepMerge,
   getConfigNotices,
   getConfigReloadError,
@@ -338,6 +339,18 @@ describe("resolveRouting — roles (D1, D12)", () => {
   it("accepts roles naming agents that no preset or tier defines (native agents)", () => {
     const resolved = resolveRouting(cfgOf({ routing: { roles: { search: ["not-a-tier"] } } }), "v2");
     expect(resolved.roles.search).toEqual(["not-a-tier"]);
+  });
+
+  it("keeps an empty list for a class: that class has no native candidates", () => {
+    const resolved = resolveRouting(cfgOf({ routing: { roles: { search: [], implement: ["general"] } } }), "v2");
+    expect(resolved.roles).toEqual({ search: [], implement: ["general"] });
+  });
+
+  it("exports the task classes roles may name, and the D12 default uses only those", () => {
+    expect(ROUTING_TASK_CLASSES).toEqual(["search", "recon", "mechanical", "implement", "debug", "design", "review", "other"]);
+    for (const taskClass of Object.keys(DEFAULT_V2_ROLES)) {
+      expect(ROUTING_TASK_CLASSES as readonly string[]).toContain(taskClass);
+    }
   });
 
   it("does not let the shared v2 default be mutated through a result", () => {
@@ -728,6 +741,57 @@ describe("hot reload of the global override file with a routing block", () => {
       invalidateConfigCache();
       const merged = resolveRouting(loadConfig(project), "v2");
       expect(merged).toMatchObject({ engine: "advise", margin: 0.3, roles: { search: ["explore"] } });
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces roles wholesale across layers instead of merging per class (QA-1.1-7)", () => {
+    const project = mkdtempSync(join(tmpdir(), "oc-mr-routing-roles-"));
+    try {
+      mkdirSync(join(project, ".git"), { recursive: true });
+      mkdirSync(join(project, ".opencode"), { recursive: true });
+      editOverride({ routing: { roles: { search: ["explore"], implement: ["general"], review: ["general"] } } });
+      // Global alone.
+      expect(resolveRouting(loadConfig(project), "v2").roles).toEqual({
+        search: ["explore"],
+        implement: ["general"],
+        review: ["general"],
+      });
+      // A project layer that sets roles replaces the whole map: no search, no review.
+      writeFileSync(
+        join(project, ".opencode", "opencode-model-router.overrides.jsonc"),
+        JSON.stringify({ routing: { roles: { debug: ["general"], implement: [] } } }),
+        "utf-8",
+      );
+      invalidateConfigCache();
+      expect(resolveRouting(loadConfig(project), "v2").roles).toEqual({ debug: ["general"], implement: [] });
+      // A project layer that does not mention roles leaves the global map alone.
+      writeFileSync(
+        join(project, ".opencode", "opencode-model-router.overrides.jsonc"),
+        JSON.stringify({ routing: { margin: 0.4 } }),
+        "utf-8",
+      );
+      invalidateConfigCache();
+      expect(resolveRouting(loadConfig(project), "v2").roles).toEqual({
+        search: ["explore"],
+        implement: ["general"],
+        review: ["general"],
+      });
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("a layer with roles {} disables every native candidate, whatever the layers below say", () => {
+    editOverride({ routing: { roles: { search: ["explore"] } } });
+    const project = mkdtempSync(join(tmpdir(), "oc-mr-routing-roles-"));
+    try {
+      mkdirSync(join(project, ".git"), { recursive: true });
+      mkdirSync(join(project, ".opencode"), { recursive: true });
+      writeFileSync(join(project, ".opencode", "opencode-model-router.overrides.jsonc"), JSON.stringify({ routing: { roles: {} } }), "utf-8");
+      invalidateConfigCache();
+      expect(resolveRouting(loadConfig(project), "v2").roles).toEqual({});
     } finally {
       rmSync(project, { recursive: true, force: true });
     }

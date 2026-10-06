@@ -731,7 +731,7 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 | `classifier.samples` | `integer` | `1` | `1` or `3` | Samples per classification. |
 | `classifier.maxStateChars` | `integer` | `2000` | `[200, 20000]` | How much of the prompt a model backend may see; never file contents. |
 | `classifier.presets` | `Record<string, { backend?, model? }>` | `{}` | each entry as above | Per-preset override of `backend` / `model`. The preset name need not exist (switching presets never bricks startup). Each entry, merged over the top level, must itself satisfy the model / `baseUrl` rule. |
-| `roles` | `Record<string, string[]>` | v2: see [Roles](#roles); v1: `{}` | class → non-empty array of agent ids | Agent ids and class names match `^[a-z0-9_-]+$`. |
+| `roles` | `Record<string, string[]>` | v2: see [Roles](#roles); v1: `{}` | class → array of agent ids | Classes: `search \| recon \| mechanical \| implement \| debug \| design \| review \| other` (`ROUTING_TASK_CLASSES`). Agent ids match `^[A-Za-z0-9][A-Za-z0-9_./-]*$`, case-sensitive (`ContextScout`, `team/helper`). An empty array means no native candidates for that class. See [Roles](#roles). |
 | `outcomes.path` | `string \| null` | `null` | non-empty string | Where the outcome store persists. `null` = the directory that already holds the `*.scorecard.log` files. |
 | `outcomes.halfLifeDays` | `number` | `14` | `[1, 365]` | Older verdicts weigh less. |
 | `outcomes.maxEffectiveSamples` | `number` | `50` | `[5, 1000]` | Cap on the effective sample size of one `(class × agent × model#variant)` posterior. |
@@ -820,11 +820,11 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 
 ### Roles
 
-`roles` maps a task class to an ordered list of **agent ids** that are appended, as candidates, to the ladders of the router tiers. The router tiers are always in every ladder; roles only add native or user agents. Agent ids and class names match `^[a-z0-9_-]+$`; every class needs a non-empty array; duplicates within a class are dropped, order kept. An agent id need not name a tier or an agent of the active preset (it may be a native agent such as `explore`).
+`roles` maps a task class to an ordered list of **agent ids** that are appended, as candidates, to the ladders of the router tiers. The router tiers are always in every ladder; roles only add native or user agents. Class names are one of `search`, `recon`, `mechanical`, `implement`, `debug`, `design`, `review`, `other` (an unknown class is rejected). Agent ids match `^[A-Za-z0-9][A-Za-z0-9_./-]*$` and are case-sensitive host agent names (`ContextScout`, `team/helper`); an id with whitespace, `#` or a leading `-`/`.`/`/` is rejected. Duplicates within a class are dropped, order kept. An agent id need not name a tier or an agent of the active preset (it may be a native agent such as `explore`). A class may be an **empty array**: no native candidates for that class (this relaxes "non-empty array" so that one class can be switched off without writing `{}`).
 
 - **OpenCode v2, key absent:** the default applies — `{ "search": ["explore"], "implement": ["general"], "debug": ["general"], "review": ["general"] }`.
 - **`roles: {}`** disables native candidates (on either host).
-- **A `roles` you write replaces the default as a whole.** A class you leave out has no native candidates; there is no per-class merge.
+- **A `roles` you write replaces the default as a whole.** A class you leave out has no native candidates; there is no per-class merge. The same holds **across override layers**: the highest-priority layer that sets `roles` (project over global over bundled) supplies the entire map; the layers below it contribute nothing to it, and a layer that does not mention `roles` leaves the one below untouched.
 - **OpenCode v1:** the default is `{}`. Setting `roles` explicitly is the one opt-in effect on v1, and it is text-only: the static `R:` line lists those agents as destinations for their classes. No model override and no engine.
 
 ### Tier `candidates`
@@ -903,7 +903,7 @@ A tier may list the `(model, variant, costRatio)` rungs the engine can use for i
 | A tier's `effort` (when present) must be one of `low \| medium \| high \| xhigh \| max`. Error: `tiers.json: preset '<preset>' tier '<tier>': effort must be one of low, medium, high, xhigh, max`. |
 | `escalate.variantSteps` must be `auto` or `none`. |
 | A tier's `candidates` (when present) must be an array of objects; `model` (when present) must be `provider/model`, `variant` a non-empty string without whitespace or `#`, `costRatio` a number > 0; no two entries may share an effective `(model, variant)`; a non-empty list must contain the tier's own `(model, variant)` with its `costRatio` equal to the tier's or omitted; the effective `costRatio` must not decrease along the list. |
-| `routing` must be an object; every key of the [`routing` table](#keys) must be of its type and within its range, and a classifier backend other than `rules` needs a `provider/model[#variant]` model (plus an `http(s)` `baseUrl` for `openai-compatible` and `typesafe`) — for the top level and for every `classifier.presets` entry. `roles` classes and agent ids must match `^[a-z0-9_-]+$` and every class needs a non-empty array. |
+| `routing` must be an object; every key of the [`routing` table](#keys) must be of its type and within its range, and a classifier backend other than `rules` needs a `provider/model[#variant]` model (plus an `http(s)` `baseUrl` for `openai-compatible` and `typesafe`) — for the top level and for every `classifier.presets` entry. `roles` classes must be one of `search|recon|mechanical|implement|debug|design|review|other`, agent ids must match `^[A-Za-z0-9][A-Za-z0-9_./-]*$`, and each class is an array (empty allowed). |
 
 An invalid value in the bundled `tiers.json` throws at load; the same value in an
 overrides file is reported via `console.warn` and that override layer is dropped.

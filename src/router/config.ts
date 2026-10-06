@@ -213,6 +213,22 @@ export type RoutingProfile = (typeof ROUTING_PROFILES)[number];
 export const CLASSIFIER_BACKENDS = ["rules", "host", "openai-compatible", "typesafe"] as const;
 export type ClassifierBackend = (typeof CLASSIFIER_BACKENDS)[number];
 
+/**
+ * The task classes `routing.roles` may name. The classifier (Phase 1.2) assigns
+ * one of these to every dispatch; `other` is the catch-all.
+ */
+export const ROUTING_TASK_CLASSES = [
+  "search",
+  "recon",
+  "mechanical",
+  "implement",
+  "debug",
+  "design",
+  "review",
+  "other",
+] as const;
+export type RoutingTaskClass = (typeof ROUTING_TASK_CLASSES)[number];
+
 export const VARIANT_STEP_MODES = ["auto", "none"] as const;
 export type VariantStepsMode = (typeof VARIANT_STEP_MODES)[number];
 
@@ -1370,8 +1386,12 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
 // they validated, so a config object cannot change between check and use.
 // ---------------------------------------------------------------------------
 
-/** Agent ids and task-class names in `routing.roles`. */
-const ROUTING_ID_PATTERN = /^[a-z0-9_-]+$/;
+/**
+ * Agent ids in `routing.roles`: host agent names, case-sensitive (an agent may be
+ * called `ContextScout` or `team/helper`; QA-1.1-5). Nothing that could not be a
+ * name: no empty id, no whitespace, no `#`.
+ */
+const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./-]*$/;
 /** Environment variable names (`classifier.apiKeyEnv`). */
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** A variant id: non-empty, no whitespace, no `#` (the ref separator). */
@@ -1595,21 +1615,23 @@ function validateRoles(routing: Record<string, unknown>): Record<string, string[
   if (roles === undefined) return undefined;
   const out: Record<string, string[]> = {};
   for (const [taskClass, agents] of Object.entries(roles)) {
-    if (!ROUTING_ID_PATTERN.test(taskClass)) {
+    if (!pickEnum(ROUTING_TASK_CLASSES, taskClass)) {
       throw new Error(
-        `tiers.json: routing.roles class '${taskClass}' must match ${ROUTING_ID_PATTERN.source}`,
+        `tiers.json: routing.roles class '${taskClass}' must be one of ${ROUTING_TASK_CLASSES.join("|")}`,
       );
     }
-    if (!Array.isArray(agents) || agents.length === 0) {
+    // An empty list is allowed: it means "no native candidates for this class"
+    // (a deliberate deviation from "non-empty arrays", QA-1.1-7).
+    if (!Array.isArray(agents)) {
       throw new Error(
-        `tiers.json: routing.roles.'${taskClass}' must be a non-empty array of agent ids (got ${describeValue(agents)})`,
+        `tiers.json: routing.roles.'${taskClass}' must be an array of agent ids (got ${describeValue(agents)})`,
       );
     }
     const ids: string[] = [];
     for (const agent of agents as unknown[]) {
-      if (typeof agent !== "string" || !ROUTING_ID_PATTERN.test(agent)) {
+      if (typeof agent !== "string" || !AGENT_ID_PATTERN.test(agent)) {
         throw new Error(
-          `tiers.json: routing.roles.'${taskClass}' entries must be agent ids matching ${ROUTING_ID_PATTERN.source} (got ${describeValue(agent)})`,
+          `tiers.json: routing.roles.'${taskClass}' entries must be agent ids matching ${AGENT_ID_PATTERN.source} (got ${describeValue(agent)})`,
         );
       }
       ids.push(agent);
@@ -2177,6 +2199,23 @@ function keepLastValidConfig(
 }
 
 /**
+ * `routing.roles` is replaced wholesale by the highest-priority layer that sets
+ * it, not merged class by class (QA-1.1-7): the default is replaced as a whole
+ * too, so a layer's `roles` is the complete list of what it wants, and a class
+ * it leaves out cannot be re-enabled by a lower layer.
+ */
+function replaceRolesWholesale(merged: unknown, layers: readonly OverrideLayer[]): unknown {
+  if (!isPlainObject(merged) || !isPlainObject(merged.routing)) return merged;
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const routing = layers[i]!.data.routing;
+    if (isPlainObject(routing) && Object.hasOwn(routing, "roles") && routing.roles !== undefined) {
+      return { ...merged, routing: { ...merged.routing, roles: routing.roles } };
+    }
+  }
+  return merged;
+}
+
+/**
  * Build a fresh config from tiers.json + override layers + persisted state.
  * Throws only when tiers.json itself is unreadable/invalid. Override and state
  * problems are warned about, skipped, and appended to `failures`.
@@ -2195,7 +2234,10 @@ function buildConfig(
 
   if (layers.length > 0) {
     const merge = (ls: OverrideLayer[]): unknown =>
-      ls.reduce<unknown>((acc, l) => deepMerge(acc, l.data), base);
+      replaceRolesWholesale(
+        ls.reduce<unknown>((acc, l) => deepMerge(acc, l.data), base),
+        ls,
+      );
 
     try {
       cfg = validateConfig(merge(layers));

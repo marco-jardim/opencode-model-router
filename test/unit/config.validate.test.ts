@@ -757,33 +757,56 @@ describe("validateConfig — routing.roles", () => {
     expect(cfg.routing?.roles?.search).not.toBe(input);
   });
 
+  it("accepts an empty list for a class: no native candidates for that class (QA-1.1-7)", () => {
+    const cfg = validateConfig(withRouting({ roles: { search: [], implement: ["general"] } }));
+    expect(cfg.routing?.roles).toEqual({ search: [], implement: ["general"] });
+  });
+
   it.each([
-    ["an empty array", []],
     ["a string", "explore"],
     ["null", null],
     ["an object", { 0: "explore" }],
   ])("rejects a class whose value is %s", (_label, agents) => {
     expect(() => validateConfig(withRouting({ roles: { search: agents } }))).toThrow(
-      /routing\.roles\.'search' must be a non-empty array of agent ids/,
+      /routing\.roles\.'search' must be an array of agent ids/,
     );
   });
 
-  it.each([["empty string", ""], ["uppercase", "Explore"], ["space", "my agent"], ["slash", "a/b"], ["number", 3], ["null", null]])(
-    "rejects an agent id that is %s",
-    (_label, agent) => {
-      expect(() => validateConfig(withRouting({ roles: { search: ["explore", agent] } }))).toThrow(
-        /routing\.roles\.'search' entries must be agent ids matching \^\[a-z0-9_-\]\+\$/,
-      );
+  it.each(["explore", "general", "ContextScout", "team/helper", "my-custom_agent2", "a.b", "X"])(
+    "accepts agent id %s (case-sensitive host agent names, QA-1.1-5)",
+    (agent) => {
+      expect(validateConfig(withRouting({ roles: { search: [agent] } })).routing?.roles?.search).toEqual([agent]);
     },
   );
 
-  it("rejects a class key that is not an id", () => {
-    expect(() => validateConfig(withRouting({ roles: { "": ["explore"] } }))).toThrow(/routing\.roles class ''/);
-    expect(() => validateConfig(withRouting({ roles: { "Bad Class": ["explore"] } }))).toThrow(
-      /routing\.roles class 'Bad Class'/,
+  it.each([
+    ["empty string", ""],
+    ["whitespace", "my agent"],
+    ["leading space", " explore"],
+    ["a hash", "a#b"],
+    ["a leading slash", "/a"],
+    ["a leading dash", "-a"],
+    ["a leading dot", ".hidden"],
+    ["a number", 3],
+    ["null", null],
+  ])("rejects an agent id that is %s", (_label, agent) => {
+    expect(() => validateConfig(withRouting({ roles: { search: ["explore", agent] } }))).toThrow(
+      /routing\.roles\.'search' entries must be agent ids matching \^\[A-Za-z0-9\]\[A-Za-z0-9_\.\/-\]\*\$/,
     );
   });
 
+  it.each(["search", "recon", "mechanical", "implement", "debug", "design", "review", "other"])(
+    "accepts the task class %s",
+    (taskClass) => {
+      expect(() => validateConfig(withRouting({ roles: { [taskClass]: ["explore"] } }))).not.toThrow();
+    },
+  );
+
+  it.each(["", "Search", "Bad Class", "plan", "explore"])("rejects the unknown task class '%s'", (taskClass) => {
+    expect(() => validateConfig(withRouting({ roles: { [taskClass]: ["explore"] } }))).toThrow(
+      new RegExp(`routing\\.roles class '${taskClass}' must be one of search\\|recon\\|mechanical\\|implement\\|debug\\|design\\|review\\|other`),
+    );
+  });
   it("rejects roles that is not an object", () => {
     expect(() => validateConfig(withRouting({ roles: ["explore"] }))).toThrow(/routing\.roles must be an object/);
     expect(() => validateConfig(withRouting({ roles: null }))).toThrow(/routing\.roles must be an object/);
