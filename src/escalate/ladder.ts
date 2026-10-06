@@ -1,6 +1,23 @@
 import { effortCeilingFor, effortRank, minEffort, nextEffort } from "../router/agent-options";
 import { resolveEffortBump, type EffortLevel, type RouterConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
+import {
+  DEFAULT_VARIANT,
+  buildVariantLadder,
+  catalogVariantIds,
+  estimateTokensFromChars,
+  inputBudget,
+  nextVariant,
+  resumeDecision,
+  variantPosition,
+  type CatalogModel,
+  type ResumeDecision,
+  type VariantLadder,
+} from "./variants";
+
+// The resume decision lives in variants.ts; re-exported so the plan's API
+// location (`ladder.ts`) holds.
+export { resumeDecision, type ResumeDecision } from "./variants";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -10,6 +27,24 @@ export interface EffortBumpPolicy {
   perTier: Record<string, { base: EffortLevel; bound: EffortLevel }>;
 }
 
+/** Per-tier variant data; built only on v2 with variantSteps "auto" and a catalog entry. */
+export interface TierVariantInfo {
+  /** "provider/model" of the tier. */
+  model: string;
+  /** tier.variant (a catalog member) or DEFAULT_VARIANT. */
+  base: string;
+  /** buildVariantLadder(...) for that model. */
+  ladder: VariantLadder;
+  /** inputBudget(catalogEntry.limit) (A5/A10). */
+  inputBudget: number | null;
+}
+
+export interface VariantPolicy {
+  /** routing.sessionReuse.maxContextFraction (default 0.6). */
+  maxContextFraction: number;
+  perTier: Record<string, TierVariantInfo>;
+}
+
 export interface EscalatePolicy {
   ladder: string[];
   floorTier?: string | null;
@@ -17,6 +52,7 @@ export interface EscalatePolicy {
   maxTotalAttempts: number;
   costMultiple?: number | null;
   effortBump?: EffortBumpPolicy | null;
+  variants?: VariantPolicy | null;
 }
 
 export interface LadderState {
@@ -27,6 +63,16 @@ export interface LadderState {
   firstAttemptCost: number | null;
   cumulativeCost: number;
   currentEffort?: EffortLevel | null;
+  /** Variant reached by variant steps on the current tier; null = the tier's base. */
+  currentVariant?: string | null;
+  /** Variant steps taken in this delegation (never reset). */
+  variantSteps?: number;
+  /** Child of the latest attempt; null = none, or a fresh start is pending. */
+  childSessionID?: string | null;
+  /** stepContextTokens() of that child's last step; null = unknown. */
+  lastStepTokens?: number | null;
+  /** inputBudget of the model the next attempt runs on. */
+  nextModelContext?: number | null;
 }
 
 export type LadderActionKind = "accept" | "retry" | "escalate" | "give_up";
@@ -37,6 +83,40 @@ export interface LadderAction {
   forcingMessage?: string;
   reason?: string;
   effort?: EffortLevel;
+  /** Present only on a D10 variant step (action is "retry"). */
+  variantStep?: true;
+  /** Escalate only: target agent id (= tier name for router tiers). */
+  agent?: string;
+  /** "provider/model" of the target, when it has TierVariantInfo. */
+  model?: string;
+  /** Catalog-validated target variant; absent = default / leave unchanged. */
+  variant?: string;
+  /** Present on every retry/escalate when policy.variants is set. */
+  resume?: boolean;
+  /** D11 "decision and both numbers are logged"; present iff resume is. */
+  resumeBasis?: ResumeDecision;
+}
+
+/** Fourth, optional argument of nextAction. */
+export interface LadderSessionInput {
+  dispatchPromptChars: number;
+}
+
+/** Child observation passed to recordAttempt after an attempt on a session-aware policy. */
+export interface LadderChildObservation {
+  sessionID: string;
+  lastStepTokens: number | null;
+}
+
+/** Second, optional argument of buildEscalatePolicy (filled by Phase 2.3 from 1.1's resolved config). */
+export interface LadderSessionPolicyInput {
+  host: "v1" | "v2";
+  /** Default "auto" (D10). */
+  variantSteps?: "auto" | "none";
+  /** Default 0.6 (§1.4). */
+  maxContextFraction?: number;
+  /** Catalog lookup for a "provider/model" id; must not throw. */
+  catalog: (model: string) => CatalogModel | null | undefined;
 }
 
 export interface LadderVerdict {
@@ -77,20 +157,41 @@ export function newLadderState(
     cumulativeCost: 0,
   };
   if (policy.effortBump) state.currentEffort = null;
+  if (policy.variants) {
+    state.currentVariant = null;
+    state.variantSteps = 0;
+    state.childSessionID = null;
+    state.lastStepTokens = null;
+    // Budget of the start tier (after floorTier).
+    state.nextModelContext = ownTierInfo(policy, state.currentTier)?.inputBudget ?? null;
+  }
   return state;
 }
 
 export function recordAttempt(
   state: LadderState,
   costUnits = 0,
+  child?: LadderChildObservation,
 ): LadderState {
-  return {
+  const next: LadderState = {
     ...state,
     totalAttempts: state.totalAttempts + 1,
     cumulativeCost: state.cumulativeCost + costUnits,
     firstAttemptCost:
       state.firstAttemptCost == null ? costUnits : state.firstAttemptCost,
   };
+  // Only a session-aware state records its child; otherwise the shape is unchanged.
+  if (child && state.childSessionID !== undefined) {
+    next.childSessionID = child.sessionID;
+    next.lastStepTokens = child.lastStepTokens;
+  }
+  return next;
+}
+
+/** Own-property lookup, like the effort bump's, so a tier named `__proto__` cannot reach Object.prototype. */
+function ownTierInfo(policy: EscalatePolicy, tier: string): TierVariantInfo | undefined {
+  const perTier = policy.variants?.perTier;
+  return perTier && Object.prototype.hasOwnProperty.call(perTier, tier) ? perTier[tier] : undefined;
 }
 
 export function nextTierAfter(
@@ -208,7 +309,10 @@ export function advance(state: LadderState, action: LadderAction): LadderState {
   return state;
 }
 
-export function buildEscalatePolicy(cfg: RouterConfig): EscalatePolicy {
+export function buildEscalatePolicy(
+  cfg: RouterConfig,
+  session?: LadderSessionPolicyInput,
+): EscalatePolicy {
   const esc = cfg.enforcement?.escalate;
   const policy: EscalatePolicy = {
     ladder: esc?.ladder ?? ["fast", "medium", "heavy"],
@@ -220,7 +324,43 @@ export function buildEscalatePolicy(cfg: RouterConfig): EscalatePolicy {
   const effortBump = buildEffortBump(cfg);
   // Keep bump-off policies byte-identical to the original golden fixture.
   if (effortBump) policy.effortBump = effortBump;
+  const variants = buildVariantPolicy(cfg, session);
+  // Absent key when off, so policies without session input stay byte-identical.
+  if (variants) policy.variants = variants;
   return policy;
+}
+
+function buildVariantPolicy(
+  cfg: RouterConfig,
+  session?: LadderSessionPolicyInput,
+): VariantPolicy | null {
+  if (!session || session.host !== "v2" || (session.variantSteps ?? "auto") === "none") return null; // D1, D10
+  const { max } = resolveEffortBump(cfg); // cap for catalog ladders (F2)
+  const entries: Array<[string, TierVariantInfo]> = [];
+  for (const [name, tier] of Object.entries(getActiveTiers(cfg) ?? {})) {
+    if (tier === null || typeof tier !== "object" || typeof tier.model !== "string" || tier.model.length === 0) continue;
+    const configured = typeof tier.variant === "string" && tier.variant.length > 0 ? tier.variant : null;
+    // One effort delivery per tier (F3): effort/thinking/reasoning-configured tiers keep the effortBump path.
+    if (configured === null && (tier.effort !== undefined || tier.thinking !== undefined || tier.reasoning !== undefined)) continue;
+    const entry = session.catalog(tier.model);
+    const ids = catalogVariantIds(entry);
+    if (ids === null) continue; // no catalog: today's behaviour for this tier
+    if (configured !== null && !ids.includes(configured)) continue; // invalid configured variant: never resume-switch it
+    const raw = (tier as { candidates?: unknown }).candidates; // raw config, never resolveCandidates() (F11)
+    entries.push([name, {
+      model: tier.model,
+      base: configured ?? DEFAULT_VARIANT,
+      ladder: buildVariantLadder({
+        model: tier.model,
+        catalog: entry,
+        candidates: Array.isArray(raw) ? raw : undefined,
+        maxEffort: max,
+      }),
+      inputBudget: inputBudget(entry?.limit),
+    }]);
+  }
+  if (entries.length === 0) return null;
+  return { maxContextFraction: session.maxContextFraction ?? 0.6, perTier: Object.fromEntries(entries) };
 }
 
 function buildEffortBump(cfg: RouterConfig): EffortBumpPolicy | null {
