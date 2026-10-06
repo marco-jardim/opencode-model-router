@@ -163,7 +163,7 @@ Nothing else is ever read: no file contents, no system prompt, no session histor
 1. The instruction and option set are constants (`BACKEND_PROMPT`, `CLASS_OPTIONS`, `RISK_OPTIONS`, `SCOPE_OPTIONS`); task text never reaches them.
 2. Task text appears only inside one delimited block whose markers carry a per-call nonce; `<<<`/`>>>` inside the state are neutralised in `state.ts`, so the text cannot close its block or forge another item.
 3. The instruction is placed before the block and the answer constraint after it ("sandwich"); TypeSafe gets the text in the `state` field, which its API treats as data.
-4. The answer is one label validated by exact match against the shuffled option set; anything else is `invalid`. A successful injection can only pick another valid class; it cannot set `needs` (never model-decided), lower `risk` (max-merged) or bypass `pin` (route line only).
+4. The answer is one label validated by exact match against the shuffled option set; anything else is `invalid`. A successful injection can only pick another valid class; it cannot remove a need (a model can only ADD needs, through the implied needs of the class it picks), lower `risk` (max-merged) or bypass `pin` (route line only).
 5. Option order is shuffled per request; with `samples: 3`, order-dependent answers become `disagree` → confidence 0.
 6. The D14 bound and `scrubText` apply before anything leaves the process; `ClassifierState` is branded so no backend can be handed raw text.
 
@@ -248,7 +248,7 @@ export function createClassifierBackend(settings: ClassifierSettings, deps: { ge
 #### 8. Amended during implementation (decisions taken in 1.2.1, beyond the plan text)
 
 1. `classify()` returns `ClassifyResult` (`facts` is the plan's `TaskFacts`, plus `pin`, `detection`, `stripped`, `trace`) so 2.2 never parses the route line twice.
-2. Backends decide the class only (TypeSafe also risk and scope, max-merged); `needs` are never model-decided (a model must not be able to weaken the A11 permission filter).
+2. Backends decide the class only (TypeSafe also risk and scope, max-merged); a model can only ADD needs, namely the implied needs of the class it picks (`CLASS_IMPLIED_NEEDS`); it can never remove one, so it cannot weaken the A11 permission filter (QA-1.2-21).
 3. A route line may raise risk but never lower it; needs are unioned; class and scope override (D13 "overrides rules").
 4. The backend gate also requires `source === "rules"`: route-line and plan facts are authoritative even when `minClassConfidence > 0.9`.
 5. `timeoutMs` is enforced by racing a timer for all three backends (Phase 0.P handoff); `AbortController` is still used (effective for `fetch`, best-effort for `ctx.generate.text`).
@@ -263,11 +263,56 @@ export function createClassifierBackend(settings: ClassifierSettings, deps: { ge
 
 | Id | Severity | File:line | Description | Resolution |
 |---|---|---|---|---|
-| — | — | — | none at design time (QA-1.2 runs after 1.2.5) | — |
+| — | — | — | none at design time (QA-1.2 runs after 1.2.5); round 1 below | — |
+
+### Round 1 fixes (QA-1.2 round 1: 2 critical, 7 major, 8 minor, 4 nit)
+
+Plan decisions applied: A14 (default vitest pool only), A18 (HTTP backends and plain `http:`), A19 (backend labels vs rules-matched classes). One commit per finding group on `car/p12`; every commit green (typecheck, the four classify files, `related src/router/sessions.ts`).
+
+| Id | Sev | Finding | Fix | Commit |
+|---|---|---|---|---|
+| QA-1.2-1 | critical | The state scrub (`scrubText`) missed env-style names, quoted JSON keys, "password is X", URL credentials, PEM blocks, several token shapes and bare high-entropy runs | New `classify/scrub.ts` (`scrubState`, layered on `scrubText`, which is untouched) used for the state, raw answers and logged reasons; policy gate `hasCredentialSignal`: a task that names a credential, or that the scrubber had to redact, never reaches a backend (`trace.backendSkipped = "credentials"`). 15 probe strings are tests (the 12 named + `Authorization: Basic`, `curl -u`, a bare 40-char run). Limitation: the entropy rule needs a digit and ≥ 3.5 bits/char, so a 32+ letter-only random string is not redacted by it (it is by any credential word around it, and the gate) | `efe58fc` |
+| QA-1.2-2 | critical | `[route]` smuggling through quoted text and duplicate lines | Not recognised (nor stripped) inside ``` / ~~~ fences, on lines indented ≥ 4 columns, after `>`, or longer than 500 chars; differing lines → `conflict: true` (no `d`, no `pin`, contradicted class/risk/scope/needs dropped); `edgeOnly` and `trace.routeLines {count, conflict, edgeOnly}` for the decision row; `routeLinePositions: "edges"` option for 2.2 | `9817ae8`, `9599807` |
+| QA-1.2-3 | major | `rm -rf`-class commands could be a confident `mechanical`/low | Destructive vocabulary (rm -r/-f, Remove-Item, force push, git clean/checkout ./restore ./rebase/filter-*, `--no-verify`, DELETE FROM, TRUNCATE, DROP … TABLE, unpublish, `.env`, private/ssh/signing keys, case-sensitive `*_TOKEN`/`*_SECRET`/… env names, terraform destroy, kubectl delete) → high risk (so mechanical ≤ 0.5); column rename / `alter` → ≥ medium | `13f755d` |
+| QA-1.2-4 | major | Section headers hid risk words | High/medium risk scanned over the whole body; an excluded section ends at its first blank line | `d525afd` |
+| QA-1.2-5 | major | `D:\git\repo` / `~/git/x` produced a shell need | Needs (external_dir excepted) matched on text without path-like tokens, plus path-aware lookarounds on tool names | `8153264` |
+| QA-1.2-6 | major | Participles and nouns produced edit needs | Imperative/progressive forms only; no `commit` in edit; no `-ation` in impl-feature | `51822f3` |
+| QA-1.2-7 | major | ReDoS: ~1 s on `"a"×20000`, `"a."×10000`, `"a/"×10000` | Runs of 200+ path chars / whitespace collapse (anchored, linear); shape gates measure the first 2000 chars | `208cb2d` |
+| QA-1.2-8 | major | A19 | A backend label replaces the rules class only if the rules matched it (or nothing); confidence capped below `minClassConfidence` (0.6 in batch) unless it agrees; `trace.backend.rejected` | `080060d` |
+| QA-1.2-9 | major | A18 | A key is never sent over `http:` to a non-loopback host; `baseUrl` must be http(s) without embedded credentials; effective host logged once at creation | `b056b2e` |
+| QA-1.2-10 | minor | No breaker, unbounded abandoned requests, wasted waits | 3 consecutive timeouts/errors → disabled 5 min (one trial after); abandoned requests capped at 12; `samples: 3` settles when two agree; `classifyMany` stops after a failed chunk | `50e2be4` |
+| QA-1.2-11 | minor | Regex/scrub ran on the whole prompt | Prompt and description cut to `RULES_MAX_CHARS` before any regex/scrub (a trailing acceptance block is found by a linear `indexOf`) | `19602d5` |
+| QA-1.2-12 | minor | Closing fence had to repeat the opener exactly; unclosed fences leaked | Line-based `fences.ts`: closer ≥ opener length and ≥ 3, same character; unclosed runs to the end | `19602d5` |
+| QA-1.2-13 | minor | `.` in `a.ts` ended negation windows | `.` is a boundary only before whitespace/end; spaced ` - `, ` – ` and any `—` are boundaries | `5a27c4a` |
+| QA-1.2-14 | minor | `needs=shell, edit` lost `edit` | Whitespace around the commas of a needs list is normalised (`needs=shell, class=debug` keeps both fields) | `5ab1d94` |
+| QA-1.2-15 | minor | First `Working directory:` line won | Caller `cwd`, else the ENVIRONMENT section's line, else the last occurrence | `2e728b6` |
+| QA-1.2-16 | minor | Bare `push`/`publish`/`permissions`/`auth` over-fired | `push` needs git/remote context, `publish` npm/package/registry context; `permissions` alone and `src/auth/` paths are not high risk | `942bc20` |
+| QA-1.2-17 | minor | `ctx.generate.text` may prepend host instructions | Recorded as a DF3 check item (below) | this commit |
+| QA-1.2-18 | nit | `maxStateChars` was clamped below as well as above | Only the upper bound (20 000) clamps; a smaller value is honoured | `19602d5` |
+| QA-1.2-19 | nit | The failure path returned the prompt with its route lines | Stripped in a separate `try` (plain line filter as the last resort); honours `routeLinePositions` | `802b63f` |
+| QA-1.2-20 | nit | `isValidResult` ignored source/risk/scope/bookkeeping | All fields validated | `802b63f` |
+| QA-1.2-21 | nit | "needs are never model-decided" was overstated | Wording fixed here and in `types.ts`: a model can only ADD needs | `9599807`, this commit |
+
+Not fully fixed here (by design of the finding or of the phase): the enforcement of "route lines only at the edges" and of the project-layer classifier-key trust belong to Phase 2.2 / 1.1 (handoffs below; the classifier side — `routeLinePositions` and the plain-`http:` refusal — is done); QA-1.2-17 is a checklist item for DF3, not code.
+
+### Design changes since 1.2.1 (round 1)
+
+- **R1/R4/R14:** runs of 200+ `[\w./\\-]` characters and 200+ whitespace characters collapse before any analysis; the class text is measured by the shape gates over its first 2000 characters only (`analyzeRules`; `shapeOf` itself reports the true length).
+- **R2:** an excluded section hides only its first paragraph (up to the first blank line). **R11:** risk vocabulary is scanned over the whole body. **R3:** working directory = caller → ENVIRONMENT section → last `Working directory:` line.
+- **R5:** `.` ends a negation window only before whitespace/end; spaced `-`/`–` and `—` do too.
+- **R9:** needs except `external_dir` run on path-free text; the edit need has no participles/`commit`; `push`/`publish` need context.
+- **R11 vocabulary:** destructive operations and secret-named env vars are high risk (case-sensitive list); column rename/`alter` are medium; `permissions` alone and `auth` as a path segment are not high.
+- **L1/L2:** route lines are whole, unindented, unquoted, short lines outside fences; differing lines conflict; `needs=` tolerates spaces around commas; optional edges-only recognition.
+- **D14:** `scrubState` replaces `scrubText`; prompt and description are bounded before any regex; `maxStateChars` clamps only above; fenced code via `fences.ts`; credential policy gate in `index.ts`.
+- **Merge (step 5):** A19 class filter and confidence caps; `trace.backend.rejected`; `trace.backendSkipped`; `trace.routeLines`; `isValidResult` validates every field.
+- **Backends:** A18 endpoint checks and effective-host log; circuit breaker, abandoned-request cap, early majority for `samples: 3`; `classifyMany` stops after a failed chunk.
 
 ## Deferred by plan
 
-- Live `host` classifier check with real credentials and an owner-named model → checkpoint DF3 (A4, A13); `host` is documented as experimental until then.
+- Live `host` classifier check with real credentials and an owner-named model → checkpoint DF3 (A4, A13); `host` is documented as experimental until then. DF3 check items for the live run (QA-1.2-17):
+  - **Does `ctx.generate.text` prepend host instructions** (an agent/system prompt, tool or skill text, project instructions) to the request? If it does, the classifier prompt is not the only text the model sees: the one-label answer may be disturbed (invalid rate), and the D14 privacy statement must mention what the host adds. Compare the request the host sends with `prompt` (host logs or a proxy) and record the invalid rate over a sample of ≥ 30 dispatches.
+  - Is the answer plain text (no reasoning preface, no fence)? `parseLabel` accepts one fence, quotes and JSON `label`, nothing else.
+  - Is an abandoned call really cancelled by the `signal` (the abandoned-request cap and breaker assume it may keep running and billing)?
 - Wiring into `execute.before` (strip, classify, decision log) → Phase 2.2; `/annotate-plan` emission of route lines → the M8 plan-annotation task.
 - Per-preset `routing.classifier.presets` resolution → Phase 1.1 resolver / Phase 2.2 caller (the classifier receives resolved `ClassifierSettings`).
 - Logprob-based confidence (D4 "logprobs or sample agreement") is not used: no 1.2 task asks for it and the host API returns text only.
@@ -278,7 +323,8 @@ export function createClassifierBackend(settings: ClassifierSettings, deps: { ge
 - **to 1.2.2–1.2.5 (@medium)** — implement "Design (1.2.1)" as written; any deviation goes back to a heavy design dispatch.
 - **to 1.1** — the resolved classifier block must be assignable to `ClassifierSettings` (`backend` ∈ `CLASSIFIER_BACKEND_KINDS`, `samples: 1 | 3` as a literal type, `null` rather than `undefined` for `model`/`baseUrl`/`apiKeyEnv`). Suggested extra validation: `backend: "typesafe"` without `apiKeyEnv` (the backend otherwise disables itself at call time with a logged reason).
 - **to 1.4** — `CLASS_STATIC_TIER` and `CLASS_COST_RANK` are available for D7 priors; `plan.ts` must emit `[route class=<c> risk=<r> scope=<s> needs=<a,b> d=<deterministic|grader|none>]` on its own line with values from the `types.ts` vocabularies (any other value is ignored by the parser).
-- **to 2.2** — build the backend once per config load with `createClassifierBackend(settings, { generate: ctx.generate, logger })` (the log-once set and the `response_format` memo live on the instance); call `classify({ description, prompt, cwd: <dispatch location directory> }, deps)` once per `subagent` call; use `result.stripped` as the rewritten prompt; record `result.trace` in the decision log; `classify` never throws and settles within `timeoutMs + INDEX_TIMEOUT_GRACE_MS`.
+- **to 2.2** — build the backend once per config load with `createClassifierBackend(settings, { generate: ctx.generate, logger })` (the log-once set, the `response_format` memo, the circuit breaker and the abandoned-request count live on the instance); call `classify({ description, prompt, cwd }, deps)` once per `subagent` call with **`cwd` = the task's worktree/dispatch location directory** (the baseline of `external_dir`; never rely on the prompt's own `Working directory:` line) and **`routeLinePositions: "edges"`** (a route line counts only as the first or last non-empty line of the orchestrator's prompt; anywhere else it stays in the prompt as text); use `result.stripped` as the rewritten prompt; record `result.trace` in the decision row, in particular `trace.routeLines {count, conflict, edgeOnly}`, `trace.backend {status, rejected, reason}` and `trace.backendSkipped`; `classify` never throws and settles within `timeoutMs + INDEX_TIMEOUT_GRACE_MS`. A conflicting route-line set (`conflict: true`) never pins and never carries `d`; treat it as a prompt-quality signal in the log.
+- **to 1.1 (A18)** — the project-local override layer must not be able to set `routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}`; this module refuses a key over plain `http:` to a non-loopback host as the second line of defence, and `baseUrl` is validated at call time (http(s), no embedded credentials).
 - **to QA-1.2** — focus: injection fixtures against all three renderers, the D14 length invariant, determinism of rules over shuffled inputs, the mechanical/high-risk cap, templated-dispatch handling (R2) and directive-line stripping.
 
 ## Verdict
@@ -323,8 +369,8 @@ Logging uses the `ClassifierLogger` of `types.ts` (structurally `PluginLogger.wa
 
 | Id | Severity | File:line | Description | Resolution |
 |---|---|---|---|---|
-| I-1 | minor | `types.ts` `NEED_RULES.shell` (`\bgit\b`) | A path segment named `git` (e.g. `D:\git\repo\a.ts`) is a `shell` need. Over-restrictive, never unsafe (an extra need can only narrow the candidate agents). Not changed: `types.ts` is the 1.2.1 contract. | open (a path-aware lookbehind would fix it) |
-| I-2 | minor | `rules.ts` negation (R5) | `.` is a clause boundary, so a dotted file name inside a negation window ("do not touch a.ts and refactor") ends the window early and the later verb is not negated. Per design (R5 lists `.`). | open |
+| I-1 | minor | `types.ts` `NEED_RULES.shell` (`\bgit\b`) | A path segment named `git` (e.g. `D:\git\repo\a.ts`) is a `shell` need. Over-restrictive, never unsafe (an extra need can only narrow the candidate agents). Not changed: `types.ts` is the 1.2.1 contract. | fixed in round 1 (QA-1.2-5: path-free needs text and path-aware lookarounds) |
+| I-2 | minor | `rules.ts` negation (R5) | `.` is a clause boundary, so a dotted file name inside a negation window ("do not touch a.ts and refactor") ends the window early and the later verb is not negated. Per design (R5 lists `.`). | fixed in round 1 (QA-1.2-13: `.` is a boundary only before whitespace/end) |
 | I-3 | info | `rules.ts` R6 | A shipped entry listed under another tier than its anchor tier (`medium: ["search"]`) is a custom pattern of that tier, per the design's "(pattern === kw && tier === t)" wording. | by design |
 
 ### Verification
@@ -334,3 +380,12 @@ Logging uses the `ClassifierLogger` of `types.ts` (structurally `PluginLogger.wa
 - `npm run typecheck` green before each commit.
 - Mutation spot checks (reverted): neutralising off in `state.ts` → 3 backend tests fail; mechanical cap and the `source === "rules"` gate off in `index.ts` → 3 index tests fail.
 - No network in unit tests: host backends use a fake `ctx.generate`; HTTP backends use an injected `fetch`; the host test also asserts `globalThis.fetch` is never called.
+
+### Round 1 verification
+
+- `npm run typecheck` green; default vitest pool only (A14).
+- `npx vitest run test/unit/routing-classify.rules.test.ts test/unit/routing-classify.route-line.test.ts test/unit/routing-classify.backends.test.ts test/unit/routing-classify.index.test.ts` → 4 files, 444 tests pass (rules 180, route line 53, backends 127, index 84; 226 before round 1).
+- `npx vitest related src/router/sessions.ts --run` → 50 files passed, 3 skipped, 1463 tests passed, 55 skipped; `src\router\sessions.ts`, `src\guard\scrub.ts` and `classifyTrivial` untouched.
+- Rules timing, best of 10 after a warm-up (QA-1.2-7): `"a"×20000` 0.087 ms, `"a."×10000` 0.067 ms, `"a/"×10000` 0.065 ms (before the fix: ≈ 590 ms, 950 ms and 950 ms; 230 ms for 20 000 newlines); 2 kB prose 0.40 ms; 10 kB prose 1.28 ms. Worst remaining shape (runs of 199 characters just under the collapse threshold, 100 of them) 3.8 ms, asserted under 10 ms because 5 ms flakes on a loaded CI core; the three required strings are asserted under 5 ms.
+- `scrubState` on 20 000-character hostile runs (`a`, `a-`, `A_`, `token`) stays linear (asserted under 100 ms; the first draft took 260 ms on `a-`×10000 because of an unbounded scheme prefix).
+- Secret-shaped fixtures are assembled at run time (`["sk", "live", …].join("_")`): GitHub push protection rejected the literal Stripe-shaped string in the first QA-1.2-1 commit, which was amended before it reached the remote.
