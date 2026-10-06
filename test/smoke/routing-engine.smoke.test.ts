@@ -19,7 +19,7 @@ import { makeKey } from "../../src/routing/outcomes";
 import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
 import type { RouterConfig } from "../../src/router/config";
 import {
-  MODELS, ROOT, RoutingHost, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
+  MODELS, ROOT, RoutingHost, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -421,7 +421,69 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const ok = modified.length === 0 && packageDiff.length === 1 && packageDiff[0]!.startsWith("+") && packageDiff[0]!.includes("smoke:routing") && v1Files.every(file => git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) === "");
       s.verdict(ok, `${changed.length} path(s) changed under test/smoke since ${BASE_COMMIT} (all added: ${modified.length === 0}); package.json changed lines: ${packageDiff.join(" | ")}`);
     });
-  });});
+  });
+  it("7 openai responses: effort delivery of a same-model variant change on the OpenAI Responses route (A7 / QA-0P-26)", async () => {
+    const host = await RoutingHost.start("responses", {
+      routing: { engine: "shadow" },
+      providers: { openai: { settings: { baseURL: "$BASE_URL", apiKey: "keyless-smoke-fake" } } },
+    });
+    try {
+      await runScenario("7-openai-responses", "The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.", async s => {
+        const catalog = (await host.client.model.list({ location: { directory: host.project } })).data.filter(m => m.providerID === "openai" && m.enabled);
+        const luna = catalog.find(m => m.id === "gpt-6-luna");
+        const sol = catalog.find(m => m.id === "gpt-6-sol");
+        s.observed.openaiModelsWithVariants = catalog.filter(m => m.variants.length >= 2).map(m => `${m.id}: ${m.variants.map(v => v.id).join("/")}`);
+        s.observed.providerList = arr(obj(await host.getJson("/api/provider")).data).map(p => ({ id: obj(p).id, package: obj(p).package, activation: obj(p).activation }));
+        if (!luna || !sol) { s.verdict(false, "the isolated catalog has no gpt-6-luna / gpt-6-sol"); return; }
+        const rootID = await host.newRoot("responses root");
+        const inBand = (r: WireRequest) => r.messages.filter(m => m.type === "configuration_update").map(m => obj(m.reasoning).effort).filter(e => e !== undefined);
+        const topLevel = (r: WireRequest) => obj(r.payload.reasoning).effort;
+        const effective = (r: WireRequest) => inBand(r).at(-1) ?? topLevel(r);
+        type Row = { case: string; asked: string; storedModel: string | undefined; catalogModel: string | undefined; wireModel: string | undefined; topLevel: unknown; inBandAllHistory: unknown[]; effective: unknown; reasoningField: unknown };
+        const table: Row[] = [];
+        const step = async (name: string, call: Obj) => {
+          const mark = host.provider.requests.length;
+          const d = await host.dispatch(rootID, { agent: "general", description: `R7 ${name}`, ...call });
+          const stored = await host.client.session.get({ sessionID: d.childID });
+          const requests = host.provider.requests.slice(mark).filter(r => r.session === d.childID && r.kind === "primary");
+          for (const r of requests) table.push({ case: name, asked: String(call.model), storedModel: stored.model ? ref(stored.model) : undefined, catalogModel: r.catalogModel, wireModel: r.model, topLevel: topLevel(r), inBandAllHistory: inBand(r), effective: effective(r), reasoningField: r.payload.reasoning });
+          return { childID: d.childID, requests };
+        };
+        const l = "openai/gpt-6-luna";
+        const a = await step("A same-model bump (low)", { prompt: "R7 A start", model: `${l}#low` });
+        await step("A same-model bump (high)", { prompt: "R7 A resume", sessionID: a.childID, model: `${l}#high` });
+        await step("A same-model bump (max)", { prompt: "R7 A resume 2", sessionID: a.childID, model: `${l}#max` });
+        const f = await step("F default then high (bare)", { prompt: "R7 F start", model: l });
+        await step("F default then high (high)", { prompt: "R7 F resume", sessionID: f.childID, model: `${l}#high` });
+        const m = await step("M model and variant together (luna low)", { prompt: "R7 M start", model: `${l}#low` });
+        await step("M model and variant together (sol high)", { prompt: "R7 M resume", sessionID: m.childID, model: "openai/gpt-6-sol#high" });
+        const r1 = await step("R1 bare model after a variant (luna high)", { prompt: "R7 R1 start", model: `${l}#high` });
+        await step("R1 bare model after a variant (bare luna)", { prompt: "R7 R1 resume", sessionID: r1.childID, model: l });
+        const rows = (name: string) => table.filter(r => r.case.startsWith(name));
+        s.observed.table = table;
+        s.observed.firstConfigurationUpdateItem = host.provider.requests.flatMap(r => r.messages.filter(item => item.type === "configuration_update")).at(0);
+        s.observed.providerErrors = host.provider.errors;
+        s.observed.hostErrors = host.errorLines();
+        s.observed.protocolNote = "Scripted Responses fixture: SSE response.created / output_item.added / output_text.delta / output_item.done / response.completed (message item), or a function_call item for tool calls. The host accepted it for every request (no provider or host errors). Whether api.openai.com honours an in-band configuration_update was NOT verified.";
+        const A = rows("A same-model");
+        const F = rows("F default");
+        const stepsOk = A.map(r => String(r.effective)).join() === "low,high,max" && A.every(r => r.topLevel === "low") && A.slice(1).every(r => r.inBandAllHistory.length > 0)
+          && F.length === 2 && F[1]!.effective === "high" && F[1]!.inBandAllHistory.at(-1) === "high";
+        const M = rows("M model");
+        const R = rows("R1 bare");
+        s.observed.derived = {
+          sameModelBumpEffective: A.map(r => r.effective), sameModelBumpTopLevel: A.map(r => r.topLevel),
+          defaultThenHigh: F.map(r => ({ topLevel: r.topLevel, effective: r.effective, reasoningField: r.reasoningField })),
+          modelAndVariantTogether: M.map(r => ({ wireModel: r.wireModel, topLevel: r.topLevel, inBand: r.inBandAllHistory, effective: r.effective })),
+          bareModelAfterVariant: R.map(r => ({ storedModel: r.storedModel, topLevel: r.topLevel, inBand: r.inBandAllHistory, effective: r.effective })),
+        };
+        s.verdict(stepsOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `same-model luna low->high->max: effective ${A.map(r => String(r.effective)).join("->")} (top-level ${A.map(r => String(r.topLevel)).join("->")}); default->high: ${F.map(r => String(r.effective)).join("->")}; luna low -> sol high: ${M.map(r => String(r.effective)).join("->")}; bare luna after #high: ${R.map(r => String(r.effective)).join("->")} (stored ${R.map(r => r.storedModel).join(" / ")})`);
+      });
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 300_000);});
 
 void str;
 void MODELS;
