@@ -160,7 +160,7 @@ export const READ_ONLY_TOOLS = new Set(["grep", "read", "glob", "ls"]);
 // ---------------------------------------------------------------------------
 
 /** Normalise a taskPattern keyword to a lowercase stem for substring matching. */
-function normTaskKw(kw: string): string {
+export function normTaskKw(kw: string): string {
   return kw.toLowerCase().split("(")[0]!.split("/")[0]!.trim();
 }
 
@@ -176,7 +176,7 @@ function normTaskKw(kw: string): string {
  * common phrasing; `step N` is also matched inline, since it frequently appears
  * mid-line rather than at the start of one.
  */
-const MULTI_STEP_RE =
+export const MULTI_STEP_RE =
   /(?:^\s*(?:[-*+]|\d+[.):])\s)|\bstep\s*\d+\s*[.):]|\bthen\b|\bone at a time\b|\bone-at-a-time\b|\bsequentially\b|\bin order\b|\bin this exact order\b|\beach\b|\bafter that\b|\bfor every\b|;|&&/im;
 
 /**
@@ -185,7 +185,7 @@ const MULTI_STEP_RE =
  * Two items are deliberately NOT enough: "read a.json, b.json" is already caught
  * by the path count, and a two-item phrase is common in single-shot requests.
  */
-const ENUMERATION_RE =
+export const ENUMERATION_RE =
   /[\w./-]+\s*,\s*[\w./-]+\s*(?:,\s*[\w./-]+|\b(?:and|or)\s+[\w./-]+)/i;
 
 /**
@@ -207,7 +207,7 @@ const ENUMERATION_RE =
  * words ending in `s` — "what does all this mean in tiers.json" must stay a
  * single-file lookup.
  */
-const DISTRIBUTIVE_RE =
+export const DISTRIBUTIVE_RE =
   /\b(?:every|all)\s+(?:(?:the|these|those|other|remaining)\s+)?(?:(?!of\b)[a-z][a-z-]*\s+){0,2}(?:files?|modules?|tests?|configs?|dirs?|directory|directories|components?|routes?|stores?|handlers?|guards?|helpers?|scripts?|packages?|classes?|functions?|endpoints?|entries?|(?!(?:this|its|his|hers|thus|was|has|does|less|plus|yes|gas|bus|css|js|status|focus|process|access|address|business|class|success)\b)[a-z][a-z-]{2,}s)\b(?!\.[a-z])/i;
 
 /**
@@ -215,7 +215,7 @@ const DISTRIBUTIVE_RE =
  * written as prose. Matched per line so the `Working directory:` / `Platform:` /
  * `Shell:` footer described below cannot inflate the count.
  */
-const IMPERATIVE_LINE_RE =
+export const IMPERATIVE_LINE_RE =
   /^\s*(?:read|search|grep|list|find|check|report|summari[sz]e|open|inspect|show|tell|explain|analy[sz]e|compare|verify|count|locate|trace)\b/i;
 
 /**
@@ -228,7 +228,7 @@ const IMPERATIVE_LINE_RE =
  * extension is what keeps a POSIX cwd (`/home/u/proj`) from being miscounted as
  * a target file.
  */
-const PATH_TOKEN_RE =
+export const PATH_TOKEN_RE =
   /[\w./\\-]*[\w-]\.(?:ts|tsx|js|jsx|mjs|cjs|json|jsonc|md|ya?ml|toml|txt|css|scss|html|py|rs|go|rb|java|sh|ps1|sql|lock)\b/gi;
 
 /**
@@ -238,7 +238,7 @@ const PATH_TOKEN_RE =
  * field in package.json" names one. The lookahead prevents double-counting
  * `README.md`, which `PATH_TOKEN_RE` already matches.
  */
-const BARE_FILENAME_RE =
+export const BARE_FILENAME_RE =
   /\b(?:Makefile|Dockerfile|LICENSE|README|CHANGELOG|Gemfile|Rakefile|Procfile|NOTICE|CODEOWNERS)\b(?!\.\w)/g;
 
 /**
@@ -249,7 +249,7 @@ const BARE_FILENAME_RE =
  * requiring exactly one path would reclassify them. Breadth that names no file
  * is caught by `ENUMERATION_RE` and `IMPERATIVE_LINE_RE` instead.
  */
-const MAX_TRIVIAL_PATHS = 1;
+export const MAX_TRIVIAL_PATHS = 1;
 
 /**
  * Backstop for multi-step dispatches that use none of the marker words above:
@@ -258,7 +258,7 @@ const MAX_TRIVIAL_PATHS = 1;
  * recon brief, and measured AFTER the cwd/platform footer so that footer can
  * never by itself push a dispatch over the line.
  */
-const MAX_TRIVIAL_CHARS = 240;
+export const MAX_TRIVIAL_CHARS = 240;
 
 /**
  * Classify a dispatch as "trivial" AT DISPATCH TIME (m2): conservative,
