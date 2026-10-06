@@ -177,6 +177,12 @@ beforeEach(async () => {
   assertTmpIsGuarded(os.tmpdir);
 });
 
+// A skipped test file never runs `afterAll`, but its setup file did create these dirs: remove them when the worker exits.
+process.once("exit", () => {
+  rmSync(guard.isolatedHome, { recursive: true, force: true });
+  rmSync(guard.isolatedTmp, { recursive: true, force: true });
+});
+
 afterAll(() => {
   rmSync(guard.isolatedHome, { recursive: true, force: true });
   rmSync(guard.isolatedTmp, { recursive: true, force: true });
