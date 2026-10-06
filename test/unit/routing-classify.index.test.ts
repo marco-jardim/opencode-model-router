@@ -992,3 +992,15 @@ describe("routeLinePositions (A22)", () => {
     expect(anywhere.stripped).toBe("hello\nmore");
   });
 });
+describe("an entropy-only redaction still reaches the backend, redacted (QA-1.2-26)", () => {
+  it("a commit hash in the task is redacted in the state and does not skip the backend", async () => {
+    const hash = "83401ca9".repeat(5);
+    const { backend, classifyFn } = fakeBackend(() => okResult("review"));
+    const result = await classify(input(`hello ${hash}`), makeDeps(backend));
+    expect(classifyFn).toHaveBeenCalledTimes(1);
+    const [state] = classifyFn.mock.calls[0]!;
+    expect(state.text).toContain("[REDACTED]");
+    expect(state.text).not.toContain(hash);
+    expect(result.trace.backendSkipped).toBeUndefined();
+  });
+});

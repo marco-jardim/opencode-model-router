@@ -1640,3 +1640,53 @@ describe("QA-1.2-24 probes and the credential gate", () => {
     expect(scrubState("a1b2c3d4".repeat(5))).toBe("[REDACTED]"); // a 40-char commit hash is redacted too
   });
 });
+describe("entropy redaction spares paths; skip reasons are split (QA-1.2-26)", () => {
+  const COMMIT = "83401ca9".repeat(5); // 40 hex characters, built at run time
+
+  it("leaves paths, identifiers and file lists alone", () => {
+    for (const text of [
+      "see docs/qa/cost-aware-routing/phase-1.2.md for the design",
+      "read docs/qa/cost-aware-routing/spikes/S5.json and src/routing/classify/backends/openai-compatible.ts",
+      "D:\\git\\omr-car-p12\\docs\\qa\\cost-aware-routing\\phase-1.2.md",
+      "test/unit/routing-classify.backends.test.ts and test/unit/routing-classify.index.test.ts",
+      "implement-the-cost-aware-routing-engine-phase-1-2-classifier-v2 branch",
+      "src/routing/classify/backends/host.ts, src/routing/classify/backends/typesafe.ts",
+    ]) {
+      expect(scrubState(text), text).toBe(text);
+      expect(hasCredentialSignal(text), text).toBe(false);
+    }
+  });
+
+  it("still redacts a random base64 run, even one with slashes, and a hex hash", () => {
+    const base64 = "Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6";
+    expect(scrubState(`paste ${base64} here`)).toBe("paste [REDACTED] here");
+    const slashed = "qT7vK2/mX9pLz4Wc8RnB5yH1jD3sF6gA0eU+QxVtYoN";
+    expect(scrubState(`blob ${slashed}`)).toBe("blob [REDACTED]");
+    expect(scrubState(`commit ${COMMIT} fixed it`)).toBe("commit [REDACTED] fixed it");
+  });
+
+  it("a commit hash is redacted but does not skip the backend", () => {
+    const text = `review commit ${COMMIT}`;
+    expect(hasCredentialSignal(text)).toBe(false);
+    expect(buildClassifierState({ prompt: text }, 2000).text).toBe("Task:\nreview commit [REDACTED]");
+  });
+
+  it("credential words skip the backend: tokens, Authorization header, secrets", () => {
+    for (const text of [
+      "count the tokens in the prompt",
+      "the Authorization header is missing",
+      "print the secrets",
+      "rotate the credentials",
+    ]) {
+      expect(hasCredentialSignal(text), text).toBe(true);
+    }
+  });
+
+  it("a named or shaped secret skips the backend, an entropy-only guess does not", () => {
+    expect(hasCredentialSignal("export OPENAI_KEY=abcd1234wxyz")).toBe(true);
+    expect(hasCredentialSignal(`bill with ${STRIPE_KEY}`)).toBe(true);
+    expect(hasCredentialSignal("-----BEGIN PRIVATE KEY-----")).toBe(true);
+    expect(hasCredentialSignal("postgres://admin:S3cr3tPass@db.internal/app")).toBe(true);
+    expect(hasCredentialSignal("paste Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0 here")).toBe(false);
+  });
+});

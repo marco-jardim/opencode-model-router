@@ -87,9 +87,15 @@ const TOKEN_RES: readonly RegExp[] = [
  */
 const HEX_RUN_RE = /(?<![0-9A-Za-z])[0-9A-Fa-f]{32,}(?![0-9A-Za-z])/g;
 
-/** A run this long that looks random is a key, hash or blob, not prose. */
-const HIGH_ENTROPY_RUN_RE = /[A-Za-z0-9+/_=-]{32,}/g;
+/**
+ * A run this long that looks random is a key, hash or blob, not prose. `.` and
+ * `\` are part of the run so a whole path is judged as a path (QA-1.2-26).
+ */
+const HIGH_ENTROPY_RUN_RE = /[A-Za-z0-9+/_=.\\-]{32,}/g;
 const MIN_ENTROPY_BITS = 3.5;
+/** A run whose characters belong to word-like segments this much (or more) is a path or identifier. */
+const WORDLIKE_SHARE = 0.7;
+const WORDLIKE_SEGMENT_RE = /^(?:[A-Z]?[a-z]{1,}\d{0,3}|\d{1,4})$/;
 
 function shannonEntropy(text: string): number {
   const counts = new Map<string, number>();
@@ -102,8 +108,25 @@ function shannonEntropy(text: string): number {
   return bits;
 }
 
+/**
+ * Share of the run's characters that sit in word-like segments (`docs`, `cost`,
+ * `p12`, `2026`, `Classify`) when it is cut at `/ \ . _ - + =`. A path or a
+ * kebab-case identifier is nearly all word-like; a base64 key almost never is.
+ */
+function wordlikeShare(run: string): number {
+  let wordlike = 0;
+  let total = 0;
+  for (const segment of run.split(/[/\\._=+-]+/)) {
+    if (segment === "") continue;
+    total += segment.length;
+    if (WORDLIKE_SEGMENT_RE.test(segment)) wordlike += segment.length;
+  }
+  return total === 0 ? 0 : wordlike / total;
+}
+
 function looksRandom(run: string): boolean {
   if (!/\d/.test(run) || !/[A-Za-z]/.test(run)) return false;
+  if (wordlikeShare(run) >= WORDLIKE_SHARE) return false;
   return shannonEntropy(run) >= MIN_ENTROPY_BITS;
 }
 
