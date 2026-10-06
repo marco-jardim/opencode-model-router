@@ -629,6 +629,10 @@ interface DispatchSlot {
   lastTouch: number;
   /** Context size of the child's largest step of this registration (D11), or null until a step is observed. */
   stepTokens: number | null;
+  /** The child's execution ended after this registration (`noteExecutionEnded`): every step event of it was seen. */
+  ended: boolean;
+  /** Callers of `awaitExecutionEnd` still waiting; settled with `true` at the end, `false` when the slot goes away. */
+  waiters: Set<(ended: boolean) => void>;
 }
 
 /** Hard bound on remembered children; the oldest registration is dropped first. */
@@ -645,6 +649,16 @@ const dispatchRegistry = new Map<string, DispatchSlot>();
  */
 let attemptSeq = 0;
 const attemptNonce = randomBytes(4).toString("hex");
+
+/** Remove a registration and release whoever waits for its execution end (the wait ends `false`); true when it existed. */
+function dropDispatch(childSessionID: string): boolean {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return false;
+  dispatchRegistry.delete(childSessionID);
+  for (const settle of [...slot.waiters]) settle(false);
+  slot.waiters.clear();
+  return true;
+}
 
 /**
  * Register (or re-register) the dispatch facts of a child session. Re-registering an existing child
@@ -674,12 +688,12 @@ export function rememberDispatch(
     registeredAt: nowMs,
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
-  dispatchRegistry.delete(childSessionID);
-  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs, stepTokens: null });
+  dropDispatch(childSessionID);
+  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs, stepTokens: null, ended: false, waiters: new Set() });
   while (dispatchRegistry.size > MAX_DISPATCH_RECORDS) {
     const oldest = dispatchRegistry.keys().next();
     if (oldest.done === true) break;
-    dispatchRegistry.delete(oldest.value);
+    dropDispatch(oldest.value);
   }
   return record;
 }
@@ -710,21 +724,70 @@ export function noteStepContext(childSessionID: string, tokens: number, nowMs: n
   slot.lastTouch = nowMs;
 }
 
-/** The context size of the child's latest step of its current registration, or null (unknown, unregistered). */
+/**
+ * The child execution ended (`session.execution.*`): the events are delivered in order, so every step event of the
+ * registration has been noted. Marks the current registration and wakes the callers of `awaitExecutionEnd`. A child
+ * that is not registered is ignored. Only a registration made after an earlier end can be marked by a later one,
+ * because a re-registration starts with `ended: false`.
+ */
+export function noteExecutionEnded(childSessionID: string, nowMs: number = Date.now()): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return;
+  slot.ended = true;
+  slot.lastTouch = nowMs;
+  for (const settle of [...slot.waiters]) settle(true);
+  slot.waiters.clear();
+}
+
+/**
+ * The context size of the **largest** step of the child's current registration (D11), or null: unknown, not
+ * registered, or the execution end has not been seen since the registration (QA-2.3-2). The end event follows
+ * every step event on the stream, so a number read before it may miss the final, largest step, which would make a
+ * resume look safe when it is not; null leads the ladder to a fresh start (`unknown-tokens`).
+ */
 export function lastStepContext(childSessionID: string): number | null {
-  return dispatchRegistry.get(childSessionID)?.stepTokens ?? null;
+  const slot = dispatchRegistry.get(childSessionID);
+  return slot !== undefined && slot.ended ? slot.stepTokens : null;
+}
+
+/**
+ * Wait, at most `timeoutMs` and until `signal` aborts, for the child's execution end since its current
+ * registration. Resolves `true` when it was seen (now or meanwhile), `false` on timeout, abort, or when the
+ * registration is replaced or removed. Never rejects. The wait is the runner's only barrier against an end event
+ * that is still queued behind the stream's earlier events.
+ */
+export function awaitExecutionEnd(childSessionID: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return Promise.resolve(false);
+  if (slot.ended) return Promise.resolve(true);
+  if (signal?.aborted === true || !(timeoutMs > 0)) return Promise.resolve(false);
+  const waiters = slot.waiters;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    // A pending wait must never keep the process alive.
+    if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+    const onAbort = (): void => finish(false);
+    function finish(ended: boolean): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      waiters.delete(finish);
+      resolve(ended);
+    }
+    waiters.add(finish);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** Remove one child; true when it was registered. */
 export function forgetDispatch(childSessionID: string): boolean {
-  return dispatchRegistry.delete(childSessionID);
+  return dropDispatch(childSessionID);
 }
 
 /** Remove every child dispatched by `parentSessionID` (the orchestrator went away); returns what was removed. */
 export function forgetDispatchesOf(parentSessionID: string): DispatchRecord[] {
   const removed: DispatchRecord[] = [];
   for (const [id, slot] of [...dispatchRegistry]) {
-    if (slot.record.parentSessionID === parentSessionID && dispatchRegistry.delete(id)) removed.push(slot.record);
+    if (slot.record.parentSessionID === parentSessionID && dropDispatch(id)) removed.push(slot.record);
   }
   return removed;
 }
@@ -733,7 +796,7 @@ export function forgetDispatchesOf(parentSessionID: string): DispatchRecord[] {
 export function sweepDispatches(nowMs: number = Date.now(), ttlMs: number = DEFAULT_IDLE_TTL_MS): number {
   let removed = 0;
   for (const [id, slot] of [...dispatchRegistry]) {
-    if (nowMs - slot.lastTouch >= ttlMs && dispatchRegistry.delete(id)) removed += 1;
+    if (nowMs - slot.lastTouch >= ttlMs && dropDispatch(id)) removed += 1;
   }
   return removed;
 }
@@ -745,5 +808,5 @@ export function dispatchCount(): number {
 
 /** Test-only: drop every registration. */
 export function resetDispatchRegistry(): void {
-  dispatchRegistry.clear();
+  for (const id of [...dispatchRegistry.keys()]) dropDispatch(id);
 }

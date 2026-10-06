@@ -30,6 +30,7 @@ import {
   forgetDispatch,
   forgetDispatchesOf,
   lookupDispatch,
+  noteExecutionEnded,
   noteStepContext,
   sweepDispatches,
   touchDispatch,
@@ -655,6 +656,9 @@ export function createIngest(deps: IngestDeps): Ingest {
     onExecutionEnded(childSessionID: string): void {
       try {
         if (lookupDispatch(childSessionID) === undefined) return;
+        // Phase 2.3 (QA-2.3-2): every step event of this registration has been noted, whatever the engine mode; the
+        // delegate ladder reads the child's context only after this.
+        noteExecutionEnded(childSessionID, safeNow(now));
         closeLastAttempt(childSessionID);
       } catch (error) {
         warn("execution end failed", error, { childSessionID });

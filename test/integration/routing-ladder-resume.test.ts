@@ -54,6 +54,11 @@ interface Scenario {
   readonly during?: (attempt: number, sid: string) => void;
   /** Never settle the producer of attempt `n` (it only ends when its signal aborts). */
   readonly hangAttempt?: number;
+  /**
+   * When the host's `session.execution.*` event for a producer reaches the plugin: right after its last step event
+   * (default), 300 ms after the producer returned (the runner has to wait for it), or never.
+   */
+  readonly executionEnd?: "immediate" | "late" | "never";
 }
 
 const fullTier = (tier: TierConfig): TierConfig => ({ description: "test tier", whenToUse: ["testing"], ...tier } as TierConfig);
@@ -79,6 +84,8 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
   let savedProfile: string | undefined;
   const instances: Hooks[] = [];
   const dirs: string[] = [];
+  /** Delayed `session.execution.*` events still pending; cleared per test so one never lands in the next. */
+  const lateEnds: Array<ReturnType<typeof setTimeout>> = [];
   let counter = 0;
 
   beforeEach(() => {
@@ -96,6 +103,7 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
   });
 
   afterEach(async () => {
+    for (const timer of lateEnds.splice(0)) clearTimeout(timer);
     for (const hooks of instances.splice(0)) await hooks.dispose();
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
@@ -172,6 +180,9 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
           type: "session.step.ended",
           data: { sessionID: sid, assistantMessageID: `m${attempt}`, finish: "stop", cost: 0, tokens: { input: (s.contextTokens ?? (() => 5_000))(attempt), output: 100, reasoning: 0, cache: { read: 0, write: 0 } } },
         });
+        const endMode = s.executionEnd ?? "immediate";
+        if (endMode === "immediate") ingest?.onExecutionEnded(sid);
+        else if (endMode === "late") lateEnds.push(setTimeout(() => ingest?.onExecutionEnded(sid), 300));
         return { sessionID: sid, text: "producer output" };
       },
       async dispose(sid: string) {
@@ -293,6 +304,21 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
       ]);
       expect(t.events.indexOf("dispose:child-1")).toBeLessThan(t.events.indexOf("create:child-2"));
       expect(t.runs[1]!.prompt).toContain("[router escalation]");
+    });
+
+    it("QA-2.3-2: an execution end that is still queued when the gate finishes is awaited (bounded), then the child resumes", async () => {
+      const t = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true], executionEnd: "late" });
+      await t.run();
+      expect(t.runs.map((r) => [r.sid, r.resumeSessionID, r.model?.variant])).toEqual([["child-1", undefined, "low"], ["child-1", "child-1", "medium"]]);
+    });
+
+    it("QA-2.3-2: steps recorded but no execution end ever seen: the child is not trusted and the next attempt starts fresh", async () => {
+      const t = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true], executionEnd: "never" });
+      const started = Date.now();
+      await t.run();
+      expect(t.runs.map((r) => [r.sid, r.resumeSessionID, r.model?.variant])).toEqual([["child-1", undefined, "low"], ["child-2", undefined, "medium"]]);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(900); // the bounded wait (1 s), not an indefinite one
+      expect(t.events.indexOf("dispose:child-1")).toBeLessThan(t.events.indexOf("create:child-2"));
     });
 
     it("starts fresh when the producer's context is unknown (no step event reached the registry)", async () => {

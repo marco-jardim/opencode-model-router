@@ -75,6 +75,7 @@ import {
   buildCapBanner,
   DEFAULT_TIER_CAPS,
   READ_ONLY_TOOLS,
+  awaitExecutionEnd,
   lastStepContext,
 } from "./router/sessions";
 import type { Cap, SubagentState } from "./router/sessions";
@@ -603,6 +604,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * a few seconds so a burst of delegations asks the host once. Best effort: a missing, failing or slow catalog is
    * `undefined`, and the ladder then behaves exactly as without variant info (fresh sessions, tier ratios).
    */
+  /** How long a failed ladder attempt waits for its child's execution end before it starts fresh (QA-2.3-2). */
+  const RESUME_END_WAIT_MS = 1_000;
   const RUNNER_CATALOG_TTL_MS = 15_000;
   const RUNNER_CATALOG_TIMEOUT_MS = 3_000;
   let runnerCatalog: { at: number; lookup: CatalogLookup } | undefined;
@@ -670,7 +673,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             acceptance?: string;
             cwd?: string;
           },
-          toolCtx?: { sessionID?: string },
+          toolCtx?: { sessionID?: string; abort?: AbortSignal },
         ): Promise<string> {
           // Every ladder iteration creates its own producer session. Tracked out
           // here (not inside the try) so the finally below can dispose any that an
@@ -1116,13 +1119,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   ? tiersForCost[tier].costRatio
                   : 1);
               // D11: the child and its last-step context (from the registry) decide a resume. A producer that errored
-              // or timed out reports no context, so the next attempt starts fresh.
+              // or timed out reports no context, so the next attempt starts fresh. The context is read only once the
+              // child's execution end has been seen (QA-2.3-2): that event follows every step event on the stream, so
+              // the number includes the final, largest step. The gate has usually run long enough for it to be there;
+              // when it is not, wait for it, at most RESUME_END_WAIT_MS and no longer than the delegation lives, and
+              // otherwise start fresh (`unknown-tokens`). Nothing is awaited when no retry can follow.
+              let lastStepTokens: number | null = null;
+              if (sessionAware && !attempt.producerFailed) {
+                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable") {
+                  await awaitExecutionEnd(producerSid, RESUME_END_WAIT_MS, toolCtx?.abort);
+                }
+                lastStepTokens = lastStepContext(producerSid);
+              }
               state = recordAttempt(
                 state,
                 costRatio,
-                sessionAware
-                  ? { sessionID: producerSid, lastStepTokens: attempt.producerFailed ? null : lastStepContext(producerSid) }
-                  : undefined,
+                sessionAware ? { sessionID: producerSid, lastStepTokens } : undefined,
               );
               // The verdict of this attempt, on the attempt's own registration (variant steps feed the store separately).
               if (recording && !gateRes.verdict.skipped) ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict));

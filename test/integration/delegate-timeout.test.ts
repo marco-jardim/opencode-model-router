@@ -680,7 +680,7 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     const verdicts = [false, true];
     const log: string[] = [];
     let producerRuns = 0;
-    let ingest: { onStepEnded(event: unknown): Promise<void> } | undefined;
+    let ingest: { onStepEnded(event: unknown): Promise<void>; onExecutionEnded(sessionID: string): void } | undefined;
     const hooks = await ModelRouterPlugin({
       directory: dir, worktree: dir,
       client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
@@ -702,6 +702,7 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
           await request.onCreated(sid);
           if (producerRuns === 1) {
             await ingest?.onStepEnded({ id: `step-${sid}`, type: "session.step.ended", data: { sessionID: sid, finish: "stop", cost: 0, tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } } });
+            ingest?.onExecutionEnded(sid); // the host's session.execution.* event, after the last step
           }
           if (producerRuns === 2) {
             await new Promise<void>((_resolve, reject) => request.signal?.addEventListener("abort", () => { log.push(`aborted:${sid}`); reject(request.signal?.reason); }, { once: true }));

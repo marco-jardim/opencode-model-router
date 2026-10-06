@@ -31,12 +31,14 @@ import {
   type PricingLookup,
 } from "../../src/routing/outcomes/ingest";
 import {
+  awaitExecutionEnd,
   dispatchCount,
   forgetDispatch,
   forgetDispatchesOf,
   lastStepContext,
   lookupDispatch,
   MAX_DISPATCH_RECORDS,
+  noteExecutionEnded,
   noteStepContext,
   rememberDispatch,
   resetDispatchRegistry,
@@ -1212,12 +1214,15 @@ describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
     };
   }
 
-  it("keeps input + cache.read + cache.write + output of a registered child's step, null before any step", async () => {
+  it("keeps input + cache.read + cache.write + output of the largest step, readable once the execution end was seen (QA-2.3-2)", async () => {
     const h = harness();
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1");
     expect(lastStepContext("c1")).toBeNull();
     await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 1000, output: 100, cache: { read: 400, write: 50 } }));
+    // steps recorded, no execution end yet: the final, largest step may still be queued, so the number is not trusted
+    expect(lastStepContext("c1")).toBeNull();
+    ingest.onExecutionEnded("c1");
     expect(lastStepContext("c1")).toBe(1550);
   });
 
@@ -1227,19 +1232,22 @@ describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1");
     await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 2000, output: 500 }));
+    ingest.onExecutionEnded("c1");
     expect(lastStepContext("c1")).toBe(2500);
     expect(h.bundles).toHaveLength(0);
     expect(readdirSync(h.dir)).toEqual([]);
   });
 
-  it("ignores an unregistered session and a failed step", async () => {
+  it("an execution end of an unregistered session is ignored, and so are an unregistered session's and a failed step", async () => {
     const h = harness();
     const ingest = h.make({ pricing: PRICED });
     await ingest.onStepEnded(stepWithTokens("t1", "ghost", { input: 10, output: 1 }));
+    ingest.onExecutionEnded("ghost");
     expect(lastStepContext("ghost")).toBeNull();
     dispatch("c1");
     await ingest.onStepEnded({ id: "f1", type: "session.step.failed", data: { sessionID: "c1", cost: 0.01, tokens: { input: 9000, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } } });
-    expect(lastStepContext("c1")).toBeNull();
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBeNull(); // ended, but no step was noted
   });
 
   it("the largest step of a registration wins, so a duplicate delivery of an older step cannot lower it", async () => {
@@ -1249,18 +1257,22 @@ describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
     await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 1000, output: 100 }));
     await ingest.onStepEnded(stepWithTokens("t2", "c1", { input: 3000, output: 200 }));
     await ingest.onStepEnded(stepWithTokens("t1-again", "c1", { input: 1000, output: 100 }));
+    ingest.onExecutionEnded("c1");
     expect(lastStepContext("c1")).toBe(3200);
   });
 
-  it("a re-registration (a resume or a ladder attempt) starts from null again", async () => {
+  it("a re-registration (a resume or a ladder attempt) starts from null and not ended", async () => {
     const h = harness();
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1");
     await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 5000, output: 100 }));
+    ingest.onExecutionEnded("c1");
     expect(lastStepContext("c1")).toBe(5100);
     dispatch("c1"); // the same child, next attempt
     expect(lastStepContext("c1")).toBeNull();
     await ingest.onStepEnded(stepWithTokens("t2", "c1", { input: 6000, output: 100 }));
+    expect(lastStepContext("c1")).toBeNull(); // the first execution's end does not count for this registration
+    ingest.onExecutionEnded("c1");
     expect(lastStepContext("c1")).toBe(6100);
   });
 
@@ -1270,6 +1282,7 @@ describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
     dispatch("c1");
     await ingest.onStepEnded({ id: "t1", type: "session.step.ended", data: { sessionID: "c1", cost: 0, tokens: { input: "many", output: 1 } } });
     await ingest.onStepEnded({ id: "t2", type: "session.step.ended", data: { sessionID: "c1", cost: 0 } });
+    ingest.onExecutionEnded("c1");
     expect(lastStepContext("c1")).toBeNull();
     noteStepContext("c1", Number.NaN);
     noteStepContext("c1", -1);
@@ -1280,10 +1293,87 @@ describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
     expect(lastStepContext("c1")).toBe(0);
   });
 
-  it("noting a step refreshes the idle stamp, so a long-running child is not swept", () => {
+  it("noting a step or an end refreshes the idle stamp, so a long-running child is not swept", () => {
     dispatch("c1");
     noteStepContext("c1", 10, T0 + 3_000_000);
     expect(sweepDispatches(T0 + 3_000_000 + 60_000, 3_600_000)).toBe(0);
+    dispatch("c2");
+    noteExecutionEnded("c2", T0 + 3_000_000);
+    expect(sweepDispatches(T0 + 3_000_000 + 60_000, 3_600_000)).toBe(0);
     expect(lookupDispatch("c1")).toBeDefined();
+    expect(lookupDispatch("c2")).toBeDefined();
+  });
+});
+
+describe("awaitExecutionEnd (QA-2.3-2): the runner's bounded, abortable barrier", () => {
+  it("resolves true at once when the end was already seen, false for an unregistered child", async () => {
+    dispatch("c1");
+    noteExecutionEnded("c1");
+    await expect(awaitExecutionEnd("c1", 1_000)).resolves.toBe(true);
+    await expect(awaitExecutionEnd("ghost", 1_000)).resolves.toBe(false);
+  });
+
+  it("resolves true when the end arrives while waiting, and the context is then readable", async () => {
+    dispatch("c1");
+    noteStepContext("c1", 321);
+    const waiting = awaitExecutionEnd("c1", 5_000);
+    expect(lastStepContext("c1")).toBeNull();
+    noteExecutionEnded("c1");
+    await expect(waiting).resolves.toBe(true);
+    expect(lastStepContext("c1")).toBe(321);
+  });
+
+  it("times out with false and leaves the child unread (fresh start)", async () => {
+    vi.useFakeTimers();
+    try {
+      dispatch("c1");
+      noteStepContext("c1", 321);
+      const waiting = awaitExecutionEnd("c1", 1_000);
+      await vi.advanceTimersByTimeAsync(999);
+      let settled = false;
+      void waiting.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(waiting).resolves.toBe(false);
+      expect(lastStepContext("c1")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an abort ends the wait with false, an already aborted signal does not wait at all, and no timer is left behind", async () => {
+    vi.useFakeTimers();
+    try {
+      dispatch("c1");
+      const controller = new AbortController();
+      const waiting = awaitExecutionEnd("c1", 60_000, controller.signal);
+      controller.abort();
+      await expect(waiting).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(awaitExecutionEnd("c1", 60_000, controller.signal)).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a registration that is replaced or forgotten releases the waiter with false", async () => {
+    dispatch("c1");
+    const replaced = awaitExecutionEnd("c1", 60_000);
+    dispatch("c1");
+    await expect(replaced).resolves.toBe(false);
+    const forgotten = awaitExecutionEnd("c1", 60_000);
+    forgetDispatch("c1");
+    await expect(forgotten).resolves.toBe(false);
+    dispatch("c2");
+    const reset = awaitExecutionEnd("c2", 60_000);
+    resetDispatchRegistry();
+    await expect(reset).resolves.toBe(false);
+  });
+
+  it("a non-positive timeout does not wait", async () => {
+    dispatch("c1");
+    await expect(awaitExecutionEnd("c1", 0)).resolves.toBe(false);
   });
 });

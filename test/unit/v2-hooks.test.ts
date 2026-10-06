@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import v2Plugin from "../../src/v2";
 import type { Plugin } from "@opencode/plugin";
-import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import { lastStepContext, rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
@@ -1033,6 +1033,21 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it("QA-2.3-2: a child's context is readable only after its execution end event, in every engine mode (static here)", async () => {
+    const { home, outcomes } = routingHome(); // a routing block without an engine: static
+    const f = fixture();
+    const { cleanup, forgetSession } = await startPlugin(f, catalog(), home);
+    register("child-1");
+    f.emit(stepEvent("e1", "child-1", { finish: "stop" }));
+    await barrier(f, forgetSession, "barrier-1");
+    expect(lastStepContext("child-1")).toBeNull(); // the final step may still be queued behind the stream's events
+    f.emit({ id: "x1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+    await barrier(f, forgetSession, "barrier-2");
+    expect(lastStepContext("child-1")).toBe(1100);
+    await cleanup();
+    expect(readdirSync(outcomes)).toEqual([]); // memory only: nothing was written
+    rmSync(home, { recursive: true, force: true });
+  });
   it("ignores step events of sessions that are not registered children", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const f = fixture();
