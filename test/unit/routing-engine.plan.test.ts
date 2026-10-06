@@ -551,6 +551,33 @@ describe("QA-1.4-13: the QA match is narrow", () => {
   });
 });
 
+describe("QA-1.4-19 (A26): the result reports how many steps the annotation pinned", () => {
+  const plan = [
+    step("design", "Design the new engine"), // engine-chosen heavy → pinned
+    step("qa", "QA the release"), // QA → heavy + pin
+    step("tagged", "Refactor [tier:heavy]\n[route class=implement d=none]"), // existing route line edited to add pin
+    step("already", "Ship it [tier:heavy]\n[route class=implement d=none pin]"), // already pinned: not this annotation's work
+    step("plain", "Search the repo"), // not pinned
+    step("route", "Ship [tier:fast]\n[route class=search pin]"), // pinned by the plan itself
+  ];
+  const stubFacts = (index: number) => facts(index === 0 ? "design" : index === 2 || index === 3 ? "implement" : "search", { risk: index === 0 ? "high" : "low" });
+
+  it("counts the pins this annotation added: engine route lines carrying pin and edited route lines", async () => {
+    const out = await annotateSteps(plan, stubDeps(stubFacts));
+    expect(out.map((a) => a.pin)).toEqual([true, true, true, true, false, true]);
+    expect(out.pinnedCount).toBe(3);
+  });
+
+  it("is an array property that does not leak into equality or iteration; annotating again pins nothing", async () => {
+    const first = await annotateSteps(plan, stubDeps(stubFacts));
+    expect(Object.keys(first)).toEqual(first.map((_, i) => String(i)));
+    expect([...first]).toHaveLength(plan.length);
+    const second = await annotateSteps(first.map((a) => step(a.id, a.text)), stubDeps(stubFacts));
+    expect(second.pinnedCount).toBe(0);
+    expect((await annotateSteps([], deps())).pinnedCount).toBe(0);
+    expect(await annotateSteps([], deps())).toEqual([]);
+  });
+});
 describe("QA-1.4-18: a verb or adjective before QA, and QA followed by on/of/for, a colon or the line end", () => {
   const pins = async (lines: readonly string[]) =>
     (await annotateSteps(lines.map((l, i) => step(`s${i}`, l)), stubDeps(() => facts("search", { risk: "low" })))).map((a) => a.pin);

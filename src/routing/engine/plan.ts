@@ -246,13 +246,28 @@ function unknownResult(text: string): ClassifyResult {
 // ---------------------------------------------------------------------------
 
 /**
+ * The annotated steps, in order, plus how many of them THIS annotation pinned (A26, QA-1.4-19): steps given an
+ * engine route line that carries `pin`, or an existing route line edited to add it. A step that was already
+ * pinned, or whose text did not change, is not counted, so annotating an annotated plan reports 0.
+ * `pinnedCount` is a non-enumerable property: the result still compares and iterates as a plain array.
+ */
+export type AnnotatedPlan = AnnotatedStep[] & { readonly pinnedCount: number };
+
+function withPinnedCount(steps: AnnotatedStep[]): AnnotatedPlan {
+  const pinnedCount = steps.filter((a) => a.pin && a.changed && (a.routeEdited || a.routeSource === "engine")).length;
+  const plan: AnnotatedPlan = Object.assign([...steps], { pinnedCount });
+  Object.defineProperty(plan, "pinnedCount", { enumerable: false });
+  return plan;
+}
+
+/**
  * Annotate a plan's steps in one pass. Never throws for well-typed input: a classifier failure leaves the
  * steps with `UNKNOWN_FACTS` (confidence 0, so the engine keeps the static tier and never switches).
  * `steps` must already be split by the caller (2.4 owns plan parsing); fenced code blocks inside a step are
  * respected (nothing inside a fence is a tag, a route line or a task line).
  */
-export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDeps): Promise<AnnotatedStep[]> {
-  if (steps.length === 0) return [];
+export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDeps): Promise<AnnotatedPlan> {
+  if (steps.length === 0) return withPinnedCount([]);
   const { cfg, routing, agents, store } = deps;
 
   // --- one batched classification ---------------------------------------------------------------
@@ -361,5 +376,5 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
       dispatchPrompt: `${routeLine}${scan.eol}${withoutRoute}`,
     });
   });
-  return annotated;
+  return withPinnedCount(annotated);
 }

@@ -27,4 +27,4 @@ export type { ChosenInput, LadderBuildInput } from "./ladders";
 export { MIN_EVIDENCE_TO_MOVE, generateTaxonomy } from "./protocol-line";
 export type { TaxonomyInput } from "./protocol-line";
 export { annotateSteps, detectionOf, formatRouteLine } from "./plan";
-export type { AnnotateDeps, AnnotatedStep, PlanStep } from "./plan";
+export type { AnnotateDeps, AnnotatedPlan, AnnotatedStep, PlanStep } from "./plan";
