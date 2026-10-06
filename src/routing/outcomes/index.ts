@@ -14,9 +14,7 @@ import type {
   OutcomesBundle,
   OutcomeTuning,
   PersistDeps,
-  Persister,
   FlushScheduler,
-  WriteResult,
 } from "./types";
 import { sanitizeTuning } from "./beta";
 import { createOutcomeStore } from "./store";
@@ -91,6 +89,12 @@ interface RegistryEntry {
 }
 
 const registry = new Map<string, RegistryEntry>();
+/**
+ * Directories whose last holder released but whose final flush has not finished (QA-1.3-1). The entry
+ * leaves `registry` at once (a new acquire builds a fresh bundle), but that bundle's initial load waits
+ * for this promise, so it can never read the file before the previous bundle wrote it.
+ */
+const closing = new Map<string, Promise<void>>();
 
 function registryId(dir: string): string {
   const abs = resolve(dir);
@@ -102,22 +106,6 @@ function unreadableResult(error: unknown): LoadResult {
   return { status: "corrupt", snapshot: { version: 1, entries: {} }, dropped: 0, savedAt: null, message };
 }
 
-/**
- * A persister whose writes wait for the initial load. Without it a flush that fires before the load
- * finished could overwrite the file the load is about to read (or quarantine).
- */
-function gatedPersister(persister: Persister, ready: Promise<LoadResult>): Pick<Persister, "saveSnapshot" | "appendRows"> {
-  return {
-    async saveSnapshot(snapshot): Promise<WriteResult> {
-      await ready;
-      return persister.saveSnapshot(snapshot);
-    },
-    async appendRows(rows): Promise<WriteResult> {
-      await ready;
-      return persister.appendRows(rows);
-    },
-  };
-}
 
 function holderOf(entry: RegistryEntry, id: string): OutcomesBundle {
   let released = false;
@@ -129,7 +117,15 @@ function holderOf(entry: RegistryEntry, id: string): OutcomesBundle {
       entry.refs -= 1;
       if (entry.refs > 0) return;
       if (registry.get(id) === entry) registry.delete(id);
-      await entry.core.flusher.dispose();
+      // Chain behind an earlier close of the same directory so closes finish in order.
+      const previous = closing.get(id);
+      const done: Promise<void> = Promise.all([previous, entry.core.flusher.dispose()])
+        .then(() => undefined)
+        .finally(() => {
+          if (closing.get(id) === done) closing.delete(id);
+        });
+      closing.set(id, done);
+      await done;
     },
   };
 }
@@ -157,17 +153,18 @@ export function acquireOutcomes(options: AcquireOutcomesOptions): OutcomesBundle
   const deps = options.deps ?? nodePersistDeps(options.logger);
   const store = createOutcomeStore({ ...tuning, now: deps.now });
   const persister = createPersister(options.dir, deps);
-  const ready: Promise<LoadResult> = persister
-    .load({ quarantine: true })
+  const ready: Promise<LoadResult> = (closing.get(id) ?? Promise.resolve())
+    .then(() => persister.load({ quarantine: true }))
     .then((result) => {
       if (result.status === "ok") store.fromSnapshot(result.snapshot, { mode: "merge" });
       return result;
     })
     .catch((error: unknown) => unreadableResult(error));
-  const flusher = createFlusher(store, gatedPersister(persister, ready), {
+  const flusher = createFlusher(store, persister, {
     now: deps.now,
     scheduler: options.scheduler ?? nodeScheduler(),
     logger: options.logger,
+    ready,
   });
   const entry: RegistryEntry = { core: { dir: options.dir, store, persister, flusher, ready }, refs: 1, tuning };
   registry.set(id, entry);

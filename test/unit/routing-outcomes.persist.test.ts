@@ -1252,6 +1252,27 @@ describe("flusher: failures, drops, flushNow, dispose", () => {
     expect(sched.pending()).toHaveLength(0);
   });
 
+  it("QA-1.3-1: a flush waits for deps.ready and takes its snapshot only afterwards", async () => {
+    const c = clock();
+    const store = createOutcomeStore({ now: c.now });
+    const sched = manualScheduler();
+    const fake = fakePersister();
+    const gate = deferred();
+    const flusher = createFlusher(store, fake.persister, { now: c.now, scheduler: sched.scheduler, logger: makeLogger(), ready: gate.promise });
+    store.recordVerdict(KEY, "pass", { attemptID: "a", step: "dispatch" });
+    void flusher.requestFlush();
+    await sched.fireNext();
+    expect(fake.saves).toHaveLength(0);
+    // the "load" merges disk evidence while the flush is parked
+    const disk = createOutcomeStore({ now: c.now });
+    disk.recordVerdict(KEY, "pass", { attemptID: "d", step: "dispatch" });
+    store.fromSnapshot(disk.snapshot(), { mode: "merge" });
+    gate.resolve();
+    await tick();
+    expect(fake.saves).toHaveLength(1);
+    expect(fake.saves[0]?.entries[KEY]?.counts.pass).toBe(2);
+  });
+
   it("dispose after a failing flush still cancels the retry timer", async () => {
     const { flusher, sched, fake, mutate } = flusherSetup();
     fake.results.save = { ok: false, error: "nope" };
@@ -1331,6 +1352,38 @@ describe("acquireOutcomes (A3)", () => {
     await a.release();
     const b = acquire();
     expect(b.store).not.toBe(a.store);
+  });
+
+  it("QA-1.3-1: a re-acquire while the previous release is still flushing sees the flushed file (no lost update)", async () => {
+    const { acquire, deps, dir, mem } = acquireSetup();
+    const a = acquire();
+    await a.ready;
+    for (let i = 0; i < 4; i++) a.store.recordVerdict(KEY, "pass", { attemptID: `p${i}`, step: "dispatch" });
+    const closing = a.release(); // deliberately not awaited
+    const b = acquire();
+    expect(b.store).not.toBe(a.store);
+    b.store.recordVerdict(KEY, "fail", { attemptID: "f1", step: "dispatch" });
+    const loaded = await b.ready;
+    expect(loaded.status).toBe("ok"); // it saw a's final write
+    await closing;
+    await b.release();
+    const disk = await createPersister(dir, deps).load({ quarantine: false });
+    expect(disk.status).toBe("ok");
+    expect(disk.snapshot.entries[KEY]?.counts).toMatchObject({ pass: 4, fail: 1 });
+    expect(mem.touched.filter((t) => t.op === "writeDurable")).toHaveLength(2);
+  });
+
+  it("QA-1.3-1: repeated release/acquire cycles chain their closes in order", async () => {
+    const { acquire, deps, dir } = acquireSetup();
+    let bundle = acquire();
+    for (let i = 0; i < 5; i++) {
+      bundle.store.recordVerdict(KEY, "pass", { attemptID: `c${i}`, step: "dispatch" });
+      const next = (void bundle.release(), acquire());
+      bundle = next;
+    }
+    await bundle.release();
+    const disk = await createPersister(dir, deps).load({ quarantine: false });
+    expect(disk.snapshot.entries[KEY]?.counts.pass).toBe(5);
   });
 
   it("loads the disk snapshot into the store and merges records made before the load finished", async () => {

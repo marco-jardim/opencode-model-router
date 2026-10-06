@@ -698,6 +698,7 @@ export function createFlusher(
   }
 
   async function doFlush(): Promise<void> {
+    if (deps.ready !== undefined) await deps.ready;
     let ok = true;
     const revision = store.revision;
     if (revision !== writtenRevision) {

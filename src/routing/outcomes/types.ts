@@ -634,6 +634,8 @@ export interface FlusherDeps {
   readonly now: Clock;
   readonly scheduler: FlushScheduler;
   readonly logger: OutcomeLogger;
+  /** Every flush waits for this first (the initial disk load), so a snapshot is never taken before it merged. Must not reject. */
+  readonly ready?: Promise<unknown>;
 }
 
 export interface FlusherOptions {
