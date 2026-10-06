@@ -462,7 +462,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       row = {
         chosen: unresolvedChoice(facts.class, agent, routerIds),
         best: null, switched: false, pinned: pin, unit: "ratio", costs: {}, confidence: 0,
-        reason: "kept: the dispatched agent resolves to no model, so nothing could be priced",
+        reason: "kept:unresolved: the dispatched agent resolves to no model, so nothing could be priced",
       };
     } else {
       const ladder = buildLadder({

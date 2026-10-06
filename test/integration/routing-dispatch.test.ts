@@ -363,6 +363,21 @@ describe("enforce", () => {
     expect(row!.reason).toMatch(/^kept:/);
   });
 
+  it("QA-3.2-R2-5: an agent that resolves to no model is kept with its own reason code, kept:unresolved, and the dispatch is left alone", async () => {
+    for (const engine of ["shadow", "enforce"] as const) {
+      const world = await makeWorld({ engine });
+      // the orchestrator's own model is unknown and `general` has none of its own: the pick resolves to no model at all
+      world.session.current = { id: "root", agent: "build", permissions: [{ action: "subagent", resource: "*", effect: "allow" }], location: { directory: world.home } };
+      await world.start();
+      const after = await routed(world, { agent: "general", prompt: "Look at the thing." });
+      expect(after).toMatchObject({ agent: "general", prompt: "Look at the thing." }); // nothing rewritten, nothing priced
+      expect(after.model).toBeUndefined();
+      const [row] = await world.rows();
+      expect(row, engine).toMatchObject({ mode: engine, switched: false, best: null, chosen: { agent: "general" } });
+      expect(row!.reason, engine).toMatch(/^kept:unresolved: the dispatched agent resolves to no model/);
+      expect(row!.reason, engine).not.toMatch(/^kept: /); // the prefix is a reason code, like every other kept row
+    }
+  });
   it("[route pin]: input untouched, the row is pinned with a computed best, and the pin line is stripped", async () => {
     const world = await makeWorld({ engine: "enforce", roles: {} });
     world.seed(KEYS.medium, 0, 20);
