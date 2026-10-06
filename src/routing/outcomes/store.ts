@@ -243,6 +243,29 @@ function subtractEntry(disk: Entry, base: Entry, tuning: OutcomeTuning): Entry {
   };
 }
 
+/**
+ * QA-1.3-16: can `disk` be a later state of the lineage that `base` belongs to? Every counter and every
+ * sample count only ever grows, so one that is *lower* on disk means the file was reset or replaced (deleted
+ * and started again by a fresh process, restored from a backup, ...). Subtracting the baseline from such an
+ * entry would swallow the new writer's records, so it is taken whole instead.
+ */
+function descendsFrom(disk: Entry, base: Entry): boolean {
+  const d = disk.counts;
+  const b = base.counts;
+  return (
+    d.pass >= b.pass &&
+    d.fail >= b.fail &&
+    d.falseRefusals >= b.falseRefusals &&
+    d.variantPass >= b.variantPass &&
+    d.variantFail >= b.variantFail &&
+    disk.cost.unpricedAttempts >= base.cost.unpricedAttempts &&
+    disk.cost.measuredUSD.n >= base.cost.measuredUSD.n &&
+    disk.cost.tokens.n >= base.cost.tokens.n &&
+    disk.cost.steps.n >= base.cost.steps.n &&
+    disk.cost.finalMessageTokens.n >= base.cost.finalMessageTokens.n
+  );
+}
+
 function isEmptyEntry(e: Entry): boolean {
   const c = e.counts;
   const k = e.cost;
@@ -596,7 +619,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
           continue;
         }
         const base = key in baseEntries ? readEntry(key, baseEntries[key]) : null;
-        const delta = base === null ? current : subtractEntry(current, base, tuning);
+        const delta = base === null || !descendsFrom(current, base) ? current : subtractEntry(current, base, tuning);
         if (isEmptyEntry(delta)) continue;
         absorb(key as OutcomeKey, delta, t);
         accepted += 1;

@@ -951,15 +951,53 @@ describe("mergeForeign (QA-1.3-4)", () => {
     expect(nothing.snapshot()).toEqual(loaded(baseline).snapshot());
   });
 
-  it("deltas are floored at 0 when the disk has less than the baseline, and invalid disk entries are dropped", () => {
+  it("QA-1.3-16: an entry whose counters are lower than the baseline is a new lineage and is absorbed whole, not subtracted", () => {
+    const baseline = sharedStart(); // 3 pass, 2 fail, 2 attempts
+    const mine = loaded(baseline);
+    const fresh = createOutcomeStore({ now: clock().now }); // e.g. the file was deleted and a new process started over
+    fresh.recordVerdict(K(), "fail", signal("n1"));
+    fresh.recordStep(K(), step("ns0", { cost: 0.5, tokens: tokens({ input: 700, output: 70 }), final: true }));
+    expect(mine.mergeForeign(fresh.snapshot(), baseline)).toEqual({ accepted: 1, dropped: 0 });
+    const entry = mine.snapshot().entries[K()];
+    expect(entry?.counts).toEqual({ pass: 3, fail: 3, falseRefusals: 0, variantPass: 0, variantFail: 0 }); // 2 + the new 1
+    expect(entry?.cost.measuredUSD.n).toBe(3); // 2 + 1
+    expect(entry?.cost.measuredUSD.mean).toBeCloseTo((0.1 + 0.3 + 0.5) / 3, 12);
+    expect(entry?.cost.tokens.n).toBe(3);
+  });
+
+  it("QA-1.3-16: ANY lower counter or sample count triggers it, a growing one does not", () => {
+    const baseline = sharedStart();
+    const lowerCounter = JSON.parse(JSON.stringify(baseline)) as { entries: Record<string, { counts: Record<string, number>; cost: { tokens: { n: number } } }> };
+    const entry = lowerCounter.entries[K()];
+    if (!entry) throw new Error("fixture");
+    entry.counts.pass = 5; // up…
+    entry.counts.fail = 1; // …but one counter is down: not a descendant
+    const a = loaded(baseline);
+    a.mergeForeign(lowerCounter as unknown as OutcomeSnapshot, baseline);
+    expect(a.snapshot().entries[K()]?.counts).toMatchObject({ pass: 3 + 5, fail: 2 + 1 });
+
+    const lowerN = JSON.parse(JSON.stringify(baseline)) as typeof lowerCounter;
+    const entryN = lowerN.entries[K()];
+    if (!entryN) throw new Error("fixture");
+    entryN.counts.pass = 9; // counters only grew…
+    entryN.cost.tokens.n = 1; // …but a sample count shrank
+    const b = loaded(baseline);
+    b.mergeForeign(lowerN as unknown as OutcomeSnapshot, baseline);
+    expect(b.snapshot().entries[K()]?.counts.pass).toBe(3 + 9);
+
+    const grown = JSON.parse(JSON.stringify(baseline)) as typeof lowerCounter;
+    const entryG = grown.entries[K()];
+    if (!entryG) throw new Error("fixture");
+    entryG.counts.pass = 5; // +2 over the baseline, nothing lower
+    const c = loaded(baseline);
+    c.mergeForeign(grown as unknown as OutcomeSnapshot, baseline);
+    expect(c.snapshot().entries[K()]?.counts.pass).toBe(3 + 2);
+  });
+
+  it("invalid disk entries are dropped and counted", () => {
     const baseline = sharedStart();
     const mine = loaded(baseline);
-    const shrunk = createOutcomeStore({ now: clock().now });
-    shrunk.recordVerdict(K(), "pass", signal("only"));
-    const snapshot = JSON.stringify(mine.snapshot());
-    expect(mine.mergeForeign(shrunk.snapshot(), baseline)).toEqual({ accepted: 0, dropped: 0 });
-    expect(JSON.stringify(mine.snapshot())).toBe(snapshot);
-    const junk = { version: 1, entries: { "not a key": {}, ...shrunk.snapshot().entries } } as unknown as OutcomeSnapshot;
+    const junk = { version: 1, entries: { "not a key": {}, [K()]: baseline.entries[K()] } } as unknown as OutcomeSnapshot;
     expect(mine.mergeForeign(junk, baseline)).toEqual({ accepted: 0, dropped: 1 });
   });
 

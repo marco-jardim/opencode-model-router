@@ -1599,6 +1599,27 @@ describe("foreign writers (QA-1.3-4)", () => {
     expect(logger.warn.mock.calls.filter((call) => String(call[0]).includes("another process writes"))).toHaveLength(2); // once per process
   });
 
+  it("QA-1.3-16: outcomes.json deleted, a fresh process writes 1 fail, A saves: the disk has A's 3 fails plus the new one", async () => {
+    const { a, b, c, mem, dir, onDisk } = twoProcesses();
+    await a.persister.load();
+    for (let i = 0; i < 3; i++) a.record("fail");
+    await a.flusher.flushNow();
+    expect((await onDisk())?.counts).toMatchObject({ fail: 3 });
+
+    mem.files.delete(join(dir, OUTCOMES_FILE)); // reset by hand / restored backup / cleaner
+    c.advance(1000);
+    await b.persister.load(); // a fresh process starts from nothing
+    b.record("fail");
+    await b.flusher.flushNow();
+    expect((await onDisk())?.counts).toMatchObject({ fail: 1 });
+
+    c.advance(1000);
+    a.record("pass"); // A is dirty again
+    await a.flusher.flushNow(); // disk (1 fail) is below A's baseline (3 fails): a new lineage, absorbed whole
+    expect((await onDisk())?.counts).toMatchObject({ pass: 1, fail: 4 });
+    expect(a.store.snapshot().entries[KEY]?.counts).toMatchObject({ pass: 1, fail: 4 });
+  });
+
   it("cost statistics merge exactly while under the cap (attempt-weighted means)", async () => {
     const { a, b, c, onDisk } = twoProcesses();
     const tokens = { ...emptyTokenSample(), input: 100, output: 10 };
