@@ -413,7 +413,7 @@ describe("directives, acceptance blocks, risk and scope", () => {
   });
 
   it("high-risk vocabulary ignores negation; other negations apply", () => {
-    expect(classifyByRules("list the exports. do not publish anything", cfg).risk).toBe("high");
+    expect(classifyByRules("list the exports. do not publish the package", cfg).risk).toBe("high");
     expect(classifyByRules("rename the secrets file", cfg).risk).toBe("high");
   });
 
@@ -830,5 +830,56 @@ describe("working directory resolution (QA-1.2-15)", () => {
       "ENVIRONMENT: Platform: win32",
     ].join("\n");
     expect(needsOf(text)).toEqual(["edit"]);
+  });
+});
+describe("push, publish, permissions and auth need context (QA-1.2-16)", () => {
+  const facts = (text: string) => classifyByRules(text, cfg);
+
+  it("push is a network operation only next to git/remote vocabulary", () => {
+    for (const text of ["git push origin main", "push the branch", "push the commits to origin", "push to the remote", "then push to github"]) {
+      expect(facts(text).needs, text).toContain("network");
+    }
+    for (const text of ["push the button", "add a push notification handler", "push the item onto the stack", "push"]) {
+      expect(facts(text).needs, text).not.toContain("network");
+    }
+  });
+
+  it("publish is a network operation (and high risk) only next to npm/package/registry vocabulary", () => {
+    for (const text of ["npm publish", "publish to npm", "publish the package", "publish the image to the registry", "yarn publish the library"]) {
+      const f = facts(text);
+      expect(f.needs, text).toContain("network");
+      expect(f.risk, text).toBe("high");
+    }
+    for (const text of ["publish the docs", "publish the report to the wiki", "publish the results"]) {
+      const f = facts(text);
+      expect(f.needs, text).not.toContain("network");
+      expect(f.risk, text).not.toBe("high");
+    }
+    expect(facts("unpublish the docs").risk).toBe("high");
+  });
+
+  it("'permissions' alone is not high risk; granting or escalating them is", () => {
+    for (const text of ["list the permissions of a.ts", "check file permissions", "explain the permissions model of the sandbox"]) {
+      expect(facts(text).risk, text).not.toBe("high");
+    }
+    for (const text of ["grant admin permissions to the service", "escalate privileges for the job", "revoke access for the bot", "add an rbac rule", "run it with sudo"]) {
+      expect(facts(text).risk, text).toBe("high");
+    }
+  });
+
+  it("an auth path or file name alone is not high risk; the auth topic is", () => {
+    for (const text of [
+      "rename foo to bar in src/auth/login.ts",
+      "read src/auth.ts",
+      "list the files in packages/authentication/",
+      "rename foo to bar in D:\\work\\repo\\auth\\login.ts",
+    ]) {
+      expect(facts(text).risk, text).not.toBe("high");
+    }
+    const mechanical = facts("rename foo to bar in src/auth/login.ts");
+    expect(mechanical).toMatchObject({ class: "mechanical", risk: "low", confidence: 0.8 });
+    for (const text of ["refactor the auth module", "fix the authentication flow", "review authorization checks", "rename the auth helper."]) {
+      expect(facts(text).risk, text).toBe("high");
+    }
   });
 });
