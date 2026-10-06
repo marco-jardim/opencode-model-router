@@ -1442,6 +1442,26 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
     "chat.message": async (input: any, output: any) => {
       if (bypassed) return;
+      // 2.4.3 (QA-2.4-9): the cost doctor's notice rides with the user's own turn, as one more text part of the message being created.
+      // OpenCode v2 joins a message's parts into the prompt text, so there it lands at the end of the latest user turn; the system prompt
+      // is never touched. Only a PROVEN root session takes it (never a subagent or a grader), and only when one may be waiting.
+      if (advisorNotifier !== undefined && advisorNotifier.maybePending() && typeof input?.sessionID === "string") {
+        const noticeSession: string = input.sessionID;
+        try {
+          if (!graderSessions.has(noticeSession) && !sessionStore.isSubagent(noticeSession) && (await lookupRootSession(noticeSession)) === true) {
+            const notice = await advisorNotifier.take();
+            if (notice !== null && Array.isArray(output?.parts)) {
+              output.parts.push({
+                type: "text" as const,
+                synthetic: true,
+                text: `Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${notice}`,
+              });
+            }
+          }
+        } catch (error) {
+          logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
+        }
+      }
       // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig(projectDir);
@@ -2292,12 +2312,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (ctx.routerHost !== "v2" && hasExplicitV1Roles(cfg)) systemPrompt = applyV1Roles(systemPrompt, cfg, await loadV1Agents());
       output.system.push(systemPrompt);
 
-      // 2.4.3: the cost doctor's throttled notice. `poll` is O(1) when nothing is due and never throws; in advise/enforce a notice that
-      // is ready is appended here (once per `routing.advisor.noticeIntervalHours`, across restarts), in static/shadow it is logged.
-      const advisorNotice = advisorNotifier?.poll() ?? null;
-      if (advisorNotice !== null) {
-        output.system.push(`Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${advisorNotice}`);
-      }
+      // 2.4.3: the cost doctor's throttled check. `poll` is O(1) when nothing is due and never throws. In static/shadow a notice is logged
+      // from here; in advise/enforce it is delivered with the user's next turn (the `chat.message` hook below), never in the system prompt:
+      // a system part that changes would cost the orchestrator its prompt cache (QA-2.4-9).
+      advisorNotifier?.poll();
 
       // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
       // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt

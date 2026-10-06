@@ -880,6 +880,13 @@ describe("validateConfig — routing.outcomes / sessionReuse / advisor", () => {
     );
   });
 
+  it("QA-2.4-5: validates advisor.notify as a boolean (default true), independent of advisor.enabled", () => {
+    expect(validateConfig(withRouting({ advisor: { notify: false } })).routing?.advisor?.notify).toBe(false);
+    expect(validateConfig(withRouting({ advisor: { notify: true, enabled: false } })).routing?.advisor).toMatchObject({ notify: true, enabled: false });
+    expect(validateConfig(withRouting({ advisor: {} })).routing?.advisor?.notify).toBeUndefined(); // absent stays absent; resolveRouting defaults it to true
+    expect(() => validateConfig(withRouting({ advisor: { notify: "no" } }))).toThrow(/routing\.advisor\.notify must be a boolean/);
+  });
+
   it("validates advisor.enabled as a boolean", () => {
     expect(validateConfig(withRouting({ advisor: { enabled: false } })).routing?.advisor?.enabled).toBe(false);
     expect(() => validateConfig(withRouting({ advisor: { enabled: "no" } }))).toThrow(

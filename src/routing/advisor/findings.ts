@@ -13,8 +13,9 @@
  * file, nothing else.
  */
 
+import { readFileSync } from "node:fs";
 import type { RouterConfig, TierConfig } from "../../router/config";
-import { resolveCandidates, resolveClassifierForPreset, resolveRouting, resolveVariantSteps } from "../../router/config";
+import { configPath, resolveCandidates, resolveClassifierForPreset, resolveRouting, resolveVariantSteps, validateConfig } from "../../router/config";
 import { getActiveTiers } from "../../router/protocol";
 import { buildEscalatePolicy } from "../../escalate/ladder";
 import type { TierVariantInfo } from "../../escalate/ladder";
@@ -86,10 +87,14 @@ export interface Finding {
   readonly snippet: string | null;
   /** The OpenCode v1 spelling of a host-target snippet (`agent.title.model` / `small_model`), or `null`. */
   readonly snippetV1: string | null;
+  /** The finding concerns a tier of a bundled preset that the user has not modified (QA-2.4-5): listed in `/router`, never in a notice. */
+  readonly bundledTier: boolean;
+  /** May appear in a notice: a warning or a saving that is not about an unmodified bundled tier. */
+  readonly notify: boolean;
 }
 
-/** What a check produces: `runChecks` adds `target` (and a null `snippetV1`). */
-type RawFinding = Omit<Finding, "target" | "snippetV1"> & { readonly snippetV1?: string | null };
+/** What a check produces: `runChecks` adds `target`, `snippetV1`, `bundledTier` and `notify`. */
+type RawFinding = Omit<Finding, "target" | "snippetV1" | "bundledTier" | "notify"> & { readonly snippetV1?: string | null };
 
 /** The slice of a host `Model.Info` the checks read (structural; extra fields are ignored). */
 export interface AdvisorCatalogModel {
@@ -576,6 +581,55 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["classifier-model", classifierModel],
 ];
 
+/** The findings whose `subject` is a tier name of the active preset. */
+const TIER_SCOPED: ReadonlySet<FindingId> = new Set<FindingId>([
+  "model-not-in-catalog",
+  "no-tool-support",
+  "variant-not-offered",
+  "effort-not-offered",
+  "variant-effort",
+  "rejected-candidates",
+  "foreign-candidates",
+  "covered-tier",
+  "variant-ladder-budget",
+  "tier-agent-unavailable",
+]);
+
+function stable(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+let bundledMemo: { readonly config: RouterConfig | null } | undefined;
+
+/** The shipped `tiers.json`, validated like any config; read once per process. `null` = unreadable (a tier is then not "bundled"). */
+function bundledConfig(onError: (check: string, error: unknown) => void): RouterConfig | null {
+  if (bundledMemo === undefined) {
+    try {
+      bundledMemo = { config: validateConfig(JSON.parse(readFileSync(configPath(), "utf-8"))) };
+    } catch (error) {
+      bundledMemo = { config: null };
+      onError("bundled-preset", error); // reported once; every tier then counts as the user's own, so its findings still notify
+    }
+  }
+  return bundledMemo.config;
+}
+
+/** The tier of the ACTIVE preset is exactly what the shipped `tiers.json` defines for that preset and tier (no override touched it). */
+function isUnmodifiedBundledTier(cfg: RouterConfig, tierName: string, onError: (check: string, error: unknown) => void): boolean {
+  const live = cfg.presets[cfg.activePreset]?.[tierName];
+  const shipped = bundledConfig(onError)?.presets[cfg.activePreset]?.[tierName];
+  return live !== undefined && shipped !== undefined && stable(live) === stable(shipped);
+}
+
+/** Test seam: forget the memoized shipped config. */
+export function resetBundledConfigMemo(): void {
+  bundledMemo = undefined;
+}
+
 /**
  * Run every check. A throwing check is reported to `onError` and skipped; the rest still run. Findings come back sorted by
  * severity (warning, saving, info), then by check order, so the list is stable.
@@ -593,7 +647,11 @@ export function runChecks(
   for (const [name, check] of CHECKS) {
     try {
       for (const raw of check(input)) {
-        out.push({ finding: { ...raw, target: FINDING_TARGET[raw.id], snippetV1: raw.snippetV1 ?? null }, order: order++ });
+        const bundledTier = TIER_SCOPED.has(raw.id) && isUnmodifiedBundledTier(cfg, raw.subject, onError);
+        out.push({
+          finding: { ...raw, target: FINDING_TARGET[raw.id], snippetV1: raw.snippetV1 ?? null, bundledTier, notify: raw.severity !== "info" && !bundledTier },
+          order: order++,
+        });
       }
     } catch (error) {
       onError(name, error);
