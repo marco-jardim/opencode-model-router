@@ -1,7 +1,7 @@
 // Phase 2.1 (M6): the plugin's verdict and false-refusal call sites feed the outcome store, on v2 and only
 // when routing.engine != static. Temp directories only (HOME is redirected; outcomes path is injected).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
@@ -31,10 +31,13 @@ function setup(routing?: Record<string, unknown>): void {
   vi.stubEnv("HOME", home);
   vi.stubEnv("USERPROFILE", home);
   vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
+  // QA-2.1-4: every config, the static ones included, names an explicit empty outcomes directory, and the tests
+  // assert it stays empty. A routing block without `engine` is static.
+  mkdirSync(outcomes, { recursive: true });
   mkdirSync(dirname(overridePath()), { recursive: true });
   writeFileSync(overridePath(), JSON.stringify({
     enforcement: { verify: { testBaseline: false } },
-    ...(routing ? { routing: { outcomes: { path: outcomes }, ...routing } } : {}),
+    routing: { outcomes: { path: outcomes }, ...(routing ?? {}) },
   }));
   invalidateConfigCache();
 }
@@ -135,7 +138,7 @@ describe("false-refusal call site", () => {
     setup({ engine: "shadow" });
     const hooks = await plugin("v2");
     expect(await refusal(hooks, "unregistered")).toContain("FALSE-REFUSAL SUSPECT");
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
   });
 
   it.each([
@@ -148,7 +151,7 @@ describe("false-refusal call site", () => {
     register("refusal-child");
     expect(await refusal(hooks, "refusal-child")).toContain("FALSE-REFUSAL SUSPECT");
     await hooks.dispose();
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
   });
 });
 
@@ -174,7 +177,7 @@ describe("verification verdict call site", () => {
     const hooks = await plugin("v2", true);
     register("child");
     await verified(hooks, "child");
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
   });
 
   it.each([
@@ -186,6 +189,6 @@ describe("verification verdict call site", () => {
     register("child");
     await verified(hooks, "child");
     await hooks.dispose();
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
   });
 });

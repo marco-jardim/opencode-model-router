@@ -21,6 +21,14 @@
  *    trailing slash, a `..` segment, a different case or an 8.3 short name does
  *    not hide it) the call throws: fail fast, before anything is written.
  *
+ * The same goes for the temp directory (QA-2.1-4): `os.tmpdir()` (named export and
+ * `default`) and `TEMP`/`TMP`/`TMPDIR` point at a private temp dir per test file,
+ * removed afterwards. Code that writes under `os.tmpdir()` by default, notably the
+ * scorecard directory `<tmpdir>/opencode-model-router-trajectory` that also holds
+ * the outcome store and the decision log, can therefore never reach the real one
+ * (which a live OpenCode session may be writing to). A test that points
+ * `TEMP`/`TMP`/`TMPDIR` back at the real temp dir makes `tmpdir()` throw.
+ *
  * A test file that mocks `node:os` itself replaces this mock, and with it the
  * guard. Such a file must keep the guard by including
  * `homedir: guardedHomedir` (see `test/unit/tree.test.ts`); the `beforeEach`
@@ -34,7 +42,15 @@ const guard = vi.hoisted(() => ({
   realHome: "",
   isolatedHome: "",
   original: { HOME: undefined as string | undefined, USERPROFILE: undefined as string | undefined },
+  realTmp: "",
+  isolatedTmp: "",
+  originalTmp: {} as Record<string, string | undefined>,
 }));
+
+/** Environment variables `os.tmpdir()` reads, in the platform's own order. */
+const TMP_ENV = process.platform === "win32" ? (["TEMP", "TMP"] as const) : (["TMPDIR", "TMP", "TEMP"] as const);
+/** Holds the real temp dir for the whole process, so a later test file of the same process still knows it. */
+export const REAL_TMPDIR_ENV = "OMR_TEST_REAL_TMPDIR";
 
 const WINDOWS = process.platform === "win32";
 
@@ -96,23 +112,76 @@ export function assertHomeIsGuarded(homedir: () => string): void {
   }
 }
 
+/**
+ * The guarded `os.tmpdir()`: the TEMP/TMP/TMPDIR a test redirected (the setup itself points them at a private
+ * dir), else that private dir; throws instead of ever returning the real temp dir.
+ */
+export function guardedTmpdir(): string {
+  let resolved = guard.isolatedTmp;
+  for (const name of TMP_ENV) {
+    const value = process.env[name];
+    if (value !== undefined && value !== "") {
+      resolved = value;
+      break;
+    }
+  }
+  if (guard.realTmp !== "" && sameDir(resolved, guard.realTmp)) {
+    throw new Error(
+      `home-guard: a test resolved the real temp directory (${resolved}), which holds the live scorecard and outcome files. ` +
+        "Point TEMP/TMP/TMPDIR at a temp dir instead (see test/setup/home-guard.ts, QA-2.1-4).",
+    );
+  }
+  return resolved;
+}
+
+/** Fails when `tmpdir()` names the real temp dir; run before every test against the `os` module the file sees. */
+export function assertTmpIsGuarded(tmpdir: () => string): void {
+  const dir = tmpdir();
+  if (guard.realTmp !== "" && sameDir(dir, guard.realTmp)) {
+    throw new Error(
+      `home-guard: os.tmpdir() resolves the real temp directory (${dir}) in this test file. ` +
+        "A file that mocks node:os itself must include `tmpdir: guardedTmpdir` from test/setup/home-guard.ts (QA-2.1-4).",
+    );
+  }
+}
+
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
-  return { ...actual, homedir: guardedHomedir, default: { ...actual, homedir: guardedHomedir } };
+  return {
+    ...actual,
+    homedir: guardedHomedir,
+    tmpdir: guardedTmpdir,
+    default: { ...actual, homedir: guardedHomedir, tmpdir: guardedTmpdir },
+  };
 });
 
 // Runs once per test file, before it is imported: capture what is real.
 const realOs = await vi.importActual<typeof import("node:os")>("node:os");
 guard.realHome = realOs.homedir();
 guard.original = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
-guard.isolatedHome = mkdtempSync(join(realOs.tmpdir(), "omr-home-guard-"));
+// The real temp dir is read once per process: after the first file the environment already points at a private dir.
+guard.realTmp = process.env[REAL_TMPDIR_ENV] ?? realOs.tmpdir();
+process.env[REAL_TMPDIR_ENV] = guard.realTmp;
+guard.isolatedHome = mkdtempSync(join(guard.realTmp, "omr-home-guard-"));
+guard.isolatedTmp = mkdtempSync(join(guard.realTmp, "omr-tmp-guard-"));
+for (const name of ["TEMP", "TMP", "TMPDIR"]) {
+  guard.originalTmp[name] = process.env[name];
+  process.env[name] = guard.isolatedTmp;
+}
 
 // A dynamic import goes through the test file's own module mocks, so this sees
 // exactly the `homedir` the code under test sees.
 beforeEach(async () => {
-  assertHomeIsGuarded((await import("node:os")).homedir);
+  const os = await import("node:os");
+  assertHomeIsGuarded(os.homedir);
+  assertTmpIsGuarded(os.tmpdir);
 });
 
 afterAll(() => {
   rmSync(guard.isolatedHome, { recursive: true, force: true });
+  rmSync(guard.isolatedTmp, { recursive: true, force: true });
+  for (const [name, value] of Object.entries(guard.originalTmp)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
 });

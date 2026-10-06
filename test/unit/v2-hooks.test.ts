@@ -9,7 +9,7 @@ import { getActiveTiers } from "../../src/router/protocol";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import v2Plugin from "../../src/v2";
 import type { Plugin } from "@opencode/plugin";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
@@ -948,8 +948,11 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-ingest-"));
     const outcomes = join(home, "outcomes");
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    // QA-2.1-4: every config, the static ones included, names an explicit empty outcomes directory, and the tests
+    // assert it stays empty. A routing block without `engine` is static.
+    mkdirSync(outcomes, { recursive: true });
     mkdirSync(dirname(overridePath()), { recursive: true });
-    if (routing) writeFileSync(overridePath(), JSON.stringify({ routing: { outcomes: { path: outcomes }, ...routing } }));
+    writeFileSync(overridePath(), JSON.stringify({ routing: { outcomes: { path: outcomes }, ...(routing ?? {}) } }));
     invalidateConfigCache();
     return { home, outcomes };
   }
@@ -1038,13 +1041,16 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit({ id: "e2", type: "session.step.ended", data: { assistantMessageID: "no-session" } });
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("with no routing block (engine static) nothing is written and the catalog is never read", async () => {
-    const { home, outcomes } = routingHome();
+  it.each([
+    { name: "a routing block without an engine", routing: {} },
+    { name: "engine static", routing: { engine: "static" } },
+  ])("$name (static): nothing is written to the explicit outcomes directory and the catalog is never read", async ({ routing }) => {
+    const { home, outcomes } = routingHome(routing);
     const f = fixture();
     const model = catalog();
     const { cleanup, forgetSession } = await startPlugin(f, model, home);
@@ -1053,7 +1059,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit({ id: "i1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
     rmSync(home, { recursive: true, force: true });
   });
@@ -1066,7 +1072,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit(stepEvent("e1", "child-low", { finish: "stop" }));
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(existsSync(outcomes)).toBe(false);
+    expect(readdirSync(outcomes)).toEqual([]);
     rmSync(home, { recursive: true, force: true });
   });
 
