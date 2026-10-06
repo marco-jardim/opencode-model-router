@@ -628,6 +628,25 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     expect(pinned.args).toMatchObject({ agent: "fast" });
     expect(pinned.switched).toBe(true);
   });
+
+  it("a pinned resume is not rewritten, and its row does not claim it was sent to the running agent (QA-3.1 side note)", async () => {
+    const world = await makeWorld({ engine: "enforce" }, FLOOR("medium"));
+    await world.start();
+    await hostStart(world, "child-pin-row", { agent: "fast", prompt: SEARCH }); // lifted to medium, picked fast
+    const pinned = await hostResume(world, "child-pin-row", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it." });
+    expect(pinned.args).toMatchObject({ agent: "fast" }); // the arguments really are untouched
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, pinned: true, chosen: { agent: "fast" } });
+    expect(row!.reason.startsWith("kept:resume:running: ")).toBe(true);
+    expect(row!.reason).toContain("would be sent to @medium (not applied to a pinned dispatch)");
+    expect(row!.reason).not.toMatch(/; sent to @medium/);
+    // the unpinned resume of the same shape still says it was sent
+    await hostStart(world, "child-unpinned-row", { agent: "fast", prompt: SEARCH });
+    const unpinned = await hostResume(world, "child-unpinned-row", { agent: "fast", prompt: SEARCH });
+    expect(unpinned.args).toMatchObject({ agent: "medium" });
+    const last = (await resumeRows(world)).at(-1)!;
+    expect(last.reason).toMatch(/; sent to @medium so the host does not switch it back/);
+  });
 });
 describe("advise: input untouched, protocol and hint through the context hook", () => {
   async function adviseWorld(withEvidence: boolean) {
