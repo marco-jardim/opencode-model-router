@@ -84,7 +84,7 @@ Let it collect a period of data, read it with [`/router stats`](#outcomes-the-de
 }
 ```
 
-`/router` (the bare status view) prints the **applied** engine and the build of the running code, `router: engine=<mode> build=<version>+<sha7>`, then one `router: config notice: …` line per finding of the last config load, then the [cost doctor](#the-cost-doctor) section. With the engine live (anything but `static`) the same view ends the cost doctor section with a `Decision log:` note: a ladder-attempt row's `confidence` is the delegation's class confidence, while a dispatch row's is the class confidence scaled by the winner's evidence (`n/(n+5)`). After changing the mode, run `/router` to confirm the new one is live. A code update needs a host restart; a config change does not.
+`/router` (the bare status view) prints the **applied** engine and the build of the running code, `router: engine=<mode> build=<version>+<sha7>` (the package version and the first 7 digits of the plugin checkout's git sha, read once when the code loads; `unknown` for a checkout with no readable `.git`; a restart refreshes it, so it is the proof that a code update is live), then one `router: config notice: …` line per finding of the last config load, then the [cost doctor](#the-cost-doctor) section. With the engine live (anything but `static`) the same view ends the cost doctor section with a `Decision log:` note: a ladder-attempt row's `confidence` is the delegation's class confidence, while a dispatch row's is the class confidence scaled by the winner's evidence (`n/(n+5)`). After changing the mode, run `/router` to confirm the new one is live. A code update needs a host restart; a config change does not.
 
 **Kill switch.** Set `routing.engine` back to `static`. It takes effect on the next hot reload and stops all decisions, recording and `R:`-line changes. The outcome files stay where they are.
 
@@ -94,12 +94,12 @@ For a `subagent` call on v2 with `engine != static`, the tool hook does this bef
 
 1. **Parse and strip** the optional first-line `[route …]` directive (also `CAP:` and `VERIFY:` are handled as before).
 2. **Classify** into task facts: rules first, then the route line's typed fields, then, only when the class confidence is below `routing.minClassConfidence` and a backend is configured, the model backend, then `unknown`.
-3. **Build the candidates**: the ladder of the tier the orchestrator picked, plus the agents of `routing.roles[class]`, minus candidates the parent may not start, whose permissions do not cover `needs`, or that are below `enforcement.escalate.floorTier`.
+3. **Build the candidates**: **every router tier on the escalate ladder** (`enforcement.escalate.ladder`, default `fast → medium → heavy`; each tier contributes its rungs on the tier's own model), plus the agents of `routing.roles[class]`. Not only the tier the orchestrator picked: the pick is one of the candidates, and the others are what it is compared with. A `routing.roles` agent that is absent, hidden, primary, not permitted for the parent, or whose evaluated permissions do not cover `needs` is excluded when the ladder is built (it is not priced; the reason is kept for the log). Every router tier and every remaining role agent is **priced**; one that is below `enforcement.escalate.floorTier`, whose permissions do not cover `needs` (a router tier is checked here, not at build time), or that would be a move down on a high-risk dispatch with no detection **stays priced** (it appears in the row's `costs`) **but cannot be `best`**.
 4. **Price every candidate** with the [expected-cost formula](#the-expected-cost-formula) from the store's posteriors and measured costs.
 5. **Decide**: `best` is the cheapest eligible candidate; the decision is `kept` or `switched`.
 6. **Act by mode**: `shadow` and `advise` only log; `enforce` rewrites `event.input.agent` and `event.input.model` when the rules below allow it. The row is written either way.
 
-A dispatch that **resumes** an existing child (`task_id`/`sessionID`) is never switched by the engine in any mode (A30). Its decision is still logged with `switched: false` and a reason starting `kept:resume`. In `enforce`, a resume never moves a child away from where it runs because of the router: if the resume names the orchestrator's original pick of a child the router moved (a floor lift or an evidence switch) and the child runs another agent, the arguments are rewritten to the running agent and model (reason `kept:resume:running`), because the host would otherwise switch the child back. If the orchestrator names a different agent on purpose, that is honoured, with the floor lift applied (never below the floor). A child the registry does not know (swept, or a restart) or one that belongs to another orchestrator is left as the orchestrator named it, and a pinned resume is never rewritten. `shadow` and `advise` leave the arguments alone and say in the row what `enforce` would do.
+A dispatch that **resumes** an existing child (`task_id`/`sessionID`) is never switched by the engine in any mode (A30). Its decision is still logged with `switched: false` and a reason starting `kept:resume`. In `enforce`, a resume never moves a child away from where it runs because of the router: if the resume names the orchestrator's original pick of a child the router moved (a floor lift or an evidence switch) and the child runs another agent, the arguments are rewritten to the running agent and model (reason `kept:resume:running`), because the host would otherwise switch the child back. If the orchestrator names a different agent on purpose, that is honoured, with the floor lift applied (never below the floor): **that is the one case where a resume is switched, and it is policy, not the engine**: in `enforce` such a row has `switched: true` and a reason starting `lift:floor` (counted on the `Floor lifts` line, outside the enforced-switch counts). A child the registry does not know (swept, or a restart) or one that belongs to another orchestrator is left as the orchestrator named it, and a pinned resume is never rewritten. `shadow` and `advise` leave the arguments alone and say in the row what `enforce` would do.
 
 ### The route line
 
@@ -117,7 +117,7 @@ The orchestrator (or `/annotate-plan`) may describe the work in one line:
 
 ### The generated `R:` line and the hint
 
-In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 recorded outcomes**, so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. The per-turn hint classifies the latest user message with the rules classifier only (a hint never costs a model call), is at most two lines (`Route hint: for <class> work like this turn, prefer @<agent> (<description>) over @<chosen>.` and `Why: …`) and appears only when the kernel would switch, so it never contradicts the `R:` line. It is a separate system part, so the protocol prefix stays cacheable, but the hint part changes with each user turn.
+In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 effective outcomes for that class** (see [When `enforce` switches](#when-enforce-switches-a-dispatch) for what "effective" means), so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. The per-turn hint classifies the latest user message with the rules classifier only (a hint never costs a model call), is at most two lines (`Route hint: for <class> work like this turn, prefer @<agent> (<description>) over @<chosen>.` and `Why: …`) and appears only when the kernel would switch, so it never contradicts the `R:` line. It is a separate system part, so the protocol prefix stays cacheable, but the hint part changes with each user turn.
 
 ### `/annotate-plan`
 
@@ -131,7 +131,7 @@ In `advise` and `enforce` the taxonomy line of the delegation protocol is replac
 
 ## The expected-cost formula
 
-For candidate `k`, whose successor on its ladder is `next(k)` (the next variant of the same model, then the next model; after the last rung the successor is "give up"):
+For candidate `k`, where `next(k)` is the next attempt the cascade makes when the attempt on `k` fails (a retry, a variant step, then the next tier; after the last attempt the successor is "give up"):
 
 ```text
 C(k) = c_k + tax_k + (1 − p_k) · [ d · C(next(k)) + (1 − d) · U ]
@@ -145,29 +145,48 @@ C(k) = c_k + tax_k + (1 − p_k) · [ d · C(next(k)) + (1 − d) · U ]
 | `d` | Probability that a wrong result is **caught** (so the cascade continues): `routing.detection.deterministic` (0.95) when a deterministic `[acceptance]` check is present, `grader` (0.7) when an LLM grader is scheduled, `none` (0.3) otherwise. |
 | `U` | Cost of giving up or shipping a wrong result, by `routing.profile` and the task's risk, in units where `fast = 1`: `frugal` {low 3, medium 8, high 20}, `balanced` {5, 15, 40}, `safe` {10, 30, 100}. |
 
-The kernel does not use a fixed `next(k)` chain for the router tiers: it prices them by **simulating the runner** (`buildEscalatePolicy` and the ladder functions, including retries, `maxTotalAttempts`, the cost ceiling and skipped covered tiers), so the figures below are the plain cascade, which is what the simulation reduces to when each tier has one rung and one attempt.
+For the router tiers `next(k)` is **not** a fixed chain of tiers: the kernel prices each tier by **simulating the runner** (`buildEscalatePolicy` and the ladder functions: retries, variant steps, `maxTotalAttempts`, the cost ceiling and skipped covered tiers) and evaluating the formula over the attempts the runner would actually make, each attempt with the posterior of the rung it runs on. A native agent's cascade is its own model, then the owning tier's rungs, then the next router tier.
 
 ### Worked example
 
-A `medium`-owned task (`implement`, risk `medium`), `balanced` profile (`U = 15`), a grader-checked dispatch (`d = 0.7`), tiers priced by `costRatio` (1, 5, 20), no measured tax. The orchestrator picked `@medium`.
+Every assumption is stated, and the figures are the output of the real kernel (`buildLadder` and `decide`), pinned by `test/unit/docs-drift.test.ts`:
 
-With **priors only** (fast one rank below: `p = 0.55`; medium `p = 0.80`; heavy one rank above: `p = 0.85`):
+- **Policy:** the default escalate policy: ladder `fast → medium → heavy`, `maxAttemptsPerTier: 1` (**one retry** in the same tier before escalating), `maxTotalAttempts: 4`, cost ceiling 4× the first attempt; no model catalog, so no variant steps.
+- **Candidates:** `roles: {}`, so only the three router tiers: `fast` = `claude-sonnet-5-5#low` (`costRatio` 1), `medium` = `claude-sonnet-5-5#medium` (5), `heavy` = `claude-opus-5-5#xhigh` (20). Tiers are priced by `costRatio` (no USD), no measured tax.
+- **The task:** class `implement` (static tier `medium`), risk `medium`, `balanced` profile (`U = 15`), a grader-checked dispatch (`d = 0.7`), class confidence 1. The orchestrator picked `@medium`.
+
+The attempts the runner makes when every attempt fails and the failure is caught (the 4× ceiling ends each cascade):
+
+| Start | Attempts |
+|---|---|
+| `fast` | `fast`, `fast` (the retry), `medium` |
+| `medium` | `medium`, `medium`, `heavy` |
+| `heavy` | `heavy`, `heavy` |
+
+With **priors only** (`fast` one rank below the class's static tier: `p = 0.55`; `medium` `p = 0.80`; `heavy` one rank above: `p = 0.85`), evaluated from the last attempt backwards:
 
 ```text
-C(heavy)  = 20 + (1 − 0.85) · 15                                   = 22.25
-C(medium) =  5 + (1 − 0.80) · [0.7 · 22.25 + 0.3 · 15]             =  9.015
-C(fast)   =  1 + (1 − 0.55) · [0.7 ·  9.015 + 0.3 · 15]            =  5.865
+heavy:  last attempt   20 + 0.15 · 15                        = 22.250
+        first          20 + 0.15 · [0.7 · 22.250 + 0.3 · 15] = 23.011       C(heavy)  = 23.011
+medium: third (heavy)  22.250
+        second          5 + 0.20 · [0.7 · 22.250 + 0.3 · 15] =  9.015
+        first           5 + 0.20 · [0.7 ·  9.015 + 0.3 · 15] =  7.162       C(medium) =  7.162
+fast:   third (medium)  5 + 0.20 · 15                        =  8.000
+        second          1 + 0.45 · [0.7 ·  8.000 + 0.3 · 15] =  5.545
+        first           1 + 0.45 · [0.7 ·  5.545 + 0.3 · 15] =  4.772       C(fast)   =  4.772
 ```
 
-`@fast` is cheaper than the pick by far more than the margin (`5.865 < 0.8 · 9.015 = 7.212`), but **priors alone never move a dispatch down** (A24, A27): `@fast` has no outcomes yet, so it is not eligible as `best`. The decision is `kept` with reason `evidence`, and the cheapest unevidenced option is written to the row's `trace.argmin`.
+The margin threshold is `0.8 · C(medium) = 0.8 · 7.162 = 5.730`. `@fast` (4.772) is below it, but **priors alone never move a dispatch down** (A24, A27): `@fast` has no outcomes yet, so it is not eligible as `best`. The decision is `kept` with reason `evidence`, and the cheapest unevidenced option, `@fast`, is written to the row's `trace.argmin`.
 
-After `@fast` has been tried on this class and 10 of 12 attempts passed verification, its posterior is `Beta(2.75 + 10, 2.25 + 2)` = `Beta(12.75, 4.25)`, `p = 0.75`:
+After `@fast` has been tried on this class and 10 of 12 attempts passed verification, its posterior is `Beta(2.75 + 10, 2.25 + 2)` = `Beta(12.75, 4.25)`, `p = 0.75`. Only `fast`'s cascade changes:
 
 ```text
-C(fast) = 1 + (1 − 0.75) · [0.7 · 9.015 + 0.3 · 15] = 3.703
+fast:   third (medium)  8.000
+        second          1 + 0.25 · [0.7 ·  8.000 + 0.3 · 15] =  3.525
+        first           1 + 0.25 · [0.7 ·  3.525 + 0.3 · 15] =  2.742       C(fast)   =  2.742
 ```
 
-`3.703 < 7.212`, the candidate has at least 5 outcomes, and, if the class confidence, permissions and floor allow it, `enforce` sends this dispatch to `@fast`. In `advise` the orchestrator is told so in a `Route hint`; in `shadow` the row records `switched: true` and nothing else happens.
+`2.742 < 5.730`, and the candidate now has at least 5 effective outcomes, so, if the class confidence, permissions and floor allow it, `enforce` sends this dispatch to `@fast`. In `advise` the orchestrator is told so in a `Route hint`; in `shadow` the row records `switched: true` and nothing else happens.
 
 ## Cost units and zero-cost models
 
@@ -187,7 +206,7 @@ C(fast) = 1 + (1 − 0.75) · [0.7 · 9.015 + 0.3 · 15] = 3.703
 2. The task facts' confidence is at least `routing.minClassConfidence` (0.7). Below it, the engine does not read the store for that dispatch at all.
 3. The candidate agent's **evaluated** permissions cover `needs` (never inferred from the agent id; `grants` count unconditional allows only, so an agent with `bash: ask` never covers `shell`), and the parent is allowed to start it.
 4. The candidate is not below `enforcement.escalate.floorTier`.
-5. **Evidence gate.** A candidate is eligible as `best` only if it has at least 5 recorded outcomes for the class, or ranks strictly above the orchestrator's pick. The gate filters the candidate set *before* the argmin (A27). The unfiltered argmin is logged in the row's `trace.argmin` when it differs from `best`. Priors alone never move a dispatch down or sideways.
+5. **Evidence gate.** A candidate is eligible as `best` only if it has at least **5 effective outcomes on its own key** (`class × agent × model#variant`), or ranks strictly above the orchestrator's pick. *Effective* means the recorded verdicts and false refusals after decay: each outcome loses weight with a half-life of `routing.outcomes.halfLifeDays` (14), and one key holds at most `routing.outcomes.maxEffectiveSamples` (50). Five outcomes recorded weeks ago can therefore count for fewer than 5, and outcomes on other keys (another class, another model or variant) do not count. The gate filters the candidate set *before* the argmin (A27). The unfiltered argmin is logged in the row's `trace.argmin` when it differs from `best`. Priors alone never move a dispatch down or sideways.
 6. **Never down on high risk without detection:** a dispatch with `risk == high` and `d == none` is never moved to a lower rank.
 7. The prompt does not carry `pin`, and the dispatch is not a resume.
 
@@ -295,7 +314,7 @@ What a classifier backend may send off your machine is bounded by D14, and by tr
   - an **env-style name**: `…_TOKEN`, `…_SECRET`, `…_PASSWORD`, `…_PASSWD`, `…_API_KEY`, `…_ACCESS_KEY`, `…_PRIVATE_KEY`, `…_CREDENTIAL(S)`, or any upper-case name ending in `_KEY` (`OPENAI_KEY`), with or without a value;
   - a reference to a **`.env` file**;
   - a **PEM header** (`-----BEGIN … PRIVATE KEY`, `-----BEGIN … CERTIFICATE`);
-  - anything the **scrubber would redact** by shape (a named assignment, "password is …", URL credentials, `Authorization:` headers, `curl -u`, provider token shapes, a long hex run). The scrubber's entropy-only guess (a commit hash, a long identifier) does **not** skip the backend: the redacted state is sent.
+  - anything the **scrubber would redact** by shape (a named assignment, "password is …", URL credentials, `Authorization:` headers, `curl -u`, `mysql -p…`, provider token shapes). A redaction that is only the scrubber's **entropy guess**, such as a long hex run (a commit hash) or another long random-looking identifier, does **not** skip the backend: the text is redacted and the redacted state is still sent.
 
   The dispatch is then classified by rules only, no backend call is made, and the row's `trace.backendSkipped` is `"credentials"`. This is a policy, not a defect: it errs on the side of not sending, so a task that merely **mentions** a token or a key is not sent to a model backend either. If many of your dispatches mention these words, expect `trace.backendSkipped` on their rows and rules-only classes for them.
 - **Known limits of the scrubber** (accepted, QA-1.2-34/35/36): lowercase and camelCase key names are not redacted by shape (a credential *word* around them still trips the gate); the redaction of guessed secrets does not skip the backend; a 32+ character secret made only of letters is not redacted by the entropy rule (a credential word near it is). Do not send task text that holds secrets to a backend you do not control, and prefer a local backend (Ollama) for `enforce`.
@@ -315,7 +334,7 @@ What a classifier backend may send off your machine is bounded by D14, and by tr
 
 - `roles: {}` disables native candidates. A `roles` you write replaces the default as a whole (no per-class merge, also across override layers).
 - A native or user agent is a candidate with, as rungs, **its own configured model first** (from the host's agent list; for example the owner's `agent.explore.model = anthropic/claude-haiku-4-5`), then the rungs of the router tier that owns the class in the static taxonomy, applied by a per-call `model` override. An agent without a configured model gets an own-model rung on the parent's model.
-- A candidate must be `mode != primary`, not `hidden`, and permitted for the parent. The permission filter reads the agent's **evaluated** permissions against the task's `needs`: with the host's native permissions `explore` is read-only (`glob`, `grep`, `read`, `webfetch`, `websearch`) and is excluded when `needs` contains `shell` or `edit`; `general` has the full set. The host re-checks permissions after the hook rewrites `agent` (`Subagent denied: …`), so the filter runs before any swap.
+- A candidate must be `mode != primary`, not `hidden`, and permitted for the parent. The permission filter reads the agent's **evaluated** permissions against the task's `needs`: with the host's native permissions `explore` is read-only (`glob`, `grep`, `read`, `subagent`, `webfetch`, `websearch`) and is excluded when `needs` contains `shell` or `edit`; `general` has the full set. The host re-checks permissions after the hook rewrites `agent` (`Subagent denied: …`), so the filter runs before any swap.
 - The built-in agents `build`, `plan`, `title`, `summary` and `compaction` cannot be subagents; naming one is accepted and noticed, and the engine skips it.
 - **No nested delegation, ever.** The plugin never raises the host's `subagent_depth`; the delegation depth guard stays as it is.
 - Priors for a native agent come from the rank it inherits: the role it is listed under, or the matching rung's rank when its own model equals a preset rung (the lower of the two).
@@ -330,7 +349,7 @@ The ladder is what happens **after** a failed verification of a `delegate` dispa
 - **Where the ladder comes from.** Explicit `candidates` of the tier, else the catalog's variants of the tier's model. A catalog ladder is capped at `enforcement.escalate.effortBumpMax` (default `xhigh`) **independently of `effortBump`**, so with the default the live `claude-haiku-4-5` ladder loses `max`; explicit `candidates` are not capped. Set `effortBumpMax: "max"` or list `max` in `candidates` to use it.
 - **Budget reserve (A17, A17a).** When variant steps are on, a variant step or a plain retry is taken only if `maxTotalAttempts − totalAttempts − 1 ≥ H`, `H` being the number of ladder tiers above the current one; otherwise the ladder escalates. The reserve applies only when variant steps are enabled for the session. Every action carries the `costRatio` of the rung it runs and the runner charges that, not the tier's base ratio.
 - **No repeats.** The ladder records the highest rung run per model and never re-runs a `(model, variant)` that already failed in the same ladder. An escalation into a tier whose base is already covered enters at the first rung above the one reached, or skips the tier when none exists. A same-model tier is skipped only when it has no variant above the reached one.
-- **A tier with both `variant` and `effort`/`thinking`/`reasoning` (A20)** stays on the effort-bump path only (an empty variant ladder), so effort is never delivered twice. The cost doctor reports it (`variant-effort`) and suggests dropping `effort` and listing `candidates`. On the bundled `anthropic` and `hybrid-2` presets the medium and heavy tiers carry `effort`, so variant steps and cross-tier resume exist only on tiers without it.
+- **A tier with both `variant` and `effort`/`thinking`/`reasoning` (A20)** stays on the effort-bump path only (an empty variant ladder), so effort is never delivered twice. The cost doctor reports it (`variant-effort`) and suggests dropping `effort` and listing `candidates`. On the bundled `anthropic` preset **every** tier carries `effort` (`fast` `low`, `medium` `medium`, `heavy` `xhigh`), so that preset has **no variant steps and no cross-tier resume** until you drop `effort` and list `candidates`. On `hybrid-2` the `medium` and `heavy` tiers carry `effort` and the `fast` tier does not, so only its `fast` tier has variant steps.
 - **`variantSteps: "none"`** disables variant steps **and** session resume: every attempt is a fresh child, exactly as in `2.2.0`.
 
 **Resume or start fresh (D11, A5, A29).** A retry or escalation **resumes** the child session (`sessionID`, plus `model`, plus `agent` when the role changes; history is kept) when
@@ -391,7 +410,7 @@ Both print the same table for a time window and produce the same text for the sa
 | `Orchestrator resumes` | `task_id`/`sessionID` dispatches. A resume is never switched, so it is **outside every routing metric** (agreement, switched, savings, per-class and per-key dispatch counts, the evidence gate) and reported only here; its verdict still counts for the key the child ran on. |
 | `Kept for lack of evidence` | Fresh routed dispatches whose decision was `kept` for reason `evidence` (A27). |
 
-Below the table: **By class**, **By key** (dispatches, attempts, pass/fail/unverifiable, pass rate, false refusals and refusal rate, USD per attempt over the key's lifetime), **Gated by evidence (`trace.argmin`)** and **Resume vs fresh** (`variant`, `retry`, `escalate` rows). The `trace.argmin` table counts every row in which a cheaper candidate without evidence existed, **including rows where the chosen dispatch was best anyway**, so it is not the same quantity as `Kept for lack of evidence`. The script prints notes (no outcome data, skipped lines, a rotated log) on stderr; `/router stats` appends them after the table.
+Below the table: **By class**, **By key** (dispatches, attempts, pass/fail/unverifiable, pass rate, false refusals and refusal rate, USD per attempt over the key's lifetime; **these are raw lifetime counts of the window's rows and the store, not the decayed effective counts of the evidence gate**, so a key can show 5 attempts and still be below the gate), **Gated by evidence (`trace.argmin`)** and **Resume vs fresh** (`variant`, `retry`, `escalate` rows). The `trace.argmin` table counts every row in which a cheaper candidate without evidence existed, **including rows where the chosen dispatch was best anyway**, so it is not the same quantity as `Kept for lack of evidence`. The script prints notes (no outcome data, skipped lines, a rotated log) on stderr; `/router stats` appends them after the table.
 
 ## The cost doctor
 
@@ -432,7 +451,7 @@ Suggestions come from the live catalog only and never from hard-coded model ids 
 
 OpenCode v1 is unchanged in every mode (D1). With no `routing` block nothing differs from `2.2.0`, byte for byte (the v1 goldens pin it). With a `routing` block on v1:
 
-- the block is parsed and validated; `routing.engine` is coerced to `static` with one log line per process, `[model-router] routing.engine ignored on OpenCode v1`; `variantSteps` is ignored; nothing is recorded; there is no cost doctor and no `/router stats`.
+- the block is parsed and validated; `routing.engine` is coerced to `static` with one log line per process, `[model-router] routing.engine ignored on OpenCode v1`; `variantSteps` is ignored; nothing is recorded; there is no cost doctor. `/router stats` (listed only when the config has a `routing` block) still runs on v1, but there is no live store to flush: it reads only what an earlier v2 run left in the outcomes directory, and prints nothing new from v1 itself.
 - **One opt-in effect (A28): the roles line.** When you set `routing.roles` explicitly on v1 and name at least one agent that is a subagent, not hidden and available, the static `R:` line gets a ` | by class: c→@agent` suffix listing those agents as destinations for their classes. It is prose only: no model override, no engine. The agent list comes from the host's `client.app.agents()`, cached for 60 s and fetched only when `roles` is set; on a failure the line stays the shipped one. The first turn after start has no roles line (the list is fetched in the background); it appears from the second turn. `roles: {}` means "no roles": nothing is fetched and nothing changes.
 - `/annotate-plan` adds nothing for the engine on v1 (and none under `static`): `[route …]` lines are emitted only where the engine will strip and honour them.
 
@@ -459,4 +478,4 @@ OpenCode v1 is unchanged in every mode (D1). With no `routing` block nothing dif
 | `/router stats`, `/annotate-plan`, the v1 roles line | `src/routing/commands/` |
 | Variant ladder and resume planning | `src/escalate/ladder.ts`, `variants.ts`, `resume.ts` |
 
-The v2 adapter hands the plugin three things it did not have before, through the legacy plugin context built in `src/v2.ts`: `routerAgents` (the host's agent list for the dispatching location), `routerGenerate` (the host's `generate` call, present only when the host has one; the `host` classifier backend uses it) and `routerSynthetic` (the call that writes a synthetic transcript entry; the cost doctor's notice uses it). A host without them gets log lines or no feature, never an error.
+The v2 adapter passes the plugin these host hooks through the legacy plugin context built in `src/v2.ts` (alongside the older `routerChildRunner`, the delegate runner's host client): `routerCatalog` (the host's model catalog for the dispatching location, read for prices, variants and limits), `routerAgents` (the host's agent list for that location), `routerGenerate` (the host's `generate` call, present only when the host has one; the `host` classifier backend uses it), `routerSynthetic` (the call that writes a synthetic transcript entry; the cost doctor's notice uses it), `routerOnIngest` (hands the plugin's single telemetry ingest back to the adapter, so the event loop feeds the instance that also receives the verdicts) and `routerHost` (`"v2"`, which is how the plugin knows which host it runs on). A host without them gets log lines or no feature, never an error.
