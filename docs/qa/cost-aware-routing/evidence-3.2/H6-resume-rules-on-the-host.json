@@ -1,0 +1,233 @@
+{
+  "scenario": "H6-resume-rules-on-the-host",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "f9c780d6-2579-4f90-846a-96e843570b82",
+  "recordedAt": "2026-10-06T21:46:56.058Z",
+  "harness": {
+    "headSha": "3be0dddec4428a1364fa9dc43fafb4efb4b3a815",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "5f7ddf341dc79a9b3497e0849d44b6f6e25c0afe",
+      "test/smoke/helpers/routing-host.ts": "610d5c0e7fc56494aeae1c27021031b56700f8cf"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "On a real host with escalate.floorTier=medium in enforce: (1) a fast dispatch is lifted to medium and the host's child runs medium/sonnet#medium; (2) a resume naming the original pick `fast` is rewritten to `medium` (row reason kept:resume:running) and the host's child STAYS medium; (3) a resume naming `heavy` on purpose is honoured: the host's switchAgent moves the child to heavy AND to heavy's model; (4) a resume naming `fast` is lifted to the floor (medium), never below it; (5) a PINNED resume naming `fast` is not rewritten and the host moves the child to fast/sonnet#low (the behaviour the rule protects against); (6) what the host does with a resume of a session that is not a child of the caller, and with an agent the session's permissions deny, is recorded.",
+  "observed": {
+    "steps": [
+      {
+        "name": "1 fresh fast (lifted)",
+        "asked": {
+          "agent": "fast"
+        },
+        "hookInput": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium"
+        },
+        "status": "completed",
+        "hostChild": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_eecd15e25ffezK8FDs69FRsheN"
+        },
+        "childID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+      },
+      {
+        "name": "2 resume naming the original pick",
+        "asked": {
+          "agent": "fast",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "hookInput": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "status": "completed",
+        "hostChild": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_eecd15e25ffezK8FDs69FRsheN"
+        },
+        "childID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+      },
+      {
+        "name": "3 resume naming heavy on purpose",
+        "asked": {
+          "agent": "heavy",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "hookInput": {
+          "agent": "heavy",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "status": "completed",
+        "hostChild": {
+          "agent": "heavy",
+          "model": "anthropic/claude-opus-5-5#xhigh",
+          "parentID": "ses_eecd15e25ffezK8FDs69FRsheN"
+        },
+        "childID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+      },
+      {
+        "name": "4 resume naming fast after heavy",
+        "asked": {
+          "agent": "fast",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "hookInput": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "status": "completed",
+        "hostChild": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_eecd15e25ffezK8FDs69FRsheN"
+        },
+        "childID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+      },
+      {
+        "name": "5 pinned resume naming fast",
+        "asked": {
+          "agent": "fast",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "hookInput": {
+          "agent": "fast",
+          "sessionID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+        },
+        "status": "completed",
+        "hostChild": {
+          "agent": "fast",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_eecd15e25ffezK8FDs69FRsheN"
+        },
+        "childID": "ses_eecd15ca3ffet4drlb6kyNbYpW"
+      },
+      {
+        "name": "6a resume of another root's child",
+        "status": "error",
+        "error": {
+          "string": "Tool.Error: Session ses_eecd15ca3ffet4drlb6kyNbYpW is not a child of the current session",
+          "props": {
+            "message": "Session ses_eecd15ca3ffet4drlb6kyNbYpW is not a child of the current session",
+            "_tag": "Tool.Error"
+          }
+        },
+        "hostChildAfter": {
+          "agent": "fast",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_eecd15e25ffezK8FDs69FRsheN"
+        }
+      },
+      {
+        "name": "6b resume naming an agent the session denies",
+        "status": "error",
+        "error": {
+          "string": "Tool.Error: Subagent denied: heavy",
+          "props": {
+            "message": "Subagent denied: heavy",
+            "_tag": "Tool.Error",
+            "error": {
+              "_tag": "Permission.BlockedError"
+            }
+          }
+        },
+        "hookInput": {
+          "agent": "heavy"
+        },
+        "hostChildAfter": {
+          "agent": "medium",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_eecd1555effenCxmr5wEKbRgKm"
+        }
+      }
+    ],
+    "rows": [
+      {
+        "session": "root1",
+        "resume": false,
+        "childSessionID": null,
+        "chosen": "fast",
+        "best": "medium",
+        "switched": true,
+        "pinned": false,
+        "reason": "lift:floor: dispatch lifted from @fast to @medium by enforcement.escalate.floorTier; engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (5.7867 ratio) [the pick is below floorTier (rank 0 < 1); its cost is that of the floor path th"
+      },
+      {
+        "session": "root1",
+        "resume": true,
+        "childSessionID": "child1",
+        "chosen": "fast",
+        "best": "fast",
+        "switched": false,
+        "pinned": false,
+        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; sent to @medium so the host does not switch it back (A30); engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.024 "
+      },
+      {
+        "session": "root1",
+        "resume": true,
+        "childSessionID": "child1",
+        "chosen": "heavy",
+        "best": "heavy",
+        "switched": false,
+        "pinned": false,
+        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:evidence: kept: the cheapest option search|router:medium|anthropic/claude-sonnet-5-5#medium (0.0245 usd, rank 1, the pick is rank 2) needs ≥ 5 r"
+      },
+      {
+        "session": "root1",
+        "resume": true,
+        "childSessionID": "child1",
+        "chosen": "fast",
+        "best": "medium",
+        "switched": true,
+        "pinned": false,
+        "reason": "lift:floor: resume lifted from @fast to @medium by enforcement.escalate.floorTier (the child runs @heavy); engine decision: kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:best-is-chosen: kept"
+      },
+      {
+        "session": "root1",
+        "resume": true,
+        "childSessionID": "child1",
+        "chosen": "fast",
+        "best": "fast",
+        "switched": false,
+        "pinned": true,
+        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast); engine decision: kept:pinned: kept: pinned dispatch (best se"
+      },
+      {
+        "session": "root2",
+        "resume": true,
+        "childSessionID": "child1",
+        "chosen": "medium",
+        "best": "medium",
+        "switched": false,
+        "pinned": false,
+        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0264 usd)"
+      },
+      {
+        "session": "root3",
+        "resume": false,
+        "childSessionID": null,
+        "chosen": "fast",
+        "best": "medium",
+        "switched": true,
+        "pinned": false,
+        "reason": "lift:floor: dispatch lifted from @fast to @medium by enforcement.escalate.floorTier; engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0264 usd) [the pick is below floorTier (rank 0 < 1); its cost is that of the floor path the "
+      },
+      {
+        "session": "root3",
+        "resume": true,
+        "childSessionID": "ses_eecd154d7ffe8eeB2yEgZh20VR",
+        "chosen": "heavy",
+        "switched": false,
+        "pinned": false,
+        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:no-candidates: kept: no candidate could be priced"
+      }
+    ],
+    "hostErrors": [],
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: fresh fast -> medium; resume naming fast -> medium; resume naming heavy -> heavy/anthropic/claude-opus-5-5#xhigh; resume naming fast after heavy -> medium; pinned resume naming fast -> fast/anthropic/claude-sonnet-5-5#low; foreign resume status error; denied resume status error",
+  "notes": []
+}

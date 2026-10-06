@@ -298,12 +298,13 @@ export class RoutingProvider {
 export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync} from 'node:fs';
 const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify({...x,__t:Date.now()})+'\\n');
 const clone=(x)=>{try{return structuredClone(x);}catch{return {unclonable:String(x)};}};
+const ser=(error)=>{try{return {string:String(error),props:JSON.parse(JSON.stringify(error,Object.getOwnPropertyNames(error).filter(k=>k!=='stack')))};}catch{return {string:String(error)};}};
 export default {id:'routing-smoke-probe',async setup(ctx){
  const instance=ctx.location&&ctx.location.directory;
  const iid=Math.random().toString(36).slice(2,8);
  log('SMOKE_EVENTS',{type:'probe.instance.started',__instance:instance,__iid:iid});
  await ctx.tool.hook('execute.before',e=>{log('SMOKE_HOOKS',{hook:'before',iid,instance,sessionID:e.sessionID,callID:e.id,agent:e.agent,tool:e.tool,input:clone(e.input)});});
- await ctx.tool.hook('execute.after',e=>{log('SMOKE_HOOKS',{hook:'after',iid,instance,sessionID:e.sessionID,callID:e.id,agent:e.agent,tool:e.tool,status:e.status,result:e.status==='completed'?clone(e.result):undefined,error:e.status==='error'?clone(e.error):undefined});});
+ await ctx.tool.hook('execute.after',e=>{log('SMOKE_HOOKS',{hook:'after',iid,instance,sessionID:e.sessionID,callID:e.id,agent:e.agent,tool:e.tool,status:e.status,result:e.status==='completed'?clone(e.result):undefined,error:e.status==='error'?ser(e.error):undefined});});
  await ctx.session.hook('http.request',e=>{
   e.request.headers.set('x-proof-session',e.sessionID);
   e.request.headers.set('x-proof-agent',e.agent??'aux');
@@ -554,8 +555,8 @@ export class RoutingHost {
   async dump(): Promise<Obj | undefined> { return existsSync(this.logs.dump) ? obj(JSON.parse(await readFile(this.logs.dump, "utf8"))) : undefined; }
 
   /** The scripted root orchestrator: a root session on the scripted model with a session-level allow-all (no `ask` can block headless). */
-  async newRoot(title: string, model: ModelRef = this.options.rootModel ?? ROOT_MODEL, directory: string = this.project): Promise<string> {
-    return (await this.client.session.create({ agent: "build", model, title, location: { directory }, permissions: [{ action: "*", resource: "*", effect: "allow" }] })).id;
+  async newRoot(title: string, model: ModelRef = this.options.rootModel ?? ROOT_MODEL, directory: string = this.project, permissions: Rule[] = [{ action: "*", resource: "*", effect: "allow" }]): Promise<string> {
+    return (await this.client.session.create({ agent: "build", model, title, location: { directory }, permissions })).id;
   }
 
   /** Prompts the root so that its scripted model emits one tool call; waits for the matching execute.after and for the root to go idle. */
@@ -567,7 +568,7 @@ export class RoutingHost {
     if (!before) throw new Error(`no execute.before record for ${after.callID}`);
     await this.settle(rootID);
     const output = obj(obj(after.result).output);
-    const failed = /sessionID: (ses_[A-Za-z0-9]+)/.exec(String(obj(after.error).message ?? ""))?.[1];
+    const failed = /sessionID: (ses_[A-Za-z0-9]+)/.exec(String(obj(after.error).string ?? ""))?.[1];
     return { before, after, callID: after.callID, childID: str(output.sessionID) ?? failed };
   }
   /** `call("subagent", …)` that must identify exactly one child (from the result, or from a parent with exactly one child). */

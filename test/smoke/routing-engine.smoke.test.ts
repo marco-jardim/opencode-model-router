@@ -15,7 +15,7 @@
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { makeKey } from "../../src/routing/outcomes";
+import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
 import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
 import type { RouterConfig } from "../../src/router/config";
 import {
@@ -483,7 +483,57 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
-  }, 300_000);});
+  }, 300_000);
+  it("H6 resume: floor lift, kept:resume:running, an honoured agent switch, a pinned resume, a non-child resume and a denied agent (A30 amended)", async () => {
+    const host = await RoutingHost.start("resume", { routing: { engine: "enforce" }, overrides: { enforcement: { escalate: { floorTier: "medium" } } } });
+    try {
+      await runScenario("H6-resume-rules-on-the-host", "On a real host with escalate.floorTier=medium in enforce: (1) a fast dispatch is lifted to medium and the host's child runs medium/sonnet#medium; (2) a resume naming the original pick `fast` is rewritten to `medium` (row reason kept:resume:running) and the host's child STAYS medium; (3) a resume naming `heavy` on purpose is honoured: the host's switchAgent moves the child to heavy AND to heavy's model; (4) a resume naming `fast` is lifted to the floor (medium), never below it; (5) a PINNED resume naming `fast` is not rewritten and the host moves the child to fast/sonnet#low (the behaviour the rule protects against); (6) what the host does with a resume of a session that is not a child of the caller, and with an agent the session's permissions deny, is recorded.", async s => {
+        const rootID = await host.newRoot("resume root");
+        const state = async (childID: string) => { const c = await host.client.session.get({ sessionID: childID }); return { agent: c.agent, model: c.model ? ref(c.model) : undefined, parentID: c.parentID }; };
+        const steps: Obj[] = [];
+        const record = async (name: string, input: Obj, childID?: string) => {
+          const d = await host.dispatch(rootID, { description: `H6 ${name}`, background: false, ...input, ...(childID ? { sessionID: childID } : {}) });
+          const after = await state(d.childID);
+          steps.push({ name, asked: { agent: input.agent, sessionID: childID }, hookInput: { agent: obj(d.before.input).agent, model: obj(d.before.input).model, sessionID: obj(d.before.input).sessionID }, status: d.after.status, hostChild: after, childID: d.childID });
+          return { d, after };
+        };
+        const first = await record("1 fresh fast (lifted)", { agent: "fast", prompt: SEARCH_PROMPT });
+        const childID = first.d.childID;
+        const keep = await record("2 resume naming the original pick", { agent: "fast", prompt: SEARCH_PROMPT }, childID);
+        const up = await record("3 resume naming heavy on purpose", { agent: "heavy", prompt: SEARCH_PROMPT }, childID);
+        const down = await record("4 resume naming fast after heavy", { agent: "fast", prompt: SEARCH_PROMPT }, childID);
+        const pinned = await record("5 pinned resume naming fast", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it again." }, childID);
+        // a session that is not a child of the caller
+        const otherRoot = await host.newRoot("resume root 2");
+        const foreign = await host.call(otherRoot, "subagent", { agent: "medium", description: "H6 foreign resume", prompt: SEARCH_PROMPT, sessionID: childID, background: false });
+        const afterForeign = await state(childID);
+        steps.push({ name: "6a resume of another root's child", status: foreign.after.status, error: foreign.after.error, resultSessionID: foreign.childID, hostChildAfter: afterForeign });
+        // an agent the session's permissions deny
+        const denyRoot = await host.newRoot("resume root 3", undefined, undefined, [{ action: "*", resource: "*", effect: "allow" }, { action: "subagent", resource: "heavy", effect: "deny" }]);
+        const denyFirst = await host.dispatch(denyRoot, { agent: "fast", description: "H6 deny start", prompt: SEARCH_PROMPT, background: false });
+        const denied = await host.call(denyRoot, "subagent", { agent: "heavy", description: "H6 deny resume", prompt: SEARCH_PROMPT, sessionID: denyFirst.childID, background: false });
+        const afterDenied = await state(denyFirst.childID);
+        steps.push({ name: "6b resume naming an agent the session denies", status: denied.after.status, error: denied.after.error, hookInput: { agent: obj(denied.before.input).agent, model: obj(denied.before.input).model }, hostChildAfter: afterDenied });
+        const rows = await host.waitForRows("every decision row", r => r.length >= 8, 90_000);
+        s.observed.steps = steps;
+        s.observed.rows = rows.map(r => ({ session: r.sessionID === rootID ? "root1" : r.sessionID === otherRoot ? "root2" : "root3", resume: r.resume, childSessionID: r.childSessionID === childID ? "child1" : r.childSessionID, chosen: r.chosen.agent, best: r.best?.agent, switched: r.switched, pinned: r.pinned, reason: r.reason.slice(0, 260) }));
+        s.observed.hostErrors = host.errorLines();
+        s.observed.routerLogLines = host.routerLogLines();
+        const rootRows = rows.filter(r => r.sessionID === rootID);
+        const medium = `${MODELS.sonnet}#medium`;
+        const ok = first.after.agent === "medium" && first.after.model === medium && rootRows[0]?.reason.startsWith(FLOOR_LIFT_REASON) === true
+          && keep.after.agent === "medium" && keep.after.model === medium && obj(keep.d.before.input).agent === "medium" && rootRows[1]?.reason.startsWith(RESUME_RUNNING_REASON) === true
+          && up.after.agent === "heavy" && up.after.model === `${MODELS.opus}#xhigh`
+          && down.after.agent === "medium" && down.after.model === medium && rootRows[3]?.reason.startsWith(FLOOR_LIFT_REASON) === true
+          && pinned.after.agent === "fast" && pinned.after.model === `${MODELS.sonnet}#low` && rootRows[4]?.pinned === true && rootRows[4]?.reason.startsWith(RESUME_RUNNING_REASON) === true && rootRows[4]?.reason.includes("NOT rewritten") === true && !rootRows[4]?.reason.includes("sent to @medium")
+          && host.errorLines().length === 0;
+        s.verdict(ok, `fresh fast -> ${first.after.agent}; resume naming fast -> ${keep.after.agent}; resume naming heavy -> ${up.after.agent}/${up.after.model}; resume naming fast after heavy -> ${down.after.agent}; pinned resume naming fast -> ${pinned.after.agent}/${pinned.after.model}; foreign resume status ${String(foreign.after.status)}; denied resume status ${String(denied.after.status)}`);
+      });
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 400_000);});
 
 void str;
 void MODELS;
