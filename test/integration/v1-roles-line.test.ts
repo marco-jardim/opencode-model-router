@@ -128,17 +128,30 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     expect(rLine(prompt)).toBe(`${base} | by class: search→@explore`);
   });
 
-  it("without routing.roles the system prompt is the baseline, byte for byte (SHA-256 pinned against the baseline), whatever else routing says", async () => {
-    for (const routing of [null, {}, { engine: "enforce" }, { engine: "advise", profile: "safe", margin: 0.5 }, { roles: {} }, { advisor: { enabled: false } }, { classifier: { backend: "rules" } }]) {
-      invalidateConfigCache();
-      const { hooks, agentsCall } = await plugin(routing);
-      const [prompt] = await turn(hooks);
-      expect(sha(prompt!), `routing=${JSON.stringify(routing)}`).toBe(sha(baseline()));
-      expect(prompt).toBe(baseline());
-      expect(agentsCall).not.toHaveBeenCalled(); // the agent list is not even fetched
-    }
-  });
+  /**
+   * What the v1 plugin put into `output.system` at 1fc94a3 (the commit this phase started from) for the `anthropic` preset, an orchestrator
+   * of `anthropic/claude-sonnet-5-5`, advisory enforcement and a root session: ONE part, 6 357 characters. Computed by running this very
+   * harness against a `git archive` of 1fc94a3, never against the current code (QA-2.4-14), so a change to the v1 protocol shows up here.
+   */
+  const SYSTEM_PROMPT_1FC94A3 = { sha256: "56854f788c0d1d22fad12c9425fdd33e4947b1683be0a9a877787ba5bd911409", length: 6357 } as const;
 
+  it.each([
+    ["no routing block", null],
+    ["an empty routing block", {}],
+    ["engine enforce (ignored on v1)", { engine: "enforce" }],
+    ["advise with profile and margin", { engine: "advise", profile: "safe", margin: 0.5 }],
+    ["roles: {}", { roles: {} }],
+    ["advisor disabled", { advisor: { enabled: false } }],
+    ["classifier rules", { classifier: { backend: "rules" } }],
+  ] as const)("without an explicit routing.roles (%s) the whole output.system is what 1fc94a3 produced: one part with the pinned SHA-256", async (_name, routing) => {
+    invalidateConfigCache();
+    const { hooks, agentsCall } = await plugin(routing as Record<string, unknown> | null);
+    const system = await turn(hooks);
+    expect(system).toHaveLength(1); // the whole array, not just its first part
+    expect(system.map((part) => ({ sha256: sha(part), length: part.length }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
+    expect(system[0]).toBe(baseline()); // and the current assembleSystemPrompt agrees with that commit's output
+    expect(agentsCall).not.toHaveBeenCalled(); // the agent list is not even fetched
+  });
   it("a configured class whose agents are all unusable leaves the line as shipped", async () => {
     const { hooks, agentsCall } = await plugin({ roles: { search: ["build", "missing", "ghost", "fast"], debug: ["title", "compaction"] } });
     await turn(hooks);
