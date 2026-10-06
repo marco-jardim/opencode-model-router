@@ -352,10 +352,11 @@ export function nextAction(
 
   const variants = policy.variants ?? null;
   const info = variants ? ownTierInfo(policy, state.currentTier) : undefined;
-  // A17 budget reserve: on a tier with variant info, spending another attempt here (variant step
-  // or plain retry) must leave one attempt for each ladder tier above; otherwise escalate now.
-  // Tiers without variant info are untouched.
-  const mayStay = !info || reserveAllows(policy, state);
+  // A17/A17a budget reserve: whenever variant steps are enabled for the session (`policy.variants`),
+  // spending another attempt on any tier (variant step or plain retry, cataloged or not) must leave
+  // one attempt for each ladder tier above; otherwise escalate now (QA-1.5-21). Without
+  // `policy.variants` the ladder is exactly the 2.2.0 one.
+  const mayStay = !variants || reserveAllows(policy, state);
 
   // (5V) variant step (D10): not gated by attemptsThisTier; steps 3 and 4 above
   // already bound it by maxTotalAttempts and the cost ceiling.

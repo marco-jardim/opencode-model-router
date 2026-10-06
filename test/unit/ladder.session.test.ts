@@ -1301,14 +1301,37 @@ describe("A17 budget reserve", () => {
     expect(nextAction(sessionState({ currentTier: "fast", totalAttempts: 1 }), fail, policy)).toMatchObject({ action: "retry", variantStep: true });
   });
 
-  it("does not touch tiers without variant info", () => {
+  it("applies to every tier of a variants-enabled session, cataloged or not, and to none without policy.variants (QA-1.5-21)", () => {
     const policy = handPolicy({ medium: info(OPUS, "medium", ["medium", "high"]) }, { maxTotalAttempts: 2 });
+    // fast has no variant info, but the session has variant steps: 2 - 1 - 1 = 0 < H = 2, so it escalates.
     const action = nextAction(sessionState({ totalAttempts: 1 }), fail, policy);
-    expect(action).toMatchObject({ action: "retry", tier: "fast" }); // plain retry although 2-1-1 = 0 < 2
-    expect(action).not.toHaveProperty("model");
-    expect(action).not.toHaveProperty("variantStep");
+    expect(action).toMatchObject({ action: "escalate", tier: "medium", agent: "medium" });
+    // without policy.variants the same counters give today's plain retry
+    const plain: EscalatePolicy = { ladder: ["fast", "medium", "heavy"], maxAttemptsPerTier: 1, maxTotalAttempts: 2, costMultiple: null };
+    const retry = nextAction(
+      { currentTier: "fast", attemptsThisTier: 0, totalAttempts: 1, escalations: 0, firstAttemptCost: 1, cumulativeCost: 1 },
+      fail,
+      plain,
+    );
+    expect(retry).toMatchObject({ action: "retry", tier: "fast" });
+    expect(retry).not.toHaveProperty("model");
+    expect(nextAction({ ...sessionState({ totalAttempts: 1 }) }, fail, { ...policy, variants: null })).toMatchObject({ action: "retry", tier: "fast" });
   });
 
+  it("probe: effort tiers with an uncataloged medium still reach heavy (QA-1.5-21)", () => {
+    const tiers: Record<string, TierConfig> = {
+      fast: { model: SONNET, effort: "low" },
+      medium: { model: "x/unknown", effort: "medium" },
+      heavy: { model: OPUS, effort: "high" },
+    };
+    const policy = buildEscalatePolicy(makeConfig(tiers, { effortBump: false, costCeiling: { multiple: 1000 } }), V2);
+    expect(Object.keys(policy.variants!.perTier)).toEqual(["fast", "heavy"]); // medium has no catalog entry
+    const run = runLoop(policy);
+    // before the fix medium ignored the reserve and kept the last attempt for itself
+    expect(run.states.map((s) => s.currentTier)).toEqual(["fast", "fast", "medium", "heavy"]);
+    expect(run.actions.map((a) => a.action)).toEqual(["retry", "escalate", "escalate", "give_up"]);
+    expect(run.actions[3]).toEqual({ action: "give_up", reason: "max total attempts (4) reached" });
+  });
   it("never gives up early on a tier with variant info while total attempts remain and a higher tier exists", () => {
     for (let maxTotalAttempts = 1; maxTotalAttempts <= 8; maxTotalAttempts++) {
       const policy = handPolicy(perTier, { maxTotalAttempts, maxAttemptsPerTier: 2 });
@@ -1453,8 +1476,8 @@ describe("property-based: session-aware loop", () => {
           expect(action.action).not.toBe("escalate");
         }
         if (verdict.pass) expect(action.action).toBe("accept");
-        // A17: a retry on a tier with variant info always leaves one attempt for every tier above it.
-        if (action.action === "retry" && policy.variants?.perTier[state.currentTier]) {
+        // A17a: in a variants-enabled session a retry always leaves one attempt for every tier above it.
+        if (action.action === "retry" && policy.variants) {
           const above = policy.ladder.length - 1 - policy.ladder.indexOf(state.currentTier);
           expect(maxTotalAttempts - state.totalAttempts - 1).toBeGreaterThanOrEqual(above);
         }
