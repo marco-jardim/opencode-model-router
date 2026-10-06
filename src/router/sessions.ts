@@ -1,6 +1,7 @@
 import type { RouterConfig } from "./config";
 import { fingerprintToolCall } from "../guard/fingerprint";
 import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep";
+import type { DecisionFacts, LadderStepKind } from "../routing/outcomes/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -562,4 +563,151 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
       outputRef.output = existing ? `${existing}\n\n${banner}` : banner;
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch-facts registry (M6, plan 2.1.1, amendment A3)
+//
+// Remembers, per child session, what the router knew when it dispatched it: the typed
+// facts, the agent and model that were actually dispatched, and the attempt id that
+// outcome signals are scored under. Telemetry ingestion (src/routing/outcomes/ingest.ts)
+// reads it to attribute `session.step.ended`, verdicts and false refusals; a child that is
+// not registered here is never recorded.
+//
+// MODULE (process) scope, deliberately unlike the per-instance session store above: the host
+// delivers the same event to the plugin instance of every live location (S3b), so every
+// instance must see the same registry. Entries are TTL-swept with the existing store sweeper
+// (index.ts calls `sweepDispatches` from the same idle sweep) and bounded in size.
+// ---------------------------------------------------------------------------
+
+export interface DispatchInput {
+  /** Typed task facts of the dispatch (1.2 `TaskFacts` is assignable). */
+  facts: DecisionFacts;
+  /** Agent id the child runs under (router tier or host agent). */
+  agent: string;
+  /** `provider/model` the child runs on, or null when it could not be resolved (nothing is recorded then). */
+  model: string | null;
+  /** Variant of that model; null/absent = `default` (A9). */
+  variant?: string | null;
+  /** Router tier that owns the dispatch, when there is one. */
+  tier?: string | null;
+  /** The dispatch's `[acceptance]` detection depth or text, carried for the engine; ingestion does not read it. */
+  acceptance?: string | null;
+  /** The orchestrator session that dispatched the child. */
+  parentSessionID?: string | null;
+  /** Attempt id outcomes are scored under. Default: `${childSessionID}:${attemptIndex}`, a new index per call. */
+  attemptId?: string;
+  /** Id of the decision row of this dispatch (2.2), so verdict/refusal rows can reference it. */
+  decisionID?: string | null;
+  /** Kind of attempt (default `dispatch`; 2.3 ladder attempts pass `variant | retry | escalate`). */
+  step?: LadderStepKind;
+}
+
+export interface DispatchRecord {
+  readonly childSessionID: string;
+  readonly facts: DecisionFacts;
+  readonly agent: string;
+  readonly model: string | null;
+  readonly variant: string | null;
+  readonly tier: string | null;
+  readonly acceptance: string | null;
+  readonly parentSessionID: string | null;
+  readonly attemptId: string;
+  /** 0 for the first dispatch of the child; +1 for each re-registration (resume or ladder attempt). */
+  readonly attemptIndex: number;
+  readonly decisionID: string | null;
+  readonly step: LadderStepKind;
+  readonly registeredAt: number;
+}
+
+interface DispatchSlot {
+  record: DispatchRecord;
+  lastTouch: number;
+}
+
+/** Hard bound on remembered children; the oldest registration is dropped first. */
+export const MAX_DISPATCH_RECORDS = 2000;
+
+const dispatchRegistry = new Map<string, DispatchSlot>();
+
+/**
+ * Register (or re-register) the dispatch facts of a child session. Re-registering an existing child
+ * (a resume, or a ladder attempt) starts a new attempt: the index moves on unless the caller supplies
+ * `attemptId`, so one attempt is never scored twice. Returns the stored record.
+ */
+export function rememberDispatch(
+  childSessionID: string,
+  input: DispatchInput,
+  nowMs: number = Date.now(),
+): DispatchRecord {
+  const previous = dispatchRegistry.get(childSessionID);
+  const attemptIndex = previous === undefined ? 0 : previous.record.attemptIndex + 1;
+  const record: DispatchRecord = Object.freeze({
+    childSessionID,
+    facts: input.facts,
+    agent: input.agent,
+    model: input.model,
+    variant: input.variant ?? null,
+    tier: input.tier ?? null,
+    acceptance: input.acceptance ?? null,
+    parentSessionID: input.parentSessionID ?? null,
+    attemptId: input.attemptId ?? `${childSessionID}:${attemptIndex}`,
+    attemptIndex,
+    decisionID: input.decisionID ?? null,
+    step: input.step ?? "dispatch",
+    registeredAt: nowMs,
+  });
+  // Delete first so a re-registration moves to the young end of the insertion order.
+  dispatchRegistry.delete(childSessionID);
+  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs });
+  while (dispatchRegistry.size > MAX_DISPATCH_RECORDS) {
+    const oldest = dispatchRegistry.keys().next();
+    if (oldest.done === true) break;
+    dispatchRegistry.delete(oldest.value);
+  }
+  return record;
+}
+
+/** The registered dispatch of a child session, or undefined (unknown, forgotten or swept). */
+export function lookupDispatch(childSessionID: string): DispatchRecord | undefined {
+  return dispatchRegistry.get(childSessionID)?.record;
+}
+
+/** Refresh a child's idle stamp (called on every recorded step so a long-running child is not swept). */
+export function touchDispatch(childSessionID: string, nowMs: number = Date.now()): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot !== undefined) slot.lastTouch = nowMs;
+}
+
+/** Remove one child; true when it was registered. */
+export function forgetDispatch(childSessionID: string): boolean {
+  return dispatchRegistry.delete(childSessionID);
+}
+
+/** Remove every child dispatched by `parentSessionID` (the orchestrator went away); returns how many. */
+export function forgetDispatchesOf(parentSessionID: string): number {
+  let removed = 0;
+  for (const [id, slot] of [...dispatchRegistry]) {
+    if (slot.record.parentSessionID === parentSessionID && dispatchRegistry.delete(id)) removed += 1;
+  }
+  return removed;
+}
+
+/** Evict every dispatch idle for >= ttlMs (future stamps are never evicted); returns how many. */
+export function sweepDispatches(nowMs: number = Date.now(), ttlMs: number = DEFAULT_IDLE_TTL_MS): number {
+  let removed = 0;
+  for (const [id, slot] of [...dispatchRegistry]) {
+    if (nowMs - slot.lastTouch >= ttlMs && dispatchRegistry.delete(id)) removed += 1;
+  }
+  return removed;
+}
+
+/** Number of registered children (tests, diagnostics). */
+export function dispatchCount(): number {
+  return dispatchRegistry.size;
+}
+
+/** Test-only: drop every registration. */
+export function resetDispatchRegistry(): void {
+  dispatchRegistry.clear();
 }
