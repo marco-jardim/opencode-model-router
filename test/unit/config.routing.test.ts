@@ -8,6 +8,7 @@ import {
   DEFAULT_V2_ROLES,
   ROUTING_DEFAULTS,
   ROUTING_ENGINE_IGNORED_ON_V1,
+  deepMerge,
   getConfigReloadError,
   invalidateConfigCache,
   loadConfig,
@@ -27,6 +28,7 @@ import {
   readGitSha,
   readPackageVersion,
 } from "../../src/router/build-info";
+import { parseJsonc } from "../../src/router/jsonc";
 import { readFileSync } from "node:fs";
 
 const ROOT = resolve(__dirname, "..", "..");
@@ -951,5 +953,63 @@ describe("build-info", () => {
         `router: engine=static build=${buildInfo.version}+${buildInfo.sha === "unknown" ? "unknown" : buildInfo.sha.slice(0, 7)}`,
       );
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// docs/CONFIG_REFERENCE.md must say what the code does (1.1.5): its defaults
+// block and every example are parsed here, so a drift fails the build.
+// ---------------------------------------------------------------------------
+
+describe("docs/CONFIG_REFERENCE.md — routing section", () => {
+  const docs = readFileSync(join(ROOT, "docs", "CONFIG_REFERENCE.md"), "utf-8");
+
+  /** The JSONC fence that directly follows `<!-- <marker> -->`. */
+  function blockAfter(marker: string): unknown {
+    const at = docs.indexOf(`<!-- ${marker} -->`);
+    expect(at, `marker ${marker}`).toBeGreaterThanOrEqual(0);
+    const match = /```jsonc\n([\s\S]*?)\n```/.exec(docs.slice(at));
+    expect(match, `fence after ${marker}`).not.toBeNull();
+    return parseJsonc(match![1]!);
+  }
+
+  it("documents exactly the v2 defaults that resolveRouting applies", () => {
+    const { applied: _applied, ...resolved } = resolveRouting(cfgOf(), "v2");
+    expect(blockAfter("routing-defaults: v2")).toEqual(resolved);
+  });
+
+  it("lists every defaulted key in the keys table", () => {
+    const paths = (value: unknown, prefix: string): string[] =>
+      Object.entries(value as Record<string, unknown>).flatMap(([k, v]) =>
+        typeof v === "object" && v !== null && !Array.isArray(v) ? paths(v, `${prefix}${k}.`) : [`${prefix}${k}`],
+      );
+    const { roles: _roles, ...defaults } = ROUTING_DEFAULTS as Record<string, unknown>;
+    const keys = [...paths(defaults, ""), "classifier.presets", "roles"];
+    for (const key of keys) {
+      expect(docs, key).toContain(`| \`${key}\` |`);
+    }
+  });
+
+  it.each(["static", "shadow", "advise", "enforce"] as const)("has a valid, working example for engine %s", (mode) => {
+    const example = blockAfter(`routing-example: ${mode}`);
+    const cfg = validateConfig(rawConfig(example as Record<string, unknown>));
+    expect(resolveRouting(cfg, "v2").engine).toBe(mode);
+  });
+
+  it("has a valid example for candidates, resolved as documented", () => {
+    const example = blockAfter("routing-example: candidates");
+    const cfg = validateConfig(deepMerge(rawConfig(), example) as Record<string, unknown>);
+    expect(resolveCandidates("medium", cfg)).toEqual([
+      { model: "anthropic/claude-sonnet-5-5", variant: "medium", costRatio: 5 },
+      { model: "anthropic/claude-sonnet-5-5", variant: "high", costRatio: 8 },
+      { model: "openai/gpt-6-luna", variant: "high", costRatio: 9 },
+    ]);
+  });
+
+  it("documents the /router marker line, the v1 notice and the variantSteps / roles rules", () => {
+    expect(docs).toContain("router: engine=<mode> build=<version>+<sha7>");
+    expect(docs).toContain("[model-router] routing.engine ignored on OpenCode v1");
+    expect(docs).toContain("`variantSteps`");
+    expect(docs).toContain("**`roles: {}`** disables native candidates");
   });
 });

@@ -44,6 +44,7 @@ falls back to its in-code default), so you only ever see them in an overrides fi
 | `subagentTiers` | `Record<string, string>` | `{}` — no pre-existing agent is touched | Opt-in map of your own subagent names to tier names, repointing them at the active preset's model for that tier. Unknown tier names are skipped at resolve time rather than rejected. |
 | `antiNarration` | `boolean` | `false` | Adds the anti-narration clause to Claude tier prompts and enables the non-blocking narration detector. |
 | `experimental` | `{ verifiedDelegateTool?: boolean }` | `{}` — every experimental feature off | Opt-in features. `verifiedDelegateTool` exposes the independently-verified `delegate` tool, also settable via `MODEL_ROUTER_VERIFIED_DELEGATE=1`. |
+| `routing` | object | `{}` — engine `static`, today's behaviour | The cost-aware routing engine (#74): engine mode, profile, margin, classifier, roles, outcome store, session reuse, advisor. Per-tier `candidates` and `escalate.variantSteps` belong to the same feature. See [`routing`](#routing--cost-aware-routing-engine-74). |
 
 ---
 
@@ -557,6 +558,7 @@ produces no notice. `background` and `pendingTtlMs` are read at plugin start, so
 | `maxTotalAttempts` | `number` | `4` | Hard ceiling across all tiers and retries. Must be integer ≥ 1. |
 | `effortBump` | `boolean` | `true` | Retry a failed router-ladder attempt on the same tier one effort level higher before escalating. `false` restores the previous ladder exactly. |
 | `effortBumpMax` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"xhigh"` | Upper bound for bumped attempts, further clamped per model. |
+| `variantSteps` | `"auto" \| "none"` | `"auto"` | OpenCode v2 only: retry on the same model's next variant before escalating the model. Always `none` on v1. See [`escalate.variantSteps`](#escalatevariantsteps). |
 | `costCeiling.base` | `string` | `"firstAttemptCostUnits"` | Reference point for cost ceiling. `"firstAttemptCostUnits"` = cost of the first producing attempt. |
 | `costCeiling.multiple` | `number` | `4` | Ceiling = first-attempt cost × multiple. Must be > 0. Further retries/escalation halt once recorded cumulative cost exceeds this. |
 
@@ -698,6 +700,170 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 
 ---
 
+## `routing` — cost-aware routing engine (#74)
+
+The `routing` block configures the cost-aware routing engine: typed task decisions, outcome-calibrated tiers and session-aware effort bumps. It is **entirely optional**. With no `routing` block (or `engine: "static"`) every behaviour is exactly that of the static taxonomy: identical protocol text, identical `R:` line, identical ladder decisions. The block lives in `tiers.json` or, like everything else, in an overrides file; the global file `~/.config/opencode/opencode-model-router.overrides.jsonc` is the usual place, and a change to it is picked up by the normal hot reload (no restart, no `/router` command).
+
+> **Status.** The configuration surface — parsing, validation, defaults and `/router` reporting — is implemented. The engine that consumes it lands in later phases of the same release; until then `engine` selects nothing by itself. This note goes away when the engine does.
+
+**Host.** The engine, the ladder's variant/session steps, telemetry ingestion and the advisor run on **OpenCode v2** only (D1). On **v1** the block is still parsed and validated, but `routing.engine` is coerced to `static` with one logged line per process, `[model-router] routing.engine ignored on OpenCode v1`, and `enforcement.escalate.variantSteps` is ignored. The single v1 effect, opt-in only, is [`roles`](#roles).
+
+`/router` (the bare status view) prints one marker line with the **applied** engine and the build of the running code: `router: engine=<mode> build=<version>+<sha7>`, e.g. `router: engine=shadow build=2.3.0+3b3dba4` (`unknown` when the checkout has no readable `.git`). On v1 it always shows `engine=static`.
+
+### Keys
+
+Every key is optional. Types and ranges are enforced by `validateConfig`; defaults are applied by `resolveRouting(cfg, host)` in `src/router/config.ts`, the only place they live, and are checked against this table by a test.
+
+| Key | Type | Default | Values / range | Notes |
+|---|---|---|---|---|
+| `engine` | `string` | `"static"` | `static \| shadow \| advise \| enforce` | See [Engine modes](#engine-modes). Forced to `static` on v1. |
+| `profile` | `string` | `"balanced"` | `frugal \| balanced \| safe` | Price of giving up on a task, per risk level, in cost units where `fast = 1`: `frugal` {low 3, medium 8, high 20}, `balanced` {5, 15, 40}, `safe` {10, 30, 100}. |
+| `margin` | `number` | `0.2` | `[0, 0.9]` | `enforce` only: the engine replaces the orchestrator's choice only if `C(best) ≤ (1 − margin) · C(chosen)`. |
+| `minClassConfidence` | `number` | `0.7` | `[0, 1]` | Below this the engine does not trust the task class and keeps the orchestrator's choice. |
+| `detection.deterministic` | `number` | `0.95` | `[0, 1]` | Probability that a wrong result is caught, by verification depth: a deterministic `[acceptance]` check is present. |
+| `detection.grader` | `number` | `0.7` | `[0, 1]` | …an LLM grader is scheduled. |
+| `detection.none` | `number` | `0.3` | `[0, 1]` | …neither. |
+| `classifier.backend` | `string` | `"rules"` | `rules \| host \| openai-compatible \| typesafe` | Where an uncertain task class is decided. `rules` is local and free. The classifier is never an agent and never appears in the protocol. |
+| `classifier.model` | `string \| null` | `null` | `provider/model` or `provider/model#variant` | **Required** (non-empty) whenever the effective backend is not `rules`; the classifier model is never picked automatically. |
+| `classifier.baseUrl` | `string \| null` | `null` | `http(s)` URL | **Required** for `openai-compatible` and `typesafe`; validated whenever set. |
+| `classifier.apiKeyEnv` | `string \| null` | `null` | environment variable name, `[A-Za-z_][A-Za-z0-9_]*` | Optional; the key itself is never stored in the config. |
+| `classifier.timeoutMs` | `integer` | `1500` | `[100, 30000]` | A backend that does not answer in time yields an `unknown` class; it never blocks a dispatch. |
+| `classifier.samples` | `integer` | `1` | `1` or `3` | Samples per classification. |
+| `classifier.maxStateChars` | `integer` | `2000` | `[200, 20000]` | How much of the prompt a model backend may see; never file contents. |
+| `classifier.presets` | `Record<string, { backend?, model? }>` | `{}` | each entry as above | Per-preset override of `backend` / `model`. The preset name need not exist (switching presets never bricks startup). Each entry, merged over the top level, must itself satisfy the model / `baseUrl` rule. |
+| `roles` | `Record<string, string[]>` | v2: see [Roles](#roles); v1: `{}` | class → non-empty array of agent ids | Agent ids and class names match `^[a-z0-9_-]+$`. |
+| `outcomes.path` | `string \| null` | `null` | non-empty string | Where the outcome store persists. `null` = the directory that already holds the `*.scorecard.log` files. |
+| `outcomes.halfLifeDays` | `number` | `14` | `[1, 365]` | Older verdicts weigh less. |
+| `outcomes.maxEffectiveSamples` | `number` | `50` | `[5, 1000]` | Cap on the effective sample size of one `(class × agent × model#variant)` posterior. |
+| `sessionReuse.maxContextFraction` | `number` | `0.6` | `(0, 0.95]` | A retry or escalation resumes the child session only while the next model's input budget has room under this fraction. |
+| `advisor.enabled` | `boolean` | `true` | | The cost doctor's findings and once-per-interval notice. |
+| `advisor.noticeIntervalHours` | `number` | `24` | `[1, 720]` | Minimum hours between notices. |
+
+Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and compared with `resolveRouting`, so it cannot drift from the code; on v1 only `roles` differs: `{}`):
+
+<!-- routing-defaults: v2 -->
+```jsonc
+{
+  "engine": "static",
+  "profile": "balanced",
+  "margin": 0.2,
+  "minClassConfidence": 0.7,
+  "detection": { "deterministic": 0.95, "grader": 0.7, "none": 0.3 },
+  "classifier": {
+    "backend": "rules",
+    "model": null,
+    "baseUrl": null,
+    "apiKeyEnv": null,
+    "timeoutMs": 1500,
+    "samples": 1,
+    "maxStateChars": 2000,
+    "presets": {}
+  },
+  "roles": { "search": ["explore"], "implement": ["general"], "debug": ["general"], "review": ["general"] },
+  "outcomes": { "path": null, "halfLifeDays": 14, "maxEffectiveSamples": 50 },
+  "sessionReuse": { "maxContextFraction": 0.6 },
+  "advisor": { "enabled": true, "noticeIntervalHours": 24 }
+}
+```
+
+**Unknown keys** inside `routing` (and its blocks) are ignored, not rejected, like every other block of this file, so a config written for a newer release still loads. Only the prototype-reparenting keys `__proto__`, `constructor` and `prototype` are refused. A value of the wrong type or outside its range throws; in an overrides file that drops the layer with a warning, and a reload that turns invalid keeps serving the last valid config and logs why.
+
+### Engine modes
+
+`engine` is the one switch. Modes are raised one step at a time; each is a config-only change.
+
+**`static`** (default) — the shipped taxonomy only. Equivalent to having no `routing` block.
+
+<!-- routing-example: static -->
+```jsonc
+{ "routing": { "engine": "static" } }
+```
+
+**`shadow`** — decide and record, change nothing: every dispatch writes a decision row (what the engine would have chosen and why) while the orchestrator's choice stands.
+
+<!-- routing-example: shadow -->
+```jsonc
+{ "routing": { "engine": "shadow", "profile": "balanced" } }
+```
+
+**`advise`** — as `shadow`, and the engine's generated `R:` line and a short per-turn hint reach the orchestrator, which still decides.
+
+<!-- routing-example: advise -->
+```jsonc
+{
+  "routing": {
+    "engine": "advise",
+    "profile": "balanced",
+    "classifier": { "backend": "host", "model": "opencode-go/deepseek-v4.1-flash", "timeoutMs": 10000 }
+  }
+}
+```
+
+**`enforce`** — as `advise`, and the engine reassigns the dispatch's `model` / `agent` when its choice is cheaper by at least `margin`, the class confidence reaches `minClassConfidence`, the candidate agent's permissions cover what the task needs and the candidate is not below `floorTier`. A dispatch carrying `[route pin]` is never switched.
+
+<!-- routing-example: enforce -->
+```jsonc
+{
+  "routing": {
+    "engine": "enforce",
+    "profile": "balanced",
+    "margin": 0.2,
+    "minClassConfidence": 0.7,
+    "roles": { "search": ["explore"], "implement": ["general"] }
+  }
+}
+```
+
+### Roles
+
+`roles` maps a task class to an ordered list of **agent ids** that are appended, as candidates, to the ladders of the router tiers. The router tiers are always in every ladder; roles only add native or user agents. Agent ids and class names match `^[a-z0-9_-]+$`; every class needs a non-empty array; duplicates within a class are dropped, order kept. An agent id need not name a tier or an agent of the active preset (it may be a native agent such as `explore`).
+
+- **OpenCode v2, key absent:** the default applies — `{ "search": ["explore"], "implement": ["general"], "debug": ["general"], "review": ["general"] }`.
+- **`roles: {}`** disables native candidates (on either host).
+- **A `roles` you write replaces the default as a whole.** A class you leave out has no native candidates; there is no per-class merge.
+- **OpenCode v1:** the default is `{}`. Setting `roles` explicitly is the one opt-in effect on v1, and it is text-only: the static `R:` line lists those agents as destinations for their classes. No model override and no engine.
+
+### Tier `candidates`
+
+A tier may list the `(model, variant, costRatio)` rungs the engine can use for it:
+
+<!-- routing-example: candidates -->
+```jsonc
+{
+  "presets": {
+    "anthropic": {
+      "medium": {
+        "model": "anthropic/claude-sonnet-5-5", "variant": "medium", "costRatio": 5,
+        "candidates": [
+          { "variant": "medium", "costRatio": 5 },
+          { "variant": "high", "costRatio": 8 },
+          { "model": "openai/gpt-6-luna", "variant": "high", "costRatio": 9 }
+        ]
+      }
+    }
+  }
+}
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `model` | `string` | the tier's `model` | `provider/model`. |
+| `variant` | `string` | none — the model's default variant | **Not** inherited from the tier. Non-empty, no whitespace, no `#`. |
+| `costRatio` | `number` | the tier's `costRatio` (or its conventional default: `fast` 1, `medium` 5, `heavy` 20, other 1) | Must be `> 0`. |
+
+- Without `candidates`, or with `candidates: []`, the tier's ladder is exactly one rung: its own `(model, variant, costRatio)`.
+- With `candidates` the ladder is those rungs, in order. List the tier's own rung first if you want it in the ladder; it is not added for you.
+- No two rungs may name the same effective `(model, variant)` once the omitted `model` is filled in from the tier; two variant-less rungs of one model count as the same rung.
+- `resolveCandidates(tierName, cfg)` returns the resolved ladder for the active preset (an unknown tier yields `[]`).
+
+### `escalate.variantSteps`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enforcement.escalate.variantSteps` | `"auto" \| "none"` | `"auto"` | OpenCode v2 only. `auto`: a failed verification first retries on the same model's next variant (resuming the child session) before the ladder escalates the model; variant steps do not consume `maxAttemptsPerTier` but do count toward `maxTotalAttempts` and the cost ceiling. `none`: the previous behaviour. Always `none` on v1, where the `effortBump` path stays as is. |
+
+---
+
 ## Validation rules
 
 `validateConfig` throws on `tiers.json` load if any of these are violated:
@@ -731,6 +897,9 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | `verify.testScope` must be `"affected"` or `"full"`; `verify.defaultVerify` must be `"deferred"` or `"required"`. |
 | `proportional.trivialBypass` must be a boolean. |
 | A tier's `effort` (when present) must be one of `low \| medium \| high \| xhigh \| max`. Error: `tiers.json: preset '<preset>' tier '<tier>': effort must be one of low, medium, high, xhigh, max`. |
+| `escalate.variantSteps` must be `auto` or `none`. |
+| A tier's `candidates` (when present) must be an array of objects; `model` (when present) must be `provider/model`, `variant` a non-empty string without whitespace or `#`, `costRatio` a number > 0; no two entries may share an effective `(model, variant)`. |
+| `routing` must be an object; every key of the [`routing` table](#keys) must be of its type and within its range, and a classifier backend other than `rules` needs a `provider/model[#variant]` model (plus an `http(s)` `baseUrl` for `openai-compatible` and `typesafe`) — for the top level and for every `classifier.presets` entry. `roles` classes and agent ids must match `^[a-z0-9_-]+$` and every class needs a non-empty array. |
 
 An invalid value in the bundled `tiers.json` throws at load; the same value in an
 overrides file is reported via `console.warn` and that override layer is dropped.
