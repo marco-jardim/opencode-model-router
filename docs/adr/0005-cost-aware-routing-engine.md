@@ -113,8 +113,8 @@ The plan (§1.5, "Amended during implementation") holds the full text of each am
 | A18, A19 | D14, D4 | Project-local files cannot set the classifier; a backend label cannot invent a class. |
 | A22, A26 | D13 | The route line is the first line only; heavy steps are pinned. |
 | A28 | D1 | The v1 text-only roles line. |
-| A31 | D18, F4 | The cost doctor has no `summary` finding; `title-model-unset` follows the host's own title pick; acceptance criterion 8 is reworded. |
-| A32 | D18, F4 | Advisor notices are a synthetic transcript entry one user turn late, throttled per project with a weekly reminder. |
+| A31 | F4 (cost doctor) | The cost doctor has no `summary` finding; `title-model-unset` follows the host's own title pick; acceptance criterion 8 is reworded. |
+| A32 | F4 (cost doctor) | In `advise`/`enforce`, advisor notices are a synthetic transcript entry one user turn late, throttled per project (a state file and a lock) with a weekly reminder; in `static`/`shadow` the notice is a log line with a memory-only throttle and no file. |
 | A33 | D10, F4 | `maxAttemptsPerTier: 1` does not escalate straight away (one retry of the same rung comes first); the `attempts-without-variants` finding is reworded. |
 
 ## Findings (evidence)
