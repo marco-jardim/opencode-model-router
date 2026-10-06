@@ -435,6 +435,32 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
     expect(decide(input({ ladder, store: store(6), chosen: chosenOf(high), facts: mediumFacts() })).reasonCode).toBe("switched");
   });
 
+  it("QA-1.4-15: a sideways switch at an equal rank is gated exactly like a down switch", () => {
+    // a and b share rank 1 AND the same price: only the posterior differs. Equal rank is not a strictly higher rank.
+    const { ladder, a, b } = pairLadder(8, 8);
+    const store = (n: number) => fakeStore({ p: { [keyOf(a)]: 0.99, [keyOf(b)]: 0.5 }, n: { [keyOf(a)]: n, [keyOf(b)]: 10 } });
+    const gated = decide(input({ ladder, store: store(0), chosen: chosenOf(b) }));
+    expect(gated.best?.key).toBe(keyOf(a));
+    expect(gated.reasonCode).toBe("kept:evidence");
+    expect(gated.switched).toBe(false);
+    expect(decide(input({ ladder, store: store(4), chosen: chosenOf(b) })).reasonCode).toBe("kept:evidence");
+    expect(decide(input({ ladder, store: store(5), chosen: chosenOf(b) })).reasonCode).toBe("switched");
+  });
+
+  it("QA-1.4-15: only a strictly higher rank is ungated, however the prices compare", () => {
+    // The pick is the rank-0 rung; the winner is dearer to attempt but ranked above it: ungated.
+    const low = rung("fast", "openai/gpt-6-luna-fast", "medium", 1, 0);
+    const high = rung("medium", "anthropic/claude-sonnet-5-5", "xhigh", 3, 1);
+    const ladder: Ladder = { candidates: [low, high], next: [null, null], classRank: 1, excluded: [] };
+    const store = fakeStore({ p: { [keyOf(low)]: 0.1, [keyOf(high)]: 1 } }); // no recorded outcomes anywhere
+    const up = decide(input({ ladder, store, chosen: chosenOf(low), facts: mediumFacts() }));
+    expect(up.best?.key).toBe(keyOf(high));
+    expect(up.reasonCode).toBe("switched");
+    // The same pair the other way round is a switch down: gated.
+    const down = decide(input({ ladder, store: fakeStore({ p: { [keyOf(low)]: 1, [keyOf(high)]: 0.1 } }), chosen: chosenOf(high), facts: mediumFacts() }));
+    expect(down.best?.key).toBe(keyOf(low));
+    expect(down.reasonCode).toBe("kept:evidence");
+  });
   it("margin is checked first: a best that does not clear the margin reports kept:margin, not kept:evidence", () => {
     const { ladder, b } = pairLadder(7, 8);
     const store = fakeStore({ p: { [keyOf(ladder.candidates[0]!)]: 1, [keyOf(b)]: 1 } });

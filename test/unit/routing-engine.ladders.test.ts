@@ -15,7 +15,7 @@ import { buildEscalatePolicy, type LadderSessionPolicyInput } from "../../src/es
 import type { CatalogModel } from "../../src/escalate/variants";
 import { CLASS_STATIC_TIER, NEEDS, TASK_CLASSES } from "../../src/routing/classify/types";
 import type { Need, TaskClass, TaskFacts } from "../../src/routing/classify/types";
-import type { ModelPricing } from "../../src/routing/outcomes/types";
+import type { ModelPricing, OutcomeKey } from "../../src/routing/outcomes/types";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import type { DecisionInput, EngineStoreView } from "../../src/routing/engine/types";
 import { emptyCostStats } from "../../src/routing/outcomes/cost";
@@ -606,6 +606,74 @@ describe("QA-1.4-1: an own-model rung takes the price AND the rank of the matchi
   });
 });
 
+describe("QA-1.4-15: only a strictly higher rank is ungated (A24 amended) — the QA probes E2, E3, E4", () => {
+  const detection = { deterministic: 0.95, grader: 0.7, none: 0.3 };
+  const keyOf = (cls: string, agent: string, origin: "router" | "host", model: string, variant: string) => `${cls}|${origin}:${agent}|${model}#${variant}` as OutcomeKey;
+
+  it("E2: `general` on haiku inherits medium's rank and price; 3 failures on medium make it the sideways argmin → kept:evidence", () => {
+    const agents = [...routerAgents(), nativeAgent("general", HAIKU, ["shell", "web", "edit", "network"])];
+    const cfg = plainCfg();
+    const f = { class: "implement", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+    const ladder = buildLadder({ cfg, routing: { roles: { implement: ["general"] } }, facts: f, agents });
+    const own = ladder.candidates.find((c) => c.source === "role-own-model")!;
+    expect(own).toMatchObject({ rank: 1, costRatio: 5, tier: "medium" }); // no preset rung on haiku: inherited rank and price
+    const store = createOutcomeStore({ now: () => 1_000 });
+    const mediumKey = keyOf("implement", "medium", "router", SONNET, "medium");
+    for (let i = 0; i < 3; i++) store.recordVerdict(mediumKey, "fail", { attemptID: `m${i}`, step: "dispatch" });
+    const decision = decide({
+      facts: f, ladder, store, detection: "none", pin: false,
+      routing: { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection },
+      chosen: resolveChosen({ cfg, agents, agent: "medium" })!,
+    });
+    expect(decision.best?.agent).toBe("general");
+    expect(decision.switched).toBe(false);
+    expect(decision.reasonCode).toBe("kept:evidence");
+    // With 5 outcomes on the winner's own key the same decision switches.
+    for (let i = 0; i < 5; i++) store.recordVerdict(keyOf("implement", "general", "host", HAIKU, "default"), "pass", { attemptID: `g${i}`, step: "dispatch" });
+    const backed = decide({ facts: f, ladder, store, detection: "none", pin: false, routing: { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection }, chosen: resolveChosen({ cfg, agents, agent: "medium" })! });
+    expect(backed.reasonCode).toBe("switched");
+  });
+
+  it("E3: medium#high → medium#low (same price, same rank) after 4 failures on the pick → kept:evidence", () => {
+    const cfg = cfgOf({
+      fast: tier(SONNET, "low", 1),
+      medium: tier(SONNET, "high", 5, { candidates: [{ variant: "low", costRatio: 5 }, { variant: "high", costRatio: 5 }] }),
+      heavy: tier(OPUS, "xhigh", 20),
+    });
+    // risk high + no detection: never-down keeps `fast` out, so the argmin is the sideways rung.
+    const f = { class: "implement", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: f, agents: routerAgents() });
+    const [low, high] = ladder.candidates.filter((c) => c.tier === "medium");
+    expect([low!.variant, high!.variant, low!.costRatio, high!.costRatio, low!.rank, high!.rank]).toEqual(["low", "high", 5, 5, 1, 1]);
+    const store = createOutcomeStore({ now: () => 1_000 });
+    const pickKey = keyOf("implement", "medium", "router", SONNET, "high");
+    for (let i = 0; i < 4; i++) store.recordVerdict(pickKey, "fail", { attemptID: `h${i}`, step: "dispatch" });
+    const decision = decide({
+      facts: f, ladder, store, detection: "none", pin: false,
+      routing: { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection },
+      chosen: resolveChosen({ cfg, agents: routerAgents(), agent: "medium", model: `${SONNET}#high` })!,
+    });
+    expect(decision.chosen.variant).toBe("high");
+    expect(decision.best?.agent).toBe("medium");
+    expect(decision.best?.variant).toBe("low");
+    expect(decision.reasonCode).toBe("kept:evidence");
+  });
+
+  it("E4: search, safe/high/deterministic, margin 0.1, priors only: fast → explore@haiku is sideways → kept:evidence", () => {
+    const agents = [...routerAgents(), EXPLORE];
+    const cfg = plainCfg();
+    const f = { class: "search", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+    const ladder = buildLadder({ cfg, routing: { roles: { search: ["explore"] } }, facts: f, agents });
+    const decision = decide({
+      facts: f, ladder, store: createOutcomeStore({ now: () => 1_000 }), detection: "deterministic", pin: false,
+      routing: { profile: "safe", margin: 0.1, minClassConfidence: 0.7, detection },
+      chosen: resolveChosen({ cfg, agents, agent: "fast" })!,
+    });
+    expect(decision.best?.agent).toBe("explore");
+    expect(decision.switched).toBe(false);
+    expect(decision.reasonCode).toBe("kept:evidence");
+  });
+});
 describe("QA-1.4-3: router tier rungs honour permitted, hidden and mode", () => {
   const unavailable: ReadonlyArray<readonly [string, Partial<HostAgentInfo>]> = [
     ["not permitted", { permitted: false }],

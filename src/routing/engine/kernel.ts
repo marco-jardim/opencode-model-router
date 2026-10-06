@@ -72,9 +72,10 @@ export const GIVE_UP_COST: Readonly<Record<RoutingProfile, Readonly<Record<Risk,
 export const DEFAULT_REMAINING_TURNS = 4;
 
 /**
- * A24 (QA-1.4-6): a switch to a candidate that is cheaper to attempt or ranked lower than the pick (a "down"
- * switch) needs at least this much recorded evidence on the candidate's own key: the strength of a D7 prior,
- * so priors alone never move a dispatch down. Switches up are not gated.
+ * A24 (QA-1.4-6, amended by QA-1.4-15): only a switch to a STRICTLY HIGHER rank is ungated. Every other
+ * switch — down, sideways at an equal rank (a role agent on a rung of the pick's own tier, a lower variant of
+ * the same model) — needs at least this much recorded evidence on the candidate's own key: the strength of a
+ * D7 prior, so priors alone never move a dispatch down or sideways. (The name predates the amendment.)
  */
 export const MIN_EVIDENCE_TO_SWITCH_DOWN: number = PRIOR_STRENGTH;
 
@@ -435,9 +436,9 @@ export function decide(input: DecisionInput): Decision {
   } else if (!(bestCost < threshold)) {
     reasonCode = "kept:margin";
     reason = `kept: C(best)=${fmt(bestCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
-  } else if (isDownSwitch(c, cands, bestIndex, chosenIndex) && !hasMinEvidence(evidence[bestIndex]!)) {
+  } else if (!isStrictlyHigher(cands, bestIndex, chosenIndex) && !hasMinEvidence(evidence[bestIndex]!)) {
     reasonCode = "kept:evidence";
-    reason = `kept: moving down to ${bestChoice!.key} needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[bestIndex]!)}`;
+    reason = `kept: moving to ${bestChoice!.key} (rank ${cands[bestIndex]!.rank}, the pick is rank ${cands[chosenIndex]!.rank}) needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[bestIndex]!)}`;
   } else {
     reasonCode = "switched";
     reason = `switched: C(best)=${fmt(bestCost)} < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
@@ -463,9 +464,9 @@ export function decide(input: DecisionInput): Decision {
   });
 }
 
-/** A24: `best` is cheaper to attempt, or ranked lower, than the pick. */
-function isDownSwitch(c: Float64Array, cands: readonly Candidate[], best: number, chosen: number): boolean {
-  return c[best]! < c[chosen]! || cands[best]!.rank < cands[chosen]!.rank;
+/** A24 (QA-1.4-15): `best` is ranked strictly above the pick; the only switch the evidence gate lets through unaided. */
+function isStrictlyHigher(cands: readonly Candidate[], best: number, chosen: number): boolean {
+  return cands[best]!.rank > cands[chosen]!.rank;
 }
 
 /**
