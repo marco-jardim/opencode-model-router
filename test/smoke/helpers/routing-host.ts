@@ -350,6 +350,8 @@ export interface HostOptions {
   readonly rootModel?: ModelRef;
   /** Skip the router plugin (control host). */
   readonly withoutRouter?: boolean;
+  /** Merged over the generated opencode.json (the host's own config: agents, providers…). */
+  readonly hostConfig?: Obj;
   /** Seeds written to the outcomes store BEFORE the host starts (through the repo's own store + persister, on the temp dir). */
   readonly seed?: readonly Seed[];
 }
@@ -435,6 +437,7 @@ export class RoutingHost {
       model: ref(root),
       plugins: [...(this.options.withoutRouter ? [] : [ROOT]), probe],
       providers: { anthropic: { settings: { baseURL, apiKey: "keyless-smoke-fake" } }, ...this.resolveProviders(baseURL) },
+      ...obj(this.options.hostConfig),
     }));
     const password = randomBytes(24).toString("base64url");
     Object.assign(env, {
@@ -529,9 +532,18 @@ export class RoutingHost {
   }
   /** The events of one session (de-duplicated by event id). */
   async eventsOf(sessionID: string): Promise<EventRecord[]> { return (await this.events()).filter(e => obj(e.data).sessionID === sessionID); }
+  /** A read-only GET against THIS isolated host (never the user's service). */
+  async getJson(route: string): Promise<unknown> {
+    const url = new URL(route, this.baseUrl);
+    url.searchParams.set("location[directory]", this.project);
+    const response = await fetch(url, { headers: { authorization: this.authorization }, signal: AbortSignal.timeout(30_000) });
+    return JSON.parse(await response.text());
+  }
   tail(chars = 3_000): string { return this.output.slice(-chars); }
   /** Every host log line that mentions the router at warn/error level (the plugin's own diagnostics). */
   routerLogLines(): string[] { return this.output.split(/\r?\n/).filter(line => /\[router\]|\[model-router\]/.test(line) && /(WARN|ERROR)/i.test(line)); }
+  /** Host log lines at ERROR level (a failed model initialization, a failed session drain…). */
+  errorLines(): string[] { return this.output.split(/\r?\n/).filter(line => /level=ERROR/.test(line)); }
   async hooks(): Promise<HookRecord[]> { return jsonl<HookRecord>(this.logs.hooks); }
   async rawEvents(): Promise<EventRecord[]> { return jsonl<EventRecord>(this.logs.events); }
   /** rawEvents() with duplicates (the same event id seen by several plugin instances) removed. */

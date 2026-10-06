@@ -1,0 +1,35 @@
+{
+  "scenario": "5b-advisor-title-model-set",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "d7513ac6-0488-4a1e-84d4-4d90f48b329f",
+  "recordedAt": "2026-10-06T21:29:59.055Z",
+  "harness": {
+    "headSha": "b8aec76382d7b884ffdd3d358d57ca1a124c9f79",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "044bea85b89f9c5d32a9e10d2b08a5e1f52a5cdf",
+      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "With agents.title.model set in the host config the real title agent record carries that model and /router has NO title finding, even from a session of the provider without a small model.",
+  "observed": {
+    "titleAgentRecord": [
+      {
+        "id": "title",
+        "hidden": true,
+        "model": {
+          "id": "claude-haiku-4-5",
+          "providerID": "anthropic"
+        }
+      }
+    ],
+    "doctorLines": [
+      "Cost doctor: 2 findings (0 warning, 0 saving, 2 info)",
+      "  [info] variant-ladder-budget (fast): Tier fast has 3 variant steps (low → medium → high → xhigh) and maxTotalAttempts is 4: a failing delegation can spend its whole attempt budget on this tier's variants. The budget reserve still keeps an escalation reachable, but every variant of an unpriced model counts at the tier's costRatio unless you give it its own.",
+      "  [info] covered-tier (medium): Tier medium (anthropic/claude-sonnet-5-5#medium) is covered by tier fast's variant steps (up to #xhigh): an escalation from fast skips it and goes straight to the next tier that adds something."
+    ],
+    "hostErrorLines": []
+  },
+  "assertionResult": "PASS: title agent model={\"id\":\"claude-haiku-4-5\",\"providerID\":\"anthropic\"}; title finding present=false",
+  "notes": []
+}

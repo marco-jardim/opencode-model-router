@@ -15,8 +15,10 @@
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { makeKey } from "../../src/routing/outcomes";
+import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
+import type { RouterConfig } from "../../src/router/config";
 import {
-  MODELS, RoutingHost, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
+  MODELS, RoutingHost, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -333,7 +335,73 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
   }, 400_000);
-});
+
+  it("5 advisor: /router reports the title finding only when the host finds no small model for the session's provider", async () => {
+    const host = await RoutingHost.start("advisor", {
+      routing: { engine: "advise" },
+      providers: { smallless: { name: "Smallless", package: "@opencode/ai/providers/anthropic", settings: { baseURL: "$BASE_URL", apiKey: "keyless-smoke-fake" }, models: { "big-1": { name: "Big One", limit: { context: 200_000, output: 8_000 } } } } },
+    });
+    try {
+      await runScenario("5-advisor", "After QA-2.4-1 the summary finding is gone and `title-model-unset` fires only when agents.title.model is unset AND the host's Model.small pick finds nothing for the SESSION'S provider while a cheaper title-eligible model exists elsewhere. On the real host: /router from a session of the anthropic provider (which has a claude-haiku) has NO title finding; from a session of a provider without a small model it HAS one. (Divergence from plan 3.2 scenario 5, which still says 'title/summary'.)", async s => {
+        const router = async (rootID: string) => {
+          const before = (await host.client.session.context({ sessionID: rootID })).length;
+          await host.client.session.command({ sessionID: rootID, name: "router", text: "" });
+          await host.settle(rootID);
+          const messages = await host.client.session.context({ sessionID: rootID });
+          const added = messages.slice(before).filter(m => m.type === "user").map(m => String(m.text ?? JSON.stringify(m)));
+          return added.join("\n");
+        };
+        const anthropicRoot = await host.newRoot("advisor root anthropic");
+        await host.prompt(anthropicRoot, "hello");
+        const withHaiku = await router(anthropicRoot);
+        const smallRoot = await host.newRoot("advisor root smallless", { providerID: "smallless", id: "big-1" });
+        await host.prompt(smallRoot, "hello");
+        const withoutSmall = await router(smallRoot);
+        const dump = await host.dump();
+        const agents = arr(dump?.agents).map(obj);
+        const models = arr(dump?.models).map(obj);
+        s.observed.anthropicSession = { rootID: anthropicRoot, commandLines: withHaiku.split(/\r?\n/).slice(0, 80) };
+        s.observed.smalllessSession = { rootID: smallRoot, commandLines: withoutSmall.split(/\r?\n/).slice(0, 80) };
+        s.observed.hostAgentRecords = agents.map(a => ({ id: a.id, mode: a.mode, hidden: a.hidden, model: a.model, keys: Object.keys(a) }));
+        s.observed.hostModelRecordSample = models.filter(m => m.id === "claude-haiku-4-5" || m.providerID === "smallless").map(m => ({ providerID: m.providerID, id: m.id, enabled: m.enabled, status: m.status, family: m.family, capabilities: m.capabilities, keys: m.keys }));
+        s.observed.providerList = arr(obj(await host.getJson("/api/provider")).data).map(p => ({ id: obj(p).id, package: obj(p).package, activation: obj(p).activation }));
+        s.observed.hostErrorLines = host.errorLines();
+        s.observed.harnessNote = "A custom provider with package @opencode/ai/providers/anthropic-compatible does NOT initialize in the standalone host (\"Cannot find package @opencode/ai\"; only packages a built-in provider uses are bundled); the fixture therefore uses the bundled @opencode/ai/providers/anthropic under a custom provider id.";
+        s.observed.routerLogLines = host.routerLogLines();
+        const ok = !/title-model-unset|agents\.title\.model/.test(withHaiku) && /\[saving\] title-model-unset/.test(withoutSmall) && /anthropic\/claude-haiku-4-5/.test(withoutSmall) && host.routerLogLines().length === 0 && host.errorLines().length === 0
+          && agents.some(a => a.id === "title" && a.hidden === true && a.model === undefined) && models.some(m => m.id === "claude-haiku-4-5" && m.enabled === true && m.status === "active" && m.family === "claude-haiku" && obj(m.capabilities).tools === true);
+        s.verdict(ok, `anthropic session (haiku available): title finding ${/agents\.title\.model/.test(withHaiku)}; smallless session: title finding ${/agents\.title\.model/.test(withoutSmall)}`);
+      });
+
+      // The same session on a host whose title agent HAS a model: no finding (2.4 handoff "and not when set").
+      const configured = await RoutingHost.start("advisor-title-set", {
+        routing: { engine: "advise" },
+        providers: { smallless: { name: "Smallless", package: "@opencode/ai/providers/anthropic", settings: { baseURL: "$BASE_URL", apiKey: "keyless-smoke-fake" }, models: { "big-1": { name: "Big One", limit: { context: 200_000, output: 8_000 } } } } },
+        hostConfig: { agents: { title: { model: "anthropic/claude-haiku-4-5" } } },
+      });
+      try {
+        await runScenario("5b-advisor-title-model-set", "With agents.title.model set in the host config the real title agent record carries that model and /router has NO title finding, even from a session of the provider without a small model.", async s => {
+          const rootID = await configured.newRoot("advisor root smallless (title set)", { providerID: "smallless", id: "big-1" });
+          await configured.prompt(rootID, "hello");
+          const before = (await configured.client.session.context({ sessionID: rootID })).length;
+          await configured.client.session.command({ sessionID: rootID, name: "router", text: "" });
+          await configured.settle(rootID);
+          const text = (await configured.client.session.context({ sessionID: rootID })).slice(before).filter(m => m.type === "user").map(m => String(m.text ?? "")).join("\n");
+          const agentList = (await configured.client.agent.list()).data.filter(a => a.id === "title");
+          s.observed.titleAgentRecord = agentList.map(a => ({ id: a.id, hidden: a.hidden, model: (a as { model?: unknown }).model }));
+          s.observed.doctorLines = text.split(/\r?\n/).filter(l => /Cost doctor|\[(info|saving|warning)\]/.test(l));
+          s.observed.hostErrorLines = configured.errorLines();
+          const ok = !/title-model-unset/.test(text) && /Cost doctor/.test(text) && agentList.some(a => obj(a.model).id === "claude-haiku-4-5") && configured.errorLines().length === 0;
+          s.verdict(ok, `title agent model=${JSON.stringify(agentList[0]?.model)}; title finding present=${/title-model-unset/.test(text)}`);
+        });
+      } finally {
+        expect((await configured.stop()).hostPortClosed).toBe(true);
+      }
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 300_000);});
 
 void str;
 void MODELS;

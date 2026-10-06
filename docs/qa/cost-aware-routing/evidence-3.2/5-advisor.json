@@ -1,0 +1,325 @@
+{
+  "scenario": "5-advisor",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "d7513ac6-0488-4a1e-84d4-4d90f48b329f",
+  "recordedAt": "2026-10-06T21:29:54.338Z",
+  "harness": {
+    "headSha": "b8aec76382d7b884ffdd3d358d57ca1a124c9f79",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "044bea85b89f9c5d32a9e10d2b08a5e1f52a5cdf",
+      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "After QA-2.4-1 the summary finding is gone and `title-model-unset` fires only when agents.title.model is unset AND the host's Model.small pick finds nothing for the SESSION'S provider while a cheaper title-eligible model exists elsewhere. On the real host: /router from a session of the anthropic provider (which has a claude-haiku) has NO title finding; from a session of a provider without a small model it HAS one. (Divergence from plan 3.2 scenario 5, which still says 'title/summary'.)",
+  "observed": {
+    "anthropicSession": {
+      "rootID": "ses_eece08202ffeSf0l3SupZ4XA3m",
+      "commandLines": [
+        "# Model Router",
+        "Enforcement: **advisory**",
+        "",
+        "Commands:",
+        "- `/router enforce <off|advisory|enforced>` — set hard-block enforcement (persisted)",
+        "- `/router overrides` — show the global + project override file paths and precedence",
+        "- `/router models [provider]` — list valid model ids from your configured providers",
+        "- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats`)",
+        "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+        "router: engine=advise build=2.2.0+b8aec76",
+        "router: last checkpoint=DF3",
+        "",
+        "Cost doctor: 2 findings (0 warning, 0 saving, 2 info)",
+        "  [info] variant-ladder-budget (fast): Tier fast has 3 variant steps (low → medium → high → xhigh) and maxTotalAttempts is 4: a failing delegation can spend its whole attempt budget on this tier's variants. The budget reserve still keeps an escalation reachable, but every variant of an unpriced model counts at the tier's costRatio unless you give it its own.",
+        "  [info] covered-tier (medium): Tier medium (anthropic/claude-sonnet-5-5#medium) is covered by tier fast's variant steps (up to #xhigh): an escalation from fast skips it and goes straight to the next tier that adds something.",
+        "Decision log: a ladder-attempt row's confidence is the delegation's class confidence; a dispatch row's is the class confidence scaled by the winner's evidence (n/(n+5))."
+      ]
+    },
+    "smalllessSession": {
+      "rootID": "ses_eece07f93ffecHYlYFaXavYkG0",
+      "commandLines": [
+        "# Model Router",
+        "Enforcement: **advisory**",
+        "",
+        "Commands:",
+        "- `/router enforce <off|advisory|enforced>` — set hard-block enforcement (persisted)",
+        "- `/router overrides` — show the global + project override file paths and precedence",
+        "- `/router models [provider]` — list valid model ids from your configured providers",
+        "- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats`)",
+        "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+        "router: engine=advise build=2.2.0+b8aec76",
+        "router: last checkpoint=DF3",
+        "",
+        "Cost doctor: 3 findings (0 warning, 1 saving, 2 info)",
+        "  [saving] title-model-unset (title): agents.title.model is unset and the host finds no small model of smallless in your catalog (it looks for gpt-luna, gemini-flash-lite, gemini-flash, claude-haiku of the session's provider), so session titles are generated with the session's own model, smallless/big-1. The cheapest priced model the host accepts for it in your catalog is anthropic/claude-haiku-4-5 ($1/$5 per Mtok in/out).",
+        "      fix (opencode.json): {\"agents\":{\"title\":{\"model\":\"anthropic/claude-haiku-4-5\"}}}",
+        "      v1 form (opencode.json): {\"agent\":{\"title\":{\"model\":\"anthropic/claude-haiku-4-5\"}}} or {\"small_model\":\"anthropic/claude-haiku-4-5\"}",
+        "  [info] variant-ladder-budget (fast): Tier fast has 3 variant steps (low → medium → high → xhigh) and maxTotalAttempts is 4: a failing delegation can spend its whole attempt budget on this tier's variants. The budget reserve still keeps an escalation reachable, but every variant of an unpriced model counts at the tier's costRatio unless you give it its own.",
+        "  [info] covered-tier (medium): Tier medium (anthropic/claude-sonnet-5-5#medium) is covered by tier fast's variant steps (up to #xhigh): an escalation from fast skips it and goes straight to the next tier that adds something.",
+        "Decision log: a ladder-attempt row's confidence is the delegation's class confidence; a dispatch row's is the class confidence scaled by the winner's evidence (n/(n+5))."
+      ]
+    },
+    "hostAgentRecords": [
+      {
+        "id": "build",
+        "mode": "primary",
+        "hidden": false,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "general",
+        "mode": "subagent",
+        "hidden": false,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "explore",
+        "mode": "subagent",
+        "hidden": false,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "compaction",
+        "mode": "primary",
+        "hidden": true,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "title",
+        "mode": "primary",
+        "hidden": true,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "summary",
+        "mode": "primary",
+        "hidden": true,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "plan",
+        "mode": "primary",
+        "hidden": false,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "model-router-grader",
+        "mode": "subagent",
+        "hidden": true,
+        "keys": [
+          "id",
+          "name",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "permissions"
+        ]
+      },
+      {
+        "id": "fast",
+        "mode": "subagent",
+        "hidden": false,
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "keys": [
+          "id",
+          "name",
+          "model",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "steps",
+          "permissions"
+        ]
+      },
+      {
+        "id": "medium",
+        "mode": "subagent",
+        "hidden": false,
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "medium"
+        },
+        "keys": [
+          "id",
+          "name",
+          "model",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "steps",
+          "permissions"
+        ]
+      },
+      {
+        "id": "heavy",
+        "mode": "subagent",
+        "hidden": false,
+        "model": {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "xhigh"
+        },
+        "keys": [
+          "id",
+          "name",
+          "model",
+          "request",
+          "description",
+          "mode",
+          "hidden",
+          "steps",
+          "permissions"
+        ]
+      }
+    ],
+    "hostModelRecordSample": [
+      {
+        "providerID": "anthropic",
+        "id": "claude-haiku-4-5",
+        "enabled": true,
+        "status": "active",
+        "family": "claude-haiku",
+        "capabilities": {
+          "tools": true,
+          "input": [
+            "text",
+            "image",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "keys": [
+          "id",
+          "modelID",
+          "providerID",
+          "family",
+          "name",
+          "package",
+          "settings",
+          "capabilities",
+          "variants",
+          "time",
+          "cost",
+          "status",
+          "enabled",
+          "limit"
+        ]
+      },
+      {
+        "providerID": "smallless",
+        "id": "big-1",
+        "enabled": true,
+        "status": "active",
+        "capabilities": {
+          "tools": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "keys": [
+          "id",
+          "modelID",
+          "providerID",
+          "name",
+          "package",
+          "settings",
+          "capabilities",
+          "variants",
+          "time",
+          "cost",
+          "status",
+          "enabled",
+          "limit"
+        ]
+      }
+    ],
+    "providerList": [
+      {
+        "id": "anthropic",
+        "package": "@opencode/ai/providers/anthropic",
+        "activation": "enabled"
+      },
+      {
+        "id": "opencode",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "activation": "enabled"
+      },
+      {
+        "id": "smallless",
+        "package": "@opencode/ai/providers/anthropic",
+        "activation": "enabled"
+      }
+    ],
+    "hostErrorLines": [],
+    "harnessNote": "A custom provider with package @opencode/ai/providers/anthropic-compatible does NOT initialize in the standalone host (\"Cannot find package @opencode/ai\"; only packages a built-in provider uses are bundled); the fixture therefore uses the bundled @opencode/ai/providers/anthropic under a custom provider id.",
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: anthropic session (haiku available): title finding false; smallless session: title finding true",
+  "notes": []
+}
