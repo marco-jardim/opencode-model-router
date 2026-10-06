@@ -477,6 +477,13 @@ export const FLOOR_LIFT_REASON = "lift:floor";
  */
 export const RESUME_REASON = "kept:resume";
 
+/**
+ * Reason prefix of a resume that repeats the orchestrator's original pick of a child the router moved (a floor lift, an evidence switch):
+ * the host would switch the child back to that pick, so `enforce` sends the resume to the agent/model the child runs (plan amendment A30,
+ * QA-2.4-R3-1). Still a `kept:resume` row (`startsWith(RESUME_REASON)`), `switched` false, outside every routing metric.
+ */
+export const RESUME_RUNNING_REASON = "kept:resume:running";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */

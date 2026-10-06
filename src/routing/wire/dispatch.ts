@@ -50,6 +50,7 @@ import { resolve as resolvePath, sep } from "node:path";
 import {
   FLOOR_LIFT_REASON,
   RESUME_REASON,
+  RESUME_RUNNING_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -149,6 +150,8 @@ interface Decided {
   readonly description: string | null;
   /** What the engine dispatches: the fallback for what the final input leaves out. */
   readonly final: { readonly agent: string; readonly model: string; readonly variant: string | null };
+  /** The agent the orchestrator NAMED for this dispatch, before the router changed anything: recorded with the child (QA-2.4-R3-1). */
+  readonly picked: string;
   readonly routerIds: readonly string[];
   /** Resolve an agent the legacy hook switched to (the same resolution the engine used for the pick). */
   readonly resolve: (agent: string) => ChosenDispatch | null;
@@ -362,7 +365,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     register(entry.resumeID, {
       facts: before.facts, agent: before.agent, model: before.model, variant: before.variant, tier: before.tier, acceptance: before.acceptance,
       parentSessionID: before.parentSessionID, attemptId: before.attemptId, decisionID: before.decisionID, step: before.step,
-      outcomes: before.outcomes, keepExecution: true,
+      outcomes: before.outcomes, picked: before.picked, keepExecution: true,
     });
   };
 
@@ -394,6 +397,20 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     if (lifted === null || info === undefined) return null;
     if (!info.permitted || info.mode === "primary" || info.hidden) return null;
     return coversNeeds(info.grants, facts.needs) ? lifted : null;
+  };
+
+  /**
+   * A30 as amended (QA-2.4-R3-1): the host switches a resumed child to the agent the resume NAMES when it differs from the one the child
+   * runs (`switchAgent` in the host's subagent tool: the child's model becomes that agent's). An orchestrator that resumes a child
+   * with its own original pick of a child the router moved (floor lift, evidence switch) would move it back below where the router put
+   * it. What the child runs, when that is the case: the resume names the pick the child was dispatched under, the child runs another
+   * agent, and it is this orchestrator's child.
+   */
+  const runningAfterRouter = (resumeID: string, parentSessionID: string, named: string): { agent: string; model: string; variant: string | null } | null => {
+    const record = lookupDispatch(resumeID);
+    if (record === undefined || record.parentSessionID !== parentSessionID) return null;
+    if (record.picked === null || record.picked !== named || record.agent === named || record.model === null) return null;
+    return { agent: record.agent, model: record.model, variant: record.variant };
   };
 
   const decideAndRecord = async (call: RouteCall, prepared: Prepared, session: SessionView, view: AgentView | null): Promise<RouteOutcome> => {
@@ -449,16 +466,39 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       // A30 (QA-2.4-R2-3): a dispatch that resumes an existing child (`task_id`/`sessionID`) is never switched by the engine, in any mode:
       // the kernel's decision is still logged (best, costs, its own reason), but `switched` is false and the reason code is `kept:resume`.
       const resuming = resumeID !== null;
+      // QA-2.4-R3-1 (A30 amended): the router never moves a child from where it runs. A resume that repeats the orchestrator's original
+      // pick of a child the router moved is sent to the agent/model the child runs (`enforce`; the other modes only say so in the row).
+      const running = resumeID === null ? null : runningAfterRouter(resumeID, call.sessionID, agent);
       row = {
         chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
-        reason: resuming
-          ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
-          : `${decision.reasonCode}: ${decision.reason}`,
+        reason: running !== null
+          ? `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${mode === "enforce" ? "sent to @" + running.agent : "would be sent to @" + running.agent + " (not applied in " + mode + ")"} so the host does not switch it back (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
+          : resuming
+            ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
+            : `${decision.reasonCode}: ${decision.reason}`,
       };
       final = { agent, model: chosen.model, variant: chosen.variant };
 
-      if (mode === "enforce" && !decision.pinned && !resuming) {
+      if (mode === "enforce" && !decision.pinned && running !== null) {
+        outcome = { ...outcome, agent: running.agent, model: refOf(running.model, running.variant) };
+        final = { agent: running.agent, model: running.model, variant: running.variant };
+      } else if (mode === "enforce" && !decision.pinned && resuming) {
+        // A resume naming an agent other than the one the child runs, and other than the pick it was dispatched under, is the
+        // orchestrator's choice: honoured, never below the floor. Without a record of the child nothing is known to move.
+        const record = lookupDispatch(resumeID);
+        const lifted = record !== undefined && record.parentSessionID === call.sessionID && record.agent !== agent ? floorLift(prepared, chosen, infos, facts) : null;
+        if (lifted !== null) {
+          outcome = { ...outcome, agent: lifted.agent.id, model: refOf(lifted.model, lifted.variant) };
+          final = { agent: lifted.agent.id, model: lifted.model, variant: lifted.variant };
+          row = {
+            ...row,
+            best: choiceOf(facts.class, lifted),
+            switched: true,
+            reason: `${FLOOR_LIFT_REASON}: resume lifted from @${agent} to @${lifted.agent.id} by enforcement.escalate.floorTier (the child runs @${record?.agent ?? "?"}); engine decision: ${row.reason}`,
+          };
+        }
+      } else if (mode === "enforce" && !decision.pinned) {
         if (decision.switched && decision.target !== null) {
           const target = decision.target;
           outcome = { ...outcome, agent: target.agent.id, model: refOf(target.model, target.variant) };
@@ -505,6 +545,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         final,
         routerIds,
         resolve: (target) => resolveChosen({ cfg: prepared.cfg, agents: infos, agent: target, parentModel: session.model }),
+        picked: agent,
         at: now(),
       });
       trim(decided, MAX_PENDING);
@@ -590,6 +631,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           parentSessionID: d.parentSessionID,
           decisionID: d.decisionID,
           step: "dispatch",
+          picked: d.picked,
         };
         const t = now();
         sweep(t);

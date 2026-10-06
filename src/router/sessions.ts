@@ -603,6 +603,12 @@ export interface DispatchInput {
   attemptId?: string;
   /** Id of the decision row of this dispatch (2.2), so verdict/refusal rows can reference it. */
   decisionID?: string | null;
+  /**
+   * The agent the orchestrator NAMED for this dispatch before the router changed anything (a floor lift, an evidence switch): what a
+   * later resume of the child that repeats it must not be allowed to move back (the host switches a resumed child to the agent the
+   * resume names; QA-2.4-R3-1). Absent for a registration that is not an orchestrator dispatch (the runner's, a ladder step).
+   */
+  picked?: string | null;
   /** Kind of attempt (default `dispatch`; 2.3 ladder attempts pass `variant | retry | escalate`). */
   step?: LadderStepKind;
   /**
@@ -634,6 +640,8 @@ export interface DispatchRecord {
   /** 0 for the first registration of the child; +1 for each re-registration. Display only: it restarts at 0 after an eviction, `attemptId` never repeats. */
   readonly attemptIndex: number;
   readonly decisionID: string | null;
+  /** See `DispatchInput.picked`. */
+  readonly picked: string | null;
   readonly step: LadderStepKind;
   /** See `DispatchInput.outcomes`: false = ingestion was off where this child was registered. */
   readonly outcomes: boolean;
@@ -703,6 +711,7 @@ export function rememberDispatch(
     attemptId: input.attemptId ?? `${childSessionID}:${attemptIndex}:${attemptNonce}-${++attemptSeq}`,
     attemptIndex,
     decisionID: input.decisionID ?? null,
+    picked: input.picked ?? null,
     step: input.step ?? "dispatch",
     outcomes: input.outcomes ?? true,
     registeredAt: nowMs,
