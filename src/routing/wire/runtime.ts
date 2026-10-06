@@ -96,7 +96,7 @@ interface Held {
 }
 
 export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
-  const now = deps.now ?? Date.now;
+  const now = deps.now ?? (() => Date.now());
   const acquire = deps.acquire ?? acquireOutcomes;
   const agentsTtlMs = deps.agentsTtlMs ?? 5_000;
   const readyTimeoutMs = deps.readyTimeoutMs ?? 500;

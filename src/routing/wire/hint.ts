@@ -103,7 +103,7 @@ function describeError(error: unknown): string {
 }
 
 export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmenter {
-  const now = deps.now ?? Date.now;
+  const now = deps.now ?? (() => Date.now());
   let taxonomyMemo: { cfg: Prepared["cfg"]; agent: string; at: number; line: string } | null = null;
   const hints = new Map<string, { key: string; hint: string | null }>();
 

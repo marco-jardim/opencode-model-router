@@ -183,7 +183,7 @@ function unresolvedChoice(cls: string, agent: string, routerIds: readonly string
 }
 
 export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
-  const now = deps.now ?? Date.now;
+  const now = deps.now ?? (() => Date.now());
   const pending: Pending[] = [];
   let sequence = 0;
 

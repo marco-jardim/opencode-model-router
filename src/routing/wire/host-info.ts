@@ -193,7 +193,7 @@ function describeError(error: unknown): string {
 }
 
 export function createWireCatalog(list: () => Promise<readonly RawCatalogModel[]>, options: WireCatalogOptions = {}): WireCatalog {
-  const now = options.now ?? Date.now;
+  const now = options.now ?? (() => Date.now());
   const ttlMs = options.ttlMs ?? 60_000;
   const retryMs = options.retryMs ?? 15_000;
   const loadTimeoutMs = options.loadTimeoutMs ?? 2_000;

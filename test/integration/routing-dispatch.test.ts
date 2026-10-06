@@ -1,0 +1,673 @@
+// Phase 2.2 (M7): dispatch-time routing on OpenCode v2. The kernel (1.4) is wired into the adapter's execute.before and
+// context hook; these tests drive the real `registerV2Hooks` over a fake v2 context, a real outcome store (A3 bundle) and
+// real config files. Temp directories only: HOME and the outcomes path are redirected, nothing touches the user's files.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { Context } from "@opencode/plugin/promise/plugin";
+import type { Hooks } from "@opencode-ai/plugin";
+import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
+import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
+import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
+import { assembleSystemPrompt, buildTaskTaxonomy } from "../../src/router/protocol";
+import { lookupDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
+import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
+import { resetIngestState } from "../../src/routing/outcomes/ingest";
+
+const logger = { warn: vi.fn() };
+
+const SONNET = "anthropic/claude-sonnet-5-5";
+const OPUS = "anthropic/claude-opus-5-5";
+const HAIKU = "anthropic/claude-haiku-4-5";
+const ALLOW_ALL = [{ action: "*", resource: "*", effect: "allow" }];
+const READ_ONLY = [
+  { action: "*", resource: "*", effect: "deny" },
+  ...["glob", "grep", "read", "webfetch", "websearch"].map((action) => ({ action, resource: "*", effect: "allow" })),
+];
+
+const KEYS = {
+  medium: makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "medium"),
+  heavy: makeKey("implement", { origin: "router", id: "heavy" }, "anthropic", "claude-opus-5-5", "xhigh"),
+  fast: makeKey("search", { origin: "router", id: "fast" }, "anthropic", "claude-sonnet-5-5", "low"),
+  explore: makeKey("search", { origin: "host", id: "explore" }, "anthropic", "claude-haiku-4-5", "default"),
+  reconFast: makeKey("recon", { origin: "router", id: "fast" }, "anthropic", "claude-sonnet-5-5", "low"),
+  reconExplore: makeKey("recon", { origin: "host", id: "explore" }, "anthropic", "claude-haiku-4-5", "default"),
+};
+
+interface World {
+  home: string;
+  outcomes: string;
+  ctx: any;
+  agents: Record<string, any>;
+  session: { current: Record<string, unknown> | Error };
+  toolHooks: Record<string, (event: any) => Promise<void>>;
+  sessionHooks: Record<string, (event: any) => Promise<void>>;
+  emit(event: unknown): void;
+  start(legacy?: Record<string, unknown>): Promise<void>;
+  bundle: OutcomesBundle;
+  seed(key: string, pass: number, fail: number): void;
+  rows(): Promise<DecisionRow[]>;
+  generate: ReturnType<typeof vi.fn>;
+}
+
+const worlds: World[] = [];
+const cleanups: Array<() => Promise<void>> = [];
+
+function registry(): Record<string, any> {
+  const base = { request: { settings: {}, headers: {}, body: {} }, hidden: false };
+  const [sonnetProvider, sonnetId] = SONNET.split("/") as [string, string];
+  const [opusProvider, opusId] = OPUS.split("/") as [string, string];
+  const [haikuProvider, haikuId] = HAIKU.split("/") as [string, string];
+  return {
+    build: { ...base, id: "build", mode: "primary", permissions: ALLOW_ALL },
+    fast: { ...base, id: "fast", mode: "subagent", model: { providerID: sonnetProvider, id: sonnetId, variant: "low" }, permissions: ALLOW_ALL, description: "fast tier" },
+    medium: { ...base, id: "medium", mode: "subagent", model: { providerID: sonnetProvider, id: sonnetId, variant: "medium" }, permissions: ALLOW_ALL, description: "medium tier" },
+    heavy: { ...base, id: "heavy", mode: "subagent", model: { providerID: opusProvider, id: opusId, variant: "xhigh" }, permissions: ALLOW_ALL, description: "heavy tier" },
+    explore: { ...base, id: "explore", mode: "subagent", model: { providerID: haikuProvider, id: haikuId }, permissions: READ_ONLY, description: "Fast read-only codebase exploration" },
+    general: { ...base, id: "general", mode: "subagent", permissions: ALLOW_ALL, description: "General purpose agent" },
+  };
+}
+
+function catalog() {
+  const variants = (...ids: string[]) => ids.map((id) => ({ id }));
+  return [
+    { providerID: "anthropic", id: "claude-sonnet-5-5", variants: variants("low", "medium", "high"), limit: { context: 200_000, output: 32_000 }, cost: [] },
+    { providerID: "anthropic", id: "claude-opus-5-5", variants: variants("low", "medium", "high", "xhigh"), limit: { context: 200_000, output: 32_000 }, cost: [] },
+    { providerID: "anthropic", id: "claude-haiku-4-5", variants: variants("high", "max"), limit: { context: 200_000, output: 32_000 }, cost: [] },
+  ];
+}
+
+/** `routing: null` writes no routing block at all; `extra` is merged into the override file. */
+async function makeWorld(routing: Record<string, unknown> | null, extra: Record<string, unknown> = {}): Promise<World> {
+  const home = mkdtempSync(join(tmpdir(), "router-dispatch-"));
+  const outcomes = join(home, "outcomes");
+  mkdirSync(outcomes, { recursive: true });
+  vi.stubEnv("HOME", home);
+  vi.stubEnv("USERPROFILE", home);
+  mkdirSync(dirname(overridePath()), { recursive: true });
+  writeFileSync(overridePath(), JSON.stringify({
+    enforcement: { verify: { testBaseline: false } },
+    ...extra,
+    ...(routing === null ? {} : { routing: { outcomes: { path: outcomes }, ...routing } }),
+  }));
+  invalidateConfigCache();
+  resetDispatchRegistry();
+  resetIngestState();
+
+  const agents = registry();
+  const session: World["session"] = {
+    current: {
+      id: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5", variant: "xhigh" },
+      permissions: [{ action: "subagent", resource: "*", effect: "allow" }], location: { directory: home },
+    },
+  };
+  const toolHooks: World["toolHooks"] = {};
+  const sessionHooks: World["sessionHooks"] = {};
+  const queue: unknown[] = [];
+  let wake = () => {};
+  const register = () => ({ dispose: vi.fn(async () => {}) });
+  const generate = vi.fn(async () => ({ text: "implement" }));
+  const ctx = {
+    location: { directory: home, project: { directory: home } },
+    agent: { reload: vi.fn(async () => {}), list: vi.fn(async () => ({ data: Object.values(agents) })), transform: vi.fn(async () => register()) },
+    command: { reload: vi.fn(async () => {}), transform: vi.fn(async () => register()) },
+    model: { list: vi.fn(async () => ({ data: catalog() })) },
+    generate: { text: generate },
+    tool: {
+      transform: vi.fn(async () => register()),
+      hook: vi.fn(async (name: string, cb: any) => { toolHooks[name] = cb; return register(); }),
+    },
+    session: {
+      get: vi.fn(async () => { if (session.current instanceof Error) throw session.current; return session.current; }),
+      context: vi.fn(async () => [] as unknown[]),
+      prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
+      hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),
+    },
+    event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+      signal.addEventListener("abort", () => wake(), { once: true });
+      while (!signal.aborted) {
+        if (queue.length) yield queue.shift();
+        else await new Promise<void>((resolve) => { wake = resolve; });
+      }
+    } },
+  };
+  const bundle = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
+  await bundle.ready;
+  const world: World = {
+    home, outcomes, ctx, agents, session, toolHooks, sessionHooks, bundle, generate,
+    emit(event) { queue.push(event); wake(); },
+    async start(legacy = {}) {
+      const cleanup = await registerV2Hooks(ctx as unknown as Context, legacy as unknown as Hooks);
+      cleanups.push(cleanup);
+    },
+    seed(key, pass, fail) {
+      for (let i = 0; i < pass; i++) bundle.store.recordVerdict(key as never, "pass", { attemptID: `${key}:p${i}`, step: "dispatch" });
+      for (let i = 0; i < fail; i++) bundle.store.recordVerdict(key as never, "fail", { attemptID: `${key}:f${i}`, step: "dispatch" });
+    },
+    async rows() {
+      await bundle.flusher.flushNow();
+      return (await bundle.persister.readRows()).rows.filter((row): row is DecisionRow => row.kind === "decision");
+    },
+  };
+  worlds.push(world);
+  return world;
+}
+
+let seq = 0;
+function dispatch(world: World, input: Record<string, unknown>, over: Record<string, unknown> = {}) {
+  const event: any = { tool: "subagent", input: { description: "work item", ...input }, sessionID: "root", agent: "build", messageID: "m", id: `call-${++seq}`, ...over };
+  return { event, run: () => world.toolHooks["execute.before"](event) };
+}
+
+async function routed(world: World, input: Record<string, unknown>, over: Record<string, unknown> = {}) {
+  const call = dispatch(world, input, over);
+  await call.run();
+  return call.event.input as Record<string, any>;
+}
+
+const IMPLEMENT = (extra = "") => `[route class=implement risk=high scope=single${extra}]\nImplement the change in src/a.ts.`;
+
+beforeEach(() => { vi.stubEnv("MODEL_ROUTER_ENFORCE", ""); });
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0)) await cleanup();
+  for (const world of worlds.splice(0)) {
+    await world.bundle.release();
+    rmSync(world.home, { recursive: true, force: true });
+  }
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+  invalidateConfigCache();
+  resetDispatchRegistry();
+  resetIngestState();
+  logger.warn.mockReset();
+});
+
+describe("static: byte-identical and silent (§1.2)", () => {
+  it("a config with no routing block leaves the call alone, records nothing and writes nothing", async () => {
+    const world = await makeWorld(null);
+    await world.start();
+    const input = { agent: "medium", prompt: `${IMPLEMENT()}\nBody`, background: true, sessionID: "child-9" };
+    const after = await routed(world, input);
+    expect(after).toEqual({ description: "work item", agent: "medium", prompt: `${IMPLEMENT()}\nBody`, background: true, sessionID: "child-9" });
+    expect(lookupDispatch("child-9")).toBeUndefined();
+    expect(world.ctx.session.get).not.toHaveBeenCalled();
+    expect(world.ctx.model.list).not.toHaveBeenCalled();
+    expect(readdirSync(world.outcomes)).toEqual([]);
+    expect(existsSync(join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME))).toBe(false);
+  });
+
+  it("engine: static with a routing block is the same, and a [route …] line stays in the prompt", async () => {
+    const world = await makeWorld({ engine: "static" });
+    await world.start();
+    const prompt = IMPLEMENT(" pin");
+    const after = await routed(world, { agent: "medium", prompt });
+    expect(after.prompt).toBe(prompt);
+    expect(after.agent).toBe("medium");
+    expect(after.model).toBeUndefined();
+    expect(world.ctx.session.get).not.toHaveBeenCalled();
+    expect(await world.rows()).toEqual([]);
+    expect(readdirSync(world.outcomes).filter((name) => name.startsWith("decisions"))).toEqual([]);
+  });
+
+  it("the system prompt of a static session is the legacy one, byte for byte", async () => {
+    const world = await makeWorld({ engine: "static" });
+    const cfg = loadConfig(world.home);
+    const protocol = assembleSystemPrompt(cfg, undefined, false);
+    await world.start({ "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => { output.system.push(protocol); } });
+    const event: any = { sessionID: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, options: {}, system: [], messages: [] };
+    await world.sessionHooks.context(event);
+    expect(event.system.map((part: { text: string }) => part.text)).toEqual([v2Instructions(protocol)]);
+  });
+});
+
+describe("shadow: log, never change", () => {
+  it("logs a decision row (switched = would switch) and leaves agent and model alone; the route line is stripped", async () => {
+    const world = await makeWorld({ engine: "shadow", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    await world.start();
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(after.agent).toBe("medium");
+    expect(after.model).toBeUndefined();
+    expect(after.prompt).toBe("Implement the change in src/a.ts.");
+    const rows = await world.rows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: "decision", mode: "shadow", pinned: false, switched: true, step: "dispatch", resume: false, childSessionID: null,
+      chosen: { agent: "medium", origin: "router" }, best: { agent: "heavy", origin: "router" },
+      facts: { class: "implement", risk: "high", source: "route-line" },
+    });
+    expect(rows[0]!.trace).toMatchObject({ routeLines: { count: 1, conflict: false }, backend: null });
+    expect(Object.keys(rows[0]!.costs).length).toBeGreaterThan(1);
+    expect(rows[0]!.unit).toBe("ratio");
+  });
+
+  it("with no evidence the decision is a kept row whose best is the orchestrator's pick", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", prompt: "Implement the change in src/a.ts." });
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: false, pinned: false, chosen: { agent: "medium" } });
+    expect(row!.reason).toMatch(/^kept:/);
+  });
+
+  it("shadow leaves the system prompt exactly as the legacy hook built it", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    world.seed(KEYS.fast, 0, 20);
+    world.seed(KEYS.explore, 20, 0);
+    const cfg = loadConfig(world.home);
+    const protocol = assembleSystemPrompt(cfg, undefined, false);
+    await world.start({ "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => { output.system.push(protocol); } });
+    const event: any = { sessionID: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, options: {}, system: [], messages: [] };
+    await world.sessionHooks.context(event);
+    expect(event.system.map((part: { text: string }) => part.text)).toEqual([v2Instructions(protocol)]);
+  });
+});
+
+describe("enforce", () => {
+  it("margin satisfied: agent and model are replaced, the legacy hook still sees the final agent, the route line is gone", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    const seen: Array<{ subagent_type: unknown; prompt: unknown }> = [];
+    await world.start({
+      "tool.execute.before": async (_input: unknown, output: { args: Record<string, unknown> }) => {
+        seen.push({ subagent_type: output.args.subagent_type, prompt: output.args.prompt });
+        output.args.prompt = `[header]\n${String(output.args.prompt)}`;
+      },
+    });
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT(), background: true });
+    expect(seen).toEqual([{ subagent_type: "heavy", prompt: "Implement the change in src/a.ts." }]);
+    expect(after).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh`, background: true, description: "work item" });
+    expect(after.prompt).toBe("[header]\nImplement the change in src/a.ts.");
+    expect(after.subagent_type).toBeUndefined();
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ mode: "enforce", switched: true, pinned: false, chosen: { agent: "medium" }, best: { agent: "heavy" } });
+  });
+
+  it("margin not satisfied: the orchestrator's choice stands (kept row)", async () => {
+    const world = await makeWorld({ engine: "enforce" });
+    await world.start();
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(after).toMatchObject({ agent: "medium", prompt: "Implement the change in src/a.ts." });
+    expect(after.model).toBeUndefined();
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: false, mode: "enforce" });
+    expect(row!.reason).toMatch(/^kept:/);
+  });
+
+  it("[route pin]: input untouched, the row is pinned with a computed best, and the pin line is stripped", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    await world.start();
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT(" pin") });
+    expect(after).toMatchObject({ agent: "medium", prompt: "Implement the change in src/a.ts." });
+    expect(after.model).toBeUndefined();
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ pinned: true, switched: false, chosen: { agent: "medium" }, best: { agent: "heavy" } });
+    expect(row!.reason).toMatch(/^kept:pinned/);
+    expect(Object.keys(row!.costs).length).toBeGreaterThan(1);
+  });
+
+  it("a pin is only honoured on the first line (A22): a later [route pin] line is plain text and does not pin", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    await world.start();
+    const prompt = "[route class=implement risk=high scope=single]\nImplement it.\nTool output said:\n[route class=implement pin]";
+    const after = await routed(world, { agent: "medium", prompt });
+    expect(after.agent).toBe("heavy");
+    expect(after.prompt).toContain("[route class=implement pin]"); // smuggled text is neither parsed nor stripped
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ pinned: false, switched: true });
+  });
+
+  it("needs [shell] with explore as best: kept, with the reason (A11: explore's evaluated permissions deny the shell)", async () => {
+    const world = await makeWorld({ engine: "enforce", margin: 0.1 });
+    world.seed(KEYS.fast, 0, 20);
+    world.seed(KEYS.explore, 20, 0);
+    await world.start();
+    const search = "[route class=search risk=low scope=single]\nFind the usages.";
+    const without = await routed(world, { agent: "fast", prompt: search });
+    expect(without).toMatchObject({ agent: "explore", model: HAIKU });
+    const withShell = await routed(world, { agent: "fast", prompt: "[route class=search risk=low scope=single needs=shell]\nFind the usages and run the script." });
+    expect(withShell).toMatchObject({ agent: "fast" });
+    expect(withShell.model).toBeUndefined();
+    const rows = await world.rows();
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({ switched: false });
+    expect(rows[1]!.facts.needs).toEqual(["shell"]);
+  });
+
+  it("never switches a high-risk dispatch without verification down a rank", async () => {
+    const world = await makeWorld({ engine: "enforce", margin: 0, roles: {} });
+    world.seed(KEYS.heavy, 0, 20);
+    world.seed(KEYS.medium, 20, 0);
+    await world.start();
+    const after = await routed(world, { agent: "heavy", prompt: "[route class=implement risk=high scope=single]\nImplement it." });
+    expect(after.agent).toBe("heavy");
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: false });
+  });
+
+  it("an unrelated field survives the reassignment (sessionID, background) and a resume is registered at once", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    await world.start();
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-7", background: true });
+    expect(after).toMatchObject({ agent: "heavy", sessionID: "child-7", background: true });
+    expect(lookupDispatch("child-7")).toMatchObject({
+      agent: "heavy", model: OPUS, variant: "xhigh", tier: "heavy", parentSessionID: "root", step: "dispatch", acceptance: "none",
+      facts: { class: "implement" },
+    });
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ resume: true, childSessionID: "child-7" });
+    expect(lookupDispatch("child-7")!.decisionID).toBe(row!.decisionID);
+  });
+
+  it("floorTier lifts a dispatch that starts below it, and the row says so (1.4 handoff)", async () => {
+    const world = await makeWorld({ engine: "enforce" }, { enforcement: { verify: { testBaseline: false }, escalate: { floorTier: "medium" } } });
+    await world.start();
+    const after = await routed(world, { agent: "fast", prompt: "[route class=search risk=low scope=single]\nFind it." });
+    expect(after).toMatchObject({ agent: "medium", model: `${SONNET}#medium` });
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: true, best: { agent: "medium" }, chosen: { agent: "fast" } });
+    expect(row!.reason).toContain("floorTier");
+  });
+});
+
+describe("advise: input untouched, protocol and hint through the context hook", () => {
+  async function adviseWorld(withEvidence: boolean) {
+    const world = await makeWorld({ engine: "advise", margin: 0.1, roles: { search: ["explore"], recon: ["explore"] } });
+    if (withEvidence) {
+      world.seed(KEYS.fast, 0, 20);
+      world.seed(KEYS.explore, 20, 0);
+      world.seed(KEYS.reconFast, 0, 20);
+      world.seed(KEYS.reconExplore, 20, 0);
+    }
+    const cfg = loadConfig(world.home);
+    const protocol = assembleSystemPrompt(cfg, undefined, false);
+    await world.start({ "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => { output.system.push(protocol); } });
+    return { world, cfg, protocol };
+  }
+
+  const turn = (text: string): any => ({
+    sessionID: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, options: {}, system: [],
+    messages: [{ role: "user", content: [{ type: "text", text }] }],
+  });
+
+  it("the dispatch is untouched (aside from the route line) and a decision row is written", async () => {
+    const { world } = await adviseWorld(true);
+    const after = await routed(world, { agent: "fast", prompt: "[route class=search risk=low scope=single]\nFind the usages." });
+    expect(after).toMatchObject({ agent: "fast", prompt: "Find the usages." });
+    expect(after.model).toBeUndefined();
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ mode: "advise", switched: true, best: { agent: "explore" } });
+  });
+
+  it("with evidence the R: line gains a by-class segment, the route paragraph is appended and a hint is added", async () => {
+    const { world, cfg, protocol } = await adviseWorld(true);
+    const shipped = v2Instructions(protocol);
+    const event = turn("Find all the usages of parseConfig in the repository");
+    await world.sessionHooks.context(event);
+    const texts = event.system.map((part: { text: string }) => part.text) as string[];
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toContain(`${buildTaskTaxonomy(cfg)} | by class: search→@explore recon→@explore`);
+    expect(texts[0]).toContain("Routing line (optional)");
+    expect(texts[0]).not.toMatch(/\bmodel\b/);
+    expect(texts[0]!.replace(/\n\nRouting line \(optional\)[\s\S]*$/, "")).toBe(shipped.replace(buildTaskTaxonomy(cfg), () => `${buildTaskTaxonomy(cfg)} | by class: search→@explore recon→@explore`));
+    expect(texts[1]).toMatch(/^Route hint: for recon work like this turn, prefer @explore \(Fast read-only codebase exploration\) over @fast\.\nWhy: /);
+    expect(texts[1]!.split("\n")).toHaveLength(2);
+  });
+
+  it("without evidence the R: line is the shipped one and there is no hint, only the route paragraph", async () => {
+    const { world, cfg, protocol } = await adviseWorld(false);
+    const event = turn("Find all the usages of parseConfig in the repository");
+    await world.sessionHooks.context(event);
+    const texts = event.system.map((part: { text: string }) => part.text) as string[];
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.startsWith(v2Instructions(protocol))).toBe(true);
+    expect(texts[0]).toContain(buildTaskTaxonomy(cfg));
+    expect(texts[0]).toContain("Routing line (optional)");
+  });
+
+  it("the hint is stable within a turn and refreshed by a new user message; a child session gets nothing", async () => {
+    const { world } = await adviseWorld(true);
+    const first = turn("Find all the usages of parseConfig in the repository");
+    await world.sessionHooks.context(first);
+    const again = turn("Find all the usages of parseConfig in the repository");
+    await world.sessionHooks.context(again);
+    expect(again.system.map((part: { text: string }) => part.text)).toEqual(first.system.map((part: { text: string }) => part.text));
+    const child: any = { ...turn("Find usages"), system: [] };
+    // the legacy hook pushes nothing for a child: no protocol text, so nothing to adapt
+    const pushedNothing = await makeWorld({ engine: "advise" });
+    await pushedNothing.start({ "experimental.chat.system.transform": async () => undefined });
+    await pushedNothing.sessionHooks.context(child);
+    expect(child.system).toEqual([]);
+  });
+
+  it("enforce appends the paragraph that lets the engine switch; shadow never does", async () => {
+    const world = await makeWorld({ engine: "enforce" });
+    const cfg = loadConfig(world.home);
+    const protocol = assembleSystemPrompt(cfg, undefined, false);
+    await world.start({ "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => { output.system.push(protocol); } });
+    const event = turn("Do the thing");
+    await world.sessionHooks.context(event);
+    const text = event.system[0].text as string;
+    expect(text).toContain("may start a dispatch on another agent");
+    expect(text).not.toContain("does not change your dispatches");
+  });
+});
+
+describe("classifier and failures never block a dispatch", () => {
+  it("a classifier backend that hangs falls back to the rules facts within the timeout and the dispatch proceeds", async () => {
+    const world = await makeWorld({ engine: "shadow", classifier: { backend: "host", model: "anthropic/claude-haiku-4-5", timeoutMs: 100 } });
+    world.generate.mockImplementation(() => new Promise<{ text: string }>(() => undefined));
+    await world.start();
+    const started = Date.now();
+    const after = await routed(world, { agent: "medium", prompt: "Please look into the thing we discussed yesterday." });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(after).toMatchObject({ agent: "medium", prompt: "Please look into the thing we discussed yesterday." });
+    const [row] = await world.rows();
+    expect(row).toBeDefined();
+    expect(row!.facts.source).not.toBe("host");
+  });
+
+  it("an engine failure is logged and the call goes through as written", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const world = await makeWorld({ engine: "enforce" });
+    world.session.current = new Error("session store offline");
+    await world.start();
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(after).toMatchObject({ agent: "medium", prompt: IMPLEMENT() });
+    expect(await world.rows()).toEqual([]);
+    expect(warn.mock.calls.flat().join("\n")).toContain("the dispatching session is unavailable");
+  });
+
+  it("an agent list that fails keeps the orchestrator's choice and does not throw into the session", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await world.start();
+    world.ctx.agent.list.mockRejectedValue(new Error("agents unavailable"));
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(after).toMatchObject({ agent: "medium", prompt: "Implement the change in src/a.ts." });
+    expect(after.model).toBeUndefined();
+    const logged = warn.mock.calls.flat().join("\n");
+    expect(logged).toContain("the agent list is unavailable");
+    expect(logged).not.toContain("the engine failed");
+  });
+
+  it("a subagent's own dispatch (a child session) is left exactly as it is: nothing parsed, nothing stripped", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    world.session.current = { id: "child", parentID: "root", agent: "general", permissions: [], location: { directory: world.home } };
+    await world.start();
+    const prompt = IMPLEMENT(" pin");
+    const after = await routed(world, { agent: "medium", prompt }, { sessionID: "child" });
+    expect(after).toMatchObject({ agent: "medium", prompt });
+    expect(await world.rows()).toEqual([]);
+  });
+
+  it("the verification grader agent is never routed", async () => {
+    const world = await makeWorld({ engine: "enforce" });
+    await world.start();
+    const after = await routed(world, { agent: V2_GRADER_AGENT, prompt: IMPLEMENT() });
+    expect(after.prompt).toBe(IMPLEMENT());
+    expect(await world.rows()).toEqual([]);
+  });
+});
+
+describe("plan route lines and subagentTiers", () => {
+  it("a plan route line is authoritative: its d= sets the verification depth carried to ingestion", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", prompt: "[route class=debug risk=medium scope=multi needs=shell,edit d=deterministic]\nFix the failing test.", sessionID: "child-plan" });
+    expect(lookupDispatch("child-plan")).toMatchObject({ acceptance: "deterministic", facts: { class: "debug", risk: "medium", scope: "multi", needs: ["shell", "edit"], source: "plan" } });
+  });
+
+  it("subagentTiers still fills a missing model when the engine does not switch, and never overrides the engine's own", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} }, { subagentTiers: { general: "fast" } });
+    await world.start();
+    const kept = await routed(world, { agent: "general", prompt: "[route class=other]\nAnything." });
+    expect(kept).toMatchObject({ agent: "general", model: `${SONNET}#low` });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    const switched = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(switched).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh` });
+    const explicit = await routed(world, { agent: "general", model: `${OPUS}#high`, prompt: "[route class=other]\nAnything." });
+    expect(explicit.model).toBe(`${OPUS}#high`);
+  });
+});
+
+describe("registration for ingestion (2.1 handoff)", () => {
+  it("a fresh child is registered when its session.created arrives (parent, agent and title match), once", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", description: "implement a", prompt: IMPLEMENT() });
+    await routed(world, { agent: "medium", description: "implement b", prompt: IMPLEMENT() });
+    world.emit({ type: "session.created", data: { sessionID: "child-b", parentID: "root", agent: "medium", title: "implement b" } });
+    world.emit({ type: "session.created", data: { sessionID: "child-a", parentID: "root", agent: "medium", title: "implement a" } });
+    world.emit({ type: "session.created", data: { sessionID: "stranger", parentID: "other-root", agent: "medium", title: "implement a" } });
+    await vi.waitFor(() => { expect(lookupDispatch("child-a")).toBeDefined(); expect(lookupDispatch("child-b")).toBeDefined(); });
+    expect(lookupDispatch("stranger")).toBeUndefined();
+    expect(lookupDispatch("child-a")).toMatchObject({ agent: "medium", model: SONNET, variant: "medium", parentSessionID: "root", tier: "medium" });
+    expect(lookupDispatch("child-a")!.attemptIndex).toBe(0);
+  });
+
+  it("a second execution of the same child is a new registration (QA-2.1-R2-10)", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-r" });
+    const first = lookupDispatch("child-r")!;
+    await routed(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-r" });
+    const second = lookupDispatch("child-r")!;
+    expect(second.attemptIndex).toBe(first.attemptIndex + 1);
+    expect(second.attemptId).not.toBe(first.attemptId);
+    expect(second.decisionID).not.toBe(first.decisionID);
+  });
+
+  it("a dispatch whose call ended without a child is dropped and cannot be claimed by a later child", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    const call = dispatch(world, { agent: "medium", description: "denied", prompt: IMPLEMENT() });
+    await call.run();
+    await world.toolHooks["execute.after"]({ id: call.event.id, tool: "subagent", status: "failed", sessionID: "root" });
+    world.emit({ type: "session.created", data: { sessionID: "late-child", parentID: "root", agent: "medium", title: "denied" } });
+    world.emit({ type: "session.deleted", data: { sessionID: "barrier" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lookupDispatch("late-child")).toBeUndefined();
+  });
+
+  it("a session.created without an agent claims the oldest pending dispatch of its parent", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", description: "first", prompt: IMPLEMENT() });
+    await routed(world, { agent: "fast", description: "second", prompt: "[route class=search]\nFind it." });
+    world.emit({ type: "session.created", data: { sessionID: "anon-1", parentID: "root" } });
+    world.emit({ type: "session.created", data: { sessionID: "anon-2", parentID: "root" } });
+    await vi.waitFor(() => { expect(lookupDispatch("anon-1")).toBeDefined(); expect(lookupDispatch("anon-2")).toBeDefined(); });
+    expect(lookupDispatch("anon-1")).toMatchObject({ agent: "medium", facts: { class: "implement" } });
+    expect(lookupDispatch("anon-2")).toMatchObject({ agent: "fast", facts: { class: "search" } });
+  });
+
+  it("an agent mismatch is not claimed: a child of another agent never takes the dispatch", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", description: "only", prompt: IMPLEMENT() });
+    world.emit({ type: "session.created", data: { sessionID: "producer", parentID: "root", agent: "fast", title: "only" } });
+    world.emit({ type: "session.deleted", data: { sessionID: "barrier" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lookupDispatch("producer")).toBeUndefined();
+    world.emit({ type: "session.created", data: { sessionID: "real", parentID: "root", agent: "medium", title: "only" } });
+    await vi.waitFor(() => { expect(lookupDispatch("real")).toBeDefined(); });
+  });
+
+  it("the waiting list is bounded: the oldest dispatches are dropped first (memory does not grow)", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    for (let i = 0; i < 205; i++) await routed(world, { agent: "medium", description: `d${i}`, prompt: IMPLEMENT() });
+    world.emit({ type: "session.created", data: { sessionID: "survivor", parentID: "root", agent: "medium" } });
+    await vi.waitFor(() => { expect(lookupDispatch("survivor")).toBeDefined(); });
+    expect(lookupDispatch("survivor")!.decisionID).toMatch(/:6$/); // 1..5 were dropped
+  });
+
+  it("a dispatch is forgotten after the waiting limit", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await routed(world, { agent: "medium", description: "slow", prompt: IMPLEMENT() });
+      vi.setSystemTime(Date.now() + 121_000);
+      world.emit({ type: "session.created", data: { sessionID: "too-late", parentID: "root", agent: "medium", title: "slow" } });
+      world.emit({ type: "session.deleted", data: { sessionID: "barrier" } });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(lookupDispatch("too-late")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a hot reload to static stops everything at the next dispatch: untouched input, no new row, the store is released", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(await world.rows()).toHaveLength(1);
+    writeFileSync(overridePath(), JSON.stringify({ enforcement: { verify: { testBaseline: false } }, routing: { engine: "static", outcomes: { path: world.outcomes } } }));
+    invalidateConfigCache();
+    const input = { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-static" };
+    const after = await routed(world, input);
+    expect(after).toMatchObject({ agent: "medium", prompt: IMPLEMENT(), sessionID: "child-static" });
+    expect(lookupDispatch("child-static")).toBeUndefined();
+    expect(await world.rows()).toHaveLength(1);
+  });
+
+  it("static registers nothing, even for a session.created event of a child", async () => {
+    const world = await makeWorld(null);
+    await world.start();
+    await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    world.emit({ type: "session.created", data: { sessionID: "child-s", parentID: "root", agent: "medium", title: "work item" } });
+    world.emit({ type: "session.deleted", data: { sessionID: "barrier" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lookupDispatch("child-s")).toBeUndefined();
+  });
+});
+
+describe("latency", () => {
+  it("the local routing path stays under 5 ms per dispatch over 100 dispatches (warm catalog and agents)", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    await routed(world, { agent: "medium", prompt: IMPLEMENT() }); // warms the catalog, the agent list and the store
+    const started = performance.now();
+    for (let i = 0; i < 100; i++) await routed(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: `child-${i}` });
+    const perDispatch = (performance.now() - started) / 100;
+    expect(perDispatch).toBeLessThan(5);
+  });
+});
