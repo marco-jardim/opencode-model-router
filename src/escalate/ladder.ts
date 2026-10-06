@@ -206,7 +206,8 @@ export function newLadderState(
     // Budget of the start tier (after floorTier).
     const start = ownTierInfo(policy, state.currentTier);
     state.nextModelContext = start?.inputBudget ?? null; // telemetry only
-    state.triedByModel = start ? { [start.model]: start.base } : {}; // the first attempt runs the start tier's base
+    // The first attempt runs the start tier's base, unless the tier is effort-configured (QA-1.5-18).
+    state.triedByModel = start && !start.effortConfigured ? { [start.model]: start.base } : {};
   }
   return state;
 }
@@ -343,12 +344,17 @@ function skipCoveredTiers(
   policy: EscalatePolicy,
   from: TierVariantInfo,
 ): EscalationTarget {
-  const tried = raiseTried(state.triedByModel, from.model, state.currentVariant ?? from.base);
+  // An effort-configured tier is never a coverage source (QA-1.5-18): its own rung is not recorded.
+  const tried = from.effortConfigured
+    ? (state.triedByModel ?? {})
+    : raiseTried(state.triedByModel, from.model, state.currentVariant ?? from.base);
   let hops = 0;
   while (next != null) {
     const to = ownTierInfo(policy, next);
-    const reached = to && Object.prototype.hasOwnProperty.call(tried, to.model) ? tried[to.model] : undefined;
-    if (!to || reached === undefined || !variantCovered(to.base, reached)) return { tier: next };
+    // ...and never covered: its effort delivery differs from any variant rung, so it always runs.
+    if (!to || to.effortConfigured) return { tier: next };
+    const reached = Object.prototype.hasOwnProperty.call(tried, to.model) ? tried[to.model] : undefined;
+    if (reached === undefined || !variantCovered(to.base, reached)) return { tier: next };
     const entry = nextVariant(to.ladder, reached);
     if (entry !== null) return { tier: next, variant: entry };
     if (++hops >= policy.ladder.length) return { tier: null }; // guard: duplicate ladder entries cannot spin
@@ -479,7 +485,7 @@ export function nextAction(
         if (entry !== undefined) action.carryVariant = true;
       }
       Object.assign(action, costFields(target, action.variant));
-      action.rung = { model: target.model, variant: action.variant ?? DEFAULT_VARIANT };
+      if (!target.effortConfigured) action.rung = { model: target.model, variant: action.variant ?? DEFAULT_VARIANT };
     }
     Object.assign(action, sessionFields(state, variants, target, action.forcingMessage!, session));
   }

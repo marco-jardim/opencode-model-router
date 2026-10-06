@@ -1242,6 +1242,82 @@ describe("triedByModel (A17a, QA-1.5-17)", () => {
     expect(entry).toMatchObject({ model: SONNET, variant: "max", carryVariant: true, rung: { model: SONNET, variant: "max" } });
   });
 
+  describe("effort-configured tiers (A17a, QA-1.5-18)", () => {
+    const OFF = { effortBump: false, costCeiling: { multiple: 1000 } };
+
+    it("probe: effort tiers sonnet@low, sonnet@high, opus@high all run, medium is not skipped", () => {
+      const tiers: Record<string, TierConfig> = {
+        fast: { model: SONNET, effort: "low" },
+        medium: { model: SONNET, effort: "high" },
+        heavy: { model: OPUS, effort: "high" },
+      };
+      const policy = buildEscalatePolicy(makeConfig(tiers, OFF), V2);
+      for (const tier of ["fast", "medium", "heavy"]) expect(policy.variants!.perTier[tier]).toMatchObject({ effortConfigured: true });
+      const run = runLoop(policy);
+      expect(run.states.map((s) => s.currentTier)).toEqual(["fast", "fast", "medium", "heavy"]);
+      expect(run.actions.map((a) => [a.action, a.tier])).toEqual([["retry", "fast"], ["escalate", "medium"], ["escalate", "heavy"], ["give_up", undefined]]);
+      for (const action of run.actions) {
+        expect(action).not.toHaveProperty("rung");
+        expect(action).not.toHaveProperty("carryVariant");
+        expect(action).not.toHaveProperty("variantStep");
+      }
+      expect(run.state.triedByModel).toEqual({}); // nothing an effort tier runs is a coverage source
+    });
+
+    it("probe: thinking tiers 2k vs 16k on the same model all run, medium is not skipped", () => {
+      const tiers: Record<string, TierConfig> = {
+        fast: { model: SONNET, thinking: { budgetTokens: 2000 } },
+        medium: { model: SONNET, thinking: { budgetTokens: 16000 } },
+        heavy: { model: OPUS, thinking: { budgetTokens: 16000 } },
+      };
+      const run = runLoop(buildEscalatePolicy(makeConfig(tiers, OFF), V2));
+      expect(run.states.map((s) => s.currentTier)).toEqual(["fast", "fast", "medium", "heavy"]);
+      const reasoning: Record<string, TierConfig> = {
+        fast: { model: SONNET, reasoning: { effort: "low" } },
+        medium: { model: SONNET, reasoning: { effort: "high" } },
+        heavy: { model: OPUS, reasoning: { effort: "high" } },
+      };
+      expect(runLoop(buildEscalatePolicy(makeConfig(reasoning, OFF), V2)).states.map((s) => s.currentTier)).toEqual(["fast", "fast", "medium", "heavy"]);
+    });
+
+    it("an effort tier is never a coverage source: its variant is not recorded and does not cover the next tier", () => {
+      const tiers: Record<string, TierConfig> = {
+        fast: { model: SONNET, variant: "xhigh", effort: "low" }, // A20: effort path only, its xhigh is just its configured base
+        medium: { model: SONNET, variant: "medium" },
+      };
+      const policy = buildEscalatePolicy(makeConfig(tiers, { ...OFF, ladder: ["fast", "medium"] }), V2);
+      expect(newLadderState("fast", policy).triedByModel).toEqual({});
+      const action = nextAction(sessionState({ attemptsThisTier: 1, triedByModel: {} }), fail, policy);
+      expect(action).toMatchObject({ action: "escalate", tier: "medium", variant: "medium", rung: { model: SONNET, variant: "medium" } });
+      expect(action).not.toHaveProperty("carryVariant");
+    });
+
+    it("an effort tier is never covered: it runs even after the same model reached xhigh, and records nothing", () => {
+      const tiers: Record<string, TierConfig> = {
+        fast: { model: SONNET, variant: "xhigh" },
+        medium: { model: SONNET, effort: "low" },
+      };
+      const policy = buildEscalatePolicy(makeConfig(tiers, { ...OFF, ladder: ["fast", "medium"] }), V2);
+      const state = sessionState({ attemptsThisTier: 1, triedByModel: { [SONNET]: "xhigh" } });
+      const action = nextAction(state, fail, policy);
+      expect(action).toMatchObject({ action: "escalate", tier: "medium", model: SONNET });
+      expect(action).not.toHaveProperty("variant");
+      expect(action).not.toHaveProperty("rung");
+      expect(action).not.toHaveProperty("carryVariant");
+      expect(advance(state, action).triedByModel).toEqual({ [SONNET]: "xhigh" });
+    });
+
+    it("an effort tier as the current tier adds no rung to the record when it escalates", () => {
+      const policy = buildEscalatePolicy(
+        makeConfig({ fast: { model: SONNET, effort: "low" }, medium: { model: SONNET, variant: "medium" } }, { ...OFF, ladder: ["fast", "medium"] }),
+        V2,
+      );
+      // the effort tier's own (model, default) rung must not cover medium (default is below medium)
+      const action = nextAction(sessionState({ attemptsThisTier: 1, currentVariant: null, triedByModel: {} }), fail, policy);
+      expect(action).toMatchObject({ tier: "medium", variant: "medium" });
+      expect(action).not.toHaveProperty("carryVariant");
+    });
+  });
   it("QA-1.5-2: a carried escalation lands on the target's ladder and carries that rung's ratio", () => {
     const build = (candidateRatio: number | undefined) =>
       buildEscalatePolicy(
