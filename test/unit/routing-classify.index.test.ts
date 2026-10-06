@@ -840,3 +840,84 @@ describe("classify bounds its work on huge prompts (QA-1.2-11)", () => {
     expect(state.text.length).toBeLessThanOrEqual(500);
   });
 });
+describe("failure paths still strip route lines (QA-1.2-19)", () => {
+  const hostileDescription = (prompt: string): ClassifyInput =>
+    ({
+      prompt,
+      get description(): string {
+        throw new Error("description boom");
+      },
+    }) as ClassifyInput;
+
+  it("classify: a failure after the route line was parsed still returns the prompt without it", async () => {
+    const deps = makeDeps(null);
+    const result = await classify(hostileDescription("[route class=design pin]\nhello\n[route risk=high]"), deps);
+    expect(result.facts).toBe(UNKNOWN_FACTS);
+    expect(result.pin).toBe(false);
+    expect(result.stripped).toBe("hello\n");
+    expect(deps.messages).toEqual(["classifier failed: description boom"]);
+  });
+
+  it("classifyMany: only the failing item takes the failure path, with its route lines stripped", async () => {
+    const deps = makeDeps(null);
+    const results = await classifyMany(
+      [input("grep for foo"), hostileDescription("[route class=design]\nhello"), input("rename a to b in c.ts")],
+      deps,
+    );
+    expect(results.map((r) => r.facts.class)).toEqual(["search", "other", "mechanical"]);
+    expect(results[1]!.facts).toBe(UNKNOWN_FACTS);
+    expect(results[1]!.stripped).toBe("hello");
+  });
+
+  it("route-looking lines inside a fence survive the failure path, as they do on the normal path", async () => {
+    const prompt = "```\n[route class=design]\n```\n[route class=debug]\nhello";
+    const result = await classify(hostileDescription(prompt), makeDeps(null));
+    expect(result.stripped).toBe("```\n[route class=design]\n```\nhello");
+  });
+});
+
+describe("a backend result is validated field by field (QA-1.2-20)", () => {
+  const good = okResult("debug", 0.6);
+  const broken: ReadonlyArray<readonly [string, unknown]> = [
+    ["unknown source", { ...good, facts: { ...good.facts, source: "evil" } }],
+    ["numeric source", { ...good, facts: { ...good.facts, source: 7 } }],
+    ["bad risk", { ...good, facts: { ...good.facts, risk: "extreme" } }],
+    ["bad scope", { ...good, facts: { ...good.facts, scope: "galaxy" } }],
+    ["negative latency", { ...good, latencyMs: -1 }],
+    ["NaN latency", { ...good, latencyMs: Number.NaN }],
+    ["string calls", { ...good, calls: "1" }],
+    ["object raw", { ...good, raw: {} }],
+    ["numeric reason", { ...good, reason: 5 }],
+    ["missing raw", { facts: good.facts, status: "ok", latencyMs: 1, calls: 1 }],
+  ];
+
+  it.each(broken)("%s -> invalid, the rules facts stand", async (_label, bad) => {
+    const { backend } = fakeBackend(() => bad as unknown as BackendResult);
+    const result = await classify(input("hello"), makeDeps(backend));
+    expect(result.facts).toEqual(result.trace.rules);
+    expect(result.trace.backend).toMatchObject({ status: "invalid", reason: "malformed backend result" });
+  });
+
+  it("the same checks apply to batch entries", async () => {
+    const { backend } = fakeBackend(
+      () => okResult("search"),
+      () => [okResult("debug"), { ...good, facts: { ...good.facts, scope: "galaxy" } }],
+    );
+    const results = await classifyMany([input("hello one"), input("hello two")], makeDeps(backend));
+    expect(results.map((r) => r.trace.backend?.status)).toEqual(["ok", "invalid"]);
+  });
+
+  it("well-formed results with every optional field pass", async () => {
+    const full: BackendResult = {
+      facts: { class: "design", confidence: 0.6, source: "typesafe", risk: "high", scope: "repo" },
+      raw: "{}",
+      status: "ok",
+      reason: undefined,
+      latencyMs: 0,
+      calls: 0,
+    };
+    const { backend } = fakeBackend(() => full);
+    const result = await classify(input("hello"), makeDeps(backend));
+    expect(result.facts).toMatchObject({ class: "design", risk: "high", scope: "repo", source: "typesafe" });
+  });
+});

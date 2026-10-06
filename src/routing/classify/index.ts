@@ -24,6 +24,7 @@ import { analyzeRules } from "./rules";
 import { hasCredentialSignal } from "./scrub";
 import { buildClassifierState } from "./state";
 import {
+  BACKEND_IDS,
   CLASS_BASE_RISK,
   CLASS_IMPLIED_NEEDS,
   CLASS_OPTIONS,
@@ -99,11 +100,24 @@ function synthetic(status: BackendStatus, reason: string, latencyMs: number): Ba
   };
 }
 
-/** A backend result is trusted only when its status, class and confidence are in range. */
+const BACKEND_SOURCES: readonly string[] = [...BACKEND_IDS, "unknown"];
+
+function isNonNegativeNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * A backend result is trusted only when every field the merge or the decision
+ * log reads is well formed: status, class, confidence in [0, 1], source, the
+ * optional risk and scope, and the bookkeeping numbers (QA-1.2-20).
+ */
 function isValidResult(value: unknown): value is BackendResult {
   if (typeof value !== "object" || value === null) return false;
   const r = value as Partial<BackendResult>;
   if (typeof r.status !== "string" || !BACKEND_STATUSES.includes(r.status)) return false;
+  if (!isNonNegativeNumber(r.latencyMs) || !isNonNegativeNumber(r.calls)) return false;
+  if (r.raw !== null && typeof r.raw !== "string") return false;
+  if (r.reason !== undefined && typeof r.reason !== "string") return false;
   const facts = r.facts;
   if (typeof facts !== "object" || facts === null) return false;
   if (!TASK_CLASSES.includes(facts.class)) return false;
@@ -111,9 +125,11 @@ function isValidResult(value: unknown): value is BackendResult {
   if (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     return false;
   }
+  if (!BACKEND_SOURCES.includes(facts.source)) return false;
+  if (facts.risk !== undefined && !RISKS.includes(facts.risk)) return false;
+  if (facts.scope !== undefined && !SCOPES.includes(facts.scope)) return false;
   return true;
 }
-
 /** The classes a backend may pick: those the rules matched (search and recon are one family); null = any. */
 function allowedClasses(matched: readonly TaskClass[]): ReadonlySet<TaskClass> | null {
   if (matched.length === 0) return null;
@@ -199,6 +215,25 @@ function unknownResult(stripped: string): ClassifyResult {
       backend: null,
     },
   };
+}
+
+/**
+ * The prompt with its route lines removed, for the failure paths: whatever broke
+ * the classification, the rewritten prompt must not carry a `[route …]` line to
+ * the subagent. Its own `try`: stripping may succeed where the rest failed, and
+ * if it does fail, a plain line filter (which cannot throw on a string) stands in.
+ */
+function strippedOf(input: ClassifyInput, deps: ClassifyDeps): string {
+  const prompt = promptOf(input);
+  try {
+    return parseRouteLine(prompt).stripped;
+  } catch (error) {
+    safeWarn(deps.logger, `classifier could not strip route lines: ${reasonOf(error)}`);
+    return prompt
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*\[route\b/i.test(line))
+      .join("\n");
+  }
 }
 
 /** The prompt of an input that may be hostile (a throwing getter was already logged by the caller). */
@@ -345,7 +380,7 @@ export async function classify(input: ClassifyInput, deps: ClassifyDeps): Promis
     return resultOf(prepared, backend, outcome, deps);
   } catch (error) {
     safeWarn(deps.logger, `classifier failed: ${reasonOf(error)}`);
-    return unknownResult(promptOf(input));
+    return unknownResult(strippedOf(input, deps));
   }
 }
 
@@ -374,7 +409,7 @@ export async function classifyMany(
         prepared[index] = prepare(input, deps);
       } catch (error) {
         safeWarn(deps.logger, `classifier failed: ${reasonOf(error)}`);
-        results[index] = unknownResult(promptOf(input));
+        results[index] = unknownResult(strippedOf(input, deps));
       }
     });
 
@@ -466,7 +501,9 @@ export async function classifyMany(
   return results.map((result, index) => {
     if (result !== undefined) return result;
     const item = prepared[index];
-    return item === undefined ? unknownResult(promptOf(list[index]!)) : resultOf(item, null, null, deps, { batch: true });
+    return item === undefined
+      ? unknownResult(strippedOf(list[index]!, deps))
+      : resultOf(item, null, null, deps, { batch: true });
   });
 }
 
