@@ -28,6 +28,13 @@ const key = {
   searchFast: makeKey("search", { origin: "router", id: "fast" }, SONNET.providerID, SONNET.id, "low"),
   searchHeavy: makeKey("search", { origin: "router", id: "heavy" }, OPUS.providerID, OPUS.id, "xhigh"),
 };
+const ROOT_PARENT = { providerID: "anthropic", id: "claude-opus-4-7" } as const;
+/** `fast` keeps failing `search` and the read-only host agent `explore` (on the orchestrator's own model) keeps passing it: the class MOVES to explore. */
+const MOVE_SEED: readonly Seed[] = [
+  { key: key.searchFast, pass: 0, fail: 20 },
+  { key: makeKey("search", { origin: "host", id: "explore" }, ROOT_PARENT.providerID, ROOT_PARENT.id, "default"), pass: 20, fail: 0 },
+];
+const SEARCH_ASK = "Find every usage of parseThing in the repository and list the files.";
 /** Both tiers have passed `search` 20 times: the cheaper one wins on cost alone (evidence on both sides). */
 const SEARCH_SEED: readonly Seed[] = [{ key: key.searchFast, pass: 20, fail: 0 }, { key: key.searchHeavy, pass: 20, fail: 0 }];
 const SEARCH_PROMPT = "[route class=search risk=low scope=single]\nFind every usage of parseThing in the repository and list the files.";
@@ -161,6 +168,54 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           && baseIids.length === 1 && baseIids[0] !== iidsBefore[0] && rowsFinal.length === rows0 + 2 && child.agent === "fast" && baseChild.agent === "fast" && host.routerLogLines().length === 0;
         s.verdict(ok, `execute.before delivered to ${iidsBefore.length} of 2 instances (after: ${iidsAfter.length}); step.ended delivered to ${new Set(raw.map(e => e.__iid)).size} instance(s) with ${new Set(raw.map(e => e.id)).size} event id; from the base-location session the hook went to a different single instance (${baseIids.length}); rows ${rows0} -> ${rowsFinal.length} for two dispatches; both children fast`);
       });    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 300_000);
+  it("2 advise: the generated R: line and the route hint reach the orchestrator's request after seeding the store; dispatches are left alone", async () => {
+    const control = await RoutingHost.start("advise-control", { routing: { engine: "advise" } });
+    let controlSystem = "";
+    let controlRootID = "";
+    try {
+      controlRootID = await control.newRoot("advise control root");
+      await control.prompt(controlRootID, SEARCH_ASK);
+      controlSystem = control.requestsOf(controlRootID).find(r => r.kind === "primary")?.system ?? "";
+    } finally {
+      expect((await control.stop()).hostPortClosed).toBe(true);
+    }
+    const host = await RoutingHost.start("advise", { routing: { engine: "advise" }, seed: MOVE_SEED });
+    try {
+      await runScenario("2-advise", "engine=advise: after the store is seeded (fast fails search, explore passes it) the system prompt the host sends for the orchestrator carries a generated R: line that moves search to @explore plus a 'Route hint' for the search turn; with no evidence (control host) neither is there and the R: line is the shipped one. A dispatch in advise is logged (would switch) but the host's child still runs the orchestrator's pick.", async s => {
+        const rootID = await host.newRoot("advise root");
+        await host.prompt(rootID, SEARCH_ASK);
+        const request = host.requestsOf(rootID).find(r => r.kind === "primary");
+        const system = request?.system ?? "";
+        const rLines = (text: string) => text.split(/\r?\n/).filter(line => /^R:/.test(line.trim()) || line.includes("by class:"));
+        const hintLines = system.split(/\r?\n/).filter(line => /Route hint: for |^Why:/.test(line));
+        // advise never changes a dispatch: the orchestrator asks for fast and the host's child is fast, while the row says it would move to explore
+        const dispatched = await host.dispatch(rootID, { agent: "fast", description: "Find usages", prompt: SEARCH_PROMPT, background: false });
+        const child = await host.client.session.get({ sessionID: dispatched.childID });
+        const rows = await host.waitForRows("the decision row", r => r.length >= 1);
+        s.observed.rootID = rootID;
+        s.observed.controlRootID = controlRootID;
+        s.observed.rootRequest = { catalogModel: request?.catalogModel, agent: request?.agent, systemChars: system.length, rLines: rLines(system), hintLines };
+        s.observed.controlRLines = rLines(controlSystem);
+        s.observed.controlHasHint = /Route hint: for /.test(controlSystem);
+        s.observed.routeLineParagraphPresent = /\[route class=/.test(system);
+        s.observed.hostChild = { id: dispatched.childID, agent: child.agent, model: child.model };
+        s.observed.row = rows[0];
+        s.observed.routerLogLines = host.routerLogLines();
+        const row = rows[0]!;
+        const seededLine = rLines(system).join("\n");
+        const controlLine = rLines(controlSystem).join("\n");
+        const ok = request !== undefined && /Route hint: for search work like this turn, prefer @explore/.test(system) && !/Route hint: for /.test(controlSystem)
+          && seededLine !== controlLine && /search.{0,4}@explore/.test(seededLine) && !/@explore/.test(controlLine)
+          && child.agent === "fast" && sameModel(child.model, SONNET, "low")
+          && row.mode === "advise" && row.switched === true && row.chosen.agent === "fast" && row.best?.agent === "explore"
+          && host.routerLogLines().length === 0;
+        s.verdict(ok, `R: line seeded=${JSON.stringify(seededLine.slice(-160))} control=${JSON.stringify(controlLine.slice(-160))}; hint=${JSON.stringify(hintLines[0] ?? null)}; advise dispatch: child agent=${child.agent}, row switched=${row.switched} best=${row.best?.agent}`);
+      });
+    } finally {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }

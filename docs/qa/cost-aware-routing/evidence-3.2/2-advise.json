@@ -1,0 +1,101 @@
+{
+  "scenario": "2-advise",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "240dd27c-3011-4217-92d2-e9b259a7e063",
+  "recordedAt": "2026-10-06T21:13:24.791Z",
+  "harness": {
+    "headSha": "28929517fd8ab652b62cc81d110117999ab71946",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "2f3c762f1df5ed954b664bfc78b5568c4176b3b7",
+      "test/smoke/helpers/routing-host.ts": "180045122a75b014eff9afe604b3d763c9ccd049"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "engine=advise: after the store is seeded (fast fails search, explore passes it) the system prompt the host sends for the orchestrator carries a generated R: line that moves search to @explore plus a 'Route hint' for the search turn; with no evidence (control host) neither is there and the R: line is the shipped one. A dispatch in advise is logged (would switch) but the host's child still runs the orchestrator's pick.",
+  "observed": {
+    "rootID": "ses_eecef9c23ffeQshUbpLWeFpB2c",
+    "controlRootID": "ses_eecefaaf3ffeZJ4J5089dKPS3i",
+    "rootRequest": {
+      "catalogModel": "anthropic/claude-opus-4-7#default",
+      "agent": "build",
+      "systemChars": 20032,
+      "rLines": [
+        "R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca | by class: search→@explore"
+      ],
+      "hintLines": [
+        "Route hint: for search work like this turn, prefer @explore (Fast agent specialized for exploring codebases. Use this wh…) over @fast.",
+        "Why: switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=3.5643 ratio"
+      ]
+    },
+    "controlRLines": [
+      "R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca"
+    ],
+    "controlHasHint": false,
+    "routeLineParagraphPresent": true,
+    "hostChild": {
+      "id": "ses_eecef98e4ffevIiOhrza2FmaCG",
+      "agent": "fast",
+      "model": {
+        "id": "claude-sonnet-5-5",
+        "providerID": "anthropic",
+        "variant": "low"
+      }
+    },
+    "row": {
+      "v": 1,
+      "ts": "2026-10-06T21:13:24.427Z",
+      "sessionID": "ses_eecef9c23ffeQshUbpLWeFpB2c",
+      "kind": "decision",
+      "decisionID": "ses_eecef9c23ffeQshUbpLWeFpB2c:1791321204426:1",
+      "mode": "advise",
+      "childSessionID": null,
+      "facts": {
+        "class": "search",
+        "risk": "low",
+        "scope": "single",
+        "needs": [],
+        "confidence": 0.9,
+        "source": "route-line"
+      },
+      "chosen": {
+        "key": "search|router:fast|anthropic/claude-sonnet-5-5#low",
+        "agent": "fast",
+        "origin": "router",
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "low"
+      },
+      "best": {
+        "key": "search|host:explore|anthropic/claude-opus-4-7#default",
+        "agent": "explore",
+        "origin": "host",
+        "model": "anthropic/claude-opus-4-7",
+        "variant": "default"
+      },
+      "switched": true,
+      "pinned": false,
+      "unit": "ratio",
+      "costs": {
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 4.455338988933241,
+        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.7866811875,
+        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.965,
+        "search|host:explore|anthropic/claude-opus-4-7#default": 1.16454025276669,
+        "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
+      },
+      "confidence": 0.72,
+      "reason": "switched: switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=3.5643 ratio",
+      "step": "dispatch",
+      "resume": false,
+      "trace": {
+        "routeLines": {
+          "count": 1,
+          "conflict": false,
+          "edgeOnly": true
+        },
+        "backend": null
+      }
+    },
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: R: line seeded=\"nt/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca | by class: search→@explore\" control=\"e-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca\"; hint=\"Route hint: for search work like this turn, prefer @explore (Fast agent specialized for exploring codebases. Use this wh…) over @fast.\"; advise dispatch: child agent=fast, row switched=true best=explore",
+  "notes": []
+}
