@@ -18,7 +18,7 @@ import { classifyMany as realClassifyMany } from "../../src/routing/classify";
 import { fenceMask } from "../../src/routing/classify/fences";
 import { parseRouteLine } from "../../src/routing/classify/route-line";
 import type { ClassifierBackend, ClassifyInput, ClassifyResult } from "../../src/routing/classify/types";
-import { agentInfosForPlan, annotatePlanText, locatePlan, renderDirectives, splitPlan } from "../../src/routing/commands/annotate-plan";
+import { agentInfosForPlan, annotatePlanText, applyAdditions, locatePlan, renderDirectives, splitPlan, withTagAtStart } from "../../src/routing/commands/annotate-plan";
 import type { AnnotateDeps } from "../../src/routing/engine";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
 
@@ -48,11 +48,11 @@ function makeDeps(over: { backend?: ClassifierBackend | null; settings?: typeof 
 }
 
 const ROUTE_LINE_RE = /^ {0,3}\[route [^\]]*\][ \t]*$/;
-const TIER_SUFFIX_RE = / \[tier:[A-Za-z0-9_-]+\]$/;
+const TIER_TAG_ANYWHERE_RE = /\[tier:[A-Za-z0-9_-]+\] ?/;
 
 /**
- * Additive: every line of `before` appears in `after`, in order and unchanged, except that the step's task line may carry an appended
- * ` [tier:X]` and an existing route line may gain ` pin`; every other line of `after` is a new route line.
+ * Additive: every line of `before` appears in `after`, in order and unchanged, except that the first line of a step may carry an inserted
+ * `[tier:X]` (after its marker) and an existing route line may gain ` pin`; every other line of `after` is a new route line.
  */
 function expectAdditive(before: string, after: string): void {
   const a = before.split(/\r\n|\n|\r/);
@@ -61,7 +61,7 @@ function expectAdditive(before: string, after: string): void {
   for (const original of a) {
     while (j < b.length) {
       const line = b[j]!;
-      if (line === original || (line.startsWith(original.trimEnd()) && TIER_SUFFIX_RE.test(line) && line === `${original.trimEnd()}${line.slice(original.trimEnd().length)}`) || (ROUTE_LINE_RE.test(original) && ROUTE_LINE_RE.test(line))) break;
+      if (line === original || line.replace(TIER_TAG_ANYWHERE_RE, "") === original || (ROUTE_LINE_RE.test(original) && ROUTE_LINE_RE.test(line))) break;
       expect(line, `inserted line ${j + 1} must be a route line`).toMatch(ROUTE_LINE_RE);
       j += 1;
     }
@@ -70,7 +70,6 @@ function expectAdditive(before: string, after: string): void {
   }
   for (; j < b.length; j += 1) expect(b[j]!, `trailing line ${j + 1} must be a route line`).toMatch(ROUTE_LINE_RE);
 }
-
 /** No route line inside a fenced block, and the fenced blocks themselves are byte-identical. */
 function expectFencesUntouched(before: string, after: string): void {
   const fencedLines = (text: string): string[] => {
@@ -175,13 +174,13 @@ describe("/annotate-plan: annotating plans (F3, A26)", () => {
     expect(result.steps.filter((s) => s.tier === "heavy").every((s) => s.pin)).toBe(true);
     expect(result.pinnedCount).toBe(1);
     expect(result.text).toMatchInlineSnapshot(`
-      "1. Find all API endpoints in the codebase [tier:medium]
+      "1. [tier:medium] Find all API endpoints in the codebase
       [route class=implement risk=medium scope=multi needs=edit d=none]
-      2. Add rate limiting middleware to each endpoint [tier:medium]
+      2. [tier:medium] Add rate limiting middleware to each endpoint
       [route class=implement risk=medium scope=multi needs=edit d=none]
-      3. Write integration tests for rate limiting [tier:medium]
+      3. [tier:medium] Write integration tests for rate limiting
       [route class=implement risk=medium scope=multi needs=edit d=none]
-      4. Design a token bucket algorithm for advanced rate limiting [tier:heavy]
+      4. [tier:heavy] Design a token bucket algorithm for advanced rate limiting
       [route class=design risk=high scope=multi d=none pin]
       "
     `);
@@ -206,15 +205,15 @@ describe("/annotate-plan: annotating plans (F3, A26)", () => {
       **Goal.** \`shadow\`, \`advise\`, \`enforce\` live in \`execute.before\` and the context hook; \`[route …]\` parsed and stripped.
 
       **Tasks.**
-      - 2.2.1 \`[tier:heavy]\` Design \`src\\routing\\wire\\dispatch.ts\`: \`routeDispatch(event, cfg, store, catalog)\` composing M2 → ladders → M4; ordering relative to the existing \`subagentTiers\` override. [tier:heavy]
+      - [tier:heavy] 2.2.1 \`[tier:heavy]\` Design \`src\\routing\\wire\\dispatch.ts\`: \`routeDispatch(event, cfg, store, catalog)\` composing M2 → ladders → M4; ordering relative to the existing \`subagentTiers\` override.
       [route class=design risk=high scope=multi d=none pin]
-      - 2.2.2 \`[tier:medium]\` Implement \`dispatch.ts\`, \`hint.ts\`; wire in \`v2-hooks.ts\` \`execute.before\` and the context hook. [tier:medium]
+      - [tier:medium] 2.2.2 \`[tier:medium]\` Implement \`dispatch.ts\`, \`hint.ts\`; wire in \`v2-hooks.ts\` \`execute.before\` and the context hook.
       [route class=implement risk=medium scope=multi needs=edit d=none]
-      - 2.2.3 \`[tier:medium]\` Protocol text for \`advise\`/\`enforce\`: one paragraph instructing the orchestrator to add the \`[route …]\` line (D13). [tier:medium]
+      - [tier:medium] 2.2.3 \`[tier:medium]\` Protocol text for \`advise\`/\`enforce\`: one paragraph instructing the orchestrator to add the \`[route …]\` line (D13).
       [route class=other risk=medium scope=multi needs=edit d=none]
-      - 2.2.4 \`[tier:medium]\` Decision log rows per §0.11 "What is measured". [tier:medium]
+      - [tier:medium] 2.2.4 \`[tier:medium]\` Decision log rows per §0.11 "What is measured".
       [route class=other risk=medium scope=multi d=none]
-      - QA \`[tier:heavy]\` adversarial review of the phase diff. [tier:heavy]
+      - [tier:heavy] QA \`[tier:heavy]\` adversarial review of the phase diff.
       [route class=review risk=medium scope=multi d=none pin]
 
       **Tests (\`test\\integration\\routing-dispatch.test.ts\`).** Fake v2 ctx: \`static\` → input untouched, no log.
@@ -247,17 +246,17 @@ describe("/annotate-plan: annotating plans (F3, A26)", () => {
     expect(result.text).toMatchInlineSnapshot(`
       "# Release plan
 
-      1. Audit the config loader for security issues [tier:heavy]
+      1. [tier:heavy] Audit the config loader for security issues
       [route class=design risk=high scope=multi d=none pin]
          \`\`\`ts
          // 1. fake step inside a fence
          - not a step
          [tier:fast] not a tag, [route class=search] not a route line
          \`\`\`
-      2. Update the changelog [tier:medium]
+      2. [tier:medium] Update the changelog
       [route class=other risk=medium scope=multi needs=edit d=none]
          - nested bullet detail
-      3. Run QA on the release branch [tier:heavy]
+      3. [tier:heavy] Run QA on the release branch
       [route class=review risk=high scope=multi d=none pin]
       4. [tier:medium] Refactor the helper
       [route class=implement risk=medium scope=multi needs=shell,edit d=none]
@@ -450,14 +449,106 @@ describe("locatePlan, agentInfosForPlan, renderDirectives", () => {
     expect(text).toContain("4 steps found");
     expect(text).toContain("Classification: backend=host; sources: ");
     expect(text).toContain("backend outcomes: ok 3, timeout 1; backend latency 812 ms; first error: timed out");
-    expect(text).toContain("never put one inside a fenced code block");
-    expect(text).toMatch(/- line 11 "3\. Run QA on the release branch": tag \[tier:heavy\] \(the step has none\); insert `\[route [^`]*pin\]` \[facts source: \w+\]/);
-    expect(text).toMatch(/- line 12 "4\. \[tier:medium\] Refactor the helper": already tagged \[tier:medium\]; insert/);
+    expect(text).toContain("never write a `[route …]` line inside a fenced code block");
+    // each instruction is complete and quoted: the line to write, the anchor to write it at, and "outside any code fence"
+    expect(text).toContain('- line 11 "3. Run QA on the release branch": rewrite line 11 as "3. [tier:heavy] Run QA on the release branch"; insert directly below line 11 (outside any code fence) the line "[route class=review risk=high scope=multi d=none pin]" [facts source: rules]');
+    expect(text).toContain('- line 12 "4. [tier:medium] Refactor the helper": insert directly below line 12 (outside any code fence) the line "[route class=implement risk=medium scope=multi needs=shell,edit d=none]" [facts source: rules]');
+    expect(text).not.toContain("rewrite line 12"); // already tagged: no tag instruction
     const annotatedAgain = await annotatePlanText(result.text, makeDeps().deps);
     expect(renderDirectives(annotatedAgain, { path: "p", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } })).toContain("add nothing");
   });
 });
 
+// ---------------------------------------------------------------------------
+// The directives are the annotation (QA-2.4-4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The model's side, written independently of `applyAdditions`: read the message part's instructions and carry them out literally on the
+ * original plan (bottom to top, so line numbers stay valid), the way the part tells the model to.
+ */
+function carryOut(plan: string, directives: string): { text: string; anchors: Array<{ line: number; quoted: string }> } {
+  const lines = plan.split(/\r\n|\n|\r/);
+  const eol = /\r\n|\n|\r/.exec(plan)?.[0] ?? "\n";
+  const str = '"((?:[^"\\\\]|\\\\.)*)"';
+  const anchors: Array<{ line: number; quoted: string }> = [];
+  type Op = { at: number; apply: () => void };
+  const ops: Op[] = [];
+  for (const entry of directives.split("\n").filter((l) => l.startsWith("- line "))) {
+    const head = new RegExp(`^- line (\\d+) ${str}: `).exec(entry)!;
+    const line = Number(head[1]);
+    const quoted = JSON.parse(`"${head[2]}"`) as string;
+    anchors.push({ line, quoted });
+    for (const m of entry.matchAll(new RegExp(`rewrite line (\\d+) as ${str}`, "g"))) {
+      ops.push({ at: Number(m[1]), apply: () => { lines[Number(m[1]) - 1] = JSON.parse(`"${m[2]}"`) as string; } });
+    }
+    for (const m of entry.matchAll(new RegExp(`replace line (\\d+) \\(was ${str}\\) with ${str}`, "g"))) {
+      ops.push({ at: Number(m[1]), apply: () => { lines[Number(m[1]) - 1] = JSON.parse(`"${m[3]}"`) as string; } });
+    }
+    for (const m of entry.matchAll(new RegExp(`insert directly below line (\\d+) \\(outside any code fence\\) the line ${str}`, "g"))) {
+      ops.push({ at: Number(m[1]) + 0.5, apply: () => { lines.splice(Number(m[1]), 0, JSON.parse(`"${m[2]}"`) as string); } });
+    }
+  }
+  // rewrites and replacements first (they do not move lines), then insertions from the bottom up
+  for (const op of ops.filter((o) => Number.isInteger(o.at))) op.apply();
+  for (const op of ops.filter((o) => !Number.isInteger(o.at)).sort((a, b) => b.at - a.at)) op.apply();
+  return { text: lines.join(eol), anchors };
+}
+
+describe("the directives reproduce the annotated text, anchored outside fences (QA-2.4-4)", () => {
+  const plans: Array<[string, string]> = [
+    ["README example", README_PLAN.trimEnd()],
+    ["this plan's §3 excerpt", SECTION_PLAN.trimEnd()],
+    ["fenced and nested code", FENCED_PLAN.trimEnd()],
+    ["CRLF", FENCED_PLAN.trimEnd().replace(/\n/g, "\r\n")],
+    ["a step on the last line, no final newline", "1. one\n2. two"],
+    ["checkboxes, headings as steps, tilde fences", ["- [ ] Fix the parser", "  ~~~sh", "  - not a step", "  ~~~", "* Run QA on the build", "  1) nested item"].join("\n")],
+  ];
+
+  it.each(plans)("%s: carrying the instructions out literally gives exactly the annotated text", async (_name, plan) => {
+    const result = await annotatePlanText(plan, makeDeps().deps);
+    const text = renderDirectives(result, { path: "p.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } });
+    const { text: done, anchors } = carryOut(plan, text);
+    expect(done).toBe(result.text);
+    expect(done).toBe(applyAdditions(plan, result.additions));
+    const original = plan.split(/\r\n|\n|\r/);
+    const fenced = fenceMask(original);
+    for (const { line, quoted } of anchors) {
+      expect(original[line - 1], `anchor of line ${line}`).toBe(quoted); // the quoted text is the line as it is in the file
+      expect(fenced[line - 1], `line ${line} is inside a fence`).not.toBe(true); // so is nothing inserted below it
+    }
+    expectFencesUntouched(plan, done);
+  });
+
+  it("the anchors of the nested-fence fixture are the step lines and never a line inside a block", async () => {
+    const result = await annotatePlanText(FENCED_PLAN, makeDeps().deps);
+    expect(result.additions.map((a) => a.line)).toEqual([3, 9, 11, 12]);
+    expect(result.additions.map((a) => a.anchor)).toEqual(["1. Audit the config loader for security issues", "2. Update the changelog", "3. Run QA on the release branch", "4. [tier:medium] Refactor the helper"]);
+    // a route line below a step whose block follows it stays above the block
+    const lines = result.text.split("\n");
+    expect(lines[3]).toMatch(ROUTE_LINE_RE); // directly below "1. [tier:heavy] Audit …", before its fenced block
+    expect(lines[4]).toBe("   ```ts");
+  });
+
+  it("withTagAtStart: after a list marker, a checkbox or heading hashes; at the start otherwise; nothing doubled", () => {
+    expect(withTagAtStart("1. Find it", "fast")).toBe("1. [tier:fast] Find it");
+    expect(withTagAtStart("10) Find it", "fast")).toBe("10) [tier:fast] Find it");
+    expect(withTagAtStart("  - Find it", "medium")).toBe("  - [tier:medium] Find it");
+    expect(withTagAtStart("* [ ] Find it", "fast")).toBe("* [ ] [tier:fast] Find it");
+    expect(withTagAtStart("- [x] Done", "fast")).toBe("- [x] [tier:fast] Done");
+    expect(withTagAtStart("### Step 2: go", "heavy")).toBe("### [tier:heavy] Step 2: go");
+    expect(withTagAtStart("plain text", "fast")).toBe("[tier:fast] plain text");
+    expect(withTagAtStart("  plain text", "fast")).toBe("  [tier:fast] plain text");
+    expect(withTagAtStart("- ", "fast")).toBe("- [tier:fast]");
+  });
+
+  it("applyAdditions keeps the file's line endings, including for a final line without one, and changes nothing without additions", () => {
+    const additions = [{ line: 2, anchor: "- b", tag: { tier: "fast", line: "- [tier:fast] b" }, insertRoute: { indent: "", text: "[route class=search d=none]" }, replaceRoute: null, source: "rules" }];
+    expect(applyAdditions("- a\r\n- b", additions)).toBe("- a\r\n- [tier:fast] b\r\n[route class=search d=none]");
+    expect(applyAdditions("- a\r\n- b\r\n", additions)).toBe("- a\r\n- [tier:fast] b\r\n[route class=search d=none]\r\n");
+    expect(applyAdditions("- a\n- b\n", [])).toBe("- a\n- b\n");
+  });
+});
 // ---------------------------------------------------------------------------
 // The command in the plugin
 // ---------------------------------------------------------------------------
@@ -580,7 +671,7 @@ describe("/annotate-plan in the plugin", () => {
     expect(text).toContain("## Router route lines (model-router, engine=shadow)");
     expect(text).toContain(`Computed by the router for ${join(home, "PLAN.md")}: 4 steps found, 4 need an addition, 1 pinned by this annotation`);
     expect(text).toContain("Classification: backend=rules");
-    expect(text).toMatch(/- line 4 "4\. Design a token bucket algorithm for advanced rate limiting": tag \[tier:heavy\] \(the step has none\); insert `\[route class=design [^`]*pin\]`/);
+    expect(text).toContain('- line 4 "4. Design a token bucket algorithm for advanced rate limiting": rewrite line 4 as "4. [tier:heavy] Design a token bucket algorithm for advanced rate limiting"; insert directly below line 4 (outside any code fence) the line "[route class=design risk=high scope=multi d=none pin]" [facts source: rules]');
     // with no argument it finds PLAN.md in the project directory, as the template says
     expect((await run(hooks, ""))[0]?.text).toContain("4 steps found");
   });

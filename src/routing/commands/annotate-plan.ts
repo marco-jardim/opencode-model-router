@@ -7,11 +7,12 @@
  * with ONE batched `classifyMany` call (rules per step, then the configured backend, rules again on any failure), runs 1.4's
  * `annotateSteps` (class → start tier, pins, route lines) and hands the model the exact lines to insert as an extra message part.
  *
- *  - Additive: existing lines are never changed. An existing `[tier:X]` or `[route …]` is authoritative; the one edit an existing route
- *    line can get is ` pin` appended when its step is `[tier:heavy]` or a QA step (A26), and that is reported as such.
+ *  - Additive: no line is removed or reordered. An existing `[tier:X]` or `[route …]` is authoritative. The only edits to an existing line
+ *    are `[tier:X]` inserted after the step's list marker (the template's "at the START of each step") and ` pin` appended to an existing
+ *    route line when its step is `[tier:heavy]` or a QA step (A26); both are reported as such.
  *  - Safe with code: nothing inside a fenced block (``` or ~~~, nested or not) starts a step, is a tag, or receives a route line.
  *  - The hook does not write the plan file. `annotatePlanText` produces the whole annotated text (used by the tests and by anyone who wants
- *    to write it); the message part lists only the lines the model has to add.
+ *    to write it); the message part lists, step by step, the exact lines the model has to write, derived from the same additions.
  *
  * Pure apart from the injected `classifyMany`, and the file reads of `locatePlan`.
  */
@@ -21,6 +22,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import type { RouterConfig } from "../../router/config";
 import { classifyMany as classifyManyWith, type ClassifyDeps } from "../classify";
 import { fenceMask } from "../classify/fences";
+import { parseRouteLine } from "../classify/route-line";
 import type { ClassifyInput, ClassifyResult } from "../classify/types";
 import { annotateSteps } from "../engine";
 import type { AnnotateDeps, AnnotatedStep, PlanStep } from "../engine";
@@ -187,10 +189,34 @@ export function splitPlan(text: string): PlacedStep[] {
     return { id: `L${run.start + 1}`, text: text.slice(from, to), line: run.start + 1, from, to };
   });
 }
-
 // ---------------------------------------------------------------------------
 // Annotating
 // ---------------------------------------------------------------------------
+
+/**
+ * One step's additions, in terms of lines of the ORIGINAL plan: the single definition of "what `/annotate-plan` adds". The annotated text
+ * ({@link applyAdditions}) and the message part ({@link renderDirectives}) are both made from it, so what the model is asked to write is
+ * exactly what the tests snapshot.
+ *  - the tier tag goes at the START of the step, after its list marker or heading hashes (the command template's rule 1:
+ *    `1. [tier:fast] Find all …`), and only when the step has none;
+ *  - the route line goes on the line directly BELOW the step's first line (plan 2.4.4: `[route …]` after each `[tier:X]`), indented like
+ *    that line (at most 3 spaces). The first line of a step is never inside a fenced block, so neither is the insertion point;
+ *  - an existing route line is edited in place only to add ` pin` (A26).
+ */
+export interface PlanAddition {
+  /** 1-based line of the step's first line (the anchor), as it is in the file now. */
+  readonly line: number;
+  /** That line, verbatim. */
+  readonly anchor: string;
+  /** The anchor rewritten with `[tier:X]` after its marker; `null` when the step already carries a tier tag. */
+  readonly tag: { readonly tier: string; readonly line: string } | null;
+  /** A new route line to put directly below the anchor (`indent` + `text`); `null` when the step has a route line already. */
+  readonly insertRoute: { readonly indent: string; readonly text: string } | null;
+  /** An existing route line that only gains ` pin`: its 1-based line, what it is now and what it becomes. */
+  readonly replaceRoute: { readonly line: number; readonly before: string; readonly text: string } | null;
+  /** Where the step's facts came from (`rules`, `host`, `plan`, …). */
+  readonly source: string;
+}
 
 export interface AnnotatedPlanText {
   /** The whole plan with every step annotated; equal to the input when nothing had to change. */
@@ -199,6 +225,70 @@ export interface AnnotatedPlanText {
   readonly steps: readonly AnnotatedStep[];
   /** Steps this annotation pinned (A26). */
   readonly pinnedCount: number;
+  /** What was added, step by step (only steps that change). */
+  readonly additions: readonly PlanAddition[];
+}
+
+const TAG_SLOT_RE = /^(?: {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+(?:\[[ xX]\][ \t]+)?| {0,3}#{1,6}[ \t]+)/;
+
+/** `line` with `[tier:X]` after its list marker (and checkbox) or heading hashes; at the start of the text when there is neither. */
+export function withTagAtStart(line: string, tier: string): string {
+  const prefix = TAG_SLOT_RE.exec(line)?.[0] ?? /^[ \t]*/.exec(line)?.[0] ?? "";
+  const rest = line.slice(prefix.length);
+  return rest === "" ? `${prefix}[tier:${tier}]` : `${prefix}[tier:${tier}] ${rest}`;
+}
+
+function additionsOf(placed: readonly PlacedStep[], steps: readonly AnnotatedStep[]): PlanAddition[] {
+  const out: PlanAddition[] = [];
+  placed.forEach((where, index) => {
+    const step = steps[index] as AnnotatedStep;
+    if (!step.changed) return;
+    const original = where.text.split(LINE_SPLIT_RE).filter((_, i) => i % 2 === 0);
+    const annotated = step.text.split(LINE_SPLIT_RE).filter((_, i) => i % 2 === 0);
+    const anchor = original[0] ?? "";
+    let replaceRoute: PlanAddition["replaceRoute"] = null;
+    if (step.routeEdited) {
+      // The engine edited an existing, unfenced route line in place: the same line index in both texts.
+      const mask = fenceMask(original);
+      const at = original.findIndex((line, i) => mask[i] !== true && parseRouteLine(line, { positions: "any" }).count > 0);
+      if (at >= 0 && annotated[at] !== undefined && annotated[at] !== original[at]) {
+        replaceRoute = { line: where.line + at, before: original[at] as string, text: annotated[at] as string };
+      }
+    }
+    out.push({
+      line: where.line,
+      anchor,
+      tag: step.tierSource === "engine" ? { tier: step.tier, line: withTagAtStart(anchor, step.tier) } : null,
+      insertRoute: step.routeSource === "engine" ? { indent: (/^ */.exec(anchor)?.[0] ?? "").slice(0, 3), text: step.routeLine } : null,
+      replaceRoute,
+      source: step.facts.source,
+    });
+  });
+  return out;
+}
+
+/** Apply additions to the plan they were computed for: the mechanical meaning of {@link PlanAddition}. Line endings are the file's own. */
+export function applyAdditions(text: string, additions: readonly PlanAddition[]): string {
+  const parts = text.split(LINE_SPLIT_RE);
+  const lines: string[] = [];
+  const terminators: string[] = [];
+  parts.forEach((part, index) => {
+    if (index % 2 === 0) lines.push(part);
+    else terminators.push(part);
+  });
+  const docEol = terminators[0] ?? "\n";
+  const byLine = new Map(additions.map((addition) => [addition.line, addition]));
+  const replacements = new Map<number, string>();
+  for (const addition of additions) if (addition.replaceRoute !== null) replacements.set(addition.replaceRoute.line, addition.replaceRoute.text);
+  let out = "";
+  lines.forEach((line, index) => {
+    const addition = byLine.get(index + 1);
+    const current = addition?.tag != null ? addition.tag.line : (replacements.get(index + 1) ?? line);
+    const eol = terminators[index];
+    if (addition?.insertRoute != null) out += `${current}${eol ?? docEol}${addition.insertRoute.indent}${addition.insertRoute.text}${eol ?? ""}`;
+    else out += `${current}${eol ?? ""}`;
+  });
+  return out;
 }
 
 /**
@@ -207,24 +297,17 @@ export interface AnnotatedPlanText {
  */
 export async function annotatePlanText(text: string, deps: AnnotateDeps): Promise<AnnotatedPlanText> {
   const placed = splitPlan(text);
-  if (placed.length === 0) return { text, placed, steps: [], pinnedCount: 0 };
-  // A step that ends the text has no terminator of its own: give it the file's, so an inserted route line is joined with the same line
-  // ending as everything else, and take it off again afterwards.
+  if (placed.length === 0) return { text, placed, steps: [], pinnedCount: 0, additions: [] };
+  // A step that ends the text has no terminator of its own: give it the file's, so the engine joins an inserted route line with the same
+  // line ending as everything else (only its tier, route and pin DECISIONS are used from the engine, not its text).
   const eol = /\r\n|\n|\r/.exec(text)?.[0] ?? "\n";
-  const synthetic = (step: PlacedStep): boolean => step.to === text.length && !/[\r\n]$/.test(step.text);
   const annotated = await annotateSteps(
-    placed.map((step) => ({ id: step.id, text: synthetic(step) ? `${step.text}${eol}` : step.text })),
+    placed.map((step) => ({ id: step.id, text: step.to === text.length && !/[\r\n]$/.test(step.text) ? `${step.text}${eol}` : step.text })),
     deps,
   );
-  let out = "";
-  let last = 0;
-  placed.forEach((step, index) => {
-    const annotatedText = (annotated[index] as AnnotatedStep).text;
-    out += text.slice(last, step.from) + (synthetic(step) && annotatedText.endsWith(eol) ? annotatedText.slice(0, -eol.length) : annotatedText);
-    last = step.to;
-  });
-  out += text.slice(last);
-  return { text: out, placed, steps: [...annotated], pinnedCount: annotated.pinnedCount };
+  const steps = [...annotated];
+  const additions = additionsOf(placed, steps);
+  return { text: applyAdditions(text, additions), placed, steps, pinnedCount: annotated.pinnedCount, additions };
 }
 
 // ---------------------------------------------------------------------------
@@ -242,50 +325,43 @@ export interface ClassificationReport {
   readonly error: string | null;
 }
 
-const EXCERPT_CHARS = 80;
 const MAX_LISTED_STEPS = 300;
+const q = (value: string): string => JSON.stringify(value);
 
-function excerptOf(text: string): string {
-  const first = text.split(LINE_SPLIT_RE)[0] ?? "";
-  const clean = first.trim().replace(/"/g, "'");
-  return clean.length > EXCERPT_CHARS ? `${clean.slice(0, EXCERPT_CHARS - 1)}…` : clean;
-}
-
-/** What the model is told to add, step by step, plus the facts a checkpoint records (source per step, latency, errors). */
+/**
+ * What the model is told to write, one line per step that changes, anchored on line numbers of the file as it is now and quoting the
+ * anchor line so it can be found even after earlier insertions moved the numbers. Each piece is a complete instruction with the exact
+ * line to write (JSON-quoted), so nothing is left to the model's judgement: `rewrite line N as "…"`, `insert directly below line N
+ * (outside any code fence) the line "…"`, `replace line M (was "…") with "…"`.
+ */
 export function renderDirectives(
   result: AnnotatedPlanText,
   info: { readonly path: string; readonly engine: string; readonly classification: ClassificationReport },
 ): string {
-  const { steps, placed } = result;
-  const needing = steps
-    .map((step, index) => ({ step, placed: placed[index] as PlacedStep }))
-    .filter(({ step }) => step.changed);
+  const { steps, additions } = result;
   const sources = new Map<string, number>();
   for (const step of steps) sources.set(step.facts.source, (sources.get(step.facts.source) ?? 0) + 1);
   const statuses = Object.entries(info.classification.statuses).map(([status, count]) => `${status} ${count}`).join(", ");
   const lines = [
     `## Router route lines (model-router, engine=${info.engine})`,
-    `Computed by the router for ${info.path}: ${steps.length} step${steps.length === 1 ? "" : "s"} found, ${needing.length} need${needing.length === 1 ? "s" : ""} an addition, ${result.pinnedCount} pinned by this annotation (a \`[tier:heavy]\` or QA step is never moved by the engine).`,
+    `Computed by the router for ${info.path}: ${steps.length} step${steps.length === 1 ? "" : "s"} found, ${additions.length} need${additions.length === 1 ? "s" : ""} an addition, ${result.pinnedCount} pinned by this annotation (a \`[tier:heavy]\` or QA step is never moved by the engine).`,
     `Classification: backend=${info.classification.backend}; sources: ${[...sources].map(([source, count]) => `${source} ${count}`).join(", ") || "none"}${statuses === "" ? "" : `; backend outcomes: ${statuses}`}${info.classification.latencyMs === null ? "" : `; backend latency ${info.classification.latencyMs} ms`}${info.classification.error === null ? "" : `; first error: ${info.classification.error}`}.`,
   ];
-  if (needing.length === 0) {
+  if (additions.length === 0) {
     lines.push("Every step already carries its tier and route line: add nothing.");
     return lines.join("\n");
   }
   lines.push(
-    "Add exactly these lines, keeping every existing line as it is. A `[route …]` line goes on its own line directly after the step's first line, indented like that line (at most 3 spaces); never put one inside a fenced code block, and do not invent others. A tier tag is added only where it says so.",
+    "Make exactly these changes, keeping every other line as it is. Line numbers are those of the file now: apply the list from the last step to the first (or find each line by its quoted text) so earlier insertions do not move the later ones. Each quoted string is the complete line to write. Where a tier tag is listed it replaces the template's tag rule for that step (it is already at the start, as the template says); never write a `[route …]` line inside a fenced code block, and do not invent others.",
   );
-  for (const { step, placed: where } of needing.slice(0, MAX_LISTED_STEPS)) {
-    const tag = step.tierSource === "engine" ? `tag [tier:${step.tier}] (the step has none); ` : `already tagged [tier:${step.tier}]; `;
-    const route = step.routeEdited
-      ? `replace its existing route line with \`${step.routeLine}\` (the only change is \`pin\`)`
-      : step.routeSource === "engine"
-        ? `insert \`${step.routeLine}\``
-        : "keep its existing route line";
-    // The excerpt is the line as it is in the file (the annotated text already carries the tag the model is about to add).
-    lines.push(`- line ${where.line} "${excerptOf(where.text)}": ${tag}${route} [facts source: ${step.facts.source}]`);
+  for (const addition of additions.slice(0, MAX_LISTED_STEPS)) {
+    const pieces: string[] = [];
+    if (addition.tag !== null) pieces.push(`rewrite line ${addition.line} as ${q(addition.tag.line)}`);
+    if (addition.insertRoute !== null) pieces.push(`insert directly below line ${addition.line} (outside any code fence) the line ${q(`${addition.insertRoute.indent}${addition.insertRoute.text}`)}`);
+    if (addition.replaceRoute !== null) pieces.push(`replace line ${addition.replaceRoute.line} (was ${q(addition.replaceRoute.before)}) with ${q(addition.replaceRoute.text)}`);
+    lines.push(`- line ${addition.line} ${q(addition.anchor)}: ${pieces.join("; ")} [facts source: ${addition.source}]`);
   }
-  if (needing.length > MAX_LISTED_STEPS) lines.push(`- … ${needing.length - MAX_LISTED_STEPS} more steps: run /annotate-plan again after applying these.`);
+  if (additions.length > MAX_LISTED_STEPS) lines.push(`- … ${additions.length - MAX_LISTED_STEPS} more steps: run /annotate-plan again after applying these.`);
   return lines.join("\n");
 }
 
