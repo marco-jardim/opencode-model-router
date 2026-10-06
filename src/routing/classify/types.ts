@@ -833,17 +833,19 @@ export interface NeedRule {
 export const NEED_RULES: readonly NeedRule[] = [
   {
     need: "shell",
+    // Tool names are matched as whole words that are not part of a path or file name
+    // (`D:\git\repo`, `~/git/x`, `.github/`, `git.exe` are not a shell need; QA-1.2-5).
     terms: [
-      /\brg\b/i,
-      /\bgit\b/i,
-      /\b(?:npm|npx|pnpm|yarn|bun|deno)\b/i,
-      /\b(?:tsc|vitest|jest|pytest|mocha|eslint|prettier)\b/i,
-      /\b(?:pwsh|powershell|bash|zsh|shell|terminal)\b/i,
-      /\bcargo\b/i,
+      /(?<![\\/.\w-])rg\b(?![\\/]|\.\w)/i,
+      /(?<![\\/.\w-])git\b(?![\\/]|\.\w)/i,
+      /(?<![\\/.\w-])(?:npm|npx|pnpm|yarn|bun|deno)\b(?![\\/]|\.\w)/i,
+      /(?<![\\/.\w-])(?:tsc|vitest|jest|pytest|mocha|eslint|prettier)\b(?![\\/]|\.\w)/i,
+      /(?<![\\/.\w-])(?:pwsh|powershell|bash|zsh|shell|terminal)\b(?![\\/]|\.\w)/i,
+      /(?<![\\/.\w-])cargo\b(?![\\/]|\.\w)/i,
       /\bgo\s+(?:test|build|run|vet)\b/i,
       /\bmake\s+(?:test|build|install|all|clean|check)\b/i,
-      /\bdocker\b/i,
-      /\bkubectl\b/i,
+      /(?<![\\/.\w-])docker\b(?![\\/]|\.\w)/i,
+      /(?<![\\/.\w-])kubectl\b(?![\\/]|\.\w)/i,
       /\bnode\s+(?:-e\b|\S+\.[cm]?js\b)/i,
       /\b(?:run|execute)\s+(?:the\s+)?(?:tests?|suite|build|scripts?|typecheck|linter|lint|commands?|benchmarks?)\b/i,
       /\btypecheck\b/i,

@@ -625,3 +625,53 @@ describe("risk scans the whole body; excluded sections end at a blank line (QA-1
     expect(facts.needs).not.toContain("shell");
   });
 });
+describe("needs are path-aware (QA-1.2-5)", () => {
+  const needsOf = (text: string): readonly Need[] => classifyByRules(text, cfg).needs;
+
+  it("a path segment named like a tool is not that tool", () => {
+    for (const text of [
+      "list D:\\git\\repo",
+      "list D:\\git\\repo\\src\\a.ts",
+      "list ~/git/x",
+      "read .github/workflows/ci.yml",
+      "read src/git/hooks.ts",
+      "read packages/npm/index.js",
+      "read docker/compose.yml",
+      "read C:\\tools\\bash\\notes.txt",
+      "read git.exe",
+    ]) {
+      expect(needsOf(text), text).not.toContain("shell");
+    }
+  });
+
+  it("the tools themselves are still a shell need", () => {
+    for (const text of [
+      "git status",
+      "run git log -3",
+      "run npm test",
+      "docker compose up",
+      "docker-compose up",
+      "use bash to list the files",
+      "rg foo src",
+      "run the tests with vitest",
+    ]) {
+      expect(needsOf(text), text).toContain("shell");
+    }
+  });
+
+  it("a tool named next to a path still counts", () => {
+    expect(needsOf("git diff D:\\git\\repo\\src\\a.ts")).toContain("shell");
+    expect(needsOf("cd ~/git/x && npm test")).toContain("shell");
+  });
+
+  it("verbs inside a slash list are not needs: 'read/search/write' is a list of tools", () => {
+    expect(needsOf("tools: read/search/write")).not.toContain("edit");
+  });
+
+  it("URLs keep their web need; external_dir still reads paths", () => {
+    expect(needsOf("fetch https://example.com/git/docs")).toEqual(["web"]);
+    const facts = classifyByRules("write the log to C:\\Users\\me\\git\\x.log", cfg, { cwd: "D:\\work\\repo" });
+    expect(facts.needs).toEqual(["edit", "external_dir"]);
+    expect(classifyByRules("open ~/notes.txt", cfg).needs).toEqual(["external_dir"]);
+  });
+});

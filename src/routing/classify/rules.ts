@@ -118,6 +118,25 @@ const REPO_SCOPE_RES: readonly RegExp[] = REPO_SCOPE_TERMS.map(globalCopy);
 const ABS_PATH_RES: readonly RegExp[] = [WINDOWS_ABS_PATH_RE, POSIX_ABS_PATH_RE].map(globalCopy);
 const ACCEPTANCE_ALL_RE = new RegExp(ACCEPTANCE_BLOCK_RE.source, "gi");
 
+/**
+ * Path-like tokens, removed before the needs vocabulary runs (external_dir is
+ * the exception: it reads paths). `D:\git\repo` and `~/git/x` are places, not
+ * the `git` tool; "read/search/write" is a list, not a write (QA-1.2-5). URLs
+ * are left alone: a candidate may not start right after `:` or `/`.
+ */
+const PATHLIKE_RES: readonly RegExp[] = [
+  globalCopy(WINDOWS_ABS_PATH_RE),
+  /(?<![\w:/.~-])\/[\w.@+-]+(?:\/[\w.@+-]*)*/g,
+  /(?<!\w)~[\\/][^\s"'`]*/g,
+  /(?<![\w:/\\.~-])[\w.@+-]+(?:[\\/][\w.@+-]*)+/g,
+];
+
+function withoutPaths(text: string): string {
+  let out = text;
+  for (const re of PATHLIKE_RES) out = out.replace(re, " ");
+  return out;
+}
+
 const TEMPLATE_LABELS: ReadonlySet<string> = new Set(TEMPLATE_SECTION_LABELS);
 const CLASS_EXCLUDED: ReadonlySet<string> = new Set(CLASS_EXCLUDED_SECTIONS);
 const NEEDS_EXCLUDED: ReadonlySet<string> = new Set(NEEDS_EXCLUDED_SECTIONS);
@@ -444,8 +463,9 @@ export function analyzeRules(
 
   // R9 — needs
   const needs = new Set<Need>();
+  const pathFreeText = withoutPaths(needsText);
   for (const rule of COMPILED_NEEDS) {
-    if (hasHit(rule.res, needsText, true)) {
+    if (hasHit(rule.res, rule.need === "external_dir" ? needsText : pathFreeText, true)) {
       needs.add(rule.need);
       for (const implied of rule.implies) needs.add(implied);
     }
