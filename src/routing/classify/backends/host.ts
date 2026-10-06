@@ -26,6 +26,7 @@ import {
   disabledMany,
   finish,
   finishMany,
+  backendUnavailable,
   gatherSamples,
   guarded,
   guardedMany,
@@ -86,12 +87,15 @@ export function createHostBackend(deps: HostBackendDeps): ClassifierBackend {
       return guarded(rt, startedAt, async () => {
         const model = hostModel();
         if (model === null) return disabled(rt, BAD_MODEL, startedAt);
+        const blocked = backendUnavailable(rt);
+        if (blocked !== null) return disabled(rt, blocked, startedAt);
         const samples = settings.samples;
         const choices = options.choices.length > 0 ? options.choices : CLASS_OPTIONS;
         const rendered = Array.from({ length: samples }, () =>
           renderSinglePrompt(state, choices, options.random),
         );
         const gathered = await gatherSamples<SampleAnswer>(
+          rt,
           samples,
           settings.timeoutMs,
           new AbortController(),
@@ -101,6 +105,7 @@ export function createHostBackend(deps: HostBackendDeps): ClassifierBackend {
             const label = parseLabel(text, rendered[index]!.labels);
             return { label, raw: cutRaw(text) };
           },
+          (answer) => answer.label,
         );
         const labels = gathered.settled.map((s) => (s.kind === "value" ? s.v.label : null));
         const outcome = resolveOutcome(labels, gathered.settled, samples, gathered.timedOut, settings.timeoutMs);
@@ -117,11 +122,14 @@ export function createHostBackend(deps: HostBackendDeps): ClassifierBackend {
       return guardedMany(rt, states.length, startedAt, async () => {
         const model = hostModel();
         if (model === null) return disabledMany(rt, states.length, BAD_MODEL, startedAt);
+        const blocked = backendUnavailable(rt);
+        if (blocked !== null) return disabledMany(rt, states.length, blocked, startedAt);
         const samples = settings.samples;
         const count = states.length;
         const choices = options.choices.length > 0 ? options.choices : CLASS_OPTIONS;
         const rendered = Array.from({ length: samples }, () => renderBatchPrompt(states, choices, options.random));
         const gathered = await gatherSamples<BatchAnswer>(
+          rt,
           samples,
           settings.timeoutMs,
           new AbortController(),
@@ -136,6 +144,7 @@ export function createHostBackend(deps: HostBackendDeps): ClassifierBackend {
               raw: cutRaw(text),
             };
           },
+          (answer) => (answer.labels.length > 0 ? answer.labels.join("|") : null),
         );
         const settled: Array<Settled<BatchAnswer>> = gathered.settled;
         const outcomes = states.map((_, item) =>

@@ -32,6 +32,7 @@ import {
   disabledMany,
   finish,
   finishMany,
+  backendUnavailable,
   gatherSamples,
   guarded,
   guardedMany,
@@ -204,10 +205,13 @@ export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps)
       return guarded(rt, startedAt, async () => {
         const target = endpoint();
         if (typeof target === "string") return disabled(rt, target, startedAt);
+        const blocked = backendUnavailable(rt);
+        if (blocked !== null) return disabled(rt, blocked, startedAt);
         const samples = settings.samples;
         const choices = options.choices.length > 0 ? options.choices : CLASS_OPTIONS;
         const rendered = Array.from({ length: samples }, () => renderSinglePrompt(state, choices, options.random));
         const gathered = await gatherSamples<SampleAnswer>(
+          rt,
           samples,
           settings.timeoutMs,
           new AbortController(),
@@ -217,6 +221,7 @@ export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps)
             if (answer.content === null) return { label: null, raw: null, reason: answer.reason };
             return { label: parseLabel(answer.content, r.labels), raw: cutRaw(answer.content) };
           },
+          (answer) => answer.label,
         );
         const labels = gathered.settled.map((s) => (s.kind === "value" ? s.v.label : null));
         const outcome = resolveOutcome(labels, gathered.settled, samples, gathered.timedOut, settings.timeoutMs);
@@ -233,11 +238,14 @@ export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps)
       return guardedMany(rt, states.length, startedAt, async () => {
         const target = endpoint();
         if (typeof target === "string") return disabledMany(rt, states.length, target, startedAt);
+        const blocked = backendUnavailable(rt);
+        if (blocked !== null) return disabledMany(rt, states.length, blocked, startedAt);
         const samples = settings.samples;
         const count = states.length;
         const choices = options.choices.length > 0 ? options.choices : CLASS_OPTIONS;
         const rendered = Array.from({ length: samples }, () => renderBatchPrompt(states, choices, options.random));
         const gathered = await gatherSamples<BatchAnswer>(
+          rt,
           samples,
           settings.timeoutMs,
           new AbortController(),
@@ -247,6 +255,7 @@ export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps)
             if (answer.content === null) return { labels: [], raw: null, reason: answer.reason };
             return { labels: parseBatchLabels(answer.content, count, r.labels), raw: cutRaw(answer.content) };
           },
+          (answer) => (answer.labels.length > 0 ? answer.labels.join("|") : null),
         );
         const settled: Array<Settled<BatchAnswer>> = gathered.settled;
         const outcomes = states.map((_, item) =>

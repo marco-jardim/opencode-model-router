@@ -36,6 +36,7 @@ import {
   type TaskClass,
 } from "../types";
 import {
+  backendUnavailable,
   checkBaseUrl,
   createRuntime,
   cutRaw,
@@ -182,6 +183,8 @@ export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBack
       return guarded(rt, startedAt, async () => {
         const target = endpoint();
         if (typeof target === "string") return disabled(rt, target, startedAt);
+        const blocked = backendUnavailable(rt);
+        if (blocked !== null) return disabled(rt, blocked, startedAt);
         const classChoices = options.choices.length > 0 ? options.choices : CLASS_OPTIONS;
         const body = {
           state: state.text,
@@ -205,7 +208,7 @@ export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBack
           },
         };
         const classLabels = classChoices.map((c) => c.label);
-        const gathered = await gatherSamples<SingleAnswer>(1, settings.timeoutMs, new AbortController(), async (_, signal) => {
+        const gathered = await gatherSamples<SingleAnswer>(rt, 1, settings.timeoutMs, new AbortController(), async (_, signal) => {
           const reply = await post(target, body, signal);
           if (reply.answers === null) {
             return { cls: null, confidence: 0, raw: reply.raw, reason: reply.reason };
@@ -256,6 +259,8 @@ export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBack
       return guardedMany(rt, states.length, startedAt, async () => {
         const target = endpoint();
         if (typeof target === "string") return disabledMany(rt, states.length, target, startedAt);
+        const blocked = backendUnavailable(rt);
+        if (blocked !== null) return disabledMany(rt, states.length, blocked, startedAt);
         const count = states.length;
         const classChoices = options.choices.length > 0 ? options.choices : CLASS_OPTIONS;
         const rendered = renderBatchPrompt(states, classChoices, options.random);
@@ -274,7 +279,7 @@ export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBack
         }
         const body = { state: rendered.blocks, model: target.model, questions };
         const classLabels = classChoices.map((c) => c.label);
-        const gathered = await gatherSamples<BatchAnswer>(1, settings.timeoutMs, new AbortController(), async (_, signal) => {
+        const gathered = await gatherSamples<BatchAnswer>(rt, 1, settings.timeoutMs, new AbortController(), async (_, signal) => {
           const reply = await post(target, body, signal);
           if (reply.answers === null) return { items: [], raw: reply.raw, reason: reply.reason };
           const items = Array.from({ length: count }, (_, i) => {

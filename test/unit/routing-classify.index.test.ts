@@ -763,3 +763,62 @@ describe("A19: the backend only chooses among the classes the rules matched (QA-
     expect(result.trace.backend?.rejected).toBeUndefined();
   });
 });
+describe("classifyMany stops after a failed chunk (QA-1.2-10)", () => {
+  const items = (n: number): ClassifyInput[] => Array.from({ length: n }, (_, i) => input(`hello ${i}`));
+
+  it("a chunk whose answers all fail ends the plan's backend calls; the remaining items keep the rules facts", async () => {
+    const { backend, classifyManyFn } = fakeBackend(
+      () => okResult("search"),
+      (count) => Array.from({ length: count }, () => failResult("timeout")),
+    );
+    const deps = makeDeps(backend);
+    const results = await classifyMany(items(120), deps);
+    expect(classifyManyFn).toHaveBeenCalledTimes(1);
+    expect(results).toHaveLength(120);
+    expect(results.slice(0, 50).every((r) => r.trace.backend?.status === "timeout")).toBe(true);
+    expect(results.slice(50).every((r) => r.trace.backend?.status === "disabled")).toBe(true);
+    expect(results[60]!.trace.backend?.reason).toBe("skipped: the previous batch failed");
+    expect(results.every((r) => r.facts.source === "rules")).toBe(true);
+    expect(deps.messages.filter((m) => m.includes("skipping 70 remaining items"))).toHaveLength(1);
+  });
+
+  it("a rejecting, hung or malformed batch also stops; an all-invalid batch does not", async () => {
+    const rejecting = fakeBackend(() => okResult("search"), () => Promise.reject(new Error("down")));
+    await classifyMany(items(101), makeDeps(rejecting.backend));
+    expect(rejecting.classifyManyFn).toHaveBeenCalledTimes(1);
+
+    const malformed = fakeBackend(() => okResult("search"), () => "nope");
+    await classifyMany(items(101), makeDeps(malformed.backend));
+    expect(malformed.classifyManyFn).toHaveBeenCalledTimes(1);
+
+    const hung = fakeBackend(() => okResult("search"), () => new Promise<BackendResult[]>(() => undefined));
+    await classifyMany(items(101), makeDeps(hung.backend, { settings: settings({ timeoutMs: 20 }) }));
+    expect(hung.classifyManyFn).toHaveBeenCalledTimes(1);
+
+    const invalid = fakeBackend(
+      () => okResult("search"),
+      (count) => Array.from({ length: count }, () => failResult("invalid")),
+    );
+    await classifyMany(items(101), makeDeps(invalid.backend));
+    expect(invalid.classifyManyFn).toHaveBeenCalledTimes(3);
+  });
+
+  it("a partially failing chunk (some answers ok) does not stop the plan", async () => {
+    const { backend, classifyManyFn } = fakeBackend(
+      () => okResult("search"),
+      (count) => Array.from({ length: count }, (_, i) => (i === 0 ? okResult("debug") : failResult("error"))),
+    );
+    await classifyMany(items(120), makeDeps(backend));
+    expect(classifyManyFn).toHaveBeenCalledTimes(3);
+  });
+
+  it("the last chunk failing logs nothing about skipping", async () => {
+    const { backend } = fakeBackend(
+      () => okResult("search"),
+      (count) => Array.from({ length: count }, () => failResult("error")),
+    );
+    const deps = makeDeps(backend);
+    await classifyMany(items(30), deps);
+    expect(deps.messages.some((m) => m.includes("skipping"))).toBe(false);
+  });
+});

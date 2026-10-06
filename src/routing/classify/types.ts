@@ -1105,6 +1105,12 @@ export const STATE_DESCRIPTION_MAX_CHARS = 200;
 export const MAX_BATCH_ITEMS = 50;
 /** Raw answers kept in BackendResult.raw. */
 export const RAW_ANSWER_MAX_CHARS = 1000;
+/** Consecutive timeouts/errors after which a backend instance stops calling out (QA-1.2-10). */
+export const BREAKER_FAILURES = 3;
+/** How long an open circuit breaker keeps a backend disabled. */
+export const BREAKER_COOLDOWN_MS = 300_000;
+/** Requests that outlived their call (timed out or left behind by an early majority) and are still in flight. */
+export const MAX_ABANDONED_REQUESTS = 12;
 /** Extra time the composer (index.ts) waits beyond timeoutMs before declaring a backend hung. */
 export const INDEX_TIMEOUT_GRACE_MS = 100;
 

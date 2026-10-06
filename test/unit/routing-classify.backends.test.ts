@@ -556,7 +556,7 @@ describe("host backend", () => {
     expect(seen).toEqual([]);
   });
 
-  it("samples 3: 2/3 agreement gives 0.67, unanimity 1, three different labels disagree with 0", async () => {
+  it("samples 3: 2/3 agreement gives 0.67, an early majority 0.67 too, three different labels disagree with 0", async () => {
     const answers = (list: string[]): HostGenerate["text"] => {
       let i = 0;
       return async () => ({ text: list[i++]! });
@@ -567,8 +567,11 @@ describe("host backend", () => {
     expect(majority.facts).toMatchObject({ class: "debug", confidence: 0.67, source: "host" });
     expect(majority.calls).toBe(3);
 
+    // The group ends as soon as two answers agree (QA-1.2-10): the third is not awaited, so 2 votes of 3.
     const all = makeHost(answers(["review", "review", "review"]), { samples: 3 });
-    expect((await all.backend.classify(stateOf("x"), callOptions(seeded(1)))).facts.confidence).toBe(1);
+    const early = await all.backend.classify(stateOf("x"), callOptions(seeded(1)));
+    expect(early.facts.confidence).toBe(0.67);
+    expect(early.calls).toBe(3);
 
     const none = makeHost(answers(["debug", "design", "review"]), { samples: 3 });
     const result = await none.backend.classify(stateOf("x"), callOptions(seeded(1)));
@@ -1324,5 +1327,170 @@ describe("A18: keys never travel over plain http to a remote host (QA-1.2-9)", (
       "classifier openai-compatible: effective host localhost (http, loopback)",
       "classifier typesafe: effective host unavailable (classifier.baseUrl is not set)",
     ]);
+  });
+});
+describe("resilience: early majority, circuit breaker, abandoned cap (QA-1.2-10)", () => {
+  function hostWith(
+    text: HostGenerate["text"],
+    overrides: Partial<ClassifierSettings> = {},
+    clock: { t: number } = { t: 1_000 },
+  ) {
+    const { logger, logs } = makeLogger();
+    const backend = createHostBackend({
+      generate: { text },
+      settings: settings(overrides),
+      logger,
+      now: () => clock.t,
+    });
+    return { backend, logs, clock };
+  }
+  const run = (backend: ReturnType<typeof hostWith>["backend"]) =>
+    backend.classify(stateOf("x"), callOptions(seeded(1)));
+  const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
+
+  it("samples 3 settles as soon as two agree, without waiting for the third, and aborts it", async () => {
+    let n = 0;
+    let signal: AbortSignal | undefined;
+    const text = vi.fn<HostGenerate["text"]>((_input, options) => {
+      n++;
+      if (n <= 2) return Promise.resolve({ text: "debug" });
+      signal = options?.signal;
+      return new Promise(() => undefined);
+    });
+    const { backend } = hostWith(text, { samples: 3, timeoutMs: 5_000 });
+    const started = performance.now();
+    const result = await run(backend);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(result.status).toBe("ok");
+    expect(result.facts).toMatchObject({ class: "debug", confidence: 0.67 });
+    expect(result.calls).toBe(3);
+    expect(signal!.aborted).toBe(true);
+  });
+
+  it("with one sample there is nothing to agree on", async () => {
+    const text = vi.fn<HostGenerate["text"]>(async () => ({ text: "debug" }));
+    const { backend } = hostWith(text, { samples: 1 });
+    expect((await run(backend)).facts.confidence).toBe(0.6);
+  });
+
+  it("three consecutive errors open the circuit: no request for 5 minutes, one log line, then a single trial", async () => {
+    const text = vi.fn<HostGenerate["text"]>(async () => {
+      throw new Error("503 upstream");
+    });
+    const { backend, logs, clock } = hostWith(text);
+    for (let i = 0; i < 3; i++) expect((await run(backend)).status).toBe("error");
+    expect(text).toHaveBeenCalledTimes(3);
+    expect(logs.some((l) => l.message.startsWith("classifier host: circuit breaker opened after 3"))).toBe(true);
+
+    const blocked = await run(backend);
+    await run(backend);
+    expect(blocked.status).toBe("disabled");
+    expect(blocked.calls).toBe(0);
+    expect(blocked.reason).toBe("circuit breaker open after 3 consecutive timeouts or errors (5 min cooldown)");
+    expect(text).toHaveBeenCalledTimes(3);
+    expect(logs.filter((l) => l.message.startsWith("classifier host: disabled (circuit breaker")).length).toBe(1);
+
+    clock.t += 299_000;
+    expect((await run(backend)).status).toBe("disabled");
+    clock.t += 2_000; // past the cooldown: one trial request
+    expect((await run(backend)).status).toBe("error");
+    expect(text).toHaveBeenCalledTimes(4);
+    expect((await run(backend)).status).toBe("disabled"); // the failed trial reopened it at once
+    expect(text).toHaveBeenCalledTimes(4);
+  });
+
+  it("a successful trial closes the circuit for good", async () => {
+    let fail = true;
+    const text = vi.fn<HostGenerate["text"]>(async () => {
+      if (fail) throw new Error("down");
+      return { text: "search" };
+    });
+    const { backend, clock } = hostWith(text);
+    for (let i = 0; i < 3; i++) await run(backend);
+    clock.t += 300_001;
+    fail = false;
+    expect((await run(backend)).status).toBe("ok");
+    fail = true;
+    expect((await run(backend)).status).toBe("error");
+    expect((await run(backend)).status).toBe("error"); // two failures: still closed
+    expect(text).toHaveBeenCalledTimes(6);
+  });
+
+  it("timeouts count as failures too", async () => {
+    const text = vi.fn<HostGenerate["text"]>(() => new Promise(() => undefined));
+    const { backend } = hostWith(text, { timeoutMs: 15 });
+    for (let i = 0; i < 3; i++) expect((await run(backend)).status).toBe("timeout");
+    expect((await run(backend)).status).toBe("disabled");
+    expect(text).toHaveBeenCalledTimes(3);
+  });
+
+  it("an answer from the server, even an invalid one, resets the failure count", async () => {
+    const script = ["error", "error", "invalid", "error", "error", "ok"] as const;
+    let i = 0;
+    const text = vi.fn<HostGenerate["text"]>(async () => {
+      const step = script[i++]!;
+      if (step === "error") throw new Error("down");
+      return { text: step === "ok" ? "search" : "not a label" };
+    });
+    const { backend } = hostWith(text);
+    const statuses: string[] = [];
+    for (let k = 0; k < script.length; k++) statuses.push((await run(backend)).status);
+    expect(statuses).toEqual(["error", "error", "invalid", "error", "error", "ok"]);
+    expect(text).toHaveBeenCalledTimes(6);
+  });
+
+  it("caps requests left in flight: after 12 abandoned the backend refuses until they settle", async () => {
+    const held: Array<(value: { text: string }) => void> = [];
+    let n = 0;
+    const text = vi.fn<HostGenerate["text"]>(() => {
+      // Requests 0 and 1 of every group agree at once; request 2 never answers (until released).
+      if (n++ % 3 < 2) return Promise.resolve({ text: "debug" });
+      return new Promise((resolve) => held.push(resolve));
+    });
+    const { backend, logs } = hostWith(text, { samples: 3, timeoutMs: 5_000 });
+    for (let i = 0; i < 12; i++) expect((await run(backend)).status).toBe("ok");
+    expect(held).toHaveLength(12);
+
+    const refused = await run(backend);
+    expect(refused.status).toBe("disabled");
+    expect(refused.reason).toBe("too many abandoned requests still in flight (limit 12)");
+    expect(text).toHaveBeenCalledTimes(36);
+    expect(logs.filter((l) => l.message.includes("too many abandoned")).length).toBe(1);
+
+    for (const release of held) release({ text: "debug" });
+    await tick();
+    expect((await run(backend)).status).toBe("ok");
+    expect(text).toHaveBeenCalledTimes(39);
+  });
+
+  it("the HTTP backends share the breaker: three HTTP 500s open it", async () => {
+    const { logger } = makeLogger();
+    const fetchFn = vi.fn<FetchLike>(async () => response(500, "oops"));
+    const backend = createOpenAICompatibleBackend({
+      fetch: fetchFn,
+      env: {},
+      settings: settings({ backend: "openai-compatible", baseUrl: "http://localhost:11434/v1", apiKeyEnv: null }),
+      logger,
+    });
+    for (let i = 0; i < 3; i++) expect((await backend.classify(stateOf("x"), callOptions(seeded(1)))).status).toBe("error");
+    const blocked = await backend.classify(stateOf("x"), callOptions(seeded(1)));
+    expect(blocked.status).toBe("disabled");
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    const many = await backend.classifyMany([stateOf("a"), stateOf("b")], callOptions(seeded(1)));
+    expect(many.map((r) => r.status)).toEqual(["disabled", "disabled"]);
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+  });
+
+  it("batches feed the breaker once per call, not once per item", async () => {
+    const text = vi.fn<HostGenerate["text"]>(async () => {
+      throw new Error("down");
+    });
+    const { backend } = hostWith(text);
+    const many = [stateOf("a"), stateOf("b"), stateOf("c"), stateOf("d")];
+    await backend.classifyMany(many, callOptions(seeded(1)));
+    await backend.classifyMany(many, callOptions(seeded(1)));
+    expect((await backend.classifyMany(many, callOptions(seeded(1)))).every((r) => r.status === "error")).toBe(true);
+    expect((await backend.classifyMany(many, callOptions(seeded(1)))).every((r) => r.status === "disabled")).toBe(true);
+    expect(text).toHaveBeenCalledTimes(3);
   });
 });

@@ -8,7 +8,10 @@
 import { scrubState } from "../scrub";
 import {
   BACKEND_PROMPT,
+  BREAKER_COOLDOWN_MS,
+  BREAKER_FAILURES,
   CONFIDENCE,
+  MAX_ABANDONED_REQUESTS,
   RAW_ANSWER_MAX_CHARS,
   type BackendId,
   type BackendResult,
@@ -365,41 +368,78 @@ export function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<Settled
 export interface Gathered<T> {
   /** One entry per request, in start order; unsettled ones are `timeout`. */
   readonly settled: Array<Settled<T>>;
+  /** The group timer fired before the group finished. */
   readonly timedOut: boolean;
 }
 
 /**
- * Start `count` requests together and wait for all of them, as a group, for at
- * most `timeoutMs`. On timeout the controller is aborted (best effort) and the
- * answers that already settled are kept. Never rejects, never throws.
+ * Start `count` requests together and wait for them as a group for at most
+ * `timeoutMs`. The group also ends early when two requests agree (their
+ * `agreementKey` is equal and non-null): a majority of three cannot change, so
+ * waiting for the third only costs latency. Whatever is still in flight when the
+ * group ends is aborted (best effort) and counted as abandoned on the runtime
+ * until it settles. Never rejects, never throws.
  */
-export async function gatherSamples<T>(
+export function gatherSamples<T>(
+  rt: BackendRuntime,
   count: number,
   timeoutMs: number,
   controller: AbortController,
   start: (index: number, signal: AbortSignal) => Promise<T>,
+  agreementKey?: (value: T) => string | null,
 ): Promise<Gathered<T>> {
-  const slots: Array<Settled<T> | null> = Array.from({ length: count }, () => null);
-  const running: Array<Promise<void>> = [];
-  for (let i = 0; i < count; i++) {
-    running.push(
-      (async () => start(i, controller.signal))().then(
-        (v) => {
-          slots[i] = { kind: "value", v };
-        },
-        (e: unknown) => {
-          slots[i] = { kind: "error", e };
-        },
-      ),
-    );
-  }
-  const raced = await raceTimeout(Promise.all(running), timeoutMs);
-  const timedOut = raced.kind === "timeout";
-  const settled = slots.map((slot): Settled<T> => slot ?? { kind: "timeout" });
-  if (timedOut) controller.abort();
-  return { settled, timedOut };
-}
+  return new Promise<Gathered<T>>((resolve) => {
+    const slots: Array<Settled<T> | null> = Array.from({ length: count }, () => null);
+    const abandoned = new Set<number>();
+    const keys = new Map<string, number>();
+    let settledCount = 0;
+    let done = false;
 
+    const finishGroup = (timedOut: boolean, early: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      slots.forEach((slot, i) => {
+        if (slot === null) abandoned.add(i);
+      });
+      rt.abandoned += abandoned.size;
+      resolve({ settled: slots.map((slot): Settled<T> => slot ?? { kind: "timeout" }), timedOut });
+      if (timedOut || early) controller.abort();
+    };
+
+    const onSettled = (index: number, outcome: Settled<T>): void => {
+      if (done) {
+        if (abandoned.delete(index)) rt.abandoned = Math.max(0, rt.abandoned - 1);
+        return;
+      }
+      slots[index] = outcome;
+      settledCount++;
+      if (agreementKey !== undefined && outcome.kind === "value") {
+        const key = agreementKey(outcome.v);
+        if (key !== null) {
+          const seen = (keys.get(key) ?? 0) + 1;
+          keys.set(key, seen);
+          if (seen >= 2 && settledCount < count) {
+            finishGroup(false, true);
+            return;
+          }
+        }
+      }
+      if (settledCount === count) finishGroup(false, false);
+    };
+
+    const delay = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 0;
+    const timer = setTimeout(() => finishGroup(true, false), delay);
+    (timer as { unref?: () => void }).unref?.();
+
+    for (let i = 0; i < count; i++) {
+      (async () => start(i, controller.signal))().then(
+        (v) => onSettled(i, { kind: "value", v }),
+        (e: unknown) => onSettled(i, { kind: "error", e }),
+      );
+    }
+  });
+}
 // ---------------------------------------------------------------------------
 // Text hygiene
 // ---------------------------------------------------------------------------
@@ -433,6 +473,12 @@ export interface BackendRuntime {
   readonly now: () => number;
   /** `disabled` reasons already logged by this instance. */
   readonly disabledLogged: Set<string>;
+  /** Consecutive timeouts/errors (circuit breaker). */
+  failures: number;
+  /** The breaker keeps the backend disabled until this time (ms, `now`); 0 = closed. */
+  openUntil: number;
+  /** Requests still in flight after their call ended (timed out, or left behind by an early majority). */
+  abandoned: number;
 }
 
 export function createRuntime(
@@ -440,7 +486,7 @@ export function createRuntime(
   logger: ClassifierLogger,
   now: (() => number) | undefined,
 ): BackendRuntime {
-  return { id, logger, now: now ?? Date.now, disabledLogged: new Set() };
+  return { id, logger, now: now ?? Date.now, disabledLogged: new Set(), failures: 0, openUntil: 0, abandoned: 0 };
 }
 
 /** Logger calls must not break the never-throws contract of a backend. */
@@ -530,9 +576,51 @@ export function logResults(rt: BackendRuntime, results: readonly BackendResult[]
   }
 }
 
+// ---------------------------------------------------------------------------
+// Circuit breaker and abandoned-request cap (QA-1.2-10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Why this instance must not issue a request right now, or null. Stable text, so
+ * the once-per-reason `disabled` log does not repeat while the condition holds.
+ */
+export function backendUnavailable(rt: BackendRuntime): string | null {
+  if (rt.openUntil > rt.now()) {
+    return `circuit breaker open after ${BREAKER_FAILURES} consecutive timeouts or errors (${BREAKER_COOLDOWN_MS / 60_000} min cooldown)`;
+  }
+  if (rt.abandoned >= MAX_ABANDONED_REQUESTS) {
+    return `too many abandoned requests still in flight (limit ${MAX_ABANDONED_REQUESTS})`;
+  }
+  return null;
+}
+
+/**
+ * Feed one call's statuses to the breaker. A timeout or error is a failure; any
+ * answer the server actually gave (ok, disagree, invalid) closes the circuit;
+ * `disabled` says nothing. After the cooldown the next call is a trial: a single
+ * failure reopens the circuit at once.
+ */
+function recordStatuses(rt: BackendRuntime, statuses: readonly BackendStatus[]): void {
+  if (statuses.some((s) => s === "ok" || s === "disagree" || s === "invalid")) {
+    rt.failures = 0;
+    rt.openUntil = 0;
+    return;
+  }
+  if (!statuses.some((s) => s === "timeout" || s === "error")) return;
+  rt.failures++;
+  if (rt.failures >= BREAKER_FAILURES) {
+    rt.openUntil = rt.now() + BREAKER_COOLDOWN_MS;
+    safeWarn(
+      rt.logger,
+      `classifier ${rt.id}: circuit breaker opened after ${rt.failures} consecutive timeouts or errors; no requests for ${BREAKER_COOLDOWN_MS / 60_000} min`,
+    );
+  }
+}
+
 /** A finished single classification: build, log, return. */
 export function finish(rt: BackendRuntime, outcome: Outcome, calls: number, startedAt: number): BackendResult {
   const result = buildResult(rt, outcome, calls, Math.max(0, rt.now() - startedAt));
+  recordStatuses(rt, [result.status]);
   logResults(rt, [result]);
   return result;
 }
@@ -546,6 +634,7 @@ export function finishMany(
 ): BackendResult[] {
   const latencyMs = Math.max(0, rt.now() - startedAt);
   const results = outcomes.map((outcome) => buildResult(rt, outcome, calls, latencyMs));
+  recordStatuses(rt, results.map((r) => r.status));
   logResults(rt, results);
   return results;
 }

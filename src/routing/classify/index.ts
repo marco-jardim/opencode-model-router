@@ -401,8 +401,16 @@ export async function classifyMany(
     if (backend !== null && gated.length > 0) {
       const random = deps.random ?? Math.random;
       const budget = hangBudget(deps);
+      // A failed chunk (QA-1.2-10) means the backend is down or broken: asking it again for each remaining
+      // chunk would only burn one timeout per chunk, so the rest of the plan keeps its rules facts.
+      let skipRest: BackendResult | null = null;
       for (let from = 0; from < gated.length; from += MAX_BATCH_ITEMS) {
         const chunk = gated.slice(from, from + MAX_BATCH_ITEMS);
+        if (skipRest !== null) {
+          const skippedAnswer = skipRest;
+          chunk.forEach((item) => outcomes.set(item.index, skippedAnswer));
+          continue;
+        }
         const states = chunk.map((item) => item.state);
         const raced = await raceTimeout(
           (async () => backend.classifyMany(states, { choices: CLASS_OPTIONS, random }))(),
@@ -427,6 +435,18 @@ export async function classifyMany(
           answers = chunk.map(() => failed);
         }
         chunk.forEach((item, i) => outcomes.set(item.index, answers[i]!));
+        const failedChunk =
+          raced.kind !== "value" ||
+          !Array.isArray(raced.v) ||
+          raced.v.length !== chunk.length ||
+          answers.every((a) => a.status === "timeout" || a.status === "error" || a.status === "disabled");
+        if (failedChunk && from + MAX_BATCH_ITEMS < gated.length) {
+          skipRest = synthetic("disabled", "skipped: the previous batch failed", 0);
+          safeWarn(
+            deps.logger,
+            `classifier ${backend.id}: skipping ${gated.length - from - MAX_BATCH_ITEMS} remaining items after a failed batch`,
+          );
+        }
       }
     }
 
