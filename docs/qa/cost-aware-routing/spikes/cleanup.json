@@ -1,0 +1,36 @@
+{
+  "spike": "cleanup",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
+  "recordedAt": "2026-10-06T04:52:16.838Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
+    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "After every spike swept its sessions, the scripted host has no session left, and tearing it down (taskkill /T /F on Windows) leaves its port closed.",
+  "observed": {
+    "remainingSessions": [],
+    "teardown": {
+      "pid": 31616,
+      "method": "taskkill /PID <pid> /T /F",
+      "taskkill": {
+        "status": 0,
+        "killedPids": [
+          38808,
+          31616,
+          70120,
+          70028
+        ],
+        "stderr": ""
+      },
+      "exitCode": 1,
+      "hostPort": 4245,
+      "hostPortClosed": true,
+      "providerStopped": true
+    }
+  },
+  "assertionResult": "PASS: 0 session(s) remain; taskkill /PID <pid> /T /F (exit 1); host port 4245 closed=true; provider stopped=true",
+  "notes": []
+}

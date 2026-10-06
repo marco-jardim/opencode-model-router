@@ -1,51 +1,69 @@
 /** Phase 0.P spike harness for the cost-aware routing plan (#74).
  *
- * Runs spikes S1-S6 against a REAL OpenCode v2 host (2.0.22) and records the
- * verbatim evidence for each one as JSON in docs/qa/cost-aware-routing/spikes/.
+ * Runs spikes S1-S6 (+ S1-deny, S2b) against a REAL OpenCode v2 host (2.0.22) and
+ * records the evidence for each one as JSON in docs/qa/cost-aware-routing/spikes/.
  * Assertions read HOST STATE (session get/list/context, catalog, the host's own
- * event stream); never only the variables of the hook that caused the change.
+ * event stream, the provider's wire requests); never only the variables of the
+ * hook that caused the change.
  *
- *   RUN_OC_SMOKE_V2_SPIKES=1 [OPENCODE_V2_BIN=<abs path to opencode 2>] \
+ *   RUN_OC_SMOKE_V2_SPIKES=1 [RUN_OC_SPIKE_LIVE_CATALOG=1] [OPENCODE_V2_BIN=<abs path to opencode 2>] \
  *     npx vitest run --config vitest.smoke.config.ts test/smoke/routing-spikes.smoke.test.ts
  *
- * - S1-S3, S5, S6 start ONE isolated `opencode serve` (private HOME/XDG, keyless,
- *   a scripted Anthropic Messages provider, a probe plugin that records hook and
- *   event traffic). Nothing here calls a paid model.
- * - S4 is a catalog READ against the user's real, already running OpenCode v2
- *   service (its URL/password come from the user's state dir and are never
- *   written to the evidence). v2 keeps credentials in its own database, so a
- *   fresh isolated host has no real providers; copying a 7 GB live database is
- *   not an option. S4 never creates a session and never generates.
- * The evidence JSON is written BEFORE each assertion so a disproven hypothesis
- * still leaves its observation behind. Strings over 400 chars are clipped in the
- * evidence ("...[clipped, N chars]"); everything else is verbatim.
+ * - Without RUN_OC_SMOKE_V2_SPIKES=1 every test is skipped.
+ * - S1-S3, S5 (scripted part), S6 start ONE isolated `opencode serve`: allowlisted
+ *   environment (no provider credentials), private HOME/XDG, a scripted Anthropic
+ *   Messages provider, and a probe plugin that records hook, event and generate
+ *   traffic. Nothing there calls a paid model. The host process tree is killed at
+ *   the end (taskkill /T /F on Windows) and its port is asserted closed.
+ * - RUN_OC_SPIKE_LIVE_CATALOG=1 additionally opts in to the user's REAL, already
+ *   running OpenCode v2 service (URL/password come from the user's state dir and
+ *   are never written to the evidence):
+ *     S4  reads GET /api/model and /api/provider for an ALREADY-LIVE location and
+ *         asserts the live location set is unchanged afterwards.
+ *     S5  makes ONE <=10-token generate call to opencode-go/deepseek-v4.1-flash,
+ *         but only if the location /api/experimental/generate resolves to (the
+ *         global config directory) is already live; otherwise it records why it
+ *         was skipped. No session is ever created or written on the live service.
+ * - Evidence JSON is written BEFORE each assertion so a disproven hypothesis still
+ *   leaves its observation behind. Every file carries the run id, recordedAt and
+ *   the harness git ids. Strings longer than 400 chars INSIDE `observed` are
+ *   clipped ("...[clipped, N chars]"); notes, hypothesis and assertionResult are
+ *   never clipped. The user's home path and name are redacted to <home>/<user>.
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { existsSync } from "node:fs";
+import { connect } from "node:net";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { listenOnFetchSafePort, pickFetchSafePort } from "./helpers/fetch-safe-port";
 import type { Block, RequestBody } from "./helpers/scripted-provider";
 
 const ROOT = path.resolve(__dirname, "../..");
+const HARNESS_FILE = "test/smoke/routing-spikes.smoke.test.ts";
 const RUN = process.env.RUN_OC_SMOKE_V2_SPIKES === "1";
+const LIVE = RUN && process.env.RUN_OC_SPIKE_LIVE_CATALOG === "1";
+const RUN_ID = randomUUID();
 const EVIDENCE_DIR = path.join(ROOT, "docs", "qa", "cost-aware-routing", "spikes");
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+/** The host's effort order (@opencode/ai ReasoningEfforts); variants are expected in this order. */
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const IN_BAND_CAVEAT = "CAVEAT: the in-band {role:system, output_config:{effort}} message is how the host LOWERS an effort change for the Anthropic Messages protocol. It was observed against a scripted provider only; whether api.anthropic.com honours it was NOT verified. The host emits it only for same-model changes (to-llm-message.ts modelSwitched) and, per the host source, only for models that support effort updates: see the haiku case in S2b.";
 
 // ---------------------------------------------------------------- types ----
 type Obj = Record<string, unknown>;
 interface ModelRef { id: string; providerID: string; variant?: string }
-interface SessionInfo { id: string; parentID?: string; agent?: string; model?: ModelRef; cost?: unknown; tokens?: unknown; outcome?: string; title?: string }
+interface Rule { action: string; resource: string; effect: "allow" | "deny" | "ask" }
+interface SessionInfo { id: string; parentID?: string; agent?: string; model?: ModelRef; cost?: unknown; tokens?: unknown; outcome?: string; title?: string; permissions?: unknown }
 interface ModelInfo { id: string; providerID: string; enabled: boolean; variants: { id: string }[]; cost: unknown; limit: { context: number; input?: number; output: number } }
 interface HostClient {
   session: {
     list(input?: { parentID?: string | null; limit?: number }): Promise<{ data: SessionInfo[] }>;
-    create(input: { agent?: string; model?: ModelRef; title?: string; location?: { directory: string } }): Promise<SessionInfo>;
+    create(input: { agent?: string; model?: ModelRef; title?: string; location?: { directory: string }; permissions?: Rule[] }): Promise<SessionInfo>;
     get(input: { sessionID: string }): Promise<SessionInfo>;
     remove(input: { sessionID: string }): Promise<void>;
     prompt(input: { sessionID: string; text: string }): Promise<unknown>;
@@ -57,29 +75,54 @@ interface HostClient {
   model: { list(input?: { location?: { directory: string } }): Promise<{ data: ModelInfo[] }> };
   plugin: { list(): Promise<{ data: { id: string; state: { status: string; error?: string } }[] }> };
   agent: { list(): Promise<{ data: { id: string; mode: string; model?: ModelRef }[] }> };
+  debug: { location: { list(): Promise<{ directory: string }[]>; evict(input: { location: { directory: string } }): Promise<void> } };
 }
 interface HookRecord { hook: "before" | "after"; sessionID: string; callID: string; agent: string; tool: string; before?: unknown; after?: unknown; status?: string; result?: unknown; error?: unknown }
-interface EventRecord { type: string; data?: Obj; [key: string]: unknown }
+interface EventRecord { type: string; id?: string; location?: unknown; __instance?: string; data?: Obj; [key: string]: unknown }
 interface Capture {
   model?: string; catalogModel?: string; session?: string; agent?: string; kind?: string; stream: boolean;
   outputConfig?: unknown; thinking?: unknown; inputTokens: number; lastText: string; toolResult: boolean; reply: "dispatch" | "text";
   /** Every top-level request field except messages/system/tools (those are reduced to their sizes). */
   payload: Obj;
-  /** The request messages verbatim (S2b reads them to see how an effort change reaches the provider). */
+  toolNames: string[];
+  /** The request messages verbatim (the S2/S2b cases read them to see how an effort change reaches the provider). */
   messages?: RequestBody["messages"];
 }
 
 // -------------------------------------------------------------- helpers ----
 const obj = (value: unknown): Obj => (value !== null && typeof value === "object" ? value as Obj : {});
-/** Clip very long strings only (the S6 filler); everything else stays verbatim. */
+/** Clip very long strings only (the S6 filler); everything else stays verbatim. Applied to `observed` only. */
 function clip(value: unknown): unknown {
   if (typeof value === "string") return value.length > 400 ? `${value.slice(0, 200)}...[clipped, ${value.length} chars]` : value;
   if (Array.isArray(value)) return value.map(clip);
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, clip(v)]));
   return value;
 }
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Replaces the user's home path (long, forward-slash and 8.3 short forms) and name in every string. */
+function redact(value: unknown): unknown {
+  const home = homedir();
+  const shortHome = path.dirname(path.dirname(path.dirname(tmpdir())));
+  const homes = [...new Set([home, home.replaceAll("\\", "/"), shortHome, shortHome.replaceAll("\\", "/")])].filter(h => h.length > 3);
+  const patterns = homes.map(h => new RegExp(escapeRegExp(h), "gi"));
+  const name = new RegExp(escapeRegExp(userInfo().username), "gi");
+  const clean = (text: string) => patterns.reduce((acc, re) => acc.replace(re, "<home>"), text).replace(name, "<user>");
+  const walk = (node: unknown): unknown => {
+    if (typeof node === "string") return clean(node);
+    if (Array.isArray(node)) return node.map(walk);
+    if (node !== null && typeof node === "object") return Object.fromEntries(Object.entries(node).map(([k, v]) => [clean(k), walk(v)]));
+    return node;
+  };
+  return walk(value);
+}
 /** Effort changes the host sends IN-BAND: {"role":"system","content":[],"output_config":{"effort":...}} messages. */
 const inBandEfforts = (c: Capture): unknown[] => (c.messages ?? []).map(m => obj(obj(m).output_config).effort).filter(e => e !== undefined);
+/** In-band efforts that sit AFTER the last assistant message, i.e. a change announced for THIS request. */
+const inBandTrailing = (c: Capture): unknown[] => {
+  const messages = c.messages ?? [];
+  const lastAssistant = messages.map(m => m.role).lastIndexOf("assistant");
+  return messages.slice(lastAssistant + 1).map(m => obj(obj(m).output_config).effort).filter(e => e !== undefined);
+};
 /** The effort the provider is actually told to use: the last in-band effort, else the top-level output_config.effort. */
 const effectiveEffort = (c: Capture): unknown => inBandEfforts(c).at(-1) ?? obj(c.outputConfig).effort;
 async function waitFor<T>(label: string, probe: () => Promise<T | undefined> | T | undefined, timeoutMs = 30_000, stepMs = 100): Promise<T> {
@@ -110,6 +153,15 @@ async function loadClient(baseUrl: string, authorization: string): Promise<HostC
   return mod.OpenCode.make({ baseUrl, headers: { authorization } });
 }
 const basic = (user: string, password: string) => `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`;
+const canonical = (p: string) => { let real = p; try { real = realpathSync.native(p); } catch { /* not on disk (yet) */ } return path.normalize(real).replace(/[\\/]+$/, "").toLowerCase(); };
+const samePath = (a: string, b: string) => canonical(a) === canonical(b);
+const portOpen = (port: number) => new Promise<boolean>(resolve => {
+  const socket = connect({ host: "127.0.0.1", port });
+  socket.once("connect", () => { socket.destroy(); resolve(true); });
+  socket.once("error", () => resolve(false));
+});
+const locationSet = (list: { directory: string }[]) => list.map(l => canonical(l.directory)).sort();
+const setDigest = (list: { directory: string }[]) => createHash("sha256").update(locationSet(list).join("\n")).digest("hex").slice(0, 16);
 
 // ----------------------------------------------------- scripted provider ----
 /** Fills every heading of the host's compaction SUMMARY_TEMPLATE (session/compaction.ts) so a compaction can complete. */
@@ -138,7 +190,7 @@ class SpikeProvider {
       const inputTokens = Math.max(10, Math.ceil(raw.length / 4));
       const { messages: _messages, system: _system, tools: _tools, ...fields } = body;
       this.captures.push({
-        payload: { ...fields, "messages.length": _messages?.length, "tools.length": _tools?.length }, messages: _messages,
+        payload: { ...fields, "messages.length": _messages?.length, "tools.length": _tools?.length }, messages: _messages, toolNames: (_tools ?? []).map(t => t.name),
         model: body.model, catalogModel: header("x-proof-model"), session: header("x-proof-session"), agent: header("x-proof-agent"), kind: header("x-proof-kind"),
         stream: body.stream === true, outputConfig: body.output_config, thinking: body.thinking, inputTokens, lastText, toolResult, reply: call ? "dispatch" : "text",
       });
@@ -179,18 +231,28 @@ class SpikeProvider {
 
 // ------------------------------------------------------------ probe plugin ----
 /** Native v2 plugin. It (a) rewrites `subagent` input in `tool.execute.before`
- * when SPIKE_REWRITE names a matching rewrite (S1), (b) logs every subagent
- * before/after, (c) logs session events from ctx.event.subscribe (S3, S6) and
- * (d) tags provider requests with session/agent/model/kind headers. */
+ * when SPIKE_REWRITE names a matching spec (S1), (b) from the same hook calls
+ * ctx.generate.text when the spec asks for it (S5, the PLUGIN path), (c) logs every
+ * subagent before/after, (d) logs session events from ctx.event.subscribe, tagged
+ * with the location of the plugin instance that saw them (S3, S6) and (e) tags
+ * provider requests with session/agent/model/kind headers. */
 const PROBE_PLUGIN = `import {appendFileSync, readFileSync} from 'node:fs';
 const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify(x)+'\\n');
 const rewriteSpec=()=>{try{return JSON.parse(readFileSync(process.env.SPIKE_REWRITE,'utf8'));}catch{return undefined;}};
+const ser=(error)=>{try{return {string:String(error),props:JSON.parse(JSON.stringify(error,Object.getOwnPropertyNames(error).filter(k=>k!=='stack')))};}catch{return {string:String(error)};}};
 export default {id:'routing-spike-probe',async setup(ctx){
- await ctx.tool.hook('execute.before',e=>{
+ const instance=ctx.location&&ctx.location.directory;
+ await ctx.tool.hook('execute.before',async e=>{
   if(e.tool!=='subagent')return;
   const before=structuredClone(e.input);
   const spec=rewriteSpec();
-  if(spec&&e.input&&typeof e.input==='object'&&typeof e.input.prompt==='string'&&e.input.prompt.includes(spec.when)) e.input={...e.input,...spec.set};
+  const hit=Boolean(spec&&e.input&&typeof e.input==='object'&&typeof e.input.prompt==='string'&&e.input.prompt.includes(spec.when));
+  if(hit&&spec.set) e.input={...e.input,...spec.set};
+  if(hit&&spec.generate){
+   const t0=performance.now();
+   try{const result=await ctx.generate.text(spec.generate.request);log('SPIKE_GENERATE',{label:spec.generate.label,ok:true,latencyMs:Math.round(performance.now()-t0),result,instance});}
+   catch(error){log('SPIKE_GENERATE',{label:spec.generate.label,ok:false,latencyMs:Math.round(performance.now()-t0),error:ser(error),instance});}
+  }
   log('SPIKE_HOOKS',{hook:'before',sessionID:e.sessionID,callID:e.id,agent:e.agent,tool:e.tool,before,after:structuredClone(e.input)});
  });
  await ctx.tool.hook('execute.after',e=>{
@@ -205,8 +267,8 @@ export default {id:'routing-spike-probe',async setup(ctx){
  });
  (async()=>{
   try{for await(const event of ctx.event.subscribe({})){
-   if(typeof event.type==='string'&&event.type.startsWith('session.')&&!/(delta|streamed)/.test(event.type)) log('SPIKE_EVENTS',event);
-  }}catch(error){log('SPIKE_EVENTS',{type:'probe.subscription.failed',error:String(error)});}
+   if(typeof event.type==='string'&&event.type.startsWith('session.')&&!/(delta|streamed)/.test(event.type)) log('SPIKE_EVENTS',{...event,__instance:instance});
+  }}catch(error){log('SPIKE_EVENTS',{type:'probe.subscription.failed',error:String(error),__instance:instance});}
  })();
 }};`;
 
@@ -214,6 +276,12 @@ export default {id:'routing-spike-probe',async setup(ctx){
 const ROOT_MODEL: ModelRef = { providerID: "anthropic", id: "claude-opus-4-7" };
 const SMALL_CONTEXT = 12_000; // above the ~5k-token fixed system prompt, below the S6 oversize prompt
 const ref = (m: ModelRef) => `${m.providerID}/${m.id}${m.variant ? `#${m.variant}` : ""}`;
+/** Environment the isolated host may inherit; everything else (provider credentials included) is dropped. */
+const ENV_ALLOWLIST = new Set(["PATH", "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR"]);
+const CREDENTIAL_NAME = /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|ANTHROPIC|OPENAI|COPILOT|GITHUB|^GH_|GEMINI|GOOGLE|AZURE|AWS_)/i;
+
+interface Teardown { pid?: number; method: string; taskkill?: Obj; exitCode: number | null | undefined; hostPort: number; hostPortClosed: boolean; providerStopped: boolean }
+interface Dispatched { before: HookRecord; after: HookRecord; childID: string }
 
 class ScriptedHost {
   readonly provider = new SpikeProvider();
@@ -221,19 +289,23 @@ class ScriptedHost {
   baseUrl = "";
   authorization = "";
   project = "";
+  port = 0;
+  /** Names (never values) of the environment variables the host process received. */
+  envKeys: string[] = [];
   /** The server base-configuration location that /api/experimental/generate always uses. */
   configDir = "";
-  logs = { hooks: "", events: "", rewrite: "" };
+  logs = { hooks: "", events: "", rewrite: "", generate: "" };
   private child?: ChildProcess;
   private output = "";
+  private teardown?: Promise<Teardown>;
   constructor(readonly root: string) {}
 
   async start(): Promise<this> {
     const executable = v2Executable();
     const version = spawnSync(executable, ["--version"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
     expect(version.stdout.trim(), version.stderr).toMatch(/^(?:opencode v)?2\./);
-    const env = { ...process.env } as Record<string, string | undefined>;
-    for (const name of Object.keys(env)) if (/^(OPENCODE_|MODEL_ROUTER_|XDG_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|COPILOT_|GH_TOKEN$|GITHUB_TOKEN$)/.test(name)) delete env[name];
+    const env: Record<string, string | undefined> = {};
+    for (const [name, value] of Object.entries(process.env)) if (ENV_ALLOWLIST.has(name.toUpperCase())) env[name] = value;
     for (const [name, dir] of Object.entries({ HOME: "home", USERPROFILE: "home", XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp" })) {
       env[name] = path.join(this.root, dir);
       await mkdir(env[name]!, { recursive: true });
@@ -244,9 +316,8 @@ class ScriptedHost {
     await mkdir(plugin, { recursive: true });
     await writeFile(path.join(plugin, "package.json"), JSON.stringify({ name: "routing-spike-probe", type: "module", exports: { ".": "./server.mjs", "./server": "./server.mjs" } }));
     await writeFile(path.join(plugin, "server.mjs"), PROBE_PLUGIN);
-    this.logs = { hooks: path.join(this.root, "hooks.jsonl"), events: path.join(this.root, "events.jsonl"), rewrite: path.join(this.root, "rewrite.json") };
-    await writeFile(this.logs.hooks, "");
-    await writeFile(this.logs.events, "");
+    this.logs = { hooks: path.join(this.root, "hooks.jsonl"), events: path.join(this.root, "events.jsonl"), rewrite: path.join(this.root, "rewrite.json"), generate: path.join(this.root, "generate.jsonl") };
+    for (const file of [this.logs.hooks, this.logs.events, this.logs.generate]) await writeFile(file, "");
     const baseURL = await this.provider.start();
     const configDir = this.configDir = path.join(env.XDG_CONFIG_HOME!, "opencode");
     await mkdir(configDir, { recursive: true });
@@ -264,10 +335,13 @@ class ScriptedHost {
     Object.assign(env, {
       OPENCODE_PASSWORD: password, OPENCODE_TEST_HOME: env.HOME, PWD: this.project,
       OPENCODE_CONFIG_PROJECT_DISABLE: "true", OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_FILEWATCHER_DISABLE: "true",
-      SPIKE_HOOKS: this.logs.hooks, SPIKE_EVENTS: this.logs.events, SPIKE_REWRITE: this.logs.rewrite,
+      SPIKE_HOOKS: this.logs.hooks, SPIKE_EVENTS: this.logs.events, SPIKE_REWRITE: this.logs.rewrite, SPIKE_GENERATE: this.logs.generate,
     });
-    const port = await pickFetchSafePort();
-    this.child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs"], { cwd: this.project, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    this.envKeys = Object.keys(env).sort();
+    // No credential-shaped variable may reach the host; OPENCODE_PASSWORD is the harness's own random one.
+    expect(this.envKeys.filter(name => CREDENTIAL_NAME.test(name) && name !== "OPENCODE_PASSWORD")).toEqual([]);
+    this.port = await pickFetchSafePort();
+    this.child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(this.port), "--print-logs"], { cwd: this.project, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     this.child.stdout!.on("data", chunk => { this.output += chunk; });
     this.child.stderr!.on("data", chunk => { this.output += chunk; });
     this.baseUrl = await waitFor("host to listen", () => {
@@ -286,34 +360,48 @@ class ScriptedHost {
     return this;
   }
 
-  async stop(): Promise<void> {
-    if (this.child && this.child.exitCode === null) {
-      const closed = new Promise<void>(resolve => this.child!.once("close", () => resolve()));
-      this.child.kill();
-      await Promise.race([closed, delay(5_000)]);
-      if (this.child.exitCode === null) this.child.kill("SIGKILL");
+  /** Kills the host process TREE (taskkill /T /F on Windows), stops the provider and asserts the host port is closed. Idempotent. */
+  stop(): Promise<Teardown> { return this.teardown ??= this.doStop(); }
+  private async doStop(): Promise<Teardown> {
+    const child = this.child;
+    const pid = child?.pid;
+    let method = "none (never started or already exited)";
+    let taskkill: Obj | undefined;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+      if (process.platform === "win32" && pid !== undefined) {
+        const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8", windowsHide: true });
+        method = "taskkill /PID <pid> /T /F";
+        taskkill = { status: result.status, killedPids: [...new Set([...(result.stdout ?? "").matchAll(/PID\D*(\d+)/g)].map(m => Number(m[1])))], stderr: result.stderr?.trim() };
+      } else { child.kill(); method = "SIGTERM"; }
+      await Promise.race([closed, delay(10_000)]);
     }
-    await this.provider.stop();
+    const providerStopped = await this.provider.stop().then(() => true, () => false);
+    const hostPortClosed = this.port === 0 ? true : await waitFor("host port to close", async () => (await portOpen(this.port)) ? undefined : true, 10_000, 200).catch(() => false);
+    return { pid, method, taskkill, exitCode: child?.exitCode, hostPort: this.port, hostPortClosed, providerStopped };
   }
 
   async hooks(): Promise<HookRecord[]> { return jsonl<HookRecord>(this.logs.hooks); }
-  /** Every plugin instance (one per initialised location) subscribes, so the same host event can be logged twice: dedupe by event id. */
+  /** Every event line as logged: one per (event, plugin instance that saw it). */
+  async rawEvents(): Promise<EventRecord[]> { return jsonl<EventRecord>(this.logs.events); }
+  /** rawEvents() with duplicates (same event id seen by several plugin instances, one per live location) removed. Callers that report counts must also report rawEvents(). */
   async events(): Promise<EventRecord[]> {
     const seen = new Set<string>();
-    return (await jsonl<EventRecord>(this.logs.events)).filter(e => { const id = typeof e.id === "string" ? e.id : undefined; if (id === undefined) return true; if (seen.has(id)) return false; seen.add(id); return true; });
+    return (await this.rawEvents()).filter(e => { const id = typeof e.id === "string" ? e.id : undefined; if (id === undefined) return true; if (seen.has(id)) return false; seen.add(id); return true; });
   }
-  async setRewrite(spec: { when: string; set: Obj } | undefined) {
+  async generations(): Promise<Obj[]> { return jsonl<Obj>(this.logs.generate); }
+  async setRewrite(spec: { when: string; set?: Obj; generate?: { label: string; request: Obj } } | undefined) {
     if (spec) await writeFile(this.logs.rewrite, JSON.stringify(spec)); else await rm(this.logs.rewrite, { force: true });
   }
   tail(): string { return this.output.slice(-3_000); }
 
   /** The scripted root orchestrator: creates a root session on the scripted model. */
-  async root_(title: string): Promise<string> {
-    return (await this.client.session.create({ agent: "build", model: ROOT_MODEL, title, location: { directory: this.project } })).id;
+  async root_(title: string, permissions?: Rule[]): Promise<string> {
+    return (await this.client.session.create({ agent: "build", model: ROOT_MODEL, title, location: { directory: this.project }, ...(permissions ? { permissions } : {}) })).id;
   }
 
-  /** Prompts the root so that its scripted model emits one `subagent` call with `call` as input. */
-  async dispatch(rootID: string, call: Obj): Promise<{ before: HookRecord; after: HookRecord; childID: string }> {
+  /** Prompts the root so that its scripted model emits one `subagent` call with `call` as input. The child id may be absent (a refused dispatch). */
+  async dispatchMaybe(rootID: string, call: Obj): Promise<{ before: HookRecord; after: HookRecord; childID: string | undefined }> {
     const seen = (await this.hooks()).filter(h => h.sessionID === rootID && h.hook === "after").length;
     await this.client.session.prompt({ sessionID: rootID, text: `SPIKE_CALL=${JSON.stringify(call)}` });
     const after = await waitFor("subagent execute.after hook", async () => (await this.hooks()).filter(h => h.sessionID === rootID && h.hook === "after")[seen], 90_000);
@@ -321,9 +409,17 @@ class ScriptedHost {
     if (!before) throw new Error(`no execute.before record for ${after.callID}`);
     await this.settle(rootID);
     const result = obj(obj(after.result).output);
-    const childID = typeof result.sessionID === "string" ? result.sessionID : (await this.client.session.list({ parentID: rootID })).data[0]?.id;
-    if (!childID) throw new Error(`dispatch produced no child session: ${JSON.stringify(after)}`);
-    return { before, after, childID };
+    const failed = /sessionID: (ses_[A-Za-z0-9]+)/.exec(String(obj(after.error).message ?? ""))?.[1];
+    return { before, after, childID: typeof result.sessionID === "string" ? result.sessionID : failed };
+  }
+
+  /** dispatchMaybe that must identify exactly one child (from the tool result, or from a parent that has exactly one child). */
+  async dispatch(rootID: string, call: Obj): Promise<Dispatched> {
+    const d = await this.dispatchMaybe(rootID, call);
+    if (d.childID) return { before: d.before, after: d.after, childID: d.childID };
+    const kids = (await this.client.session.list({ parentID: rootID })).data;
+    if (kids.length !== 1) throw new Error(`cannot identify the child: the tool result carried no sessionID and the parent has ${kids.length} children (${JSON.stringify(d.after)})`);
+    return { before: d.before, after: d.after, childID: kids[0]!.id };
   }
 
   /** Waits until the session is idle again (root turn fully finished). */
@@ -358,6 +454,23 @@ async function jsonl<T>(file: string): Promise<T[]> {
   return (await readFile(file, "utf8")).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line) as T);
 }
 
+/** The user's real, already running OpenCode v2 service. Read-only helpers; never creates sessions or writes config. */
+async function liveService() {
+  const file = path.join(homedir(), ".local", "state", "opencode", "service.json");
+  if (!existsSync(file)) return undefined;
+  const service = JSON.parse(await readFile(file, "utf8")) as { url: string; password: string; version?: string };
+  const call = async (method: "GET" | "POST", route: string, options: { directory?: string; body?: unknown } = {}) => {
+    const url = new URL(route, service.url);
+    if (options.directory) url.searchParams.set("location[directory]", options.directory);
+    const started = performance.now();
+    const response = await fetch(url, { method, headers: { authorization: basic("opencode", service.password), ...(options.body ? { "content-type": "application/json" } : {}) }, ...(options.body ? { body: JSON.stringify(options.body) } : {}), signal: AbortSignal.timeout(60_000) });
+    const text = await response.text();
+    return { status: response.status, text, latencyMs: Math.round(performance.now() - started) };
+  };
+  const locations = async () => JSON.parse((await call("GET", "/api/debug/location")).text) as { directory: string }[];
+  return { version: service.version, call, locations };
+}
+
 // ------------------------------------------------------------ spike runner ----
 /** `partial` marks a pass whose hypothesis only held in part; it is reported as PARTIAL-PASS in the evidence. */
 interface Spike { observed: Obj; notes: string[]; verdict(pass: boolean, detail: string, partial?: boolean): void; keep: Set<string> }
@@ -374,12 +487,21 @@ afterAll(async () => {
   if (hostRoot) await rm(hostRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 }, 60_000);
 
+let harnessIds: Obj | undefined;
+/** Git ids of the harness file used for THIS run: HEAD, the file's blob sha (matches `git ls-tree` once committed) and whether it differs from HEAD. */
+function harnessGitIds(): Obj {
+  if (harnessIds) return harnessIds;
+  try {
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
+    harnessIds = { file: HARNESS_FILE, headSha: git("rev-parse", "HEAD"), blobSha: git("hash-object", HARNESS_FILE), uncommittedChanges: git("status", "--porcelain", "--", HARNESS_FILE).length > 0 };
+  } catch (error) { harnessIds = { file: HARNESS_FILE, error: String(error) }; }
+  return harnessIds;
+}
+
 async function writeEvidence(id: string, hypothesis: string, assertionResult: string, spike: Spike): Promise<void> {
   await mkdir(EVIDENCE_DIR, { recursive: true });
-  await writeFile(path.join(EVIDENCE_DIR, `${id}.json`), `${JSON.stringify(clip({
-    spike: id, host: "opencode v2.0.22 (native v2 plugin API)", recordedAt: new Date().toISOString(),
-    hypothesis, observed: spike.observed, assertionResult, notes: spike.notes,
-  }), null, 2)}\n`);
+  const record = { spike: id, host: "opencode v2.0.22 (native v2 plugin API)", runId: RUN_ID, recordedAt: new Date().toISOString(), harness: harnessGitIds(), hypothesis, observed: clip(spike.observed), assertionResult, notes: spike.notes };
+  await writeFile(path.join(EVIDENCE_DIR, `${id}.json`), `${JSON.stringify(redact(record), null, 2)}\n`);
 }
 
 /** Runs one spike: records evidence BEFORE asserting, sweeps the sessions it created, and fails on orphans. */
@@ -405,7 +527,7 @@ async function spike(id: string, hypothesis: string, body: (s: Spike, host: Scri
   expect(verdict!.pass, `${id} hypothesis disproven — ${verdict!.detail}`).toBe(true);
 }
 
-const sessionView = (s: SessionInfo) => ({ id: s.id, parentID: s.parentID, agent: s.agent, model: s.model, cost: s.cost, tokens: s.tokens, outcome: s.outcome, title: s.title });
+const sessionView = (s: SessionInfo) => ({ id: s.id, parentID: s.parentID, agent: s.agent, model: s.model, cost: s.cost, tokens: s.tokens, outcome: s.outcome, title: s.title, permissions: s.permissions });
 async function childState(host: ScriptedHost, childID: string) {
   const session = await host.client.session.get({ sessionID: childID });
   const messages = await host.client.session.context({ sessionID: childID });
@@ -421,13 +543,25 @@ async function pickTarget(host: ScriptedHost) {
   const target = usable.find(m => m.id !== ROOT_MODEL.id) ?? usable[0];
   return { catalog, target, rootEntry: catalog.find(m => m.providerID === ROOT_MODEL.providerID && m.id === ROOT_MODEL.id) };
 }
+const costFields = (tier: unknown) => { const t = obj(tier); return [t.input, t.output, obj(t.cache).read, obj(t.cache).write]; };
+/** A model is unpriced when its cost list is empty or every tier's input/output/cache fields are 0 or absent. */
+const isUnpriced = (cost: unknown) => !Array.isArray(cost) || cost.length === 0 || cost.every(tier => costFields(tier).every(v => v === undefined || v === 0));
+/** Variant ids that are effort names must appear in the host's effort order; others (e.g. "thinking") are reported separately. */
+function variantOrder(variants: { id: string }[]) {
+  const ids = variants.map(v => v.id);
+  const known = ids.filter(id => EFFORT_ORDER.includes(id));
+  const indexes = known.map(id => EFFORT_ORDER.indexOf(id));
+  return { ids, nonEffortIds: ids.filter(id => !EFFORT_ORDER.includes(id)), inHostEffortOrder: indexes.every((v, i) => i === 0 || v >= indexes[i - 1]!) };
+}
 
 // ------------------------------------------------------------------ spikes ----
 const d = RUN ? describe : describe.skip;
+const itLive = LIVE ? it : it.skip;
 d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
   it("S1: a plugin execute.before hook can reassign subagent agent+model and the host stores the child that way", async () => {
     await spike("S1", "tool.hook('execute.before') reassigning event.input of the subagent tool (agent general->explore, model -> provider/model#variant) makes the host create the CHILD session with the rewritten agent and model/variant.", async (s, host) => {
       const { target, rootEntry } = await pickTarget(host);
+      s.observed.hostEnvKeys = host.envKeys;
       s.observed.catalogRootModel = rootEntry && { id: rootEntry.id, variants: rootEntry.variants.map(v => v.id), cost: rootEntry.cost, limit: rootEntry.limit };
       if (!target) { s.observed.catalogProblem = "no anthropic model with >=2 variants"; throw new Error("no catalog model with variants to rewrite to"); }
       const variant = target.variants.at(-1)!.id;
@@ -450,6 +584,35 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
     });
   }, 240_000);
 
+  it("S1-deny: the same hook swap is refused when the parent is denied the target agent", async () => {
+    await spike("S1-deny", "With a permission rule that DENIES subagent 'explore' to the parent session, the execute.before swap general->explore does not yield an explore child: the host refuses the dispatch (permission is asserted after the hook, on the rewritten input).", async (s, host) => {
+      const { target } = await pickTarget(host);
+      if (!target) throw new Error("no catalog model with variants to rewrite to");
+      const rewritten = `${target.providerID}/${target.id}#${target.variants.at(-1)!.id}`;
+      // Session-level rule: permissions are merged [agent rules, session rules] and the LAST matching rule wins (permission.ts evaluate/findLast).
+      const deny: Rule[] = [{ action: "subagent", resource: "explore", effect: "deny" }];
+      const rootID = await host.root_("S1-deny root", deny);
+      s.observed.rootSessionPermissions = (await host.client.session.get({ sessionID: rootID })).permissions;
+      s.observed.denyRule = deny;
+      // Control: an un-rewritten general dispatch under the same root must still work.
+      const control = await host.dispatch(rootID, { agent: "general", description: "S1-deny control", prompt: "S1D_CONTROL reply briefly", background: false });
+      await host.setRewrite({ when: "S1D_MARK", set: { agent: "explore", model: rewritten } });
+      const denied = await host.dispatchMaybe(rootID, { agent: "general", description: "S1-deny dispatch", prompt: "S1D_MARK reply briefly", background: false });
+      await host.setRewrite(undefined);
+      const children = (await host.client.session.list({ parentID: rootID })).data.map(sessionView);
+      s.observed.control = { childID: control.childID, status: control.after.status };
+      s.observed.hookBefore = denied.before.before; s.observed.hookAfterRewrite = denied.before.after; s.observed.toolAfter = denied.after;
+      s.observed.childrenOfRoot = children;
+      s.observed.deniedDispatchChildID = denied.childID;
+      s.observed.providerRequestsForExplore = host.provider.captures.filter(c => c.agent === "explore").length;
+      const refused = denied.after.status === "error";
+      const exploreChild = children.find(c => c.id !== control.childID && c.agent === "explore");
+      s.observed.derived = { rewriteApplied: obj(denied.before.after).agent === "explore", refused, errorMessage: obj(denied.after.error).message, exploreChildCreated: exploreChild !== undefined, controlAllowed: control.after.status === "completed" };
+      if (exploreChild) s.notes.push(`DENY BYPASSED: the host created child ${exploreChild.id} with agent=${exploreChild.agent} even though the parent is denied 'explore'.`);
+      s.verdict(refused && exploreChild === undefined && control.after.status === "completed", `rewrite applied=${obj(denied.before.after).agent === "explore"}; dispatch status=${denied.after.status}; error=${JSON.stringify(obj(denied.after.error).message)}; explore child created=${exploreChild !== undefined}; control general dispatch=${control.after.status}`);
+    });
+  }, 240_000);
+
   it("S2: resuming a child with sessionID + a higher #variant keeps history and changes the variant; a different agent switches the agent", async () => {
     await spike("S2", "A subagent call with sessionID + model '<same model>#<higher variant>' switches the stored child's variant while its history grows; a further call with a different agent switches the stored agent.", async (s, host) => {
       const { target } = await pickTarget(host);
@@ -469,8 +632,14 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       s.observed.afterFirstDispatch = one; s.observed.afterVariantResume = two; s.observed.afterAgentResume = three;
       s.observed.hooks = { first: [first.before.before, first.after.status], second: [second.before.before, second.after.status, second.after.result], third: [third.before.before, third.after.status, third.after.result] };
       s.observed.sameChildEverywhere = [first.childID, second.childID, third.childID];
-      s.observed.providerCapturesForChild = host.provider.captures.filter(c => c.session === childID).map(c => ({ model: c.model, catalogModel: c.catalogModel, agent: c.agent, kind: c.kind, outputConfig: c.outputConfig, thinking: c.thinking, lastText: c.lastText.slice(0, 80) }));
+      const childRequests = host.provider.captures.filter(c => c.session === childID);
+      s.observed.providerCapturesForChild = childRequests.map(c => ({ model: c.model, catalogModel: c.catalogModel, agent: c.agent, kind: c.kind, outputConfig: c.outputConfig, thinking: c.thinking, toolCount: c.toolNames.length, toolNames: c.toolNames, lastText: c.lastText.slice(0, 80) }));
+      const primary = childRequests.filter(c => c.kind === "primary");
+      const generalTools = primary[1]?.toolNames ?? [];
+      const exploreTools = primary[2]?.toolNames ?? [];
+      s.observed.agentSwitchTools = { requestAfterVariantResume: { agent: primary[1]?.agent, toolCount: generalTools.length, toolNames: generalTools }, requestAfterAgentSwitch: { agent: primary[2]?.agent, toolCount: exploreTools.length, toolNames: exploreTools }, onlyUnderGeneral: generalTools.filter(t => !exploreTools.includes(t)), onlyUnderExplore: exploreTools.filter(t => !generalTools.includes(t)) };
       if (low === high) s.notes.push("model exposes a single variant: variant-switch part is unverifiable");
+      if (generalTools.join() === exploreTools.join()) s.notes.push("Under this fixture permission config (global allow-all) the request carries the SAME tool list for agent general and agent explore: switching the agent did not change the tools the provider is offered.");
       const variantOk = low !== high && one.session.model?.variant === low && two.session.model?.variant === high;
       const historyOk = two.messageCount > one.messageCount && three.messageCount > two.messageCount && second.childID === childID;
       const agentOk = one.session.agent === "general" && two.session.agent === "general" && three.session.agent === "explore";
@@ -490,32 +659,34 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       s.observed.derived = { effectiveEffortFollowsVariant: followsWire, topLevelEffortFollowsVariant: topLevelFollows };
       if (!followsWire) s.notes.push("WIRE FINDING: after a resume the stored session variant changes, but the effort the provider receives (top-level output_config.effort or the last in-band output_config.effort) does not follow it; see observed.wireEffort.");
       else if (!topLevelFollows) s.notes.push("After a same-model resume the TOP-LEVEL output_config.effort stays at the first request value; the new effort is delivered in-band as a {role:system, output_config:{effort}} message (observed.wireEffort[].inBandEfforts). The EFFECTIVE effort follows the stored variant.");
+      s.notes.push(IN_BAND_CAVEAT);
       s.verdict(variantOk && historyOk && agentOk, `variant ${one.session.model?.variant}->${two.session.model?.variant} (wanted ${low}->${high}); messages ${one.messageCount}->${two.messageCount}->${three.messageCount}; agent ${one.session.agent}->${two.session.agent}->${three.session.agent}`);
     });
   }, 300_000);
 
-  it("S2b: resuming a child with a DIFFERENT model id moves the wire model; the wire effort is recorded for model-switch, variant-bump and fresh-child cases", async () => {
-    await spike("S2b", "Resuming a child with sessionID + a different model id makes the provider receive the new model (stored model == wire model); a later resume with a higher variant, and a fresh child started at that variant, show whether output_config.effort follows the variant. Control: a fresh child honours the variant on its first request.", async (s, host) => {
+  it("S2b: resuming a child with a DIFFERENT model id moves the wire model; the wire effort is recorded for model-switch, variant-bump, no-variant, haiku and fresh-child cases", async () => {
+    await spike("S2b", "Resuming a child with sessionID + a different model id makes the provider receive the new model (stored model == wire model); a later resume with a higher variant, and a fresh child started at that variant, show whether the effort the provider receives follows the variant. Control: a fresh child honours the variant on its first request. A later model switch to a higher variant (A#low -> A#high -> B#xhigh) delivers xhigh as the top-level effort with no new in-band message.", async (s, host) => {
       const catalog = (await host.client.model.list({ location: { directory: host.project } })).data;
       const entry = (id: string) => catalog.find(m => m.providerID === "anthropic" && m.id === id && m.enabled);
       const A = entry("claude-sonnet-5-5");
-      const B = ["claude-opus-5-5", "claude-opus-4-7"].map(entry).find(m => m !== undefined && m.variants.some(v => v.id === "low") && m.variants.some(v => v.id === "high"));
-      s.observed.catalogModels = { A: A && { id: A.id, variants: A.variants.map(v => v.id) }, B: B && { id: B.id, variants: B.variants.map(v => v.id) }, opus55InIsolatedCatalog: entry("claude-opus-5-5") !== undefined };
-      if (!A || !B || !A.variants.some(v => v.id === "low") || !A.variants.some(v => v.id === "high")) throw new Error("isolated catalog lacks the A/B models or their low/high variants");
+      const B = ["claude-opus-5-5", "claude-opus-4-7"].map(entry).find(m => m !== undefined && m.variants.some(v => v.id === "low") && m.variants.some(v => v.id === "high") && m.variants.some(v => v.id === "xhigh"));
+      const haiku = entry("claude-haiku-4-5");
+      s.observed.catalogModels = { A: A && { id: A.id, variants: A.variants.map(v => v.id) }, B: B && { id: B.id, variants: B.variants.map(v => v.id) }, haiku: haiku && { id: haiku.id, variants: haiku.variants.map(v => v.id) }, opus55InIsolatedCatalog: entry("claude-opus-5-5") !== undefined };
+      if (!A || !B || !A.variants.some(v => v.id === "low") || !A.variants.some(v => v.id === "high")) throw new Error("isolated catalog lacks the A/B models or their low/high/xhigh variants");
       const refA = `anthropic/${A.id}`;
       const refB = `anthropic/${B.id}`;
       const rootID = await host.root_("S2b root");
-      type Row = { case: string; request: number; asked: string | undefined; storedModelAfter: ModelRef | undefined; requestRef: string | undefined; wireModel: string | undefined; wireEffort: unknown; payload: Obj; messages: RequestBody["messages"]; inBandEfforts: unknown[]; effectiveEffort: unknown };
+      type Row = { case: string; core: boolean; request: number; asked: string | undefined; storedModelAfter: ModelRef | undefined; requestRef: string | undefined; wireModel: string | undefined; wireEffort: unknown; payload: Obj; messages: RequestBody["messages"]; inBandEfforts: unknown[]; inBandTrailing: unknown[]; effectiveEffort: unknown };
       const table: Row[] = [];
-      const step = async (caseName: string, call: Obj) => {
+      const step = async (caseName: string, call: Obj, core = true) => {
         const mark = host.provider.captures.length;
-        const d = await host.dispatch(rootID, { agent: "general", description: `S2b ${caseName}`, ...call });
-        const stored = await childState(host, d.childID);
-        const reqs = host.provider.captures.slice(mark).filter(c => c.session === d.childID && c.kind === "primary");
-        for (const c of reqs) table.push({ case: caseName, request: table.filter(r => r.case === caseName).length + 1, asked: typeof call.model === "string" ? call.model : undefined, storedModelAfter: stored.session.model, requestRef: c.catalogModel, wireModel: c.model, wireEffort: obj(c.outputConfig).effort, payload: c.payload, messages: c.messages, inBandEfforts: inBandEfforts(c), effectiveEffort: effectiveEffort(c) });
-        return { childID: d.childID, stored, reqs };
+        const dispatched = await host.dispatch(rootID, { agent: "general", description: `S2b ${caseName}`, ...call });
+        const stored = await childState(host, dispatched.childID);
+        const reqs = host.provider.captures.slice(mark).filter(c => c.session === dispatched.childID && c.kind === "primary");
+        for (const c of reqs) table.push({ case: caseName, core, request: table.filter(r => r.case === caseName).length + 1, asked: typeof call.model === "string" ? call.model : undefined, storedModelAfter: stored.session.model, requestRef: c.catalogModel, wireModel: c.model, wireEffort: obj(c.outputConfig).effort, payload: c.payload, messages: c.messages, inBandEfforts: inBandEfforts(c), inBandTrailing: inBandTrailing(c), effectiveEffort: effectiveEffort(c) });
+        return { childID: dispatched.childID, stored, reqs };
       };
-      // Case 0 (the S2 situation): same model, variant bump on resume. Payload excerpts for point 4.
+      // Case 0 (the S2 situation): same model, variant bump on resume.
       const c0 = await step("case0 same-model variant bump", { prompt: "S2b case0 start", model: `${refA}#low` });
       await step("case0 same-model variant bump", { prompt: "S2b case0 resume", sessionID: c0.childID, model: `${refA}#high` });
       // Case 1/2: model switch on resume, then a variant bump on the new model.
@@ -527,6 +698,21 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       await step("case4 model and variant switch together", { prompt: "S2b case4 resume other model, higher variant", sessionID: c4.childID, model: `${refB}#high` });
       // Case 3 (control): a fresh child started directly at the high variant.
       const c3 = await step("case3 fresh child at high", { prompt: "S2b case3 fresh", model: `${refA}#high` });
+      // Case 7: A#low -> A#high (same-model bump, in-band) -> B#xhigh (model switch with a higher variant).
+      const c7 = await step("case7 A low, A high, then B xhigh", { prompt: "S2b case7 start", model: `${refA}#low` }, false);
+      await step("case7 A low, A high, then B xhigh", { prompt: "S2b case7 bump", sessionID: c7.childID, model: `${refA}#high` }, false);
+      await step("case7 A low, A high, then B xhigh", { prompt: "S2b case7 switch to B xhigh", sessionID: c7.childID, model: `${refB}#xhigh` }, false);
+      // Case 6: a child dispatched WITHOUT a variant, then resumed at #high.
+      const c6 = await step("case6 no variant, then high", { prompt: "S2b case6 start", model: refA }, false);
+      await step("case6 no variant, then high", { prompt: "S2b case6 resume high", sessionID: c6.childID, model: `${refA}#high` }, false);
+      // Case 5: claude-haiku-4-5 (variants high, max): resume high -> max.
+      if (haiku) {
+        const ids = haiku.variants.map(v => v.id);
+        const lo = ids.includes("high") ? "high" : ids[0]!;
+        const hi = ids.includes("max") ? "max" : ids.at(-1)!;
+        const c5 = await step("case5 haiku variant bump", { prompt: "S2b case5 start", model: `anthropic/${haiku.id}#${lo}` }, false);
+        await step("case5 haiku variant bump", { prompt: "S2b case5 resume", sessionID: c5.childID, model: `anthropic/${haiku.id}#${hi}` }, false);
+      } else s.notes.push("claude-haiku-4-5 is absent from the isolated catalog: the haiku case was not run");
       const messages = await host.client.session.context({ sessionID: c1.childID });
       s.observed.table = table;
       s.observed.switchedChildMessages = {
@@ -542,117 +728,212 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       const storedFollowsModel = sw[1]?.storedModelAfter?.id === B.id && sw[1]?.storedModelAfter?.variant === "low" && bump[0]?.storedModelAfter?.variant === "high";
       const freshHonoursVariant = fresh.length === 1 && fresh[0]!.wireEffort === "high";
       const effortFollowsAfterSwitch = sw[1]?.effectiveEffort === "low" && bump[0]?.effectiveEffort === "high";
-      const allEffective = table.every(r => r.effectiveEffort === r.storedModelAfter?.variant);
+      const allEffective = table.filter(r => r.core).every(r => r.effectiveEffort === r.storedModelAfter?.variant);
       const case0 = rowsOf("case0 same-model variant bump");
-      s.observed.derived = { wireFollowsModelSwitch: wireFollowsModel, storedFollowsModelSwitch: storedFollowsModel, freshChildHonoursVariant: freshHonoursVariant, effectiveEffortFollowsVariantAfterSwitch: effortFollowsAfterSwitch, allEffectiveEffortsFollowStoredVariant: allEffective, sameModelResumeTopLevelEffort: case0.map(r => r.wireEffort), sameModelResumeEffectiveEffort: case0.map(r => r.effectiveEffort) };
-      if (!effortFollowsAfterSwitch) s.notes.push("WIRE FINDING: after resuming with a different model and then a higher variant, the effective effort did not follow the stored variant; see observed.table.");
-      if (case0.map(r => r.wireEffort).join() !== "low,high") s.notes.push("Top-level output_config.effort did not change on a same-model variant bump (the S2 observation is confirmed); the bump is delivered in-band, see derived.requestsCarryingEffortInBand.");
-      const inBand = table.filter(r => r.inBandEfforts.length > 0).map(r => ({ row: `${r.case}/${r.request}`, topLevelEffort: r.wireEffort, inBandEfforts: r.inBandEfforts }));
+      const seven = rowsOf("case7 A low, A high, then B xhigh");
+      const finalSeven = seven.at(-1);
+      const xhighTopLevel = seven.length === 3 && finalSeven?.wireModel === B.id && finalSeven.wireEffort === "xhigh" && finalSeven.inBandTrailing.length === 0;
+      const noVariant = rowsOf("case6 no variant, then high");
+      const haikuRows = rowsOf("case5 haiku variant bump");
+      s.observed.derived = {
+        wireFollowsModelSwitch: wireFollowsModel, storedFollowsModelSwitch: storedFollowsModel, freshChildHonoursVariant: freshHonoursVariant,
+        effectiveEffortFollowsVariantAfterSwitch: effortFollowsAfterSwitch, allEffectiveEffortsFollowStoredVariant: allEffective,
+        sameModelResumeTopLevelEffort: case0.map(r => r.wireEffort), sameModelResumeEffectiveEffort: case0.map(r => r.effectiveEffort),
+        caseA_low_A_high_B_xhigh: seven.map(r => ({ request: r.request, wireModel: r.wireModel, topLevelEffort: r.wireEffort, inBandAllHistory: r.inBandEfforts, inBandForThisRequest: r.inBandTrailing, stored: r.storedModelAfter })),
+        xhighIsTopLevelWithNoNewInBandMessage: xhighTopLevel,
+        noVariantChild: noVariant.map(r => ({ request: r.request, asked: r.asked, storedVariant: r.storedModelAfter?.variant, topLevelEffort: r.wireEffort, thinking: r.payload.thinking, inBandAllHistory: r.inBandEfforts, inBandForThisRequest: r.inBandTrailing })),
+        haikuBump: haikuRows.map(r => ({ request: r.request, asked: r.asked, storedVariant: r.storedModelAfter?.variant, topLevelEffort: r.wireEffort, thinking: r.payload.thinking, outputConfig: r.payload.output_config, inBandAllHistory: r.inBandEfforts, inBandForThisRequest: r.inBandTrailing })),
+        haikuInBandPresentOnResume: haikuRows.length === 2 ? haikuRows[1]!.inBandTrailing.length > 0 : undefined,
+      };
+      const inBand = table.filter(r => r.inBandTrailing.length > 0).map(r => ({ row: `${r.case}/${r.request}`, topLevelEffort: r.wireEffort, inBandForThisRequest: r.inBandTrailing }));
       const both = rowsOf("case4 model and variant switch together");
       const lost = both.length === 2 && both[1]!.effectiveEffort !== "high";
       s.observed.derived = { ...obj(s.observed.derived), requestsCarryingEffortInBand: inBand, modelAndVariantSwitchTogether: both.map(r => ({ wireModel: r.wireModel, topLevelEffort: r.wireEffort, inBandEfforts: r.inBandEfforts, stored: r.storedModelAfter })), effortLostOnModelAndVariantSwitch: lost };
-      if (inBand.length > 0) s.notes.push(`In-band effort: ${inBand.map(r => `${r.row} top-level ${String(r.topLevelEffort)} + in-band ${JSON.stringify(r.inBandEfforts)}`).join("; ")}. The effort change travels as a {"role":"system","output_config":{"effort":...}} message inside the request messages, not in the top-level output_config.effort. Host source: session/runner/to-llm-message.ts modelSwitched() emits Message.effort({effort, previous}) only when the model id is unchanged.`);
-      if (lost) s.notes.push("EFFORT LOST: resuming with a different model AND a higher variant sent neither a top-level nor an in-band effort of the requested value (modelSwitched() returns no effort message when the model id changes).");      s.verdict(wireFollowsModel && storedFollowsModel && freshHonoursVariant && allEffective, `wire model ${sw.map(r => r.wireModel).join("->")}->${bump.map(r => r.wireModel).join()} (stored ${sw.map(r => r.storedModelAfter?.id).join("->")}); effective effort by request [${table.map(r => String(r.effectiveEffort)).join(", ")}] vs stored variants [${table.map(r => r.storedModelAfter?.variant).join(", ")}]; fresh child top-level effort ${fresh.map(r => r.wireEffort).join()}`);
+      if (!effortFollowsAfterSwitch) s.notes.push("WIRE FINDING: after resuming with a different model and then a higher variant, the effective effort did not follow the stored variant; see observed.table.");
+      if (case0.map(r => r.wireEffort).join() !== "low,high") s.notes.push("Top-level output_config.effort did not change on a same-model variant bump (the S2 observation is confirmed); the bump is delivered in-band, see derived.requestsCarryingEffortInBand.");
+      if (inBand.length > 0) s.notes.push(`In-band effort for the request itself: ${inBand.map(r => `${r.row} top-level ${String(r.topLevelEffort)} + in-band ${JSON.stringify(r.inBandForThisRequest)}`).join("; ")}. The effort change travels as a {"role":"system","output_config":{"effort":...}} message inside the request messages, not in the top-level output_config.effort. Host source: session/runner/to-llm-message.ts modelSwitched() emits Message.effort({effort, previous}) only when the model id is unchanged.`);
+      if (lost) s.notes.push("EFFORT LOST: resuming with a different model AND a higher variant sent neither a top-level nor an in-band effort of the requested value (modelSwitched() returns no effort message when the model id changes).");
+      if (haikuRows.length === 2) s.notes.push(`Haiku (${haikuRows.map(r => r.storedModelAfter?.variant).join("->")}): top-level effort ${haikuRows.map(r => String(r.wireEffort)).join("->")}; in-band effort for the resumed request ${JSON.stringify(haikuRows[1]!.inBandTrailing)}; top-level thinking ${haikuRows.map(r => JSON.stringify(r.payload.thinking)).join(" -> ")}; output_config ${haikuRows.map(r => JSON.stringify(r.payload.output_config)).join(" -> ")}.`);
+      s.notes.push(IN_BAND_CAVEAT);
+      s.verdict(wireFollowsModel && storedFollowsModel && freshHonoursVariant && allEffective && xhighTopLevel, `wire model ${sw.map(r => r.wireModel).join("->")}->${bump.map(r => r.wireModel).join()} (stored ${sw.map(r => r.storedModelAfter?.id).join("->")}); effective effort by core request [${table.filter(r => r.core).map(r => String(r.effectiveEffort)).join(", ")}] vs stored variants [${table.filter(r => r.core).map(r => r.storedModelAfter?.variant).join(", ")}]; fresh child top-level effort ${fresh.map(r => r.wireEffort).join()}; A low->A high->B xhigh: final top-level ${String(finalSeven?.wireEffort)}, in-band for that request ${JSON.stringify(finalSeven?.inBandTrailing)}`);
     });
-  }, 300_000);
+  }, 400_000);
 
   it("S3: a plugin event subscription receives session.step.ended with cost and tokens for the child", async () => {
     await spike("S3", "ctx.event.subscribe in a plugin delivers a session.step.ended event for the CHILD session whose data carries cost and tokens {input, output, reasoning, cache{read,write}}.", async (s, host) => {
       const { target } = await pickTarget(host);
       const rootID = await host.root_("S3 root");
       const { childID } = await host.dispatch(rootID, { agent: "general", description: "S3 dispatch", prompt: "S3 child task", ...(target ? { model: `${target.providerID}/${target.id}` } : {}) });
-      const ended = await waitFor("session.step.ended for the child", async () => (await host.events()).filter(e => e.type === "session.step.ended" && e.data?.sessionID === childID), 20_000).catch(() => []);
+      const ended = await waitFor("session.step.ended for the child", async () => { const found = (await host.events()).filter(e => e.type === "session.step.ended" && e.data?.sessionID === childID); return found.length > 0 ? found : undefined; }, 20_000).catch(() => []);
       const stored = await childState(host, childID);
-      const all = (await host.events()).filter(e => e.data?.sessionID === childID);
+      const raw = (await host.rawEvents()).filter(e => e.data?.sessionID === childID);
+      const deduped = (await host.events()).filter(e => e.data?.sessionID === childID);
+      const rawEnded = raw.filter(e => e.type === "session.step.ended");
+      const idView = (e: EventRecord) => ({ type: e.type, id: e.id, location: e.location, pluginInstance: e.__instance });
+      s.observed.counts = { rawChildEvents: raw.length, dedupedChildEvents: deduped.length, rawStepEnded: rawEnded.length, dedupedStepEnded: ended.length, distinctPluginInstancesSeen: [...new Set((await host.rawEvents()).map(e => e.__instance))].length };
+      s.observed.rawStepEndedIdentity = rawEnded.map(idView);
+      s.observed.rawChildEventIdentity = raw.map(idView);
       s.observed.stepEndedEvents = ended;
-      s.observed.childEventTypes = all.map(e => e.type);
+      s.observed.childEventTypes = deduped.map(e => e.type);
       s.observed.storedChildTotals = { cost: stored.session.cost, tokens: stored.session.tokens };
       s.observed.catalogCost = target && { id: target.id, cost: target.cost };
       const data = obj(ended[0]?.data);
       const tokens = obj(data.tokens);
       const shape = ended.length > 0 && Object.hasOwn(data, "cost") && ["input", "output", "reasoning"].every(k => Object.hasOwn(tokens, k)) && ["read", "write"].every(k => Object.hasOwn(obj(tokens.cache), k));
       s.observed.derived = { events: ended.length, costType: typeof data.cost, costValue: data.cost, costPositive: typeof data.cost === "number" ? data.cost > 0 : undefined, tokenKeys: Object.keys(tokens), cacheKeys: Object.keys(obj(tokens.cache)) };
+      if (raw.length !== deduped.length) s.notes.push(`${raw.length - deduped.length} duplicate event line(s) were removed by id: the same host event reached the probe once per live plugin instance (see rawStepEndedIdentity[].pluginInstance).`);
       if (!(typeof data.cost === "number" && data.cost > 0)) s.notes.push("cost is not > 0: the model has no catalog pricing here, so cost is a zero/unpriced value (hypothesis says that yields 0)");
-      s.verdict(shape, `${ended.length} session.step.ended event(s) for the child; cost=${JSON.stringify(data.cost)} tokens=${JSON.stringify(data.tokens)}`);
+      s.verdict(shape, `${ended.length} session.step.ended event(s) for the child (${rawEnded.length} raw line(s)); cost=${JSON.stringify(data.cost)} tokens=${JSON.stringify(data.tokens)}`);
     });
   }, 240_000);
 
-  it("S4: the real host catalog lists variants[].id, cost and limit.context for the candidate models", async () => {
-    await spike("S4", "The host model catalog (GET /api/model, the call behind ctx.model.list) exposes variants[].id in order, cost and limit.context for the real configured models anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, opencode/deepseek-v4.1-flash.", async (s) => {
-      const file = path.join(homedir(), ".local", "state", "opencode", "service.json");
-      s.observed.source = "the user's running OpenCode v2 service (read-only GET /api/model and /api/provider; no session, no generation)";
-      if (!existsSync(file)) { s.notes.push(`IMPOSSIBLE: ${file} does not exist, so there is no live service with the real config`); s.verdict(false, "no live real-config host"); return; }
-      const service = JSON.parse(await readFile(file, "utf8")) as { url: string; password: string; version?: string };
-      const get = async (route: string) => {
-        const response = await fetch(new URL(route, service.url), { headers: { authorization: basic("opencode", service.password) }, signal: AbortSignal.timeout(30_000) });
-        return { status: response.status, body: JSON.parse(await response.text()) as Obj };
-      };
-      s.observed.serviceVersion = service.version;
-      const models = await get("/api/model");
-      const providers = await get("/api/provider");
-      const catalog = (models.body.data ?? []) as ModelInfo[];
-      s.observed.status = { model: models.status, provider: providers.status };
-      s.observed.location = models.body.location;
-      s.observed.providerActivation = ((providers.body.data ?? []) as { id: string; activation: string }[]).map(p => `${p.id}:${p.activation}`);
-      s.observed.catalogProviders = [...new Set(catalog.map(m => m.providerID))];
+  itLive("S4: the real host catalog (live, opt-in) lists variants[].id, cost and limit.context for the candidate models", async () => {
+    await spike("S4", "The host model catalog (GET /api/model, the call behind ctx.model.list) of an already-live location of the user's running service exposes variants[].id in the host's effort order, cost (all tiers) and limit for anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, opencode/deepseek-v4.1-flash and every gpt-6-luna* model (including gpt-6-luna-fast, the @fast tier model).", async (s) => {
+      s.observed.source = "the user's running OpenCode v2 service: read-only GET /api/debug/location, /api/model and /api/provider for an ALREADY-LIVE location; no session, no generation, no config write";
+      const live = await liveService();
+      if (!live) { s.notes.push("ABORTED: the user's service.json does not exist, so there is no live service with the real config"); s.verdict(false, "no live real-config host"); return; }
+      s.observed.serviceVersion = live.version;
+      const before = await live.locations();
+      const preferred = ["D:\\git\\opencode-model-router", "D:\\git\\Claude-model-router"];
+      const chosen = before.find(l => preferred.some(p => samePath(p, l.directory)));
+      s.observed.liveLocationsBefore = { count: before.length, digest: setDigest(before) };
+      if (!chosen) { s.notes.push(`ABORTED: neither ${preferred.join(" nor ")} is a live location, and reading another location could start a plugin instance on the user's service`); s.verdict(false, "no preferred live location"); return; }
+      s.observed.readLocation = chosen.directory;
+      const models = await live.call("GET", "/api/model", { directory: chosen.directory });
+      const providers = await live.call("GET", "/api/provider", { directory: chosen.directory });
+      const after = await live.locations();
+      const unchanged = JSON.stringify(locationSet(before)) === JSON.stringify(locationSet(after));
+      s.observed.liveLocationsAfter = { count: after.length, digest: setDigest(after), setUnchanged: unchanged };
+      const catalog = (JSON.parse(models.text).data ?? []) as ModelInfo[];
+      const providerList = (JSON.parse(providers.text).data ?? []) as { id: string; activation: string }[];
+      s.observed.status = { model: models.status, provider: providers.status, modelLatencyMs: models.latencyMs };
+      s.observed.catalogModelCount = catalog.length;
       const wanted = ["anthropic/claude-sonnet-5-5", "anthropic/claude-opus-5-5", "anthropic/claude-haiku-4-5", "openai/gpt-6-luna", "opencode/deepseek-v4.1-flash"];
-      const view = (m: ModelInfo) => ({ ref: `${m.providerID}/${m.id}`, enabled: m.enabled, variants: m.variants.map(v => v.id), cost: m.cost, limitContext: m.limit.context, limit: m.limit });
+      const view = (m: ModelInfo) => ({ ref: `${m.providerID}/${m.id}`, enabled: m.enabled, variants: m.variants.map(v => v.id), variantOrder: variantOrder(m.variants), cost: m.cost, unpriced: isUnpriced(m.cost), limit: { context: m.limit.context, input: m.limit.input, output: m.limit.output } });
+      const relevant = new Set<string>();
       s.observed.requested = Object.fromEntries(wanted.map(w => {
         const [provider, ...rest] = w.split("/");
         const id = rest.join("/");
         const exact = catalog.find(m => m.providerID === provider && m.id === id);
         // The same model id under another provider (e.g. opencode-go) is reported separately, never conflated.
-        const elsewhere = catalog.filter(m => m.id === id && m.providerID !== provider).map(view);
-        return [w, { exact: exact ? view(exact) : "ABSENT from the catalog", sameIdOtherProviders: elsewhere }];
+        const elsewhere = catalog.filter(m => m.id === id && m.providerID !== provider);
+        [exact, ...elsewhere].forEach(m => m && relevant.add(m.providerID));
+        return [w, { exact: exact ? view(exact) : "ABSENT from the catalog", sameIdOtherProviders: elsewhere.map(view) }];
       }));
-      const present = wanted.filter(w => catalog.some(m => `${m.providerID}/${m.id}` === w));
+      // @fast tier: every provider that lists any gpt-6-luna* id, with all tiers of cost and limit.context/limit.input.
+      const luna = catalog.filter(m => m.id.includes("gpt-6-luna"));
+      luna.forEach(m => relevant.add(m.providerID));
+      s.observed.gpt6LunaFamily = luna.map(view);
+      s.observed.gpt6LunaFast = luna.filter(m => m.id === "gpt-6-luna-fast").map(view);
+      s.observed.providerActivationForRecordedProviders = providerList.filter(p => relevant.has(p.id)).map(p => `${p.id}:${p.activation}`);
+      const exactEntries = wanted.flatMap(w => { const m = catalog.find(x => `${x.providerID}/${x.id}` === w); return m ? [m] : []; });
+      const present = exactEntries.map(m => `${m.providerID}/${m.id}`);
       s.observed.presentExact = present;
       s.observed.absentExact = wanted.filter(w => !present.includes(w));
-      const complete = present.every(w => { const m = catalog.find(x => `${x.providerID}/${x.id}` === w)!; return Array.isArray(m.variants) && Array.isArray(m.cost) && typeof m.limit.context === "number"; });
+      const recorded = [...exactEntries, ...luna];
+      const unpriced = recorded.filter(m => isUnpriced(m.cost)).map(m => `${m.providerID}/${m.id}`);
+      s.observed.unpricedModels = [...new Set(unpriced)];
+      const outOfOrder = recorded.filter(m => !variantOrder(m.variants).inHostEffortOrder).map(m => `${m.providerID}/${m.id}`);
+      s.observed.variantsOutOfHostEffortOrder = outOfOrder;
+      const complete = recorded.every(m => Array.isArray(m.variants) && Array.isArray(m.cost) && typeof m.limit.context === "number");
       if (s.observed.absentExact && (s.observed.absentExact as string[]).length > 0) s.notes.push("Some requested ids are absent under that exact provider/id; see sameIdOtherProviders for where the host actually lists them.");
-      s.verdict(models.status === 200 && present.length > 0 && complete, `${present.length}/${wanted.length} requested ids exist under that exact provider/id (${present.join(", ")}); absent: ${(s.observed.absentExact as string[]).join(", ") || "none"}; every present entry exposes variants[], cost[] and limit.context`, present.length < wanted.length);
+      if (unpriced.length > 0) s.notes.push(`UNPRICED (cost list empty or every field 0): ${[...new Set(unpriced)].join(", ")}. For these the host reports cost 0 per step; a router must not treat 0 as cheap.`);
+      if (luna.filter(m => m.id === "gpt-6-luna-fast").length === 0) s.notes.push("gpt-6-luna-fast is not listed by any provider at this location.");
+      s.verdict(models.status === 200 && present.length > 0 && complete && outOfOrder.length === 0 && unchanged, `${present.length}/${wanted.length} requested ids exist under that exact provider/id (${present.join(", ")}); absent: ${(s.observed.absentExact as string[]).join(", ") || "none"}; gpt-6-luna* entries: ${luna.map(m => `${m.providerID}/${m.id}`).join(", ") || "none"}; every recorded entry exposes variants[], cost[] and limit.context; variants in host effort order: ${outOfOrder.length === 0}; live location set unchanged by the read: ${unchanged}`, present.length < wanted.length);
     }, false);
   }, 120_000);
 
-  it("S5: POST /api/experimental/generate returns non-empty data.text for the scripted model", async () => {
-    await spike("S5", "POST /api/experimental/generate with { prompt, model } returns data.text (non-empty) using the scripted provider model.", async (s, host) => {
-      // The host runs this route against the server's BASE configuration location
-      // (the global config dir), never the request's project location, and that
-      // location's plugin graph is lazy. Record the cold call, warm that location
-      // with a catalog read, then measure the calls that matter.
-      const url = new URL("/api/experimental/generate", host.baseUrl);
-      const call = async (phase: string, prompt: string): Promise<Obj> => {
+  it("S5: ctx.generate.text from a plugin (and POST /api/experimental/generate) returns non-empty text for the scripted model", async () => {
+    await spike("S5", "A plugin calling ctx.generate.text({ prompt, model }) (the PLUGIN path) returns non-empty text using the scripted provider model; the raw POST /api/experimental/generate route (which the host source runs against the server base-configuration location) is recorded as a secondary path, including what a cold base location does.", async (s, host) => {
+      const rootID = await host.root_("S5 root");
+      const rawCall = async (phase: string, prompt: string): Promise<Obj> => {
         const started = performance.now();
-        const response = await fetch(url, { method: "POST", headers: { authorization: host.authorization, "content-type": "application/json" }, body: JSON.stringify({ prompt, model: ROOT_MODEL }), signal: AbortSignal.timeout(60_000) });
+        const response = await fetch(new URL("/api/experimental/generate", host.baseUrl), { method: "POST", headers: { authorization: host.authorization, "content-type": "application/json" }, body: JSON.stringify({ prompt, model: ROOT_MODEL }), signal: AbortSignal.timeout(60_000) });
         const text = await response.text();
         return { phase, request: { prompt, model: ROOT_MODEL }, status: response.status, latencyMs: Math.round(performance.now() - started), rawBody: text };
       };
-      const cold = await call("cold (base-config location not yet initialised)", "S5 cold probe");
+      const pluginCall = async (label: string, prompt: string): Promise<Obj> => {
+        await host.setRewrite({ when: `S5_PLUGIN_${label}`, generate: { label, request: { prompt, model: ROOT_MODEL } } });
+        await host.dispatch(rootID, { agent: "general", description: `S5 ${label}`, prompt: `S5_PLUGIN_${label} trigger` });
+        await host.setRewrite(undefined);
+        return (await host.generations()).filter(g => g.label === label).at(-1) ?? { label, missing: "the probe plugin logged no generate record" };
+      };
+      const baseLive = async () => (await host.client.debug.location.list()).some(l => samePath(l.directory, host.configDir));
+      const coldStart = async () => {
+        let evict: string;
+        try { await host.client.debug.location.evict({ location: { directory: host.configDir } }); evict = "evicted"; } catch (error) { evict = `evict failed: ${String(error)}`; }
+        await delay(300);
+        return { evict, baseLocationLiveAfterEvict: await baseLive() };
+      };
+      const textOf = (rawBody: unknown) => { try { return obj(obj(JSON.parse(String(rawBody))).data).text; } catch { return undefined; } };
+      s.observed.baseConfigLocation = host.configDir;
+      s.observed.baseLocationLiveAtStart = await baseLive();
+      // E1: the plugin path from a cold base location.
+      const e1Cold = await coldStart();
+      const e1 = await pluginCall("plugin-cold", "S5 plugin cold probe");
+      const e1LiveAfter = await baseLive();
+      // E3: raw route cold, then a catalog read at the base location (timed), then the retry.
+      const e3Cold = await coldStart();
+      const e3First = await rawCall("raw cold", "S5 raw cold probe 2");
       const catalogUrl = new URL("/api/model", host.baseUrl);
       catalogUrl.searchParams.set("location[directory]", host.configDir);
-      const warmedAfterMs = await (async () => {
-        const started = performance.now();
-        await waitFor("base-config catalog to list the scripted model", async () => {
-          const response = await fetch(catalogUrl, { headers: { authorization: host.authorization }, signal: AbortSignal.timeout(30_000) });
-          const body = obj(JSON.parse(await response.text()));
-          return ((body.data ?? []) as ModelInfo[]).some(m => m.providerID === ROOT_MODEL.providerID && m.id === ROOT_MODEL.id && m.enabled) ? true : undefined;
-        }, 30_000, 250);
-        return Math.round(performance.now() - started);
-      })().catch((error: unknown) => `never warmed: ${String(error)}`);
-      const runs: Obj[] = [cold];
-      for (const prompt of ["S5 generate probe one", "S5 generate probe two"]) runs.push(await call("warm", prompt));
-      s.observed.runs = runs;
-      s.observed.baseConfigLocation = host.configDir;
-      s.observed.baseConfigCatalogWarmedAfterMs = warmedAfterMs;
-      s.observed.providerCaptures = host.provider.captures.filter(c => c.lastText.startsWith("S5 ") || c.kind === "generate").map(c => ({ model: c.model, catalogModel: c.catalogModel, kind: c.kind, session: c.session, stream: c.stream, lastText: c.lastText }));
-      const texts = runs.map(r => { try { return obj(obj(JSON.parse(String(r.rawBody))).data).text; } catch { return undefined; } });
-      s.observed.extractedText = texts;
-      const warm = runs.slice(1);
-      const warmTexts = texts.slice(1);
-      if (cold.status !== 200) s.notes.push(`The cold call failed (${cold.status} ${String(cold.rawBody)}): the route resolves models in the server base-configuration location, which must be initialised first (a catalog read at that location does it).`);
-      s.verdict(warm.every(r => r.status === 200) && warmTexts.every(t => typeof t === "string" && t.length > 0), `cold ${cold.status}; warm status ${warm.map(r => r.status).join(",")}; data.text ${JSON.stringify(warmTexts)}; warm latency ${warm.map(r => r.latencyMs).join("/")} ms`);
+      const catalogStarted = performance.now();
+      await waitFor("base-config catalog to list the scripted model", async () => {
+        const response = await fetch(catalogUrl, { headers: { authorization: host.authorization }, signal: AbortSignal.timeout(30_000) });
+        return ((obj(JSON.parse(await response.text())).data ?? []) as ModelInfo[]).some(m => m.providerID === ROOT_MODEL.providerID && m.id === ROOT_MODEL.id && m.enabled) ? true : undefined;
+      }, 30_000, 250).catch(() => undefined);
+      const catalogReadMs = Math.round(performance.now() - catalogStarted);
+      const e3Retry = await rawCall("raw retry after catalog read", "S5 raw retry with catalog read");
+      // E2: raw route cold again, then retries WITHOUT any catalog read: one immediately and one after the SAME pause the catalog read took.
+      const e2Cold = await coldStart();
+      const e2First = await rawCall("raw cold", "S5 raw cold probe");
+      const e2Immediate = await rawCall("raw retry immediately, no catalog read", "S5 raw immediate retry");
+      await delay(catalogReadMs);
+      const e2Retry = await rawCall(`raw retry after the same ${catalogReadMs}ms pause, no catalog read`, "S5 raw retry without catalog read");      // Warm calls: plugin path (primary) and raw route (secondary).
+      const pluginWarm = [await pluginCall("plugin-warm-1", "S5 plugin warm probe one"), await pluginCall("plugin-warm-2", "S5 plugin warm probe two")];
+      const rawWarm = [await rawCall("raw warm", "S5 raw warm probe one"), await rawCall("raw warm", "S5 raw warm probe two")];
+      s.observed.experiments = {
+        E1_pluginPathCold: { coldStart: e1Cold, result: e1, baseLocationLiveAfterPluginCall: e1LiveAfter },
+        E3_rawColdThenCatalogReadThenRetry: { coldStart: e3Cold, first: e3First, catalogReadMs, retry: e3Retry },
+        E2_rawColdThenRetriesWithoutCatalogRead: { coldStart: e2Cold, first: e2First, immediateRetry: e2Immediate, retryAfterSamePause: e2Retry, pauseMs: catalogReadMs },
+      };
+      s.observed.pluginPathWarm = pluginWarm;
+      s.observed.rawRouteWarm = rawWarm;
+      s.observed.extractedRawTexts = [e3First, e3Retry, e2First, e2Immediate, e2Retry, ...rawWarm].map(r => ({ phase: r.phase, status: r.status, text: textOf(r.rawBody) }));
+      s.observed.scriptedProviderCaptures = host.provider.captures.filter(c => c.lastText.startsWith("S5 ") || c.kind === "generate").map(c => ({ model: c.model, catalogModel: c.catalogModel, kind: c.kind, session: c.session, stream: c.stream, lastText: c.lastText }));
+      const pluginTexts = pluginWarm.map(r => obj(r.result).text);
+      const pluginOk = pluginWarm.every(r => r.ok === true) && pluginTexts.every(t => typeof t === "string" && t.length > 0);
+      const rawOk = rawWarm.every(r => r.status === 200 && typeof textOf(r.rawBody) === "string");
+      s.observed.derived = {
+        pluginPathColdOutcome: e1.ok === true ? "ok" : e1.ok === false ? `error ${JSON.stringify(e1.error)}` : "no record",
+        rawImmediateRetryWithoutCatalogReadFixesCold: e2First.status !== 200 ? e2Immediate.status === 200 : "cold call already succeeded",
+        rawRetryAfterSamePauseWithoutCatalogReadFixesCold: e2First.status !== 200 ? e2Retry.status === 200 : "cold call already succeeded",
+        rawRetryAfterCatalogReadFixesCold: e3First.status !== 200 ? e3Retry.status === 200 : "cold call already succeeded",
+        pluginWarmLatencyMs: pluginWarm.map(r => r.latencyMs), rawWarmLatencyMs: rawWarm.map(r => r.latencyMs),
+      };
+      if (e1.ok !== true) s.notes.push(`The plugin-path cold call failed: ${JSON.stringify(e1.error ?? e1)}`);
+      if (e2First.status !== 200 || e3First.status !== 200) s.notes.push(`Raw route, cold base location: ${e3First.status} ${String(e3First.rawBody)}. Retry after a catalog read at the base location (the read took ${catalogReadMs} ms): ${e3Retry.status}. Without any catalog read: immediate retry ${e2Immediate.status}, retry after the same ${catalogReadMs} ms pause ${e2Retry.status}.`);
+      // Optional live check (opt-in): ONE <=10-token generate call through the user's running service, only if its base location is already live.
+      if (LIVE) {
+        const live = await liveService();
+        if (!live) s.observed.live = { skipped: "no live service (service.json missing)" };
+        else {
+          const baseDir = path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "opencode");
+          const before = await live.locations();
+          const baseIsLive = before.some(l => samePath(l.directory, baseDir));
+          if (!baseIsLive) s.observed.live = { skipped: "skipped: base location not live, would start a plugin instance", baseLocationChecked: baseDir, liveLocationCount: before.length, liveLocationsDigest: setDigest(before) };
+          else {
+            const request = { prompt: "Reply with the single word: ok", model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" } };
+            const result = await live.call("POST", "/api/experimental/generate", { body: request });
+            const after = await live.locations();
+            s.observed.live = { baseLocationChecked: baseDir, request, status: result.status, latencyMs: result.latencyMs, rawBody: result.text, credentialsUnavailable503: result.status === 503 || /credentials are unavailable/i.test(result.text), liveLocationSetUnchanged: JSON.stringify(locationSet(before)) === JSON.stringify(locationSet(after)) };
+          }
+        }
+      }
+      if (e1.ok === true && !e1Cold.baseLocationLiveAfterEvict) s.notes.push(`The plugin path succeeded on its FIRST call while the base config location was not live before it (it was ${e1LiveAfter ? "live" : "still not live"} right after the call), whereas the raw route returned the cold 400 from the same state. It was issued from the plugin instance of ${String(e1.instance)}.`);
+      s.verdict(pluginOk && rawOk, `plugin path: cold ${e1.ok === true ? "ok" : "failed"}, warm ${pluginWarm.map(r => `${r.ok === true ? "ok" : "failed"} ${JSON.stringify(obj(r.result).text)} ${r.latencyMs}ms`).join(" / ")}; raw route: cold ${e2First.status}, retry without catalog read ${e2Retry.status}, retry after catalog read ${e3Retry.status}, warm ${rawWarm.map(r => r.status).join(",")}${LIVE ? `; live: ${JSON.stringify(obj(s.observed.live).skipped ?? obj(s.observed.live).status)}` : ""}`);
     });
-  }, 180_000);
+  }, 300_000);
 
   it("S6: switching a child to a smaller-context model and sending an oversize prompt triggers compaction or surfaces an error", async () => {
     await spike("S6", "Resuming a child with a model whose limit.context is far below the prompt size results in a host reaction (compaction request/message or a surfaced error) rather than silently sending the oversize request unchanged.", async (s, host) => {
@@ -690,8 +971,14 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
     });
   }, 300_000);
 
-  it("cleanup: no orphan sessions remain on the scripted host", async () => {
-    const host = await getHost();
-    expect((await host.everySession()).map(sessionView)).toEqual([]);
-  }, 60_000);
+  it("cleanup: no orphan sessions remain; the host process tree is killed and its port is closed", async () => {
+    await spike("cleanup", "After every spike swept its sessions, the scripted host has no session left, and tearing it down (taskkill /T /F on Windows) leaves its port closed.", async (s) => {
+      const host = await getHost();
+      const remaining = (await host.everySession()).map(sessionView);
+      s.observed.remainingSessions = remaining;
+      const teardown = await host.stop();
+      s.observed.teardown = teardown;
+      s.verdict(remaining.length === 0 && teardown.hostPortClosed && teardown.providerStopped, `${remaining.length} session(s) remain; ${teardown.method} (exit ${String(teardown.exitCode)}); host port ${teardown.hostPort} closed=${teardown.hostPortClosed}; provider stopped=${teardown.providerStopped}`);
+    }, false);
+  }, 90_000);
 });

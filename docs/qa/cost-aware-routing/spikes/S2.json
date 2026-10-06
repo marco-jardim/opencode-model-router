@@ -1,7 +1,14 @@
 {
   "spike": "S2",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "recordedAt": "2026-10-06T04:26:39.321Z",
+  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
+  "recordedAt": "2026-10-06T04:52:08.161Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
+    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "uncommittedChanges": true
+  },
   "hypothesis": "A subagent call with sessionID + model '<same model>#<higher variant>' switches the stored child's variant while its history grows; a further call with a different agent switches the stored agent.",
   "observed": {
     "target": {
@@ -18,8 +25,8 @@
     },
     "afterFirstDispatch": {
       "session": {
-        "id": "ses_ef0895289ffeMEPS8ts8qQ88t8",
-        "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
+        "id": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+        "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
         "agent": "general",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -49,8 +56,8 @@
     },
     "afterVariantResume": {
       "session": {
-        "id": "ses_ef0895289ffeMEPS8ts8qQ88t8",
-        "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
+        "id": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+        "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
         "agent": "general",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -84,8 +91,8 @@
     },
     "afterAgentResume": {
       "session": {
-        "id": "ses_ef0895289ffeMEPS8ts8qQ88t8",
-        "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
+        "id": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+        "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
         "agent": "explore",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -136,24 +143,24 @@
           "agent": "general",
           "description": "S2 resume variant",
           "prompt": "S2 second prompt",
-          "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+          "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
           "model": "anthropic/claude-sonnet-5-5#max"
         },
         "completed",
         {
           "output": {
-            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
             "status": "completed",
             "output": "CHILD_OK"
           },
           "content": [
             {
               "type": "text",
-              "text": "<subagent sessionID=\"ses_ef0895289ffeMEPS8ts8qQ88t8\" state=\"completed\">\nCHILD_OK\n</subagent>"
+              "text": "<subagent sessionID=\"ses_ef071fe37ffedG7BPKQkX2Q50U\" state=\"completed\">\nCHILD_OK\n</subagent>"
             }
           ],
           "metadata": {
-            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
             "status": "completed"
           }
         }
@@ -163,32 +170,32 @@
           "agent": "explore",
           "description": "S2 resume agent",
           "prompt": "S2 third prompt",
-          "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8"
+          "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U"
         },
         "completed",
         {
           "output": {
-            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
             "status": "completed",
             "output": "CHILD_OK"
           },
           "content": [
             {
               "type": "text",
-              "text": "<subagent sessionID=\"ses_ef0895289ffeMEPS8ts8qQ88t8\" state=\"completed\">\nCHILD_OK\n</subagent>"
+              "text": "<subagent sessionID=\"ses_ef071fe37ffedG7BPKQkX2Q50U\" state=\"completed\">\nCHILD_OK\n</subagent>"
             }
           ],
           "metadata": {
-            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
             "status": "completed"
           }
         }
       ]
     },
     "sameChildEverywhere": [
-      "ses_ef0895289ffeMEPS8ts8qQ88t8",
-      "ses_ef0895289ffeMEPS8ts8qQ88t8",
-      "ses_ef0895289ffeMEPS8ts8qQ88t8"
+      "ses_ef071fe37ffedG7BPKQkX2Q50U",
+      "ses_ef071fe37ffedG7BPKQkX2Q50U",
+      "ses_ef071fe37ffedG7BPKQkX2Q50U"
     ],
     "providerCapturesForChild": [
       {
@@ -206,6 +213,21 @@
             "prefix_mismatch_behavior": "drop_block"
           }
         },
+        "toolCount": 12,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "question",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ],
         "lastText": "You are a subagent spawned by another session.\nS2 first prompt"
       },
       {
@@ -223,6 +245,21 @@
             "prefix_mismatch_behavior": "drop_block"
           }
         },
+        "toolCount": 12,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "question",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ],
         "lastText": "S2 second prompt"
       },
       {
@@ -240,9 +277,64 @@
             "prefix_mismatch_behavior": "drop_block"
           }
         },
+        "toolCount": 12,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "question",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ],
         "lastText": "S2 third prompt"
       }
     ],
+    "agentSwitchTools": {
+      "requestAfterVariantResume": {
+        "agent": "general",
+        "toolCount": 12,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "question",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ]
+      },
+      "requestAfterAgentSwitch": {
+        "agent": "explore",
+        "toolCount": 12,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "question",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ]
+      },
+      "onlyUnderGeneral": [],
+      "onlyUnderExplore": []
+    },
     "checks": {
       "variantOk": true,
       "historyOk": true,
@@ -306,8 +398,8 @@
       ],
       "secondChildStored": {
         "session": {
-          "id": "ses_ef089508fffesrPCz1sF5k1eq8",
-          "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
+          "id": "ses_ef071fc8affe5fDmd4SV8pny99",
+          "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
           "agent": "general",
           "model": {
             "id": "claude-sonnet-5-5",
@@ -350,9 +442,9 @@
     },
     "cleanup": {
       "removed": [
-        "ses_ef089508fffesrPCz1sF5k1eq8",
-        "ses_ef0895289ffeMEPS8ts8qQ88t8",
-        "ses_ef08952baffeqDAkpMKdYeEGoq"
+        "ses_ef071fc8affe5fDmd4SV8pny99",
+        "ses_ef071fe37ffedG7BPKQkX2Q50U",
+        "ses_ef071fe67ffeyE8IWzsOpAOLVg"
       ],
       "errors": [],
       "orphans": []
@@ -361,6 +453,8 @@
   },
   "assertionResult": "PASS: variant low->max (wanted low->max); messages 3->7->11; agent general->general->explore",
   "notes": [
-    "After a same-model resume the TOP-LEVEL output_config.effort stays at the first request value; the new effort is delivered in-band as a {role:system, output_config:{effort}} message (observed.wireEffort[].inBandEfforts). The EFFECTIVE effort follows the stored variant."
+    "Under this fixture permission config (global allow-all) the request carries the SAME tool list for agent general and agent explore: switching the agent did not change the tools the provider is offered.",
+    "After a same-model resume the TOP-LEVEL output_config.effort stays at the first request value; the new effort is delivered in-band as a {role:system, output_config:{effort}} message (observed.wireEffort[].inBandEfforts). The EFFECTIVE effort follows the stored variant.",
+    "CAVEAT: the in-band {role:system, output_config:{effort}} message is how the host LOWERS an effort change for the Anthropic Messages protocol. It was observed against a scripted provider only; whether api.anthropic.com honours it was NOT verified. The host emits it only for same-model changes (to-llm-message.ts modelSwitched) and, per the host source, only for models that support effort updates: see the haiku case in S2b."
   ]
 }

@@ -1,40 +1,140 @@
 {
   "spike": "S5",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "recordedAt": "2026-10-06T04:21:35.327Z",
-  "hypothesis": "POST /api/experimental/generate with { prompt, model } returns data.text (non-empty) using the scripted provider model.",
+  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
+  "recordedAt": "2026-10-06T04:52:12.825Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
+    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "A plugin calling ctx.generate.text({ prompt, model }) (the PLUGIN path) returns non-empty text using the scripted provider model; the raw POST /api/experimental/generate route (which the host source runs against the server base-configuration location) is recorded as a secondary path, including what a cold base location does.",
   "observed": {
-    "runs": [
-      {
-        "phase": "cold (base-config location not yet initialised)",
-        "request": {
-          "prompt": "S5 cold probe",
-          "model": {
-            "providerID": "anthropic",
-            "id": "claude-opus-4-7"
-          }
+    "baseConfigLocation": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\config\\opencode",
+    "baseLocationLiveAtStart": false,
+    "experiments": {
+      "E1_pluginPathCold": {
+        "coldStart": {
+          "evict": "evicted",
+          "baseLocationLiveAfterEvict": false
         },
-        "status": 400,
-        "latencyMs": 37,
-        "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
+        "result": {
+          "label": "plugin-cold",
+          "ok": true,
+          "latencyMs": 7,
+          "result": {
+            "text": "CHILD_OK"
+          },
+          "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+        },
+        "baseLocationLiveAfterPluginCall": false
       },
-      {
-        "phase": "warm",
-        "request": {
-          "prompt": "S5 generate probe one",
-          "model": {
-            "providerID": "anthropic",
-            "id": "claude-opus-4-7"
-          }
+      "E3_rawColdThenCatalogReadThenRetry": {
+        "coldStart": {
+          "evict": "evicted",
+          "baseLocationLiveAfterEvict": false
         },
-        "status": 200,
+        "first": {
+          "phase": "raw cold",
+          "request": {
+            "prompt": "S5 raw cold probe 2",
+            "model": {
+              "providerID": "anthropic",
+              "id": "claude-opus-4-7"
+            }
+          },
+          "status": 400,
+          "latencyMs": 34,
+          "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
+        },
+        "catalogReadMs": 261,
+        "retry": {
+          "phase": "raw retry after catalog read",
+          "request": {
+            "prompt": "S5 raw retry with catalog read",
+            "model": {
+              "providerID": "anthropic",
+              "id": "claude-opus-4-7"
+            }
+          },
+          "status": 200,
+          "latencyMs": 7,
+          "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
+        }
+      },
+      "E2_rawColdThenRetriesWithoutCatalogRead": {
+        "coldStart": {
+          "evict": "evicted",
+          "baseLocationLiveAfterEvict": false
+        },
+        "first": {
+          "phase": "raw cold",
+          "request": {
+            "prompt": "S5 raw cold probe",
+            "model": {
+              "providerID": "anthropic",
+              "id": "claude-opus-4-7"
+            }
+          },
+          "status": 400,
+          "latencyMs": 27,
+          "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
+        },
+        "immediateRetry": {
+          "phase": "raw retry immediately, no catalog read",
+          "request": {
+            "prompt": "S5 raw immediate retry",
+            "model": {
+              "providerID": "anthropic",
+              "id": "claude-opus-4-7"
+            }
+          },
+          "status": 400,
+          "latencyMs": 3,
+          "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
+        },
+        "retryAfterSamePause": {
+          "phase": "raw retry after the same 261ms pause, no catalog read",
+          "request": {
+            "prompt": "S5 raw retry without catalog read",
+            "model": {
+              "providerID": "anthropic",
+              "id": "claude-opus-4-7"
+            }
+          },
+          "status": 200,
+          "latencyMs": 8,
+          "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
+        },
+        "pauseMs": 261
+      }
+    },
+    "pluginPathWarm": [
+      {
+        "label": "plugin-warm-1",
+        "ok": true,
         "latencyMs": 9,
-        "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
+        "result": {
+          "text": "CHILD_OK"
+        },
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
       },
       {
-        "phase": "warm",
+        "label": "plugin-warm-2",
+        "ok": true,
+        "latencyMs": 6,
+        "result": {
+          "text": "CHILD_OK"
+        },
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+      }
+    ],
+    "rawRouteWarm": [
+      {
+        "phase": "raw warm",
         "request": {
-          "prompt": "S5 generate probe two",
+          "prompt": "S5 raw warm probe one",
           "model": {
             "providerID": "anthropic",
             "id": "claude-opus-4-7"
@@ -43,36 +143,127 @@
         "status": 200,
         "latencyMs": 8,
         "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
+      },
+      {
+        "phase": "raw warm",
+        "request": {
+          "prompt": "S5 raw warm probe two",
+          "model": {
+            "providerID": "anthropic",
+            "id": "claude-opus-4-7"
+          }
+        },
+        "status": 200,
+        "latencyMs": 10,
+        "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
       }
     ],
-    "baseConfigLocation": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-spikes-gMw1z1\\config\\opencode",
-    "baseConfigCatalogWarmedAfterMs": 283,
-    "providerCaptures": [
+    "extractedRawTexts": [
+      {
+        "phase": "raw cold",
+        "status": 400
+      },
+      {
+        "phase": "raw retry after catalog read",
+        "status": 200,
+        "text": "CHILD_OK"
+      },
+      {
+        "phase": "raw cold",
+        "status": 400
+      },
+      {
+        "phase": "raw retry immediately, no catalog read",
+        "status": 400
+      },
+      {
+        "phase": "raw retry after the same 261ms pause, no catalog read",
+        "status": 200,
+        "text": "CHILD_OK"
+      },
+      {
+        "phase": "raw warm",
+        "status": 200,
+        "text": "CHILD_OK"
+      },
+      {
+        "phase": "raw warm",
+        "status": 200,
+        "text": "CHILD_OK"
+      }
+    ],
+    "scriptedProviderCaptures": [
       {
         "model": "claude-opus-4-7",
         "stream": true,
-        "lastText": "S5 generate probe one"
+        "lastText": "S5 plugin cold probe"
       },
       {
         "model": "claude-opus-4-7",
         "stream": true,
-        "lastText": "S5 generate probe two"
+        "lastText": "S5 raw retry with catalog read"
+      },
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 raw retry without catalog read"
+      },
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 plugin warm probe one"
+      },
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 plugin warm probe two"
+      },
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 raw warm probe one"
+      },
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 raw warm probe two"
       }
     ],
-    "extractedText": [
-      null,
-      "CHILD_OK",
-      "CHILD_OK"
-    ],
+    "derived": {
+      "pluginPathColdOutcome": "ok",
+      "rawImmediateRetryWithoutCatalogReadFixesCold": false,
+      "rawRetryAfterSamePauseWithoutCatalogReadFixesCold": true,
+      "rawRetryAfterCatalogReadFixesCold": true,
+      "pluginWarmLatencyMs": [
+        9,
+        6
+      ],
+      "rawWarmLatencyMs": [
+        8,
+        10
+      ]
+    },
+    "live": {
+      "skipped": "skipped: base location not live, would start a plugin instance",
+      "baseLocationChecked": "<home>\\.config\\opencode",
+      "liveLocationCount": 13,
+      "liveLocationsDigest": "edb028dccf0d41ef"
+    },
     "cleanup": {
-      "removed": [],
+      "removed": [
+        "ses_ef071e953ffewttDv1QMZlSBQA",
+        "ses_ef071ea42ffeIwUGZZ42YsACDg",
+        "ses_ef071efc1ffeLN5X91ZfUNuRZu",
+        "ses_ef071f133ffebyJcR3D3RUNWwq"
+      ],
       "errors": [],
       "orphans": []
     },
     "providerErrors": []
   },
-  "assertionResult": "PASS: cold 400; warm status 200,200; data.text [\"CHILD_OK\",\"CHILD_OK\"]; warm latency 9/8 ms",
+  "assertionResult": "PASS: plugin path: cold ok, warm ok \"CHILD_OK\" 9ms / ok \"CHILD_OK\" 6ms; raw route: cold 400, retry without catalog read 200, retry after catalog read 200, warm 200,200; live: \"skipped: base location not live, would start a plugin instance\"",
   "notes": [
-    "The cold call failed (400 {\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}): the route resolves models in the server base-configuration location, which must be initialised first (a catalog read at that location does it)."
+    "Raw route, cold base location: 400 {\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}. Retry after a catalog read at the base location (the read took 261 ms): 200. Without any catalog read: immediate retry 400, retry after the same 261 ms pause 200.",
+    "The plugin path succeeded on its FIRST call while the base config location was not live before it (it was still not live right after the call), whereas the raw route returned the cold 400 from the same state. It was issued from the plugin instance of <home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project."
   ]
 }
