@@ -10,7 +10,6 @@
  * file contents, no system prompt, no session history.
  */
 
-import { scrubText } from "../../guard/scrub";
 import {
   ACCEPTANCE_BLOCK_RE,
   CODE_BLOCK_PLACEHOLDER,
@@ -19,6 +18,7 @@ import {
   STATE_DESCRIPTION_MAX_CHARS,
   type ClassifierState,
 } from "./types";
+import { scrubState } from "./scrub";
 
 const MIN_STATE_CHARS = 200;
 const MAX_STATE_CHARS = 20_000;
@@ -61,10 +61,10 @@ export function buildClassifierState(
 
   // Scrub first, then bound: a secret cut in half by the bound would no longer match a token shape.
   const description = neutralize(
-    scrubText(String(input.description ?? "").replace(/\s+/g, " ").trim()),
+    scrubState(String(input.description ?? "").replace(/\s+/g, " ").trim()),
   ).slice(0, STATE_DESCRIPTION_MAX_CHARS);
-  const acceptance = acceptanceRaw === null ? null : neutralize(scrubText(acceptanceRaw));
-  const body = neutralize(scrubText(bodyRaw));
+  const acceptance = acceptanceRaw === null ? null : neutralize(scrubState(acceptanceRaw));
+  const body = neutralize(scrubState(bodyRaw));
 
   const parts: string[] = [];
   let used = 0;

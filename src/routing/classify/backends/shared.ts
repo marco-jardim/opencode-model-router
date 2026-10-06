@@ -5,7 +5,7 @@
  * the logging helpers. Randomness is always injected.
  */
 
-import { scrubText } from "../../../guard/scrub";
+import { scrubState } from "../scrub";
 import {
   BACKEND_PROMPT,
   CONFIDENCE,
@@ -355,11 +355,11 @@ export function reasonOf(error: unknown): string {
   } catch {
     text = "unprintable error";
   }
-  return scrubText(text).slice(0, 200);
+  return scrubState(text).slice(0, 200);
 }
 
 export function cutRaw(text: string): string {
-  return scrubText(text).slice(0, RAW_ANSWER_MAX_CHARS);
+  return scrubState(text).slice(0, RAW_ANSWER_MAX_CHARS);
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import {
 import { createTypeSafeBackend } from "./backends/typesafe";
 import { applyRouteLine, parseRouteLine } from "./route-line";
 import { classifyByRules } from "./rules";
+import { hasCredentialSignal } from "./scrub";
 import { buildClassifierState } from "./state";
 import {
   CLASS_BASE_RISK,
@@ -29,6 +30,7 @@ import {
   CONFIDENCE,
   INDEX_TIMEOUT_GRACE_MS,
   MAX_BATCH_ITEMS,
+  RULES_MAX_CHARS,
   NEEDS,
   RISKS,
   SCOPES,
@@ -196,7 +198,21 @@ function isGated(facts: TaskFacts, deps: ClassifyDeps): boolean {
   );
 }
 
-function resultOf(prepared: Prepared, backend: ClassifierBackend | null, outcome: BackendResult | null): ClassifyResult {
+/**
+ * Policy gate (QA-1.2-1): a task that names a credential, or contains something
+ * the scrubber had to redact, never reaches a backend; the rules facts stand.
+ */
+function mentionsCredentials(prepared: Prepared): boolean {
+  const description = typeof prepared.input.description === "string" ? prepared.input.description : "";
+  return hasCredentialSignal(description.slice(0, RULES_MAX_CHARS) + "\n" + prepared.parsed.stripped.slice(0, RULES_MAX_CHARS));
+}
+
+function resultOf(
+  prepared: Prepared,
+  backend: ClassifierBackend | null,
+  outcome: BackendResult | null,
+  skipped?: "credentials",
+): ClassifyResult {
   const merged = outcome === null ? prepared.facts : mergeBackend(prepared.facts, outcome);
   return {
     facts: finalize(merged),
@@ -206,6 +222,7 @@ function resultOf(prepared: Prepared, backend: ClassifierBackend | null, outcome
     trace: {
       rules: prepared.rules,
       routeLine: prepared.parsed.line,
+      ...(skipped ? { backendSkipped: skipped } : {}),
       backend:
         backend === null || outcome === null
           ? null
@@ -240,6 +257,7 @@ export async function classify(input: ClassifyInput, deps: ClassifyDeps): Promis
     const prepared = prepare(input, deps);
     const backend = deps.backend;
     if (backend === null || !isGated(prepared.facts, deps)) return resultOf(prepared, null, null);
+    if (mentionsCredentials(prepared)) return resultOf(prepared, null, null, "credentials");
 
     const state = buildClassifierState(
       { description: input.description, prompt: prepared.parsed.stripped },
@@ -302,9 +320,14 @@ export async function classifyMany(
 
     const backend = deps.backend;
     const gated: GatedItem[] = [];
+    const skipped = new Set<number>();
     prepared.forEach((item, index) => {
       if (item === undefined || backend === null || !isGated(item.facts, deps)) return;
       try {
+        if (mentionsCredentials(item)) {
+          skipped.add(index);
+          return;
+        }
         const input = list[index]!;
         const state = buildClassifierState(
           { description: input.description, prompt: item.parsed.stripped },
@@ -351,7 +374,7 @@ export async function classifyMany(
 
     prepared.forEach((item, index) => {
       if (item === undefined) return;
-      results[index] = resultOf(item, backend, outcomes.get(index) ?? null);
+      results[index] = resultOf(item, backend, outcomes.get(index) ?? null, skipped.has(index) ? "credentials" : undefined);
     });
   } catch (error) {
     safeWarn(deps.logger, `classifier failed: ${reasonOf(error)}`);

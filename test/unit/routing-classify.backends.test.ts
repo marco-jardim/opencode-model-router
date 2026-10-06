@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildClassifierState } from "../../src/routing/classify/state";
+import { hasCredentialSignal, scrubState } from "../../src/routing/classify/scrub";
 import {
   cutRaw,
   makeNonce,
@@ -1068,5 +1069,144 @@ describe("typesafe backend", () => {
     expect(results.map((r) => r.status)).toEqual(["error", "error"]);
     expect(await backend.classifyMany([], callOptions(seeded(1)))).toEqual([]);
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA-1.2-1: secrets never leave the machine
+// ---------------------------------------------------------------------------
+
+// Secret-shaped fixtures are assembled at runtime so that no literal token shape lands in the repository
+// (GitHub push protection would, rightly, reject it).
+const STRIPE_KEY = ["sk", "live", "51HxYzAbCdEfGhIjKlMnOpQrSt"].join("_");
+const HF_TOKEN = ["hf", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"].join("_");
+const GITLAB_TOKEN = ["glpat", "AbCdEfGhIjKlMnOpQrSt"].join("-");
+const NPM_TOKEN = ["npm", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"].join("_");
+
+describe("state scrub (QA-1.2-1)", () => {
+  /** [label, text, every fragment that must not survive]. */
+  const PROBES: ReadonlyArray<readonly [string, string, readonly string[]]> = [
+    ["env-style DATABASE_PASSWORD", "export DATABASE_PASSWORD=hunter2hunter2xyz", ["hunter2hunter2xyz"]],
+    [
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      ["wJalrXUtnFEMI", "bPxRfiCYEXAMPLEKEY"],
+    ],
+    ["client_secret", "client_secret: 9f8e7d6c5b4a3928", ["9f8e7d6c5b4a3928"]],
+    ['JSON "password"', '{"password": "correct horse battery staple"}', ["correct", "horse", "battery", "staple"]],
+    ["spoken password", "the password is P@ssw0rd!2024 for staging", ["P@ssw0rd!2024", "ssw0rd"]],
+    ["URL credentials", "postgres://admin:S3cr3tPass@db.internal/app", ["S3cr3tPass"]],
+    ["Stripe sk_live_", `bill with ${STRIPE_KEY} today`, [STRIPE_KEY, "AbCdEfGhIjKlMnOpQrSt"]],
+    ["Hugging Face hf_", `use ${HF_TOKEN} to pull`, [HF_TOKEN, "UvWxYz0123456789"]],
+    ["GitLab glpat-", `clone with ${GITLAB_TOKEN}`, [GITLAB_TOKEN, "KlMnOpQrSt"]],
+    ["npm_ token", `publish with ${NPM_TOKEN}`, [NPM_TOKEN, "UvWxYz0123456789"]],
+    [
+      "PEM RSA block",
+      "key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7bq98abcDEFghi\nxyz0123456789ABCDEF==\n-----END RSA PRIVATE KEY-----\ndone",
+      ["MIIEpAIBAAKCAQEA7bq98", "xyz0123456789ABCDEF"],
+    ],
+    ["secret with base64 punctuation", "secret=abcdef+ghijk/lmnopq==", ["abcdef", "ghijk", "lmnopq"]],
+    [
+      "own: Authorization header",
+      "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' https://api.example.com",
+      ["dXNlcjpwYXNzd29yZA"],
+    ],
+    ["own: curl -u user:pass", "curl -u admin:hunter2 https://api.example.com/v1", ["hunter2"]],
+    [
+      "own: bare high-entropy run",
+      "paste Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6 here",
+      ["Zm9vYmFyMTIzNDU2Nzg5MGFiY2Rl"],
+    ],
+  ];
+
+  for (const [label, text, fragments] of PROBES) {
+    it(`${label}: redacted in the prompt, the description and the acceptance block`, () => {
+      const state = buildClassifierState(
+        { description: text, prompt: `${text}\n[acceptance]\ncheck: ${text}\n[/acceptance]` },
+        4000,
+      );
+      for (const fragment of fragments) expect(state.text, fragment).not.toContain(fragment);
+      expect(state.text).toContain("[REDACTED]");
+      expect(scrubState(text)).not.toBe(text);
+    });
+  }
+
+  it("a rendered host request never carries any probe secret", async () => {
+    const prompts: string[] = [];
+    const { logger } = makeLogger();
+    const backend = createHostBackend({
+      generate: {
+        text: async (input) => {
+          prompts.push(input.prompt);
+          return { text: "search" };
+        },
+      },
+      settings: settings(),
+      logger,
+    });
+    for (const [, text, fragments] of PROBES) {
+      await backend.classify(stateOf(`please look at this: ${text}`), callOptions(seeded(3)));
+      for (const fragment of fragments) expect(prompts.at(-1)!, fragment).not.toContain(fragment);
+    }
+    expect(prompts).toHaveLength(PROBES.length);
+  });
+
+  it("is idempotent and leaves ordinary text, paths and identifiers alone", () => {
+    for (const [, text] of PROBES) expect(scrubState(scrubState(text))).toBe(scrubState(text));
+    for (const plain of [
+      "implement the route-line parser in src/routing/classify/route-line.ts",
+      "src/routing/classify/backends/openai-compatible.ts and test/unit/routing-classify.backends.test.ts",
+      "rename getFoo to fetchFoo in src/a.ts",
+      "the quick brown fox jumps over the lazy dog, twice",
+      "process.env.NODE_ENV is production",
+    ]) {
+      expect(scrubState(plain), plain).toBe(plain);
+    }
+  });
+
+  it("quoted and multi-line values: only the value goes", () => {
+    expect(scrubState('password: "a b c" and then more')).toBe('password: [REDACTED] and then more');
+    expect(scrubState("API_KEY='x y' next")).toBe("API_KEY=[REDACTED] next");
+    expect(scrubState("x\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\ny")).toBe(
+      "x\n[REDACTED] (PEM block)\ny",
+    );
+    expect(scrubState("-----BEGIN PRIVATE KEY-----\ntruncated paste")).toBe("[REDACTED] (PEM block)");
+  });
+
+  it("a long run of name characters is linear (no quadratic backtracking)", () => {
+    for (const text of ["a".repeat(20_000), "a-".repeat(10_000), "A_".repeat(10_000), "token".repeat(4_000)]) {
+      const started = performance.now();
+      scrubState(text);
+      expect(performance.now() - started).toBeLessThan(100);
+    }
+  });
+});
+
+describe("hasCredentialSignal (QA-1.2-1 policy gate)", () => {
+  it("fires on credential words, env-style names, PEM headers and anything the scrubber redacts", () => {
+    for (const text of [
+      "the password is in the vault",
+      "set GITHUB_TOKEN before running",
+      "rotate the API key",
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "copy .env to the server",
+      "use Bearer abc",
+      `see ${STRIPE_KEY}`,
+      "run with Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0",
+    ]) {
+      expect(hasCredentialSignal(text), text).toBe(true);
+    }
+  });
+
+  it("stays quiet on ordinary tasks", () => {
+    for (const text of [
+      "rename getFoo to fetchFoo in src/a.ts",
+      "the tokenizer splits words",
+      "read process.env.NODE_ENV",
+      "implement the parser",
+      "",
+    ]) {
+      expect(hasCredentialSignal(text), text).toBe(false);
+    }
   });
 });

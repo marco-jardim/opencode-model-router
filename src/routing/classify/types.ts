@@ -324,6 +324,8 @@ export interface RulesAnalysis {
 export interface ClassifyTrace {
   readonly rules: TaskFacts;
   readonly routeLine: RouteLine | null;
+  /** The backend was not consulted although the rules were unsure: the task names a credential (QA-1.2-1). */
+  readonly backendSkipped?: "credentials";
   readonly backend: {
     readonly id: BackendId;
     readonly status: BackendStatus;

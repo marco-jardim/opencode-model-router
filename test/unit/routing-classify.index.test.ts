@@ -597,3 +597,52 @@ describe("createClassifierBackend", () => {
     expect(result.trace.backend).toMatchObject({ id: "host", status: "ok", calls: 1 });
   });
 });
+
+const STRIPE_KEY = ["sk", "live", "51HxYzAbCdEfGhIjKlMnOpQrSt"].join("_");
+
+describe("credential policy gate (QA-1.2-1)", () => {
+  it("never consults the backend for a task that names a credential; the rules facts stand", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+    for (const prompt of [
+      "hello, the password is hunter2",
+      "hello GITHUB_TOKEN",
+      `hello ${STRIPE_KEY}`,
+      "hello\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",
+    ]) {
+      const result = await classify(input(prompt), makeDeps(backend));
+      expect(result.facts, prompt).toEqual(result.trace.rules);
+      expect(result.trace.backend).toBeNull();
+      expect(result.trace.backendSkipped).toBe("credentials");
+    }
+    expect(classifyFn).not.toHaveBeenCalled();
+  });
+
+  it("also checks the description", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+    const result = await classify(input("hello", { description: "rotate the API key" }), makeDeps(backend));
+    expect(classifyFn).not.toHaveBeenCalled();
+    expect(result.trace.backendSkipped).toBe("credentials");
+  });
+
+  it("confident rules never reach the gate (no skip marker)", async () => {
+    const { backend } = fakeBackend(() => okResult("design"));
+    const result = await classify(input("grep for password in src"), makeDeps(backend));
+    expect(result.trace.backendSkipped).toBeUndefined();
+    expect(result.facts.source).toBe("rules");
+  });
+
+  it("classifyMany skips only the items that mention credentials", async () => {
+    const { backend, classifyManyFn } = fakeBackend(
+      () => okResult("search"),
+      () => [okResult("debug"), okResult("debug")],
+    );
+    const results = await classifyMany(
+      [input("hello one"), input("hello, the token is abc"), input("hello two")],
+      makeDeps(backend),
+    );
+    expect(classifyManyFn).toHaveBeenCalledTimes(1);
+    expect(classifyManyFn.mock.calls[0]![0]).toHaveLength(2);
+    expect(results.map((r) => r.trace.backendSkipped)).toEqual([undefined, "credentials", undefined]);
+    expect(results.map((r) => r.facts.class)).toEqual(["debug", "other", "debug"]);
+  });
+});
