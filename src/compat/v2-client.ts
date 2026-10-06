@@ -3,6 +3,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import { ResumeRejectedError, type ChildSessionRunner } from "./child-session";
+import { markRunnerDispatch } from "../router/sessions";
 
 export const V2_GRADER_AGENT = "model-router-grader";
 const RETAINED_CONTEXT_LIMIT = 500;
@@ -104,12 +105,16 @@ export function createV2Runtime(ctx: Plugin.Context) {
         if (request.system) childSystems.set(resumeID, request.system);
       }
       const model = request.model;
+      // 2.2 / 2.3 single writer (QA-2.2-1): announce the native call to the 2.2 dispatch router, which must leave it alone
+      // (this runner has chosen the agent and model#variant, writes the attempt's row and registers the child itself).
+      let withdrawMark: (() => void) | undefined;
       try {
         // A resumed child is registered here, before the host can run it, exactly like a created one is in `progress`.
         if (resumeID !== undefined) {
           await request.onCreated(resumeID);
           signal.throwIfAborted();
         }
+        withdrawMark = markRunnerDispatch({ parentSessionID: toolContext.sessionID, agent: request.agent ?? V2_GRADER_AGENT, prompt: request.prompt });
         const result = await native.execute({
           agent: request.agent ?? V2_GRADER_AGENT,
           description: request.agent ? `Router ${request.agent} delegation` : "Router result verification",
@@ -165,6 +170,7 @@ export function createV2Runtime(ctx: Plugin.Context) {
         }
         throw error;
       } finally {
+        withdrawMark?.(); // a hook that never fired must not leave a mark behind
         if (childID) {
           childSystems.delete(childID);
           activeChildren.delete(childID);

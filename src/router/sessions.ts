@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { RouterConfig } from "./config";
 import { fingerprintToolCall } from "../guard/fingerprint";
 import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep";
@@ -612,6 +612,13 @@ export interface DispatchInput {
    * whose own configuration said not to. Default `true`.
    */
   outcomes?: boolean;
+  /**
+   * QA-2.3-1a (integration 2.2 + 2.3): this registration corrects or completes the SAME execution of an already registered
+   * child (the 2.2 router fixing a heuristic claim, or registering a child under its result), so the step context and the
+   * execution-end state the registry has seen are kept, and whoever waits for the end keeps waiting. Default `false`: a
+   * resume or a ladder attempt is a new execution and starts from nothing.
+   */
+  keepExecution?: boolean;
 }
 
 export interface DispatchRecord {
@@ -698,8 +705,14 @@ export function rememberDispatch(
     registeredAt: nowMs,
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
-  dropDispatch(childSessionID);
-  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs, stepTokens: null, ended: false, waiters: new Set() });
+  // QA-2.3-1a: a registration of the same execution keeps what was observed of it (see `DispatchInput.keepExecution`).
+  const carried = input.keepExecution === true ? previous : undefined;
+  if (carried !== undefined) dispatchRegistry.delete(childSessionID);
+  else dropDispatch(childSessionID);
+  dispatchRegistry.set(childSessionID, {
+    record, lastTouch: nowMs,
+    stepTokens: carried?.stepTokens ?? null, ended: carried?.ended ?? false, waiters: carried?.waiters ?? new Set(),
+  });
   while (dispatchRegistry.size > MAX_DISPATCH_RECORDS) {
     const oldest = dispatchRegistry.keys().next();
     if (oldest.done === true) break;
@@ -820,3 +833,94 @@ export function dispatchCount(): number {
 export function resetDispatchRegistry(): void {
   for (const id of [...dispatchRegistry.keys()]) dropDispatch(id);
 }
+
+// ===========================================================================================================
+// Phase 2.2 / 2.3 integration — the single-writer runner token (QA-2.2-1, QA-2.3-1). Self-contained block.
+//
+// The delegate runner (2.3) dispatches producer and grader children through the host's native `subagent` tool, and the
+// host runs the plugin's `tool.execute.before` hook for those calls exactly as it does for the orchestrator's own. The 2.2
+// dispatch router must not touch them: the runner has already decided the agent and model#variant of the attempt, writes
+// the attempt's decision row and registers the child itself (one writer). The runner announces each native call here, just
+// before it makes it, keyed by the calling session, the agent and a hash of the prompt; the router consumes the mark when
+// the hook arrives and leaves the call alone. Marks expire and are bounded, and the runner withdraws its own mark when the
+// call returns, so a hook that never fires cannot leave a mark that would later swallow an orchestrator dispatch.
+// ===========================================================================================================
+
+/** A runner mark is honoured for at most this long. */
+export const RUNNER_TOKEN_TTL_MS = 120_000;
+/** Bound on live marks (oldest key dropped first). */
+export const MAX_RUNNER_TOKENS = 256;
+
+/** Marks per `parent \0 agent \0 sha1(prompt)`, each the expiry instant of one announced call. */
+const runnerTokens = new Map<string, number[]>();
+
+export interface RunnerDispatchKey {
+  /** The session whose tool context the runner dispatches under (`ToolContext.sessionID`, `event.sessionID` in the hook). */
+  readonly parentSessionID: string;
+  /** The agent the call names (the grader agent for a verification). */
+  readonly agent: string;
+  /** The exact prompt string of the call. */
+  readonly prompt: string;
+}
+
+function runnerTokenKey(key: RunnerDispatchKey): string {
+  return `${key.parentSessionID}\u0000${key.agent}\u0000${createHash("sha1").update(key.prompt).digest("hex")}`;
+}
+
+function liveMarks(marks: number[], nowMs: number): number[] {
+  return marks.filter((expiresAt) => expiresAt > nowMs);
+}
+
+/**
+ * The runner is about to make a native `subagent` call: announce it. Returns a function that withdraws this announcement
+ * (call it when the native call has returned); withdrawing a mark that was consumed or expired is a no-op.
+ */
+export function markRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.now()): () => void {
+  const id = runnerTokenKey(key);
+  const expiresAt = nowMs + RUNNER_TOKEN_TTL_MS;
+  const marks = liveMarks(runnerTokens.get(id) ?? [], nowMs);
+  marks.push(expiresAt);
+  runnerTokens.delete(id);
+  runnerTokens.set(id, marks);
+  while (runnerTokens.size > MAX_RUNNER_TOKENS) {
+    const oldest = runnerTokens.keys().next();
+    if (oldest.done === true) break;
+    runnerTokens.delete(oldest.value);
+  }
+  return () => {
+    const current = runnerTokens.get(id);
+    if (current === undefined) return;
+    const at = current.indexOf(expiresAt);
+    if (at >= 0) current.splice(at, 1);
+    if (current.length === 0) runnerTokens.delete(id);
+  };
+}
+
+/** The hook for a native call arrived: true (and the mark is spent) when the runner announced it, else false. */
+export function consumeRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.now()): boolean {
+  const id = runnerTokenKey(key);
+  const marks = runnerTokens.get(id);
+  if (marks === undefined) return false;
+  const live = liveMarks(marks, nowMs);
+  if (live.length === 0) {
+    runnerTokens.delete(id);
+    return false;
+  }
+  live.shift();
+  if (live.length === 0) runnerTokens.delete(id);
+  else runnerTokens.set(id, live);
+  return true;
+}
+
+/** Number of live runner marks (diagnostics, tests). */
+export function runnerTokenCount(nowMs: number = Date.now()): number {
+  let count = 0;
+  for (const marks of runnerTokens.values()) count += liveMarks(marks, nowMs).length;
+  return count;
+}
+
+/** Test-only: forget every mark. */
+export function resetRunnerTokens(): void {
+  runnerTokens.clear();
+}
+// ===== end of the 2.2 / 2.3 runner token block ===============================================================

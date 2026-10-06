@@ -8,10 +8,15 @@ import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
-import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
+import { V2_GRADER_AGENT, createV2Runtime, type V2Runtime } from "../../src/compat/v2-client";
+import { createAttemptRecorder } from "../../src/escalate/attempt-recorder";
+import type { AttemptPlan } from "../../src/escalate/resume";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { assembleSystemPrompt, buildTaskTaxonomy } from "../../src/router/protocol";
-import { lookupDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import {
+  dispatchCount, lastStepContext, lookupDispatch, markRunnerDispatch, noteExecutionEnded, noteStepContext, resetDispatchRegistry,
+  resetRunnerTokens, runnerTokenCount,
+} from "../../src/router/sessions";
 import { resetDispatchRouting } from "../../src/routing/wire/dispatch";
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
@@ -48,7 +53,9 @@ interface World {
   allToolHooks: Record<string, Array<(event: any) => Promise<void>>>;
   sessionHooks: Record<string, (event: any) => Promise<void>>;
   emit(event: unknown): void;
-  start(legacy?: Record<string, unknown>): Promise<() => Promise<void>>;
+  start(legacy?: Record<string, unknown>, runtime?: V2Runtime): Promise<() => Promise<void>>;
+  /** What the fake host's native `subagent` tool received, after every registered execute.before hook ran. */
+  native: Array<Record<string, any>>;
   bundle: OutcomesBundle;
   seed(key: string, pass: number, fail: number): void;
   rows(): Promise<DecisionRow[]>;
@@ -98,6 +105,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
   invalidateConfigCache();
   resetDispatchRegistry();
   resetDispatchRouting();
+  resetRunnerTokens();
   resetIngestState();
 
   const agents = registry();
@@ -115,6 +123,20 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
   const wake = () => { for (const resolve of [...wakers]) resolve(); };
   const register = () => ({ dispose: vi.fn(async () => {}) });
   const generate = vi.fn(async () => ({ text: "implement" }));
+  const native: World["native"] = [];
+  let childSeq = 0;
+  /** The host's native subagent tool as the runner reaches it (`ctx.tool.list()`): the host runs the plugin hooks for it too. */
+  const hostSubagent = vi.fn(async (input: Record<string, any>, nativeContext: any) => {
+    const event: any = { tool: "subagent", input: { ...input }, sessionID: nativeContext.sessionID, agent: nativeContext.agent, messageID: nativeContext.messageID, id: nativeContext.id };
+    for (const hook of allToolHooks["execute.before"] ?? []) await hook(event);
+    native.push(event.input);
+    const resumed = typeof event.input.sessionID === "string" ? event.input.sessionID : null;
+    const sessionID = resumed ?? `child-${++childSeq}`;
+    await nativeContext.progress({ sessionID, status: "running" }); // the runner registers the child here (onCreated)
+    if (resumed === null) wakeEvent({ type: "session.created", data: { sessionID, parentID: nativeContext.sessionID, agent: event.input.agent, title: event.input.description } });
+    return { output: { sessionID, status: "completed", output: "done" } };
+  });
+  const wakeEvent = (event: unknown) => { queue.push(event); wake(); };
   const ctx = {
     location: { directory: home, project: { directory: home } },
     agent: { reload: vi.fn(async () => {}), list: vi.fn(async () => ({ data: Object.values(agents) })), transform: vi.fn(async () => register()) },
@@ -122,6 +144,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
     model: { list: vi.fn(async () => ({ data: catalog() })) },
     generate: { text: generate },
     tool: {
+      list: vi.fn(async () => [{ id: "subagent", execute: hostSubagent }]),
       transform: vi.fn(async () => register()),
       hook: vi.fn(async (name: string, cb: any) => { toolHooks[name] = cb; (allToolHooks[name] ??= []).push(cb); return register(); }),
     },
@@ -129,6 +152,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
       get: vi.fn(async () => { if (session.current instanceof Error) throw session.current; return session.current; }),
       context: vi.fn(async () => [] as unknown[]),
       prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
+      interrupt: vi.fn(async () => ({ interrupted: true })), remove: vi.fn(async () => {}), move: vi.fn(async () => {}),
       hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),
     },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
@@ -142,10 +166,10 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
   const bundle = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
   await bundle.ready;
   const world: World = {
-    home, outcomes, ctx, agents, session, toolHooks, allToolHooks, sessionHooks, bundle, generate,
+    home, outcomes, ctx, agents, session, toolHooks, allToolHooks, sessionHooks, bundle, generate, native,
     emit(event) { queue.push(event); wake(); },
-    async start(legacy = {}) {
-      const cleanup = await registerV2Hooks(ctx as unknown as Context, legacy as unknown as Hooks);
+    async start(legacy = {}, runtime) {
+      const cleanup = await registerV2Hooks(ctx as unknown as Context, legacy as unknown as Hooks, runtime);
       cleanups.push(cleanup);
       return cleanup;
     },
@@ -189,6 +213,7 @@ afterEach(async () => {
   invalidateConfigCache();
   resetDispatchRegistry();
   resetDispatchRouting();
+  resetRunnerTokens();
   resetIngestState();
   logger.warn.mockReset();
 });
@@ -945,6 +970,184 @@ describe("disposal during preparation (QA-2.2-13)", () => {
     expect(call.event.input).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // not even the route line was stripped
     expect(lookupDispatch("child-late")).toBeUndefined();
     expect(await world.rows()).toEqual([]);
+  });
+});
+describe("single writer with the delegate runner (QA-2.2-1, QA-2.3-1)", () => {
+  const FACTS = { class: "implement", risk: "high", scope: "single", needs: [] as string[], confidence: 1, source: "rules" };
+  const MODEL = { providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "medium" };
+  const PLAN: AttemptPlan = { step: "dispatch", tier: "medium", agent: "medium", model: MODEL };
+
+  /** A world whose engine WOULD switch an orchestrator's `medium` implement dispatch to heavy, plus a real v2 runtime and recorder. */
+  async function runnerWorld(routing: Record<string, unknown> = { engine: "enforce", roles: {} }) {
+    const world = await makeWorld(routing);
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    const runtime = createV2Runtime(world.ctx as never);
+    const recorder = createAttemptRecorder({ host: "v2", config: () => loadConfig(world.home), logger });
+    const toolContext = { sessionID: "root", agent: "build", messageID: "message", id: "call-delegate", signal: new AbortController().signal, progress: vi.fn(async () => {}) } as never;
+    cleanups.push(async () => { await recorder.dispose(); await runtime.dispose(); });
+    const runChild = (request: { agent?: string; prompt: string; model?: { providerID: string; modelID: string; variant?: string }; resumeSessionID?: string; system?: string }, plan: AttemptPlan | null = PLAN) =>
+      runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        ...request,
+        onCreated: async (sessionID) => {
+          if (plan !== null) recorder.record({ childSessionID: sessionID, parentSessionID: "root", plan, facts: FACTS, acceptance: "none", resumed: request.resumeSessionID !== undefined });
+        },
+      }));
+    return { world, runtime, recorder, runChild };
+  }
+
+  it("enforce: a runner dispatch through the 2.2 execute.before reaches the host exactly as the runner wrote it, with one decision row (the recorder's) and one registration", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    await world.start({}, runtime);
+    await runChild({ agent: "medium", prompt: IMPLEMENT(), model: MODEL });
+    expect(world.native).toEqual([{
+      agent: "medium", description: "Router medium delegation", prompt: IMPLEMENT(), model: `${SONNET}#medium`, background: false,
+    }]); // no agent/model rewrite (the engine would have gone to heavy), no route-line strip
+    const rows = await world.rows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ decisionID: expect.stringMatching(/^ladder-/), step: "dispatch", switched: false, childSessionID: "child-1", mode: "enforce" });
+    expect(dispatchCount()).toBe(1);
+    expect(lookupDispatch("child-1")).toMatchObject({ agent: "medium", model: SONNET, variant: "medium", decisionID: rows[0]!.decisionID, step: "dispatch", attemptIndex: 0 });
+    expect(world.ctx.session.get).not.toHaveBeenCalled(); // the 2.2 router did not even read the session
+    expect(runnerTokenCount()).toBe(0); // the mark was spent by the hook and withdrawn by the runner
+    // the host's session.created for the runner child changes nothing
+    await vi.waitFor(() => { expect(world.ctx.model.list).toBeDefined(); });
+    world.emit({ type: "session.deleted", data: { sessionID: "barrier" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lookupDispatch("child-1")).toMatchObject({ attemptIndex: 0, decisionID: rows[0]!.decisionID });
+    expect(await world.rows()).toHaveLength(1);
+  });
+
+  it("a normal orchestrator dispatch with the same agent and prompt and no mark is still routed", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    await world.start({}, runtime);
+    await runChild({ agent: "medium", prompt: IMPLEMENT(), model: MODEL });
+    const orchestrator = await routed(world, { agent: "medium", prompt: IMPLEMENT() }, { id: "call-orchestrator" });
+    expect(orchestrator).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh`, prompt: "Implement the change in src/a.ts." });
+    const rows = await world.rows();
+    expect(rows.map((row) => [row.decisionID.startsWith("ladder-"), row.switched])).toEqual([[true, false], [false, true]]);
+  });
+
+  it("a mark is spent by exactly one hook call: an identical orchestrator dispatch right after the runner's is routed", async () => {
+    const { world } = await runnerWorld();
+    await world.start();
+    markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: IMPLEMENT() });
+    const first = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(first).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // the announced call: untouched
+    const second = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(second).toMatchObject({ agent: "heavy", prompt: "Implement the change in src/a.ts." });
+    expect(await world.rows()).toHaveLength(1);
+  });
+
+  it("a mark is keyed on session, agent and prompt: another prompt, agent or parent session is routed", async () => {
+    const { world } = await runnerWorld();
+    await world.start();
+    markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: `${IMPLEMENT()}\nvariant` });
+    markRunnerDispatch({ parentSessionID: "root", agent: "fast", prompt: IMPLEMENT() });
+    markRunnerDispatch({ parentSessionID: "other", agent: "medium", prompt: IMPLEMENT() });
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(after).toMatchObject({ agent: "heavy" });
+    expect(runnerTokenCount()).toBe(3);
+  });
+
+  it("a mark expires: past its time limit the same dispatch is routed", async () => {
+    const { world } = await runnerWorld();
+    await world.start();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: IMPLEMENT() });
+      vi.setSystemTime(Date.now() + 121_000);
+      const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+      expect(after).toMatchObject({ agent: "heavy" });
+      expect(runnerTokenCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a grader call (the runner's verification child) is not routed and writes nothing", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    await world.start({}, runtime);
+    await runChild({ prompt: "Grade this result", system: "You are a grader" }, null);
+    expect(world.native).toEqual([{ agent: V2_GRADER_AGENT, description: "Router result verification", prompt: "Grade this result", background: false }]);
+    expect(await world.rows()).toEqual([]);
+    expect(dispatchCount()).toBe(0);
+    expect(runnerTokenCount()).toBe(0);
+  });
+
+  it("a resumed runner attempt is left alone too, and the recorder's second registration is its own attempt", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    world.session.current = { ...(world.session.current as Record<string, unknown>) };
+    await world.start({}, runtime);
+    await runChild({ agent: "medium", prompt: IMPLEMENT(), model: MODEL });
+    world.ctx.session.get.mockImplementation(async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: "root", agent: "medium" }));
+    await runChild({ agent: "medium", prompt: "[router escalation] retry", model: { ...MODEL, variant: "high" }, resumeSessionID: "child-1" }, { ...PLAN, step: "variant", model: { ...MODEL, variant: "high" } });
+    expect(world.native[1]).toEqual({
+      agent: "medium", description: "Router medium delegation", prompt: "[router escalation] retry", model: `${SONNET}#high`, sessionID: "child-1", background: false,
+    });
+    const rows = await world.rows();
+    expect(rows.map((row) => [row.step, row.resume, row.decisionID.startsWith("ladder-")])).toEqual([["dispatch", false, true], ["variant", true, true]]);
+    expect(lookupDispatch("child-1")).toMatchObject({ step: "variant", attemptIndex: 1 });
+  });
+
+  it("two plugin instances: the instance that consumes the mark and the one that does not both leave the runner's call alone", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    await world.start({}, runtime);
+    await world.start({}, runtime);
+    expect(world.allToolHooks["execute.before"]).toHaveLength(2);
+    await runChild({ agent: "medium", prompt: IMPLEMENT(), model: MODEL });
+    expect(world.native[0]).toMatchObject({ agent: "medium", prompt: IMPLEMENT(), model: `${SONNET}#medium` });
+    expect(await world.rows()).toHaveLength(1);
+    expect(dispatchCount()).toBe(1);
+  });
+
+  it("the runner's child is never claimed for a waiting orchestrator dispatch, by its title or because it is already registered", async () => {
+    const { world } = await runnerWorld({ engine: "shadow", roles: {} });
+    await world.start();
+    const call = dispatch(world, { agent: "medium", description: "orchestrator work", prompt: IMPLEMENT() });
+    await call.run();
+    world.emit({ type: "session.created", data: { sessionID: "runner-child", parentID: "root", agent: "medium", title: "Router medium delegation" } });
+    world.emit({ type: "session.created", data: { sessionID: "runner-grader", parentID: "root", agent: "medium", title: "Router result verification" } });
+    const { rememberDispatch } = await import("../../src/router/sessions");
+    const registered = rememberDispatch("runner-owned", { facts: FACTS, agent: "medium", model: SONNET, variant: "medium", parentSessionID: "root", decisionID: "ladder-x", step: "variant" });
+    world.emit({ type: "session.created", data: { sessionID: "runner-owned", parentID: "root", agent: "medium", title: "something else" } });
+    world.emit({ type: "session.created", data: { sessionID: "orchestrator-child", parentID: "root", agent: "medium", title: "orchestrator work" } });
+    await vi.waitFor(() => { expect(lookupDispatch("orchestrator-child")).toBeDefined(); });
+    expect(lookupDispatch("runner-child")).toBeUndefined();
+    expect(lookupDispatch("runner-grader")).toBeUndefined();
+    expect(lookupDispatch("runner-owned")).toBe(registered);
+    expect(lookupDispatch("orchestrator-child")).toMatchObject({ parentSessionID: "root", agent: "medium", facts: { class: "implement" } });
+  });
+
+  it("the title the guard recognises is the one the runner sends", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    await world.start({}, runtime);
+    await runChild({ agent: "medium", prompt: "x", model: MODEL });
+    await runChild({ prompt: "y", system: "s" }, null);
+    expect(world.native.map((input) => input.description)).toEqual(["Router medium delegation", "Router result verification"]);
+  });
+});
+
+describe("a correction keeps what the registry has seen of the execution (QA-2.3-1a)", () => {
+  it("2.2 fixing a wrong claim at execute.after keeps the child's step context and end state", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    const a = dispatch(world, { agent: "medium", description: "same", prompt: IMPLEMENT() });
+    const b = dispatch(world, { agent: "medium", description: "same", prompt: "[route class=debug risk=low scope=single]\nFix it." });
+    await a.run();
+    await b.run();
+    world.emit({ type: "session.created", data: { sessionID: "X", parentID: "root", agent: "medium", title: "same" } });
+    world.emit({ type: "session.created", data: { sessionID: "C", parentID: "root", agent: "medium", title: "same" } });
+    await vi.waitFor(() => { expect(lookupDispatch("C")).toBeDefined(); });
+    // the runner-visible observations of C's execution, made while it was registered under the wrong dispatch
+    noteStepContext("C", 4321);
+    noteExecutionEnded("C");
+    expect(lastStepContext("C")).toBe(4321);
+    const result = (child: string) => ({ output: { sessionID: child, status: "completed", output: "" }, content: [], metadata: { sessionID: child, status: "completed" } });
+    await world.toolHooks["execute.after"]({ id: a.event.id, tool: "subagent", status: "completed", sessionID: "root", result: result("C") });
+    const [rowA] = await world.rows();
+    expect(lookupDispatch("C")!.decisionID).toBe(rowA!.decisionID); // corrected ...
+    expect(lastStepContext("C")).toBe(4321); // ... and the execution's state survived the re-registration
   });
 });
 describe("latency", () => {

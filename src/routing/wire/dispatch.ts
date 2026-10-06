@@ -24,7 +24,13 @@
  *     title decide which one). `execute.after` then names the child (`onCallResult`): a dispatch still waiting is
  *     registered under it, and a heuristic claim that picked the wrong child is corrected before the verdict is
  *     recorded. A call that ends without a result, or whose hook chain throws, is dropped (`onCallFinished`).
- *  6. Multi-instance (A3): the same hook event may reach several plugin instances of the process; only the first
+ *  6. Single writer with the delegate runner (QA-2.2-1, QA-2.3-1): the runner (2.3) dispatches its producer and grader children
+ *     through the same native tool, so the same hooks fire for them. It announces each call (`markRunnerDispatch`, keyed by
+ *     the calling session, the agent and a hash of the prompt) and `route()` consumes the mark first: the call is left exactly
+ *     as the runner wrote it (no rewrite, no route-line strip, no floor lift, no decision row, no registration). The runner's
+ *     own recorder is the only writer for ladder attempts. A `session.created` that is the runner's child is never claimed
+ *     for an orchestrator dispatch (already registered, or titled like a runner call).
+ *  7. Multi-instance (A3): the same hook event may reach several plugin instances of the process; only the first
  *     instance whose engine is live acts on a call (a process-wide set of handled calls).
  */
 
@@ -36,7 +42,9 @@ import type { ChosenDispatch, Decision, HostAgentInfo } from "../engine/types";
 import { classify } from "../classify";
 import type { ClassifyResult, TaskFacts } from "../classify/types";
 import type { RouterConfig } from "../../router/config";
-import { forgetDispatch, lookupDispatch, rememberDispatch, type DetectionDepth, type DispatchInput } from "../../router/sessions";
+import {
+  consumeRunnerDispatch, forgetDispatch, lookupDispatch, rememberDispatch, type DetectionDepth, type DispatchInput,
+} from "../../router/sessions";
 import {
   FLOOR_LIFT_REASON,
   LOG_ROW_VERSION,
@@ -88,6 +96,12 @@ export interface RouteOutcome {
 }
 
 const UNTOUCHED: RouteOutcome = Object.freeze({ mode: "static" });
+
+/**
+ * Titles of the runner's own children (`description` of `v2-client.ts`: `Router <agent> delegation`, `Router result
+ * verification`): a `session.created` carrying one is the runner's, never an orchestrator dispatch's.
+ */
+const RUNNER_CHILD_TITLE = /^Router (?:.+ delegation|result verification)$/;
 
 export interface DispatchRouter {
   /** Decide and log one `subagent` call. Registers nothing (see `commit`). Never throws. */
@@ -413,6 +427,13 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     async route(call): Promise<RouteOutcome> {
       try {
         const agent = str(call.args.agent);
+        // QA-2.2-1: a call the delegate runner announced is the runner's alone; spend the mark, and tell the other instances
+        // of this process (A3) that the call is handled, so none of them routes it either.
+        if (agent !== null && typeof call.args.prompt === "string"
+          && consumeRunnerDispatch({ parentSessionID: call.sessionID, agent, prompt: call.args.prompt })) {
+          claimCall(`${call.sessionID}\u0000${call.callID}`);
+          return UNTOUCHED;
+        }
         if (agent === null || agent === deps.graderAgent) return UNTOUCHED;
         const prepared = await deps.runtime.prepare(call.cfg);
         if (prepared === null) return UNTOUCHED; // static: nothing touched
@@ -489,10 +510,13 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         const sessionID = str(created.sessionID);
         const parentID = str(created.parentID);
         if (sessionID === null || parentID === null || entries.size === 0) return;
+        // The runner registers its own children (and titles them `Router …`): never take one for an orchestrator dispatch.
+        if (lookupDispatch(sessionID) !== undefined) return;
+        const title = str(created.title);
+        if (title !== null && RUNNER_CHILD_TITLE.test(title)) return;
         const t = now();
         sweep(t);
         const agent = str(created.agent);
-        const title = str(created.title);
         const mine = [...entries.values()].filter((entry) => entry.parentSessionID === parentID && claimable(entry, t));
         const sameAgent = agent === null ? mine : mine.filter((entry) => entry.agent === agent);
         if (sameAgent.length === 0) return;
@@ -513,7 +537,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         entries.delete(callID);
         if (entry === undefined || childSessionID === null || entry.state === "resumed") return;
         // Still waiting (the event was missed, or the claim expired), or claimed for a different child: the result is the truth.
-        if (lookupDispatch(childSessionID)?.decisionID !== entry.input.decisionID) register(childSessionID, entry.input);
+        // The same execution, corrected or completed: keep what the registry has seen of it (QA-2.3-1a).
+        if (lookupDispatch(childSessionID)?.decisionID !== entry.input.decisionID) register(childSessionID, { ...entry.input, keepExecution: true });
         if (entry.state === "claimed" && entry.claimedChild !== undefined && entry.claimedChild !== childSessionID
           && lookupDispatch(entry.claimedChild)?.decisionID === entry.input.decisionID) {
           forgetDispatch(entry.claimedChild); // a wrong claim: that child belongs to another dispatch, which registers it from its own result
