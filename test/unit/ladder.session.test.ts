@@ -320,12 +320,36 @@ describe("buildEscalatePolicy with session input", () => {
     expect(buildEscalatePolicy(makeConfig(OWNER), throwing)).not.toHaveProperty("variants");
     expect(() => buildEscalatePolicy(makeConfig(OWNER), { ...throwing, warn: () => { throw new Error("logger down"); } })).not.toThrow();
   });
-  it("keeps a tier with both a variant and an effort on the variant path", () => {
-    const policy = buildEscalatePolicy(makeConfig({ fast: { model: SONNET, variant: "low", effort: "low" } }), V2);
-    expect(Object.keys(policy.variants!.perTier)).toEqual(["fast"]);
-    expect(policy).not.toHaveProperty("effortBump");
+  it("a tier with both a variant and an effort setting stays on the effort path only: empty ladder, base kept (A20, QA-1.5-8)", () => {
+    for (const effortSetting of [
+      { effort: "low" as const },
+      { thinking: { budgetTokens: 2000 } },
+      { reasoning: { effort: "low" as const } },
+    ]) {
+      const policy = buildEscalatePolicy(makeConfig({ fast: { model: SONNET, variant: "low", ...effortSetting } }), V2);
+      const fast = policy.variants!.perTier.fast!;
+      expect(fast.ladder).toMatchObject({ variants: [], source: "none" });
+      expect(fast).toMatchObject({ base: "low", effortConfigured: true, inputBudget: 1_000_000 });
+      const retry = nextAction(sessionState({ attemptsThisTier: 0 }), fail, policy);
+      expect(retry).toMatchObject({ action: "retry", model: SONNET, variant: "low" }); // the tier's own configured variant
+      expect(retry).not.toHaveProperty("variantStep");
+    }
+    // a tier with a variant and no effort setting keeps its ladder and carries no flag
+    const stepping = buildEscalatePolicy(makeConfig({ fast: { model: SONNET, variant: "low" } }), V2).variants!.perTier.fast!;
+    expect(stepping.ladder.variants).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(stepping).not.toHaveProperty("effortConfigured");
   });
 
+  it("flags effort-configured tiers and only them", () => {
+    const policy = buildEscalatePolicy(
+      makeConfig({ fast: { model: SONNET, effort: "low" }, medium: { model: SONNET }, heavy: { model: OPUS, variant: "high" } }),
+      V2,
+    );
+    const { fast, medium, heavy } = policy.variants!.perTier;
+    expect(fast).toHaveProperty("effortConfigured", true);
+    expect(medium).not.toHaveProperty("effortConfigured");
+    expect(heavy).not.toHaveProperty("effortConfigured");
+  });
   it("omits a tier whose configured variant is absent from the catalog", () => {
     const policy = buildEscalatePolicy(
       makeConfig({ fast: { model: SONNET, variant: "turbo" }, medium: { model: SONNET, variant: "medium" } }),
@@ -1433,6 +1457,7 @@ describe("property-based: session-aware loop", () => {
         const roll = rng();
         if (roll < 0.4 && ids.length > 0) tier.variant = pick(ids);
         else if (roll < 0.5) tier.effort = "low";
+        if (rng() < 0.1) tier.effort = "low"; // sometimes on top of a variant (A20)
         if (rng() < 0.2 && ids.length > 0) tier.candidates = [{ variant: pick(ids) }, { variant: pick([...ids, "turbo"]) }];
         tiers[name] = tier;
       }
@@ -1449,6 +1474,14 @@ describe("property-based: session-aware loop", () => {
       });
       const policy = buildEscalatePolicy(config, { host: "v2", catalog: catalogLookup, maxContextFraction: pick([0.3, 0.6, 1]) });
 
+      // A20: a tier that configures an effort setting never has a variant to step to, and is flagged.
+      for (const [name, tier] of Object.entries(tiers)) {
+        const info = policy.variants?.perTier[name];
+        if (info && tier.effort !== undefined) {
+          expect(info.ladder.variants).toEqual([]);
+          expect(info.effortConfigured).toBe(true);
+        }
+      }
       // One effort delivery per tier: a tier on the effort bump never has a variant to step to.
       for (const tier of Object.keys(policy.variants?.perTier ?? {})) {
         if (Object.keys(policy.effortBump?.perTier ?? {}).includes(tier)) {

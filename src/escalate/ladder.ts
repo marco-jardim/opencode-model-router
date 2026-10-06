@@ -43,6 +43,12 @@ export interface TierVariantInfo {
    * means the ratio is unknown and the runner charges the tier's `costRatio`.
    */
   costRatios: Record<string, number>;
+  /**
+   * Set when the tier configures `effort`/`thinking`/`reasoning` (A20, QA-1.5-18): its effort travels
+   * on the effort path only, so it has an empty variant ladder, is never treated as covered by another
+   * tier and never counts as a coverage source in `triedByModel`.
+   */
+  effortConfigured?: true;
 }
 
 export interface VariantPolicy {
@@ -568,10 +574,10 @@ function buildVariantPolicy(
     const ids = catalogVariantIds(entry);
     const configured = typeof tier.variant === "string" && tier.variant.length > 0 ? tier.variant : null;
     if (configured !== null && !(ids ?? []).includes(configured)) continue; // invalid configured variant: never resume-switch it
-    // One effort delivery per tier (F3, QA-1.5-8): effort/thinking/reasoning-configured tiers keep the
-    // effortBump path and get an empty variant ladder; they still carry their model and budget.
-    const effortConfigured =
-      configured === null && (tier.effort !== undefined || tier.thinking !== undefined || tier.reasoning !== undefined);
+    // One effort delivery per tier (F3, A20): a tier that configures effort/thinking/reasoning stays on
+    // the effort path only, with or without a `variant`, and gets an empty variant ladder; it still
+    // carries its model, base and budget.
+    const effortConfigured = tier.effort !== undefined || tier.thinking !== undefined || tier.reasoning !== undefined;
     const raw = (tier as { candidates?: unknown }).candidates; // raw config, never resolveCandidates() (F11)
     const base = configured ?? DEFAULT_VARIANT;
     const ladder = effortConfigured
@@ -588,6 +594,7 @@ function buildVariantPolicy(
       ladder,
       inputBudget: inputBudget(entry.limit),
       costRatios: rungCostRatios(tier, raw, base, ladder),
+      ...(effortConfigured ? { effortConfigured: true as const } : {}),
     }]);
   }
   if (entries.length === 0) return null;
