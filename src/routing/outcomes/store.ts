@@ -26,7 +26,7 @@ import type {
   Verdict,
 } from "./types";
 import { OUTCOMES_SCHEMA_ID, OUTCOMES_SCHEMA_VERSION, parseKey, safeNow } from "./types";
-import { MIN_TINY, SAME_RANK_PRIOR, capEvidence, decayFactor, decayTo, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
+import { DAY_MS, MIN_TINY, SAME_RANK_PRIOR, capEvidence, decayFactor, decayTo, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
 import {
   addTokens,
   cleanTokenSample,
@@ -508,7 +508,16 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     },
 
     posterior(key: OutcomeKey, prior: BetaPrior = SAME_RANK_PRIOR) {
-      return posteriorOf(entries.get(key)?.beta, prior, clockNow(), tuning);
+      const t = clockNow();
+      const entry = entries.get(key);
+      if (entry !== undefined && entry.beta.updatedAt > t + DAY_MS) {
+        // QA-1.3-7: the evidence is stamped more than a day after "now" (a clock that was ahead when it was
+        // written, since corrected). Re-stamp it *in the store*: a pure read would leave it frozen until the
+        // wall clock catches up. The counts are untouched, so nothing inflates; the change is persisted state.
+        entry.beta = { alpha: entry.beta.alpha, beta: entry.beta.beta, updatedAt: t };
+        revision += 1;
+      }
+      return posteriorOf(entry?.beta, prior, t, tuning);
     },
 
     cost(key: OutcomeKey): CostStats {

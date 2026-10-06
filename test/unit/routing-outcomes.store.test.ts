@@ -210,6 +210,38 @@ describe("posterior", () => {
     expect(JSON.stringify(store.snapshot())).toBe(snapshot);
   });
 
+  it("QA-1.3-7: evidence stamped a year ahead is re-stamped by the first read after the clock was corrected, so it decays again", () => {
+    const c = clock(T0 + 365 * DAY_MS); // a clock that jumped a year ahead
+    const store = createOutcomeStore({ now: c.now });
+    for (let i = 0; i < 8; i++) store.recordVerdict(K(), "pass", signal(`a${i}`));
+    expect(store.snapshot().entries[K()]?.beta.updatedAt).toBe(T0 + 365 * DAY_MS);
+
+    c.set(T0); // corrected
+    const revision = store.revision;
+    expect(store.posterior(K()).n).toBe(8); // the same evidence, not inflated, not decayed yet
+    expect(store.snapshot().entries[K()]?.beta).toEqual({ alpha: 8, beta: 0, updatedAt: T0 }); // stored, not just computed
+    expect(store.snapshot().entries[K()]?.counts.pass).toBe(8);
+    expect(store.revision).toBe(revision + 1); // persisted state changed: the flusher writes it
+
+    c.set(T0 + 30 * DAY_MS);
+    expect(store.posterior(K()).n).toBeCloseTo(8 * 2 ** (-30 / 14), 9); // decays again (without the fix it stayed 8)
+    const after = store.revision;
+    store.posterior(K());
+    expect(store.revision).toBe(after); // a normal read never writes
+  });
+
+  it("QA-1.3-7: a stamp less than a day ahead is jitter and is left alone; a missing key never writes", () => {
+    const c = clock(T0 + 12 * 3_600_000);
+    const store = createOutcomeStore({ now: c.now });
+    store.recordVerdict(K(), "pass", signal("a"));
+    c.set(T0);
+    const revision = store.revision;
+    store.posterior(K());
+    store.posterior(K("never-seen"));
+    expect(store.revision).toBe(revision);
+    expect(store.snapshot().entries[K()]?.beta.updatedAt).toBe(T0 + 12 * 3_600_000);
+  });
+
   it("a clock going backwards does not inflate the posterior", () => {
     const c = clock();
     const store = createOutcomeStore({ now: c.now });
