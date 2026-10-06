@@ -1555,7 +1555,7 @@ describe("foreign writers (QA-1.3-4)", () => {
       const flusher = createFlusher(store, persister, { now: base.c.now, scheduler: sched.scheduler, logger: base.logger });
       let n = 0;
       const record = (verdict: "pass" | "fail") => store.recordVerdict(KEY, verdict, { attemptID: `p${pid}-${n++}`, step: "dispatch" });
-      return { store, persister, flusher, record };
+      return { store, persister, flusher, record, sched };
     };
     const a = make(1);
     const b = make(2);
@@ -1685,23 +1685,111 @@ describe("foreign writers (QA-1.3-4)", () => {
 
   it("readForeignWrites: null until someone else writes, then the file and the baseline to diff against", async () => {
     const { a, b, c, deps, dir } = twoProcesses();
-    expect(await a.persister.readForeignWrites()).toBeNull(); // never loaded: nothing to compare with
+    const unchanged = { status: "unchanged" };
+    expect(await a.persister.readForeignWrites()).toEqual(unchanged); // never loaded: nothing to compare with
     await a.persister.load();
-    expect(await a.persister.readForeignWrites()).toBeNull();
+    expect(await a.persister.readForeignWrites()).toEqual(unchanged);
     b.record("pass");
     c.advance(1000);
     await b.persister.saveSnapshot(b.store.snapshot());
     const foreign = await a.persister.readForeignWrites();
-    expect(foreign?.baseline).toEqual({ version: 1, entries: {} });
-    expect(foreign?.disk).toEqual(b.store.snapshot());
-    expect(await a.persister.readForeignWrites()).toBeNull(); // already handled
+    expect(foreign).toEqual({ status: "merge", baseline: { version: 1, entries: {} }, disk: b.store.snapshot() });
+    expect(await a.persister.readForeignWrites()).toEqual(unchanged); // already handled
     // after our own save the baseline is what we wrote
     a.record("fail");
     await a.persister.saveSnapshot(a.store.snapshot());
-    expect(await a.persister.readForeignWrites()).toBeNull();
+    expect(await a.persister.readForeignWrites()).toEqual(unchanged);
     c.advance(1000);
     await createPersister(dir, { ...deps, pid: 9 }).saveSnapshot(snapshotOf("pass", "pass"));
-    expect((await a.persister.readForeignWrites())?.baseline).toEqual(a.store.snapshot());
+    expect(await a.persister.readForeignWrites()).toMatchObject({ status: "merge", baseline: a.store.snapshot() });
+  });
+
+  it("QA-1.3-18: a foreign change that cannot be read skips the save (nothing is overwritten blind) and is picked up on the retry", async () => {
+    const { a, b, c, mem, dir, onDisk, logger } = twoProcesses();
+    await a.persister.load();
+    await b.persister.load();
+    for (let i = 0; i < 2; i++) a.record("pass");
+    await a.flusher.flushNow();
+    c.advance(1000);
+    const bLoaded = await b.persister.load();
+    b.store.fromSnapshot(bLoaded.snapshot, { mode: "merge" });
+    for (let i = 0; i < 3; i++) b.record("fail");
+    await b.flusher.flushNow();
+    const theirs = mem.files.get(join(dir, OUTCOMES_FILE))?.text;
+    expect((await onDisk())?.counts).toMatchObject({ pass: 2, fail: 3 });
+
+    // A is dirty; B's write has to be read first, and the read fails
+    c.advance(1000);
+    a.record("pass");
+    let failing = true;
+    const writesBefore = mem.touched.filter((t) => t.op === "writeDurable").length;
+    mem.hooks.readText = (path) => {
+      if (failing && path === join(dir, OUTCOMES_FILE)) throw fsError("EIO", "disk hiccup");
+    };
+    logger.warn.mockClear();
+    await a.flusher.flushNow();
+    expect(mem.touched.filter((t) => t.op === "writeDurable").length).toBe(writesBefore); // no write at all this round
+    expect(mem.files.get(join(dir, OUTCOMES_FILE))?.text).toBe(theirs); // B's data untouched
+    expect(logger.warn).toHaveBeenCalledTimes(2); // the read failure, then the (single) failing-streak report
+    expect(a.sched.pending()).toHaveLength(1); // the snapshot is still pending: a retry is armed
+    expect(a.flusher.pendingRows).toBe(0);
+
+    // the disk recovers: the change was NOT recorded as seen, so it is merged now and nothing is lost
+    failing = false;
+    c.advance(1000);
+    await a.flusher.flushNow();
+    expect((await onDisk())?.counts).toMatchObject({ pass: 3, fail: 3 });
+    expect(a.store.snapshot().entries[KEY]?.counts).toMatchObject({ pass: 3, fail: 3 });
+  });
+
+  it("QA-1.3-18: a stat failure also skips the save", async () => {
+    const { a, mem, c, dir } = twoProcesses();
+    await a.persister.load();
+    a.record("pass");
+    await a.flusher.flushNow();
+    c.advance(1000);
+    a.record("pass");
+    const before = mem.files.get(join(dir, OUTCOMES_FILE))?.text;
+    mem.hooks.stat = (path) => {
+      if (path === join(dir, OUTCOMES_FILE)) throw fsError("EIO", "stat failed");
+    };
+    await a.flusher.flushNow();
+    expect(mem.files.get(join(dir, OUTCOMES_FILE))?.text).toBe(before);
+    delete mem.hooks.stat;
+    c.advance(1000);
+    await a.flusher.flushNow();
+    expect(JSON.parse(mem.files.get(join(dir, OUTCOMES_FILE))?.text ?? "null").entries[KEY].counts.pass).toBe(2);
+  });
+
+  it("QA-1.3-18: an unparseable foreign file is moved aside BEFORE the save, once, and the save then goes through", async () => {
+    const { a, mem, c, dir, logger } = twoProcesses();
+    await a.persister.load();
+    a.record("pass");
+    await a.flusher.flushNow();
+    const path = join(dir, OUTCOMES_FILE);
+    c.advance(1000);
+    mem.files.set(path, { text: '{"schema": "opencode-model-router.outcomes", "vers', mtimeMs: c.now() }); // a torn write by someone else
+    a.record("pass");
+    mem.touched.length = 0;
+    logger.warn.mockClear();
+    await a.flusher.flushNow();
+
+    const ops = mem.touched.filter((t) => t.op === "rename" || t.op === "writeDurable");
+    expect(ops[0]).toEqual({ op: "rename", path }); // the quarantine move of outcomes.json comes first…
+    expect(ops.findIndex((t) => t.op === "writeDurable")).toBeGreaterThan(0); // …then the temp write
+    const copies = corruptCopies(mem.files);
+    expect(copies).toHaveLength(1);
+    expect(mem.files.get(copies[0] ?? "")?.text).toContain('"vers');
+    expect(JSON.parse(mem.files.get(path)?.text ?? "null").entries[KEY].counts.pass).toBe(2);
+    expect(logger.warn.mock.calls.filter((call) => String(call[0]).includes("unreadable outcomes.json"))).toHaveLength(1);
+
+    // handled: no repeat on the next save
+    c.advance(1000);
+    a.record("pass");
+    logger.warn.mockClear();
+    await a.flusher.flushNow();
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(corruptCopies(mem.files)).toHaveLength(1);
   });
 
   it("a foreign file that is unreadable is replaced (with a warning); one that is not ours is never overwritten", async () => {
@@ -1716,6 +1804,7 @@ describe("foreign writers (QA-1.3-4)", () => {
     a.record("pass");
     await a.flusher.flushNow();
     expect(logger.warn.mock.calls.some((call) => String(call[0]).includes("unreadable outcomes.json"))).toBe(true);
+    expect(corruptCopies(mem.files)).toHaveLength(1); // moved aside, not just overwritten
     expect(JSON.parse(mem.files.get(path)?.text ?? "null").entries[KEY].counts.pass).toBe(2);
 
     c.advance(1000);

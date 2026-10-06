@@ -643,13 +643,17 @@ export interface ReadRowsResult {
   readonly generations: number;
 }
 
-/** The other writer's view of `outcomes.json` and the state this process last synced with it (QA-1.3-4). */
-export interface ForeignWrites {
-  /** The file as another process left it. */
-  readonly disk: OutcomeSnapshot;
-  /** What this process last loaded or wrote: `disk − baseline` is what the other writer added. */
-  readonly baseline: OutcomeSnapshot;
-}
+/**
+ * Result of checking `outcomes.json` for another writer (QA-1.3-4, QA-1.3-18):
+ * - `unchanged`: nothing to merge (file untouched, removed, not ours, or unparseable and already moved aside);
+ * - `merge`: another process wrote it: its content, and the baseline this process last synced with
+ *   (`disk − baseline` is what the other writer added);
+ * - `skip`: the file could not be read, so the snapshot must not be written this round.
+ */
+export type ForeignCheck =
+  | { readonly status: "unchanged" }
+  | { readonly status: "merge"; readonly disk: OutcomeSnapshot; readonly baseline: OutcomeSnapshot }
+  | { readonly status: "skip"; readonly reason: string };
 
 export interface Persister {
   readonly dir: string;
@@ -668,10 +672,11 @@ export interface Persister {
   /** Every generation, oldest first. Never throws. */
   readRows(): Promise<ReadRowsResult>;
   /**
-   * `outcomes.json` changed on disk since this persister last loaded or wrote it (another process): its content
-   * and the baseline to diff it against; `null` when nothing changed or the file cannot be merged. Never throws.
+   * Has another process rewritten `outcomes.json` since this persister last loaded or wrote it? The mtime is
+   * recorded only after the new content was read and parsed; an unparseable file is moved aside (quarantined)
+   * before it can be overwritten; a read failure is `skip`. Never throws.
    */
-  readForeignWrites(): Promise<ForeignWrites | null>;
+  readForeignWrites(): Promise<ForeignCheck>;
 }
 
 /** Injected timers; the real implementation `unref()`s them so they never keep a process alive. */

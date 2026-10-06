@@ -13,7 +13,7 @@ import { isAbsolute, join, normalize, resolve } from "node:path";
 import type {
   DecisionRow,
   FlusherDeps,
-  ForeignWrites,
+  ForeignCheck,
   FlusherOptions,
   FlushScheduler,
   LoadResult,
@@ -620,57 +620,73 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       }
     },
 
-    async readForeignWrites(): Promise<ForeignWrites | null> {
+    async readForeignWrites(): Promise<ForeignCheck> {
       try {
-        if (readOnlyReason !== null || lastKnownMtime === undefined) return null;
-        const current = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
-        if (current === lastKnownMtime) return null;
-        lastKnownMtime = current; // handled here, so the save that follows does not report it again
-        if (current === null) return null; // removed: the next save recreates it
+        if (readOnlyReason !== null || lastKnownMtime === undefined) return { status: "unchanged" };
+        // Strict stat/read: a failure here is "we do not know what is on disk", never "nothing changed".
+        const st = await fs.stat(outcomesPath);
+        const current = st?.mtimeMs ?? null;
+        if (current === lastKnownMtime) return { status: "unchanged" };
+        if (current === null) {
+          lastKnownMtime = null; // removed: the next save recreates it (its entries are then a new lineage, QA-1.3-16)
+          return { status: "unchanged" };
+        }
         const text = await withRetry(() => fs.readText(outcomesPath), sleep, delays);
-        if (text === null) return null;
+        if (text === null) {
+          lastKnownMtime = null; // vanished between the stat and the read
+          return { status: "unchanged" };
+        }
         let json: unknown;
+        let unparseable: string | null = null;
         try {
           json = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
         } catch (error) {
-          logger.warn("[router] another process left an unreadable outcomes.json; the next save replaces it", {
-            path: outcomesPath,
-            error: describeError(error),
-          });
-          return null;
+          unparseable = `invalid JSON: ${describeError(error)}`;
         }
-        const parsed = parseSnapshot(json);
-        if (!parsed.ok) {
-          if (parsed.reason === "unsupported-version") {
-            readOnlyReason = "unrecognized outcome store on disk";
-            logger.warn("[router] another process replaced outcomes.json with a file this plugin does not own; not overwriting it", {
-              path: outcomesPath,
-              reason: parsed.message,
-            });
+        const parsed = unparseable === null ? parseSnapshot(json) : null;
+        if (parsed !== null && parsed.ok) {
+          // Only a successfully parsed file counts as "seen" (QA-1.3-18): the mtime is recorded here, not before.
+          const previous = baseline ?? emptySnapshot();
+          baseline = parsed.snapshot;
+          lastKnownMtime = current;
+          if (warnedMerge) {
+            logger.info?.("[router] merged another process's outcome changes", { path: outcomesPath });
           } else {
-            logger.warn("[router] another process left a malformed outcomes.json; the next save replaces it", {
+            warnedMerge = true;
+            logger.warn("[router] another process writes this outcome directory; its changes are merged into this process's before each save", {
               path: outcomesPath,
-              reason: parsed.message,
             });
           }
-          return null;
+          return { status: "merge", disk: parsed.snapshot, baseline: previous };
         }
-        const previous = baseline ?? emptySnapshot();
-        baseline = parsed.snapshot;
-        const detail = { path: outcomesPath };
-        if (warnedMerge) {
-          logger.info?.("[router] merged another process's outcome changes", detail);
-        } else {
-          warnedMerge = true;
-          logger.warn("[router] another process writes this outcome directory; its changes are merged into this process's before each save", detail);
+        if (parsed !== null && parsed.reason === "unsupported-version") {
+          readOnlyReason = parsed.message.startsWith("unsupported outcome store version")
+            ? "unsupported outcome store version on disk"
+            : "unrecognized outcome store on disk";
+          lastKnownMtime = current;
+          logger.warn("[router] another process replaced outcomes.json with a file this plugin does not own; not overwriting it", {
+            path: outcomesPath,
+            reason: parsed.message,
+          });
+          return { status: "unchanged" }; // the save that follows is refused as read-only
         }
-        return { disk: parsed.snapshot, baseline: previous };
+        // Garbage or a malformed version-1 file: move it aside *before* the save replaces it.
+        logger.warn("[router] another process left an unreadable outcomes.json; it is moved aside and replaced", {
+          path: outcomesPath,
+          reason: unparseable ?? (parsed !== null && !parsed.ok ? parsed.message : "unknown"),
+        });
+        await quarantineCorrupt();
+        lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
+        return { status: "unchanged" };
       } catch (error) {
-        logger.warn("[router] could not check outcomes.json for another writer", { path: outcomesPath, error: describeError(error) });
-        return null;
+        const reason = describeError(error);
+        logger.warn("[router] could not read outcomes.json to check for another writer; the snapshot save is skipped this round", {
+          path: outcomesPath,
+          error: reason,
+        });
+        return { status: "skip", reason: `cannot read ${resolve(outcomesPath)}: ${reason}` };
       }
     },
-
     async readRows(): Promise<ReadRowsResult> {
       const rows: LogRow[] = [];
       const files: string[] = [];
@@ -801,13 +817,24 @@ export function createFlusher(
     }
   }
 
-  async function absorbForeignWrites(): Promise<void> {
-    if (persister.readForeignWrites === undefined || store.mergeForeign === undefined) return;
+  /**
+   * Merge what another process wrote into memory before ours is saved. Returns false when the file could not be
+   * checked: the snapshot is then NOT written this round (it stays pending and is retried), because writing
+   * blind could overwrite what we failed to read (QA-1.3-18).
+   */
+  async function absorbForeignWrites(): Promise<boolean> {
+    if (persister.readForeignWrites === undefined || store.mergeForeign === undefined) return true;
     try {
-      const foreign = await persister.readForeignWrites();
-      if (foreign !== null) store.mergeForeign(foreign.disk, foreign.baseline);
+      const check = await persister.readForeignWrites();
+      if (check.status === "merge") store.mergeForeign(check.disk, check.baseline);
+      if (check.status === "skip") {
+        noteFailure("snapshot", check.reason);
+        return false;
+      }
+      return true;
     } catch (error) {
-      logger.warn("[router] another process's outcome changes could not be merged", { error: describeError(error) });
+      noteFailure("snapshot", `cannot check for another writer: ${describeError(error)}`);
+      return false;
     }
   }
 
@@ -815,10 +842,13 @@ export function createFlusher(
     if (deps.ready !== undefined) await deps.ready;
     let ok = true;
     if (!snapshotBlocked && store.revision !== writtenRevision) {
-      await absorbForeignWrites(); // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
+      // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
+      const checked = await absorbForeignWrites();
       const revision = store.revision;
-      const result = await persister.saveSnapshot(store.snapshot());
-      if (result.ok) {
+      const result = checked ? await persister.saveSnapshot(store.snapshot()) : null;
+      if (result === null) {
+        ok = false; // skipped, already reported; the snapshot stays pending
+      } else if (result.ok) {
         writtenRevision = revision;
       } else if (result.readOnly === true) {
         snapshotBlocked = true;
