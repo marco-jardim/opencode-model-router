@@ -489,6 +489,15 @@ describe("QA-1.4-1: an own-model rung takes the price AND the rank of the matchi
     expect(decision.best?.agent).toBe("medium");
   });
 
+  it("priors alone do not switch: medium risk + deliverable detection, empty store → kept:evidence (A24)", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents });
+    const chosen = resolveChosen({ cfg: plainCfg(), agents, agent: "medium" })!;
+    const decision = decide(decisionInput({ ladder, chosen, detection: "deterministic", facts: { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } }));
+    expect(decision.best?.agent).not.toBe("medium"); // the priors do prefer a cheaper rung ...
+    expect(decision.switched).toBe(false); // ... but there is no recorded outcome behind it
+    expect(decision.reasonCode).toBe("kept:evidence");
+  });
+
   it("floor tier: the fast-ranked own-model rung is below a medium floor and never best", () => {
     const cfg = plainCfg({ enforcement: { escalate: { floorTier: "medium" } } });
     const ladder = buildLadder({ cfg, routing: { roles }, facts: facts("implement", ["edit"]), agents });

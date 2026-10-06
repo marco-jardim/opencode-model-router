@@ -33,9 +33,8 @@ import {
   type TaskFacts,
 } from "../classify/types";
 import type { ModelPricing } from "../outcomes/types";
-import { decide } from "./kernel";
+import { decide, hasMinEvidence } from "./kernel";
 import { buildLadder, floorRankOf, resolveChosen, routerTierIds } from "./ladders";
-import { MIN_EVIDENCE_TO_MOVE } from "./protocol-line";
 import type { Decision, EngineStoreView, HostAgentInfo } from "./types";
 
 export interface PlanStep {
@@ -268,7 +267,7 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
       decision.switched &&
       decision.best !== null &&
       decision.target !== null &&
-      store.posterior(decision.best.key).n >= MIN_EVIDENCE_TO_MOVE
+      hasMinEvidence(store.posterior(decision.best.key).n)
     ) {
       tier = decision.target.tier;
     }

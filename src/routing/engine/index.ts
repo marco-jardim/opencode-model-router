@@ -8,10 +8,12 @@ export type * from "./types";
 export {
   DEFAULT_REMAINING_TURNS,
   GIVE_UP_COST,
+  MIN_EVIDENCE_TO_SWITCH_DOWN,
   candidateKey,
   coversNeeds,
   decide,
   giveUpCost,
+  hasMinEvidence,
 } from "./kernel";
 export {
   buildLadder,

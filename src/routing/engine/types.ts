@@ -191,6 +191,8 @@ export type DecisionReasonCode =
   | "kept:best-is-chosen"
   | "kept:class-confidence"
   | "kept:margin"
+  /** A24: a down switch whose `best` has fewer than 5 recorded outcomes. */
+  | "kept:evidence"
   | "kept:invalid-config";
 
 export interface Decision {

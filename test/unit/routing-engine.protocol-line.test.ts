@@ -167,7 +167,8 @@ describe("D2 degenerate case: no evidence ⇒ the generated line IS the shipped 
   it("priors alone never move a class, even when the kernel would switch (margin 0)", () => {
     const cfg = shipped("anthropic", { margin: 0 });
     const routing = resolveRouting(cfg, "v2");
-    // Not vacuous: on priors alone the kernel itself switches `implement` away from medium at margin 0.
+    // Not vacuous: on priors alone the kernel's argmin for `implement` is another rung at margin 0, and only the
+    // A24 evidence gate (no recorded outcomes) keeps it from switching.
     const facts = { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } as const;
     const decision = decide({
       facts,
@@ -178,7 +179,9 @@ describe("D2 degenerate case: no evidence ⇒ the generated line IS the shipped 
       routing,
       store: createOutcomeStore(),
     });
-    expect(decision.switched).toBe(true);
+    expect(decision.best?.agent).not.toBe("medium");
+    expect(decision.reasonCode).toBe("kept:evidence");
+    expect(decision.switched).toBe(false);
     expect(taxonomy(cfg, "v2", createOutcomeStore())).toBe(buildTaskTaxonomy(cfg));
   });
 });

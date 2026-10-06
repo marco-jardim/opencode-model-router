@@ -405,7 +405,8 @@ describe("annotateSteps — evidence moves the engine tier", () => {
     for (let i = 0; i < 20; i++) store.recordVerdict(HEAVY_KEY, "fail", { attemptID: `h${i}`, step: "dispatch" });
     for (let i = 0; i < 20; i++) store.recordVerdict(MEDIUM_KEY, "pass", { attemptID: `m${i}`, step: "dispatch" });
     const out = await annotateSteps([designStep], stubDeps(designFacts, { store }));
-    expect(out[0]!.decision?.switched).toBe(true);
+    // The kernel itself (A24) refuses the down switch to `fast`: it has no recorded outcomes.
+    expect(out[0]!.decision?.reasonCode).toBe("kept:evidence");
     expect(out[0]!.decision?.best?.agent).toBe("fast");
     expect(out[0]!.tier).toBe("heavy");
   });

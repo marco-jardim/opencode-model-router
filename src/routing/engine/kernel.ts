@@ -59,6 +59,21 @@ export const GIVE_UP_COST: Readonly<Record<RoutingProfile, Readonly<Record<Risk,
 /** D8 `remainingTurnsEstimate`. */
 export const DEFAULT_REMAINING_TURNS = 4;
 
+/**
+ * A24 (QA-1.4-6): a switch to a candidate that is cheaper to attempt or ranked lower than the pick (a "down"
+ * switch) needs at least this much recorded evidence on the candidate's own key: the strength of a D7 prior,
+ * so priors alone never move a dispatch down. Switches up are not gated.
+ */
+export const MIN_EVIDENCE_TO_SWITCH_DOWN: number = PRIOR_STRENGTH;
+
+/** Decay and floating point make "five outcomes recorded a moment ago" 4.9999999…; this absorbs only that. */
+const EVIDENCE_EPSILON = 1e-6;
+
+/** Whether `n` effective outcomes (a posterior's `n`) reach {@link MIN_EVIDENCE_TO_SWITCH_DOWN}. */
+export function hasMinEvidence(n: number): boolean {
+  return Number.isFinite(n) && n + EVIDENCE_EPSILON >= MIN_EVIDENCE_TO_SWITCH_DOWN;
+}
+
 const EMPTY_MEAN: MeanStat = Object.freeze({ mean: 0, n: 0 });
 
 // ---------------------------------------------------------------------------
@@ -349,6 +364,9 @@ export function decide(input: DecisionInput): Decision {
   } else if (!(bestCost < threshold)) {
     reasonCode = "kept:margin";
     reason = `kept: C(best)=${fmt(bestCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
+  } else if (isDownSwitch(c, cands, bestIndex, chosenIndex) && !hasMinEvidence(evidence[bestIndex]!)) {
+    reasonCode = "kept:evidence";
+    reason = `kept: moving down to ${bestChoice!.key} needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[bestIndex]!)}`;
   } else {
     reasonCode = "switched";
     reason = `switched: C(best)=${fmt(bestCost)} < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
@@ -372,6 +390,11 @@ export function decide(input: DecisionInput): Decision {
     ineligible,
     target: bestIndex === null ? null : cands[bestIndex]!,
   });
+}
+
+/** A24: `best` is cheaper to attempt, or ranked lower, than the pick. */
+function isDownSwitch(c: Float64Array, cands: readonly Candidate[], best: number, chosen: number): boolean {
+  return c[best]! < c[chosen]! || cands[best]!.rank < cands[chosen]!.rank;
 }
 
 /**

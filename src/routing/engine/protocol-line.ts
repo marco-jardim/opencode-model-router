@@ -24,14 +24,13 @@ import {
   TASK_CLASSES,
   type TaskFacts,
 } from "../classify/types";
-import { PRIOR_STRENGTH } from "../outcomes/beta";
 import type { ModelPricing } from "../outcomes/types";
-import { decide } from "./kernel";
+import { MIN_EVIDENCE_TO_SWITCH_DOWN, decide, hasMinEvidence } from "./kernel";
 import { buildLadder, floorRankOf, resolveChosen, roleAgentExclusion, routerTierIds, tierRankOf } from "./ladders";
 import type { EngineStoreView, HostAgentInfo } from "./types";
 
 /** `best` must carry evidence at least as strong as the prior before a class line moves (= `PRIOR_STRENGTH`). */
-export const MIN_EVIDENCE_TO_MOVE: number = PRIOR_STRENGTH;
+export const MIN_EVIDENCE_TO_MOVE: number = MIN_EVIDENCE_TO_SWITCH_DOWN;
 
 export interface TaxonomyInput {
   readonly cfg: RouterConfig;
@@ -90,7 +89,7 @@ function v2Segments(input: TaxonomyInput, store: EngineStoreView): string[] {
     const decision = decide({ facts, chosen, ladder, detection: "none", pin: false, routing, store, floorRank });
     if (!decision.switched || decision.best === null || decision.target === null) continue;
     if (decision.best.agent === staticTier) continue; // a variant change inside the same tier never changes the line
-    if (store.posterior(decision.best.key).n < MIN_EVIDENCE_TO_MOVE) continue;
+    if (!hasMinEvidence(store.posterior(decision.best.key).n)) continue;
     segments.push(`${cls}→@${decision.best.agent}`);
   }
   return segments;

@@ -2,10 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_REMAINING_TURNS,
   GIVE_UP_COST,
+  MIN_EVIDENCE_TO_SWITCH_DOWN,
   candidateKey,
   coversNeeds,
   decide,
   giveUpCost,
+  hasMinEvidence,
 } from "../../src/routing/engine/kernel";
 import type {
   Candidate,
@@ -140,7 +142,9 @@ function fakeStore(spec: FakeStoreSpec = {}): FakeStore {
 
 /** p = (0.6, 0.9, 0.95) for (fast, medium, heavy) — the worked example of the design discussion. */
 function workedStore(): FakeStore {
-  return fakeStore({ p: { [keyOf(FAST)]: 0.6, [keyOf(MEDIUM)]: 0.9, [keyOf(HEAVY)]: 0.95 } });
+  // 10 recorded outcomes per key: enough evidence for a down switch (A24).
+  const n = { [keyOf(FAST)]: 10, [keyOf(MEDIUM)]: 10, [keyOf(HEAVY)]: 10 };
+  return fakeStore({ p: { [keyOf(FAST)]: 0.6, [keyOf(MEDIUM)]: 0.9, [keyOf(HEAVY)]: 0.95 }, n });
 }
 
 function input(over: Partial<DecisionInput> = {}): DecisionInput {
@@ -317,7 +321,7 @@ function pairLadder(cheap: number, dear: number): { ladder: Ladder; a: Candidate
     a,
     b,
     ladder: { candidates: [a, b], next: [null, null], classRank: 1, excluded: [] },
-    store: fakeStore({ p: { [keyOf(a)]: 1, [keyOf(b)]: 1 } }),
+    store: fakeStore({ p: { [keyOf(a)]: 1, [keyOf(b)]: 1 }, n: { [keyOf(a)]: 10, [keyOf(b)]: 10 } }),
   };
 }
 
@@ -371,6 +375,81 @@ describe("D9 margin rule (A16)", () => {
   });
 });
 
+describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best's key (QA-1.4-6)", () => {
+  const BALANCED: KernelRouting = { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection: { deterministic: 0.95, grader: 0.7, none: 0.3 } };
+  const mediumFacts = (): TaskFacts => facts({ risk: "medium" });
+
+  function priorsOnly(store: DecisionInput["store"]) {
+    return decide(input({ store, routing: BALANCED, facts: mediumFacts(), detection: "deterministic", chosen: chosenOf(MEDIUM) }));
+  }
+
+  it("implement + deterministic with an empty store: the priors would switch, the gate keeps (kept:evidence)", () => {
+    const d = priorsOnly(createOutcomeStore({ now: () => 1_000 }));
+    // C(fast) ≈ 5.35 < 0.8 · C(medium) ≈ 7.5, fast is a rank down with no data.
+    expect(d.best?.key).toBe(keyOf(FAST));
+    expect(d.costs[keyOf(FAST)]).toBeLessThan(0.8 * d.costs[keyOf(MEDIUM)]!);
+    expect(d.switched).toBe(false);
+    expect(d.reasonCode).toBe("kept:evidence");
+    expect(d.reason).toContain("5 recorded outcomes");
+    expect(d.target).toBe(FAST); // best is still computed
+    // The same without a store at all: priors alone never move a dispatch down.
+    expect(priorsOnly(null).reasonCode).toBe("kept:evidence");
+  });
+
+  it("with 5 recorded outcomes on best's key the same decision switches; with 4 it is kept", () => {
+    const record = (count: number) => {
+      const store = createOutcomeStore({ now: () => 1_000 });
+      for (let i = 0; i < count; i++) store.recordVerdict(keyOf(FAST), "pass", { attemptID: `p${i}`, step: "dispatch" });
+      return store;
+    };
+    const five = priorsOnly(record(5));
+    expect(five.reasonCode).toBe("switched");
+    expect(five.switched).toBe(true);
+    const four = priorsOnly(record(4));
+    expect(four.reasonCode).toBe("kept:evidence");
+    expect(four.best?.key).toBe(keyOf(FAST));
+  });
+
+  it("outcomes on OTHER keys do not count: the evidence must be on best's own key", () => {
+    const store = createOutcomeStore({ now: () => 1_000 });
+    for (let i = 0; i < 20; i++) store.recordVerdict(keyOf(MEDIUM), "fail", { attemptID: `m${i}`, step: "dispatch" });
+    expect(priorsOnly(store).reasonCode).toBe("kept:evidence");
+  });
+
+  it("a switch up is not gated, with or without data", () => {
+    const store = fakeStore({ p: { [keyOf(FAST)]: 0.6, [keyOf(MEDIUM)]: 0.9, [keyOf(HEAVY)]: 0.95 } }); // n = 0 everywhere
+    const d = decide(input({ detection: "grader", chosen: chosenOf(FAST), store }));
+    expect(d.best?.key).toBe(keyOf(MEDIUM));
+    expect(d.switched).toBe(true);
+    expect(d.reasonCode).toBe("switched");
+  });
+
+  it("a lower rank counts as down even when the attempt is dearer", () => {
+    const low = rung("fast", "openai/gpt-6-luna-fast", "medium", 9, 0);
+    const high = rung("medium", "anthropic/claude-sonnet-5-5", "xhigh", 8, 1);
+    const ladder: Ladder = { candidates: [low, high], next: [null, null], classRank: 1, excluded: [] };
+    const store = (n: number) => fakeStore({ p: { [keyOf(low)]: 1, [keyOf(high)]: 0.2 }, n: { [keyOf(low)]: n, [keyOf(high)]: 10 } });
+    const gated = decide(input({ ladder, store: store(0), chosen: chosenOf(high), facts: mediumFacts() }));
+    expect(gated.best?.key).toBe(keyOf(low));
+    expect(gated.reasonCode).toBe("kept:evidence");
+    expect(decide(input({ ladder, store: store(6), chosen: chosenOf(high), facts: mediumFacts() })).reasonCode).toBe("switched");
+  });
+
+  it("margin is checked first: a best that does not clear the margin reports kept:margin, not kept:evidence", () => {
+    const { ladder, b } = pairLadder(7, 8);
+    const store = fakeStore({ p: { [keyOf(ladder.candidates[0]!)]: 1, [keyOf(b)]: 1 } });
+    expect(decide(input({ ladder, store, chosen: chosenOf(b) })).reasonCode).toBe("kept:margin");
+  });
+
+  it("hasMinEvidence: the strength of a prior, with only float jitter forgiven", () => {
+    expect(MIN_EVIDENCE_TO_SWITCH_DOWN).toBe(5);
+    expect(hasMinEvidence(5)).toBe(true);
+    expect(hasMinEvidence(4.9999999)).toBe(true);
+    expect(hasMinEvidence(4.99)).toBe(false);
+    expect(hasMinEvidence(0)).toBe(false);
+    expect(hasMinEvidence(Number.NaN)).toBe(false);
+  });
+});
 describe("D9 / D13 pin", () => {
   it("pin → kept, pinned: true, best still computed", () => {
     const d = decide(input({ pin: true }));
@@ -389,7 +468,10 @@ describe("D9 / D13 pin", () => {
 
 describe("D9 never down a rank when risk == high and d == none", () => {
   const store = (): FakeStore =>
-    fakeStore({ p: { [keyOf(FAST)]: 0.99, [keyOf(MEDIUM)]: 0.9, [keyOf(HEAVY)]: 0.95 } });
+    fakeStore({
+      p: { [keyOf(FAST)]: 0.99, [keyOf(MEDIUM)]: 0.9, [keyOf(HEAVY)]: 0.95 },
+      n: { [keyOf(FAST)]: 10, [keyOf(MEDIUM)]: 10, [keyOf(HEAVY)]: 10 },
+    });
 
   it("keeps the chosen rank; lower ranks are ineligible", () => {
     const d = decide(input({ store: store(), detection: "none", chosen: chosenOf(MEDIUM) }));
