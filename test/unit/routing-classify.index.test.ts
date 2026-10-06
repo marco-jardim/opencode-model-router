@@ -20,6 +20,7 @@ import {
   type HostGenerate,
   type TaskClass,
 } from "../../src/routing/classify";
+import { hasCredentialSignal, scrubState } from "../../src/routing/classify/scrub";
 import { createHostBackend } from "../../src/routing/classify/backends/host";
 import { createTypeSafeBackend } from "../../src/routing/classify/backends/typesafe";
 
@@ -684,6 +685,119 @@ describe("credential policy gate (QA-1.2-1)", () => {
     expect(results.map((r) => r.trace.backendSkipped)).toEqual([undefined, "credentials", undefined]);
     expect(results.map((r) => r.trace.backend?.label)).toEqual(["debug", undefined, "debug"]);
     expect(results.map((r) => r.facts.class)).toEqual(["other", "other", "other"]);
+  });
+});
+
+/**
+ * DF3 (2026-10-06): the credential gate was suspected of a false positive on the live classifier probe. It was not: the probe's
+ * own row (20:34:08Z) shows the host backend ran (`trace.backend` = host/ok/other, 1688 ms); the `backendSkipped: "credentials"`
+ * rows read as the probe's belonged to another session writing the same `decisions.jsonl`, dispatching long briefs that name
+ * credentials. These tests pin both sides of the D14 gate so the next reading of a live row has something to compare against.
+ *
+ * The rule (QA-1.2-1, QA-1.2-26): the backend is skipped for a task whose description or prompt (a) contains a credential word
+ * as a whole word (password, passwd, passphrase, secret, credential, api/access/private/ssh/signing key, token, bearer,
+ * authorization, oauth), (b) names an env-style secret (`X_TOKEN`, `X_SECRET`, `X_PASSWORD`, `X_API_KEY`, `*_KEY` in capitals,
+ * `.env`), (c) carries a PEM header, or (d) contains anything the scrubber redacts by name or shape (assignment, URL
+ * credentials, provider token). An entropy-only redaction (a commit hash, a long identifier) does not skip. "token" gates in its
+ * LLM sense too ("fix the token counter"): the text cannot tell the two apart, a false skip costs only the rules facts, a false
+ * pass sends a credential off the machine.
+ */
+describe("credential policy gate: DF3 probe, ordinary prompts, real secrets (QA-1.2-1, DF3)", () => {
+  const PROBE_PROMPT = 'Which word is longer, "alpha" or "omega"? Reply with one word only, no tools.';
+  const PROBE_DESCRIPTION = "DF3 classifier probe 2";
+
+  it("the DF3 probe is not a credential signal and reaches the backend (the live row: other, 0.2, host ok)", async () => {
+    expect(hasCredentialSignal(PROBE_DESCRIPTION + "\n" + PROBE_PROMPT)).toBe(false);
+    expect(scrubState(PROBE_DESCRIPTION + "\n" + PROBE_PROMPT)).toBe(PROBE_DESCRIPTION + "\n" + PROBE_PROMPT);
+
+    const { backend, classifyFn } = fakeBackend(() => okResult("other", 0.2));
+    const result = await classify(input(PROBE_PROMPT, { description: PROBE_DESCRIPTION }), makeDeps(backend));
+    expect(classifyFn).toHaveBeenCalledTimes(1);
+    expect(result.trace.backendSkipped).toBeUndefined();
+    expect(result.trace.backend).toMatchObject({ id: "host", status: "ok", label: "other" });
+    // Exactly the facts of the live row at 20:34:08Z: the rules class stands when the backend says `other`.
+    expect(result.facts).toEqual({ class: "other", risk: "medium", scope: "single", needs: [], confidence: 0.2, source: "rules" });
+  });
+
+  it("the probe in a batch (the /annotate-plan path, one backend call for the whole plan) is not skipped either", async () => {
+    const { backend, classifyManyFn } = fakeBackend(
+      () => okResult("other"),
+      () => [okResult("other", 0.2), okResult("other", 0.2)],
+    );
+    const results = await classifyMany(
+      [input(PROBE_PROMPT, { description: PROBE_DESCRIPTION }), input(PROBE_PROMPT, { description: "DF3 classifier probe 1" })],
+      makeDeps(backend),
+    );
+    expect(classifyManyFn).toHaveBeenCalledTimes(1);
+    expect(classifyManyFn.mock.calls[0]![0]).toHaveLength(2);
+    expect(results.map((r) => r.trace.backendSkipped)).toEqual([undefined, undefined]);
+    expect(results.map((r) => r.trace.backend?.status)).toEqual(["ok", "ok"]);
+  });
+
+  it("a long brief that names the credential gate is skipped, as designed (what the other session's rows were)", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+    const brief = [
+      "Diagnose and fix a suspected false positive in the classifier's credential policy gate.",
+      "Real secrets and keys must still gate: a token, a password or an API key never leaves the machine.",
+    ].join("\n");
+    const result = await classify(input(brief), makeDeps(backend));
+    expect(classifyFn).not.toHaveBeenCalled();
+    expect(result.trace.backendSkipped).toBe("credentials");
+  });
+
+  // [prompt, gates]: `gates` is the D14 judgement of the rule above, not a measurement of what the rules would call it.
+  const ORDINARY: ReadonlyArray<readonly [string, boolean]> = [
+    ["fix the token counter in stats.ts", true], // the word "token": an LLM token is indistinguishable from a credential; conservative on purpose
+    ["rename the password field label in the login form", true], // names a credential
+    ["review the API key rotation doc", true], // names a credential
+    ["refactor the Authorization middleware", true], // names the Authorization header
+    ["add a unit test for the pricing table in src/routing/engine/ladders.ts", false],
+    ["add a composite primary key to the users table migration", false], // `key` alone is prose (only api/access/private/ssh/signing key, or `X_KEY`)
+    ["change the cache key to include the model id", false],
+    ["explain why the build fails on Windows with ENOENT in scripts/build.mjs", false],
+    ["bump vitest to the latest minor and fix the type errors", false],
+    ["write a short summary of the retry logic", false],
+  ];
+
+  it("ten ordinary engineering prompts: only those that name a credential gate", () => {
+    expect(ORDINARY).toHaveLength(10);
+    for (const [prompt, gates] of ORDINARY) {
+      expect(hasCredentialSignal(prompt), prompt).toBe(gates);
+    }
+  });
+
+  it("through classify: a gated prompt never reaches the backend, an ungated one does when the rules are unsure", async () => {
+    for (const [prompt, gates] of ORDINARY) {
+      const { backend, classifyFn } = fakeBackend(() => okResult("other"));
+      const result = await classify(input(prompt), makeDeps(backend));
+      const unsure = result.trace.rules.confidence < 0.7;
+      expect(classifyFn.mock.calls.length, prompt).toBe(gates || !unsure ? 0 : 1);
+      expect(result.trace.backendSkipped, prompt).toBe(gates && unsure ? "credentials" : undefined);
+    }
+  });
+
+  // Built at run time (like STRIPE_KEY): the repository carries no literal that looks like a key.
+  const REAL_SECRETS: ReadonlyArray<readonly [string, string]> = [
+    ["OpenAI project key", ["sk", "proj", "A1b2C3d4E5f6G7h8I9j0K1l2"].join("-")],
+    ["Anthropic key", ["sk", "ant", "api03", "A1b2C3d4E5f6G7h8I9j0K1l2"].join("-")],
+    ["GitHub token", ["ghp", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"].join("_")],
+    ["AWS access key id", "AKIA" + "IOSFODNN7EXAMPLE"],
+    ["named assignment", "password" + "=" + "hunter2"],
+    ["PEM header", "-----BEGIN " + "OPENSSH PRIVATE KEY-----"],
+    ["Stripe key", STRIPE_KEY],
+  ];
+
+  it("real secrets gate, alone and inside an otherwise ordinary prompt", async () => {
+    for (const [label, secret] of REAL_SECRETS) {
+      expect(hasCredentialSignal(secret), label).toBe(true);
+      const prompt = `hello, write a short summary of this: ${secret}`;
+      expect(hasCredentialSignal(prompt), label).toBe(true);
+      const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+      const result = await classify(input(prompt), makeDeps(backend));
+      expect(classifyFn, label).not.toHaveBeenCalled();
+      expect(result.trace.backend, label).toBeNull();
+      expect(result.trace.backendSkipped, label).toBe("credentials");
+    }
   });
 });
 describe("classify — route-line smuggling (QA-1.2-2)", () => {
