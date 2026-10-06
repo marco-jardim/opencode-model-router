@@ -1,42 +1,46 @@
 {
   "scenario": "8-live-store-untouched",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
-  "recordedAt": "2026-10-06T23:31:12.600Z",
+  "runId": "f4083c26-705d-4070-8558-9326793a280c",
+  "recordedAt": "2026-10-06T23:53:05.867Z",
   "harness": {
-    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "headSha": "2979423676eee1df3da15005d0b661b1eddeec73",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
-      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+      "test/smoke/routing-engine.smoke.test.ts": "126867764c605441b797450582c1e63125a36027",
+      "test/smoke/helpers/routing-host.ts": "4a6e339cb1ba4dfafef27b4cf440c37caffdd5b6"
     },
     "uncommittedChanges": false
   },
-  "expectation": "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl and no `ses_<id>.scorecard.log` it gained or grew names a session of this run (ids from every host's own session.created events). The user's config files are unchanged.",
+  "expectation": "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl and no `ses_<id>.scorecard.log` it gained or grew names a session of this run (ids from every host's own session.created events), and no `advisor-notice.<hash>` file it gained or changed is the hash of a project directory of this run (`noticeFiles()`). The user's config files are unchanged.",
   "observed": {
-    "snapshotTakenAt": "2026-10-06T23:26:09.227Z",
+    "snapshotTakenAt": "2026-10-06T23:51:17.419Z",
     "liveStore": {
       "dir": "<tmpdir>/opencode-model-router-trajectory",
-      "filesBefore": 14003,
-      "filesAfter": 14005,
-      "bytesBefore": 4649334,
-      "bytesAfter": 4653420,
-      "added": 2,
+      "filesBefore": 14007,
+      "filesAfter": 14007,
+      "bytesBefore": 4663118,
+      "bytesAfter": 4667855,
+      "added": 0,
       "addedNonSession": [],
       "removed": [],
       "grownFiles": [
-        "decisions.jsonl",
-        "outcomes.json"
+        "decisions.jsonl"
       ],
       "grownSessionFiles": 0
     },
+    "liveNoticeFiles": {
+      "addedOrChanged": 0,
+      "namingAProjectOfThisRun": 0,
+      "projectDirsOfThisRunChecked": 4
+    },
     "liveScorecards": {
-      "addedOrGrown": 2,
+      "addedOrGrown": 0,
       "namingASessionOfThisRun": 0
     },
     "liveDecisionsLog": {
       "appendedRows": 3,
       "rowsNamingASessionOfThisRun": 0,
-      "sessionsOfThisRunSeen": 50
+      "sessionsOfThisRunSeen": 8
     },
     "liveConfig": {
       "dir": "~/.config/opencode",
@@ -49,6 +53,6 @@
       ]
     }
   },
-  "assertionResult": "PASS: live store 14003 -> 14005 files (+2 new, 2 of them ses_ scorecards, non-ses_ new: none); 3 row(s) appended to the live decisions.jsonl, 0 naming a session of this run, 2 scorecard(s) added or grown, 0 naming one (50 sessions of this run seen); config files changed: none",
+  "assertionResult": "PASS: live store 14007 -> 14007 files (+0 new, 0 of them ses_ scorecards, non-ses_ new: none); 3 row(s) appended to the live decisions.jsonl, 0 naming a session of this run, 0 scorecard(s) added or grown, 0 naming one (8 sessions of this run seen); 0 notice file(s) added or changed, 0 named after one of the 4 project directories of this run; config files changed: none",
   "notes": []
 }

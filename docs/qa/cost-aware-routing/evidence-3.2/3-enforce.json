@@ -1,24 +1,24 @@
 {
   "scenario": "3-enforce",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
-  "recordedAt": "2026-10-06T23:27:15.645Z",
+  "runId": "f4083c26-705d-4070-8558-9326793a280c",
+  "recordedAt": "2026-10-06T23:51:50.588Z",
   "harness": {
-    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "headSha": "2979423676eee1df3da15005d0b661b1eddeec73",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
-      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+      "test/smoke/routing-engine.smoke.test.ts": "126867764c605441b797450582c1e63125a36027",
+      "test/smoke/helpers/routing-host.ts": "4a6e339cb1ba4dfafef27b4cf440c37caffdd5b6"
     },
     "uncommittedChanges": false
   },
   "expectation": "engine=enforce: the orchestrator asks for heavy on a search task with no acceptance block; the engine swaps it to fast (sonnet-5-5#low). The CHILD SESSION held by the host has agent fast and model sonnet-5-5 variant low, the provider received that model with effort low, the row says switched=true, and the step record lands under the fast key.",
   "observed": {
-    "rootID": "ses_eec758508ffef69ymrTyYlKV95",
-    "childID": "ses_eec7583e4ffesp5DDVT0T21WUb",
+    "rootID": "ses_eec5f0410ffeU10ooO2L1CmvZH",
+    "childID": "ses_eec5f02c4ffeOVfST4vBX58znF",
     "hookBeforeInput": {
       "agent": "fast",
       "description": "Find usages",
-      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
+      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-AZMW7o\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
       "background": false,
       "model": "anthropic/claude-sonnet-5-5#low"
     },
@@ -29,7 +29,7 @@
         "providerID": "anthropic",
         "variant": "low"
       },
-      "parentID": "ses_eec758508ffef69ymrTyYlKV95",
+      "parentID": "ses_eec5f0410ffeU10ooO2L1CmvZH",
       "tokens": {
         "input": 7423,
         "output": 5,
@@ -42,7 +42,7 @@
     },
     "hostListedChildren": [
       {
-        "id": "ses_eec7583e4ffesp5DDVT0T21WUb",
+        "id": "ses_eec5f02c4ffeOVfST4vBX58znF",
         "agent": "fast",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -61,10 +61,10 @@
     ],
     "row": {
       "v": 1,
-      "ts": "2026-10-06T23:26:45.218Z",
-      "sessionID": "ses_eec758508ffef69ymrTyYlKV95",
+      "ts": "2026-10-06T23:51:20.063Z",
+      "sessionID": "ses_eec5f0410ffeU10ooO2L1CmvZH",
       "kind": "decision",
-      "decisionID": "ses_eec758508ffef69ymrTyYlKV95:1791329205217:1",
+      "decisionID": "ses_eec5f0410ffeU10ooO2L1CmvZH:1791330680062:1",
       "mode": "enforce",
       "childSessionID": null,
       "facts": {
@@ -93,9 +93,9 @@
       "pinned": false,
       "unit": "ratio",
       "costs": {
-        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.164540152670744,
-        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737508455,
-        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.1906001774076,
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645401870669345,
+        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.78664473751036,
+        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600217376918,
         "search|host:explore|anthropic/claude-opus-4-7#default": 1.8226999999999998,
         "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
       },
