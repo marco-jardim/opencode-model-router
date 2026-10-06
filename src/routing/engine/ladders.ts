@@ -19,15 +19,17 @@ import {
   resolveCandidates,
   resolvePresetName,
   type ResolvedRouting,
+  type ResolvedCandidate,
   type RouterConfig,
   type TierConfig,
 } from "../../router/config";
-import { buildEscalatePolicy } from "../../escalate/ladder";
+import { buildEscalatePolicy, type EscalatePolicy, type LadderSessionPolicyInput } from "../../escalate/ladder";
 import { variantCovered } from "../../escalate/variants";
 import { CLASS_STATIC_TIER, NEEDS, type Need, type TaskFacts } from "../classify/types";
 import { classifyAgentOrigin, normalizeVariant, splitModelRef } from "../outcomes/types";
 import type { AgentRef, ModelPricing } from "../outcomes/types";
 import { coversNeeds } from "./kernel";
+import { simulateRunner, type RunnerRung } from "./simulate";
 import type {
   Candidate,
   ChosenDispatch,
@@ -65,7 +67,10 @@ export function routerTierIds(cfg: RouterConfig): readonly string[] {
  * for the runtime ladder.
  */
 export function escalateLadder(cfg: RouterConfig): readonly string[] {
-  const raw: unknown = buildEscalatePolicy(cfg).ladder;
+  return ladderOf(cfg, buildEscalatePolicy(cfg).ladder);
+}
+
+function ladderOf(cfg: RouterConfig, raw: unknown): readonly string[] {
   if (!Array.isArray(raw)) return [];
   const out: string[] = [];
   for (const tier of raw) {
@@ -141,9 +146,10 @@ function firstUncovered(
   k: Candidate,
   following: readonly number[],
   all: readonly Candidate[],
+  skipCovered = true,
 ): number | null {
   for (const j of following) {
-    if (!skippedAfter(cfg, k, all[j]!)) return j;
+    if (!skipCovered || !skippedAfter(cfg, k, all[j]!)) return j;
   }
   return null;
 }
@@ -164,6 +170,11 @@ export interface LadderBuildInput {
   readonly parentModel?: string | null;
   /** Receives one line per failed pricing lookup; its own failures are swallowed. */
   readonly logger?: { warn(message: string): void };
+  /**
+   * The input the 1.5 runner's policy is built with (`buildEscalatePolicy(cfg, session)`: host, catalog,
+   * `variantSteps`, `maxContextFraction`). Absent = no variant steps, as on v1 or without a catalog (A25).
+   */
+  readonly session?: LadderSessionPolicyInput;
 }
 
 function normalizedVariant(variant: string | null | undefined): string | null {
@@ -229,27 +240,63 @@ function modelOfAgent(info: HostAgentInfo, parentModel: string | null | undefine
   return nonEmpty(info.model) ?? nonEmpty(parentModel);
 }
 
+/** The base rung of a tier: its own model, variant and ratio (the rung `resolveCandidates` lists for it). */
+function tierBaseRung(cfg: RouterConfig, tier: string): RunnerRung | undefined {
+  const config = tierConfigOf(cfg, tier);
+  if (config === undefined || typeof config.model !== "string") return undefined;
+  const variant = normalizedVariant(config.variant);
+  const rungs = resolveCandidates(tier, cfg);
+  const own = rungs.find((rung) => sameRung({ model: rung.model, variant: normalizedVariant(rung.variant) }, { model: config.model, variant }));
+  const costRatio = (own ?? rungs[0])?.costRatio;
+  return costRatio === undefined ? undefined : { tier, model: config.model, variant, costRatio };
+}
+
+/**
+ * A25: the rungs of a tier the 1.5 runner can walk — the ones on the tier's own model. A `candidates` rung on
+ * another model is escalation territory: the runner never runs it, so it is not modelled (`dropped`).
+ */
+function modelledRungs(cfg: RouterConfig, tier: string): { readonly kept: readonly ResolvedCandidate[]; readonly dropped: readonly ResolvedCandidate[] } {
+  const model = tierConfigOf(cfg, tier)?.model;
+  const rungs = resolveCandidates(tier, cfg);
+  if (typeof model !== "string") return { kept: rungs, dropped: [] };
+  return { kept: rungs.filter((rung) => rung.model === model), dropped: rungs.filter((rung) => rung.model !== model) };
+}
+
 /**
  * Build the candidate graph of one decision (§3): the router rungs of the escalate ladder, then the role
  * agents of `facts.class` (D12) with their own-model rung and the owning tier's rungs.
+ *
+ * Router rungs (A25): every rung on the tier's own model; each carries the attempts the 1.5 runner makes
+ * from it — `Ladder.paths`, simulated with `buildEscalatePolicy(cfg, session)` and `nextAction`/`advance` —
+ * so the kernel prices retries, `maxTotalAttempts`, the cost ceiling and covered-tier skips as the runner
+ * performs them. Rungs only the runner reaches (variant steps) are `Ladder.reachable`, never `best`.
+ * `session` is the same input the runner's policy is built with (host, catalog, `variantSteps`); without it
+ * the policy has no variant steps, exactly as the runner would behave.
  *
  * Own-model rung of a role agent (D7, A25): when its `(model, variant)` matches a rung of the preset it takes
  * that rung's price AND `min(owningRank, matched.rank)` (an agent on the fast tier's model is a fast-ranked
  * candidate, whatever class it serves); the inherited rank of the owning tier applies only when no rung
  * matches. An agent without a configured model runs on the parent's model and gets its own-model rung there.
+ * A role chain is a static successor chain (own model, the owning tier's rungs, then the first router rung of
+ * the next tier above, entered as a fresh dispatch).
  *
  * Router rungs of a tier whose agent is `mode: primary`, hidden or not permitted are excluded
- * (`agent-unavailable`): they can never be `best`.
+ * (`agent-unavailable`): they can never be `best` (a simulated path may still pass through them).
  *
  * Never throws for well-typed input; an unknown preset or a ladder with no resolvable tier yields an empty
  * ladder (the kernel then reports `kept:no-candidates`).
  */
 export function buildLadder(input: LadderBuildInput): Ladder {
   const { cfg, facts, agents } = input;
-  const order = escalateLadder(cfg);
+  const policy: EscalatePolicy = buildEscalatePolicy(cfg, input.session);
+  const order = ladderOf(cfg, policy.ladder);
+  const rankOf = (tier: string | null | undefined): number | null => {
+    const rank = typeof tier === "string" ? order.indexOf(tier) : -1;
+    return rank >= 0 ? rank : null;
+  };
   const routerIds = routerTierIds(cfg);
   const owningTier = Object.hasOwn(CLASS_STATIC_TIER, facts.class) ? CLASS_STATIC_TIER[facts.class] : null;
-  const owningRank = tierRankOf(cfg, owningTier);
+  const owningRank = rankOf(owningTier);
   const excluded: ExcludedCandidate[] = [];
   const excludedOf = (id: string, why: ExclusionReason, info: HostAgentInfo | undefined): void => {
     const ref = typeof info?.model === "string" ? splitModelRef(info.model) : null;
@@ -262,7 +309,7 @@ export function buildLadder(input: LadderBuildInput): Ladder {
   };
 
   // --- router block --------------------------------------------------------------------------------
-  /** Every rung of the preset (available or not): the price/rank table of the own-model rungs. */
+  /** Every rung of the preset, modelled or not, available or not: the price/rank table of own-model rungs. */
   const presetRungs: Candidate[] = [];
   const candidates: Candidate[] = [];
   const next: (number | null)[] = [];
@@ -270,18 +317,25 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     const info = agents?.find((agent) => agent.id === tier);
     const unavailable = info !== undefined && agentUnavailable(info);
     const grants = info?.grants ?? null;
-    for (const rung of resolveCandidates(tier, cfg)) {
-      const candidate: Candidate = {
-        agent: { origin: "router", id: tier },
-        model: rung.model,
-        variant: normalizedVariant(rung.variant),
-        costRatio: rung.costRatio,
-        rank,
-        tier,
-        source: "tier",
-        grants,
-        ...priced(input, rung.model),
-      };
+    const { kept, dropped } = modelledRungs(cfg, tier);
+    const routerRung = (rung: ResolvedCandidate): Candidate => ({
+      agent: { origin: "router", id: tier },
+      model: rung.model,
+      variant: normalizedVariant(rung.variant),
+      costRatio: rung.costRatio,
+      rank,
+      tier,
+      source: "tier",
+      grants,
+      ...priced(input, rung.model),
+    });
+    for (const rung of dropped) {
+      const candidate = routerRung(rung);
+      presetRungs.push(candidate);
+      excluded.push({ agent: candidate.agent, model: candidate.model, variant: candidate.variant, why: "not-modelled" });
+    }
+    for (const rung of kept) {
+      const candidate = routerRung(rung);
       presetRungs.push(candidate);
       if (unavailable) {
         excluded.push({ agent: candidate.agent, model: candidate.model, variant: candidate.variant, why: "agent-unavailable" });
@@ -291,18 +345,16 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     }
   });
   const routerCount = candidates.length;
+  for (let k = 0; k < routerCount; k++) next.push(null); // router rungs are priced through `paths` (below)
+
+  // --- role chains ---------------------------------------------------------------------------------
   const indexes = (from: number, to: number): number[] => {
     const out: number[] = [];
     for (let i = from; i < to; i++) out.push(i);
     return out;
   };
-  for (let k = 0; k < routerCount; k++) {
-    next.push(firstUncovered(cfg, candidates[k]!, indexes(k + 1, routerCount), candidates));
-  }
-
-  // --- role chains ---------------------------------------------------------------------------------
   const roleIds = ownRoles(input.routing.roles, facts.class);
-  const tierRungs = owningTier !== null && owningRank !== null ? resolveCandidates(owningTier, cfg) : [];
+  const tierRungs = owningTier !== null && owningRank !== null ? modelledRungs(cfg, owningTier).kept : [];
   const firstTierRung = tierRungs[0];
   for (const id of roleIds) {
     const info = agents?.find((agent) => agent.id === id);
@@ -363,14 +415,58 @@ export function buildLadder(input: LadderBuildInput): Ladder {
       chain.push(candidate);
     }
 
-    // After the chain, the cascade continues with the router rungs of the tiers above the owning tier.
+    // After the chain, the cascade continues with the router rungs of the tiers above the owning tier; like
+    // the runner, coverage skips apply there only when the policy has variant info.
     const above: number[] = [];
     for (let j = 0; j < routerCount; j++) if (candidates[j]!.rank > owningRank) above.push(j);
     candidates.push(...chain);
     for (let position = 0; position < chain.length; position++) {
-      const following = [...indexes(chainStart + position + 1, chainStart + chain.length), ...above];
-      next.push(firstUncovered(cfg, candidates[chainStart + position]!, following, candidates));
+      const k = candidates[chainStart + position]!;
+      const inChain = firstUncovered(cfg, k, indexes(chainStart + position + 1, chainStart + chain.length), candidates);
+      next.push(inChain ?? firstUncovered(cfg, k, above, candidates, policy.variants != null));
     }
+  }
+
+  // --- simulated runner paths (A25) --------------------------------------------------------------------
+  const reachable: Candidate[] = [];
+  const paths: (number[] | null)[] = candidates.map(() => null);
+  const tierBase = (tier: string): RunnerRung | undefined => tierBaseRung(cfg, tier);
+  const indexOfRung = (rung: RunnerRung): number | null => {
+    const same = (c: Candidate): boolean => c.tier === rung.tier && c.agent.origin === "router" && sameRung(c, rung);
+    for (let j = 0; j < routerCount; j++) if (same(candidates[j]!)) return j;
+    const known = reachable.findIndex(same);
+    if (known >= 0) return candidates.length + known;
+    const rank = rankOf(rung.tier);
+    if (rank === null) return null;
+    reachable.push({
+      agent: { origin: "router", id: rung.tier },
+      model: rung.model,
+      variant: rung.variant,
+      costRatio: rung.costRatio,
+      rank,
+      tier: rung.tier,
+      source: "tier",
+      grants: agents?.find((agent) => agent.id === rung.tier)?.grants ?? null,
+      ...priced(input, rung.model),
+    });
+    return candidates.length + reachable.length - 1;
+  };
+  for (let k = 0; k < routerCount; k++) {
+    const start = candidates[k]!;
+    const attempts = simulateRunner(policy, tierBase, {
+      tier: start.tier,
+      model: start.model,
+      variant: start.variant,
+      costRatio: start.costRatio,
+    });
+    const path: number[] = [];
+    for (const attempt of attempts) {
+      const j = indexOfRung(attempt);
+      if (j === null) break;
+      path.push(j);
+    }
+    // A router rung is priced through its path; its `next` stays null (a path is not a pointer chain).
+    paths[k] = path.length > 0 ? path : null;
   }
 
   return {
@@ -378,6 +474,8 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     next,
     classRank: owningRank,
     excluded,
+    ...(reachable.length > 0 ? { reachable } : {}),
+    paths,
   };
 }
 // ---------------------------------------------------------------------------

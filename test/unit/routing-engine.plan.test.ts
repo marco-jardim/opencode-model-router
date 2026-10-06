@@ -399,18 +399,36 @@ describe("annotateSteps — evidence moves the engine tier", () => {
     expect(out[0]!.decision?.reasonCode).toBe("kept:class-confidence");
   });
 
-  it("the argmin must itself carry evidence: a cheaper rung with no data does not move the step", async () => {
-    // Medium passes 20×, heavy fails 20×, but fast (the kernel's argmin on priors) has no data: stays heavy.
+  it("a down switch to a rung with no recorded outcomes is refused by the kernel itself (A24, kept:evidence)", async () => {
+    // heavy fails 20×, but the cheaper rungs have no data at all: the priors alone never move the step down.
     const store = createOutcomeStore();
     for (let i = 0; i < 20; i++) store.recordVerdict(HEAVY_KEY, "fail", { attemptID: `h${i}`, step: "dispatch" });
-    for (let i = 0; i < 20; i++) store.recordVerdict(MEDIUM_KEY, "pass", { attemptID: `m${i}`, step: "dispatch" });
     const out = await annotateSteps([designStep], stubDeps(designFacts, { store }));
-    // The kernel itself (A24) refuses the down switch to `fast`: it has no recorded outcomes.
     expect(out[0]!.decision?.reasonCode).toBe("kept:evidence");
-    expect(out[0]!.decision?.best?.agent).toBe("fast");
+    expect(out[0]!.decision?.best?.agent).not.toBe("heavy");
     expect(out[0]!.tier).toBe("heavy");
   });
 
+  it("an up switch is not gated by the kernel, but the plan still wants evidence on the winner", async () => {
+    const FAST_SEARCH = "search|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey;
+    const MEDIUM_SEARCH = "search|router:medium|anthropic/claude-sonnet-5-5#medium" as OutcomeKey;
+    const searchStep = step("s", `Search the repo\n${ACCEPT_TESTS}`);
+    const searchFacts = () => facts("search", { risk: "high" }); // a costly give-up makes the dearer, reliable rung worth it
+    const store = (mediumPasses: number) => {
+      const s = createOutcomeStore();
+      for (let i = 0; i < 20; i++) s.recordVerdict(FAST_SEARCH, "fail", { attemptID: `f${i}`, step: "dispatch" });
+      for (let i = 0; i < mediumPasses; i++) s.recordVerdict(MEDIUM_SEARCH, "pass", { attemptID: `m${i}`, step: "dispatch" });
+      return s;
+    };
+    const backed = await annotateSteps([searchStep], stubDeps(searchFacts, { store: store(20) }));
+    expect(backed[0]!.decision?.reasonCode).toBe("switched");
+    expect(backed[0]!.decision?.best?.agent).toBe("medium");
+    expect(backed[0]!.tier).toBe("medium");
+    const bare = await annotateSteps([searchStep], stubDeps(searchFacts, { store: store(0) }));
+    expect(bare[0]!.decision?.switched).toBe(true); // the kernel does not gate a switch up ...
+    expect(bare[0]!.decision?.best?.agent).not.toBe("fast");
+    expect(bare[0]!.tier).toBe("fast"); // ... the plan keeps the static tier until the winner has data
+  });
   it("weak evidence (n < 5) and a missing store keep the static tier even if the kernel would switch on priors", async () => {
     const weak = await annotateSteps([designStep], stubDeps(designFacts, { store: storeWith(3, 3) }));
     expect(weak[0]!.tier).toBe("heavy");

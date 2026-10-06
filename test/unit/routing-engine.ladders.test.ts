@@ -7,15 +7,18 @@ import {
   resolveChosen,
   tierRankOf,
 } from "../../src/routing/engine/ladders";
-import { decide } from "../../src/routing/engine/kernel";
+import { candidateKey, decide } from "../../src/routing/engine/kernel";
 import type { HostAgentInfo, Ladder } from "../../src/routing/engine/types";
 import { DEFAULT_V2_ROLES, resolveRouting } from "../../src/router/config";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
+import { buildEscalatePolicy, type LadderSessionPolicyInput } from "../../src/escalate/ladder";
+import type { CatalogModel } from "../../src/escalate/variants";
 import { CLASS_STATIC_TIER, NEEDS, TASK_CLASSES } from "../../src/routing/classify/types";
 import type { Need, TaskClass, TaskFacts } from "../../src/routing/classify/types";
 import type { ModelPricing } from "../../src/routing/outcomes/types";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
-import type { DecisionInput } from "../../src/routing/engine/types";
+import type { DecisionInput, EngineStoreView } from "../../src/routing/engine/types";
+import { emptyCostStats } from "../../src/routing/outcomes/cost";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -63,6 +66,25 @@ const GENERAL = nativeAgent("general", SONNET, ["shell", "web", "edit", "network
 
 /** The D12 v2 default roles (the 1.1 resolution), not a hand-copied table. */
 const V2_ROLES = resolveRouting(plainCfg(), "v2").roles;
+
+/** Live variant lists of Phase 0.P S4, as in ladder.session.test.ts. */
+const entryOf = (variants: string[]): CatalogModel => ({ variants: variants.map((id) => ({ id })), limit: { input: 1_000_000 } });
+const CATALOG: Record<string, CatalogModel> = {
+  [SONNET]: entryOf(["low", "medium", "high", "xhigh", "max"]),
+  [OPUS]: entryOf(["low", "medium", "high", "xhigh", "max"]),
+  [HAIKU]: entryOf(["high", "max"]),
+};
+const catalog = (model: string): CatalogModel | undefined => (Object.hasOwn(CATALOG, model) ? CATALOG[model] : undefined);
+
+/** The attempts of each candidate's simulated runner path, as `tier#variant` (`~` = a rung only the runner reaches). */
+function pathsOf(ladder: Ladder): string[][] {
+  const label = (index: number): string => {
+    const reachable = index >= ladder.candidates.length;
+    const c = reachable ? ladder.reachable![index - ladder.candidates.length]! : ladder.candidates[index]!;
+    return `${reachable ? "~" : ""}${c.tier}#${c.variant ?? "default"}`;
+  };
+  return ladder.candidates.map((_, k) => (ladder.paths?.[k] ?? []).map(label));
+}
 
 function summary(ladder: Ladder): string[] {
   return ladder.candidates.map((c, k) => `${c.agent.origin}:${c.agent.id} ${c.model}#${c.variant ?? "default"} r${c.rank} ->${ladder.next[k] ?? "end"}`);
@@ -115,18 +137,29 @@ describe("grantsFromTools (A11)", () => {
 // Router rungs
 // ---------------------------------------------------------------------------
 
-describe("buildLadder — router rungs", () => {
-  it("single-candidate tiers: one rung per tier, next = the next tier's first rung, last gives up", () => {
+describe("buildLadder — router rungs and the simulated runner (A25)", () => {
+  it("single-candidate tiers: one rung per tier, each priced through the runner's own cascade", () => {
     const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
     expect(summary(ladder)).toEqual([
-      `router:fast ${SONNET}#low r0 ->1`,
-      `router:medium ${SONNET}#medium r1 ->2`,
+      `router:fast ${SONNET}#low r0 ->end`,
+      `router:medium ${SONNET}#medium r1 ->end`,
       `router:heavy ${OPUS}#xhigh r2 ->end`,
     ]);
     expect(ladder.candidates.map((c) => c.costRatio)).toEqual([1, 5, 20]);
     expect(ladder.candidates.every((c) => c.source === "tier" && c.grants !== null)).toBe(true);
     expect(ladder.classRank).toBe(1);
     expect(ladder.excluded).toEqual([]);
+    expect(ladder.reachable).toBeUndefined();
+  });
+
+  it("shipped-config case (ratios 1/5/20, cost ceiling 4): fast, fast retry, medium, then the runner gives up", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
+    // fast: 1, retry 1 (cum 2 ≤ 4), medium 5 (cum 7 > 4 × 1): the heavy tier is NOT on fast's cascade.
+    expect(pathsOf(ladder)[0]).toEqual(["fast#low", "fast#low", "medium#medium"]);
+    // medium: 5, retry 5, heavy 20 (cum 30 > 4 × 5): give up after heavy.
+    expect(pathsOf(ladder)[1]).toEqual(["medium#medium", "medium#medium", "heavy#xhigh"]);
+    // heavy: 20, retry 20, nothing above.
+    expect(pathsOf(ladder)[2]).toEqual(["heavy#xhigh", "heavy#xhigh"]);
   });
 
   it("classRank is the rank of the class's static tier; null for `other`", () => {
@@ -136,53 +169,117 @@ describe("buildLadder — router rungs", () => {
     expect(buildLadder({ ...base, facts: facts("other") }).classRank).toBeNull();
   });
 
-  it("variants before models: candidates are laid out in order and the next variant comes before the next tier", () => {
+  it("a policy that allows the plain cascade (no retries, no ceiling) walks fast → medium → heavy", () => {
+    const cfg = plainCfg({ enforcement: { escalate: { maxAttemptsPerTier: 0, costCeiling: { multiple: 1000 } } } });
+    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
+    expect(pathsOf(ladder)).toEqual([
+      ["fast#low", "medium#medium", "heavy#xhigh"],
+      ["medium#medium", "heavy#xhigh"],
+      ["heavy#xhigh"],
+    ]);
+  });
+
+  it("maxTotalAttempts and the cost ceiling end the path", () => {
+    const base = { routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() } as const;
+    const two = buildLadder({ ...base, cfg: plainCfg({ enforcement: { escalate: { maxAttemptsPerTier: 0, maxTotalAttempts: 2, costCeiling: { multiple: 1000 } } } }) });
+    expect(pathsOf(two)[0]).toEqual(["fast#low", "medium#medium"]);
+    const ceiling = buildLadder({ ...base, cfg: plainCfg({ enforcement: { escalate: { maxAttemptsPerTier: 0, maxTotalAttempts: 9, costCeiling: { multiple: 1.5 } } } }) });
+    expect(pathsOf(ceiling)[0]).toEqual(["fast#low", "medium#medium"]); // 1 + 5 > 1.5 × 1: give up after medium
+    const retries = buildLadder({ ...base, cfg: plainCfg({ enforcement: { escalate: { maxAttemptsPerTier: 2, maxTotalAttempts: 9, costCeiling: { multiple: 1000 } } } }) });
+    expect(pathsOf(retries)[0]).toEqual(["fast#low", "fast#low", "fast#low", "medium#medium", "medium#medium", "medium#medium", "heavy#xhigh", "heavy#xhigh", "heavy#xhigh"]);
+  });
+
+  it("floorTier lifts the start: a rung below the floor runs the floor tier's base", () => {
+    const cfg = plainCfg({ enforcement: { escalate: { floorTier: "medium", maxAttemptsPerTier: 0, costCeiling: { multiple: 1000 } } } });
+    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
+    expect(pathsOf(ladder)[0]).toEqual(["medium#medium", "heavy#xhigh"]);
+  });
+
+  it("explicit candidates of the tier's own model are laid out in order; an other-model rung is not modelled", () => {
     const cfg = cfgOf({
       fast: tier(HAIKU, "low", 1),
-      medium: tier(SONNET, "medium", 5, { candidates: [{ variant: "medium", costRatio: 5 }, { variant: "high", costRatio: 7 }] }),
+      medium: tier(SONNET, "medium", 5, { candidates: [{ variant: "medium", costRatio: 5 }, { variant: "high", costRatio: 7 }, { model: OPUS, variant: "high", costRatio: 9 }] }),
       heavy: tier(OPUS, "xhigh", 20),
     });
     const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
     expect(summary(ladder)).toEqual([
-      `router:fast ${HAIKU}#low r0 ->1`,
-      `router:medium ${SONNET}#medium r1 ->2`,
-      `router:medium ${SONNET}#high r1 ->3`,
+      `router:fast ${HAIKU}#low r0 ->end`,
+      `router:medium ${SONNET}#medium r1 ->end`,
+      `router:medium ${SONNET}#high r1 ->end`,
       `router:heavy ${OPUS}#xhigh r2 ->end`,
     ]);
     expect(ladder.candidates.map((c) => c.costRatio)).toEqual([1, 5, 7, 20]);
+    expect(ladder.excluded).toEqual([{ agent: { origin: "router", id: "medium" }, model: OPUS, variant: "high", why: "not-modelled" }]);
+    // Without variant info a dispatch on medium#high retries that same rung before the tier above.
+    expect(pathsOf(ladder)[2]).toEqual(["medium#high", "medium#high", "heavy#xhigh"]);
   });
 
-  it("a rung already covered by the one just tried is skipped (fast = sonnet#high, medium = sonnet#medium)", () => {
-    const cfg = cfgOf({
-      fast: tier(SONNET, "high", 1),
-      medium: tier(SONNET, "medium", 5),
-      heavy: tier(OPUS, "xhigh", 20),
-    });
-    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
-    expect(ladder.next).toEqual([2, 2, null]); // fast skips medium (covered by high); medium → heavy
-  });
+  describe("with variant info (a v2 catalog)", () => {
+    const session = { host: "v2", catalog } satisfies LadderSessionPolicyInput;
 
-  it("effort-configured tiers are never covered (A20)", () => {
-    const covered = cfgOf({
-      fast: tier(SONNET, "high", 1),
-      medium: tier(SONNET, "medium", 5),
-      heavy: tier(OPUS, "xhigh", 20),
+    it("the runner steps variants before escalating: the rungs only it reaches are `reachable`, never candidates", () => {
+      const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session });
+      expect(ladder.candidates).toHaveLength(3);
+      expect(pathsOf(ladder)[0]).toEqual(["fast#low", "~fast#medium", "~medium#high"]);
+      expect(ladder.reachable!.map((c) => `${c.tier}#${c.variant} x${c.costRatio} r${c.rank}`)).toEqual(
+        expect.arrayContaining(["fast#medium x1 r0", "medium#high x5 r1"]),
+      );
+      expect(ladder.reachable!.every((c) => c.source === "tier" && c.agent.origin === "router")).toBe(true);
     });
-    for (const effortTier of ["fast", "medium"]) {
-      const cfg = {
-        ...covered,
-        presets: { p: { ...covered.presets.p, [effortTier]: { ...covered.presets.p![effortTier]!, effort: "medium" as const } } },
+
+    it("a tier covered by a rung already tried on its model is skipped (A17a)", () => {
+      const cfg = cfgOf(
+        { fast: tier(SONNET, "xhigh", 1), medium: tier(SONNET, "medium", 5), heavy: tier(OPUS, "xhigh", 20) },
+        { enforcement: { escalate: { maxAttemptsPerTier: 0, costCeiling: { multiple: 1000 } } } },
+      );
+      const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session });
+      expect(pathsOf(ladder)[0]).toEqual(["fast#xhigh", "heavy#xhigh"]); // medium (sonnet#medium) adds nothing after sonnet#xhigh
+      expect(pathsOf(ladder)[1]).toEqual(["medium#medium", "~medium#high", "~medium#xhigh", "heavy#xhigh"]);
+    });
+
+    it("effort-configured tiers are never covered (A20)", () => {
+      const covered = (effortTier: string): RouterConfig => {
+        const tiers: Record<string, TierConfig> = {
+          fast: tier(SONNET, "xhigh", 1),
+          medium: tier(SONNET, "medium", 5),
+          heavy: tier(OPUS, "xhigh", 20),
+        };
+        tiers[effortTier] = { ...tiers[effortTier]!, effort: "medium" };
+        return cfgOf(tiers, { enforcement: { escalate: { maxAttemptsPerTier: 0, costCeiling: { multiple: 1000 } } } });
       };
+      for (const effortTier of ["fast", "medium"]) {
+        const ladder = buildLadder({ cfg: covered(effortTier), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session });
+        expect(pathsOf(ladder)[0]!.slice(0, 2), effortTier).toEqual(["fast#xhigh", "medium#medium"]);
+      }
+    });
+
+    it("A→B→A: a tier whose model the cascade already ran above it is not modelled (heavy after fast sonnet#high, medium opus#medium)", () => {
+      const cfg = cfgOf({
+        fast: tier(SONNET, "high", 1),
+        medium: tier(OPUS, "medium", 2),
+        heavy: tier(SONNET, "medium", 3, { candidates: [{ variant: "medium", costRatio: 3 }, { model: HAIKU, costRatio: 3 }] }),
+      });
+      const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session });
+      // fast: sonnet#high, variant step xhigh, then opus#medium, its next variant (the reserve keeps one attempt
+      // for the tier above, but heavy is covered by sonnet#xhigh and has no rung above it): heavy never runs.
+      expect(pathsOf(ladder)[0]).toEqual(["fast#high", "~fast#xhigh", "medium#medium", "~medium#high"]);
+      expect(pathsOf(ladder)[0]!.some((rung) => rung.startsWith("heavy"))).toBe(false);
+      // The other-model heavy rung (haiku) is not modelled at all.
+      expect(ladder.excluded).toEqual([{ agent: { origin: "router", id: "heavy" }, model: HAIKU, variant: null, why: "not-modelled" }]);
+      expect(ladder.candidates.map((c) => c.tier)).toEqual(["fast", "medium", "heavy"]);
+    });
+
+    it("no session, no variant info: the runner neither steps variants nor skips covered tiers", () => {
+      const cfg = cfgOf(
+        { fast: tier(SONNET, "xhigh", 1), medium: tier(SONNET, "medium", 5), heavy: tier(OPUS, "xhigh", 20) },
+        { enforcement: { escalate: { maxAttemptsPerTier: 0, costCeiling: { multiple: 1000 } } } },
+      );
       const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
-      expect(ladder.next, effortTier).toEqual([1, 2, null]);
-    }
+      expect(pathsOf(ladder)[0]).toEqual(["fast#xhigh", "medium#medium", "heavy#xhigh"]);
+      const v1 = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session: { host: "v1", catalog } });
+      expect(pathsOf(v1)[0]).toEqual(["fast#xhigh", "medium#medium", "heavy#xhigh"]);
+    });
   });
-
-  it("the same variant on the same model is covered even across tiers", () => {
-    const cfg = cfgOf({ fast: tier(SONNET, "low", 1), medium: tier(SONNET, "low", 5), heavy: tier(OPUS, "xhigh", 20) });
-    expect(buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() }).next).toEqual([2, 2, null]);
-  });
-
   it("router grants come from the supplied agents; null when agents are unavailable", () => {
     const cfg = plainCfg();
     const withGrants = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: [{ ...routerAgents(["fast"])[0]!, grants: ["web"] }, ...routerAgents(["medium"])] });
@@ -222,8 +319,8 @@ describe("buildLadder — roles with native agents (D12 default roles)", () => {
   it("explore: own model first (inherits fast's rank and ratio), then the fast ladder, then medium's first rung", () => {
     const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: V2_ROLES }, facts: facts("search"), agents });
     expect(summary(ladder)).toEqual([
-      `router:fast ${SONNET}#low r0 ->1`,
-      `router:medium ${SONNET}#medium r1 ->2`,
+      `router:fast ${SONNET}#low r0 ->end`,
+      `router:medium ${SONNET}#medium r1 ->end`,
       `router:heavy ${OPUS}#xhigh r2 ->end`,
       `host:explore ${HAIKU}#default r0 ->4`,
       `host:explore ${SONNET}#low r0 ->1`, // last rung of the chain → medium's first rung (coverage-skipped: medium#medium is not covered by #low)
@@ -610,6 +707,98 @@ describe("QA-1.4-10: a failing pricing lookup prices as unpriced", () => {
   });
 });
 // ---------------------------------------------------------------------------
+// A25: the plan's worked examples, re-checked against the simulated runner; speed
+// ---------------------------------------------------------------------------
+
+/** A store view with a fixed posterior mean per tier agent (and 10 recorded outcomes everywhere). */
+function tierStore(means: Readonly<Record<string, number>>): EngineStoreView {
+  return {
+    posterior: (key, prior = { alpha: 4, beta: 1 }) => {
+      const agent = /\|router:([^|]+)\|/.exec(key)?.[1];
+      const mean = agent !== undefined && Object.hasOwn(means, agent) ? means[agent]! : prior.alpha / (prior.alpha + prior.beta);
+      return { alpha: prior.alpha, beta: prior.beta, mean, n: 10, prior };
+    },
+    cost: () => emptyCostStats(),
+    classTokenProfile: () => null,
+  };
+}
+
+describe("A25 worked examples: p = (0.6, 0.9, 0.95), safe/high (U = 100), tiers 1 / 5 / 20", () => {
+  const routing = { profile: "safe", margin: 0.2, minClassConfidence: 0.7, detection: { deterministic: 1, grader: 0.5, none: 0.3 } } as const;
+  const store = tierStore({ fast: 0.6, medium: 0.9, heavy: 0.95 });
+  const f = { class: "implement", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+
+  function costs(cfg: RouterConfig, detection: "deterministic" | "grader", chosenAgent: string) {
+    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: f, agents: routerAgents() });
+    const chosen = resolveChosen({ cfg, agents: routerAgents(), agent: chosenAgent })!;
+    const d = decide({ facts: f, chosen, ladder, detection, pin: false, routing, store });
+    const byTier = (tierName: string): number => d.costs[`implement|router:${tierName}|${tierName === "heavy" ? OPUS : SONNET}#${tierName === "fast" ? "low" : tierName === "medium" ? "medium" : "xhigh"}`]!;
+    return { d, fast: byTier("fast"), medium: byTier("medium"), heavy: byTier("heavy") };
+  }
+
+  it("a policy that allows the plain cascade (maxAttemptsPerTier 0, no ceiling) reproduces the plan's numbers", () => {
+    const cfg = plainCfg({ enforcement: { escalate: { maxAttemptsPerTier: 0, costCeiling: { multiple: 1000 } } } });
+    const one = costs(cfg, "deterministic", "heavy");
+    expect([one.fast, one.medium, one.heavy].map((x) => Math.round(x * 1e9) / 1e9)).toEqual([4, 7.5, 25]);
+    expect(one.d.best?.agent).toBe("fast");
+    expect(one.d.switched).toBe(true);
+    const half = costs(cfg, "grader", "fast");
+    expect([half.fast, half.medium, half.heavy].map((x) => Math.round(x * 1e9) / 1e9)).toEqual([23.25, 11.25, 25]);
+    expect(half.d.best?.agent).toBe("medium");
+  });
+
+  it("under the shipped policy (one retry per tier, cost ceiling 4×) the same p's price the runner's real cascade", () => {
+    const shipped = plainCfg();
+    const one = costs(shipped, "deterministic", "heavy");
+    // fast = f, f, m · medium = m, m, h · heavy = h, h  (see the kernel test "prices the attempts the runner makes")
+    expect([one.fast, one.medium, one.heavy].map((x) => Math.round(x * 1e9) / 1e9)).toEqual([3.8, 5.75, 21.25]);
+    const half = costs(shipped, "grader", "fast");
+    expect([half.fast, half.medium, half.heavy].map((x) => Math.round(x * 1e9) / 1e9)).toEqual([25.8, 10.5625, 23.125]);
+  });
+});
+
+describe("speed", () => {
+  /** 12 router rungs (3 tiers × 4 variants of one model each) plus a role chain, on a v2 catalog. */
+  function bigCfg(): RouterConfig {
+    const rungs = (model: string, ratio: number): Pick<TierConfig, "candidates"> => ({
+      candidates: ["low", "medium", "high", "xhigh"].map((variant, i) => ({ model, variant, costRatio: ratio + i })),
+    });
+    return cfgOf({
+      fast: tier(HAIKU, "low", 1, rungs(HAIKU, 1)),
+      medium: tier(SONNET, "low", 6, rungs(SONNET, 6)),
+      heavy: tier(OPUS, "low", 12, rungs(OPUS, 12)),
+    });
+  }
+
+  it("builds a 12-rung ladder with simulated paths and decides it, each well under 2 ms (median)", () => {
+    const cfg = bigCfg();
+    const agents = [...routerAgents(), EXPLORE, GENERAL];
+    const session = { host: "v2", catalog } satisfies LadderSessionPolicyInput;
+    const store = createOutcomeStore({ now: () => 0 });
+    const f = { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } as const;
+    const build = () => buildLadder({ cfg, routing: { roles: V2_ROLES }, facts: f, agents, session });
+    const ladder = build();
+    expect(ladder.candidates.filter((c) => c.source === "tier")).toHaveLength(12);
+    ladder.candidates.forEach((c, k) => store.recordVerdict(candidateKey("implement", c), k % 3 === 0 ? "fail" : "pass", { attemptID: `x${k}`, step: "dispatch" }));
+    const chosen = resolveChosen({ cfg, agents, agent: "medium" })!;
+    const time = (fn: () => unknown): number => {
+      for (let i = 0; i < 30; i++) fn(); // warm-up
+      const runs: number[] = [];
+      for (let i = 0; i < 200; i++) {
+        const t0 = performance.now();
+        fn();
+        runs.push(performance.now() - t0);
+      }
+      runs.sort((a, b) => a - b);
+      return runs[100]!;
+    };
+    const buildMs = time(build);
+    const decideMs = time(() => decide({ facts: f, chosen, ladder, detection: "deterministic", pin: false, routing: ROUTING, store }));
+    expect(decideMs).toBeLessThan(2);
+    expect(buildMs).toBeLessThan(2);
+  });
+});
+// ---------------------------------------------------------------------------
 // Property: no cycle can exist (plan "cycle impossible")
 // ---------------------------------------------------------------------------
 
@@ -635,6 +824,7 @@ function pick<T>(random: () => number, list: readonly T[]): T {
 }
 
 interface Scenario {
+  readonly session?: LadderSessionPolicyInput;
   readonly cfg: RouterConfig;
   readonly roles: Record<string, string[]>;
   readonly agents: HostAgentInfo[] | null;
@@ -669,7 +859,17 @@ function scenario(seed: number): Scenario {
     tiers[name] = config;
   }
   const ladderOrder = random() < 0.3 ? [...names].reverse() : names;
-  const cfg = cfgOf(tiers, { enforcement: { escalate: { ladder: ladderOrder } } });
+  const cfg = cfgOf(tiers, {
+    enforcement: {
+      escalate: {
+        ladder: ladderOrder,
+        maxAttemptsPerTier: Math.floor(random() * 3),
+        maxTotalAttempts: 1 + Math.floor(random() * 6),
+        costCeiling: { multiple: pick(random, [1.5, 4, 100]) },
+      },
+    },
+  });
+  const session: LadderSessionPolicyInput | undefined = random() < 0.5 ? { host: "v2", catalog } : undefined;
 
   const cls = pick(random, TASK_CLASSES);
   const needs = NEEDS.filter(() => random() < 0.2);
@@ -687,30 +887,44 @@ function scenario(seed: number): Scenario {
             permitted: random() < 0.9,
           }),
         );
-  return { cfg, roles, agents, cls, needs };
+  return { cfg, roles, agents, cls, needs, ...(session === undefined ? {} : { session }) };
 }
 
 describe("buildLadder — acyclic by construction (property, 500 seeded random ladders)", () => {
-  it("every pointer is null or in range; router pointers strictly increase; following next terminates without repeating", () => {
+  it("every pointer is null or in range; role chains only move forward or into higher router tiers; every runner path is finite and in range", () => {
     let withRoles = 0;
+    let withReachable = 0;
     for (let seed = 1; seed <= 500; seed++) {
       const s = scenario(seed);
-      const ladder = buildLadder({ cfg: s.cfg, routing: { roles: s.roles }, facts: facts(s.cls, s.needs), agents: s.agents });
+      const ladder = buildLadder({ cfg: s.cfg, routing: { roles: s.roles }, facts: facts(s.cls, s.needs), agents: s.agents, ...(s.session === undefined ? {} : { session: s.session }) });
       const label = `seed ${seed}`;
       const n = ladder.candidates.length;
+      const total = n + (ladder.reachable?.length ?? 0);
       expect(ladder.next.length, label).toBe(n);
+      expect(ladder.paths?.length, label).toBe(n);
       const routerCount = ladder.candidates.filter((c) => c.source === "tier").length;
+      const maxTotal = buildEscalatePolicy(s.cfg).maxTotalAttempts;
       ladder.candidates.forEach((c, k) => {
         expect(c.source === "tier" ? k < routerCount : k >= routerCount, `${label} layout ${k}`).toBe(true);
         expect(Number.isFinite(c.costRatio) && c.costRatio > 0, `${label} ratio ${k}`).toBe(true);
         expect(c.rank, `${label} rank ${k}`).toBeGreaterThanOrEqual(0);
         const target = ladder.next[k];
+        const path = ladder.paths?.[k] ?? null;
+        if (k < routerCount) {
+          // Router rungs are priced through their simulated path, never through a pointer.
+          expect(target, `${label} router next ${k}`).toBeNull();
+          expect(path, `${label} router path ${k}`).not.toBeNull();
+          // It starts at the rung itself (or at an identical duplicate of it, which a hand-written list can hold).
+          const first = ladder.candidates[path![0]!]!;
+          expect([first.tier, first.model, first.variant], `${label} router path starts at the rung ${k}`).toEqual([c.tier, c.model, c.variant]);
+          expect(path!.length, `${label} router path length ${k}`).toBeLessThanOrEqual(maxTotal);
+          for (const a of path!) expect(Number.isInteger(a) && a >= 0 && a < total, `${label} path index ${k}→${a}`).toBe(true);
+          return;
+        }
+        expect(path, `${label} role rungs have no path ${k}`).toBeNull();
         if (target === null) return;
         expect(Number.isInteger(target) && target >= 0 && target < n, `${label} range ${k}→${target}`).toBe(true);
-        if (k < routerCount) {
-          expect(target, `${label} router ${k}→${target}`).toBeGreaterThan(k);
-          expect(target < routerCount, `${label} router stays in block ${k}`).toBe(true);
-        } else if (target < routerCount) {
+        if (target < routerCount) {
           // A chain leaves into the router rungs of a strictly higher tier only.
           expect(ladder.candidates[target]!.rank, `${label} chain exit ${k}→${target}`).toBeGreaterThan(c.rank);
         } else {
@@ -718,6 +932,11 @@ describe("buildLadder — acyclic by construction (property, 500 seeded random l
           expect(ladder.candidates[target]!.agent, `${label} chain agent ${k}`).toEqual(c.agent);
         }
       });
+      for (const r of ladder.reachable ?? []) {
+        expect(r.source === "tier" && r.agent.origin === "router", `${label} reachable kind`).toBe(true);
+        expect(Number.isFinite(r.costRatio) && r.costRatio > 0 && r.rank >= 0, `${label} reachable rung`).toBe(true);
+      }
+      // Following `next` from any rung terminates without repeating.
       for (let start = 0; start < n; start++) {
         const seen = new Set<number>();
         let at: number | null = start;
@@ -731,15 +950,16 @@ describe("buildLadder — acyclic by construction (property, 500 seeded random l
         }
       }
       if (n > routerCount) withRoles += 1;
+      if ((ladder.reachable?.length ?? 0) > 0) withReachable += 1;
     }
-    // The generator really exercises role chains (not a vacuous pass).
+    // The generator really exercises role chains and variant steps (not a vacuous pass).
     expect(withRoles).toBeGreaterThan(40);
+    expect(withReachable).toBeGreaterThan(20);
   });
-
   it("is deterministic: equal inputs build equal ladders", () => {
     for (let seed = 1; seed <= 40; seed++) {
       const s = scenario(seed);
-      const input = { cfg: s.cfg, routing: { roles: s.roles }, facts: facts(s.cls, s.needs), agents: s.agents };
+      const input = { cfg: s.cfg, routing: { roles: s.roles }, facts: facts(s.cls, s.needs), agents: s.agents, ...(s.session === undefined ? {} : { session: s.session }) };
       expect(buildLadder(input)).toEqual(buildLadder(input));
     }
   });

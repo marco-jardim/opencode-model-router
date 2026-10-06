@@ -17,6 +17,18 @@
  *  - d     `routing.detection[detection]`;
  *  - U     `GIVE_UP_COST[profile][risk]` (fast = 1), times the USD value of one ratio unit in usd.
  *
+ * What "k fails and the failure is detected" leads to (A25): for a rung with a simulated runner path
+ * (`Ladder.paths`, built by `ladders.ts` from `nextAction`/`advance` of the 1.5 runner) the same recurrence
+ * runs over the attempts the runner really makes — retries, variant steps, covered-tier skips, the
+ * `maxTotalAttempts` and the cost ceiling included — and ends in `U`. Rungs without a path (role chains,
+ * hand-built ladders) use the static `next` pointer; a chain that reaches a router rung continues with that
+ * rung's path as if it were a fresh dispatch (the runner state of the chain is not carried over).
+ *
+ * Caveat of the USD unit (QA-1.4-14): `U` is a ratio-unit constant, converted to USD with the price of ONE
+ * ratio unit measured on the cheapest-ratio candidate (D8 "fast = 1"). That candidate's USD estimate is the
+ * only anchor, so a noisy or stale estimate for it rescales `U` for the whole decision; when it cannot be
+ * derived the decision falls back to ratio units for every candidate instead of mixing units (D5).
+ *
  * Pure: no I/O, no clock, no module state. The only reads are the injected store view's
  * `posterior`/`cost`/`classTokenProfile`. Memoisation lives in arrays local to one `decide` call.
  * Every runtime import is a pure module (`outcomes/beta`, `outcomes/cost`, `outcomes/types`).
@@ -209,19 +221,31 @@ export function decide(input: DecisionInput): Decision {
     });
   }
 
-  const parts = cands.map((c) => modelParts(c.model, c.variant));
-  const keys = cands.map((c, k) => keyOf(cls, c.agent, parts[k]!));
-  const chosenIndex = keys.indexOf(chosenKey);
+  // `all` = the dispatchable candidates, then the rungs only the 1.5 runner reaches (A25): the second kind is
+  // priced like the first (it can sit on a simulated path) but is never `best`.
+  const all: readonly Candidate[] = ladder.reachable === undefined || ladder.reachable.length === 0
+    ? cands
+    : [...cands, ...ladder.reachable];
+  const total = all.length;
+  const parts = all.map((c) => modelParts(c.model, c.variant));
+  const keys = all.map((c, k) => keyOf(cls, c.agent, parts[k]!));
+  let chosenIndex = -1;
+  for (let k = 0; k < n; k++) {
+    if (keys[k] === chosenKey) {
+      chosenIndex = k;
+      break;
+    }
+  }
   const chosenRank = chosenIndex >= 0 ? cands[chosenIndex]!.rank : null;
 
   // --- p_k: D7 prior by rank offset + evidence (store reads only for a trusted class) ------------
   const referenceRank = trusted
     ? (ladder.classRank ?? chosenRank ?? 0)
     : (chosenRank ?? ladder.classRank ?? 0);
-  const p = new Float64Array(n);
-  const evidence = new Float64Array(n);
-  for (let k = 0; k < n; k++) {
-    const prior = priorForRankOffset(cands[k]!.rank - referenceRank);
+  const p = new Float64Array(total);
+  const evidence = new Float64Array(total);
+  for (let k = 0; k < total; k++) {
+    const prior = priorForRankOffset(all[k]!.rank - referenceRank);
     const priorMean = prior.alpha / (prior.alpha + prior.beta);
     if (store === null) {
       p[k] = priorMean;
@@ -233,21 +257,21 @@ export function decide(input: DecisionInput): Decision {
   }
 
   // --- unit (D5) and c_k ------------------------------------------------------------------------
-  const stats: (CostStats | null)[] = cands.map((_, k) => (store === null ? null : store.cost(keys[k]!)));
+  const stats: (CostStats | null)[] = all.map((_, k) => (store === null ? null : store.cost(keys[k]!)));
   const classProfile = store === null ? null : store.classTokenProfile(cls);
   let unit: CostUnit = "ratio";
   let usd: readonly number[] | null = null;
   let usdPerRatioUnit = 1;
   if (store !== null) {
-    const unitCandidates: UnitCandidate[] = cands.map((c, k) => ({
+    const unitCandidates: UnitCandidate[] = all.map((c, k) => ({
       key: keys[k]!,
       priced: !isUnpriced(c.pricing),
       measuredUSD: stats[k]?.measuredUSD ?? EMPTY_MEAN,
       tokenSamples: tokenSamples(stats[k] ?? null, classProfile),
     }));
     if (compareUnit(unitCandidates) === "usd") {
-      const estimates = cands.map((c, k) => expectedAttemptUSD(stats[k]!, c.pricing, classProfile));
-      const scale = usdScale(cands, estimates);
+      const estimates = all.map((c, k) => expectedAttemptUSD(stats[k]!, c.pricing, classProfile));
+      const scale = usdScale(all, estimates);
       if (scale !== null && estimates.every((v) => isFiniteNumber(v) && v >= 0)) {
         unit = "usd";
         usd = estimates as number[];
@@ -256,23 +280,23 @@ export function decide(input: DecisionInput): Decision {
     }
   }
 
-  const c = new Float64Array(n);
-  const usable = new Uint8Array(n);
-  for (let k = 0; k < n; k++) {
-    const value = usd !== null ? usd[k]! : cands[k]!.costRatio;
+  const c = new Float64Array(total);
+  const usable = new Uint8Array(total);
+  for (let k = 0; k < total; k++) {
+    const value = usd !== null ? usd[k]! : all[k]!.costRatio;
     const ok = usd !== null ? isFiniteNumber(value) && value >= 0 : isFiniteNumber(value) && value > 0;
     c[k] = ok ? value : 0;
     usable[k] = ok ? 1 : 0;
   }
 
   // --- tax_k (D8): measured USD only; 0 in ratio units and until measured ------------------------
-  const tax = new Float64Array(n);
+  const tax = new Float64Array(total);
   const orchestrator = input.orchestrator ?? null;
   if (unit === "usd" && orchestrator !== null) {
     const turns = isFiniteNumber(input.remainingTurns) && input.remainingTurns >= 0
       ? input.remainingTurns
       : DEFAULT_REMAINING_TURNS;
-    for (let k = 0; k < n; k++) {
+    for (let k = 0; k < total; k++) {
       const s = stats[k];
       if (s === null || s === undefined) continue;
       const t = taxUSD(s.finalMessageTokens, turns, orchestrator.pricing, orchestrator.contextTokens);
@@ -284,22 +308,70 @@ export function decide(input: DecisionInput): Decision {
   const d = clamp01(ownValue(routing.detection as Readonly<Record<string, number>>, input.detection));
   const U = giveUpCost(routing.profile, facts.risk) * usdPerRatioUnit;
 
-  // --- C(k): D8 recursion, memoised per call --------------------------------------------------------
+  // --- simulated runner paths (A25): the usable prefix of each candidate's attempt list --------------
+  const pathCache: (readonly number[] | null)[] = new Array<readonly number[] | null>(n).fill(null);
+  for (let k = 0; k < n; k++) {
+    const raw = ladder.paths?.[k];
+    if (!Array.isArray(raw)) continue;
+    const prefix: number[] = [];
+    for (const a of raw as readonly unknown[]) {
+      if (typeof a !== "number" || !Number.isInteger(a) || a < 0 || a >= total || usable[a] !== 1) break;
+      prefix.push(a);
+    }
+    if (prefix.length > 0) pathCache[k] = prefix;
+    else usable[k] = 0; // its first attempt cannot be priced
+  }
+
+  // --- C(k): D8 recursion, evaluated iteratively and memoised per call --------------------------------
+  //   C(k) = c_k + tax_k + (1 − p_k)·[d·C(next(k)) + (1 − d)·U]        (static `next` chain)
+  // A candidate with a simulated path a_1…a_m (a_1 = k) is the same recurrence over the attempts the runner
+  // makes (retries and variant steps included), ending in `U` after a_m. Iteration, not recursion: a chain of
+  // thousands of rungs must not be able to exhaust the stack (QA-1.4-12).
   const memo = new Float64Array(n);
-  const visit = new Uint8Array(n); // 0 = new, 1 = on the current path, 2 = done
+  const visit = new Uint8Array(n); // 0 = new, 1 = on the current chain, 2 = done
   const next = ladder.next;
-  const cascade = (k: number): number => {
-    if (visit[k] === 2) return memo[k]!;
-    if (visit[k] === 1) return U; // defensive: a cycle is a give-up, never an infinite escalation
-    visit[k] = 1;
-    const j = next[k];
-    const successor = typeof j === "number" && Number.isInteger(j) && j >= 0 && j < n && usable[j] === 1
-      ? cascade(j)
-      : U;
-    const value = c[k]! + tax[k]! + (1 - p[k]!) * (d * successor + (1 - d) * U);
-    memo[k] = value;
-    visit[k] = 2;
-    return value;
+  const attemptValue = (a: number, after: number): number =>
+    c[a]! + tax[a]! + (1 - p[a]!) * (d * after + (1 - d) * U);
+  const cascade = (start: number): number => {
+    if (visit[start] === 2) return memo[start]!;
+    const stack: number[] = [];
+    let tail = U;
+    let k = start;
+    for (;;) {
+      if (visit[k] === 2) {
+        tail = memo[k]!;
+        break;
+      }
+      if (visit[k] === 1) {
+        tail = U; // defensive: a cycle is a give-up, never an infinite escalation
+        break;
+      }
+      const path = pathCache[k];
+      if (path !== null && path !== undefined) {
+        let value = U;
+        for (let i = path.length - 1; i >= 0; i--) value = attemptValue(path[i]!, value);
+        memo[k] = value;
+        visit[k] = 2;
+        tail = value;
+        break;
+      }
+      visit[k] = 1;
+      stack.push(k);
+      const j = next[k];
+      if (typeof j === "number" && Number.isInteger(j) && j >= 0 && j < n && usable[j] === 1) {
+        k = j;
+        continue;
+      }
+      tail = U; // no, out-of-range or unusable successor: give up
+      break;
+    }
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const node = stack[i]!;
+      tail = attemptValue(node, tail);
+      memo[node] = tail;
+      visit[node] = 2;
+    }
+    return memo[start]!;
   };
 
   const C = new Float64Array(n).fill(Number.NaN);
@@ -310,7 +382,6 @@ export function decide(input: DecisionInput): Decision {
     C[k] = value;
     if (isFiniteNumber(value) && !Object.prototype.hasOwnProperty.call(costs, keys[k]!)) costs[keys[k]!] = value;
   }
-
   // --- best: argmin over the pick and the eligible candidates ------------------------------------
   const chosenPriced = chosenIndex >= 0 && usable[chosenIndex] === 1 && isFiniteNumber(C[chosenIndex]);
   const floorRank = isFiniteNumber(input.floorRank) ? input.floorRank : null;

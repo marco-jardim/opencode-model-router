@@ -34,7 +34,7 @@ import {
 } from "../classify/types";
 import type { ModelPricing } from "../outcomes/types";
 import { decide, hasMinEvidence } from "./kernel";
-import { buildLadder, floorRankOf, resolveChosen, routerTierIds } from "./ladders";
+import { buildLadder, type LadderBuildInput, floorRankOf, resolveChosen, routerTierIds } from "./ladders";
 import type { Decision, EngineStoreView, HostAgentInfo } from "./types";
 
 export interface PlanStep {
@@ -49,6 +49,10 @@ export interface AnnotateDeps {
   readonly agents: readonly HostAgentInfo[] | null;
   readonly store: EngineStoreView | null;
   readonly pricing?: (model: string) => ModelPricing;
+  /** Forwarded to `buildLadder`: the runner policy's session input (A25), the parent model, the pricing logger. */
+  readonly session?: LadderBuildInput["session"];
+  readonly parentModel?: string | null;
+  readonly logger?: LadderBuildInput["logger"];
   /** 1.2 `classifyMany` bound to its deps with `routeLinePositions: "any"` (tooling); called exactly once. */
   readonly classifyMany: (inputs: readonly ClassifyInput[]) => Promise<ClassifyResult[]>;
 }
@@ -251,6 +255,9 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
             facts,
             agents,
             ...(deps.pricing === undefined ? {} : { pricing: deps.pricing }),
+            ...(deps.session === undefined ? {} : { session: deps.session }),
+            ...(deps.parentModel === undefined ? {} : { parentModel: deps.parentModel }),
+            ...(deps.logger === undefined ? {} : { logger: deps.logger }),
           }),
           detection,
           pin,

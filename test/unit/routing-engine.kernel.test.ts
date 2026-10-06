@@ -681,6 +681,101 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+describe("A25 simulated runner paths (QA-1.4-2)", () => {
+  // The runner's own cascade from each rung (ladders.ts simulates it): retry, retry, escalate...
+  const pathLadder = (paths: Ladder["paths"], over: Partial<Ladder> = {}): Ladder => ({ ...routerLadder(), paths, ...over });
+  const cascade: Ladder["paths"] = [[0, 0, 1], [1, 1, 2], [2, 2]];
+
+  it("prices the attempts the runner makes, retries included (d = 1, U = 100)", () => {
+    const d = decide(input({ ladder: pathLadder(cascade), detection: "deterministic" }));
+    // fast: m = 5 + 0.1·100 = 15; f₂ = 1 + 0.4·15 = 7; f₁ = 1 + 0.4·7 = 3.8
+    expect(d.costs[keyOf(FAST)]).toBeCloseTo(3.8, 10);
+    // medium: h = 20 + 0.05·100 = 25; m₂ = 5 + 0.1·25 = 7.5; m₁ = 5 + 0.1·7.5 = 5.75
+    expect(d.costs[keyOf(MEDIUM)]).toBeCloseTo(5.75, 10);
+    // heavy: h₂ = 25; h₁ = 20 + 0.05·25 = 21.25
+    expect(d.costs[keyOf(HEAVY)]).toBeCloseTo(21.25, 10);
+    expect(d.best?.key).toBe(keyOf(FAST));
+  });
+
+  it("detection d = 0.5: each attempt keeps (1 − p)·[d·next + (1 − d)·U]", () => {
+    const d = decide(input({ ladder: pathLadder(cascade), detection: "grader", chosen: chosenOf(FAST) }));
+    // fast: m = 5 + 0.1·(0.5·100 + 50) = 15; f₂ = 1 + 0.4·(0.5·15 + 50) = 24; f₁ = 1 + 0.4·(0.5·24 + 50) = 25.8
+    expect(d.costs[keyOf(FAST)]).toBeCloseTo(25.8, 10);
+    // medium: h = 25; m₂ = 5 + 0.1·(0.5·25 + 50) = 11.25; m₁ = 5 + 0.1·(0.5·11.25 + 50) = 10.5625
+    expect(d.costs[keyOf(MEDIUM)]).toBeCloseTo(10.5625, 10);
+    // heavy: h₂ = 25; h₁ = 20 + 0.05·(0.5·25 + 50) = 23.125
+    expect(d.costs[keyOf(HEAVY)]).toBeCloseTo(23.125, 10);
+  });
+
+  it("a path replaces the rung's `next` pointer; rungs without a path still use `next`", () => {
+    const ladder: Ladder = { ...routerLadder(), paths: [[0], null, undefined as unknown as null] };
+    const d = decide(input({ ladder, detection: "deterministic" }));
+    expect(d.costs[keyOf(FAST)]).toBeCloseTo(1 + 0.4 * 100, 10); // fast: a lone attempt, give up (its `next` is ignored)
+    expect(d.costs[keyOf(MEDIUM)]).toBeCloseTo(7.5, 10); // no path: the static chain medium → heavy
+    expect(d.costs[keyOf(HEAVY)]).toBeCloseTo(25, 10);
+  });
+
+  it("a rung only the runner reaches is priced from its own key, listed in no `costs` and never best or chosen", () => {
+    const stepped = rung("fast", "anthropic/claude-sonnet-5-5", "medium", 1, 0);
+    const store = fakeStore({ p: { [keyOf(FAST)]: 0.6, [keyOf(MEDIUM)]: 0.9, [keyOf(HEAVY)]: 0.95, [keyOf(stepped)]: 0.99 }, n: { [keyOf(FAST)]: 10, [keyOf(stepped)]: 10 } });
+    const ladder = pathLadder([[0, 3, 1], null, null], { reachable: [stepped] });
+    const d = decide(input({ ladder, store, detection: "deterministic" }));
+    // fast → fast#medium (reachable, p = 0.99) → medium: m = 5 + 0.1·100 = 15; s = 1 + 0.01·15; f = 1 + 0.4·s
+    expect(d.costs[keyOf(FAST)]).toBeCloseTo(1 + 0.4 * (1 + 0.01 * 15), 10);
+    expect(Object.keys(d.costs)).not.toContain(keyOf(stepped));
+    expect(d.ineligible[keyOf(stepped)]).toBeUndefined();
+    expect(d.best?.key).not.toBe(keyOf(stepped));
+    // Dispatching the reachable-only rung itself is not a candidate dispatch.
+    const onStepped = decide(input({ ladder, store, chosen: chosenOf(stepped), detection: "deterministic" }));
+    expect(onStepped.reasonCode).toBe("kept:chosen-not-candidate");
+    expect(store.priors.get(keyOf(stepped))).toEqual({ alpha: 2.75, beta: 2.25 }); // rank 0 vs class rank 1
+  });
+
+  it("the path stops before an unusable or out-of-range attempt; an unusable first attempt makes the rung invalid", () => {
+    const broken = { ...MEDIUM, costRatio: Number.NaN };
+    const cut = decide(input({ ladder: { ...routerLadder([FAST, broken, HEAVY]), paths: [[0, 1, 2], null, null] }, chosen: chosenOf(FAST), detection: "deterministic" }));
+    expect(cut.costs[keyOf(FAST)]).toBeCloseTo(1 + 0.4 * 100, 10);
+    const outOfRange = decide(input({ ladder: pathLadder([[0, 99, 1], null, null]), chosen: chosenOf(FAST), detection: "deterministic" }));
+    expect(outOfRange.costs[keyOf(FAST)]).toBeCloseTo(1 + 0.4 * 100, 10);
+    const first = decide(input({ ladder: { ...routerLadder([FAST, broken, HEAVY]), paths: [null, [1, 2], null] }, chosen: chosenOf(FAST) }));
+    expect(first.costs[keyOf(MEDIUM)]).toBeUndefined();
+    expect(first.ineligible[keyOf(MEDIUM)]).toBe("invalid-cost");
+  });
+
+  it("paths price in USD like candidates: one unit for the whole decision, reachable rungs included", () => {
+    const F = { ...FAST, pricing: PRICED };
+    const M = { ...MEDIUM, pricing: PRICED };
+    const H = { ...HEAVY, pricing: PRICED };
+    const stepped = rung("fast", "anthropic/claude-sonnet-5-5", "medium", 1, 0, { pricing: PRICED });
+    const p = { [keyOf(F)]: 0.6, [keyOf(M)]: 0.9, [keyOf(H)]: 0.95, [keyOf(stepped)]: 0.9 };
+    const usd = { [keyOf(F)]: measured(0.01), [keyOf(M)]: measured(0.05), [keyOf(H)]: measured(0.2), [keyOf(stepped)]: measured(0.02) };
+    const ladder: Ladder = { ...routerLadder([F, M, H]), reachable: [stepped], paths: [[0, 3, 1], null, null] };
+    const d = decide(input({ ladder, store: fakeStore({ p, cost: usd }) }));
+    expect(d.unit).toBe("usd");
+    // USD per ratio unit = 0.01 / 1 → U = 1; fast → stepped → medium: m = 0.05 + 0.1·1; s = 0.02 + 0.1·m (d = 1 on deterministic detection)
+    const m = 0.05 + 0.1 * 1;
+    const s = 0.02 + 0.1 * m;
+    expect(d.costs[keyOf(F)]).toBeCloseTo(0.01 + 0.4 * s, 12);
+    // One unpriced reachable rung forces ratio units for everything (never mixed).
+    const unpriced = { ...stepped, pricing: UNPRICED };
+    const mixed = decide(input({ ladder: { ...ladder, reachable: [unpriced] }, store: fakeStore({ p, cost: { ...usd, [keyOf(unpriced)]: emptyCostStats() } }) }));
+    expect(mixed.unit).toBe("ratio");
+  });
+  it("QA-1.4-12: a 20 000-rung chain neither overflows the stack nor takes long", () => {
+    const count = 20_000;
+    const cands = Array.from({ length: count }, (_, i) => rung("fast", `prov/model-${i}`, null, 1 + (i % 7), 0));
+    const ladder: Ladder = { candidates: cands, next: cands.map((_, i) => (i + 1 < count ? i + 1 : null)), classRank: 0, excluded: [] };
+    const t0 = performance.now();
+    const d = decide(input({ ladder, store: null, chosen: chosenOf(cands[0]!), facts: facts({ risk: "low" }), detection: "deterministic" }));
+    const elapsed = performance.now() - t0;
+    expect(Object.keys(d.costs)).toHaveLength(count);
+    expect(Object.values(d.costs).every(Number.isFinite)).toBe(true);
+    expect(elapsed).toBeLessThan(2000);
+    // And one 20 000-attempt path.
+    const long = decide(input({ ladder: { ...routerLadder([FAST]), paths: [Array.from({ length: count }, () => 0)] }, chosen: chosenOf(FAST), detection: "deterministic" }));
+    expect(Number.isFinite(long.costs[keyOf(FAST)]!)).toBe(true);
+  });
+});
 describe("purity", () => {
   it("memoisation does not leak across calls on the same ladder object", () => {
     const ladder = deepFreeze(routerLadder());

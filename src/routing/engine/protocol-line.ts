@@ -26,7 +26,7 @@ import {
 } from "../classify/types";
 import type { ModelPricing } from "../outcomes/types";
 import { MIN_EVIDENCE_TO_SWITCH_DOWN, decide, hasMinEvidence } from "./kernel";
-import { buildLadder, floorRankOf, resolveChosen, roleAgentExclusion, routerTierIds, tierRankOf } from "./ladders";
+import { buildLadder, type LadderBuildInput, floorRankOf, resolveChosen, roleAgentExclusion, routerTierIds, tierRankOf } from "./ladders";
 import type { EngineStoreView, HostAgentInfo } from "./types";
 
 /** `best` must carry evidence at least as strong as the prior before a class line moves (= `PRIOR_STRENGTH`). */
@@ -39,6 +39,10 @@ export interface TaxonomyInput {
   readonly store: EngineStoreView | null;
   readonly agents: readonly HostAgentInfo[] | null;
   readonly pricing?: (model: string) => ModelPricing;
+  /** Forwarded to `buildLadder`: the runner policy's session input (A25), the parent model, the pricing logger. */
+  readonly session?: LadderBuildInput["session"];
+  readonly parentModel?: string | null;
+  readonly logger?: LadderBuildInput["logger"];
 }
 
 function ownRoleList(roles: Readonly<Record<string, readonly string[]>>, cls: string): readonly string[] {
@@ -85,6 +89,9 @@ function v2Segments(input: TaxonomyInput, store: EngineStoreView): string[] {
       facts,
       agents,
       ...(input.pricing === undefined ? {} : { pricing: input.pricing }),
+      ...(input.session === undefined ? {} : { session: input.session }),
+      ...(input.parentModel === undefined ? {} : { parentModel: input.parentModel }),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
     const decision = decide({ facts, chosen, ladder, detection: "none", pin: false, routing, store, floorRank });
     if (!decision.switched || decision.best === null || decision.target === null) continue;

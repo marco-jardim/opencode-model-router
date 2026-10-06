@@ -68,7 +68,9 @@ export interface Candidate {
 
 /**
  * The candidate graph of one decision. `next[k]` is the index of the rung the cascade of D8 moves to
- * when candidate `k` fails and the failure is detected (`null` = terminal: give up at cost `U`).
+ * when candidate `k` fails and the failure is detected (`null` = terminal: give up at cost `U`). A candidate
+ * that has a simulated runner path in `paths` is priced through that path instead and its `next` is `null`
+ * (A25: the router rungs); role chains use `next`.
  * `ladders.ts` guarantees the graph is acyclic; the kernel also treats any back edge, out-of-range or
  * unusable successor as terminal, so no input can make it recurse forever.
  */
@@ -84,6 +86,19 @@ export interface Ladder {
   readonly classRank: number | null;
   /** Candidates dropped while building the ladder (permissions, unknown agents, ...), for the log. */
   readonly excluded: readonly ExcludedCandidate[];
+  /**
+   * Rungs the 1.5 runner reaches (variant steps, covered-tier entries) that the engine never dispatches on
+   * its own: priced exactly like candidates, never `best`. Indices `candidates.length + i` in {@link paths}.
+   */
+  readonly reachable?: readonly Candidate[];
+  /**
+   * A25: per candidate, the attempts the 1.5 runner makes when every attempt fails and the failure is
+   * detected, as indices into `[...candidates, ...reachable]` (first = the candidate itself): retries,
+   * variant steps, escalations, covered-tier skips, `maxTotalAttempts` and the cost ceiling are already
+   * applied by simulating `nextAction`/`advance`. The path ends in a give-up (cost `U`). `null`/absent =
+   * the candidate is priced through its `next` pointer instead (role chains, hand-built ladders).
+   */
+  readonly paths?: readonly (readonly number[] | null)[];
 }
 
 export type ExclusionReason =
@@ -94,7 +109,9 @@ export type ExclusionReason =
   /** The class has no static tier on the escalate ladder, so a role agent has no inherited rank (D7). */
   | "no-owning-tier"
   /** Same `(agent, model, variant)` as an earlier rung, or a role naming a router tier agent. */
-  | "duplicate";
+  | "duplicate"
+  /** A25: an other-model rung of a tier's `candidates`; the 1.5 runner never runs it (escalation territory). */
+  | "not-modelled";
 
 /**
  * What the caller knows about one host agent: `ctx.agent.list()` on v2 (router tier agents
