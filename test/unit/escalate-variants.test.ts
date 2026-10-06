@@ -11,7 +11,9 @@ import {
   nextVariant,
   resumeDecision,
   stepContextTokens,
+  variantCovered,
   variantPosition,
+  variantRange,
   variantRank,
   type CatalogModel,
   type VariantLadder,
@@ -47,6 +49,46 @@ describe("variant ranks and the default position (A9)", () => {
   });
 });
 
+describe("variant ranges and coverage (QA-1.5-3)", () => {
+  it("gives a ranked id a point and default the interval [-1, rank(high)]", () => {
+    expect(variantRange("medium")).toEqual({ low: 3, high: 3 });
+    expect(variantRange("none")).toEqual({ low: 0, high: 0 });
+    for (const id of [DEFAULT_VARIANT, "", null, undefined]) expect(variantRange(id)).toEqual({ low: -1, high: variantRank("high") });
+    expect(variantRange("turbo")).toBeNull();
+  });
+
+  it("covers the same variant, and a ranked base at or below the reached rank", () => {
+    expect(variantCovered("medium", "medium")).toBe(true);
+    expect(variantCovered("low", "medium")).toBe(true);
+    expect(variantCovered("none", "max")).toBe(true);
+    expect(variantCovered("high", "medium")).toBe(false);
+    expect(variantCovered("max", "xhigh")).toBe(false);
+  });
+
+  it("covers a default base only from high upwards", () => {
+    for (const reached of ["high", "xhigh", "max"]) expect(variantCovered(DEFAULT_VARIANT, reached)).toBe(true);
+    for (const reached of ["none", "low", "medium"]) expect(variantCovered(DEFAULT_VARIANT, reached)).toBe(false);
+  });
+
+  it("lets a reached default cover nothing but default itself", () => {
+    for (const base of ["none", "low", "medium", "high", "max"]) expect(variantCovered(base, DEFAULT_VARIANT)).toBe(false);
+    for (const id of [DEFAULT_VARIANT, "", null, undefined]) {
+      for (const other of [DEFAULT_VARIANT, "", null, undefined]) expect(variantCovered(id, other)).toBe(true);
+    }
+  });
+
+  it("covers an unranked id only against itself", () => {
+    expect(variantCovered("turbo", "turbo")).toBe(true);
+    expect(variantCovered("turbo", "max")).toBe(false);
+    expect(variantCovered("high", "turbo")).toBe(false);
+    expect(variantCovered("turbo", DEFAULT_VARIANT)).toBe(false);
+  });
+
+  it("keeps nextVariant stepping from default at the 3.5 position", () => {
+    expect(nextVariant(ladder(["low", "medium", "high"]), DEFAULT_VARIANT)).toBe("high");
+    expect(nextVariant(ladder(["low", "medium"]), DEFAULT_VARIANT)).toBeNull();
+  });
+});
 describe("catalogVariantIds", () => {
   it("returns null without a variants array", () => {
     expect(catalogVariantIds(undefined)).toBeNull();

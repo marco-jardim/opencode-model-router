@@ -91,6 +91,37 @@ export function variantPosition(id: string | null | undefined): number | null {
   return rank >= 0 ? rank : null;
 }
 
+/** Interval a variant occupies on the effort scale. */
+export interface VariantRange {
+  readonly low: number;
+  readonly high: number;
+}
+
+/**
+ * The effort interval of a variant (QA-1.5-3). A ranked id is a point. `default` is a range, because
+ * the provider's own default effort is unobserved (F9): from "below everything" (-1) up to `high`.
+ * `null` for an unranked id.
+ */
+export function variantRange(id: string | null | undefined): VariantRange | null {
+  if (id == null || id === "" || id === DEFAULT_VARIANT) return { low: -1, high: variantRank("high") };
+  const rank = variantRank(id);
+  return rank >= 0 ? { low: rank, high: rank } : null;
+}
+
+/**
+ * Whether a tier whose base is `base` adds nothing once `reached` has been tried on the same model:
+ * the very same variant, or a base whose highest possible effort is at most the lowest possible
+ * effort of `reached`. `default` as a base is only covered by `high` or above; `default` as the
+ * reached variant covers nothing but `default` itself.
+ */
+export function variantCovered(base: string | null | undefined, reached: string | null | undefined): boolean {
+  const normalized = (id: string | null | undefined): string => (id == null || id === "" ? DEFAULT_VARIANT : id);
+  if (normalized(base) === normalized(reached)) return true;
+  const b = variantRange(base);
+  const r = variantRange(reached);
+  return b !== null && r !== null && b.high <= r.low;
+}
+
 /** Catalog variant ids in catalog order, deduplicated; `null` when the entry has no `variants` array. */
 export function catalogVariantIds(catalog: CatalogModel | null | undefined): readonly string[] | null {
   const variants = catalog?.variants;

@@ -9,7 +9,7 @@ import {
   inputBudget,
   nextVariant,
   resumeDecision,
-  variantPosition,
+  variantCovered,
   type CatalogModel,
   type ResumeDecision,
   type VariantLadder,
@@ -97,6 +97,8 @@ export interface LadderAction {
   model?: string;
   /** Catalog-validated target variant; absent = default / leave unchanged. */
   variant?: string;
+  /** Escalate only: the target tier continues from `variant` (the reached one) instead of its base; advance seeds currentVariant. */
+  carryVariant?: true;
   /**
    * A17: costRatio of the rung this action runs (`model` + `variant`), on variant steps, plain
    * retries and escalations when it is known. The runner charges `action.costRatio ?? tier.costRatio`.
@@ -278,27 +280,35 @@ function reserveAllows(policy: EscalatePolicy, state: LadderState): boolean {
   return policy.maxTotalAttempts - state.totalAttempts - 1 >= tiersAbove(policy, state.currentTier);
 }
 
-/** D10 "escalate the model": skip next tiers on the same model whose base the current tier already covered. */
+/** Where an escalation lands; `covered` = a same-model tier whose base the current tier already reached. */
+interface EscalationTarget {
+  tier: string | null;
+  covered: boolean;
+}
+
+/**
+ * D10 "escalate the model": pass over next tiers on the same model whose base the current tier already
+ * covered (QA-1.5-3: `default` is a range, see `variantCovered`), unless such a tier still has a variant
+ * above the reached one (QA-1.5-4). That tier is kept and flagged `covered`, so the escalation runs at
+ * the reached variant and the tier's own steps continue upwards from it.
+ */
 function skipCoveredTiers(
   next: string | null,
   state: LadderState,
   policy: EscalatePolicy,
   from: TierVariantInfo,
-): string | null {
-  const reached = variantPosition(state.currentVariant ?? from.base);
-  if (reached === null) return next;
+): EscalationTarget {
+  const reached = state.currentVariant ?? from.base;
   let hops = 0;
   while (next != null) {
     const to = ownTierInfo(policy, next);
-    if (!to || to.model !== from.model) return next;
-    const position = variantPosition(to.base);
-    if (position === null || position > reached) return next;
-    if (++hops >= policy.ladder.length) return null; // guard: duplicate ladder entries cannot spin
+    if (!to || to.model !== from.model || !variantCovered(to.base, reached)) return { tier: next, covered: false };
+    if (nextVariant(to.ladder, reached) !== null) return { tier: next, covered: true };
+    if (++hops >= policy.ladder.length) return { tier: null, covered: false }; // guard: duplicate ladder entries cannot spin
     next = nextTierAfter(next, policy);
   }
-  return null;
+  return { tier: null, covered: false };
 }
-
 export function nextAction(
   state: LadderState,
   verdict: LadderVerdict | null | undefined,
@@ -394,7 +404,8 @@ export function nextAction(
 
   // (6) escalate or give_up
   let next = nextTierAfter(state.currentTier, policy);
-  if (variants && info) next = skipCoveredTiers(next, state, policy, info);
+  let covered = false;
+  if (variants && info) ({ tier: next, covered } = skipCoveredTiers(next, state, policy, info));
   if (next == null) {
     return {
       action: "give_up",
@@ -411,8 +422,12 @@ export function nextAction(
     action.agent = next; // D11: the role changes on escalation
     if (target) {
       action.model = target.model;
-      const v = emittable(target, target.base);
-      if (v !== undefined) action.variant = v;
+      // A covered tier keeps the reached variant (QA-1.5-4) instead of dropping to its lower base.
+      const v = covered && info ? emittable(info, state.currentVariant ?? info.base) : emittable(target, target.base);
+      if (v !== undefined) {
+        action.variant = v;
+        if (v !== target.base) action.carryVariant = true;
+      }
       Object.assign(action, costFields(target, action.variant));
     }
     Object.assign(action, sessionFields(state, variants, target, action.forcingMessage!, session));
@@ -449,7 +464,8 @@ export function advance(state: LadderState, action: LadderAction): LadderState {
       escalations: state.escalations + 1,
     };
     if (next.currentEffort !== undefined) next.currentEffort = null;
-    if (next.currentVariant !== undefined) next.currentVariant = null; // new tier starts at its base
+    // A new tier starts at its base, unless it continues from the reached variant (QA-1.5-4).
+    if (next.currentVariant !== undefined) next.currentVariant = action.carryVariant === true ? (action.variant ?? null) : null;
     applySession(next, action);
     return next;
   }
