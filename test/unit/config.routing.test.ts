@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import {
   DEFAULT_V2_ROLES,
@@ -18,6 +18,7 @@ import {
   resolveClassifierForPreset,
   resolveRouting,
   resolveVariantSteps,
+  statePath,
   validateConfig,
   type RouterConfig,
 } from "../../src/router/config";
@@ -32,6 +33,69 @@ import { parseJsonc } from "../../src/router/jsonc";
 import { readFileSync } from "node:fs";
 
 const ROOT = resolve(__dirname, "..", "..");
+
+// ---------------------------------------------------------------------------
+// Isolation from the real home directory (QA-1.1-1).
+//
+// config.ts builds the global override and state paths from `os.homedir()`.
+// Redirecting `process.env.HOME` / `USERPROFILE` is NOT enough: under
+// `--pool=threads` (worker threads) an env change does not reach `homedir()`, and
+// a test that writes "the global override" then writes the user's real file.
+// So `node:os`.homedir is mocked at module level, the env is redirected as well,
+// and a guard fails every test BEFORE it can write if either path is outside the
+// temporary home.
+// ---------------------------------------------------------------------------
+
+const fakeHome = vi.hoisted(() => ({ dir: undefined as string | undefined }));
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const mockedHomedir = (): string => fakeHome.dir ?? actual.homedir();
+  return { ...actual, homedir: mockedHomedir, default: { ...actual, homedir: mockedHomedir } };
+});
+
+let tmpHome = "";
+let restoreHomeEnv: () => void = () => {};
+
+/** Throw unless `p` is a path strictly inside the temporary home. */
+function assertInsideTmpHome(p: string): void {
+  const rel = tmpHome === "" ? "" : relative(tmpHome, p);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(
+      `config.routing.test: refusing to touch ${p}: it is not inside the temporary home "${tmpHome}" (QA-1.1-1)`,
+    );
+  }
+}
+
+beforeEach(() => {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  restoreHomeEnv = () => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+  };
+  tmpHome = mkdtempSync(join(tmpdir(), "oc-mr-routing-"));
+  process.env.HOME = tmpHome;
+  process.env.USERPROFILE = tmpHome;
+  fakeHome.dir = tmpHome;
+  // Before any test body can write: where the module under test would write.
+  if (homedir() !== tmpHome) {
+    throw new Error(`config.routing.test: os.homedir() is "${homedir()}", not the temporary home "${tmpHome}" (QA-1.1-1)`);
+  }
+  assertInsideTmpHome(overridePath());
+  assertInsideTmpHome(statePath());
+  invalidateConfigCache();
+});
+
+afterEach(() => {
+  restoreHomeEnv();
+  fakeHome.dir = undefined;
+  if (tmpHome !== "") rmSync(tmpHome, { recursive: true, force: true });
+  tmpHome = "";
+  invalidateConfigCache();
+});
 
 /** A raw config with three tiers; `extra` overrides or adds top-level keys. */
 function rawConfig(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -539,17 +603,11 @@ describe("the shipped tiers.json (no routing block: behaviour unchanged)", () =>
 // ---------------------------------------------------------------------------
 
 describe("hot reload of the global override file with a routing block", () => {
-  let tmpHome: string;
-  let savedHome: string | undefined;
-  let savedUserProfile: string | undefined;
+  // The temporary home, the env redirect, the os.homedir() mock and the guard
+  // come from the file-level hooks above.
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    savedHome = process.env.HOME;
-    savedUserProfile = process.env.USERPROFILE;
-    tmpHome = mkdtempSync(join(tmpdir(), "oc-mr-routing-"));
-    process.env.HOME = tmpHome;
-    process.env.USERPROFILE = tmpHome;
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     resetRoutingWarnings();
     invalidateConfigCache();
@@ -557,18 +615,13 @@ describe("hot reload of the global override file with a routing block", () => {
 
   afterEach(() => {
     warnSpy.mockRestore();
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
-    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = savedUserProfile;
-    rmSync(tmpHome, { recursive: true, force: true });
-    invalidateConfigCache();
   });
 
   /** Write the global override WITHOUT invalidating the cache, bumping its mtime like a real edit. */
   let tick = 0;
   function editOverride(content: unknown): void {
     const p = overridePath();
+    assertInsideTmpHome(p); // belt and braces: never write outside the temporary home
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, typeof content === "string" ? content : JSON.stringify(content), "utf-8");
     const later = new Date(Date.now() + 60_000 * ++tick);

@@ -9,7 +9,7 @@
 |---|---|
 | Worktree / branch | `D:\git\omr-car-p11`, `car/p11`, clean at start (`git status --short` empty), based on `car/main` @ `3b3dba4` |
 | Build step (1.1.6) | **none**: `package.json` scripts are `test`, `test:watch`, `test:coverage`, `smoke*`, `typecheck`. The runtime `.git` read in `src\router\build-info.ts` is the only sha source |
-| Phase 0.P handoffs to 1.1 | (a) global-override hot reload proven by `config.routing.test.ts` › "hot reload of the global override file with a routing block" (HOME redirected to a temp dir, no explicit invalidate, mtime bumped like a real edit; also through the `/router` command); (b) runtime `.git` read only; (c) `routing.classifier = { backend: "host", model: "opencode-go/deepseek-v4.1-flash", timeoutMs: 10000 }` accepted (validate test and override-layer test) |
+| Phase 0.P handoffs to 1.1 | (a) global-override hot reload proven by `config.routing.test.ts` › "hot reload of the global override file with a routing block" (HOME redirected **and `os.homedir()` mocked**, see QA-1.1-1, to a temp dir, no explicit invalidate, mtime bumped like a real edit; also through the `/router` command); (b) runtime `.git` read only; (c) `routing.classifier = { backend: "host", model: "opencode-go/deepseek-v4.1-flash", timeoutMs: 10000 }` accepted (validate test and override-layer test) |
 | Full-suite baseline | `car/main` @ `3b3dba4`: `Test Files 109 passed \| 3 skipped`. **Not re-run here** (phase instruction: scoped runs only) |
 
 ### Results (all run in `D:\git\omr-car-p11`)
@@ -53,7 +53,22 @@ Decisions (the first is a deviation from the plan's wording; the rest are choice
 
 ## Findings
 
-Adversarial QA is a separate `@heavy` dispatch and has not run, so there are no `QA-1.1-n` findings yet. Points I would challenge myself (candidates for the reviewer, not findings):
+| Id | Sev. | Where | Finding | Resolution |
+|---|---|---|---|---|
+| QA-1.1-1 | critical | `test/unit/config.routing.test.ts` hot-reload tests | The tests redirected only `process.env.HOME`/`USERPROFILE`. Under `--pool=threads` an env change does not reach `os.homedir()`, which `config.ts` uses for `overridePath()`/`statePath()`, so the tests wrote the user's REAL global override file `~/.config/opencode/opencode-model-router.overrides.jsonc` (`{"routing":{"engine":"enforce"}}`), which drives the live router config. The orchestrator deleted the file | `fix(routing): address QA-1.1-1 isolate tests from the real home directory`: `node:os` `homedir` is mocked at module level (`vi.mock` + `vi.hoisted`), the env redirect is kept, the temp home is created in a **file-level** `beforeEach`, and a guard in that hook throws before any test body unless `os.homedir()`, `overridePath()` and `statePath()` are inside the temp home (`editOverride` re-asserts before each write). `config.ts` unchanged. Verified under `--pool=threads` and `--pool=forks`: the real override file stays absent and the real state file's `LastWriteTime` stays `2026-10-05 08:47:03` |
+
+**Pre-existing tests with the same weakness (not fixed here: outside this phase's write-set).** They redirect `HOME`/`USERPROFILE` only (none mocks `node:os` `homedir`) and then write through `config.ts`; under `--pool=threads` each of these writes the real files (heuristic grep; a test that reaches `writeState` through a command spelled differently would be missed):
+
+- `test/unit/config.overrides.test.ts`: `overridePath()` writes at 189, 213, 255 (and others); `writeState` at 303.
+- `test/integration/router-command.test.ts`: `/router enforce enforced|off` (state write) at 45, 54, 58.
+- `test/integration/fable-effort-preset.test.ts`: `writeState` at 47, 94.
+- `test/integration/prompt-style-mixed.test.ts`: `writeState` at 79, 102, 143, 171, 182.
+- `test/integration/ladder-wiring.test.ts`: `overridePath()` writes at 210–211, 285.
+- `test/integration/router-reload-failure.test.ts`: `overridePath()` write at 58.
+
+Tests that build the path from their own temp dir (`join(home, ".config/opencode/…")`: `deferred-verification`, `delegate-timeout`, `router-verify-tool`, `e2e/harness`) cannot write the real home, but under threads `loadConfig` would read the real one instead of theirs. Under the default pool (forks) none of this applies. **Do not run those files with `--pool=threads`.**
+
+Adversarial QA by `@heavy` has not run beyond the above. Points I would challenge myself (candidates for the reviewer, not findings):
 
 1. **Agent-id pattern `^[a-z0-9_-]+$`** is the plan's, but `subagentTiers` already documents a user agent named `ContextScout`; such an agent cannot be listed in `routing.roles`. Followed the plan; a case-insensitive pattern may be wanted.
 2. **Unknown keys are ignored** (deviation above): a typo such as `routing.margn` loads silently. Consistent with the file; the alternative would make one typo drop a whole override layer.
