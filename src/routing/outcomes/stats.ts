@@ -235,6 +235,17 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     return { step, resume, fresh: ofStep.length - resume };
   });
 
+  // 2.4: the orchestrator's own resumes (2.2 `task_id`/`sessionID`) and the A27 evidence gate, over the routed dispatch rows.
+  const routedDispatches = dispatchRows.filter((r) => !isDelegateAttempt(r));
+  const argminCounts = new Map<OutcomeKey, number>();
+  for (const r of routedDispatches) {
+    const key = r.trace?.argmin?.key;
+    if (key !== undefined) argminCounts.set(key, (argminCounts.get(key) ?? 0) + 1);
+  }
+  const argmin = [...argminCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || compareCodeUnits(a[0], b[0]))
+    .map(([key, count]) => ({ key, count }));
+
   return {
     version: 1,
     window: { since: isoOrNull(since), until: isoOrNull(until) },
@@ -259,6 +270,8 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
       passRate: ratio(variantPass, variantPass + variantFail),
     },
     resumeVsFresh,
+    orchestratorResumes: { resumed: routedDispatches.filter((r) => r.resume).length, total: routedDispatches.length },
+    gate: { keptEvidence: routedDispatches.filter((r) => r.reason.startsWith("kept:evidence")).length, argmin },
   };
 }
 
@@ -314,6 +327,9 @@ export function renderMarkdown(table: StatsTable): string {
             `| Estimated savings (${s.unit}) | ${s.unit === "usd" ? fmtUSD(s.total) : fmtRatioAmount(s.total)} over ${s.rows} rows |`,
         )),
     `| Variant steps | ${table.variantSteps.taken} taken; pass ${fmtRatio(table.variantSteps.passRate)} |`,
+    // 2.4: not ladder decisions, so they are not rows of the D11 table below (QA-2.3-7).
+    `| Orchestrator resumes (task_id / sessionID; not a ladder step) | ${table.orchestratorResumes.resumed} of ${table.orchestratorResumes.total} routed dispatches |`,
+    `| Kept for lack of evidence (A27) | ${table.gate.keptEvidence} of ${table.routed} routed dispatches |`,
   ];
 
   const classTable =
@@ -344,6 +360,12 @@ export function renderMarkdown(table: StatsTable): string {
     ...table.resumeVsFresh.filter((r) => r.step !== "dispatch").map((r) => `| ${r.step} | ${r.resume} | ${r.fresh} |`),
   ].join("\n");
 
+  // A27 / DF3: the cheapest option the evidence filter held back (`trace.argmin`), i.e. where the gate stops the engine.
+  const argminTable =
+    table.gate.argmin.length === 0
+      ? "_none_"
+      : ["| Cheapest key held back | Rows |", "|---|---|", ...table.gate.argmin.map((r) => `| ${cell(r.key)} | ${r.count} |`)].join("\n");
+
   const blocks = [
     "## Routing stats",
     `Window: ${table.window.since ?? "start"} → ${table.window.until ?? "open"}`,
@@ -352,8 +374,12 @@ export function renderMarkdown(table: StatsTable): string {
     classTable,
     "### By key",
     keyTable,
+    "### Gated by evidence (trace.argmin)",
+    argminTable,
     "### Resume vs fresh",
     resumeTable,
+    // QA-2.1-10: rows are only recorded under a trusted class, so the rates below the metrics are not over every dispatch.
+    "_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._",
   ];
   return blocks.join("\n\n") + "\n";
 }

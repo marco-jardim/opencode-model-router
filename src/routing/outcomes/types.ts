@@ -853,6 +853,19 @@ export interface StatsTable {
   };
   /** Fixed order: LADDER_STEP_KINDS. `renderMarkdown` leaves the `dispatch` row out (QA-2.3-7); the data keeps it. */
   readonly resumeVsFresh: readonly ResumeFreshRow[];
+  /**
+   * The orchestrator's own resumes (2.2: a `subagent` call with `task_id`/`sessionID` that reused a child), over the routed dispatch rows.
+   * Not ladder decisions, so they are reported on their own line and never in the D11 resume-vs-fresh table (QA-2.3-7, 2.4).
+   */
+  readonly orchestratorResumes: { readonly resumed: number; readonly total: number };
+  /**
+   * The evidence gate (A27) over the routed dispatch rows of the window: how many were kept because the cheapest option had no
+   * evidence yet (`kept:evidence`), and which keys that cheapest-but-unproven option was (`trace.argmin`), most frequent first.
+   */
+  readonly gate: {
+    readonly keptEvidence: number;
+    readonly argmin: ReadonlyArray<{ readonly key: OutcomeKey; readonly count: number }>;
+  };
 }
 
 /** What the CLI reads from a directory (a Persister satisfies it). */

@@ -174,6 +174,8 @@ describe("summarize", () => {
         { step: "retry", resume: 0, fresh: 0 },
         { step: "escalate", resume: 0, fresh: 0 },
       ],
+      orchestratorResumes: { resumed: 0, total: 0 },
+      gate: { keptEvidence: 0, argmin: [] },
     });
     const text = JSON.stringify(table) + renderMarkdown(table);
     expect(text).not.toMatch(/NaN|undefined|Infinity/);
@@ -546,7 +548,19 @@ describe("renderMarkdown", () => {
       { step: "retry", resume: 0, fresh: 2 },
       { step: "escalate", resume: 0, fresh: 0 },
     ],
+    orchestratorResumes: { resumed: 1, total: 7 },
+    gate: {
+      keptEvidence: 3,
+      argmin: [
+        { key: "search|host:explore|anthropic/claude-haiku-4-5#default" as OutcomeKey, count: 2 },
+        { key: "implement|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey, count: 1 },
+      ],
+    },
   };
+
+  /** QA-2.1-10: the footnote both `routing:stats` and `/router stats` carry. */
+  const FOOTNOTE =
+    "_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._";
 
   const expected = [
     "## Routing stats",
@@ -565,6 +579,8 @@ describe("renderMarkdown", () => {
     "| Estimated savings (ratio) | 1.50 over 3 rows |",
     "| Estimated savings (usd) | $0.0123 over 2 rows |",
     "| Variant steps | 3 taken; pass 1/2 (50.0%) |",
+    "| Orchestrator resumes (task_id / sessionID; not a ladder step) | 1 of 7 routed dispatches |",
+    "| Kept for lack of evidence (A27) | 3 of 7 routed dispatches |",
     "",
     "### By class",
     "",
@@ -580,6 +596,13 @@ describe("renderMarkdown", () => {
     "| implement\\|router:medium\\|anthropic/claude-sonnet-5-5#default | 4 | 6 | 3 | 1 | 1 | 3/4 (75.0%) | 1 | 1/6 (16.7%) | $0.0123 (n=4) |",
     "| search\\|host:explore\\|anthropic/claude-haiku-4-5#default | 3 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |",
     "",
+    "### Gated by evidence (trace.argmin)",
+    "",
+    "| Cheapest key held back | Rows |",
+    "|---|---|",
+    "| search\\|host:explore\\|anthropic/claude-haiku-4-5#default | 2 |",
+    "| implement\\|router:fast\\|anthropic/claude-sonnet-5-5#low | 1 |",
+    "",
     "### Resume vs fresh",
     "",
     "| Step | Resume | Fresh |",
@@ -587,6 +610,8 @@ describe("renderMarkdown", () => {
     "| variant | 2 | 1 |",
     "| retry | 0 | 2 |",
     "| escalate | 0 | 0 |",
+    "",
+    FOOTNOTE,
     "",
   ].join("\n");
 
@@ -623,12 +648,18 @@ describe("renderMarkdown", () => {
         "| Switched | 0 of 0 non-pinned routed (n/a); enforced 0; failed 0 (verified 0 of 0 enforced) |",
         "| Estimated savings | n/a |",
         "| Variant steps | 0 taken; pass n/a |",
+        "| Orchestrator resumes (task_id / sessionID; not a ladder step) | 0 of 0 routed dispatches |",
+        "| Kept for lack of evidence (A27) | 0 of 0 routed dispatches |",
         "",
         "### By class",
         "",
         "_none_",
         "",
         "### By key",
+        "",
+        "_none_",
+        "",
+        "### Gated by evidence (trace.argmin)",
         "",
         "_none_",
         "",
@@ -639,6 +670,8 @@ describe("renderMarkdown", () => {
         "| variant | 0 | 0 |",
         "| retry | 0 | 0 |",
         "| escalate | 0 | 0 |",
+        "",
+        FOOTNOTE,
         "",
       ].join("\n"),
     );
@@ -1212,5 +1245,55 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
       { ...refusal("V1", at(2), A, "variant"), attemptID: "c-V1:0", overrides: "pass" as const },
     ];
     expect(summarize(null, rows, { since: null, until: null }).variantSteps).toMatchObject({ taken: 1, passRate: { num: 0, den: 1, rate: 0 } });
+  });
+});
+describe("summarize: the 2.4 additions (orchestrator resumes, the evidence gate)", () => {
+  const trace = (argmin?: OutcomeKey) => ({ routeLines: { count: 0, conflict: false, edgeOnly: true }, backend: null, ...(argmin === undefined ? {} : { argmin: choice(argmin) }) });
+  const all = { since: null, until: null };
+
+  it("counts the orchestrator's own resumes over the routed dispatch rows only, never the ladder's or the delegate runner's", () => {
+    const rows = [
+      decision("D1", "2026-10-06T10:00:00.000Z", { resume: true }),
+      decision("D2", "2026-10-06T10:01:00.000Z"),
+      decision("D3", "2026-10-06T10:02:00.000Z", { resume: true }),
+      decision("ladder-1", "2026-10-06T10:03:00.000Z", { resume: true, best: null }), // the delegate runner's first attempt
+      decision("L1", "2026-10-06T10:04:00.000Z", { step: "variant", resume: true }), // a ladder step, not a dispatch
+    ];
+    const table = summarize(null, rows, all);
+    expect(table.orchestratorResumes).toEqual({ resumed: 2, total: 3 });
+    // the D11 table still counts the dispatch row (data) and the variant step apart from it
+    expect(table.resumeVsFresh.find((r) => r.step === "variant")).toEqual({ step: "variant", resume: 1, fresh: 0 });
+    expect(renderMarkdown(table)).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step) | 2 of 3 routed dispatches |");
+  });
+
+  it("counts kept:evidence rows and the trace.argmin keys, most frequent first, ties by key", () => {
+    const rows = [
+      decision("E1", "2026-10-06T10:00:00.000Z", { reason: "kept:evidence: the cheapest option needs 5 outcomes", trace: trace(B) }),
+      decision("E2", "2026-10-06T10:01:00.000Z", { reason: "kept:evidence: ...", trace: trace(B) }),
+      decision("E3", "2026-10-06T10:02:00.000Z", { reason: "kept:evidence: ...", trace: trace(C) }),
+      decision("E4", "2026-10-06T10:03:00.000Z", { reason: "kept:margin: not enough", trace: trace() }),
+      decision("E5", "2026-10-06T10:04:00.000Z", { reason: "switched: cheaper", trace: trace(C) }),
+      decision("ladder-2", "2026-10-06T10:05:00.000Z", { reason: "kept:evidence: ignored", best: null, trace: trace(B) }),
+    ];
+    const table = summarize(null, rows, all);
+    expect(table.gate.keptEvidence).toBe(3);
+    expect(table.gate.argmin).toEqual([
+      { key: B, count: 2 },
+      { key: C, count: 2 },
+    ].sort((a, b) => b.count - a.count || (a.key < b.key ? -1 : 1)));
+    const out = renderMarkdown(table);
+    expect(out).toContain("| Kept for lack of evidence (A27) | 3 of 5 routed dispatches |");
+    expect(out).toContain("### Gated by evidence (trace.argmin)");
+    expect(out).toContain("| Cheapest key held back | Rows |");
+  });
+
+  it("windowing applies to both additions", () => {
+    const rows = [
+      decision("W1", "2026-10-05T10:00:00.000Z", { reason: "kept:evidence: old", trace: trace(B), resume: true }),
+      decision("W2", "2026-10-06T10:00:00.000Z", { reason: "kept:evidence: new", trace: trace(C) }),
+    ];
+    const table = summarize(null, rows, { since: Date.parse("2026-10-06T00:00:00.000Z"), until: null });
+    expect(table.gate).toEqual({ keptEvidence: 1, argmin: [{ key: C, count: 1 }] });
+    expect(table.orchestratorResumes).toEqual({ resumed: 0, total: 1 });
   });
 });
