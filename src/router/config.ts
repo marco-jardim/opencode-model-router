@@ -1837,7 +1837,7 @@ function ownRungProblem(
   tierCostRatio: number,
   candidates: readonly CandidateSpec[],
 ): string | undefined {
-  if (candidates.length === 0) return undefined;
+  // `candidates` is non-empty: both callers check, an empty list means "none".
   const ownKey = rungKey(tierModel, tierVariant);
   const index = candidates.findIndex((c) => rungKey(c.model ?? tierModel, c.variant) === ownKey);
   if (index === -1) {
@@ -1975,8 +1975,9 @@ export function hasExplicitCandidates(tier: TierConfig): boolean {
  * `costRatio` for it. Loading reports it as a config notice.
  */
 export function candidatesProblem(tierName: string, tier: TierConfig): string | undefined {
-  if (!hasExplicitCandidates(tier)) return undefined;
-  return ownRungProblem(tier.model, tier.variant, tierCostRatioOf(tierName, tier.costRatio), tier.candidates ?? []);
+  const listed = tier.candidates;
+  if (listed === undefined || listed.length === 0) return undefined;
+  return ownRungProblem(tier.model, tier.variant, tierCostRatioOf(tierName, tier.costRatio), listed);
 }
 
 /**

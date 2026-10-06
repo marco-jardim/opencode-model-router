@@ -1139,6 +1139,11 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(noticeMessages()).toEqual(["ignoring unknown routing key: routing.margn"]);
     });
 
+    it("logs nothing for a config that did not come from loadConfig (it carries no notices)", () => {
+      warnConfigNotices(cfgOf({ routing: { margn: 1 } }), logger);
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
     it("logs nothing for a config without notices, or when given no config", () => {
       editOverride({ routing: { engine: "shadow" } });
       reload();

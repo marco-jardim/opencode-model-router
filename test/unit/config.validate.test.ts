@@ -1162,6 +1162,16 @@ describe("validateConfig — tier variant and per-preset costRatio (QA-1.1-26, Q
     ).toThrow(/\(anthropic\/claude-sonnet-5-5, high\) has costRatio 9 in 'heavy\.candidates\[1\]' but 8 in 'medium\.candidates\[1\]'/);
   });
 
+  it("names the default variant when the clashing pair has none", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, costRatio: 5 },
+          heavy: { model: "openai/gpt-6-luna", costRatio: 2, candidates: [{}, { model: SONNET, costRatio: 9 }] },
+        }),
+      ),
+    ).toThrow(/\(anthropic\/claude-sonnet-5-5, default\) has costRatio 9 in 'heavy\.candidates\[1\]' but 5 in 'medium \(own rung\)'/);
+  });
   it("accepts the same (model, variant) at the same costRatio, and different variants at different ones", () => {
     expect(() =>
       validateConfig(
