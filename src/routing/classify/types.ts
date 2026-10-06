@@ -265,6 +265,8 @@ export type FetchLike = (
     readonly headers: Record<string, string>;
     readonly body: string;
     readonly signal: AbortSignal;
+    /** Always `error`: a redirect would carry the key and the state to a host nobody configured (QA-1.2-31). */
+    readonly redirect: "error";
   },
 ) => Promise<{ readonly ok: boolean; readonly status: number; text(): Promise<string> }>;
 

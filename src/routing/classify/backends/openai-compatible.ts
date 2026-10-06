@@ -169,6 +169,7 @@ export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps)
       headers: target.headers,
       body: requestBody(target, system, user, labels, batchCount, withSchema),
       signal,
+      redirect: "error",
     });
     if (!response.ok) {
       // The status below is the reported failure; the body is read only to detect `response_format` rejection.

@@ -161,6 +161,7 @@ export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBack
       headers: target.headers,
       body: JSON.stringify(body),
       signal,
+      redirect: "error",
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();

@@ -1690,3 +1690,75 @@ describe("entropy redaction spares paths; skip reasons are split (QA-1.2-26)", (
     expect(hasCredentialSignal("paste Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0 here")).toBe(false);
   });
 });
+describe("redirects are never followed (QA-1.2-31)", () => {
+  const KEY = "k-0123456789abcdef";
+
+  it("every request of both HTTP backends, single and batch, passes redirect: error", async () => {
+    const { logger } = makeLogger();
+    const seen: Array<string> = [];
+    const fetchFn: FetchLike = async (_url, init) => {
+      seen.push(init.redirect);
+      return response(200, chatBody("search"));
+    };
+    const openai = createOpenAICompatibleBackend({
+      fetch: fetchFn,
+      env: { LLM_KEY: KEY },
+      settings: settings({ backend: "openai-compatible", baseUrl: "https://api.example.com/v1", apiKeyEnv: "LLM_KEY", samples: 3 }),
+      logger,
+    });
+    await openai.classify(stateOf("x"), callOptions(seeded(1)));
+    await openai.classifyMany([stateOf("a"), stateOf("b")], callOptions(seeded(1)));
+    const typesafe = createTypeSafeBackend({
+      fetch: fetchFn,
+      env: { TS_KEY: KEY },
+      settings: settings({ backend: "typesafe", baseUrl: "https://api.typesafe.ai", apiKeyEnv: "TS_KEY" }),
+      logger,
+    });
+    await typesafe.classify(stateOf("x"), callOptions(seeded(1)));
+    await typesafe.classifyMany([stateOf("a"), stateOf("b")], callOptions(seeded(1)));
+    expect(seen).toHaveLength(8); // openai: 3 samples single + 3 samples batch; typesafe: 1 + 1
+    expect(new Set(seen)).toEqual(new Set(["error"]));
+  });
+
+  it("a redirect that the runtime refuses is an error result, not a followed request", async () => {
+    const { logger, logs } = makeLogger();
+    const calls: string[] = [];
+    const fetchFn: FetchLike = async (url, init) => {
+      calls.push(url);
+      expect(init.redirect).toBe("error");
+      throw new TypeError("fetch failed: redirect mode is set to error");
+    };
+    const backend = createOpenAICompatibleBackend({
+      fetch: fetchFn,
+      env: { LLM_KEY: KEY },
+      settings: settings({ backend: "openai-compatible", baseUrl: "https://api.example.com/v1", apiKeyEnv: "LLM_KEY" }),
+      logger,
+    });
+    const result = await backend.classify(stateOf("x"), callOptions(seeded(1)));
+    expect(result.status).toBe("error");
+    expect(result.reason).toContain("redirect mode is set to error");
+    expect(calls).toEqual(["https://api.example.com/v1/chat/completions"]);
+    expect(JSON.stringify(logs)).not.toContain(KEY);
+  });
+
+  it("the default global fetch wrapper forwards the init untouched, redirect included", async () => {
+    const real = globalThis.fetch;
+    let received: RequestInit | undefined;
+    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+      received = init;
+      return new Response(chatBody("search"), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const { createClassifierBackend } = await import("../../src/routing/classify");
+      const { logger } = makeLogger();
+      const backend = createClassifierBackend(
+        settings({ backend: "openai-compatible", baseUrl: "https://api.example.com/v1", apiKeyEnv: null }),
+        { logger, env: {} },
+      );
+      await backend!.classify(stateOf("x"), callOptions(seeded(1)));
+      expect(received?.redirect).toBe("error");
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+});
