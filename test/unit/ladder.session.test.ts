@@ -85,7 +85,7 @@ function info(
   budget: number | null = 1_000_000,
   costRatios: Record<string, number> = {},
 ): TierVariantInfo {
-  return { model, base, ladder: { model, variants, source: "catalog", rejected: [] }, inputBudget: budget, costRatios };
+  return { model, base, ladder: { model, variants, source: "catalog", rejected: [], foreign: [] }, inputBudget: budget, costRatios };
 }
 
 function handPolicy(
@@ -292,6 +292,13 @@ describe("buildEscalatePolicy with session input", () => {
     expect(buildEscalatePolicy(makeConfig({ fast: notArray }), V2).variants!.perTier.fast!.ladder.source).toBe("catalog");
   });
 
+  it("a candidates array without a rung of the tier's model leaves no variant steps and reports the other rungs (QA-1.5-5)", () => {
+    const otherOnly = { model: SONNET, candidates: [{ model: OPUS, variant: "high" }] };
+    const policy = buildEscalatePolicy(makeConfig({ fast: otherOnly }), V2);
+    const ladder = policy.variants!.perTier.fast!.ladder;
+    expect(ladder).toMatchObject({ variants: [], source: "candidates", foreign: [{ model: OPUS, variant: "high" }] });
+    expect(nextAction(sessionState({ attemptsThisTier: 0 }), fail, policy)).not.toHaveProperty("variantStep");
+  });
   it("reads the budget from the catalog (limit.input, or context - output) and null when unknown", () => {
     const policy = buildEscalatePolicy(
       makeConfig({

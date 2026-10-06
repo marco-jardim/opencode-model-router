@@ -49,15 +49,29 @@ export interface VariantCandidate {
   readonly variant?: string | null;
 }
 
+/** A configured candidate rung on another model: variant steps never walk it (escalation territory). */
+export interface ForeignRung {
+  readonly model: string;
+  readonly variant: string | null;
+}
+
 export interface VariantLadder {
   /** `provider/model`, as configured. */
   readonly model: string;
-  /** Step targets in step order; always a subset of the catalog's `variants[].id`. */
+  /** Step targets in step order, strictly rising in rank; always a subset of the catalog's `variants[].id`. */
   readonly variants: readonly string[];
-  /** `candidates` when explicit candidates named a variant of this model, `none` without a catalog. */
+  /**
+   * `candidates` whenever the tier configured a non-empty `candidates` array (even if no rung of this
+   * model survived, QA-1.5-5), `catalog` for the catalog order, `none` without a catalog `variants` array.
+   */
   readonly source: "catalog" | "candidates" | "none";
-  /** Candidate variants dropped because the catalog does not offer them (for the advisor and logs). */
+  /**
+   * Candidate variants of this model dropped: absent from the catalog, unranked, or not ranked above
+   * every variant kept before them (for the advisor and logs).
+   */
   readonly rejected: readonly string[];
+  /** Candidate rungs naming another model (for the 2.4 advisor); never part of `variants`. */
+  readonly foreign: readonly ForeignRung[];
 }
 
 export interface VariantLadderInput {
@@ -135,58 +149,82 @@ export function catalogVariantIds(catalog: CatalogModel | null | undefined): rea
   return ids;
 }
 
-function namedCandidateVariants(
-  model: string,
-  candidates: VariantLadderInput["candidates"],
-): string[] {
-  if (!Array.isArray(candidates)) return [];
-  const named: string[] = [];
+interface CandidateScan {
+  /** Variants this model's candidates name, in candidate order, deduplicated. */
+  named: string[];
+  /** Rungs that name another model, deduplicated. */
+  foreign: ForeignRung[];
+  /** The tier configured a non-empty `candidates` array. */
+  explicit: boolean;
+}
+
+function scanCandidates(model: string, candidates: VariantLadderInput["candidates"]): CandidateScan {
+  const scan: CandidateScan = { named: [], foreign: [], explicit: false };
+  if (!Array.isArray(candidates) || candidates.length === 0) return scan;
+  scan.explicit = true;
   for (const candidate of candidates) {
     if (candidate === null || typeof candidate !== "object") continue;
     const candidateModel = candidate.model ?? model;
-    const variant = candidate.variant;
-    if (candidateModel !== model || typeof variant !== "string" || variant.length === 0) continue;
-    if (!named.includes(variant)) named.push(variant);
+    if (typeof candidateModel !== "string") continue;
+    const variant = typeof candidate.variant === "string" && candidate.variant.length > 0 ? candidate.variant : null;
+    if (candidateModel !== model) {
+      if (!scan.foreign.some((rung) => rung.model === candidateModel && rung.variant === variant)) {
+        scan.foreign.push(Object.freeze({ model: candidateModel, variant }));
+      }
+      continue;
+    }
+    if (variant !== null && !scan.named.includes(variant)) scan.named.push(variant);
   }
-  return named;
+  return scan;
 }
-
 function freezeLadder(
   model: string,
   variants: string[],
   source: VariantLadder["source"],
   rejected: string[],
+  foreign: ForeignRung[],
 ): VariantLadder {
   return Object.freeze({
     model,
     variants: Object.freeze(variants),
     source,
     rejected: Object.freeze(rejected),
+    foreign: Object.freeze(foreign),
   });
 }
 
 /**
  * The variant ladder of one model (D10).
  *
- * - Explicit candidates naming a variant of `model` define the ladder in
- *   their own order, minus ids the catalog does not offer (`rejected`).
- * - Otherwise the catalog's `variants[].id` in catalog order, keeping only
- *   ranked ids at or below `maxEffort` that strictly raise the rank, so a
- *   catalog ladder never steps down even if a catalog is out of order.
+ * - A non-empty `candidates` array makes the ladder exactly the variants its entries name for `model`,
+ *   in their own order, keeping only ids the catalog offers that are ranked strictly above everything
+ *   kept before them (the rest go to `rejected`), so a candidate ladder never steps down either. The
+ *   source is `candidates` even when nothing survives; entries naming another model are reported in
+ *   `foreign`. No `maxEffort` cap applies: the user listed them.
+ * - Otherwise the catalog's `variants[].id` in catalog order, keeping only ranked ids at or below
+ *   `maxEffort` that strictly raise the rank, so a catalog ladder never steps down even if a catalog
+ *   is out of order.
  * - Without a catalog `variants` array there is no ladder.
  */
 export function buildVariantLadder(input: VariantLadderInput): VariantLadder {
   const { model } = input;
   const catalogIds = catalogVariantIds(input.catalog);
-  const named = namedCandidateVariants(model, input.candidates);
-  if (catalogIds === null) return freezeLadder(model, [], "none", named);
-  if (named.length > 0) {
-    return freezeLadder(
-      model,
-      named.filter((id) => catalogIds.includes(id)),
-      "candidates",
-      named.filter((id) => !catalogIds.includes(id)),
-    );
+  const scan = scanCandidates(model, input.candidates);
+  if (catalogIds === null) return freezeLadder(model, [], "none", scan.named, scan.foreign);
+  if (scan.explicit) {
+    const variants: string[] = [];
+    const rejected: string[] = [];
+    let last = -1;
+    for (const id of scan.named) {
+      const rank = variantRank(id);
+      if (!catalogIds.includes(id) || rank < 0 || rank <= last) {
+        rejected.push(id);
+        continue;
+      }
+      variants.push(id);
+      last = rank;
+    }
+    return freezeLadder(model, variants, "candidates", rejected, scan.foreign);
   }
   const cap = input.maxEffort == null ? Number.POSITIVE_INFINITY : variantRank(input.maxEffort);
   const variants: string[] = [];
@@ -197,9 +235,8 @@ export function buildVariantLadder(input: VariantLadderInput): VariantLadder {
     variants.push(id);
     last = rank;
   }
-  return freezeLadder(model, variants, "catalog", []);
+  return freezeLadder(model, variants, "catalog", [], []);
 }
-
 /**
  * The next variant step from `current` on `ladder`, or `null` when none.
  *

@@ -21,6 +21,7 @@ import {
 
 // Live catalog variant lists recorded by Phase 0.P S4 (host effort order).
 const SONNET = "anthropic/claude-sonnet-5-5";
+const OPUS = "anthropic/claude-opus-5-5";
 const HAIKU = "anthropic/claude-haiku-4-5";
 const LUNA = "openai/gpt-6-luna";
 const catalog = (...ids: string[]): CatalogModel => ({ variants: ids.map((id) => ({ id })) });
@@ -30,7 +31,7 @@ const luna = catalog("none", "low", "medium", "high", "xhigh", "max");
 const deepseek = catalog("low", "high", "max");
 
 function ladder(variants: string[], source: VariantLadder["source"] = "catalog"): VariantLadder {
-  return { model: SONNET, variants, source, rejected: [] };
+  return { model: SONNET, variants, source, rejected: [], foreign: [] };
 }
 
 describe("variant ranks and the default position (A9)", () => {
@@ -110,7 +111,7 @@ describe("catalogVariantIds", () => {
 describe("buildVariantLadder", () => {
   it("builds the ladder from [low, medium, high, xhigh] in catalog order", () => {
     expect(buildVariantLadder({ model: SONNET, catalog: catalog("low", "medium", "high", "xhigh") })).toEqual({
-      model: SONNET, variants: ["low", "medium", "high", "xhigh"], source: "catalog", rejected: [],
+      model: SONNET, variants: ["low", "medium", "high", "xhigh"], source: "catalog", rejected: [], foreign: [],
     });
   });
 
@@ -139,12 +140,15 @@ describe("buildVariantLadder", () => {
 
   it("has no ladder without a catalog variants array and reports named candidates as rejected", () => {
     expect(buildVariantLadder({ model: SONNET, catalog: undefined, candidates: [{ variant: "high" }] })).toEqual({
-      model: SONNET, variants: [], source: "none", rejected: ["high"],
+      model: SONNET, variants: [], source: "none", rejected: ["high"], foreign: [],
     });
     expect(buildVariantLadder({ model: SONNET, catalog: { limit: { context: 1 } } }).source).toBe("none");
     expect(buildVariantLadder({ model: SONNET, catalog: { variants: [] } })).toEqual({
-      model: SONNET, variants: [], source: "catalog", rejected: [],
+      model: SONNET, variants: [], source: "catalog", rejected: [], foreign: [],
     });
+    // other-model rungs are still reported without a catalog
+    expect(buildVariantLadder({ model: SONNET, catalog: undefined, candidates: [{ model: OPUS, variant: "high" }] }).foreign)
+      .toEqual([{ model: OPUS, variant: "high" }]);
   });
 
   it("explicit candidates override catalog order and are not capped", () => {
@@ -152,9 +156,20 @@ describe("buildVariantLadder", () => {
       model: SONNET,
       catalog: sonnet,
       maxEffort: "high",
-      candidates: [{ variant: "max" }, { variant: "medium" }, { variant: "high" }],
+      candidates: [{ variant: "medium" }, { variant: "max" }],
     });
-    expect(built).toEqual({ model: SONNET, variants: ["max", "medium", "high"], source: "candidates", rejected: [] });
+    expect(built).toEqual({ model: SONNET, variants: ["medium", "max"], source: "candidates", rejected: [], foreign: [] });
+  });
+
+  it("drops candidates not ranked above everything kept so far and reports them as rejected (QA-1.5-5)", () => {
+    const messy = catalog("low", "medium", "high", "xhigh", "max", "fast");
+    expect(buildVariantLadder({ model: SONNET, catalog: messy, candidates: [{ variant: "max" }, { variant: "medium" }, { variant: "high" }] }))
+      .toMatchObject({ variants: ["max"], source: "candidates", rejected: ["medium", "high"] });
+    expect(buildVariantLadder({ model: SONNET, catalog: messy, candidates: [{ variant: "high" }, { variant: "fast" }, { variant: "xhigh" }, { variant: "low" }] }))
+      .toMatchObject({ variants: ["high", "xhigh"], rejected: ["fast", "low"] });
+    // a rank is never repeated: the dedupe happens first, a different id with an equal rank cannot exist
+    expect(buildVariantLadder({ model: SONNET, catalog: messy, candidates: [{ variant: "low" }, { variant: "low" }, { variant: "medium" }] }))
+      .toMatchObject({ variants: ["low", "medium"], rejected: [] });
   });
 
   it("filters candidates to this model, validates them against the catalog and dedupes", () => {
@@ -164,7 +179,7 @@ describe("buildVariantLadder", () => {
       candidates: [
         { variant: "medium" },
         { model: SONNET, variant: "high" },
-        { model: "anthropic/claude-opus-5-5", variant: "xhigh" },
+        { model: OPUS, variant: "xhigh" },
         { variant: "ultra" },
         { variant: "default" },
         { variant: "medium" },
@@ -174,19 +189,54 @@ describe("buildVariantLadder", () => {
         undefined,
       ],
     });
-    expect(built).toEqual({ model: SONNET, variants: ["medium", "high"], source: "candidates", rejected: ["ultra", "default"] });
+    expect(built).toEqual({
+      model: SONNET,
+      variants: ["medium", "high"],
+      source: "candidates",
+      rejected: ["ultra", "default"],
+      foreign: [{ model: OPUS, variant: "xhigh" }],
+    });
   });
 
-  it("falls back to the catalog when no candidate names a variant of this model", () => {
+  it("reports other-model rungs once, with a null variant for a model-only rung", () => {
     const built = buildVariantLadder({
       model: SONNET,
       catalog: sonnet,
-      maxEffort: "xhigh",
-      candidates: [{ model: SONNET }, { model: "anthropic/claude-opus-5-5", variant: "xhigh" }],
+      candidates: [{ model: OPUS }, { model: OPUS }, { model: OPUS, variant: "high" }, { model: OPUS, variant: "high" }, { variant: "low" }],
     });
-    expect(built).toMatchObject({ variants: ["low", "medium", "high", "xhigh"], source: "catalog" });
+    expect(built.variants).toEqual(["low"]);
+    expect(built.foreign).toEqual([{ model: OPUS, variant: null }, { model: OPUS, variant: "high" }]);
+    expect(Object.isFrozen(built.foreign)).toBe(true);
+    expect(Object.isFrozen(built.foreign[0])).toBe(true);
   });
 
+  it("uses the candidates source even when no rung of this model survives (QA-1.5-5)", () => {
+    const onlyOther = buildVariantLadder({
+      model: SONNET,
+      catalog: sonnet,
+      maxEffort: "xhigh",
+      candidates: [{ model: SONNET }, { model: OPUS, variant: "xhigh" }],
+    });
+    expect(onlyOther).toEqual({
+      model: SONNET,
+      variants: [],
+      source: "candidates",
+      rejected: [],
+      foreign: [{ model: OPUS, variant: "xhigh" }],
+    });
+    const allRejected = buildVariantLadder({ model: SONNET, catalog: sonnet, candidates: [{ variant: "ultra" }] });
+    expect(allRejected).toMatchObject({ variants: [], source: "candidates", rejected: ["ultra"] });
+  });
+
+  it("falls back to the catalog only for an absent or empty candidates array", () => {
+    for (const candidates of [undefined, null, []] as const) {
+      expect(buildVariantLadder({ model: SONNET, catalog: sonnet, maxEffort: "xhigh", candidates })).toMatchObject({
+        variants: ["low", "medium", "high", "xhigh"],
+        source: "catalog",
+        foreign: [],
+      });
+    }
+  });
   it("returns a frozen ladder and leaves its inputs untouched", () => {
     const candidates = [{ variant: "high" }];
     const entry = catalog("low", "high");
@@ -195,6 +245,7 @@ describe("buildVariantLadder", () => {
     expect(Object.isFrozen(built)).toBe(true);
     expect(Object.isFrozen(built.variants)).toBe(true);
     expect(Object.isFrozen(built.rejected)).toBe(true);
+    expect(Object.isFrozen(built.foreign)).toBe(true);
     expect(JSON.stringify({ candidates, entry })).toBe(before);
   });
 });
