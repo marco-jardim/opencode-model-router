@@ -1158,6 +1158,31 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(markerLines(await runRouter("v2"))[0]).toContain("engine=static");
     });
 
+    const v1Notices = (): string[] =>
+      warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("routing.engine ignored"));
+
+    it("logs the v1 notice exactly once at plugin init, before any /router (QA-1.1-8)", async () => {
+      editOverride({ routing: { engine: "enforce" } });
+      const ctx = {} as unknown as Parameters<typeof ModelRouterPlugin>[0];
+      await ModelRouterPlugin(ctx);
+      expect(v1Notices()).toEqual(["[model-router] routing.engine ignored on OpenCode v1"]);
+      await runRouter(undefined);
+      await runRouter(undefined);
+      expect(v1Notices()).toHaveLength(1);
+    });
+
+    it("logs no notice at init on v2, for engine static on v1, or without a routing block", async () => {
+      editOverride({ routing: { engine: "enforce" } });
+      await ModelRouterPlugin({ routerHost: "v2" } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      expect(v1Notices()).toEqual([]);
+      editOverride({ routing: { engine: "static" } });
+      await ModelRouterPlugin({} as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      unlinkSync(overridePath());
+      invalidateConfigCache();
+      await ModelRouterPlugin({} as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      expect(v1Notices()).toEqual([]);
+    });
+
     it("reports the applied (coerced) engine on v1 and logs the notice once", async () => {
       editOverride({ routing: { engine: "enforce" } });
       const first = markerLines(await runRouter(undefined));

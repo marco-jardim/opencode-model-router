@@ -14,6 +14,7 @@ import {
   findProjectOverride,
   resolveVerifyBudget,
   resolveDepthLimit,
+  resolveRouting,
   routerStatusLines,
   warnDeprecatedVerifyKeys,
 } from "./router/config";
@@ -384,6 +385,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
   const routerWarn = { warn: (message: string) => logger.warn(message) };
+  resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
   const depthTracker = createDepthTracker({
     async getParent(id) {
       if (sessionRootMemo.get(id) === true) return null;
