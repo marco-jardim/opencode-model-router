@@ -128,7 +128,7 @@ describe("false-refusal call site", () => {
     try {
       const rows = (await reader.persister.readRows()).rows;
       expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ kind: "refusal", childSessionID: "refusal-child", decisionID: "d-1", attemptID: expect.stringMatching(/^refusal-child:0:\d+$/), key: KEY, sessionID: ORCHESTRATOR });
+      expect(rows[0]).toMatchObject({ kind: "refusal", childSessionID: "refusal-child", decisionID: "d-1", attemptID: expect.stringMatching(/^refusal-child:0:[0-9a-f]{8}-\d+$/), key: KEY, sessionID: ORCHESTRATOR });
     } finally {
       await reader.release();
     }

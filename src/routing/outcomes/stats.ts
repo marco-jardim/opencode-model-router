@@ -113,25 +113,33 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   // A refusal belongs to this window's refusal rate only when its decision row is in the window too
   // (QA-1.3-13); otherwise `falseRefusals / attempts` could pass 100 %. Refusals without a decision id stay.
   const windowDecisionIDs = new Set(decisions.map((r) => r.decisionID));
-  // QA-2.1-3: a refusal for an attempt that already has a `pass` row overrides it, exactly as the store does
-  // (pass → fail, `falseRefusals` + 1). The pass row may sit outside the window (or the log may have rotated), so the
-  // join looks at every row; a converted pass inside the window becomes a fail, and a conversion whose pass row is
-  // not in the window still counts as one fail for this window.
-  const passedAttempts = new Set<string>();
-  for (const row of rows) if (row.kind === "verdict" && row.verdict === "pass") passedAttempts.add(row.attemptID);
+  // QA-2.1-3 / R2-2: a refusal that records `overrides: "pass"` turned a `pass` of the same attempt into a failure,
+  // exactly as the store does (pass → fail, `falseRefusals` + 1). The conversion set comes from every row handed in,
+  // not only the window: the pass row may sit in an earlier window or in a rotated log. A converted attempt's pass is
+  // never counted as a pass; its failure is counted once, with the refusal, whichever window each row is in. Only the
+  // explicit marker counts: a refusal without it (another attempt, or after a fail) is a refusal and nothing else.
   const converted = new Set<string>();
+  for (const row of rows) if (row.kind === "refusal" && row.overrides === "pass") converted.add(row.attemptID);
+  const decisiveAttempts = new Set(verdicts.filter((v) => v.verdict !== "unverifiable").map((v) => v.attemptID));
   const effectiveVerdicts: Array<Pick<VerdictRow, "key" | "verdict" | "step" | "attemptID">> = [];
+  const unverifiableSeen = new Set<string>();
+  for (const v of verdicts) {
+    if (v.verdict === "pass" && converted.has(v.attemptID)) continue;
+    if (v.verdict === "unverifiable") {
+      // R2-9: a later pass/fail row for the attempt replaces an earlier unverifiable one; one unverifiable per attempt.
+      if (decisiveAttempts.has(v.attemptID) || unverifiableSeen.has(v.attemptID)) continue;
+      unverifiableSeen.add(v.attemptID);
+    }
+    effectiveVerdicts.push(v);
+  }
+  const countedRefusals: RefusalRow[] = [];
+  const failedByRefusal = new Set<string>();
   for (const r of refusals) {
     if (r.decisionID !== null && !windowDecisionIDs.has(r.decisionID)) continue;
+    countedRefusals.push(r);
     slot(r.key).falseRefusals += 1;
-    if (r.overrides === "pass" || passedAttempts.has(r.attemptID)) converted.add(r.attemptID);
-  }
-  const windowPassed = new Set(verdicts.filter((v) => v.verdict === "pass").map((v) => v.attemptID));
-  for (const v of verdicts) {
-    effectiveVerdicts.push(v.verdict === "pass" && converted.has(v.attemptID) ? { ...v, verdict: "fail" } : v);
-  }
-  for (const r of refusals) {
-    if (converted.has(r.attemptID) && !windowPassed.has(r.attemptID) && (r.decisionID === null || windowDecisionIDs.has(r.decisionID))) {
+    if (r.overrides === "pass" && !failedByRefusal.has(r.attemptID)) {
+      failedByRefusal.add(r.attemptID);
       effectiveVerdicts.push({ key: r.key, verdict: "fail", step: r.step, attemptID: r.attemptID });
     }
   }
@@ -192,7 +200,16 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   // Variant steps.
   const variantVerdicts = effectiveVerdicts.filter((v) => v.step === "variant");
   const variantPass = variantVerdicts.filter((v) => v.verdict === "pass").length;
-  const variantFail = variantVerdicts.filter((v) => v.verdict === "fail").length;
+  // R2-3: a refusal that was an attempt's first terminal signal is a variant failure in the store (`variantFail`), though it has
+  // no verdict row; one after a verdict, or a conversion (already a synthetic fail above), adds nothing.
+  const decidedAttempts = new Set(effectiveVerdicts.filter((v) => v.verdict !== "unverifiable").map((v) => v.attemptID));
+  let variantRefusalFails = 0;
+  for (const r of countedRefusals) {
+    if (r.step !== "variant" || decidedAttempts.has(r.attemptID)) continue;
+    decidedAttempts.add(r.attemptID);
+    variantRefusalFails += 1;
+  }
+  const variantFail = variantVerdicts.filter((v) => v.verdict === "fail").length + variantRefusalFails;
 
   const resumeVsFresh: ResumeFreshRow[] = LADDER_STEP_KINDS.map((step) => {
     const ofStep = decisions.filter((r) => r.step === step);

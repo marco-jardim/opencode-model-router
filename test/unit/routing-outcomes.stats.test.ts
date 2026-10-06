@@ -1042,9 +1042,61 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
     expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1, passRate: { num: 0, den: 1, rate: 0 } });
   });
 
-  it("also joins on the attempt id when the row carries no marker", () => {
+  it("QA-2.1-R2-2: only the explicit marker converts; a refusal without it on a pass row's attempt is just a refusal", () => {
     const rows = [decision("X1", at(0)), verdict("X1", at(1), A, "pass"), sameAttempt("X1")];
-    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+    expect(cell(rows, A)).toMatchObject({ pass: 1, fail: 0, falseRefusals: 1 });
+  });
+
+  it("QA-2.1-R2-2 (P5): duplicate refusal rows for one converted attempt add one fail, not two", () => {
+    const rows = [
+      decision("X1", at(0)),
+      verdict("X1", at(1), A, "pass"),
+      sameAttempt("X1", { overrides: "pass" }),
+      { ...sameAttempt("X1", { overrides: "pass" }), ts: at(3) },
+    ];
+    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 2, passRate: { num: 0, den: 1, rate: 0 } });
+    // the same with the pass in an earlier window: the synthetic fail is added once
+    const split = [
+      decision("X2", "2026-10-05T10:00:00.000Z"),
+      verdict("X2", "2026-10-05T10:01:00.000Z", A, "pass"),
+      sameAttempt("X2", { overrides: "pass", decisionID: null }),
+      { ...sameAttempt("X2", { overrides: "pass", decisionID: null }), ts: at(3) },
+    ];
+    expect(cell(split, A, { since: Date.parse("2026-10-06T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 2 });
+  });
+
+  it("QA-2.1-R2-2 (P5): pass in the window, refusal after it: the pass is not a pass, and no fail is invented", () => {
+    const rows = [decision("X1", at(0)), verdict("X1", at(1), A, "pass"), sameAttempt("X1", { overrides: "pass", ts: "2026-10-07T01:00:00.000Z" })];
+    const inFirstWindow = { since: Date.parse("2026-10-06T00:00:00.000Z"), until: Date.parse("2026-10-07T00:00:00.000Z") };
+    expect(cell(rows, A, inFirstWindow)).toMatchObject({ pass: 0, fail: 0, falseRefusals: 0 });
+    // the window of the refusal: one fail (no decision row there, so the refusal needs a null decision id to count)
+    const later = [...rows.slice(0, 2), sameAttempt("X1", { overrides: "pass", ts: "2026-10-07T01:00:00.000Z", decisionID: null })];
+    expect(cell(later, A, { since: Date.parse("2026-10-07T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+  });
+
+  it("QA-2.1-R2-9: a later pass/fail row replaces an earlier unverifiable row of the same attempt", () => {
+    const attempt = (row: VerdictRow): VerdictRow => ({ ...row, attemptID: "c-U:0" });
+    const rows = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, "pass"))];
+    expect(cell(rows, A)).toMatchObject({ pass: 1, fail: 0, unverifiable: 0 });
+    const reversed = [rows[0]!, rows[2]!, rows[1]!];
+    expect(cell(reversed, A)).toMatchObject({ pass: 1, unverifiable: 0 });
+    const still = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, "unverifiable"))];
+    expect(cell(still, A)).toMatchObject({ pass: 0, fail: 0, unverifiable: 1 });
+  });
+
+  it("QA-2.1-R2-3: a refusal that was the first terminal signal of a variant attempt is a variant failure, like the store's", () => {
+    const stats = (rows: LogRow[]) => summarize(null, rows, { since: null, until: null }).variantSteps;
+    const alone = [decision("V1", at(0), { step: "variant" }), { ...refusal("V1", at(1), A, "variant"), attemptID: "c-V1:0" }];
+    expect(stats(alone)).toMatchObject({ taken: 1, passRate: { num: 0, den: 1, rate: 0 } });
+    // after a fail verdict (the store: lifetime counter only): still one variant failure
+    const afterFail = [...alone.slice(0, 1), { ...verdict("V1", at(1), A, "fail", "variant"), attemptID: "c-V1:0" }, ...alone.slice(1)];
+    expect(stats(afterFail)).toMatchObject({ passRate: { num: 0, den: 1, rate: 0 } });
+    // another variant attempt that passed: 1 of 2
+    const mixed = [...alone, decision("V2", at(2), { step: "variant" }), verdict("V2", at(3), A, "pass", "variant")];
+    expect(stats(mixed)).toMatchObject({ taken: 2, passRate: { num: 1, den: 2, rate: 0.5 } });
+    // a refusal of a dispatch (not variant) step does not count
+    const dispatchStep = [decision("D1", at(0)), refusal("D1", at(1), A)];
+    expect(stats(dispatchStep).passRate).toMatchObject({ den: 0 });
   });
 
   it("leaves a refusal of another attempt, and a refusal after a fail, as one refusal and no extra fail", () => {

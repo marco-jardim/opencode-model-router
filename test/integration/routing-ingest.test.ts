@@ -166,9 +166,9 @@ describe("dispatch registry (2.1.1)", () => {
     expect(lookupDispatch("c1")).toBeUndefined();
     dispatch("c1");
     const first = lookupDispatch("c1");
-    expect(first).toMatchObject({ agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", tier: "medium", parentSessionID: "root", attemptIndex: 0, attemptId: expect.stringMatching(/^c1:0:\d+$/), step: "dispatch", decisionID: null });
+    expect(first).toMatchObject({ agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", tier: "medium", parentSessionID: "root", attemptIndex: 0, attemptId: expect.stringMatching(/^c1:0:[0-9a-f]{8}-\d+$/), step: "dispatch", decisionID: null });
     dispatch("c1");
-    expect(lookupDispatch("c1")).toMatchObject({ attemptIndex: 1, attemptId: expect.stringMatching(/^c1:1:\d+$/) });
+    expect(lookupDispatch("c1")).toMatchObject({ attemptIndex: 1, attemptId: expect.stringMatching(/^c1:1:[0-9a-f]{8}-\d+$/) });
     rememberDispatch("c1", { facts: FACTS, agent: "medium", model: null, attemptId: "custom", decisionID: "d-9", step: "variant" }, T0);
     expect(lookupDispatch("c1")).toMatchObject({ attemptIndex: 2, attemptId: "custom", decisionID: "d-9", step: "variant", model: null, variant: null });
     expect(forgetDispatch("c1")).toBe(true);
@@ -191,6 +191,18 @@ describe("dispatch registry (2.1.1)", () => {
     // an explicit id is kept verbatim
     rememberDispatch("c1", { facts: FACTS, agent: "medium", model: null, attemptId: "mine" }, T0);
     expect(lookupDispatch("c1")!.attemptId).toBe("mine");
+  });
+
+  it("QA-2.1-R2-2 (P5): default attempt ids differ across process restarts (a fresh module load)", async () => {
+    const idsOf = async (): Promise<string[]> => {
+      vi.resetModules();
+      const fresh = await import("../../src/router/sessions");
+      return [0, 1, 2].map(() => fresh.rememberDispatch("c1", { facts: FACTS, agent: "medium", model: null }, T0).attemptId);
+    };
+    const first = await idsOf();
+    const second = await idsOf(); // same child, same indices, same sequence numbers as a restarted process would have
+    expect(new Set([...first, ...second]).size).toBe(6);
+    expect(first.map((id) => id.replace(/:[0-9a-f]{8}-/, ":x-"))).toEqual(second.map((id) => id.replace(/:[0-9a-f]{8}-/, ":x-")));
   });
 
   it("sweeps entries idle for the TTL, honours touches and never evicts future stamps", () => {
@@ -545,7 +557,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     expect(entry?.beta.beta).toBeGreaterThan(0);
     const refusal = (await h.rows()).filter((r) => r.kind === "refusal");
     expect(refusal).toHaveLength(1);
-    expect(refusal[0]).toMatchObject({ childSessionID: "c1", attemptID: expect.stringMatching(/^c1:0:\d+$/), key: MEDIUM_KEY, decisionID: "d-1", step: "dispatch" });
+    expect(refusal[0]).toMatchObject({ childSessionID: "c1", attemptID: expect.stringMatching(/^c1:0:[0-9a-f]{8}-\d+$/), key: MEDIUM_KEY, decisionID: "d-1", step: "dispatch" });
   });
 
   it("refusal before the verdict: the verdict does not score the attempt a second time, and writes no row", async () => {

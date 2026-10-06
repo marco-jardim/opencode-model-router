@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { RouterConfig } from "./config";
 import { fingerprintToolCall } from "../guard/fingerprint";
 import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep";
@@ -598,7 +599,7 @@ export interface DispatchInput {
   acceptance?: DetectionDepth | null;
   /** The orchestrator session that dispatched the child. */
   parentSessionID?: string | null;
-  /** Attempt id outcomes are scored under. Default: `${childSessionID}:${attemptIndex}:${seq}`, unique for the life of the process. */
+  /** Attempt id outcomes are scored under. Default: `${childSessionID}:${attemptIndex}:${nonce}-${seq}`, unique across restarts. */
   attemptId?: string;
   /** Id of the decision row of this dispatch (2.2), so verdict/refusal rows can reference it. */
   decisionID?: string | null;
@@ -636,9 +637,12 @@ const dispatchRegistry = new Map<string, DispatchSlot>();
  * Process-wide attempt counter (QA-2.1-1). `attemptIndex` restarts at 0 whenever a child is re-registered after
  * an eviction (TTL, bound, session deletion), so `${child}:${index}` alone can name two different attempts, and
  * the store, which remembers scored attempt ids, would then drop the second attempt's outcome. The sequence
- * number makes every default attempt id unique.
+ * number makes every default attempt id unique within the process, and a random per-process component makes it unique
+ * across restarts too (QA-2.1-R2-2): the outcome log outlives the process, and ids that repeat after a restart would
+ * let `routing:stats` join a refusal to the wrong pass.
  */
 let attemptSeq = 0;
+const attemptNonce = randomBytes(4).toString("hex");
 
 /**
  * Register (or re-register) the dispatch facts of a child session. Re-registering an existing child
@@ -661,7 +665,7 @@ export function rememberDispatch(
     tier: input.tier ?? null,
     acceptance: input.acceptance ?? null,
     parentSessionID: input.parentSessionID ?? null,
-    attemptId: input.attemptId ?? `${childSessionID}:${attemptIndex}:${++attemptSeq}`,
+    attemptId: input.attemptId ?? `${childSessionID}:${attemptIndex}:${attemptNonce}-${++attemptSeq}`,
     attemptIndex,
     decisionID: input.decisionID ?? null,
     step: input.step ?? "dispatch",
