@@ -489,6 +489,8 @@ export function createIngest(deps: IngestDeps): Ingest {
     // (the orchestrator's own), and the settings may cost a config fingerprint check.
     const record = lookupDispatch(childSessionID);
     if (record === undefined) return null;
+    // Registered where ingestion was off (QA-2.3-6): another instance's configuration decides, not this one's.
+    if (record.outcomes === false) return null;
     const settings = deps.settings();
     if (settings === null) return null;
     const confidence = record.facts.confidence;

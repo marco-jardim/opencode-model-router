@@ -11,6 +11,7 @@ import {
 } from "../../src/escalate/attempt-recorder";
 import type { AttemptPlan } from "../../src/escalate/resume";
 import { lastStepContext, lookupDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import { createIngest, ingestSettings, resetIngestState } from "../../src/routing/outcomes/ingest";
 import type { RouterConfig } from "../../src/router/config";
 import {
   acquireOutcomes,
@@ -86,9 +87,10 @@ function harness(): Harness {
   };
 }
 
-beforeEach(() => resetDispatchRegistry());
+beforeEach(() => { resetDispatchRegistry(); resetIngestState(); });
 afterEach(() => {
   resetDispatchRegistry();
+  resetIngestState();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -232,5 +234,53 @@ describe("classifyDelegation", () => {
     const broken = { get routing(): never { throw new Error("boom"); } } as unknown as RouterConfig;
     await expect(classifyDelegation(broken, "v2", "task", undefined, { warn: (m) => { warnings.push(m); } })).resolves.toBeNull();
     expect(warnings.some((w) => w.includes("classifying the delegation failed"))).toBe(true);
+  });
+});
+
+describe("QA-2.3-6: attempts registered while ingestion is off are not scored by another instance", () => {
+  it("a static recorder marks its attempts; a shadow ingest (another location's plugin instance) skips them and still sees the context", async () => {
+    const h = harness();
+    const staticRecorder = createAttemptRecorder({ host: "v2", config: () => config({}, h.outcomes), logger: h.logger, acquire: h.acquire });
+    const shadowConfig = config({ engine: "shadow" }, h.outcomes);
+    const shadowRecorder = createAttemptRecorder({ host: "v2", config: () => shadowConfig, logger: h.logger, acquire: h.acquire, now: () => T0 });
+    const ingest = createIngest({ settings: () => ingestSettings(shadowConfig, "v2"), logger: h.logger, acquire: h.acquire, now: () => T0 });
+    try {
+      staticRecorder.record(attempt({ childSessionID: "off-1", plan: plan({ agent: "fast", tier: "fast" }) }));
+      shadowRecorder.record(attempt({ childSessionID: "on-1", plan: plan({ agent: "medium", tier: "medium" }) }));
+      expect(lookupDispatch("off-1")?.outcomes).toBe(false);
+      expect(lookupDispatch("on-1")?.outcomes).toBe(true);
+      for (const child of ["off-1", "on-1"]) {
+        await ingest.onStepEnded({
+          id: `step-${child}`, type: "session.step.ended",
+          data: { sessionID: child, assistantMessageID: `m-${child}`, finish: "stop", cost: 0, tokens: { input: 700, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } },
+        });
+        ingest.onVerdict(child, "pass");
+        ingest.onFalseRefusal(child);
+        ingest.onExecutionEnded(child);
+      }
+      const bundle = h.bundles[0]!;
+      const keys = bundle.store.keys();
+      expect(keys).toHaveLength(1);
+      expect(keys[0]).toContain("router:medium"); // only the attempt registered with ingestion on
+      expect(keys.some((key) => key.includes("router:fast"))).toBe(false);
+      // The marked attempt left no verdict or refusal row either; its decision row was never written.
+      const rows = (await (async () => { await bundle.flusher.flushNow(); return (await bundle.persister.readRows()).rows; })());
+      expect(rows.filter((row) => row.kind !== "decision" && "childSessionID" in row && row.childSessionID === "off-1")).toEqual([]);
+      expect(rows.filter((row) => row.kind === "decision").map((row) => row.kind === "decision" && row.childSessionID)).toEqual(["on-1"]);
+      // The context bookkeeping is independent of ingestion: both children's contexts are known to the ladder.
+      expect(lastStepContext("off-1")).toBe(750);
+      expect(lastStepContext("on-1")).toBe(750);
+    } finally {
+      await ingest.dispose();
+      await staticRecorder.dispose();
+      await shadowRecorder.dispose();
+    }
+  });
+
+  it("a record registered without the field (a 2.2 dispatch) is scoreable", () => {
+    const h = harness();
+    const recorder = createAttemptRecorder({ host: "v2", config: () => config({ engine: "shadow" }, h.outcomes), logger: h.logger, acquire: h.acquire });
+    recorder.record(attempt());
+    expect(lookupDispatch("c1")?.outcomes).toBe(true);
   });
 });

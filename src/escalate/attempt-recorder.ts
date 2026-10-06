@@ -155,6 +155,8 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
           parentSessionID: attempt.parentSessionID,
           decisionID,
           step: plan.step,
+          // Registered with ingestion off (engine static): no instance may score it (QA-2.3-6).
+          outcomes: settings !== null,
         }, safeNow(now));
         if (settings === null || decisionID === null || plan.model === undefined) return;
         const bundle = bundleFor(settings);

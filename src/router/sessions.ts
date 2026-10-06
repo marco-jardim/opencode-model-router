@@ -605,6 +605,13 @@ export interface DispatchInput {
   decisionID?: string | null;
   /** Kind of attempt (default `dispatch`; 2.3 ladder attempts pass `variant | retry | escalate`). */
   step?: LadderStepKind;
+  /**
+   * `false`: the instance that registered the child had outcome ingestion off (`routing.engine: static`), so no
+   * instance may score this attempt (QA-2.3-6). The registry is process-wide and every plugin instance (one per
+   * location) sees the child's events, so an instance in `shadow` would otherwise record the outcomes of a dispatch
+   * whose own configuration said not to. Default `true`.
+   */
+  outcomes?: boolean;
 }
 
 export interface DispatchRecord {
@@ -621,6 +628,8 @@ export interface DispatchRecord {
   readonly attemptIndex: number;
   readonly decisionID: string | null;
   readonly step: LadderStepKind;
+  /** See `DispatchInput.outcomes`: false = ingestion was off where this child was registered. */
+  readonly outcomes: boolean;
   readonly registeredAt: number;
 }
 
@@ -685,6 +694,7 @@ export function rememberDispatch(
     attemptIndex,
     decisionID: input.decisionID ?? null,
     step: input.step ?? "dispatch",
+    outcomes: input.outcomes ?? true,
     registeredAt: nowMs,
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
