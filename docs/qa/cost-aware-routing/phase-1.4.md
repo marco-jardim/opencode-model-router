@@ -218,6 +218,39 @@ All runs: `npx vitest run test/unit/routing-engine.<name>.test.ts` (default pool
 - **E6 → D8/A17a.** `next(k)` is a static pointer; coverage is relative to `k` only.
 - **E7 → Decision.** `Decision.confidence = facts.confidence × n/(n + 5)` of `best`, reported only.
 
+### Implementation (1.4.2)
+
+Implemented exactly per §3–§7 on top of the committed `types.ts` / `kernel.ts` (neither was edited; no spec'd bug fix was needed). Commits on `car/p14`, each `Refs #74`, pushed one by one:
+
+| Commit | Content |
+|---|---|
+| `feat(routing): add engine candidate ladders` | `ladders.ts` + `routing-engine.ladders.test.ts` (37 tests) |
+| `feat(routing): generate the by-class taxonomy line` | `protocol-line.ts` + `routing-engine.protocol-line.test.ts` (30 tests) |
+| `feat(routing): annotate plan steps with tier and route lines` | `plan.ts` + `routing-engine.plan.test.ts` (30 tests) |
+| `feat(routing): export the engine public surface` | `index.ts` + `routing-engine.index.test.ts` (1 test) |
+
+- **Modules.** `ladders.ts` (`escalateLadder`, `tierRankOf`, `floorRankOf`, `grantsFromTools`, `buildLadder`, `resolveChosen`), `protocol-line.ts` (`generateTaxonomy`, `MIN_EVIDENCE_TO_MOVE`), `plan.ts` (`detectionOf`, `formatRouteLine`, `annotateSteps`), `index.ts` (re-exports only). All pure: no I/O, no clock, no randomness, no module-level state; runtime imports are `router/config`, `router/protocol` (`buildTaskTaxonomy`), `escalate/ladder`, `escalate/variants`, `verify/dod`, `routing/classify/{route-line,types}` and `routing/outcomes/{types,beta}` only. Nothing outside `src/routing/engine/` and the tests was edited (`src/router/protocol.ts`, `src/compat/*`, `src/index.ts` untouched).
+- **D2 pinned in tests.** `routing-engine.protocol-line.test.ts` loads the shipped `tiers.json` through `loadConfig(<worktree>)` under an empty `HOME`/`USERPROFILE` (`findProjectOverride(root) === undefined`, `activeMode === "normal"`) and asserts, for `anthropic` and `hybrid-2`: the raw `buildDelegationProtocol` SHA-256 + length (3249 / 3288), the `R:` SHA-256 `5aca1a71…2452`, and the v2-adapted (`v2Instructions`) SHA-256 + length (`aa24cbbf…9817`, `10c2437a…370b`) with `subagent(agent=` present and `Task(` / `subagent_type` absent. The degenerate matrix (2 presets × {no store, empty store} × {v2 `roles: {}`, v2 default roles, v1 without routing}) asserts `generateTaxonomy === buildTaskTaxonomy`, the unchanged hashes after `protocol.replace(base, generated)` and the `R:` line equality. A "priors alone never move a class (margin 0)" test first proves the kernel *does* switch `implement` on priors at `margin: 0` (so the evidence gate, not a kernel coincidence, keeps the line static).
+- **Verification.** `npm run typecheck` green before every commit. Scoped run `npx vitest run test/unit/routing-engine.kernel.test.ts test/unit/routing-engine.ladders.test.ts test/unit/routing-engine.protocol-line.test.ts test/unit/routing-engine.plan.test.ts test/unit/routing-engine.index.test.ts test/unit/protocol.test.ts` (default pool, A14): 6 files, 192 tests passed. The property test builds 500 seeded random presets / roles / agent lists and checks range, forward-only router pointers, chain exits only into strictly higher router tiers, and termination of `next` from every rung (and that > 40 of the 500 scenarios actually contain role chains).
+
+#### Design deviations and readings taken (1.4.2)
+
+1. **Extra exports of `ladders.ts`.** `routerTierIds(cfg)` and `roleAgentExclusion(id, info, routerIds)` are exported so `protocol-line.ts` shares the agent-level role filter with `buildLadder`. They are *not* re-exported from `index.ts` (§6 lists the public surface exactly).
+2. **v1 role filter (§4).** Read literally as "§3's agent-level filter minus the needs check": a role naming a router tier of the preset (`duplicate`), a reserved id, an id absent from `agents`, a `primary`, `hidden` or not-permitted agent is skipped. The class-level `no-owning-tier` rule is *not* applied on v1 (the parenthetical in §4 does not list it), so a configured role for `other` is rendered as text.
+3. **`agents === null` (§3).** No role candidates, as specified; each configured role agent of the class is additionally recorded in `Ladder.excluded` as `agent-unavailable` ("absent from `agents`").
+4. **Excluded entries.** `model`/`variant` of an entry are the agent's configured model split with `splitModelRef` (`""` / `null` when absent or unparsable). A tier rung dropped as identical to the own-model rung adds one `duplicate` entry for that agent.
+5. **Task line (§5).** The "first line" of a step is the first non-empty line that is *not itself a route line*. It is used for the classifier `description`, for appending ` [tier:X]`, for the route-line insertion point and for the `\bQA\b` pin test. With a literal first non-empty line a step whose first line is an existing `[route …]` would have had ` [tier:X]` appended to it, which breaks the route-line syntax.
+6. **Tier fallback (§5).** When the class's static tier (or `cfg.defaultTier` for `other`) is not a tier of the active preset, the engine tier falls back to `cfg.defaultTier` if that one exists in the preset — never tag a tier that does not exist. With the shipped presets this branch is dead.
+7. **`decision` also for existing tags.** The kernel is run for steps that already carry `[tier:X]` too (chosen = that tier), so a `[tier:heavy]` step reports `kept:pinned`; `decision` is `null` only when `resolveChosen` cannot resolve the pick (e.g. a tag naming an unknown tier). The tag itself is never changed.
+8. **Evidence gate uses `best`'s evidence (§4/§5).** If the kernel's argmin is a cheaper rung with no data (e.g. `fast` on priors) while the evidence favours another rung, the tier stays static (test "the argmin must itself carry evidence").
+9. **Placement edge cases (§5).** Indent = leading *spaces* of the task line capped at 3 (a tab contributes nothing). The inserted line uses the terminator that follows the task line, else the first terminator of the text, else `\n`; `dispatchPrompt` always joins with `\n`. A step with no non-empty line is returned unchanged (its `dispatchPrompt` still starts with the route line). With several (conflicting) existing route lines the first is the step's `routeLine`; the text is never touched.
+10. **`MIN_EVIDENCE_TO_MOVE`** is defined as `PRIOR_STRENGTH` (= 5) from `outcomes/beta` instead of a literal; a test pins `=== 5`.
+11. **`grantsFromTools`** compares tool ids case-insensitively (harmless widening).
+12. **`pricing`** is called once per rung per `buildLadder` call without a `try`/`catch`, as specified ("must not throw (wrap it)"): the 2.2 caller owns the wrapper.
+13. **Extra test file** `routing-engine.index.test.ts` (not in §7) pins the exact exported name set of `index.ts` and its identity with the module exports.
+
+For QA-1.4: the plan file's §1.5 list should still receive E1–E7 (orchestrator, see Handoffs); items 1–13 above are the only places 1.4.2 interpreted the design.
+
 ## Findings
 
 None yet — 1.4 QA has not run.
@@ -238,4 +271,4 @@ None yet — 1.4 QA has not run.
 
 ## Verdict
 
-Pending 1.4.2 implementation and QA (open findings: n/a).
+1.4.1 and 1.4.2 implemented; pending QA-1.4 (open findings: n/a).
