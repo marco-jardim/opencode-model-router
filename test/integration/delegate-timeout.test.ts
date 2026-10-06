@@ -809,6 +809,47 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     }
   });
 
+  it("QA-2.3-R2-6: an abandoned catalog call that fails late does not release the marker of the newer call", async () => {
+    writeResumeOverrides();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const pending: Array<{ resolve(models: typeof catalog): void; reject(error: Error): void }> = [];
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: () => new Promise<typeof catalog>((resolve, reject) => { pending.push({ resolve, reject }); }),
+      routerChildRunner: immediateRunner([]),
+    } as unknown as RouterPluginInput) as unknown as DelegateHooks;
+    const execute = () => hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    try {
+      const first = execute();
+      await vi.advanceTimersByTimeAsync(3_100); // call 1 hangs past its timeout
+      await first;
+      expect(pending).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(61_000); // call 1 is abandoned
+      const second = execute();
+      await vi.advanceTimersByTimeAsync(3_100); // call 2 hangs too
+      await second;
+      expect(pending).toHaveLength(2);
+      pending[0]!.reject(new Error("late failure of the abandoned call"));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(16_000); // past the TTL of the negative answer
+      const third = execute();
+      await vi.advanceTimersByTimeAsync(100);
+      await third;
+      expect(pending).toHaveLength(2); // call 2 is still outstanding: nothing starts behind it
+      // the newer call's own late answer fills the cache, and the next delegation uses it
+      pending[1]!.resolve(catalog);
+      await vi.advanceTimersByTimeAsync(0);
+      const fourth = execute();
+      await vi.advanceTimersByTimeAsync(100);
+      await fourth;
+      expect(pending).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
+      await hooks.dispose();
+    }
+  });
   it("QA-2.3-3: concurrent delegations share one catalog load, and a late answer still fills the cache", async () => {
     writeResumeOverrides();
     let listCalls = 0;

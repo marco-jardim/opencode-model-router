@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
-import { createV2Runtime, V2_GRADER_AGENT } from "../../src/compat/v2-client";
+import { createV2Runtime, STRAY_CLEANUP_TIMEOUT_MS, V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { createVerificationWiring } from "../../src/verify/wiring";
 import type { RouterConfig } from "../../src/router/config";
 import * as routerConfig from "../../src/router/config";
@@ -448,7 +448,7 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
     });
     await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
       prompt: "go", resumeSessionID: "child", onCreated: async () => {},
-    }))).rejects.toThrow("changed its child session ID (child -> another)");
+    }))).rejects.toMatchObject({ name: "ResumeRejectedError", sessionID: "child", message: expect.stringContaining("the host started another child (another) instead") });
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
     // QA-2.3-5: the child the host started instead is stopped and removed too, not left running
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "another" }, undefined);
@@ -466,6 +466,69 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
       prompt: "go", resumeSessionID: "child", onCreated: async () => {},
     }))).rejects.toThrow("removing it failed (session is busy)");
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+  });
+
+  it("QA-2.3-R2-3: a removal the host never finishes does not hang the delegation; a resume still ends as a rejection the caller retries fresh", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runtime, toolContext, execute, context } = fixture();
+      execute.mockImplementationOnce(async (_input, childContext) => {
+        await childContext.progress({ sessionID: "another", status: "running" });
+        return { output: { sessionID: "another", status: "completed", output: "x" } };
+      });
+      context.session.remove.mockImplementationOnce(() => new Promise<void>(() => undefined)); // never settles
+      const outcome = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+        prompt: "go", resumeSessionID: "child", onCreated: async () => {},
+      })).then(() => ({ error: undefined as unknown }), (error: unknown) => ({ error }));
+      let settled = false;
+      void outcome.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(STRAY_CLEANUP_TIMEOUT_MS - 1);
+      expect(settled).toBe(false); // still bounded, not yet over
+      await vi.advanceTimersByTimeAsync(2);
+      const { error } = await outcome;
+      expect(error).toBeInstanceOf(ResumeRejectedError);
+      expect((error as Error).message).toContain(`removing it did not finish within ${STRAY_CLEANUP_TIMEOUT_MS} ms`);
+      expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
+      expect(vi.getTimerCount()).toBe(0); // the bound's timer is cleared
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the host's own wrapping of the progress error cannot hide the rejection (the caller tests its type)", async () => {
+    const { runtime, toolContext, execute } = fixture();
+    execute.mockImplementationOnce(async (_input, childContext) => {
+      try {
+        await childContext.progress({ sessionID: "another", status: "running" });
+      } catch (error) {
+        throw new Error(`ToolFailure: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return { output: { sessionID: "another", status: "completed", output: "x" } };
+    });
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "go", resumeSessionID: "child", onCreated: async () => {},
+    }))).rejects.toBeInstanceOf(ResumeRejectedError);
+  });
+
+  it("a hanging removal also leaves a created child's error bounded, as a plain error", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runtime, toolContext, execute, context } = fixture();
+      execute.mockImplementationOnce(async (_input, childContext) => {
+        await childContext.progress({ sessionID: "first", status: "running" });
+        await childContext.progress({ sessionID: "second", status: "running" });
+        return { output: { sessionID: "second", status: "completed", output: "x" } };
+      });
+      context.session.remove.mockImplementationOnce(() => new Promise<void>(() => undefined));
+      const outcome = runtime.withToolContext(toolContext, () => runtime.childRunner.run({ prompt: "go", onCreated: async () => {} }))
+        .then(() => ({ error: undefined as unknown }), (error: unknown) => ({ error }));
+      await vi.advanceTimersByTimeAsync(STRAY_CLEANUP_TIMEOUT_MS + 1);
+      const { error } = await outcome;
+      expect(error).not.toBeInstanceOf(ResumeRejectedError);
+      expect((error as Error).message).toContain("changed its child session ID (first -> second; removing it did not finish");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a created child that changes its id is handled the same way (not only a resume)", async () => {

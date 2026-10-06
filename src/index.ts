@@ -619,6 +619,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let runnerCatalogLoad: Promise<CatalogLookup | undefined> | undefined;
   /** When the outstanding `routerCatalog()` call started; it may outlive its timeout. */
   let runnerCatalogCallAt: number | undefined;
+  /** Id of the latest call (QA-2.3-R2-6): an abandoned call that settles late must not clear the state of a newer one. */
+  let runnerCatalogCallId = 0;
   let runnerCatalogFailing = false;
   const runnerCatalogFailed = (error: unknown): undefined => {
     runnerCatalog = { at: Date.now(), lookup: undefined };
@@ -640,15 +642,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       return Promise.resolve(undefined);
     }
     runnerCatalogCallAt = nowMs;
+    const callId = ++runnerCatalogCallId;
     const answer = Promise.resolve().then(() => list()).then(
       (models) => {
-        runnerCatalogCallAt = undefined;
+        // A late answer is still a catalog, whichever call it answers; only the latest call owns the marker.
+        if (callId === runnerCatalogCallId) runnerCatalogCallAt = undefined;
         const lookup = createCatalogLookup(models);
         runnerCatalog = { at: Date.now(), lookup };
         runnerCatalogFailing = false;
         return lookup;
       },
       (error: unknown) => {
+        // A failure of an abandoned call says nothing about the newer one: leave its marker and the cache alone.
+        if (callId !== runnerCatalogCallId) return undefined;
         runnerCatalogCallAt = undefined;
         return runnerCatalogFailed(error);
       },
@@ -887,11 +893,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const model = tierModel(activeCfg, tier) ?? undefined;
               if (sessionAware && attemptPlan.step !== "dispatch") {
                 // D11: the decision and both numbers are in the decision row (engine != static). The log line is for
-                // anomalies (QA-2.3-4): a fresh start the ladder did not choose by the threshold (unknown context, no
-                // budget, a runner override). The routine ones (a resume, a start over the threshold) are only logged
-                // with the existing opt-in debug flag.
+                // anomalies (QA-2.3-4): a fresh start nobody chose (unknown context, no budget, an invalid catalog
+                // variant). The routine ones are only logged with the existing opt-in debug flag: a resume, a start over
+                // the threshold, and the two conservative overrides that the shipped presets hit on every escalation
+                // (`effort-path`, `bare-model-after-variant`; QA-2.3-R2-2).
                 const basis = attemptPlan.resumeBasis;
-                const routine = resumeTarget !== undefined || basis?.reason === "at-or-over-threshold";
+                const routine =
+                  resumeTarget !== undefined ||
+                  basis?.reason === "at-or-over-threshold" ||
+                  attemptPlan.fresh === "effort-path" ||
+                  attemptPlan.fresh === "bare-model-after-variant";
                 if (!routine || process.env.MODEL_ROUTER_TRAJECTORY_DEBUG === "1") {
                   logger.warn(
                     `[router] ladder ${attemptPlan.step} on ${tier}: ${resumeTarget !== undefined ? "resuming the child session" : "fresh child session"}` +
@@ -1170,7 +1181,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // otherwise start fresh (`unknown-tokens`). Nothing is awaited when no retry can follow.
               let lastStepTokens: number | null = null;
               if (sessionAware && !attempt.producerFailed) {
-                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable") {
+                // No wait when nothing can follow this attempt (QA-2.3-R2-5): accepted, unverifiable, or the ladder's
+                // own limits (checks 3 and 4 of `nextAction`) are reached after it.
+                const firstCost = state.firstAttemptCost ?? costRatio;
+                const limitReached =
+                  state.totalAttempts + 1 >= policy.maxTotalAttempts ||
+                  (policy.costMultiple != null && state.cumulativeCost + costRatio > firstCost * policy.costMultiple);
+                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable" && !limitReached) {
                   await awaitExecutionEnd(producerSid, RESUME_END_WAIT_MS, toolCtx?.abort);
                 }
                 lastStepTokens = lastStepContext(producerSid);

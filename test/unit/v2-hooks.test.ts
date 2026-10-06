@@ -1048,7 +1048,28 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     expect(readdirSync(outcomes)).toEqual([]); // memory only: nothing was written
     rmSync(home, { recursive: true, force: true });
   });
-  it("ignores step events of sessions that are not registered children", async () => {
+
+  it("QA-2.3-R2-1: the adapter passes the event id, so a copy of an end event delivered after a re-registration is ignored", async () => {
+    const { home, outcomes } = routingHome();
+    const f = fixture();
+    const { cleanup, forgetSession } = await startPlugin(f, catalog(), home);
+    register("child-1");
+    f.emit(stepEvent("e1", "child-1", { finish: "stop" }));
+    f.emit({ id: "end-1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+    await barrier(f, forgetSession, "barrier-1");
+    expect(lastStepContext("child-1")).toBe(1100);
+    register("child-1"); // the runner resumes the child: attempt N+1
+    f.emit(stepEvent("e2", "child-1", { finish: "tool-calls" }));
+    f.emit({ id: "end-1", type: "session.execution.succeeded", data: { sessionID: "child-1" } }); // the same event, delivered again
+    await barrier(f, forgetSession, "barrier-2");
+    expect(lastStepContext("child-1")).toBeNull();
+    f.emit({ id: "end-2", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
+    await barrier(f, forgetSession, "barrier-3");
+    expect(lastStepContext("child-1")).toBe(1100);
+    await cleanup();
+    expect(readdirSync(outcomes)).toEqual([]);
+    rmSync(home, { recursive: true, force: true });
+  });  it("ignores step events of sessions that are not registered children", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const f = fixture();
     const model = catalog();
@@ -1243,7 +1264,10 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
       expect(ingest.sweep).toHaveBeenCalledTimes(4);
       // QA-2.1-6: the three execution-end events (not the literal idle) end the child's attempt
       expect(ingest.onExecutionEnded).toHaveBeenCalledTimes(3);
-      expect(ingest.onExecutionEnded).toHaveBeenCalledWith("s");
+      // QA-2.3-R2-1: each call carries its event's id, so a second delivery of the same event can be recognised
+      for (const type of ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]) {
+        expect(ingest.onExecutionEnded).toHaveBeenCalledWith("s", type);
+      }
       expect(ingest.onStepEnded).not.toHaveBeenCalled();
       expect(ingest.dispose).not.toHaveBeenCalled();
       await cleanup();

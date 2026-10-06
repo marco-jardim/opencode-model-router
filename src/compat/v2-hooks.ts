@@ -499,7 +499,7 @@ export async function registerV2Hooks(
             // The v2 equivalents of session.idle: coalesced, throttled flush (D15); never awaited.
             await ingesting(event.type, () => {
               // The child's attempt is over: fold it before the flush that persists it.
-              if (EXECUTION_END_TYPES.has(event.type)) ingest.onExecutionEnded(data.sessionID);
+              if (EXECUTION_END_TYPES.has(event.type)) ingest.onExecutionEnded(data.sessionID, event.id);
               ingest.sweep();
               ingest.requestFlush();
             });
