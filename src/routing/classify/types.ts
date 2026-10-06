@@ -346,8 +346,12 @@ export interface ClassifyTrace {
     readonly reason?: string;
     readonly latencyMs: number;
     readonly calls: number;
-    /** The backend answered `ok` but its class is not one the rules matched: the rules class stands (A19). */
+    /** The backend's own `ok` label, whatever became of it (the class in `facts` is the rules' unless it agreed). */
+    readonly label?: TaskClass;
+    /** The label is not a class the rules matched: the rules class stands (A19). */
     readonly rejected?: true;
+    /** The label is a matched class that differs from the rules class: kept here only (QA-1.2-27). */
+    readonly disagrees?: true;
   } | null;
 }
 
@@ -1095,8 +1099,6 @@ export const CONFIDENCE = {
   backendSingleSample: 0.6,
   /** A backend label equal to the rules' winning class (not `other`). */
   backendAgreesWithRules: 0.8,
-  /** Cap on a backend label that does not agree with the rules, in a batch (A19). */
-  backendBatchCap: 0.6,
 } as const;
 
 /** Facts returned when classification itself failed (index.ts catch-all). Confidence 0: never switches (D9). */
