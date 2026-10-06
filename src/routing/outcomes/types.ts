@@ -464,6 +464,12 @@ export interface RouteChoice {
 
 export const LOG_ROW_VERSION = 1;
 
+/**
+ * Reason prefix of a decision row whose dispatch was lifted to `enforcement.escalate.floorTier` by the 2.2 adapter (QA-2.2-7).
+ * It is policy, not a decision the engine took on evidence, so D17's "switched and failed" does not count it.
+ */
+export const FLOOR_LIFT_REASON = "lift:floor";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */
@@ -821,9 +827,15 @@ export interface StatsTable {
     readonly count: number;
     /** count / non-pinned dispatch rows. */
     readonly share: RatioCell;
-    /** Switched rows whose attempt ended in a `fail` verdict or a false refusal (D17 input). */
+    /**
+     * Switches the engine ENFORCED on its own evidence: `enforce` rows with `switched`, floor lifts (`lift:floor`) excluded
+     * (QA-2.2-7). `count` also holds the would-switches of `shadow`/`advise` rows (the DF3 number); `failed` and `verified` only
+     * concern these (QA-2.2-8), because only an enforced switch can fail because of the switch.
+     */
+    readonly enforced: number;
+    /** Enforced switches whose attempt ended in a `fail` verdict or a false refusal (D17 input). */
     readonly failed: number;
-    /** Switched rows whose outcome is known (a pass/fail verdict or a refusal exists): the denominator that makes `failed` readable. */
+    /** Enforced switches whose outcome is known (a pass/fail verdict or a refusal exists): the denominator that makes `failed` readable. */
     readonly verified: number;
   };
   /** One entry per unit present in the window, sorted by unit name. */

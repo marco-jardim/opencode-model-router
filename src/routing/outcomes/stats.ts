@@ -24,7 +24,7 @@ import type {
   StatsWindow,
   VerdictRow,
 } from "./types";
-import { DECISIONS_MAX_GENERATIONS, LADDER_STEP_KINDS, STATS_EXIT } from "./types";
+import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, STATS_EXIT } from "./types";
 import { createOutcomeStore } from "./store";
 
 // ---------------------------------------------------------------------------
@@ -181,6 +181,9 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     }
   }
   const switchedRows = nonPinned.filter((r) => r.switched);
+  // QA-2.2-7/8: D17 asks whether a dispatch the engine moved ON ITS OWN EVIDENCE failed. A shadow/advise row is a would-switch (nothing
+  // moved) and a floor lift is policy, so neither can be a failed switch.
+  const enforcedSwitches = switchedRows.filter((r) => r.mode === "enforce" && !r.reason.startsWith(FLOOR_LIFT_REASON));
 
   // Savings: Σ C(chosen) − C(best) per unit, never summed across units. Summed in ascending order so
   // the total does not depend on the row order.
@@ -231,8 +234,9 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     switched: {
       count: switchedRows.length,
       share: ratio(switchedRows.length, nonPinned.length),
-      failed: switchedRows.filter((r) => failedDecisionIDs.has(r.decisionID)).length,
-      verified: switchedRows.filter((r) => decidedDecisionIDs.has(r.decisionID)).length,
+      enforced: enforcedSwitches.length,
+      failed: enforcedSwitches.filter((r) => failedDecisionIDs.has(r.decisionID)).length,
+      verified: enforcedSwitches.filter((r) => decidedDecisionIDs.has(r.decisionID)).length,
     },
     savings,
     variantSteps: {
@@ -284,7 +288,7 @@ export function renderMarkdown(table: StatsTable): string {
     `| Dispatches | ${table.dispatches} |`,
     `| Pinned | ${table.pinned} |`,
     `| Agreement (best == chosen, non-pinned) | ${fmtRatio(table.agreement)} |`,
-    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned (${fmtPercent(table.switched.share)}); failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.count}) |`,
+    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned (${fmtPercent(table.switched.share)}); enforced ${table.switched.enforced}; failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.enforced} enforced) |`,
     ...(table.savings.length === 0
       ? ["| Estimated savings | n/a |"]
       : table.savings.map(

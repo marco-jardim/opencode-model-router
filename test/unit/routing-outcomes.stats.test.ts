@@ -14,7 +14,7 @@ import {
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { createPersister, nodePersistFs } from "../../src/routing/outcomes/persist";
 import { emptyTokenSample } from "../../src/routing/outcomes/cost";
-import { DECISIONS_MAX_GENERATIONS, OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
+import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
 import type {
   DecisionRow,
   LoadResult,
@@ -162,7 +162,7 @@ describe("summarize", () => {
       byClass: [],
       byKey: [],
       agreement: { num: 0, den: 0, rate: null },
-      switched: { count: 0, share: { num: 0, den: 0, rate: null }, failed: 0, verified: 0 },
+      switched: { count: 0, share: { num: 0, den: 0, rate: null }, enforced: 0, failed: 0, verified: 0 },
       savings: [],
       variantSteps: { taken: 0, passRate: { num: 0, den: 0, rate: null } },
       resumeVsFresh: [
@@ -242,6 +242,24 @@ describe("summarize", () => {
     expect(row(C)).toMatchObject({ dispatches: 1, attempts: 1, pass: 0, fail: 0, passRate: rate(0, 0), measuredUSD: null });
   });
 
+  it("QA-2.2-8 / QA-2.2-7: `failed` and `verified` only concern switches the engine enforced on its own evidence (not would-switches, not floor lifts)", () => {
+    const rows: LogRow[] = [
+      decision("w1", SINCE, { mode: "shadow", switched: true, best: choice(C) }),
+      decision("w2", SINCE, { mode: "advise", switched: true, best: choice(C) }),
+      decision("e1", SINCE, { mode: "enforce", switched: true, best: choice(C) }),
+      decision("e2", SINCE, { mode: "enforce", switched: true, best: choice(C) }),
+      decision("l1", SINCE, { mode: "enforce", switched: true, best: choice(C), reason: `${FLOOR_LIFT_REASON}: dispatch lifted from @fast to @medium` }),
+      verdict("w1", SINCE, C, "fail"),
+      verdict("w2", SINCE, C, "fail"),
+      verdict("e1", SINCE, C, "fail"),
+      verdict("e2", SINCE, C, "pass"),
+      verdict("l1", SINCE, C, "fail"),
+    ];
+    const table = summarize(null, rows, NONE);
+    expect(table.switched).toMatchObject({ count: 5, enforced: 2, failed: 1, verified: 2 });
+    expect(renderMarkdown(table)).toContain("enforced 2; failed 1 (verified 2 of 2 enforced)");
+  });
+
   it("a switched row of shadow or advise is a would-switch: it counts under chosen.key, only enforce moves the dispatch to best.key (2.2)", () => {
     const rows = [
       decision("W1", SINCE, { mode: "shadow", switched: true, chosen: choice(A), best: choice(C) }),
@@ -301,7 +319,7 @@ describe("summarize", () => {
   });
 
   it("QA-1.3-13: `verified` counts switched dispatches whose outcome is known (pass/fail verdict or refusal; unverifiable does not)", () => {
-    const sw = (id: string) => decision(id, SINCE, { switched: true, best: choice(C) });
+    const sw = (id: string) => decision(id, SINCE, { mode: "enforce", switched: true, best: choice(C) });
     const rows: LogRow[] = [
       sw("s1"),
       sw("s2"),
@@ -316,10 +334,11 @@ describe("summarize", () => {
     expect(summarize(null, rows, { since: iso(SINCE), until: iso(UNTIL) }).switched).toEqual({
       count: 5,
       share: rate(5, 5),
+      enforced: 5,
       failed: 2, // s2 (fail) and s4 (refusal)
       verified: 3, // s1, s2, s4
     });
-    expect(renderMarkdown(summarize(null, rows, NONE))).toContain("failed 2 (verified 3 of 5)");
+    expect(renderMarkdown(summarize(null, rows, NONE))).toContain("enforced 5; failed 2 (verified 3 of 5 enforced)");
   });
 
   it("measuredUSD comes from the store (lifetime) and is null without a store or without samples", () => {
@@ -342,7 +361,7 @@ describe("summarize", () => {
     expect(table.agreement).toEqual({ num: 0, den: 0, rate: null });
     expect(table.switched.share).toEqual({ num: 0, den: 0, rate: null });
     expect(renderMarkdown(table)).toContain("| Agreement (best == chosen, non-pinned) | n/a |");
-    expect(renderMarkdown(table)).toContain("| Switched | 0 of 0 non-pinned (n/a); failed 0 (verified 0 of 0) |");
+    expect(renderMarkdown(table)).toContain("| Switched | 0 of 0 non-pinned (n/a); enforced 0; failed 0 (verified 0 of 0 enforced) |");
     // best === null rows do not enter the agreement denominator either
     const noBest = summarize(null, [decision("N1", SINCE, { best: null })], NONE);
     expect(noBest.agreement).toEqual({ num: 0, den: 0, rate: null });
@@ -350,18 +369,18 @@ describe("summarize", () => {
 
   it("switched: count, share of non-pinned, and failed (fail verdict or refusal anywhere in the log)", () => {
     const table = summarize(null, scenario(), WINDOW);
-    expect(table.switched).toEqual({ count: 1, share: rate(1, 3), failed: 1, verified: 1 });
+    expect(table.switched).toEqual({ count: 1, share: rate(1, 3), enforced: 1, failed: 1, verified: 1 });
     // the failing verdict is outside the window; windowing the other way round must not change `failed`
     const justD4 = summarize(null, scenario(), { since: iso("2026-10-06T13:00:00Z"), until: iso("2026-10-06T13:30:00Z") });
     expect(justD4.switched.failed).toBe(1);
     // pass and unverifiable do not count; a refusal does
-    const base = decision("S", SINCE, { switched: true, best: choice(C) });
+    const base = decision("S", SINCE, { mode: "enforce", switched: true, best: choice(C) });
     expect(summarize(null, [base, verdict("S", SINCE, C, "pass")], NONE).switched.failed).toBe(0);
     expect(summarize(null, [base, verdict("S", SINCE, C, "unverifiable")], NONE).switched.failed).toBe(0);
     expect(summarize(null, [base, refusal("S", UNTIL, C)], NONE).switched.failed).toBe(1);
     expect(summarize(null, [base, verdict("other", SINCE, C, "fail")], NONE).switched.failed).toBe(0);
     // pinned switched rows are not "switched" for D17
-    expect(summarize(null, [{ ...base, pinned: true }], NONE).switched).toEqual({ count: 0, share: rate(0, 0), failed: 0, verified: 0 });
+    expect(summarize(null, [{ ...base, pinned: true }], NONE).switched).toEqual({ count: 0, share: rate(0, 0), enforced: 0, failed: 0, verified: 0 });
   });
 
   it("mixed units → one savings row per unit, never summed together", () => {
@@ -467,7 +486,7 @@ describe("renderMarkdown", () => {
       },
     ],
     agreement: rate(2, 5),
-    switched: { count: 2, share: rate(2, 6), failed: 1, verified: 1 },
+    switched: { count: 2, share: rate(2, 6), enforced: 2, failed: 1, verified: 1 },
     savings: [
       { unit: "ratio", total: 1.5, rows: 3 },
       { unit: "usd", total: 0.01234, rows: 2 },
@@ -491,7 +510,7 @@ describe("renderMarkdown", () => {
     "| Dispatches | 7 |",
     "| Pinned | 1 |",
     "| Agreement (best == chosen, non-pinned) | 2/5 (40.0%) |",
-    "| Switched | 2 of 6 non-pinned (33.3%); failed 1 (verified 1 of 2) |",
+    "| Switched | 2 of 6 non-pinned (33.3%); enforced 2; failed 1 (verified 1 of 2 enforced) |",
     "| Estimated savings (ratio) | 1.50 over 3 rows |",
     "| Estimated savings (usd) | $0.0123 over 2 rows |",
     "| Variant steps | 3 taken; pass 1/2 (50.0%) |",
@@ -548,7 +567,7 @@ describe("renderMarkdown", () => {
         "| Dispatches | 0 |",
         "| Pinned | 0 |",
         "| Agreement (best == chosen, non-pinned) | n/a |",
-        "| Switched | 0 of 0 non-pinned (n/a); failed 0 (verified 0 of 0) |",
+        "| Switched | 0 of 0 non-pinned (n/a); enforced 0; failed 0 (verified 0 of 0 enforced) |",
         "| Estimated savings | n/a |",
         "| Variant steps | 0 taken; pass n/a |",
         "",
@@ -579,7 +598,7 @@ describe("renderMarkdown", () => {
     for (const seed of [11, 12, 13]) expect(renderMarkdown(summarize(storeWithMeasuredA(), shuffled(rows, seed), WINDOW))).toBe(reference);
     expect(reference).toContain("| Dispatches | 4 |");
     expect(reference).toContain("| Agreement (best == chosen, non-pinned) | 1/3 (33.3%) |");
-    expect(reference).toContain("| Switched | 1 of 3 non-pinned (33.3%); failed 1 (verified 1 of 1) |");
+    expect(reference).toContain("| Switched | 1 of 3 non-pinned (33.3%); enforced 1; failed 1 (verified 1 of 1 enforced) |");
     expect(reference).toContain("| Variant steps | 1 taken; pass 0/1 (0.0%) |");
     expect(reference).toContain("$0.2000 (n=3) |");
     expect(reference).toContain("Window: 2026-10-06T00:00:00.000Z → 2026-10-07T00:00:00.000Z");
