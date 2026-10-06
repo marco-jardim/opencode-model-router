@@ -813,6 +813,13 @@ export const TEMPLATE_SECTION_LABELS = [
   "ENVIRONMENT",
 ] as const;
 
+/**
+ * Sections that list prohibitions. Their first paragraph is scanned for risk words
+ * with negation honoured: "never force-push, never print secrets" names no risk
+ * the task takes (A22, QA-1.2-29); a non-negated mention there still counts.
+ */
+export const PROHIBITION_SECTIONS: readonly string[] = ["MUST NOT DO", "CONSTRAINTS"];
+
 /** A text is templated when at least this many known section headers occur. */
 export const TEMPLATE_MIN_SECTIONS = 2;
 

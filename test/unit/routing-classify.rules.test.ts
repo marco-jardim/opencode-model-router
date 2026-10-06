@@ -922,3 +922,63 @@ describe("push, publish, permissions and auth need context (QA-1.2-16)", () => {
     }
   });
 });
+describe("negated prohibitions do not raise risk (A22, QA-1.2-29)", () => {
+  const dispatch = (mustNotDo: string, extra: string[] = []): string =>
+    [
+      "1. TASK: rename getFoo to fetchFoo in src/a.ts",
+      "2. EXPECTED OUTCOME: the symbol is renamed everywhere it is used",
+      "3. TOOLS: read/search/write",
+      "4. MUST DO: keep the diff small",
+      `5. MUST NOT DO: ${mustNotDo}`,
+      "6. CONTEXT: background about the repo",
+      "7. ENVIRONMENT: Platform: win32. Shell: pwsh",
+      ...extra,
+    ].join("\n");
+
+  it("a 7-section dispatch whose only risky words are prohibited stays low risk and keeps its confidence", () => {
+    const facts = classifyByRules(dispatch("never force-push, never print secrets"), cfg);
+    expect(facts).toMatchObject({ class: "mechanical", risk: "low", confidence: 0.8 });
+    for (const prohibition of [
+      "do not publish the package, no deploys to production",
+      "never rm -rf anything; don't touch the .env file",
+      "without credentials or git rebase",
+      "avoid drop table, never use --no-verify",
+    ]) {
+      expect(classifyByRules(dispatch(prohibition), cfg).risk, prohibition).not.toBe("high");
+    }
+  });
+
+  it("CONSTRAINTS sections behave the same", () => {
+    const text = [
+      "TASK: rename foo to bar in a.ts",
+      "CONSTRAINTS: never force-push; do not touch secrets",
+      "ENVIRONMENT: Platform: win32",
+    ].join("\n");
+    expect(classifyByRules(text, cfg).risk).toBe("low");
+  });
+
+  it("a risky word that is not itself negated still counts in a prohibition paragraph", () => {
+    expect(classifyByRules(dispatch("force-push is forbidden"), cfg).risk).toBe("high");
+    expect(classifyByRules(dispatch("no edits outside src; production deploys are off limits"), cfg).risk).toBe("high");
+  });
+
+  it("outside prohibition sections negation is still ignored for risk", () => {
+    expect(classifyByRules(dispatch("nothing special", ["8. CONTEXT: never force-push"]), cfg).risk).toBe("high");
+    expect(classifyByRules("rename foo to bar in a.ts. Never force-push.", cfg).risk).toBe("high");
+    expect(classifyByRules(dispatch("keep it small").replace("rename getFoo", "force-push getFoo"), cfg).risk).toBe("high");
+  });
+
+  it("only the first paragraph of the section is a prohibition list; text after a blank line is task text", () => {
+    const text = [
+      "TASK: rename foo to bar in a.ts",
+      "MUST NOT DO: never force-push",
+      "",
+      "then deploy it to production",
+    ].join("\n");
+    expect(classifyByRules(text, cfg).risk).toBe("high");
+  });
+
+  it("a prohibition without a templated dispatch is ordinary text (negation ignored for risk)", () => {
+    expect(classifyByRules("MUST NOT DO: never force-push", cfg).risk).toBe("high");
+  });
+});

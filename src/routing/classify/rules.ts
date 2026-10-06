@@ -40,6 +40,7 @@ import {
   NON_ENGLISH_MIN_LETTERS,
   NON_ENGLISH_MIN_WORDS,
   POSIX_ABS_PATH_RE,
+  PROHIBITION_SECTIONS,
   REPO_SCOPE_TERMS,
   RISKS,
   RULES_MAX_CHARS,
@@ -145,6 +146,7 @@ function withoutPaths(text: string): string {
 const TEMPLATE_LABELS: ReadonlySet<string> = new Set(TEMPLATE_SECTION_LABELS);
 const CLASS_EXCLUDED: ReadonlySet<string> = new Set(CLASS_EXCLUDED_SECTIONS);
 const NEEDS_EXCLUDED: ReadonlySet<string> = new Set(NEEDS_EXCLUDED_SECTIONS);
+const PROHIBITIONS: ReadonlySet<string> = new Set(PROHIBITION_SECTIONS);
 const ENGLISH_WORDS: ReadonlySet<string> = new Set(ENGLISH_MARKERS);
 const NON_ENGLISH_WORDS: ReadonlySet<string> = new Set(NON_ENGLISH_MARKERS);
 
@@ -315,6 +317,10 @@ interface Sections {
   readonly needsText: string;
   /** Content of the ENVIRONMENT section(s), where the host states the working directory ("" when none). */
   readonly environmentText: string;
+  /** Everything the risk vocabulary scans with negation IGNORED: the whole body minus the prohibition paragraphs. */
+  readonly riskText: string;
+  /** The first paragraph of the MUST NOT DO / CONSTRAINTS sections, scanned with negation honoured (A22). */
+  readonly prohibitionText: string;
 }
 
 /**
@@ -332,16 +338,19 @@ function splitSections(body: string): Sections {
     if (TEMPLATE_LABELS.has(label)) headers.push({ line: i, label, prefixLength: m[0].length });
   }
   if (headers.length < TEMPLATE_MIN_SECTIONS) {
-    return { templated: false, focusText: body, needsText: body, environmentText: "" };
+    return { templated: false, focusText: body, needsText: body, environmentText: "", riskText: body, prohibitionText: "" };
   }
   const focus: string[] = [];
   const needs: string[] = [];
   const environment: string[] = [];
+  const risk: string[] = [];
+  const prohibitions: string[] = [];
   const first = headers[0]!.line;
   if (first > 0) {
     const preamble = lines.slice(0, first).join("\n");
     focus.push(preamble);
     needs.push(preamble);
+    risk.push(preamble);
   }
   for (let h = 0; h < headers.length; h++) {
     const header = headers[h]!;
@@ -352,6 +361,13 @@ function splitSections(body: string): Sections {
     const afterBlank = blank === -1 ? "" : content.slice(blank + 1).join("\n");
     const whole = content.join("\n");
     if (header.label === "ENVIRONMENT") environment.push(whole);
+    if (PROHIBITIONS.has(header.label)) {
+      // Only the first paragraph is a list of prohibitions; text after a blank line is task text again.
+      prohibitions.push(blank === -1 ? whole : content.slice(0, blank).join("\n"));
+      risk.push(afterBlank);
+    } else {
+      risk.push(whole);
+    }
     focus.push(CLASS_EXCLUDED.has(header.label) ? afterBlank : whole);
     needs.push(NEEDS_EXCLUDED.has(header.label) ? afterBlank : whole);
   }
@@ -360,6 +376,8 @@ function splitSections(body: string): Sections {
     focusText: focus.join("\n"),
     needsText: needs.join("\n"),
     environmentText: environment.join("\n"),
+    riskText: risk.join("\n"),
+    prohibitionText: prohibitions.join("\n"),
   };
 }
 
@@ -465,7 +483,7 @@ export function analyzeRules(
 ): RulesAnalysis {
   const raw = collapseLongRuns(String(text ?? "").slice(0, RULES_MAX_CHARS));
   const body = prepareBody(raw);
-  const { templated, focusText, needsText, environmentText } = splitSections(body);
+  const { templated, focusText, needsText, environmentText, riskText, prohibitionText } = splitSections(body);
   const cwd = resolveCwd(body, environmentText, ctx);
   // The gates are quadratic in the longest run of path characters (a token just under the collapse
   // threshold still costs ~its length squared), so only the head of a long prompt is measured; breadth
@@ -532,8 +550,11 @@ export function analyzeRules(
   let risk: Risk = CLASS_BASE_RISK[taskClass];
   // Risk vocabulary is scanned over the WHOLE body, every section included: a section header must
   // not hide "production", "credentials" or "deploy" from the risk estimate (QA-1.2-4).
-  if (hasHit(HIGH_RISK_RES, body, false)) risk = "high";
-  else if (hasHit(MEDIUM_RISK_RES, body, false)) risk = maxRisk(risk, "medium");
+  // Prohibition paragraphs (MUST NOT DO, CONSTRAINTS) count only where the risky word is not itself prohibited.
+  if (hasHit(HIGH_RISK_RES, riskText, false) || hasHit(HIGH_RISK_RES, prohibitionText, true)) risk = "high";
+  else if (hasHit(MEDIUM_RISK_RES, riskText, false) || hasHit(MEDIUM_RISK_RES, prohibitionText, true)) {
+    risk = maxRisk(risk, "medium");
+  }
   if (
     (scope === "repo" && needs.has("edit")) ||
     (needs.has("external_dir") && needs.has("edit")) ||
