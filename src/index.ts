@@ -887,11 +887,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const model = tierModel(activeCfg, tier) ?? undefined;
               if (sessionAware && attemptPlan.step !== "dispatch") {
                 // D11: the decision and both numbers are in the decision row (engine != static). The log line is for
-                // anomalies (QA-2.3-4): a fresh start the ladder did not choose by the threshold (unknown context, no
-                // budget, a runner override). The routine ones (a resume, a start over the threshold) are only logged
-                // with the existing opt-in debug flag.
+                // anomalies (QA-2.3-4): a fresh start nobody chose (unknown context, no budget, an invalid catalog
+                // variant). The routine ones are only logged with the existing opt-in debug flag: a resume, a start over
+                // the threshold, and the two conservative overrides that the shipped presets hit on every escalation
+                // (`effort-path`, `bare-model-after-variant`; QA-2.3-R2-2).
                 const basis = attemptPlan.resumeBasis;
-                const routine = resumeTarget !== undefined || basis?.reason === "at-or-over-threshold";
+                const routine =
+                  resumeTarget !== undefined ||
+                  basis?.reason === "at-or-over-threshold" ||
+                  attemptPlan.fresh === "effort-path" ||
+                  attemptPlan.fresh === "bare-model-after-variant";
                 if (!routine || process.env.MODEL_ROUTER_TRAJECTORY_DEBUG === "1") {
                   logger.warn(
                     `[router] ladder ${attemptPlan.step} on ${tier}: ${resumeTarget !== undefined ? "resuming the child session" : "fresh child session"}` +

@@ -443,6 +443,67 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
       }
     });
 
+    it("QA-2.3-R2-2: the conservative overrides (effort-path, bare-model-after-variant) are routine: silent without the debug flag", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        // an escalation across an effort-configured tier (`medium` sets variant and effort: A20)
+        const effort = await setup({
+          tiers: {
+            fast: { model: SONNET, variant: "low", costRatio: 1 },
+            medium: { model: SONNET, variant: "medium", effort: "high", costRatio: 5 },
+            heavy: { model: OPUS, variant: "xhigh", costRatio: 20 },
+          },
+          routing: {}, escalate: { maxAttemptsPerTier: 0, maxTotalAttempts: 10, costCeiling: { multiple: 100 } },
+          verdicts: [false, false, false, false, true],
+        });
+        await effort.run();
+        const escalation = effort.runs.find((run) => run.agent === "medium");
+        expect(escalation).toBeDefined();
+        expect(escalation!.resumeSessionID).toBeUndefined(); // the override took effect: a fresh child
+        expect(effort.created.length).toBeGreaterThanOrEqual(2);
+        expect(ladderLines(warn)).toEqual([]);
+
+        // a bare model after variant steps (1.5 R1)
+        warn.mockClear();
+        resetDispatchRegistry();
+        const bare = await setup({
+          tiers: { fast: { model: SONNET, costRatio: 1 }, medium: { model: OPUS, costRatio: 5 } },
+          routing: {}, escalate: { maxTotalAttempts: 8, costCeiling: { multiple: 100 } }, verdicts: [false, false, false, false, true],
+        });
+        await bare.run();
+        expect(bare.runs.at(-1)!.resumeSessionID).toBeUndefined();
+        expect(ladderLines(warn)).toEqual([]);
+
+        // unknown context and an invalid variant are still anomalies
+        warn.mockClear();
+        resetDispatchRegistry();
+        const catalog = defaultCatalog();
+        const invalid = await setup({
+          tiers: OWNER, routing: {}, verdicts: [false, true], catalog,
+          during: (attempt) => { if (attempt === 1) Object.assign(catalog[0]!, { variants: [{ id: "low" }, { id: "high" }, { id: "xhigh" }] }); },
+        });
+        await invalid.run();
+        expect(ladderLines(warn).some((line) => line.includes("invalid-variant"))).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("with the debug flag the overrides are logged, reason included", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      process.env.MODEL_ROUTER_TRAJECTORY_DEBUG = "1";
+      try {
+        const t = await setup({
+          tiers: { fast: { model: SONNET, costRatio: 1 }, medium: { model: OPUS, costRatio: 5 } },
+          routing: {}, escalate: { maxTotalAttempts: 8, costCeiling: { multiple: 100 } }, verdicts: [false, false, false, false, true],
+        });
+        await t.run();
+        expect(ladderLines(warn).some((line) => line.includes("runner: bare-model-after-variant"))).toBe(true);
+      } finally {
+        delete process.env.MODEL_ROUTER_TRAJECTORY_DEBUG;
+        warn.mockRestore();
+      }
+    });
     it("the existing debug flag brings the routine lines back", async () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
       process.env.MODEL_ROUTER_TRAJECTORY_DEBUG = "1";
