@@ -19,7 +19,7 @@ import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/rou
 import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
 import type { RouterConfig } from "../../src/router/config";
 import {
-  MODELS, ROOT, RoutingHost, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
+  MODELS, ROOT, RoutingHost, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -529,6 +529,101 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           && host.errorLines().length === 0;
         s.verdict(ok, `fresh fast -> ${first.after.agent}; resume naming fast -> ${keep.after.agent}; resume naming heavy -> ${up.after.agent}/${up.after.model}; resume naming fast after heavy -> ${down.after.agent}; pinned resume naming fast -> ${pinned.after.agent}/${pinned.after.model}; foreign resume status ${String(foreign.after.status)}; denied resume status ${String(denied.after.status)}`);
       });
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 400_000);
+  it("H7 effort: bare-model resume (R1), the effort options of a resumed child after an agent switch (QA-1.5-22) and a default -> high step (F9) on the Anthropic route", async () => {
+    const effortPreset = {
+      fast: { ...SMOKE_PRESET.fast, effort: "low" },
+      medium: { ...SMOKE_PRESET.medium, effort: "medium" },
+      heavy: { ...SMOKE_PRESET.heavy, effort: "xhigh" },
+    };
+    const host = await RoutingHost.start("effort", { routing: null, overrides: { presets: { smoke: effortPreset } } });
+    try {
+      await runScenario("H7-effort-r1-qa1522-f9", "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy the request carries the TARGET agent's effort once, not the previous agent's, and nothing stacks; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).", async s => {
+        const rootID = await host.newRoot("effort root");
+        type Row = { case: string; asked: string; storedModel: string | undefined; storedAgent: string | undefined; catalogModel: string | undefined; wireModel: string | undefined; topLevelEffort: unknown; thinking: unknown; outputConfig: unknown; inBandAllHistory: unknown[]; effective: unknown };
+        const table: Row[] = [];
+        const step = async (name: string, call: Obj) => {
+          const mark = host.provider.requests.length;
+          const d = await host.dispatch(rootID, { description: `H7 ${name}`, background: false, ...call });
+          const stored = await host.client.session.get({ sessionID: d.childID });
+          for (const r of host.provider.requests.slice(mark).filter(q => q.session === d.childID && q.kind === "primary")) {
+            table.push({ case: name, asked: JSON.stringify({ agent: call.agent, model: call.model }), storedModel: stored.model ? ref(stored.model) : undefined, storedAgent: stored.agent, catalogModel: r.catalogModel, wireModel: r.model, topLevelEffort: obj(r.payload.output_config).effort, thinking: r.payload.thinking, outputConfig: r.payload.output_config, inBandAllHistory: inBandEfforts(r), effective: effectiveEffort(r) });
+          }
+          return d.childID;
+        };
+        // QA-1.5-22: agent switches on one child (no model named: the host moves the child to the new agent's model)
+        const a = await step("A agent switch (fast)", { agent: "fast", prompt: "H7 A start" });
+        await step("A agent switch (medium)", { agent: "medium", prompt: "H7 A resume medium", sessionID: a });
+        await step("A agent switch (heavy)", { agent: "heavy", prompt: "H7 A resume heavy", sessionID: a });
+        await step("A agent switch (back to fast)", { agent: "fast", prompt: "H7 A resume fast", sessionID: a });
+        // R1: bare model after a variant, same model and another model
+        const sonnet = MODELS.sonnet;
+        const r1 = await step("R1 bare model (sonnet#low)", { agent: "general", prompt: "H7 R1 start", model: `${sonnet}#low` });
+        await step("R1 bare model (bare sonnet)", { agent: "general", prompt: "H7 R1 resume same model bare", sessionID: r1, model: sonnet });
+        const r1b = await step("R1b bare other model (sonnet#low)", { agent: "general", prompt: "H7 R1b start", model: `${sonnet}#low` });
+        await step("R1b bare other model (bare opus)", { agent: "general", prompt: "H7 R1b resume other model bare", sessionID: r1b, model: MODELS.opus });
+        // F9: default (bare) start, then #high
+        const f9 = await step("F9 default then high (bare)", { agent: "general", prompt: "H7 F9 start", model: sonnet });
+        await step("F9 default then high (high)", { agent: "general", prompt: "H7 F9 resume", sessionID: f9, model: `${sonnet}#high` });
+        s.observed.table = table;
+        s.observed.agentRecords = (await host.client.agent.list()).data.filter(x => ["fast", "medium", "heavy"].includes(x.id)).map(x => ({ id: x.id, model: x.model }));
+        s.observed.providerErrors = host.provider.errors;
+        s.observed.hostErrors = host.errorLines();
+        const rowsOf = (name: string) => table.filter(r => r.case.startsWith(name));
+        const A = rowsOf("A agent switch");
+        const R1 = rowsOf("R1 bare");
+        const R1b = rowsOf("R1b");
+        const F9 = rowsOf("F9");
+        s.observed.derived = {
+          agentSwitchEffective: A.map(r => ({ agent: r.storedAgent, stored: r.storedModel, topLevel: r.topLevelEffort, inBand: r.inBandAllHistory, thinking: r.thinking, effective: r.effective })),
+          bareSameModelAfterVariant: R1.map(r => ({ stored: r.storedModel, topLevel: r.topLevelEffort, inBand: r.inBandAllHistory, effective: r.effective })),
+          bareOtherModelAfterVariant: R1b.map(r => ({ stored: r.storedModel, wireModel: r.wireModel, topLevel: r.topLevelEffort, inBand: r.inBandAllHistory, effective: r.effective })),
+          defaultThenHigh: F9.map(r => ({ stored: r.storedModel, topLevel: r.topLevelEffort, thinking: r.thinking, inBand: r.inBandAllHistory, effective: r.effective })),
+        };
+        const stored = (r: Row) => r.storedModel?.split("#")[1];
+        // The two properties the runner needs: the effective effort of every agent-switch request is the TARGET tier's configured effort (low, medium, xhigh, low) and the in-band list never grows past one entry per change.
+        const targetEfforts = ["low", "medium", "xhigh", "low"];
+        const effortOk = A.length === 4 && A.every((r, i) => r.effective === targetEfforts[i] || (r.effective === stored(r) && stored(r) === targetEfforts[i]));
+        s.verdict(effortOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `agent switch effective efforts ${A.map(r => String(r.effective)).join("->")} (stored ${A.map(stored).join("->")}); bare sonnet after #high: stored ${R1.map(stored).join("->")} effective ${R1.map(r => String(r.effective)).join("->")}; bare opus after sonnet#high: stored ${R1b.map(stored).join("->")} effective ${R1b.map(r => String(r.effective)).join("->")}; default->high effective ${F9.map(r => String(r.effective)).join("->")}`);
+      });
+
+      // QA-1.5-22, distinguishing: the tier's `effort` differs from its `variant`, so the wire shows which of the two the request follows.
+      const distinct = await RoutingHost.start("effort-distinct", { routing: null, overrides: { presets: { smoke: {
+        fast: { ...SMOKE_PRESET.fast, effort: "low" },
+        medium: { ...SMOKE_PRESET.medium, variant: "medium", effort: "xhigh" },
+        heavy: { ...SMOKE_PRESET.heavy, effort: "xhigh" },
+      } } } });
+      try {
+        await runScenario("H7b-effort-option-vs-variant", "With medium configured as variant=medium but effort=xhigh, a child started on fast and resumed on medium: the wire shows whether the request follows the agent's effort OPTION (xhigh) or the stored VARIANT (medium), and that the previous agent's option (low) is not carried.", async s => {
+          const rootID = await distinct.newRoot("effort root distinct");
+          const rows: Obj[] = [];
+          const step = async (name: string, call: Obj) => {
+            const mark = distinct.provider.requests.length;
+            const d = await distinct.dispatch(rootID, { description: `H7b ${name}`, background: false, ...call });
+            const stored = await distinct.client.session.get({ sessionID: d.childID });
+            for (const r of distinct.provider.requests.slice(mark).filter(q => q.session === d.childID && q.kind === "primary")) {
+              rows.push({ case: name, storedAgent: stored.agent, storedModel: stored.model ? ref(stored.model) : undefined, catalogModel: r.catalogModel, topLevelEffort: obj(r.payload.output_config).effort, outputConfig: r.payload.output_config, thinking: r.payload.thinking, inBand: inBandEfforts(r), effective: effectiveEffort(r), options: Object.keys(r.payload).filter(k => !["model", "max_tokens", "stream", "thinking", "output_config", "metadata", "temperature"].includes(k)) });
+            }
+            return d.childID;
+          };
+          const child = await step("fast start", { agent: "fast", prompt: "H7b start" });
+          await step("resume on medium", { agent: "medium", prompt: "H7b resume", sessionID: child });
+          const control = await step("fresh medium (control)", { agent: "medium", prompt: "H7b fresh medium" });
+          s.observed.rows = rows;
+          s.observed.controlChild = control;
+          s.observed.providerErrors = distinct.provider.errors;
+          const [first, resumed, fresh] = rows;
+          const followsVariant = resumed?.effective === "medium" && fresh?.effective === "xhigh" ? "resumed request follows the stored variant (medium) while a FRESH medium child follows the agent's effort option (xhigh)" : `resumed effective ${String(resumed?.effective)}, fresh medium effective ${String(fresh?.effective)}`;
+          s.observed.reading = followsVariant;
+          s.verdict(first !== undefined && resumed !== undefined && fresh !== undefined && distinct.errorLines().length === 0, `fast start effective ${String(first?.effective)}; resumed on medium effective ${String(resumed?.effective)} (top-level ${String(resumed?.topLevelEffort)}, in-band ${JSON.stringify(resumed?.inBand)}); fresh medium effective ${String(fresh?.effective)}; ${followsVariant}`);
+        });
+      } finally {
+        expect((await distinct.stop()).hostPortClosed).toBe(true);
+      }
     } finally {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
