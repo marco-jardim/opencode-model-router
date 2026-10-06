@@ -78,7 +78,9 @@ const OWNER: Record<string, TierConfig> = {
   heavy: { model: OPUS, variant: "xhigh", costRatio: 20 },
 };
 
-describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
+// Several tests run five real attempts (config load, verification gate, grader child each); under a parallel `related` run the default
+// 5 s is not enough on a loaded machine, so the suite gets 20 s.
+describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000 }, () => {
   let dir: string;
   let savedHome: string | undefined;
   let savedProfile: string | undefined;
