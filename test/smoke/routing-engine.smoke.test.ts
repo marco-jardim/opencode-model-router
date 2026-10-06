@@ -14,14 +14,17 @@
  *   plugin's own variables or logs. Evidence is written to docs/qa/cost-aware-routing/evidence-3.2/ BEFORE each assertion.
  */
 import { afterAll, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
 import { makeKey } from "../../src/routing/outcomes";
 import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
 import type { RouterConfig } from "../../src/router/config";
 import {
-  MODELS, RoutingHost, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
+  MODELS, ROOT, RoutingHost, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
+/** The tip of car/main this phase branched from. */
+const BASE_COMMIT = "71815eb";
 const d = RUN ? describe : describe.skip;
 
 const SONNET = { providerID: "anthropic", id: "claude-sonnet-5-5" } as const;
@@ -401,7 +404,24 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
-  }, 300_000);});
+  }, 300_000);
+  it("6 v1 untouched: the files of the existing v1 smoke suite and the smoke:keyless script are byte-identical to the base commit", async () => {
+    await runScenario("6-v1-untouched", "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly the smoke:routing line. The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).", async s => {
+      const git = (...args: string[]) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
+      const changed = git("diff", "--name-status", BASE_COMMIT, "--", "test/smoke", "vitest.smoke.config.ts").split(/\r?\n/).filter(Boolean);
+      const modified = changed.filter(line => !line.startsWith("A\t"));
+      const packageDiff = git("diff", "-U0", BASE_COMMIT, "--", "package.json").split(/\r?\n/).filter(line => /^[+-](?![+-])/.test(line));
+      const v1Files = ["registration.smoke.test.ts", "subagent-tiers.smoke.test.ts", "deferred-catalog.smoke.test.ts", "depth-effort.smoke.test.ts", "helpers/scripted-provider.ts", "helpers/scripted-provider.test.ts", "helpers/fetch-safe-port.ts"];
+      s.observed.baseCommit = BASE_COMMIT;
+      s.observed.changedSinceBase = changed;
+      s.observed.modifiedOrDeleted = modified;
+      s.observed.packageJsonChangedLines = packageDiff;
+      s.observed.v1SuiteFiles = v1Files.map(file => ({ file, changed: git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) !== "" }));
+      s.observed.externalRun = "npm run smoke:keyless with OpenCode 1.18.34 first on PATH: 5 files passed, 27 tests passed, 11 skipped (the v2 describes); log in 6-smoke-keyless.log.txt";
+      const ok = modified.length === 0 && packageDiff.length === 1 && packageDiff[0]!.startsWith("+") && packageDiff[0]!.includes("smoke:routing") && v1Files.every(file => git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) === "");
+      s.verdict(ok, `${changed.length} path(s) changed under test/smoke since ${BASE_COMMIT} (all added: ${modified.length === 0}); package.json changed lines: ${packageDiff.join(" | ")}`);
+    });
+  });});
 
 void str;
 void MODELS;

@@ -1,0 +1,59 @@
+{
+  "scenario": "6-v1-untouched",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "86eca0e5-48c7-4f5d-bc72-994770c7b5c5",
+  "recordedAt": "2026-10-06T21:40:50.871Z",
+  "harness": {
+    "headSha": "474d6c1154cee3acc86419228f442e479a01fae8",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "a2f3ec93f538429278dedcf6e4b958ea8617aee5",
+      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly the smoke:routing line. The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).",
+  "observed": {
+    "baseCommit": "71815eb",
+    "changedSinceBase": [
+      "A\ttest/smoke/helpers/routing-host.ts",
+      "A\ttest/smoke/routing-engine.smoke.test.ts"
+    ],
+    "modifiedOrDeleted": [],
+    "packageJsonChangedLines": [
+      "+    \"smoke:routing\": \"cross-env RUN_OC_SMOKE_ROUTING=1 vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts\","
+    ],
+    "v1SuiteFiles": [
+      {
+        "file": "registration.smoke.test.ts",
+        "changed": false
+      },
+      {
+        "file": "subagent-tiers.smoke.test.ts",
+        "changed": false
+      },
+      {
+        "file": "deferred-catalog.smoke.test.ts",
+        "changed": false
+      },
+      {
+        "file": "depth-effort.smoke.test.ts",
+        "changed": false
+      },
+      {
+        "file": "helpers/scripted-provider.ts",
+        "changed": false
+      },
+      {
+        "file": "helpers/scripted-provider.test.ts",
+        "changed": false
+      },
+      {
+        "file": "helpers/fetch-safe-port.ts",
+        "changed": false
+      }
+    ],
+    "externalRun": "npm run smoke:keyless with OpenCode 1.18.34 first on PATH: 5 files passed, 27 tests passed, 11 skipped (the v2 describes); log in 6-smoke-keyless.log.txt"
+  },
+  "assertionResult": "PASS: 2 path(s) changed under test/smoke since 71815eb (all added: true); package.json changed lines: +    \"smoke:routing\": \"cross-env RUN_OC_SMOKE_ROUTING=1 vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts\",",
+  "notes": []
+}
