@@ -24,7 +24,7 @@ import type {
   StatsWindow,
   VerdictRow,
 } from "./types";
-import { LADDER_STEP_KINDS, STATS_EXIT } from "./types";
+import { DECISIONS_MAX_GENERATIONS, LADDER_STEP_KINDS, STATS_EXIT } from "./types";
 import { createOutcomeStore } from "./store";
 
 // ---------------------------------------------------------------------------
@@ -444,8 +444,13 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Prom
       io.stderr(`routing-stats: no outcome data in ${source.dir}\n`);
     }
     if (read.skipped > 0) io.stderr(`routing-stats: skipped ${read.skipped} unreadable decision-log line(s)\n`);
-    if (read.generations > 0 && read.oldestTs !== null && (args.since === null || args.since < Date.parse(read.oldestTs))) {
-      // The log keeps a bounded number of generations: history before the oldest retained row is gone (QA-1.3-10).
+    if (
+      read.generations >= DECISIONS_MAX_GENERATIONS &&
+      read.oldestTs !== null &&
+      (args.since === null || args.since < Date.parse(read.oldestTs))
+    ) {
+      // Rotation prunes only beyond DECISIONS_MAX_GENERATIONS rotated files, so fewer than that means nothing has
+      // been dropped yet (QA-1.3-19). At the limit, history before the oldest retained row may be gone (QA-1.3-10).
       io.stderr(
         `routing-stats: warning: the decision log has rotated; its oldest retained row is ${read.oldestTs}, so ${
           args.since === null ? "an unbounded" : "this"

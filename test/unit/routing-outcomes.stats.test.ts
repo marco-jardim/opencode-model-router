@@ -14,7 +14,7 @@ import {
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { createPersister, nodePersistFs } from "../../src/routing/outcomes/persist";
 import { emptyTokenSample } from "../../src/routing/outcomes/cost";
-import { OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
+import { DECISIONS_MAX_GENERATIONS, OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
 import type {
   DecisionRow,
   LoadResult,
@@ -786,7 +786,7 @@ describe("runStatsCli", () => {
 
   it("QA-1.3-10: warns when the log has rotated and the window starts before (or without) its oldest retained row", async () => {
     const oldest = "2026-10-05T08:00:00.000Z";
-    const rotated = { readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: 2, files: ["g1", "g2", "live"] }) };
+    const rotated = { readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: DECISIONS_MAX_GENERATIONS, files: ["g1", "g2", "g3", "live"] }) };
     const warning = (since?: string) => async () => {
       const { io, errs, out } = fakeIo(rotated);
       expect(await runStatsCli(since === undefined ? [] : ["--since", since], io)).toBe(0);
@@ -798,11 +798,17 @@ describe("runStatsCli", () => {
     expect(await warning("2026-10-05T07:59:59Z")()).toContain("may be incomplete");
     expect(await warning(oldest)()).toBe(""); // the window starts at the oldest retained row: nothing is missing
     expect(await warning("2026-10-06")()).toBe("");
+    // QA-1.3-19: fewer generations than the retention limit means nothing was pruned yet: no warning
+    for (const generations of [1, DECISIONS_MAX_GENERATIONS - 1]) {
+      const young = fakeIo({ readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations, files: ["g1", "live"] }) });
+      await runStatsCli([], young.io);
+      expect(young.errs, `generations ${generations}`).toEqual([]);
+    }
     // no rotated generation, or no rows: nothing to warn about
     const never = fakeIo({ readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: 0, files: ["live"] }) });
     await runStatsCli([], never.io);
     expect(never.errs).toEqual([]);
-    const empty = fakeIo({ readRows: async () => readResult({ generations: 1, files: ["g1"] }) });
+    const empty = fakeIo({ readRows: async () => readResult({ generations: DECISIONS_MAX_GENERATIONS, files: ["g1"] }) });
     await runStatsCli([], empty.io);
     expect(empty.errs).toEqual([]);
   });
