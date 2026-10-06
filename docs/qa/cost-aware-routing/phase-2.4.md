@@ -44,7 +44,7 @@
 | `src\index.ts` | `/router stats`, the checkpoint line, the Cost doctor section, the notice in the system transform, the `/annotate-plan` handler (a message part), the v1 roles hunk; **1 line removed** against `1fc94a3`: `output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));` became assemble, the A28 condition, push (the `/annotate-plan` template block is untouched) |
 | `src\commands\output.ts` | one help bullet for `/router stats` |
 | `src\compat\child-session.ts`, `src\v2.ts` | `routerAgents` and `routerGenerate` on the v2 plugin input (see the API addition below) |
-| `test\integration\routing-advisor.test.ts` (52 tests), `annotate-plan-route.test.ts` (23), `v1-roles-line.test.ts` (8); `test\unit\routing-outcomes.stats.test.ts` (82, 6 new, 5 snapshots updated) | |
+| `test\integration\routing-advisor.test.ts` (52 tests), `annotate-plan-route.test.ts` (23), `v1-roles-line.test.ts` (8); `test\unit\routing-outcomes.stats.test.ts` (82; 3 new, the expectations behind 5 existing tests updated) | |
 
 ### How each plan task was done
 
