@@ -55,19 +55,19 @@ directives, which are binding and override your defaults. The rules that matter 
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **DF0** (Phase 0.P closed, QA PASS; baseline in `docs\qa\cost-aware-routing\dogfood.md` `## DF0`) |
-| **Next task id** | **Wave 1**: Phases 1.1, 1.2, 1.3, 1.5 start in parallel (first tasks 1.1.1, 1.2.1, 1.3.1, 1.5.1), each in its own worktree from `car/main`; tag `car/wave-1-base` at the `car/main` tip first (§0.6.3). 1.4 starts after 1.1, 1.2, 1.3 merge. |
+| Checkpoint reached | **DF0** done; **Wave 1 in progress** (handover revision 2, written mid-wave in `car/main`; `master` still holds revision 1 until DF1) |
+| **Next task id** | Wave 1 QA: Phases 1.1, 1.2, 1.3, 1.5 have finished QA rounds 1 and 2 fixes (1.1 and 1.2 round-2 fixes may still be finishing — check each branch log and `phase-1.x.md` "Round 2 fixes"). Next: round-3 re-review of round-2 MAJOR/CRITICAL fixes only (QA-1.1-22/23, QA-1.2-22/23/24, QA-1.5-17/18; 1.3 had none) by the same @heavy reviewer sessions → write each `## Verdict` → merge 1.1, 1.2, 1.3, 1.5 into `car/main` one at a time (capped suite after each; reconcile 1.5's `(tier as { candidates?: unknown })` cast with 1.1's typed `TierConfig.candidates`; add the post-merge test pinning `ROUTING_TASK_CLASSES` == 1.2 `TASK_CLASSES`) → Phase 1.4 (kernel) → DF1. |
 | `master` | fast-forwarded to `car/main` at the 0.P close (A12; docs + gated smoke test only, no restart needed); was `8e7a890` |
 | `car/main` | tip = merge of `car/p0p` (Phase 0.P); check `git -C D:\git\omr-car-main log --oneline -3` |
 | Base directory | `D:\git\opencode-model-router` (branch `master`); the session alias `D:\git\Claude-model-router` is the same repository — always use the `D:\git\opencode-model-router` form in dispatches |
 | Integration worktree | `D:\git\omr-car-main` on `car/main` (base `D:\git\opencode-model-router`; `npm ci` done; typecheck + capped suite green at `8e7a890`: 109 files passed, 3 skipped) |
-| Phase worktrees | none open (`D:\git\omr-car-p0p` removed after the 0.P merge). Pattern: `D:\git\omr-car-p<id>` on `car/p<id>` (`1.4` → `p14`) from `car/main`, base `D:\git\opencode-model-router` |
+| Phase worktrees | `D:\git\omr-car-p11` (`car/p11`, Phase 1.1), `D:\git\omr-car-p12` (`car/p12`, 1.2), `D:\git\omr-car-p13` (`car/p13`, 1.3), `D:\git\omr-car-p15` (`car/p15`, 1.5); all created from `car/main` @ `3b3dba4` (tag `car/wave-1-base`), base `D:\git\opencode-model-router` |
 | Other worktrees on the machine (not ours; never touch) | `D:\git\opencode-model-router-v2` (`fix/gate-task-cwd`), `D:\git\opencode-model-router-release` (`release/1.13.0`), `D:\git\opencode-model-router-agent-options-gate` (`fix/agent-options-provider-gate`), detached worktrees under `C:\Users\Marquinho\AppData\Local\Temp\` |
 | Active router config | Plugin loaded from `D:\git\opencode-model-router` (`C:\Users\Marquinho\.config\opencode\opencode.json:189`); bundled `D:\git\opencode-model-router\tiers.json` + state `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json` (`activePreset: hybrid-2`, `activeMode: normal`, `enforcementMode: advisory`); no override files. **Checkpoint edit target:** `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (create at DF2 with only the `routing` block) |
 | Current `routing` block | none (engine = `static` by absence) |
 | Scorecard / D15 directory | `C:\Users\Marquinho\AppData\Local\Temp\opencode-model-router-trajectory` |
 | Host | OpenCode `v2.0.22`; source `anomalyco/opencode` @ `527f0b931d1f9b3ebd34e106c51b31ce5db5b075`; `@opencode/plugin` 2.0.22 |
-| Open QA findings | none (Phase 0.P PASS; accepted minors listed in `phase-0P.md`) |
+| Open QA findings | Wave 1 round-2 fixes under re-review; plan amendments A14–A22 recorded in §1.5 on `car/main` (`81ca09e`, `ae0704e`) |
 | 0.P close-out | done: QA PASS, `car/p0p` merged into `car/main`, capped suite green, `master` fast-forwarded, `D:\git\omr-car-p0p` removed, Wave-1 comment posted on #74 |
 | Owner decisions pending | **Classifier model for the DF3 live check (A13)** — asked at 0.P close; until answered, the DF3 check is skipped. Record the answer here. |
 | Spike evidence hygiene | Any spike re-run that is not meant to replace the evidence: `git -C <worktree> checkout -- docs/qa/cost-aware-routing/spikes` afterwards (QA-0P-42) |
@@ -109,3 +109,11 @@ directives, which are binding and override your defaults. The rules that matter 
 | Full suite slow or flaky under parallel worktrees | Capped (`--maxWorkers=2`) and serialized; smoke tests serial; `npm ci` one worktree at a time. |
 | Merge conflict in `src\index.ts` / `src\compat\v2-hooks.ts` | Single-owner files per wave; only the orchestrator merges, in `D:\git\omr-car-main`, one phase at a time. |
 | A QA reviewer keeps finding minors on round 3+ | Fix only blocking/critical/major; record the rest as "accepted — QA round limit". |
+
+
+## 6. Wave 1 notes
+
+- **Never run vitest with `--pool=threads`** (A14): a Phase 1.1 test wrote the user's real `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (`{"routing":{"engine":"enforce"}}`) under threads; the orchestrator deleted it at ≈03:25. Phase 1.1 adds a global home guard (`test\setup\home-guard.ts`).
+- Delegates frequently end a turn mid-task ("Tools are available again…"); resume the same session with "finish, do not end your turn until committed/pushed/clean". The router grader's "NOT ACCEPTED" verdicts on those were based on a truncated injected criterion, not the deliverable — do not escalate on them.
+- Reviewer sessions (@heavy): 1.1 `ses_ef023787effeEObHxLv3MGeGY3`, 1.2 `ses_ef0234eb4ffevS1GTHmwcKeFUl`, 1.3 `ses_ef0231f14ffekDb3IRcSoChUDO`, 1.5 `ses_ef022ef72ffeAqMqtMr0BJxicE`. Producer sessions (@medium): 1.1 `ses_ef0521c71ffehscJXwyETnXMvV`, 1.2 `ses_ef03cb9e0ffe2SaokGGLv5GoPT`, 1.3 `ses_ef03c8de2ffekddgvTJIIsof1p`, 1.5 `ses_ef03c5af9ffeuuv113Ch6t0O7A`.
+- Owner decision still pending: classifier model for the DF3 live check (A13).
