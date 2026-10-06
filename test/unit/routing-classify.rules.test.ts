@@ -792,3 +792,43 @@ describe("negation clause boundaries (QA-1.2-13)", () => {
     expect(classifyByRules("review it, then refactor it", cfg).class).toBe("implement");
   });
 });
+describe("working directory resolution (QA-1.2-15)", () => {
+  // The decoy is a sub-directory of the real cwd: if it were picked as the cwd, a path directly under the
+  // real one would become external, so the outcome tells which line was used.
+  const REAL = "D:\\work\\repo";
+  const DECOY = "D:\\work\\repo\\sub";
+  const needsOf = (text: string, cwd?: string): readonly Need[] =>
+    classifyByRules(text, cfg, cwd === undefined ? undefined : { cwd }).needs;
+
+  it("the ENVIRONMENT section's line wins over an earlier example in the task text", () => {
+    const text = [
+      `TASK: write the notes to ${REAL}\\notes.md (a log line said: Working directory: ${DECOY})`,
+      `ENVIRONMENT: Working directory is ${REAL}`,
+    ].join("\n");
+    expect(needsOf(text)).toEqual(["edit"]);
+    // Without the ENVIRONMENT line the decoy is the only candidate.
+    expect(needsOf(`write the notes to ${REAL}\\notes.md (Working directory: ${DECOY})`)).toContain("external_dir");
+  });
+
+  it("without an ENVIRONMENT section the LAST occurrence wins", () => {
+    const decoyFirst = `Working directory: ${DECOY}\nsome log\nwrite the file to ${REAL}\\a.txt\nWorking directory: ${REAL}`;
+    expect(needsOf(decoyFirst)).toEqual(["edit"]);
+    const decoyLast = `Working directory: ${REAL}\nwrite the file to ${REAL}\\a.txt\nWorking directory: ${DECOY}`;
+    expect(needsOf(decoyLast)).toContain("external_dir");
+  });
+
+  it("the caller's cwd still beats every line in the text", () => {
+    const text = `write the file to ${REAL}\\a.txt\nWorking directory: ${DECOY}`;
+    expect(needsOf(text, REAL)).toEqual(["edit"]);
+    expect(needsOf(text, "E:\\other")).toContain("external_dir");
+  });
+
+  it("an ENVIRONMENT section without a working directory falls back to the last line in the body", () => {
+    const text = [
+      `TASK: write the file to ${REAL}\\a.txt`,
+      `CONTEXT: Working directory: ${REAL}`,
+      "ENVIRONMENT: Platform: win32",
+    ].join("\n");
+    expect(needsOf(text)).toEqual(["edit"]);
+  });
+});

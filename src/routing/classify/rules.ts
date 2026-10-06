@@ -121,6 +121,7 @@ const MEDIUM_RISK_RES: readonly RegExp[] = MEDIUM_RISK_TERMS.map(globalCopy);
 const REPO_SCOPE_RES: readonly RegExp[] = REPO_SCOPE_TERMS.map(globalCopy);
 const ABS_PATH_RES: readonly RegExp[] = [WINDOWS_ABS_PATH_RE, POSIX_ABS_PATH_RE].map(globalCopy);
 const ACCEPTANCE_ALL_RE = new RegExp(ACCEPTANCE_BLOCK_RE.source, "gi");
+const CWD_LINE_ALL_RE = new RegExp(CWD_LINE_RE.source, "gi");
 
 /**
  * Path-like tokens, removed before the needs vocabulary runs (external_dir is
@@ -312,6 +313,8 @@ interface Sections {
   readonly templated: boolean;
   readonly focusText: string;
   readonly needsText: string;
+  /** Content of the ENVIRONMENT section(s), where the host states the working directory ("" when none). */
+  readonly environmentText: string;
 }
 
 /**
@@ -329,10 +332,11 @@ function splitSections(body: string): Sections {
     if (TEMPLATE_LABELS.has(label)) headers.push({ line: i, label, prefixLength: m[0].length });
   }
   if (headers.length < TEMPLATE_MIN_SECTIONS) {
-    return { templated: false, focusText: body, needsText: body };
+    return { templated: false, focusText: body, needsText: body, environmentText: "" };
   }
   const focus: string[] = [];
   const needs: string[] = [];
+  const environment: string[] = [];
   const first = headers[0]!.line;
   if (first > 0) {
     const preamble = lines.slice(0, first).join("\n");
@@ -347,26 +351,44 @@ function splitSections(body: string): Sections {
     const blank = content.findIndex((line, i) => i > 0 && line.trim() === "");
     const afterBlank = blank === -1 ? "" : content.slice(blank + 1).join("\n");
     const whole = content.join("\n");
+    if (header.label === "ENVIRONMENT") environment.push(whole);
     focus.push(CLASS_EXCLUDED.has(header.label) ? afterBlank : whole);
     needs.push(NEEDS_EXCLUDED.has(header.label) ? afterBlank : whole);
   }
-  return { templated: true, focusText: focus.join("\n"), needsText: needs.join("\n") };
+  return {
+    templated: true,
+    focusText: focus.join("\n"),
+    needsText: needs.join("\n"),
+    environmentText: environment.join("\n"),
+  };
 }
 
 function trimPathTail(path: string): string {
   return path.replace(/[.,;:)]+$/, "");
 }
 
-/** R3: the dispatch working directory, from the caller or the `Working directory:` line. */
-function resolveCwd(body: string, ctx: { cwd?: string } | undefined): string | null {
+/** The path of the LAST `Working directory:` line in `text`, or null. */
+function lastWorkingDirectory(text: string): string | null {
+  let found: string | null = null;
+  scan(CWD_LINE_ALL_RE, text, (m) => {
+    const path = m[1] ? trimPathTail(m[1]) : "";
+    if (path !== "") found = path;
+    return false;
+  });
+  return found;
+}
+
+/**
+ * R3: the dispatch working directory. The caller's `cwd` wins (the orchestrator
+ * knows the task's worktree); otherwise the `Working directory:` line of the
+ * ENVIRONMENT section, where the host writes it; otherwise the LAST such line
+ * anywhere (a quoted log or an earlier example must not outvote the footer
+ * that closes the prompt; QA-1.2-15).
+ */
+function resolveCwd(body: string, environmentText: string, ctx: { cwd?: string } | undefined): string | null {
   const given = ctx?.cwd;
   if (typeof given === "string" && given.trim() !== "") return given.trim();
-  const m = CWD_LINE_RE.exec(body);
-  if (m?.[1]) {
-    const found = trimPathTail(m[1]);
-    if (found !== "") return found;
-  }
-  return null;
+  return lastWorkingDirectory(environmentText) ?? lastWorkingDirectory(body);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,8 +465,8 @@ export function analyzeRules(
 ): RulesAnalysis {
   const raw = collapseLongRuns(String(text ?? "").slice(0, RULES_MAX_CHARS));
   const body = prepareBody(raw);
-  const cwd = resolveCwd(body, ctx);
-  const { templated, focusText, needsText } = splitSections(body);
+  const { templated, focusText, needsText, environmentText } = splitSections(body);
+  const cwd = resolveCwd(body, environmentText, ctx);
   // The gates are quadratic in the longest run of path characters (a token just under the collapse
   // threshold still costs ~its length squared), so only the head of a long prompt is measured; breadth
   // markers show up long before 2000 characters. `chars` then reports the head, never the full length.
