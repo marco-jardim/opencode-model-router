@@ -196,6 +196,15 @@ The amendment texts are canonical in the plan, §1.5 "Amended during implementat
 | QA-0P-44 | nit | harness `:877` | stale `service.json` with the live gate on throws instead of skipping | accepted — QA round limit (only reachable with the manual live opt-in) |
 | QA-0P-45 | nit | plan A10, this file S5 row, A4 vs DF3 | wrong tiered-cost example; stale latencies; experimental wording mismatch | fixed: A10 example, S5 6/6 ms and 272 ms, A4/DF3 aligned |
 
+**Round 3 re-review** of QA-0P-38/39/40 (`acf092b`): all three resolved; no new blocking/critical/major. Minors raised, accepted — QA round limit:
+
+| Id | Sev. | Finding | Disposition |
+|---|---|---|---|
+| QA-0P-46 | minor | DF3 sample steps may score ≥ `minClassConfidence` on rules and skip the backend (fails safe: `host` stays experimental) | accepted — QA round limit; DF3 executor phrases the two sample steps without taxonomy keywords |
+| QA-0P-47 | minor | `/annotate-plan` trigger may need the human to type it if no host command route exists | accepted — QA round limit; handover row "Liveness probe / slash commands" covers it |
+| QA-0P-48 | minor | during the DF3 one-shot every session on the machine can call the `host` classifier | accepted — QA round limit; run the check with no other sessions active |
+| QA-0P-49 | minor | 1.2 tests say "mocked HTTP" for `host`; `AbortController` may not cancel `ctx.generate.text` | accepted — QA round limit; handoff to 1.2 (race against a timer; fake `ctx.generate`) |
+
 ## Deferred by plan
 
 - `tsx` absent → `routing:stats` invocation decided in Phase 1.3 (plan troubleshooting row).
@@ -206,7 +215,7 @@ The amendment texts are canonical in the plan, §1.5 "Amended during implementat
 ## Handoffs
 
 - **to 1.1** — 1.1.4: test that a change to the global override file is picked up by hot reload (A6). 1.1.6: runtime `.git` read only. Config validation must accept `routing.classifier` with `backend: "host"` + a catalog model (used at DF3).
-- **to 1.2** — `host` backend via `ctx.generate.text`; the classifier model must resolve at the dispatching location; errors → `unknown` (A4).
+- **to 1.2** — `host` backend via `ctx.generate.text`; the classifier model must resolve at the dispatching location; errors → `unknown` (A4); enforce `timeoutMs` by racing the call against a timer (an abandoned call may still complete and bill); unit tests use a fake `ctx.generate`, not mocked HTTP (QA-0P-49).
 - **to 1.3** — `tsx` not installed; unpriced = empty or all-zero, all tiers; tiered price lookup (A1, A10).
 - **to 1.4** — D2 snapshot pins the raw builder output (SHA-256 above) and the v2-adapted text; every live candidate compares in `costRatio` today (A1).
 - **to 1.5** — D11 rule with `inputBudget` (A5, A10); rank of `default` (A9); variant catalogs differ per model; haiku variants are thinking budgets (A7).
@@ -218,4 +227,4 @@ The amendment texts are canonical in the plan, §1.5 "Amended during implementat
 
 ## Verdict
 
-_Pending QA round 3 (re-review of round-2 fixes; from round 3 only blocking/critical/major are fixed)._
+**PASS — open findings: 0** (no blocking/critical/major open; every round-1 and round-2 finding fixed; QA-0P-42, 44, 46–49 accepted under the round limit). Phase 0.P DoD: spike harness committed and green on the acceptance check (10 passed, 1 skipped); verdict per hypothesis written; scorecard directory and active config recorded; `car/main` and `D:\git\omr-car-main` exist; `dogfood.md` has `## DF0`; amendments A1–A13 in the plan.
