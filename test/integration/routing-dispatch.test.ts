@@ -528,6 +528,8 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     expect(row).toMatchObject({ resume: true, switched: false, mode: "enforce", childSessionID: "child-lift", chosen: { agent: "fast" } });
     expect(row!.reason.startsWith("kept:resume:running: ")).toBe(true);
     expect(row!.reason).toContain("@medium");
+    expect(row!.reason).toContain("sent to @medium so the host does not switch it back (A30)");
+    expect(row!.reason).not.toContain("NOT rewritten");
     expect(lookupDispatch("child-lift")).toMatchObject({ agent: "medium", model: SONNET, variant: "medium", picked: "fast", decisionID: row!.decisionID });
     // and again: the pick is remembered across resumes
     const again = await hostResume(world, "child-lift", { agent: "fast", prompt: SEARCH });
@@ -627,6 +629,12 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     const pinned = await hostResume(world, "child-pin", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it." });
     expect(pinned.args).toMatchObject({ agent: "fast" });
     expect(pinned.switched).toBe(true);
+    // 3.2 smoke (real host): the row of a pinned resume must not claim it was sent to the running agent, because it was sent as named
+    const pinnedRow = (await resumeRows(world)).at(-1);
+    expect(pinnedRow).toMatchObject({ resume: true, pinned: true, switched: false, childSessionID: "child-pin", chosen: { agent: "fast" } });
+    expect(pinnedRow!.reason.startsWith("kept:resume:running: ")).toBe(true);
+    expect(pinnedRow!.reason).toContain("pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast)");
+    expect(pinnedRow!.reason).not.toContain("sent to @medium");
   });
 });
 describe("advise: input untouched, protocol and hint through the context hook", () => {
