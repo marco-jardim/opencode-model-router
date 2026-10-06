@@ -994,6 +994,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     register("child-1");
     f.emit(stepEvent("e1", "child-1", { finish: "tool-calls", cost: 0.01 }));
     f.emit(stepEvent("e2", "child-1", { finish: "stop", cost: 0.02 }));
+    f.emit({ id: "x1", type: "session.execution.succeeded", data: { sessionID: "child-1" } }); // the attempt folds here
     await barrier(f, forgetSession, "barrier");
     const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
     try {
@@ -1061,6 +1062,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const event = stepEvent("same-id", "child-1", { finish: "stop", cost: 0.02 });
     a.emit(event);
     b.emit(event);
+    a.emit({ id: "x-a", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
     await barrier(a, first.forgetSession, "barrier-a");
     await barrier(b, second.forgetSession, "barrier-b");
     const peek = acquireOutcomes({ dir: outcomes, tuning: DEFAULT_OUTCOME_TUNING, logger });
@@ -1091,7 +1093,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
 
   describe("with an injected ingest", () => {
     const fake = () => ({
-      onStepEnded: vi.fn(async () => {}), onVerdict: vi.fn(), onFalseRefusal: vi.fn(), onSessionGone: vi.fn(),
+      onStepEnded: vi.fn(async () => {}), onExecutionEnded: vi.fn(), onVerdict: vi.fn(), onFalseRefusal: vi.fn(), onSessionGone: vi.fn(),
       requestFlush: vi.fn(), sweep: vi.fn(), dispose: vi.fn(async () => {}),
     } satisfies Ingest);
 
@@ -1133,6 +1135,16 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
       }
     });
 
+    it("QA-2.1-6: routes failed steps to ingest like finished ones", async () => {
+      const ingest = fake();
+      const f = fixture();
+      const { forgetSession } = await start(f, catalog(), {}, { ingest });
+      f.emit({ id: "f1", type: "session.step.failed", data: { sessionID: "child-1", cost: 0.01 } });
+      await barrier(f, forgetSession, "barrier");
+      expect(ingest.onStepEnded).toHaveBeenCalledTimes(1);
+      expect(ingest.onStepEnded).toHaveBeenCalledWith(expect.objectContaining({ type: "session.step.failed" }));
+    });
+
     it("flushes and sweeps on the idle equivalents, not on unrelated events, and disposes on cleanup", async () => {
       const ingest = fake();
       const f = fixture();
@@ -1145,6 +1157,9 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
       await barrier(f, forgetSession, "barrier");
       expect(ingest.requestFlush).toHaveBeenCalledTimes(4);
       expect(ingest.sweep).toHaveBeenCalledTimes(4);
+      // QA-2.1-6: the three execution-end events (not the literal idle) end the child's attempt
+      expect(ingest.onExecutionEnded).toHaveBeenCalledTimes(3);
+      expect(ingest.onExecutionEnded).toHaveBeenCalledWith("s");
       expect(ingest.onStepEnded).not.toHaveBeenCalled();
       expect(ingest.dispose).not.toHaveBeenCalled();
       await cleanup();

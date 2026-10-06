@@ -48,7 +48,9 @@ import type {
   OutcomesBundle,
   OutcomeTuning,
   RefusalRow,
+  OutcomeStore,
   StepEndedTokens,
+  StepSample,
   Verdict,
   VerdictRow,
 } from "./types";
@@ -256,15 +258,41 @@ export const SEEN_EVENT_CAP = 4096;
 const SIGNAL_CAP = 4096;
 /** Children whose last attempt id is tracked (so a superseded attempt can be folded). */
 const LAST_ATTEMPT_CAP = 2000;
-/** Children already reported as unkeyable (model unresolved), one warning each. */
+/** Final steps held back until their attempt ends (QA-2.1-6). */
+const HELD_FINAL_CAP = 2000;
+/** A held final step whose attempt never reported its end is folded after this idle time (the store's own default). */
+const HELD_FINAL_IDLE_MS = 30 * 60_000;
+/** Model references already reported as unkeyable (model unresolved), one warning each. */
 const WARNED_CAP = 500;
 
 const seenEvents = new Map<string, true>();
 const signalled = new Set<string>();
 /** What scored each attempt in the store (`pass`, `fail` or `refusal`), so a refusal knows whether it converts a pass. */
 const scored = new Map<string, "pass" | "fail" | "refusal">();
-const lastAttemptByChild = new Map<string, string>();
+/** `${outcomesDir}|${child}` → the attempt the child's latest step belongs to (a store in another directory is another recording). */
+const lastAttemptByChild = new Map<string, LastAttempt>();
 const warnedUnkeyed = new Set<string>();
+
+interface LastAttempt {
+  readonly dir: string;
+  readonly attempt: string;
+}
+
+interface HeldFinal {
+  readonly dir: string;
+  readonly attempt: string;
+  readonly key: OutcomeKey;
+  /** Already marked `final`: recorded as such when the attempt ends. */
+  readonly sample: StepSample;
+  readonly at: number;
+}
+/**
+ * QA-2.1-6: a step that finished with anything but `tool-calls` only sets the attempt's `finalOutput`; the attempt
+ * stays open (a `length` or `error` finish may be followed by more steps) and is folded when its execution ends. The
+ * step is held here, outside the store, until the next step of the attempt (then it was not the last), the end of the
+ * execution, the session's deletion, a sweep or a dispose.
+ */
+const heldFinals = new Map<string, HeldFinal>();
 
 function boundedSet<V>(map: Map<string, V>, key: string, value: V, cap: number): void {
   map.delete(key);
@@ -303,10 +331,13 @@ function firstDelivery(eventKey: string): boolean {
   return true;
 }
 
-function rememberAttempt(child: string, attemptId: string): string | undefined {
-  const previous = lastAttemptByChild.get(child);
-  lastAttemptByChild.delete(child);
-  lastAttemptByChild.set(child, attemptId);
+const scopeKey = (dir: string, id: string): string => `${dir}|${id}`;
+
+function rememberAttempt(dir: string, child: string, attemptId: string): string | undefined {
+  const mapKey = scopeKey(dir, child);
+  const previous = lastAttemptByChild.get(mapKey)?.attempt;
+  lastAttemptByChild.delete(mapKey);
+  lastAttemptByChild.set(mapKey, { dir, attempt: attemptId });
   while (lastAttemptByChild.size > LAST_ATTEMPT_CAP) {
     const oldest = lastAttemptByChild.keys().next();
     if (oldest.done === true) break;
@@ -323,6 +354,7 @@ export function resetIngestState(): void {
   scored.clear();
   lastAttemptByChild.clear();
   warnedUnkeyed.clear();
+  heldFinals.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -349,8 +381,13 @@ export interface IngestDeps {
 }
 
 export interface Ingest {
-  /** `session.step.ended` for a registered child. Awaits only the (cached) catalog lookup. Never rejects. */
+  /**
+   * `session.step.ended` (and `session.step.failed`, when it carries a cost or tokens) of a registered child. Awaits
+   * only the cached catalog lookup, bounded by its load timeout. Never rejects.
+   */
   onStepEnded(event: IngestEvent): Promise<void>;
+  /** The child's execution ended (succeeded, failed or interrupted): its open attempt is folded (QA-2.1-6). */
+  onExecutionEnded(childSessionID: string): void;
   /** A verifier verdict for the child's current attempt. Never throws. */
   onVerdict(childSessionID: string, outcome: Verdict): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
@@ -366,12 +403,17 @@ export interface Ingest {
 }
 
 /** Event types after which the router flushes (v2's equivalents of `session.idle`, plus the idle/deleted events). */
-export const FLUSH_EVENT_TYPES: ReadonlySet<string> = new Set([
-  "session.idle",
-  "session.deleted",
+/** The v2 events that end a session's execution (the adapter maps them to `session.idle`). */
+export const EXECUTION_END_TYPES: ReadonlySet<string> = new Set([
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+]);
+
+export const FLUSH_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "session.idle",
+  "session.deleted",
+  ...EXECUTION_END_TYPES,
 ]);
 
 function describe(error: unknown): string {
@@ -437,17 +479,18 @@ export function createIngest(deps: IngestDeps): Ingest {
     }
     const cls = record.facts.class;
     if (typeof cls !== "string" || cls === "" || cls === "unknown") return null;
-    if (record.model === null) return unkeyable(childSessionID, "the dispatch registered no model");
+    if (record.model === null) return unkeyable(`${record.agent}|`, childSessionID, "the dispatch registered no model");
     const ref = splitModelRef(record.model);
-    if (ref === null) return unkeyable(childSessionID, `model "${record.model}" is not provider/model`);
+    if (ref === null) return unkeyable(`${record.agent}|${record.model}`, childSessionID, `model "${record.model}" is not provider/model`);
     const variant = record.variant ?? ref.variant;
     const origin = classifyAgentOrigin(record.agent, settings.routerAgentIds);
     const key = makeKey(cls, { origin, id: record.agent }, ref.provider, ref.model, variant);
     return { record, settings, key };
   };
 
-  const unkeyable = (childSessionID: string, why: string): null => {
-    if (boundedAdd(warnedUnkeyed, childSessionID, WARNED_CAP)) {
+  // One warning per model reference (QA-2.1-12), not per child: every child of an unresolved agent says the same.
+  const unkeyable = (reference: string, childSessionID: string, why: string): null => {
+    if (boundedAdd(warnedUnkeyed, reference, WARNED_CAP)) {
       deps.logger.warn(`[router] outcome ingestion: child ${childSessionID} is not recorded: ${why}`);
     }
     return null;
@@ -461,22 +504,74 @@ export function createIngest(deps: IngestDeps): Ingest {
     sessionID: record.parentSessionID ?? "",
   });
 
-  const closeLastAttempt = (childSessionID: string): void => {
-    const last = lastAttemptByChild.get(childSessionID);
-    lastAttemptByChild.delete(childSessionID);
-    if (last !== undefined) held?.bundle.store.closeAttempt(last);
+  /** Held final steps this instance created (`${dir}|${attempt}`), released with it. */
+  const ownedHeld = new Set<string>();
+
+  /** The outcomes directory this instance writes to right now, or null when ingestion is off. */
+  const currentDir = (): string | null => held?.dir ?? deps.settings()?.outcomesDir ?? null;
+
+  /** The shared store of `dir`, through this instance's bundle when it has one; null when ingestion is off for `dir`. */
+  const storeOf = (dir: string): OutcomeStore | null => {
+    if (held !== null) return held.dir === dir ? held.bundle.store : null;
+    const settings = deps.settings();
+    return settings === null || settings.outcomesDir !== dir ? null : (bundleFor(settings)?.store ?? null);
   };
 
+  /** Record the held final step of an attempt: as its last step (`asFinal`, folds the attempt) or as a plain step. */
+  const settle = (dir: string, attemptId: string, asFinal: boolean): void => {
+    const heldKey = scopeKey(dir, attemptId);
+    const pending = heldFinals.get(heldKey);
+    if (pending === undefined) return;
+    heldFinals.delete(heldKey);
+    ownedHeld.delete(heldKey);
+    storeOf(dir)?.recordStep(pending.key, asFinal ? pending.sample : { ...pending.sample, final: false });
+  };
+
+  /** Fold an attempt that is over: its held final step first, then whatever is still open. */
+  const endAttempt = (dir: string, attemptId: string): void => {
+    settle(dir, attemptId, true);
+    storeOf(dir)?.closeAttempt(attemptId);
+  };
+
+  const closeLastAttempt = (childSessionID: string): void => {
+    const dir = currentDir();
+    if (dir === null) return;
+    const mapKey = scopeKey(dir, childSessionID);
+    const last = lastAttemptByChild.get(mapKey);
+    lastAttemptByChild.delete(mapKey);
+    if (last !== undefined) endAttempt(last.dir, last.attempt);
+  };
+
+  const settleOwned = (): void => {
+    for (const heldKey of [...ownedHeld]) {
+      const pending = heldFinals.get(heldKey);
+      if (pending === undefined) ownedHeld.delete(heldKey);
+      else settle(pending.dir, pending.attempt, true);
+    }
+  };
+
+  /** QA-2.1-11: ingestion went off (engine switched to static): finish what is pending and let the bundle go. */
+  const dropIfOff = (): boolean => {
+    if (held === null || deps.settings() !== null) return false;
+    settleOwned();
+    const current = held;
+    held = null;
+    void current.bundle.release().catch((error: unknown) => warn("releasing the outcomes bundle failed", error));
+    return true;
+  };
   return {
     async onStepEnded(event: IngestEvent): Promise<void> {
       try {
-        if (event.type !== "session.step.ended" || !isRecord(event.data)) return;
+        const failed = event.type === "session.step.failed";
+        if ((event.type !== "session.step.ended" && !failed) || !isRecord(event.data)) return;
         const data = event.data;
         const sessionID = data.sessionID;
         if (typeof sessionID !== "string") return;
         const first = targetOf(sessionID);
         if (first === null) return;
         const tokens = isRecord(data.tokens) ? (data.tokens as unknown as StepEndedTokens) : undefined;
+        // A failed step reports cost and tokens only when it got that far (QA-2.1-6): nothing measured, nothing to add.
+        if (failed && typeof data.cost !== "number" && tokens === undefined) return;
         const eventKey =
           typeof event.id === "string" && event.id !== ""
             ? event.id
@@ -497,22 +592,41 @@ export function createIngest(deps: IngestDeps): Ingest {
         if (!firstDelivery(`${settings.outcomesDir}|${eventKey}`)) return;
         const bundle = bundleFor(settings);
         if (bundle === null) return;
-        const superseded = rememberAttempt(sessionID, record.attemptId);
-        if (superseded !== undefined && superseded !== record.attemptId) bundle.store.closeAttempt(superseded);
-        bundle.store.recordStep(key, {
+        const dir = settings.outcomesDir;
+        const superseded = rememberAttempt(dir, sessionID, record.attemptId);
+        if (superseded !== undefined && superseded !== record.attemptId) endAttempt(dir, superseded);
+        const sample: StepSample = {
           attemptID: record.attemptId,
           cost: typeof data.cost === "number" ? data.cost : Number.NaN,
           pricing: pricingState(pricing),
           tokens: tokenSampleFromEvent(
             tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
           ),
-          final: data.finish !== "tool-calls",
-        });
+          final: false,
+        };
+        // A step after a held final one proves that one was not the last.
+        settle(dir, record.attemptId, false);
+        if (!failed && data.finish !== "tool-calls") {
+          const heldKey = scopeKey(dir, record.attemptId);
+          boundedSet(heldFinals, heldKey, { dir, attempt: record.attemptId, key, sample: { ...sample, final: true }, at: safeNow(now) }, HELD_FINAL_CAP);
+          ownedHeld.add(heldKey);
+        } else {
+          bundle.store.recordStep(key, sample);
+        }
         touchDispatch(sessionID, safeNow(now));
       } catch (error) {
         warn("session.step.ended failed", error);
       }
     },
+    onExecutionEnded(childSessionID: string): void {
+      try {
+        if (lookupDispatch(childSessionID) === undefined) return;
+        closeLastAttempt(childSessionID);
+      } catch (error) {
+        warn("execution end failed", error, { childSessionID });
+      }
+    },
+
     onVerdict(childSessionID: string, outcome: Verdict): void {
       try {
         const target = targetOf(childSessionID);
@@ -586,7 +700,6 @@ export function createIngest(deps: IngestDeps): Ingest {
         }
         // The orchestrator went away: its children can no longer receive verdicts.
         for (const child of forgetDispatchesOf(sessionID)) closeLastAttempt(child.childSessionID);
-        warnedUnkeyed.delete(sessionID);
         if (held !== null) void held.bundle.flusher.requestFlush();
       } catch (error) {
         warn("session cleanup failed", error, { sessionID });
@@ -595,6 +708,7 @@ export function createIngest(deps: IngestDeps): Ingest {
 
     requestFlush(): void {
       try {
+        if (dropIfOff()) return;
         if (held !== null) void held.bundle.flusher.requestFlush();
       } catch (error) {
         warn("flush request failed", error);
@@ -603,9 +717,18 @@ export function createIngest(deps: IngestDeps): Ingest {
 
     sweep(): void {
       try {
-        sweepDispatches(safeNow(now));
-        for (const child of [...lastAttemptByChild.keys()]) {
-          if (lookupDispatch(child) === undefined) lastAttemptByChild.delete(child);
+        dropIfOff();
+        const t = safeNow(now);
+        sweepDispatches(t);
+        // A child that was swept away can no longer end its attempt: fold it.
+        for (const [mapKey, last] of [...lastAttemptByChild]) {
+          const child = mapKey.slice(last.dir.length + 1);
+          if (lookupDispatch(child) !== undefined) continue;
+          lastAttemptByChild.delete(mapKey);
+          endAttempt(last.dir, last.attempt);
+        }
+        for (const pending of [...heldFinals.values()]) {
+          if (t - pending.at >= HELD_FINAL_IDLE_MS) settle(pending.dir, pending.attempt, true);
         }
         held?.bundle.store.sweepAttempts();
       } catch (error) {
@@ -616,6 +739,7 @@ export function createIngest(deps: IngestDeps): Ingest {
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;
+      settleOwned();
       const current = held;
       held = null;
       if (current === null) return;

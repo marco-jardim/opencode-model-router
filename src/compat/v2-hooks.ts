@@ -13,7 +13,7 @@ import { resolveSubagentOverrides } from "../router/subagents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
-import { FLUSH_EVENT_TYPES, createCatalogPricing, createIngest, ingestSettings } from "../routing/outcomes/ingest";
+import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, createCatalogPricing, createIngest, ingestSettings } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -443,9 +443,9 @@ export async function registerV2Hooks(
         if (abort.signal.aborted) break;
         try {
           const data = event.data as Record<string, any>;
-          if (event.type === "session.step.ended") {
+          if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
-            await ingesting("session.step.ended", () => ingest.onStepEnded(event));
+            await ingesting(event.type, () => ingest.onStepEnded(event));
             continue;
           }
           if (event.type === "session.deleted") {
@@ -453,7 +453,12 @@ export async function registerV2Hooks(
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {
             // The v2 equivalents of session.idle: coalesced, throttled flush (D15); never awaited.
-            await ingesting(event.type, () => { ingest.sweep(); ingest.requestFlush(); });
+            await ingesting(event.type, () => {
+              // The child's attempt is over: fold it before the flush that persists it.
+              if (EXECUTION_END_TYPES.has(event.type)) ingest.onExecutionEnded(data.sessionID);
+              ingest.sweep();
+              ingest.requestFlush();
+            });
           }
           if (event.type === "session.text.ended") {
             const output = { text: data.text };

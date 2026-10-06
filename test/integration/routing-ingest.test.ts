@@ -267,6 +267,8 @@ describe("step ingestion (2.1.2)", () => {
     await ingest.onStepEnded(step("e1", "c1", { cost: 0.01, input: 1000, output: 100, finish: "tool-calls" }));
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(0); // folded only on the final step
     await ingest.onStepEnded(step("e2", "c1", { cost: 0.02, input: 2000, output: 300, finish: "stop" }));
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(0); // QA-2.1-6: the final step waits for the end of the execution
+    ingest.onExecutionEnded("c1");
     const cost = h.store().cost(MEDIUM_KEY);
     expect(cost.measuredUSD.n).toBe(1);
     expect(cost.measuredUSD.mean).toBeCloseTo(0.03, 9);
@@ -284,6 +286,7 @@ describe("step ingestion (2.1.2)", () => {
       const ingest = h.make({ pricing });
       dispatch("c1");
       await ingest.onStepEnded(step("e1", "c1", { cost: 0, input: 5340, output: 5, finish: "stop" }));
+      ingest.onExecutionEnded("c1");
       const cost = h.store().cost(MEDIUM_KEY);
       expect(cost.measuredUSD.n).toBe(0);
       expect(cost.unpricedAttempts).toBe(1);
@@ -297,10 +300,12 @@ describe("step ingestion (2.1.2)", () => {
     const priced = h.make({ pricing: PRICED });
     dispatch("c1");
     await priced.onStepEnded(step("e1", "c1", { cost: 0, finish: "stop" }));
+    priced.onExecutionEnded("c1");
     expect(h.store().cost(MEDIUM_KEY).measuredUSD).toMatchObject({ n: 1, mean: 0 });
     const unpriced = h.make({ pricing: EMPTY_PRICING });
     dispatch("c2", { facts: { ...FACTS, class: "debug" } });
     await unpriced.onStepEnded(step("e2", "c2", { cost: 0.5, finish: "stop" }));
+    unpriced.onExecutionEnded("c2");
     const key = makeKey("debug", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "medium");
     expect(h.store().cost(key).measuredUSD).toMatchObject({ n: 1, mean: 0.5 });
   });
@@ -320,6 +325,8 @@ describe("step ingestion (2.1.2)", () => {
     dispatch("c2", { agent: "fast", model: "opencode-go/gpt-6-luna", variant: null });
     await ingest.onStepEnded(step("e1", "c1", { cost: 0, finish: "stop" }));
     await ingest.onStepEnded(step("e2", "c2", { cost: 0, finish: "stop" }));
+    ingest.onExecutionEnded("c1");
+    ingest.onExecutionEnded("c2");
     expect(loads).toBe(1);
     expect(h.store().cost(MEDIUM_KEY).unpricedAttempts).toBe(1);
     const luna = makeKey("implement", { origin: "router", id: "fast" }, "opencode-go", "gpt-6-luna", null);
@@ -331,6 +338,7 @@ describe("step ingestion (2.1.2)", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1", { agent: "explore", model: "anthropic/claude-haiku-4-5", variant: null, facts: { ...FACTS, class: "search" } });
     await ingest.onStepEnded(step("e1", "c1", { finish: "stop" }));
+    ingest.onExecutionEnded("c1");
     expect(h.store().keys()).toEqual([makeKey("search", { origin: "host", id: "explore" }, "anthropic", "claude-haiku-4-5", null)]);
   });
 
@@ -339,6 +347,7 @@ describe("step ingestion (2.1.2)", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1", { model: "anthropic/claude-sonnet-5-5#high", variant: null });
     await ingest.onStepEnded(step("e1", "c1", { finish: "stop" }));
+    ingest.onExecutionEnded("c1");
     expect(h.store().keys()).toEqual([makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "high")]);
   });
 
@@ -360,6 +369,7 @@ describe("step ingestion (2.1.2)", () => {
     await ingest.onStepEnded(step("e1", "c1", { cost: 0.01, finish: "tool-calls" }));
     dispatch("c1"); // resume: attempt c1:1
     await ingest.onStepEnded(step("e2", "c1", { cost: 0.04, finish: "stop" }));
+    ingest.onExecutionEnded("c1");
     const cost = h.store().cost(MEDIUM_KEY);
     expect(cost.steps.n).toBe(2); // two attempts folded
     expect(cost.measuredUSD.n).toBe(2);
@@ -376,6 +386,7 @@ describe("step ingestion (2.1.2)", () => {
     await expect(ingest.onStepEnded(step("e1", "c1", { finish: "tool-calls" }))).resolves.toBeUndefined();
     expect(h.warnings.some((w) => w.includes("session.step.ended failed") && w.includes("catalog exploded"))).toBe(true);
     await ingest.onStepEnded(step("e2", "c1", { finish: "stop", cost: 0.02 }));
+    ingest.onExecutionEnded("c1");
     expect(h.store().cost(MEDIUM_KEY).measuredUSD.n).toBe(1);
   });
 
@@ -386,6 +397,7 @@ describe("step ingestion (2.1.2)", () => {
     const bad = step("e1", "c1", { finish: "stop" });
     (bad.data as { cost: unknown }).cost = "free";
     await ingest.onStepEnded(bad);
+    ingest.onExecutionEnded("c1");
     const cost = h.store().cost(MEDIUM_KEY);
     expect(cost.measuredUSD.n).toBe(0);
     expect(cost.tokens.n).toBe(1);
@@ -401,6 +413,7 @@ describe("duplicate delivery (A3, S3b)", () => {
     const event = step("evt-1", "c1", { finish: "stop", cost: 0.02 });
     await Promise.all([a.onStepEnded(event), b.onStepEnded(event)]);
     await b.onStepEnded(event);
+    a.onExecutionEnded("c1");
     const cost = h.store().cost(MEDIUM_KEY);
     expect(cost.steps).toMatchObject({ n: 1, mean: 1 });
     expect(cost.measuredUSD).toMatchObject({ n: 1 });
@@ -410,6 +423,7 @@ describe("duplicate delivery (A3, S3b)", () => {
     expect(h.bundles).toHaveLength(1);
     dispatch("c2");
     await b.onStepEnded(step("evt-3", "c2", { finish: "stop", cost: 0.01 }));
+    b.onExecutionEnded("c2");
     expect(h.bundles).toHaveLength(2);
     expect(h.bundles[1]!.store).toBe(h.bundles[0]!.store);
     expect(h.bundles[1]!.flusher).toBe(h.bundles[0]!.flusher);
@@ -424,6 +438,7 @@ describe("duplicate delivery (A3, S3b)", () => {
     const event = step("evt-2", "c1", { finish: "stop" });
     await stat.onStepEnded(event);
     await live.onStepEnded(event);
+    live.onExecutionEnded("c1");
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
   });
 
@@ -442,6 +457,7 @@ describe("duplicate delivery (A3, S3b)", () => {
     await b.onStepEnded(last);
     release();
     await aLoop;
+    b.onExecutionEnded("c1");
     const cost = h.store().cost(MEDIUM_KEY);
     expect(cost.steps).toMatchObject({ n: 1, mean: 2 }); // both steps of the attempt, each once
     expect(cost.finalMessageTokens.mean).toBe(333);
@@ -458,6 +474,8 @@ describe("duplicate delivery (A3, S3b)", () => {
     await a.onStepEnded(event);
     await b.onStepEnded(event);
     await a.onStepEnded(event);
+    a.onExecutionEnded("c1");
+    b.onExecutionEnded("c1");
     expect(one.store().cost(MEDIUM_KEY).steps.n).toBe(1);
     expect(two.store().cost(MEDIUM_KEY).steps.n).toBe(1);
     expect(one.store()).not.toBe(two.store());
@@ -471,6 +489,7 @@ describe("duplicate delivery (A3, S3b)", () => {
     const event = step("", "c1", { finish: "stop" });
     await a.onStepEnded(event);
     await b.onStepEnded(event);
+    a.onExecutionEnded("c1");
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
     expect(SEEN_EVENT_CAP).toBeGreaterThanOrEqual(1000);
   });
@@ -657,6 +676,7 @@ describe("class confidence gate (phase 1.2 handoff)", () => {
     // the dispatch is still known: a later, trusted dispatch of the same child is recorded
     dispatch("low", { facts: { ...FACTS, confidence: 0.7 } });
     await ingest.onStepEnded(step("e2", "low", { finish: "stop" }));
+    ingest.onExecutionEnded("low");
     expect(h.store().keys()).toEqual([MEDIUM_KEY]);
   });
 
@@ -724,6 +744,7 @@ describe("registry lifetime", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1");
     await ingest.onStepEnded(step("e1", "c1", { finish: "stop" }));
+    ingest.onExecutionEnded("c1");
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
     dispatch("c2");
     h.clock.t = T0 + 61 * 60_000;
@@ -780,6 +801,116 @@ describe("registry lifetime", () => {
     expect(lookupDispatch("c1")).toBeUndefined();
     expect(lookupDispatch("c2")).toBeDefined();
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+  });
+});
+
+describe("attempt lifecycle (QA-2.1-6)", () => {
+  const failedStep = (id: string, sessionID: string, data: Record<string, unknown>): IngestEvent => ({ id, type: "session.step.failed", data: { sessionID, assistantMessageID: `m-${id}`, ...data } });
+
+  it("a non-tool-calls finish only sets the final output: the attempt stays open until the execution ends", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(step("e1", "c1", { finish: "tool-calls", cost: 0.01, output: 10 }));
+    await ingest.onStepEnded(step("e2", "c1", { finish: "length", cost: 0.01, output: 50 }));
+    await ingest.onStepEnded(step("e3", "c1", { finish: "stop", cost: 0.01, output: 300 }));
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(0);
+    ingest.onExecutionEnded("c1");
+    const cost = h.store().cost(MEDIUM_KEY);
+    expect(cost.steps).toMatchObject({ n: 1, mean: 3 });
+    expect(cost.finalMessageTokens).toMatchObject({ n: 1, mean: 300 }); // the last step, not the cut-off one
+    expect(cost.measuredUSD.mean).toBeCloseTo(0.03, 9);
+  });
+
+  it("the end of an execution folds an attempt that never produced a final message", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(step("e1", "c1", { finish: "tool-calls", cost: 0.02 }));
+    ingest.onExecutionEnded("c1");
+    const cost = h.store().cost(MEDIUM_KEY);
+    expect(cost.steps).toMatchObject({ n: 1, mean: 1 });
+    expect(cost.finalMessageTokens.n).toBe(0);
+    // a step that arrives after the end belongs to a closed attempt
+    await ingest.onStepEnded(step("e2", "c1", { finish: "stop" }));
+    ingest.onExecutionEnded("c1");
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+  });
+
+  it("ignores an execution end for a child that is not registered", () => {
+    const h = harness();
+    const ingest = h.make();
+    ingest.onExecutionEnded("ghost");
+    expect(h.bundles).toHaveLength(0);
+  });
+
+  it.each([
+    { name: "a sweep after the idle limit", end: (ingest: Ingest, h: Harness) => { h.clock.t = T0 + 31 * 60_000; touchDispatch("c1", h.clock.t); ingest.sweep(); } },
+    { name: "the child's session deletion", end: (ingest: Ingest) => { ingest.onSessionGone("c1"); } },
+    { name: "a resume (the next attempt of the child)", end: async (ingest: Ingest) => { dispatch("c1"); await ingest.onStepEnded(step("e9", "c1", { finish: "tool-calls" })); } },
+    { name: "dispose", end: async (ingest: Ingest) => { await ingest.dispose(); } },
+  ])("a held final step is not lost when the end event never comes: $name", async ({ end }) => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(step("e1", "c1", { finish: "tool-calls", cost: 0.01, output: 10 }));
+    await ingest.onStepEnded(step("e2", "c1", { finish: "stop", cost: 0.02, output: 300 }));
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(0);
+    await end(ingest, h);
+    const cost = h.store().cost(MEDIUM_KEY);
+    expect(cost.steps.n).toBeGreaterThanOrEqual(1);
+    expect(cost.finalMessageTokens).toMatchObject({ n: 1, mean: 300 });
+    expect(cost.measuredUSD.mean).toBeCloseTo(0.03, 9);
+  });
+
+  it("records the cost and tokens of a failed step when it has them, and nothing when it has neither", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(step("e1", "c1", { finish: "tool-calls", cost: 0.01 }));
+    await ingest.onStepEnded(failedStep("f0", "c1", { error: { message: "boom" } })); // nothing measured
+    await ingest.onStepEnded(failedStep("f1", "c1", { cost: 0.03, tokens: { input: 500, output: 20, reasoning: 0, cache: { read: 0, write: 0 } } }));
+    ingest.onExecutionEnded("c1");
+    const cost = h.store().cost(MEDIUM_KEY);
+    expect(cost.steps).toMatchObject({ n: 1, mean: 2 });
+    expect(cost.measuredUSD.mean).toBeCloseTo(0.04, 9);
+    expect(cost.tokens).toMatchObject({ input: 1500, output: 120 });
+    expect(cost.finalMessageTokens.n).toBe(0); // a failed step is never a final message
+  });
+});
+
+describe("ingestion switched off at runtime (QA-2.1-11)", () => {
+  it.each(["sweep", "requestFlush"] as const)("%s releases the bundle once the settings resolve to null, and the data is flushed", async (trigger) => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(step("e1", "c1", { finish: "stop", cost: 0.02 }));
+    h.settings = null;
+    ingest[trigger]();
+    await vi.waitFor(() => expect(existsSync(join(h.dir, "outcomes.json"))).toBe(true)); // the last holder's release flushed
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1); // the held final step was folded first
+    // later signals do nothing while off
+    dispatch("c2");
+    ingest.onVerdict("c2", "pass");
+    expect(h.bundles).toHaveLength(1);
+    // and recording resumes with a fresh holder when it is switched back on
+    h.settings = { engine: "shadow", minClassConfidence: 0.7, outcomesDir: h.dir, tuning: DEFAULT_OUTCOME_TUNING, routerAgentIds: new Set(["medium"]) };
+    ingest.onVerdict("c2", "pass");
+    expect(h.bundles).toHaveLength(2);
+  });
+});
+
+describe("unkeyable warnings (QA-2.1-12)", () => {
+  it("warns once per model reference, not per child", () => {
+    const h = harness();
+    const ingest = h.make();
+    for (const child of ["a", "b", "c"]) dispatch(child, { model: null, agent: "ghost" });
+    dispatch("d", { model: null, agent: "other" });
+    for (const child of ["e", "f"]) dispatch(child, { model: "not-a-reference", agent: "ghost" });
+    for (const child of ["a", "b", "c", "d", "e", "f"]) ingest.onVerdict(child, "pass");
+    ingest.onVerdict("a", "pass");
+    expect(h.warnings.filter((w) => w.includes("not recorded"))).toHaveLength(3);
+    expect(h.bundles).toHaveLength(0);
   });
 });
 
@@ -940,6 +1071,7 @@ describe("throughput", () => {
     const elapsed = performance.now() - started;
     expect(loads).toBe(1);
     expect(elapsed).toBeLessThan(100);
+    for (let i = 0; i < 10; i++) ingest.onExecutionEnded(`c${i}`);
     expect(h.store().keys()).toEqual([MEDIUM_KEY as OutcomeKey]);
     expect(h.store().cost(MEDIUM_KEY).tokens.n).toBeGreaterThan(0);
   });
