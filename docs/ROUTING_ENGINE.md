@@ -84,7 +84,7 @@ Let it collect a period of data, read it with [`/router stats`](#outcomes-the-de
 }
 ```
 
-`/router` (the bare status view) prints the **applied** engine and the build of the running code, `router: engine=<mode> build=<version>+<sha7>`, then one `router: config notice: …` line per finding of the last config load, then the [cost doctor](#the-cost-doctor) section. After changing the mode, run `/router` to confirm the new one is live. A code update needs a host restart; a config change does not.
+`/router` (the bare status view) prints the **applied** engine and the build of the running code, `router: engine=<mode> build=<version>+<sha7>`, then one `router: config notice: …` line per finding of the last config load, then the [cost doctor](#the-cost-doctor) section. With the engine live (anything but `static`) the same view ends the cost doctor section with a `Decision log:` note: a ladder-attempt row's `confidence` is the delegation's class confidence, while a dispatch row's is the class confidence scaled by the winner's evidence (`n/(n+5)`). After changing the mode, run `/router` to confirm the new one is live. A code update needs a host restart; a config change does not.
 
 **Kill switch.** Set `routing.engine` back to `static`. It takes effect on the next hot reload and stops all decisions, recording and `R:`-line changes. The outcome files stay where they are.
 
