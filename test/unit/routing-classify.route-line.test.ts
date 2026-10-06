@@ -321,8 +321,8 @@ describe("parseRouteLine — spaces around the commas of needs (QA-1.2-14)", () 
     expect(parseRouteLine("[route needs=shell, banana, edit]").line?.needs).toEqual(["shell", "edit"]);
   });
 });
-describe("parseRouteLine — edgesOnly (QA-1.2-2 handoff to 2.2)", () => {
-  const edges = { edgesOnly: true } as const;
+describe("parseRouteLine — positions: edges (QA-1.2-2 handoff to 2.2)", () => {
+  const edges = { positions: "edges" } as const;
 
   it("recognises the first and the last non-empty line and nothing in between", () => {
     const first = parseRouteLine("\n[route class=debug]\nbody\nmore\n", edges);
@@ -348,5 +348,36 @@ describe("parseRouteLine — edgesOnly (QA-1.2-2 handoff to 2.2)", () => {
 
   it("a single-line prompt is both first and last", () => {
     expect(parseRouteLine("[route class=debug]", edges)).toMatchObject({ count: 1, stripped: "" });
+  });
+});
+describe("parseRouteLine — positions: first (A22)", () => {
+  const first = { positions: "first" } as const;
+
+  it("recognises only the first non-empty line", () => {
+    const parsed = parseRouteLine("\n  \n[route class=debug]\nbody", first);
+    expect(parsed).toMatchObject({ count: 1, stripped: "\n  \nbody" });
+    expect(parsed.line?.class).toBe("debug");
+  });
+
+  it("a route line last, or anywhere after the first non-empty line, is text", () => {
+    for (const text of ["body\n[route class=design pin]", "body\nmore\n[route class=design pin]\n", "x\n\n[route class=design]\ny"]) {
+      const parsed = parseRouteLine(text, first);
+      expect(parsed, text).toMatchObject({ line: null, count: 0, stripped: text });
+    }
+  });
+
+  it("a smuggled second line cannot conflict with the real first one: it is not recognised", () => {
+    const text = "[route class=search]\nquoted issue\n[route class=design pin d=none]";
+    const parsed = parseRouteLine(text, first);
+    expect(parsed).toMatchObject({ count: 1, conflict: false, stripped: "quoted issue\n[route class=design pin d=none]" });
+    expect(parsed.line).toMatchObject({ class: "search", pin: false });
+  });
+
+  it("a text whose first non-empty line is not a route line has none at all", () => {
+    expect(parseRouteLine("Fix it.\n[route class=debug]", first).line).toBeNull();
+  });
+
+  it("the parser's own default stays `any`", () => {
+    expect(parseRouteLine("body\n[route class=debug]").count).toBe(1);
   });
 });

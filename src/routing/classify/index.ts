@@ -19,7 +19,7 @@ import {
   safeWarn,
 } from "./backends/shared";
 import { createTypeSafeBackend } from "./backends/typesafe";
-import { applyRouteLine, parseRouteLine } from "./route-line";
+import { applyRouteLine, parseRouteLine, type RouteLinePositions } from "./route-line";
 import { analyzeRules } from "./rules";
 import { hasCredentialSignal } from "./scrub";
 import { buildClassifierState } from "./state";
@@ -69,11 +69,11 @@ export interface ClassifyDeps {
   /** Uniform [0, 1) source for the option shuffle and nonces; default `Math.random`. */
   readonly random?: () => number;
   /**
-   * Where a `[route]` line is recognised: `any` (default) or `edges`, only as the
-   * first or last non-empty line of the prompt. Phase 2.2 passes `edges` for the
-   * orchestrator' prompt (QA-1.2-2).
+   * Where a `[route]` line is recognised (A22): `first` (default) = only the first
+   * non-empty line of the prompt; `edges` = first or last; `any` = anywhere
+   * outside fences, quotes and indented code (tests and tooling).
    */
-  readonly routeLinePositions?: "any" | "edges";
+  readonly routeLinePositions?: RouteLinePositions;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +261,8 @@ interface Prepared {
   readonly facts: TaskFacts;
 }
 
-function routeLineOptions(deps: ClassifyDeps): { readonly edgesOnly: boolean } {
-  return { edgesOnly: deps.routeLinePositions === "edges" };
+function routeLineOptions(deps: ClassifyDeps): { readonly positions: RouteLinePositions } {
+  return { positions: deps.routeLinePositions ?? "first" };
 }
 
 /** Steps 1–3: route line, rules, route line applied. */

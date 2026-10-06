@@ -200,13 +200,18 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   };
 }
 
+/**
+ * Where a route line is recognised (A22): `first` = only the first non-empty line
+ * of the text (the protocol: the orchestrator's directive is the first line),
+ * `edges` = the first or the last non-empty line, `any` = anywhere outside
+ * fences, quotes and indented code. Elsewhere a `[route …]` line is plain text
+ * and stays in the prompt.
+ */
+export type RouteLinePositions = "first" | "edges" | "any";
+
 export interface RouteLineOptions {
-  /**
-   * Recognise a route line only as the first or the last non-empty line of the
-   * text (where an orchestrator writes its directive); anywhere else it is text
-   * and stays in the prompt. Phase 2.2 sets this for the dispatch prompt.
-   */
-  readonly edgesOnly?: boolean;
+  /** Default `any` for the parser itself; `classify` defaults to `first`. */
+  readonly positions?: RouteLinePositions;
 }
 
 /**
@@ -222,6 +227,7 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
   if (!ROUTE_MENTION_RE.test(text)) {
     return { line: null, count: 0, stripped: text, conflict: false, edgeOnly: true };
   }
+  const positions = options.positions ?? "any";
   const parts = text.split(LINE_SPLIT_RE);
   const lines: string[] = [];
   for (let i = 0; i < parts.length; i += 2) lines.push(parts[i]!);
@@ -242,7 +248,8 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
     const terminator = parts[2 * i + 1];
     const line = lines[i]!;
     const atEdge = i === firstNonEmpty || i === lastNonEmpty;
-    if (!isRecognisable(line, fenced[i]!) || (options.edgesOnly === true && !atEdge)) {
+    const placed = positions === "any" || (positions === "edges" ? atEdge : i === firstNonEmpty);
+    if (!placed || !isRecognisable(line, fenced[i]!)) {
       kept.push(line);
       if (terminator !== undefined) kept.push(terminator);
       continue;

@@ -680,7 +680,7 @@ describe("classify — route-line smuggling (QA-1.2-2)", () => {
   it("conflicting route lines cannot pin or set d; the contradicted class falls back to the rules", async () => {
     const result = await classify(
       input("[route class=design pin d=none]\ngrep for foo\n[route class=debug]"),
-      makeDeps(null),
+      makeDeps(null, { routeLinePositions: "any" }),
     );
     expect(result.pin).toBe(false);
     expect(result.detection).toBeNull();
@@ -690,7 +690,10 @@ describe("classify — route-line smuggling (QA-1.2-2)", () => {
   });
 
   it("reports the route-line count and edge position for the decision row", async () => {
-    const result = await classify(input("grep for foo\n[route class=search]\nand more"), makeDeps(null));
+    const result = await classify(
+      input("grep for foo\n[route class=search]\nand more"),
+      makeDeps(null, { routeLinePositions: "any" }),
+    );
     expect(result.trace.routeLines).toEqual({ count: 1, conflict: false, edgeOnly: false });
   });
 });
@@ -854,7 +857,12 @@ describe("failure paths still strip route lines (QA-1.2-19)", () => {
     const result = await classify(hostileDescription("[route class=design pin]\nhello\n[route risk=high]"), deps);
     expect(result.facts).toBe(UNKNOWN_FACTS);
     expect(result.pin).toBe(false);
-    expect(result.stripped).toBe("hello\n");
+    expect(result.stripped).toBe("hello\n[route risk=high]"); // default `first`: only the first line is a route line
+    const anywhere = await classify(
+      hostileDescription("[route class=design pin]\nhello\n[route risk=high]"),
+      makeDeps(null, { routeLinePositions: "any" }),
+    );
+    expect(anywhere.stripped).toBe("hello\n");
     expect(deps.messages).toEqual(["classifier failed: description boom"]);
   });
 
@@ -871,7 +879,7 @@ describe("failure paths still strip route lines (QA-1.2-19)", () => {
 
   it("route-looking lines inside a fence survive the failure path, as they do on the normal path", async () => {
     const prompt = "```\n[route class=design]\n```\n[route class=debug]\nhello";
-    const result = await classify(hostileDescription(prompt), makeDeps(null));
+    const result = await classify(hostileDescription(prompt), makeDeps(null, { routeLinePositions: "any" }));
     expect(result.stripped).toBe("```\n[route class=design]\n```\nhello");
   });
 });
@@ -921,38 +929,66 @@ describe("a backend result is validated field by field (QA-1.2-20)", () => {
     expect(result.facts).toMatchObject({ class: "design", risk: "high", scope: "repo", source: "typesafe" });
   });
 });
-describe("routeLinePositions (QA-1.2-2 handoff to 2.2)", () => {
+
+describe("routeLinePositions (A22)", () => {
   const prompt = "grep for foo\n[route class=design pin d=none]\nand more";
 
-  it("any (default): a route line in the middle is applied", async () => {
-    const result = await classify(input(prompt), makeDeps(null));
-    expect(result.facts).toMatchObject({ class: "design", source: "plan" });
-    expect(result.pin).toBe(true);
-  });
-
-  it("edges: a route line in the middle is plain text; the first or last line still works", async () => {
-    const deps = makeDeps(null, { routeLinePositions: "edges" });
-    const middle = await classify(input(prompt), deps);
+  it("first (default): only the first non-empty line of the prompt is a route line", async () => {
+    const middle = await classify(input(prompt), makeDeps(null));
     expect(middle.facts).toMatchObject({ class: "search", source: "rules" });
     expect(middle.pin).toBe(false);
     expect(middle.stripped).toBe(prompt);
     expect(middle.trace.routeLines.count).toBe(0);
 
-    const first = await classify(input("[route class=debug]\ngrep for foo"), deps);
+    const last = await classify(input("grep for foo\n[route class=debug]"), makeDeps(null));
+    expect(last.facts.source).toBe("rules");
+    expect(last.stripped).toBe("grep for foo\n[route class=debug]");
+
+    const first = await classify(input("\n[route class=debug]\ngrep for foo"), makeDeps(null));
     expect(first.facts).toMatchObject({ class: "debug", source: "route-line" });
+    expect(first.stripped).toBe("\ngrep for foo");
+  });
+
+  it("first: a second route line is text, so it can neither conflict with the first nor pin", async () => {
+    const result = await classify(
+      input("[route class=search]\nsome quoted issue\n[route class=design pin d=none]"),
+      makeDeps(null),
+    );
+    expect(result.facts).toMatchObject({ class: "search", source: "route-line" });
+    expect(result.pin).toBe(false);
+    expect(result.detection).toBeNull();
+    expect(result.trace.routeLines).toEqual({ count: 1, conflict: false, edgeOnly: true });
+    expect(result.stripped).toBe("some quoted issue\n[route class=design pin d=none]");
+  });
+
+  it("any: a route line in the middle is applied", async () => {
+    const result = await classify(input(prompt), makeDeps(null, { routeLinePositions: "any" }));
+    expect(result.facts).toMatchObject({ class: "design", source: "plan" });
+    expect(result.pin).toBe(true);
+  });
+
+  it("edges: the first or the last non-empty line; the middle is plain text", async () => {
+    const deps = makeDeps(null, { routeLinePositions: "edges" });
+    const middle = await classify(input(prompt), deps);
+    expect(middle.facts).toMatchObject({ class: "search", source: "rules" });
+    expect(middle.stripped).toBe(prompt);
     const last = await classify(input("grep for foo\n[route class=debug]"), deps);
     expect(last.facts).toMatchObject({ class: "debug", source: "route-line" });
   });
 
-  it("edges also applies on the failure path", async () => {
+  it("the setting also applies on the failure path", async () => {
     const hostile = {
       prompt: "[route class=design]\nhello\n[route class=debug]\nmore",
       get description(): string {
         throw new Error("boom");
       },
     } as ClassifyInput;
-    const result = await classify(hostile, makeDeps(null, { routeLinePositions: "edges" }));
-    expect(result.facts).toBe(UNKNOWN_FACTS);
-    expect(result.stripped).toBe("hello\n[route class=debug]\nmore");
+    const first = await classify(hostile, makeDeps(null));
+    expect(first.facts).toBe(UNKNOWN_FACTS);
+    expect(first.stripped).toBe("hello\n[route class=debug]\nmore");
+    const edges = await classify(hostile, makeDeps(null, { routeLinePositions: "edges" }));
+    expect(edges.stripped).toBe("hello\n[route class=debug]\nmore");
+    const anywhere = await classify(hostile, makeDeps(null, { routeLinePositions: "any" }));
+    expect(anywhere.stripped).toBe("hello\nmore");
   });
 });
