@@ -71,7 +71,7 @@ import { createEngineRuntime } from "./routing/wire/runtime";
 import type { EngineRuntime } from "./routing/wire/runtime";
 import {
   advisorSettings,
-  catalogFromModels,
+  catalogFromProviders,
   createAdvisorNotifier,
   formatFindings,
   hostConfigFromAgents,
@@ -222,6 +222,8 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string)
 
   return buildRouterHelp(
     resolveEnforcementMode({ config: cfg, env: process.env }).mode,
+    // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
+    { stats: cfg.routing !== undefined },
   );
 }
 
@@ -537,22 +539,28 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // Fetch and normalize opencode's live provider/model catalog. Best-effort:
   // returns null when the client call fails, e.g. the server is not ready yet.
   // The pure analysis (validateModels) lives in src/router/catalog.ts.
-  const fetchCatalog = async (): Promise<Catalog | null> => {
+  const fetchCatalogRaw = async (): Promise<{ catalog: Catalog; raw: unknown } | null> => {
     try {
       const res: any = await ctx.client.config.providers();
-      return normalizeCatalog(res?.data);
+      return { catalog: normalizeCatalog(res?.data), raw: res?.data };
     } catch {
       return null;
     }
   };
+  const fetchCatalog = async (): Promise<Catalog | null> => (await fetchCatalogRaw())?.catalog ?? null;
 
   // M8 (Phase 2.4): the cost doctor reads the host's agents and model catalog (v2 only, D1). Each call is bounded and failing
   // one only leaves the checks that need it silent; nothing here ever throws into a session.
   // The orchestrator's model as the last root-session turn reported it: the host's title pick depends on its provider (QA-2.4-1).
   let lastPrimary: { providerID: string; modelID: string | null } | null = null;
   const ADVISOR_HOST_TIMEOUT_MS = 3_000;
-  const gatherAdvisorInputs = async (): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
-    const attempt = async (label: string, call: (() => Promise<readonly unknown[]>) | undefined): Promise<readonly unknown[] | null> => {
+  // The catalog comes from `config.providers()` (the call `/router` already makes for the model check, enriched with cost and capabilities
+  // by the v2 adapter), so the doctor does not ask the host for the model list a second time (QA-2.4-3). `prefetched` is that call's result
+  // when the caller already has it.
+  const gatherAdvisorInputs = async (
+    prefetched?: { raw: unknown } | null,
+  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
+    const attempt = async <T>(label: string, call: (() => Promise<T>) | undefined): Promise<T | null> => {
       if (call === undefined) return null;
       try {
         return await withTimeout(call(), ADVISOR_HOST_TIMEOUT_MS, label);
@@ -561,8 +569,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         return null;
       }
     };
-    const [agents, models] = await Promise.all([attempt("host agent list", ctx.routerAgents), attempt("model catalog", ctx.routerCatalog)]);
-    return { host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary), catalog: models === null ? null : catalogFromModels(models) };
+    const [agents, providers] = await Promise.all([
+      attempt("host agent list", ctx.routerAgents),
+      prefetched !== undefined ? Promise.resolve(prefetched) : attempt("model catalog", fetchCatalogRaw),
+    ]);
+    return {
+      host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary),
+      catalog: providers === null ? null : catalogFromProviders(providers.raw),
+    };
   };
   const advisorNotifier = ctx.routerHost === "v2"
     ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2"), config: () => cfg, gather: gatherAdvisorInputs, logger })
@@ -599,10 +613,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return infos;
   };
   /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
-  const buildCostDoctorLines = async (): Promise<string[]> => {
+  const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
     const routing = resolveRouting(cfg, "v2");
     if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
-    const { host, catalog } = await gatherAdvisorInputs();
+    const { host, catalog } = await gatherAdvisorInputs(prefetched);
     const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), {
       hostKnown: host !== null,
       catalogKnown: catalog !== null && catalog.length > 0,
@@ -2332,16 +2346,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           cfg = loadConfig(projectDir);
           warnConfigIssues(cfg, logger);
         } catch {}
-        const runtime = annotatePlanRuntime();
-        if (runtime !== undefined && ctx.routerAgents !== undefined) {
-          const directives = await buildAnnotateDirectives(input.arguments ?? "", {
-            cfg,
-            runtime,
-            listAgents: ctx.routerAgents,
-            dirs: [...new Set([ctx.directory, ctx.worktree].filter((dir): dir is string => typeof dir === "string" && dir !== ""))],
-            logger,
-          });
-          if (directives !== null) output.parts.push({ type: "text" as const, text: directives });
+        try {
+          const runtime = annotatePlanRuntime();
+          if (runtime !== undefined && ctx.routerAgents !== undefined) {
+            const directives = await buildAnnotateDirectives(input.arguments ?? "", {
+              cfg,
+              runtime,
+              listAgents: ctx.routerAgents,
+              dirs: [...new Set([ctx.directory, ctx.worktree].filter((dir): dir is string => typeof dir === "string" && dir !== ""))],
+              logger,
+            });
+            if (directives !== null) output.parts.push({ type: "text" as const, text: directives });
+          }
+        } catch (error) {
+          // No part: the command is then exactly what it was (QA-2.4-15).
+          logger.warn("[router] /annotate-plan: route lines unavailable; the plan is annotated without them", { error: describeError(error) });
         }
       }
 
@@ -2429,26 +2448,40 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
         } else if (sub === "stats") {
           // 2.4.5 (D18): the table of `npm run routing:stats`, run by the very same driver over the configured store.
-          text = formatStatsReply(
-            await runStatsCommand(parts.slice(1).join(" "), { cfg, host: ctx.routerHost === "v2" ? "v2" : "v1", logger }),
-          );
+          try {
+            text = formatStatsReply(await runStatsCommand(parts.slice(1).join(" "), { cfg, host: ctx.routerHost === "v2" ? "v2" : "v1", logger }));
+          } catch (error) {
+            logger.warn("[router] /router stats failed", { error: describeError(error) });
+            text = `routing-stats: ${describeError(error)}`;
+          }
         } else {
           text = buildRouterOutput(cfg, args, projectDir);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
-            // 2.4.5: the last dogfood checkpoint recorded next to this code (omitted when there is none).
-            const checkpoint = checkpointLine();
+            // 2.4.5: the last dogfood checkpoint recorded next to this code (omitted when there is none). Only with a `routing` block:
+            // without one `/router` is exactly what it was (QA-2.4-3, §1.2).
+            const optedIn = cfg.routing !== undefined;
+            const checkpoint = optedIn ? checkpointLine() : null;
             if (checkpoint !== null) text += "\n" + checkpoint;
-            const catalog = await fetchCatalog();
+            // One `config.providers()` call serves the model check below and the cost doctor.
+            const fetched = await fetchCatalogRaw();
+            const catalog = fetched?.catalog ?? null;
             if (catalog) {
               const issues = validateModels(cfg, catalog);
               if (issues.length > 0) {
                 text += "\n\n" + formatModelIssues(issues);
               }
             }
-            // 2.4.3: the cost doctor (v2 only; the advisor needs the v2 agent list and catalog).
-            if (ctx.routerHost === "v2") text += "\n\n" + (await buildCostDoctorLines()).join("\n");
+            // 2.4.3: the cost doctor (v2 only, and only with a `routing` block; the advisor needs the v2 agent list and catalog).
+            if (ctx.routerHost === "v2" && optedIn) {
+              try {
+                text += "\n\n" + (await buildCostDoctorLines(fetched)).join("\n");
+              } catch (error) {
+                logger.warn("[router] cost doctor failed", { error: describeError(error) });
+                text += `\n\nCost doctor: unavailable (${describeError(error)}).`;
+              }
+            }
           }
         }
         output.parts.push({ type: "text" as const, text });

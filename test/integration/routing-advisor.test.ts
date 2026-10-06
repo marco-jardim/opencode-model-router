@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
-import { invalidateConfigCache, overridePath, validateConfig } from "../../src/router/config";
+import { invalidateConfigCache, loadConfig, overridePath, routerStatusLines, validateConfig } from "../../src/router/config";
 import { DECISIONS_FILE, acquireOutcomes, makeKey } from "../../src/routing/outcomes";
 import type { DecisionRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
@@ -24,6 +24,7 @@ import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { buildEscalatePolicy } from "../../src/escalate/ladder";
 import {
   HOST_SMALL_MODEL_FAMILIES,
+  catalogFromProviders,
   cheapestTitleModel,
   formatFindings,
   formatNotice,
@@ -463,6 +464,35 @@ describe("cost doctor: failure policy and rendering", () => {
     expect(notice).toContain("1 finding worth a look (1 warning, 0 saving)");
   });
 
+  it("QA-2.4-16: an agent whose mode is not subagent, primary or all is not judged: mode is null and the agent checks stay silent", () => {
+    const view = hostConfigFromAgents([{ id: "fast", mode: "weird", hidden: false }, { id: "medium", hidden: false }, { id: "explore", mode: 7, hidden: false, model: { providerID: "anthropic", id: "claude-haiku-4-5" } }]);
+    expect(view.agents.map((a) => a.mode)).toEqual([null, null, null]);
+    const cfgTst = cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: { engine: "shadow" } });
+    const findings = runAdvisor(cfgTst, view, CATALOG);
+    expect(find(findings, "tier-agent-unavailable", "fast")).toBeUndefined(); // unknown mode: not judged
+    expect(find(findings, "tier-agent-unavailable", "medium")).toBeUndefined();
+    expect(find(findings, "tier-agent-unavailable", "heavy")).toBeDefined(); // genuinely absent from the list
+    expect(find(findings, "native-role-unmatched-rung", "explore")).toBeUndefined();
+  });
+
+  it("catalogFromProviders reads a config.providers() payload (enabled models with cost and capabilities) and rejects other shapes", () => {
+    const payload = {
+      providers: [
+        { id: "anthropic", models: { "claude-haiku-4-5": { id: "claude-haiku-4-5", status: "active", enabled: true, family: "claude-haiku", capabilities: { tools: true, input: ["text", "image"], output: ["text"] }, cost: [{ input: 1, output: 5, cache: { read: 0, write: 0 } }], variants: [{ id: "high" }] } } },
+        { id: "p", models: { keyed: { status: "beta" }, junk: 3 } },
+        { name: "no id", models: {} },
+      ],
+      default: {},
+    };
+    const catalog = catalogFromProviders(payload);
+    expect(catalog?.map((m) => `${m.providerID}/${m.id}`)).toEqual(["anthropic/claude-haiku-4-5", "p/keyed"]);
+    expect(catalog?.[0]).toMatchObject({ enabled: true, status: "active", family: "claude-haiku", capabilities: { tools: true, input: ["text", "image"], output: ["text"] } });
+    expect(catalog?.[1]).toMatchObject({ status: "beta", capabilities: null });
+    expect(hostSmallModel(catalog ?? [], "anthropic")?.id).toBe("claude-haiku-4-5"); // what the adapter hands over is enough for the host's pick
+    expect(catalogFromProviders(undefined)).toBeNull();
+    expect(catalogFromProviders({ providers: "x" })).toBeNull();
+    expect(catalogFromProviders({ providers: [] })).toEqual([]);
+  });
   it("hostConfigFromAgents reads id, model reference, mode and hidden, and skips junk", () => {
     const view = hostConfigFromAgents([
       { id: "title", mode: "primary", hidden: true },
@@ -909,6 +939,10 @@ describe("cost doctor in the plugin", () => {
     readonly catalog?: () => Promise<readonly unknown[]>;
     readonly logs: string[];
     readonly agentCalls: () => number;
+    /** `client.config.providers()` calls (what `/router` already made at 1fc94a3, and what the doctor now reuses). */
+    readonly providerCalls: () => number;
+    /** `routerCatalog` calls: the doctor no longer makes any. */
+    readonly catalogCalls: () => number;
   }
 
   /** Raw host records (Agent.Info / Model.Info) as the v2 adapter hands them over. */
@@ -929,25 +963,41 @@ describe("cost doctor in the plugin", () => {
     invalidateConfigCache();
     const logs: string[] = [];
     let agentCalls = 0;
+    let providerCalls = 0;
+    let catalogCalls = 0;
     const agents = over.agents ?? (async () => rawAgents());
+    const catalog = over.catalog ?? (async () => rawCatalog());
+    /** The v2 adapter's `config.providers()` payload: enabled models per provider, with cost and capabilities. */
+    const providers = async (): Promise<{ data: unknown }> => {
+      providerCalls += 1;
+      const byProvider = new Map<string, Record<string, unknown>>();
+      for (const entry of await catalog()) {
+        const m = entry as AdvisorCatalogModel;
+        const models = byProvider.get(m.providerID) ?? {};
+        models[m.id] = m;
+        byProvider.set(m.providerID, models);
+      }
+      return { data: { providers: [...byProvider].map(([id, models]) => ({ id, models })), default: {} } };
+    };
     const ctx = {
       directory: home,
       worktree: home,
       client: {
         app: { log: async (request: { body: { message: string } }) => { logs.push(request.body.message); return {}; } },
         session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) },
+        ...((over.host ?? "v2") === "v2" ? { config: { providers } } : {}),
       },
       ...((over.host ?? "v2") === "v2"
         ? {
             routerHost: "v2" as const,
             routerAgents: async () => { agentCalls += 1; return agents(); },
-            routerCatalog: over.catalog ?? (async () => rawCatalog()),
+            routerCatalog: async () => { catalogCalls += 1; return catalog(); },
           }
         : {}),
     };
     const hooks = (await ModelRouterPlugin(ctx as unknown as RouterPluginInput)) as unknown as Hooks;
     instances.push(hooks);
-    return { hooks, host: { logs, agentCalls: () => agentCalls } };
+    return { hooks, host: { logs, agentCalls: () => agentCalls, providerCalls: () => providerCalls, catalogCalls: () => catalogCalls } };
   }
 
   const ask = async (hooks: Hooks, args = ""): Promise<string> => {
@@ -1048,5 +1098,52 @@ describe("cost doctor in the plugin", () => {
     expect(host.agentCalls()).toBe(0);
     expect(host.logs.some((m) => m.includes("Cost doctor"))).toBe(false);
     expect(readdirSync(home).sort()).not.toContain("store");
+  });
+
+  /** `/router` as 1fc94a3 printed it (the help text, frozen from that commit's `buildRouterHelp`), before the status lines. */
+  const ROUTER_HELP_1FC94A3 = [
+    "# Model Router",
+    "Enforcement: **advisory**",
+    "",
+    "Commands:",
+    "- `/router enforce <off|advisory|enforced>` — set hard-block enforcement (persisted)",
+    "- `/router overrides` — show the global + project override file paths and precedence",
+    "- `/router models [provider]` — list valid model ids from your configured providers",
+    "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+  ].join("\n");
+
+  it("QA-2.4-3: without a routing block a bare /router on v2 is byte-identical to 1fc94a3's, and makes no agent or model-list call", async () => {
+    const { hooks, host } = await plugin({ routing: null });
+    await turn(hooks); // even after an orchestrator turn
+    const text = await ask(hooks);
+    const status = routerStatusLines(loadConfig(home), "v2");
+    expect(text).toBe(`${ROUTER_HELP_1FC94A3}\n${status.join("\n")}\n\n`.replace(/\n\n$/, "")); // help, then the status lines, nothing else
+    expect(text).not.toContain("Cost doctor");
+    expect(text).not.toContain("last checkpoint");
+    expect(text).not.toContain("/router stats");
+    expect(host.agentCalls()).toBe(0);
+    expect(host.catalogCalls()).toBe(0);
+    expect(host.providerCalls()).toBe(1); // the model check `/router` always made: one call, as before
+  });
+
+  it("QA-2.4-3: with a routing block the doctor reads the SAME config.providers() call as the model check, never routerCatalog", async () => {
+    const { hooks, host } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
+    await turn(hooks);
+    const before = host.providerCalls();
+    const text = await ask(hooks);
+    expect(text).toContain("Cost doctor: ");
+    expect(text).toContain("/router stats");
+    expect(text).toMatch(/^router: last checkpoint=DF\d+$/m);
+    expect(host.providerCalls() - before).toBe(1);
+    expect(host.catalogCalls()).toBe(0);
+  });
+
+  it("QA-2.4-15: a failure inside the doctor prints a one-line error for it, logs it, and keeps the rest of /router", async () => {
+    const poisoned = { get id(): string { throw new Error("agent record exploded"); } };
+    const { hooks, host } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } }, agents: async () => [poisoned] });
+    const text = await ask(hooks);
+    expect(text).toContain("Cost doctor: unavailable (Error: agent record exploded).");
+    expect(text).toContain("/router overrides");
+    expect(host.logs.some((m) => m.includes("cost doctor failed"))).toBe(true);
   });
 });

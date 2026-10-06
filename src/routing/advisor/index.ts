@@ -71,7 +71,7 @@ export function hostConfigFromAgents(raw: readonly unknown[], primary: HostConfi
     agents.push({
       id: entry.id,
       model: agentModelRef(entry.model),
-      mode: typeof entry.mode === "string" ? entry.mode : "primary",
+      mode: entry.mode === "subagent" || entry.mode === "primary" || entry.mode === "all" ? entry.mode : null,
       hidden: entry.hidden === true,
     });
   }
@@ -109,6 +109,24 @@ export function catalogFromModels(raw: readonly unknown[]): AdvisorCatalogModel[
     });
   }
   return models;
+}
+
+/**
+ * The advisor's catalog from a `config.providers()` payload (`{ providers: [{ id, models: { <id>: Model.Info-like } }] }`, which the v2
+ * adapter fills with `enabled`, `status`, `family`, `capabilities`, `cost`, `variants` and `limit`). The host lists only enabled models
+ * there, so a model of the router's ladder that is missing is "not in the catalog".
+ */
+export function catalogFromProviders(raw: unknown): AdvisorCatalogModel[] | null {
+  if (!isRecord(raw) || !Array.isArray(raw.providers)) return null;
+  const records: unknown[] = [];
+  for (const provider of raw.providers) {
+    if (!isRecord(provider) || typeof provider.id !== "string" || !isRecord(provider.models)) continue;
+    for (const [key, model] of Object.entries(provider.models)) {
+      if (!isRecord(model)) continue;
+      records.push({ ...model, providerID: provider.id, id: typeof model.id === "string" ? model.id : key });
+    }
+  }
+  return catalogFromModels(records);
 }
 
 // ---------------------------------------------------------------------------

@@ -109,7 +109,8 @@ export interface HostAgentView {
   readonly id: string;
   /** `provider/model[#variant]`, or `null` when the agent has no model of its own. */
   readonly model: string | null;
-  readonly mode: string;
+  /** `subagent`, `primary` or `all` as the host reports it; `null` when the record carries none of those (a check then says nothing about the agent). */
+  readonly mode: "subagent" | "primary" | "all" | null;
   readonly hidden: boolean;
 }
 
@@ -509,7 +510,7 @@ const nativeRoles: Check = ({ cfg, host }) => {
   for (const [taskClass, agents] of Object.entries(routing.roles)) {
     for (const id of agents) {
       const agent = host.agents.find((a) => a.id === id);
-      if (agent === undefined || agent.model === null || agent.mode === "primary" || agent.hidden || reported.has(id)) continue;
+      if (agent === undefined || agent.model === null || agent.mode === null || agent.mode === "primary" || agent.hidden || reported.has(id)) continue;
       const { model, variant } = splitModelRef(agent.model);
       if (rungKeys.has(`${model}#${variant ?? DEFAULT_VARIANT}`)) continue;
       reported.add(id);
@@ -533,7 +534,7 @@ const tierAgents: Check = ({ cfg, host }) => {
   const findings: RawFinding[] = [];
   for (const [name] of activeTierEntries(cfg)) {
     const agent = host.agents.find((a) => a.id === name);
-    if (agent !== undefined && agent.mode !== "primary" && !agent.hidden) continue;
+    if (agent !== undefined && (agent.mode === null || (agent.mode !== "primary" && !agent.hidden))) continue; // an unknown mode is not judged
     findings.push({
       id: "tier-agent-unavailable",
       severity: "warning",
