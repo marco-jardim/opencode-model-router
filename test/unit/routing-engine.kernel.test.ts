@@ -273,7 +273,9 @@ describe("D8 worked examples: p = (0.6, 0.9, 0.95), U = 100", () => {
     expect(d.costs[keyOf(HEAVY)]).toBeCloseTo(20 + 0.15 * 15, 10);
     expect(d.costs[keyOf(MEDIUM)]).toBeCloseTo(9.015, 10);
     expect(d.costs[keyOf(FAST)]).toBeCloseTo(5.864725, 10);
-    expect(d.best?.key).toBe(keyOf(FAST));
+    // A27: fast is a rank down with no recorded outcomes, so it is the argmin but cannot be `best`.
+    expect(d.argmin?.key).toBe(keyOf(FAST));
+    expect(d.best?.key).toBe(keyOf(MEDIUM));
     expect(d.unit).toBe("ratio");
     expect(d.confidence).toBe(0); // priors only
   });
@@ -386,12 +388,14 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
   it("implement + deterministic with an empty store: the priors would switch, the gate keeps (kept:evidence)", () => {
     const d = priorsOnly(createOutcomeStore({ now: () => 1_000 }));
     // C(fast) ≈ 5.35 < 0.8 · C(medium) ≈ 7.5, fast is a rank down with no data.
-    expect(d.best?.key).toBe(keyOf(FAST));
+    expect(d.argmin?.key).toBe(keyOf(FAST)); // the unfiltered argmin (A27)
+    expect(d.best?.key).toBe(keyOf(MEDIUM)); // `best` is drawn after the evidence filter
+    expect(d.ineligible[keyOf(FAST)]).toBe("evidence");
     expect(d.costs[keyOf(FAST)]).toBeLessThan(0.8 * d.costs[keyOf(MEDIUM)]!);
     expect(d.switched).toBe(false);
     expect(d.reasonCode).toBe("kept:evidence");
     expect(d.reason).toContain("5 recorded outcomes");
-    expect(d.target).toBe(FAST); // best is still computed
+    expect(d.target).toBe(MEDIUM); // best is still computed
     // The same without a store at all: priors alone never move a dispatch down.
     expect(priorsOnly(null).reasonCode).toBe("kept:evidence");
   });
@@ -407,13 +411,19 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
     expect(five.switched).toBe(true);
     const four = priorsOnly(record(4));
     expect(four.reasonCode).toBe("kept:evidence");
-    expect(four.best?.key).toBe(keyOf(FAST));
+    expect(four.argmin?.key).toBe(keyOf(FAST));
+    expect(four.best?.key).toBe(keyOf(MEDIUM));
   });
 
   it("outcomes on OTHER keys do not count: the evidence must be on best's own key", () => {
     const store = createOutcomeStore({ now: () => 1_000 });
     for (let i = 0; i < 20; i++) store.recordVerdict(keyOf(MEDIUM), "fail", { attemptID: `m${i}`, step: "dispatch" });
-    expect(priorsOnly(store).reasonCode).toBe("kept:evidence");
+    const d = priorsOnly(store);
+    // fast is the argmin, but it has no outcomes of its own; heavy (ranked above) is eligible yet does not clear the margin.
+    expect(d.argmin?.key).toBe(keyOf(FAST));
+    expect(d.ineligible[keyOf(FAST)]).toBe("evidence");
+    expect(d.switched).toBe(false);
+    expect(d.reasonCode).toBe("kept:margin");
   });
 
   it("a switch up is not gated, with or without data", () => {
@@ -430,7 +440,8 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
     const ladder: Ladder = { candidates: [low, high], next: [null, null], classRank: 1, excluded: [] };
     const store = (n: number) => fakeStore({ p: { [keyOf(low)]: 1, [keyOf(high)]: 0.2 }, n: { [keyOf(low)]: n, [keyOf(high)]: 10 } });
     const gated = decide(input({ ladder, store: store(0), chosen: chosenOf(high), facts: mediumFacts() }));
-    expect(gated.best?.key).toBe(keyOf(low));
+    expect(gated.argmin?.key).toBe(keyOf(low));
+    expect(gated.best?.key).toBe(keyOf(high));
     expect(gated.reasonCode).toBe("kept:evidence");
     expect(decide(input({ ladder, store: store(6), chosen: chosenOf(high), facts: mediumFacts() })).reasonCode).toBe("switched");
   });
@@ -440,7 +451,8 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
     const { ladder, a, b } = pairLadder(8, 8);
     const store = (n: number) => fakeStore({ p: { [keyOf(a)]: 0.99, [keyOf(b)]: 0.5 }, n: { [keyOf(a)]: n, [keyOf(b)]: 10 } });
     const gated = decide(input({ ladder, store: store(0), chosen: chosenOf(b) }));
-    expect(gated.best?.key).toBe(keyOf(a));
+    expect(gated.argmin?.key).toBe(keyOf(a));
+    expect(gated.best?.key).toBe(keyOf(b));
     expect(gated.reasonCode).toBe("kept:evidence");
     expect(gated.switched).toBe(false);
     expect(decide(input({ ladder, store: store(4), chosen: chosenOf(b) })).reasonCode).toBe("kept:evidence");
@@ -458,7 +470,8 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
     expect(up.reasonCode).toBe("switched");
     // The same pair the other way round is a switch down: gated.
     const down = decide(input({ ladder, store: fakeStore({ p: { [keyOf(low)]: 1, [keyOf(high)]: 0.1 } }), chosen: chosenOf(high), facts: mediumFacts() }));
-    expect(down.best?.key).toBe(keyOf(low));
+    expect(down.argmin?.key).toBe(keyOf(low));
+    expect(down.best?.key).toBe(keyOf(high));
     expect(down.reasonCode).toBe("kept:evidence");
   });
   it("margin is checked first: a best that does not clear the margin reports kept:margin, not kept:evidence", () => {
@@ -467,6 +480,100 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
     expect(decide(input({ ladder, store, chosen: chosenOf(b) })).reasonCode).toBe("kept:margin");
   });
 
+  describe("A27 (QA-2.2-4): the evidence filter applies BEFORE the argmin", () => {
+    // implement/high, no detection, balanced-like numbers of the shipped ROUTING (safe, U = 100).
+    const GENERAL = rung("general", "anthropic/claude-sonnet-5-5", "medium", 5, 1, {
+      agent: { origin: "host", id: "general" },
+      source: "role-tier-rung",
+      tier: "medium",
+    });
+    const ladder = routerLadder([GENERAL, MEDIUM, HEAVY]);
+    const run = (spec: FakeStoreSpec, over: Partial<DecisionInput> = {}) =>
+      decide(input({ ladder, chosen: chosenOf(MEDIUM), detection: "none", store: fakeStore(spec), ...over }));
+    const mediumFailing = { [keyOf(MEDIUM)]: 0.2 };
+
+    it("an unevidenced sideways argmin no longer blocks an ungated upward switch: heavy wins", () => {
+      const d = run({ p: { ...mediumFailing, [keyOf(GENERAL)]: 0.99, [keyOf(HEAVY)]: 0.95 }, n: { [keyOf(MEDIUM)]: 20 } });
+      expect(d.argmin?.key).toBe(keyOf(GENERAL)); // the cheapest option ...
+      expect(d.ineligible[keyOf(GENERAL)]).toBe("evidence"); // ... has no outcomes and is not ranked above the pick
+      expect(d.best?.key).toBe(keyOf(HEAVY));
+      expect(d.switched).toBe(true);
+      expect(d.reasonCode).toBe("switched");
+      expect(d.target).toBe(HEAVY);
+    });
+
+    it("when no eligible candidate is cheaper the pick is kept, and the reason names the gated argmin", () => {
+      const d = run({ p: { [keyOf(MEDIUM)]: 0.9, [keyOf(GENERAL)]: 0.99, [keyOf(HEAVY)]: 0.95 }, n: { [keyOf(MEDIUM)]: 20 } });
+      expect(d.argmin?.key).toBe(keyOf(GENERAL));
+      expect(d.best?.key).toBe(keyOf(MEDIUM));
+      expect(d.switched).toBe(false);
+      expect(d.reasonCode).toBe("kept:evidence");
+      expect(d.reason).toContain(keyOf(GENERAL));
+    });
+
+    it("with evidence on it, the cheapest eligible candidate wins", () => {
+      const d = run({
+        p: { ...mediumFailing, [keyOf(GENERAL)]: 0.99, [keyOf(HEAVY)]: 0.95 },
+        n: { [keyOf(MEDIUM)]: 20, [keyOf(GENERAL)]: 5 },
+      });
+      expect(d.argmin?.key).toBe(keyOf(GENERAL));
+      expect(d.best?.key).toBe(keyOf(GENERAL));
+      expect(d.ineligible[keyOf(GENERAL)]).toBeUndefined();
+      expect(d.reasonCode).toBe("switched");
+      // 4 outcomes are not enough
+      const four = run({ p: { ...mediumFailing, [keyOf(GENERAL)]: 0.99, [keyOf(HEAVY)]: 0.95 }, n: { [keyOf(MEDIUM)]: 20, [keyOf(GENERAL)]: 4 } });
+      expect(four.best?.key).toBe(keyOf(HEAVY));
+    });
+
+    it("a higher rank is ungated but still has to be cheaper: among the eligible the cheapest wins", () => {
+      const d = run({ p: { [keyOf(MEDIUM)]: 0.97, [keyOf(HEAVY)]: 0.99, [keyOf(GENERAL)]: 0.5 }, n: { [keyOf(MEDIUM)]: 20 } });
+      expect(d.best?.key).toBe(keyOf(MEDIUM)); // heavy costs more than the healthy pick
+      expect(d.reasonCode).not.toBe("switched");
+    });
+
+    it("argmin equals best when nothing was filtered, and the row can always log it", () => {
+      const d = run({ p: { ...mediumFailing, [keyOf(HEAVY)]: 0.95 }, n: { [keyOf(MEDIUM)]: 20, [keyOf(GENERAL)]: 10 } }, {});
+      expect(d.argmin?.key).toBe(d.best?.key);
+      expect(decide(input({ ladder: { candidates: [], next: [], classRank: 1, excluded: [] } })).argmin).toBeNull();
+    });
+
+    it("the filters keep their reasons: needs, floor and never-down still win over evidence", () => {
+      const noShell = rung("general", "anthropic/claude-sonnet-5-5", "medium", 5, 1, { agent: { origin: "host", id: "general" }, source: "role-tier-rung", tier: "medium", grants: READ_ONLY });
+      const d = decide(input({
+        ladder: routerLadder([noShell, MEDIUM, HEAVY]), chosen: chosenOf(MEDIUM), detection: "none", facts: facts({ needs: ["shell"] }),
+        store: fakeStore({ p: { [keyOf(noShell)]: 0.99, ...mediumFailing } }),
+      }));
+      expect(d.ineligible[keyOf(noShell)]).toBe("needs");
+      // QA-2.2-R2-5: floor and never-down also keep their own reasons for a candidate that has no evidence either
+      const lower = rung("general", "anthropic/claude-sonnet-5-5", "low", 1, 0, { agent: { origin: "host", id: "general" }, source: "role-tier-rung", tier: "fast" });
+      const lowerLadder = routerLadder([lower, MEDIUM, HEAVY]);
+      const cheap = fakeStore({ p: { [keyOf(lower)]: 0.99, ...mediumFailing } });
+      const floor = decide(input({ ladder: lowerLadder, chosen: chosenOf(MEDIUM), detection: "deterministic", facts: facts({ risk: "medium" }), store: cheap, floorRank: 1 }));
+      expect(floor.ineligible[keyOf(lower)]).toBe("floor");
+      const neverDown = decide(input({ ladder: lowerLadder, chosen: chosenOf(MEDIUM), detection: "none", facts: facts({ risk: "high" }), store: cheap }));
+      expect(neverDown.ineligible[keyOf(lower)]).toBe("never-down");
+      // without either filter the same candidate is only held back by the missing evidence
+      const plain = decide(input({ ladder: lowerLadder, chosen: chosenOf(MEDIUM), detection: "deterministic", facts: facts({ risk: "medium" }), store: cheap }));
+      expect(plain.ineligible[keyOf(lower)]).toBe("evidence");
+    });
+
+    it("QA-2.2-R2-4: a gated cheapest option that does not clear the margin is named in the kept:margin reason as C(cheapest)", () => {
+      const d = run({ p: { [keyOf(MEDIUM)]: 0.9, [keyOf(GENERAL)]: 0.92, [keyOf(HEAVY)]: 0.95 }, n: { [keyOf(MEDIUM)]: 20 } });
+      expect(d.argmin?.key).toBe(keyOf(GENERAL));
+      expect(d.best?.key).toBe(keyOf(MEDIUM));
+      expect(d.reasonCode).toBe("kept:margin");
+      expect(d.reason).toContain("C(cheapest)=");
+      expect(d.reason).toContain(keyOf(GENERAL));
+      expect(d.reason).toContain("gated by evidence");
+      expect(d.reason).not.toContain("C(best)=");
+      // the ordinary margin reason keeps C(best)
+      const { ladder: pair, a, b } = pairLadder(7, 8);
+      const plain = decide(input({ ladder: pair, store: fakeStore({ p: { [keyOf(a)]: 1, [keyOf(b)]: 1 }, n: { [keyOf(a)]: 10, [keyOf(b)]: 10 } }), chosen: chosenOf(b) }));
+      expect(plain.best?.key).toBe(keyOf(a)); // evidence on both: nothing was gated
+      expect(plain.reasonCode).toBe("kept:margin");
+      expect(plain.reason).toContain("C(best)=");
+    });
+  });
   it("hasMinEvidence: the strength of a prior, with only float jitter forgiven", () => {
     expect(MIN_EVIDENCE_TO_SWITCH_DOWN).toBe(5);
     expect(hasMinEvidence(5)).toBe(true);
@@ -540,7 +647,7 @@ describe("D9 gates: class confidence, needs, floor, chosen outside the ladder", 
       grants: READ_ONLY,
     });
     const ladder = routerLadder([explore, MEDIUM]);
-    const store = fakeStore({ p: { [keyOf(explore)]: 0.99 } });
+    const store = fakeStore({ p: { [keyOf(explore)]: 0.99 }, n: { [keyOf(explore)]: 10 } });
     const d = decide(input({ ladder, store, chosen: chosenOf(MEDIUM), detection: "deterministic", facts: facts({ needs: ["shell"] }) }));
     expect(d.ineligible[keyOf(explore)]).toBe("needs");
     expect(d.best?.key).toBe(keyOf(MEDIUM));

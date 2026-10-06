@@ -405,7 +405,8 @@ describe("annotateSteps — evidence moves the engine tier", () => {
     for (let i = 0; i < 20; i++) store.recordVerdict(HEAVY_KEY, "fail", { attemptID: `h${i}`, step: "dispatch" });
     const out = await annotateSteps([designStep], stubDeps(designFacts, { store }));
     expect(out[0]!.decision?.reasonCode).toBe("kept:evidence");
-    expect(out[0]!.decision?.best?.agent).not.toBe("heavy");
+    expect(out[0]!.decision?.argmin?.key).not.toBe(out[0]!.decision?.chosen.key); // a cheaper rung exists, but cannot be `best` (A27)
+    expect(out[0]!.decision?.best?.key).toBe(out[0]!.decision?.chosen.key);
     expect(out[0]!.tier).toBe("heavy");
   });
 

@@ -12,6 +12,9 @@ import {
   isClaudeModel,
   isAdaptiveOnlyClaudeModel,
   assembleSystemPrompt,
+  DELEGATION_PROTOCOL_HEADING,
+  swapTaxonomyLine,
+  buildRouteLineProtocol,
 } from "../../src/router/protocol";
 import { validateConfig } from "../../src/router/config";
 import type { RouterConfig } from "../../src/router/config";
@@ -232,5 +235,101 @@ describe("buildDoDProtocolSection", () => {
     const out = buildDoDProtocolSection(cfg);
     expect(out).toContain("REQUIRED");
     expect(out).not.toContain("auto-inferred");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.2 seams: the generated R: line and the route-line paragraph (advise / enforce only)
+// ---------------------------------------------------------------------------
+
+/** `rich` in normal mode: the decomposition hint is present and the taxonomy line is `R: @fast→recon/lookup @medium→impl`. */
+const normal = { ...rich, activeMode: undefined } as unknown as RouterConfig;
+/** The same without taskPatterns: no `R:` line in the protocol. */
+const noTaxonomy = { ...normal, taskPatterns: undefined } as unknown as RouterConfig;
+
+describe("DELEGATION_PROTOCOL_HEADING", () => {
+  it("is the first line of the delegation protocol", () => {
+    expect(buildDelegationProtocol(normal).split("\n")[0]).toBe(DELEGATION_PROTOCOL_HEADING);
+    expect(assembleSystemPrompt(normal, undefined, true).includes(DELEGATION_PROTOCOL_HEADING)).toBe(true);
+  });
+});
+
+describe("swapTaxonomyLine", () => {
+  const base = buildTaskTaxonomy(normal);
+
+  it("with the shipped line it returns the protocol untouched, byte for byte (D2)", () => {
+    const protocol = buildDelegationProtocol(normal);
+    expect(swapTaxonomyLine(protocol, normal, base)).toBe(protocol);
+    expect(swapTaxonomyLine(assembleSystemPrompt(normal, "anthropic/claude-opus-5-5", true), normal, base)).toBe(assembleSystemPrompt(normal, "anthropic/claude-opus-5-5", true));
+  });
+
+  it("replaces only the R: line, in place", () => {
+    const protocol = buildDelegationProtocol(normal);
+    const swapped = swapTaxonomyLine(protocol, normal, `${base} | by class: search→@explore`);
+    expect(swapped).toBe(protocol.replace(base, () => `${base} | by class: search→@explore`));
+    expect(swapped.split("\n").length).toBe(protocol.split("\n").length);
+  });
+
+  it("splices: `$&`, `$1` and `$$` inside agent ids are literal (QA-1.4-11)", () => {
+    const protocol = buildDelegationProtocol(normal);
+    const line = `${base} | by class: search→@a$&b$1c$$d`;
+    const swapped = swapTaxonomyLine(protocol, normal, line);
+    expect(swapped).toContain("@a$&b$1c$$d");
+    expect(swapped.split(base).length).toBe(2);
+  });
+
+  it("inserts the line before the decomposition hint when the protocol has no R: line", () => {
+    const protocol = buildDelegationProtocol(noTaxonomy);
+    expect(protocol).not.toContain("R:");
+    const swapped = swapTaxonomyLine(protocol, noTaxonomy, "R: by class: search→@explore");
+    const lines = swapped.split("\n");
+    const at = lines.indexOf("R: by class: search→@explore");
+    expect(at).toBeGreaterThan(0);
+    expect(lines[at - 1]).toBe("");
+    expect(lines[at + 1]).toBe("");
+    expect(lines[at + 2]).toBe(buildDecomposeHint(noTaxonomy));
+    expect(swapped.replace("R: by class: search→@explore\n\n", "")).toBe(protocol);
+  });
+
+  it("inserts before `Rules:` when there is no decomposition hint either", () => {
+    const bare = { ...noTaxonomy, activeMode: "budget" } as unknown as RouterConfig;
+    expect(buildDecomposeHint(bare)).toBe("");
+    const protocol = buildDelegationProtocol(bare);
+    const swapped = swapTaxonomyLine(protocol, bare, "R: by class: search→@explore");
+    expect(swapped.split("\n").indexOf("R: by class: search→@explore")).toBeGreaterThan(0);
+    expect(swapped.indexOf("R: by class")).toBeLessThan(swapped.indexOf("Rules: "));
+    expect(swapped.replace("R: by class: search→@explore\n\n", "")).toBe(protocol);
+  });
+
+  it("leaves a text that does not carry the base line, an empty line and an unanchored text alone", () => {
+    expect(swapTaxonomyLine("a stripped child prompt", normal, `${base} | by class: x→@y`)).toBe("a stripped child prompt");
+    expect(swapTaxonomyLine("no anchors here", noTaxonomy, "R: by class: x→@y")).toBe("no anchors here");
+    const protocol = buildDelegationProtocol(noTaxonomy);
+    expect(swapTaxonomyLine(protocol, noTaxonomy, "")).toBe(protocol);
+  });
+});
+
+describe("buildRouteLineProtocol (D13, A22, §0.10.11)", () => {
+  for (const mode of ["advise", "enforce"] as const) {
+    it(`${mode}: says FIRST line, documents pin and the vocabularies, and never asks the orchestrator to choose a model`, () => {
+      const text = buildRouteLineProtocol(mode);
+      expect(text).toContain("FIRST line");
+      expect(text).toContain("`[route class=<c> risk=<r> scope=<s> needs=<n,..> pin]`");
+      expect(text).toContain("search|recon|mechanical|implement|debug|design|review|other");
+      expect(text).toContain("low|medium|high");
+      expect(text).toContain("single|multi|repo");
+      expect(text).toContain("shell|web|edit|network|external_dir");
+      expect(text).toContain("bare flag `pin`");
+      expect(text).toContain("QA review");
+      expect(text).toContain("Route hint");
+      expect(text).not.toMatch(/\bmodel\b/i);
+      expect(text).not.toMatch(/\bTask\s*\(/);
+    });
+  }
+
+  it("enforce says the router may switch; advise says it does not", () => {
+    expect(buildRouteLineProtocol("enforce")).toContain("may start a dispatch on another agent");
+    expect(buildRouteLineProtocol("advise")).toContain("does not change your dispatches");
+    expect(buildRouteLineProtocol("advise")).not.toContain("may start a dispatch");
   });
 });

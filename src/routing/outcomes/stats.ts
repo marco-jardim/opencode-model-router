@@ -24,7 +24,7 @@ import type {
   StatsWindow,
   VerdictRow,
 } from "./types";
-import { DECISIONS_MAX_GENERATIONS, LADDER_STEP_KINDS, STATS_EXIT } from "./types";
+import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, STATS_EXIT } from "./types";
 import { createOutcomeStore } from "./store";
 
 // ---------------------------------------------------------------------------
@@ -47,9 +47,22 @@ function isoOrNull(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
-/** The key a decision row actually dispatched to: `best` when `enforce` switched, else `chosen`. */
+/** QA-2.2-7: a row the 2.2 adapter lifted to `floorTier` (policy, not an engine decision on evidence). */
+function isFloorLift(row: DecisionRow): boolean {
+  return row.reason.startsWith(FLOOR_LIFT_REASON);
+}
+
+/** QA-INT-2: a first attempt the delegate runner's recorder wrote (its decision ids start with `ladder-`; it has no `best`). */
+function isDelegateAttempt(row: DecisionRow): boolean {
+  return row.decisionID.startsWith("ladder-");
+}
+
+/**
+ * The key a decision row actually dispatched to: `best` when `enforce` switched, else `chosen`. A `switched` row of `shadow`
+ * or `advise` is a would-switch (2.2): nothing was dispatched to `best`, so it must not count as a dispatch there.
+ */
 function dispatchedKey(row: DecisionRow): OutcomeKey {
-  return row.switched && row.best !== null ? row.best.key : row.chosen.key;
+  return row.mode === "enforce" && row.switched && row.best !== null ? row.best.key : row.chosen.key;
 }
 
 interface KeyAcc {
@@ -162,8 +175,10 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   });
 
   // Agreement: best == chosen over non-pinned dispatches that have a best.
-  const withBest = nonPinned.filter((r) => r.best !== null);
-  const agreement = ratio(withBest.filter((r) => r.best !== null && r.best.key === r.chosen.key).length, withBest.length);
+  // QA-INT-2 / QA-2.2-R2-3: the rows the kernel decided: a `best` exists and the dispatch is not a floor lift (policy, whose `best` is the
+  // lifted tier, not an argmin). Delegate first attempts (the runner's recorder rows, `best: null`) and lifts are counted on their own lines.
+  const routedRows = nonPinned.filter((r) => r.best !== null && !isFloorLift(r));
+  const agreement = ratio(routedRows.filter((r) => r.best !== null && r.best.key === r.chosen.key).length, routedRows.length);
 
   // Switched, and how many of those ended in a fail verdict or a false refusal (any window).
   const failedDecisionIDs = new Set<string>();
@@ -177,12 +192,15 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
       decidedDecisionIDs.add(row.decisionID);
     }
   }
-  const switchedRows = nonPinned.filter((r) => r.switched);
+  const switchedRows = routedRows.filter((r) => r.switched);
+  // QA-2.2-7/8: D17 asks whether a dispatch the engine moved ON ITS OWN EVIDENCE failed. A shadow/advise row is a would-switch (nothing
+  // moved) and a floor lift is policy, so neither can be a failed switch.
+  const enforcedSwitches = switchedRows.filter((r) => r.mode === "enforce");
 
   // Savings: Σ C(chosen) − C(best) per unit, never summed across units. Summed in ascending order so
   // the total does not depend on the row order.
   const terms = new Map<CostUnit, number[]>();
-  for (const r of nonPinned) {
+  for (const r of routedRows) {
     if (r.best === null) continue;
     const chosenCost = r.costs[r.chosen.key];
     const bestCost = r.costs[r.best.key];
@@ -221,15 +239,19 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     version: 1,
     window: { since: isoOrNull(since), until: isoOrNull(until) },
     dispatches: dispatchRows.length,
+    routed: dispatchRows.filter((r) => !isDelegateAttempt(r)).length,
+    delegateFirstAttempts: dispatchRows.filter(isDelegateAttempt).length,
+    floorLifts: dispatchRows.filter(isFloorLift).length,
     pinned: dispatchRows.filter((r) => r.pinned).length,
     byClass,
     byKey,
     agreement,
     switched: {
       count: switchedRows.length,
-      share: ratio(switchedRows.length, nonPinned.length),
-      failed: switchedRows.filter((r) => failedDecisionIDs.has(r.decisionID)).length,
-      verified: switchedRows.filter((r) => decidedDecisionIDs.has(r.decisionID)).length,
+      share: ratio(switchedRows.length, routedRows.length),
+      enforced: enforcedSwitches.length,
+      failed: enforcedSwitches.filter((r) => failedDecisionIDs.has(r.decisionID)).length,
+      verified: enforcedSwitches.filter((r) => decidedDecisionIDs.has(r.decisionID)).length,
     },
     savings,
     variantSteps: {
@@ -279,9 +301,12 @@ export function renderMarkdown(table: StatsTable): string {
     "| Metric | Value |",
     "|---|---|",
     `| Dispatches | ${table.dispatches} |`,
+    `| Routed dispatches | ${table.routed} |`,
+    `| Delegate first attempts | ${table.delegateFirstAttempts} |`,
+    `| Floor lifts | ${table.floorLifts} |`,
     `| Pinned | ${table.pinned} |`,
     `| Agreement (best == chosen, non-pinned) | ${fmtRatio(table.agreement)} |`,
-    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned (${fmtPercent(table.switched.share)}); failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.count}) |`,
+    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned routed (${fmtPercent(table.switched.share)}); enforced ${table.switched.enforced}; failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.enforced} enforced) |`,
     ...(table.savings.length === 0
       ? ["| Estimated savings | n/a |"]
       : table.savings.map(
@@ -310,10 +335,13 @@ export function renderMarkdown(table: StatsTable): string {
           ),
         ].join("\n");
 
+  // QA-2.3-7: the rendered table is the ladder's. `dispatch` counts first dispatches (always fresh for `delegate`) and the
+  // `sessionID`/`task_id` resumes of dispatched subagents, neither of which is a D11 ladder decision, so its row is left out
+  // here; `resumeVsFresh` itself (and `--json`) keeps it, so those numbers stay countable.
   const resumeTable = [
     "| Step | Resume | Fresh |",
     "|---|---|---|",
-    ...table.resumeVsFresh.map((r) => `| ${r.step} | ${r.resume} | ${r.fresh} |`),
+    ...table.resumeVsFresh.filter((r) => r.step !== "dispatch").map((r) => `| ${r.step} | ${r.resume} | ${r.fresh} |`),
   ].join("\n");
 
   const blocks = [

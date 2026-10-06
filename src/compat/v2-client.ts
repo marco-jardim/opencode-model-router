@@ -2,10 +2,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
-import type { ChildSessionRunner } from "./child-session";
+import { ResumeRejectedError, type ChildSessionRunner } from "./child-session";
+import { markRunnerDispatch, runnerDescription } from "../router/sessions";
 
 export const V2_GRADER_AGENT = "model-router-grader";
 const RETAINED_CONTEXT_LIMIT = 500;
+/** How long a delegation waits for the host to remove a child it started by mistake before it reports the error. */
+export const STRAY_CLEANUP_TIMEOUT_MS = 2_000;
 
 /** The small v1 client surface still used by the shared hooks. */
 export function createV2Runtime(ctx: Plugin.Context) {
@@ -57,6 +60,28 @@ export function createV2Runtime(ctx: Plugin.Context) {
     // v2 has no app.log endpoint. createPluginLogger uses its console fallback.
   };
 
+  /**
+   * Stop and remove a child the host started that no caller knows (QA-2.3-5). Bounded (QA-2.3-R2-3): resolves with ""
+   * when it is gone, otherwise with a sentence for the error (a failure, or a removal still running after
+   * STRAY_CLEANUP_TIMEOUT_MS, which then finishes or fails in the background without anyone waiting for it). Never rejects.
+   */
+  const removeStray = async (sessionID: string): Promise<string> => {
+    const removal = childRunner.dispose(sessionID).then(
+      () => "",
+      (error: unknown) => `; removing it failed (${error instanceof Error ? error.message : String(error)})`,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<string>((resolve) => {
+      timer = setTimeout(() => resolve(`; removing it did not finish within ${STRAY_CLEANUP_TIMEOUT_MS} ms and may still be running`), STRAY_CLEANUP_TIMEOUT_MS);
+      if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+    });
+    try {
+      return await Promise.race([removal, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const childRunner: ChildSessionRunner = {
     async run(request) {
       lifetime.signal.throwIfAborted();
@@ -82,14 +107,46 @@ export function createV2Runtime(ctx: Plugin.Context) {
         ...(request.signal ? [request.signal] : []),
       ]);
       signal.throwIfAborted();
-      let childID: string | undefined;
+      const resumeID = request.resumeSessionID;
+      if (resumeID !== undefined) {
+        // The host resumes any session id it is given, so ours checks that the child exists and belongs to the
+        // calling session before anything is sent. Whatever the lookup says other than "my child", the caller
+        // falls back to a fresh child.
+        const parent = scope.context.sessionID;
+        let info: { parentID?: unknown } | undefined;
+        try {
+          info = await ctx.session.get({ sessionID: resumeID }, { signal });
+        } catch (error) {
+          signal.throwIfAborted();
+          throw new ResumeRejectedError(resumeID, `session lookup failed (${error instanceof Error ? error.message : String(error)})`);
+        }
+        if (info?.parentID !== parent) throw new ResumeRejectedError(resumeID, `it is not a child of session ${parent}`);
+      }
+      // A resumed child is known up front: the host does not create one, and a progress event for another id is an error.
+      let childID: string | undefined = resumeID;
+      /** Set when the host answered a resume with another child; thrown from `run` whatever the host made of the progress error. */
+      let strayResume: ResumeRejectedError | undefined;
+      if (resumeID !== undefined) {
+        activeChildren.set(resumeID, controller);
+        if (request.system) childSystems.set(resumeID, request.system);
+      }
       const model = request.model;
+      // 2.2 / 2.3 single writer (QA-2.2-1): announce the native call to the 2.2 dispatch router, which must leave it alone
+      // (this runner has chosen the agent and model#variant, writes the attempt's row and registers the child itself).
+      let withdrawMark: (() => void) | undefined;
       try {
+        // A resumed child is registered here, before the host can run it, exactly like a created one is in `progress`.
+        if (resumeID !== undefined) {
+          await request.onCreated(resumeID);
+          signal.throwIfAborted();
+        }
+        withdrawMark = markRunnerDispatch({ parentSessionID: toolContext.sessionID, agent: request.agent ?? V2_GRADER_AGENT, prompt: request.prompt });
         const result = await native.execute({
           agent: request.agent ?? V2_GRADER_AGENT,
-          description: request.agent ? `Router ${request.agent} delegation` : "Router result verification",
+          description: runnerDescription(request.agent),
           prompt: request.prompt,
           ...(model ? { model: `${model.providerID}/${model.modelID}${model.variant ? `#${model.variant}` : ""}` } : {}),
+          ...(resumeID !== undefined ? { sessionID: resumeID } : {}),
           background: false,
         }, {
           ...toolContext,
@@ -97,7 +154,22 @@ export function createV2Runtime(ctx: Plugin.Context) {
           async progress(metadata) {
             const sessionID = metadata.sessionID;
             if (typeof sessionID === "string" && sessionID !== childID) {
-              if (childID) throw new Error("[model-router] native subagent changed its child session ID");
+              if (childID) {
+                // The host started another child than the one this call is about (a resume that did not resume, or a
+                // second child): no caller knows its id, so it is stopped and removed here before the error, or it
+                // would live until the host is restarted (QA-2.3-5). The original child is interrupted below.
+                // The removal is bounded (QA-2.3-R2-3): a host that hangs on it must not hang the delegation, and the error
+                // says so instead of hiding it.
+                const cleanup = await removeStray(sessionID);
+                if (resumeID !== undefined && childID === resumeID) {
+                  // A resume that did not resume: the caller starts a fresh child for the same attempt (D11 fallback)
+                  // instead of counting a failed attempt. Kept aside so the host's own wrapping of a progress error
+                  // cannot hide the type.
+                  strayResume = new ResumeRejectedError(resumeID, `the host started another child (${sessionID}) instead${cleanup}`);
+                  throw strayResume;
+                }
+                throw new Error(`[model-router] native subagent changed its child session ID (${childID} -> ${sessionID}${cleanup})`);
+              }
               childID = sessionID;
               activeChildren.set(sessionID, controller);
               if (request.system) childSystems.set(sessionID, request.system);
@@ -126,8 +198,9 @@ export function createV2Runtime(ctx: Plugin.Context) {
         if (childID) {
           try { await ctx.session.interrupt({ sessionID: childID }); } catch { /* keep the original dispatch failure */ }
         }
-        throw error;
+        throw strayResume ?? error;
       } finally {
+        withdrawMark?.(); // a hook that never fired must not leave a mark behind
         if (childID) {
           childSystems.delete(childID);
           activeChildren.delete(childID);

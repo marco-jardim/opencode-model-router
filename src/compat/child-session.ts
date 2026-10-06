@@ -1,4 +1,5 @@
 import type { PluginInput } from "@opencode-ai/plugin";
+import type { RunnerCatalogModel } from "../escalate/resume";
 import type { CatalogModel, Ingest } from "../routing/outcomes/ingest";
 
 /** Marks the legacy tool.execute.before output bag when verification starts for
@@ -17,8 +18,27 @@ export interface ChildSessionRequest {
   system?: string;
   prompt: string;
   signal?: AbortSignal;
+  /**
+   * Resume this existing child (the host `subagent` call's `sessionID`, D11) instead of creating one: the
+   * history is kept, `agent`/`model` switch it when they differ. The runner checks that it is a child of the
+   * calling session first and rejects with {@link ResumeRejectedError} otherwise, before anything is sent.
+   * `onCreated(resumeSessionID)` runs for a resumed child too (after that check, before the host runs it), so
+   * one callback registers every child the request runs on; `cwd` is not applied again.
+   */
+  resumeSessionID?: string;
   /** Runs before the child can start its first model request. */
   onCreated(sessionID: string): Promise<void>;
+}
+
+/**
+ * A resume that was refused before the child ran: the session is gone, or it is not a child of the calling
+ * session. Nothing was sent, so the caller may start a fresh child for the same attempt (D11 fallback).
+ */
+export class ResumeRejectedError extends Error {
+  constructor(readonly sessionID: string, reason: string) {
+    super(`[model-router] cannot resume child session ${sessionID}: ${reason}`);
+    this.name = "ResumeRejectedError";
+  }
 }
 
 export interface ChildSessionRunner {
@@ -30,8 +50,11 @@ export type RouterPluginInput = PluginInput & {
   routerChildRunner?: ChildSessionRunner;
   /** Set only by src/v2.ts; absent = v1 host (A3). */
   routerHost?: "v2";
-  /** Set only by src/v2.ts: the host model catalog (`ctx.model.list`), used to price child steps (A1). */
-  routerCatalog?: () => Promise<readonly CatalogModel[]>;
+  /**
+   * Set only by src/v2.ts: the host model catalog (`ctx.model.list`): prices child steps (A1) and, with its `variants`
+   * and `limit`, lets the delegate ladder validate variants and size resumes (D10/D11, Phase 2.3).
+   */
+  routerCatalog?: () => Promise<readonly (CatalogModel & RunnerCatalogModel)[]>;
   /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */
   routerOnIngest?: (ingest: Ingest) => void;
 };

@@ -198,7 +198,9 @@ export type IneligibleReason =
   /** `risk == high` and `d == none`: never down a rank (D9). */
   | "never-down"
   /** Non-finite or non-positive attempt cost. */
-  | "invalid-cost";
+  | "invalid-cost"
+  /** A27: not ranked above the pick and fewer than 5 recorded outcomes for its key: it cannot be `best`. */
+  | "evidence";
 
 export type DecisionReasonCode =
   | "switched"
@@ -228,6 +230,12 @@ export interface Decision {
   readonly reasonCode: DecisionReasonCode;
   /** Human-readable reason, with the compared costs. */
   readonly reason: string;
+  /**
+   * A27: the argmin BEFORE the evidence filter (the cheapest candidate that passes the permission, floor and never-down
+   * filters, whether or not it has evidence); `null` when nothing could be priced. It differs from `best` exactly when the
+   * evidence gate removed a cheaper candidate: the statistics log it in the row's trace.
+   */
+  readonly argmin: RouteChoice | null;
   /** `C(k)` per candidate key, finite numbers only, in `unit`. */
   readonly costs: Readonly<Record<string, number>>;
   /** D5: every cost of this decision is in this unit. */

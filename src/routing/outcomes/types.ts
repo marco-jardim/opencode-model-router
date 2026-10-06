@@ -464,12 +464,40 @@ export interface RouteChoice {
 
 export const LOG_ROW_VERSION = 1;
 
+/**
+ * Reason prefix of a decision row whose dispatch was lifted to `enforcement.escalate.floorTier` by the 2.2 adapter (QA-2.2-7).
+ * It is policy, not a decision the engine took on evidence, so D17's "switched and failed" does not count it.
+ */
+export const FLOOR_LIFT_REASON = "lift:floor";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */
   readonly ts: string;
   /** Parent (orchestrator) session. */
   readonly sessionID: string;
+}
+
+/**
+ * What the classifier saw for one dispatch (1.2 `ClassifyTrace`, trimmed to what the log needs): how many route lines the
+ * prompt carried, and what the model backend did. Optional: ladder-attempt rows have none.
+ */
+export interface DecisionTrace {
+  readonly routeLines: { readonly count: number; readonly conflict: boolean; readonly edgeOnly: boolean };
+  readonly backend: {
+    readonly id: string;
+    readonly status: string;
+    readonly latencyMs: number;
+    readonly label?: string;
+    readonly rejected?: true;
+    readonly disagrees?: true;
+  } | null;
+  readonly backendSkipped?: "credentials";
+  /**
+   * A27: the argmin BEFORE the evidence filter, written only when the filter removed it (it differs from `best`): the
+   * cheapest option the engine could not trust yet. `routing:stats` counts these to show where the gate holds it back.
+   */
+  readonly argmin?: RouteChoice;
 }
 
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */
@@ -497,6 +525,8 @@ export interface DecisionRow extends LogRowBase {
   readonly step: LadderStepKind;
   /** The attempt reuses an existing child session (D11 resume, or a `sessionID`/`task_id` dispatch). */
   readonly resume: boolean;
+  /** Classifier trace of a routed dispatch (2.2; Phase 1.2 handoff): route-line count/conflict and the backend outcome. */
+  readonly trace?: DecisionTrace;
 }
 
 export interface VerdictRow extends LogRowBase {
@@ -788,6 +818,12 @@ export interface StatsTable {
   /** ISO strings of the window bounds; null = unbounded. */
   readonly window: { readonly since: string | null; readonly until: string | null };
   readonly dispatches: number;
+  /** Dispatch rows written by the 2.2 router (QA-INT-2): every dispatch row but the delegate runner's first attempts. */
+  readonly routed: number;
+  /** First attempts of `delegate` (the runner's recorder rows, decision ids `ladder-…`): not routed by the engine. */
+  readonly delegateFirstAttempts: number;
+  /** Dispatches lifted to `floorTier` by the adapter (`lift:floor`, QA-2.2-R2-3): policy, outside the switched and savings numbers. */
+  readonly floorLifts: number;
   readonly pinned: number;
   readonly byClass: readonly ClassStatsRow[];
   readonly byKey: readonly KeyStatsRow[];
@@ -797,9 +833,15 @@ export interface StatsTable {
     readonly count: number;
     /** count / non-pinned dispatch rows. */
     readonly share: RatioCell;
-    /** Switched rows whose attempt ended in a `fail` verdict or a false refusal (D17 input). */
+    /**
+     * Switches the engine ENFORCED on its own evidence: `enforce` rows with `switched`, floor lifts (`lift:floor`) excluded
+     * (QA-2.2-7). `count` also holds the would-switches of `shadow`/`advise` rows (the DF3 number); `failed` and `verified` only
+     * concern these (QA-2.2-8), because only an enforced switch can fail because of the switch.
+     */
+    readonly enforced: number;
+    /** Enforced switches whose attempt ended in a `fail` verdict or a false refusal (D17 input). */
     readonly failed: number;
-    /** Switched rows whose outcome is known (a pass/fail verdict or a refusal exists): the denominator that makes `failed` readable. */
+    /** Enforced switches whose outcome is known (a pass/fail verdict or a refusal exists): the denominator that makes `failed` readable. */
     readonly verified: number;
   };
   /** One entry per unit present in the window, sorted by unit name. */
@@ -809,7 +851,7 @@ export interface StatsTable {
     /** pass / (pass + fail) over windowed verdict rows of `variant` attempts. */
     readonly passRate: RatioCell;
   };
-  /** Fixed order: LADDER_STEP_KINDS. */
+  /** Fixed order: LADDER_STEP_KINDS. `renderMarkdown` leaves the `dispatch` row out (QA-2.3-7); the data keeps it. */
   readonly resumeVsFresh: readonly ResumeFreshRow[];
 }
 

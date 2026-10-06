@@ -31,11 +31,15 @@ import {
   type PricingLookup,
 } from "../../src/routing/outcomes/ingest";
 import {
+  awaitExecutionEnd,
   dispatchCount,
   forgetDispatch,
   forgetDispatchesOf,
+  lastStepContext,
   lookupDispatch,
   MAX_DISPATCH_RECORDS,
+  noteExecutionEnded,
+  noteStepContext,
   rememberDispatch,
   resetDispatchRegistry,
   sweepDispatches,
@@ -1198,5 +1202,277 @@ describe("throughput", () => {
     for (let i = 0; i < 10; i++) ingest.onExecutionEnded(`c${i}`);
     expect(h.store().keys()).toEqual([MEDIUM_KEY as OutcomeKey]);
     expect(h.store().cost(MEDIUM_KEY).tokens.n).toBeGreaterThan(0);
+  });
+});
+
+describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
+  function stepWithTokens(id: string, sessionID: string, tokens: { input: number; output: number; cache?: { read?: number; write?: number } }): IngestEvent {
+    return {
+      id,
+      type: "session.step.ended",
+      data: { sessionID, assistantMessageID: `m-${id}`, finish: "tool-calls", cost: 0.01, tokens: { reasoning: 0, cache: { read: 0, write: 0 }, ...tokens } },
+    };
+  }
+
+  it("keeps input + cache.read + cache.write + output of the largest step, readable once the execution end was seen (QA-2.3-2)", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    expect(lastStepContext("c1")).toBeNull();
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 1000, output: 100, cache: { read: 400, write: 50 } }));
+    // steps recorded, no execution end yet: the final, largest step may still be queued, so the number is not trusted
+    expect(lastStepContext("c1")).toBeNull();
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBe(1550);
+  });
+
+  it("is noted in every engine mode: the settings gate (static) does not apply and nothing is written", async () => {
+    const h = harness();
+    h.settings = null; // routing.engine static
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 2000, output: 500 }));
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBe(2500);
+    expect(h.bundles).toHaveLength(0);
+    expect(readdirSync(h.dir)).toEqual([]);
+  });
+
+  it("an execution end of an unregistered session is ignored, and so are an unregistered session's and a failed step", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    await ingest.onStepEnded(stepWithTokens("t1", "ghost", { input: 10, output: 1 }));
+    ingest.onExecutionEnded("ghost");
+    expect(lastStepContext("ghost")).toBeNull();
+    dispatch("c1");
+    await ingest.onStepEnded({ id: "f1", type: "session.step.failed", data: { sessionID: "c1", cost: 0.01, tokens: { input: 9000, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } } });
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBeNull(); // ended, but no step was noted
+  });
+
+  it("the largest step of a registration wins, so a duplicate delivery of an older step cannot lower it", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 1000, output: 100 }));
+    await ingest.onStepEnded(stepWithTokens("t2", "c1", { input: 3000, output: 200 }));
+    await ingest.onStepEnded(stepWithTokens("t1-again", "c1", { input: 1000, output: 100 }));
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBe(3200);
+  });
+
+  it("a re-registration (a resume or a ladder attempt) starts from null and not ended", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 5000, output: 100 }));
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBe(5100);
+    dispatch("c1"); // the same child, next attempt
+    expect(lastStepContext("c1")).toBeNull();
+    await ingest.onStepEnded(stepWithTokens("t2", "c1", { input: 6000, output: 100 }));
+    expect(lastStepContext("c1")).toBeNull(); // the first execution's end does not count for this registration
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBe(6100);
+  });
+
+  it("ignores malformed token payloads, and noteStepContext ignores non-finite, negative and unknown input", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded({ id: "t1", type: "session.step.ended", data: { sessionID: "c1", cost: 0, tokens: { input: "many", output: 1 } } });
+    await ingest.onStepEnded({ id: "t2", type: "session.step.ended", data: { sessionID: "c1", cost: 0 } });
+    ingest.onExecutionEnded("c1");
+    expect(lastStepContext("c1")).toBeNull();
+    noteStepContext("c1", Number.NaN);
+    noteStepContext("c1", -1);
+    noteStepContext("ghost", 10);
+    expect(lastStepContext("c1")).toBeNull();
+    expect(lastStepContext("ghost")).toBeNull();
+    noteStepContext("c1", 0);
+    expect(lastStepContext("c1")).toBe(0);
+  });
+
+  it("noting a step or an end refreshes the idle stamp, so a long-running child is not swept", () => {
+    dispatch("c1");
+    noteStepContext("c1", 10, T0 + 3_000_000);
+    expect(sweepDispatches(T0 + 3_000_000 + 60_000, 3_600_000)).toBe(0);
+    dispatch("c2");
+    noteExecutionEnded("c2", T0 + 3_000_000);
+    expect(sweepDispatches(T0 + 3_000_000 + 60_000, 3_600_000)).toBe(0);
+    expect(lookupDispatch("c1")).toBeDefined();
+    expect(lookupDispatch("c2")).toBeDefined();
+  });
+});
+
+describe("awaitExecutionEnd (QA-2.3-2): the runner's bounded, abortable barrier", () => {
+  it("resolves true at once when the end was already seen, false for an unregistered child", async () => {
+    dispatch("c1");
+    noteExecutionEnded("c1");
+    await expect(awaitExecutionEnd("c1", 1_000)).resolves.toBe(true);
+    await expect(awaitExecutionEnd("ghost", 1_000)).resolves.toBe(false);
+  });
+
+  it("resolves true when the end arrives while waiting, and the context is then readable", async () => {
+    dispatch("c1");
+    noteStepContext("c1", 321);
+    const waiting = awaitExecutionEnd("c1", 5_000);
+    expect(lastStepContext("c1")).toBeNull();
+    noteExecutionEnded("c1");
+    await expect(waiting).resolves.toBe(true);
+    expect(lastStepContext("c1")).toBe(321);
+  });
+
+  it("times out with false and leaves the child unread (fresh start)", async () => {
+    vi.useFakeTimers();
+    try {
+      dispatch("c1");
+      noteStepContext("c1", 321);
+      const waiting = awaitExecutionEnd("c1", 1_000);
+      await vi.advanceTimersByTimeAsync(999);
+      let settled = false;
+      void waiting.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(waiting).resolves.toBe(false);
+      expect(lastStepContext("c1")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an abort ends the wait with false, an already aborted signal does not wait at all, and no timer is left behind", async () => {
+    vi.useFakeTimers();
+    try {
+      dispatch("c1");
+      const controller = new AbortController();
+      const waiting = awaitExecutionEnd("c1", 60_000, controller.signal);
+      controller.abort();
+      await expect(waiting).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(awaitExecutionEnd("c1", 60_000, controller.signal)).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a registration that is replaced or forgotten releases the waiter with false", async () => {
+    dispatch("c1");
+    const replaced = awaitExecutionEnd("c1", 60_000);
+    dispatch("c1");
+    await expect(replaced).resolves.toBe(false);
+    const forgotten = awaitExecutionEnd("c1", 60_000);
+    forgetDispatch("c1");
+    await expect(forgotten).resolves.toBe(false);
+    dispatch("c2");
+    const reset = awaitExecutionEnd("c2", 60_000);
+    resetDispatchRegistry();
+    await expect(reset).resolves.toBe(false);
+  });
+
+  it("a non-positive timeout does not wait", async () => {
+    dispatch("c1");
+    await expect(awaitExecutionEnd("c1", 0)).resolves.toBe(false);
+  });
+});
+
+describe("a duplicate execution-end event (QA-2.3-R2-1, A3: every plugin instance receives every event)", () => {
+  const stepOf = (id: string, sessionID: string, input: number): IngestEvent => ({
+    id, type: "session.step.ended",
+    data: { sessionID, assistantMessageID: `m-${id}`, finish: "stop", cost: 0, tokens: { input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  });
+
+  it("the same end id, delivered by a second instance after the child was registered again, does not mark the new registration ended", async () => {
+    vi.useFakeTimers();
+    try {
+      const a = harness();
+      a.settings = null;
+      const instanceA = a.make({ pricing: PRICED });
+      const b = harness();
+      b.settings = null;
+      const instanceB = b.make({ pricing: PRICED });
+      dispatch("X");
+      await instanceA.onStepEnded(stepOf("s1", "X", 300_000));
+      instanceA.onExecutionEnded("X", "end-1");
+      expect(lastStepContext("X")).toBe(300_000);
+      dispatch("X"); // the runner resumes X: attempt N+1
+      expect(lastStepContext("X")).toBeNull();
+      instanceB.onExecutionEnded("X", "end-1"); // the lagging instance delivers the SAME event of attempt N
+      await instanceA.onStepEnded(stepOf("s2", "X", 310_000));
+      const waiting = awaitExecutionEnd("X", 1_000);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(lastStepContext("X")).toBeNull(); // N+1's final, larger step and its own end are still queued
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(waiting).resolves.toBe(false); // so the runner starts fresh instead of trusting 310 000
+      // N+1's own end has another id and is applied, by whichever instance delivers it first
+      instanceB.onExecutionEnded("X", "end-2");
+      expect(lastStepContext("X")).toBe(310_000);
+      instanceA.onExecutionEnded("X", "end-2"); // its copy is ignored too
+      expect(lastStepContext("X")).toBe(310_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an end without an id cannot be told apart and is applied every time", () => {
+    dispatch("X");
+    const instance = harness().make({ pricing: PRICED });
+    instance.onExecutionEnded("X");
+    noteStepContext("X", 5);
+    expect(lastStepContext("X")).toBe(5);
+    dispatch("X");
+    noteStepContext("X", 6);
+    instance.onExecutionEnded("X"); // no id: the legacy behaviour
+    expect(lastStepContext("X")).toBe(6);
+  });
+
+  it("the end ids are remembered in a bounded set, oldest first", () => {
+    dispatch("X");
+    noteExecutionEnded("X", T0, "first");
+    expect(lastStepContext("X")).toBeNull(); // ended, but no step noted
+    noteStepContext("X", 1);
+    expect(lastStepContext("X")).toBe(1);
+    for (let n = 0; n < 2_100; n++) noteExecutionEnded("other", T0, `end-${n}`); // evicts "first" (cap 2 048)
+    dispatch("X"); // not ended again
+    noteStepContext("X", 2);
+    expect(lastStepContext("X")).toBeNull();
+    noteExecutionEnded("X", T0, "first"); // forgotten: applied again (a copy this late is not expected)
+    expect(lastStepContext("X")).toBe(2);
+    dispatch("X");
+    noteStepContext("X", 3);
+    noteExecutionEnded("X", T0, "end-2099"); // still remembered: it was applied to "other" and is ignored here
+    expect(lastStepContext("X")).toBeNull();
+  });
+  it("a stale copy does not fold the new attempt early when ingestion is live (the fold is deduped per outcomes directory)", async () => {
+    const h = harness();
+    const a = h.make({ pricing: PRICED });
+    const b = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await a.onStepEnded(stepOf("e1", "c1", 1_000));
+    a.onExecutionEnded("c1", "x1"); // attempt N folds with its held final step
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+    dispatch("c1"); // attempt N+1
+    await a.onStepEnded(stepOf("e2", "c1", 2_000)); // its final step is held until its own end
+    b.onExecutionEnded("c1", "x1"); // the lagging copy of N's end
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1); // N+1 is not folded yet
+    a.onExecutionEnded("c1", "x2");
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(2);
+  });
+
+  it("an instance that cannot record does not consume the end another instance folds with", async () => {
+    const live = harness();
+    const off = harness();
+    off.settings = null;
+    const instanceOff = off.make({ pricing: PRICED });
+    const instanceLive = live.make({ pricing: PRICED });
+    dispatch("c1");
+    await instanceLive.onStepEnded(stepOf("e1", "c1", 1_000));
+    instanceOff.onExecutionEnded("c1", "x1"); // arrives first, cannot record: marks the registry, folds nothing
+    expect(live.store().cost(MEDIUM_KEY).steps.n).toBe(0);
+    expect(lastStepContext("c1")).toBe(1_000);
+    instanceLive.onExecutionEnded("c1", "x1"); // the instance that can record still folds
+    expect(live.store().cost(MEDIUM_KEY).steps.n).toBe(1);
   });
 });

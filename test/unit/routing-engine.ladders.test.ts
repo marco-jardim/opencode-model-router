@@ -590,8 +590,9 @@ describe("QA-1.4-1: an own-model rung takes the price AND the rank of the matchi
     const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents });
     const chosen = resolveChosen({ cfg: plainCfg(), agents, agent: "medium" })!;
     const decision = decide(decisionInput({ ladder, chosen, detection: "deterministic", facts: { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } }));
-    expect(decision.best?.agent).not.toBe("medium"); // the priors do prefer a cheaper rung ...
-    expect(decision.switched).toBe(false); // ... but there is no recorded outcome behind it
+    expect(decision.argmin?.agent).not.toBe("medium"); // the priors do prefer a cheaper rung ...
+    expect(decision.best?.agent).toBe("medium"); // ... A27: it cannot be `best` ...
+    expect(decision.switched).toBe(false); // ... because there is no recorded outcome behind it
     expect(decision.reasonCode).toBe("kept:evidence");
   });
 
@@ -625,7 +626,8 @@ describe("QA-1.4-15: only a strictly higher rank is ungated (A24 amended) — th
       routing: { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection },
       chosen: resolveChosen({ cfg, agents, agent: "medium" })!,
     });
-    expect(decision.best?.agent).toBe("general");
+    expect(decision.argmin?.agent).toBe("general");
+    expect(decision.best?.agent).toBe("medium");
     expect(decision.switched).toBe(false);
     expect(decision.reasonCode).toBe("kept:evidence");
     // With 5 outcomes on the winner's own key the same decision switches.
@@ -654,8 +656,9 @@ describe("QA-1.4-15: only a strictly higher rank is ungated (A24 amended) — th
       chosen: resolveChosen({ cfg, agents: routerAgents(), agent: "medium", model: `${SONNET}#high` })!,
     });
     expect(decision.chosen.variant).toBe("high");
-    expect(decision.best?.agent).toBe("medium");
-    expect(decision.best?.variant).toBe("low");
+    expect(decision.argmin?.agent).toBe("medium");
+    expect(decision.argmin?.variant).toBe("low");
+    expect(decision.best?.variant).toBe("high");
     expect(decision.reasonCode).toBe("kept:evidence");
   });
 
@@ -692,8 +695,12 @@ describe("QA-1.4-15: only a strictly higher rank is ungated (A24 amended) — th
       routing: { profile: "safe", margin: 0.1, minClassConfidence: 0.7, detection },
       chosen: resolveChosen({ cfg, agents, agent: "fast" })!,
     });
-    expect(decision.best?.agent).toBe("explore");
-    expect(decision.reasonCode).toBe("kept:evidence");
+    expect(decision.argmin?.agent).toBe("explore");
+    expect(decision.ineligible[candidateKey("search", ladder.candidates.find((c) => c.source === "role-own-model")!)]).toBe("evidence");
+    // A27: explore cannot be best without its own 5 outcomes, but the pick's 4 failures now let a higher-ranked (ungated)
+    // rung win instead of nothing moving at all.
+    expect(decision.best?.agent).toBe("medium");
+    expect(decision.reasonCode).toBe("switched");
   });
 });
 describe("QA-1.4-16: a role chain's attempts and cost carry into its exit into the router block", () => {

@@ -15,6 +15,9 @@ import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
 import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
+import { createEngineRuntime } from "../routing/wire/runtime";
+import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
+import { createSystemAugmenter } from "../routing/wire/hint";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -105,6 +108,21 @@ export async function registerV2Hooks(
       if (!abort.signal.aborted) ingestLogger.warn(`[router] telemetry ingestion: ${what} failed`, { error: error instanceof Error ? error.message : String(error) });
     }
   };
+  // M7 (2.2): dispatch routing and the protocol/hint adaptation share one runtime; it touches nothing (no host call, no
+  // store, no disk) while routing.engine is static, which is the default and what every config without a `routing` block is.
+  const sessionOf = (sessionID: string): Promise<unknown> => ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]);
+  const engine = createEngineRuntime({
+    loadConfig: () => loadConfig(ctx.location.directory),
+    listAgents: async () => (await ctx.agent.list()).data,
+    listModels: async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
+    ...(ctx.generate === undefined ? {} : { generate: ctx.generate }),
+    logger: ingestLogger,
+  });
+  const dispatchRouter = createDispatchRouter({
+    runtime: engine, getSession: sessionOf, graderAgent: V2_GRADER_AGENT, directory: ctx.location.directory,
+    logger: { warn: (message, extra) => ingestLogger.warn(message, extra), debug: (message, extra) => console.debug(message, extra ?? "") },
+  });
+  const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger });
   let eventTask: Promise<void> | undefined;
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
@@ -127,6 +145,8 @@ export async function registerV2Hooks(
     await runtime?.dispose?.();
     // Before the event task: disposing releases a step handler that waits for the model catalog (QA-2.1-5).
     await ingest.dispose();
+    dispatchRouter.dispose(); // this location no longer owns its sessions
+    await engine.dispose();
     await eventTask;
     await Promise.allSettled(registrations.map((registration) => registration.dispose()));
     await hooks.dispose?.();
@@ -274,7 +294,8 @@ export async function registerV2Hooks(
         if (!(key in event.options)) event.options[key] = value;
       }
       await legacy["chat.params"]?.(input, event.options);
-      const verify = loadConfig(ctx.location.directory).enforcement?.verify;
+      const routerConfig = loadConfig(ctx.location.directory);
+      const verify = routerConfig.enforcement?.verify;
       if (event.agent === V2_GRADER_AGENT
         && (verify?.graderTemperature === null
           || !(verify?.graderTemperatureModels ?? []).includes(`${event.model.providerID}/${event.model.id}`))) {
@@ -295,6 +316,11 @@ export async function registerV2Hooks(
         return Array.prototype.push.apply(output.system, texts);
       } });
       await legacy["experimental.chat.system.transform"]?.(input, output);
+      // M7 (2.2): advise/enforce swap the R: line, append the route-line paragraph and add the per-turn hint.
+      // static/shadow (and every config without a routing block) leave `output.system` exactly as the legacy hook built it.
+      await systemAugmenter.augment({
+        sessionID: event.sessionID, agent: event.agent, parentModel: `${event.model.providerID}/${event.model.id}`, messages: event.messages, cfg: routerConfig,
+      }, output.system, added);
       event.system = output.system.map((text): SystemPart =>
         original.get(text)?.shift() ?? { type: "text", text: added.has(text) ? v2Instructions(text) : text });
       runtime?.applyChildSystem(event.sessionID, event.system);
@@ -330,41 +356,65 @@ export async function registerV2Hooks(
 
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       const args = await scopedArgs(event);
-      const original = args && typeof args === "object" ? { ...args } : args;
-      const output = { args };
-      if (event.tool === "subagent" && args && typeof args.agent === "string" && args.model === undefined) {
+      if (event.tool === "subagent" && args && typeof args.agent === "string") {
+        // The model `subagentTiers` would fill in when the call names none (unchanged behaviour: only then, only for a mapped agent).
         const cfg = loadConfig(ctx.location.directory);
-        if (cfg.subagentTiers?.[args.agent]) {
-          const actual = await ctx.agent.list();
-          const overrides = actual.data.some((agent) => agent.id === args.agent) ? resolveSubagentOverrides({
-            subagentTiers: cfg.subagentTiers, tiers: getActiveTiers(cfg),
-            existingAgents: Object.fromEntries(actual.data.map((agent) => [agent.id, { mode: agent.mode }])),
-          }) : {};
-          const override = overrides[args.agent];
-          if (override) args.model = `${override.model}${override.variant ? `#${override.variant}` : ""}`;
+        let tierModel: string | undefined;
+        if (args.model === undefined) {
+          if (cfg.subagentTiers?.[args.agent]) {
+            const actual = await ctx.agent.list();
+            const overrides = actual.data.some((agent) => agent.id === args.agent) ? resolveSubagentOverrides({
+              subagentTiers: cfg.subagentTiers, tiers: getActiveTiers(cfg),
+              existingAgents: Object.fromEntries(actual.data.map((agent) => [agent.id, { mode: agent.mode }])),
+            }) : {};
+            const override = overrides[args.agent];
+            if (override) tierModel = `${override.model}${override.variant ? `#${override.variant}` : ""}`;
+          }
         }
+        // M7 (2.2): the engine goes first. Static (the default) returns untouched without any host call; shadow/advise only
+        // log and strip `[route …]`; enforce may also replace agent and model. `subagentTiers` then only fills a missing model.
+        const routed = await dispatchRouter.route({
+          callID: event.id, sessionID: event.sessionID, agent: event.agent, args, tierModel, cfg,
+        });
+        if (routed.prompt !== undefined) args.prompt = routed.prompt;
+        if (routed.agent !== undefined) { args.agent = routed.agent; args.subagent_type = routed.agent; }
+        if (routed.model !== undefined) args.model = routed.model;
+        if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
       }
-      await within(hookContext(event), async () => {
-        await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
-      });
-      const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
-      const banner = (output as Record<PropertyKey, unknown>)[DEPTH_BANNER];
-      if (typeof banner === "string") {
-        depthBanners.delete(event.id);
-        depthBanners.set(event.id, banner);
-        while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+      // After routing: the prompt the legacy hook starts from is the one the engine left (a stripped route line is not "added" text).
+      try {
+        const original = args && typeof args === "object" ? { ...args } : args;
+        const output = { args };
+        await within(hookContext(event), async () => {
+          await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
+        });
+        const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
+        const banner = (output as Record<PropertyKey, unknown>)[DEPTH_BANNER];
+        if (typeof banner === "string") {
+          depthBanners.delete(event.id);
+          depthBanners.set(event.id, banner);
+          while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+        }
+        if (verifying) {
+          verifyingCalls.add(event.id);
+          while (verifyingCalls.size > 1000) verifyingCalls.delete(verifyingCalls.values().next().value!);
+        }
+        if (event.tool === "subagent" && typeof output.args?.prompt === "string") {
+          const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
+          output.args.prompt = translateAdded(prompt, output.args.prompt);
+        }
+        event.input = nativeArgs(event.tool, output.args, original, verifying);
+      } catch (error) {
+        dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
+        throw error;
       }
-      if (verifying) {
-        verifyingCalls.add(event.id);
-        while (verifyingCalls.size > 1000) verifyingCalls.delete(verifyingCalls.values().next().value!);
-      }
-      if (event.tool === "subagent" && typeof output.args?.prompt === "string") {
-        const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
-        output.args.prompt = translateAdded(prompt, output.args.prompt);
-      }
-      event.input = nativeArgs(event.tool, output.args, original, verifying);
+      // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
+      dispatchRouter.commit(event.id, event.input);
     }));
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
+      // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
+      // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
+      dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
       const banner = depthBanners.get(event.id);
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
@@ -442,6 +492,8 @@ export async function registerV2Hooks(
             await ingesting(event.type, () => ingest.onStepEnded(event));
             continue;
           }
+          // A new child session: the dispatch the engine routed for it is registered with the 2.1 registry (2.2).
+          if (event.type === "session.created") dispatchRouter.onSessionCreated({ sessionID: data.sessionID, parentID: data.parentID, agent: data.agent, title: data.title });
           if (event.type === "session.deleted") {
             runtime?.forgetSession?.(data.sessionID);
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
@@ -449,7 +501,7 @@ export async function registerV2Hooks(
             // The v2 equivalents of session.idle: coalesced, throttled flush (D15); never awaited.
             await ingesting(event.type, () => {
               // The child's attempt is over: fold it before the flush that persists it.
-              if (EXECUTION_END_TYPES.has(event.type)) ingest.onExecutionEnded(data.sessionID);
+              if (EXECUTION_END_TYPES.has(event.type)) ingest.onExecutionEnded(data.sessionID, event.id);
               ingest.sweep();
               ingest.requestFlush();
             });

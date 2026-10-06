@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import type { RouterPluginInput } from "./compat/child-session";
-import { DEPTH_BANNER, TASK_VERIFICATION } from "./compat/child-session";
+import { DEPTH_BANNER, ResumeRejectedError, TASK_VERIFICATION } from "./compat/child-session";
 
 // Imports for internal use within this module
 import {
@@ -15,6 +15,7 @@ import {
   resolveVerifyBudget,
   resolveDepthLimit,
   resolveRouting,
+  resolveVariantSteps,
   routerStatusLines,
   warnConfigIssues,
 } from "./router/config";
@@ -74,6 +75,8 @@ import {
   buildCapBanner,
   DEFAULT_TIER_CAPS,
   READ_ONLY_TOOLS,
+  awaitExecutionEnd,
+  lastStepContext,
 } from "./router/sessions";
 import type { Cap, SubagentState } from "./router/sessions";
 import { createTrajectoryStore } from "./telemetry/trajectory";
@@ -105,7 +108,11 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
-import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard } from "./escalate/ladder";
+import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
+import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
+import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
+import { classifyDelegation, createAttemptRecorder } from "./escalate/attempt-recorder";
+import type { AttemptRecorder, DelegationFacts } from "./escalate/attempt-recorder";
 import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
 import { createDepthGuard } from "./router/depth-guard";
 import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
@@ -380,6 +387,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     () => { pending.sweep(); },
     // 2.1.2: expired dispatch registrations and idle open outcome attempts (v2 only; `ingest` is declared below).
     () => { ingest?.sweep(); },
+    // 2.3: release the ladder-attempt recorder's outcomes bundle once the engine is static again.
+    () => { attemptRecorder?.sweep(); },
   ]);
 
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
@@ -406,6 +415,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return { ...core, dispose: async () => { ingestAbort.abort(); await core.dispose(); } };
   })() : undefined;
   if (ingest) ctx.routerOnIngest?.(ingest);
+  // Phase 2.3: what the delegate ladder tells the telemetry about each attempt (registry entry + decision row). v2 only (D1).
+  const attemptRecorder: AttemptRecorder | undefined = ctx.routerHost === "v2"
+    ? createAttemptRecorder({ host: "v2", config: () => cfg, logger })
+    : undefined;
   resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
   const depthTracker = createDepthTracker({
     async getParent(id) {
@@ -586,6 +599,74 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return (await lookupRootSession(sessionID)) === true;
   };
 
+  /**
+   * Phase 2.3: the host model catalog as the delegate ladder reads it (variants and limits per model). Best effort: a
+   * missing, failing or slow catalog is `undefined`, and the ladder then behaves exactly as without variant info
+   * (fresh sessions, tier ratios). QA-2.3-3: the answer, positive or negative, is cached for the TTL; delegations that
+   * ask while a load is running share it; a call that outlived its timeout is not repeated behind itself (a late answer
+   * still fills the cache); and a failure is logged once per streak, until a load succeeds. So with a hung catalog the
+   * first delegation waits for the timeout and every later one answers at once.
+   */
+  /** How long a failed ladder attempt waits for its child's execution end before it starts fresh (QA-2.3-2). */
+  const RESUME_END_WAIT_MS = 1_000;
+  const RUNNER_CATALOG_TTL_MS = 15_000;
+  const RUNNER_CATALOG_TIMEOUT_MS = 3_000;
+  /** A catalog call still pending after this long is abandoned: a new one may start behind it. */
+  const RUNNER_CATALOG_ABANDON_MS = 60_000;
+  /** The last answer, valid for the TTL; `lookup` undefined = the catalog was unavailable. */
+  let runnerCatalog: { at: number; lookup: CatalogLookup | undefined } | undefined;
+  /** The load in progress (bounded by the timeout), shared by every delegation that asks meanwhile. */
+  let runnerCatalogLoad: Promise<CatalogLookup | undefined> | undefined;
+  /** When the outstanding `routerCatalog()` call started; it may outlive its timeout. */
+  let runnerCatalogCallAt: number | undefined;
+  /** Id of the latest call (QA-2.3-R2-6): an abandoned call that settles late must not clear the state of a newer one. */
+  let runnerCatalogCallId = 0;
+  let runnerCatalogFailing = false;
+  const runnerCatalogFailed = (error: unknown): undefined => {
+    runnerCatalog = { at: Date.now(), lookup: undefined };
+    if (!runnerCatalogFailing) {
+      runnerCatalogFailing = true;
+      logger.warn("[router] ladder: the model catalog is unavailable; variant steps and resume are off until it answers", { error: describeError(error) });
+    }
+    return undefined;
+  };
+  const loadRunnerCatalog = (): Promise<CatalogLookup | undefined> => {
+    const list = ctx.routerCatalog;
+    if (!list) return Promise.resolve(undefined);
+    const nowMs = Date.now();
+    if (runnerCatalog !== undefined && nowMs - runnerCatalog.at < RUNNER_CATALOG_TTL_MS) return Promise.resolve(runnerCatalog.lookup);
+    if (runnerCatalogLoad !== undefined) return runnerCatalogLoad;
+    if (runnerCatalogCallAt !== undefined && nowMs - runnerCatalogCallAt < RUNNER_CATALOG_ABANDON_MS) {
+      // An earlier call timed out and is still outstanding: no second `list()` behind it.
+      runnerCatalog = { at: nowMs, lookup: undefined };
+      return Promise.resolve(undefined);
+    }
+    runnerCatalogCallAt = nowMs;
+    const callId = ++runnerCatalogCallId;
+    const answer = Promise.resolve().then(() => list()).then(
+      (models) => {
+        // A late answer is still a catalog, whichever call it answers; only the latest call owns the marker.
+        if (callId === runnerCatalogCallId) runnerCatalogCallAt = undefined;
+        const lookup = createCatalogLookup(models);
+        runnerCatalog = { at: Date.now(), lookup };
+        runnerCatalogFailing = false;
+        return lookup;
+      },
+      (error: unknown) => {
+        // A failure of an abandoned call says nothing about the newer one: leave its marker and the cache alone.
+        if (callId !== runnerCatalogCallId) return undefined;
+        runnerCatalogCallAt = undefined;
+        return runnerCatalogFailed(error);
+      },
+    );
+    const load: Promise<CatalogLookup | undefined> = withTimeout(answer, RUNNER_CATALOG_TIMEOUT_MS, "model catalog")
+      .catch((error: unknown) => runnerCatalogFailed(error))
+      .finally(() => {
+        if (runnerCatalogLoad === load) runnerCatalogLoad = undefined;
+      });
+    runnerCatalogLoad = load;
+    return load;
+  };
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
@@ -601,6 +682,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await disposeVerification();
       // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
       await ingest?.dispose();
+      await attemptRecorder?.dispose();
       await logger.flush();
     },
     tool: {
@@ -634,7 +716,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             acceptance?: string;
             cwd?: string;
           },
-          toolCtx?: { sessionID?: string },
+          toolCtx?: { sessionID?: string; abort?: AbortSignal },
         ): Promise<string> {
           // Every ladder iteration creates its own producer session. Tracked out
           // here (not inside the try) so the finally below can dispose any that an
@@ -684,9 +766,36 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             });
             const effectiveCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd : dod.cwd;
 
-            const policy = buildEscalatePolicy(activeCfg);
+            // Phase 2.3 (D10/D11): on v2 with `variantSteps: auto` (A15: only with a `routing` block) and a catalog,
+            // the ladder is session-aware: variant steps on the same model first, resume of the child session
+            // under the context threshold. Anything else keeps the policy exactly as before (no variants key).
+            const host = ctx.routerHost === "v2" ? "v2" : "v1";
+            const variantMode = resolveVariantSteps(activeCfg, host);
+            const catalog = host === "v2" && ctx.routerChildRunner && variantMode === "auto" ? await loadRunnerCatalog() : undefined;
+            const policy = buildEscalatePolicy(
+              activeCfg,
+              catalog === undefined
+                ? undefined
+                : {
+                    host,
+                    variantSteps: variantMode,
+                    maxContextFraction: resolveRouting(activeCfg, host).sessionReuse.maxContextFraction,
+                    catalog,
+                    warn: (message) => logger.warn(message),
+                  },
+            );
+            const sessionAware = policy.variants != null;
             let state = newLadderState(initialTier, policy);
             const tiersForCost: any = getActiveTiers(activeCfg);
+            // A17 / QA-1.5-20: the first attempt runs the start tier's base rung; every later one charges its action's rung.
+            let rungCost: number | undefined = startCostRatio(policy, state);
+            let plan: AttemptPlan = planFirstAttempt(activeCfg, state.currentTier);
+            // Registry entry + decision row per attempt: for the ladder's own resume decision (the child's last step
+            // context) and for the outcome store. Without a routing block both are off and nothing is registered.
+            const recording = attemptRecorder !== undefined && (sessionAware || attemptRecorder.engineLive(activeCfg));
+            const delegation: DelegationFacts | null = recording
+              ? await classifyDelegation(activeCfg, host, args.task, args.acceptance, logger)
+              : null;
 
             // Independent safety net: even a policy bug cannot loop unbounded.
             const safetyMax =
@@ -698,7 +807,6 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
             let producerText = "";
             let forcing: string | null = null;
-            let effort: EffortLevel | undefined;
 
             /**
              * One turn of the escalation ladder: create a producer session, run
@@ -711,31 +819,51 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
              * in the middle of it obscured both halves.
              */
             const runProducerAttempt = async (
-              tier: string,
+              attemptPlan: AttemptPlan,
               forcingNote: string | null,
-              effort?: EffortLevel,
             ): Promise<{
               sessionID: string;
               text: string;
               gateRes: Awaited<ReturnType<typeof accept>>;
+              /** The producer errored or timed out: its context is not trusted for a resume (D11). */
+              producerFailed: boolean;
             } | {
               sessionID: string;
               text: string;
               /** 2.4.2c: deferred; the section 1.5-16 footer to append to the result. */
               deferredFooter: string;
             } | null> => {
+              const tier = attemptPlan.tier;
+              const effort = attemptPlan.effort;
               const taskText = forcingNote
                 ? `${scrubText(forcingNote)}\n\n${args.task}`
                 : args.task;
 
               let producerSid: string | undefined;
+              /** The child this attempt actually runs on; a resume the host refuses starts a fresh one instead. */
+              let resumeTarget: string | undefined = attemptPlan.resumeSessionID;
               const registerProducer = async (sid: string) => {
                 producerSid = sid;
-                producerSessions.push(sid);
+                if (!producerSessions.includes(sid)) producerSessions.push(sid);
                 depthTracker.recordPluginChild(sid, toolCtx?.sessionID ?? null);
                 if (effort !== undefined) {
                   const tierCfg = getActiveTiers(activeCfg)[tier];
-                  if (tierCfg) effortOverrides.set(sid, tier, tierCfg, effort);
+                  // The D10 fallback (an invalid variant) delivers the step's effort through the override on a bare
+                  // model, so the override's tier carries that effort and no variant (effortCeilingFor needs both).
+                  if (tierCfg) effortOverrides.set(sid, tier, attemptPlan.fresh === "invalid-variant" ? { ...tierCfg, variant: undefined, effort } : tierCfg, effort);
+                }
+                // Phase 2.3: a distinct attempt in the dispatch registry (with its step label) and, when the engine is
+                // live, a decision row. Before the child can run, so its first step event finds the registration.
+                if (recording && delegation !== null) {
+                  attemptRecorder?.record({
+                    childSessionID: sid,
+                    parentSessionID: toolCtx?.sessionID ?? null,
+                    plan: attemptPlan,
+                    config: activeCfg,
+                    facts: delegation.facts,
+                    acceptance: delegation.acceptance,
+                    resumed: sid === resumeTarget,
+                  });
                 }
                 // Keep the ORIGINAL dispatch reference across retries/escalations:
                 // recapturing after a failed attempt would excuse its regression.
@@ -763,6 +891,26 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
 
               const model = tierModel(activeCfg, tier) ?? undefined;
+              if (sessionAware && attemptPlan.step !== "dispatch") {
+                // D11: the decision and both numbers are in the decision row (engine != static). The log line is for
+                // anomalies (QA-2.3-4): a fresh start nobody chose (unknown context, no budget, an invalid catalog
+                // variant). The routine ones are only logged with the existing opt-in debug flag: a resume, a start over
+                // the threshold, and the two conservative overrides that the shipped presets hit on every escalation
+                // (`effort-path`, `bare-model-after-variant`; QA-2.3-R2-2).
+                const basis = attemptPlan.resumeBasis;
+                const routine =
+                  resumeTarget !== undefined ||
+                  basis?.reason === "at-or-over-threshold" ||
+                  attemptPlan.fresh === "effort-path" ||
+                  attemptPlan.fresh === "bare-model-after-variant";
+                if (!routine || process.env.MODEL_ROUTER_TRAJECTORY_DEBUG === "1") {
+                  logger.warn(
+                    `[router] ladder ${attemptPlan.step} on ${tier}: ${resumeTarget !== undefined ? "resuming the child session" : "fresh child session"}` +
+                    `${basis ? ` (${basis.reason}; tokens=${basis.tokens} budget=${basis.budget} threshold=${basis.threshold})` : ""}` +
+                    `${attemptPlan.fresh ? `; runner: ${attemptPlan.fresh}` : ""}`,
+                  );
+                }
+              }
               let producerText = "";
               // Provider-failover vs quality-escalation precedence (Phase 3.3):
               // Provider-failover is advisory only — a text chain injected into the orchestrator
@@ -779,15 +927,30 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               let producerError: string | null = null;
               const childAbort = ctx.routerChildRunner ? new AbortController() : undefined;
               try {
+                const runChild = (resume: string | undefined) => ctx.routerChildRunner!.run({
+                  parentSessionID: toolCtx?.sessionID,
+                  agent: attemptPlan.agent,
+                  model: attemptPlan.model,
+                  prompt: taskText,
+                  signal: childAbort!.signal,
+                  ...(resume === undefined ? {} : { resumeSessionID: resume }),
+                  onCreated: registerProducer,
+                });
                 const res: any = await withTimeout<unknown>(
-                  ctx.routerChildRunner ? ctx.routerChildRunner.run({
-                    parentSessionID: toolCtx?.sessionID,
-                    agent: tier,
-                    model: model ? { ...model, variant: getActiveTiers(activeCfg)[tier]?.variant } : undefined,
-                    prompt: taskText,
-                    signal: childAbort!.signal,
-                    onCreated: registerProducer,
-                  }) : ctx.client.session.prompt({
+                  ctx.routerChildRunner ? (async () => {
+                    try {
+                      return await runChild(resumeTarget);
+                    } catch (error) {
+                      // D11 fallback: a resume the host side refuses before anything ran (the child is gone, or is not
+                      // ours) is not a failed attempt: the same attempt starts on a fresh child.
+                      if (resumeTarget === undefined || !(error instanceof ResumeRejectedError)) throw error;
+                      logger.warn(`[router] ladder ${attemptPlan.step} on ${tier}: ${error.message}; starting a fresh child session`);
+                      const refused = resumeTarget;
+                      resumeTarget = undefined;
+                      await disposeChildSession(refused);
+                      return await runChild(undefined);
+                    }
+                  })() : ctx.client.session.prompt({
                     path: { id: producerSid! },
                     body: {
                       ...(model ? { model } : {}),
@@ -975,9 +1138,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // Dispose this attempt's backend session before the next iteration
               // so a long ladder never accumulates live sessions.
               effortOverrides.clear(producerSid);
-              await disposeChildSession(producerSid);
+              // A session-aware ladder (2.3) may resume this child on the next attempt, so its disposal is the loop's
+              // decision, taken once the ladder has said retry/escalate and whether it resumes; every exit path is
+              // still covered by the `finally` below. Without a session-aware policy: as before.
+              if (!sessionAware) await disposeChildSession(producerSid);
 
-              return { sessionID: producerSid, text: producerText, gateRes };
+              return { sessionID: producerSid, text: producerText, gateRes, producerFailed: producerError !== null };
             };
 
             while (true) {
@@ -988,7 +1154,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 );
               }
               const tier = state.currentTier;
-              const attempt = await runProducerAttempt(tier, forcing, effort);
+              const attempt = await runProducerAttempt(plan, forcing);
               if (!attempt) {
                 return withDepthBanner("[router] delegate failed: could not create a producer session.");
               }
@@ -1001,16 +1167,44 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const producerSid = attempt.sessionID;
               const gateRes = attempt.gateRes;
 
+              // A17: charge the rung this attempt ran (a candidate's own ratio), the tier's ratio when it has none.
               const costRatio =
-                typeof tiersForCost?.[tier]?.costRatio === "number"
+                rungCost ??
+                (typeof tiersForCost?.[tier]?.costRatio === "number"
                   ? tiersForCost[tier].costRatio
-                  : 1;
-              state = recordAttempt(state, costRatio);
+                  : 1);
+              // D11: the child and its last-step context (from the registry) decide a resume. A producer that errored
+              // or timed out reports no context, so the next attempt starts fresh. The context is read only once the
+              // child's execution end has been seen (QA-2.3-2): that event follows every step event on the stream, so
+              // the number includes the final, largest step. The gate has usually run long enough for it to be there;
+              // when it is not, wait for it, at most RESUME_END_WAIT_MS and no longer than the delegation lives, and
+              // otherwise start fresh (`unknown-tokens`). Nothing is awaited when no retry can follow.
+              let lastStepTokens: number | null = null;
+              if (sessionAware && !attempt.producerFailed) {
+                // No wait when nothing can follow this attempt (QA-2.3-R2-5): accepted, unverifiable, or the ladder's
+                // own limits (checks 3 and 4 of `nextAction`) are reached after it.
+                const firstCost = state.firstAttemptCost ?? costRatio;
+                const limitReached =
+                  state.totalAttempts + 1 >= policy.maxTotalAttempts ||
+                  (policy.costMultiple != null && state.cumulativeCost + costRatio > firstCost * policy.costMultiple);
+                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable" && !limitReached) {
+                  await awaitExecutionEnd(producerSid, RESUME_END_WAIT_MS, toolCtx?.abort);
+                }
+                lastStepTokens = lastStepContext(producerSid);
+              }
+              state = recordAttempt(
+                state,
+                costRatio,
+                sessionAware ? { sessionID: producerSid, lastStepTokens } : undefined,
+              );
+              // The verdict of this attempt, on the attempt's own registration (variant steps feed the store separately).
+              if (recording && !gateRes.verdict.skipped) ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict));
 
               const action = nextAction(
                 state,
                 { pass: gateRes.accepted, outcome: gateRes.verdict.outcome, reasons: gateRes.verdict.reasons },
                 policy,
+                sessionAware ? { dispatchPromptChars: args.task.length } : undefined,
               );
 
               if (action.action === "accept") {
@@ -1039,8 +1233,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
               // retry or escalate
               forcing = action.forcingMessage ?? null;
-              effort = action.effort;
               state = advance(state, action);
+              plan = planNextAttempt({ action, state, previous: plan, cfg: activeCfg, policy, catalog });
+              // The rung the plan actually dispatches (QA-2.3-8: not the action's when the plan fell back to the tier's model).
+              rungCost = plan.costRatio;
+              // The child this attempt ran on is kept only when the next attempt resumes it (D11); otherwise it is
+              // discarded now, so a long ladder never accumulates live sessions.
+              if (sessionAware && plan.resumeSessionID !== producerSid) await disposeChildSession(producerSid);
             }
           } catch {
             return withDepthBanner("[router] delegate failed (fail-closed): the delegation or verification could not complete.");

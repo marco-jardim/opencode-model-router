@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { RouterConfig } from "./config";
 import { fingerprintToolCall } from "../guard/fingerprint";
 import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep";
@@ -605,6 +605,20 @@ export interface DispatchInput {
   decisionID?: string | null;
   /** Kind of attempt (default `dispatch`; 2.3 ladder attempts pass `variant | retry | escalate`). */
   step?: LadderStepKind;
+  /**
+   * `false`: the instance that registered the child had outcome ingestion off (`routing.engine: static`), so no
+   * instance may score this attempt (QA-2.3-6). The registry is process-wide and every plugin instance (one per
+   * location) sees the child's events, so an instance in `shadow` would otherwise record the outcomes of a dispatch
+   * whose own configuration said not to. Default `true`.
+   */
+  outcomes?: boolean;
+  /**
+   * QA-2.3-1a (integration 2.2 + 2.3): this registration corrects or completes the SAME execution of an already registered
+   * child (the 2.2 router fixing a heuristic claim, or registering a child under its result), so the step context and the
+   * execution-end state the registry has seen are kept, and whoever waits for the end keeps waiting. Default `false`: a
+   * resume or a ladder attempt is a new execution and starts from nothing.
+   */
+  keepExecution?: boolean;
 }
 
 export interface DispatchRecord {
@@ -621,16 +635,27 @@ export interface DispatchRecord {
   readonly attemptIndex: number;
   readonly decisionID: string | null;
   readonly step: LadderStepKind;
+  /** See `DispatchInput.outcomes`: false = ingestion was off where this child was registered. */
+  readonly outcomes: boolean;
   readonly registeredAt: number;
 }
 
 interface DispatchSlot {
   record: DispatchRecord;
   lastTouch: number;
+  /** Context size of the child's largest step of this registration (D11), or null until a step is observed. */
+  stepTokens: number | null;
+  /** The child's execution ended after this registration (`noteExecutionEnded`): every step event of it was seen. */
+  ended: boolean;
+  /** Callers of `awaitExecutionEnd` still waiting; settled with `true` at the end, `false` when the slot goes away. */
+  waiters: Set<(ended: boolean) => void>;
 }
 
 /** Hard bound on remembered children; the oldest registration is dropped first. */
 export const MAX_DISPATCH_RECORDS = 2000;
+/** Execution-end event ids already applied (`noteExecutionEnded`), bounded, oldest first. */
+const SEEN_END_CAP = 2048;
+const seenEnds = new Set<string>();
 
 const dispatchRegistry = new Map<string, DispatchSlot>();
 /**
@@ -643,6 +668,16 @@ const dispatchRegistry = new Map<string, DispatchSlot>();
  */
 let attemptSeq = 0;
 const attemptNonce = randomBytes(4).toString("hex");
+
+/** Remove a registration and release whoever waits for its execution end (the wait ends `false`); true when it existed. */
+function dropDispatch(childSessionID: string): boolean {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return false;
+  dispatchRegistry.delete(childSessionID);
+  for (const settle of [...slot.waiters]) settle(false);
+  slot.waiters.clear();
+  return true;
+}
 
 /**
  * Register (or re-register) the dispatch facts of a child session. Re-registering an existing child
@@ -669,15 +704,22 @@ export function rememberDispatch(
     attemptIndex,
     decisionID: input.decisionID ?? null,
     step: input.step ?? "dispatch",
+    outcomes: input.outcomes ?? true,
     registeredAt: nowMs,
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
-  dispatchRegistry.delete(childSessionID);
-  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs });
+  // QA-2.3-1a: a registration of the same execution keeps what was observed of it (see `DispatchInput.keepExecution`).
+  const carried = input.keepExecution === true ? previous : undefined;
+  if (carried !== undefined) dispatchRegistry.delete(childSessionID);
+  else dropDispatch(childSessionID);
+  dispatchRegistry.set(childSessionID, {
+    record, lastTouch: nowMs,
+    stepTokens: carried?.stepTokens ?? null, ended: carried?.ended ?? false, waiters: carried?.waiters ?? new Set(),
+  });
   while (dispatchRegistry.size > MAX_DISPATCH_RECORDS) {
     const oldest = dispatchRegistry.keys().next();
     if (oldest.done === true) break;
-    dispatchRegistry.delete(oldest.value);
+    dropDispatch(oldest.value);
   }
   return record;
 }
@@ -693,16 +735,97 @@ export function touchDispatch(childSessionID: string, nowMs: number = Date.now()
   if (slot !== undefined) slot.lastTouch = nowMs;
 }
 
+/**
+ * Note the context size (D11: `input + cache.read + cache.write + output`) of a finished step of a registered
+ * child. Phase 2.3: the delegate ladder reads it to decide resume vs fresh, whatever the engine mode, so it is
+ * kept in memory here and never touches the disk. The largest value of the current registration wins: the
+ * context only grows within a child, a duplicate delivery of an older step cannot lower it, and after a
+ * compaction the larger number errs towards a fresh start. A re-registration (a resume, a ladder attempt)
+ * starts from null. An unregistered child, or a value that is not a finite number >= 0, is ignored.
+ */
+export function noteStepContext(childSessionID: string, tokens: number, nowMs: number = Date.now()): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined || typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return;
+  slot.stepTokens = slot.stepTokens === null ? tokens : Math.max(slot.stepTokens, tokens);
+  slot.lastTouch = nowMs;
+}
+
+/**
+ * The child execution ended (`session.execution.*`): the events are delivered in order, so every step event of the
+ * registration has been noted. Marks the current registration and wakes the callers of `awaitExecutionEnd`. A child
+ * that is not registered is ignored. Only a registration made after an earlier end can be marked by a later one,
+ * because a re-registration starts with `ended: false`.
+ */
+export function noteExecutionEnded(childSessionID: string, nowMs: number = Date.now(), eventId?: string): void {
+  // QA-2.3-R2-1: the host delivers the same event to the plugin instance of every live location (A3), and a lagging
+  // instance can deliver it after the child was registered again; that stale copy must not mark the new registration
+  // as ended. An event id is applied once per process; an event without an id cannot be told apart and is applied.
+  if (typeof eventId === "string" && eventId !== "") {
+    if (seenEnds.has(eventId)) return;
+    seenEnds.add(eventId);
+    while (seenEnds.size > SEEN_END_CAP) {
+      const oldest = seenEnds.values().next();
+      if (oldest.done === true) break;
+      seenEnds.delete(oldest.value);
+    }
+  }
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return;
+  slot.ended = true;
+  slot.lastTouch = nowMs;
+  for (const settle of [...slot.waiters]) settle(true);
+  slot.waiters.clear();
+}
+
+/**
+ * The context size of the **largest** step of the child's current registration (D11), or null: unknown, not
+ * registered, or the execution end has not been seen since the registration (QA-2.3-2). The end event follows
+ * every step event on the stream, so a number read before it may miss the final, largest step, which would make a
+ * resume look safe when it is not; null leads the ladder to a fresh start (`unknown-tokens`).
+ */
+export function lastStepContext(childSessionID: string): number | null {
+  const slot = dispatchRegistry.get(childSessionID);
+  return slot !== undefined && slot.ended ? slot.stepTokens : null;
+}
+
+/**
+ * Wait, at most `timeoutMs` and until `signal` aborts, for the child's execution end since its current
+ * registration. Resolves `true` when it was seen (now or meanwhile), `false` on timeout, abort, or when the
+ * registration is replaced or removed. Never rejects. The wait is the runner's only barrier against an end event
+ * that is still queued behind the stream's earlier events.
+ */
+export function awaitExecutionEnd(childSessionID: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return Promise.resolve(false);
+  if (slot.ended) return Promise.resolve(true);
+  if (signal?.aborted === true || !(timeoutMs > 0)) return Promise.resolve(false);
+  const waiters = slot.waiters;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    // A pending wait must never keep the process alive.
+    if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+    const onAbort = (): void => finish(false);
+    function finish(ended: boolean): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      waiters.delete(finish);
+      resolve(ended);
+    }
+    waiters.add(finish);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** Remove one child; true when it was registered. */
 export function forgetDispatch(childSessionID: string): boolean {
-  return dispatchRegistry.delete(childSessionID);
+  return dropDispatch(childSessionID);
 }
 
 /** Remove every child dispatched by `parentSessionID` (the orchestrator went away); returns what was removed. */
 export function forgetDispatchesOf(parentSessionID: string): DispatchRecord[] {
   const removed: DispatchRecord[] = [];
   for (const [id, slot] of [...dispatchRegistry]) {
-    if (slot.record.parentSessionID === parentSessionID && dispatchRegistry.delete(id)) removed.push(slot.record);
+    if (slot.record.parentSessionID === parentSessionID && dropDispatch(id)) removed.push(slot.record);
   }
   return removed;
 }
@@ -711,7 +834,7 @@ export function forgetDispatchesOf(parentSessionID: string): DispatchRecord[] {
 export function sweepDispatches(nowMs: number = Date.now(), ttlMs: number = DEFAULT_IDLE_TTL_MS): number {
   let removed = 0;
   for (const [id, slot] of [...dispatchRegistry]) {
-    if (nowMs - slot.lastTouch >= ttlMs && dispatchRegistry.delete(id)) removed += 1;
+    if (nowMs - slot.lastTouch >= ttlMs && dropDispatch(id)) removed += 1;
   }
   return removed;
 }
@@ -723,5 +846,143 @@ export function dispatchCount(): number {
 
 /** Test-only: drop every registration. */
 export function resetDispatchRegistry(): void {
-  dispatchRegistry.clear();
+  seenEnds.clear();
+  for (const id of [...dispatchRegistry.keys()]) dropDispatch(id);
 }
+
+// ===========================================================================================================
+// Phase 2.2 / 2.3 integration — the single-writer runner token (QA-2.2-1, QA-2.3-1). Self-contained block.
+//
+// The delegate runner (2.3) dispatches producer and grader children through the host's native `subagent` tool, and the
+// host runs the plugin's `tool.execute.before` hook for those calls exactly as it does for the orchestrator's own. The 2.2
+// dispatch router must not touch them: the runner has already decided the agent and model#variant of the attempt, writes
+// the attempt's decision row and registers the child itself (one writer). The runner announces each native call here, just
+// before it makes it, keyed by the calling session, the agent and a hash of the prompt; the router consumes the mark when
+// the hook arrives and leaves the call alone. The router only looks at a call that carries the runner's own `description`
+// (`runnerDescription`), so an orchestrator dispatch with the same agent and prompt can never spend the runner's mark
+// (QA-INT-1); if another plugin rewrote the prompt on the way, a runner-titled call still finds its mark by (session, agent).
+// Marks expire and are bounded, each has its own id for withdrawal (QA-INT-3), and the runner withdraws its own mark when
+// the call returns, so a hook that never fires cannot leave a mark that would later swallow an orchestrator dispatch.
+// ===========================================================================================================
+
+/** A runner mark is honoured for at most this long. */
+export const RUNNER_TOKEN_TTL_MS = 120_000;
+/** Bound on live mark keys (oldest key dropped first). */
+export const MAX_RUNNER_TOKENS = 256;
+/** The `description` of a runner verification (grader) call. */
+export const RUNNER_VERIFICATION_DESCRIPTION = "Router result verification";
+
+/** The `description` the runner sends with a native call: `Router <agent> delegation`, or the verification text (no agent). */
+export function runnerDescription(agent: string | undefined): string {
+  return agent ? `Router ${agent} delegation` : RUNNER_VERIFICATION_DESCRIPTION;
+}
+
+interface RunnerMark {
+  /** Unique per announcement: a withdrawal removes exactly its own mark (QA-INT-3). */
+  readonly id: number;
+  readonly expiresAt: number;
+}
+
+/** Marks per `parent \0 agent \0 sha1(prompt)`. */
+const runnerTokens = new Map<string, RunnerMark[]>();
+let runnerMarkSeq = 0;
+
+export interface RunnerDispatchKey {
+  /** The session whose tool context the runner dispatches under (`ToolContext.sessionID`, `event.sessionID` in the hook). */
+  readonly parentSessionID: string;
+  /** The agent the call names (the grader agent for a verification). */
+  readonly agent: string;
+  /** The exact prompt string of the call. */
+  readonly prompt: string;
+}
+
+function runnerTokenPrefix(parentSessionID: string, agent: string): string {
+  return `${parentSessionID}\u0000${agent}\u0000`;
+}
+
+function runnerTokenKey(key: RunnerDispatchKey): string {
+  return `${runnerTokenPrefix(key.parentSessionID, key.agent)}${createHash("sha1").update(key.prompt).digest("hex")}`;
+}
+
+function liveMarks(marks: readonly RunnerMark[], nowMs: number): RunnerMark[] {
+  return marks.filter((mark) => mark.expiresAt > nowMs);
+}
+
+/**
+ * The runner is about to make a native `subagent` call: announce it. Returns a function that withdraws this announcement
+ * (call it when the native call has returned); withdrawing a mark that was consumed or expired is a no-op, and it never
+ * removes another announcement's mark.
+ */
+export function markRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.now()): () => void {
+  const id = runnerTokenKey(key);
+  const mark: RunnerMark = { id: ++runnerMarkSeq, expiresAt: nowMs + RUNNER_TOKEN_TTL_MS };
+  const marks = liveMarks(runnerTokens.get(id) ?? [], nowMs);
+  marks.push(mark);
+  runnerTokens.delete(id);
+  runnerTokens.set(id, marks);
+  while (runnerTokens.size > MAX_RUNNER_TOKENS) {
+    const oldest = runnerTokens.keys().next();
+    if (oldest.done === true) break;
+    runnerTokens.delete(oldest.value);
+  }
+  return () => {
+    const current = runnerTokens.get(id);
+    if (current === undefined) return;
+    const at = current.findIndex((candidate) => candidate.id === mark.id);
+    if (at >= 0) current.splice(at, 1);
+    if (current.length === 0) runnerTokens.delete(id);
+  };
+}
+
+/** The hook for a native call arrived: true (and the mark is spent) when the runner announced exactly this call, else false. */
+export function consumeRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.now()): boolean {
+  const id = runnerTokenKey(key);
+  const marks = runnerTokens.get(id);
+  if (marks === undefined) return false;
+  const live = liveMarks(marks, nowMs);
+  if (live.length === 0) {
+    runnerTokens.delete(id);
+    return false;
+  }
+  live.shift();
+  if (live.length === 0) runnerTokens.delete(id);
+  else runnerTokens.set(id, live);
+  return true;
+}
+
+/**
+ * QA-INT-1: the call carries the runner's title but its prompt is not the announced one (another plugin rewrote it). Spend the
+ * oldest live mark of this session and agent, whatever its prompt; false when there is none.
+ */
+export function consumeRunnerDispatchLoose(key: { readonly parentSessionID: string; readonly agent: string }, nowMs: number = Date.now()): boolean {
+  const prefix = runnerTokenPrefix(key.parentSessionID, key.agent);
+  let bestKey: string | null = null;
+  let best: RunnerMark | null = null;
+  for (const [id, marks] of runnerTokens) {
+    if (!id.startsWith(prefix)) continue;
+    for (const mark of liveMarks(marks, nowMs)) {
+      if (best === null || mark.expiresAt < best.expiresAt) {
+        best = mark;
+        bestKey = id;
+      }
+    }
+  }
+  if (best === null || bestKey === null) return false;
+  const remaining = (runnerTokens.get(bestKey) ?? []).filter((mark) => mark.id !== best!.id);
+  if (remaining.length === 0) runnerTokens.delete(bestKey);
+  else runnerTokens.set(bestKey, remaining);
+  return true;
+}
+
+/** Number of live runner marks (diagnostics, tests). */
+export function runnerTokenCount(nowMs: number = Date.now()): number {
+  let count = 0;
+  for (const marks of runnerTokens.values()) count += liveMarks(marks, nowMs).length;
+  return count;
+}
+
+/** Test-only: forget every mark. */
+export function resetRunnerTokens(): void {
+  runnerTokens.clear();
+}
+// ===== end of the 2.2 / 2.3 runner token block ===============================================================
