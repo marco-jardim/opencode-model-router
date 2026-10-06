@@ -107,7 +107,7 @@ function configuredModel(cfg: RouterConfig, tier: string): AttemptModel | undefi
 }
 
 /** The first attempt of a delegation: the start tier exactly as the runner always dispatched it. */
-export function planFirstAttempt(cfg: RouterConfig, tier: string, costRatio?: number): AttemptPlan {
+export function planFirstAttempt(cfg: RouterConfig, tier: string): AttemptPlan {
   const model = configuredModel(cfg, tier);
   return {
     step: "dispatch",
@@ -115,7 +115,6 @@ export function planFirstAttempt(cfg: RouterConfig, tier: string, costRatio?: nu
     agent: tier,
     ...(model === undefined ? {} : { model }),
     ...(model?.variant === undefined ? {} : { variant: model.variant }),
-    ...(costRatio === undefined ? {} : { costRatio }),
   };
 }
 
@@ -153,11 +152,18 @@ export function planNextAttempt(input: NextAttemptInput): AttemptPlan {
     const invalid =
       parsed === null || (action.variant !== undefined && (ids === null || !ids.includes(action.variant)));
     if (invalid) {
-      // D10 fallback: a fresh session on the tier's configured model; the step's effort, if the variant names
-      // one, travels as the producer-side effort override instead (v1 path).
+      // D10 fallback: a fresh session on the tier's model. When the variant names an effort level, the effort travels
+      // as the producer-side effort override (the v1 path) and the model goes bare, so the effort is delivered once
+      // and never next to a variant (A7/F3: which one wins on the wire is unverified). Otherwise the tier's own
+      // model and variant, with no effort.
       fresh = "invalid-variant";
-      model = configuredModel(cfg, tier);
-      if (effort === undefined && action.variant !== undefined && isEffortLevel(action.variant)) effort = action.variant;
+      const configured = configuredModel(cfg, tier);
+      if (configured !== undefined && action.variant !== undefined && isEffortLevel(action.variant)) {
+        model = { providerID: configured.providerID, modelID: configured.modelID };
+        effort = effort ?? action.variant;
+      } else {
+        model = configured;
+      }
     } else {
       model = { ...parsed, ...(action.variant === undefined ? {} : { variant: action.variant }) };
     }

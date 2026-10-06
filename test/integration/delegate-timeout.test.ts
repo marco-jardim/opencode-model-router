@@ -619,3 +619,112 @@ describe("delegate time-boxes (fake timers)", () => {
     }
   });
 });
+
+describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", () => {
+  let dir: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mrto-resume-"));
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    process.env.HOME = dir;
+    process.env.USERPROFILE = dir;
+    delete process.env.MODEL_ROUTER_ENFORCE;
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (savedHome !== undefined) process.env.HOME = savedHome;
+    else delete process.env.HOME;
+    if (savedUserProfile !== undefined) process.env.USERPROFILE = savedUserProfile;
+    else delete process.env.USERPROFILE;
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
+    invalidateConfigCache();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  function writeResumeOverrides(): void {
+    const p = path.join(dir, ".config/opencode/opencode-model-router.overrides.jsonc");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tier = (model: string, variant: string, costRatio: number) => ({ model, variant, costRatio, description: "test tier", whenToUse: ["testing"] });
+    fs.writeFileSync(p, JSON.stringify({
+      activePreset: "tst",
+      presets: { tst: {
+        fast: tier("anthropic/claude-sonnet-5-5", "low", 1),
+        medium: tier("anthropic/claude-sonnet-5-5", "medium", 5),
+        heavy: tier("anthropic/claude-opus-5-5", "xhigh", 20),
+      } },
+      routing: {},
+      enforcement: { escalate: { maxTotalAttempts: 8, costCeiling: { multiple: 100 } } },
+    }), "utf-8");
+    invalidateConfigCache();
+  }
+
+  const catalog = ["anthropic/claude-sonnet-5-5", "anthropic/claude-opus-5-5"].map((ref) => {
+    const [providerID, id] = ref.split("/");
+    return { providerID: providerID!, id: id!, variants: ["low", "medium", "high", "xhigh"].map((v) => ({ id: v })), limit: { input: 1_000_000, context: 1_000_000, output: 4_096 } };
+  });
+
+  it("cuts a resumed child that never answers off at the producer ceiling, aborts its signal, and carries on fresh", async () => {
+    writeResumeOverrides();
+    const verdicts = [false, true];
+    const log: string[] = [];
+    let producerRuns = 0;
+    let ingest: { onStepEnded(event: unknown): Promise<void> } | undefined;
+    const hooks: any = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: async () => catalog,
+      // The plugin's own telemetry ingest: the host publishes a finished step's usage on the event stream, and the
+      // ladder's resume decision (D11) reads the child's context from what the ingest saw.
+      routerOnIngest: (created: typeof ingest) => { ingest = created; },
+      routerChildRunner: {
+        run: async (request: any) => {
+          if (request.system !== undefined) {
+            const sid = `grader-${sessionCounter++}`;
+            await request.onCreated(sid);
+            return { sessionID: sid, text: JSON.stringify({ pass: verdicts.shift() ?? false, reasons: ["scripted verdict"] }) };
+          }
+          producerRuns += 1;
+          const sid = request.resumeSessionID ?? `resume-child-${producerRuns}`;
+          log.push(`${request.resumeSessionID === undefined ? "create" : "resume"}:${sid}:${request.model?.variant}`);
+          await request.onCreated(sid);
+          if (producerRuns === 1) {
+            await ingest?.onStepEnded({ id: `step-${sid}`, type: "session.step.ended", data: { sessionID: sid, finish: "stop", cost: 0, tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } } });
+          }
+          if (producerRuns === 2) {
+            await new Promise<void>((_resolve, reject) => request.signal.addEventListener("abort", () => { log.push(`aborted:${sid}`); reject(request.signal.reason); }, { once: true }));
+          }
+          return { sessionID: sid, text: "producer output" };
+        },
+        dispose: async (sid: string) => { log.push(`dispose:${sid}`); },
+      },
+    } as any);
+
+    const pending: Promise<string> = hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    await vi.advanceTimersByTimeAsync(DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS + 1_000);
+    const result = await pending;
+    await hooks.dispose();
+
+    expect(result).toContain("[router ✓ verified:");
+    // attempt 1 fresh, attempt 2 resumed the child with the next variant and hung, attempt 3 fresh (a producer that
+    // timed out reports no trustworthy context, D11), still stepping the variant.
+    expect(log.filter((e) => !e.startsWith("dispose:"))).toEqual([
+      "create:resume-child-1:low",
+      "resume:resume-child-1:medium",
+      "aborted:resume-child-1",
+      "create:resume-child-3:high",
+    ]);
+    expect(log.indexOf("dispose:resume-child-1")).toBeLessThan(log.indexOf("create:resume-child-3:high"));
+  });
+});

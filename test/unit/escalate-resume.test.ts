@@ -197,7 +197,8 @@ describe("planNextAttempt: catalog validation before the call (D10 fallback)", (
     expect(next.action.variant).toBe("medium");
     expect(next.plan.fresh).toBe("invalid-variant");
     expect(next.plan.resumeSessionID).toBeUndefined();
-    expect(next.plan.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "low" }); // the tier's own
+    expect(next.plan.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-5-5" }); // bare: the effort override carries it
+    expect(next.plan.variant).toBeUndefined();
     expect(next.plan.effort).toBe("medium"); // fresh session + effort override instead
     expect(next.plan.step).toBe("variant");
   });
@@ -208,7 +209,8 @@ describe("planNextAttempt: catalog validation before the call (D10 fallback)", (
     const next = failOnce(cfg, policy, newLadderState("fast", policy), planFirstAttempt(cfg, "fast"), "child-1", 1_000, () => undefined);
     expect(next.plan.fresh).toBe("invalid-variant");
     expect(next.plan.resumeSessionID).toBeUndefined();
-    expect(next.plan.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "low" });
+    expect(next.plan.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-5-5" });
+    expect(next.plan.effort).toBe("medium");
   });
 
   it("a target variant that is not an effort level (an unlisted candidate) falls back fresh without an effort override", () => {
@@ -223,6 +225,7 @@ describe("planNextAttempt: catalog validation before the call (D10 fallback)", (
     expect(plan.fresh).toBe("invalid-variant");
     expect(plan.effort).toBeUndefined();
     expect(plan.resumeSessionID).toBeUndefined();
+    expect(plan.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "low" }); // the tier's own, no effort to carry
   });
 
   it("an invalid variant never resumes, even when the ladder said resume", () => {
