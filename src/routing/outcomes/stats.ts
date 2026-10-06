@@ -47,9 +47,12 @@ function isoOrNull(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
-/** The key a decision row actually dispatched to: `best` when `enforce` switched, else `chosen`. */
+/**
+ * The key a decision row actually dispatched to: `best` when `enforce` switched, else `chosen`. A `switched` row of `shadow`
+ * or `advise` is a would-switch (2.2): nothing was dispatched to `best`, so it must not count as a dispatch there.
+ */
 function dispatchedKey(row: DecisionRow): OutcomeKey {
-  return row.switched && row.best !== null ? row.best.key : row.chosen.key;
+  return row.mode === "enforce" && row.switched && row.best !== null ? row.best.key : row.chosen.key;
 }
 
 interface KeyAcc {

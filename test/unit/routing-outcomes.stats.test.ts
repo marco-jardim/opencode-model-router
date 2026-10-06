@@ -242,6 +242,19 @@ describe("summarize", () => {
     expect(row(C)).toMatchObject({ dispatches: 1, attempts: 1, pass: 0, fail: 0, passRate: rate(0, 0), measuredUSD: null });
   });
 
+  it("a switched row of shadow or advise is a would-switch: it counts under chosen.key, only enforce moves the dispatch to best.key (2.2)", () => {
+    const rows = [
+      decision("W1", SINCE, { mode: "shadow", switched: true, chosen: choice(A), best: choice(C) }),
+      decision("W2", SINCE, { mode: "advise", switched: true, chosen: choice(A), best: choice(C) }),
+      decision("W3", SINCE, { mode: "enforce", switched: true, chosen: choice(A), best: choice(C) }),
+    ];
+    const table = summarize(null, rows, NONE);
+    const row = (key: OutcomeKey) => table.byKey.find((r) => r.key === key);
+    expect(row(A)?.dispatches).toBe(2);
+    expect(row(C)?.dispatches).toBe(1);
+    expect(table.switched.count).toBe(3); // the would-switch count of the shadow/advise periods (DF3) is unchanged
+  });
+
   it("a key that only has verdict rows (or refusals without a decision id) still gets a line", () => {
     const only = makeKey("review", { origin: "host", id: "general" }, "openai", "gpt");
     const rows = [verdict("Z", SINCE, only, "fail"), { ...refusal("Z2", SINCE, only), decisionID: null }];
