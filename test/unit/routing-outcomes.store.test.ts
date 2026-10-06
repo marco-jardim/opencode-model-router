@@ -334,14 +334,77 @@ describe("recordFalseRefusal (D4: a false refusal is a failure)", () => {
     expect(store.snapshot().entries[K()]?.counts.pass).toBe(0);
   });
 
-  it("a refusal after a verdict only bumps the lifetime counter and the revision", () => {
+  it("a refusal after a fail verdict (or a second refusal) only bumps the lifetime counter and the revision", () => {
     const store = createOutcomeStore({ now: clock().now });
-    store.recordVerdict(K(), "pass", signal("a"));
+    store.recordVerdict(K(), "fail", signal("a"));
     const revision = store.revision;
     expect(store.recordFalseRefusal(K(), signal("a"))).toBe(false);
     expect(store.revision).toBe(revision + 1);
     expect(store.posterior(K()).n).toBe(1);
-    expect(store.snapshot().entries[K()]?.counts.falseRefusals).toBe(1);
+    expect(store.snapshot().entries[K()]?.counts).toMatchObject({ fail: 1, falseRefusals: 1 });
+    store.recordFalseRefusal(K(), signal("b"));
+    expect(store.recordFalseRefusal(K(), signal("b"))).toBe(false);
+    expect(store.snapshot().entries[K()]?.counts.falseRefusals).toBe(3);
+  });
+
+  it("QA-1.3-6: a refusal after a pass converts it into a failure (beta, counters, return value)", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    expect(store.recordVerdict(K(), "pass", signal("a"))).toBe(true);
+    const revision = store.revision;
+    expect(store.recordFalseRefusal(K(), signal("a"))).toBe(true);
+    expect(store.revision).toBe(revision + 1);
+    const entry = store.snapshot().entries[K()];
+    expect(entry?.beta).toEqual({ alpha: 0, beta: 1, updatedAt: T0 });
+    expect(entry?.counts).toEqual({ pass: 0, fail: 1, falseRefusals: 1, variantPass: 0, variantFail: 0 });
+    expect(store.posterior(K()).mean).toBeCloseTo(4 / 6, 12); // same as a refusal-first attempt
+    // the attempt stays scored: later signals do nothing more
+    expect(store.recordVerdict(K(), "pass", signal("a"))).toBe(false);
+    expect(store.recordFalseRefusal(K(), signal("a"))).toBe(false);
+    expect(store.snapshot().entries[K()]?.beta).toEqual({ alpha: 0, beta: 1, updatedAt: T0 });
+    expect(store.snapshot().entries[K()]?.counts).toMatchObject({ pass: 0, fail: 1, falseRefusals: 2 });
+  });
+
+  it("QA-1.3-6: the pass's contribution is taken out at its decayed weight, other evidence stays", () => {
+    const c = clock();
+    const store = createOutcomeStore({ now: c.now });
+    store.recordVerdict(K(), "pass", signal("old"));
+    store.recordVerdict(K(), "pass", signal("a"));
+    store.recordVerdict(K(), "pass", signal("older-fail-free"));
+    c.advance(14 * DAY_MS); // one half-life later
+    expect(store.recordFalseRefusal(K(), signal("a"))).toBe(true);
+    const beta = store.snapshot().entries[K()]?.beta;
+    expect(beta?.alpha).toBeCloseTo(3 * 0.5 - 0.5, 12);
+    expect(beta?.beta).toBeCloseTo(1, 12);
+    expect(beta?.updatedAt).toBe(T0 + 14 * DAY_MS);
+    expect(store.snapshot().entries[K()]?.counts).toMatchObject({ pass: 2, fail: 1, falseRefusals: 1 });
+  });
+
+  it("QA-1.3-6: variant counters move with the conversion", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    store.recordVerdict(K(), "pass", signal("a", "variant"));
+    store.recordVerdict(K(), "pass", signal("b"));
+    expect(store.snapshot().entries[K()]?.counts).toMatchObject({ pass: 2, variantPass: 1, variantFail: 0 });
+    expect(store.recordFalseRefusal(K(), signal("a", "variant"))).toBe(true);
+    expect(store.snapshot().entries[K()]?.counts).toEqual({ pass: 1, fail: 1, falseRefusals: 1, variantPass: 0, variantFail: 1 });
+    expect(store.snapshot().entries[K()]?.beta.alpha).toBe(1);
+  });
+
+  it("QA-1.3-6: alpha and the pass counter are floored at 0 when the evidence behind the attempt is gone", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    store.recordVerdict(K(), "pass", signal("x"));
+    store.fromSnapshot({ version: 1, entries: {} }); // e.g. a replace-load wiped the evidence; the attempt is still remembered
+    expect(store.recordFalseRefusal(K(), signal("x"))).toBe(true);
+    const after = store.snapshot().entries[K()];
+    expect(after?.beta.alpha).toBe(0);
+    expect(after?.beta.beta).toBe(1);
+    expect(after?.counts).toEqual({ pass: 0, fail: 1, falseRefusals: 1, variantPass: 0, variantFail: 0 });
+  });
+  it("QA-1.3-6: a refusal for an attempt scored under another key does not convert it", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    store.recordVerdict(K("one"), "pass", signal("a"));
+    expect(store.recordFalseRefusal(K("two"), signal("a"))).toBe(false);
+    expect(store.snapshot().entries[K("one")]?.counts).toMatchObject({ pass: 1, fail: 0 });
+    expect(store.snapshot().entries[K("two")]?.counts).toMatchObject({ falseRefusals: 1 });
   });
 
   it("a variant refusal also counts as a variant failure", () => {

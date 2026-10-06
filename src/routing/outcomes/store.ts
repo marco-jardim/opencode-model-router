@@ -26,7 +26,7 @@ import type {
   Verdict,
 } from "./types";
 import { OUTCOMES_SCHEMA_ID, OUTCOMES_SCHEMA_VERSION, parseKey } from "./types";
-import { SAME_RANK_PRIOR, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
+import { SAME_RANK_PRIOR, capEvidence, decayFactor, decayTo, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
 import {
   addTokens,
   cleanTokenSample,
@@ -70,15 +70,25 @@ function compareCodeUnits(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** LRU set on a Map: refresh = delete + set; evict from the front. */
-function touch(set: Map<string, true>, id: string, max: number): void {
-  set.delete(id);
-  set.set(id, true);
-  while (set.size > max) {
-    const oldest = set.keys().next();
+/** LRU on a Map: refresh = delete + set; evict from the front. */
+function remember<V>(map: Map<string, V>, id: string, value: V, max: number): void {
+  map.delete(id);
+  map.set(id, value);
+  while (map.size > max) {
+    const oldest = map.keys().next();
     if (oldest.done === true) break;
-    set.delete(oldest.value);
+    map.delete(oldest.value);
   }
+}
+
+/** What scored an attempt (QA-1.3-6): enough to convert a pass into a failure when a false refusal follows it. */
+interface ScoredInfo {
+  readonly key: OutcomeKey;
+  readonly kind: "pass" | "fail" | "refusal";
+  /** Instant of the Beta observation. */
+  readonly at: number;
+  /** The scoring signal was a `variant` step. */
+  readonly variant: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +235,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
 
   const entries = new Map<OutcomeKey, Entry>();
   const open = new Map<string, OpenAttempt>();
-  const scored = new Map<string, true>();
+  const scored = new Map<string, ScoredInfo>();
   const closed = new Map<string, true>();
 
   /** Existing entry, or a new one for a well-formed key (`cls` is cached from `parseKey`); null for a malformed key. */
@@ -251,12 +261,16 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     revision += 1;
   }
 
-  function closeInternal(attemptID: string, remember: boolean): void {
+  function markClosed(attemptID: string): void {
+    remember(closed, attemptID, true, maxScored);
+  }
+
+  function closeInternal(attemptID: string, rememberClosed: boolean): void {
     const attempt = open.get(attemptID);
     if (attempt === undefined) return;
     open.delete(attemptID);
     fold(attempt);
-    if (remember) touch(closed, attemptID, maxScored);
+    if (rememberClosed) markClosed(attemptID);
   }
 
   const store: OutcomeStore = {
@@ -273,15 +287,17 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
 
     recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal): boolean {
       if (verdict !== "pass" && verdict !== "fail") return false;
-      if (scored.has(signal.attemptID)) {
-        touch(scored, signal.attemptID, maxScored);
+      const previous = scored.get(signal.attemptID);
+      if (previous !== undefined) {
+        remember(scored, signal.attemptID, previous, maxScored);
         return false;
       }
       const entry = entryFor(key);
       if (entry === null) return false;
       const pass = verdict === "pass";
       const variant = signal.step === "variant";
-      entry.beta = observe(entry.beta, pass, now(), tuning);
+      const t = now();
+      entry.beta = observe(entry.beta, pass, t, tuning);
       const c = entry.counts;
       entry.counts = {
         pass: c.pass + (pass ? 1 : 0),
@@ -290,7 +306,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
         variantPass: c.variantPass + (variant && pass ? 1 : 0),
         variantFail: c.variantFail + (variant && !pass ? 1 : 0),
       };
-      touch(scored, signal.attemptID, maxScored);
+      remember(scored, signal.attemptID, { key, kind: pass ? "pass" : "fail", at: t, variant }, maxScored);
       revision += 1;
       return true;
     },
@@ -298,14 +314,43 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     recordFalseRefusal(key: OutcomeKey, signal: AttemptSignal): boolean {
       const entry = entryFor(key);
       if (entry === null) return false;
-      const firstSignal = !scored.has(signal.attemptID);
-      const variantFail = firstSignal && signal.step === "variant" ? 1 : 0;
+      const previous = scored.get(signal.attemptID);
       const c = entry.counts;
-      entry.counts = { ...c, falseRefusals: c.falseRefusals + 1, variantFail: c.variantFail + variantFail };
-      if (firstSignal) entry.beta = observe(entry.beta, false, now(), tuning);
-      touch(scored, signal.attemptID, maxScored);
-      revision += 1;
-      return firstSignal;
+      const t = now();
+      revision += 1; // the lifetime counter below always changes
+      if (previous === undefined) {
+        // First terminal signal of the attempt: a failure.
+        const variant = signal.step === "variant";
+        entry.counts = { ...c, falseRefusals: c.falseRefusals + 1, variantFail: c.variantFail + (variant ? 1 : 0) };
+        entry.beta = observe(entry.beta, false, t, tuning);
+        remember(scored, signal.attemptID, { key, kind: "refusal", at: t, variant }, maxScored);
+        return true;
+      }
+      if (previous.kind === "pass" && previous.key === key) {
+        // QA-1.3-6: the pass was wrong. Observe the failure, take the pass's decayed contribution back out
+        // of alpha (floored at 0; an approximation once the cap has rescaled the evidence) and move the
+        // counters pass → fail.
+        const decayed = decayTo(entry.beta, t, tuning);
+        const contribution = decayFactor(t - previous.at, tuning.halfLifeDays);
+        entry.beta = capEvidence(
+          { alpha: Math.max(0, decayed.alpha - contribution), beta: decayed.beta + 1, updatedAt: decayed.updatedAt },
+          tuning.maxEffectiveSamples,
+        );
+        const v = previous.variant ? 1 : 0;
+        entry.counts = {
+          pass: Math.max(0, c.pass - 1),
+          fail: c.fail + 1,
+          falseRefusals: c.falseRefusals + 1,
+          variantPass: Math.max(0, c.variantPass - v),
+          variantFail: c.variantFail + v,
+        };
+        remember(scored, signal.attemptID, { key, kind: "refusal", at: t, variant: previous.variant }, maxScored);
+        return true;
+      }
+      // Already a failure (fail verdict or an earlier refusal): lifetime counter only.
+      entry.counts = { ...c, falseRefusals: c.falseRefusals + 1 };
+      remember(scored, signal.attemptID, previous, maxScored);
+      return false;
     },
 
     recordStep(key: OutcomeKey, step: StepSample): void {
@@ -343,7 +388,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       open.delete(step.attemptID);
       if (step.final) {
         fold(next);
-        touch(closed, step.attemptID, maxScored);
+        markClosed(step.attemptID);
         return;
       }
       open.set(step.attemptID, next);
