@@ -36,3 +36,17 @@
 
 **Incident in the period:** a Phase 1.1 test run with `--pool=threads` wrote the user's real `opencode-model-router.overrides.jsonc` (`{"routing":{"engine":"enforce"}}`); the orchestrator deleted it at ≈03:25, before any engine code was live (A14; global home guard added). Restart time lost: recorded at resume.
 **Liveness result (resume, 2026-10-06T11:41:54Z):** `/router` shows `router: engine=static build=2.2.0+8ce54f2` — the DF1 code is live. Restart wall-clock: sync at 2026-10-06T09:35Z, probe at 2026-10-06T11:41:54Z (includes the human's idle time; not attributable to the restart alone). Live protocol text: not re-captured from the restarted session; byte-identity is enforced by the Phase 1.4 D2 snapshot tests (raw and v2 forms) on the synced commit.
+
+## DF2 — after Phases 2.1, 2.2 and 2.3 (2026-10-06)
+
+**Status:** sync done, awaiting restart.
+
+**Mode after checkpoint:** `static` until the restart; then `shadow` (override file `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` = `{"routing":{"engine":"shadow"}}`, created only after the liveness probe passes).
+
+**Sync:** `master` in the base checkout fast-forwarded to `car/main` @ `2878319` (Phase 2.1 `a08229c`, Phases 2.2 and 2.3 `2878319`; QA PASS on each, plan amendments A27–A29). Rollback tag `car/sync-2-prev` = previous `master` (`8ce54f2`). Capped full suite on `car/main` @ `2878319`: 137 files passed, 3 skipped; 11 387 tests passed, 66 skipped; 255 s.
+
+**Liveness:** code sync requires a host restart (A8). Probe after restart: `/router` must show `engine=static` and build `2.2.0+2878319` (first 7 of the synced sha). Result: pending.
+
+**`routing:stats`:** pending, after the restart: `node scripts/routing-stats.ts` (expect an empty or no store). The decision log and outcome store start writing once `shadow` is active; from then on every QA and `[tier:heavy]` dispatch carries `[route pin]`.
+
+**Open owner decision (QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume and variant steps exist only on the fast tier; use `candidates` or drop `effort` where `variant` is set. Phase 2.4's advisor surfaces it.

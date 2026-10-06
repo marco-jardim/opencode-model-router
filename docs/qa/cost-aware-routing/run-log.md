@@ -12,3 +12,8 @@ Delegation incidents, take-overs (§0.10.2), restarts and sync incidents, in tim
 | ≈01:45 | 0.P QA round 1 | `@heavy` QA: 1 critical, 8 major, 11 minor, 5 nit | All addressed (harness `5113977`, docs `1409f3a`). |
 | ≈02:10 | 0.P QA round 2 | `@heavy` re-review: 20 resolved, 5 partial; new: 3 major, 7 minor, 2 nit | All addressed (harness `d9e2358`, docs/plan/handover in the following commit). |
 | 2026-10-06T11:41:54Z | DF1 | Host restart for the DF1 code sync (A8) | Liveness probe `/router` → `engine=static build=2.2.0+8ce54f2`; resumed with Phase 2.1. |
+| 2026-10-06 | 2.1 merge | Phase 2.1 (telemetry ingestion) QA PASS at round 3 | Merged into `car/main` as `a08229c`; report `phase-2.1.md`. |
+| 2026-10-06 | Wave 2 | Two subagent sessions hit a socket disconnect | Resumed the same sessions; no work lost. |
+| 2026-10-06 | Wave 2 | Router-grader returned spurious NOT ACCEPTED verdicts on in-progress notes | Not escalated; they were not verdicts on a deliverable (same pattern as the Wave 1 verdicts, handover §6). |
+| 2026-10-06 | 2.2 / 2.3 merge | Phases 2.2 and 2.3 integrated on `car/p22`; QA: 2.2 round 2 PASS, integration round 1 PASS (all fixes applied), 2.3 round 3 PASS | Merged into `car/main` as `2878319`. Capped suite on `car/main` @ `2878319`: 137 files passed, 3 skipped; 11387 tests passed, 66 skipped; 255 s. |
+| 2026-10-06 | DF2 | Code sync: `master` in the base checkout fast-forwarded to `2878319`; rollback tag `car/sync-2-prev` = `8ce54f2` | Awaiting the owner's restart (A8). After it: liveness probe (`/router` → `engine=static`, build `2.2.0+2878319`), `routing-stats`, create the global override file with `{"routing":{"engine":"shadow"}}`, then `[route pin]` on QA/heavy dispatches. |
