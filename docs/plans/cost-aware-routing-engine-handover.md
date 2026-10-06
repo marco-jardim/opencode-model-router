@@ -69,7 +69,7 @@ directives, which are binding and override your defaults. The rules that matter 
 | Host | OpenCode `v2.0.22`; source `anomalyco/opencode` @ `527f0b931d1f9b3ebd34e106c51b31ce5db5b075`; `@opencode/plugin` 2.0.22 |
 | Open QA findings | none. Plan amendments A1–A26 in §1.5. Handoffs to 2.1–2.4 are in each `docs\qa\cost-aware-routing\phase-1.x.md` "Handoffs" section — read all five before starting each Wave 2 phase. |
 | 0.P close-out | done: QA PASS, `car/p0p` merged into `car/main`, capped suite green, `master` fast-forwarded, `D:\git\omr-car-p0p` removed, Wave-1 comment posted on #74 |
-| Owner decisions pending | **Classifier model for the DF3 live check (A13)** — asked at 0.P close; until answered, the DF3 check is skipped. Record the answer here. |
+| Owner decisions | **DF3 live classifier check model (A13): `opencode-go/deepseek-v4.1-flash`** — decided by the owner on 2026-10-06. Use it in the DF3 one-shot (`routing.classifier = { "backend": "host", "model": "opencode-go/deepseek-v4.1-flash", "timeoutMs": 10000 }`), then restore. |
 | Spike evidence hygiene | Any spike re-run that is not meant to replace the evidence: `git -C <worktree> checkout -- docs/qa/cost-aware-routing/spikes` afterwards (QA-0P-42) |
 | Liveness probe / slash commands | The orchestrator has no tool to type `/router` or `/annotate-plan`; at DF1 find the host API route that runs a session command (host source at the pinned sha) or ask the human to type it |
 | Last `routing:stats` | n/a (script arrives in Phase 1.3); DF0 baseline from scorecards |

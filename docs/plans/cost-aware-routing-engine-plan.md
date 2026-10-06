@@ -309,7 +309,7 @@ The workload that calibrates the scoreboard is **this plan's own execution**. As
 - **A26 → 2.4.4 (QA-1.4-19).** `/annotate-plan` pins every step whose final tag is `[tier:heavy]` (tagged, QA, or engine-chosen), not only tagged/QA steps; annotation reports the number of steps it pinned.
 - **A18 → D3 / D14 / D15 (QA-1.1-2, QA-1.2-9).** The project-local override layer (`<repo>/.opencode/opencode-model-router.overrides.jsonc`) may not set `routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}` or `routing.outcomes.path`; those keys are dropped from that layer with a one-time warning. HTTP backends refuse to send a key over plain `http:` to a non-loopback host.
 - **A19 → D4 / D14 (QA-1.2-8).** A backend label replaces the rules class only if it is one of the classes the rules matched (or rules matched none); otherwise the rules class stands. Backend confidence is capped below `minClassConfidence` unless it agrees with rules.
-- **A13 → §0.11 DF3 / D3 / D14.** The classifier model of any live `host`/HTTP backend check is named by the owner, never picked automatically (task text leaves the machine to that provider's account, and the override file is global). Without that decision the DF3 live check is skipped and `host` ships as experimental.
+- **A13 → §0.11 DF3 / D3 / D14.** The classifier model of any live `host`/HTTP backend check is named by the owner, never picked automatically (task text leaves the machine to that provider's account, and the override file is global). Without that decision the DF3 live check is skipped and `host` ships as experimental. **Owner decision (2026-10-06): the DF3 check uses `opencode-go/deepseek-v4.1-flash`.**
 
 ### 1.6 Target flows
 
