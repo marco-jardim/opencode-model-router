@@ -1,0 +1,132 @@
+{
+  "spike": "S1-deny",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:18.358Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "With a permission rule that DENIES subagent 'explore' to the parent session, the execute.before swap general->explore does not yield an explore child: the host refuses the dispatch (permission is asserted after the hook, on the rewritten input).",
+  "observed": {
+    "rootSessionPermissions": [
+      {
+        "action": "subagent",
+        "resource": "explore",
+        "effect": "deny"
+      }
+    ],
+    "denyRule": [
+      {
+        "action": "subagent",
+        "resource": "explore",
+        "effect": "deny"
+      }
+    ],
+    "control": {
+      "childID": "ses_ef0624395ffejPYODS2MhV6Bwa",
+      "status": "completed"
+    },
+    "hookBefore": {
+      "agent": "general",
+      "description": "S1-deny dispatch",
+      "prompt": "S1D_MARK reply briefly",
+      "background": false
+    },
+    "hookAfterRewrite": {
+      "agent": "explore",
+      "description": "S1-deny dispatch",
+      "prompt": "S1D_MARK reply briefly",
+      "background": false,
+      "model": "anthropic/claude-sonnet-5-5#max"
+    },
+    "toolAfter": {
+      "hook": "after",
+      "sessionID": "ses_ef06243c8ffeBTJUCdWM6CDfXW",
+      "callID": "toolu_spike_7",
+      "agent": "build",
+      "tool": "subagent",
+      "status": "error",
+      "error": {
+        "_tag": "Tool.Error",
+        "message": "Subagent denied: explore",
+        "error": {
+          "_tag": "Permission.BlockedError",
+          "rules": [
+            {
+              "action": "*",
+              "resource": "*",
+              "effect": "allow"
+            },
+            {
+              "action": "*",
+              "resource": "*",
+              "effect": "allow"
+            },
+            {
+              "action": "subagent",
+              "resource": "explore",
+              "effect": "deny"
+            }
+          ],
+          "permission": "subagent",
+          "resources": [
+            "explore"
+          ]
+        }
+      }
+    },
+    "childrenOfRoot": [
+      {
+        "id": "ses_ef0624395ffejPYODS2MhV6Bwa",
+        "parentID": "ses_ef06243c8ffeBTJUCdWM6CDfXW",
+        "agent": "general",
+        "model": {
+          "id": "claude-opus-4-7",
+          "providerID": "anthropic",
+          "variant": "default"
+        },
+        "cost": 0.02672,
+        "tokens": {
+          "input": 5319,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S1-deny control",
+        "permissions": [
+          {
+            "action": "subagent",
+            "resource": "explore",
+            "effect": "deny"
+          }
+        ]
+      }
+    ],
+    "providerRequestsForExploreDuringThisSpike": 0,
+    "derived": {
+      "rewriteApplied": true,
+      "refused": true,
+      "errorMessage": "Subagent denied: explore",
+      "exploreChildCreated": false,
+      "controlAllowed": true
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef0624395ffejPYODS2MhV6Bwa",
+        "ses_ef06243c8ffeBTJUCdWM6CDfXW"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: rewrite applied=true; dispatch status=error; error=\"Subagent denied: explore\"; explore child created=false; control general dispatch=completed",
+  "notes": []
+}

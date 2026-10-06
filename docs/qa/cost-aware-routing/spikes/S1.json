@@ -1,0 +1,230 @@
+{
+  "spike": "S1",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:17.843Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "tool.hook('execute.before') reassigning event.input of the subagent tool (agent general->explore, model -> provider/model#variant) makes the host create the CHILD session with the rewritten agent and model/variant.",
+  "observed": {
+    "hostEnvKeys": [
+      "APPDATA",
+      "COMSPEC",
+      "HOME",
+      "LOCALAPPDATA",
+      "OPENCODE_CONFIG_PROJECT_DISABLE",
+      "OPENCODE_DISABLE_MODELS_FETCH",
+      "OPENCODE_DISABLE_PROJECT_CONFIG",
+      "OPENCODE_FILEWATCHER_DISABLE",
+      "OPENCODE_PASSWORD",
+      "OPENCODE_TEST_HOME",
+      "PATH",
+      "PATHEXT",
+      "PWD",
+      "SPIKE_EVENTS",
+      "SPIKE_GENERATE",
+      "SPIKE_HOOKS",
+      "SPIKE_REWRITE",
+      "SYSTEMROOT",
+      "TEMP",
+      "TMP",
+      "TMPDIR",
+      "USERPROFILE",
+      "WINDIR",
+      "XDG_CACHE_HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME"
+    ],
+    "catalogRootModel": {
+      "id": "claude-opus-4-7",
+      "variants": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "cost": [
+        {
+          "input": 5,
+          "output": 25,
+          "cache": {
+            "read": 0.5,
+            "write": 6.25
+          }
+        }
+      ],
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      }
+    },
+    "target": {
+      "ref": "anthropic/claude-sonnet-5-5#max",
+      "variants": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "agents": [
+      {
+        "id": "build",
+        "mode": "primary"
+      },
+      {
+        "id": "general",
+        "mode": "subagent"
+      },
+      {
+        "id": "explore",
+        "mode": "subagent"
+      },
+      {
+        "id": "compaction",
+        "mode": "primary"
+      },
+      {
+        "id": "title",
+        "mode": "primary"
+      },
+      {
+        "id": "summary",
+        "mode": "primary"
+      },
+      {
+        "id": "plan",
+        "mode": "primary"
+      }
+    ],
+    "hookBefore": {
+      "agent": "general",
+      "description": "S1 dispatch",
+      "prompt": "S1_MARK reply briefly",
+      "background": false
+    },
+    "hookAfterRewrite": {
+      "agent": "explore",
+      "description": "S1 dispatch",
+      "prompt": "S1_MARK reply briefly",
+      "background": false,
+      "model": "anthropic/claude-sonnet-5-5#max"
+    },
+    "toolAfter": {
+      "hook": "after",
+      "sessionID": "ses_ef0624642ffe190U1M7iMnbffR",
+      "callID": "toolu_spike_1",
+      "agent": "build",
+      "tool": "subagent",
+      "status": "completed",
+      "result": {
+        "output": {
+          "sessionID": "ses_ef0624560ffeghB6DFK5g7Ttzj",
+          "status": "completed",
+          "output": "CHILD_OK"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<subagent sessionID=\"ses_ef0624560ffeghB6DFK5g7Ttzj\" state=\"completed\">\nCHILD_OK\n</subagent>"
+          }
+        ],
+        "metadata": {
+          "sessionID": "ses_ef0624560ffeghB6DFK5g7Ttzj",
+          "status": "completed"
+        }
+      }
+    },
+    "storedChild": {
+      "session": {
+        "id": "ses_ef0624560ffeghB6DFK5g7Ttzj",
+        "parentID": "ses_ef0624642ffe190U1M7iMnbffR",
+        "agent": "explore",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "cost": 0.010264,
+        "tokens": {
+          "input": 5107,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S1 dispatch"
+      },
+      "messageCount": 3,
+      "messageTypes": [
+        "user",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": []
+    },
+    "listedChildren": [
+      {
+        "id": "ses_ef0624560ffeghB6DFK5g7Ttzj",
+        "parentID": "ses_ef0624642ffe190U1M7iMnbffR",
+        "agent": "explore",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "cost": 0.010264,
+        "tokens": {
+          "input": 5107,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S1 dispatch"
+      }
+    ],
+    "providerCapturesForChild": [
+      {
+        "model": "claude-sonnet-5-5",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "agent": "explore",
+        "kind": "primary",
+        "outputConfig": {
+          "effort": "max"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        }
+      }
+    ],
+    "cleanup": {
+      "removed": [
+        "ses_ef0624560ffeghB6DFK5g7Ttzj",
+        "ses_ef0624642ffe190U1M7iMnbffR"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: child stored as agent=explore model={\"id\":\"claude-sonnet-5-5\",\"providerID\":\"anthropic\",\"variant\":\"max\"} (wanted explore {\"providerID\":\"anthropic\",\"id\":\"claude-sonnet-5-5\",\"variant\":\"max\"})",
+  "notes": []
+}

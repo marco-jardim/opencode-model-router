@@ -1,0 +1,711 @@
+{
+  "spike": "S4",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:24.903Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "The host model catalog (GET /api/model, the call behind ctx.model.list) of an already-live location of the user's running service exposes variants[].id in the host's effort order, cost (all tiers) and limit for anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, opencode/deepseek-v4.1-flash and every gpt-6-luna* model (including gpt-6-luna-fast, the @fast tier model).",
+  "observed": {
+    "source": "the user's running OpenCode v2 service: read-only GET /api/debug/location, /api/model and /api/provider for an ALREADY-LIVE location; no POST, no session, no generation, no config write",
+    "serviceVersion": "2.0.22",
+    "liveLocationsBefore": {
+      "count": 13,
+      "digest": "edb028dccf0d41ef"
+    },
+    "readLocation": "D:\\git\\opencode-model-router",
+    "liveLocationsAfter": {
+      "count": 13,
+      "digest": "edb028dccf0d41ef",
+      "setUnchanged": true
+    },
+    "status": {
+      "model": 200,
+      "provider": 200,
+      "modelLatencyMs": 87
+    },
+    "catalogModelCount": 756,
+    "requested": {
+      "anthropic/claude-sonnet-5-5": {
+        "exact": {
+          "ref": "anthropic/claude-sonnet-5-5",
+          "enabled": true,
+          "variants": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "variantOrder": {
+            "ids": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "nonEffortIds": [],
+            "inHostEffortOrder": true
+          },
+          "cost": [
+            {
+              "input": 0,
+              "output": 0,
+              "cache": {
+                "read": 0,
+                "write": 0
+              }
+            }
+          ],
+          "unpriced": true,
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          }
+        },
+        "sameIdOtherProviders": []
+      },
+      "anthropic/claude-opus-5-5": {
+        "exact": {
+          "ref": "anthropic/claude-opus-5-5",
+          "enabled": true,
+          "variants": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "variantOrder": {
+            "ids": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "nonEffortIds": [],
+            "inHostEffortOrder": true
+          },
+          "cost": [
+            {
+              "input": 0,
+              "output": 0,
+              "cache": {
+                "read": 0,
+                "write": 0
+              }
+            }
+          ],
+          "unpriced": true,
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          }
+        },
+        "sameIdOtherProviders": []
+      },
+      "anthropic/claude-haiku-4-5": {
+        "exact": {
+          "ref": "anthropic/claude-haiku-4-5",
+          "enabled": true,
+          "variants": [
+            "high",
+            "max"
+          ],
+          "variantOrder": {
+            "ids": [
+              "high",
+              "max"
+            ],
+            "nonEffortIds": [],
+            "inHostEffortOrder": true
+          },
+          "cost": [
+            {
+              "input": 0,
+              "output": 0,
+              "cache": {
+                "read": 0,
+                "write": 0
+              }
+            }
+          ],
+          "unpriced": true,
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          }
+        },
+        "sameIdOtherProviders": []
+      },
+      "openai/gpt-6-luna": {
+        "exact": {
+          "ref": "openai/gpt-6-luna",
+          "enabled": true,
+          "variants": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "variantOrder": {
+            "ids": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "nonEffortIds": [],
+            "inHostEffortOrder": true
+          },
+          "cost": [],
+          "unpriced": true,
+          "limit": {
+            "context": 400000,
+            "input": 272000,
+            "output": 128000
+          }
+        },
+        "sameIdOtherProviders": [
+          {
+            "ref": "opencode-go/gpt-6-luna",
+            "enabled": true,
+            "variants": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "variantOrder": {
+              "ids": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "nonEffortIds": [],
+              "inHostEffortOrder": true
+            },
+            "cost": [
+              {
+                "input": 0.1,
+                "output": 0.5,
+                "cache": {
+                  "read": 0.01,
+                  "write": 0.125
+                }
+              },
+              {
+                "tier": {
+                  "type": "context",
+                  "size": 272000
+                },
+                "input": 0.2,
+                "output": 0.75,
+                "cache": {
+                  "read": 0.02,
+                  "write": 0.25
+                }
+              }
+            ],
+            "unpriced": false,
+            "limit": {
+              "context": 1050000,
+              "input": 922000,
+              "output": 128000
+            }
+          }
+        ]
+      },
+      "opencode/deepseek-v4.1-flash": {
+        "exact": "ABSENT from the catalog",
+        "sameIdOtherProviders": [
+          {
+            "ref": "opencode-go/deepseek-v4.1-flash",
+            "enabled": true,
+            "variants": [
+              "low",
+              "high",
+              "max"
+            ],
+            "variantOrder": {
+              "ids": [
+                "low",
+                "high",
+                "max"
+              ],
+              "nonEffortIds": [],
+              "inHostEffortOrder": true
+            },
+            "cost": [
+              {
+                "input": 0.15,
+                "output": 0.6,
+                "cache": {
+                  "read": 0.003,
+                  "write": 0
+                }
+              }
+            ],
+            "unpriced": false,
+            "limit": {
+              "context": 1000000,
+              "output": 384000
+            }
+          }
+        ]
+      }
+    },
+    "gpt6LunaFamily": [
+      {
+        "ref": "openrouter/openai/gpt-6-luna",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [
+          {
+            "input": 0.1,
+            "output": 0.5,
+            "cache": {
+              "read": 0.01,
+              "write": 0.125
+            }
+          },
+          {
+            "tier": {
+              "type": "context",
+              "size": 272000
+            },
+            "input": 0.2,
+            "output": 0.75,
+            "cache": {
+              "read": 0.02,
+              "write": 0.25
+            }
+          }
+        ],
+        "unpriced": false,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "openrouter/openai/gpt-6-luna-pro",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [
+          {
+            "input": 0.1,
+            "output": 0.5,
+            "cache": {
+              "read": 0.01,
+              "write": 0.125
+            }
+          },
+          {
+            "tier": {
+              "type": "context",
+              "size": 272000
+            },
+            "input": 0.2,
+            "output": 0.75,
+            "cache": {
+              "read": 0.02,
+              "write": 0.25
+            }
+          }
+        ],
+        "unpriced": false,
+        "limit": {
+          "context": 1050000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "opencode-go/gpt-6-luna",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [
+          {
+            "input": 0.1,
+            "output": 0.5,
+            "cache": {
+              "read": 0.01,
+              "write": 0.125
+            }
+          },
+          {
+            "tier": {
+              "type": "context",
+              "size": 272000
+            },
+            "input": 0.2,
+            "output": 0.75,
+            "cache": {
+              "read": 0.02,
+              "write": 0.25
+            }
+          }
+        ],
+        "unpriced": false,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "amazon-bedrock/us.openai.gpt-6-luna",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [
+          {
+            "input": 0.11,
+            "output": 0.55,
+            "cache": {
+              "read": 0.011,
+              "write": 0.1375
+            }
+          },
+          {
+            "tier": {
+              "type": "context",
+              "size": 272000
+            },
+            "input": 0.22,
+            "output": 0.825,
+            "cache": {
+              "read": 0.022,
+              "write": 0.275
+            }
+          }
+        ],
+        "unpriced": false,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "amazon-bedrock/global.openai.gpt-6-luna",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [
+          {
+            "input": 0.1,
+            "output": 0.5,
+            "cache": {
+              "read": 0.01,
+              "write": 0.125
+            }
+          },
+          {
+            "tier": {
+              "type": "context",
+              "size": 272000
+            },
+            "input": 0.2,
+            "output": 0.75,
+            "cache": {
+              "read": 0.02,
+              "write": 0.25
+            }
+          }
+        ],
+        "unpriced": false,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "amazon-bedrock/openai.gpt-6-luna",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [
+          {
+            "input": 0.11,
+            "output": 0.55,
+            "cache": {
+              "read": 0.011,
+              "write": 0.1375
+            }
+          },
+          {
+            "tier": {
+              "type": "context",
+              "size": 272000
+            },
+            "input": 0.22,
+            "output": 0.825,
+            "cache": {
+              "read": 0.022,
+              "write": 0.275
+            }
+          }
+        ],
+        "unpriced": false,
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "openai/gpt-6-luna",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [],
+        "unpriced": true,
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      },
+      {
+        "ref": "openai/gpt-6-luna-fast",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [],
+        "unpriced": true,
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      }
+    ],
+    "gpt6LunaFast": [
+      {
+        "ref": "openai/gpt-6-luna-fast",
+        "enabled": true,
+        "variants": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "variantOrder": {
+          "ids": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nonEffortIds": [],
+          "inHostEffortOrder": true
+        },
+        "cost": [],
+        "unpriced": true,
+        "limit": {
+          "context": 400000,
+          "input": 272000,
+          "output": 128000
+        }
+      }
+    ],
+    "providerActivationForRecordedProviders": [
+      "anthropic:enabled",
+      "openrouter:auto",
+      "opencode-go:auto",
+      "amazon-bedrock:enabled",
+      "openai:enabled"
+    ],
+    "presentExact": [
+      "anthropic/claude-sonnet-5-5",
+      "anthropic/claude-opus-5-5",
+      "anthropic/claude-haiku-4-5",
+      "openai/gpt-6-luna"
+    ],
+    "absentExact": [
+      "opencode/deepseek-v4.1-flash"
+    ],
+    "unpricedModels": [
+      "anthropic/claude-sonnet-5-5",
+      "anthropic/claude-opus-5-5",
+      "anthropic/claude-haiku-4-5",
+      "openai/gpt-6-luna",
+      "openai/gpt-6-luna-fast"
+    ],
+    "variantsOutOfHostEffortOrder": []
+  },
+  "assertionResult": "PARTIAL-PASS: 4/5 requested ids exist under that exact provider/id (anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna); absent: opencode/deepseek-v4.1-flash; gpt-6-luna* entries: openrouter/openai/gpt-6-luna, openrouter/openai/gpt-6-luna-pro, opencode-go/gpt-6-luna, amazon-bedrock/us.openai.gpt-6-luna, amazon-bedrock/global.openai.gpt-6-luna, amazon-bedrock/openai.gpt-6-luna, openai/gpt-6-luna, openai/gpt-6-luna-fast; every recorded entry exposes variants[], cost[] and limit.context; variants in host effort order: true; live location set unchanged by the read: true",
+  "notes": [
+    "Some requested ids are absent under that exact provider/id; see sameIdOtherProviders for where the host actually lists them.",
+    "UNPRICED (catalog cost list empty or every field 0): anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, openai/gpt-6-luna-fast. This is INFERRED from the catalog prices only: the harness ran no step on these models, so it did not observe a reported cost. A router must not treat a price of 0 as cheap."
+  ]
+}

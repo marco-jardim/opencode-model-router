@@ -1,0 +1,1272 @@
+{
+  "spike": "S2b",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:21.894Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "Resuming a child with sessionID + a different model id makes the provider receive the new model (stored model == wire model); a later resume with a higher variant, and a fresh child started at that variant, show whether the effort the provider receives follows the variant. Control: a fresh child honours the variant on its first request. A later model switch to a higher variant (A#low -> A#high -> B#xhigh) delivers xhigh as the top-level effort with no new in-band message.",
+  "observed": {
+    "catalogModels": {
+      "A": {
+        "id": "claude-sonnet-5-5",
+        "variants": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "B": {
+        "id": "claude-opus-5-5",
+        "variants": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "haiku": {
+        "id": "claude-haiku-4-5",
+        "variants": [
+          "high",
+          "max"
+        ]
+      },
+      "opus55InIsolatedCatalog": true
+    },
+    "table": [
+      {
+        "case": "case0 same-model variant bump",
+        "core": true,
+        "request": 1,
+        "asked": "anthropic/claude-sonnet-5-5#low",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case0 start",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "low"
+      },
+      {
+        "case": "case0 same-model variant bump",
+        "core": true,
+        "request": 2,
+        "asked": "anthropic/claude-sonnet-5-5#high",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#high",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 4,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case0 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [],
+            "output_config": {
+              "effort": "high"
+            }
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case0 resume",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [
+          "high"
+        ],
+        "inBandTrailing": [
+          "high"
+        ],
+        "effectiveEffort": "high"
+      },
+      {
+        "case": "case1 model switch",
+        "core": true,
+        "request": 1,
+        "asked": "anthropic/claude-sonnet-5-5#low",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case1 start",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "low"
+      },
+      {
+        "case": "case1 model switch",
+        "core": true,
+        "request": 2,
+        "asked": "anthropic/claude-opus-5-5#low",
+        "storedModelAfter": {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "requestRef": "anthropic/claude-opus-5-5#low",
+        "wireModel": "claude-opus-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-opus-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 3,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case1 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case1 resume other model",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "low"
+      },
+      {
+        "case": "case2 variant bump after switch",
+        "core": true,
+        "request": 1,
+        "asked": "anthropic/claude-opus-5-5#high",
+        "storedModelAfter": {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-opus-5-5#high",
+        "wireModel": "claude-opus-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-opus-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 6,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case1 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case1 resume other model"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [],
+            "output_config": {
+              "effort": "high"
+            }
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case2 resume higher variant",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [
+          "high"
+        ],
+        "inBandTrailing": [
+          "high"
+        ],
+        "effectiveEffort": "high"
+      },
+      {
+        "case": "case4 model and variant switch together",
+        "core": true,
+        "request": 1,
+        "asked": "anthropic/claude-sonnet-5-5#low",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case4 start",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "low"
+      },
+      {
+        "case": "case4 model and variant switch together",
+        "core": true,
+        "request": 2,
+        "asked": "anthropic/claude-opus-5-5#high",
+        "storedModelAfter": {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-opus-5-5#high",
+        "wireModel": "claude-opus-5-5",
+        "wireEffort": "high",
+        "payload": {
+          "model": "claude-opus-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "high"
+          },
+          "messages.length": 3,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case4 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case4 resume other model, higher variant",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "high"
+      },
+      {
+        "case": "case3 fresh child at high",
+        "core": true,
+        "request": 1,
+        "asked": "anthropic/claude-sonnet-5-5#high",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#high",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "high",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "high"
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case3 fresh",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "high"
+      },
+      {
+        "case": "case7 A low, A high, then B xhigh",
+        "core": false,
+        "request": 1,
+        "asked": "anthropic/claude-sonnet-5-5#low",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case7 start",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "low"
+      },
+      {
+        "case": "case7 A low, A high, then B xhigh",
+        "core": false,
+        "request": 2,
+        "asked": "anthropic/claude-sonnet-5-5#high",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#high",
+        "wireModel": "claude-sonnet-5-5",
+        "wireEffort": "low",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages.length": 4,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case7 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [],
+            "output_config": {
+              "effort": "high"
+            }
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case7 bump",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [
+          "high"
+        ],
+        "inBandTrailing": [
+          "high"
+        ],
+        "effectiveEffort": "high"
+      },
+      {
+        "case": "case7 A low, A high, then B xhigh",
+        "core": false,
+        "request": 3,
+        "asked": "anthropic/claude-opus-5-5#xhigh",
+        "storedModelAfter": {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "xhigh"
+        },
+        "requestRef": "anthropic/claude-opus-5-5#xhigh",
+        "wireModel": "claude-opus-5-5",
+        "wireEffort": "xhigh",
+        "payload": {
+          "model": "claude-opus-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "output_config": {
+            "effort": "xhigh"
+          },
+          "messages.length": 5,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case7 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case7 bump"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case7 switch to B xhigh",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": [],
+        "effectiveEffort": "xhigh"
+      },
+      {
+        "case": "case6 no variant, then high",
+        "core": false,
+        "request": 1,
+        "asked": "anthropic/claude-sonnet-5-5",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "default"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#default",
+        "wireModel": "claude-sonnet-5-5",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case6 start",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": []
+      },
+      {
+        "case": "case6 no variant, then high",
+        "core": false,
+        "request": 2,
+        "asked": "anthropic/claude-sonnet-5-5#high",
+        "storedModelAfter": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-sonnet-5-5#high",
+        "wireModel": "claude-sonnet-5-5",
+        "payload": {
+          "model": "claude-sonnet-5-5",
+          "stream": true,
+          "max_tokens": 128000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "messages.length": 4,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case6 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [],
+            "output_config": {
+              "effort": "high"
+            }
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case6 resume high",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [
+          "high"
+        ],
+        "inBandTrailing": [
+          "high"
+        ],
+        "effectiveEffort": "high"
+      },
+      {
+        "case": "case5 haiku variant bump",
+        "core": false,
+        "request": 1,
+        "asked": "anthropic/claude-haiku-4-5#high",
+        "storedModelAfter": {
+          "id": "claude-haiku-4-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        },
+        "requestRef": "anthropic/claude-haiku-4-5#high",
+        "wireModel": "claude-haiku-4-5",
+        "payload": {
+          "model": "claude-haiku-4-5",
+          "stream": true,
+          "max_tokens": 64000,
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 16000
+          },
+          "messages.length": 1,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case5 start",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": []
+      },
+      {
+        "case": "case5 haiku variant bump",
+        "core": false,
+        "request": 2,
+        "asked": "anthropic/claude-haiku-4-5#max",
+        "storedModelAfter": {
+          "id": "claude-haiku-4-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "requestRef": "anthropic/claude-haiku-4-5#max",
+        "wireModel": "claude-haiku-4-5",
+        "payload": {
+          "model": "claude-haiku-4-5",
+          "stream": true,
+          "max_tokens": 64000,
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 31999
+          },
+          "messages.length": 3,
+          "tools.length": 12
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "You are a subagent spawned by another session.\nS2b case5 start"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CHILD_OK"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "S2b case5 resume",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "inBandEfforts": [],
+        "inBandTrailing": []
+      }
+    ],
+    "switchedChildMessages": {
+      "modelSwitched": [
+        {
+          "model": {
+            "id": "claude-opus-5-5",
+            "providerID": "anthropic",
+            "variant": "low"
+          },
+          "previous": {
+            "id": "claude-sonnet-5-5",
+            "providerID": "anthropic",
+            "variant": "low"
+          }
+        },
+        {
+          "model": {
+            "id": "claude-opus-5-5",
+            "providerID": "anthropic",
+            "variant": "high"
+          },
+          "previous": {
+            "id": "claude-opus-5-5",
+            "providerID": "anthropic",
+            "variant": "low"
+          }
+        }
+      ],
+      "assistantModels": [
+        {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "high"
+        }
+      ]
+    },
+    "finalStored": {
+      "case1Child": {
+        "session": {
+          "id": "ses_ef0623c90ffeLXkZjWjLxEph82",
+          "parentID": "ses_ef0623e3dffeCHKRo1pHsqChsX",
+          "agent": "general",
+          "model": {
+            "id": "claude-opus-5-5",
+            "providerID": "anthropic",
+            "variant": "high"
+          },
+          "cost": 0.054294,
+          "tokens": {
+            "input": 16188,
+            "output": 15,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "outcome": "succeeded",
+          "title": "S2b case1 model switch"
+        },
+        "messageCount": 11,
+        "messageTypes": [
+          "user",
+          "assistant",
+          "idle",
+          "model-switched",
+          "user",
+          "assistant",
+          "idle",
+          "model-switched",
+          "user",
+          "assistant",
+          "idle"
+        ],
+        "compactionMessages": []
+      },
+      "case3Child": {
+        "session": {
+          "id": "ses_ef062395effe7HGKq5vzg3kU7l",
+          "parentID": "ses_ef0623e3dffeCHKRo1pHsqChsX",
+          "agent": "general",
+          "model": {
+            "id": "claude-sonnet-5-5",
+            "providerID": "anthropic",
+            "variant": "high"
+          },
+          "cost": 0.01076,
+          "tokens": {
+            "input": 5355,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "outcome": "succeeded",
+          "title": "S2b case3 fresh child at high"
+        },
+        "messageCount": 3,
+        "messageTypes": [
+          "user",
+          "assistant",
+          "idle"
+        ],
+        "compactionMessages": []
+      }
+    },
+    "derived": {
+      "wireFollowsModelSwitch": true,
+      "storedFollowsModelSwitch": true,
+      "freshChildHonoursVariant": true,
+      "effectiveEffortFollowsVariantAfterSwitch": true,
+      "allEffectiveEffortsFollowStoredVariant": true,
+      "sameModelResumeTopLevelEffort": [
+        "low",
+        "low"
+      ],
+      "sameModelResumeEffectiveEffort": [
+        "low",
+        "high"
+      ],
+      "caseA_low_A_high_B_xhigh": [
+        {
+          "request": 1,
+          "wireModel": "claude-sonnet-5-5",
+          "topLevelEffort": "low",
+          "inBandAllHistory": [],
+          "inBandForThisRequest": [],
+          "stored": {
+            "id": "claude-sonnet-5-5",
+            "providerID": "anthropic",
+            "variant": "low"
+          }
+        },
+        {
+          "request": 2,
+          "wireModel": "claude-sonnet-5-5",
+          "topLevelEffort": "low",
+          "inBandAllHistory": [
+            "high"
+          ],
+          "inBandForThisRequest": [
+            "high"
+          ],
+          "stored": {
+            "id": "claude-sonnet-5-5",
+            "providerID": "anthropic",
+            "variant": "high"
+          }
+        },
+        {
+          "request": 3,
+          "wireModel": "claude-opus-5-5",
+          "topLevelEffort": "xhigh",
+          "inBandAllHistory": [],
+          "inBandForThisRequest": [],
+          "stored": {
+            "id": "claude-opus-5-5",
+            "providerID": "anthropic",
+            "variant": "xhigh"
+          }
+        }
+      ],
+      "xhighIsTopLevelWithNoNewInBandMessage": true,
+      "noVariantChild": [
+        {
+          "request": 1,
+          "asked": "anthropic/claude-sonnet-5-5",
+          "storedVariant": "default",
+          "thinking": {
+            "type": "adaptive",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "inBandAllHistory": [],
+          "inBandForThisRequest": []
+        },
+        {
+          "request": 2,
+          "asked": "anthropic/claude-sonnet-5-5#high",
+          "storedVariant": "high",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "inBandAllHistory": [
+            "high"
+          ],
+          "inBandForThisRequest": [
+            "high"
+          ]
+        }
+      ],
+      "haikuBump": [
+        {
+          "request": 1,
+          "asked": "anthropic/claude-haiku-4-5#high",
+          "storedVariant": "high",
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 16000
+          },
+          "inBandAllHistory": [],
+          "inBandForThisRequest": []
+        },
+        {
+          "request": 2,
+          "asked": "anthropic/claude-haiku-4-5#max",
+          "storedVariant": "max",
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 31999
+          },
+          "inBandAllHistory": [],
+          "inBandForThisRequest": []
+        }
+      ],
+      "haikuInBandPresentOnResume": false,
+      "requestsCarryingEffortInBand": [
+        {
+          "row": "case0 same-model variant bump/2",
+          "topLevelEffort": "low",
+          "inBandForThisRequest": [
+            "high"
+          ]
+        },
+        {
+          "row": "case2 variant bump after switch/1",
+          "topLevelEffort": "low",
+          "inBandForThisRequest": [
+            "high"
+          ]
+        },
+        {
+          "row": "case7 A low, A high, then B xhigh/2",
+          "topLevelEffort": "low",
+          "inBandForThisRequest": [
+            "high"
+          ]
+        },
+        {
+          "row": "case6 no variant, then high/2",
+          "inBandForThisRequest": [
+            "high"
+          ]
+        }
+      ],
+      "modelAndVariantSwitchTogether": [
+        {
+          "wireModel": "claude-sonnet-5-5",
+          "topLevelEffort": "low",
+          "inBandEfforts": [],
+          "stored": {
+            "id": "claude-sonnet-5-5",
+            "providerID": "anthropic",
+            "variant": "low"
+          }
+        },
+        {
+          "wireModel": "claude-opus-5-5",
+          "topLevelEffort": "high",
+          "inBandEfforts": [],
+          "stored": {
+            "id": "claude-opus-5-5",
+            "providerID": "anthropic",
+            "variant": "high"
+          }
+        }
+      ],
+      "effortLostOnModelAndVariantSwitch": false
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef06235bfffeHXrsEeAauEPjDL",
+        "ses_ef06236e7ffeAt7EadRZ54QYhN",
+        "ses_ef06238b2ffepk0oeMYImoDKsZ",
+        "ses_ef062395effe7HGKq5vzg3kU7l",
+        "ses_ef0623a7dffeZjTXm8b2gz5ltp",
+        "ses_ef0623c90ffeLXkZjWjLxEph82",
+        "ses_ef0623e11ffehEV5SOCGlPpY80",
+        "ses_ef0623e3dffeCHKRo1pHsqChsX"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: wire model claude-sonnet-5-5->claude-opus-5-5->claude-opus-5-5 (stored claude-sonnet-5-5->claude-opus-5-5); effective effort by core request [low, high, low, low, high, low, high, high] vs stored variants [low, high, low, low, high, low, high, high]; fresh child top-level effort high; A low->A high->B xhigh: final top-level xhigh, in-band for that request []",
+  "notes": [
+    "Top-level output_config.effort did not change on a same-model variant bump (the S2 observation is confirmed); the bump is delivered in-band, see derived.requestsCarryingEffortInBand.",
+    "In-band effort for the request itself: case0 same-model variant bump/2 top-level low + in-band [\"high\"]; case2 variant bump after switch/1 top-level low + in-band [\"high\"]; case7 A low, A high, then B xhigh/2 top-level low + in-band [\"high\"]; case6 no variant, then high/2 top-level undefined + in-band [\"high\"]. The effort change travels as a {\"role\":\"system\",\"output_config\":{\"effort\":...}} message inside the request messages, not in the top-level output_config.effort. Host source: session/runner/to-llm-message.ts modelSwitched() emits Message.effort({effort, previous}) only when the model id is unchanged.",
+    "Haiku (high->max): top-level effort undefined->undefined; in-band effort for the resumed request []; top-level thinking {\"type\":\"enabled\",\"budget_tokens\":16000} -> {\"type\":\"enabled\",\"budget_tokens\":31999}; output_config  -> .",
+    "CAVEAT: the in-band {role:system, output_config:{effort}} message is how the host LOWERS an effort change for the Anthropic Messages protocol. It was observed against a scripted provider only; whether api.anthropic.com honours it was NOT verified. The host emits it only for same-model changes (to-llm-message.ts modelSwitched) and, per the host source, only for models that support effort updates: see the haiku case in S2b."
+  ]
+}

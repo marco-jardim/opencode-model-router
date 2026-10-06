@@ -1,0 +1,65 @@
+{
+  "spike": "cleanup",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:33.834Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "After every spike swept its sessions, each scripted host has no session left, and tearing it down (taskkill /T /F on Windows) leaves its port closed.",
+  "observed": {
+    "hosts": [
+      {
+        "host": "main",
+        "started": true,
+        "remainingSessions": [],
+        "teardown": {
+          "pid": 71120,
+          "method": "taskkill /PID <pid> /T /F",
+          "taskkill": {
+            "status": 0,
+            "killedPids": [
+              74552,
+              71120,
+              69188,
+              74940
+            ],
+            "stderr": ""
+          },
+          "exitCode": 1,
+          "hostPort": 14931,
+          "hostPortClosed": true,
+          "providerStopped": true
+        }
+      },
+      {
+        "host": "native",
+        "started": true,
+        "remainingSessions": [],
+        "teardown": {
+          "pid": 80972,
+          "method": "taskkill /PID <pid> /T /F",
+          "taskkill": {
+            "status": 0,
+            "killedPids": [
+              48984,
+              80972,
+              61188,
+              74940
+            ],
+            "stderr": ""
+          },
+          "exitCode": 1,
+          "hostPort": 14946,
+          "hostPortClosed": true,
+          "providerStopped": true
+        }
+      }
+    ]
+  },
+  "assertionResult": "PASS: main: 0 session(s) remain; taskkill /PID <pid> /T /F (exit 1); port 14931 closed=true; provider stopped=true | native: 0 session(s) remain; taskkill /PID <pid> /T /F (exit 1); port 14946 closed=true; provider stopped=true",
+  "notes": []
+}
