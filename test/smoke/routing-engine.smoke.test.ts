@@ -142,7 +142,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       // ---- handoffs (phase-2.2/2.3 "to 3.2"): host events and tool hooks, read from the same host ----
       const firstRoot = (await host.client.session.list()).data.find(r => !r.parentID)!;
       const firstChild = (await host.client.session.list({ parentID: firstRoot.id })).data[0]!;
-      await runScenario("H1-events-and-hooks-enforce-host", "Host events for a subagent child: session.created carries parentID/agent/title; session.execution.* events carry an id and are delivered for the child before the tool call returns; the plugin's execute.before hook ran for the model-emitted subagent call.", async s => {
+      await runScenario("H1-events-and-hooks-enforce-host", "Host events for a subagent child: session.created carries parentID/agent/title; session.execution.* events carry an id (verified) and their delivery to the plugin was OBSERVED before the probe's execute.after hook of the same call: one sample per run, a few tens of ms, not a bound the plugin relies on (the runner waits up to 1 s for the end and starts fresh otherwise); the plugin's execute.before hook ran for the model-emitted subagent call.", async s => {
         const events = await host.eventsOf(firstChild.id);
         const created = (await host.events()).filter(e => e.type === "session.created" && obj(e.data).sessionID === firstChild.id);
         const execution = events.filter(e => e.type.startsWith("session.execution"));
@@ -156,9 +156,9 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const createdData = obj(created[0]?.data);
         const ended = execution.filter(e => /succeeded|failed|interrupted|ended/.test(e.type));
         const ok = created.length === 1 && createdData.parentID === firstRoot.id && createdData.agent === "fast" && createdData.title === "Find usages"
-          && execution.length >= 2 && execution.every(e => typeof e.id === "string" && e.id !== "") && ended.length >= 1 && ended.every(e => (e.__t ?? Infinity) <= afterT + 1000)
+          && execution.length >= 2 && execution.every(e => typeof e.id === "string" && e.id !== "") && ended.length >= 1 && ended.every(e => (e.__t ?? Infinity) <= afterT) // observed, one sample per run: delivered before the probe's own after-hook (no slack: the old +1000 ms made this vacuous)
           && hooks.some(h => h.hook === "before") && hooks.some(h => h.hook === "after");
-        s.verdict(ok, `session.created data keys=${Object.keys(createdData).join(",")} parentID=${String(createdData.parentID)} agent=${String(createdData.agent)} title=${String(createdData.title)}; execution events ${execution.map(e => e.type).join(",")} ids present=${execution.every(e => typeof e.id === "string")}; end delivered ${ended.map(e => (e.__t ?? 0) - afterT).join(",")} ms vs the tool return`);
+        s.verdict(ok, `session.created data keys=${Object.keys(createdData).join(",")} parentID=${String(createdData.parentID)} agent=${String(createdData.agent)} title=${String(createdData.title)}; execution events ${execution.map(e => e.type).join(",")} ids present=${execution.every(e => typeof e.id === "string")}; end observed ${ended.map(e => (e.__t ?? 0) - afterT).join(",")} ms before the probe's after-hook (one sample)`);
       });
       await runScenario("H2-tool-hooks-per-instance", "With a second live plugin instance (the server base-configuration location made live) the host delivers EVENTS to every instance but the TOOL HOOKS of a call only to the instance of the session's location (open question of 2.2 R2-2); the router acts once per call (one decision row per dispatch, A3), from a session of either location.", async s => {
         const base = await host.makeBaseLocationLive();
@@ -180,6 +180,14 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         await new Promise(resolve => setTimeout(resolve, 3_000)); // late duplicates, if any
         const rowsFinal = await host.decisionRows();
         const baseChild = await host.client.session.get({ sessionID: fromBase.childID });
+        // each of the three fast children (scenario 3's, this one and the base-location one) is ONE attempt in the store, and its tokens were added once although two instances saw its step events
+        const firstHostChild = await host.client.session.get({ sessionID: firstChild.id });
+        const hostInputTotal = [firstHostChild, child, baseChild].reduce((sum, c) => sum + (c.tokens?.input ?? 0), 0);
+        const keyed = await host.waitForEntries("three fast attempts folded", e => (e[key.searchFast]?.cost.tokens.n ?? 0) >= 3);
+        await new Promise(resolve => setTimeout(resolve, 3_000)); // a late duplicate, if any
+        const keyedFinal = await host.outcomeEntries();
+        const fastCost = keyedFinal[key.searchFast]?.cost;
+        s.observed.storeCountedOnce = { fastAttempts: fastCost?.tokens.n, fastInputMeanTimesN: fastCost === undefined ? undefined : Math.round(fastCost.tokens.input * fastCost.tokens.n), hostChildrenInputTotal: hostInputTotal, heavyAttempts: keyedFinal[key.searchHeavy]?.cost.tokens.n, firstSnapshotN: keyed[key.searchFast]?.cost.tokens.n };
         s.observed.baseLocation = base;
         s.observed.liveLocations = await host.client.debug.location.list();
         s.observed.projectSession = { rootID, beforeHookInstances: iidsBefore, afterHookInstances: iidsAfter, hookInstanceDirectories: [...new Set(hooks.map(h => h.instance))] };
@@ -190,8 +198,9 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         s.observed.hostChild = { agent: child.agent, model: child.model };
         s.observed.routerLogLines = host.routerLogLines();
         const ok = iidsBefore.length === 1 && iidsAfter.length === 1 && new Set(raw.map(e => e.__iid)).size >= 2 && new Set(raw.map(e => e.id)).size === 1
-          && baseIids.length === 1 && baseIids[0] !== iidsBefore[0] && rowsFinal.length === rows0 + 2 && child.agent === "fast" && baseChild.agent === "fast" && host.routerLogLines().length === 0;
-        s.verdict(ok, `execute.before delivered to ${iidsBefore.length} of 2 instances (after: ${iidsAfter.length}); step.ended delivered to ${new Set(raw.map(e => e.__iid)).size} instance(s) with ${new Set(raw.map(e => e.id)).size} event id; from the base-location session the hook went to a different single instance (${baseIids.length}); rows ${rows0} -> ${rowsFinal.length} for two dispatches; both children fast`);
+          && baseIids.length === 1 && baseIids[0] !== iidsBefore[0] && rowsFinal.length === rows0 + 2 && child.agent === "fast" && baseChild.agent === "fast" && host.routerLogLines().length === 0
+          && fastCost?.tokens.n === 3 && Math.abs(fastCost.tokens.input * fastCost.tokens.n - hostInputTotal) < 1 && keyedFinal[key.searchHeavy]?.cost.tokens.n === 0;
+        s.verdict(ok, `execute.before delivered to ${iidsBefore.length} of 2 instances (after: ${iidsAfter.length}); step.ended delivered to ${new Set(raw.map(e => e.__iid)).size} instance(s) with ${new Set(raw.map(e => e.id)).size} event id; from the base-location session the hook went to a different single instance (${baseIids.length}); rows ${rows0} -> ${rowsFinal.length} for two dispatches; both children fast; store: fast key ${fastCost?.tokens.n} attempts, input ${fastCost === undefined ? "?" : Math.round(fastCost.tokens.input * fastCost.tokens.n)} = the hosts' ${hostInputTotal} (counted once), heavy key ${keyedFinal[key.searchHeavy]?.cost.tokens.n} attempts`);
       });    } finally {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
@@ -391,7 +400,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         s.observed.hostErrorLines = host.errorLines();
         s.observed.harnessNote = "A custom provider with package @opencode/ai/providers/anthropic-compatible does NOT initialize in the standalone host (\"Cannot find package @opencode/ai\"; only packages a built-in provider uses are bundled); the fixture therefore uses the bundled @opencode/ai/providers/anthropic under a custom provider id.";
         s.observed.routerLogLines = host.routerLogLines();
-        const ok = !/title-model-unset|agents\.title\.model/.test(withHaiku) && /\[saving\] title-model-unset/.test(withoutSmall) && /anthropic\/claude-haiku-4-5/.test(withoutSmall) && host.routerLogLines().length === 0 && host.errorLines().length === 0
+        const ok = /Cost doctor/.test(withHaiku) && !/title-model-unset|agents\.title\.model/.test(withHaiku) && /\[saving\] title-model-unset/.test(withoutSmall) && /anthropic\/claude-haiku-4-5/.test(withoutSmall) && host.routerLogLines().length === 0 && host.errorLines().length === 0
           && agents.some(a => a.id === "title" && a.hidden === true && a.model === undefined) && models.some(m => m.id === "claude-haiku-4-5" && m.enabled === true && m.status === "active" && m.family === "claude-haiku" && obj(m.capabilities).tools === true);
         s.verdict(ok, `anthropic session (haiku available): title finding ${/agents\.title\.model/.test(withHaiku)}; smallless session: title finding ${/agents\.title\.model/.test(withoutSmall)}`);
       });
@@ -426,7 +435,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
     }
   }, 300_000);
   it("6 v1 untouched: the files of the existing v1 smoke suite and the smoke:keyless script are byte-identical to the base commit", async () => {
-    await runScenario("6-v1-untouched", "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly the smoke:routing line. The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).", async s => {
+    await runScenario("6-v1-untouched", "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly two lines, `smoke:routing` and the `smoke:v1` alias of `smoke:keyless` (QA-3.2-11). The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).", async s => {
       const git = (...args: string[]) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
       const changed = git("diff", "--name-status", BASE_COMMIT, "--", "test/smoke", "vitest.smoke.config.ts").split(/\r?\n/).filter(Boolean);
       const modified = changed.filter(line => !line.startsWith("A\t"));
@@ -438,7 +447,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       s.observed.packageJsonChangedLines = packageDiff;
       s.observed.v1SuiteFiles = v1Files.map(file => ({ file, changed: git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) !== "" }));
       s.observed.externalRun = "npm run smoke:keyless with OpenCode 1.18.34 first on PATH: 5 files passed, 27 tests passed, 11 skipped (the v2 describes); log in 6-smoke-keyless.log.txt";
-      const ok = modified.length === 0 && packageDiff.length === 1 && packageDiff[0]!.startsWith("+") && packageDiff[0]!.includes("smoke:routing") && v1Files.every(file => git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) === "");
+      const ok = modified.length === 0 && packageDiff.length === 2 && packageDiff.every(line => line.startsWith("+")) && packageDiff.some(line => line.includes("smoke:routing")) && packageDiff.some(line => line.includes("\"smoke:v1\": \"npm run smoke:keyless\"")) && v1Files.every(file => git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) === "");
       s.verdict(ok, `${changed.length} path(s) changed under test/smoke since ${BASE_COMMIT} (all added: ${modified.length === 0}); package.json changed lines: ${packageDiff.join(" | ")}`);
     });
   }, 60_000);
@@ -448,7 +457,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       providers: { openai: { settings: { baseURL: "$BASE_URL", apiKey: "keyless-smoke-fake" } } },
     });
     try {
-      await runScenario("7-openai-responses", "The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.", async s => {
+      await runScenario("7-openai-responses", "(HOST EMISSION ONLY: what the host sends to a scripted Responses provider; acceptance by api.openai.com is not verified.) The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.", async s => {
         const catalog = (await host.client.model.list({ location: { directory: host.project } })).data.filter(m => m.providerID === "openai" && m.enabled);
         const luna = catalog.find(m => m.id === "gpt-6-luna");
         const sol = catalog.find(m => m.id === "gpt-6-sol");
@@ -488,7 +497,9 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const A = rows("A same-model");
         const F = rows("F default");
         const stepsOk = A.map(r => String(r.effective)).join() === "low,high,max" && A.every(r => r.topLevel === "low") && A.slice(1).every(r => r.inBandAllHistory.length > 0)
-          && F.length === 2 && F[1]!.effective === "high" && F[1]!.inBandAllHistory.at(-1) === "high";
+          && F.length === 2 && F[1]!.effective === "high" && F[1]!.inBandAllHistory.at(-1) === "high"
+          // the bare (default) start sends NO reasoning field at all; `{summary: "auto"}` is what the RESUMED request carries
+          && F[0]!.reasoningField === undefined && JSON.stringify(F[1]!.reasoningField) === JSON.stringify({ summary: "auto" });
         const M = rows("M model");
         const R = rows("R1 bare");
         s.observed.derived = {
@@ -497,7 +508,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           modelAndVariantTogether: M.map(r => ({ wireModel: r.wireModel, topLevel: r.topLevel, inBand: r.inBandAllHistory, effective: r.effective })),
           bareModelAfterVariant: R.map(r => ({ storedModel: r.storedModel, topLevel: r.topLevel, inBand: r.inBandAllHistory, effective: r.effective })),
         };
-        s.verdict(stepsOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `same-model luna low->high->max: effective ${A.map(r => String(r.effective)).join("->")} (top-level ${A.map(r => String(r.topLevel)).join("->")}); default->high: ${F.map(r => String(r.effective)).join("->")}; luna low -> sol high: ${M.map(r => String(r.effective)).join("->")}; bare luna after #high: ${R.map(r => String(r.effective)).join("->")} (stored ${R.map(r => r.storedModel).join(" / ")})`);
+        s.verdict(stepsOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `(host emission only) same-model luna low->high->max: effective ${A.map(r => String(r.effective)).join("->")} (top-level ${A.map(r => String(r.topLevel)).join("->")}); default->high: ${F.map(r => String(r.effective)).join("->")}; luna low -> sol high: ${M.map(r => String(r.effective)).join("->")}; bare luna after #high: ${R.map(r => String(r.effective)).join("->")} (stored ${R.map(r => r.storedModel).join(" / ")})`);
       });
     } finally {
       const teardown = await host.stop();
@@ -596,7 +607,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
     };
     const host = await RoutingHost.start("effort", { routing: null, overrides: { presets: { smoke: effortPreset } } });
     try {
-      await runScenario("H7-effort-r1-qa1522-f9", "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy the request carries the TARGET agent's effort once, not the previous agent's, and nothing stacks; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).", async s => {
+      await runScenario("H7-effort-r1-qa1522-f9", "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy -> fast the request carries the TARGET agent's effort once and not the previous agent's: on a same-model switch the top level keeps the previous agent's effort and the target's travels in-band (one entry), on a model change the top level carries it and nothing is in-band; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).", async s => {
         const rootID = await host.newRoot("effort root");
         type Row = { case: string; asked: string; storedModel: string | undefined; storedAgent: string | undefined; catalogModel: string | undefined; wireModel: string | undefined; topLevelEffort: unknown; thinking: unknown; outputConfig: unknown; inBandAllHistory: unknown[]; effective: unknown };
         const table: Row[] = [];
@@ -641,7 +652,9 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const stored = (r: Row) => r.storedModel?.split("#")[1];
         // The two properties the runner needs: the effective effort of every agent-switch request is the TARGET tier's configured effort (low, medium, xhigh, low) and the in-band list never grows past one entry per change.
         const targetEfforts = ["low", "medium", "xhigh", "low"];
-        const effortOk = A.length === 4 && A.every((r, i) => r.effective === targetEfforts[i] || (r.effective === stored(r) && stored(r) === targetEfforts[i]));
+        const effortOk = A.length === 4 && A.every((r, i) => r.effective === targetEfforts[i] || (r.effective === stored(r) && stored(r) === targetEfforts[i]))
+          // the in-band list: nothing on the first request and on the two model changes, exactly one entry (the target's) on the same-model switch
+          && A.map(r => r.inBandAllHistory.join(",")).join("|") === "|medium||" && A.map(r => String(r.topLevelEffort)).join() === "low,low,xhigh,low";
         s.verdict(effortOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `agent switch effective efforts ${A.map(r => String(r.effective)).join("->")} (stored ${A.map(stored).join("->")}); bare sonnet after #low: stored ${R1.map(stored).join("->")} effective ${R1.map(r => String(r.effective)).join("->")}; bare opus after sonnet#low: stored ${R1b.map(stored).join("->")} effective ${R1b.map(r => String(r.effective)).join("->")}; default->high effective ${F9.map(r => String(r.effective)).join("->")}`);
       });
 
@@ -652,7 +665,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         heavy: { ...SMOKE_PRESET.heavy, effort: "xhigh" },
       } } } });
       try {
-        await runScenario("H7b-effort-option-vs-variant", "With medium configured as variant=medium but effort=xhigh, a child started on fast and resumed on medium: the wire shows whether the request follows the agent's effort OPTION (xhigh) or the stored VARIANT (medium), and that the previous agent's option (low) is not carried.", async s => {
+        await runScenario("H7b-effort-option-vs-variant", "MEASUREMENT (the verdict asserts only that the three requests were observed): with medium configured as variant=medium but effort=xhigh, a child started on fast and resumed on medium: the wire shows whether the request follows the agent's effort OPTION (xhigh) or the stored VARIANT (medium), and that the previous agent's option (low) is not carried.", async s => {
           const rootID = await distinct.newRoot("effort root distinct");
           const rows: Obj[] = [];
           const step = async (name: string, call: Obj) => {
@@ -736,7 +749,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
     }
   }, 400_000);
   it("8 live store and live config: nothing of this run reached the user's outcomes store or OpenCode config", async () => {
-    await runScenario("8-live-store-untouched", "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl names a session of this run. The user's config files are unchanged.", async s => {
+    await runScenario("8-live-store-untouched", "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl and no `ses_<id>.scorecard.log` it gained or grew names a session of this run (ids from every host's own session.created events). The user's config files are unchanged.", async s => {
       const before = liveBefore!;
       const after = { store: await listDir(LIVE_STORE), config: await listDir(LIVE_CONFIG) };
       const added = Object.keys(after.store).filter(n => !(n in before.store));
@@ -759,14 +772,18 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           }
         } finally { await handle.close(); }
       }
+      // QA-3.2-2: a `ses_<id>.scorecard.log` the live store gained or grew must not be named after a session this run created (ids come from every host's own session.created events)
+      const scorecardIds = [...added, ...grown].filter(n => /^ses_.+\.scorecard\.log$/.test(n)).map(n => n.replace(/\.scorecard\.log$/, ""));
+      const scorecardsNamingRun = scorecardIds.filter(id => seenSessionIDs.has(id));
       const configChanged = Object.keys(after.config).filter(n => !(n in before.config) || after.config[n]!.size !== before.config[n]!.size || after.config[n]!.mtimeMs !== before.config[n]!.mtimeMs);
       const routerFiles = ["opencode.json", "opencode-model-router.overrides.jsonc", "opencode-model-router.state.json"].filter(n => n in before.config || n in after.config);
       s.observed.snapshotTakenAt = before.at;
       s.observed.liveStore = { dir: "<tmpdir>/opencode-model-router-trajectory", filesBefore: Object.keys(before.store).length, filesAfter: Object.keys(after.store).length, bytesBefore: Object.values(before.store).reduce((n, f) => n + f.size, 0), bytesAfter: Object.values(after.store).reduce((n, f) => n + f.size, 0), added: added.length, addedNonSession, removed, grownFiles: grown.filter(n => !/^ses_/.test(n)), grownSessionFiles: grown.filter(n => /^ses_/.test(n)).length };
+      s.observed.liveScorecards = { addedOrGrown: scorecardIds.length, namingASessionOfThisRun: scorecardsNamingRun.length };
       s.observed.liveDecisionsLog = { appendedRows: appended, rowsNamingASessionOfThisRun: foreignRows, sessionsOfThisRunSeen: seenSessionIDs.size };
       s.observed.liveConfig = { dir: "~/.config/opencode", fileCount: Object.keys(after.config).length, changedSinceSnapshot: configChanged, routerFilesUnchanged: routerFiles.filter(n => !configChanged.includes(n)) };
-      const ok = foreignRows === 0 && seenSessionIDs.size > 0 && routerFiles.every(n => !configChanged.includes(n));
-      s.verdict(ok, `live store ${Object.keys(before.store).length} -> ${Object.keys(after.store).length} files (+${added.length} new, ${added.length - addedNonSession.length} of them ses_ scorecards, non-ses_ new: ${addedNonSession.join(",") || "none"}); ${appended} row(s) appended to the live decisions.jsonl, ${foreignRows} naming a session of this run (${seenSessionIDs.size} seen); config files changed: ${configChanged.join(",") || "none"}`);
+      const ok = foreignRows === 0 && scorecardsNamingRun.length === 0 && seenSessionIDs.size > 0 && routerFiles.every(n => !configChanged.includes(n));
+      s.verdict(ok, `live store ${Object.keys(before.store).length} -> ${Object.keys(after.store).length} files (+${added.length} new, ${added.length - addedNonSession.length} of them ses_ scorecards, non-ses_ new: ${addedNonSession.join(",") || "none"}); ${appended} row(s) appended to the live decisions.jsonl, ${foreignRows} naming a session of this run, ${scorecardIds.length} scorecard(s) added or grown, ${scorecardsNamingRun.length} naming one (${seenSessionIDs.size} sessions of this run seen); config files changed: ${configChanged.join(",") || "none"}`);
     });
   }, 120_000);
 });

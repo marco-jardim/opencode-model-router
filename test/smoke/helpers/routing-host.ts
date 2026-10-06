@@ -81,22 +81,23 @@ export async function waitFor<T>(label: string, probe: () => Promise<T | undefin
   }
 }
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-/** Replaces the user's home path (long, forward-slash and 8.3 short forms) and name in every string. */
-export function redact(value: unknown): unknown {
+/**
+ * Replaces the user's home path (long, forward-slash and 8.3 short forms, each also as it appears inside JSON text: `\\`-escaped and
+ * `\\\\`-escaped, which is how a path inside a string that was itself serialized shows up), the 8.3 short user name and the user name.
+ * Works on the SERIALIZED text, so no spelling survives inside a nested JSON string (QA-3.2-9).
+ */
+export function redactText(text: string): string {
   const home = homedir();
   const shortHome = path.dirname(path.dirname(path.dirname(tmpdir())));
-  const homes = [...new Set([home, home.replaceAll("\\", "/"), shortHome, shortHome.replaceAll("\\", "/")])].filter(h => h.length > 3);
-  const patterns = homes.map(h => new RegExp(escapeRegExp(h), "gi"));
-  const name = new RegExp(escapeRegExp(userInfo().username), "gi");
-  const clean = (text: string) => patterns.reduce((acc, re) => acc.replace(re, "<home>"), text).replace(name, "<user>");
-  const walk = (node: unknown): unknown => {
-    if (typeof node === "string") return clean(node);
-    if (Array.isArray(node)) return node.map(walk);
-    if (node !== null && typeof node === "object") return Object.fromEntries(Object.entries(node).map(([k, v]) => [clean(k), walk(v)]));
-    return node;
-  };
-  return walk(value);
+  const forms = (value: string): string[] => [value, value.replaceAll("\\", "/"), value.replaceAll("\\", "\\\\"), value.replaceAll("\\", "\\\\\\\\")];
+  const homes = [...new Set([home, shortHome].flatMap(forms))].filter(h => h.length > 3).sort((x, y) => y.length - x.length);
+  const names = [...new Set([path.basename(shortHome), userInfo().username].filter(n => n.length > 2))].sort((x, y) => y.length - x.length);
+  let out = text;
+  for (const h of homes) out = out.replace(new RegExp(escapeRegExp(h), "gi"), "<home>");
+  for (const n of names) out = out.replace(new RegExp(escapeRegExp(n), "gi"), "<user>");
+  return out;
 }
+export function redact(value: unknown): unknown { return JSON.parse(redactText(JSON.stringify(value))) as unknown; }
 export function clip(value: unknown, max = 600): unknown {
   if (typeof value === "string") return value.length > max ? `${value.slice(0, max / 2)}...[clipped, ${value.length} chars]` : value;
   if (Array.isArray(value)) return value.map(v => clip(v, max));
@@ -483,6 +484,8 @@ export class RoutingHost {
   private async doStop(): Promise<Teardown> {
     const child = this.child;
     const pid = child?.pid;
+    // Every session id this host ever created, from its own event log (the session list misses children the runner already deleted), plus what it holds now.
+    try { for (const e of await this.rawEvents()) { if (e.type === "session.created") for (const id of [obj(e.data).sessionID, obj(e.data).parentID]) if (typeof id === "string") seenSessionIDs.add(id); } } catch { /* no event log */ }
     if (child && child.exitCode === null) { try { for (const s of await this.everySession()) seenSessionIDs.add(s.id); } catch { /* the host is already gone */ } }
     let method = "none (never started or already exited)";
     let taskkill: Obj | undefined;
@@ -660,7 +663,7 @@ function harnessGitIds(): Obj {
     harnessIds = {
       headSha: git("rev-parse", "HEAD"),
       blobShas: Object.fromEntries(["test/smoke/routing-engine.smoke.test.ts", "test/smoke/helpers/routing-host.ts"].map(f => [f, git("hash-object", f)])),
-      uncommittedChanges: git("status", "--porcelain", "--", "test/smoke").length > 0,
+      uncommittedChanges: git("status", "--porcelain", "--", "src", "test/smoke", "package.json").length > 0,
     };
   } catch (error) { harnessIds = { error: String(error) }; }
   return harnessIds;
