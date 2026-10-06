@@ -1,24 +1,24 @@
 {
   "scenario": "3-enforce",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
-  "recordedAt": "2026-10-06T22:09:28.600Z",
+  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
+  "recordedAt": "2026-10-06T22:22:44.675Z",
   "harness": {
-    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
+    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
       "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
     "uncommittedChanges": false
   },
   "expectation": "engine=enforce: the orchestrator asks for heavy on a search task with no acceptance block; the engine swaps it to fast (sonnet-5-5#low). The CHILD SESSION held by the host has agent fast and model sonnet-5-5 variant low, the provider received that model with effort low, the row says switched=true, and the step record lands under the fast key.",
   "observed": {
-    "rootID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
-    "childID": "ses_eecbcb910ffe41844NRLNgDUCY",
+    "rootID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
+    "childID": "ses_eecb09387ffer9copbFmSJsx0u",
     "hookBeforeInput": {
       "agent": "fast",
       "description": "Find usages",
-      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
+      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
       "background": false,
       "model": "anthropic/claude-sonnet-5-5#low"
     },
@@ -29,7 +29,7 @@
         "providerID": "anthropic",
         "variant": "low"
       },
-      "parentID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
+      "parentID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
       "tokens": {
         "input": 7423,
         "output": 5,
@@ -42,7 +42,7 @@
     },
     "hostListedChildren": [
       {
-        "id": "ses_eecbcb910ffe41844NRLNgDUCY",
+        "id": "ses_eecb09387ffer9copbFmSJsx0u",
         "agent": "fast",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -61,10 +61,10 @@
     ],
     "row": {
       "v": 1,
-      "ts": "2026-10-06T22:08:58.529Z",
-      "sessionID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
+      "ts": "2026-10-06T22:22:14.578Z",
+      "sessionID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
       "kind": "decision",
-      "decisionID": "ses_eecbcbac0ffedLg2O6wHiu5a0d:1791324538528:1",
+      "decisionID": "ses_eecb0950bffeTVBAAFmKm7nQ6d:1791325334577:1",
       "mode": "enforce",
       "childSessionID": null,
       "facts": {
@@ -93,9 +93,9 @@
       "pinned": false,
       "unit": "ratio",
       "costs": {
-        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645402330077312,
-        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737512904,
-        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600270757002,
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645401631555472,
+        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737509036,
+        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.19060018959123,
         "search|host:explore|anthropic/claude-opus-4-7#default": 1.8226999999999998,
         "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
       },

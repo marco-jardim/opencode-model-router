@@ -1,12 +1,12 @@
 {
   "scenario": "H4-runner-hooks-and-execution-events",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
-  "recordedAt": "2026-10-06T22:11:15.968Z",
+  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
+  "recordedAt": "2026-10-06T22:24:28.077Z",
   "harness": {
-    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
+    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
       "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
     "uncommittedChanges": false
@@ -20,15 +20,15 @@
     "subagentHookCount": 0,
     "executionSucceeded": [
       {
-        "id": "evt_11344f99f001xeRPd6rj00i0i6",
-        "deliveredAt": 1791324649894
+        "id": "evt_11351104d0014XXzjad7qxRq4l",
+        "deliveredAt": 1791325442134
       },
       {
-        "id": "evt_11345002d002O3Yf8m6E5V7nRs",
-        "deliveredAt": 1791324651575
+        "id": "evt_1135116e7001AcnSzvcN4AX6Bd",
+        "deliveredAt": 1791325443825
       }
     ],
-    "secondAttemptStartedAt": 1791324651516,
+    "secondAttemptStartedAt": 1791325443758,
     "rowsForProducer": [
       {
         "step": "dispatch",
@@ -52,6 +52,6 @@
       }
     ]
   },
-  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_11344f99f001xeRPd6rj00i0i6,evt_11345002d002O3Yf8m6E5V7nRs delivered 1791324649894,1791324651575 before the resume's model.selected 1791324651516; producer rows 2",
+  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_11351104d0014XXzjad7qxRq4l,evt_1135116e7001AcnSzvcN4AX6Bd delivered 1791325442134,1791325443825 before the resume's model.selected 1791325443758; producer rows 2",
   "notes": []
 }

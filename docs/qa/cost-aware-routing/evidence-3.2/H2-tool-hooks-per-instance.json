@@ -1,58 +1,58 @@
 {
   "scenario": "H2-tool-hooks-per-instance",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
-  "recordedAt": "2026-10-06T22:10:02.468Z",
+  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
+  "recordedAt": "2026-10-06T22:23:18.177Z",
   "harness": {
-    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
+    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
       "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
     "uncommittedChanges": false
   },
   "expectation": "With a second live plugin instance (the server base-configuration location made live) the host delivers EVENTS to every instance but the TOOL HOOKS of a call only to the instance of the session's location (open question of 2.2 R2-2); the router acts once per call (one decision row per dispatch, A3), from a session of either location.",
   "observed": {
-    "baseLocation": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\config\\opencode",
+    "baseLocation": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\config\\opencode",
     "liveLocations": [
       {
-        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project"
+        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project"
       },
       {
-        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\config\\opencode"
+        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\config\\opencode"
       }
     ],
     "projectSession": {
-      "rootID": "ses_eecbc3e13ffePHeeMFOzF6FYjw",
+      "rootID": "ses_eecb01a43ffeF1H9SU1Rv5zIOG",
       "beforeHookInstances": [
-        "b2cxgr"
+        "d8tr4r"
       ],
       "afterHookInstances": [
-        "b2cxgr"
+        "d8tr4r"
       ],
       "hookInstanceDirectories": [
-        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project"
+        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project"
       ]
     },
     "stepEndedLinesPerInstance": [
       {
-        "id": "evt_11343c39500195ZWuKFfOJOp0I",
-        "iid": "b2cxgr",
-        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project"
+        "id": "evt_1134fe6c2001sWXAhvUz2skvsV",
+        "iid": "d8tr4r",
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project"
       },
       {
-        "id": "evt_11343c39500195ZWuKFfOJOp0I",
-        "iid": "l53zog",
-        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\config\\opencode"
+        "id": "evt_1134fe6c2001sWXAhvUz2skvsV",
+        "iid": "8oysyy",
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\config\\opencode"
       }
     ],
     "baseSession": {
-      "rootID": "ses_eecbbcd66ffepnhwSxrY5CLHJg",
+      "rootID": "ses_eecafa8a7ffetnedyOj0e0pIIG",
       "beforeHookInstances": [
-        "l53zog"
+        "8oysyy"
       ],
       "hookInstanceDirectories": [
-        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\config\\opencode"
+        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\config\\opencode"
       ],
       "child": {
         "agent": "fast",
@@ -70,12 +70,12 @@
     },
     "rowsOfTheTwoDispatches": [
       {
-        "sessionID": "ses_eecbc3e13ffePHeeMFOzF6FYjw",
+        "sessionID": "ses_eecb01a43ffeF1H9SU1Rv5zIOG",
         "mode": "enforce",
         "switched": true
       },
       {
-        "sessionID": "ses_eecbbcd66ffepnhwSxrY5CLHJg",
+        "sessionID": "ses_eecafa8a7ffetnedyOj0e0pIIG",
         "mode": "enforce",
         "switched": true
       }
