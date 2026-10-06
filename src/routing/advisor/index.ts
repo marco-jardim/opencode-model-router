@@ -2,11 +2,13 @@
  * Cost doctor (M8, Phase 2.4.2): `runAdvisor`, the `/router` rendering and the throttled notice.
  *
  * The notice is the only part with state, and only when it goes to the orchestrator's context (advise/enforce): then a small JSON
- * file next to the outcome store (D15 directory, `advisor-notice.json`) holds the throttle, the findings the user was last told about and
- * a notice that is waiting for delivery, and a lock file (`advisor-notice.lock`, exclusive create) makes two processes agree on who
- * delivers it. A notice goes out only when the set of notice-worthy findings CHANGED since the last one (a reminder after 7 days), a
+ * file next to the outcome store (D15 directory, `advisor-notice.<project hash>.json`: one per project) holds the throttle, the findings
+ * the user was last told about and a notice that is waiting for delivery, and a lock file (`advisor-notice.<project hash>.lock`,
+ * exclusive create, a stale one taken over by rename) makes two processes agree on who delivers it. A notice goes out only when the
+ * notice-worthy findings contain one the user was not told about yet (a reminder after 7 days; a set that only shrank is not news), a
  * check runs at most once per `routing.advisor.noticeIntervalHours` (never more often than hourly), and a notice produced by one
- * process is delivered by the next one if the first never got to (without new host calls). In log mode (static/shadow) the throttle
+ * process is delivered by the next one if the first never got to, once that process's own check has confirmed that the findings it
+ * was about are still the current ones (otherwise it is dropped). In log mode (static/shadow) the throttle
  * is in memory and NO file is read or written. Nothing runs on OpenCode v1, with `routing.advisor.enabled: false` or `notify: false`,
  * or when the config has no `routing` block at all (§1.2: today's behaviour, no new files, no new log lines). `/router` runs
  * `runAdvisor` on demand and writes nothing.
@@ -16,9 +18,10 @@
  * is not asked again on every turn.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { resolveRouting, type RouterConfig } from "../../router/config";
 import { nodePersistFs, renameWithRetry, resolveOutcomesDir } from "../outcomes/persist";
 import type { PersistFs } from "../outcomes/types";
@@ -204,13 +207,19 @@ export function formatNotice(findings: readonly Finding[]): string | null {
 // Settings
 // ---------------------------------------------------------------------------
 
-export const NOTICE_FILE = "advisor-notice.json";
-export const NOTICE_LOCK_FILE = "advisor-notice.lock";
-const STATE_VERSION = 2;
+/** The state and lock file names of one project: the project directory is part of the name (QA-2.4-R2-5), so projects never share a notice. */
+export function noticeFiles(project: string): { readonly state: string; readonly lock: string } {
+  const normalized = process.platform === "win32" ? resolve(project).toLowerCase() : resolve(project);
+  const id = createHash("sha256").update(normalized).digest("hex").slice(0, 12);
+  return { state: `advisor-notice.${id}.json`, lock: `advisor-notice.${id}.lock` };
+}
+
+const STATE_VERSION = 3;
 /** A check never runs more often than this, whatever the configuration says (QA-2.4-7). */
 export const MIN_INTERVAL_MS = 3_600_000;
 /** An unchanged set of findings is mentioned again after this long at the earliest (QA-2.4-5). */
 export const REMINDER_MS = 7 * 24 * 3_600_000;
+/** A lock younger than this (by its file time, never by what it says) is held by a live process. */
 const LOCK_STALE_MS = 30_000;
 const BUSY_BACKOFF_MS = 30_000;
 const BACKOFF_AFTER_ERROR_MS = 10 * 60_000;
@@ -218,6 +227,8 @@ const BACKOFF_AFTER_ERROR_MS = 10 * 60_000;
 export interface AdvisorSettings {
   /** The D15 directory (`routing.outcomes.path` or the default): the state and lock files live here (context delivery only). */
   readonly dir: string;
+  /** The project directory the notice belongs to: it names the state and lock files, so a notice is never delivered into another project. */
+  readonly project: string;
   /** Time between checks, at least {@link MIN_INTERVAL_MS}. */
   readonly intervalMs: number;
   /** `context`: handed to the orchestrator's next user turn (advise/enforce; persisted); `log`: written to the log (static/shadow; memory only). */
@@ -228,13 +239,18 @@ export interface AdvisorSettings {
  * `null` = the advisor never notifies: v1, `routing.advisor.enabled: false`, `routing.advisor.notify: false`, or no `routing` block at all
  * (today's behaviour, byte for byte: no file, no log line, no host call).
  */
-export function advisorSettings(cfg: RouterConfig, host: "v1" | "v2", env: { tmpdir: string; homedir: string } = { tmpdir: tmpdir(), homedir: homedir() }): AdvisorSettings | null {
+export function advisorSettings(
+  cfg: RouterConfig,
+  host: "v1" | "v2",
+  env: { tmpdir?: string; homedir?: string; project?: string } = {},
+): AdvisorSettings | null {
   if (host !== "v2" || cfg.routing === undefined) return null;
   const routing = resolveRouting(cfg, "v2");
   if (!routing.advisor.enabled || !routing.advisor.notify) return null;
   const hours = routing.advisor.noticeIntervalHours;
   return {
-    dir: resolveOutcomesDir(routing.outcomes.path, env),
+    dir: resolveOutcomesDir(routing.outcomes.path, { tmpdir: env.tmpdir ?? tmpdir(), homedir: env.homedir ?? homedir() }),
+    project: env.project ?? "",
     intervalMs: Math.max(MIN_INTERVAL_MS, Number.isFinite(hours) ? hours * 3_600_000 : 24 * 3_600_000),
     deliver: routing.engine === "advise" || routing.engine === "enforce" ? "context" : "log",
   };
@@ -245,40 +261,50 @@ export function advisorSettings(cfg: RouterConfig, host: "v1" | "v2", env: { tmp
 // ---------------------------------------------------------------------------
 
 export interface NoticeState {
-  readonly version: 2;
+  readonly version: 3;
+  /** The project directory this state is for (also in the file name). */
+  readonly project: string;
   /** ISO time of the last completed check. */
   readonly lastRunAt: string;
   /** ISO time the last notice was delivered, or `null`. */
   readonly lastNoticeAt: string | null;
-  /** The fingerprint of the findings the user was last told about; `null` once a check found nothing worth a notice. */
-  readonly noticedFingerprint: string | null;
-  /** A notice produced and not yet delivered: the next process to take it delivers it. */
+  /** The notice-worthy findings (`id:subject`) the user was last told about, narrowed to those still found at the last check. */
+  readonly noticedKeys: readonly string[];
+  /** A notice produced and not yet delivered: the next process to take it delivers it, once a check has confirmed it is still current. */
   readonly pendingText: string | null;
-  readonly pendingFingerprint: string | null;
+  /** The findings that notice was about. */
+  readonly pendingKeys: readonly string[] | null;
 }
 
 function parseState(text: string): NoticeState | null {
   try {
     const raw: unknown = JSON.parse(text);
-    if (!isRecord(raw) || raw.version !== STATE_VERSION || typeof raw.lastRunAt !== "string" || !Number.isFinite(Date.parse(raw.lastRunAt))) return null;
+    if (!isRecord(raw) || raw.version !== STATE_VERSION || typeof raw.project !== "string") return null;
+    if (typeof raw.lastRunAt !== "string" || !Number.isFinite(Date.parse(raw.lastRunAt))) return null;
     const str = (value: unknown): string | null => (typeof value === "string" ? value : null);
+    const keys = (value: unknown): string[] | null => (Array.isArray(value) && value.every((key) => typeof key === "string") ? (value as string[]) : null);
     return {
       version: STATE_VERSION,
+      project: raw.project,
       lastRunAt: raw.lastRunAt,
       lastNoticeAt: str(raw.lastNoticeAt),
-      noticedFingerprint: str(raw.noticedFingerprint),
+      noticedKeys: keys(raw.noticedKeys) ?? [],
       pendingText: str(raw.pendingText),
-      pendingFingerprint: str(raw.pendingFingerprint),
+      pendingKeys: keys(raw.pendingKeys),
     };
   } catch {
     return null; // not JSON: the caller reports the file as unreadable
   }
 }
 
-/** The notice-worthy findings, as a stable string: the same set always gives the same text, in any order. */
-function fingerprintOf(findings: readonly Finding[]): string {
-  return findings.filter((f) => f.notify).map((f) => `${f.id}:${f.subject}`).sort().join(",");
+/** The notice-worthy findings, as a stable list: the same set always gives the same keys, in any order. */
+function keysOf(findings: readonly Finding[]): string[] {
+  return [...new Set(findings.filter((f) => f.notify).map((f) => `${f.id}:${f.subject}`))].sort();
 }
+
+const sameKeys = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((key, i) => key === b[i]);
+
+const codeOf = (error: unknown): string | null => (isRecord(error) && typeof error.code === "string" ? error.code : null);
 
 /** What the notifier needs of a file system: `PersistFs` plus an exclusive create (the lock). */
 export interface AdvisorFs extends PersistFs {
@@ -294,7 +320,7 @@ export function nodeAdvisorFs(): AdvisorFs {
       try {
         handle = await open(path, "wx");
       } catch (error) {
-        if (isRecord(error) && error.code === "EEXIST") return false;
+        if (codeOf(error) === "EEXIST") return false;
         throw error;
       }
       try {
@@ -323,16 +349,17 @@ export interface AdvisorNotifierDeps {
 
 export interface AdvisorNotifier {
   /**
-   * Cheap and synchronous (call it on every orchestrator turn). Starts a background check when one is due; in log mode the check
-   * logs its notice. Never throws.
+   * Cheap and synchronous (call it on every orchestrator turn). Starts a background check when one is due (or when a notice a previous
+   * process left has still to be confirmed); in log mode the check logs its notice. Never throws.
    */
   poll(): void;
   /** A context notice may be waiting: one is in memory, or the persisted state has not been read yet. Synchronous, no I/O. */
   maybePending(): boolean;
   /**
    * Hand over the pending context notice, once: across processes the one that claims it (under the lock) delivers it, the others get
-   * `null`. Reads the persisted state on its first call, so a notice a previous process left is delivered at the first turn without a
-   * host call. `null` in log mode. Never throws.
+   * `null`. Reads the persisted state on its first call. A notice a previous process left is delivered only after a check of this
+   * process has confirmed that the findings it was about are still the current ones (otherwise it is dropped). `null` in log mode.
+   * Never throws.
    */
   take(): Promise<string | null>;
   /** Resolves when the check in flight (if any) has finished. */
@@ -349,19 +376,29 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
   let blockedUntil = 0;
   let inFlight: Promise<void> | null = null;
   let loaded: Promise<void> | null = null;
-  let pending: { readonly text: string; readonly fingerprint: string } | null = null;
+  /** `verified`: produced by a check of this process, or confirmed by one; a notice read from the state file is not, until then. */
+  let pending: { readonly text: string; readonly keys: readonly string[]; readonly verified: boolean } | null = null;
   /** The pending notice is in the state file (so claiming it under the lock is meaningful). */
   let pendingPersisted = false;
   /** Log mode, memory only: what was last logged and when. */
-  let loggedFingerprint: string | null = null;
+  let loggedKeys: ReadonlySet<string> = new Set();
   let loggedAt = 0;
 
-  const readState = async (dir: string): Promise<{ state: NoticeState | null; failed: boolean }> => {
+  const pathsOf = (settings: AdvisorSettings): { readonly dir: string; readonly project: string; readonly state: string; readonly lock: string } => {
+    const names = noticeFiles(settings.project);
+    return { dir: settings.dir, project: settings.project, state: join(settings.dir, names.state), lock: join(settings.dir, names.lock) };
+  };
+
+  const readState = async (settings: AdvisorSettings): Promise<{ state: NoticeState | null; failed: boolean }> => {
     try {
-      const text = await fs.readText(join(dir, NOTICE_FILE));
+      const text = await fs.readText(pathsOf(settings).state);
       if (text === null) return { state: null, failed: false };
       const state = parseState(text);
       if (state === null) deps.logger.warn("[router] cost doctor: the notice state file is unreadable or of another version; it is rewritten at the next check");
+      else if (state.project !== settings.project) {
+        deps.logger.warn("[router] cost doctor: the notice state file belongs to another project; it is ignored and rewritten at the next check");
+        return { state: null, failed: false };
+      }
       return { state, failed: false };
     } catch (error) {
       deps.logger.warn("[router] cost doctor: could not read the notice state", { error: describeError(error) });
@@ -369,10 +406,10 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
     }
   };
 
-  const writeState = async (dir: string, state: NoticeState): Promise<boolean> => {
+  const writeState = async (settings: AdvisorSettings, state: NoticeState): Promise<boolean> => {
     try {
+      const { dir, state: target } = pathsOf(settings);
       await fs.mkdirp(dir);
-      const target = join(dir, NOTICE_FILE);
       const temp = `${target}.${process.pid}.tmp`;
       await fs.writeDurable(temp, `${JSON.stringify(state)}\n`);
       await renameWithRetry(fs, temp, target, sleep);
@@ -385,22 +422,46 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
 
   /**
    * Run `run` while holding the exclusive lock file, so two processes never decide or deliver at once. `busy` = another process holds a
-   * fresh lock. A lock that cannot be created at all (permissions, read-only disk) is logged and `run` goes ahead without it: the
-   * advisor is best effort, and a duplicate notice beats a lost one.
+   * live lock. A lock is stale only when its FILE TIME is older than {@link LOCK_STALE_MS}: what it says (or that it is still empty, in
+   * the instant between its creation and its first write) never decides that. A stale lock is taken over by renaming it to a name of its
+   * own, which only one process can do; the winner then creates a lock of its own. A lock that cannot be created at all (permissions,
+   * read-only disk) is logged and `run` goes ahead without it: the advisor is best effort, and a duplicate notice beats a lost one.
    */
-  const withLock = async <T>(dir: string, run: () => Promise<T>): Promise<{ status: "ran"; value: T } | { status: "busy" }> => {
-    const lockPath = join(dir, NOTICE_LOCK_FILE);
+  const withLock = async <T>(settings: AdvisorSettings, run: () => Promise<T>): Promise<{ status: "ran"; value: T } | { status: "busy" }> => {
+    const { dir, lock: lockPath } = pathsOf(settings);
     let acquired = false;
     try {
       await fs.mkdirp(dir);
-      for (let attempt = 0; attempt < 2 && !acquired; attempt += 1) {
+      for (let attempt = 0; attempt < 3 && !acquired; attempt += 1) {
         if (await fs.createExclusive(lockPath, String(now()))) {
           acquired = true;
           break;
         }
-        const heldSince = Number(await fs.readText(lockPath));
-        if (Number.isFinite(heldSince) && heldSince > 0 && now() - heldSince < LOCK_STALE_MS) return { status: "busy" };
-        await fs.unlink(lockPath); // stale (a crashed holder) or unreadable: take it over, once
+        const held = await fs.stat(lockPath);
+        if (held === null) continue; // released meanwhile: create it
+        if (now() - held.mtimeMs < LOCK_STALE_MS) return { status: "busy" };
+        const grave = `${lockPath}.stale-${randomUUID()}`;
+        try {
+          await fs.rename(lockPath, grave);
+        } catch (error) {
+          if (codeOf(error) === "ENOENT") continue; // another process took it over first
+          throw error;
+        }
+        // The name we moved may be a live lock a faster process created after our look: put it back when it is not stale after all.
+        const moved = await fs.stat(grave);
+        if (moved !== null && now() - moved.mtimeMs < LOCK_STALE_MS) {
+          try {
+            await fs.rename(grave, lockPath);
+          } catch (error) {
+            deps.logger.warn("[router] cost doctor: could not put back a live lock", { error: describeError(error) });
+          }
+          return { status: "busy" };
+        }
+        try {
+          await fs.unlink(grave);
+        } catch (error) {
+          deps.logger.warn("[router] cost doctor: could not remove a stale notice lock", { error: describeError(error) });
+        }
       }
       if (!acquired) return { status: "busy" };
     } catch (error) {
@@ -419,83 +480,90 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
     }
   };
 
-  /** Context mode: read the persisted state once per process; a notice a previous process left becomes pending. */
+  /** Context mode: read the persisted state once per process; a notice a previous process left becomes pending, unverified. */
   const ensureLoaded = (settings: AdvisorSettings): Promise<void> => {
     loaded ??= (async () => {
-      const { state } = await readState(settings.dir);
+      const { state } = await readState(settings);
       nextDueAt = state === null ? 0 : Date.parse(state.lastRunAt) + settings.intervalMs;
       if (state?.pendingText != null) {
-        pending = { text: state.pendingText, fingerprint: state.pendingFingerprint ?? "" };
+        pending = { text: state.pendingText, keys: state.pendingKeys ?? [], verified: false };
         pendingPersisted = true;
       }
     })();
     return loaded;
   };
 
-  const produce = async (): Promise<{ text: string | null; fingerprint: string }> => {
+  const produce = async (): Promise<{ text: string | null; keys: string[] }> => {
     const { host, catalog } = await deps.gather();
     const findings = runAdvisor(deps.config(), host, catalog, deps.logger);
-    return { text: noticeWorthy(findings) ? formatNotice(findings) : null, fingerprint: fingerprintOf(findings) };
+    return { text: noticeWorthy(findings) ? formatNotice(findings) : null, keys: keysOf(findings) };
   };
 
   const checkContext = async (settings: AdvisorSettings): Promise<void> => {
     await ensureLoaded(settings);
-    if (pending !== null) return; // a notice waits for delivery: no host call
-    if (now() < (nextDueAt ?? 0)) return;
-    const { text, fingerprint } = await produce();
-    const outcome = await withLock(settings.dir, async () => {
+    if (pending?.verified === true) return; // a notice waits for delivery: no host call
+    if (pending === null && now() < (nextDueAt ?? 0)) return;
+    // With a notice left by a previous process this check is not throttled: it is what confirms (or drops) it.
+    const { text, keys } = await produce();
+    const outcome = await withLock(settings, async () => {
       // Decide on the state as it is NOW: another process may have checked or produced a notice meanwhile.
-      const { state: fresh } = await readState(settings.dir);
+      const { state: fresh } = await readState(settings);
       const t = now();
-      if (fresh !== null && fresh.pendingText !== null) {
-        pending = { text: fresh.pendingText, fingerprint: fresh.pendingFingerprint ?? "" };
+      const stored = fresh !== null && fresh.pendingText !== null ? fresh : null;
+      if (stored !== null && stored.pendingText !== null && sameKeys(stored.pendingKeys ?? [], keys)) {
+        // A notice about exactly the findings found now (another process's, or the one a previous process left): current, deliverable.
+        pending = { text: stored.pendingText, keys, verified: true };
         pendingPersisted = true;
+        nextDueAt = Date.parse(stored.lastRunAt) + settings.intervalMs;
+        return;
+      }
+      if (stored === null && fresh !== null && t < Date.parse(fresh.lastRunAt) + settings.intervalMs) {
+        pending = null; // whoever held it has delivered it
         nextDueAt = Date.parse(fresh.lastRunAt) + settings.intervalMs;
         return;
       }
-      if (fresh !== null && t < Date.parse(fresh.lastRunAt) + settings.intervalMs) {
-        nextDueAt = Date.parse(fresh.lastRunAt) + settings.intervalMs;
-        return;
-      }
+      // A stored notice about findings that are not the current ones is dropped here (QA-2.4-R2-5): what follows decides afresh.
       const lastNotice = fresh?.lastNoticeAt == null ? null : Date.parse(fresh.lastNoticeAt);
-      const changed = fingerprint !== (fresh?.noticedFingerprint ?? null);
+      const noticed = new Set(fresh?.noticedKeys ?? []);
+      const hasNew = keys.some((key) => !noticed.has(key));
       const reminder = lastNotice !== null && t - lastNotice >= REMINDER_MS;
-      const notify = text !== null && (changed || reminder);
+      // QA-2.4-R2-6: only a finding not told about yet, or the weekly reminder, is news; a set that merely shrank is not.
+      const notify = text !== null && (hasNew || reminder);
       const next: NoticeState = {
         version: STATE_VERSION,
+        project: settings.project,
         lastRunAt: new Date(t).toISOString(),
         lastNoticeAt: fresh?.lastNoticeAt ?? null,
-        noticedFingerprint: text === null ? null : (fresh?.noticedFingerprint ?? null), // findings gone: a return is a change
+        noticedKeys: keys.filter((key) => noticed.has(key)), // what went away and comes back is news again
         pendingText: notify ? text : null,
-        pendingFingerprint: notify ? fingerprint : null,
+        pendingKeys: notify ? keys : null,
       };
-      const saved = await writeState(settings.dir, next);
+      const saved = await writeState(settings, next);
       nextDueAt = t + settings.intervalMs;
-      if (notify && text !== null) {
-        pending = { text, fingerprint };
-        pendingPersisted = saved;
-      }
+      pending = notify && text !== null ? { text, keys, verified: true } : null;
+      pendingPersisted = notify && saved;
     });
     if (outcome.status === "busy") {
       loaded = null; // read the state again next time: the other process is writing it
+      pending = null;
       blockedUntil = now() + BUSY_BACKOFF_MS;
     }
   };
 
   /** Log mode: the throttle lives in memory only and no file is read or written. */
   const checkLog = async (settings: AdvisorSettings): Promise<void> => {
-    const { text, fingerprint } = await produce();
+    const { text, keys } = await produce();
     const t = now();
     nextDueAt = t + settings.intervalMs;
     if (text === null) {
-      loggedFingerprint = null;
+      loggedKeys = new Set();
       return;
     }
-    if (fingerprint !== loggedFingerprint || t - loggedAt >= REMINDER_MS) {
+    if (keys.some((key) => !loggedKeys.has(key)) || t - loggedAt >= REMINDER_MS) {
       deps.logger.warn(text);
-      loggedFingerprint = fingerprint;
       loggedAt = t;
     }
+    loggedKeys = new Set(keys);
   };
 
   const start = (settings: AdvisorSettings): void => {
@@ -516,8 +584,9 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
       try {
         const settings = deps.settings();
         if (settings === null || inFlight !== null || now() < blockedUntil) return;
-        if (settings.deliver === "context" && pending !== null) return;
-        if (nextDueAt !== null && now() < nextDueAt) return;
+        if (settings.deliver === "context" && pending?.verified === true) return;
+        const confirming = settings.deliver === "context" && pending !== null; // a notice from a previous process, not yet confirmed
+        if (!confirming && nextDueAt !== null && now() < nextDueAt) return;
         start(settings);
       } catch (error) {
         deps.logger.warn("[router] cost doctor: poll failed", { error: describeError(error) });
@@ -539,22 +608,22 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
         if (settings === null || settings.deliver !== "context") return null;
         await ensureLoaded(settings);
         const mine = pending;
-        if (mine === null) return null;
+        if (mine === null || !mine.verified) return null;
         if (!pendingPersisted) {
           pending = null; // it never reached the state file (no coordination possible): deliver it
           return mine.text;
         }
         for (let attempt = 0; attempt < 3; attempt += 1) {
-          const claim = await withLock(settings.dir, async (): Promise<string | null> => {
-            const { state: fresh, failed } = await readState(settings.dir);
+          const claim = await withLock(settings, async (): Promise<string | null> => {
+            const { state: fresh, failed } = await readState(settings);
             if (failed) return mine.text; // the state cannot be read: no coordination, deliver
             if (fresh === null || fresh.pendingText === null) return null; // another process delivered it
-            await writeState(settings.dir, {
+            await writeState(settings, {
               ...fresh,
               lastNoticeAt: new Date(now()).toISOString(),
-              noticedFingerprint: fresh.pendingFingerprint ?? fresh.noticedFingerprint,
+              noticedKeys: fresh.pendingKeys ?? fresh.noticedKeys,
               pendingText: null,
-              pendingFingerprint: null,
+              pendingKeys: null,
             });
             return fresh.pendingText;
           });

@@ -17,7 +17,7 @@ import { invalidateConfigCache, loadConfig, overridePath, routerStatusLines, val
 import { DECISIONS_FILE, acquireOutcomes, makeKey } from "../../src/routing/outcomes";
 import type { DecisionRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
-import { advisorSettings, createAdvisorNotifier } from "../../src/routing/advisor";
+import { advisorSettings, createAdvisorNotifier, noticeFiles } from "../../src/routing/advisor";
 import type { AdvisorFs, AdvisorNotifierDeps, AdvisorSettings } from "../../src/routing/advisor";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { buildEscalatePolicy } from "../../src/escalate/ladder";
@@ -92,7 +92,12 @@ const noHost: HostConfigView = { agents: [] };
 const hostWith = (...agents: Array<Record<string, unknown>>): HostConfigView => hostConfigFromAgents(agents);
 /** An anthropic session (priced Sonnet) whose title agent has no model; with CATALOG_CHEAP the host finds no small model for it. */
 const TITLE_HOST = hostConfigFromAgents(
-  [{ id: "title", mode: "primary", hidden: true }, { id: "summary", mode: "primary", hidden: true }],
+  [
+    { id: "title", mode: "primary", hidden: true },
+    { id: "summary", mode: "primary", hidden: true },
+    // the router's own tier agents are there, as on a host the plugin is registered in (a missing one is a finding that notifies: QA-2.4-R2-7)
+    ...["fast", "medium", "heavy"].map((id) => ({ id, mode: "subagent" })),
+  ],
   { providerID: "anthropic", modelID: "claude-sonnet-5-5" },
 );
 const CHEAP = model("x/cheap", { cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }] });
@@ -687,30 +692,44 @@ describe("/router stats and the checkpoint line", () => {
 // The throttled notice (2.4.2; reworked for QA-2.4-5, -6, -7, -8, -10)
 // ---------------------------------------------------------------------------
 
-function memoryFs(files: Map<string, string> = new Map(), options: { failWrites?: boolean; failReads?: boolean } = {}): AdvisorFs & { files: Map<string, string> } {
-  return {
+function memoryFs(
+  files: Map<string, string> = new Map(),
+  options: { failWrites?: boolean; failReads?: boolean } = {},
+): AdvisorFs & { files: Map<string, string>; mtimes: Map<string, number>; clock: { now: number } | null } {
+  /** File times: set when a file is written through this fs (from `clock`, which `notifier` assigns); a seeded file has none (= long ago). */
+  const mtimes = new Map<string, number>();
+  const fs: AdvisorFs & { files: Map<string, string>; mtimes: Map<string, number>; clock: { now: number } | null } = {
     files,
+    mtimes,
+    clock: null,
     async mkdirp() {},
     async readText(path) {
-      if (options.failReads === true && path.endsWith("advisor-notice.json")) throw new Error("disk unreadable");
+      if (options.failReads === true && path.includes("advisor-notice") && path.endsWith(".json")) throw new Error("disk unreadable");
       return files.get(path) ?? null;
     },
     async writeDurable(path, data) {
       if (options.failWrites === true) throw new Error("disk full");
       files.set(path, data);
+      mtimes.set(path, fs.clock?.now ?? 0);
     },
     async appendText(path, data) {
       files.set(path, (files.get(path) ?? "") + data);
     },
     async rename(from, to) {
-      files.set(to, files.get(from) ?? "");
+      const body = files.get(from);
+      if (body === undefined) throw Object.assign(new Error(`ENOENT: ${from}`), { code: "ENOENT" }); // exactly one of two racing renames wins
+      files.set(to, body);
+      mtimes.set(to, mtimes.get(from) ?? 0);
       files.delete(from);
+      mtimes.delete(from);
     },
     async unlink(path) {
       files.delete(path);
+      mtimes.delete(path);
     },
-    async stat() {
-      return null;
+    async stat(path) {
+      const body = files.get(path);
+      return body === undefined ? null : { size: body.length, mtimeMs: mtimes.get(path) ?? 0 };
     },
     async readdir() {
       return [];
@@ -719,31 +738,41 @@ function memoryFs(files: Map<string, string> = new Map(), options: { failWrites?
     async createExclusive(path, data) {
       if (files.has(path)) return false;
       files.set(path, data);
+      mtimes.set(path, fs.clock?.now ?? 0);
       return true;
     },
   };
+  return fs;
 }
-
 const HOUR = 3_600_000;
-const STATE_PATH = join("/state", "advisor-notice.json");
-const LOCK_PATH = join("/state", "advisor-notice.lock");
+const PROJECT = "/work/project";
+const STATE_PATH = join("/state", noticeFiles(PROJECT).state);
+const LOCK_PATH = join("/state", noticeFiles(PROJECT).lock);
 const stateOf = (fs: ReturnType<typeof memoryFs>): Record<string, unknown> => JSON.parse(fs.files.get(STATE_PATH) ?? "null") as Record<string, unknown>;
 
 describe("cost doctor: the throttled notice (context delivery)", () => {
-  const settings = (over: Partial<AdvisorSettings> = {}): AdvisorSettings => ({ dir: "/state", intervalMs: 24 * HOUR, deliver: "context", ...over });
+  const settings = (over: Partial<AdvisorSettings> = {}): AdvisorSettings => ({ dir: "/state", project: PROJECT, intervalMs: 24 * HOUR, deliver: "context", ...over });
   /** One finding that notifies: the title agent has no model and the host finds no small model. */
   const withFinding = async () => ({ host: TITLE_HOST, catalog: CATALOG_CHEAP });
-  /** The same finding plus a second one, so the fingerprint differs. */
+  /** The same finding plus a second one (the host has no `fast` agent: an environment finding that notifies), so the set differs. */
   const withTwoFindings = async () => ({
-    host: TITLE_HOST,
-    catalog: [model(SONNET), model(OPUS, { cost: [{ input: 15, output: 75, cache: { read: 1.5, write: 18 } }] }), CHEAP],
-  });
-  const without = async () => ({ host: noHost, catalog: CATALOG });
+    host: hostConfigFromAgents(
+      [
+        { id: "title", mode: "primary", hidden: true },
+        { id: "summary", mode: "primary", hidden: true },
+        { id: "medium", mode: "subagent" },
+        { id: "heavy", mode: "subagent" },
+      ],
+      { providerID: "anthropic", modelID: "claude-sonnet-5-5" },
+    ),
+    catalog: CATALOG_CHEAP,
+  });  const without = async () => ({ host: noHost, catalog: CATALOG });
   /** A ladder whose catalog matches and carries no effort: only informational findings. */
   const QUIET_CFG = () => cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: {} });
 
   function notifier(fs: ReturnType<typeof memoryFs>, clock: { now: number }, extra: Partial<AdvisorNotifierDeps> = {}) {
     const warn = vi.fn();
+    fs.clock = clock; // the file times of what this notifier writes are the test clock's
     const gather = vi.fn(extra.gather ?? withFinding);
     const instance = createAdvisorNotifier({
       settings: () => settings(),
@@ -772,13 +801,13 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     n.instance.poll();
     await n.instance.settled();
     expect(n.instance.maybePending()).toBe(true);
-    expect(stateOf(fs)).toMatchObject({ version: 2, pendingFingerprint: "title-model-unset:title", lastNoticeAt: null });
+    expect(stateOf(fs)).toMatchObject({ version: 3, project: PROJECT, pendingKeys: ["title-model-unset:title"], lastNoticeAt: null });
     const text = await n.instance.take();
     expect(text).toContain("[model-router] Cost doctor:");
     expect(text).toMatch(/\(\d+ warning, \d+ saving\)/);
     expect(await n.instance.take()).toBeNull(); // exactly once
     expect(n.instance.maybePending()).toBe(false);
-    expect(stateOf(fs)).toMatchObject({ pendingText: null, pendingFingerprint: null, noticedFingerprint: "title-model-unset:title", lastNoticeAt: "2026-10-06T12:00:00.000Z", lastRunAt: "2026-10-06T12:00:00.000Z" });
+    expect(stateOf(fs)).toMatchObject({ pendingText: null, pendingKeys: null, noticedKeys: ["title-model-unset:title"], lastNoticeAt: "2026-10-06T12:00:00.000Z", lastRunAt: "2026-10-06T12:00:00.000Z" });
     expect(fs.files.has(LOCK_PATH)).toBe(false); // the lock is always released
     expect(n.gather).toHaveBeenCalledTimes(1);
   });
@@ -802,7 +831,7 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     const changing = notifier(fs, clock, { gather: withTwoFindings, config: () => cfgOf({ routing: {} }) });
     clock.now += 25 * HOUR;
     const second = await turn(changing);
-    expect(second === null || second.includes("worth a look")).toBe(true);
+    expect(second).not.toBeNull(); // the second finding is news
   });
 
   it("a different notice-worthy set is announced; findings that go away and come back are announced again", async () => {
@@ -814,7 +843,7 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     which = async () => ({ host: TITLE_HOST, catalog: CATALOG }); // no cheaper model any more: the title finding is gone, the effort ones are bundled
     clock.now += 25 * HOUR;
     expect(await turn(n)).toBeNull();
-    expect(stateOf(fs)).toMatchObject({ noticedFingerprint: null }); // cleared: a return is a change
+    expect(stateOf(fs)).toMatchObject({ noticedKeys: [] }); // cleared: a return is a change
     which = withFinding;
     clock.now += 25 * HOUR;
     expect(await turn(n)).not.toBeNull();
@@ -830,7 +859,7 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     expect(restarted.gather).not.toHaveBeenCalled();
   });
 
-  it("QA-2.4-8: a notice a process produced and never delivered is persisted and delivered by the next process at its first turn, without a host call", async () => {
+  it("QA-2.4-8: a notice a process produced and never delivered is persisted, and the next process delivers it once its own check has confirmed it", async () => {
     const fs = memoryFs();
     const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
     const first = notifier(fs, clock);
@@ -840,13 +869,19 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     clock.now += 5 * 60_000;
     const second = notifier(fs, clock);
     expect(second.instance.maybePending()).toBe(true);
-    const text = await second.instance.take(); // the very first turn
-    expect(text).toContain("Cost doctor");
+    expect(await second.instance.take()).toBeNull(); // the very first turn: read from the file, not confirmed
     expect(second.gather).not.toHaveBeenCalled();
-    expect(stateOf(fs)).toMatchObject({ pendingText: null, noticedFingerprint: "title-model-unset:title" });
+    second.instance.poll(); // the confirming check is not throttled by the interval
+    await second.instance.settled();
+    expect(second.gather).toHaveBeenCalledTimes(1);
+    const text = await second.instance.take();
+    expect(text).toContain("Cost doctor");
+    expect(stateOf(fs)).toMatchObject({ pendingText: null, noticedKeys: ["title-model-unset:title"] });
     expect(await notifier(fs, clock).instance.take()).toBeNull();
+    second.instance.poll();
+    await second.instance.settled();
+    expect(second.gather).toHaveBeenCalledTimes(1); // and nothing more is asked of the host
   });
-
   it("QA-2.4-6/10: two processes never both deliver one notice, and never both produce one", async () => {
     const fs = memoryFs();
     const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
@@ -866,13 +901,18 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     await first.instance.settled();
     const c = notifier(fs2, clock);
     const d = notifier(fs2, clock);
-    const raced = await Promise.all([c.instance.take(), d.instance.take()]);
+    c.instance.poll(); // each confirms the notice first
+    d.instance.poll();
+    await Promise.all([c.instance.settled(), d.instance.settled()]);
+    const raced = await Promise.all([c.instance.take(), d.instance.take(), c.instance.take(), d.instance.take()]);
     expect(raced.filter((text) => text !== null)).toHaveLength(1);
+    expect(fs2.files.has(LOCK_PATH)).toBe(false);
   });
 
-  it("a fresh lock held by another process makes this one wait (nothing decided, backed off); a stale or unreadable lock is taken over", async () => {
+  it("a fresh lock held by another process makes this one wait (nothing decided, backed off); a stale one is taken over", async () => {
     const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
     const busy = memoryFs(new Map([[LOCK_PATH, String(clock.now - 1_000)]]));
+    busy.mtimes.set(LOCK_PATH, clock.now - 1_000);
     const n = notifier(busy, clock);
     n.instance.poll();
     await n.instance.settled();
@@ -884,13 +924,181 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     busy.files.delete(LOCK_PATH);
     clock.now += 60_000;
     expect(await turn(n)).not.toBeNull();
-    for (const stale of [String(clock.now - 120_000), "garbage"]) {
-      const fs = memoryFs(new Map([[LOCK_PATH, stale]]));
-      expect(await turn(notifier(fs, clock))).not.toBeNull();
+    // QA-2.4-R2-4: stale = the FILE is older than the minimum age, whatever the body says (a body that looks fresh, garbage, or nothing)
+    for (const body of [String(clock.now), "garbage", ""]) {
+      const fs = memoryFs(new Map([[LOCK_PATH, body]]));
+      fs.mtimes.set(LOCK_PATH, clock.now - 120_000);
+      expect(await turn(notifier(fs, clock)), `body ${JSON.stringify(body)}`).not.toBeNull();
       expect(fs.files.has(LOCK_PATH)).toBe(false);
+      expect([...fs.files.keys()].filter((path) => path.includes(".stale-"))).toEqual([]); // the renamed lock is removed
     }
   });
 
+  it("QA-2.4-R2-4: a fresh lock is never taken over, empty or not: its body says nothing about its age", async () => {
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    for (const body of ["", "0", "garbage", String(clock.now - 3_600_000)]) {
+      const fs = memoryFs(new Map([[LOCK_PATH, body]]));
+      fs.mtimes.set(LOCK_PATH, clock.now - 2_000); // its holder created it two seconds ago and has not written to it yet
+      const rename = vi.spyOn(fs, "rename");
+      const unlink = vi.spyOn(fs, "unlink");
+      const n = notifier(fs, clock);
+      n.instance.poll();
+      await n.instance.settled();
+      expect(fs.files.get(LOCK_PATH), `body ${JSON.stringify(body)}`).toBe(body);
+      expect(rename).not.toHaveBeenCalled();
+      expect(unlink).not.toHaveBeenCalled();
+      expect(fs.files.has(STATE_PATH)).toBe(false); // nothing was decided
+    }
+  });
+
+  it("QA-2.4-R2-4: of two processes finding the same stale lock only one takes it over (by renaming it), and they never both decide", async () => {
+    const fs = memoryFs(new Map([[LOCK_PATH, ""]]));
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    fs.mtimes.set(LOCK_PATH, clock.now - 120_000);
+    const rename = vi.spyOn(fs, "rename");
+    const a = notifier(fs, clock);
+    const b = notifier(fs, clock);
+    a.instance.poll();
+    b.instance.poll();
+    await Promise.all([a.instance.settled(), b.instance.settled()]);
+    const taken = await Promise.all([a.instance.take(), b.instance.take(), a.instance.take(), b.instance.take()]);
+    expect(taken.filter((text) => text !== null)).toHaveLength(1);
+    const graves = rename.mock.calls.filter(([, to]) => String(to).includes(".stale-"));
+    expect(graves.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(graves.map(([, to]) => String(to))).size).toBe(graves.length); // every takeover has a name of its own
+    expect(fs.files.has(LOCK_PATH)).toBe(false);
+    expect([...fs.files.keys()].filter((path) => path.includes(".stale-"))).toEqual([]);
+  });
+
+  it("QA-2.4-R2-4: a lock that turns out to be live after it was renamed is put back, and this process waits", async () => {
+    const fs = memoryFs(new Map([[LOCK_PATH, "held"]]));
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    fs.mtimes.set(LOCK_PATH, clock.now - 120_000);
+    const real = fs.stat.bind(fs);
+    let looks = 0;
+    vi.spyOn(fs, "stat").mockImplementation(async (path) => {
+      looks += 1;
+      if (path === LOCK_PATH) return { size: 4, mtimeMs: clock.now - 120_000 }; // it looked stale…
+      const moved = await real(path);
+      return moved === null ? null : { ...moved, mtimeMs: clock.now - 1_000 }; // …but what was moved is a lock someone refreshed since
+    });
+    const n = notifier(fs, clock);
+    n.instance.poll();
+    await n.instance.settled();
+    expect(looks).toBeGreaterThanOrEqual(2);
+    expect(fs.files.get(LOCK_PATH)).toBe("held"); // back where it was
+    expect([...fs.files.keys()].filter((path) => path.includes(".stale-"))).toEqual([]);
+    expect(fs.files.has(STATE_PATH)).toBe(false);
+  });
+
+  it("QA-2.4-R2-5: the state is per project: two projects over one directory keep their own throttle and notice", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const inProject = (project: string) => notifier(fs, clock, { settings: () => settings({ project }) });
+    const a = inProject("/work/a");
+    const b = inProject("/work/b");
+    expect(noticeFiles("/work/a").state).not.toBe(noticeFiles("/work/b").state);
+    expect(noticeFiles("/work/a").lock).not.toBe(noticeFiles("/work/b").lock);
+    expect(noticeFiles("/work/a")).toEqual(noticeFiles("/work/a"));
+    a.instance.poll();
+    await a.instance.settled();
+    const fileA = join("/state", noticeFiles("/work/a").state);
+    const fileB = join("/state", noticeFiles("/work/b").state);
+    expect(fs.files.has(fileA)).toBe(true);
+    expect(fs.files.has(fileB)).toBe(false);
+    // project A's notice, still pending, is never handed to project B; B has nothing throttled and checks for itself
+    expect(await b.instance.take()).toBeNull();
+    expect(JSON.parse(fs.files.get(fileA)!)).toMatchObject({ project: "/work/a" });
+    expect(await turn(b)).toContain("Cost doctor");
+    expect(JSON.parse(fs.files.get(fileB)!)).toMatchObject({ project: "/work/b", noticedKeys: ["title-model-unset:title"] });
+    expect(await a.instance.take()).toContain("Cost doctor"); // and A still gets its own
+  });
+
+  it("QA-2.4-R2-5: a state file that names another project is ignored and rewritten", async () => {
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const foreign = JSON.stringify({ version: 3, project: "/work/elsewhere", lastRunAt: new Date(clock.now).toISOString(), lastNoticeAt: null, noticedKeys: [], pendingText: "someone else's notice", pendingKeys: ["x:y"] });
+    const fs = memoryFs(new Map([[STATE_PATH, foreign]]));
+    const n = notifier(fs, clock);
+    expect(await n.instance.take()).toBeNull();
+    const text = await turn(n);
+    expect(text).toContain("Cost doctor");
+    expect(text).not.toContain("someone else");
+    expect(n.warn.mock.calls.some(([m]) => String(m).includes("belongs to another project"))).toBe(true);
+    expect(stateOf(fs)).toMatchObject({ project: PROJECT });
+  });
+
+  it("QA-2.4-R2-5: a notice left by a previous process is dropped when the findings it was about are no longer current", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const first = notifier(fs, clock);
+    first.instance.poll();
+    await first.instance.settled();
+    expect(stateOf(fs).pendingKeys).toEqual(["title-model-unset:title"]);
+    clock.now += 5 * 60_000;
+    // the user has fixed what it was about: the check of the next process finds nothing worth a notice
+    const second = notifier(fs, clock, { gather: without });
+    second.instance.poll();
+    await second.instance.settled();
+    expect(await second.instance.take()).toBeNull();
+    expect(stateOf(fs)).toMatchObject({ pendingText: null, pendingKeys: null, noticedKeys: [] });
+    expect(second.instance.maybePending()).toBe(false);
+    expect(await notifier(fs, clock).instance.take()).toBeNull(); // and no later process is handed it either
+    // a notice about DIFFERENT findings replaces it: the new one is delivered, never the old text
+    const fs2 = memoryFs();
+    const old = notifier(fs2, clock);
+    old.instance.poll();
+    await old.instance.settled();
+    const oldText = stateOf(fs2).pendingText as string;
+    const changed = notifier(fs2, clock, { gather: withTwoFindings });
+    changed.instance.poll();
+    await changed.instance.settled();
+    const text = await changed.instance.take();
+    expect(text).not.toBeNull();
+    expect(text).not.toBe(oldText);
+    expect((stateOf(fs2).noticedKeys as string[]).length).toBeGreaterThan(1);
+  });
+
+  it("QA-2.4-R2-6: only a finding not announced yet (or the weekly reminder) notifies; a set that only shrank does not", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    let which: () => Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> = withTwoFindings;
+    const n = notifier(fs, clock, { gather: () => which() });
+    expect(await turn(n)).not.toBeNull();
+    const both = stateOf(fs).noticedKeys as string[];
+    expect(both.length).toBeGreaterThan(1);
+    which = withFinding; // one of the two is fixed: a subset of what the user was told
+    clock.now += 25 * HOUR;
+    expect(await turn(n)).toBeNull();
+    const one = stateOf(fs).noticedKeys as string[];
+    expect(one).toEqual(["title-model-unset:title"]);
+    expect(stateOf(fs)).toMatchObject({ pendingText: null, pendingKeys: null });
+    which = withTwoFindings; // the one that went away is back: news again
+    clock.now += 25 * HOUR;
+    expect(await turn(n)).not.toBeNull();
+    expect(stateOf(fs).noticedKeys).toEqual(both);
+    which = withFinding; // shrinks again, and a week after the last notice the reminder is due even though nothing is new
+    clock.now += 25 * HOUR;
+    expect(await turn(n)).toBeNull();
+    clock.now += 8 * 24 * HOUR;
+    expect(await turn(n)).not.toBeNull();
+    // log mode: the same rule, in memory
+    const log = notifier(memoryFs(), clock, { settings: () => settings({ deliver: "log" }), gather: () => which() });
+    const logged = (): number => log.warn.mock.calls.filter(([m]) => String(m).startsWith("[model-router] Cost doctor:")).length;
+    which = withTwoFindings;
+    log.instance.poll();
+    await log.instance.settled();
+    expect(logged()).toBe(1);
+    which = withFinding;
+    clock.now += 25 * HOUR;
+    log.instance.poll();
+    await log.instance.settled();
+    expect(logged()).toBe(1); // shrunk: not logged again
+    which = withTwoFindings;
+    clock.now += 25 * HOUR;
+    log.instance.poll();
+    await log.instance.settled();
+    expect(logged()).toBe(2); // the finding that came back
+  });
   it("QA-2.4-10: log mode throttles in memory only, reads and writes no file, logs a changed set and a weekly reminder", async () => {
     const fs = memoryFs();
     const read = vi.spyOn(fs, "readText");
@@ -927,7 +1135,7 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
     const quiet = notifier(fs, clock, { gather: without, config: QUIET_CFG });
     expect(await turn(quiet)).toBeNull();
-    expect(stateOf(fs)).toMatchObject({ lastNoticeAt: null, noticedFingerprint: null, pendingText: null });
+    expect(stateOf(fs)).toMatchObject({ lastNoticeAt: null, noticedKeys: [], pendingText: null });
     clock.now += HOUR;
     expect(await turn(quiet)).toBeNull();
     expect(quiet.gather).toHaveBeenCalledTimes(1);
@@ -976,12 +1184,12 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
   });
 
   it("an unreadable state file is reported and treated as absent; a state of another version is rewritten", async () => {
-    for (const content of ["{not json", JSON.stringify({ version: 1, lastRunAt: "2026-10-06T00:00:00Z", lastNoticeAt: null, fingerprint: "" })]) {
+    for (const content of ["{not json", JSON.stringify({ version: 1, lastRunAt: "2026-10-06T00:00:00Z", lastNoticeAt: null, fingerprint: "" }), JSON.stringify({ version: 2, lastRunAt: "2026-10-06T00:00:00Z", lastNoticeAt: null, noticedFingerprint: null, pendingText: "stale", pendingFingerprint: "x" })]) {
       const fs = memoryFs(new Map([[STATE_PATH, content]]));
       const n = notifier(fs, { now: Date.parse("2026-10-06T12:00:00Z") });
       expect(await turn(n)).not.toBeNull();
       expect(n.warn.mock.calls.some(([m]) => String(m).includes("unreadable or of another version"))).toBe(true);
-      expect(stateOf(fs)).toMatchObject({ version: 2 });
+      expect(stateOf(fs)).toMatchObject({ version: 3, project: PROJECT });
     }
     const failing = memoryFs(new Map(), { failReads: true });
     const n = notifier(failing, { now: Date.parse("2026-10-06T12:00:00Z") });
@@ -1028,6 +1236,24 @@ describe("cost doctor: findings on bundled tiers never notify (QA-2.4-5)", () =>
     // still shown in /router, with the reason
     const lines = formatFindings(findings);
     expect(lines.some((l) => l.includes("[warning] variant-effort (medium)") && l.includes("never in a notice"))).toBe(true);
+  });
+
+  it("QA-2.4-R2-7: only the findings about a tier's CONFIGURATION are quiet on an unmodified bundled tier; those about the user's environment notify", () => {
+    // the host offers none of the bundled models, has no tool support on the one it offers, and no agent of the router's tiers
+    const elsewhere = runAdvisor(cfgOf({ preset: "anthropic", routing: {} }), hostWith({ id: "other", mode: "subagent" }), [model("x/other")]);
+    for (const id of ["model-not-in-catalog", "tier-agent-unavailable"] as const) {
+      const found = elsewhere.filter((f) => f.id === id);
+      expect(found.length, id).toBeGreaterThan(0);
+      expect(found.every((f) => !f.bundledTier && f.notify), id).toBe(true);
+    }
+    const noTools = runAdvisor(cfgOf({ preset: "anthropic", routing: {} }), noHost, [model(SONNET, { capabilities: { tools: false, input: ["text"], output: ["text"] } }), model(OPUS)]);
+    expect(noTools.filter((f) => f.id === "no-tool-support").every((f) => !f.bundledTier && f.notify)).toBe(true);
+    expect(find(noTools, "no-tool-support")).toBeDefined();
+    // the configuration findings of the same tiers stay quiet
+    const shape = runAdvisor(cfgOf({ preset: "anthropic", routing: {} }), noHost, CATALOG);
+    for (const f of shape.filter((finding) => ["variant-effort", "rejected-candidates", "foreign-candidates", "covered-tier", "variant-ladder-budget", "effort-not-offered"].includes(finding.id))) {
+      expect(f, f.id).toMatchObject({ bundledTier: true, notify: false });
+    }
   });
 
   it("a tier the user changed notifies again, and so do host findings and findings on the user's own preset", () => {
@@ -1244,7 +1470,7 @@ describe("cost doctor in the plugin", () => {
     expect(parts).toEqual([{ type: "text", text: "again" }]);
     expect(host.synthetic).toHaveLength(1); // handed over once
     expect((await turn(hooks)).some((p) => p.includes("Cost doctor"))).toBe(false); // and the system prompt never carries it
-    await until(() => (existsSync(store) ? readdirSync(store) : []).includes("advisor-notice.json"));
+    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice.") && n.endsWith(".json"))); // one state file per project (QA-2.4-R2-5)
     expect(readdirSync(store).filter((name) => name.endsWith(".lock"))).toEqual([]); // the lock is released
     // a restart: same directory, nothing is due and nothing is pending
     const again = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
@@ -1257,7 +1483,7 @@ describe("cost doctor in the plugin", () => {
     expect(again.host.agentCalls()).toBe(0); // throttled before any host call
   });
 
-  it("QA-2.4-8: a notice a previous process left pending is delivered at the first user message of the next one, without a host call", async () => {
+  it("QA-2.4-8 / R2-5: a notice a previous process left pending is delivered by the next one only after its own check has confirmed it is still current", async () => {
     const first = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
     await turn(first.hooks);
     await until(() => {
@@ -1271,12 +1497,16 @@ describe("cost doctor in the plugin", () => {
     instances.splice(instances.indexOf(first.hooks), 1);
     const second = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
     expect(await userMessage(second.hooks, "root-9", "first message")).toEqual([{ type: "text", text: "first message" }]);
-    await until(() => second.host.synthetic.length > 0);
+    expect(second.host.synthetic).toHaveLength(0); // not yet: it is only a notice from the file until this process has looked at the host itself
+    await turn(second.hooks); // the confirming check runs in the background
+    await until(() => {
+      void userMessage(second.hooks, "root-9", "next message");
+      return second.host.synthetic.length > 0;
+    });
     expect(second.host.synthetic[0]).toMatchObject({ sessionID: "root-9", description: "Model router cost doctor" });
     expect(second.host.synthetic[0]!.text).toContain("Cost doctor");
-    expect(second.host.agentCalls()).toBe(0);
+    expect(second.host.synthetic).toHaveLength(1);
   });
-
   it("a subagent's or a grader's message never takes the notice; the root session still gets it afterwards", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, parents: { "child-1": "root-1" } });
     await turn(hooks);

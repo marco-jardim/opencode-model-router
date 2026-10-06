@@ -581,18 +581,20 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["classifier-model", classifierModel],
 ];
 
-/** The findings whose `subject` is a tier name of the active preset. */
-const TIER_SCOPED: ReadonlySet<FindingId> = new Set<FindingId>([
-  "model-not-in-catalog",
-  "no-tool-support",
-  "variant-not-offered",
-  "effort-not-offered",
+/**
+ * The findings about the SHAPE of a tier's configuration (`subject` is a tier name of the active preset): what the shipped `tiers.json`
+ * defines for that tier is not the user's doing, so while the tier is exactly as shipped these are listed in `/router` and never announced
+ * (QA-2.4-R2-7). The findings about the user's ENVIRONMENT (`model-not-in-catalog`, `no-tool-support`, `variant-not-offered`,
+ * `tier-agent-unavailable`: the model is not offered, has no tools, the agent is not there) are real whoever wrote the tier, so they
+ * always notify.
+ */
+const CONFIG_SHAPE: ReadonlySet<FindingId> = new Set<FindingId>([
   "variant-effort",
   "rejected-candidates",
   "foreign-candidates",
   "covered-tier",
   "variant-ladder-budget",
-  "tier-agent-unavailable",
+  "effort-not-offered",
 ]);
 
 function stable(value: unknown): string {
@@ -603,31 +605,36 @@ function stable(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-let bundledMemo: { readonly config: RouterConfig | null } | undefined;
+/**
+ * The shipped `tiers.json`, validated like any config, read once per loaded config: the memo is keyed by the `RouterConfig` object, and
+ * `loadConfig` hands out a new object on every reload, so a `tiers.json` the plugin update replaced is read again (QA-2.4-R2-11) while
+ * a config in use is not re-read on every check. `null` = unreadable (a tier is then not "bundled").
+ */
+let bundledMemo = new WeakMap<RouterConfig, { readonly config: RouterConfig | null }>();
 
-/** The shipped `tiers.json`, validated like any config; read once per process. `null` = unreadable (a tier is then not "bundled"). */
-function bundledConfig(onError: (check: string, error: unknown) => void): RouterConfig | null {
-  if (bundledMemo === undefined) {
+function bundledConfig(cfg: RouterConfig, onError: (check: string, error: unknown) => void): RouterConfig | null {
+  let memo = bundledMemo.get(cfg);
+  if (memo === undefined) {
     try {
-      bundledMemo = { config: validateConfig(JSON.parse(readFileSync(configPath(), "utf-8"))) };
+      memo = { config: validateConfig(JSON.parse(readFileSync(configPath(), "utf-8"))) };
     } catch (error) {
-      bundledMemo = { config: null };
-      onError("bundled-preset", error); // reported once; every tier then counts as the user's own, so its findings still notify
+      memo = { config: null };
+      onError("bundled-preset", error); // reported once per loaded config; every tier then counts as the user's own, so its findings still notify
     }
+    bundledMemo.set(cfg, memo);
   }
-  return bundledMemo.config;
+  return memo.config;
 }
-
 /** The tier of the ACTIVE preset is exactly what the shipped `tiers.json` defines for that preset and tier (no override touched it). */
 function isUnmodifiedBundledTier(cfg: RouterConfig, tierName: string, onError: (check: string, error: unknown) => void): boolean {
   const live = cfg.presets[cfg.activePreset]?.[tierName];
-  const shipped = bundledConfig(onError)?.presets[cfg.activePreset]?.[tierName];
+  const shipped = bundledConfig(cfg, onError)?.presets[cfg.activePreset]?.[tierName];
   return live !== undefined && shipped !== undefined && stable(live) === stable(shipped);
 }
 
-/** Test seam: forget the memoized shipped config. */
+/** Test seam: forget every memoized shipped config. */
 export function resetBundledConfigMemo(): void {
-  bundledMemo = undefined;
+  bundledMemo = new WeakMap();
 }
 
 /**
@@ -647,7 +654,7 @@ export function runChecks(
   for (const [name, check] of CHECKS) {
     try {
       for (const raw of check(input)) {
-        const bundledTier = TIER_SCOPED.has(raw.id) && isUnmodifiedBundledTier(cfg, raw.subject, onError);
+        const bundledTier = CONFIG_SHAPE.has(raw.id) && isUnmodifiedBundledTier(cfg, raw.subject, onError);
         out.push({
           finding: { ...raw, target: FINDING_TARGET[raw.id], snippetV1: raw.snippetV1 ?? null, bundledTier, notify: raw.severity !== "info" && !bundledTier },
           order: order++,

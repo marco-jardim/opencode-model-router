@@ -579,7 +579,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     };
   };
   const advisorNotifier = ctx.routerHost === "v2"
-    ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2"), config: () => cfg, gather: gatherAdvisorInputs, logger })
+    ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2", { project: projectDir }), config: () => cfg, gather: gatherAdvisorInputs, logger })
     : undefined;
   // `/annotate-plan` (Phase 2.4.4): its own engine runtime (agent list, catalog, classifier backend, outcome store), created on the first use
   // and only on v2; with `routing.engine: static` its `prepare()` answers null before any host call, store or file.
