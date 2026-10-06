@@ -1312,6 +1312,116 @@ describe("round 2 (QA-2.2-R2-1, R2-2, R2-7)", () => {
     });
   });
 });
+describe("instance selection: the session's directory picks the instance, with a fallback (QA-2.2-R2-2)", () => {
+  const sessionIn = (world: World, directory: string): void => {
+    world.session.current = { id: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, permissions: [{ action: "subagent", resource: "*", effect: "allow" }], location: { directory } };
+  };
+  const deliver = async (world: World, order: "in-order" | "reversed" = "in-order") => {
+    const hooks = order === "in-order" ? world.allToolHooks["execute.before"]! : [...world.allToolHooks["execute.before"]!].reverse();
+    const event: any = { tool: "subagent", input: { description: "d", agent: "medium", prompt: IMPLEMENT() }, sessionID: "root", agent: "build", messageID: "m", id: `call-sel-${++seq}` };
+    for (const hook of hooks) await hook(event);
+    return event.input as Record<string, any>;
+  };
+  /** A second plugin instance at `directory`, with its own `agent.list` spy: only the instance that acts asks the host for the agents. */
+  const instanceAt = async (world: World, directory: string, engine?: "static" | "shadow") => {
+    mkdirSync(directory, { recursive: true });
+    if (engine !== undefined) {
+      mkdirSync(join(directory, ".opencode"), { recursive: true });
+      writeFileSync(join(directory, ".opencode", "opencode-model-router.overrides.jsonc"), JSON.stringify({ routing: { engine } }));
+      invalidateConfigCache();
+    }
+    const list = vi.fn(async () => ({ data: Object.values(world.agents) }));
+    const ctx = { ...world.ctx, location: { directory, project: { directory } }, agent: { ...world.ctx.agent, list } };
+    cleanups.push(await registerV2Hooks(ctx as unknown as Context, {} as unknown as Hooks));
+    list.mockClear();
+    return list;
+  };
+  const stripped = "Implement the change in src/a.ts.";
+
+  it("one instance, the session in a subdirectory of its project: routed", async () => {
+    const world = await makeWorld({ engine: "shadow", roles: {} });
+    await world.start();
+    sessionIn(world, join(world.home, "packages", "app", "src"));
+    expect(await deliver(world)).toMatchObject({ prompt: stripped });
+    expect(await world.rows()).toHaveLength(1);
+  });
+
+  it("one instance, a session directory unrelated to it: routed by the fallback, logged once at debug", async () => {
+    const world = await makeWorld({ engine: "shadow", roles: {} });
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    await world.start();
+    sessionIn(world, process.platform === "win32" ? "Z:\\no\\such\\place" : "/no/such/place");
+    expect(await deliver(world)).toMatchObject({ prompt: stripped });
+    expect(await deliver(world)).toMatchObject({ prompt: stripped });
+    expect(await world.rows()).toHaveLength(2);
+    const lines = debug.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("no plugin instance owns the session directory"));
+    expect(lines).toHaveLength(1); // once per directory, not per dispatch
+  });
+
+  it("two live instances, one matching the session's directory exactly: only that one acts (either delivery order)", async () => {
+    for (const order of ["in-order", "reversed"] as const) {
+      const world = await makeWorld({ engine: "shadow", roles: {} });
+      await world.start();
+      const listA = world.ctx.agent.list as ReturnType<typeof vi.fn>;
+      const dirB = join(world.home, "projLive");
+      const listB = await instanceAt(world, dirB);
+      listA.mockClear();
+      sessionIn(world, dirB);
+      expect(await deliver(world, order)).toMatchObject({ prompt: stripped });
+      expect(listB).toHaveBeenCalledTimes(1);
+      expect(listA).not.toHaveBeenCalled();
+      expect(await world.rows()).toHaveLength(1);
+      listB.mockClear();
+      sessionIn(world, world.home);
+      expect(await deliver(world, order)).toMatchObject({ prompt: stripped });
+      expect(listA).toHaveBeenCalledTimes(1);
+      expect(listB).not.toHaveBeenCalled();
+      expect(await world.rows()).toHaveLength(2);
+      await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+      for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true }); }
+    }
+  });
+
+  it("static at the root and shadow at a sub-project: a session in the sub-project (or below it) belongs to the shadow instance; elsewhere in the root to the static one", async () => {
+    const world = await makeWorld({ engine: "static", roles: {} });
+    await world.start(); // the root instance: the global config says static
+    const listRoot = world.ctx.agent.list as ReturnType<typeof vi.fn>;
+    const sub = join(world.home, "sub");
+    const listSub = await instanceAt(world, sub, "shadow");
+    expect(loadConfig(sub).routing?.engine).toBe("shadow");
+    expect(loadConfig(world.home).routing?.engine).toBe("static");
+    listRoot.mockClear();
+    let expectedRows = 0;
+    for (const directory of [sub, join(sub, "deep", "er")]) {
+      sessionIn(world, directory);
+      expect(await deliver(world), `session in ${directory}`).toMatchObject({ prompt: stripped });
+      expect(await world.rows()).toHaveLength(++expectedRows); // the shadow instance acted (the root one is static and could not)
+    }
+    expect(listSub).toHaveBeenCalledTimes(1); // its agent list is cached for the second dispatch
+    expect(listRoot).not.toHaveBeenCalled();
+    // a session elsewhere under the root: the root instance owns it, and it is static
+    sessionIn(world, join(world.home, "other"));
+    expect(await deliver(world)).toMatchObject({ prompt: IMPLEMENT() });
+    expect(await world.rows()).toHaveLength(2);
+  });
+
+  it("a disposed instance no longer owns anything: the remaining one takes its sessions through the fallback", async () => {
+    const world = await makeWorld({ engine: "shadow", roles: {} });
+    await world.start();
+    const listA = world.ctx.agent.list as ReturnType<typeof vi.fn>;
+    const dirB = join(world.home, "gone");
+    mkdirSync(dirB, { recursive: true });
+    const ctxB = { ...world.ctx, location: { directory: dirB, project: { directory: dirB } } };
+    const disposeB = await registerV2Hooks(ctxB as unknown as Context, {} as unknown as Hooks);
+    sessionIn(world, dirB);
+    await disposeB(); // its hooks stay registered in the fake bus, but its directory is no longer owned
+    listA.mockClear();
+    const event: any = { tool: "subagent", input: { description: "d", agent: "medium", prompt: IMPLEMENT() }, sessionID: "root", agent: "build", messageID: "m", id: `call-gone-${++seq}` };
+    await world.allToolHooks["execute.before"]![0]!(event); // instance A's hook
+    expect(event.input).toMatchObject({ prompt: stripped });
+    expect(listA).toHaveBeenCalledTimes(1);
+  });
+});
 describe("latency", () => {
   it("the local routing path stays under 5 ms per dispatch over 100 dispatches (warm catalog and agents)", async () => {
     const world = await makeWorld({ engine: "shadow" });

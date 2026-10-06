@@ -38,6 +38,8 @@ import {
 
 export interface WireLogger {
   warn(message: string, extra?: Record<string, unknown>): void;
+  /** Optional: lines that only matter when someone is looking (the dispatch router's instance-selection fallback). */
+  debug?(message: string, extra?: Record<string, unknown>): void;
 }
 
 export interface RuntimeDeps {

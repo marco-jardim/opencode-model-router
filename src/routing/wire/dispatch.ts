@@ -46,7 +46,7 @@ import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
   type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
-import { resolve as resolvePath } from "node:path";
+import { resolve as resolvePath, sep } from "node:path";
 import {
   FLOOR_LIFT_REASON,
   LOG_ROW_VERSION,
@@ -123,6 +123,8 @@ export interface DispatchRouter {
   pendingCount(): number;
   /** Children registered by a wrong heuristic claim and not yet taken over by their own dispatch (diagnostics, tests). */
   misclaimedCount(): number;
+  /** This instance is gone: it no longer owns any session directory. Idempotent. */
+  dispose(): void;
 }
 
 export interface DispatchRouterDeps {
@@ -174,13 +176,47 @@ interface Entry {
  */
 const handledCalls = new Set<string>();
 
-/** QA-2.2-R2-2: the same directory, whatever the spelling (separators, trailing separator, case on Windows). */
-function sameDirectory(a: string, b: string): boolean {
-  const norm = (value: string): string => {
-    const resolved = resolvePath(value).replace(/[\\/]+$/, "");
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-  };
-  return norm(a) === norm(b);
+/** A directory in comparable form: absolute, no trailing separator, lower case on Windows (separators, spelling and case then compare by value). */
+function normalizeDirectory(value: string): string {
+  const resolved = resolvePath(value).replace(/[\\/]+$/, "");
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isSameOrInside(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
+/**
+ * QA-2.2-R2-2 (and its fallback): every dispatch router of the process, with the directory of its plugin instance (A3: one instance
+ * per location). Which of them acts on a session is decided by the session's directory alone, see `ownsSession`.
+ */
+const liveInstances = new Map<number, string>();
+let instanceSeq = 0;
+/** Directories whose "no instance owns this" fallback was already logged (bounded). */
+const loggedFallbacks = new Set<string>();
+
+/**
+ * Does the instance with directory `mine` act on a session that lives in `sessionDirectory`?
+ *  1. a live instance whose directory IS the session's directory acts (so a static instance of that location is never overridden);
+ *  2. otherwise the live instance whose directory is the deepest ANCESTOR of the session's (a session in a subdirectory of the
+ *     project, or of a sub-project, belongs to the nearest project root);
+ *  3. otherwise (a moved session, a path the host spells differently): the first live instance to claim the call acts, as it did
+ *     before instance selection existed; it is logged once per directory at debug level.
+ * Instances that share a directory both qualify; the claim of the call (A3) lets the first one act.
+ */
+function ownsSession(mine: string, sessionDirectory: string, logger: { debug?: (message: string, extra?: Record<string, unknown>) => void }): boolean {
+  const target = normalizeDirectory(sessionDirectory);
+  const directories = [...liveInstances.values()].map(normalizeDirectory);
+  const own = normalizeDirectory(mine);
+  if (directories.includes(target)) return own === target;
+  const ancestors = directories.filter((directory) => isSameOrInside(directory, target));
+  if (ancestors.length > 0) return own === ancestors.reduce((deepest, directory) => (directory.length > deepest.length ? directory : deepest));
+  if (!loggedFallbacks.has(target)) {
+    loggedFallbacks.add(target);
+    while (loggedFallbacks.size > 64) loggedFallbacks.delete(loggedFallbacks.values().next().value as string);
+    logger.debug?.("[router] routing: no plugin instance owns the session directory; the first live instance acts", { sessionDirectory });
+  }
+  return true;
 }
 
 function claimCall(key: string): boolean {
@@ -193,6 +229,8 @@ function claimCall(key: string): boolean {
 /** Test-only: forget which calls were handled. */
 export function resetDispatchRouting(): void {
   handledCalls.clear();
+  liveInstances.clear();
+  loggedFallbacks.clear();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -282,6 +320,8 @@ function unresolvedChoice(cls: string, agent: string, routerIds: readonly string
 
 export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const now = deps.now ?? (() => Date.now());
+  const instanceID = ++instanceSeq;
+  liveInstances.set(instanceID, deps.directory);
   /** Between `route()` and `commit()`. */
   const decided = new Map<string, Decided>();
   /** Committed dispatches, in insertion order, until their call ends. */
@@ -494,9 +534,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           deps.logger.warn("[router] routing: the dispatching session is unavailable; the dispatch proceeds as the orchestrator chose", { error: describeError(error) });
           return UNTOUCHED;
         }
-        // QA-2.2-R2-2: the session decides which instance acts. A session of another location belongs to that location's instance
-        // (which may be static); only a session that names no directory falls back to the first live instance.
-        if (session.directory !== null && !sameDirectory(session.directory, deps.directory)) return UNTOUCHED;
+        // QA-2.2-R2-2: the session decides which instance acts (exact directory, else the deepest ancestor, else the first live
+        // instance, see `ownsSession`); a session that names no directory also falls to the first live instance.
+        if (session.directory !== null && !ownsSession(deps.directory, session.directory, deps.logger)) return UNTOUCHED;
         if (!claimCall(callKey)) return UNTOUCHED;
         // Only an orchestrator's own prompt is parsed (QA focus: a delegate must not be able to pin or steer).
         if (session.parentID !== null) return UNTOUCHED;
@@ -624,6 +664,10 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     },
 
     misclaimedCount: () => misclaimed.size,
+
+    dispose(): void {
+      liveInstances.delete(instanceID);
+    },
 
     pendingCount(): number {
       const t = now();

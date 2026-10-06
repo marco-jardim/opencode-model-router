@@ -119,7 +119,8 @@ export async function registerV2Hooks(
     logger: ingestLogger,
   });
   const dispatchRouter = createDispatchRouter({
-    runtime: engine, getSession: sessionOf, graderAgent: V2_GRADER_AGENT, directory: ctx.location.directory, logger: ingestLogger,
+    runtime: engine, getSession: sessionOf, graderAgent: V2_GRADER_AGENT, directory: ctx.location.directory,
+    logger: { warn: (message, extra) => ingestLogger.warn(message, extra), debug: (message, extra) => console.debug(message, extra ?? "") },
   });
   const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger });
   let eventTask: Promise<void> | undefined;
@@ -144,6 +145,7 @@ export async function registerV2Hooks(
     await runtime?.dispose?.();
     // Before the event task: disposing releases a step handler that waits for the model catalog (QA-2.1-5).
     await ingest.dispose();
+    dispatchRouter.dispose(); // this location no longer owns its sessions
     await engine.dispose();
     await eventTask;
     await Promise.allSettled(registrations.map((registration) => registration.dispose()));
