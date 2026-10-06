@@ -30,6 +30,18 @@ This directory holds design/implementation plans for `opencode-model-router`.
   - QA reports: [`../qa/depth-and-effort/`](../qa/depth-and-effort/)
     — spike evidence, adversarial findings and phase verification records.
 
+- [`cost-aware-routing-engine-plan.md`](./cost-aware-routing-engine-plan.md)
+  — Cost-Aware Routing Engine (#74, inspired by #73; target `2.3.0`, OpenCode
+  v2 only): typed task facts decided in code, an outcome-calibrated scoreboard
+  per (class × agent × model#variant), an expected-cost decision kernel behind
+  `routing.engine: static | shadow | advise | enforce`, same-session variant
+  bumps before model escalation, and a cost doctor for host-side waste.
+  Decision record: `../adr/0005-cost-aware-routing-engine.md` (written in
+  Phase 3.1). QA reports: `../qa/cost-aware-routing/`.
+  - Handover: [`cost-aware-routing-engine-handover.md`](./cost-aware-routing-engine-handover.md)
+    — kickoff prompt, execution state, planning-session considerations,
+    troubleshooting, and the resume point after every host restart.
+
 ## Related records
 
 - Architecture decision records: [`../adr/`](../adr/)
