@@ -1,0 +1,1026 @@
+{
+  "scenario": "8b-live-store-phase-window",
+  "what": "Read-only before/after snapshot of the user's live outcomes store over the whole Phase 3.2 window. Taken by hand (not by the suite): names and sizes only, and the rows appended to the live decisions.jsonl between the two snapshots. Complements 8-live-store-untouched.json, which is taken by the suite over its own run.",
+  "snapshots": {
+    "before": {
+      "takenAt": "2026-10-06T17:59:03-03:00",
+      "files": 13947,
+      "bytes": 4541243.0,
+      "nameSizeDigest": "3d4ba65e860c90db"
+    },
+    "after": {
+      "takenAt": "2026-10-06T19:26:42-03:00",
+      "files": 13984,
+      "bytes": 4608948.0,
+      "nameSizeDigest": "3a8549c411642e83"
+    }
+  },
+  "removed": [],
+  "addedFiles": {
+    "count": 37,
+    "scorecards": 35,
+    "others": [
+      "advisor-notice.ea0693112b7e.json",
+      "advisor-notice.ea3a792c6ed0.json"
+    ],
+    "list": [
+      {
+        "name": "advisor-notice.ea0693112b7e.json",
+        "sizeAfter": 169
+      },
+      {
+        "name": "advisor-notice.ea3a792c6ed0.json",
+        "sizeAfter": 171
+      },
+      {
+        "name": "ses_eecb1a579ffeHDHGrMlM0p1eBa.scorecard.log",
+        "sizeAfter": 108
+      },
+      {
+        "name": "ses_eecbaf69fffeupj87HkovFn6sK.scorecard.log",
+        "sizeAfter": 127
+      },
+      {
+        "name": "ses_eecc38c16ffe7xZyWIFKa8dHwM.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eecc70061ffe6O2kY9tWaZEr3y.scorecard.log",
+        "sizeAfter": 115
+      },
+      {
+        "name": "ses_eecc8cbb5ffe6qNquasJg2szOl.scorecard.log",
+        "sizeAfter": 254
+      },
+      {
+        "name": "ses_eeccc4597ffevKNKYlGJ4BgjqD.scorecard.log",
+        "sizeAfter": 112
+      },
+      {
+        "name": "ses_eeccc72ffffexcw7994b5a8Mou.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eeccff643ffeOZhXCWvTf7AfFM.scorecard.log",
+        "sizeAfter": 114
+      },
+      {
+        "name": "ses_eecd03f70ffeIIpvHvYKKMkIre.scorecard.log",
+        "sizeAfter": 126
+      },
+      {
+        "name": "ses_eecd1b61affe8xceshOuP5nmxH.scorecard.log",
+        "sizeAfter": 120
+      },
+      {
+        "name": "ses_eecd21fcfffeMu8KPaAzHESY50.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eecd353b2ffeAQqbGTKMwekGk0.scorecard.log",
+        "sizeAfter": 112
+      },
+      {
+        "name": "ses_eecd36296ffe208NbLjxlO7Qwp.scorecard.log",
+        "sizeAfter": 112
+      },
+      {
+        "name": "ses_eecdab18cffehW1rKR9gh0FGuc.scorecard.log",
+        "sizeAfter": 121
+      },
+      {
+        "name": "ses_eecdae13fffesxZQTlYN2Xn4Fs.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eece0baf4ffeQupR9t2RwQaFUj.scorecard.log",
+        "sizeAfter": 126
+      },
+      {
+        "name": "ses_eece0decfffe5tK5yBLd1xF0aM.scorecard.log",
+        "sizeAfter": 119
+      },
+      {
+        "name": "ses_eece106eeffevnzTP43bZPKtS6.scorecard.log",
+        "sizeAfter": 377
+      },
+      {
+        "name": "ses_eece80c45ffeoJbX8GqV7K4gF8.scorecard.log",
+        "sizeAfter": 112
+      },
+      {
+        "name": "ses_eece82f53ffemFGChAeHrteiv2.scorecard.log",
+        "sizeAfter": 121
+      },
+      {
+        "name": "ses_eececb730ffeOxT1ZHT1z6TZ9E.scorecard.log",
+        "sizeAfter": 125
+      },
+      {
+        "name": "ses_eececce73ffezaWCDsyK4Yc4co.scorecard.log",
+        "sizeAfter": 108
+      },
+      {
+        "name": "ses_eecf2cb04ffepeSp7tyjHPVcCt.scorecard.log",
+        "sizeAfter": 108
+      },
+      {
+        "name": "ses_eecf32765ffeEsKha4y6KxY3xg.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eecf34adcffe9wyHXZDWwHl1rq.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eecf39427ffeTN3LcGJrk096M9.scorecard.log",
+        "sizeAfter": 122
+      },
+      {
+        "name": "ses_eecf43f81ffeRpwT63YFCD30L3.scorecard.log",
+        "sizeAfter": 113
+      },
+      {
+        "name": "ses_eecf461cfffegMCSIdej6xRPPx.scorecard.log",
+        "sizeAfter": 114
+      },
+      {
+        "name": "ses_eecf92dd6ffeZbf9G06N8taEpH.scorecard.log",
+        "sizeAfter": 392
+      },
+      {
+        "name": "ses_eecf94510ffege9feJs5qqxXC4.scorecard.log",
+        "sizeAfter": 125
+      },
+      {
+        "name": "ses_eecf9acf7ffeCBR0NqwJ65Zeqv.scorecard.log",
+        "sizeAfter": 122
+      },
+      {
+        "name": "ses_eecfa0d91ffe1MkrmfbnPx3w9N.scorecard.log",
+        "sizeAfter": 112
+      },
+      {
+        "name": "ses_eed024c94ffeioJFLMbF6vaqI6.scorecard.log",
+        "sizeAfter": 125
+      },
+      {
+        "name": "ses_eed02d357ffeI6JbqM9B1u0yYY.scorecard.log",
+        "sizeAfter": 380
+      },
+      {
+        "name": "ses_eed1341b3ffeLL8RWcbzaU8q48.scorecard.log",
+        "sizeAfter": 124
+      }
+    ]
+  },
+  "changedExistingFiles": [
+    {
+      "name": "decisions.jsonl",
+      "sizeBefore": 137193,
+      "sizeAfter": 197986
+    },
+    {
+      "name": "outcomes.json",
+      "sizeBefore": 6541,
+      "sizeAfter": 7568
+    },
+    {
+      "name": "ses_eed02c68effe2hUQADT2btSMI0.scorecard.log",
+      "sizeBefore": 127,
+      "sizeAfter": 381
+    },
+    {
+      "name": "ses_eed10fba7ffeR0CNi3jebIFOVL.scorecard.log",
+      "sizeBefore": 253,
+      "sizeAfter": 520
+    }
+  ],
+  "advisorNoticeFilesAdded": [
+    {
+      "name": "advisor-notice.ea0693112b7e.json",
+      "project": "D:\\git\\agent-city-frontend",
+      "lastRunAt": "2026-10-06T21:45:22.436Z"
+    },
+    {
+      "name": "advisor-notice.ea3a792c6ed0.json",
+      "project": "D:\\git\\opencode-model-router",
+      "lastRunAt": "2026-10-06T22:13:30.245Z"
+    }
+  ],
+  "decisionsLog": {
+    "bytesBefore": 137193,
+    "bytesAfter": 197986,
+    "appendedRows": 48,
+    "sessions": [
+      {
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "rows": 7,
+        "modes": [
+          "advise"
+        ],
+        "kinds": [
+          "decision",
+          "verdict"
+        ],
+        "firstTs": "2026-10-06T21:45:35.614Z",
+        "lastTs": "2026-10-06T22:14:48.226Z",
+        "keys": [
+          "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "mechanical|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "recon|router:fast|openai/gpt-6-luna-fast#medium"
+        ]
+      },
+      {
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "rows": 27,
+        "modes": [
+          "advise"
+        ],
+        "kinds": [
+          "decision",
+          "verdict"
+        ],
+        "firstTs": "2026-10-06T21:01:37.182Z",
+        "lastTs": "2026-10-06T21:57:44.434Z",
+        "keys": [
+          "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "design|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "mechanical|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+          "review|router:medium|anthropic/claude-sonnet-5-5#xhigh"
+        ]
+      },
+      {
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "rows": 7,
+        "modes": [
+          "advise"
+        ],
+        "kinds": [
+          "decision"
+        ],
+        "firstTs": "2026-10-06T21:08:10.355Z",
+        "lastTs": "2026-10-06T21:55:46.315Z",
+        "keys": [
+          "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+          "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "review|router:heavy|anthropic/claude-opus-5-5#xhigh"
+        ]
+      },
+      {
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "rows": 7,
+        "modes": [
+          "advise"
+        ],
+        "kinds": [
+          "decision",
+          "verdict"
+        ],
+        "firstTs": "2026-10-06T21:02:49.841Z",
+        "lastTs": "2026-10-06T22:16:57.095Z",
+        "keys": [
+          "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+          "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+          "review|router:medium|anthropic/claude-sonnet-5-5#xhigh"
+        ]
+      }
+    ],
+    "rows": [
+      {
+        "ts": "2026-10-06T21:01:37.182Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eed024c94ffeioJFLMbF6vaqI6",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "unverifiable",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T21:01:58.031Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:02:23.438Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "implement",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:02:55.657Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "implement",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:02:49.841Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "design",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:02:53.324Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed02d357ffeI6JbqM9B1u0yYY",
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:08:10.355Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:class-confidence"
+      },
+      {
+        "ts": "2026-10-06T21:08:19.217Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T21:08:23.831Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eecf9acf7ffeCBR0NqwJ65Zeqv",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "pass",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T21:09:02.974Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "implement",
+        "resume": false,
+        "reasonHead": "kept:margin"
+      },
+      {
+        "ts": "2026-10-06T21:09:13.725Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eecf92dd6ffeZbf9G06N8taEpH",
+        "chosenKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "debug",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:09:21.874Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:09:30.832Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:10:04.114Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eecf39427ffeTN3LcGJrk096M9",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "pass",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T21:16:28.28Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "design",
+        "resume": false,
+        "reasonHead": "kept:class-confidence"
+      },
+      {
+        "ts": "2026-10-06T21:21:29.695Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:21:38.712Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:27:04.669Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eed02d357ffeI6JbqM9B1u0yYY",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "fail",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T21:27:28.188Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed10fba7ffeR0CNi3jebIFOVL",
+        "chosenKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "debug",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:27:32.92Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed02d357ffeI6JbqM9B1u0yYY",
+        "chosenKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "debug",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:29:18.802Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "implement",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:29:29.201Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:29:38.325Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:35:50.719Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed02c68effe2hUQADT2btSMI0",
+        "chosenKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:36:01.676Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:36:13.947Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:43:55.041Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eece106eeffevnzTP43bZPKtS6",
+        "chosenKey": "design|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "design|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "design",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:44:16.671Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T21:44:05.091Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eecf92dd6ffeZbf9G06N8taEpH",
+        "chosenKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:44:12.976Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:45:35.614Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:fast|openai/gpt-6-luna-fast#medium",
+        "bestKey": "recon|router:fast|openai/gpt-6-luna-fast#medium",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T21:46:02.381Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:fast|openai/gpt-6-luna-fast#medium",
+        "bestKey": "recon|router:fast|openai/gpt-6-luna-fast#medium",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T21:47:37.811Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "implement",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:47:56.619Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T21:51:39.187Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed02c68effe2hUQADT2btSMI0",
+        "chosenKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:51:47.443Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:evidence"
+      },
+      {
+        "ts": "2026-10-06T21:51:59.03Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "review|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T21:53:09.396Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eed02c68effe2hUQADT2btSMI0",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "pass",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T21:55:33.842Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "bestKey": "design|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "design",
+        "resume": false,
+        "reasonHead": "kept:class-confidence"
+      },
+      {
+        "ts": "2026-10-06T21:55:46.315Z",
+        "sessionID": "ses_ef099b1e0ffe7BcoD9Trb0TpTm",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T21:56:12.756Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eecd03f70ffeIIpvHvYKKMkIre",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "pass",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T21:57:29.104Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eece106eeffevnzTP43bZPKtS6",
+        "chosenKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "debug|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "debug",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T21:57:44.434Z",
+        "sessionID": "ses_eed11db93ffeA4vnt4UjKyZKIY",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "mechanical|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "mechanical|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "mechanical",
+        "resume": false,
+        "reasonHead": "kept:best-is-chosen"
+      },
+      {
+        "ts": "2026-10-06T22:01:30.876Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "mechanical|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "mechanical|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "mechanical",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T22:10:53.494Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": null,
+        "chosenKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "implement",
+        "resume": false,
+        "reasonHead": "kept:pinned"
+      },
+      {
+        "ts": "2026-10-06T22:14:48.226Z",
+        "sessionID": "ses_eecd25670ffenVMhGqkOpaOOvT",
+        "kind": "verdict",
+        "mode": null,
+        "step": "dispatch",
+        "childSessionID": "ses_eecbaf69fffeupj87HkovFn6sK",
+        "chosenKey": null,
+        "bestKey": null,
+        "key": "implement|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "verdict": "pass",
+        "class": null,
+        "resume": null,
+        "reasonHead": null
+      },
+      {
+        "ts": "2026-10-06T22:16:53.58Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed10fba7ffeR0CNi3jebIFOVL",
+        "chosenKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "review|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "review",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      },
+      {
+        "ts": "2026-10-06T22:16:57.095Z",
+        "sessionID": "ses_ef09ca71effe2FoiBgxxJuCg6W",
+        "kind": "decision",
+        "mode": "advise",
+        "step": "dispatch",
+        "childSessionID": "ses_eed02d357ffeI6JbqM9B1u0yYY",
+        "chosenKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "bestKey": "recon|router:medium|anthropic/claude-sonnet-5-5#xhigh",
+        "key": null,
+        "verdict": null,
+        "class": "recon",
+        "resume": true,
+        "reasonHead": "kept:resume"
+      }
+    ]
+  },
+  "attribution": {
+    "basis": "construction plus row content (the 17:59 snapshot holds names and sizes only, it cannot name the writer of a file by itself)",
+    "construction": "Every isolated smoke host ran with private HOME/USERPROFILE/XDG/APPDATA/LOCALAPPDATA/TEMP/TMP and an explicit routing.outcomes.path in its own temp directory, so a smoke host cannot write to the live store. The vitest process itself loads no plugin and only reads the live store.",
+    "content": "All appended rows are mode advise (the live engine) on the user's live preset (openai/gpt-6-luna-fast#medium, anthropic/claude-sonnet-5-5#xhigh, classes recon/review/design/implement/debug, minClassConfidence 0.7), which no smoke preset contains; none of the sessions appears in any committed smoke evidence (64 session ids over the git history); the two advisor-notice files name live projects.",
+    "possibleWriters": [
+      "the user's own running host (all appended rows; the scorecards at about one file per one to two minutes all day)",
+      "smoke:keyless (OpenCode 1.18.34), run unwrapped at 18:30-18:40: three of its five files (registration, subagent-tiers, deferred-catalog) redirect HOME/XDG/APPDATA/LOCALAPPDATA but NOT TEMP/TMP, so their router plugin would use the real os.tmpdir() default store; 5 of the new scorecards were created in that window, which equals the live host's rate outside it, so it cannot be told apart from the live host by this snapshot. Later runs of the suite used a private TEMP (see phase-3.2.md, QA-3.2-3)."
+    ]
+  }
+}
+

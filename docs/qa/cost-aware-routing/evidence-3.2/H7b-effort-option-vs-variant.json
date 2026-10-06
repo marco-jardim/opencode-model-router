@@ -1,0 +1,84 @@
+{
+  "scenario": "H7b-effort-option-vs-variant",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:31:01.743Z",
+  "harness": {
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "MEASUREMENT (the verdict asserts only that the three requests were observed): with medium configured as variant=medium but effort=xhigh, a child started on fast and resumed on medium: the wire shows whether the request follows the agent's effort OPTION (xhigh) or the stored VARIANT (medium), and that the previous agent's option (low) is not carried.",
+  "observed": {
+    "rows": [
+      {
+        "case": "fast start",
+        "storedAgent": "fast",
+        "storedModel": "anthropic/claude-sonnet-5-5#low",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "topLevelEffort": "low",
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "inBand": [],
+        "effective": "low",
+        "options": []
+      },
+      {
+        "case": "resume on medium",
+        "storedAgent": "medium",
+        "storedModel": "anthropic/claude-sonnet-5-5#medium",
+        "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+        "topLevelEffort": "xhigh",
+        "outputConfig": {
+          "effort": "xhigh"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "inBand": [],
+        "effective": "xhigh",
+        "options": []
+      },
+      {
+        "case": "fresh medium (control)",
+        "storedAgent": "medium",
+        "storedModel": "anthropic/claude-sonnet-5-5#medium",
+        "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+        "topLevelEffort": "xhigh",
+        "outputConfig": {
+          "effort": "xhigh"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "inBand": [],
+        "effective": "xhigh",
+        "options": []
+      }
+    ],
+    "controlChild": "ses_eec719afdffeSQkd1MX38YXMxH",
+    "providerErrors": [],
+    "reading": "resumed effective xhigh, fresh medium effective xhigh"
+  },
+  "assertionResult": "PASS: fast start effective low; resumed on medium effective xhigh (top-level xhigh, in-band []); fresh medium effective xhigh; resumed effective xhigh, fresh medium effective xhigh",
+  "notes": []
+}
