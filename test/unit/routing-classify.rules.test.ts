@@ -763,3 +763,32 @@ describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
     expect(shapeOf(`read ${"a/".repeat(3000)} please`).paths).toBe(0);
   });
 });
+describe("negation clause boundaries (QA-1.2-13)", () => {
+  it("a dot inside a file name does not end the negation window", () => {
+    expect(classifyByRules("do not touch a.ts and refactor", cfg).class).toBe("other");
+    expect(classifyByRules("do not touch src/a.ts or src/b.ts, refactor", cfg).class).toBe("implement"); // the comma ends it
+    expect(classifyByRules("without changing config.json 1.2.3 refactor", cfg).class).toBe("other");
+  });
+
+  it("a dot followed by whitespace (or the end) still ends it", () => {
+    expect(classifyByRules("do not touch a.ts. Refactor the parser", cfg).class).toBe("implement");
+    expect(classifyByRules("never rename it.\nrefactor the parser", cfg).class).toBe("implement");
+  });
+
+  it("a spaced hyphen, en dash or an em dash ends the clause; a hyphen inside a word does not", () => {
+    // `refactor` is negated by its own "do not", `rename` starts a new clause after the dash.
+    for (const sep of [" - ", " \u2013 ", " \u2014 ", "\u2014"]) {
+      const facts = classifyByRules(`do not refactor${sep}rename foo to bar in a.ts`, cfg);
+      expect(facts.class, JSON.stringify(sep)).toBe("mechanical");
+      expect(facts.confidence).toBe(0.8);
+    }
+    expect(classifyByRules("without the cache - refactor the parser", cfg).class).toBe("implement");
+    expect(classifyByRules("do not use a read-only refactor", cfg).class).toBe("other");
+  });
+
+  it("the negators still work in the common shapes", () => {
+    expect(classifyByRules("do not refactor anything", cfg).class).toBe("other");
+    expect(classifyByRules("never implement it", cfg).class).toBe("other");
+    expect(classifyByRules("review it, then refactor it", cfg).class).toBe("implement");
+  });
+});

@@ -156,11 +156,26 @@ const BUILTIN_PAIRS: ReadonlySet<string> = new Set(
 // Matching and negation (R5)
 // ---------------------------------------------------------------------------
 
-function isClauseBoundary(code: number): boolean {
-  // . ; : ! ? , \n
-  return (
-    code === 46 || code === 59 || code === 58 || code === 33 || code === 63 || code === 44 || code === 10
-  );
+function isSpace(code: number): boolean {
+  return code === 32 || code === 9 || code === 10 || code === 13 || code === 0xa0;
+}
+
+/**
+ * Does the character at `k` of `s` end a clause? `; : ! ? ,` and newline always
+ * do; an em dash does; a `.` only when whitespace (or the end) follows it, so the
+ * dot of `a.ts` or `1.2` does not cut a negation window short; a hyphen or en
+ * dash only as a spaced separator (` - `, ` – `), never inside `read-only`
+ * (QA-1.2-13).
+ */
+function isClauseBoundaryAt(s: string, k: number): boolean {
+  const code = s.charCodeAt(k);
+  if (code === 59 || code === 58 || code === 33 || code === 63 || code === 44 || code === 10) return true;
+  if (code === 0x2014) return true;
+  if (code === 46) return k + 1 >= s.length || isSpace(s.charCodeAt(k + 1));
+  if (code === 45 || code === 0x2013) {
+    return k > 0 && k + 1 < s.length && isSpace(s.charCodeAt(k - 1)) && isSpace(s.charCodeAt(k + 1));
+  }
+  return false;
 }
 
 /** R5: is the occurrence of a term at `index` of `s` preceded by a negator in its clause? */
@@ -168,7 +183,7 @@ function isNegatedAt(s: string, index: number): boolean {
   let start = index - NEGATION_WINDOW_CHARS;
   if (start < 0) start = 0;
   for (let k = index - 1; k >= start; k--) {
-    if (isClauseBoundary(s.charCodeAt(k))) {
+    if (isClauseBoundaryAt(s, k)) {
       start = k + 1;
       break;
     }
