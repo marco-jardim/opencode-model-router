@@ -77,7 +77,11 @@ export interface LadderState {
   childSessionID?: string | null;
   /** stepContextTokens() of that child's last step; null = unknown. */
   lastStepTokens?: number | null;
-  /** inputBudget of the model the next attempt runs on. */
+  /**
+   * inputBudget of the model the next attempt runs on. Telemetry only (QA-1.5-14): `advance` and
+   * `newLadderState` store it so a log or scorecard can show it, but `nextAction` never reads it. The
+   * decision uses the budget of the target tier, which `sessionFields` puts into a probe state.
+   */
   nextModelContext?: number | null;
 }
 
@@ -178,7 +182,7 @@ export function newLadderState(
     state.childSessionID = null;
     state.lastStepTokens = null;
     // Budget of the start tier (after floorTier).
-    state.nextModelContext = ownTierInfo(policy, state.currentTier)?.inputBudget ?? null;
+    state.nextModelContext = ownTierInfo(policy, state.currentTier)?.inputBudget ?? null; // telemetry only
   }
   return state;
 }
@@ -442,7 +446,7 @@ function applySession(next: LadderState, action: LadderAction): void {
   if (next.childSessionID === undefined) return; // not session-aware: shape unchanged
   if (action.resume !== true) next.childSessionID = null; // fresh start: clear the stale child
   next.lastStepTokens = null; // must be re-observed after the next attempt
-  next.nextModelContext = action.resumeBasis?.budget ?? null;
+  next.nextModelContext = action.resumeBasis?.budget ?? null; // telemetry only: nextAction never reads it
 }
 
 export function advance(state: LadderState, action: LadderAction): LadderState {

@@ -929,6 +929,14 @@ describe("child session bookkeeping", () => {
     expect(advance(state, { action: "escalate", tier: "medium" }).childSessionID).toBeNull();
   });
 
+  it("never reads nextModelContext: the decision depends on the target tier's budget only (QA-1.5-14)", () => {
+    const policy = handPolicy({ fast: info(SONNET, "xhigh", ["xhigh"], 1_000_000), medium: info(OPUS, "medium", ["medium"], 800_000) });
+    const base = sessionState({ attemptsThisTier: 1, childSessionID: "ses_a", lastStepTokens: 1000 });
+    const reference = JSON.stringify(nextAction(base, fail, policy));
+    for (const nextModelContext of [null, 0, 1, 123_456, 99_000_000]) {
+      expect(JSON.stringify(nextAction({ ...base, nextModelContext }, fail, policy))).toBe(reference);
+    }
+  });
   it("does not add session keys when advancing a non-session state", () => {
     const plain: LadderState = {
       currentTier: "fast", attemptsThisTier: 0, totalAttempts: 1, escalations: 0, firstAttemptCost: 1, cumulativeCost: 1,
