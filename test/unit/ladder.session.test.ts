@@ -738,6 +738,22 @@ describe("resume decisions", () => {
     expect(over.resumeBasis).toMatchObject({ reason: "at-or-over-threshold", tokens: threshold + 1 });
   });
 
+  it("starts fresh exactly at an inexact threshold through nextAction (0.55 × 200 000, 0.07 × 800 000)", () => {
+    const forcing = buildLadderForcingMessage(fail.reasons ?? []);
+    const estimate = estimateTokensFromChars(forcing.length)!;
+    for (const [fraction, budget, tokens] of [[0.55, 200_000, 110_000], [0.07, 800_000, 56_000]] as const) {
+      const policy = handPolicy(
+        { fast: info(SONNET, "xhigh", ["xhigh"], budget), medium: info(OPUS, "medium", ["medium"], budget) },
+        {},
+        fraction,
+      );
+      const at = nextAction(escalateState({ lastStepTokens: tokens - estimate }), fail, policy);
+      expect(at).toMatchObject({ action: "escalate", resume: false });
+      expect(at.resumeBasis).toMatchObject({ reason: "at-or-over-threshold", tokens, budget });
+      const under = nextAction(escalateState({ lastStepTokens: tokens - estimate - 1 }), fail, policy);
+      expect(under).toMatchObject({ action: "escalate", resume: true });
+    }
+  });
   it("includes the dispatch prompt in the estimate and uses the forcing message alone without it", () => {
     const policy = handPolicy(top, {}, 0.5);
     const forcing = buildLadderForcingMessage(["check failed"]);
@@ -1449,7 +1465,7 @@ describe("property-based: session-aware loop", () => {
           if (policy.variants) {
             expect(typeof action.resume).toBe("boolean");
             expect(action.resumeBasis?.resume).toBe(action.resume);
-            if (action.resume) expect(action.resumeBasis!.tokens!).toBeLessThan(action.resumeBasis!.threshold!);
+            if (action.resume) expect(action.resumeBasis!.tokens! / action.resumeBasis!.budget!).toBeLessThan(policy.variants.maxContextFraction);
           } else {
             for (const key of ["variantStep", "agent", "model", "variant", "resume", "resumeBasis"]) {
               expect(action).not.toHaveProperty(key);

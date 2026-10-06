@@ -351,14 +351,20 @@ export interface ResumeDecision {
   tokens: number | null;
   /** Input budget of the next model. */
   budget: number | null;
-  /** `maxContextFraction × budget`, when both are valid. */
+  /**
+   * `maxContextFraction × budget`, when both are valid. For logging only: the decision compares
+   * `tokens / budget < maxContextFraction`, which is exact where the product is not (QA-1.5-7).
+   */
   threshold: number | null;
 }
 
 /**
  * Resume vs fresh (D11 as amended by A5): resume only when
- * `lastStepTokens + nextPromptTokens < maxContextFraction × nextModelContext`.
- * Exactly at the threshold, and whenever any input is unknown, start fresh.
+ * `lastStepTokens + nextPromptTokens < maxContextFraction × nextModelContext`, decided as
+ * `tokens / budget < maxContextFraction`: a division is correctly rounded, so tokens exactly at the
+ * fraction compare equal, whereas the product `0.55 × 200000` is 110000.00000000001 and would resume
+ * at exactly 110000 tokens (QA-1.5-7). Exactly at the threshold, and whenever any input is unknown,
+ * start fresh.
  */
 export function resumeDecision(state: ResumeState, cfg: ResumeConfig): ResumeDecision {
   const child = state.childSessionID;
@@ -381,5 +387,5 @@ export function resumeDecision(state: ResumeState, cfg: ResumeConfig): ResumeDec
   if (budget === null) return decide("unknown-budget");
   if (estimate === null) return decide("unknown-estimate");
   if (validFraction === null) return decide("invalid-fraction");
-  return decide(tokens! < threshold! ? "under-threshold" : "at-or-over-threshold");
+  return decide(tokens! / budget! < validFraction! ? "under-threshold" : "at-or-over-threshold");
 }

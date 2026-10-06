@@ -392,6 +392,22 @@ describe("resumeDecision (D11 as amended by A5)", () => {
     expect(resumeDecision({ ...state, lastStepTokens: 401 }, cfg)).toMatchObject({ resume: false, reason: "at-or-over-threshold" });
   });
 
+  it("decides on tokens / budget, so a fraction whose product is inexact still starts fresh exactly at it (QA-1.5-7)", () => {
+    // 0.55 × 200 000 = 110 000.00000000001 and 0.07 × 800 000 = 56 000.00000000001 in doubles.
+    expect(0.55 * 200_000).toBeGreaterThan(110_000);
+    expect(0.07 * 800_000).toBeGreaterThan(56_000);
+    const at = (fraction: number, budget: number, tokens: number) =>
+      resumeDecision(
+        { childSessionID: "ses_child", lastStepTokens: tokens - 100, nextModelContext: budget },
+        { maxContextFraction: fraction, nextPromptTokens: 100 },
+      );
+    expect(at(0.55, 200_000, 110_000)).toMatchObject({ resume: false, reason: "at-or-over-threshold", tokens: 110_000 });
+    expect(at(0.55, 200_000, 109_999)).toMatchObject({ resume: true, reason: "under-threshold" });
+    expect(at(0.07, 800_000, 56_000)).toMatchObject({ resume: false, reason: "at-or-over-threshold", tokens: 56_000 });
+    expect(at(0.07, 800_000, 55_999)).toMatchObject({ resume: true, reason: "under-threshold" });
+    // the threshold is still reported for the log
+    expect(at(0.55, 200_000, 110_000).threshold).toBeCloseTo(110_000, 6);
+  });
   it("uses the budget it is given (the next model's), not a larger one", () => {
     expect(resumeDecision({ ...state, nextModelContext: 800 }, cfg)).toMatchObject({ resume: false, threshold: 400 });
     expect(resumeDecision({ ...state, nextModelContext: 1_000_000 }, cfg)).toMatchObject({ resume: true, threshold: 500_000 });
