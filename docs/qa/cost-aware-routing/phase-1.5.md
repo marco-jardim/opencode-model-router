@@ -499,16 +499,28 @@ The `final_tier` suffix becomes `currentEffort ? "@"+effort : currentVariant ? "
 - **To 1.1.** `CONFIG_REFERENCE.md` should cover three points:
   - `effortBumpMax` also caps v2 catalog variant ladders (F2);
   - explicit `candidates` override the catalog ladder and are not capped;
-  - `variantSteps: "none"` disables D10 **and** D11 (fresh sessions as today).
+  - `variantSteps: "none"` disables D10 **and** D11 (fresh sessions as today);
+  - (Round 1, QA-1.5-10) `effortBumpMax` caps catalog ladders even with `effortBump: false`, and the default `xhigh` drops `max` from the live haiku ladder `[high, max]`;
+  - (Round 1, QA-1.5-3/4) a same-model tier is skipped on escalation only when the current tier already covered its base **and** it has no variant above the reached one; a covered tier with headroom is entered at the reached variant.
 - **To 2.3.** Wire the runner as follows:
   - Build the policy with `buildEscalatePolicy(cfg, { host, variantSteps, maxContextFraction: resolveRouting(cfg, host).sessionReuse.maxContextFraction, catalog })`, where `catalog` is a non-throwing lookup over the host model list.
   - Pass `{ dispatchPromptChars: taskText.length }` to `nextAction`.
   - After each attempt, call `recordAttempt(state, cost, { sessionID: child, lastStepTokens: stepContextTokens(lastStep.tokens) })`.
   - Dispatch with `modelRef(action.model, action.variant)` when `action.model` is set, `agent` when set, and `sessionID` only when `action.resume === true`. Log `action.resumeBasis`.
   - Record a variant's `candidates[].costRatio` when it is configured (F5).
+  - **Mandatory (A17, QA-1.5-2): charge `action.costRatio ?? tier.costRatio`** for the attempt the action starts, never the tier's base ratio alone. Variant steps, plain retries and escalations carry the `costRatio` of their rung (`TierVariantInfo.costRatios`: the matching candidate's own ratio, else the tier's, keyed by variant id, `default` for the bare model). The action has no `costRatio` when the rung is unknown or the target tier has no variant info; then the tier's ratio applies. Charging only the tier ratio makes every higher variant of an unpriced model look free (F5).
+  - **A15 (QA-1.1-4): take `variantSteps` from `resolveVariantSteps(cfg, host)`, not from the raw field.** It is `"none"` when the config has no `routing` block, so without one `buildEscalatePolicy` gets no variant policy and the ladder is byte-identical to 2.2.0. Pass the resolved value in `LadderSessionPolicyInput.variantSteps`.
+  - Pass `warn` in `LadderSessionPolicyInput` (a `routerWarn`-style logger): a throwing catalog lookup is treated as no catalog entry for that model and logged once per lookup (QA-1.5-15).
+  - Honour `action.carryVariant`: on an escalation it means the target tier continues from `action.variant` (the reached one), not from its base; `advance` seeds `currentVariant`, the runner only dispatches `modelRef(action.model, action.variant)`.
+  - `state.nextModelContext` is telemetry only: `nextAction` never reads it (QA-1.5-14).
   - Verify R1.
-- **To 2.4.** Add advisor findings from `VariantLadder.rejected`, from tiers omitted by `buildVariantPolicy` because their variant is absent from the catalog, and from F5.
-- **To the orchestrator.** Record F2, F3, F4 and the A9 position (§2) as plan amendments under §1.5 "Amended during implementation". The plan file is outside this phase's write-set.
+- **To 2.4.** Add advisor findings from `VariantLadder.rejected` (now also candidates that are unranked or not ranked above everything kept before them), from `VariantLadder.foreign` (candidate rungs on other models, which variant steps never walk, QA-1.5-5), from tiers omitted by `buildVariantPolicy` because their configured variant is absent from the catalog, and from F5.
+- **To the orchestrator.** Record F2, F3, F4 and the A9 position (§2) as plan amendments under §1.5 "Amended during implementation". The plan file is outside this phase's write-set. Also record, from round 1: the F1 plan text amendment (max total precedes the cost ceiling), the F3 D10 wording (empty ladder for effort-configured tiers), and the A17 reserve and cost-charging rules as implemented (Round 1 fixes below).
+- **To the orchestrator, for the merge of `car/p15` with Phase 1.1 (QA-1.5-13).** `ladder.ts` reads the raw `candidates` through `(tier as { candidates?: unknown }).candidates` because `TierConfig` here has no such field. After the merge:
+  - read `tier.candidates` typed from 1.1 and replace the cast;
+  - use `hasExplicitCandidates(tier)` (now exported by 1.1) to decide whether `candidates` is explicit, and read the raw array for **membership** (`buildVariantLadder` must never receive `resolveCandidates()` output, whose defaulted single entry would pin the ladder, F11);
+  - take **costs** from `resolveCandidates(tierName, cfg)` (its `costRatio` is already completed from the tier), which is the source `rungCostRatios` approximates today from the raw entries plus `tier.costRatio`;
+  - the merge may also drop the local `validCostRatio` once 1.1's validation (finite, > 0) is the single source.
 
 ## Verdict
 
