@@ -982,3 +982,49 @@ describe("negated prohibitions do not raise risk (A22, QA-1.2-29)", () => {
     expect(classifyByRules("MUST NOT DO: never force-push", cfg).risk).toBe("high");
   });
 });
+describe("classes hidden in excluded paragraphs cap the confidence (QA-1.2-30)", () => {
+  const dispatch = (task: string, sections: string[]): string =>
+    [`TASK: ${task}`, ...sections, "ENVIRONMENT: Platform: win32"].join("\n");
+
+  it("a more expensive class that only CONTEXT or TOOLS mention caps confidence at 0.5; the class is unchanged", () => {
+    const plain = analyzeRules(dispatch("grep for foo in src/a.ts", []), cfg);
+    expect(plain.facts).toMatchObject({ class: "search", confidence: 0.8 });
+    expect(plain.hiddenClasses).toEqual([]);
+
+    const context = analyzeRules(dispatch("grep for foo in src/a.ts", ["CONTEXT: last week we did a refactor of the parser"]), cfg);
+    expect(context.facts).toMatchObject({ class: "search", confidence: 0.5 });
+    expect(context.hiddenClasses).toEqual(["implement"]);
+    expect(context.matched).toEqual(["search"]);
+
+    const tools = analyzeRules(dispatch("grep for foo in src/a.ts", ["TOOLS: read, grep, design review"]), cfg);
+    expect(tools.facts.class).toBe("search");
+    expect(tools.facts.confidence).toBe(0.5);
+    expect(tools.hiddenClasses).toEqual(expect.arrayContaining(["design", "review"]));
+  });
+
+  it("a class that costs the same or less than the task's does not cap", () => {
+    // TOOLS names search (cheaper than mechanical) and the task is a rename.
+    const facts = classifyByRules(dispatch("rename getFoo to fetchFoo in src/a.ts", ["TOOLS: read/search/write"]), cfg);
+    expect(facts).toMatchObject({ class: "mechanical", confidence: 0.8 });
+    expect(classifyByRules(dispatch("refactor the parser", ["CONTEXT: it was a refactor before"]), cfg).confidence).toBe(0.8);
+  });
+
+  it("a negated mention in an excluded paragraph is not a class word", () => {
+    const facts = classifyByRules(dispatch("grep for foo in src/a.ts", ["MUST NOT DO: do not refactor anything"]), cfg);
+    expect(facts).toMatchObject({ class: "search", confidence: 0.8 });
+  });
+
+  it("an untemplated text has no excluded paragraphs, hence no hidden classes", () => {
+    const flat = analyzeRules("grep for foo in src/a.ts, last week we did a refactor", cfg);
+    expect(flat.hiddenClasses).toEqual([]);
+    expect(flat.facts.class).toBe("implement"); // in flat text every word counts
+  });
+
+  it("the cap composes with the other caps and never raises", () => {
+    const facts = classifyByRules(
+      dispatch("Faça o grep do arquivo config.ts para que a validação use a nova função", ["CONTEXT: refactor"]),
+      cfg,
+    );
+    expect(facts.confidence).toBeLessThanOrEqual(0.5);
+  });
+});

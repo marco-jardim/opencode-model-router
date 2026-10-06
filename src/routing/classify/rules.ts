@@ -476,6 +476,39 @@ function maxRisk(a: Risk, b: Risk): Risk {
 // analyzeRules / classifyByRules
 // ---------------------------------------------------------------------------
 
+/**
+ * R6 + R7 on one text: the classes with a non-negated hit (built-in rules and the
+ * user's extra taskPatterns), the search/recon family merged by `breadth`, highest
+ * cost first. `anchors` (optional) collects the patterns that hit.
+ */
+function matchClasses(
+  text: string,
+  cfg: RulesConfig,
+  breadth: boolean,
+  anchors?: Set<string>,
+): TaskClass[] {
+  const candidates = new Set<TaskClass>();
+  for (const rule of COMPILED_RULES) {
+    if (hasHit(rule.res, text, true)) {
+      candidates.add(rule.class);
+      anchors?.add(rule.pattern);
+    }
+  }
+  for (const custom of customPatterns(cfg?.taskPatterns)) {
+    if (hasHit([custom.re], text, true)) {
+      candidates.add(custom.class);
+      anchors?.add(custom.anchor);
+    }
+  }
+  if (candidates.has("search") || candidates.has("recon")) {
+    const recon = candidates.has("recon");
+    candidates.delete("search");
+    candidates.delete("recon");
+    candidates.add(recon || breadth ? "recon" : "search");
+  }
+  return [...candidates].sort((a, b) => CLASS_COST_RANK[b] - CLASS_COST_RANK[a]);
+}
+
 export function analyzeRules(
   text: string,
   cfg: RulesConfig,
@@ -491,31 +524,19 @@ export function analyzeRules(
   const shape = shapeOf(focusText.length > SHAPE_WINDOW_CHARS ? focusText.slice(0, SHAPE_WINDOW_CHARS) : focusText);
   const nonEnglish = isNonEnglish(focusText);
 
-  // R6 — class candidates
-  const candidates = new Set<TaskClass>();
+  // R6/R7 — class candidates, lookup family resolved by shape
   const anchors = new Set<string>();
-  for (const rule of COMPILED_RULES) {
-    if (hasHit(rule.res, focusText, true)) {
-      candidates.add(rule.class);
-      anchors.add(rule.pattern);
-    }
-  }
-  for (const custom of customPatterns(cfg?.taskPatterns)) {
-    if (hasHit([custom.re], focusText, true)) {
-      candidates.add(custom.class);
-      anchors.add(custom.anchor);
-    }
-  }
-
-  // R7 — lookup family: search and recon are one family resolved by shape
-  if (candidates.has("search") || candidates.has("recon")) {
-    const recon = candidates.has("recon");
-    candidates.delete("search");
-    candidates.delete("recon");
-    candidates.add(recon || shape.breadth ? "recon" : "search");
-  }
-  const matched = [...candidates].sort((a, b) => CLASS_COST_RANK[b] - CLASS_COST_RANK[a]);
+  const matched = matchClasses(focusText, cfg, shape.breadth, anchors);
   const taskClass: TaskClass = matched[0] ?? "other";
+
+  // QA-1.2-30: class words that occur only inside excluded paragraphs (TOOLS, CONTEXT, …) never choose
+  // the class, but when they point at a more expensive class the class label is not to be trusted.
+  const hiddenClasses: TaskClass[] =
+    focusText === body
+      ? []
+      : matchClasses(body, cfg, shape.breadth).filter(
+          (name) => CLASS_COST_RANK[name] > CLASS_COST_RANK[taskClass],
+        );
 
   // R8 — confidence
   let confidence: number =
@@ -565,6 +586,7 @@ export function analyzeRules(
 
   // R12 — caps and output
   if (nonEnglish) confidence = Math.min(confidence, CONFIDENCE.nonEnglishCap);
+  if (hiddenClasses.length > 0) confidence = Math.min(confidence, CONFIDENCE.hiddenClassCap);
   if (taskClass === "mechanical" && risk === "high") {
     confidence = Math.min(confidence, CONFIDENCE.mechanicalHighRiskCap);
   }
@@ -577,7 +599,7 @@ export function analyzeRules(
     confidence: round2(confidence),
     source: "rules" as const,
   });
-  return { facts, matched, anchors: [...anchors], shape, nonEnglish, templated };
+  return { facts, matched, anchors: [...anchors], shape, nonEnglish, templated, hiddenClasses };
 }
 
 export function classifyByRules(text: string, cfg: RulesConfig, ctx?: { cwd?: string }): TaskFacts {

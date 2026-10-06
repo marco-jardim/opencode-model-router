@@ -330,6 +330,8 @@ export interface RulesAnalysis {
   readonly nonEnglish: boolean;
   /** The class focus text was cut from a recognised dispatch template. */
   readonly templated: boolean;
+  /** Classes that only excluded paragraphs matched and that cost more than `facts.class`; they cap the confidence (QA-1.2-30). */
+  readonly hiddenClasses: readonly TaskClass[];
 }
 
 /** Trace of one classification, for the decision log (D18). */
@@ -1103,6 +1105,8 @@ export const CONFIDENCE = {
   rulesNone: 0.2,
   /** Cap when the text is non-English. */
   nonEnglishCap: 0.5,
+  /** Cap when only excluded paragraphs (TOOLS, CONTEXT, …) point at a more expensive class (QA-1.2-30). */
+  hiddenClassCap: 0.5,
   /** Cap when the class is `mechanical` but risk is `high` (never trust a cheap label on a risky task). */
   mechanicalHighRiskCap: 0.5,
   /** A route line that carries a valid `class` (sources route-line and plan). */
