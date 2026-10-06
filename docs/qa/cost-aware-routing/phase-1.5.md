@@ -511,10 +511,13 @@ The `final_tier` suffix becomes `currentEffort ? "@"+effort : currentVariant ? "
   - **Mandatory (A17, QA-1.5-2): charge `action.costRatio ?? tier.costRatio`** for the attempt the action starts, never the tier's base ratio alone. Variant steps, plain retries and escalations carry the `costRatio` of their rung (`TierVariantInfo.costRatios`: the matching candidate's own ratio, else the tier's, keyed by variant id, `default` for the bare model). The action has no `costRatio` when the rung is unknown or the target tier has no variant info; then the tier's ratio applies. Charging only the tier ratio makes every higher variant of an unpriced model look free (F5).
   - **A15 (QA-1.1-4): take `variantSteps` from `resolveVariantSteps(cfg, host)`, not from the raw field.** It is `"none"` when the config has no `routing` block, so without one `buildEscalatePolicy` gets no variant policy and the ladder is byte-identical to 2.2.0. Pass the resolved value in `LadderSessionPolicyInput.variantSteps`.
   - Pass `warn` in `LadderSessionPolicyInput` (a `routerWarn`-style logger): a throwing catalog lookup is treated as no catalog entry for that model and logged once per lookup (QA-1.5-15).
-  - Honour `action.carryVariant`: on an escalation it means the target tier continues from `action.variant` (the reached one), not from its base; `advance` seeds `currentVariant`, the runner only dispatches `modelRef(action.model, action.variant)`.
+  - Honour `action.carryVariant` (A17a, Round 2): on an escalation it means the target tier is covered by a rung already tried on its model and is entered at `action.variant`, the first rung above that one (always a member of the target's own ladder), not at its base; `advance` seeds `currentVariant`, the runner only dispatches `modelRef(action.model, action.variant)`. Variant steps and escalations also carry `action.rung`, which `advance` records into `state.triedByModel`; the runner needs no extra bookkeeping.
+  - **Mandatory (QA-1.5-20): charge `startCostRatio(policy, state) ?? tier.costRatio` for the first attempt.** The first attempt runs the start tier's base rung, which no action carries, so a candidate ratio on that rung is otherwise never charged. Every later attempt charges `action.costRatio ?? tier.costRatio`.
+  - Take the policy's `variants` presence as the switch for the reserve: with `variantSteps: "none"`, v1 or no routing block there is no reserve and no variant fields (A17a, QA-1.5-21).
   - `state.nextModelContext` is telemetry only: `nextAction` never reads it (QA-1.5-14).
   - Verify R1.
-- **To 2.4.** Add advisor findings from `VariantLadder.rejected` (now also candidates that are unranked or not ranked above everything kept before them), from `VariantLadder.foreign` (candidate rungs on other models, which variant steps never walk, QA-1.5-5), from tiers omitted by `buildVariantPolicy` because their configured variant is absent from the catalog, and from F5.
+  - (QA-1.5-22) Also verify, on a **resumed child**, what happens to agent-level effort options (`effort`/`thinking`/`reasoning` of the tier's agent) when the escalation switches `agent` and/or `model#variant`: that the resumed child receives the target tier's effort options exactly once and does not keep the previous tier's. Until it is verified, resume across an effort-configured tier is the least trusted path.
+- **To 2.4.** Add advisor findings from `VariantLadder.rejected` (now also candidates that are unranked or not ranked above everything kept before them), from `VariantLadder.foreign` (candidate rungs on other models, which variant steps never walk, QA-1.5-5), from tiers omitted by `buildVariantPolicy` because their configured variant is absent from the catalog, and from F5. Also (A20, QA-1.5-8): report every tier that sets `variant` together with `effort`/`thinking`/`reasoning` (`TierVariantInfo.effortConfigured` with a non-default `base`): its variant ladder is empty so effort is never delivered twice; suggest `candidates` if the user wants variant steps on it. Report `VariantLadder.foreign` and tiers skipped as covered (`give_up` reason "no higher tier left to try ...").
 - **To the orchestrator.** Record F2, F3, F4 and the A9 position (§2) as plan amendments under §1.5 "Amended during implementation". The plan file is outside this phase's write-set. Also record, from round 1: the F1 plan text amendment (max total precedes the cost ceiling), the F3 D10 wording (empty ladder for effort-configured tiers), and the A17 reserve and cost-charging rules as implemented (Round 1 fixes below).
 - **To the orchestrator, for the merge of `car/p15` with Phase 1.1 (QA-1.5-13).** `ladder.ts` reads the raw `candidates` through `(tier as { candidates?: unknown }).candidates` because `TierConfig` here has no such field. After the merge:
   - read `tier.candidates` typed from 1.1 and replace the cast;
@@ -568,7 +571,7 @@ Binding decisions: plan A15 and A17 on `car/main`. Files touched: `src\escalate\
 | QA-1.5-1 | major | A17 reserve: on a tier with variant info, a variant step or a plain retry needs `maxTotalAttempts − totalAttempts − 1 ≥ H`, `H` = ladder tiers above the current one (0 when the tier is not on the ladder); otherwise the ladder escalates. Tiers without info are untouched. | `bb7fb65` |
 | QA-1.5-2 | major | `TierVariantInfo.costRatios` (a candidate''s own `costRatio`, else the tier''s; `default` for the bare model). Variant steps, plain retries and escalations carry `costRatio`; the runner charges `action.costRatio ?? tier.costRatio` (mandatory 2.3 handoff). | `90653fe` |
 | QA-1.5-3 | medium | `default` is a range for coverage (`variantRange`: low −1, high `rank(high)`; ranked ids are points). Covered iff `to.base === reached` or `high(to.base) ≤ low(reached)` (`variantCovered`); `nextVariant` keeps the 3.5 position. Probe: fast = sonnet (no variant), medium = sonnet#medium, heavy = opus#high, `effortBumpMax: medium` → medium is tried. | `2496c95` |
-| QA-1.5-4 | medium | A covered tier is skipped only if `nextVariant(to.ladder, reached) === null`; otherwise the escalation targets it at `variant: reached` with `carryVariant: true` and `advance` seeds `currentVariant`. Probe: medium = sonnet#low with candidates `[low, max]` → `max` is tried. | `2496c95` |
+| QA-1.5-4 | medium | A covered tier is skipped only if `nextVariant(to.ladder, reached) === null`; otherwise the escalation targets it with `carryVariant: true` and `advance` seeds `currentVariant`. Probe: medium = sonnet#low with candidates `[low, max]` → `max` is tried. **Superseded by Round 2 (QA-1.5-17):** the entry rung is `nextVariant(to.ladder, reached)`, not the reached variant itself. | `2496c95` |
 | QA-1.5-5 | medium | Candidate ladders drop ids not ranked above everything kept so far (into `rejected`); any non-empty `candidates` array gives `source: "candidates"` even with an empty ladder; other-model rungs are reported in the new `VariantLadder.foreign` (for the 2.4 advisor). | `321f5f4` |
 | QA-1.5-6 | medium | Variant info and input budget for every tier with a catalog entry; empty ladder for a model without variants. The policy key stays gated on v2 + `auto`. Exception kept on purpose: a tier whose configured `variant` is not in the catalog stays omitted (its base cannot be emitted). | `2937900` |
 | QA-1.5-7 | minor | Resume iff `tokens / budget < fraction` (`0.55 × 200000` and `0.07 × 800000` are inexact products); `threshold` remains for logging. Tested directly and through `nextAction`; the old comparison fails both. | `bdc3637` |
@@ -595,22 +598,14 @@ Tiers (`costRatio`): `fast` 1, `medium` 5, `heavy` 20. The loop is `runLoop` in 
 
 Why: `H(fast) = 2`. After attempt 1, `4 − 1 − 1 = 2 ≥ 2`, so the variant step to `high` is taken. After attempt 2, `4 − 2 − 1 = 1 < 2`, so the ladder escalates (sonnet is another model: nothing to skip). After attempt 3, `H(medium) = 1` and `4 − 3 − 1 = 0 < 1`, so it escalates to opus. With the real ratios the third attempt (cost 5) already crosses the ceiling, which is checked before the escalation to `heavy`.
 
-**anthropic** (`fast = anthropic/claude-sonnet-5-5#low`, `medium = anthropic/claude-sonnet-5-5#medium`, `heavy = anthropic/claude-opus-5-5#xhigh`; catalog capped at `xhigh`):
-
-| Run | Attempts, in order | Actions | Stop |
-|---|---|---|---|
-| default (×4, real ratios) | `anthropic/claude-sonnet-5-5#low`, `anthropic/claude-sonnet-5-5#medium`, `anthropic/claude-sonnet-5-5#medium` (role `medium`, ratio 5) | `retry` (variant step, ratio 1), `escalate` → `medium` (variant `medium`, ratio 5), `give_up` | `cost ceiling exceeded` (1 + 1 + 5 = 7 > 4) |
-| no ceiling (×1000) | `anthropic/claude-sonnet-5-5#low`, `anthropic/claude-sonnet-5-5#medium`, `anthropic/claude-sonnet-5-5#medium` (role `medium`), `anthropic/claude-opus-5-5#xhigh` | `retry` (variant step), `escalate` → `medium`, `escalate` → `heavy`, `give_up` | `max total attempts (4) reached` |
-| `maxTotalAttempts 10`, ×40 | `fast` steps `medium`, `high`, `xhigh`, then a plain retry at `xhigh`, then `escalate` → `heavy` (the covered `medium` has nothing above `xhigh`, so it is skipped), then a plain retry at `heavy` | | `cost ceiling exceeded` (cumulative 45 > 40) |
-
-The brief expected `sonnet#low, sonnet#medium, opus#xhigh, opus#xhigh` for the anthropic preset. That sequence is what A17 gives with the older "skip every covered tier" rule. With QA-1.5-4 the `medium` tier is covered (its base is the reached `medium`) but its own ladder still has `high` and `xhigh` above, so it is kept and the escalation runs at the reached variant under the `medium` role; opus follows only if the budget allows it. This is the literal reading of QA-1.5-4 ("skip a covered tier only if nothing is above the reached variant").
+**anthropic:** superseded by Round 2 (QA-1.5-17). The Round 1 sequence repeated `sonnet#medium` under the `medium` role; the corrected traces are in "Round 2 fixes" below.
 
 ### Observations
 
 | Id | Note |
 |---|---|
-| O4 | A covered tier with headroom costs one attempt at the **same** `model#variant` under another role (anthropic trace above). It is the price of continuing from the reached variant instead of re-entering `medium` at its base; if the orchestrator prefers the escalation to land on the next variant directly (`nextVariant(to.ladder, reached)`), only `nextAction`''s escalate branch changes. |
-| O5 | A17 corner: if the reserve forces an escalation but every tier above is covered and skipped, the result is `give_up "no higher tier"` with attempts left. It follows the rule literally and loses at most the attempts the reserve withheld. |
+| O4 | (dropped in Round 2: the repeated `sonnet#medium` no longer happens, QA-1.5-17.) |
+| O5 | A17 corner: if the reserve forces an escalation but every tier above is covered and skipped, the result was `give_up "no higher tier"` with attempts left. **Fixed in Round 2 (QA-1.5-19):** the withheld attempts are spent on the current tier. |
 | O6 | Effort-configured tiers (empty ladder) now also obey the reserve on their plain retries, because they have variant info; goldens are unaffected (no `policy.variants`). |
 | O7 | A tier whose configured `variant` is absent from the catalog stays omitted despite QA-1.5-6: its base would have to be emitted and the catalog does not offer it. 2.4 can report it. |
 | O8 | A candidates array that names no variant of the tier''s own model (for example only other models, or model-only entries) leaves the tier without variant steps by design (QA-1.5-5); `foreign` carries the rest. |
@@ -621,3 +616,57 @@ The brief expected `sonnet#low, sonnet#medium, opus#xhigh, opus#xhigh` for the a
 - `npx vitest run test/unit/ladder.session.test.ts test/unit/ladder.test.ts test/unit/escalate-variants.test.ts` (default pool): 3 files, 458 tests passed: `ladder.session.test.ts` 231 (202 at 1.5.2), `ladder.test.ts` 179 (unchanged), `escalate-variants.test.ts` 48 (38 at 1.5.1).
 - `npx vitest run test/unit/ladder.session.test.ts test/unit/escalate-variants.test.ts` with the old `tokens < threshold` comparison restored: the two QA-1.5-7 boundary tests fail, so they pin the fix.
 - `npx vitest related src/escalate/ladder.ts --run`: 37 files passed, 3 skipped (1182 tests passed, 55 skipped).
+
+## Round 2 fixes (QA-1.5, round 2)
+
+Binding amendments: A17a, A20, A21 on `car/main`. Files touched: `src\escalate\ladder.ts`, `test\unit\ladder.session.test.ts`, this file (`variants.ts` and `escalate-variants.test.ts` needed nothing). Goldens and `ladder.test.ts` are untouched.
+
+| Id | Sev | Resolution | Commit |
+|---|---|---|---|
+| QA-1.5-17 | major | `LadderState.triedByModel` (session-aware states only): the highest rung run per model (by guaranteed effort, `default` never outranks a ranked rung), set from the start tier by `newLadderState` and from `action.rung` by `advance` (variant steps and escalations; plain retries excluded). `skipCoveredTiers` reads `triedByModel[to.model]` for every later tier, whichever tier ran it. A covered target is entered at `nextVariant(to.ladder, reached)` (`carryVariant`, `advance` seeds `currentVariant`), or skipped when none exists. Non-adjacent probe: fast = sonnet#low, medium = luna#medium, heavy = sonnet#xhigh → heavy never repeats sonnet#xhigh. O4 dropped. | `c16e785` |
+| QA-1.5-4 | medium (partial) | The entry rung of a covered tier is above the tried one, not the tried one again (follows from -17). | `c16e785` |
+| QA-1.5-2 | partial | A carried escalation always lands on the target''s own ladder, so it carries that rung''s ratio (candidate ratio, else the tier''s); asserted by a unit test and by the property run. | `c16e785` |
+| QA-1.5-18 | major | `TierVariantInfo.effortConfigured` tiers are never covered, never a coverage source and never recorded in `triedByModel`; their escalations and steps carry no `rung`. Both probes pinned with the effort bump off: sonnet@low / sonnet@high / opus@high, and thinking tiers 2k vs 16k (and reasoning efforts) → `medium` runs. | `b86ad74` |
+| QA-1.5-8 | minor (partial) | A20: a tier with a `variant` **and** `effort`/`thinking`/`reasoning` has an empty variant ladder (its own variant is still emitted as its base) and `effortConfigured: true`; 2.4 advisor handoff recorded. | `500fd4a` |
+| QA-1.5-19 | minor | In step (6), when no target remains and the reserve forced the exit, `nextAction` falls back to a variant step or a plain retry without the reserve. The `give_up` reason is `no higher tier left to try (the remaining tiers only repeat rungs already tried)` when tiers exist above but are all covered; the top-of-ladder text is kept for a real top. Probe: `maxAttemptsPerTier 5`, `maxTotalAttempts 6`, all tiers on sonnet → 6 attempts, no early `give_up`. | `9bf9991` |
+| QA-1.5-20 | minor | `startCostRatio(policy, state)` exported; 2.3 charges it for attempt 1 (handoff above). | `61f8853` |
+| QA-1.5-21 | minor | The reserve is gated on `policy.variants`, not on the current tier having info (A17a). Probe: effort tiers with an uncataloged medium still reach heavy (`fast, fast, medium, heavy`). | `ead6849` |
+| QA-1.5-22 | info | 2.3 resume verification list: agent-level effort options on a resumed child. | this section |
+| A21 | info | Order accept → unverifiable → max total → cost ceiling → variant step → retry → escalate is the code order (F1); nothing to change. | n/a |
+
+### Re-pinned owner traces (Round 2)
+
+Same setup as Round 1: tiers `costRatio` 1 / 5 / 20, `maxTotalAttempts 4`, `costCeiling.multiple 4`; "no ceiling" uses `multiple 1000`. Each attempt is charged `previousAction.costRatio ?? tier.costRatio`.
+
+**anthropic** (`fast = anthropic/claude-sonnet-5-5#low`, `medium = anthropic/claude-sonnet-5-5#medium`, `heavy = anthropic/claude-opus-5-5#xhigh`):
+
+| Run | Attempts, in order | Actions | Stop |
+|---|---|---|---|
+| default (×4, real ratios) | `anthropic/claude-sonnet-5-5#low` (fast), `anthropic/claude-sonnet-5-5#medium` (fast), `anthropic/claude-sonnet-5-5#high` (medium) | `retry` (variant step, ratio 1), `escalate` → `medium` (variant `high`, `carryVariant`, ratio 5), `give_up` | `cost ceiling exceeded` (1 + 1 + 5 = 7 > 1 × 4) |
+| no ceiling (×1000) | `anthropic/claude-sonnet-5-5#low`, `anthropic/claude-sonnet-5-5#medium`, `anthropic/claude-sonnet-5-5#high`, `anthropic/claude-opus-5-5#xhigh` (heavy) | `retry` (variant step), `escalate` → `medium`, `escalate` → `heavy`, `give_up` | `max total attempts (4) reached` |
+
+`triedByModel` before each attempt (no-ceiling run): `{sonnet: low}`, `{sonnet: medium}`, `{sonnet: high}`, `{sonnet: high, opus: xhigh}`.
+
+**hybrid-2** (`fast = openai/gpt-6-luna-fast#medium`, `medium = anthropic/claude-sonnet-5-5#xhigh`, `heavy = anthropic/claude-opus-5-5#xhigh`), unchanged by Round 2:
+
+| Run | Attempts, in order | Actions | Stop |
+|---|---|---|---|
+| default (×4, real ratios) | `openai/gpt-6-luna-fast#medium`, `openai/gpt-6-luna-fast#high`, `anthropic/claude-sonnet-5-5#xhigh` (medium) | `retry` (variant step), `escalate` → `medium`, `give_up` | `cost ceiling exceeded` (1 + 1 + 5 = 7 > 4) |
+| no ceiling (×1000) | `openai/gpt-6-luna-fast#medium`, `openai/gpt-6-luna-fast#high`, `anthropic/claude-sonnet-5-5#xhigh`, `anthropic/claude-opus-5-5#xhigh` (heavy) | `retry` (variant step), `escalate` → `medium`, `escalate` → `heavy`, `give_up` | `max total attempts (4) reached` |
+
+Why anthropic changed: after `fast#medium` the reserve forces the escalation. `medium`''s base (`medium`) is covered by the tried `sonnet#medium` and its ladder has `high` and `xhigh` above, so it is entered at `high` instead of repeating `medium` (Round 1) or skipping it. Heavy is on another model, so it is entered at its base. hybrid-2 never reuses a model, so nothing is covered.
+
+### Observations
+
+| Id | Note |
+|---|---|
+| O9 | `triedByModel` stores one rung per model, ordered by guaranteed effort. A `default` attempt followed by a ranked one keeps the ranked one; the reverse keeps it too. The uncertainty of `default` (F9) therefore never hides a ranked rung. |
+| O10 | A tier on the same model as an effort-configured tier is never covered by it, even when both run the same effort in practice; it costs one extra attempt but never skips a tier the user configured differently. |
+| O11 | The reserve now also gates tiers without variant info in a variants-enabled session (QA-1.5-21), so on such a session a tier that has no catalog entry retries less often than under 2.2.0. Sessions without `policy.variants` are byte-identical to 2.2.0. |
+
+### Verification
+
+- `npm run typecheck`: green.
+- `npx vitest run test/unit/ladder.session.test.ts test/unit/ladder.test.ts test/unit/escalate-variants.test.ts` (default pool): 3 files, 477 tests passed: `ladder.session.test.ts` 250, `ladder.test.ts` 179 (unchanged), `escalate-variants.test.ts` 48.
+- `npx vitest related src/escalate/ladder.ts --run`: 37 files passed, 3 skipped (1201 tests passed, 55 skipped).
+- Mutations checked: comparing coverage against the current model only fails both non-adjacent probes and six property seeds; removing the effort exclusions fails four QA-1.5-18 tests; disabling the reserve fallback fails the QA-1.5-19 probes.
