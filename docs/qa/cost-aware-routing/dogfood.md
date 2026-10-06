@@ -23,3 +23,15 @@
 **Bias: the baseline undercounts exactly the false refusals.** A scorecard is written on `session.idle` only when the session has guard state (`D:\git\opencode-model-router\src\index.ts:1710–1713`, `guardStore.get(sid)`), which tool activity creates. A child that returns with zero tool calls therefore most likely writes no scorecard at all — which is why the 5 zero-tool `@fast` hand-backs observed during planning (handover §3.4) do not appear, and why "sessions with ≥1 scorecard line" is not a dispatch count. Verdicts are not stored either. Both signals are first measured from DF2 on, by `decisions.jsonl` and the outcome store (D4, D15). Execution session so far (from 2026-10-06 ≈01:00): 2 `@fast` dispatches in Phase 0.P, the first a "no shell" hand-back (re-dispatched, see `run-log.md`).
 
 **Restarts so far:** 0. Expected: one per code sync (DF1–DF4), per spike S7.
+
+## DF1 — after Wave 1 (2026-10-06T09:35Z)
+
+**Mode after checkpoint:** `static` (no `routing` block anywhere; no override file).
+
+**Sync:** `master` fast-forwarded to `car/main` @ `88847cb` (Phases 1.1, 1.2, 1.3, 1.4, 1.5 merged, each QA PASS with 0 open findings; plan amendments A14–A26). Rollback tag `car/sync-1-prev` = previous `master` (`3b3dba4`). `package-lock.json` unchanged → no `npm ci` in the base checkout. Capped full suite on `car/main` @ `88847cb`: 127 files passed, 3 skipped; 11 036 tests passed, 66 skipped.
+
+**Liveness:** code sync requires a host restart (A8). Probe after restart: `/router` must show `router: engine=static build=2.2.0+88847cb` (first 7 of the synced sha); the live protocol text and `R:` line must be byte-identical to 0.P.3 (v2-adapted SHA-256s pinned in Phase 1.4).
+
+**`routing:stats` (DF0 → DF1):** `node scripts/routing-stats.ts` → `routing-stats: no outcome data in C:\Users\MARQUI~1\AppData\Local\Temp\opencode-model-router-trajectory`; table all zeros (`Dispatches 0`, agreement `n/a`). Expected: the outcome store and decision log start writing at DF2 (`shadow`).
+
+**Incident in the period:** a Phase 1.1 test run with `--pool=threads` wrote the user's real `opencode-model-router.overrides.jsonc` (`{"routing":{"engine":"enforce"}}`); the orchestrator deleted it at ≈03:25, before any engine code was live (A14; global home guard added). Restart time lost: recorded at resume.

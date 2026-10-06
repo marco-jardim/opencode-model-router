@@ -55,25 +55,25 @@ directives, which are binding and override your defaults. The rules that matter 
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **DF0** done; **Wave 1 in progress** (handover revision 2, written mid-wave in `car/main`; `master` still holds revision 1 until DF1) |
-| **Next task id** | Wave 1 QA: Phases 1.1, 1.2, 1.3, 1.5 have finished QA rounds 1 and 2 fixes (1.1 and 1.2 round-2 fixes may still be finishing — check each branch log and `phase-1.x.md` "Round 2 fixes"). Next: round-3 re-review of round-2 MAJOR/CRITICAL fixes only (QA-1.1-22/23, QA-1.2-22/23/24, QA-1.5-17/18; 1.3 had none) by the same @heavy reviewer sessions → write each `## Verdict` → merge 1.1, 1.2, 1.3, 1.5 into `car/main` one at a time (capped suite after each; reconcile 1.5's `(tier as { candidates?: unknown })` cast with 1.1's typed `TierConfig.candidates`; add the post-merge test pinning `ROUTING_TASK_CLASSES` == 1.2 `TASK_CLASSES`) → Phase 1.4 (kernel) → DF1. |
-| `master` | fast-forwarded to `car/main` at the 0.P close (A12; docs + gated smoke test only, no restart needed); was `8e7a890` |
-| `car/main` | tip = merge of `car/p0p` (Phase 0.P); check `git -C D:\git\omr-car-main log --oneline -3` |
+| Checkpoint reached | **DF1 sync done, restart pending** (handover revision 3). Wave 1 merged; `master` = `car/main` = `88847cb` + the DF1 docs commit |
+| **Next task id** | **DF1 liveness probe** (after the human restarts OpenCode v2 and types `/router`): output must contain `router: engine=static build=2.2.0+<sha7 of master>`; confirm the live protocol/`R:` line equals 0.P.3 (v2 form); record restart time lost in `dogfood.md` `## DF1` and `run-log.md`. If stale → blocking (§0.1.3). Then **Phase 2.1** (telemetry ingestion): worktree `D:\git\omr-car-p21` on `car/p21` from `car/main`, first task **2.1.1**; tag `car/wave-2-base` first. |
+| `master` | fast-forwarded to `car/main` at DF1 (rollback tag `car/sync-1-prev` = `3b3dba4`) |
+| `car/main` | Wave 1 merged (`88847cb`) + DF1 docs commit |
 | Base directory | `D:\git\opencode-model-router` (branch `master`); the session alias `D:\git\Claude-model-router` is the same repository — always use the `D:\git\opencode-model-router` form in dispatches |
 | Integration worktree | `D:\git\omr-car-main` on `car/main` (base `D:\git\opencode-model-router`; `npm ci` done; typecheck + capped suite green at `8e7a890`: 109 files passed, 3 skipped) |
-| Phase worktrees | `D:\git\omr-car-p11` (`car/p11`, Phase 1.1), `D:\git\omr-car-p12` (`car/p12`, 1.2), `D:\git\omr-car-p13` (`car/p13`, 1.3), `D:\git\omr-car-p15` (`car/p15`, 1.5); all created from `car/main` @ `3b3dba4` (tag `car/wave-1-base`), base `D:\git\opencode-model-router` |
+| Phase worktrees | none open (p11, p12, p13, p14, p15 merged and removed). Integration worktree `D:\git\omr-car-main` stays. |
 | Other worktrees on the machine (not ours; never touch) | `D:\git\opencode-model-router-v2` (`fix/gate-task-cwd`), `D:\git\opencode-model-router-release` (`release/1.13.0`), `D:\git\opencode-model-router-agent-options-gate` (`fix/agent-options-provider-gate`), detached worktrees under `C:\Users\Marquinho\AppData\Local\Temp\` |
 | Active router config | Plugin loaded from `D:\git\opencode-model-router` (`C:\Users\Marquinho\.config\opencode\opencode.json:189`); bundled `D:\git\opencode-model-router\tiers.json` + state `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json` (`activePreset: hybrid-2`, `activeMode: normal`, `enforcementMode: advisory`); no override files. **Checkpoint edit target:** `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (create at DF2 with only the `routing` block) |
 | Current `routing` block | none (engine = `static` by absence) |
 | Scorecard / D15 directory | `C:\Users\Marquinho\AppData\Local\Temp\opencode-model-router-trajectory` |
 | Host | OpenCode `v2.0.22`; source `anomalyco/opencode` @ `527f0b931d1f9b3ebd34e106c51b31ce5db5b075`; `@opencode/plugin` 2.0.22 |
-| Open QA findings | Wave 1 round-2 fixes under re-review; plan amendments A14–A22 recorded in §1.5 on `car/main` (`81ca09e`, `ae0704e`) |
+| Open QA findings | none. Plan amendments A1–A26 in §1.5. Handoffs to 2.1–2.4 are in each `docs\qa\cost-aware-routing\phase-1.x.md` "Handoffs" section — read all five before starting each Wave 2 phase. |
 | 0.P close-out | done: QA PASS, `car/p0p` merged into `car/main`, capped suite green, `master` fast-forwarded, `D:\git\omr-car-p0p` removed, Wave-1 comment posted on #74 |
 | Owner decisions pending | **Classifier model for the DF3 live check (A13)** — asked at 0.P close; until answered, the DF3 check is skipped. Record the answer here. |
 | Spike evidence hygiene | Any spike re-run that is not meant to replace the evidence: `git -C <worktree> checkout -- docs/qa/cost-aware-routing/spikes` afterwards (QA-0P-42) |
 | Liveness probe / slash commands | The orchestrator has no tool to type `/router` or `/annotate-plan`; at DF1 find the host API route that runs a session command (host source at the pinned sha) or ask the human to type it |
 | Last `routing:stats` | n/a (script arrives in Phase 1.3); DF0 baseline from scorecards |
-| Sentence for the human | n/a (no restart pending) |
+| Sentence for the human | "Sync DF1 concluído; o código novo não está ativo na sessão. Reinicie o OpenCode v2, digite `/router` e depois diga 'retomar'." |
 
 ---
 
