@@ -186,18 +186,23 @@ export type ParseSnapshotResult =
   | { readonly ok: false; readonly reason: "unsupported-version" | "corrupt"; readonly message: string };
 
 /**
- * Validate a parsed `outcomes.json` envelope. A newer `version` is `unsupported-version` (never
- * overwritten by this plugin); a wrong schema, a non-object or `version < 1` is `corrupt`. Invalid
- * entries are dropped and counted; the valid ones come back with keys in sorted order.
+ * Validate a parsed `outcomes.json` envelope. A newer `version`, another schema, a non-object or a
+ * non-integer `version` is `unsupported-version` (never quarantined or overwritten by this plugin);
+ * `version < 1` or a missing `entries` object on our schema is `corrupt`. Invalid entries are dropped
+ * and counted; the valid ones come back with keys in sorted order.
  */
 export function parseSnapshot(json: unknown): ParseSnapshotResult {
-  if (!isRec(json)) return { ok: false, reason: "corrupt", message: "not a JSON object" };
+  // QA-1.3-11: valid JSON that is not a version-1 outcome store is somebody else's file (or a newer
+  // format): report it as `unsupported-version` so it is never quarantined or overwritten.
+  if (!isRec(json)) {
+    return { ok: false, reason: "unsupported-version", message: "not an outcome store: the top-level JSON value is not an object" };
+  }
   if (json.schema !== OUTCOMES_SCHEMA_ID) {
-    return { ok: false, reason: "corrupt", message: `unexpected schema ${JSON.stringify(json.schema)}` };
+    return { ok: false, reason: "unsupported-version", message: `not an outcome store: unexpected schema ${JSON.stringify(json.schema)}` };
   }
   const version = json.version;
   if (typeof version !== "number" || !Number.isInteger(version)) {
-    return { ok: false, reason: "corrupt", message: "missing or non-integer version" };
+    return { ok: false, reason: "unsupported-version", message: `unrecognized outcome store version ${JSON.stringify(version)}` };
   }
   if (version > OUTCOMES_SCHEMA_VERSION) {
     return {

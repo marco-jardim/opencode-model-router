@@ -14,7 +14,7 @@ import {
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { createPersister, nodePersistFs } from "../../src/routing/outcomes/persist";
 import { emptyTokenSample } from "../../src/routing/outcomes/cost";
-import { OUTCOMES_CORRUPT_FILE, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
+import { OUTCOMES_CORRUPT_PREFIX, OUTCOMES_FILE, STATS_EXIT, makeKey } from "../../src/routing/outcomes/types";
 import type {
   DecisionRow,
   LoadResult,
@@ -883,7 +883,7 @@ describe("scripts/routing-stats.ts (plain node)", () => {
     expect(result.stderr).toContain("invalid JSON");
     expect(await readdir(dir)).toEqual([OUTCOMES_FILE]); // strictly read-only: no quarantine file, no temp files
     expect((await readFile(file, "utf8")).startsWith('{"schema"')).toBe(true);
-    expect(await readdir(dir)).not.toContain(OUTCOMES_CORRUPT_FILE);
+    expect((await readdir(dir)).filter((n) => n.startsWith(OUTCOMES_CORRUPT_PREFIX))).toEqual([]);
   }, 60_000);
 
   it("a store written by a newer version also exits 1", async () => {

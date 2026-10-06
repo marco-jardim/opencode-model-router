@@ -524,8 +524,11 @@ export const OUTCOMES_SCHEMA_VERSION = 1;
 /** Default directory name under `os.tmpdir()`: the `*.scorecard.log` directory located in 0.P.2. */
 export const DEFAULT_OUTCOMES_DIRNAME = "opencode-model-router-trajectory";
 export const OUTCOMES_FILE = "outcomes.json";
-/** Last corrupted store, kept for forensics (overwritten by the next quarantine). */
-export const OUTCOMES_CORRUPT_FILE = "outcomes.corrupt.json";
+/** Quarantined unparseable/malformed stores: `outcomes.corrupt.<YYYYMMDDTHHMMSSmmmZ>-<pid>.json` (QA-1.3-11). */
+export const OUTCOMES_CORRUPT_PREFIX = "outcomes.corrupt.";
+export const OUTCOMES_CORRUPT_RE = /^outcomes\.corrupt\.(\d{8}T\d{9}Z)-(\d+)\.json$/;
+/** Quarantine copies kept (the newest ones). */
+export const MAX_CORRUPT_COPIES = 3;
 /** Prefix of temp files used by the atomic write (`outcomes.json.tmp-<pid>-<seq>`). */
 export const OUTCOMES_TMP_PREFIX = "outcomes.json.tmp-";
 export const DECISIONS_FILE = "decisions.jsonl";
@@ -595,7 +598,11 @@ export interface PersisterOptions {
   readonly renameRetryDelaysMs?: readonly number[];
 }
 
-/** `missing` = no file (fresh store, not an error); `corrupt` = unreadable JSON/envelope; `unsupported-version` = newer schema. */
+/**
+ * `missing` = no file (fresh store, not an error); `corrupt` = unparseable JSON or a malformed version-1
+ * envelope (quarantined); `unsupported-version` = a file this plugin must not touch: a newer version, another
+ * schema or a non-numeric version (read-only, never quarantined).
+ */
 export type LoadStatus = "ok" | "missing" | "corrupt" | "unsupported-version";
 
 export interface LoadResult {
@@ -623,7 +630,11 @@ export interface Persister {
   readonly dir: string;
   readonly outcomesPath: string;
   readonly decisionsPath: string;
-  /** Never throws. `quarantine: true` (plugin) moves a corrupt file to OUTCOMES_CORRUPT_FILE; the CLI passes false. */
+  /**
+   * Never throws. `quarantine: true` (plugin) moves an unparseable or malformed version-1 file to a unique
+   * `outcomes.corrupt.<stamp>-<pid>.json`; a file that is not ours (other schema or a newer version) is never
+   * moved or overwritten. The CLI passes false.
+   */
   load(options?: { readonly quarantine?: boolean }): Promise<LoadResult>;
   /** Atomic: temp file + durable write + rename (with Windows retries). Never throws; the old file survives any failure. */
   saveSnapshot(snapshot: OutcomeSnapshot): Promise<WriteResult>;

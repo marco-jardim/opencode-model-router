@@ -18,7 +18,8 @@ import {
   DECISIONS_FILE,
   DECISIONS_ROTATED_RE,
   DEFAULT_OUTCOMES_DIRNAME,
-  OUTCOMES_CORRUPT_FILE,
+  OUTCOMES_CORRUPT_PREFIX,
+  OUTCOMES_CORRUPT_RE,
   OUTCOMES_FILE,
   OUTCOMES_SCHEMA_ID,
   OUTCOMES_TMP_PREFIX,
@@ -70,6 +71,11 @@ function fsError(code: string, message = code): Error {
 interface MemFile {
   text: string;
   mtimeMs: number;
+}
+
+/** Quarantined copies (`outcomes.corrupt.<stamp>-<pid>.json`) present in a mem fs, oldest first. */
+function corruptCopies(files: Map<string, MemFile>): string[] {
+  return [...files.keys()].filter((p) => OUTCOMES_CORRUPT_RE.test(basename(p))).sort();
 }
 
 function createMemFs(now: () => number) {
@@ -447,24 +453,80 @@ describe("persister: load", () => {
     expect(logger.warn.mock.calls[0]?.[0]).toBe("[router] outcome store corrupted; starting fresh");
     expect(logger.warn.mock.calls[0]?.[1]).toMatchObject({ path });
     expect(mem.files.has(path)).toBe(false);
-    expect(mem.files.get(join(dir, OUTCOMES_CORRUPT_FILE))?.text).toContain('"vers');
+    const copies = corruptCopies(mem.files);
+    expect(copies).toHaveLength(1);
+    expect(basename(copies[0] ?? "")).toBe(`${OUTCOMES_CORRUPT_PREFIX}${compactStamp(T0)}-${PID}.json`);
+    expect(mem.files.get(copies[0] ?? "")?.text).toContain('"vers');
 
     expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: true });
     expect((await createPersister(dir, deps).load()).status).toBe("ok");
-    expect(mem.files.get(join(dir, OUTCOMES_CORRUPT_FILE))?.text).toContain('"vers');
+    expect(mem.files.get(copies[0] ?? "")?.text).toContain('"vers');
+  });
+
+  it.each([
+    ["version 0", JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, version: 0, entries: {} })],
+    ["a missing entries object", JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, version: 1 })],
+    ["an empty file", ""],
+    ["a truncated file", '{"schema": "opencode-model-router.outcomes", "version": 1, "entries": {'],
+  ])("QA-1.3-11: %s is corrupt: quarantined, and the next save may write", async (_name, text) => {
+    const { mem, deps, dir } = setup();
+    mem.files.set(join(dir, OUTCOMES_FILE), { text, mtimeMs: 1 });
+    const persister = createPersister(dir, deps);
+    const loaded = await persister.load();
+    expect(loaded.status).toBe("corrupt");
+    expect(corruptCopies(mem.files)).toHaveLength(1);
+    expect(mem.files.has(join(dir, OUTCOMES_FILE))).toBe(false);
+    expect((await persister.saveSnapshot(snapshotOf("pass"))).ok).toBe(true);
   });
 
   it.each([
     ["a wrong schema", JSON.stringify({ schema: "other", version: 1, entries: {} })],
-    ["a non-object", "[1, 2, 3]"],
-    ["version 0", JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, version: 0, entries: {} })],
-    ["an empty file", ""],
-  ])("%s is corrupt too", async (_name, text) => {
+    ["another tool's JSON object", JSON.stringify({ name: "package", version: "1.0.0" })],
+    ["a JSON array", "[1, 2, 3]"],
+    ["a JSON string", '"hello"'],
+    ["null", "null"],
+    ["a string version", JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, version: "1", entries: {} })],
+    ["a fractional version", JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, version: 1.5, entries: {} })],
+    ["a missing version", JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, entries: {} })],
+  ])("QA-1.3-11: %s is not ours: read-only, never quarantined, never overwritten", async (_name, text) => {
+    const { mem, deps, dir, logger } = setup();
+    const path = join(dir, OUTCOMES_FILE);
+    mem.files.set(path, { text, mtimeMs: 1 });
+    const persister = createPersister(dir, deps);
+    const loaded = await persister.load();
+    expect(loaded.status).toBe("unsupported-version");
+    expect(loaded.message).toContain(resolve(path));
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(mem.files.get(path)?.text).toBe(text);
+    expect(corruptCopies(mem.files)).toEqual([]);
+    expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: false, error: "unrecognized outcome store on disk" });
+    expect(mem.files.get(path)?.text).toBe(text);
+    expect(mem.touched.some((t) => t.op === "writeDurable" || t.op === "rename" || t.op === "unlink")).toBe(false);
+  });
+
+  it("QA-1.3-11: a UTF-8 BOM in front of a valid store is tolerated", async () => {
     const { mem, deps, dir } = setup();
-    mem.files.set(join(dir, OUTCOMES_FILE), { text, mtimeMs: 1 });
+    const snapshot = snapshotOf("pass", "fail");
+    await createPersister(dir, deps).saveSnapshot(snapshot);
+    const path = join(dir, OUTCOMES_FILE);
+    mem.files.set(path, { text: "\uFEFF" + (mem.files.get(path)?.text ?? ""), mtimeMs: 2 });
     const loaded = await createPersister(dir, deps).load();
-    expect(loaded.status).toBe("corrupt");
-    expect(mem.files.has(join(dir, OUTCOMES_CORRUPT_FILE))).toBe(true);
+    expect(loaded.status).toBe("ok");
+    expect(loaded.snapshot).toEqual(snapshot);
+    expect(corruptCopies(mem.files)).toEqual([]);
+  });
+
+  it("QA-1.3-11: quarantine names are unique per quarantine (same millisecond, same pid) and only the newest copies are kept", async () => {
+    const { mem, deps, dir } = setup();
+    const path = join(dir, OUTCOMES_FILE);
+    for (let i = 0; i < 6; i++) {
+      mem.files.set(path, { text: `garbage ${i}`, mtimeMs: 1 });
+      expect((await createPersister(dir, deps).load()).status).toBe("corrupt"); // the clock never moves
+    }
+    const copies = corruptCopies(mem.files);
+    expect(copies).toHaveLength(3);
+    expect(copies.map((p) => mem.files.get(p)?.text)).toEqual(["garbage 3", "garbage 4", "garbage 5"]);
+    expect(new Set(copies).size).toBe(3);
   });
 
   it("quarantine: false (the CLI) reports corruption but leaves the file where it is", async () => {
@@ -515,7 +577,7 @@ describe("persister: load", () => {
     expect(loaded.snapshot).toEqual({ version: 1, entries: {} });
     expect(loaded.message).toContain(resolve(path));
     expect(logger.warn).toHaveBeenCalledTimes(1);
-    expect(mem.files.has(join(dir, OUTCOMES_CORRUPT_FILE))).toBe(false);
+    expect(corruptCopies(mem.files)).toEqual([]);
 
     expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: false, error: "unsupported outcome store version on disk" });
     expect(mem.files.get(path)?.text).toBe(newer);
@@ -911,7 +973,7 @@ describe("nodePersistFs and a real directory", () => {
     expect((await stat(join(dir, DECISIONS_FILE))).size).toBeGreaterThan(0);
     await writeFile(join(dir, OUTCOMES_FILE), "{broken", "utf8");
     expect((await persister.load()).status).toBe("corrupt");
-    expect(await readdir(dir)).toContain(OUTCOMES_CORRUPT_FILE);
+    expect((await readdir(dir)).some((n) => OUTCOMES_CORRUPT_RE.test(n))).toBe(true);
   });
 
   it("nodeScheduler timers are unref'd so they never keep the process alive", () => {
@@ -1411,7 +1473,7 @@ describe("acquireOutcomes (A3)", () => {
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(bundle.store.keys()).toEqual([KEY]);
     await bundle.release();
-    expect(mem.files.get(join(dir, OUTCOMES_CORRUPT_FILE))?.text).toBe("{{{ corrupt");
+    expect(corruptCopies(mem.files).map((p) => mem.files.get(p)?.text)).toEqual(["{{{ corrupt"]);
     const reloaded = await createPersister(dir, deps).load({ quarantine: false });
     expect(reloaded.status).toBe("ok");
     expect(Object.keys(reloaded.snapshot.entries)).toEqual([KEY]);

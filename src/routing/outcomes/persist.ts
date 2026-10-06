@@ -46,7 +46,9 @@ import {
   LADDER_STEP_KINDS,
   LOG_ROW_VERSION,
   MAX_QUEUED_ROWS,
-  OUTCOMES_CORRUPT_FILE,
+  MAX_CORRUPT_COPIES,
+  OUTCOMES_CORRUPT_PREFIX,
+  OUTCOMES_CORRUPT_RE,
   OUTCOMES_FILE,
   OUTCOMES_SCHEMA_ID,
   OUTCOMES_SCHEMA_VERSION,
@@ -376,7 +378,6 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
   const { fs, sleep, logger, pid } = deps;
   const now = (): number => safeNow(deps.now);
   const outcomesPath = join(dir, OUTCOMES_FILE);
-  const corruptPath = join(dir, OUTCOMES_CORRUPT_FILE);
   const decisionsPath = join(dir, DECISIONS_FILE);
   const maxBytes = options.maxBytes ?? DECISIONS_MAX_BYTES;
   const maxGenerations = Math.max(0, Math.floor(options.maxGenerations ?? DECISIONS_MAX_GENERATIONS));
@@ -447,7 +448,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       let json: unknown;
       let parseError: string | null = null;
       try {
-        json = JSON.parse(text);
+        json = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); // a UTF-8 BOM is tolerated
       } catch (error) {
         parseError = `invalid JSON: ${describeError(error)}`;
       }
@@ -462,24 +463,17 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         }
         result = loadResult("ok", message, parsed.snapshot, parsed.dropped, savedAt);
       } else if (parsed !== null && parsed.reason === "unsupported-version") {
-        readOnlyReason = "unsupported outcome store version on disk";
-        logger.warn("[router] outcome store was written by a newer version; leaving it untouched", {
+        readOnlyReason = parsed.message.startsWith("unsupported outcome store version")
+          ? "unsupported outcome store version on disk"
+          : "unrecognized outcome store on disk";
+        logger.warn("[router] outcome store is not a version-1 file of this plugin; leaving it untouched", {
           path: outcomesPath,
           reason: parsed.message,
         });
         result = loadResult("unsupported-version", `${absPath}: ${parsed.message}`);
       } else {
         const reason = parseError ?? (parsed !== null && !parsed.ok ? parsed.message : "unknown error");
-        if (quarantine) {
-          try {
-            await renameWithRetry(fs, outcomesPath, corruptPath, sleep, delays);
-          } catch (error) {
-            logger.warn("[router] could not quarantine the corrupt outcome store; the next save overwrites it", {
-              path: outcomesPath,
-              error: describeError(error),
-            });
-          }
-        }
+        if (quarantine) await quarantineCorrupt();
         logger.warn("[router] outcome store corrupted; starting fresh", { path: outcomesPath, reason });
         result = loadResult("corrupt", `${absPath}: ${reason}`);
       }
@@ -488,6 +482,40 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
     lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
     if (quarantine) await cleanStaleTemps();
     return result;
+  }
+
+  /** Move the unparseable/malformed store aside under a unique name and keep only the newest few copies. */
+  async function quarantineCorrupt(): Promise<void> {
+    try {
+      let ms = now();
+      const newest = (await fs.readdir(dir)).filter((name) => OUTCOMES_CORRUPT_RE.test(name)).sort().at(-1);
+      const newestMs = newest === undefined ? null : stampToMs((OUTCOMES_CORRUPT_RE.exec(newest) ?? [])[1] ?? "");
+      if (newestMs !== null && ms <= newestMs) ms = newestMs + 1; // strictly newer than every kept copy, so pruning drops the oldest
+      let moved = false;
+      for (let attempt = 0; attempt < 20 && !moved; attempt++) {
+        const target = join(dir, `${OUTCOMES_CORRUPT_PREFIX}${compactStamp(ms)}-${pid}.json`);
+        if ((await statOrNull(target)) === null) {
+          await renameWithRetry(fs, outcomesPath, target, sleep, delays);
+          moved = true;
+        } else {
+          ms += 1;
+        }
+      }
+      if (!moved) throw new Error("no free quarantine file name");
+      const copies = (await fs.readdir(dir)).filter((name) => OUTCOMES_CORRUPT_RE.test(name)).sort();
+      for (const name of copies.slice(0, Math.max(0, copies.length - MAX_CORRUPT_COPIES))) {
+        try {
+          await fs.unlink(join(dir, name));
+        } catch (error) {
+          logger.info?.("[router] old quarantined outcome store not removed", { name, error: describeError(error) });
+        }
+      }
+    } catch (error) {
+      logger.warn("[router] could not quarantine the corrupt outcome store; the next save overwrites it", {
+        path: outcomesPath,
+        error: describeError(error),
+      });
+    }
   }
 
   async function checkForeignWriter(): Promise<void> {
@@ -604,7 +632,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         }
         if (text === null) continue;
         files.push(path);
-        for (const line of text.split(/\r?\n/)) {
+        for (const line of (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r?\n/)) {
           if (line.trim() === "") continue;
           const row = parseLogLine(line);
           if (row === null) skipped += 1;

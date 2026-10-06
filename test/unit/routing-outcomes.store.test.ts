@@ -786,11 +786,21 @@ describe("snapshot / fromSnapshot / parseSnapshot", () => {
       ["a missing version", envelope({ version: undefined })],
       ["a string version", envelope({ version: "1" })],
       ["a fractional version", envelope({ version: 1.5 })],
+    ])("QA-1.3-11: %s is not an outcome store of this plugin (unsupported, never quarantined)", (_name, json) => {
+      const r = parseSnapshot(json);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe("unsupported-version");
+        expect(r.message.length).toBeGreaterThan(0);
+      }
+    });
+
+    it.each([
       ["version 0", envelope({ version: 0 })],
       ["a negative version", envelope({ version: -1 })],
       ["missing entries", envelope({ entries: undefined })],
       ["array entries", envelope({ entries: [] })],
-    ])("%s is corrupt", (_name, json) => {
+    ])("%s is a malformed version-1 envelope: corrupt", (_name, json) => {
       const r = parseSnapshot(json);
       expect(r.ok).toBe(false);
       if (!r.ok) {
