@@ -211,7 +211,7 @@ The classifier's confidence only decides whether the *class* is trusted (D4). It
 | `rules` (default) | nowhere | not used | nothing | |
 | `host` | the provider of the model you name, through the host's `generate` call with **your** credentials | `provider/model[#variant]` | nothing | **Experimental**, see [Known limits](#known-limits-and-experimental-parts). |
 | `openai-compatible` | `<baseUrl>/chat/completions` | the model id on that server (the part after `provider/`) | `baseUrl` (the `/v1` root) | `apiKeyEnv` optional: no key, no `Authorization` header (local servers). `samples: 3` takes a majority vote and uses the agreement as confidence. A `json_schema` `response_format` is tried first and dropped for later calls if the server rejects it. |
-| `typesafe` | `<baseUrl>/v1/systemone` (TypeSafe "choice" questions) | sent as the request's `model` | `baseUrl` and `apiKeyEnv` | There is no built-in URL: a missing `baseUrl` disables the backend with a logged reason. TypeSafe returns a calibrated confidence, so `samples` is ignored. |
+| `typesafe` | `<baseUrl>/v1/systemone` (TypeSafe "choice" questions) | sent as the request's `model` | `baseUrl` (required at load); `apiKeyEnv` (checked at call time: without it the backend disables itself and logs why) | There is no built-in URL: a missing `baseUrl` disables the backend with a logged reason. TypeSafe returns a calibrated confidence, so `samples` is ignored. |
 
 `apiKeyEnv` names an environment variable; the key itself is never stored in the config, and it is read at each call, so setting the variable later enables the backend without a reload.
 
