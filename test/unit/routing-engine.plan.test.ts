@@ -551,6 +551,49 @@ describe("QA-1.4-13: the QA match is narrow", () => {
   });
 });
 
+describe("QA-1.4-18: a verb or adjective before QA, and QA followed by on/of/for, a colon or the line end", () => {
+  const pins = async (lines: readonly string[]) =>
+    (await annotateSteps(lines.map((l, i) => step(`s${i}`, l)), stubDeps(() => facts("search", { risk: "low" })))).map((a) => a.pin);
+
+  it("recognises the QA steps the first match missed", async () => {
+    const lines = [
+      "Run QA on phase 3",
+      "Perform QA",
+      "Final QA",
+      "Do QA for the release",
+      "run QA on the branch",
+      "Perform the QA of the build",
+      "Adversarial QA of the diff",
+      "Senior QA review",
+      "Phase 3 QA on the build",
+      "Release gate: QA:",
+      "Schedule the final QA",
+    ];
+    expect(await pins(lines)).toEqual(lines.map(() => true));
+  });
+
+  it("a QA step found this way is tagged heavy and pinned like any other", async () => {
+    const out = await annotateSteps([step("a", "Run QA on phase 3")], stubDeps(() => facts("search", { risk: "low" })));
+    expect(out[0]!.tier).toBe("heavy");
+    expect(out[0]!.pin).toBe(true);
+    expect(out[0]!.text.split("\n")[0]).toBe("Run QA on phase 3 [tier:heavy]");
+  });
+
+  it("finding ids, longer words and plain mentions stay routine work", async () => {
+    const lines = [
+      "Fix QA-1.4-3 finding",
+      "QA-1.4-15: tighten the evidence gate",
+      "Write the QA notes",
+      "Update the QA docs",
+      "Run the QAT suite",
+      "run qa checks",
+      "Do the QA2 migration",
+      "Rename QAHelper",
+      "Explain the QA process",
+    ];
+    expect(await pins(lines)).toEqual(lines.map(() => false));
+  });
+});
 describe("QA-1.4-9: fenced blocks hold no tag, route line or task line; annotation is idempotent", () => {
   it("tags and route lines inside a fence are text: the engine annotates the real task line", async () => {
     const text = "```\n[tier:heavy]\n[route class=debug pin]\n```\nFix the thing\nmore";

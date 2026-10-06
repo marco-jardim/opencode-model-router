@@ -89,13 +89,22 @@ export interface AnnotatedStep {
 
 const TIER_TAG_RE = /\[tier:([A-Za-z0-9_-]+)\]/;
 /**
- * QA-1.4-13: a QA step starts with the word `QA` (after list, heading or emphasis markers: `QA the release`,
- * `- QA: verify`, `## QA round 2`) or names a QA activity (`QA review`, `QA round`, `QA pass`, `QA sign-off`,
- * `QA gate`, `QA cycle`, `QA phase`). Case-sensitive. `Write the QA notes` or `Update the QA docs` are not QA
- * steps: that would force the heavy tier on routine work.
+ * QA-1.4-13 / QA-1.4-18: a QA step
+ *  - starts with the word `QA` (after list, heading or emphasis markers: `QA the release`, `- QA: verify`,
+ *    `## QA round 2`), or
+ *  - names a QA activity (`QA review`, `QA round`, `QA pass`, `QA sign-off`, `QA gate`, `QA cycle`, `QA phase`), or
+ *  - puts a verb or an adjective in front of it (`Run QA on phase 3`, `Perform the QA`, `Do QA for …`,
+ *    `Final QA`, `Adversarial QA`, `Senior QA review`), or
+ *  - has `QA` followed by `on` / `of` / `for`, a colon, or the end of the line (`Phase 3 QA on the build`).
+ * Case-sensitive for `QA`. The word never continues into a finding or ticket id (`QA-1.4-3`, `QA2`) or a longer
+ * word (`QAT`). `Write the QA notes`, `Update the QA docs` and `Fix QA-1.4-3 finding` are routine work: a false
+ * positive forces the heavy tier, a false negative only leaves the engine's normal choice.
  */
-const QA_LEADING_RE = /^(?:[-*+>#]+\s*|\d+[.)]\s+|\*\*|__|\s)*QA(?![A-Za-z0-9])/;
+const QA_WORD = "QA(?![A-Za-z0-9_]|-[A-Za-z0-9])";
+const QA_LEADING_RE = new RegExp(`^(?:[-*+>#]+\\s*|\\d+[.)]\\s+|\\*\\*|__|\\s)*${QA_WORD}`);
 const QA_PHRASE_RE = /\bQA[ -](?:review|round|pass|sign-?off|gate|cycle|phase)\b/;
+const QA_VERB_RE = new RegExp(`\\b(?:[Rr]un|[Pp]erform|[Dd]o|[Ff]inal|[Aa]dversarial|[Ss]enior)(?:\\s+(?:the|a|an))?\\s+${QA_WORD}`);
+const QA_CONTEXT_RE = new RegExp(`\\b${QA_WORD}(?:\\s+(?:on|of|for)\\b|\\s*:|\\s*$)`);
 const LINE_SPLIT_RE = /(\r\n|\n|\r)/;
 const DESCRIPTION_MAX_CHARS = 200;
 
@@ -104,7 +113,7 @@ function isMember<T extends string>(values: readonly T[], value: unknown): value
 }
 
 function isQaLine(line: string): boolean {
-  return QA_LEADING_RE.test(line) || QA_PHRASE_RE.test(line);
+  return QA_LEADING_RE.test(line) || QA_PHRASE_RE.test(line) || QA_VERB_RE.test(line) || QA_CONTEXT_RE.test(line);
 }
 
 /**
