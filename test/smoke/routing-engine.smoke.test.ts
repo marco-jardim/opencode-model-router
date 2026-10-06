@@ -74,7 +74,97 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
   }, 300_000);
-});
+
+  it("3 enforce: the engine swaps heavy -> fast on a search task and the host's child session runs the swapped agent and model", async () => {
+    const host = await RoutingHost.start("enforce", { routing: { engine: "enforce" }, seed: SEARCH_SEED });
+    try {
+      await runScenario("3-enforce", "engine=enforce: the orchestrator asks for heavy on a search task with no acceptance block; the engine swaps it to fast (sonnet-5-5#low). The CHILD SESSION held by the host has agent fast and model sonnet-5-5 variant low, the provider received that model with effort low, the row says switched=true, and the step record lands under the fast key.", async s => {
+        const rootID = await host.newRoot("enforce root");
+        const dispatched = await host.dispatch(rootID, { agent: "heavy", description: "Find usages", prompt: SEARCH_PROMPT, background: false });
+        const child = await host.client.session.get({ sessionID: dispatched.childID });
+        const listed = (await host.client.session.list({ parentID: rootID })).data;
+        const wire = host.requestsOf(dispatched.childID).filter(r => r.kind === "primary");
+        const rows = await host.waitForRows("the decision row", r => r.length >= 1);
+        const entries = await host.waitForEntries("a step record for the fast key", e => (e[key.searchFast]?.cost.tokens.n ?? 0) >= 1);
+        s.observed.rootID = rootID;
+        s.observed.childID = dispatched.childID;
+        s.observed.hookBeforeInput = dispatched.before.input;
+        s.observed.hostChild = { agent: child.agent, model: child.model, parentID: child.parentID, tokens: child.tokens };
+        s.observed.hostListedChildren = listed.map(c => ({ id: c.id, agent: c.agent, model: c.model }));
+        s.observed.childWire = wire.map(r => ({ catalogModel: r.catalogModel, wireModel: r.model, agent: r.agent, effort: obj(r.payload.output_config).effort }));
+        s.observed.row = rows[0];
+        s.observed.entryFast = entries[key.searchFast]?.cost;
+        s.observed.entryHeavyStepSamples = entries[key.searchHeavy]?.cost.tokens.n;
+        s.observed.routerLogLines = host.routerLogLines();
+        const row = rows[0]!;
+        const input = inputOf(dispatched.before);
+        const ok = child.agent === "fast" && sameModel(child.model, SONNET, "low") && listed.length === 1 && listed[0]!.agent === "fast"
+          && input.agent === "fast" && input.model === `${MODELS.sonnet}#low`
+          && wire.length === 1 && wire[0]!.catalogModel === `${MODELS.sonnet}#low` && wire[0]!.model === SONNET.id && obj(wire[0]!.payload.output_config).effort === "low" && wire[0]!.agent === "fast"
+          && rows.length === 1 && row.mode === "enforce" && row.switched === true && row.chosen.agent === "heavy" && row.best?.agent === "fast" && row.reason.startsWith("switched")
+          && (entries[key.searchFast]?.cost.tokens.n ?? 0) >= 1 && (entries[key.searchHeavy]?.cost.tokens.n ?? 0) === 0
+          && host.routerLogLines().length === 0;
+        s.verdict(ok, `host child agent=${child.agent} model=${child.model ? ref(child.model) : "?"} (asked heavy); wire ${wire[0]?.catalogModel} effort ${String(obj(wire[0]?.payload.output_config).effort)}; row switched=${row.switched} best=${row.best?.agent}; step records fast n=${entries[key.searchFast]?.cost.tokens.n} heavy n=${entries[key.searchHeavy]?.cost.tokens.n}`);
+      });
+
+      // ---- handoffs (phase-2.2/2.3 "to 3.2"): host events and tool hooks, read from the same host ----
+      const firstRoot = (await host.client.session.list()).data.find(r => !r.parentID)!;
+      const firstChild = (await host.client.session.list({ parentID: firstRoot.id })).data[0]!;
+      await runScenario("H1-events-and-hooks-enforce-host", "Host events for a subagent child: session.created carries parentID/agent/title; session.execution.* events carry an id and are delivered for the child before the tool call returns; the plugin's execute.before hook ran for the model-emitted subagent call.", async s => {
+        const events = await host.eventsOf(firstChild.id);
+        const created = (await host.events()).filter(e => e.type === "session.created" && obj(e.data).sessionID === firstChild.id);
+        const execution = events.filter(e => e.type.startsWith("session.execution"));
+        const hooks = (await host.hooks()).filter(h => h.sessionID === firstRoot.id && h.tool === "subagent");
+        const afterT = hooks.find(h => h.hook === "after")?.__t ?? 0;
+        s.observed.childEventTypes = events.map(e => ({ type: e.type, id: e.id, created: e.created, deliveredAt: e.__t }));
+        s.observed.sessionCreated = created.map(e => ({ id: e.id, type: e.type, data: e.data, location: e.location }));
+        s.observed.executionEvents = execution.map(e => ({ id: e.id, type: e.type, data: e.data, deliveredAt: e.__t }));
+        s.observed.subagentHookRecords = hooks.map(h => ({ hook: h.hook, iid: h.iid, callID: h.callID, agent: h.agent, at: h.__t }));
+        s.observed.toolReturnedAt = afterT;
+        const createdData = obj(created[0]?.data);
+        const ended = execution.filter(e => /succeeded|failed|interrupted|ended/.test(e.type));
+        const ok = created.length === 1 && createdData.parentID === firstRoot.id && createdData.agent === "fast" && createdData.title === "Find usages"
+          && execution.length >= 2 && execution.every(e => typeof e.id === "string" && e.id !== "") && ended.length >= 1 && ended.every(e => (e.__t ?? Infinity) <= afterT + 1000)
+          && hooks.some(h => h.hook === "before") && hooks.some(h => h.hook === "after");
+        s.verdict(ok, `session.created data keys=${Object.keys(createdData).join(",")} parentID=${String(createdData.parentID)} agent=${String(createdData.agent)} title=${String(createdData.title)}; execution events ${execution.map(e => e.type).join(",")} ids present=${execution.every(e => typeof e.id === "string")}; end delivered ${ended.map(e => (e.__t ?? 0) - afterT).join(",")} ms vs the tool return`);
+      });
+      await runScenario("H2-tool-hooks-per-instance", "With a second live plugin instance (the server base-configuration location made live) the host delivers EVENTS to every instance but the TOOL HOOKS of a call only to the instance of the session's location (open question of 2.2 R2-2); the router acts once per call (one decision row per dispatch, A3), from a session of either location.", async s => {
+        const base = await host.makeBaseLocationLive();
+        const rows0 = (await host.decisionRows()).length;
+        const rootID = await host.newRoot("enforce root 2");
+        const dispatched = await host.dispatch(rootID, { agent: "heavy", description: "Find usages again", prompt: SEARCH_PROMPT, background: false });
+        const hooks = (await host.hooks()).filter(h => h.callID === dispatched.callID);
+        const iidsBefore = [...new Set(hooks.filter(h => h.hook === "before").map(h => h.iid))];
+        const iidsAfter = [...new Set(hooks.filter(h => h.hook === "after").map(h => h.iid))];
+        const raw = (await host.rawEvents()).filter(e => obj(e.data).sessionID === dispatched.childID && e.type === "session.step.ended");
+        await host.waitForRows("the second decision row", r => r.length >= rows0 + 1);
+        const child = await host.client.session.get({ sessionID: dispatched.childID });
+        // The same dispatch from a session that lives in the OTHER location (the base configuration directory).
+        const baseRoot = await host.newRoot("enforce root at the base location", undefined, base);
+        const fromBase = await host.dispatch(baseRoot, { agent: "heavy", description: "Find usages from base", prompt: SEARCH_PROMPT, background: false });
+        const baseHooks = (await host.hooks()).filter(h => h.callID === fromBase.callID);
+        const baseIids = [...new Set(baseHooks.filter(h => h.hook === "before").map(h => h.iid))];
+        const rowsAfter = await host.waitForRows("the third decision row", r => r.length >= rows0 + 2);
+        await new Promise(resolve => setTimeout(resolve, 3_000)); // late duplicates, if any
+        const rowsFinal = await host.decisionRows();
+        const baseChild = await host.client.session.get({ sessionID: fromBase.childID });
+        s.observed.baseLocation = base;
+        s.observed.liveLocations = await host.client.debug.location.list();
+        s.observed.projectSession = { rootID, beforeHookInstances: iidsBefore, afterHookInstances: iidsAfter, hookInstanceDirectories: [...new Set(hooks.map(h => h.instance))] };
+        s.observed.stepEndedLinesPerInstance = raw.map(e => ({ id: e.id, iid: e.__iid, instance: e.__instance }));
+        s.observed.baseSession = { rootID: baseRoot, beforeHookInstances: baseIids, hookInstanceDirectories: [...new Set(baseHooks.map(h => h.instance))], child: { agent: baseChild.agent, model: baseChild.model } };
+        s.observed.rowCounts = { before: rows0, afterFirst: rowsAfter.length - 1, final: rowsFinal.length };
+        s.observed.rowsOfTheTwoDispatches = rowsFinal.slice(rows0).map(r => ({ sessionID: r.sessionID, mode: r.mode, switched: r.switched }));
+        s.observed.hostChild = { agent: child.agent, model: child.model };
+        s.observed.routerLogLines = host.routerLogLines();
+        const ok = iidsBefore.length === 1 && iidsAfter.length === 1 && new Set(raw.map(e => e.__iid)).size >= 2 && new Set(raw.map(e => e.id)).size === 1
+          && baseIids.length === 1 && baseIids[0] !== iidsBefore[0] && rowsFinal.length === rows0 + 2 && child.agent === "fast" && baseChild.agent === "fast" && host.routerLogLines().length === 0;
+        s.verdict(ok, `execute.before delivered to ${iidsBefore.length} of 2 instances (after: ${iidsAfter.length}); step.ended delivered to ${new Set(raw.map(e => e.__iid)).size} instance(s) with ${new Set(raw.map(e => e.id)).size} event id; from the base-location session the hook went to a different single instance (${baseIids.length}); rows ${rows0} -> ${rowsFinal.length} for two dispatches; both children fast`);
+      });    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 300_000);});
 
 void str;
 void MODELS;

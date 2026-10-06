@@ -61,8 +61,8 @@ export interface HostClient {
   command: { list(): Promise<{ data: { name: string }[] }> };
   debug: { location: { list(): Promise<{ directory: string }[]> } };
 }
-export interface HookRecord { hook: "before" | "after"; iid: string; instance?: string; sessionID: string; callID: string; agent?: string; tool: string; input?: Obj; status?: string; result?: Obj; error?: Obj }
-export interface EventRecord { id?: string; type: string; created?: number; location?: unknown; data?: Obj; __instance?: string; __iid?: string; [key: string]: unknown }
+export interface HookRecord { __t: number; hook: "before" | "after"; iid: string; instance?: string; sessionID: string; callID: string; agent?: string; tool: string; input?: Obj; status?: string; result?: Obj; error?: Obj }
+export interface EventRecord { __t?: number; id?: string; type: string; created?: number; location?: unknown; data?: Obj; __instance?: string; __iid?: string; [key: string]: unknown }
 export interface Dispatched { before: HookRecord; after: HookRecord; childID: string | undefined; callID: string }
 
 // ------------------------------------------------------------------ helpers ----
@@ -292,7 +292,7 @@ export class RoutingProvider {
  * session event stream (with event ids), the provider requests (it tags them with session/agent/kind/model headers) and the host's
  * own `ctx.agent.list()` / `ctx.model.list()` records (dumped once, on the first context hook). It never rewrites anything. */
 export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync} from 'node:fs';
-const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify(x)+'\\n');
+const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify({...x,__t:Date.now()})+'\\n');
 const clone=(x)=>{try{return structuredClone(x);}catch{return {unclonable:String(x)};}};
 export default {id:'routing-smoke-probe',async setup(ctx){
  const instance=ctx.location&&ctx.location.directory;
@@ -491,6 +491,20 @@ export class RoutingHost {
     return { pid, method, taskkill, exitCode: child?.exitCode, hostPort: this.port, hostPortClosed, providerStopped, rootRemoved };
   }
 
+  /** Makes the server base-configuration location live (as S3b did): a second plugin instance (location) starts in the same process. */
+  async makeBaseLocationLive(): Promise<string> {
+    const base = path.join(this.root, "config", "opencode");
+    const url = new URL("/api/model", this.baseUrl);
+    url.searchParams.set("location[directory]", base);
+    await waitFor("base-config catalog", async () => {
+      const response = await fetch(url, { headers: { authorization: this.authorization }, signal: AbortSignal.timeout(30_000) });
+      return ((obj(JSON.parse(await response.text())).data ?? []) as ModelInfo[]).length > 0 ? true : undefined;
+    }, 30_000, 250);
+    await waitFor("a second plugin instance", async () => new Set((await this.rawEvents()).filter(e => e.type === "probe.instance.started").map(e => e.__iid)).size >= 2 ? true : undefined, 30_000, 250);
+    return base;
+  }
+  /** The events of one session (de-duplicated by event id). */
+  async eventsOf(sessionID: string): Promise<EventRecord[]> { return (await this.events()).filter(e => obj(e.data).sessionID === sessionID); }
   tail(chars = 3_000): string { return this.output.slice(-chars); }
   /** Every host log line that mentions the router at warn/error level (the plugin's own diagnostics). */
   routerLogLines(): string[] { return this.output.split(/\r?\n/).filter(line => /\[router\]|\[model-router\]/.test(line) && /(WARN|ERROR)/i.test(line)); }
@@ -504,8 +518,8 @@ export class RoutingHost {
   async dump(): Promise<Obj | undefined> { return existsSync(this.logs.dump) ? obj(JSON.parse(await readFile(this.logs.dump, "utf8"))) : undefined; }
 
   /** The scripted root orchestrator: a root session on the scripted model with a session-level allow-all (no `ask` can block headless). */
-  async newRoot(title: string, model: ModelRef = this.options.rootModel ?? ROOT_MODEL): Promise<string> {
-    return (await this.client.session.create({ agent: "build", model, title, location: { directory: this.project }, permissions: [{ action: "*", resource: "*", effect: "allow" }] })).id;
+  async newRoot(title: string, model: ModelRef = this.options.rootModel ?? ROOT_MODEL, directory: string = this.project): Promise<string> {
+    return (await this.client.session.create({ agent: "build", model, title, location: { directory }, permissions: [{ action: "*", resource: "*", effect: "allow" }] })).id;
   }
 
   /** Prompts the root so that its scripted model emits one tool call; waits for the matching execute.after and for the root to go idle. */

@@ -1,0 +1,143 @@
+{
+  "scenario": "3-enforce",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "06f20716-67c9-44cb-a0e5-b3344b47d1be",
+  "recordedAt": "2026-10-06T21:11:42.507Z",
+  "harness": {
+    "headSha": "43813327409b7f5d90cb8bf38ba067ce1775d6ac",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "ac47761cef93a73c040fb7ec4f8efe731540f169",
+      "test/smoke/helpers/routing-host.ts": "180045122a75b014eff9afe604b3d763c9ccd049"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "engine=enforce: the orchestrator asks for heavy on a search task with no acceptance block; the engine swaps it to fast (sonnet-5-5#low). The CHILD SESSION held by the host has agent fast and model sonnet-5-5 variant low, the provider received that model with effort low, the row says switched=true, and the step record lands under the fast key.",
+  "observed": {
+    "rootID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
+    "childID": "ses_eecf19c98ffevNkToeGMx3SThk",
+    "hookBeforeInput": {
+      "agent": "fast",
+      "description": "Find usages",
+      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
+      "background": false,
+      "model": "anthropic/claude-sonnet-5-5#low"
+    },
+    "hostChild": {
+      "agent": "fast",
+      "model": {
+        "id": "claude-sonnet-5-5",
+        "providerID": "anthropic",
+        "variant": "low"
+      },
+      "parentID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
+      "tokens": {
+        "input": 7423,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    "hostListedChildren": [
+      {
+        "id": "ses_eecf19c98ffevNkToeGMx3SThk",
+        "agent": "fast",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        }
+      }
+    ],
+    "childWire": [
+      {
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "agent": "fast",
+        "effort": "low"
+      }
+    ],
+    "row": {
+      "v": 1,
+      "ts": "2026-10-06T21:11:12.434Z",
+      "sessionID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
+      "kind": "decision",
+      "decisionID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs:1791321072433:1",
+      "mode": "enforce",
+      "childSessionID": null,
+      "facts": {
+        "class": "search",
+        "risk": "low",
+        "scope": "single",
+        "needs": [],
+        "confidence": 0.9,
+        "source": "route-line"
+      },
+      "chosen": {
+        "key": "search|router:heavy|anthropic/claude-opus-5-5#xhigh",
+        "agent": "heavy",
+        "origin": "router",
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh"
+      },
+      "best": {
+        "key": "search|router:fast|anthropic/claude-sonnet-5-5#low",
+        "agent": "fast",
+        "origin": "router",
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "low"
+      },
+      "switched": true,
+      "pinned": false,
+      "unit": "ratio",
+      "costs": {
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645401648150124,
+        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737509124,
+        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600191436303,
+        "search|host:explore|anthropic/claude-opus-4-7#default": 1.8226999999999998,
+        "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
+      },
+      "confidence": 0.72,
+      "reason": "switched: switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=16.1525 ratio",
+      "step": "dispatch",
+      "resume": false,
+      "trace": {
+        "routeLines": {
+          "count": 1,
+          "conflict": false,
+          "edgeOnly": true
+        },
+        "backend": null
+      }
+    },
+    "entryFast": {
+      "measuredUSD": {
+        "mean": 0.014896,
+        "n": 1
+      },
+      "unpricedAttempts": 0,
+      "tokens": {
+        "n": 1,
+        "input": 7423,
+        "output": 5,
+        "reasoning": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0
+      },
+      "steps": {
+        "mean": 1,
+        "n": 1
+      },
+      "finalMessageTokens": {
+        "mean": 5,
+        "n": 1
+      }
+    },
+    "entryHeavyStepSamples": 0,
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: host child agent=fast model=anthropic/claude-sonnet-5-5#low (asked heavy); wire anthropic/claude-sonnet-5-5#low effort low; row switched=true best=fast; step records fast n=1 heavy n=0",
+  "notes": []
+}

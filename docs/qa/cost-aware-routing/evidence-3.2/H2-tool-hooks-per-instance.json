@@ -1,0 +1,95 @@
+{
+  "scenario": "H2-tool-hooks-per-instance",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "06f20716-67c9-44cb-a0e5-b3344b47d1be",
+  "recordedAt": "2026-10-06T21:12:15.929Z",
+  "harness": {
+    "headSha": "43813327409b7f5d90cb8bf38ba067ce1775d6ac",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "ac47761cef93a73c040fb7ec4f8efe731540f169",
+      "test/smoke/helpers/routing-host.ts": "180045122a75b014eff9afe604b3d763c9ccd049"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "With a second live plugin instance (the server base-configuration location made live) the host delivers EVENTS to every instance but the TOOL HOOKS of a call only to the instance of the session's location (open question of 2.2 R2-2); the router acts once per call (one decision row per dispatch, A3), from a session of either location.",
+  "observed": {
+    "baseLocation": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\config\\opencode",
+    "liveLocations": [
+      {
+        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project"
+      },
+      {
+        "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\config\\opencode"
+      }
+    ],
+    "projectSession": {
+      "rootID": "ses_eecf1206bffen8Ys88c7THIbxe",
+      "beforeHookInstances": [
+        "qbof4r"
+      ],
+      "afterHookInstances": [
+        "qbof4r"
+      ],
+      "hookInstanceDirectories": [
+        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project"
+      ]
+    },
+    "stepEndedLinesPerInstance": [
+      {
+        "id": "evt_1130ee216001aRI7YRNiATN577",
+        "iid": "qbof4r",
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project"
+      },
+      {
+        "id": "evt_1130ee216001aRI7YRNiATN577",
+        "iid": "pyk0lg",
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\config\\opencode"
+      }
+    ],
+    "baseSession": {
+      "rootID": "ses_eecf0b238ffeECAmA7I8D7Zo1P",
+      "beforeHookInstances": [
+        "pyk0lg"
+      ],
+      "hookInstanceDirectories": [
+        "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\config\\opencode"
+      ],
+      "child": {
+        "agent": "fast",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        }
+      }
+    },
+    "rowCounts": {
+      "before": 1,
+      "afterFirst": 2,
+      "final": 3
+    },
+    "rowsOfTheTwoDispatches": [
+      {
+        "sessionID": "ses_eecf1206bffen8Ys88c7THIbxe",
+        "mode": "enforce",
+        "switched": true
+      },
+      {
+        "sessionID": "ses_eecf0b238ffeECAmA7I8D7Zo1P",
+        "mode": "enforce",
+        "switched": true
+      }
+    ],
+    "hostChild": {
+      "agent": "fast",
+      "model": {
+        "id": "claude-sonnet-5-5",
+        "providerID": "anthropic",
+        "variant": "low"
+      }
+    },
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: execute.before delivered to 1 of 2 instances (after: 1); step.ended delivered to 2 instance(s) with 1 event id; from the base-location session the hook went to a different single instance (1); rows 1 -> 3 for two dispatches; both children fast",
+  "notes": []
+}
