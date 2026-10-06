@@ -5,8 +5,13 @@
  * (`/annotate-plan`), D13 (`[route pin]`), A22 (a route line is recognised in trusted positions only).
  *
  *  - ONE batched classification per call (`deps.classifyMany`, which chunks to `MAX_BATCH_ITEMS` itself).
- *  - A `[tier:X]` or `[route …]` already in a step is authoritative and is never re-emitted or duplicated, so
- *    annotating an annotated plan returns byte-identical text.
+ *  - A `[tier:X]` or `[route …]` already in a step (outside fenced code blocks, QA-1.4-9) is authoritative and
+ *    is never re-emitted or duplicated, so annotating an annotated plan returns byte-identical text. The one
+ *    edit made to an existing route line is appending ` pin` when the step must be pinned (`[tier:heavy]` or a
+ *    QA step, QA-1.4-7), which is reported (`routeEdited`).
+ *  - A QA step (QA-1.4-13: a leading `QA` word or `QA review|round|pass|…`) without a tier tag gets `heavy` if
+ *    the preset has it, else the default tier, and is pinned (QA-1.4-8). The match is deliberately narrow: a
+ *    false positive forces the heavy tier, a false negative only leaves the engine's normal choice.
  *  - Without a tier tag the engine picks the class's static tier and lets the kernel move it only on
  *    evidence (`MIN_EVIDENCE_TO_MOVE`, the same gate as the `R:` line): an empty store annotates exactly the
  *    static mapping.
@@ -18,6 +23,7 @@
 
 import type { ResolvedRouting, RouterConfig } from "../../router/config";
 import { parseAcceptanceBlock } from "../../verify/dod";
+import { fenceMask } from "../classify/fences";
 import { parseRouteLine } from "../classify/route-line";
 import {
   CLASS_STATIC_TIER,
@@ -63,13 +69,17 @@ export interface AnnotatedStep {
   readonly tierSource: "existing" | "engine";
   readonly routeLine: string;
   readonly routeSource: "existing" | "engine";
+  /** An existing route line was minimally edited to add ` pin` (a `[tier:heavy]` or QA step, QA-1.4-7). */
+  readonly routeEdited: boolean;
   readonly facts: TaskFacts;
   readonly detection: Detection;
   readonly pin: boolean;
   readonly decision: Decision | null;
   /** Annotated step text. */
   readonly text: string;
-  /** Route line FIRST (A22), then the annotated step text without route lines. */
+  /** `text` differs from the step the caller passed in. */
+  readonly changed: boolean;
+  /** Route line FIRST (A22), then the annotated step text without route lines; joined with the step's own line ending. */
   readonly dispatchPrompt: string;
 }
 
@@ -78,12 +88,23 @@ export interface AnnotatedStep {
 // ---------------------------------------------------------------------------
 
 const TIER_TAG_RE = /\[tier:([A-Za-z0-9_-]+)\]/;
-const QA_RE = /\bQA\b/;
+/**
+ * QA-1.4-13: a QA step starts with the word `QA` (after list, heading or emphasis markers: `QA the release`,
+ * `- QA: verify`, `## QA round 2`) or names a QA activity (`QA review`, `QA round`, `QA pass`, `QA sign-off`,
+ * `QA gate`, `QA cycle`, `QA phase`). Case-sensitive. `Write the QA notes` or `Update the QA docs` are not QA
+ * steps: that would force the heavy tier on routine work.
+ */
+const QA_LEADING_RE = /^(?:[-*+>#]+\s*|\d+[.)]\s+|\*\*|__|\s)*QA(?![A-Za-z0-9])/;
+const QA_PHRASE_RE = /\bQA[ -](?:review|round|pass|sign-?off|gate|cycle|phase)\b/;
 const LINE_SPLIT_RE = /(\r\n|\n|\r)/;
 const DESCRIPTION_MAX_CHARS = 200;
 
 function isMember<T extends string>(values: readonly T[], value: unknown): value is T {
   return typeof value === "string" && (values as readonly string[]).includes(value);
+}
+
+function isQaLine(line: string): boolean {
+  return QA_LEADING_RE.test(line) || QA_PHRASE_RE.test(line);
 }
 
 /**
@@ -116,14 +137,35 @@ export function formatRouteLine(facts: TaskFacts, detection: Detection, pin: boo
   return `[route ${parts.join(" ")}]`;
 }
 
-interface SplitText {
+const PIN_FIELD_RE = /(\s)pin(?:\s*=\s*[^\s\]]*)?(?=[\s\]])/i;
+
+/**
+ * The minimal edit that pins an existing route line: an explicit `pin=false`-style field becomes `pin`, a
+ * line without the field gets ` pin` before its closing bracket. Everything else (indentation, fields,
+ * trailing whitespace) is kept byte for byte. A line that already pins is returned as is.
+ */
+function withPin(line: string): string {
+  if (PIN_FIELD_RE.test(line)) return line.replace(PIN_FIELD_RE, (_whole, space: string) => `${space}pin`);
+  return line.replace(/\s*\](\s*)$/, (_whole, tail: string) => ` pin]${tail}`);
+}
+
+/** One step's text, split into lines with the structure the annotation needs (QA-1.4-9). */
+interface Scan {
   /** Line contents, without terminators. */
   readonly lines: string[];
   /** `terminators[i]` follows `lines[i]`; one fewer than `lines`. */
   readonly terminators: string[];
+  /** The step's own line ending (its first terminator, else `\n`). */
+  readonly eol: string;
+  /** Indices of the recognised route lines: outside fenced code blocks, plain, unindented, unquoted. */
+  readonly routeAt: readonly number[];
+  /** The task line: first non-empty line that is unfenced (so no fence marker either) and not a route line; -1 = none. */
+  readonly taskAt: number;
+  /** The first `[tier:X]` tag outside fenced blocks. */
+  readonly tierTag: string | null;
 }
 
-function splitText(text: string): SplitText {
+function scanStep(text: string): Scan {
   const parts = text.split(LINE_SPLIT_RE);
   const lines: string[] = [];
   const terminators: string[] = [];
@@ -131,31 +173,47 @@ function splitText(text: string): SplitText {
     if (index % 2 === 0) lines.push(part);
     else terminators.push(part);
   });
-  return { lines, terminators };
-}
-
-function isRouteLine(line: string): boolean {
-  return parseRouteLine(line, { positions: "any" }).count > 0;
-}
-
-/** Index of the step's task line: the first non-empty line that is not itself a route line; -1 when none. */
-function taskLineIndex(lines: readonly string[]): number {
-  return lines.findIndex((line) => line.trim() !== "" && !isRouteLine(line));
-}
-
-/** First recognised route line of `text` (verbatim, trimmed) — the line `parseRouteLine` strips first. */
-function firstRouteLine(text: string, stripped: string): string | null {
-  const before = splitText(text).lines;
-  const after = splitText(stripped).lines;
-  let j = 0;
-  for (const line of before) {
-    if (j < after.length && after[j] === line) {
-      j += 1;
-      continue;
+  const fenced = fenceMask(lines);
+  const routeAt: number[] = [];
+  let taskAt = -1;
+  let tierTag: string | null = null;
+  lines.forEach((line, index) => {
+    if (fenced[index] === true) return;
+    if (parseRouteLine(line, { positions: "any" }).count > 0) {
+      routeAt.push(index);
+      return;
     }
-    return line.trim();
+    if (taskAt < 0 && line.trim() !== "") taskAt = index;
+    if (tierTag === null) tierTag = TIER_TAG_RE.exec(line)?.[1] ?? null;
+  });
+  return { lines, terminators, eol: terminators[0] ?? "\n", routeAt, taskAt, tierTag };
+}
+
+/** What `placeAnnotations` changes in a step. */
+interface Edits {
+  /** ` [tier:X]` appended to the task line. */
+  readonly tag: string | null;
+  /** A new route line inserted right after the task line. */
+  readonly insertRoute: string | null;
+  /** The first existing route line replaced by this (a minimal edit of it). */
+  readonly replaceRoute: string | null;
+}
+
+function placeAnnotations(scan: Scan, edits: Edits): string {
+  const lines = [...scan.lines];
+  const terminators = [...scan.terminators];
+  if (edits.replaceRoute !== null && scan.routeAt[0] !== undefined) lines[scan.routeAt[0]] = edits.replaceRoute;
+  const at = scan.taskAt;
+  if (at >= 0) {
+    if (edits.tag !== null) lines[at] = `${lines[at]!.trimEnd()} ${edits.tag}`;
+    if (edits.insertRoute !== null) {
+      // Leading SPACES only, at most 3: the route-line parser ignores 4+ columns and counts a tab as 4.
+      const indent = (/^ */.exec(lines[at]!)?.[0] ?? "").slice(0, 3);
+      lines.splice(at + 1, 0, `${indent}${edits.insertRoute}`);
+      terminators.splice(at, 0, terminators[at] ?? scan.eol);
+    }
   }
-  return null;
+  return lines.map((line, index) => line + (terminators[index] ?? "")).join("");
 }
 
 /** What the classifier itself returns when it fails (`UNKNOWN_FACTS`, confidence 0 ⇒ never switches). */
@@ -174,23 +232,6 @@ function unknownResult(text: string): ClassifyResult {
   };
 }
 
-/** Insert ` [tier:X]` on the task line and/or the route line right after it (§5 "Placement"). */
-function placeAnnotations(text: string, tag: string | null, routeLine: string | null): string {
-  if (tag === null && routeLine === null) return text;
-  const { lines, terminators } = splitText(text);
-  const at = taskLineIndex(lines);
-  if (at < 0) return text; // nothing to annotate: blank step
-  if (tag !== null) lines[at] = `${lines[at]!.trimEnd()} ${tag}`;
-  if (routeLine !== null) {
-    // Leading SPACES only, at most 3: the route-line parser ignores 4+ columns and counts a tab as 4.
-    const indent = (/^ */.exec(lines[at]!)?.[0] ?? "").slice(0, 3);
-    const eol = terminators[at] ?? terminators[0] ?? "\n";
-    lines.splice(at + 1, 0, `${indent}${routeLine}`);
-    terminators.splice(at, 0, eol);
-  }
-  return lines.map((line, index) => line + (terminators[index] ?? "")).join("");
-}
-
 // ---------------------------------------------------------------------------
 // annotateSteps
 // ---------------------------------------------------------------------------
@@ -198,18 +239,18 @@ function placeAnnotations(text: string, tag: string | null, routeLine: string | 
 /**
  * Annotate a plan's steps in one pass. Never throws for well-typed input: a classifier failure leaves the
  * steps with `UNKNOWN_FACTS` (confidence 0, so the engine keeps the static tier and never switches).
- * `steps` must already be split by the caller (2.4 owns plan parsing and fenced blocks).
+ * `steps` must already be split by the caller (2.4 owns plan parsing); fenced code blocks inside a step are
+ * respected (nothing inside a fence is a tag, a route line or a task line).
  */
 export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDeps): Promise<AnnotatedStep[]> {
   if (steps.length === 0) return [];
   const { cfg, routing, agents, store } = deps;
 
   // --- one batched classification ---------------------------------------------------------------
-  const split = steps.map((step) => splitText(step.text));
+  const scans = steps.map((step) => scanStep(step.text));
   const inputs: ClassifyInput[] = steps.map((step, index) => {
-    const lines = split[index]!.lines;
-    const at = taskLineIndex(lines);
-    const description = (at < 0 ? "" : lines[at]!).trim().slice(0, DESCRIPTION_MAX_CHARS);
+    const scan = scans[index]!;
+    const description = (scan.taskAt < 0 ? "" : scan.lines[scan.taskAt]!).trim().slice(0, DESCRIPTION_MAX_CHARS);
     return { description, prompt: step.text };
   });
   let results: readonly ClassifyResult[];
@@ -225,24 +266,26 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
   steps.forEach((step, index) => {
     const result = results[index] ?? unknownResult(step.text);
     const facts = result.facts;
-    const lines = split[index]!.lines;
-    const at = taskLineIndex(lines);
-    const taskLine = at < 0 ? "" : lines[at]!;
+    const scan = scans[index]!;
+    const taskLine = scan.taskAt < 0 ? "" : scan.lines[scan.taskAt]!;
 
     // Existing tags are authoritative and kept verbatim.
-    const tierMatch = TIER_TAG_RE.exec(step.text);
-    const existingTier = tierMatch === null ? null : tierMatch[1]!;
+    const existingTier = scan.tierTag;
+    const existingRoute = scan.routeAt[0] === undefined ? null : scan.lines[scan.routeAt[0]]!;
     const parsed = parseRouteLine(step.text, { positions: "any" });
-    const existingRouteLine = parsed.count > 0 ? firstRouteLine(step.text, parsed.stripped) : null;
+    const routePins = result.pin === true || parsed.line?.pin === true;
 
     const detection: Detection = result.detection ?? detectionOf(step.text);
-    const pin = result.pin === true || parsed.line?.pin === true || existingTier === "heavy" || QA_RE.test(taskLine);
+    // A `[tier:heavy]` step and a QA step are pinned (D13): the engine never moves them.
+    const qaStep = isQaLine(taskLine);
+    const decisionPin = routePins || existingTier === "heavy" || qaStep;
 
-    // The static tier of the class (the orchestrator's pick), unless the plan already chose one.
-    // A mapped tier the active preset lacks falls back to the config's default tier (never tag a ghost tier).
+    // The orchestrator's pick: the plan's tag; else heavy for a QA step; else the class's static tier. A tier
+    // the active preset lacks falls back to the config's default tier (never tag a ghost tier).
     const mapped = CLASS_STATIC_TIER[facts.class] ?? cfg.defaultTier;
     const staticTier = tierIds.includes(mapped) || !tierIds.includes(cfg.defaultTier) ? mapped : cfg.defaultTier;
-    const pickedTier = existingTier ?? staticTier;
+    const qaTier = tierIds.includes("heavy") ? "heavy" : cfg.defaultTier;
+    const pickedTier = existingTier ?? (qaStep ? qaTier : staticTier);
     const chosen = resolveChosen({ cfg, agents, agent: pickedTier });
     const decision = chosen === null
       ? null
@@ -260,7 +303,7 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
             ...(deps.logger === undefined ? {} : { logger: deps.logger }),
           }),
           detection,
-          pin,
+          pin: decisionPin,
           routing,
           store,
           floorRank,
@@ -269,6 +312,7 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
     let tier = pickedTier;
     if (
       existingTier === null &&
+      !qaStep &&
       store !== null &&
       decision !== null &&
       decision.switched &&
@@ -279,25 +323,33 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
       tier = decision.target.tier;
     }
 
-    const routeLine = existingRouteLine ?? formatRouteLine(facts, detection, pin);
-    const text = placeAnnotations(
-      step.text,
-      existingTier === null ? `[tier:${tier}]` : null,
-      existingRouteLine === null ? routeLine : null,
-    );
+    // A step that ends up tagged `[tier:heavy]` is pinned, because that is how the next pass and the dispatch
+    // read the tag: annotating the annotated plan must change nothing (QA-1.4-9). The decision above was made
+    // before the tier was final, so an engine-chosen heavy could still have moved on evidence.
+    const pin = decisionPin || tier === "heavy";
+    // The route line: an existing one stays (plus ` pin` when the step must be pinned and it is not).
+    const editedRoute = existingRoute !== null && pin && !routePins ? withPin(existingRoute) : null;
+    const routeLine = (editedRoute ?? existingRoute ?? formatRouteLine(facts, detection, pin)).trim();
+    const text = placeAnnotations(scan, {
+      tag: existingTier === null ? `[tier:${tier}]` : null,
+      insertRoute: existingRoute === null ? routeLine : null,
+      replaceRoute: editedRoute,
+    });
     const withoutRoute = parseRouteLine(text, { positions: "any" }).stripped;
     annotated.push({
       id: step.id,
       tier,
       tierSource: existingTier === null ? "engine" : "existing",
       routeLine,
-      routeSource: existingRouteLine === null ? "engine" : "existing",
+      routeSource: existingRoute === null ? "engine" : "existing",
+      routeEdited: editedRoute !== null,
       facts,
       detection,
       pin,
       decision,
       text,
-      dispatchPrompt: `${routeLine}\n${withoutRoute}`,
+      changed: text !== step.text,
+      dispatchPrompt: `${routeLine}${scan.eol}${withoutRoute}`,
     });
   });
   return annotated;

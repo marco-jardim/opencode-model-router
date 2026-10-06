@@ -102,6 +102,11 @@ const WEB_TOOLS: readonly string[] = ["webfetch", "websearch"];
 const EDIT_TOOLS: readonly string[] = ["edit", "write", "patch", "apply_patch"];
 
 /**
+ * Handoff to 2.2 (QA-1.4-14): pass only the tools the agent may use UNCONDITIONALLY, i.e. the evaluated
+ * permission is `allow` for the tool (and, for `external_dir`, for every path). A tool that is `ask`,
+ * `deny` or allowed only for some patterns must be left out: a need that might block at dispatch time is not
+ * a need the agent covers (A11), and an uncovered need only makes a candidate ineligible, never worse.
+ *
  * A11: the needs covered by an agent's EVALUATED tool set. `network` means going through a shell command
  * (1.2 `NEEDS`), so it follows `shell`; `external_dir` is the host `external_directory` permission
  * evaluated to allow. Unique, in `NEEDS` order.

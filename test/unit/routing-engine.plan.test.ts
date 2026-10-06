@@ -442,6 +442,177 @@ describe("annotateSteps — evidence moves the engine tier", () => {
   });
 });
 
+describe("QA-1.4-7 / QA-1.4-8: heavy and QA steps are pinned, QA steps run on heavy", () => {
+  const implement = () => facts("implement");
+
+  it("a `[tier:heavy]` step whose route line lacks `pin` gets ` pin` appended to that line only", async () => {
+    const text = "Refactor the loader [tier:heavy]\n[route class=implement risk=medium scope=single d=none]\nbody";
+    const out = await annotateSteps([step("a", text)], stubDeps(implement));
+    const a = out[0]!;
+    expect(a.text).toBe("Refactor the loader [tier:heavy]\n[route class=implement risk=medium scope=single d=none pin]\nbody");
+    expect(a.routeEdited).toBe(true);
+    expect(a.changed).toBe(true);
+    expect(a.pin).toBe(true);
+    expect(a.routeSource).toBe("existing");
+    expect(a.routeLine).toBe("[route class=implement risk=medium scope=single d=none pin]");
+    expect(a.dispatchPrompt).toBe("[route class=implement risk=medium scope=single d=none pin]\nRefactor the loader [tier:heavy]\nbody");
+    expect(a.decision?.reasonCode).toBe("kept:pinned");
+  });
+
+  it("keeps indentation, trailing whitespace and every other field; `pin=false` becomes `pin`", async () => {
+    const out = await annotateSteps(
+      [
+        step("a", "Do it [tier:heavy]\n  [route class=search pin=false d=grader]  \nbody"),
+        step("b", "QA the build\n[route]\nbody"),
+      ],
+      stubDeps(() => facts("search", { risk: "low" })),
+    );
+    expect(out[0]!.text).toBe("Do it [tier:heavy]\n  [route class=search pin d=grader]  \nbody");
+    expect(out[0]!.routeLine).toBe("[route class=search pin d=grader]");
+    expect(out[1]!.text).toBe("QA the build [tier:heavy]\n[route pin]\nbody");
+    expect(out[1]!.routeEdited).toBe(true);
+  });
+
+  it("an existing route line that already pins is untouched and not reported as edited", async () => {
+    const text = "Do it [tier:heavy]\n[route class=search d=none pin]";
+    const out = await annotateSteps([step("a", text)], stubDeps(() => facts("search", { risk: "low" })));
+    expect(out[0]!.text).toBe(text);
+    expect(out[0]!.routeEdited).toBe(false);
+    expect(out[0]!.changed).toBe(false);
+  });
+
+  it("an existing route line on a step that needs no pin is not edited", async () => {
+    const text = "Do it [tier:fast]\n[route class=search d=none]";
+    const out = await annotateSteps([step("a", text)], stubDeps(() => facts("search", { risk: "low" })));
+    expect(out[0]!.text).toBe(text);
+    expect(out[0]!.pin).toBe(false);
+    expect(out[0]!.routeEdited).toBe(false);
+  });
+
+  it("an untagged QA step gets heavy and a pin, whatever the class says", async () => {
+    const out = await annotateSteps(
+      [step("a", "QA the release candidate"), step("b", "## QA round 2\ndetails")],
+      stubDeps(() => facts("search", { risk: "low" })),
+    );
+    for (const a of out) {
+      expect(a.tier).toBe("heavy");
+      expect(a.tierSource).toBe("engine");
+      expect(a.pin).toBe(true);
+      expect(a.routeLine.endsWith(" pin]")).toBe(true);
+      expect(a.decision?.reasonCode).toBe("kept:pinned");
+    }
+    expect(out[0]!.text.split("\n")[0]).toBe("QA the release candidate [tier:heavy]");
+    expect(out[1]!.text.split("\n")[0]).toBe("## QA round 2 [tier:heavy]");
+  });
+
+  it("a preset without a heavy tier uses the default tier for a QA step", async () => {
+    const small: RouterConfig = { ...cfg, presets: { anthropic: { fast: cfg.presets.anthropic!.fast!, medium: cfg.presets.anthropic!.medium! } }, defaultTier: "medium" };
+    const out = await annotateSteps([step("a", "QA the release")], stubDeps(() => facts("search", { risk: "low" }), { cfg: small, routing: resolveRouting(small, "v2") }));
+    expect(out[0]!.tier).toBe("medium");
+    expect(out[0]!.pin).toBe(true);
+  });
+
+  it("an existing tier tag still wins over the QA default (but the step is pinned)", async () => {
+    const out = await annotateSteps([step("a", "QA the release [tier:fast]")], stubDeps(() => facts("search", { risk: "low" })));
+    expect(out[0]!.tier).toBe("fast");
+    expect(out[0]!.tierSource).toBe("existing");
+    expect(out[0]!.pin).toBe(true);
+  });
+
+  it("a QA step never moves on evidence", async () => {
+    const store = createOutcomeStore();
+    for (let i = 0; i < 20; i++) store.recordVerdict("search|router:heavy|anthropic/claude-opus-5-5#xhigh" as OutcomeKey, "fail", { attemptID: `h${i}`, step: "dispatch" });
+    for (let i = 0; i < 20; i++) store.recordVerdict("search|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey, "pass", { attemptID: `f${i}`, step: "dispatch" });
+    const out = await annotateSteps([step("a", `QA the release\n${ACCEPT_TESTS}`)], stubDeps(() => facts("search", { risk: "low" }), { store }));
+    expect(out[0]!.tier).toBe("heavy");
+  });
+
+  it("an engine-chosen heavy is pinned too, so that annotating the annotated plan changes nothing", async () => {
+    const out = await annotateSteps([step("a", "Design the engine")], stubDeps(() => facts("design", { risk: "high" })));
+    expect(out[0]!.tier).toBe("heavy");
+    expect(out[0]!.pin).toBe(true);
+    expect(out[0]!.decision?.pinned).toBe(false); // the kernel decided before the tier was final
+  });
+});
+
+describe("QA-1.4-13: the QA match is narrow", () => {
+  const pins = async (lines: readonly string[]) =>
+    (await annotateSteps(lines.map((l, i) => step(`s${i}`, l)), stubDeps(() => facts("search", { risk: "low" })))).map((a) => a.pin);
+
+  it("a leading QA word or a named QA activity pins and forces heavy", async () => {
+    expect(await pins(["QA the release", "QA: verify the fix", "- QA review of the diff", "## QA round 2", "1. QA sign-off", "**QA** the release", "Prepare the QA review", "Hold the QA gate"])).toEqual(
+      Array.from({ length: 8 }, () => true),
+    );
+  });
+
+  it("incidental mentions are routine work: no pin, no heavy tag", async () => {
+    const lines = ["Write the QA notes", "Update the QA docs", "Run the QAT suite", "Explain quality assurance", "run qa checks", "Rename QAHelper"];
+    expect(await pins(lines)).toEqual(lines.map(() => false));
+  });
+});
+
+describe("QA-1.4-9: fenced blocks hold no tag, route line or task line; annotation is idempotent", () => {
+  it("tags and route lines inside a fence are text: the engine annotates the real task line", async () => {
+    const text = "```\n[tier:heavy]\n[route class=debug pin]\n```\nFix the thing\nmore";
+    const spy = vi.fn(async (inputs: readonly ClassifyInput[]) => inputs.map((input) => stub(facts("search", { risk: "low" }), input.prompt)));
+    const out = await annotateSteps([step("a", text)], deps({ classifyMany: spy }));
+    const a = out[0]!;
+    expect(a.tierSource).toBe("engine");
+    expect(a.routeSource).toBe("engine");
+    expect(a.pin).toBe(false);
+    expect(a.text).toBe(`\`\`\`\n[tier:heavy]\n[route class=debug pin]\n\`\`\`\nFix the thing [tier:fast]\n${a.routeLine}\nmore`);
+    expect(spy.mock.calls[0]![0][0]!.description).toBe("Fix the thing");
+    // The fenced route line stays in the dispatch prompt; only the real one leads it.
+    expect(a.dispatchPrompt).toBe(`${a.routeLine}\n\`\`\`\n[tier:heavy]\n[route class=debug pin]\n\`\`\`\nFix the thing [tier:fast]\nmore`);
+  });
+
+  it("a fence marker is never the task line; an unclosed fence leaves nothing to annotate", async () => {
+    const out = await annotateSteps(
+      [step("a", "```ts\ncode();\n```\nDo it"), step("b", "```\nnever closed\nstill code")],
+      stubDeps(() => facts("search", { risk: "low" })),
+    );
+    expect(out[0]!.text.split("\n")[3]).toBe("Do it [tier:fast]");
+    expect(out[1]!.text).toBe("```\nnever closed\nstill code");
+    expect(out[1]!.changed).toBe(false);
+    expect(out[1]!.dispatchPrompt.split("\n")[0]).toBe(out[1]!.routeLine);
+  });
+
+  it("a real tag or route line outside the fence is still found", async () => {
+    const text = "```\n[tier:heavy]\n```\nDo it [tier:medium]\n[route class=implement d=none]";
+    const out = await annotateSteps([step("a", text)], stubDeps(() => facts("implement")));
+    expect(out[0]!.tier).toBe("medium");
+    expect(out[0]!.tierSource).toBe("existing");
+    expect(out[0]!.routeSource).toBe("existing");
+    expect(out[0]!.text).toBe(text);
+  });
+
+  it("re-annotating an annotated plan twice is byte-identical", async () => {
+    const original = [
+      step("plain", "Search the repo for parseConfig\nmore"),
+      step("fence", "```\n[tier:heavy]\n[route class=debug pin]\n```\nFix the thing"),
+      step("open", "```\nnever closed"),
+      step("crlf", "\r\nSearch the repo\r\nmore\r\n"),
+      step("indent", "   - indented step\n      deeper"),
+      step("tab", "\ttabbed step"),
+      step("qa", "QA the release"),
+      step("heavy-route", "Refactor it [tier:heavy]\n[route class=implement risk=medium scope=single d=none]"),
+      step("design", "Design the new engine"),
+      step("acceptance", `Implement the parser\n${ACCEPT_TESTS}`),
+      step("blank", "  \n "),
+      step("route-first", "[route class=debug]\nFix the bug"),
+    ];
+    const first = await annotateSteps(original, deps());
+    const second = await annotateSteps(first.map((a) => step(a.id, a.text)), deps());
+    const third = await annotateSteps(second.map((a) => step(a.id, a.text)), deps());
+    expect(second.map((a) => a.text)).toEqual(first.map((a) => a.text));
+    expect(third.map((a) => a.text)).toEqual(first.map((a) => a.text));
+    expect(second.map((a) => a.dispatchPrompt)).toEqual(first.map((a) => a.dispatchPrompt));
+    expect(second.every((a) => !a.changed)).toBe(true);
+    expect(second.map((a) => a.pin)).toEqual(first.map((a) => a.pin));
+    expect(second.map((a) => a.tier)).toEqual(first.map((a) => a.tier));
+    expect(first.some((a) => a.changed)).toBe(true);
+  });
+});
 describe("annotateSteps — placement", () => {
   it("indents the route line with the task line's leading spaces, never 4 or more", async () => {
     const out = await annotateSteps(
@@ -462,7 +633,9 @@ describe("annotateSteps — placement", () => {
   it("skips leading blank lines and preserves CRLF endings", async () => {
     const out = await annotateSteps([step("a", "\r\n\r\nSearch the repo\r\nmore\r\n")], stubDeps(() => facts("search", { risk: "low" })));
     expect(out[0]!.text).toBe(`\r\n\r\nSearch the repo [tier:fast]\r\n${out[0]!.routeLine}\r\nmore\r\n`);
-    expect(out[0]!.dispatchPrompt.split("\n")[0]).toBe(out[0]!.routeLine);
+    // QA-1.4-14: the dispatch prompt keeps the step's own line ending.
+    expect(out[0]!.dispatchPrompt).toBe(`${out[0]!.routeLine}\r\n\r\n\r\nSearch the repo [tier:fast]\r\nmore\r\n`);
+    expect(out[0]!.dispatchPrompt).not.toMatch(/(?<!\r)\n/);
   });
 
   it("a one-line step gets the route line on a new line; a blank step is returned unchanged", async () => {
