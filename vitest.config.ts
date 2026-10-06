@@ -38,6 +38,10 @@ export default defineConfig({
     include: ["test/**/*.test.ts"],
     exclude: ["test/smoke/**", "node_modules/**", "dist/**", "tmp/**"],
     environment: "node",
+    // Keeps every test off the real home directory (QA-1.1-17, plan amendment
+    // A14): os.homedir() is mocked to the test's own HOME/USERPROFILE redirect or a
+    // private temp dir, in any pool. Never run vitest with --pool=threads anyway.
+    setupFiles: ["test/setup/home-guard.ts"],
     server: {
       deps: {
         inline: ["@opencode-ai/plugin"],

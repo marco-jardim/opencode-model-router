@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock("node:os", async importOriginal => ({
   ...(await importOriginal<typeof import("node:os")>()),
+  homedir: (await import("../setup/home-guard")).guardedHomedir, // keep the global home guard (QA-1.1-22)
   setPriority: (pid: number, priority: number) => {
     state.priorities.push([pid, priority]);
     if (state.priorityThrows) throw new Error("ESRCH");

@@ -8,8 +8,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
 import type { PluginLogger } from "./logger";
@@ -106,6 +107,12 @@ export interface TierConfig {
   promptStyle?: PromptStyle;
   /** Optional use-case hints shown in `/tiers`. */
   whenToUse?: string[];
+  /**
+   * Ordered `(model, variant, costRatio)` rungs the routing engine may use for
+   * this tier. Absent or empty = the tier's own single `(model, variant,
+   * costRatio)`. See {@link resolveCandidates}.
+   */
+  candidates?: TierCandidate[];
 }
 
 export type Preset = Record<string, TierConfig>;
@@ -171,12 +178,128 @@ export interface EnforcementConfig {
     failureRecheck?: boolean;
     /** Budget for the reference re-run, in ms (integer >= 1). Default 60000. */
     recheckTimeoutMs?: number };
-  escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number };
-    /** Bump reasoning effort before escalating tiers. Default true. */
-    effortBump?: boolean;
-    /** Maximum reasoning effort for a bump. Default "xhigh". */
-    effortBumpMax?: EffortLevel };
+  escalate?: EscalateConfig;
   proportional?: { trivialBypass?: boolean; trivialClassifier?: string };
+}
+
+export interface EscalateConfig {
+  floorTier?: string | null;
+  ladder?: string[];
+  maxAttemptsPerTier?: number;
+  maxTotalAttempts?: number;
+  costCeiling?: { base?: string; multiple?: number };
+  /** Bump reasoning effort before escalating tiers. Default true. */
+  effortBump?: boolean;
+  /** Maximum reasoning effort for a bump. Default "xhigh". */
+  effortBumpMax?: EffortLevel;
+  /**
+   * Retry on the same model's next variant before escalating the model (D10).
+   * OpenCode v2 only; ignored on v1. Default "auto".
+   */
+  variantSteps?: VariantStepsMode;
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing (#74): the `routing` block, tier candidates, variant steps
+// ---------------------------------------------------------------------------
+
+/** `static` = the shipped taxonomy only; the others add the engine of #74. */
+export const ROUTING_ENGINES = ["static", "shadow", "advise", "enforce"] as const;
+export type RoutingEngine = (typeof ROUTING_ENGINES)[number];
+
+/** How much a wrong, undetected result is worth in the expected-cost formula (D8). */
+export const ROUTING_PROFILES = ["frugal", "balanced", "safe"] as const;
+export type RoutingProfile = (typeof ROUTING_PROFILES)[number];
+
+export const CLASSIFIER_BACKENDS = ["rules", "host", "openai-compatible", "typesafe"] as const;
+export type ClassifierBackend = (typeof CLASSIFIER_BACKENDS)[number];
+
+/**
+ * The task classes `routing.roles` may name. The classifier (Phase 1.2) assigns
+ * one of these to every dispatch; `other` is the catch-all.
+ */
+export const ROUTING_TASK_CLASSES = [
+  "search",
+  "recon",
+  "mechanical",
+  "implement",
+  "debug",
+  "design",
+  "review",
+  "other",
+] as const;
+export type RoutingTaskClass = (typeof ROUTING_TASK_CLASSES)[number];
+
+export const VARIANT_STEP_MODES = ["auto", "none"] as const;
+export type VariantStepsMode = (typeof VARIANT_STEP_MODES)[number];
+
+/** Which host runs the plugin; `v2` is OpenCode v2 (D1). */
+export type RouterHost = "v1" | "v2";
+
+/**
+ * One rung of a tier's ladder. `model` falls back to the tier's own model;
+ * `variant` is NOT inherited (omitted = the model's default variant); `costRatio`
+ * falls back to the tier's.
+ */
+export interface TierCandidate {
+  model?: string;
+  variant?: string;
+  costRatio?: number;
+}
+
+/** Verification-depth → probability that a wrong result is caught (D8). */
+export interface DetectionConfig {
+  deterministic?: number;
+  grader?: number;
+  none?: number;
+}
+
+/** Per-preset override of the classifier's `backend` / `model`. */
+export interface ClassifierPresetOverride {
+  backend?: ClassifierBackend;
+  model?: string | null;
+}
+
+export interface ClassifierConfig {
+  backend?: ClassifierBackend;
+  /** Catalog ref `provider/model[#variant]`; required when the effective backend is not `rules` (D3). */
+  model?: string | null;
+  /** `openai-compatible` / `typesafe` only. */
+  baseUrl?: string | null;
+  apiKeyEnv?: string | null;
+  timeoutMs?: number;
+  samples?: 1 | 3;
+  maxStateChars?: number;
+  presets?: Record<string, ClassifierPresetOverride>;
+}
+
+export interface OutcomesConfig {
+  path?: string | null;
+  halfLifeDays?: number;
+  maxEffectiveSamples?: number;
+}
+
+export interface SessionReuseConfig {
+  maxContextFraction?: number;
+}
+
+export interface AdvisorConfig {
+  enabled?: boolean;
+  noticeIntervalHours?: number;
+}
+
+export interface RoutingConfig {
+  engine?: RoutingEngine;
+  profile?: RoutingProfile;
+  margin?: number;
+  minClassConfidence?: number;
+  detection?: DetectionConfig;
+  classifier?: ClassifierConfig;
+  /** Task class → ordered agent ids. Absent = host default (D12); `{}` = none. */
+  roles?: Record<string, string[]>;
+  outcomes?: OutcomesConfig;
+  sessionReuse?: SessionReuseConfig;
+  advisor?: AdvisorConfig;
 }
 
 export interface RouterConfig {
@@ -253,6 +376,8 @@ export interface RouterConfig {
   subagentTiers?: Record<string, string>;
   /** Experimental, opt-in features. Off by default. */
   experimental?: { verifiedDelegateTool?: boolean };
+  /** Cost-aware routing engine (#74). Absent = today's static routing, byte for byte. */
+  routing?: RoutingConfig;
 }
 
 export interface RouterState {
@@ -283,6 +408,8 @@ interface ConfigCacheEntry {
   reloadError: string | null;
   /** Fingerprint a reload-failure warning was last emitted for (warn once each). */
   warnedFingerprint: string | null;
+  /** Non-fatal findings of the build that produced `config` (see {@link getConfigNotices}). */
+  notices: ConfigNotice[];
 }
 
 /** Keyed by {@link normalizeProjectDir}. */
@@ -299,6 +426,7 @@ function getCacheEntry(key: string): ConfigCacheEntry {
       tolerated: new Set<string>(),
       reloadError: null,
       warnedFingerprint: null,
+      notices: [],
     };
     _configCaches.set(key, entry);
   }
@@ -325,6 +453,24 @@ function realpathOrSelf(p: string): string {
  */
 function normalizeProjectDir(dir?: string): string {
   return realpathOrSelf(dir ? resolvePath(dir) : process.cwd());
+}
+
+/**
+ * A non-fatal finding of a config build: something was ignored or looks wrong,
+ * but the config still loaded. `source` is the file concerned, when one is.
+ */
+export interface ConfigNotice {
+  source?: string;
+  message: string;
+}
+
+/**
+ * The notices of the config last built for `dir` (default: the working
+ * directory): keys dropped from the project layer, unknown `routing` keys, and
+ * the like. Empty when there are none. `/router` lists them.
+ */
+export function getConfigNotices(dir?: string): readonly ConfigNotice[] {
+  return _configCaches.get(normalizeProjectDir(dir))?.notices ?? [];
 }
 
 /**
@@ -572,6 +718,7 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
       throw new Error(`tiers.json: preset '${presetName}' must be an object`);
     }
     const tiers = preset as Record<string, unknown>;
+    const presetRungs: PresetRung[] = [];
     for (const [tierName, tier] of Object.entries(tiers)) {
       if (typeof tier !== "object" || tier === null) {
         throw new Error(
@@ -630,7 +777,40 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
           `tiers.json: preset '${presetName}' tier '${tierName}': promptStyle must be one of ${PROMPT_STYLES.join("|")}`,
         );
       }
+      // The tier's own variant is what a candidates list is matched against.
+      if (t.variant !== undefined && (typeof t.variant !== "string" || !VARIANT_ID_PATTERN.test(t.variant))) {
+        throw new Error(
+          `tiers.json: '${presetName}.${tierName}.variant' must be a non-empty string without whitespace or '#' (got ${describeValue(t.variant)})`,
+        );
+      }
+      const candidates = validateTierCandidates(t, `${presetName}.${tierName}`, tierName);
+      const tierVariant = typeof t.variant === "string" ? t.variant : undefined;
+      const tierCostRatio = tierCostRatioOf(tierName, t.costRatio);
+      if (
+        candidates !== undefined &&
+        candidates.length > 0 &&
+        ownRungProblem(t.model, tierVariant, tierCostRatio, candidates) === undefined
+      ) {
+        candidates.forEach((c, i) =>
+          presetRungs.push({
+            model: c.model ?? t.model as string,
+            variant: c.variant,
+            costRatio: c.costRatio ?? tierCostRatio,
+            source: `${tierName}.candidates[${i}]`,
+            explicit: true,
+          }),
+        );
+      } else {
+        presetRungs.push({
+          model: t.model,
+          variant: tierVariant,
+          costRatio: tierCostRatio,
+          source: `${tierName} (own rung)`,
+          explicit: false,
+        });
+      }
     }
+    assertConsistentRungCosts(presetName, presetRungs);
   }
 
   return presets;
@@ -1086,7 +1266,13 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
           `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")} (got ${describeValue(effortBumpMax)})`,
         );
       }
-      snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax });
+      const variantSteps = escalate.variantSteps;
+      if (variantSteps !== undefined && !pickEnum(VARIANT_STEP_MODES, variantSteps)) {
+        throw new Error(
+          `tiers.json: enforcement.escalate.variantSteps must be one of ${VARIANT_STEP_MODES.join("|")} (got ${describeValue(variantSteps)})`,
+        );
+      }
+      snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax, variantSteps });
       if (
         escalate.costCeiling !== undefined &&
         typeof escalate.costCeiling === "object" &&
@@ -1223,6 +1409,577 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cost-aware routing validation (#74)
+//
+// Unknown keys inside `routing` are ignored, not rejected: that is the policy of
+// every other block in this file (see modelGenerations), so a config written for
+// a newer release still loads on an older one. The only keys refused are the
+// prototype-reparenting ones (rejectPrototypeKeys), as for `enforcement`.
+// Validators read every value exactly once and return a plain snapshot of what
+// they validated, so a config object cannot change between check and use.
+// ---------------------------------------------------------------------------
+
+/**
+ * Agent ids in `routing.roles`: host agent names, case-sensitive (an agent may be
+ * called `ContextScout` or `team/helper`; QA-1.1-5). Nothing that could not be a
+ * name: no empty id, no whitespace, no `#`.
+ */
+const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_./-]*$/;
+
+/**
+ * An agent id: {@link AGENT_ID_PATTERN}, and nothing path-like beyond a plain
+ * `a/b`: no empty, `.` or `..` segment (`a//b`, `a/../b`, `a/./b`) and no
+ * trailing `/` or `.` (QA-1.1-27).
+ */
+function isAgentId(id: string): boolean {
+  return (
+    AGENT_ID_PATTERN.test(id) &&
+    !id.endsWith("/") &&
+    !id.endsWith(".") &&
+    !id.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  );
+}
+/** Environment variable names (`classifier.apiKeyEnv`). */
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** A variant id: non-empty, no whitespace, no `#` (the ref separator). */
+const VARIANT_ID_PATTERN = /^[^\s#]+$/;
+
+/** `value` as a member of `allowed`, narrowed without a cast. */
+function pickEnum<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
+  return allowed.find((candidate) => candidate === value);
+}
+
+function readEnum<T extends string>(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+  allowed: readonly T[],
+): T | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  const hit = pickEnum(allowed, value);
+  if (hit === undefined) {
+    throw new Error(
+      `tiers.json: ${path}.${key} must be one of ${allowed.join("|")} (got ${describeValue(value)})`,
+    );
+  }
+  return hit;
+}
+
+interface NumberRule {
+  min: number;
+  max: number;
+  /** `min` itself is not allowed (an open lower bound). */
+  minExclusive?: boolean;
+  integer?: boolean;
+}
+
+function readNumber(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+  rule: NumberRule,
+): number | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  const inRange =
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    (!rule.integer || Number.isInteger(value)) &&
+    (rule.minExclusive ? value > rule.min : value >= rule.min) &&
+    value <= rule.max;
+  if (typeof value !== "number" || !inRange) {
+    const lower = rule.minExclusive ? `> ${rule.min}` : `>= ${rule.min}`;
+    throw new Error(
+      `tiers.json: ${path}.${key} must be ${rule.integer ? "an integer" : "a number"} ${lower} and <= ${rule.max} (got ${describeValue(value)})`,
+    );
+  }
+  return value;
+}
+
+function readBoolean(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+): boolean | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`tiers.json: ${path}.${key} must be a boolean (got ${describeValue(value)})`);
+  }
+  return value;
+}
+
+/** A nested object block; `null` and arrays are refused (an override `null` would erase a block). */
+function readBlock(
+  parent: Record<string, unknown>,
+  key: string,
+  path: string,
+): Record<string, unknown> | undefined {
+  const value = parent[key];
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value)) {
+    throw new Error(`tiers.json: ${path}.${key} must be an object (got ${describeValue(value)})`);
+  }
+  rejectPrototypeKeys(value, `${path}.${key}`);
+  return value;
+}
+
+/**
+ * An absolute path, or `~` / `~/…` / `~\...` (the home directory; expanded by
+ * resolveRouting). On Windows "absolute" means a drive letter (`C:\x`, `C:/x`) or
+ * a UNC path (`\\server\share`): a rooted path without a drive (`\x`, `/x`) is
+ * relative to the current drive and so to wherever the process happens to run
+ * (QA-1.1-27).
+ */
+function isAbsoluteOrHomePath(value: string): boolean {
+  if (value === "~" || /^~[\\/]/.test(value)) return true;
+  if (!isAbsolute(value)) return false;
+  return process.platform !== "win32" || /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(value);
+}
+
+/** `provider/model` or `provider/model#variant` (a catalog reference). */
+function isCatalogRef(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const hash = value.indexOf("#");
+  if (hash === -1) return parseModelRef(value) !== undefined;
+  return VARIANT_ID_PATTERN.test(value.slice(hash + 1)) && parseModelRef(value.slice(0, hash)) !== undefined;
+}
+
+/** `model` / `backend` pair read from a classifier block or a per-preset override. */
+function readClassifierModel(obj: Record<string, unknown>, path: string): string | null | undefined {
+  const model = obj.model;
+  if (model === undefined || model === null) return model;
+  if (!isCatalogRef(model)) {
+    throw new Error(
+      `tiers.json: ${path}.model must be null or a 'provider/model[#variant]' string (got ${describeValue(model)})`,
+    );
+  }
+  return model;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** D3: a backend other than `rules` needs a model; the HTTP backends also need a URL. */
+function assertClassifierUsable(
+  path: string,
+  backend: ClassifierBackend,
+  model: string | null | undefined,
+  baseUrl: string | null | undefined,
+  modelKeys: string,
+): void {
+  if (backend === "rules") return;
+  if (typeof model !== "string" || model === "") {
+    throw new Error(
+      `tiers.json: ${modelKeys} must be a non-empty 'provider/model[#variant]' string when ${path}.backend is "${backend}" (the classifier is never picked automatically)`,
+    );
+  }
+  if ((backend === "openai-compatible" || backend === "typesafe") && !baseUrl) {
+    throw new Error(
+      `tiers.json: routing.classifier.baseUrl must be an http(s) URL when ${path}.backend is "${backend}"`,
+    );
+  }
+}
+
+function validateClassifier(routing: Record<string, unknown>): ClassifierConfig | undefined {
+  const c = readBlock(routing, "classifier", "routing");
+  if (c === undefined) return undefined;
+  const path = "routing.classifier";
+  const out: ClassifierConfig = {};
+
+  const backend = readEnum(c, "backend", path, CLASSIFIER_BACKENDS);
+  if (backend !== undefined) out.backend = backend;
+
+  const model = readClassifierModel(c, path);
+  if (model !== undefined) out.model = model;
+
+  const baseUrl = c.baseUrl;
+  if (baseUrl !== undefined && baseUrl !== null) {
+    if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
+      throw new Error(
+        `tiers.json: ${path}.baseUrl must be null or an http(s) URL (got ${describeValue(baseUrl)})`,
+      );
+    }
+  }
+  if (baseUrl !== undefined) out.baseUrl = baseUrl;
+
+  const apiKeyEnv = c.apiKeyEnv;
+  if (apiKeyEnv !== undefined && apiKeyEnv !== null) {
+    if (typeof apiKeyEnv !== "string" || !ENV_NAME_PATTERN.test(apiKeyEnv)) {
+      throw new Error(
+        `tiers.json: ${path}.apiKeyEnv must be null or an environment variable name (got ${describeValue(apiKeyEnv)})`,
+      );
+    }
+  }
+  if (apiKeyEnv !== undefined) out.apiKeyEnv = apiKeyEnv;
+
+  const timeoutMs = readNumber(c, "timeoutMs", path, { min: 100, max: 30_000, integer: true });
+  if (timeoutMs !== undefined) out.timeoutMs = timeoutMs;
+
+  const samples = c.samples;
+  if (samples !== undefined) {
+    if (samples !== 1 && samples !== 3) {
+      throw new Error(`tiers.json: ${path}.samples must be 1 or 3 (got ${describeValue(samples)})`);
+    }
+    out.samples = samples;
+  }
+
+  const maxStateChars = readNumber(c, "maxStateChars", path, { min: 200, max: 20_000, integer: true });
+  if (maxStateChars !== undefined) out.maxStateChars = maxStateChars;
+
+  const presets = readBlock(c, "presets", path);
+  if (presets !== undefined) {
+    const snapshot: Record<string, ClassifierPresetOverride> = {};
+    for (const [presetName, entry] of Object.entries(presets)) {
+      const entryPath = `${path}.presets.'${presetName}'`;
+      if (!isPlainObject(entry)) {
+        throw new Error(`tiers.json: ${entryPath} must be an object (got ${describeValue(entry)})`);
+      }
+      rejectPrototypeKeys(entry, entryPath);
+      const override: ClassifierPresetOverride = {};
+      const entryBackend = readEnum(entry, "backend", entryPath, CLASSIFIER_BACKENDS);
+      if (entryBackend !== undefined) override.backend = entryBackend;
+      const entryModel = readClassifierModel(entry, entryPath);
+      if (entryModel !== undefined) override.model = entryModel;
+      snapshot[presetName] = override;
+    }
+    out.presets = snapshot;
+  }
+
+  // The top level and every per-preset override must each resolve to a usable
+  // classifier, whichever layer supplied which key.
+  const effectiveBackend = out.backend ?? "rules";
+  assertClassifierUsable(path, effectiveBackend, out.model, out.baseUrl, `${path}.model`);
+  for (const [presetName, override] of Object.entries(out.presets ?? {})) {
+    const entryPath = `${path}.presets.'${presetName}'`;
+    assertClassifierUsable(
+      entryPath,
+      override.backend ?? effectiveBackend,
+      override.model !== undefined ? override.model : out.model,
+      out.baseUrl,
+      `${path}.model or ${entryPath}.model`,
+    );
+  }
+  return out;
+}
+
+function validateRoles(routing: Record<string, unknown>): Record<string, string[]> | undefined {
+  const roles = readBlock(routing, "roles", "routing");
+  if (roles === undefined) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const [taskClass, agents] of Object.entries(roles)) {
+    if (!pickEnum(ROUTING_TASK_CLASSES, taskClass)) {
+      throw new Error(
+        `tiers.json: routing.roles class '${taskClass}' must be one of ${ROUTING_TASK_CLASSES.join("|")}`,
+      );
+    }
+    // An empty list is allowed: it means "no native candidates for this class"
+    // (a deliberate deviation from "non-empty arrays", QA-1.1-7).
+    if (!Array.isArray(agents)) {
+      throw new Error(
+        `tiers.json: routing.roles.'${taskClass}' must be an array of agent ids (got ${describeValue(agents)})`,
+      );
+    }
+    const ids: string[] = [];
+    for (const agent of agents as unknown[]) {
+      if (typeof agent !== "string" || !isAgentId(agent)) {
+        throw new Error(
+          `tiers.json: routing.roles.'${taskClass}' entries must be agent ids matching ${AGENT_ID_PATTERN.source}, without '.' or '..' segments and not ending in '/' or '.' (got ${describeValue(agent)})`,
+        );
+      }
+      ids.push(agent);
+    }
+    out[taskClass] = ids;
+  }
+  return out;
+}
+
+/**
+ * Validate `routing` and return a snapshot of the validated values (or
+ * `undefined` when absent). Defaults are NOT applied here; see resolveRouting.
+ */
+function validateRouting(value: unknown): RoutingConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value)) {
+    throw new Error(`tiers.json: 'routing' must be an object (got ${describeValue(value)})`);
+  }
+  rejectPrototypeKeys(value, "routing");
+  const routing = value;
+  const out: RoutingConfig = {};
+
+  const engine = readEnum(routing, "engine", "routing", ROUTING_ENGINES);
+  if (engine !== undefined) out.engine = engine;
+  const profile = readEnum(routing, "profile", "routing", ROUTING_PROFILES);
+  if (profile !== undefined) out.profile = profile;
+  const margin = readNumber(routing, "margin", "routing", { min: 0, max: 0.9 });
+  if (margin !== undefined) out.margin = margin;
+  const minClassConfidence = readNumber(routing, "minClassConfidence", "routing", { min: 0, max: 1 });
+  if (minClassConfidence !== undefined) out.minClassConfidence = minClassConfidence;
+
+  const detection = readBlock(routing, "detection", "routing");
+  if (detection !== undefined) {
+    const d: DetectionConfig = {};
+    for (const key of ["deterministic", "grader", "none"] as const) {
+      const v = readNumber(detection, key, "routing.detection", { min: 0, max: 1 });
+      if (v !== undefined) d[key] = v;
+    }
+    // A deeper check cannot catch less than a shallower one (QA-1.1-13); compared
+    // on the effective values, so one key can break the order against a default.
+    const dd = ROUTING_DEFAULTS.detection;
+    const effective = {
+      deterministic: d.deterministic ?? dd.deterministic,
+      grader: d.grader ?? dd.grader,
+      none: d.none ?? dd.none,
+    };
+    if (!(effective.deterministic >= effective.grader && effective.grader >= effective.none)) {
+      throw new Error(
+        `tiers.json: routing.detection must satisfy deterministic >= grader >= none, because a deeper check cannot catch less than a shallower one (got deterministic ${effective.deterministic}, grader ${effective.grader}, none ${effective.none})`,
+      );
+    }
+    out.detection = d;
+  }
+
+  const classifier = validateClassifier(routing);
+  if (classifier !== undefined) out.classifier = classifier;
+  const roles = validateRoles(routing);
+  if (roles !== undefined) out.roles = roles;
+
+  const outcomes = readBlock(routing, "outcomes", "routing");
+  if (outcomes !== undefined) {
+    const o: OutcomesConfig = {};
+    const path = outcomes.path;
+    if (path !== undefined) {
+      if (path !== null && (typeof path !== "string" || !isAbsoluteOrHomePath(path))) {
+        throw new Error(
+          `tiers.json: routing.outcomes.path must be null or an absolute path; a leading ~ means the home directory (got ${describeValue(path)})`,
+        );
+      }
+      o.path = path;
+    }
+    const halfLifeDays = readNumber(outcomes, "halfLifeDays", "routing.outcomes", { min: 1, max: 365 });
+    if (halfLifeDays !== undefined) o.halfLifeDays = halfLifeDays;
+    const maxEffectiveSamples = readNumber(outcomes, "maxEffectiveSamples", "routing.outcomes", {
+      min: 5,
+      max: 1000,
+    });
+    if (maxEffectiveSamples !== undefined) o.maxEffectiveSamples = maxEffectiveSamples;
+    out.outcomes = o;
+  }
+
+  const sessionReuse = readBlock(routing, "sessionReuse", "routing");
+  if (sessionReuse !== undefined) {
+    const s: SessionReuseConfig = {};
+    const maxContextFraction = readNumber(sessionReuse, "maxContextFraction", "routing.sessionReuse", {
+      min: 0,
+      max: 0.95,
+      minExclusive: true,
+    });
+    if (maxContextFraction !== undefined) s.maxContextFraction = maxContextFraction;
+    out.sessionReuse = s;
+  }
+
+  const advisor = readBlock(routing, "advisor", "routing");
+  if (advisor !== undefined) {
+    const a: AdvisorConfig = {};
+    const enabled = readBoolean(advisor, "enabled", "routing.advisor");
+    if (enabled !== undefined) a.enabled = enabled;
+    const noticeIntervalHours = readNumber(advisor, "noticeIntervalHours", "routing.advisor", {
+      min: 1,
+      max: 720,
+    });
+    if (noticeIntervalHours !== undefined) a.noticeIntervalHours = noticeIntervalHours;
+    out.advisor = a;
+  }
+
+  return out;
+}
+
+/** A `candidates` entry after validation (every key optional, see {@link TierCandidate}). */
+type CandidateSpec = TierCandidate;
+
+/** The identity of a rung: its model and variant (an omitted variant is the default variant). */
+function rungKey(model: string, variant: string | undefined): string {
+  return `${model}\u0000${variant ?? ""}`;
+}
+
+/** A tier's own costRatio: the one it states, else the conventional default of its name. */
+function tierCostRatioOf(tierName: string, costRatio: unknown): number {
+  return typeof costRatio === "number" && Number.isFinite(costRatio) && costRatio > 0
+    ? costRatio
+    : tierDefaultsFor(tierName).costRatio;
+}
+
+/**
+ * Why a non-empty `candidates` list cannot be used next to the tier's own rung,
+ * or `undefined` when it can (QA-1.1-3, made non-fatal by QA-1.1-25):
+ *
+ * - it must contain the tier's own effective `(model, variant)`: the static choice
+ *   has to be one of the rungs, or the engine's degenerate case (D2) would have
+ *   nothing to start from;
+ * - that rung's `costRatio` is the tier's own, so it must equal it or be omitted.
+ *
+ * It is a *problem*, not a validation error: a plugin update that changes a
+ * bundled tier's variant would otherwise make a user's override file invalid and
+ * drop the whole layer. The list is ignored instead (the ladder is the tier's own
+ * rung) and the reason is noticed at load.
+ */
+function ownRungProblem(
+  tierModel: string,
+  tierVariant: string | undefined,
+  tierCostRatio: number,
+  candidates: readonly CandidateSpec[],
+): string | undefined {
+  // `candidates` is non-empty: both callers check, an empty list means "none".
+  const ownKey = rungKey(tierModel, tierVariant);
+  const index = candidates.findIndex((c) => rungKey(c.model ?? tierModel, c.variant) === ownKey);
+  if (index === -1) {
+    return `it does not contain the tier's own rung (model ${tierModel}, variant ${tierVariant ?? "default"})`;
+  }
+  const declared = candidates[index]!.costRatio;
+  if (declared !== undefined && declared !== tierCostRatio) {
+    return `its own rung (candidates[${index}]) has costRatio ${declared}, not the tier's ${tierCostRatio}`;
+  }
+  return undefined;
+}
+
+/**
+ * `tiers.<t>.candidates`: ordered rungs of a tier's ladder, in escalation order.
+ * Throws for anything malformed; returns the validated entries.
+ *
+ * - `model` falls back to the tier's own; an omitted `variant` is the model's
+ *   default variant; an omitted `costRatio` is the tier's.
+ * - No two rungs may name the same effective `(model, variant)`.
+ * - Effective `costRatio` must not decrease along the list (QA-1.1-12): the list
+ *   is walked upward on failure, and a cheaper later rung is not an escalation.
+ *
+ * The own-rung rules are NOT enforced here: see {@link ownRungProblem}.
+ */
+function validateTierCandidates(
+  tier: Record<string, unknown>,
+  label: string,
+  tierName: string,
+): CandidateSpec[] | undefined {
+  const candidates = tier.candidates;
+  if (candidates === undefined) return undefined;
+  if (!Array.isArray(candidates)) {
+    throw new Error(`tiers.json: '${label}.candidates' must be an array`);
+  }
+  const seen = new Map<string, number>();
+  const tierCostRatio = tierCostRatioOf(tierName, tier.costRatio);
+  const specs: CandidateSpec[] = [];
+  const effectiveCosts: number[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const entry: unknown = candidates[i];
+    const where = `${label}.candidates[${i}]`;
+    if (!isPlainObject(entry)) {
+      throw new Error(`tiers.json: '${where}' must be an object`);
+    }
+    rejectPrototypeKeys(entry, `${label}.candidates[${i}]`);
+    const model = entry.model;
+    if (model !== undefined && (typeof model !== "string" || !parseModelRef(model))) {
+      throw new Error(
+        `tiers.json: '${where}.model' must be 'provider/model' (got ${describeValue(model)})`,
+      );
+    }
+    const variant = entry.variant;
+    if (variant !== undefined && (typeof variant !== "string" || !VARIANT_ID_PATTERN.test(variant))) {
+      throw new Error(
+        `tiers.json: '${where}.variant' must be a non-empty string without whitespace or '#' (got ${describeValue(variant)})`,
+      );
+    }
+    const costRatio = entry.costRatio;
+    if (
+      costRatio !== undefined &&
+      (typeof costRatio !== "number" || !Number.isFinite(costRatio) || costRatio <= 0)
+    ) {
+      throw new Error(
+        `tiers.json: '${where}.costRatio' must be a number > 0 (got ${describeValue(costRatio)})`,
+      );
+    }
+    const effectiveModel = typeof model === "string" ? model : String(tier.model);
+    const key = rungKey(effectiveModel, typeof variant === "string" ? variant : undefined);
+    const first = seen.get(key);
+    if (first !== undefined) {
+      throw new Error(
+        `tiers.json: '${where}' repeats (model, variant) = (${effectiveModel}, ${typeof variant === "string" ? variant : "default"}) of candidates[${first}]`,
+      );
+    }
+    seen.set(key, i);
+    const spec: CandidateSpec = {};
+    if (typeof model === "string") spec.model = model;
+    if (typeof variant === "string") spec.variant = variant;
+    if (typeof costRatio === "number") spec.costRatio = costRatio;
+    specs.push(spec);
+    effectiveCosts.push(spec.costRatio ?? tierCostRatio);
+  }
+  for (let i = 1; i < effectiveCosts.length; i++) {
+    if (effectiveCosts[i]! < effectiveCosts[i - 1]!) {
+      throw new Error(
+        `tiers.json: '${label}.candidates[${i}]' has costRatio ${effectiveCosts[i]}, lower than candidates[${i - 1}] (${effectiveCosts[i - 1]}): candidates are listed in escalation order, so costRatio must not decrease`,
+      );
+    }
+  }
+  return specs;
+}
+
+/** One rung of a tier as the validator sees it, for the per-preset costRatio check. */
+interface PresetRung {
+  model: string;
+  variant: string | undefined;
+  costRatio: number;
+  /** Where it was written, for the error message. */
+  source: string;
+  /** True for a rung of an explicit `candidates` list (the tier's own implicit rung is not). */
+  explicit: boolean;
+}
+
+/**
+ * Within one preset a `(model, variant)` has ONE costRatio (QA-1.1-26): the
+ * engine prices a candidate by that pair, so two tiers (or a tier and a
+ * candidate list) quoting different ratios for the same pair would make the
+ * choice depend on which tier asked. Only pairs involving an explicit
+ * `candidates` entry are checked: several bundled tiers legitimately share one
+ * model at different effort levels and ratios, and say nothing about variants.
+ */
+function assertConsistentRungCosts(presetName: string, rungs: readonly PresetRung[]): void {
+  const first = new Map<string, PresetRung>();
+  for (const rung of rungs) {
+    const key = rungKey(rung.model, rung.variant);
+    const prior = first.get(key);
+    if (prior === undefined) {
+      first.set(key, rung);
+    } else if (prior.costRatio !== rung.costRatio && (prior.explicit || rung.explicit)) {
+      throw new Error(
+        `tiers.json: preset '${presetName}': (model, variant) = (${rung.model}, ${rung.variant ?? "default"}) has costRatio ${rung.costRatio} in '${rung.source}' but ${prior.costRatio} in '${prior.source}'; within a preset one (model, variant) has one costRatio`,
+      );
+    }
+  }
+}
+/** True when the tier lists at least one explicit candidate (an empty list counts as none). */
+export function hasExplicitCandidates(tier: TierConfig): boolean {
+  return Array.isArray(tier.candidates) && tier.candidates.length > 0;
+}
+
+/**
+ * Why the tier's `candidates` are ignored (the ladder is then the tier's own
+ * rung), or `undefined` when they are used or there are none (QA-1.1-25):
+ * the list lacks the tier's own `(model, variant)`, or states another
+ * `costRatio` for it. Loading reports it as a config notice.
+ */
+export function candidatesProblem(tierName: string, tier: TierConfig): string | undefined {
+  const listed = tier.candidates;
+  if (listed === undefined || listed.length === 0) return undefined;
+  return ownRungProblem(tier.model, tier.variant, tierCostRatioOf(tierName, tier.costRatio), listed);
+}
+
 /**
  * Validate a raw parsed config. Strict and throwing by design: the bundled
  * tiers.json must be valid on its own, and loadConfig turns a throw from an
@@ -1261,9 +2018,10 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateDispatchHeader(obj);
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
+  const routing = validateRouting(obj.routing);
 
   const cfg = raw as RouterConfig;
-  return withValidatedSnapshots(cfg, { enforcement });
+  return withValidatedSnapshots(cfg, { enforcement, routing });
 }
 
 /**
@@ -1362,17 +2120,113 @@ export interface OverrideLayer {
   data: Record<string, unknown>;
 }
 
-function collectOverrideLayers(dir: string, failures?: SourceFailure[]): OverrideLayer[] {
+/**
+ * `routing` keys that decide where task text is sent or where outcome data is
+ * written. A repository-controlled file must not be able to set them (A18,
+ * QA-1.1-2): cloning a project would otherwise let its author point the
+ * classifier at their own server. Only the global override may.
+ */
+const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: string]> = [
+  ["classifier", "backend"],
+  ["classifier", "model"],
+  ["classifier", "baseUrl"],
+  ["classifier", "apiKeyEnv"],
+  ["classifier", "presets"],
+  ["outcomes", "path"],
+];
+
+/** Remove the global-only `routing` keys from a project layer; returns what was dropped. */
+function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
+  const routing = data.routing;
+  if (!isPlainObject(routing)) return [];
+  const dropped: string[] = [];
+  const touched = new Set<string>();
+  for (const [block, key] of GLOBAL_ONLY_ROUTING_KEYS) {
+    const target = routing[block];
+    if (isPlainObject(target) && Object.hasOwn(target, key)) {
+      delete target[key];
+      dropped.push(`routing.${block}.${key}`);
+      touched.add(block);
+    }
+  }
+  // A block that stripping left empty goes too, and so does an emptied `routing`:
+  // any `routing` block, however empty, changes behaviour (variantSteps defaults
+  // to `auto` under one, A15), and the project file must not do that by accident.
+  for (const block of touched) {
+    const target = routing[block];
+    if (isPlainObject(target) && Object.keys(target).length === 0) delete routing[block];
+  }
+  if (dropped.length > 0 && Object.keys(routing).length === 0) delete data.routing;
+  return dropped;
+}
+
+function collectOverrideLayers(
+  dir: string,
+  failures?: SourceFailure[],
+  notices?: ConfigNotice[],
+): OverrideLayer[] {
   const layers: OverrideLayer[] = [];
   // Lowest priority first: global, then project-local (found by upward search
   // from the project directory).
-  const paths = [overridePath(), walkForProjectOverride(dir)];
-  for (const p of paths) {
+  const sources = [
+    { path: overridePath(), project: false },
+    { path: walkForProjectOverride(dir), project: true },
+  ];
+  for (const { path: p, project } of sources) {
     if (!p) continue;
     const data = readOverridesAt(p, failures);
-    if (data) layers.push({ path: p, data });
+    if (!data) continue;
+    if (project) {
+      const dropped = stripGlobalOnlyRoutingKeys(data);
+      if (dropped.length > 0) {
+        notices?.push({
+          source: p,
+          message: `ignoring ${dropped.join(", ")} from ${p}: only the global override may set it`,
+        });
+      }
+    }
+    layers.push({ path: p, data });
   }
   return layers;
+}
+
+/** The notices of the build that produced each config object (the cache hands the same object back until a reload). */
+const noticesByConfig = new WeakMap<RouterConfig, readonly ConfigNotice[]>();
+
+/** Notice texts already logged in this process (bounded); see {@link warnConfigNotices}. */
+const loggedNoticeTexts = new Set<string>();
+
+/**
+ * Log, through the plugin logger, each notice of `cfg` whose text has not been
+ * logged yet in this process (QA-1.1-23). `config.ts` itself never writes
+ * notices to the console: `console.warn` from a plugin paints over the TUI, and
+ * keying on the config fingerprint made a state-file write (`/preset`,
+ * `/budget`) re-log a typo that had not changed. The dedupe key is the text,
+ * which already names the file or the keys concerned.
+ */
+export function warnConfigNotices(
+  cfg: RouterConfig | undefined,
+  logger: Pick<PluginLogger, "warn">,
+): void {
+  if (cfg === undefined) return;
+  for (const notice of noticesByConfig.get(cfg) ?? []) {
+    if (loggedNoticeTexts.has(notice.message)) continue;
+    if (loggedNoticeTexts.size >= 256) loggedNoticeTexts.clear();
+    loggedNoticeTexts.add(notice.message);
+    logger.warn(notice.message, notice.source === undefined ? undefined : { source: notice.source });
+  }
+}
+
+/**
+ * What to log after every `loadConfig()`: the once-per-process deprecation
+ * warning and any new config notices, both through the plugin logger.
+ */
+export function warnConfigIssues(
+  cfg: RouterConfig | undefined,
+  logger: PluginLogger,
+): void {
+  warnDeprecatedVerifyKeys(cfg, logger);
+  warnConfigNotices(cfg, logger);
 }
 
 /**
@@ -1387,6 +2241,11 @@ const TIER_DEFAULTS: Record<string, { costRatio: number; steps: number }> = {
 };
 const FALLBACK_TIER_DEFAULTS = { costRatio: 1, steps: 50 };
 
+/** Defaults of a tier by name; own keys only, so `constructor` or `toString` are not tiers (QA-1.1-19). */
+function tierDefaultsFor(tierName: string): { costRatio: number; steps: number } {
+  return Object.hasOwn(TIER_DEFAULTS, tierName) ? TIER_DEFAULTS[tierName]! : FALLBACK_TIER_DEFAULTS;
+}
+
 /**
  * Fill in `costRatio`/`steps` for any tier that omits them, by tier name. Runs
  * after merge so override-defined presets behave well without restating the
@@ -1396,7 +2255,7 @@ const FALLBACK_TIER_DEFAULTS = { costRatio: 1, steps: 50 };
 function applyTierDefaults(cfg: RouterConfig): void {
   for (const preset of Object.values(cfg.presets)) {
     for (const [tierName, tier] of Object.entries(preset)) {
-      const d = TIER_DEFAULTS[tierName] ?? FALLBACK_TIER_DEFAULTS;
+      const d = tierDefaultsFor(tierName);
       if (tier.costRatio === undefined) tier.costRatio = d.costRatio;
       if (tier.steps === undefined) tier.steps = d.steps;
     }
@@ -1458,9 +2317,10 @@ export function loadConfig(dir?: string): RouterConfig {
     entry.config !== null && sourceKey === entry.sourceKey ? entry.config : null;
 
   const failures: SourceFailure[] = [];
+  const notices: ConfigNotice[] = [];
   let cfg: RouterConfig;
   try {
-    cfg = buildConfig(projectDir, failures);
+    cfg = buildConfig(projectDir, failures, notices);
   } catch (err) {
     // First load: unchanged behaviour — throw. Reload: keep the last good one.
     if (!previous) throw err;
@@ -1494,6 +2354,8 @@ export function loadConfig(dir?: string): RouterConfig {
   entry.dirty = false;
   entry.reloadError = null;
   entry.warnedFingerprint = null;
+  entry.notices = notices;
+  noticesByConfig.set(cfg, notices);
   return cfg;
 }
 
@@ -1521,25 +2383,151 @@ function keepLastValidConfig(
   return previous;
 }
 
+/** Keys each `routing` block understands; anything else is ignored (and noticed). */
+const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
+  routing: [
+    "engine",
+    "profile",
+    "margin",
+    "minClassConfidence",
+    "detection",
+    "classifier",
+    "roles",
+    "outcomes",
+    "sessionReuse",
+    "advisor",
+  ],
+  detection: ["deterministic", "grader", "none"],
+  classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
+  preset: ["backend", "model"],
+  outcomes: ["path", "halfLifeDays", "maxEffectiveSamples"],
+  sessionReuse: ["maxContextFraction"],
+  advisor: ["enabled", "noticeIntervalHours"],
+};
+
+/**
+ * Paths of the keys inside a raw `routing` block that nothing reads
+ * (`routing.margn`, `routing.classifier.bakend`, …). Validation ignores them, as
+ * it does everywhere in this file; this makes the typo visible (QA-1.1-10).
+ */
+export function findUnknownRoutingKeys(routing: unknown): string[] {
+  if (!isPlainObject(routing)) return [];
+  const unknown: string[] = [];
+  const check = (obj: Record<string, unknown>, known: readonly string[], path: string): void => {
+    for (const key of Object.keys(obj)) {
+      if (!known.includes(key)) unknown.push(`${path}.${key}`);
+    }
+  };
+  check(routing, ROUTING_KNOWN_KEYS.routing!, "routing");
+  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor"] as const) {
+    const value = routing[block];
+    if (isPlainObject(value)) check(value, ROUTING_KNOWN_KEYS[block]!, `routing.${block}`);
+  }
+  const classifier = routing.classifier;
+  const presets = isPlainObject(classifier) ? classifier.presets : undefined;
+  if (isPlainObject(presets)) {
+    for (const [name, entry] of Object.entries(presets)) {
+      if (isPlainObject(entry)) check(entry, ROUTING_KNOWN_KEYS.preset!, `routing.classifier.presets.${name}`);
+    }
+  }
+  return unknown;
+}
+
+/**
+ * OpenCode's built-in primary and internal agents. None of them can be a
+ * subagent candidate, so `routing.roles` naming one is useless (QA-1.1-18); it is
+ * accepted (the host's agent set is not known at load) but noticed, and the
+ * engine must skip it.
+ */
+export const ROUTING_RESERVED_AGENTS = ["build", "plan", "title", "summary", "compaction"] as const;
+
+/**
+ * Findings about a routing block that loaded fine but probably is not what the
+ * author meant: unknown keys, `roles` naming reserved agents, per-preset
+ * classifier overrides naming no preset. `rawRouting` is the merged block as
+ * written (validation drops unknown keys from the snapshot); `cfg` is the
+ * validated config.
+ */
+export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): string[] {
+  const messages: string[] = [];
+  const unknown = findUnknownRoutingKeys(rawRouting);
+  if (unknown.length > 0) {
+    messages.push(`ignoring unknown routing key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
+  }
+  for (const [taskClass, agents] of Object.entries(cfg.routing?.roles ?? {})) {
+    for (const agent of agents) {
+      if (ROUTING_RESERVED_AGENTS.some((reserved) => reserved === agent)) {
+        messages.push(
+          `routing.roles.'${taskClass}' names '${agent}', an OpenCode primary/internal agent that cannot be a subagent; it will be skipped`,
+        );
+      }
+    }
+  }
+  for (const [presetName, preset] of Object.entries(cfg.presets)) {
+    for (const [tierName, tier] of Object.entries(preset)) {
+      const problem = candidatesProblem(tierName, tier);
+      if (problem !== undefined) {
+        messages.push(
+          `presets.${presetName}.${tierName}.candidates are ignored, the tier's ladder is its own rung: ${problem}`,
+        );
+      }
+    }
+  }
+  for (const name of Object.keys(cfg.routing?.classifier?.presets ?? {})) {
+    if (resolvePresetName(cfg, name) === undefined) {
+      messages.push(
+        `routing.classifier.presets.'${name}' matches no preset (defined: ${Object.keys(cfg.presets).join(", ")}); the override is unused`,
+      );
+    }
+  }
+  return messages;
+}
+/**
+ * `routing.roles` is replaced wholesale by the highest-priority layer that sets
+ * it, not merged class by class (QA-1.1-7): the default is replaced as a whole
+ * too, so a layer's `roles` is the complete list of what it wants, and a class
+ * it leaves out cannot be re-enabled by a lower layer.
+ */
+function replaceRolesWholesale(merged: unknown, layers: readonly OverrideLayer[]): unknown {
+  if (!isPlainObject(merged) || !isPlainObject(merged.routing)) return merged;
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const routing = layers[i]!.data.routing;
+    if (isPlainObject(routing) && Object.hasOwn(routing, "roles") && routing.roles !== undefined) {
+      return { ...merged, routing: { ...merged.routing, roles: routing.roles } };
+    }
+  }
+  return merged;
+}
+
 /**
  * Build a fresh config from tiers.json + override layers + persisted state.
  * Throws only when tiers.json itself is unreadable/invalid. Override and state
  * problems are warned about, skipped, and appended to `failures`.
  */
-function buildConfig(dir: string, failures: SourceFailure[]): RouterConfig {
+function buildConfig(
+  dir: string,
+  failures: SourceFailure[],
+  notices: ConfigNotice[],
+): RouterConfig {
   const base = JSON.parse(readFileSync(configPath(), "utf-8"));
-  const layers = collectOverrideLayers(dir, failures);
+  const layers = collectOverrideLayers(dir, failures, notices);
 
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
   let cfg = validateConfig(base);
+  let rawUsed: unknown = base;
 
   if (layers.length > 0) {
     const merge = (ls: OverrideLayer[]): unknown =>
-      ls.reduce<unknown>((acc, l) => deepMerge(acc, l.data), base);
+      replaceRolesWholesale(
+        ls.reduce<unknown>((acc, l) => deepMerge(acc, l.data), base),
+        ls,
+      );
 
     try {
-      cfg = validateConfig(merge(layers));
+      const merged = merge(layers);
+      cfg = validateConfig(merged);
+      rawUsed = merged;
     } catch (err) {
       // A bad override must never brick startup, and one broken file must not
       // discard a good one. Fall back to the highest-priority layer that
@@ -1555,7 +2543,9 @@ function buildConfig(dir: string, failures: SourceFailure[]): RouterConfig {
       });
       for (let i = layers.length - 1; i >= 0; i--) {
         try {
-          cfg = validateConfig(merge([layers[i]!]));
+          const single = merge([layers[i]!]);
+          cfg = validateConfig(single);
+          rawUsed = single;
           for (let j = 0; j < layers.length; j++) {
             if (j !== i) {
               console.warn(`[model-router] dropped override layer ${layers[j]!.path}`);
@@ -1571,6 +2561,7 @@ function buildConfig(dir: string, failures: SourceFailure[]): RouterConfig {
             message: `${layers[i]!.path}: ${(singleErr as Error).message}`,
           });
           cfg = validateConfig(base);
+          rawUsed = base;
         }
       }
     }
@@ -1610,7 +2601,26 @@ function buildConfig(dir: string, failures: SourceFailure[]): RouterConfig {
   }
 
   applyTierDefaults(cfg);
+  const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
+  for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
+  dropIgnoredCandidates(cfg);
   return cfg;
+}
+
+/**
+ * Remove, from the built config, every `candidates` list that loading reports as
+ * ignored ({@link candidatesProblem}), after the notice has been recorded
+ * (QA-1.1-30). Leaving it on `tier.candidates` would make `hasExplicitCandidates`
+ * and any code that reads the raw list disagree with `resolveCandidates`, which
+ * already treats the tier as having only its own rung. Runs on the config this
+ * build created, never on a caller's object.
+ */
+function dropIgnoredCandidates(cfg: RouterConfig): void {
+  for (const preset of Object.values(cfg.presets)) {
+    for (const [tierName, tier] of Object.entries(preset)) {
+      if (candidatesProblem(tierName, tier) !== undefined) delete tier.candidates;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,4 +2777,294 @@ export function resolveVerifyBudget(
     baselineTimeoutMs,
     gateBudgetMs: own<number>("gateBudgetMs") ?? 90_000,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing helpers (#74)
+// ---------------------------------------------------------------------------
+
+/** The single log line of D1; also the exact text tests pin. */
+export const ROUTING_ENGINE_IGNORED_ON_V1 = "routing.engine ignored on OpenCode v1";
+
+/**
+ * D12: the roles applied on OpenCode v2 when `routing.roles` is not set. On v1
+ * the default is `{}` (D1). Setting `roles: {}` disables native candidates.
+ */
+export const DEFAULT_V2_ROLES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  search: Object.freeze(["explore"]),
+  implement: Object.freeze(["general"]),
+  debug: Object.freeze(["general"]),
+  review: Object.freeze(["general"]),
+});
+
+/**
+ * Every default of the `routing` block except `roles`, whose default depends on
+ * the host. `docs/CONFIG_REFERENCE.md` documents exactly these values and a
+ * test keeps the two in step.
+ */
+export const ROUTING_DEFAULTS = Object.freeze({
+  engine: "static" as RoutingEngine,
+  profile: "balanced" as RoutingProfile,
+  margin: 0.2,
+  minClassConfidence: 0.7,
+  detection: Object.freeze({ deterministic: 0.95, grader: 0.7, none: 0.3 }),
+  classifier: Object.freeze({
+    backend: "rules" as ClassifierBackend,
+    model: null,
+    baseUrl: null,
+    apiKeyEnv: null,
+    timeoutMs: 1500,
+    samples: 1 as 1 | 3,
+    maxStateChars: 2000,
+  }),
+  outcomes: Object.freeze({ path: null, halfLifeDays: 14, maxEffectiveSamples: 50 }),
+  sessionReuse: Object.freeze({ maxContextFraction: 0.6 }),
+  advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24 }),
+});
+
+export interface ResolvedClassifier {
+  readonly backend: ClassifierBackend;
+  readonly model: string | null;
+  readonly baseUrl: string | null;
+  readonly apiKeyEnv: string | null;
+  readonly timeoutMs: number;
+  readonly samples: 1 | 3;
+  readonly maxStateChars: number;
+  readonly presets: Readonly<Record<string, Readonly<ClassifierPresetOverride>>>;
+}
+
+/** What {@link resolveRouting} applied on top of the file, so `/router` can show it. */
+export interface RoutingApplied {
+  readonly host: RouterHost;
+  /** `routing.engine` as written (or the default), before the v1 coercion. */
+  readonly requestedEngine: RoutingEngine;
+  /** True when the engine was forced to `static` because the host is v1. */
+  readonly engineCoerced: boolean;
+  /** `configured`: `routing.roles` was set; `default`: the D12 v2 default; `none`: v1 without roles. */
+  readonly rolesSource: "configured" | "default" | "none";
+}
+
+/** A fully populated, deeply frozen view of `routing` for one host. */
+export interface ResolvedRouting {
+  /** The effective engine: `static` on v1 whatever the file says (D1). */
+  readonly engine: RoutingEngine;
+  readonly profile: RoutingProfile;
+  readonly margin: number;
+  readonly minClassConfidence: number;
+  readonly detection: Readonly<Required<DetectionConfig>>;
+  readonly classifier: ResolvedClassifier;
+  /** Class → ordered, de-duplicated agent ids. */
+  readonly roles: Readonly<Record<string, readonly string[]>>;
+  readonly outcomes: Readonly<{ path: string | null; halfLifeDays: number; maxEffectiveSamples: number }>;
+  readonly sessionReuse: Readonly<Required<SessionReuseConfig>>;
+  readonly advisor: Readonly<Required<AdvisorConfig>>;
+  readonly applied: RoutingApplied;
+}
+
+/** `~` and `~/x` become paths under the home directory; anything else is returned as is. */
+function expandHomePath(value: string | null): string | null {
+  if (value === null) return null;
+  if (value === "~") return homedir();
+  return /^~[\\/]/.test(value) ? join(homedir(), value.slice(2)) : value;
+}
+
+let warnedEngineIgnoredOnV1 = false;
+
+/** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
+export function resetRoutingWarnings(): void {
+  warnedEngineIgnoredOnV1 = false;
+  loggedNoticeTexts.clear();
+}
+
+/** Roles as fresh, de-duplicated, frozen arrays; never aliases the config. */
+function freezeRoles(
+  roles: Readonly<Record<string, readonly string[]>>,
+): Readonly<Record<string, readonly string[]>> {
+  const out: Record<string, readonly string[]> = {};
+  for (const [taskClass, agents] of Object.entries(roles)) {
+    out[taskClass] = Object.freeze([...new Set(agents)]);
+  }
+  return Object.freeze(out);
+}
+
+/**
+ * The single place the `routing` defaults are applied. Pure apart from the
+ * once-per-process notice below, and never mutates `cfg`.
+ *
+ * - `host: "v2"` applies the D12 default for `roles` when the key is absent.
+ * - `host: "v1"` forces `engine` to `static` (D1) and defaults `roles` to `{}`;
+ *   an explicit `routing.roles` is kept (the text-only v1 opt-in).
+ *
+ * The coercion is reported once per process through `logger` (its console
+ * fallback adds the `[model-router]` prefix) or, without one, `console.warn`.
+ */
+export function resolveRouting(
+  cfg: RouterConfig | undefined,
+  host: RouterHost,
+  logger?: Pick<PluginLogger, "warn">,
+): ResolvedRouting {
+  const r: RoutingConfig = cfg?.routing ?? {};
+  const d = ROUTING_DEFAULTS;
+  const requestedEngine = r.engine ?? d.engine;
+  const engineCoerced = host === "v1" && requestedEngine !== "static";
+  if (engineCoerced && !warnedEngineIgnoredOnV1) {
+    warnedEngineIgnoredOnV1 = true;
+    if (logger) logger.warn(ROUTING_ENGINE_IGNORED_ON_V1);
+    else console.warn(`[model-router] ${ROUTING_ENGINE_IGNORED_ON_V1}`);
+  }
+
+  const c: ClassifierConfig = r.classifier ?? {};
+  const presets: Record<string, Readonly<ClassifierPresetOverride>> = {};
+  for (const [name, override] of Object.entries(c.presets ?? {})) {
+    presets[name] = Object.freeze({ ...override });
+  }
+
+  const rolesSource: RoutingApplied["rolesSource"] =
+    r.roles !== undefined ? "configured" : host === "v2" ? "default" : "none";
+  const roles = freezeRoles(r.roles ?? (host === "v2" ? DEFAULT_V2_ROLES : {}));
+
+  return Object.freeze({
+    engine: host === "v1" ? "static" : requestedEngine,
+    profile: r.profile ?? d.profile,
+    margin: r.margin ?? d.margin,
+    minClassConfidence: r.minClassConfidence ?? d.minClassConfidence,
+    detection: Object.freeze({
+      deterministic: r.detection?.deterministic ?? d.detection.deterministic,
+      grader: r.detection?.grader ?? d.detection.grader,
+      none: r.detection?.none ?? d.detection.none,
+    }),
+    classifier: Object.freeze({
+      backend: c.backend ?? d.classifier.backend,
+      model: c.model ?? d.classifier.model,
+      baseUrl: c.baseUrl ?? d.classifier.baseUrl,
+      apiKeyEnv: c.apiKeyEnv ?? d.classifier.apiKeyEnv,
+      timeoutMs: c.timeoutMs ?? d.classifier.timeoutMs,
+      samples: c.samples ?? d.classifier.samples,
+      maxStateChars: c.maxStateChars ?? d.classifier.maxStateChars,
+      presets: Object.freeze(presets),
+    }),
+    roles,
+    outcomes: Object.freeze({
+      path: expandHomePath(r.outcomes?.path ?? d.outcomes.path),
+      halfLifeDays: r.outcomes?.halfLifeDays ?? d.outcomes.halfLifeDays,
+      maxEffectiveSamples: r.outcomes?.maxEffectiveSamples ?? d.outcomes.maxEffectiveSamples,
+    }),
+    sessionReuse: Object.freeze({
+      maxContextFraction: r.sessionReuse?.maxContextFraction ?? d.sessionReuse.maxContextFraction,
+    }),
+    advisor: Object.freeze({
+      enabled: r.advisor?.enabled ?? d.advisor.enabled,
+      noticeIntervalHours: r.advisor?.noticeIntervalHours ?? d.advisor.noticeIntervalHours,
+    }),
+    applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
+  });
+}
+
+/**
+ * The key of `presets` that names `presetName`: an exact match, else a
+ * case-insensitive, trimmed one, like {@link resolvePresetName} (what `/preset`
+ * uses), so `Anthropic` and `anthropic` are the same preset (QA-1.1-14).
+ * Own keys only.
+ */
+function findPresetOverrideKey(
+  presets: Readonly<Record<string, unknown>>,
+  presetName: string,
+): string | undefined {
+  if (Object.hasOwn(presets, presetName)) return presetName;
+  const normalized = presetName.trim().toLowerCase();
+  if (normalized === "") return undefined;
+  return Object.keys(presets).find((key) => key.trim().toLowerCase() === normalized);
+}
+
+/**
+ * The classifier settings that apply while `presetName` is the active preset:
+ * the top-level block with that preset's `backend` / `model` override on top.
+ * The preset name is matched like `/preset` matches it (exact, then
+ * case-insensitive); a `presets` key that matches no preset is noticed at load.
+ */
+export function resolveClassifierForPreset(
+  classifier: ResolvedClassifier,
+  presetName: string,
+): ResolvedClassifier {
+  const key = findPresetOverrideKey(classifier.presets, presetName);
+  const override = key === undefined ? undefined : classifier.presets[key];
+  if (override === undefined) return classifier;
+  return Object.freeze({
+    ...classifier,
+    backend: override.backend ?? classifier.backend,
+    model: override.model !== undefined ? override.model : classifier.model,
+  });
+}
+
+/**
+ * `enforcement.escalate.variantSteps` for one host (A15, QA-1.1-4).
+ *
+ * - On v1 it is always `none`: variant steps do not exist there (D1), so even an
+ *   explicit value is ignored.
+ * - On v2 an explicit value always wins. Absent, the default is `auto` when the
+ *   config has a `routing` block and `none` when it has not, so that a config
+ *   without `routing` keeps today's ladder byte for byte (D2).
+ */
+export function resolveVariantSteps(cfg: RouterConfig | undefined, host: RouterHost): VariantStepsMode {
+  if (host === "v1") return "none";
+  const explicit = cfg?.enforcement?.escalate?.variantSteps;
+  if (explicit !== undefined) return explicit;
+  return cfg?.routing !== undefined ? "auto" : "none";
+}
+
+/** One rung of a tier's ladder, fully resolved. */
+export interface ResolvedCandidate {
+  readonly model: string;
+  /** Absent = the model's default variant. */
+  readonly variant?: string;
+  readonly costRatio: number;
+}
+
+const NO_CANDIDATES: readonly ResolvedCandidate[] = Object.freeze([]);
+
+/**
+ * The ladder of rungs for `tierName` in the active preset (D10, D12).
+ *
+ * Without `candidates` (or with an empty list) it is exactly one rung: the
+ * tier's own `(model, variant, costRatio)`. With `candidates` it is those
+ * entries, in order, each completed from the tier: `model` and `costRatio`
+ * are inherited when omitted, `variant` is not. An unknown tier yields an
+ * empty ladder. Never throws.
+ */
+export function resolveCandidates(tierName: string, cfg: RouterConfig): readonly ResolvedCandidate[] {
+  const presetName = resolvePresetName(cfg, cfg.activePreset);
+  const preset = presetName !== undefined && Object.hasOwn(cfg.presets, presetName) ? cfg.presets[presetName] : undefined;
+  const tier = preset !== undefined && Object.hasOwn(preset, tierName) ? preset[tierName] : undefined;
+  if (tier === undefined) return NO_CANDIDATES;
+
+  const tierCostRatio = tier.costRatio ?? tierDefaultsFor(tierName).costRatio;
+  const rung = (model: string, variant: string | undefined, costRatio: number): ResolvedCandidate =>
+    Object.freeze(variant === undefined ? { model, costRatio } : { model, variant, costRatio });
+
+  const listed = tier.candidates;
+  if (listed === undefined || candidatesProblem(tierName, tier) !== undefined || !hasExplicitCandidates(tier)) {
+    return Object.freeze([rung(tier.model, tier.variant, tierCostRatio)]);
+  }
+  return Object.freeze(
+    listed.map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
+  );
+}
+/**
+ * The extra lines of the bare `/router` status view: the marker
+ * `router: engine=<mode> build=<version>+<sha7>` (the engine is the one
+ * *applied* on `host`, so always `static` on v1) followed by one
+ * `router: config notice: …` line per notice of the config last loaded for `dir`
+ * (QA-1.1-10). Passing `logger` makes the once-per-process v1 notice go through
+ * the plugin logger.
+ */
+export function routerStatusLines(
+  cfg: RouterConfig,
+  host: RouterHost,
+  logger?: Pick<PluginLogger, "warn">,
+  dir?: string,
+): string[] {
+  return [
+    formatRouterLine(resolveRouting(cfg, host, logger).engine),
+    ...getConfigNotices(dir).map((notice) => `router: config notice: ${notice.message}`),
+  ];
 }

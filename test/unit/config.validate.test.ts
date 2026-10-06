@@ -382,3 +382,863 @@ describe("validateConfig — subagentTiers", () => {
     ).toThrow("subagentTiers.'ContextScout' must be a non-empty tier name");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing (#74, Phase 1.1): `routing`, `tiers.<t>.candidates`,
+// `enforcement.escalate.variantSteps`.
+// ---------------------------------------------------------------------------
+
+import { resolve } from "node:path";
+import { candidatesProblem } from "../../src/router/config";
+
+/** A raw config carrying the given `routing` block. */
+function withRouting(routing: unknown): Record<string, unknown> {
+  return validRaw({ routing });
+}
+
+/** A raw config whose only tier is `fast` (`anthropic/claude-haiku-4-5`) with the given candidates. */
+function withCandidates(candidates: unknown): Record<string, unknown> {
+  return validRaw({
+    presets: {
+      anthropic: {
+        fast: { model: "anthropic/claude-haiku-4-5", candidates },
+      },
+    },
+  });
+}
+
+describe("validateConfig — routing: shape and unknown keys", () => {
+  it("leaves a config without a routing block untouched (same object, no routing)", () => {
+    const raw = validRaw();
+    const cfg = validateConfig(raw);
+    expect(cfg).toBe(raw);
+    expect(cfg.routing).toBeUndefined();
+  });
+
+  it("accepts an empty routing block", () => {
+    expect(validateConfig(withRouting({})).routing).toEqual({});
+  });
+
+  it.each([
+    ["null", null],
+    ["an array", []],
+    ["a string", "enforce"],
+    ["a number", 1],
+  ])("rejects routing being %s", (_label, value) => {
+    expect(() => validateConfig(withRouting(value))).toThrow(/'routing' must be an object/);
+  });
+
+  it("ignores unknown keys, like every other block of the file, and drops them from the snapshot", () => {
+    const cfg = validateConfig(
+      withRouting({ engine: "shadow", futureKnob: 1, classifier: { backend: "rules", futureKnob: true } }),
+    );
+    expect(cfg.routing).toEqual({ engine: "shadow", classifier: { backend: "rules" } });
+  });
+
+  it("rejects prototype-reparenting keys at every level", () => {
+    for (const text of [
+      '{"__proto__": {"engine": "enforce"}}',
+      '{"classifier": {"__proto__": {}}}',
+      '{"roles": {"__proto__": ["x"]}}',
+      '{"detection": {"constructor": 1}}',
+    ]) {
+      expect(() => validateConfig(withRouting(JSON.parse(text)))).toThrow(/must not contain the key/);
+    }
+  });
+
+  it("reads every value once: a getter that changes after validation cannot slip a bad value in", () => {
+    let reads = 0;
+    const routing = {
+      get margin(): number {
+        reads += 1;
+        return reads === 1 ? 0.5 : 5;
+      },
+    };
+    const cfg = validateConfig(withRouting(routing));
+    expect(cfg.routing?.margin).toBe(0.5);
+    expect(cfg.routing?.margin).toBe(0.5);
+    expect(reads).toBe(1);
+  });
+});
+
+describe("validateConfig — routing: enums and scalars", () => {
+  it.each(["static", "shadow", "advise", "enforce"])("accepts engine %s", (engine) => {
+    expect(validateConfig(withRouting({ engine })).routing?.engine).toBe(engine);
+  });
+
+  it.each(["turbo", "", "ENFORCE", 1, null])("rejects engine %j", (engine) => {
+    expect(() => validateConfig(withRouting({ engine }))).toThrow(
+      /routing\.engine must be one of static\|shadow\|advise\|enforce/,
+    );
+  });
+
+  it.each(["frugal", "balanced", "safe"])("accepts profile %s", (profile) => {
+    expect(validateConfig(withRouting({ profile })).routing?.profile).toBe(profile);
+  });
+
+  it("rejects an unknown profile", () => {
+    expect(() => validateConfig(withRouting({ profile: "reckless" }))).toThrow(
+      /routing\.profile must be one of frugal\|balanced\|safe/,
+    );
+  });
+
+  it.each([0, 0.2, 0.9])("accepts margin %s", (margin) => {
+    expect(validateConfig(withRouting({ margin })).routing?.margin).toBe(margin);
+  });
+
+  it.each([-0.01, 0.91, 1, "0.2", null, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects margin %j",
+    (margin) => {
+      expect(() => validateConfig(withRouting({ margin }))).toThrow(/routing\.margin must be a number >= 0 and <= 0.9/);
+    },
+  );
+
+  it("accepts margin 0.9 with profile safe (the extreme pair is a valid config)", () => {
+    expect(() => validateConfig(withRouting({ margin: 0.9, profile: "safe" }))).not.toThrow();
+  });
+
+  it.each([0, 0.7, 1])("accepts minClassConfidence %s", (minClassConfidence) => {
+    expect(validateConfig(withRouting({ minClassConfidence })).routing?.minClassConfidence).toBe(minClassConfidence);
+  });
+
+  it.each([-0.1, 1.01, "0.7", null])("rejects minClassConfidence %j", (minClassConfidence) => {
+    expect(() => validateConfig(withRouting({ minClassConfidence }))).toThrow(
+      /routing\.minClassConfidence must be a number >= 0 and <= 1/,
+    );
+  });
+});
+
+describe("validateConfig — routing.detection", () => {
+  it("accepts 0 and 1 for every key", () => {
+    expect(
+      validateConfig(withRouting({ detection: { deterministic: 1, grader: 0.5, none: 0 } })).routing?.detection,
+    ).toEqual({ deterministic: 1, grader: 0.5, none: 0 });
+  });
+
+  it.each(["deterministic", "grader", "none"])("rejects %s outside [0, 1]", (key) => {
+    expect(() => validateConfig(withRouting({ detection: { [key]: 1.1 } }))).toThrow(
+      new RegExp(`routing\\.detection\\.${key} must be a number >= 0 and <= 1`),
+    );
+    expect(() => validateConfig(withRouting({ detection: { [key]: -0.1 } }))).toThrow(
+      new RegExp(`routing\\.detection\\.${key}`),
+    );
+  });
+
+  it("rejects detection that is not an object", () => {
+    expect(() => validateConfig(withRouting({ detection: 0.9 }))).toThrow(/routing\.detection must be an object/);
+    expect(() => validateConfig(withRouting({ detection: null }))).toThrow(/routing\.detection must be an object/);
+  });
+});
+
+describe("validateConfig — routing.classifier", () => {
+  it.each(["rules", "host", "openai-compatible", "typesafe"])("accepts backend %s (with what it needs)", (backend) => {
+    const classifier: Record<string, unknown> = { backend };
+    if (backend !== "rules") classifier.model = "opencode-go/deepseek-v4.1-flash";
+    if (backend === "openai-compatible" || backend === "typesafe") classifier.baseUrl = "https://llm.example/v1";
+    expect(validateConfig(withRouting({ classifier })).routing?.classifier?.backend).toBe(backend);
+  });
+
+  it("rejects an unknown backend", () => {
+    expect(() => validateConfig(withRouting({ classifier: { backend: "magic" } }))).toThrow(
+      /routing\.classifier\.backend must be one of rules\|host\|openai-compatible\|typesafe/,
+    );
+  });
+
+  it('accepts the DF3 live-check shape: backend "host" + a catalog model + timeoutMs 10000 (phase 0.P handoff)', () => {
+    const cfg = validateConfig(
+      withRouting({
+        classifier: { backend: "host", model: "opencode-go/deepseek-v4.1-flash", timeoutMs: 10000 },
+      }),
+    );
+    expect(cfg.routing?.classifier).toEqual({
+      backend: "host",
+      model: "opencode-go/deepseek-v4.1-flash",
+      timeoutMs: 10000,
+    });
+  });
+
+  it.each(["host", "openai-compatible", "typesafe"])(
+    "rejects backend %s without a model, naming routing.classifier.model (D3)",
+    (backend) => {
+      expect(() =>
+        validateConfig(withRouting({ classifier: { backend, baseUrl: "https://llm.example/v1" } })),
+      ).toThrow(/routing\.classifier\.model must be a non-empty 'provider\/model\[#variant\]' string/);
+    },
+  );
+
+  it.each([null, ""])("rejects backend host with model %j", (model) => {
+    expect(() => validateConfig(withRouting({ classifier: { backend: "host", model } }))).toThrow(
+      /routing\.classifier\.model/,
+    );
+  });
+
+  it("accepts a rules classifier with no model, with a null model, and with a model that is not used", () => {
+    expect(() => validateConfig(withRouting({ classifier: { backend: "rules" } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ classifier: { model: null } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ classifier: { model: "openai/gpt-6-luna" } }))).not.toThrow();
+  });
+
+  it.each(["gpt", "/gpt", "openai/", "openai/gpt#", "openai/gpt#a b", "openai/gpt#a#b", 5])(
+    "rejects malformed model %j",
+    (model) => {
+      expect(() => validateConfig(withRouting({ classifier: { backend: "host", model } }))).toThrow(
+        /routing\.classifier\.model must be null or a 'provider\/model\[#variant\]' string/,
+      );
+    },
+  );
+
+  it.each(["openai/gpt-6-luna", "openai/gpt-6-luna#high", "openrouter/deepseek/deepseek-v3.2#low"])(
+    "accepts model %s",
+    (model) => {
+      expect(() => validateConfig(withRouting({ classifier: { backend: "host", model } }))).not.toThrow();
+    },
+  );
+
+  it.each(["openai-compatible", "typesafe"])("requires an http(s) baseUrl for %s", (backend) => {
+    const base = { backend, model: "local/qwen" };
+    expect(() => validateConfig(withRouting({ classifier: base }))).toThrow(
+      new RegExp(`routing\\.classifier\\.baseUrl must be an http\\(s\\) URL when routing\\.classifier\\.backend is "${backend}"`),
+    );
+    expect(() => validateConfig(withRouting({ classifier: { ...base, baseUrl: null } }))).toThrow(/baseUrl/);
+    for (const baseUrl of ["ftp://x.example", "not a url", "localhost:8080", 8080]) {
+      expect(() => validateConfig(withRouting({ classifier: { ...base, baseUrl } }))).toThrow(
+        /routing\.classifier\.baseUrl must be null or an http\(s\) URL/,
+      );
+    }
+    for (const baseUrl of ["http://localhost:11434/v1", "https://llm.example/v1"]) {
+      expect(() => validateConfig(withRouting({ classifier: { ...base, baseUrl } }))).not.toThrow();
+    }
+  });
+
+  it("does not require a baseUrl for host, but still validates one that is set", () => {
+    expect(() =>
+      validateConfig(withRouting({ classifier: { backend: "host", model: "a/b", baseUrl: null } })),
+    ).not.toThrow();
+    expect(() =>
+      validateConfig(withRouting({ classifier: { backend: "host", model: "a/b", baseUrl: "ftp://x" } })),
+    ).toThrow(/baseUrl/);
+  });
+
+  it("validates apiKeyEnv as an environment variable name or null", () => {
+    expect(() => validateConfig(withRouting({ classifier: { apiKeyEnv: "OMR_CLASSIFIER_KEY" } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ classifier: { apiKeyEnv: null } }))).not.toThrow();
+    for (const apiKeyEnv of ["", "has space", "1ABC", "A-B", 7]) {
+      expect(() => validateConfig(withRouting({ classifier: { apiKeyEnv } }))).toThrow(
+        /routing\.classifier\.apiKeyEnv must be null or an environment variable name/,
+      );
+    }
+  });
+
+  it.each([100, 1500, 30000])("accepts timeoutMs %s", (timeoutMs) => {
+    expect(validateConfig(withRouting({ classifier: { timeoutMs } })).routing?.classifier?.timeoutMs).toBe(timeoutMs);
+  });
+
+  it.each([99, 30001, 0, -5, 1500.5, "1500", null])("rejects timeoutMs %j", (timeoutMs) => {
+    expect(() => validateConfig(withRouting({ classifier: { timeoutMs } }))).toThrow(
+      /routing\.classifier\.timeoutMs must be an integer >= 100 and <= 30000/,
+    );
+  });
+
+  it.each([1, 3])("accepts samples %s", (samples) => {
+    expect(validateConfig(withRouting({ classifier: { samples } })).routing?.classifier?.samples).toBe(samples);
+  });
+
+  it.each([0, 2, 4, "1", null])("rejects samples %j", (samples) => {
+    expect(() => validateConfig(withRouting({ classifier: { samples } }))).toThrow(
+      /routing\.classifier\.samples must be 1 or 3/,
+    );
+  });
+
+  it.each([200, 2000, 20000])("accepts maxStateChars %s", (maxStateChars) => {
+    expect(validateConfig(withRouting({ classifier: { maxStateChars } })).routing?.classifier?.maxStateChars).toBe(
+      maxStateChars,
+    );
+  });
+
+  it.each([199, 20001, 2000.5, "2000"])("rejects maxStateChars %j", (maxStateChars) => {
+    expect(() => validateConfig(withRouting({ classifier: { maxStateChars } }))).toThrow(
+      /routing\.classifier\.maxStateChars must be an integer >= 200 and <= 20000/,
+    );
+  });
+
+  it("rejects classifier that is not an object", () => {
+    expect(() => validateConfig(withRouting({ classifier: "host" }))).toThrow(/routing\.classifier must be an object/);
+  });
+
+  describe("per-preset overrides", () => {
+    it("accepts overrides of model and backend", () => {
+      const cfg = validateConfig(
+        withRouting({
+          classifier: {
+            backend: "host",
+            model: "opencode-go/deepseek-v4.1-flash",
+            presets: {
+              anthropic: { model: "opencode-go/gpt-6-luna" },
+              local: { backend: "rules" },
+              cleared: { model: null, backend: "rules" },
+            },
+          },
+        }),
+      );
+      expect(cfg.routing?.classifier?.presets).toEqual({
+        anthropic: { model: "opencode-go/gpt-6-luna" },
+        local: { backend: "rules" },
+        cleared: { model: null, backend: "rules" },
+      });
+    });
+
+    it("accepts a preset name that no preset defines (switching presets must never brick startup)", () => {
+      expect(() =>
+        validateConfig(withRouting({ classifier: { presets: { "no-such-preset": { backend: "rules" } } } })),
+      ).not.toThrow();
+    });
+
+    it("rejects an override that resolves to a model-less backend, naming both keys", () => {
+      expect(() =>
+        validateConfig(withRouting({ classifier: { presets: { anthropic: { backend: "host" } } } })),
+      ).toThrow(/routing\.classifier\.model or routing\.classifier\.presets\.'anthropic'\.model must be a non-empty/);
+    });
+
+    it("rejects an override that clears the model of a model-backed classifier", () => {
+      expect(() =>
+        validateConfig(
+          withRouting({
+            classifier: { backend: "host", model: "a/b", presets: { anthropic: { model: null } } },
+          }),
+        ),
+      ).toThrow(/presets\.'anthropic'/);
+    });
+
+    it("rejects an override that switches to an HTTP backend without a baseUrl", () => {
+      expect(() =>
+        validateConfig(
+          withRouting({
+            classifier: { model: "a/b", presets: { anthropic: { backend: "openai-compatible" } } },
+          }),
+        ),
+      ).toThrow(/routing\.classifier\.baseUrl must be an http\(s\) URL/);
+    });
+
+    it.each([
+      ["a string", "host"],
+      ["null", null],
+      ["an array", []],
+    ])("rejects an entry that is %s", (_label, entry) => {
+      expect(() => validateConfig(withRouting({ classifier: { presets: { anthropic: entry } } }))).toThrow(
+        /routing\.classifier\.presets\.'anthropic' must be an object/,
+      );
+    });
+
+    it("rejects an unknown backend and a malformed model in an entry", () => {
+      expect(() =>
+        validateConfig(withRouting({ classifier: { presets: { anthropic: { backend: "magic" } } } })),
+      ).toThrow(/presets\.'anthropic'\.backend must be one of/);
+      expect(() =>
+        validateConfig(withRouting({ classifier: { presets: { anthropic: { model: "nope" } } } })),
+      ).toThrow(/presets\.'anthropic'\.model must be null or/);
+    });
+  });
+});
+
+describe("validateConfig — routing.roles", () => {
+  it("accepts the documented default shape and {}", () => {
+    const roles = { search: ["explore"], implement: ["general"], debug: ["general"], review: ["general"] };
+    expect(validateConfig(withRouting({ roles })).routing?.roles).toEqual(roles);
+    expect(validateConfig(withRouting({ roles: {} })).routing?.roles).toEqual({});
+  });
+
+  it("accepts agents the active preset does not define (roles may name native agents)", () => {
+    expect(() =>
+      validateConfig(withRouting({ roles: { search: ["explore", "my-custom_agent2"] } })),
+    ).not.toThrow();
+  });
+
+  it("copies the arrays, so the snapshot never aliases the input", () => {
+    const input = ["explore"];
+    const cfg = validateConfig(withRouting({ roles: { search: input } }));
+    expect(cfg.routing?.roles?.search).toEqual(["explore"]);
+    expect(cfg.routing?.roles?.search).not.toBe(input);
+  });
+
+  it("accepts an empty list for a class: no native candidates for that class (QA-1.1-7)", () => {
+    const cfg = validateConfig(withRouting({ roles: { search: [], implement: ["general"] } }));
+    expect(cfg.routing?.roles).toEqual({ search: [], implement: ["general"] });
+  });
+
+  it.each([
+    ["a string", "explore"],
+    ["null", null],
+    ["an object", { 0: "explore" }],
+  ])("rejects a class whose value is %s", (_label, agents) => {
+    expect(() => validateConfig(withRouting({ roles: { search: agents } }))).toThrow(
+      /routing\.roles\.'search' must be an array of agent ids/,
+    );
+  });
+
+  it.each(["explore", "general", "ContextScout", "team/helper", "my-custom_agent2", "a.b", "X"])(
+    "accepts agent id %s (case-sensitive host agent names, QA-1.1-5)",
+    (agent) => {
+      expect(validateConfig(withRouting({ roles: { search: [agent] } })).routing?.roles?.search).toEqual([agent]);
+    },
+  );
+
+  it.each([
+    ["empty string", ""],
+    ["whitespace", "my agent"],
+    ["leading space", " explore"],
+    ["a hash", "a#b"],
+    ["a leading slash", "/a"],
+    ["a leading dash", "-a"],
+    ["a leading dot", ".hidden"],
+    ["a number", 3],
+    ["null", null],
+  ])("rejects an agent id that is %s", (_label, agent) => {
+    expect(() => validateConfig(withRouting({ roles: { search: ["explore", agent] } }))).toThrow(
+      /routing\.roles\.'search' entries must be agent ids matching \^\[A-Za-z0-9\]\[A-Za-z0-9_\.\/-\]\*\$/,
+    );
+  });
+
+  it.each(["search", "recon", "mechanical", "implement", "debug", "design", "review", "other"])(
+    "accepts the task class %s",
+    (taskClass) => {
+      expect(() => validateConfig(withRouting({ roles: { [taskClass]: ["explore"] } }))).not.toThrow();
+    },
+  );
+
+  it.each(["", "Search", "Bad Class", "plan", "explore"])("rejects the unknown task class '%s'", (taskClass) => {
+    expect(() => validateConfig(withRouting({ roles: { [taskClass]: ["explore"] } }))).toThrow(
+      new RegExp(`routing\\.roles class '${taskClass}' must be one of search\\|recon\\|mechanical\\|implement\\|debug\\|design\\|review\\|other`),
+    );
+  });
+  it("rejects roles that is not an object", () => {
+    expect(() => validateConfig(withRouting({ roles: ["explore"] }))).toThrow(/routing\.roles must be an object/);
+    expect(() => validateConfig(withRouting({ roles: null }))).toThrow(/routing\.roles must be an object/);
+  });
+});
+
+describe("validateConfig — routing.outcomes / sessionReuse / advisor", () => {
+  it.each([1, 14, 365])("accepts outcomes.halfLifeDays %s", (halfLifeDays) => {
+    expect(validateConfig(withRouting({ outcomes: { halfLifeDays } })).routing?.outcomes?.halfLifeDays).toBe(halfLifeDays);
+  });
+
+  it.each([0.5, 0, 366, "14", null])("rejects outcomes.halfLifeDays %j", (halfLifeDays) => {
+    expect(() => validateConfig(withRouting({ outcomes: { halfLifeDays } }))).toThrow(
+      /routing\.outcomes\.halfLifeDays must be a number >= 1 and <= 365/,
+    );
+  });
+
+  it.each([5, 50, 1000])("accepts outcomes.maxEffectiveSamples %s", (maxEffectiveSamples) => {
+    expect(
+      validateConfig(withRouting({ outcomes: { maxEffectiveSamples } })).routing?.outcomes?.maxEffectiveSamples,
+    ).toBe(maxEffectiveSamples);
+  });
+
+  it.each([4, 1001, 0, "50"])("rejects outcomes.maxEffectiveSamples %j", (maxEffectiveSamples) => {
+    expect(() => validateConfig(withRouting({ outcomes: { maxEffectiveSamples } }))).toThrow(
+      /routing\.outcomes\.maxEffectiveSamples must be a number >= 5 and <= 1000/,
+    );
+  });
+
+  it("accepts outcomes.path as null, an absolute path, or a home-relative one (~, ~/x)", () => {
+    const abs = resolve("data", "omr");
+    expect(validateConfig(withRouting({ outcomes: { path: null } })).routing?.outcomes?.path).toBeNull();
+    expect(validateConfig(withRouting({ outcomes: { path: abs } })).routing?.outcomes?.path).toBe(abs);
+    for (const path of ["~", "~/omr", "~\\omr"]) {
+      expect(validateConfig(withRouting({ outcomes: { path } })).routing?.outcomes?.path).toBe(path);
+    }
+  });
+
+  it.each(["", "data/omr", "./omr", "../omr", "omr", "~user/omr", " /abs", 5, {}])(
+    "rejects outcomes.path %j: it must be absolute (QA-1.1-15)",
+    (path) => {
+      expect(() => validateConfig(withRouting({ outcomes: { path } }))).toThrow(
+        /routing\.outcomes\.path must be null or an absolute path; a leading ~ means the home directory/,
+      );
+    },
+  );
+  it.each([0.01, 0.6, 0.95])("accepts sessionReuse.maxContextFraction %s", (maxContextFraction) => {
+    expect(
+      validateConfig(withRouting({ sessionReuse: { maxContextFraction } })).routing?.sessionReuse?.maxContextFraction,
+    ).toBe(maxContextFraction);
+  });
+
+  it.each([0, -0.1, 0.96, 1, "0.6", null])("rejects sessionReuse.maxContextFraction %j", (maxContextFraction) => {
+    expect(() => validateConfig(withRouting({ sessionReuse: { maxContextFraction } }))).toThrow(
+      /routing\.sessionReuse\.maxContextFraction must be a number > 0 and <= 0.95/,
+    );
+  });
+
+  it.each([1, 24, 720])("accepts advisor.noticeIntervalHours %s", (noticeIntervalHours) => {
+    expect(
+      validateConfig(withRouting({ advisor: { noticeIntervalHours } })).routing?.advisor?.noticeIntervalHours,
+    ).toBe(noticeIntervalHours);
+  });
+
+  it.each([0, 0.5, 721, "24"])("rejects advisor.noticeIntervalHours %j", (noticeIntervalHours) => {
+    expect(() => validateConfig(withRouting({ advisor: { noticeIntervalHours } }))).toThrow(
+      /routing\.advisor\.noticeIntervalHours must be a number >= 1 and <= 720/,
+    );
+  });
+
+  it("validates advisor.enabled as a boolean", () => {
+    expect(validateConfig(withRouting({ advisor: { enabled: false } })).routing?.advisor?.enabled).toBe(false);
+    expect(() => validateConfig(withRouting({ advisor: { enabled: "no" } }))).toThrow(
+      /routing\.advisor\.enabled must be a boolean/,
+    );
+  });
+
+  it.each(["outcomes", "sessionReuse", "advisor"])("rejects %s that is not an object", (key) => {
+    expect(() => validateConfig(withRouting({ [key]: 1 }))).toThrow(new RegExp(`routing\\.${key} must be an object`));
+  });
+});
+
+describe("validateConfig — tiers.<t>.candidates", () => {
+  it("accepts a tier without candidates, and an empty list", () => {
+    expect(() => validateConfig(validRaw())).not.toThrow();
+    expect(() => validateConfig(withCandidates([]))).not.toThrow();
+  });
+
+  it("accepts entries that omit model (inherited), variant and costRatio", () => {
+    // `{}` is the tier's own rung (its model, default variant, its costRatio 1).
+    expect(() =>
+      validateConfig(withCandidates([{}, { variant: "high" }, { variant: "max", costRatio: 4 }])),
+    ).not.toThrow();
+  });
+
+  it("accepts the same variant on different models and different variants on one model", () => {
+    expect(() =>
+      validateConfig(
+        withCandidates([
+          {},
+          { variant: "high" },
+          { model: "openai/gpt-6-luna", variant: "high" },
+          { model: "openai/gpt-6-luna", variant: "low" },
+        ]),
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects a repeated (model, variant), reporting both positions", () => {
+    expect(() =>
+      validateConfig(withCandidates([{ variant: "high" }, { model: "openai/gpt-6-luna" }, { variant: "high" }])),
+    ).toThrow(/'anthropic\.fast\.candidates\[2\]' repeats \(model, variant\) = \(anthropic\/claude-haiku-4-5, high\) of candidates\[0\]/);
+  });
+
+  it("detects the repeat through inheritance (omitted model == the tier's own model)", () => {
+    expect(() =>
+      validateConfig(
+        withCandidates([{ model: "anthropic/claude-haiku-4-5", variant: "high" }, { variant: "high" }]),
+      ),
+    ).toThrow(/candidates\[1\]' repeats/);
+  });
+
+  it("treats two variant-less entries of the same model as a repeat of the default variant", () => {
+    expect(() => validateConfig(withCandidates([{ costRatio: 1 }, { costRatio: 2 }]))).toThrow(
+      /repeats \(model, variant\) = \(anthropic\/claude-haiku-4-5, default\)/,
+    );
+  });
+
+  it.each([0, -1, "5", null, Number.NaN, Number.POSITIVE_INFINITY])("rejects candidate costRatio %j", (costRatio) => {
+    expect(() => validateConfig(withCandidates([{ costRatio }]))).toThrow(
+      /'anthropic\.fast\.candidates\[0\]\.costRatio' must be a number > 0/,
+    );
+  });
+
+  it("accepts a fractional costRatio", () => {
+    expect(() => validateConfig(withCandidates([{}, { variant: "high", costRatio: 1.5 }]))).not.toThrow();
+  });
+
+  it.each(["gpt", "/gpt", "openai/", 5, null])("rejects candidate model %j", (model) => {
+    expect(() => validateConfig(withCandidates([{ model }]))).toThrow(/candidates\[0\]\.model' must be 'provider\/model'/);
+  });
+
+  it.each(["", "a b", "a#b", 5, null])("rejects candidate variant %j", (variant) => {
+    expect(() => validateConfig(withCandidates([{ variant }]))).toThrow(/candidates\[0\]\.variant' must be a non-empty string/);
+  });
+
+  it.each([
+    ["an object", {}],
+    ["a string", "high"],
+    ["null", null],
+  ])("rejects candidates being %s", (_label, candidates) => {
+    expect(() => validateConfig(withCandidates(candidates))).toThrow(/'anthropic\.fast\.candidates' must be an array/);
+  });
+
+  it.each([null, "high", 3, ["high"]])("rejects a candidate entry that is %j", (entry) => {
+    expect(() => validateConfig(withCandidates([entry]))).toThrow(/candidates\[0\]' must be an object/);
+  });
+
+  it("rejects prototype keys in an entry", () => {
+    expect(() => validateConfig(withCandidates([JSON.parse('{"__proto__": {}}')]))).toThrow(/must not contain the key/);
+  });
+});
+
+describe("validateConfig — enforcement.escalate.variantSteps", () => {
+  const withSteps = (variantSteps: unknown) => validRaw({ enforcement: { escalate: { variantSteps } } });
+
+  it.each(["auto", "none"])("accepts %s and keeps it", (variantSteps) => {
+    expect(validateConfig(withSteps(variantSteps)).enforcement?.escalate?.variantSteps).toBe(variantSteps);
+  });
+
+  it.each(["manual", "", "AUTO", true, null, 1])("rejects %j", (variantSteps) => {
+    expect(() => validateConfig(withSteps(variantSteps))).toThrow(
+      /enforcement\.escalate\.variantSteps must be one of auto\|none/,
+    );
+  });
+
+  it("is optional: absent leaves escalate exactly as written", () => {
+    const cfg = validateConfig(validRaw({ enforcement: { escalate: { maxTotalAttempts: 3 } } }));
+    expect(cfg.enforcement?.escalate).toEqual({ maxTotalAttempts: 3 });
+  });
+});
+
+describe("validateConfig — tiers.<t>.candidates: own rung and escalation order (QA-1.1-3, QA-1.1-12)", () => {
+  /** One tier named `name` in the only preset. */
+  const withTier = (name: string, tier: Record<string, unknown>): Record<string, unknown> =>
+    validRaw({ presets: { anthropic: { [name]: tier } } });
+  const SONNET = "anthropic/claude-sonnet-5-5";
+
+  /** The reason a loaded tier's candidates would be ignored (QA-1.1-25), through the real validator. */
+  const problemOf = (name: string, tier: Record<string, unknown>): string | undefined => {
+    const cfg = validateConfig(withTier(name, tier));
+    return candidatesProblem(name, cfg.presets.anthropic![name]!);
+  };
+
+  it("does not reject, but flags, a non-empty list that lacks the tier's own (model, variant) (QA-1.1-3, -25)", () => {
+    expect(() => validateConfig(withCandidates([{ variant: "high" }]))).not.toThrow();
+    expect(problemOf("fast", { model: "anthropic/claude-haiku-4-5", candidates: [{ variant: "high" }] })).toBe(
+      "it does not contain the tier's own rung (model anthropic/claude-haiku-4-5, variant default)",
+    );
+    expect(problemOf("medium", { model: SONNET, variant: "medium", candidates: [{ variant: "high" }] })).toBe(
+      "it does not contain the tier's own rung (model anthropic/claude-sonnet-5-5, variant medium)",
+    );
+  });
+
+  it("flags a list whose rungs are all on another model", () => {
+    expect(
+      problemOf("medium", { model: SONNET, variant: "medium", candidates: [{ model: "openai/gpt-6-luna", variant: "medium" }] }),
+    ).toMatch(/does not contain the tier's own rung/);
+  });
+
+  it("accepts the own rung written implicitly, explicitly, anywhere in the list", () => {
+    const tier = { model: SONNET, variant: "medium", costRatio: 5 };
+    for (const candidates of [
+      [{ variant: "medium" }, { variant: "high" }],
+      [{ model: SONNET, variant: "medium" }, { variant: "high" }],
+      [{ variant: "low", costRatio: 3 }, { variant: "medium" }, { variant: "high", costRatio: 8 }],
+    ]) {
+      expect(() => validateConfig(withTier("medium", { ...tier, candidates }))).not.toThrow();
+      expect(problemOf("medium", { ...tier, candidates })).toBeUndefined();
+    }
+  });
+
+  it("has no problem with an empty list (an empty list means no candidates)", () => {
+    expect(problemOf("medium", { model: SONNET, variant: "medium", candidates: [] })).toBeUndefined();
+    expect(problemOf("medium", { model: SONNET, variant: "medium" })).toBeUndefined();
+  });
+
+  it("treats a variant-less tier's own rung as the variant-less entry of its model", () => {
+    expect(problemOf("medium", { model: SONNET, candidates: [{}, { variant: "high" }] })).toBeUndefined();
+    expect(problemOf("medium", { model: SONNET, candidates: [{ variant: "high" }] })).toMatch(/variant default/);
+  });
+
+  it("flags an own rung whose costRatio differs from the tier's, accepts equal or omitted", () => {
+    const tier = { model: SONNET, variant: "medium", costRatio: 5 };
+    expect(
+      problemOf("medium", { ...tier, candidates: [{ variant: "medium", costRatio: 6 }, { variant: "high", costRatio: 8 }] }),
+    ).toBe("its own rung (candidates[0]) has costRatio 6, not the tier's 5");
+    for (const own of [{ variant: "medium", costRatio: 5 }, { variant: "medium" }]) {
+      expect(problemOf("medium", { ...tier, candidates: [own, { variant: "high", costRatio: 8 }] })).toBeUndefined();
+    }
+  });
+
+  it("uses the conventional costRatio of the tier name when the tier states none", () => {
+    // `medium` defaults to 5, `fast` to 1, `heavy` to 20, any other name to 1.
+    expect(problemOf("medium", { model: SONNET, candidates: [{ costRatio: 5 }] })).toBeUndefined();
+    expect(problemOf("medium", { model: SONNET, candidates: [{ costRatio: 1 }] })).toMatch(/has costRatio 1, not the tier's 5/);
+    expect(problemOf("heavy", { model: SONNET, candidates: [{ costRatio: 20 }] })).toBeUndefined();
+    expect(problemOf("custom", { model: SONNET, candidates: [{ costRatio: 1 }] })).toBeUndefined();
+    // A name that is an Object.prototype member is not a conventional tier (QA-1.1-19).
+    expect(problemOf("constructor", { model: SONNET, candidates: [{ costRatio: 1 }] })).toBeUndefined();
+  });
+
+  it("still throws for malformed entries and ordering, even next to an own-rung problem", () => {
+    expect(() => validateConfig(withCandidates([{ variant: "high", costRatio: "x" }]))).toThrow(/costRatio' must be a number > 0/);
+    expect(() => validateConfig(withCandidates([{ variant: "a" }, { variant: "a" }]))).toThrow(/repeats/);
+    expect(() => validateConfig(withCandidates([{ variant: "a", costRatio: 3 }, { variant: "b", costRatio: 2 }]))).toThrow(/must not decrease/);
+  });
+  it("rejects a costRatio that decreases along the list, naming both positions", () => {
+    expect(() =>
+      validateConfig(withCandidates([{}, { variant: "high", costRatio: 3 }, { variant: "max", costRatio: 2 }])),
+    ).toThrow(/'anthropic\.fast\.candidates\[2\]' has costRatio 2, lower than candidates\[1\] \(3\)/);
+  });
+
+  it("compares the effective costRatio: an omitted one is the tier's", () => {
+    const tier = { model: SONNET, variant: "medium", costRatio: 5 };
+    expect(() =>
+      validateConfig(withTier("medium", { ...tier, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }, { variant: "max" }] })),
+    ).toThrow(/candidates\[2\]' has costRatio 5, lower than candidates\[1\] \(8\)/);
+    expect(() =>
+      validateConfig(withTier("medium", { ...tier, candidates: [{ variant: "low", costRatio: 6 }, { variant: "medium" }] })),
+    ).toThrow(/candidates\[1\]' has costRatio 5, lower than candidates\[0\] \(6\)/);
+  });
+
+  it("accepts equal costRatios (non-decreasing, not strictly increasing)", () => {
+    expect(() => validateConfig(withCandidates([{}, { variant: "high", costRatio: 1 }, { variant: "max", costRatio: 1 }]))).not.toThrow();
+  });
+});
+describe("validateConfig — routing.detection order (QA-1.1-13)", () => {
+  it("accepts a non-increasing order, equal values included", () => {
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 0.9, grader: 0.9, none: 0.9 } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 1, grader: 0.5, none: 0 } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ detection: { grader: 0.6, none: 0.2 } }))).not.toThrow();
+  });
+
+  it("rejects grader above deterministic and none above grader, naming the values", () => {
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 0.5, grader: 0.7 } }))).toThrow(
+      /routing\.detection must satisfy deterministic >= grader >= none, because .*\(got deterministic 0\.5, grader 0\.7, none 0\.3\)/,
+    );
+    expect(() => validateConfig(withRouting({ detection: { grader: 0.2, none: 0.4 } }))).toThrow(
+      /\(got deterministic 0\.95, grader 0\.2, none 0\.4\)/,
+    );
+  });
+
+  it("compares against the defaults of the keys you leave out", () => {
+    // grader 0.98 > the default deterministic 0.95
+    expect(() => validateConfig(withRouting({ detection: { grader: 0.98 } }))).toThrow(/deterministic 0\.95, grader 0\.98/);
+    // none 0.8 > the default grader 0.7
+    expect(() => validateConfig(withRouting({ detection: { none: 0.8 } }))).toThrow(/grader 0\.7, none 0\.8/);
+    // raising deterministic alone keeps the order
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 1 } }))).not.toThrow();
+  });
+});
+describe("validateConfig — tier variant and per-preset costRatio (QA-1.1-26, QA-1.1-28)", () => {
+  const SONNET = "anthropic/claude-sonnet-5-5";
+  const presetWith = (tiers: Record<string, unknown>): Record<string, unknown> => validRaw({ presets: { anthropic: tiers } });
+
+  it.each(["low", "xhigh", "max", "v1.5", "a-b_c"])("accepts the tier variant %s", (variant) => {
+    expect(() => validateConfig(presetWith({ fast: { model: SONNET, variant } }))).not.toThrow();
+  });
+
+  it.each(["", "a b", "a#b", " high", "high ", 5, null, true, []])("rejects the tier variant %j", (variant) => {
+    expect(() => validateConfig(presetWith({ fast: { model: SONNET, variant } }))).toThrow(
+      /'anthropic\.fast\.variant' must be a non-empty string without whitespace or '#'/,
+    );
+  });
+
+  it("accepts a tier without a variant", () => {
+    expect(() => validateConfig(presetWith({ fast: { model: SONNET } }))).not.toThrow();
+  });
+
+  it("rejects the same (model, variant) quoted at two costRatios by a candidates list and another tier's own rung", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+          heavy: { model: SONNET, variant: "high", costRatio: 20 },
+        }),
+      ),
+    ).toThrow(
+      /preset 'anthropic': \(model, variant\) = \(anthropic\/claude-sonnet-5-5, high\) has costRatio 20 in 'heavy \(own rung\)' but 8 in 'medium\.candidates\[1\]'; within a preset one \(model, variant\) has one costRatio/,
+    );
+  });
+
+  it("rejects it in either order, and between two candidates lists", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          fast: { model: SONNET, variant: "high", costRatio: 1 },
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 5 }] },
+        }),
+      ),
+    ).toThrow(/has costRatio 5 in 'medium\.candidates\[1\]' but 1 in 'fast \(own rung\)'/);
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+          heavy: { model: "openai/gpt-6-luna", variant: "high", costRatio: 2, candidates: [{ variant: "high" }, { model: SONNET, variant: "high", costRatio: 9 }] },
+        }),
+      ),
+    ).toThrow(/\(anthropic\/claude-sonnet-5-5, high\) has costRatio 9 in 'heavy\.candidates\[1\]' but 8 in 'medium\.candidates\[1\]'/);
+  });
+
+  it("names the default variant when the clashing pair has none", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, costRatio: 5 },
+          heavy: { model: "openai/gpt-6-luna", costRatio: 2, candidates: [{}, { model: SONNET, costRatio: 9 }] },
+        }),
+      ),
+    ).toThrow(/\(anthropic\/claude-sonnet-5-5, default\) has costRatio 9 in 'heavy\.candidates\[1\]' but 5 in 'medium \(own rung\)'/);
+  });
+  it("accepts the same (model, variant) at the same costRatio, and different variants at different ones", () => {
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] },
+          heavy: { model: SONNET, variant: "high", costRatio: 8 },
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("does not compare two tiers' own rungs: shipped presets share a model across tiers at different ratios", () => {
+    expect(() =>
+      validateConfig(presetWith({ fast: { model: SONNET, costRatio: 1 }, medium: { model: SONNET, costRatio: 5 }, heavy: { model: SONNET, costRatio: 20 } })),
+    ).not.toThrow();
+  });
+
+  it("does not count the rungs of a candidates list that is ignored for lacking the tier's own rung", () => {
+    // medium's list has no own rung (ignored); its stray (SONNET, high) at 8 must not clash with heavy's own at 20.
+    expect(() =>
+      validateConfig(
+        presetWith({
+          medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "high", costRatio: 8 }] },
+          heavy: { model: SONNET, variant: "high", costRatio: 20 },
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("checks each preset on its own", () => {
+    expect(() =>
+      validateConfig(
+        validRaw({
+          presets: {
+            anthropic: { medium: { model: SONNET, variant: "medium", costRatio: 5, candidates: [{ variant: "medium" }, { variant: "high", costRatio: 8 }] } },
+            other: { heavy: { model: SONNET, variant: "high", costRatio: 20 } },
+          },
+        }),
+      ),
+    ).not.toThrow();
+  });
+});
+describe("validateConfig — agent ids and outcomes.path edge cases (QA-1.1-27)", () => {
+  it.each(["a.b", "team/helper", "team/sub-team/helper_2", "v1.2/agent", "a-b.c"])("accepts the agent id %s", (agent) => {
+    expect(validateConfig(withRouting({ roles: { search: [agent] } })).routing?.roles?.search).toEqual([agent]);
+  });
+
+  it.each(["a/../b", "a/./b", "a//b", "a/..", "a/.", "a/", "a.", "team/helper/", "team/helper.", "a/b/../../c"])(
+    "rejects the path-like agent id %s",
+    (agent) => {
+      expect(() => validateConfig(withRouting({ roles: { search: [agent] } }))).toThrow(
+        /routing\.roles\.'search' entries must be agent ids matching .*, without '\.' or '\.\.' segments and not ending in '\/' or '\.'/,
+      );
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")("on Windows, outcomes.path needs a drive letter or a UNC prefix", () => {
+    for (const path of ["C:\\data\\omr", "C:/data/omr", "d:\\x", "\\\\server\\share\\omr", "//server/share/omr"]) {
+      expect(validateConfig(withRouting({ outcomes: { path } })).routing?.outcomes?.path).toBe(path);
+    }
+    for (const path of ["\\data\\omr", "/data/omr", "C:data", "\\\\", "//", "\\"]) {
+      expect(() => validateConfig(withRouting({ outcomes: { path } }))).toThrow(/routing\.outcomes\.path must be null or an absolute path/);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("on POSIX, a rooted path is absolute", () => {
+    expect(validateConfig(withRouting({ outcomes: { path: "/data/omr" } })).routing?.outcomes?.path).toBe("/data/omr");
+    expect(() => validateConfig(withRouting({ outcomes: { path: "data/omr" } }))).toThrow(/absolute path/);
+  });
+});
