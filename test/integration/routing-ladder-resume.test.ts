@@ -372,7 +372,8 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
     it("a timeout interrupts the resumed child, counts as a failed attempt, and the next attempt starts fresh", async () => {
       const t = await setup({
         tiers: OWNER, routing: {}, verdicts: [false, true], hangAttempt: 2,
-        verify: { delegateTimeoutMs: 60 },
+        // Real timers: the ceiling only has to be far above attempt 1 (creating a child, loading config) on a loaded machine.
+        verify: { delegateTimeoutMs: 1_000 },
         escalate: { maxTotalAttempts: 6, costCeiling: { multiple: 100 } },
       });
       const result = await t.run();
