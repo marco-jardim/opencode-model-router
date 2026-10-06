@@ -618,3 +618,26 @@ None yet. The phase QA (`[tier:heavy]`, adversarial) runs after 1.3.3 and record
 ## Verdict
 
 Design 1.3.1 is delivered: `D:\git\opencode-model-router\src\routing\outcomes\types.ts` is final and typecheck is green. Phase QA is pending after 1.3.3, with open findings to be recorded by QA.
+
+## Implementation notes (1.3.2–1.3.3)
+
+Delivered on `car/p13` (Refs #74), one green commit per step: `beta.ts` → `cost.ts` → `store.ts` → `persist.ts` + `index.ts` → `stats.ts` + `scripts/routing-stats.ts` + the `package.json` line. Tests: `test/unit/routing-outcomes.{beta,cost,store,persist,stats}.test.ts` (338 tests). The store-dependent cases of the beta and cost files were appended in the `store.ts` commit, because they need `createOutcomeStore`.
+
+Verification: scoped vitest run of the five files (`--pool=threads`; vitest takes substring filters, so list the files or use `routing-outcomes`) and `npm run typecheck` (exit 0; `scripts/routing-stats.ts` is typechecked through the type-only import in the stats test). The stats test spawns the real script with plain `node`, against a fixture written by the real `createPersister`, and compares stdout byte for byte with `renderMarkdown(summarize(...))`; it also covers an empty and a missing directory (valid table, nothing created), a corrupt and a newer-version store (exit 1, files untouched), a relative `--dir`, the default directory (via a private `TEMP`/`TMPDIR`), `--json`, `--help` and a usage error (exit 2).
+
+Running it from PowerShell: pwsh swallows a bare `--`, so npm treats `--dir` as its own flag (`EUNKNOWNCONFIG`). Write `npm run routing:stats '--' --dir <path>` (or `node scripts/routing-stats.ts --dir <path>`). 3.1 should document this next to the Node minimum.
+
+### Design deviations (safest reading; none changes an outcome the design specifies)
+
+1. **`mergeBeta` common instant.** Both states are decayed (forward only) to `T = max(a.updatedAt, b.updatedAt, now)` instead of each to `now`, so the counts really are expressed at the `updatedAt` that is stored. Identical whenever `now` is not behind either state; a NaN `now` merges at the newest stored instant.
+2. **`recordStep` with one attempt id under two keys.** The old accumulator is folded, and the id is removed from `closed` again, so the new key's later steps are not dropped as "after the final step".
+3. **`fromSnapshot` in `replace` mode** also bumps `revision` when it cleared existing entries and accepted none (the snapshot did change).
+4. **Malformed keys** (`parseKey` → null) are ignored on `recordVerdict`/`recordFalseRefusal` (return `false`) and fold into nothing, instead of creating an entry the next load would drop.
+5. **Unreadable store file.** A non-ENOENT read error after the retries gives `load` status `corrupt` (no quarantine) and makes `saveSnapshot` refuse for this persister, so a file that could not be read is never overwritten.
+6. **Rotation names.** The new generation stamp is bumped to `newest existing stamp + 1 ms` when the clock has not advanced (or went backwards), so names stay unique and chronological; pruning re-lists the directory after the rename.
+7. **`acquireOutcomes`.** The flusher writes through a persister gated on `ready`, so a flush can never overwrite (or quarantine) the file the initial load is still reading. `AcquireOutcomesOptions` gained an optional `scheduler` (tests). `index.ts` re-exports `./types` with `export *` (superset of the listed names, no named type re-export to get wrong).
+8. **`parseStatsArgs`.** The ISO check also validates the calendar (V8 rolls `2026-02-30` over to March and accepts hour `24`), and a flag followed by another `--flag` counts as a missing value.
+9. **Script.** The inner `catch` is `catch { continue; }` (comment kept) instead of a comment-only block, to keep the "no empty catch" rule; behaviour is identical.
+10. **`package.json`.** The line sits before `"typecheck"`, so the diff is exactly one added line.
+11. **Small hardening.** `decayFactor` treats a non-positive half-life as the 14-day default; `summarize` treats non-finite window bounds as unbounded and sums savings in ascending order so the total does not depend on the row order; `readRows().files` holds full paths; extra exports: `cleanTokenSample`, `emptyTokenSample`, `emptyMeanStat`, `emptyTokenMeans`, `mergeTokenMeans`, `compactStamp`, `renameWithRetry`, `USAGE`, `StatsArgs`, `ParseStatsResult`, `ParseSnapshotResult`.
+12. **Flusher follow-up.** As designed, a request that arrives during a flush schedules one follow-up after `minIntervalMs` even if the same flush already wrote everything; the follow-up is then a no-op write.
