@@ -294,9 +294,30 @@ The plan's numbers still hold exactly under a policy that allows the plain fast 
 - 2.3: the simulation assumes a plain retry re-runs the rung it just ran, a non-base dispatch behaves like a delegation that already stepped to that variant, and a floor tier lifts the first attempt; keep the runner that way or update `simulate.ts`.
 - 2.4: `annotateSteps` returns `routeEdited` / `changed`; show an edited route line (` pin` added) to the user.
 
+### Round 2 fixes (QA-1.4)
+
+Binding amendments in `car/main`: **A24 amended** (only a strictly higher rank is ungated) and **A26** (`/annotate-plan` pins every step whose final tag is `[tier:heavy]` and reports how many it pinned). One commit per finding, all `Refs #74`, pushed.
+
+| # | Sev | Finding | Fix | Commit | Pinned by |
+|---|---|---|---|---|---|
+| QA-1.4-15 | major | The A24 gate let sideways switches through (equal rank: a role agent on a rung of the pick's tier; a lower variant of the same model at the same price) | Only `best.rank > chosen.rank` is ungated; every other switch needs ≥ 5 outcomes on best's own key, else `kept:evidence` | `66dc966` | ladders: probes **E2** (`general` on haiku inheriting medium's rank/price, implement, high risk, no detection, 3 failures on medium → `kept:evidence`; 5 outcomes on general → `switched`), **E3** (medium#high → medium#low, same price and rank, 4 failures → `kept:evidence`), **E4** (search, safe/high/deterministic, margin 0.1, priors only); kernel: equal-rank gate, strictly-higher ungated (E2/E3/E4 and the kernel test fail on the previous kernel) |
+| QA-1.4-16 | minor | A role chain exited into the router block with a fresh attempt budget and cost ceiling, so a native agent's cascade priced cheaper than the same rungs on the router | Feasible within the simulate API: every role rung now has a simulated path = the rest of its chain (same coverage-skipping walk) + `simulateAfter`: the runner continues the SAME delegation from the owning tier with the chain's attempts (`totalAttempts`), cost (`cumulativeCost`, `firstAttemptCost`), the tier's retries used up and the chain's models recorded as tried (covered tiers are skipped) | `5fafa66` | ladders "QA-1.4-16": two chain attempts leave less budget, `maxTotalAttempts: 2` and a 1.5× ceiling end the path inside the chain, a chain started on a later rung carries only what it ran, a model the chain already ran at the top variant skips its tier; E4 comparison below |
+| QA-1.4-17 | minor | A pick below `floorTier` was priced from its own rung while the runner starts on the floor tier, and nothing said so | The simulated runner already lifts the start (`newLadderState`); the kernel now appends `[the pick is below floorTier (rank r < f); its cost is that of the floor path the runner starts on]` (or `it is priced as dispatched` when the ladder has no path for it) to the decision's `reason` | `5881f25` | ladders "QA-1.4-17" (fast under a medium floor costs what medium costs, reason mentions floor); kernel |
+| QA-1.4-18 | minor | The QA match missed `Run QA on phase 3`, `Perform QA`, `Final QA`, `Do QA for …` | Also accepts a verb/adjective before QA (run, perform, do, final, adversarial, senior, optionally `the/a/an`) and QA followed by `on`/`of`/`for`, a colon or the end of the line; the QA word never continues into a finding id (`QA-1.4-3`, `QA2`) or a longer word (`QAT`) | `4b6e906` | plan "QA-1.4-18" (11 positives, 9 negatives incl. `Fix QA-1.4-3 finding`, `Write the QA notes`, `QA-1.4-15: tighten …`) |
+| QA-1.4-19 | nit | The annotation did not say how many steps it pinned (A26) | `annotateSteps` returns the steps plus `pinnedCount`: steps this annotation pinned (an engine route line carrying `pin`, or an existing route line edited to add it; already-pinned and unchanged steps are not counted, so re-annotating reports 0); non-enumerable, so the result still compares and iterates as an array; `AnnotatedPlan` exported | `6aacb33` | plan "QA-1.4-19" |
+| QA-1.4-20 | nit | `Document the \`[tier:heavy]\` tag syntax` was read as a heavy tag (and pinned) | Inline code spans (CommonMark: a backtick run closed by a run of the same length) are stripped before matching tier tags; an unclosed backtick is plain text | `c6e57c8` | plan "QA-1.4-20" (single, double and triple backticks, a real tag after a span, unclosed tick, idempotent) |
+
+**E4 cost comparison, before and after QA-1.4-16** (search, safe/high, d = 0.95, margin 0.1, priors only, tiers 1/5/20): `C(fast) = 3.1020`. Before, `explore@haiku` (own rung, then fast's rung, then medium with a fresh budget) priced `2.6391`: **14.9 % cheaper** on identical priors and prices, enough to clear the 10 % margin (2.79) and become the argmin. Now it prices `3.1020`, equal to fast, and the decision is `kept:best-is-chosen`. No A25 residual remains for the chain's exit; the one approximation left is that the chain's tier counts as having used its per-tier retries.
+
+**Supersedes the round 1 note (a):** role rungs are now priced through `Ladder.paths` as well (the rest of the chain, then the runner continuing the delegation); a role rung's `next` is informational (the in-chain / exit pointer) and the kernel only follows it for hand-built ladders. The kernel evidence gate is now "not strictly higher rank" (the constant keeps its old name `MIN_EVIDENCE_TO_SWITCH_DOWN`).
+
+**Handoffs added by round 2:**
+- **2.2:** apply `floorTier` to the dispatch itself (start the delegation on `max(pick, floor)`), so the decision row prices what runs; until then a below-floor pick is priced as the floor path and the reason says so (QA-1.4-17). Pass `session` so the continuation of a role chain uses the runner's own policy.
+- **2.4:** `/annotate-plan` shows `result.pinnedCount` ("pinned N steps") and the steps with `routeEdited`; a `[tier:heavy]` produced by the engine is pinned too (A26).
+- **QA (round 3):** the A24 gate as `rank > chosen.rank` — ask whether rank is the right "up" test for a role agent that inherited its tier's rank (sideways by construction); `simulateAfter` seeding (`attemptsThisTier`, `currentVariant`) against `nextAction` for a chain on an effort-configured tier.
 ## Findings
 
-QA-1.4 round 1 (heavy): 1 critical, 8 major, 2 minor, 3 nit — all fixed above (see "Round 1 fixes"); none open. Round 2 pending.
+QA-1.4 round 1 (heavy): 1 critical, 8 major, 2 minor, 3 nit — all fixed (see "Round 1 fixes"). Round 2: 1 major, 3 minor, 2 nit — all fixed (see "Round 2 fixes"). None open; round 3 pending.
 ## Deferred by plan
 
 - The `protocol.ts` seam that swaps in the generated `R:` line, the hint text and the decision-log rows → Phase 2.2 (`src\router\protocol.ts` is 2.2's).
@@ -313,4 +334,4 @@ QA-1.4 round 1 (heavy): 1 critical, 8 major, 2 minor, 3 nit — all fixed above 
 
 ## Verdict
 
-1.4.1 and 1.4.2 implemented; QA-1.4 round 1 fixed (14 findings, none open); pending round 2.
+1.4.1 and 1.4.2 implemented; QA-1.4 rounds 1 and 2 fixed (20 findings, none open); pending round 3.
