@@ -1175,7 +1175,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // otherwise start fresh (`unknown-tokens`). Nothing is awaited when no retry can follow.
               let lastStepTokens: number | null = null;
               if (sessionAware && !attempt.producerFailed) {
-                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable") {
+                // No wait when nothing can follow this attempt (QA-2.3-R2-5): accepted, unverifiable, or the ladder's
+                // own limits (checks 3 and 4 of `nextAction`) are reached after it.
+                const firstCost = state.firstAttemptCost ?? costRatio;
+                const limitReached =
+                  state.totalAttempts + 1 >= policy.maxTotalAttempts ||
+                  (policy.costMultiple != null && state.cumulativeCost + costRatio > firstCost * policy.costMultiple);
+                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable" && !limitReached) {
                   await awaitExecutionEnd(producerSid, RESUME_END_WAIT_MS, toolCtx?.abort);
                 }
                 lastStepTokens = lastStepContext(producerSid);
