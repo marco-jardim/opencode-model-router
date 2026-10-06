@@ -1148,7 +1148,7 @@ After `/annotate-plan`:
 4. [tier:heavy] Design a token bucket algorithm for advanced rate limiting
 ```
 
-With the [routing engine](#cost-aware-routing-opt-in-opencode-v2) live on OpenCode v2, `/annotate-plan` also emits a `[route class=… risk=… d=…]` line per step, and pins (`pin`) every step whose final tag is `[tier:heavy]`, so the engine never reroutes it. A step that **starts with a code block** is skipped and reported (the command says which line and what to add by hand); the command never edits the file itself. Details: [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md#the-route-line).
+With the [routing engine](#cost-aware-routing-opt-in-opencode-v2) live on OpenCode v2, `/annotate-plan` also emits a `[route class=… risk=… d=…]` line per step, and pins (`pin`) every step whose final tag is `[tier:heavy]`, so the engine never reroutes it. A step that **starts with a code block** is skipped and reported (the command says which line and what to add by hand); the command never edits the file itself. Details: [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md#annotate-plan).
 
 ## Token overhead
 

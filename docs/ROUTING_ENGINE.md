@@ -25,6 +25,7 @@ The routing engine decides, for every dispatch, which **agent**, **model and var
 - [The cost doctor](#the-cost-doctor)
 - [OpenCode v1](#opencode-v1)
 - [Known limits and experimental parts](#known-limits-and-experimental-parts)
+- [Where things live](#where-things-live)
 
 ## Concepts
 
@@ -117,6 +118,16 @@ The orchestrator (or `/annotate-plan`) may describe the work in one line:
 ### The generated `R:` line and the hint
 
 In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 recorded outcomes**, so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. The per-turn hint classifies the latest user message with the rules classifier only (a hint never costs a model call), is at most two lines (`Route hint: for <class> work like this turn, prefer @<agent> (<description>) over @<chosen>.` and `Why: …`) and appears only when the kernel would switch, so it never contradicts the `R:` line. It is a separate system part, so the protocol prefix stays cacheable, but the hint part changes with each user turn.
+
+### `/annotate-plan`
+
+`/annotate-plan` keeps what it always did (tag a plan's steps with `[tier:X]` and add `[acceptance]` blocks). **With a live engine on v2** (`shadow`, `advise` or `enforce`; `static` and v1 add nothing) it also does the part a model should not guess, and hands the model the exact lines to write as an extra message part:
+
+- It splits the plan into steps (top-level list items; headings are never steps; a following `[acceptance]` block belongs to its step; a plan with no list falls back to `Step`/`Task`/`Phase`/`Stage`/`Milestone` headings), **fence-aware**: nothing inside a fenced block (``` or `~~~`, nested or not) starts a step, is a tag or receives a route line.
+- It classifies every step in **one batched call**: rules per step, then the configured backend, rules again for any step the backend fails. The message part ends with a `Classification:` line (`backend=…`, backend outcomes, latency, the first error), which is also how a classifier credential or connectivity problem shows up.
+- It computes the start tier per step from the engine and emits `[tier:X]` at the **start** of the step (only when the step has none) and a `[route class=… risk=… d=…]` line directly below it. **Every step whose final tag is `[tier:heavy]` is pinned** (tagged, QA, or engine-chosen; A26), and the message reports how many it pinned. An existing `[tier:X]` or `[route …]` is authoritative; the only edit to an existing line is ` pin` appended to an existing route line.
+- **A step that starts with a code block is skipped and reported.** A list item whose content opens a fence (`1. ```bash`) cannot take a tag after its marker (it would corrupt the fence opener) or a route line below it (it would sit inside the code). The command says "step at line N starts with a code block: add nothing to it here" and gives the tier and route line for a by-hand edit. Such steps are not counted as pinned.
+- **The command never writes the file.** The additions are an edit script for the model; the annotation is additive, nothing is removed or reordered.
 
 ## The expected-cost formula
 
@@ -434,3 +445,18 @@ OpenCode v1 is unchanged in every mode (D1). With no `routing` block nothing dif
 - **Fresh-child registration is a heuristic** on the host's `session.created` event (parent, agent, title, then the oldest waiting dispatch); `execute.after` corrects a wrong claim, but steps already recorded keep their key. Waiting dispatches are claimable for 120 s.
 - **No exploration.** The engine only learns from what gets dispatched. It does not try cheaper rungs on purpose; an unevidenced cheaper candidate gets its first outcomes only when the orchestrator (or a floor, or an upward switch) puts work there. Exploration is future work.
 - **The numbers of a run are evidence of behaviour, not a benchmark.** The release's own dogfood measured the plan's workload (implementation- and QA-heavy, with pinned heavy dispatches).
+
+## Where things live
+
+| Part | Code |
+|---|---|
+| Config surface, defaults, `resolveRouting` | `src/router/config.ts` |
+| Classifier: rules, route line, scrubber, backends | `src/routing/classify/` |
+| Outcome store, cost accounting, persistence, statistics | `src/routing/outcomes/` (`scripts/routing-stats.ts`) |
+| Decision kernel, ladders, the `R:` line, plan annotation | `src/routing/engine/` |
+| Hook wiring: dispatch decision, hint, runtime | `src/routing/wire/`, `src/compat/v2-hooks.ts` |
+| Cost doctor | `src/routing/advisor/` |
+| `/router stats`, `/annotate-plan`, the v1 roles line | `src/routing/commands/` |
+| Variant ladder and resume planning | `src/escalate/ladder.ts`, `variants.ts`, `resume.ts` |
+
+The v2 adapter hands the plugin three things it did not have before, through the legacy plugin context built in `src/v2.ts`: `routerAgents` (the host's agent list for the dispatching location), `routerGenerate` (the host's `generate` call, present only when the host has one; the `host` classifier backend uses it) and `routerSynthetic` (the call that writes a synthetic transcript entry; the cost doctor's notice uses it). A host without them gets log lines or no feature, never an error.
