@@ -499,7 +499,7 @@ describe("persister: load", () => {
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(mem.files.get(path)?.text).toBe(text);
     expect(corruptCopies(mem.files)).toEqual([]);
-    expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: false, error: "unrecognized outcome store on disk" });
+    expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: false, error: "unrecognized outcome store on disk", readOnly: true });
     expect(mem.files.get(path)?.text).toBe(text);
     expect(mem.touched.some((t) => t.op === "writeDurable" || t.op === "rename" || t.op === "unlink")).toBe(false);
   });
@@ -579,7 +579,7 @@ describe("persister: load", () => {
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(corruptCopies(mem.files)).toEqual([]);
 
-    expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: false, error: "unsupported outcome store version on disk" });
+    expect(await persister.saveSnapshot(snapshotOf("pass"))).toEqual({ ok: false, error: "unsupported outcome store version on disk", readOnly: true });
     expect(mem.files.get(path)?.text).toBe(newer);
     expect(mem.touched.some((t) => t.op === "writeDurable")).toBe(false);
     // decision rows are still appended: they live in a different file
@@ -1234,6 +1234,150 @@ describe("flusher: failures, drops, flushNow, dispose", () => {
     expect(logger.info).toHaveBeenCalledTimes(1);
     await tick();
     expect(sched.pending()).toHaveLength(0);
+  });
+
+  it("QA-1.3-2: 1000 requestFlush calls with a failing save all resolve when the attempt finishes (no leaked waiters)", async () => {
+    const { flusher, sched, fake, logger, mutate } = flusherSetup();
+    fake.results.save = { ok: false, error: "disk full", code: "ENOSPC" };
+    mutate();
+    const requests = Array.from({ length: 1000 }, () => flusher.requestFlush());
+    expect(sched.timers).toHaveLength(1);
+    let resolved = 0;
+    for (const r of requests) void r.then(() => void resolved++);
+    await tick();
+    expect(resolved).toBe(0);
+    await sched.fireNext();
+    await tick();
+    expect(resolved).toBe(1000); // the attempt failed, the callers are released anyway
+    expect(fake.saves).toHaveLength(1);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    // the retry is one unref'd timer at the throttle interval, and requests made later wait for *that* attempt
+    expect(sched.pending()).toHaveLength(1);
+    expect(sched.pending()[0]?.ms).toBe(30_000);
+    const later = Array.from({ length: 1000 }, () => flusher.requestFlush());
+    expect(sched.pending()).toHaveLength(1);
+    await sched.fireNext();
+    await Promise.all(later);
+    expect(fake.saves).toHaveLength(2);
+    expect(sched.pending()).toHaveLength(1); // still failing: one retry timer, never a pile of them
+  });
+
+  it("QA-1.3-2: requests made while a flush is running are released by the next attempt, not the running one", async () => {
+    const { flusher, sched, fake, mutate } = flusherSetup();
+    mutate();
+    void flusher.requestFlush();
+    const hold = deferred();
+    fake.gate.save = hold.promise;
+    await sched.fireNext();
+    mutate();
+    let released = false;
+    void flusher.requestFlush().then(() => void (released = true));
+    fake.gate.save = null;
+    hold.resolve();
+    await tick();
+    expect(released).toBe(false); // the running attempt started before this request
+    expect(sched.pending()).toHaveLength(1);
+    await sched.fireNext();
+    await tick();
+    expect(released).toBe(true);
+    expect(fake.saves).toHaveLength(2);
+  });
+
+  it("QA-1.3-2: enqueue arms a flush without creating a promise or a waiter", async () => {
+    const { flusher, sched, fake } = flusherSetup();
+    const NativePromise = Promise;
+    let created = 0;
+    class CountingPromise<T> extends NativePromise<T> {
+      constructor(executor: (resolve: (value: T | PromiseLike<T>) => void, reject: (reason?: unknown) => void) => void) {
+        super(executor);
+        created += 1;
+      }
+    }
+    vi.stubGlobal("Promise", CountingPromise);
+    try {
+      for (let i = 0; i < 100; i++) flusher.enqueue(verdictRow(i));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(created).toBe(0);
+    expect(sched.timers).toHaveLength(1);
+    await sched.fireNext();
+    expect(fake.appends.flat()).toHaveLength(100);
+  });
+
+  it("QA-1.3-2: a read-only store is not pending work: one warning, no retry timer, rows still flow", async () => {
+    const { mem, deps, dir, logger } = setup();
+    const path = join(dir, OUTCOMES_FILE);
+    const newer = JSON.stringify({ schema: OUTCOMES_SCHEMA_ID, version: 2, entries: {} });
+    mem.files.set(path, { text: newer, mtimeMs: 1 });
+    const persister = createPersister(dir, deps);
+    expect((await persister.load()).status).toBe("unsupported-version");
+    logger.warn.mockClear();
+
+    const store = createOutcomeStore({ now: deps.now });
+    const sched = manualScheduler();
+    const flusher = createFlusher(store, persister, { now: deps.now, scheduler: sched.scheduler, logger });
+    store.recordVerdict(KEY, "pass", { attemptID: "a", step: "dispatch" });
+    flusher.enqueue(verdictRow(1));
+    await sched.fireNext();
+    await tick();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(sched.pending()).toHaveLength(0); // no permanent retry timer
+    expect(mem.files.get(path)?.text).toBe(newer);
+    expect((await persister.readRows()).rows).toHaveLength(1);
+
+    // later changes neither arm a timer nor leave a waiter behind; rows still do
+    store.recordVerdict(KEY, "pass", { attemptID: "b", step: "dispatch" });
+    await flusher.requestFlush();
+    expect(sched.pending()).toHaveLength(0);
+    flusher.enqueue(verdictRow(2));
+    expect(sched.pending()).toHaveLength(1);
+    await sched.fireNext();
+    await tick();
+    expect((await persister.readRows()).rows).toHaveLength(2);
+    expect(sched.pending()).toHaveLength(0);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("QA-1.3-3: the flush delay is clamped to [0, minIntervalMs] and a clock that went back a day resets the window", async () => {
+    const { flusher, sched, c, mutate } = flusherSetup();
+    mutate();
+    void flusher.requestFlush();
+    await sched.fireNext(); // flush ends at T0
+    await tick();
+    c.set(T0 - 86_400_000);
+    mutate();
+    void flusher.requestFlush();
+    expect(sched.pending()).toHaveLength(1);
+    expect(sched.pending()[0]?.ms).toBe(30_000); // not 30 s + one day
+    await sched.fireNext();
+    await tick();
+    // the clock jumping far ahead never makes the delay negative or larger than the interval
+    c.set(T0 + 10 * 86_400_000);
+    mutate();
+    void flusher.requestFlush();
+    expect(sched.pending()[0]?.ms).toBe(0);
+    await sched.fireNext();
+    await tick();
+    c.advance(12_000);
+    mutate();
+    void flusher.requestFlush();
+    expect(sched.pending()[0]?.ms).toBe(18_000);
+  });
+
+  it("QA-1.3-3: a non-finite clock never produces a NaN delay", async () => {
+    const { flusher, sched, c, mutate } = flusherSetup();
+    mutate();
+    void flusher.requestFlush();
+    await sched.fireNext();
+    await tick();
+    c.set(Number.NaN);
+    mutate();
+    void flusher.requestFlush();
+    const ms = sched.pending()[0]?.ms ?? Number.NaN;
+    expect(Number.isFinite(ms)).toBe(true);
+    expect(ms).toBeGreaterThanOrEqual(0);
+    expect(ms).toBeLessThanOrEqual(30_000);
   });
 
   it("a failed append puts the batch back at the front, trims to maxQueuedRows and warns about the drops", async () => {

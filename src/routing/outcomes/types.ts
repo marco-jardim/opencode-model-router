@@ -616,7 +616,15 @@ export interface LoadResult {
   readonly message: string | null;
 }
 
-export type WriteResult = { readonly ok: true } | { readonly ok: false; readonly error: string; readonly code?: string };
+export type WriteResult =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly error: string;
+      readonly code?: string;
+      /** The store on disk must not be overwritten by this plugin (newer/unrecognized/unreadable): no retry will help (QA-1.3-2). */
+      readonly readOnly?: true;
+    };
 
 export interface ReadRowsResult {
   /** Oldest generation first, file order within a file. */

@@ -570,7 +570,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
     },
 
     async saveSnapshot(snapshot: OutcomeSnapshot): Promise<WriteResult> {
-      if (readOnlyReason !== null) return { ok: false, error: readOnlyReason };
+      if (readOnlyReason !== null) return { ok: false, error: readOnlyReason, readOnly: true };
       const tmp = join(dir, `${OUTCOMES_TMP_PREFIX}${pid}-${++seq}`);
       try {
         await fs.mkdirp(dir);
@@ -658,7 +658,8 @@ export function createFlusher(
   deps: FlusherDeps,
   options: FlusherOptions = {},
 ): OutcomeFlusher {
-  const { now, scheduler, logger } = deps;
+  const { scheduler, logger } = deps;
+  const now = (): number => safeNow(deps.now);
   const minIntervalMs = options.minIntervalMs ?? FLUSH_MIN_INTERVAL_MS;
   const batchRows = Math.max(1, Math.floor(options.batchRows ?? FLUSH_BATCH_ROWS));
   const maxQueuedRows = Math.max(1, Math.floor(options.maxQueuedRows ?? MAX_QUEUED_ROWS));
@@ -667,29 +668,20 @@ export function createFlusher(
   let writtenRevision = store.revision;
   let inFlight: Promise<void> | null = null;
   let timer: { handle: unknown } | null = null;
-  let again = false;
   let lastFlushEnd = Number.NEGATIVE_INFINITY;
   let disposed = false;
   let disposing: Promise<void> | null = null;
   let droppedRows = 0;
   let failing = false;
-  let idleWaiters: Array<() => void> = [];
+  /** The snapshot cannot be written (read-only store): it is no longer pending work (QA-1.3-2). */
+  let snapshotBlocked = false;
+  /** `requestFlush` callers, released when the next flush attempt finishes, whether it succeeded or not. */
+  let waiters: Array<() => void> = [];
 
-  const hasWork = (): boolean => store.revision !== writtenRevision || queue.length > 0;
-  const quiescent = (): boolean => timer === null && inFlight === null;
+  const hasWork = (): boolean => (!snapshotBlocked && store.revision !== writtenRevision) || queue.length > 0;
 
-  function releaseIdleWaiters(force = false): void {
-    if (!force && !quiescent()) return;
-    const waiters = idleWaiters;
-    idleWaiters = [];
-    for (const release of waiters) release();
-  }
-
-  function whenIdle(): Promise<void> {
-    if (quiescent()) return Promise.resolve();
-    return new Promise<void>((done) => {
-      idleWaiters.push(done);
-    });
+  function releaseWaiters(list: Array<() => void>): void {
+    for (const release of list) release();
   }
 
   function trimQueue(): void {
@@ -704,6 +696,16 @@ export function createFlusher(
     if (failing) return;
     failing = true;
     logger.warn(`[router] outcome ${what} write failed; will retry`, { error });
+  }
+
+  /**
+   * Delay before the next flush may start: the rest of the throttle window, clamped to [0, minIntervalMs]. A
+   * clock that went backwards (QA-1.3-3) resets the window instead of stretching it by the jump.
+   */
+  function flushDelay(): number {
+    const t = now();
+    if (t < lastFlushEnd) lastFlushEnd = t;
+    return Math.min(minIntervalMs, Math.max(0, lastFlushEnd + minIntervalMs - t));
   }
 
   function schedule(ms: number): void {
@@ -735,10 +737,13 @@ export function createFlusher(
     if (deps.ready !== undefined) await deps.ready;
     let ok = true;
     const revision = store.revision;
-    if (revision !== writtenRevision) {
+    if (!snapshotBlocked && revision !== writtenRevision) {
       const result = await persister.saveSnapshot(store.snapshot());
       if (result.ok) {
         writtenRevision = revision;
+      } else if (result.readOnly === true) {
+        snapshotBlocked = true;
+        logger.warn("[router] outcome snapshots are not written: the store on disk is read-only for this plugin", { error: result.error });
       } else {
         ok = false;
         noteFailure("snapshot", result.error);
@@ -766,31 +771,43 @@ export function createFlusher(
   }
 
   function startFlush(): Promise<void> {
+    const attempt = waiters; // every request made before this attempt started is covered by it
+    waiters = [];
     const run: Promise<void> = doFlush()
       .catch((error: unknown) => {
         noteFailure("flush", describeError(error));
       })
       .finally(() => {
         if (inFlight === run) inFlight = null;
-        lastFlushEnd = now();
-        if (!disposed && (again || hasWork())) {
-          again = false;
-          if (timer === null) schedule(minIntervalMs);
+        const t = now();
+        lastFlushEnd = t;
+        if (!disposed && hasWork() && timer === null) schedule(minIntervalMs);
+        releaseWaiters(attempt);
+        // Nothing left scheduled: later requesters would wait for an attempt that will never run.
+        if (timer === null) {
+          const rest = waiters;
+          waiters = [];
+          releaseWaiters(rest);
         }
-        releaseIdleWaiters();
       });
     inFlight = run;
     return run;
   }
 
+  /** Arm a flush if there is work and none is armed or running. Creates no promise (safe in a hook). */
+  function kick(): void {
+    if (disposed || !hasWork()) return;
+    if (inFlight !== null || timer !== null) return; // the running flush's follow-up / the armed timer covers it
+    schedule(flushDelay());
+  }
+
   function requestFlush(): Promise<void> {
     if (disposed || !hasWork()) return Promise.resolve();
-    if (inFlight !== null) {
-      again = true;
-      return whenIdle();
-    }
-    if (timer === null) schedule(Math.max(0, lastFlushEnd + minIntervalMs - now()));
-    return whenIdle();
+    kick();
+    if (timer === null && inFlight === null) return Promise.resolve(); // could not be scheduled
+    return new Promise<void>((done) => {
+      waiters.push(done);
+    });
   }
 
   async function flushNow(): Promise<void> {
@@ -804,7 +821,9 @@ export function createFlusher(
       await flushNow();
       cancelTimer();
       disposed = true;
-      releaseIdleWaiters(true);
+      const rest = waiters;
+      waiters = [];
+      releaseWaiters(rest);
     })();
     return disposing;
   }
@@ -817,7 +836,7 @@ export function createFlusher(
       if (disposed) return;
       queue.push(row);
       trimQueue();
-      void requestFlush();
+      kick();
     },
     requestFlush,
     flushNow,
