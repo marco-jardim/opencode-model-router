@@ -1,6 +1,7 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { RunnerCatalogModel } from "../escalate/resume";
 import type { CatalogModel, Ingest } from "../routing/outcomes/ingest";
+import type { HostGenerate } from "../routing/classify/types";
 
 /** Marks the legacy tool.execute.before output bag when verification starts for
  * that task call. V1 hosts read only output.args, so this symbol is invisible. */
@@ -60,6 +61,8 @@ export type RouterPluginInput = PluginInput & {
    * agents have a model of their own (title, summary, the role agents) and which tier agents the host offers.
    */
   routerAgents?: () => Promise<readonly unknown[]>;
+  /** Set only by src/v2.ts: the host `generate` (the `host` classifier backend of `/annotate-plan`, A4); absent when the host has none. */
+  routerGenerate?: HostGenerate;
   /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */
   routerOnIngest?: (ingest: Ingest) => void;
 };

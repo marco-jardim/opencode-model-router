@@ -24,6 +24,7 @@ export default {
       // here so the event loop feeds the instance that also receives the verdicts (QA-2.1-7).
       routerCatalog: async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
       routerAgents: async () => (await ctx.agent.list()).data,
+      ...(ctx.generate === undefined ? {} : { routerGenerate: ctx.generate }),
       routerOnIngest: (created: Ingest) => { ingest = created; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);

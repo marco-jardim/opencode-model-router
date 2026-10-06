@@ -64,6 +64,9 @@ import { createCatalogPricing, createIngest, ingestSettings } from "./routing/ou
 import type { Ingest } from "./routing/outcomes/ingest";
 import { verdictOf } from "./routing/outcomes/types";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
+import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { createEngineRuntime } from "./routing/wire/runtime";
+import type { EngineRuntime } from "./routing/wire/runtime";
 import {
   advisorSettings,
   catalogFromModels,
@@ -560,6 +563,20 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const advisorNotifier = ctx.routerHost === "v2"
     ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2"), config: () => cfg, gather: gatherAdvisorInputs, logger })
     : undefined;
+  // `/annotate-plan` (Phase 2.4.4): its own engine runtime (agent list, catalog, classifier backend, outcome store), created on the first use
+  // and only on v2; with `routing.engine: static` its `prepare()` answers null before any host call, store or file.
+  let annotateRuntime: EngineRuntime | undefined;
+  const annotatePlanRuntime = (): EngineRuntime | undefined => {
+    if (ctx.routerHost !== "v2" || ctx.routerAgents === undefined || ctx.routerCatalog === undefined) return undefined;
+    annotateRuntime ??= createEngineRuntime({
+      loadConfig: () => cfg,
+      listAgents: ctx.routerAgents,
+      listModels: ctx.routerCatalog,
+      ...(ctx.routerGenerate === undefined ? {} : { generate: ctx.routerGenerate }),
+      logger,
+    });
+    return annotateRuntime;
+  };
   /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
   const buildCostDoctorLines = async (): Promise<string[]> => {
     const routing = resolveRouting(cfg, "v2");
@@ -724,6 +741,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await disposeVerification();
       // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
       await ingest?.dispose();
+      await annotateRuntime?.dispose();
       await attemptRecorder?.dispose();
       await logger.flush();
     },
@@ -2275,6 +2293,26 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           type: "text" as const,
           text: buildTiersOutput(cfg),
         });
+      }
+
+      if (input.command === "annotate-plan") {
+        // 2.4.4: the template (registered in the config hook) is unchanged. With a live engine on v2 this adds ONE message part: the
+        // route lines the router computed for the plan's steps (one batched classification). Everything else is as before.
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        const runtime = annotatePlanRuntime();
+        if (runtime !== undefined && ctx.routerAgents !== undefined) {
+          const directives = await buildAnnotateDirectives(input.arguments ?? "", {
+            cfg,
+            runtime,
+            listAgents: ctx.routerAgents,
+            dirs: [...new Set([ctx.directory, ctx.worktree].filter((dir): dir is string => typeof dir === "string" && dir !== ""))],
+            logger,
+          });
+          if (directives !== null) output.parts.push({ type: "text" as const, text: directives });
+        }
       }
 
       if (input.command === "router-reload") {
