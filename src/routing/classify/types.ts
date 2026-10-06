@@ -1162,8 +1162,9 @@ export const ACCEPTANCE_BLOCK_RE = /\[acceptance\][\s\S]*?\[\/acceptance\]/i;
 
 /**
  * Fenced code blocks (fences.ts: closer at least as long as the opener and of
- * the same character, an unclosed fence runs to the end) are replaced by
- * CODE_BLOCK_PLACEHOLDER in the D14 state: file contents never leave the machine.
+ * the same character, an unclosed fence runs to the end) and indented code blocks
+ * (4+ columns) are replaced by CODE_BLOCK_PLACEHOLDER in the D14 state: file
+ * contents never leave the machine.
  */
 export const CODE_BLOCK_PLACEHOLDER = "[code block omitted]";
 

@@ -10,7 +10,7 @@
  * file contents, no system prompt, no session history.
  */
 
-import { replaceFences } from "./fences";
+import { replaceFences, replaceIndentedBlocks } from "./fences";
 import { scrubState } from "./scrub";
 import { collapseLongRuns } from "./text";
 import {
@@ -92,7 +92,10 @@ export function buildClassifierState(
   const acceptanceRaw =
     first === null || first.length > RULES_MAX_CHARS ? null : dropDirectiveLines(first);
   const bodyRaw = collapseLongRuns(
-    replaceFences(dropDirectiveLines(rest.slice(0, RULES_MAX_CHARS)), CODE_BLOCK_PLACEHOLDER)
+    replaceIndentedBlocks(
+      replaceFences(dropDirectiveLines(rest.slice(0, RULES_MAX_CHARS)), CODE_BLOCK_PLACEHOLDER),
+      CODE_BLOCK_PLACEHOLDER,
+    )
       .replace(/\n{3,}/g, "\n\n")
       .trim(),
     "[long token omitted]",

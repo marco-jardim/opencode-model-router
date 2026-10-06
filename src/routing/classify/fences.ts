@@ -58,3 +58,39 @@ export function replaceFences(text: string, placeholder: string): string {
   }
   return out.join("\n");
 }
+
+/** 4+ columns of indentation (tabs count as four), on a line that has content. */
+const INDENTED_LINE_RE = /^(?: {4}|\t| {1,3}\t)/;
+
+function isIndentedCode(line: string): boolean {
+  return INDENTED_LINE_RE.test(line) && line.trim() !== "";
+}
+
+/**
+ * Replace every indented code block (QA-1.2-33) by one `placeholder`. A block is a
+ * run of lines indented four or more columns; blank lines between two such lines
+ * belong to it, blank lines after the last one do not. The CommonMark rule that an
+ * indented block cannot interrupt a paragraph is deliberately NOT applied: code
+ * pasted straight under a sentence must not reach a backend either.
+ */
+export function replaceIndentedBlocks(text: string, placeholder: string): string {
+  const lines = text.split(/\r?\n/);
+  if (!lines.some(isIndentedCode)) return text;
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!isIndentedCode(lines[i]!)) {
+      out.push(lines[i]!);
+      i++;
+      continue;
+    }
+    let last = i;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (isIndentedCode(lines[j]!)) last = j;
+      else if (lines[j]!.trim() !== "") break;
+    }
+    out.push(placeholder);
+    i = last + 1;
+  }
+  return out.join("\n");
+}
