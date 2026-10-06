@@ -580,6 +580,9 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
 // (index.ts calls `sweepDispatches` from the same idle sweep) and bounded in size.
 // ---------------------------------------------------------------------------
 
+/** `routing.detection` keys: how strongly the dispatch's acceptance checks detect a failure (D8). */
+export type DetectionDepth = "deterministic" | "grader" | "none";
+
 export interface DispatchInput {
   /** Typed task facts of the dispatch (1.2 `TaskFacts` is assignable). */
   facts: DecisionFacts;
@@ -591,11 +594,11 @@ export interface DispatchInput {
   variant?: string | null;
   /** Router tier that owns the dispatch, when there is one. */
   tier?: string | null;
-  /** The dispatch's `[acceptance]` detection depth or text, carried for the engine; ingestion does not read it. */
-  acceptance?: string | null;
+  /** The dispatch's verification depth (`routing.detection` key, D8), carried for the engine; ingestion does not read it. */
+  acceptance?: DetectionDepth | null;
   /** The orchestrator session that dispatched the child. */
   parentSessionID?: string | null;
-  /** Attempt id outcomes are scored under. Default: `${childSessionID}:${attemptIndex}`, a new index per call. */
+  /** Attempt id outcomes are scored under. Default: `${childSessionID}:${attemptIndex}:${seq}`, unique for the life of the process. */
   attemptId?: string;
   /** Id of the decision row of this dispatch (2.2), so verdict/refusal rows can reference it. */
   decisionID?: string | null;
@@ -610,10 +613,10 @@ export interface DispatchRecord {
   readonly model: string | null;
   readonly variant: string | null;
   readonly tier: string | null;
-  readonly acceptance: string | null;
+  readonly acceptance: DetectionDepth | null;
   readonly parentSessionID: string | null;
   readonly attemptId: string;
-  /** 0 for the first dispatch of the child; +1 for each re-registration (resume or ladder attempt). */
+  /** 0 for the first registration of the child; +1 for each re-registration. Display only: it restarts at 0 after an eviction, `attemptId` never repeats. */
   readonly attemptIndex: number;
   readonly decisionID: string | null;
   readonly step: LadderStepKind;
@@ -629,6 +632,13 @@ interface DispatchSlot {
 export const MAX_DISPATCH_RECORDS = 2000;
 
 const dispatchRegistry = new Map<string, DispatchSlot>();
+/**
+ * Process-wide attempt counter (QA-2.1-1). `attemptIndex` restarts at 0 whenever a child is re-registered after
+ * an eviction (TTL, bound, session deletion), so `${child}:${index}` alone can name two different attempts, and
+ * the store, which remembers scored attempt ids, would then drop the second attempt's outcome. The sequence
+ * number makes every default attempt id unique.
+ */
+let attemptSeq = 0;
 
 /**
  * Register (or re-register) the dispatch facts of a child session. Re-registering an existing child
@@ -651,7 +661,7 @@ export function rememberDispatch(
     tier: input.tier ?? null,
     acceptance: input.acceptance ?? null,
     parentSessionID: input.parentSessionID ?? null,
-    attemptId: input.attemptId ?? `${childSessionID}:${attemptIndex}`,
+    attemptId: input.attemptId ?? `${childSessionID}:${attemptIndex}:${++attemptSeq}`,
     attemptIndex,
     decisionID: input.decisionID ?? null,
     step: input.step ?? "dispatch",

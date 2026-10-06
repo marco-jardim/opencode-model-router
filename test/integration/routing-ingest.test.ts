@@ -164,14 +164,31 @@ describe("dispatch registry (2.1.1)", () => {
     expect(lookupDispatch("c1")).toBeUndefined();
     dispatch("c1");
     const first = lookupDispatch("c1");
-    expect(first).toMatchObject({ agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", tier: "medium", parentSessionID: "root", attemptIndex: 0, attemptId: "c1:0", step: "dispatch", decisionID: null });
+    expect(first).toMatchObject({ agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", tier: "medium", parentSessionID: "root", attemptIndex: 0, attemptId: expect.stringMatching(/^c1:0:\d+$/), step: "dispatch", decisionID: null });
     dispatch("c1");
-    expect(lookupDispatch("c1")).toMatchObject({ attemptIndex: 1, attemptId: "c1:1" });
+    expect(lookupDispatch("c1")).toMatchObject({ attemptIndex: 1, attemptId: expect.stringMatching(/^c1:1:\d+$/) });
     rememberDispatch("c1", { facts: FACTS, agent: "medium", model: null, attemptId: "custom", decisionID: "d-9", step: "variant" }, T0);
     expect(lookupDispatch("c1")).toMatchObject({ attemptIndex: 2, attemptId: "custom", decisionID: "d-9", step: "variant", model: null, variant: null });
     expect(forgetDispatch("c1")).toBe(true);
     expect(forgetDispatch("c1")).toBe(false);
     expect(lookupDispatch("c1")).toBeUndefined();
+  });
+
+  it("QA-2.1-1: default attempt ids never repeat in the process, even when the index restarts after an eviction", () => {
+    const seen = new Set<string>();
+    for (let round = 0; round < 3; round++) {
+      dispatch("c1");
+      seen.add(lookupDispatch("c1")!.attemptId);
+      expect(lookupDispatch("c1")!.attemptIndex).toBe(0);
+      forgetDispatch("c1"); // eviction: the next registration starts at index 0 again
+    }
+    dispatch("c1");
+    dispatch("c1");
+    seen.add(lookupDispatch("c1")!.attemptId);
+    expect(seen.size).toBe(4);
+    // an explicit id is kept verbatim
+    rememberDispatch("c1", { facts: FACTS, agent: "medium", model: null, attemptId: "mine" }, T0);
+    expect(lookupDispatch("c1")!.attemptId).toBe("mine");
   });
 
   it("sweeps entries idle for the TTL, honours touches and never evicts future stamps", () => {
@@ -471,7 +488,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     expect(entry?.beta.beta).toBeGreaterThan(0);
     const refusal = (await h.rows()).filter((r) => r.kind === "refusal");
     expect(refusal).toHaveLength(1);
-    expect(refusal[0]).toMatchObject({ childSessionID: "c1", attemptID: "c1:0", key: MEDIUM_KEY, decisionID: "d-1", step: "dispatch" });
+    expect(refusal[0]).toMatchObject({ childSessionID: "c1", attemptID: expect.stringMatching(/^c1:0:\d+$/), key: MEDIUM_KEY, decisionID: "d-1", step: "dispatch" });
   });
 
   it("refusal before the verdict: the verdict does not score the attempt a second time", () => {
@@ -492,6 +509,25 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const entry = h.store().snapshot().entries[MEDIUM_KEY];
     expect(entry?.counts).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
     expect(entry?.beta.alpha).toBeCloseTo(0, 9);
+  });
+
+  it("QA-2.1-1: a child re-registered after a TTL eviction is scored again; a refusal on the new attempt leaves the old pass alone", () => {
+    const h = harness();
+    const ingest = h.make();
+    dispatch("c1");
+    ingest.onVerdict("c1", "pass");
+    h.clock.t = T0 + 61 * 60_000;
+    ingest.sweep();
+    expect(lookupDispatch("c1")).toBeUndefined();
+    rememberDispatch("c1", { facts: FACTS, agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", parentSessionID: "root" }, h.clock.t);
+    expect(lookupDispatch("c1")!.attemptIndex).toBe(0);
+    ingest.onVerdict("c1", "fail");
+    let entry = h.store().snapshot().entries[MEDIUM_KEY];
+    expect(entry?.counts).toMatchObject({ pass: 1, fail: 1 });
+    expect(entry?.beta.alpha).toBeGreaterThan(0);
+    ingest.onFalseRefusal("c1");
+    entry = h.store().snapshot().entries[MEDIUM_KEY];
+    expect(entry?.counts).toMatchObject({ pass: 1, fail: 1, falseRefusals: 1 });
   });
 
   it("scores a ladder attempt under its step kind", () => {
