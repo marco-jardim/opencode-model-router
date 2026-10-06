@@ -363,6 +363,8 @@ export interface Teardown { pid?: number; method: string; taskkill?: Obj; exitCo
 const liveHosts = new Set<RoutingHost>();
 /** Every session id any isolated host of this run held (roots and children), kept so the live-store check can show none of them reached the user's store. */
 export const seenSessionIDs = new Set<string>();
+/** Every project / location directory of every isolated host of this run (as the host reports it and as the harness created it), for `noticeFiles()` in the live-store check (QA-3.2-R2-7). */
+export const seenProjectDirs = new Set<string>();
 
 export class RoutingHost {
   readonly provider = new RoutingProvider();
@@ -485,7 +487,14 @@ export class RoutingHost {
     const child = this.child;
     const pid = child?.pid;
     // Every session id this host ever created, from its own event log (the session list misses children the runner already deleted), plus what it holds now.
-    try { for (const e of await this.rawEvents()) { if (e.type === "session.created") for (const id of [obj(e.data).sessionID, obj(e.data).parentID]) if (typeof id === "string") seenSessionIDs.add(id); } } catch { /* no event log */ }
+    try {
+      for (const e of await this.rawEvents()) {
+        if (e.type === "session.created") for (const id of [obj(e.data).sessionID, obj(e.data).parentID]) if (typeof id === "string") seenSessionIDs.add(id);
+        for (const dir of [obj(e.location).directory, e.__instance]) if (typeof dir === "string" && dir !== "") seenProjectDirs.add(dir);
+      }
+    } catch { /* no event log */ }
+    seenProjectDirs.add(this.project);
+    seenProjectDirs.add(path.join(this.root, "config", "opencode"));
     if (child && child.exitCode === null) { try { for (const s of await this.everySession()) seenSessionIDs.add(s.id); } catch { /* the host is already gone */ } }
     let method = "none (never started or already exited)";
     let taskkill: Obj | undefined;
@@ -557,6 +566,12 @@ export class RoutingHost {
   async events(): Promise<EventRecord[]> {
     const seen = new Set<string>();
     return (await this.rawEvents()).filter(e => { if (typeof e.id !== "string") return true; if (seen.has(e.id)) return false; seen.add(e.id); return true; });
+  }
+  /** The project and location directories of this host: the one the harness made, the base-configuration location, and every directory its events name (as the host spells them). */
+  async projectDirs(): Promise<string[]> {
+    const dirs = new Set<string>([this.project, path.join(this.root, "config", "opencode")]);
+    for (const e of await this.rawEvents()) for (const dir of [obj(e.location).directory, e.__instance]) if (typeof dir === "string" && dir !== "") dirs.add(dir);
+    return [...dirs];
   }
   async dump(): Promise<Obj | undefined> { return existsSync(this.logs.dump) ? obj(JSON.parse(await readFile(this.logs.dump, "utf8"))) : undefined; }
 
