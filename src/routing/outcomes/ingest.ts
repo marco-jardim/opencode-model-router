@@ -30,9 +30,11 @@ import {
   forgetDispatch,
   forgetDispatchesOf,
   lookupDispatch,
+  noteStepContext,
   sweepDispatches,
   touchDispatch,
 } from "../../router/sessions";
+import { stepContextTokens } from "../../escalate/variants";
 import type { DispatchRecord } from "../../router/sessions";
 import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
@@ -588,6 +590,13 @@ export function createIngest(deps: IngestDeps): Ingest {
         const data = event.data;
         const sessionID = data.sessionID;
         if (typeof sessionID !== "string") return;
+        // Phase 2.3 (D11): the delegate ladder decides resume vs fresh from the child's context size, in every engine
+        // mode, so this runs before the settings gate. It only updates the in-memory registry (nothing is written)
+        // and ignores children that are not registered.
+        if (!failed && lookupDispatch(sessionID) !== undefined) {
+          const context = stepContextTokens(isRecord(data.tokens) ? data.tokens : undefined);
+          if (context !== null) noteStepContext(sessionID, context, safeNow(now));
+        }
         const first = targetOf(sessionID);
         if (first === null) return;
         const tokens = isRecord(data.tokens) ? (data.tokens as unknown as StepEndedTokens) : undefined;

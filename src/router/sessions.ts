@@ -627,6 +627,8 @@ export interface DispatchRecord {
 interface DispatchSlot {
   record: DispatchRecord;
   lastTouch: number;
+  /** Context size of the child's largest step of this registration (D11), or null until a step is observed. */
+  stepTokens: number | null;
 }
 
 /** Hard bound on remembered children; the oldest registration is dropped first. */
@@ -673,7 +675,7 @@ export function rememberDispatch(
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
   dispatchRegistry.delete(childSessionID);
-  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs });
+  dispatchRegistry.set(childSessionID, { record, lastTouch: nowMs, stepTokens: null });
   while (dispatchRegistry.size > MAX_DISPATCH_RECORDS) {
     const oldest = dispatchRegistry.keys().next();
     if (oldest.done === true) break;
@@ -691,6 +693,26 @@ export function lookupDispatch(childSessionID: string): DispatchRecord | undefin
 export function touchDispatch(childSessionID: string, nowMs: number = Date.now()): void {
   const slot = dispatchRegistry.get(childSessionID);
   if (slot !== undefined) slot.lastTouch = nowMs;
+}
+
+/**
+ * Note the context size (D11: `input + cache.read + cache.write + output`) of a finished step of a registered
+ * child. Phase 2.3: the delegate ladder reads it to decide resume vs fresh, whatever the engine mode, so it is
+ * kept in memory here and never touches the disk. The largest value of the current registration wins: the
+ * context only grows within a child, a duplicate delivery of an older step cannot lower it, and after a
+ * compaction the larger number errs towards a fresh start. A re-registration (a resume, a ladder attempt)
+ * starts from null. An unregistered child, or a value that is not a finite number >= 0, is ignored.
+ */
+export function noteStepContext(childSessionID: string, tokens: number, nowMs: number = Date.now()): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined || typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return;
+  slot.stepTokens = slot.stepTokens === null ? tokens : Math.max(slot.stepTokens, tokens);
+  slot.lastTouch = nowMs;
+}
+
+/** The context size of the child's latest step of its current registration, or null (unknown, unregistered). */
+export function lastStepContext(childSessionID: string): number | null {
+  return dispatchRegistry.get(childSessionID)?.stepTokens ?? null;
 }
 
 /** Remove one child; true when it was registered. */

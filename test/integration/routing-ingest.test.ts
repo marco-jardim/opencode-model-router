@@ -34,8 +34,10 @@ import {
   dispatchCount,
   forgetDispatch,
   forgetDispatchesOf,
+  lastStepContext,
   lookupDispatch,
   MAX_DISPATCH_RECORDS,
+  noteStepContext,
   rememberDispatch,
   resetDispatchRegistry,
   sweepDispatches,
@@ -1198,5 +1200,90 @@ describe("throughput", () => {
     for (let i = 0; i < 10; i++) ingest.onExecutionEnded(`c${i}`);
     expect(h.store().keys()).toEqual([MEDIUM_KEY as OutcomeKey]);
     expect(h.store().cost(MEDIUM_KEY).tokens.n).toBeGreaterThan(0);
+  });
+});
+
+describe("last-step context for the delegate ladder (Phase 2.3, D11)", () => {
+  function stepWithTokens(id: string, sessionID: string, tokens: { input: number; output: number; cache?: { read?: number; write?: number } }): IngestEvent {
+    return {
+      id,
+      type: "session.step.ended",
+      data: { sessionID, assistantMessageID: `m-${id}`, finish: "tool-calls", cost: 0.01, tokens: { reasoning: 0, cache: { read: 0, write: 0 }, ...tokens } },
+    };
+  }
+
+  it("keeps input + cache.read + cache.write + output of a registered child's step, null before any step", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    expect(lastStepContext("c1")).toBeNull();
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 1000, output: 100, cache: { read: 400, write: 50 } }));
+    expect(lastStepContext("c1")).toBe(1550);
+  });
+
+  it("is noted in every engine mode: the settings gate (static) does not apply and nothing is written", async () => {
+    const h = harness();
+    h.settings = null; // routing.engine static
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 2000, output: 500 }));
+    expect(lastStepContext("c1")).toBe(2500);
+    expect(h.bundles).toHaveLength(0);
+    expect(readdirSync(h.dir)).toEqual([]);
+  });
+
+  it("ignores an unregistered session and a failed step", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    await ingest.onStepEnded(stepWithTokens("t1", "ghost", { input: 10, output: 1 }));
+    expect(lastStepContext("ghost")).toBeNull();
+    dispatch("c1");
+    await ingest.onStepEnded({ id: "f1", type: "session.step.failed", data: { sessionID: "c1", cost: 0.01, tokens: { input: 9000, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } } });
+    expect(lastStepContext("c1")).toBeNull();
+  });
+
+  it("the largest step of a registration wins, so a duplicate delivery of an older step cannot lower it", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 1000, output: 100 }));
+    await ingest.onStepEnded(stepWithTokens("t2", "c1", { input: 3000, output: 200 }));
+    await ingest.onStepEnded(stepWithTokens("t1-again", "c1", { input: 1000, output: 100 }));
+    expect(lastStepContext("c1")).toBe(3200);
+  });
+
+  it("a re-registration (a resume or a ladder attempt) starts from null again", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded(stepWithTokens("t1", "c1", { input: 5000, output: 100 }));
+    expect(lastStepContext("c1")).toBe(5100);
+    dispatch("c1"); // the same child, next attempt
+    expect(lastStepContext("c1")).toBeNull();
+    await ingest.onStepEnded(stepWithTokens("t2", "c1", { input: 6000, output: 100 }));
+    expect(lastStepContext("c1")).toBe(6100);
+  });
+
+  it("ignores malformed token payloads, and noteStepContext ignores non-finite, negative and unknown input", async () => {
+    const h = harness();
+    const ingest = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await ingest.onStepEnded({ id: "t1", type: "session.step.ended", data: { sessionID: "c1", cost: 0, tokens: { input: "many", output: 1 } } });
+    await ingest.onStepEnded({ id: "t2", type: "session.step.ended", data: { sessionID: "c1", cost: 0 } });
+    expect(lastStepContext("c1")).toBeNull();
+    noteStepContext("c1", Number.NaN);
+    noteStepContext("c1", -1);
+    noteStepContext("ghost", 10);
+    expect(lastStepContext("c1")).toBeNull();
+    expect(lastStepContext("ghost")).toBeNull();
+    noteStepContext("c1", 0);
+    expect(lastStepContext("c1")).toBe(0);
+  });
+
+  it("noting a step refreshes the idle stamp, so a long-running child is not swept", () => {
+    dispatch("c1");
+    noteStepContext("c1", 10, T0 + 3_000_000);
+    expect(sweepDispatches(T0 + 3_000_000 + 60_000, 3_600_000)).toBe(0);
+    expect(lookupDispatch("c1")).toBeDefined();
   });
 });
