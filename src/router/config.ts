@@ -2283,3 +2283,243 @@ export function resolveVerifyBudget(
     gateBudgetMs: own<number>("gateBudgetMs") ?? 90_000,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing helpers (#74)
+// ---------------------------------------------------------------------------
+
+/** The single log line of D1; also the exact text tests pin. */
+export const ROUTING_ENGINE_IGNORED_ON_V1 = "routing.engine ignored on OpenCode v1";
+
+/**
+ * D12: the roles applied on OpenCode v2 when `routing.roles` is not set. On v1
+ * the default is `{}` (D1). Setting `roles: {}` disables native candidates.
+ */
+export const DEFAULT_V2_ROLES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  search: Object.freeze(["explore"]),
+  implement: Object.freeze(["general"]),
+  debug: Object.freeze(["general"]),
+  review: Object.freeze(["general"]),
+});
+
+/**
+ * Every default of the `routing` block except `roles`, whose default depends on
+ * the host. `docs/CONFIG_REFERENCE.md` documents exactly these values and a
+ * test keeps the two in step.
+ */
+export const ROUTING_DEFAULTS = Object.freeze({
+  engine: "static" as RoutingEngine,
+  profile: "balanced" as RoutingProfile,
+  margin: 0.2,
+  minClassConfidence: 0.7,
+  detection: Object.freeze({ deterministic: 0.95, grader: 0.7, none: 0.3 }),
+  classifier: Object.freeze({
+    backend: "rules" as ClassifierBackend,
+    model: null,
+    baseUrl: null,
+    apiKeyEnv: null,
+    timeoutMs: 1500,
+    samples: 1 as 1 | 3,
+    maxStateChars: 2000,
+  }),
+  outcomes: Object.freeze({ path: null, halfLifeDays: 14, maxEffectiveSamples: 50 }),
+  sessionReuse: Object.freeze({ maxContextFraction: 0.6 }),
+  advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24 }),
+});
+
+export interface ResolvedClassifier {
+  readonly backend: ClassifierBackend;
+  readonly model: string | null;
+  readonly baseUrl: string | null;
+  readonly apiKeyEnv: string | null;
+  readonly timeoutMs: number;
+  readonly samples: 1 | 3;
+  readonly maxStateChars: number;
+  readonly presets: Readonly<Record<string, Readonly<ClassifierPresetOverride>>>;
+}
+
+/** What {@link resolveRouting} applied on top of the file, so `/router` can show it. */
+export interface RoutingApplied {
+  readonly host: RouterHost;
+  /** `routing.engine` as written (or the default), before the v1 coercion. */
+  readonly requestedEngine: RoutingEngine;
+  /** True when the engine was forced to `static` because the host is v1. */
+  readonly engineCoerced: boolean;
+  /** `configured`: `routing.roles` was set; `default`: the D12 v2 default; `none`: v1 without roles. */
+  readonly rolesSource: "configured" | "default" | "none";
+}
+
+/** A fully populated, deeply frozen view of `routing` for one host. */
+export interface ResolvedRouting {
+  /** The effective engine: `static` on v1 whatever the file says (D1). */
+  readonly engine: RoutingEngine;
+  readonly profile: RoutingProfile;
+  readonly margin: number;
+  readonly minClassConfidence: number;
+  readonly detection: Readonly<Required<DetectionConfig>>;
+  readonly classifier: ResolvedClassifier;
+  /** Class → ordered, de-duplicated agent ids. */
+  readonly roles: Readonly<Record<string, readonly string[]>>;
+  readonly outcomes: Readonly<{ path: string | null; halfLifeDays: number; maxEffectiveSamples: number }>;
+  readonly sessionReuse: Readonly<Required<SessionReuseConfig>>;
+  readonly advisor: Readonly<Required<AdvisorConfig>>;
+  readonly applied: RoutingApplied;
+}
+
+let warnedEngineIgnoredOnV1 = false;
+
+/** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
+export function resetRoutingWarnings(): void {
+  warnedEngineIgnoredOnV1 = false;
+}
+
+/** Roles as fresh, de-duplicated, frozen arrays; never aliases the config. */
+function freezeRoles(
+  roles: Readonly<Record<string, readonly string[]>>,
+): Readonly<Record<string, readonly string[]>> {
+  const out: Record<string, readonly string[]> = {};
+  for (const [taskClass, agents] of Object.entries(roles)) {
+    out[taskClass] = Object.freeze([...new Set(agents)]);
+  }
+  return Object.freeze(out);
+}
+
+/**
+ * The single place the `routing` defaults are applied. Pure apart from the
+ * once-per-process notice below, and never mutates `cfg`.
+ *
+ * - `host: "v2"` applies the D12 default for `roles` when the key is absent.
+ * - `host: "v1"` forces `engine` to `static` (D1) and defaults `roles` to `{}`;
+ *   an explicit `routing.roles` is kept (the text-only v1 opt-in).
+ *
+ * The coercion is reported once per process through `logger` (its console
+ * fallback adds the `[model-router]` prefix) or, without one, `console.warn`.
+ */
+export function resolveRouting(
+  cfg: RouterConfig | undefined,
+  host: RouterHost,
+  logger?: Pick<PluginLogger, "warn">,
+): ResolvedRouting {
+  const r: RoutingConfig = cfg?.routing ?? {};
+  const d = ROUTING_DEFAULTS;
+  const requestedEngine = r.engine ?? d.engine;
+  const engineCoerced = host === "v1" && requestedEngine !== "static";
+  if (engineCoerced && !warnedEngineIgnoredOnV1) {
+    warnedEngineIgnoredOnV1 = true;
+    if (logger) logger.warn(ROUTING_ENGINE_IGNORED_ON_V1);
+    else console.warn(`[model-router] ${ROUTING_ENGINE_IGNORED_ON_V1}`);
+  }
+
+  const c: ClassifierConfig = r.classifier ?? {};
+  const presets: Record<string, Readonly<ClassifierPresetOverride>> = {};
+  for (const [name, override] of Object.entries(c.presets ?? {})) {
+    presets[name] = Object.freeze({ ...override });
+  }
+
+  const rolesSource: RoutingApplied["rolesSource"] =
+    r.roles !== undefined ? "configured" : host === "v2" ? "default" : "none";
+  const roles = freezeRoles(r.roles ?? (host === "v2" ? DEFAULT_V2_ROLES : {}));
+
+  return Object.freeze({
+    engine: host === "v1" ? "static" : requestedEngine,
+    profile: r.profile ?? d.profile,
+    margin: r.margin ?? d.margin,
+    minClassConfidence: r.minClassConfidence ?? d.minClassConfidence,
+    detection: Object.freeze({
+      deterministic: r.detection?.deterministic ?? d.detection.deterministic,
+      grader: r.detection?.grader ?? d.detection.grader,
+      none: r.detection?.none ?? d.detection.none,
+    }),
+    classifier: Object.freeze({
+      backend: c.backend ?? d.classifier.backend,
+      model: c.model ?? d.classifier.model,
+      baseUrl: c.baseUrl ?? d.classifier.baseUrl,
+      apiKeyEnv: c.apiKeyEnv ?? d.classifier.apiKeyEnv,
+      timeoutMs: c.timeoutMs ?? d.classifier.timeoutMs,
+      samples: c.samples ?? d.classifier.samples,
+      maxStateChars: c.maxStateChars ?? d.classifier.maxStateChars,
+      presets: Object.freeze(presets),
+    }),
+    roles,
+    outcomes: Object.freeze({
+      path: r.outcomes?.path ?? d.outcomes.path,
+      halfLifeDays: r.outcomes?.halfLifeDays ?? d.outcomes.halfLifeDays,
+      maxEffectiveSamples: r.outcomes?.maxEffectiveSamples ?? d.outcomes.maxEffectiveSamples,
+    }),
+    sessionReuse: Object.freeze({
+      maxContextFraction: r.sessionReuse?.maxContextFraction ?? d.sessionReuse.maxContextFraction,
+    }),
+    advisor: Object.freeze({
+      enabled: r.advisor?.enabled ?? d.advisor.enabled,
+      noticeIntervalHours: r.advisor?.noticeIntervalHours ?? d.advisor.noticeIntervalHours,
+    }),
+    applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
+  });
+}
+
+/**
+ * The classifier settings that apply while `presetName` is the active preset:
+ * the top-level block with that preset's `backend` / `model` override on top.
+ * Preset names match exactly, as written under `routing.classifier.presets`.
+ */
+export function resolveClassifierForPreset(
+  classifier: ResolvedClassifier,
+  presetName: string,
+): ResolvedClassifier {
+  const override = Object.hasOwn(classifier.presets, presetName)
+    ? classifier.presets[presetName]
+    : undefined;
+  if (override === undefined) return classifier;
+  return Object.freeze({
+    ...classifier,
+    backend: override.backend ?? classifier.backend,
+    model: override.model !== undefined ? override.model : classifier.model,
+  });
+}
+
+/**
+ * `enforcement.escalate.variantSteps` for one host: `auto` by default, and
+ * always `none` on v1, where variant steps do not exist (D1).
+ */
+export function resolveVariantSteps(cfg: RouterConfig | undefined, host: RouterHost): VariantStepsMode {
+  if (host === "v1") return "none";
+  return cfg?.enforcement?.escalate?.variantSteps ?? "auto";
+}
+
+/** One rung of a tier's ladder, fully resolved. */
+export interface ResolvedCandidate {
+  readonly model: string;
+  /** Absent = the model's default variant. */
+  readonly variant?: string;
+  readonly costRatio: number;
+}
+
+const NO_CANDIDATES: readonly ResolvedCandidate[] = Object.freeze([]);
+
+/**
+ * The ladder of rungs for `tierName` in the active preset (D10, D12).
+ *
+ * Without `candidates` (or with an empty list) it is exactly one rung: the
+ * tier's own `(model, variant, costRatio)`. With `candidates` it is those
+ * entries, in order, each completed from the tier: `model` and `costRatio`
+ * are inherited when omitted, `variant` is not. An unknown tier yields an
+ * empty ladder. Never throws.
+ */
+export function resolveCandidates(tierName: string, cfg: RouterConfig): readonly ResolvedCandidate[] {
+  const presetName = resolvePresetName(cfg, cfg.activePreset);
+  const preset = presetName !== undefined && Object.hasOwn(cfg.presets, presetName) ? cfg.presets[presetName] : undefined;
+  const tier = preset !== undefined && Object.hasOwn(preset, tierName) ? preset[tierName] : undefined;
+  if (tier === undefined) return NO_CANDIDATES;
+
+  const tierCostRatio = tier.costRatio ?? (TIER_DEFAULTS[tierName] ?? FALLBACK_TIER_DEFAULTS).costRatio;
+  const rung = (model: string, variant: string | undefined, costRatio: number): ResolvedCandidate =>
+    Object.freeze(variant === undefined ? { model, costRatio } : { model, variant, costRatio });
+
+  const listed = tier.candidates;
+  if (listed === undefined || listed.length === 0) {
+    return Object.freeze([rung(tier.model, tier.variant, tierCostRatio)]);
+  }
+  return Object.freeze(
+    listed.map((c) => rung(c.model ?? tier.model, c.variant, c.costRatio ?? tierCostRatio)),
+  );
+}
