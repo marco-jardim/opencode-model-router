@@ -18,7 +18,7 @@ Issue #73 suggested giving the project's custom agents to a routing service ("je
 
 The host (OpenCode `v2.0.22`) made this possible: a plugin may reassign the `subagent` tool input in `execute.before`; a child can be **resumed** with a different `model#variant` (history kept); every step publishes a durable `session.step.ended` with cost and tokens, children included; native agents carry their own models and permissions.
 
-The record below describes the shipped implementation. Decisions D1–D18 are the plan's; the amendments (A1–A30) that the phase spikes and the adversarial QA rounds made binding are folded into each decision and listed in the [amendment index](#amendment-index).
+The record below describes the shipped implementation. Decisions D1–D18 are the plan's; the amendments (A1–A33) that the phase spikes and the adversarial QA rounds made binding are folded into each decision and listed in the [amendment index](#amendment-index).
 
 ## Decision
 
@@ -56,7 +56,7 @@ For a class whose static tier is `t0`: a candidate of the same rank starts at `B
 
 ### D9 — The margin rule for `enforce`
 
-The engine replaces the orchestrator's choice only if `C(best) < (1 − margin) · C(chosen)` (**strict**, A16), the class confidence is at least `minClassConfidence`, the candidate's **evaluated** permissions cover the task's `needs` (A11), the candidate is not below `floorTier`, and the dispatch is not pinned. Never down on high risk without detection. A23: `best` is drawn only from candidates that pass the permission, floor and never-down filters; below `minClassConfidence` the kernel does not read the store. **A24/A27, the evidence gate:** a candidate is eligible as `best` only with at least 5 recorded outcomes for the class, or if it ranks strictly above the orchestrator's pick; the gate filters the candidates **before** the argmin (the earlier single-argmin-then-gate rule left `enforce` inert for 4 of 8 classes under the default roles), and the unfiltered argmin is logged in `trace.argmin`. **A30:** a dispatch that resumes an existing child is never switched in any mode; a resume never moves the child from where it runs because of the router (reason `kept:resume:running` when the arguments are rewritten to the running agent), and `routing:stats` keeps resumes out of every routing metric. **Floor lifts:** in `enforce` a native `subagent` dispatch below `floorTier` is lifted to the floor tier (reason prefix `lift:floor`); that is policy, counted on its own line and not in D17.
+The engine replaces the orchestrator's choice only if `C(best) < (1 − margin) · C(chosen)` (**strict**, A16), the class confidence is at least `minClassConfidence`, the candidate's **evaluated** permissions cover the task's `needs` (A11), the candidate is not below `floorTier`, and the dispatch is not pinned. Never down on high risk without detection. A23: `best` is drawn only from candidates that pass the permission, floor and never-down filters; below `minClassConfidence` the kernel does not read the store. **A24/A27, the evidence gate:** a candidate is eligible as `best` only with at least 5 **effective** outcomes on its own key for the class (recorded outcomes decayed by `routing.outcomes.halfLifeDays` and capped at `maxEffectiveSamples`), or if it ranks strictly above the orchestrator's pick; the gate filters the candidates **before** the argmin (the earlier single-argmin-then-gate rule left `enforce` inert for 4 of 8 classes under the default roles), and the unfiltered argmin is logged in `trace.argmin`. **A30:** a dispatch that resumes an existing child is never switched by the engine in any mode (`switched: false`, reason `kept:resume`); a resume never moves the child from where it runs because of the router (reason `kept:resume:running` when the arguments are rewritten to the running agent), and `routing:stats` keeps resumes out of every routing metric. The one exception is policy, not the engine: in `enforce`, a resume that names a different agent on purpose is honoured, and is lifted to `floorTier` when it would fall below it, which is a floor lift (`switched: true`, reason `lift:floor`). **Floor lifts:** in `enforce` a native `subagent` dispatch below `floorTier` is lifted to the floor tier (reason prefix `lift:floor`); that is policy, counted on its own line and not in D17.
 
 ### D10 — Variant steps before model steps, on the same session
 
@@ -76,7 +76,7 @@ The orchestrator (or `/annotate-plan`) may put one line `[route class=<c> risk=<
 
 ### D14 — Classifier state is bounded, scrubbed and English
 
-A model backend receives the description, the first `[acceptance]` block and at most `maxStateChars` characters of the prompt head, with route, `CAP:` and `VERIFY:` lines removed and code blocks replaced by a placeholder. Never file contents, never the system prompt, never session history. Secrets are scrubbed first; a task that names a credential, or that the scrubber redacted, never reaches a backend (`trace.backendSkipped = "credentials"`). Instructions are English, the options include `other`/`unknown`, the order is shuffled per call, and a disagreement between two orders lowers the confidence to 0. A18: the classifier keys and `outcomes.path` are honoured only from the bundled file and the global override, never from a project-local override, and a key is never sent over plain `http:` to a non-loopback host.
+A model backend receives the description, the first `[acceptance]` block and at most `maxStateChars` characters of the prompt head, with route, `CAP:` and `VERIFY:` lines removed and code blocks replaced by a placeholder. Never file contents, never the system prompt, never session history. Secrets are scrubbed first; a task that names a credential (a credential word such as `password`, `secret` or `token`, an env-style name, a `.env` file, a PEM header), or that the scrubber redacts by shape, never reaches a backend (`trace.backendSkipped = "credentials"`); a redaction that is only an entropy guess (a hash, a long identifier) does not skip the backend, and the redacted state is sent. Instructions are English, the options include `other`/`unknown`, the order is shuffled per call, and a disagreement between two orders lowers the confidence to 0. A18: the classifier keys and `outcomes.path` are honoured only from the bundled file and the global override, never from a project-local override, and a key is never sent over plain `http:` to a non-loopback host.
 
 ### D15 — Persistence is bounded, atomic and off the hot path
 
@@ -109,10 +109,13 @@ The plan (§1.5, "Amended during implementation") holds the full text of each am
 | A9, A17, A17a, A20, A21 | D10 | The variant ladder's invariants and the order of `nextAction`. |
 | A11 | D9, D12 | Permissions are read from the agent's evaluated rules. |
 | A15 | D2, D10 | `variantSteps` default depends on the presence of a `routing` block. |
-| A16, A23, A24, A25, A27, A30 | D8, D9 | Strict margin, the kernel's filters and evidence gate, the runner simulation, resumes never switched. |
+| A16, A23, A24, A25, A27, A30 | D8, D9 | Strict margin, the kernel's filters and evidence gate, the runner simulation, resumes never switched by the engine (a floor-lifted resume is the policy exception). |
 | A18, A19 | D14, D4 | Project-local files cannot set the classifier; a backend label cannot invent a class. |
 | A22, A26 | D13 | The route line is the first line only; heavy steps are pinned. |
 | A28 | D1 | The v1 text-only roles line. |
+| A31 | D18, F4 | The cost doctor has no `summary` finding; `title-model-unset` follows the host's own title pick; acceptance criterion 8 is reworded. |
+| A32 | D18, F4 | Advisor notices are a synthetic transcript entry one user turn late, throttled per project with a weekly reminder. |
+| A33 | D10, F4 | `maxAttemptsPerTier: 1` does not escalate straight away (one retry of the same rung comes first); the `attempts-without-variants` finding is reworded. |
 
 ## Findings (evidence)
 
@@ -132,7 +135,7 @@ The decisions above rest on spikes run against OpenCode `2.0.22` before any code
 
 - **More state on disk.** An outcome store and a decision log (up to 5 MiB, 3 rotated generations) under the temp-directory trajectory folder, plus a small notice state per project when the engine is `advise` or `enforce`.
 - **More configuration** (`routing.*`, `tiers.<t>.candidates`, `variantSteps`), all optional and defaulted. Any `routing` block, however small, enables variant steps on v2 and activates the cost doctor.
-- **`enforce` is inert until there is evidence.** The evidence gate (A24/A27) means no dispatch moves down or sideways on priors, so a fresh install under `enforce` behaves like `static` until the scoreboard fills. That is deliberate.
+- **`enforce` is inert until there is evidence.** The evidence gate (A24/A27) means nothing moves down or sideways on priors; upward switches and floor lifts still occur, so a fresh install under `enforce` is not a copy of `static`, but its cost-saving moves wait until the scoreboard fills. That is deliberate.
 - **The scoreboard only sees what is dispatched.** There is no exploration: an unevidenced cheaper rung gets its first outcomes only when something puts work there. Exploration is future work.
 - **Blind spots.** Deferred verification and `router_verify` verdicts are not recorded. Below-threshold dispatches record no outcomes, so with the rules classifier a share of dispatches never teaches the scoreboard.
 - **The rules classifier is crude on long briefs.** Backends (`host`, `openai-compatible`, `typesafe`) can help but send bounded task text off the machine.
