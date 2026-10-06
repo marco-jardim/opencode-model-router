@@ -468,7 +468,7 @@ const attemptsWithoutVariants: Check = ({ cfg }) => {
     id: "attempts-without-variants",
     severity: "info",
     subject: "",
-    message: "enforcement.escalate.maxAttemptsPerTier is 1 and variantSteps is none: a failed verification escalates straight to the next, more expensive tier. Turn variant steps on (a `routing` block makes the default `auto`) or allow a second attempt per tier.",
+    message: "enforcement.escalate.maxAttemptsPerTier is 1 and variantSteps is none: a failed verification re-runs the same rung once in a fresh child, then escalates to the next, more expensive tier; variant steps would retry a higher variant on the same session first. Turn variant steps on (a `routing` block makes the default `auto`) or allow another attempt per tier.",
     snippet: json({ enforcement: { escalate: { variantSteps: "auto" } } }),
   }];
 };

@@ -350,6 +350,11 @@ describe("cost doctor: variant ladders", () => {
   it("attempts-without-variants fires with variantSteps none and one attempt per tier, and clears otherwise", () => {
     const none = cfgOf({ preset: "tst", presets: { tst: OWNER }, escalate: { variantSteps: "none", maxAttemptsPerTier: 1 } });
     expect(find(runAdvisor(none, noHost, CATALOG), "attempts-without-variants")?.snippet).toBe(JSON.stringify({ enforcement: { escalate: { variantSteps: "auto" } } }));
+    // QA-3.1-5 (A33): one attempt per tier does NOT mean "escalate straight away": the ladder re-runs the same rung once first.
+    const message = find(runAdvisor(none, noHost, CATALOG), "attempts-without-variants")?.message ?? "";
+    expect(message).toContain("re-runs the same rung once in a fresh child, then escalates");
+    expect(message).toContain("variant steps would retry a higher variant on the same session");
+    expect(message).not.toContain("escalates straight");
     const twice = cfgOf({ preset: "tst", presets: { tst: OWNER }, escalate: { variantSteps: "none", maxAttemptsPerTier: 2 } });
     expect(find(runAdvisor(twice, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
     const auto = cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: {} });
