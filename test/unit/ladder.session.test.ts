@@ -393,7 +393,9 @@ describe("buildEscalatePolicy with session input", () => {
     expect(ladder.variants).toEqual(["medium", "max"]);
     expect(ladder.source).toBe("candidates");
     expect(ladder.rejected).toEqual(["turbo"]);
-    const notArray = { model: SONNET, candidates: { variant: "max" } };
+    // A hand-edited tiers.json can hold a non-array `candidates`; parsed JSON is untyped at runtime
+    // (same pattern as the malformed-tier fixture below), so the fixture is built via JSON.parse.
+    const notArray = JSON.parse(`{"model":"${SONNET}","candidates":{"variant":"max"}}`) as TierConfig;
     expect(buildEscalatePolicy(makeConfig({ fast: notArray }), V2).variants!.perTier.fast!.ladder.source).toBe("catalog");
   });
 

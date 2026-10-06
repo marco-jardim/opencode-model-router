@@ -1,5 +1,11 @@
 import { effortCeilingFor, effortRank, minEffort, nextEffort } from "../router/agent-options";
-import { resolveEffortBump, type EffortLevel, type RouterConfig, type TierConfig } from "../router/config";
+import {
+  resolveEffortBump,
+  type EffortLevel,
+  type RouterConfig,
+  type TierCandidate,
+  type TierConfig,
+} from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import {
   DEFAULT_VARIANT,
@@ -597,7 +603,7 @@ function validCostRatio(value: unknown): number | undefined {
  */
 function rungCostRatios(
   tier: TierConfig,
-  rawCandidates: unknown,
+  rawCandidates: readonly TierCandidate[] | undefined,
   base: string,
   ladder: VariantLadder,
 ): Record<string, number> {
@@ -656,14 +662,16 @@ function buildVariantPolicy(
     // the effort path only, with or without a `variant`, and gets an empty variant ladder; it still
     // carries its model, base and budget.
     const effortConfigured = tier.effort !== undefined || tier.thinking !== undefined || tier.reasoning !== undefined;
-    const raw = (tier as { candidates?: unknown }).candidates; // raw config, never resolveCandidates() (F11)
+    // Membership comes from the tier's own typed list (F11); ignored lists are already deleted at load
+    // (QA-1.1-30). The Array.isArray guard stays for configs built without going through load.
+    const raw: readonly TierCandidate[] | undefined = Array.isArray(tier.candidates) ? tier.candidates : undefined;
     const base = configured ?? DEFAULT_VARIANT;
     const ladder = effortConfigured
       ? buildVariantLadder({ model: tier.model, catalog: null })
       : buildVariantLadder({
           model: tier.model,
           catalog: entry,
-          candidates: Array.isArray(raw) ? raw : undefined,
+          candidates: raw,
           maxEffort: max,
         });
     entries.push([name, {
