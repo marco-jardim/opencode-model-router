@@ -12,6 +12,7 @@ import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink } from
 import { isAbsolute, join, normalize, resolve } from "node:path";
 import type {
   DecisionRow,
+  DecisionTrace,
   FlusherDeps,
   ForeignCheck,
   FlusherOptions,
@@ -263,6 +264,30 @@ function readChoice(x: unknown): RouteChoice | null {
   return { key, agent, origin, model, variant };
 }
 
+/** A trace is optional and cosmetic: a malformed one is dropped, never a reason to lose the row. */
+function readTrace(x: unknown): DecisionTrace | undefined {
+  if (!isRec(x) || !isRec(x.routeLines)) return undefined;
+  const { count, conflict, edgeOnly } = x.routeLines;
+  if (!isFiniteNum(count) || typeof conflict !== "boolean" || typeof edgeOnly !== "boolean") return undefined;
+  let backend: DecisionTrace["backend"] = null;
+  if (x.backend !== null && x.backend !== undefined) {
+    const b = x.backend;
+    if (!isRec(b) || typeof b.id !== "string" || typeof b.status !== "string" || !isFiniteNum(b.latencyMs)) return undefined;
+    backend = {
+      id: b.id,
+      status: b.status,
+      latencyMs: b.latencyMs,
+      ...(typeof b.label === "string" ? { label: b.label } : {}),
+      ...(b.rejected === true ? { rejected: true as const } : {}),
+      ...(b.disagrees === true ? { disagrees: true as const } : {}),
+    };
+  }
+  return {
+    routeLines: { count, conflict, edgeOnly },
+    backend,
+    ...(x.backendSkipped === "credentials" ? { backendSkipped: "credentials" as const } : {}),
+  };
+}
 function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {
   return LADDER_STEP_KINDS.find((kind) => kind === x) ?? null;
 }
@@ -335,6 +360,7 @@ export function parseLogLine(line: string): LogRow | null {
     Object.entries(costs).filter((entry): entry is [string, number] => isFiniteNum(entry[1])),
   );
 
+  const trace = readTrace(json.trace);
   const row: DecisionRow = {
     v: LOG_ROW_VERSION,
     kind,
@@ -354,6 +380,7 @@ export function parseLogLine(line: string): LogRow | null {
     reason,
     step,
     resume,
+    ...(trace === undefined ? {} : { trace }),
   };
   return row;
 }

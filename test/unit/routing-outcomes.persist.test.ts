@@ -878,6 +878,23 @@ describe("parseLogLine", () => {
     expect(parsed).not.toHaveProperty("futureField");
   });
 
+  it("keeps a well-formed classifier trace on a decision row (2.2) and drops a malformed one without losing the row", () => {
+    const trace = {
+      routeLines: { count: 2, conflict: true, edgeOnly: false },
+      backend: { id: "host", status: "disagree", latencyMs: 12, label: "debug", disagrees: true as const },
+      backendSkipped: "credentials" as const,
+    };
+    expect(roundTrip(decisionRow(1, { trace }))).toEqual(decisionRow(1, { trace }));
+    expect(roundTrip(decisionRow(2, { trace: { routeLines: { count: 0, conflict: false, edgeOnly: false }, backend: null } }))?.kind).toBe("decision");
+    const noTrace = roundTrip(decisionRow(3));
+    expect(noTrace).not.toHaveProperty("trace");
+    for (const bad of [{ routeLines: { count: "1" } }, { routeLines: { count: 1, conflict: false, edgeOnly: false }, backend: { id: 1 } }, "x"]) {
+      const parsed = parseLogLine(JSON.stringify({ ...decisionRow(4), trace: bad }));
+      expect(parsed?.kind).toBe("decision");
+      expect(parsed).not.toHaveProperty("trace");
+    }
+  });
+
   const base = (): Record<string, unknown> => JSON.parse(JSON.stringify(decisionRow(1))) as Record<string, unknown>;
   const verdictBase = (): Record<string, unknown> => JSON.parse(JSON.stringify(verdictRow(1))) as Record<string, unknown>;
   const mutate = (source: () => Record<string, unknown>, change: (r: Record<string, unknown>) => void): string => {

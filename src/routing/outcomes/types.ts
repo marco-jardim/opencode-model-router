@@ -472,6 +472,23 @@ interface LogRowBase {
   readonly sessionID: string;
 }
 
+/**
+ * What the classifier saw for one dispatch (1.2 `ClassifyTrace`, trimmed to what the log needs): how many route lines the
+ * prompt carried, and what the model backend did. Optional: ladder-attempt rows have none.
+ */
+export interface DecisionTrace {
+  readonly routeLines: { readonly count: number; readonly conflict: boolean; readonly edgeOnly: boolean };
+  readonly backend: {
+    readonly id: string;
+    readonly status: string;
+    readonly latencyMs: number;
+    readonly label?: string;
+    readonly rejected?: true;
+    readonly disagrees?: true;
+  } | null;
+  readonly backendSkipped?: "credentials";
+}
+
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */
 export interface DecisionRow extends LogRowBase {
   readonly kind: "decision";
@@ -497,6 +514,8 @@ export interface DecisionRow extends LogRowBase {
   readonly step: LadderStepKind;
   /** The attempt reuses an existing child session (D11 resume, or a `sessionID`/`task_id` dispatch). */
   readonly resume: boolean;
+  /** Classifier trace of a routed dispatch (2.2; Phase 1.2 handoff): route-line count/conflict and the backend outcome. */
+  readonly trace?: DecisionTrace;
 }
 
 export interface VerdictRow extends LogRowBase {
