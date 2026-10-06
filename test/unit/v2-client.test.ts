@@ -366,7 +366,7 @@ describe("native v2 child runner", () => {
       load.mockRestore();
       vi.unstubAllEnvs();
     }
-  });
+  }, 20_000); // runs the real delegate against the repository checkout (git snapshot): 0.8 s alone, over 5 s in a 70-file parallel run
 });
 
 describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
