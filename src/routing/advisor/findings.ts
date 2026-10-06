@@ -38,6 +38,7 @@ export const FINDING_IDS = [
   "variant-not-offered",
   "effort-not-offered",
   "variant-effort",
+  "effort-variant-mismatch",
   "rejected-candidates",
   "foreign-candidates",
   "covered-tier",
@@ -62,6 +63,7 @@ export const FINDING_TARGET: Readonly<Record<FindingId, FindingTarget>> = {
   "variant-not-offered": "router",
   "effort-not-offered": "router",
   "variant-effort": "router",
+  "effort-variant-mismatch": "router",
   "rejected-candidates": "router",
   "foreign-candidates": "router",
   "covered-tier": "router",
@@ -382,6 +384,33 @@ const variantWithEffort: Check = ({ cfg, byRef }) => {
   return findings;
 };
 
+/**
+ * QA-3.2 (O-32-5, measured on the real OpenCode 2.0.22 host in Phase 3.2): a tier that sets `variant` AND a different `effort` runs the EFFORT
+ * on the wire (the agent's effort option wins over the stored variant: the child is stored `#medium` while the request carries `xhigh`), but
+ * the outcome keys, the decision rows and `routing:stats` name the VARIANT. The evidence is then filed under a rung that is not what ran.
+ * Only while the engine records anything (`routing.engine` is not `static`). `variant-effort` is a different finding (the tier has no variant steps).
+ */
+const effortVariantMismatch: Check = ({ cfg, byRef }) => {
+  if (resolveRouting(cfg, "v2").engine === "static") return [];
+  const findings: RawFinding[] = [];
+  for (const [name, tier] of activeTierEntries(cfg)) {
+    if (typeof tier.variant !== "string" || tier.variant === "" || typeof tier.effort !== "string" || tier.effort === tier.variant) continue;
+    const entry = byRef?.get(tier.model);
+    const ids = entry === undefined ? null : catalogVariantIds(entry);
+    const offered = ids === null || ids.includes(tier.effort);
+    findings.push({
+      id: "effort-variant-mismatch",
+      severity: "warning",
+      subject: name,
+      message: `Tier ${name} sets variant ${tier.variant} but effort ${tier.effort}: the request runs effort ${tier.effort} (the agent's effort option wins over the stored variant), while the outcome keys, the decision rows and routing:stats name ${tier.model}#${tier.variant}, so what this tier learns is filed under a rung that is not what runs. Make them agree: ${
+        offered ? `set variant to ${tier.effort} (snippet), or ` : ""
+      }drop the effort setting.`,
+      snippet: offered ? json({ presets: { [cfg.activePreset]: { [name]: { variant: tier.effort } } } }) : null,
+    });
+  }
+  return findings;
+};
+
 /** The variant steps a tier takes from its base, in order (the ladder itself also lists the base and the rungs below it). */
 function stepsFrom(ladder: VariantLadder, base: string): string[] {
   const steps: string[] = [];
@@ -578,6 +607,7 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["title-model", titleModel],
   ["ladder-catalog", ladderCatalog],
   ["variant-effort", variantWithEffort],
+  ["effort-variant", effortVariantMismatch],
   ["variant-ladders", variantLadders],
   ["attempts", attemptsWithoutVariants],
   ["pricing", pricing],
@@ -595,6 +625,7 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
  */
 const CONFIG_SHAPE: ReadonlySet<FindingId> = new Set<FindingId>([
   "variant-effort",
+  "effort-variant-mismatch",
   "rejected-candidates",
   "foreign-candidates",
   "covered-tier",

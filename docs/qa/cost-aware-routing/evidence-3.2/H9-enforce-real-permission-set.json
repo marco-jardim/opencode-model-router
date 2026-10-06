@@ -1,0 +1,426 @@
+{
+  "scenario": "H9-enforce-real-permission-set",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:30:51.953Z",
+  "harness": {
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "With a root session that only carries `subagent * allow` (so the native `build` agent's own rules decide everything else) the heavy -> fast swap still happens; with `subagent fast` denied for the session the engine does NOT swap to fast (the host would refuse the dispatch): the child runs a permitted agent and no `Subagent denied` error occurs. The host's evaluated permissions of build/fast/heavy/explore are recorded.",
+  "observed": {
+    "agentPermissions": [
+      {
+        "id": "build",
+        "mode": "primary",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "question",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      },
+      {
+        "id": "explore",
+        "mode": "subagent",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "deny"
+          },
+          {
+            "action": "grep",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "glob",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "webfetch",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "websearch",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "read",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "subagent",
+            "resource": "*",
+            "effect": "deny"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      },
+      {
+        "id": "fast",
+        "mode": "subagent",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      },
+      {
+        "id": "medium",
+        "mode": "subagent",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      },
+      {
+        "id": "heavy",
+        "mode": "subagent",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      }
+    ],
+    "openSession": {
+      "rootID": "ses_eec72387fffes4TCkYk6KHti9g",
+      "rules": [
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "allow"
+        }
+      ],
+      "childID": "ses_eec7236caffeO3wWS0AYTSEQIr",
+      "hostChild": {
+        "agent": "fast",
+        "model": "anthropic/claude-sonnet-5-5#low"
+      }
+    },
+    "deniedSession": {
+      "rootID": "ses_eec7235a0ffezfOm6LW7mQijrp",
+      "status": "completed",
+      "hookInput": {
+        "agent": "heavy"
+      },
+      "childID": "ses_eec723516ffevViEsv6iEV5hK5",
+      "hostChild": {
+        "agent": "heavy",
+        "model": "anthropic/claude-opus-5-5#xhigh"
+      }
+    },
+    "rows": [
+      {
+        "session": "open",
+        "chosen": "heavy",
+        "best": "fast",
+        "switched": true,
+        "reason": "switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=16.1525 ratio"
+      },
+      {
+        "session": "fast-denied",
+        "chosen": "heavy",
+        "best": "heavy",
+        "switched": false,
+        "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0274 usd)"
+      }
+    ],
+    "hostErrors": [],
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: subagent-allow-only session: heavy -> fast/anthropic/claude-sonnet-5-5#low; fast-denied session: dispatch completed, child agent heavy, row switched=false (kept:best-is-chosen: the chosen dispatch is the cheapest (0.0274 usd))",
+  "notes": []
+}

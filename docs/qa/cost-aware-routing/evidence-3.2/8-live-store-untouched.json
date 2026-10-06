@@ -1,0 +1,54 @@
+{
+  "scenario": "8-live-store-untouched",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:31:12.600Z",
+  "harness": {
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl and no `ses_<id>.scorecard.log` it gained or grew names a session of this run (ids from every host's own session.created events). The user's config files are unchanged.",
+  "observed": {
+    "snapshotTakenAt": "2026-10-06T23:26:09.227Z",
+    "liveStore": {
+      "dir": "<tmpdir>/opencode-model-router-trajectory",
+      "filesBefore": 14003,
+      "filesAfter": 14005,
+      "bytesBefore": 4649334,
+      "bytesAfter": 4653420,
+      "added": 2,
+      "addedNonSession": [],
+      "removed": [],
+      "grownFiles": [
+        "decisions.jsonl",
+        "outcomes.json"
+      ],
+      "grownSessionFiles": 0
+    },
+    "liveScorecards": {
+      "addedOrGrown": 2,
+      "namingASessionOfThisRun": 0
+    },
+    "liveDecisionsLog": {
+      "appendedRows": 3,
+      "rowsNamingASessionOfThisRun": 0,
+      "sessionsOfThisRunSeen": 50
+    },
+    "liveConfig": {
+      "dir": "~/.config/opencode",
+      "fileCount": 30,
+      "changedSinceSnapshot": [],
+      "routerFilesUnchanged": [
+        "opencode.json",
+        "opencode-model-router.overrides.jsonc",
+        "opencode-model-router.state.json"
+      ]
+    }
+  },
+  "assertionResult": "PASS: live store 14003 -> 14005 files (+2 new, 2 of them ses_ scorecards, non-ses_ new: none); 3 row(s) appended to the live decisions.jsonl, 0 naming a session of this run, 2 scorecard(s) added or grown, 0 naming one (50 sessions of this run seen); config files changed: none",
+  "notes": []
+}

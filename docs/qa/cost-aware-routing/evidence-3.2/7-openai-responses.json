@@ -1,0 +1,287 @@
+{
+  "scenario": "7-openai-responses",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:29:45.408Z",
+  "harness": {
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "(HOST EMISSION ONLY: what the host sends to a scripted Responses provider; acceptance by api.openai.com is not verified.) The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.",
+  "observed": {
+    "openaiModelsWithVariants": [
+      "gpt-6.1-sol: low/medium/high/xhigh/max",
+      "gpt-6.1-sol-fast: low/medium/high/xhigh/max",
+      "gpt-6.1-sol-pro: low/medium/high/xhigh/max",
+      "gpt-6-luna: none/low/medium/high/xhigh/max",
+      "gpt-6-luna-fast: none/low/medium/high/xhigh/max",
+      "gpt-6-luna-pro: none/low/medium/high/xhigh/max",
+      "gpt-6-sol: none/low/medium/high/xhigh/max",
+      "gpt-6-sol-fast: none/low/medium/high/xhigh/max",
+      "gpt-6-sol-pro: none/low/medium/high/xhigh/max",
+      "gpt-6-astra: low/medium/high/xhigh/max",
+      "gpt-6-astra-fast: low/medium/high/xhigh/max",
+      "gpt-6-astra-pro: low/medium/high/xhigh/max",
+      "gpt-6-astra-ultrafast: low/medium/high/xhigh/max",
+      "gpt-daybreak-blue-latest: none/low/medium/high/xhigh/max",
+      "gpt-daybreak-red-latest: none/low/medium/high/xhigh/max",
+      "gpt-5.6: none/low/medium/high/xhigh/max",
+      "gpt-5.6-fast: none/low/medium/high/xhigh/max",
+      "gpt-5.6-pro: none/low/medium/high/xhigh/max",
+      "gpt-5.6-luna: none/low/medium/high/xhigh/max",
+      "gpt-5.6-luna-fast: none/low/medium/high/xhigh/max",
+      "gpt-5.6-luna-pro: none/low/medium/high/xhigh/max",
+      "gpt-5.6-terra: none/low/medium/high/xhigh/max",
+      "gpt-5.6-terra-fast: none/low/medium/high/xhigh/max",
+      "gpt-5.6-terra-pro: none/low/medium/high/xhigh/max",
+      "gpt-5.6-sol: none/low/medium/high/xhigh/max",
+      "gpt-5.6-sol-fast: none/low/medium/high/xhigh/max",
+      "gpt-5.6-sol-pro: none/low/medium/high/xhigh/max",
+      "gpt-realtime-2.1: minimal/low/medium/high/xhigh",
+      "gpt-5.5-pro: medium/high/xhigh",
+      "gpt-5.5: none/low/medium/high/xhigh",
+      "gpt-5.5-fast: none/low/medium/high/xhigh",
+      "gpt-5.4-nano: none/low/medium/high/xhigh",
+      "gpt-5.4-nano-flex: none/low/medium/high/xhigh",
+      "gpt-5.4-mini: none/low/medium/high/xhigh",
+      "gpt-5.4-mini-fast: none/low/medium/high/xhigh",
+      "gpt-5.4-mini-flex: none/low/medium/high/xhigh",
+      "gpt-5.4: none/low/medium/high/xhigh",
+      "gpt-5.4-fast: none/low/medium/high/xhigh",
+      "gpt-5.4-pro: medium/high/xhigh",
+      "gpt-5.3-codex: none/low/medium/high/xhigh",
+      "gpt-5.3-codex-fast: none/low/medium/high/xhigh",
+      "gpt-5.3-codex-spark: none/low/medium/high/xhigh",
+      "gpt-5.2-pro: medium/high/xhigh",
+      "gpt-5.2: none/low/medium/high/xhigh",
+      "gpt-5.2-fast: none/low/medium/high/xhigh",
+      "gpt-5.2-flex: none/low/medium/high/xhigh",
+      "gpt-5.1: none/low/medium/high",
+      "gpt-5.1-fast: none/low/medium/high",
+      "gpt-5.1-flex: none/low/medium/high",
+      "gpt-5-mini: minimal/low/medium/high",
+      "gpt-5-mini-fast: minimal/low/medium/high",
+      "gpt-5-mini-flex: minimal/low/medium/high",
+      "gpt-5-nano: minimal/low/medium/high",
+      "gpt-5-nano-flex: minimal/low/medium/high",
+      "gpt-5: minimal/low/medium/high",
+      "gpt-5-fast: minimal/low/medium/high",
+      "gpt-5-flex: minimal/low/medium/high",
+      "o3-pro: low/medium/high",
+      "o3: low/medium/high",
+      "o3-fast: low/medium/high",
+      "o3-flex: low/medium/high"
+    ],
+    "providerList": [
+      {
+        "id": "anthropic",
+        "package": "@opencode/ai/providers/anthropic",
+        "activation": "enabled"
+      },
+      {
+        "id": "opencode",
+        "package": "@opencode/ai/providers/openai-compatible",
+        "activation": "enabled"
+      },
+      {
+        "id": "openai",
+        "package": "@opencode/ai/providers/openai",
+        "activation": "enabled"
+      }
+    ],
+    "table": [
+      {
+        "case": "A same-model bump (low)",
+        "asked": "openai/gpt-6-luna#low",
+        "storedModel": "openai/gpt-6-luna#low",
+        "catalogModel": "openai/gpt-6-luna#low",
+        "wireModel": "gpt-6-luna",
+        "topLevel": "low",
+        "inBandAllHistory": [],
+        "effective": "low",
+        "reasoningField": {
+          "effort": "low",
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "A same-model bump (high)",
+        "asked": "openai/gpt-6-luna#high",
+        "storedModel": "openai/gpt-6-luna#high",
+        "catalogModel": "openai/gpt-6-luna#high",
+        "wireModel": "gpt-6-luna",
+        "topLevel": "low",
+        "inBandAllHistory": [
+          "high"
+        ],
+        "effective": "high",
+        "reasoningField": {
+          "effort": "low",
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "A same-model bump (max)",
+        "asked": "openai/gpt-6-luna#max",
+        "storedModel": "openai/gpt-6-luna#max",
+        "catalogModel": "openai/gpt-6-luna#max",
+        "wireModel": "gpt-6-luna",
+        "topLevel": "low",
+        "inBandAllHistory": [
+          "high",
+          "max"
+        ],
+        "effective": "max",
+        "reasoningField": {
+          "effort": "low",
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "F default then high (bare)",
+        "asked": "openai/gpt-6-luna",
+        "storedModel": "openai/gpt-6-luna#default",
+        "catalogModel": "openai/gpt-6-luna#default",
+        "wireModel": "gpt-6-luna",
+        "inBandAllHistory": []
+      },
+      {
+        "case": "F default then high (high)",
+        "asked": "openai/gpt-6-luna#high",
+        "storedModel": "openai/gpt-6-luna#high",
+        "catalogModel": "openai/gpt-6-luna#high",
+        "wireModel": "gpt-6-luna",
+        "inBandAllHistory": [
+          "high"
+        ],
+        "effective": "high",
+        "reasoningField": {
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "M model and variant together (luna low)",
+        "asked": "openai/gpt-6-luna#low",
+        "storedModel": "openai/gpt-6-luna#low",
+        "catalogModel": "openai/gpt-6-luna#low",
+        "wireModel": "gpt-6-luna",
+        "topLevel": "low",
+        "inBandAllHistory": [],
+        "effective": "low",
+        "reasoningField": {
+          "effort": "low",
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "M model and variant together (sol high)",
+        "asked": "openai/gpt-6-sol#high",
+        "storedModel": "openai/gpt-6-sol#high",
+        "catalogModel": "openai/gpt-6-sol#high",
+        "wireModel": "gpt-6-sol",
+        "topLevel": "high",
+        "inBandAllHistory": [],
+        "effective": "high",
+        "reasoningField": {
+          "effort": "high",
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "R1 bare model after a variant (luna high)",
+        "asked": "openai/gpt-6-luna#high",
+        "storedModel": "openai/gpt-6-luna#high",
+        "catalogModel": "openai/gpt-6-luna#high",
+        "wireModel": "gpt-6-luna",
+        "topLevel": "high",
+        "inBandAllHistory": [],
+        "effective": "high",
+        "reasoningField": {
+          "effort": "high",
+          "summary": "auto"
+        }
+      },
+      {
+        "case": "R1 bare model after a variant (bare luna)",
+        "asked": "openai/gpt-6-luna",
+        "storedModel": "openai/gpt-6-luna#default",
+        "catalogModel": "openai/gpt-6-luna#default",
+        "wireModel": "gpt-6-luna",
+        "topLevel": "high",
+        "inBandAllHistory": [
+          "medium"
+        ],
+        "effective": "medium",
+        "reasoningField": {
+          "effort": "high"
+        }
+      }
+    ],
+    "firstConfigurationUpdateItem": {
+      "type": "configuration_update",
+      "reasoning": {
+        "effort": "high"
+      }
+    },
+    "providerErrors": [],
+    "hostErrors": [],
+    "protocolNote": "Scripted Responses fixture: SSE response.created / output_item.added / output_text.delta / output_item.done / response.completed (message item), or a function_call item for tool calls. The host accepted it for every request (no provider or host errors). Whether api.openai.com honours an in-band configuration_update was NOT verified.",
+    "derived": {
+      "sameModelBumpEffective": [
+        "low",
+        "high",
+        "max"
+      ],
+      "sameModelBumpTopLevel": [
+        "low",
+        "low",
+        "low"
+      ],
+      "defaultThenHigh": [
+        {},
+        {
+          "effective": "high",
+          "reasoningField": {
+            "summary": "auto"
+          }
+        }
+      ],
+      "modelAndVariantTogether": [
+        {
+          "wireModel": "gpt-6-luna",
+          "topLevel": "low",
+          "inBand": [],
+          "effective": "low"
+        },
+        {
+          "wireModel": "gpt-6-sol",
+          "topLevel": "high",
+          "inBand": [],
+          "effective": "high"
+        }
+      ],
+      "bareModelAfterVariant": [
+        {
+          "storedModel": "openai/gpt-6-luna#high",
+          "topLevel": "high",
+          "inBand": [],
+          "effective": "high"
+        },
+        {
+          "storedModel": "openai/gpt-6-luna#default",
+          "topLevel": "high",
+          "inBand": [
+            "medium"
+          ],
+          "effective": "medium"
+        }
+      ]
+    }
+  },
+  "assertionResult": "PASS: (host emission only) same-model luna low->high->max: effective low->high->max (top-level low->low->low); default->high: undefined->high; luna low -> sol high: low->high; bare luna after #high: high->medium (stored openai/gpt-6-luna#high / openai/gpt-6-luna#default)",
+  "notes": []
+}

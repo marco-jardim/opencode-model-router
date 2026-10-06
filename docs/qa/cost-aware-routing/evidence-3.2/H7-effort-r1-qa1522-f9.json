@@ -1,0 +1,366 @@
+{
+  "scenario": "H7-effort-r1-qa1522-f9",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:30:58.483Z",
+  "harness": {
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy -> fast the request carries the TARGET agent's effort once and not the previous agent's: on a same-model switch the top level keeps the previous agent's effort and the target's travels in-band (one entry), on a model change the top level carries it and nothing is in-band; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).",
+  "observed": {
+    "table": [
+      {
+        "case": "A agent switch (fast)",
+        "asked": "{\"agent\":\"fast\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#low",
+        "storedAgent": "fast",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "topLevelEffort": "low",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "low"
+        },
+        "inBandAllHistory": [],
+        "effective": "low"
+      },
+      {
+        "case": "A agent switch (medium)",
+        "asked": "{\"agent\":\"medium\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#medium",
+        "storedAgent": "medium",
+        "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+        "wireModel": "claude-sonnet-5-5",
+        "topLevelEffort": "low",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "low"
+        },
+        "inBandAllHistory": [
+          "medium"
+        ],
+        "effective": "medium"
+      },
+      {
+        "case": "A agent switch (heavy)",
+        "asked": "{\"agent\":\"heavy\"}",
+        "storedModel": "anthropic/claude-opus-5-5#xhigh",
+        "storedAgent": "heavy",
+        "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+        "wireModel": "claude-opus-5-5",
+        "topLevelEffort": "xhigh",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "xhigh"
+        },
+        "inBandAllHistory": [],
+        "effective": "xhigh"
+      },
+      {
+        "case": "A agent switch (back to fast)",
+        "asked": "{\"agent\":\"fast\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#low",
+        "storedAgent": "fast",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "topLevelEffort": "low",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "low"
+        },
+        "inBandAllHistory": [],
+        "effective": "low"
+      },
+      {
+        "case": "R1 bare model (sonnet#low)",
+        "asked": "{\"agent\":\"general\",\"model\":\"anthropic/claude-sonnet-5-5#low\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#low",
+        "storedAgent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "topLevelEffort": "low",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "low"
+        },
+        "inBandAllHistory": [],
+        "effective": "low"
+      },
+      {
+        "case": "R1 bare model (bare sonnet)",
+        "asked": "{\"agent\":\"general\",\"model\":\"anthropic/claude-sonnet-5-5\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#default",
+        "storedAgent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#default",
+        "wireModel": "claude-sonnet-5-5",
+        "topLevelEffort": "low",
+        "thinking": {
+          "type": "adaptive",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "low"
+        },
+        "inBandAllHistory": [
+          "high"
+        ],
+        "effective": "high"
+      },
+      {
+        "case": "R1b bare other model (sonnet#low)",
+        "asked": "{\"agent\":\"general\",\"model\":\"anthropic/claude-sonnet-5-5#low\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#low",
+        "storedAgent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "topLevelEffort": "low",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "outputConfig": {
+          "effort": "low"
+        },
+        "inBandAllHistory": [],
+        "effective": "low"
+      },
+      {
+        "case": "R1b bare other model (bare opus)",
+        "asked": "{\"agent\":\"general\",\"model\":\"anthropic/claude-opus-5-5\"}",
+        "storedModel": "anthropic/claude-opus-5-5#default",
+        "storedAgent": "general",
+        "catalogModel": "anthropic/claude-opus-5-5#default",
+        "wireModel": "claude-opus-5-5",
+        "thinking": {
+          "type": "adaptive",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "inBandAllHistory": []
+      },
+      {
+        "case": "F9 default then high (bare)",
+        "asked": "{\"agent\":\"general\",\"model\":\"anthropic/claude-sonnet-5-5\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#default",
+        "storedAgent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#default",
+        "wireModel": "claude-sonnet-5-5",
+        "thinking": {
+          "type": "adaptive",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "inBandAllHistory": []
+      },
+      {
+        "case": "F9 default then high (high)",
+        "asked": "{\"agent\":\"general\",\"model\":\"anthropic/claude-sonnet-5-5#high\"}",
+        "storedModel": "anthropic/claude-sonnet-5-5#high",
+        "storedAgent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#high",
+        "wireModel": "claude-sonnet-5-5",
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "inBandAllHistory": [
+          "high"
+        ],
+        "effective": "high"
+      }
+    ],
+    "agentRecords": [
+      {
+        "id": "fast",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        }
+      },
+      {
+        "id": "medium",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "medium"
+        }
+      },
+      {
+        "id": "heavy",
+        "model": {
+          "id": "claude-opus-5-5",
+          "providerID": "anthropic",
+          "variant": "xhigh"
+        }
+      }
+    ],
+    "providerErrors": [],
+    "hostErrors": [],
+    "derived": {
+      "agentSwitchEffective": [
+        {
+          "agent": "fast",
+          "stored": "anthropic/claude-sonnet-5-5#low",
+          "topLevel": "low",
+          "inBand": [],
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "effective": "low"
+        },
+        {
+          "agent": "medium",
+          "stored": "anthropic/claude-sonnet-5-5#medium",
+          "topLevel": "low",
+          "inBand": [
+            "medium"
+          ],
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "effective": "medium"
+        },
+        {
+          "agent": "heavy",
+          "stored": "anthropic/claude-opus-5-5#xhigh",
+          "topLevel": "xhigh",
+          "inBand": [],
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "effective": "xhigh"
+        },
+        {
+          "agent": "fast",
+          "stored": "anthropic/claude-sonnet-5-5#low",
+          "topLevel": "low",
+          "inBand": [],
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "effective": "low"
+        }
+      ],
+      "bareSameModelAfterVariant": [
+        {
+          "stored": "anthropic/claude-sonnet-5-5#low",
+          "topLevel": "low",
+          "inBand": [],
+          "effective": "low"
+        },
+        {
+          "stored": "anthropic/claude-sonnet-5-5#default",
+          "topLevel": "low",
+          "inBand": [
+            "high"
+          ],
+          "effective": "high"
+        }
+      ],
+      "bareOtherModelAfterVariant": [
+        {
+          "stored": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "topLevel": "low",
+          "inBand": [],
+          "effective": "low"
+        },
+        {
+          "stored": "anthropic/claude-opus-5-5#default",
+          "wireModel": "claude-opus-5-5",
+          "inBand": []
+        }
+      ],
+      "defaultThenHigh": [
+        {
+          "stored": "anthropic/claude-sonnet-5-5#default",
+          "thinking": {
+            "type": "adaptive",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "inBand": []
+        },
+        {
+          "stored": "anthropic/claude-sonnet-5-5#high",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "inBand": [
+            "high"
+          ],
+          "effective": "high"
+        }
+      ]
+    }
+  },
+  "assertionResult": "PASS: agent switch effective efforts low->medium->xhigh->low (stored low->medium->xhigh->low); bare sonnet after #low: stored low->default effective low->high; bare opus after sonnet#low: stored low->default effective low->undefined; default->high effective undefined->high",
+  "notes": []
+}

@@ -1,0 +1,22 @@
+# smoke:v1 (= smoke:keyless; the existing v1 suite, test files unchanged) against OpenCode 1.18.34 first on PATH
+# run 2026-10-06 20:19-20:25 -03:00 on HEAD 0953b18 (src and test as in the final tree), TEMP/TMP/TMPDIR pointed at a private directory by a wrapper (the v1 smoke files were NOT edited): QA-3.2-3.
+# after the run the private temp directory holds no opencode-model-router-trajectory directory (the suite wrote no router scorecard or store file there).
+head=0953b18a3a781fc84eb09fac5832d579cf7ceeef
+opencode=1.18.34
+tmpdir for the run=C:\Users\<user>\AppData\Local\Temp\Claude\p32\v1tmp\
+start=2026-10-06T20:19:01.8922584-03:00
+npm notice run opencode-model-router@2.2.0 smoke:v1
+npm notice run npm run smoke:keyless
+npm notice run opencode-model-router@2.2.0 smoke:keyless
+npm notice run cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts test/smoke/deferred-catalog.smoke.test.ts test/smoke/depth-effort.smoke.test.ts test/smoke/helpers/scripted-provider.test.ts
+
+ RUN  v5.0.3 D:/git/omr-car-p32
+
+
+ Test Files  5 passed (5)
+      Tests  27 passed | 11 skipped (38)
+   Start at  20:19:02
+   Duration  400.10s (tests 100%)
+
+exit=0
+end=2026-10-06T20:25:43.4145977-03:00

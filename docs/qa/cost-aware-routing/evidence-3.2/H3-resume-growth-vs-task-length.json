@@ -1,0 +1,78 @@
+{
+  "scenario": "H3-resume-growth-vs-task-length",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:29:29.176Z",
+  "harness": {
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "The context a resumed attempt sends grows by about the forcing message plus the task prompt again (chars/4): with a 4 000-character task the second request is ~1 000 tokens larger than with an empty task, both against the first request. Token numbers are the scripted provider's own estimate (request body length / 4), not a real tokenizer; whether a real producer repeats its earlier work is NOT observable with a scripted model.",
+  "observed": {
+    "short": {
+      "requests": [
+        {
+          "inputTokens": 7359,
+          "messages": 1,
+          "lastTextChars": 117
+        },
+        {
+          "inputTokens": 7460,
+          "messages": 4,
+          "lastTextChars": 210
+        }
+      ],
+      "delta": 101,
+      "d11": [
+        null,
+        [
+          7416,
+          872000,
+          523200
+        ]
+      ],
+      "sessionInputTotals": [
+        7359,
+        14819
+      ]
+    },
+    "long": {
+      "requests": [
+        {
+          "inputTokens": 8359,
+          "messages": 1,
+          "lastTextChars": 4117
+        },
+        {
+          "inputTokens": 9460,
+          "messages": 4,
+          "lastTextChars": 4210
+        }
+      ],
+      "delta": 1101,
+      "d11": [
+        null,
+        [
+          9416,
+          872000,
+          523200
+        ]
+      ],
+      "sessionInputTotals": [
+        8359,
+        17819
+      ]
+    },
+    "expectedExtraFromTask": 1000,
+    "measuredExtra": 1000,
+    "starterOver": "unverifiable with a scripted model: the producer's replies are fixed, so whether a real model repeats its earlier work and tool calls cannot be observed here",
+    "routerEstimateOfNextContext": 9416,
+    "wireSecondRequest": 9460
+  },
+  "assertionResult": "PASS: second-request growth short=101 long=1101 (+1000 for a 4 000-char task, expected about 1000); router's D11 estimate of the next context 9416 vs 9460 on the wire",
+  "notes": []
+}

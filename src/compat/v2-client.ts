@@ -143,7 +143,9 @@ export function createV2Runtime(ctx: Plugin.Context) {
       }
       const model = request.model;
       // 2.2 / 2.3 single writer (QA-2.2-1): announce the native call to the 2.2 dispatch router, which must leave it alone
-      // (this runner has chosen the agent and model#variant, writes the attempt's row and registers the child itself).
+      // (this runner has chosen the agent and model#variant, writes the attempt's row and registers the child itself). Measured on 2.0.22
+      // (Phase 3.2, H4): the host runs no plugin tool hook for a call made through `ctx.tool.list()`, so the router never sees it and the
+      // mark is withdrawn below unconsumed; it is defensive, for a host that does hook such calls.
       let withdrawMark: (() => void) | undefined;
       try {
         // A resumed child is registered here, before the host can run it, exactly like a created one is in `progress`.

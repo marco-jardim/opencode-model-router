@@ -25,13 +25,19 @@
  *     registered under it, and a heuristic claim that picked the wrong child is corrected before the verdict is
  *     recorded. A call that ends without a result, or whose hook chain throws, is dropped (`onCallFinished`).
  *  6. Single writer with the delegate runner (QA-2.2-1, QA-2.3-1): the runner (2.3) dispatches its producer and grader children
- *     through the same native tool, so the same hooks fire for them. It announces each call (`markRunnerDispatch`, keyed by
- *     the calling session, the agent and a hash of the prompt) and `route()` consumes the mark first: the call is left exactly
- *     as the runner wrote it (no rewrite, no route-line strip, no floor lift, no decision row, no registration). The runner's
- *     own recorder is the only writer for ladder attempts. A `session.created` that is the runner's child is never claimed
- *     for an orchestrator dispatch (already registered, or titled like a runner call).
- *  7. Multi-instance (A3): the same hook event may reach several plugin instances of the process; only the first
- *     instance whose engine is live acts on a call (a process-wide set of handled calls).
+ *     through the same native tool. It announces each call (`markRunnerDispatch`, keyed by the calling session, the agent and a hash of
+ *     the prompt) and `route()` consumes the mark first: the call is left exactly as the runner wrote it (no rewrite, no route-line
+ *     strip, no floor lift, no decision row, no registration). The runner's own recorder is the only writer for ladder attempts. A
+ *     `session.created` that is the runner's child is never claimed for an orchestrator dispatch (already registered, or titled like a
+ *     runner call). MEASURED on the real OpenCode 2.0.22 host (Phase 3.2, H4): the host does NOT run the plugin's `execute.before` /
+ *     `execute.after` hooks for calls made through `ctx.tool.list()` natives, so on 2.0.22 `route()` never sees a runner call and the mark
+ *     is withdrawn unconsumed (`v2-client.ts`). The mark and the "runner description" rule are defensive: they only matter on a host
+ *     that does hook such calls.
+ *  7. Multi-instance (A3): MEASURED on 2.0.22 (Phase 3.2, H2): the host hands a SESSION EVENT to the plugin instance of every live
+ *     location, but the TOOL HOOKS of a call only to the instance of the session's location. So the owner rules (`ownsSession`: exact
+ *     directory, deepest ancestor, first live instance) and the process-wide set of handled calls are defensive for hooks; what protects
+ *     the store from a duplicated EVENT is the event-id LRU of the ingest (`firstDelivery`) and of the registry. Only the first instance
+ *     whose engine is live acts on a call.
  */
 
 import {
@@ -51,6 +57,7 @@ import {
   FLOOR_LIFT_REASON,
   RESUME_REASON,
   RESUME_RUNNING_REASON,
+  RESUME_PINNED_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -316,6 +323,15 @@ function depthOf(detection: string): DetectionDepth {
   return detection === "deterministic" || detection === "grader" ? detection : "none";
 }
 
+/**
+ * The row's reason for the kernel's decision: its reason CODE, then the kernel's text without the leading word the text carries itself
+ * (`kept: …`, `switched: …`), so a row reads `switched: C(best)=…` and `kept:best-is-chosen: the chosen dispatch …`, not `switched: switched: …` /
+ * `kept:best-is-chosen: kept: …` (QA-3.2-12). The code stays the first token: `routing:stats` reads `kept:evidence` and `lift:floor` by prefix.
+ */
+function reasonText(decision: Pick<Decision, "reasonCode" | "reason">): string {
+  return `${decision.reasonCode}: ${decision.reason.replace(/^(?:kept|switched): /, "")}`;
+}
+
 /** A pick the engine cannot resolve to a model: logged as kept, never priced (1.4 handoff). */
 function unresolvedChoice(cls: string, agent: string, routerIds: readonly string[]): RouteChoice {
   const origin = classifyAgentOrigin(agent, routerIds);
@@ -473,10 +489,13 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
         reason: running !== null
-          ? `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${decision.pinned ? "pinned, so it is sent as named and NOT rewritten (the host moves the child to @" + agent + ")" : mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${decision.reasonCode}: ${decision.reason}`
+          ? decision.pinned
+            // A pinned resume is sent as named (`kept:resume:pinned`): it was NOT rewritten, so the row must not claim it was.
+            ? `${RESUME_PINNED_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; pinned, so it is sent as named and NOT rewritten (the host moves the child to @${agent}); engine decision: ${reasonText(decision)}`
+            : `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${reasonText(decision)}`
           : resuming
-            ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
-            : `${decision.reasonCode}: ${decision.reason}`,
+            ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${reasonText(decision)}`
+            : reasonText(decision),
       };
       final = { agent, model: chosen.model, variant: chosen.variant };
 

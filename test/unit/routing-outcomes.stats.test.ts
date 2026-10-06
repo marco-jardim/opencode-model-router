@@ -1267,6 +1267,18 @@ describe("summarize: the 2.4 additions (orchestrator resumes, the evidence gate)
     expect(renderMarkdown(table)).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 2 of 3 routed dispatches |");
   });
 
+  it("a kept:resume:pinned row (QA-3.2-12) is a resume like kept:resume and kept:resume:running: counted as one, never as a routed dispatch", () => {
+    const rows = [
+      decision("P1", "2026-10-06T10:00:00.000Z", { resume: true, reason: "kept:resume:pinned: the resume names @fast … pinned, so it is sent as named and NOT rewritten" }),
+      decision("P2", "2026-10-06T10:01:00.000Z", { resume: true, reason: "kept:resume:running: the resume names @fast … sent to @medium" }),
+      decision("P3", "2026-10-06T10:02:00.000Z", { resume: true, reason: "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30)" }),
+      decision("P4", "2026-10-06T10:03:00.000Z", { reason: "kept:best-is-chosen: the chosen dispatch is the cheapest (1.2 ratio)" }),
+    ];
+    const table = summarize(null, rows, all);
+    expect(table.orchestratorResumes).toEqual({ resumed: 3, total: 4 });
+    expect(table.gate.keptEvidence).toBe(0);
+  });
+
   it("counts kept:evidence rows and the trace.argmin keys, most frequent first, ties by key", () => {
     const rows = [
       decision("E1", "2026-10-06T10:00:00.000Z", { reason: "kept:evidence: the cheapest option needs 5 outcomes", trace: trace(B) }),
