@@ -382,7 +382,7 @@ describe("docs drift: the worked example is the real kernel's output (QA-3.1-3)"
     for (let i = 0; i < 20; i++) {
       state = recordAttempt(state, ratios[state.currentTier]!);
       const action = nextAction(state, { pass: false, outcome: "fail", reasons: [] }, policy);
-      if (action.action === "give_up") return action.reason;
+      if (action.action === "give_up") return action.reason ?? "";
       if (action.action !== "retry" && action.action !== "escalate") break;
       state = advance(state, action);
     }
