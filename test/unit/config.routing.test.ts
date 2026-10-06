@@ -905,6 +905,60 @@ describe("hot reload of the global override file with a routing block", () => {
     expect(logged("candidates are ignored")).toHaveLength(1);
   });
 
+  describe("an ignored candidates list is removed from the built config (QA-1.1-30)", () => {
+    const loadMedium = (mediumPatch: Record<string, unknown>) => {
+      const first = loadConfig();
+      const presetName = first.activePreset;
+      editOverride({ presets: { [presetName]: { medium: mediumPatch } } });
+      const cfg = reload();
+      return { cfg, presetName, tier: cfg.presets[presetName]!.medium! };
+    };
+
+    it("a list without the tier's own rung: notice, no tier.candidates, hasExplicitCandidates false, one-rung ladder", () => {
+      const { cfg, tier } = loadMedium({ variant: "kept-variant", candidates: [{ variant: "other" }, { variant: "higher", costRatio: 9 }] });
+      expect(getConfigNotices().map((n) => n.message)).toEqual([
+        expect.stringContaining("candidates are ignored, the tier's ladder is its own rung: it does not contain the tier's own rung"),
+      ]);
+      expect(logged("candidates are ignored")).toHaveLength(1);
+      expect(tier.candidates).toBeUndefined();
+      expect("candidates" in tier).toBe(false);
+      expect(hasExplicitCandidates(tier)).toBe(false);
+      expect(resolveCandidates("medium", cfg)).toEqual([{ model: tier.model, variant: "kept-variant", costRatio: tier.costRatio }]);
+      expect(candidatesProblem("medium", tier)).toBeUndefined(); // nothing left to be a problem
+    });
+
+    it("a list whose own rung states another costRatio: the same", () => {
+      const { cfg, tier } = loadMedium({
+        variant: "kept-variant",
+        costRatio: 5,
+        candidates: [{ variant: "kept-variant", costRatio: 6 }, { variant: "higher", costRatio: 9 }],
+      });
+      expect(getConfigNotices().map((n) => n.message)).toEqual([
+        expect.stringContaining("its own rung (candidates[0]) has costRatio 6, not the tier's 5"),
+      ]);
+      expect(tier.candidates).toBeUndefined();
+      expect(hasExplicitCandidates(tier)).toBe(false);
+      expect(resolveCandidates("medium", cfg)).toEqual([{ model: tier.model, variant: "kept-variant", costRatio: 5 }]);
+    });
+
+    it("keeps a list that is used, and leaves other tiers alone", () => {
+      const { cfg, tier } = loadMedium({ variant: "kept-variant", costRatio: 5, candidates: [{ variant: "kept-variant" }, { variant: "higher", costRatio: 9 }] });
+      expect(getConfigNotices()).toEqual([]);
+      expect(tier.candidates).toHaveLength(2);
+      expect(hasExplicitCandidates(tier)).toBe(true);
+      expect(resolveCandidates("medium", cfg)).toHaveLength(2);
+    });
+
+    it("does not touch the caller's object when a config is validated directly", () => {
+      const raw = rawConfig({
+        presets: { anthropic: { medium: { model: "anthropic/claude-sonnet-5-5", variant: "x", costRatio: 5, candidates: [{ variant: "y" }] } } },
+      });
+      const cfg = validateConfig(raw);
+      expect(cfg.presets.anthropic!.medium!.candidates).toHaveLength(1); // only loading drops it
+      expect(candidatesProblem("medium", cfg.presets.anthropic!.medium!)).toBeDefined();
+    });
+  });
+
   it("still drops a layer whose candidates are malformed (a malformed entry is an error, not a notice)", () => {
     const first = loadConfig();
     const presetName = first.activePreset;

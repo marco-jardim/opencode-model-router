@@ -2603,7 +2603,24 @@ function buildConfig(
   applyTierDefaults(cfg);
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
   for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
+  dropIgnoredCandidates(cfg);
   return cfg;
+}
+
+/**
+ * Remove, from the built config, every `candidates` list that loading reports as
+ * ignored ({@link candidatesProblem}), after the notice has been recorded
+ * (QA-1.1-30). Leaving it on `tier.candidates` would make `hasExplicitCandidates`
+ * and any code that reads the raw list disagree with `resolveCandidates`, which
+ * already treats the tier as having only its own rung. Runs on the config this
+ * build created, never on a caller's object.
+ */
+function dropIgnoredCandidates(cfg: RouterConfig): void {
+  for (const preset of Object.values(cfg.presets)) {
+    for (const [tierName, tier] of Object.entries(preset)) {
+      if (candidatesProblem(tierName, tier) !== undefined) delete tier.candidates;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
