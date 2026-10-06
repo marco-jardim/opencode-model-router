@@ -1,13 +1,13 @@
 {
   "scenario": "H4-runner-hooks-and-execution-events",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:24:28.077Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:29:29.178Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
@@ -20,15 +20,15 @@
     "subagentHookCount": 0,
     "executionSucceeded": [
       {
-        "id": "evt_11351104d0014XXzjad7qxRq4l",
-        "deliveredAt": 1791325442134
+        "id": "evt_1138c95f7001TASnzXRRYY62XO",
+        "deliveredAt": 1791329342976
       },
       {
-        "id": "evt_1135116e7001AcnSzvcN4AX6Bd",
-        "deliveredAt": 1791325443825
+        "id": "evt_1138c9ce4001vaQkRCgo9rkQbm",
+        "deliveredAt": 1791329344781
       }
     ],
-    "secondAttemptStartedAt": 1791325443758,
+    "secondAttemptStartedAt": 1791329344630,
     "rowsForProducer": [
       {
         "step": "dispatch",
@@ -52,6 +52,6 @@
       }
     ]
   },
-  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_11351104d0014XXzjad7qxRq4l,evt_1135116e7001AcnSzvcN4AX6Bd delivered 1791325442134,1791325443825 before the resume's model.selected 1791325443758; producer rows 2",
+  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_1138c95f7001TASnzXRRYY62XO,evt_1138c9ce4001vaQkRCgo9rkQbm delivered 1791329342976,1791329344781 before the resume's model.selected 1791329344630; producer rows 2",
   "notes": []
 }

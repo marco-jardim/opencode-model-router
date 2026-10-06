@@ -1,24 +1,24 @@
 {
   "scenario": "3-enforce",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:22:44.675Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:27:15.645Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
   "expectation": "engine=enforce: the orchestrator asks for heavy on a search task with no acceptance block; the engine swaps it to fast (sonnet-5-5#low). The CHILD SESSION held by the host has agent fast and model sonnet-5-5 variant low, the provider received that model with effort low, the row says switched=true, and the step record lands under the fast key.",
   "observed": {
-    "rootID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
-    "childID": "ses_eecb09387ffer9copbFmSJsx0u",
+    "rootID": "ses_eec758508ffef69ymrTyYlKV95",
+    "childID": "ses_eec7583e4ffesp5DDVT0T21WUb",
     "hookBeforeInput": {
       "agent": "fast",
       "description": "Find usages",
-      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
+      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
       "background": false,
       "model": "anthropic/claude-sonnet-5-5#low"
     },
@@ -29,7 +29,7 @@
         "providerID": "anthropic",
         "variant": "low"
       },
-      "parentID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
+      "parentID": "ses_eec758508ffef69ymrTyYlKV95",
       "tokens": {
         "input": 7423,
         "output": 5,
@@ -42,7 +42,7 @@
     },
     "hostListedChildren": [
       {
-        "id": "ses_eecb09387ffer9copbFmSJsx0u",
+        "id": "ses_eec7583e4ffesp5DDVT0T21WUb",
         "agent": "fast",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -61,10 +61,10 @@
     ],
     "row": {
       "v": 1,
-      "ts": "2026-10-06T22:22:14.578Z",
-      "sessionID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
+      "ts": "2026-10-06T23:26:45.218Z",
+      "sessionID": "ses_eec758508ffef69ymrTyYlKV95",
       "kind": "decision",
-      "decisionID": "ses_eecb0950bffeTVBAAFmKm7nQ6d:1791325334577:1",
+      "decisionID": "ses_eec758508ffef69ymrTyYlKV95:1791329205217:1",
       "mode": "enforce",
       "childSessionID": null,
       "facts": {
@@ -93,14 +93,14 @@
       "pinned": false,
       "unit": "ratio",
       "costs": {
-        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645401631555472,
-        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737509036,
-        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.19060018959123,
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.164540152670744,
+        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737508455,
+        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.1906001774076,
         "search|host:explore|anthropic/claude-opus-4-7#default": 1.8226999999999998,
         "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
       },
       "confidence": 0.72,
-      "reason": "switched: switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=16.1525 ratio",
+      "reason": "switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=16.1525 ratio",
       "step": "dispatch",
       "resume": false,
       "trace": {

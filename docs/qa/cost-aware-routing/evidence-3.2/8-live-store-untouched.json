@@ -1,35 +1,42 @@
 {
   "scenario": "8-live-store-untouched",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:26:08.951Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:31:12.600Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
-  "expectation": "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl names a session of this run. The user's config files are unchanged.",
+  "expectation": "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl and no `ses_<id>.scorecard.log` it gained or grew names a session of this run (ids from every host's own session.created events). The user's config files are unchanged.",
   "observed": {
-    "snapshotTakenAt": "2026-10-06T22:21:38.410Z",
+    "snapshotTakenAt": "2026-10-06T23:26:09.227Z",
     "liveStore": {
       "dir": "<tmpdir>/opencode-model-router-trajectory",
-      "filesBefore": 13984,
-      "filesAfter": 13984,
-      "bytesBefore": 4608823,
-      "bytesAfter": 4608948,
-      "added": 0,
+      "filesBefore": 14003,
+      "filesAfter": 14005,
+      "bytesBefore": 4649334,
+      "bytesAfter": 4653420,
+      "added": 2,
       "addedNonSession": [],
       "removed": [],
-      "grownFiles": [],
-      "grownSessionFiles": 1
+      "grownFiles": [
+        "decisions.jsonl",
+        "outcomes.json"
+      ],
+      "grownSessionFiles": 0
+    },
+    "liveScorecards": {
+      "addedOrGrown": 2,
+      "namingASessionOfThisRun": 0
     },
     "liveDecisionsLog": {
-      "appendedRows": 0,
+      "appendedRows": 3,
       "rowsNamingASessionOfThisRun": 0,
-      "sessionsOfThisRunSeen": 41
+      "sessionsOfThisRunSeen": 50
     },
     "liveConfig": {
       "dir": "~/.config/opencode",
@@ -42,6 +49,6 @@
       ]
     }
   },
-  "assertionResult": "PASS: live store 13984 -> 13984 files (+0 new, 0 of them ses_ scorecards, non-ses_ new: none); 0 row(s) appended to the live decisions.jsonl, 0 naming a session of this run (41 seen); config files changed: none",
+  "assertionResult": "PASS: live store 14003 -> 14005 files (+2 new, 2 of them ses_ scorecards, non-ses_ new: none); 3 row(s) appended to the live decisions.jsonl, 0 naming a session of this run, 2 scorecard(s) added or grown, 0 naming one (50 sessions of this run seen); config files changed: none",
   "notes": []
 }

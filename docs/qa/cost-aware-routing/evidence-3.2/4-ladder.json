@@ -1,13 +1,13 @@
 {
   "scenario": "4-ladder",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:23:58.135Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:28:58.988Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
@@ -16,7 +16,7 @@
     "storeAfterWait": {
       "files": [
         {
-          "name": "advisor-notice.0d6b783aac0b.json",
+          "name": "advisor-notice.d567060c6d26.json",
           "size": 214
         },
         {
@@ -33,7 +33,7 @@
           "beta": {
             "alpha": 0,
             "beta": 1,
-            "updatedAt": 1791325409508
+            "updatedAt": 1791329310483
           },
           "counts": {
             "pass": 0,
@@ -70,7 +70,7 @@
           "beta": {
             "alpha": 1,
             "beta": 0,
-            "updatedAt": 1791325411229
+            "updatedAt": 1791329312181
           },
           "counts": {
             "pass": 1,
@@ -106,7 +106,7 @@
       }
     },
     "shortRun": {
-      "rootID": "ses_eecaf772dffeyw1tSzU7xzSBoJ",
+      "rootID": "ses_eec73f0c1ffegcChGHhH8FyzBe",
       "delegateResult": [
         {
           "type": "text",
@@ -115,32 +115,24 @@
       ],
       "sessionsCreatedUnderRoot": [
         {
-          "sessionID": "ses_eecaf7642ffe7QbeWlm0GLYcTB",
+          "sessionID": "ses_eec73efd1ffeijkBPCWdH2XMxf",
           "agent": "fast",
           "title": "Router fast delegation"
         },
         {
-          "sessionID": "ses_eecaf7559ffeFPHY1d8oooIOaq",
+          "sessionID": "ses_eec73ef24ffeRdMiHe0EUN8afl",
           "agent": "model-router-grader",
           "title": "Router result verification"
         },
         {
-          "sessionID": "ses_eecaf6e9dffeNovUyJGd0KUF4h",
+          "sessionID": "ses_eec73e879ffeDREX4bGV6wrF9F",
           "agent": "model-router-grader",
           "title": "Router result verification"
         }
       ],
       "producerTimeline": [
         {
-          "at": 1791325407751,
-          "agent": "fast",
-          "model": "anthropic/claude-sonnet-5-5#low",
-          "input": 0,
-          "output": 0,
-          "cost": 0
-        },
-        {
-          "at": 1791325407892,
+          "at": 1791329308865,
           "agent": "fast",
           "model": "anthropic/claude-sonnet-5-5#low",
           "input": 7359,
@@ -148,7 +140,7 @@
           "cost": 0.014768
         },
         {
-          "at": 1791325409596,
+          "at": 1791329310558,
           "agent": "fast",
           "model": "anthropic/claude-sonnet-5-5#medium",
           "input": 14819,
@@ -158,10 +150,10 @@
       ],
       "graderTimelines": [
         {
-          "id": "ses_eecaf7559ffeFPHY1d8oooIOaq",
+          "id": "ses_eec73ef24ffeRdMiHe0EUN8afl",
           "snapshots": [
             {
-              "at": 1791325408042,
+              "at": 1791329308998,
               "agent": "model-router-grader",
               "model": "anthropic/claude-opus-5-5#default",
               "input": 0,
@@ -171,10 +163,10 @@
           ]
         },
         {
-          "id": "ses_eecaf6e9dffeNovUyJGd0KUF4h",
+          "id": "ses_eec73e879ffeDREX4bGV6wrF9F",
           "snapshots": [
             {
-              "at": 1791325409732,
+              "at": 1791329310699,
               "agent": "model-router-grader",
               "model": "anthropic/claude-opus-5-5#default",
               "input": 0,
@@ -187,113 +179,113 @@
       "producerEvents": [
         {
           "type": "session.created",
-          "id": "evt_1135089ce001mSjJDOy5JWS2sU",
-          "at": 1791325407710
+          "id": "evt_1138c1034001iBZ7RachfxnkIp",
+          "at": 1791329308736
         },
         {
           "type": "session.inbox.enqueued",
-          "id": "evt_113508a18001YAzym5PlSWjDtg",
-          "at": 1791325407771
+          "id": "evt_1138c106f001bgWYC9ARx4YlTM",
+          "at": 1791329308785
         },
         {
           "type": "session.execution.started",
-          "id": "evt_113508a1c001v7Pd5ufFNB2ym4",
-          "at": 1791325407810
+          "id": "evt_1138c1072001PMgWLMj0n94i1n",
+          "at": 1791329308814
         },
         {
           "type": "session.instructions.updated",
-          "id": "evt_113508a25001S5b6pYSckM2kFc",
-          "at": 1791325407815
+          "id": "evt_1138c1078001Tf0WZmNot88BQo",
+          "at": 1791329308818
         },
         {
           "type": "session.inbox.delivered",
-          "id": "evt_113508a27001nEMnydmtB0txgJ",
-          "at": 1791325407815
+          "id": "evt_1138c1079001AstX7WY4KjM8SA",
+          "at": 1791329308818
         },
         {
           "type": "session.step.started",
-          "id": "evt_113508a4d0010hzV4lI0RyLKR1",
-          "at": 1791325407832
+          "id": "evt_1138c1097001F5NPy150YpN14m",
+          "at": 1791329308831
         },
         {
           "type": "session.text.started",
-          "id": "evt_113508a50001wYM9632EpGoG62",
-          "at": 1791325407833
+          "id": "evt_1138c109a001FFm0lyeXdYMNOP",
+          "at": 1791329308831
         },
         {
           "type": "session.text.ended",
-          "id": "evt_113508a54002SNlVG15VtOrQnL",
-          "at": 1791325407834
+          "id": "evt_1138c109d0019MFfa247uyzHum",
+          "at": 1791329308832
         },
         {
           "type": "session.step.ended",
-          "id": "evt_113508a5d001wW9C736lw4tjL5",
-          "at": 1791325407853
+          "id": "evt_1138c10a4001jlGGqHINvezMvF",
+          "at": 1791329308848
         },
         {
           "type": "session.usage.updated",
-          "id": "evt_113508a60001OyVLIMDvp0Wx40",
-          "at": 1791325407859
+          "id": "evt_1138c10a6001X8yQNmsNwOLHQL",
+          "at": 1791329308852
         },
         {
           "type": "session.execution.succeeded",
-          "id": "evt_113508a61001nzPMstthWDjh4c",
-          "at": 1791325407861
+          "id": "evt_1138c10a7001Rip484t1sZd6RW",
+          "at": 1791329308853
         },
         {
           "type": "session.model.selected",
-          "id": "evt_1135090e90014EGzlxEWI5s9NP",
-          "at": 1791325409516
+          "id": "evt_1138c17170017Gzgi0hvSASAYT",
+          "at": 1791329310491
         },
         {
           "type": "session.inbox.enqueued",
-          "id": "evt_1135090f2001rNeWmAj8lzYA5F",
-          "at": 1791325409524
+          "id": "evt_1138c1720001grzNU7N6wL7jz1",
+          "at": 1791329310499
         },
         {
           "type": "session.execution.started",
-          "id": "evt_1135090f5001Mp6Lq58bb8ppyo",
-          "at": 1791325409553
+          "id": "evt_1138c1723001GKihBZb2hqKGFm",
+          "at": 1791329310524
         },
         {
           "type": "session.inbox.delivered",
-          "id": "evt_1135090fc001v4ykI7U6p7Vnb5",
-          "at": 1791325409557
+          "id": "evt_1138c172a001eXT5GPbuExNaGG",
+          "at": 1791329310528
         },
         {
           "type": "session.step.started",
-          "id": "evt_113509119001tXskavzDvu75Pl",
-          "at": 1791325409569
+          "id": "evt_1138c1744001Oys95dzNvxpF3I",
+          "at": 1791329310539
         },
         {
           "type": "session.text.started",
-          "id": "evt_11350911b001IZjWM3q0GV5YVo",
-          "at": 1791325409569
+          "id": "evt_1138c1747001B3iS7197gfscjF",
+          "at": 1791329310539
         },
         {
           "type": "session.text.ended",
-          "id": "evt_11350911e002LoE5lXXD42C21w",
-          "at": 1791325409570
+          "id": "evt_1138c1749001LgCgG0Du0m3ZNS",
+          "at": 1791329310540
         },
         {
           "type": "session.step.ended",
-          "id": "evt_113509124001D6o1OfOfSAQye9",
-          "at": 1791325409585
+          "id": "evt_1138c1750001fCf9CD6dOw6XuX",
+          "at": 1791329310554
         },
         {
           "type": "session.usage.updated",
-          "id": "evt_113509127001Fwi73e2Eiqhpv9",
-          "at": 1791325409586
+          "id": "evt_1138c1752001FaWY7vp9VQDNFO",
+          "at": 1791329310554
         },
         {
           "type": "session.execution.succeeded",
-          "id": "evt_113509128001MTcq3J6oguPy86",
-          "at": 1791325409587
+          "id": "evt_1138c1753001X3K21p9QMexycM",
+          "at": 1791329310555
         },
         {
           "type": "session.deleted",
-          "id": "evt_11350979f001AHYd0Nwkea6kmw",
-          "at": 1791325411233
+          "id": "evt_1138c1db7001705JjVy4cLUtb5",
+          "at": 1791329312184
         }
       ],
       "producerRequests": [
@@ -314,12 +306,12 @@
       ],
       "graderRequests": [
         {
-          "session": "ses_eecaf7559ffeFPHY1d8oooIOaq",
+          "session": "ses_eec73ef24ffeRdMiHe0EUN8afl",
           "agent": "model-router-grader",
           "catalogModel": "anthropic/claude-opus-5-5#default"
         },
         {
-          "session": "ses_eecaf6e9dffeNovUyJGd0KUF4h",
+          "session": "ses_eec73e879ffeDREX4bGV6wrF9F",
           "agent": "model-router-grader",
           "catalogModel": "anthropic/claude-opus-5-5#default"
         }
@@ -328,20 +320,20 @@
     },
     "rows": [
       {
-        "decisionID": "ladder-6f43ef53-1",
+        "decisionID": "ladder-5f13f591-1",
         "step": "dispatch",
         "resume": false,
-        "childSessionID": "ses_eecaf7642ffe7QbeWlm0GLYcTB",
+        "childSessionID": "ses_eec73efd1ffeijkBPCWdH2XMxf",
         "chosen": "search|router:fast|anthropic/claude-sonnet-5-5#low",
         "switched": false,
         "mode": "advise",
         "reason": "ladder dispatch on fast; fresh child"
       },
       {
-        "decisionID": "ladder-6f43ef53-2",
+        "decisionID": "ladder-5f13f591-2",
         "step": "variant",
         "resume": true,
-        "childSessionID": "ses_eecaf7642ffe7QbeWlm0GLYcTB",
+        "childSessionID": "ses_eec73efd1ffeijkBPCWdH2XMxf",
         "chosen": "search|router:fast|anthropic/claude-sonnet-5-5#medium",
         "switched": false,
         "mode": "advise",
@@ -388,6 +380,6 @@
     ],
     "routerLogLines": []
   },
-  "assertionResult": "PASS: producer sessions=1; stored model timeline anthropic/claude-sonnet-5-5#low -> anthropic/claude-sonnet-5-5#medium; session input tokens 0 -> 7359 -> 14819; provider messages 1->4, est. input 7359->7460; rows dispatch, variant(resume); verdicts fail,pass",
+  "assertionResult": "PASS: producer sessions=1; stored model timeline anthropic/claude-sonnet-5-5#low -> anthropic/claude-sonnet-5-5#medium; session input tokens 7359 -> 14819; provider messages 1->4, est. input 7359->7460; rows dispatch, variant(resume); verdicts fail,pass",
   "notes": []
 }

@@ -1,17 +1,17 @@
 {
   "scenario": "H7-effort-r1-qa1522-f9",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:25:54.124Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:30:58.483Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
-  "expectation": "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy the request carries the TARGET agent's effort once, not the previous agent's, and nothing stacks; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).",
+  "expectation": "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy -> fast the request carries the TARGET agent's effort once and not the previous agent's: on a same-model switch the top level keeps the previous agent's effort and the target's travels in-band (one entry), on a model change the top level carries it and nothing is in-band; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).",
   "observed": {
     "table": [
       {

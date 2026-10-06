@@ -1,13 +1,13 @@
 {
   "scenario": "H9-enforce-real-permission-set",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:25:47.464Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:30:51.953Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
@@ -45,22 +45,22 @@
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\shell\\*\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\tool-output\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\tmp\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\config\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
             "effect": "allow"
           },
           {
@@ -106,22 +106,22 @@
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\shell\\*\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\tool-output\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\tmp\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\config\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
             "effect": "allow"
           },
           {
@@ -181,22 +181,22 @@
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\shell\\*\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\tool-output\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\tmp\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\config\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
             "effect": "allow"
           },
           {
@@ -237,22 +237,22 @@
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\shell\\*\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\tool-output\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\tmp\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\config\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
             "effect": "allow"
           },
           {
@@ -293,22 +293,22 @@
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\shell\\*\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\tool-output\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\tmp\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\config\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
             "effect": "allow"
           },
           {
@@ -349,22 +349,22 @@
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\shell\\*\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\shell\\*\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\data\\opencode\\tool-output\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\data\\opencode\\tool-output\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\tmp\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\tmp\\opencode\\*",
             "effect": "allow"
           },
           {
             "action": "external_directory",
-            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-uYjPiG\\config\\opencode\\*",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-p32-permissions-7XlXPY\\config\\opencode\\*",
             "effect": "allow"
           },
           {
@@ -376,7 +376,7 @@
       }
     ],
     "openSession": {
-      "rootID": "ses_eecadcc14ffeE6wE10zC7J5DIw",
+      "rootID": "ses_eec72387fffes4TCkYk6KHti9g",
       "rules": [
         {
           "action": "subagent",
@@ -384,19 +384,19 @@
           "effect": "allow"
         }
       ],
-      "childID": "ses_eecadcaaeffeqfbyS5wImLUVkR",
+      "childID": "ses_eec7236caffeO3wWS0AYTSEQIr",
       "hostChild": {
         "agent": "fast",
         "model": "anthropic/claude-sonnet-5-5#low"
       }
     },
     "deniedSession": {
-      "rootID": "ses_eecadc9c1ffeMX3f7qfKnkKsao",
+      "rootID": "ses_eec7235a0ffezfOm6LW7mQijrp",
       "status": "completed",
       "hookInput": {
         "agent": "heavy"
       },
-      "childID": "ses_eecadc940fferCLAuxlug510Xl",
+      "childID": "ses_eec723516ffevViEsv6iEV5hK5",
       "hostChild": {
         "agent": "heavy",
         "model": "anthropic/claude-opus-5-5#xhigh"
@@ -408,19 +408,19 @@
         "chosen": "heavy",
         "best": "fast",
         "switched": true,
-        "reason": "switched: switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=16.1525 ratio"
+        "reason": "switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=16.1525 ratio"
       },
       {
         "session": "fast-denied",
         "chosen": "heavy",
         "best": "heavy",
         "switched": false,
-        "reason": "kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0274 usd)"
+        "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0274 usd)"
       }
     ],
     "hostErrors": [],
     "routerLogLines": []
   },
-  "assertionResult": "PASS: subagent-allow-only session: heavy -> fast/anthropic/claude-sonnet-5-5#low; fast-denied session: dispatch completed, child agent heavy, row switched=false (kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0274 usd))",
+  "assertionResult": "PASS: subagent-allow-only session: heavy -> fast/anthropic/claude-sonnet-5-5#low; fast-denied session: dispatch completed, child agent heavy, row switched=false (kept:best-is-chosen: the chosen dispatch is the cheapest (0.0274 usd))",
   "notes": []
 }

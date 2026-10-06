@@ -1,13 +1,13 @@
 {
   "scenario": "H6-resume-rules-on-the-host",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:25:14.003Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:30:18.397Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
@@ -27,118 +27,118 @@
         "hostChild": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         },
-        "childID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+        "childID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
       },
       {
         "name": "2 resume naming the original pick",
         "asked": {
           "agent": "fast",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "hookInput": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "status": "completed",
         "hostChild": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         },
-        "childID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+        "childID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
       },
       {
         "name": "3 resume naming heavy on purpose",
         "asked": {
           "agent": "heavy",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "hookInput": {
           "agent": "heavy",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "status": "completed",
         "hostChild": {
           "agent": "heavy",
           "model": "anthropic/claude-opus-5-5#xhigh",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         },
-        "childID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+        "childID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
       },
       {
         "name": "4 resume naming fast after heavy",
         "asked": {
           "agent": "fast",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "hookInput": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "status": "completed",
         "hostChild": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         },
-        "childID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+        "childID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
       },
       {
         "name": "5a resume of another root's child (rejected by the host)",
         "status": "error",
         "error": {
-          "string": "Tool.Error: Session ses_eecae4cc4ffepSl9FGYUUVFEF4 is not a child of the current session",
+          "string": "Tool.Error: Session ses_eec72b8d7ffeAAzNXkIVyt5mD3 is not a child of the current session",
           "props": {
-            "message": "Session ses_eecae4cc4ffepSl9FGYUUVFEF4 is not a child of the current session",
+            "message": "Session ses_eec72b8d7ffeAAzNXkIVyt5mD3 is not a child of the current session",
             "_tag": "Tool.Error"
           }
         },
         "hostChildAfter": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         }
       },
       {
         "name": "5b resume naming fast after the rejected foreign resume (R2-1)",
         "asked": {
           "agent": "fast",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "hookInput": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "status": "completed",
         "hostChild": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         },
-        "childID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+        "childID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
       },
       {
         "name": "5c pinned resume naming fast",
         "asked": {
           "agent": "fast",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "hookInput": {
           "agent": "fast",
-          "sessionID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+          "sessionID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
         },
         "status": "completed",
         "hostChild": {
           "agent": "fast",
           "model": "anthropic/claude-sonnet-5-5#low",
-          "parentID": "ses_eecae4df1ffexvQ7MRxzFPd1u9"
+          "parentID": "ses_eec72b9f7ffexlh7xA08E2Ix9p"
         },
-        "childID": "ses_eecae4cc4ffepSl9FGYUUVFEF4"
+        "childID": "ses_eec72b8d7ffeAAzNXkIVyt5mD3"
       },
       {
         "name": "6 resume naming an agent the session denies",
@@ -159,7 +159,7 @@
         "hostChildAfter": {
           "agent": "medium",
           "model": "anthropic/claude-sonnet-5-5#medium",
-          "parentID": "ses_eecae4502ffeHam36dGnFSckv2"
+          "parentID": "ses_eec72af9effeF6rZPvAS0P2YVP"
         }
       }
     ],
@@ -172,7 +172,7 @@
         "best": "medium",
         "switched": true,
         "pinned": false,
-        "reason": "lift:floor: dispatch lifted from @fast to @medium by enforcement.escalate.floorTier; engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (5.7867 ratio) [the pick is below floorTier (rank 0 < 1); its cost is that of the floor path th"
+        "reason": "lift:floor: dispatch lifted from @fast to @medium by enforcement.escalate.floorTier; engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (5.7867 ratio) [the pick is below floorTier (rank 0 < 1); its cost is that of the floor path the runn"
       },
       {
         "session": "root1",
@@ -182,7 +182,7 @@
         "best": "fast",
         "switched": false,
         "pinned": false,
-        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; sent to @medium so the host does not switch it back (A30); engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.024 "
+        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; sent to @medium so the host does not switch it back (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.024 usd) ["
       },
       {
         "session": "root1",
@@ -192,7 +192,7 @@
         "best": "heavy",
         "switched": false,
         "pinned": false,
-        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:evidence: kept: the cheapest option search|router:medium|anthropic/claude-sonnet-5-5#medium (0.0245 usd, rank 1, the pick is rank 2) needs ≥ 5 r"
+        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:evidence: the cheapest option search|router:medium|anthropic/claude-sonnet-5-5#medium (0.0245 usd, rank 1, the pick is rank 2) needs ≥ 5 recorde"
       },
       {
         "session": "root1",
@@ -202,7 +202,7 @@
         "best": "medium",
         "switched": true,
         "pinned": false,
-        "reason": "lift:floor: resume lifted from @fast to @medium by enforcement.escalate.floorTier (the child runs @heavy); engine decision: kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:best-is-chosen: kept"
+        "reason": "lift:floor: resume lifted from @fast to @medium by enforcement.escalate.floorTier (the child runs @heavy); engine decision: kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:best-is-chosen: the "
       },
       {
         "session": "root2",
@@ -212,7 +212,7 @@
         "best": "medium",
         "switched": false,
         "pinned": false,
-        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0255 usd)"
+        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0255 usd)"
       },
       {
         "session": "root1",
@@ -222,7 +222,7 @@
         "best": "fast",
         "switched": false,
         "pinned": false,
-        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; sent to @medium so the host does not switch it back (A30); engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0255"
+        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; sent to @medium so the host does not switch it back (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0255 usd) "
       },
       {
         "session": "root1",
@@ -232,7 +232,7 @@
         "best": "fast",
         "switched": false,
         "pinned": true,
-        "reason": "kept:resume:running: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast); engine decision: kept:pinned: kept: pinned dispatch (best se"
+        "reason": "kept:resume:pinned: the resume names @fast, the orchestrator's own pick for a child the router moved to @medium; pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast); engine decision: kept:pinned: pinned dispatch (best search|ro"
       },
       {
         "session": "root3",
@@ -242,16 +242,16 @@
         "best": "medium",
         "switched": true,
         "pinned": false,
-        "reason": "lift:floor: dispatch lifted from @fast to @medium by enforcement.escalate.floorTier; engine decision: kept:best-is-chosen: kept: the chosen dispatch is the cheapest (0.0273 usd) [the pick is below floorTier (rank 0 < 1); its cost is that of the floor path the "
+        "reason": "lift:floor: dispatch lifted from @fast to @medium by enforcement.escalate.floorTier; engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0273 usd) [the pick is below floorTier (rank 0 < 1); its cost is that of the floor path the runner"
       },
       {
         "session": "root3",
         "resume": true,
-        "childSessionID": "ses_eecae4475ffeC0F1r1aEpAMGNT",
+        "childSessionID": "ses_eec72af0affePgLRr2dP9B41ww",
         "chosen": "heavy",
         "switched": false,
         "pinned": false,
-        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:no-candidates: kept: no candidate could be priced"
+        "reason": "kept:resume: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: kept:no-candidates: no candidate could be priced"
       }
     ],
     "hostErrors": [],

@@ -1,17 +1,17 @@
 {
   "scenario": "7-openai-responses",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:24:40.976Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:29:45.408Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
-  "expectation": "The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.",
+  "expectation": "(HOST EMISSION ONLY: what the host sends to a scripted Responses provider; acceptance by api.openai.com is not verified.) The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.",
   "observed": {
     "openaiModelsWithVariants": [
       "gpt-6.1-sol: low/medium/high/xhigh/max",
@@ -282,6 +282,6 @@
       ]
     }
   },
-  "assertionResult": "PASS: same-model luna low->high->max: effective low->high->max (top-level low->low->low); default->high: undefined->high; luna low -> sol high: low->high; bare luna after #high: high->medium (stored openai/gpt-6-luna#high / openai/gpt-6-luna#default)",
+  "assertionResult": "PASS: (host emission only) same-model luna low->high->max: effective low->high->max (top-level low->low->low); default->high: undefined->high; luna low -> sol high: low->high; bare luna after #high: high->medium (stored openai/gpt-6-luna#high / openai/gpt-6-luna#default)",
   "notes": []
 }

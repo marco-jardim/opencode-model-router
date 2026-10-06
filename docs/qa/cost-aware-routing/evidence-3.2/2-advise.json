@@ -1,20 +1,20 @@
 {
   "scenario": "2-advise",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:23:24.757Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:28:25.663Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
   "expectation": "engine=advise: after the store is seeded (fast fails search, explore passes it) the system prompt the host sends for the orchestrator carries a generated R: line that moves search to @explore plus a 'Route hint' for the search turn; with no evidence (control host) neither is there and the R: line is the shipped one. A dispatch in advise is logged (would switch) but the host's child still runs the orchestrator's pick.",
   "observed": {
-    "rootID": "ses_eecaf8480ffegM4wRbKLCw2n0S",
-    "controlRootID": "ses_eecaf9058ffeVECbbkd6RMFpZA",
+    "rootID": "ses_eec73fe29ffe2OpXHm4b7FY6ws",
+    "controlRootID": "ses_eec740ad3ffeH8y4LAGC22X7Yc",
     "rootRequest": {
       "catalogModel": "anthropic/claude-opus-4-7#default",
       "agent": "build",
@@ -33,7 +33,7 @@
     "controlHasHint": false,
     "routeLineParagraphPresent": true,
     "hostChild": {
-      "id": "ses_eecaf8284ffeflq3OFyi1mC94m",
+      "id": "ses_eec73fc97ffeTVX3pO7GczYxDk",
       "agent": "fast",
       "model": {
         "id": "claude-sonnet-5-5",
@@ -43,10 +43,10 @@
     },
     "row": {
       "v": 1,
-      "ts": "2026-10-06T22:23:24.477Z",
-      "sessionID": "ses_eecaf8480ffegM4wRbKLCw2n0S",
+      "ts": "2026-10-06T23:28:25.394Z",
+      "sessionID": "ses_eec73fe29ffe2OpXHm4b7FY6ws",
       "kind": "decision",
-      "decisionID": "ses_eecaf8480ffegM4wRbKLCw2n0S:1791325404477:1",
+      "decisionID": "ses_eec73fe29ffe2OpXHm4b7FY6ws:1791329305393:1",
       "mode": "advise",
       "childSessionID": null,
       "facts": {
@@ -75,14 +75,14 @@
       "pinned": false,
       "unit": "ratio",
       "costs": {
-        "search|router:fast|anthropic/claude-sonnet-5-5#low": 4.455339284318129,
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 4.4553392453961225,
         "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.7866811875,
         "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.965,
-        "search|host:explore|anthropic/claude-opus-4-7#default": 1.164540178920468,
+        "search|host:explore|anthropic/claude-opus-4-7#default": 1.1645401886509696,
         "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
       },
       "confidence": 0.72,
-      "reason": "switched: switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=3.5643 ratio",
+      "reason": "switched: C(best)=1.1645 < (1 − 0.2)·C(chosen)=3.5643 ratio",
       "step": "dispatch",
       "resume": false,
       "trace": {

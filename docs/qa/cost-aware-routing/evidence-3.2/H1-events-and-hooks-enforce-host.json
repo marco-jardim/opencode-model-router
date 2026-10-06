@@ -1,99 +1,99 @@
 {
   "scenario": "H1-events-and-hooks-enforce-host",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "c6e62d32-d74b-4c88-b0aa-27cae7ebe9f8",
-  "recordedAt": "2026-10-06T22:22:44.688Z",
+  "runId": "0549fb8f-c78c-445b-937d-26393f9c2366",
+  "recordedAt": "2026-10-06T23:27:15.665Z",
   "harness": {
-    "headSha": "45e51991fd2b7b566500507de8f1f6bc3712a0c9",
+    "headSha": "0953b18a3a781fc84eb09fac5832d579cf7ceeef",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "228a9b4b4a2a7b755abb95f8180af9f9d46d2d14",
-      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+      "test/smoke/routing-engine.smoke.test.ts": "9d2faba6384facab8b2804fab22c5f5ce6e9d209",
+      "test/smoke/helpers/routing-host.ts": "ba51fbbc1f25fd98fc10e14fce214c772aa610d5"
     },
     "uncommittedChanges": false
   },
-  "expectation": "Host events for a subagent child: session.created carries parentID/agent/title; session.execution.* events carry an id and are delivered for the child before the tool call returns; the plugin's execute.before hook ran for the model-emitted subagent call.",
+  "expectation": "Host events for a subagent child: session.created carries parentID/agent/title; session.execution.* events carry an id (verified) and their delivery to the plugin was OBSERVED before the probe's execute.after hook of the same call: one sample per run, a few tens of ms, not a bound the plugin relies on (the runner waits up to 1 s for the end and starts fresh otherwise); the plugin's execute.before hook ran for the model-emitted subagent call.",
   "observed": {
     "childEventTypes": [
       {
         "type": "session.created",
-        "id": "evt_1134f6c83001VkmBUONTlSpecH",
-        "created": 1791325334659,
-        "deliveredAt": 1791325334674
+        "id": "evt_1138a7c20001Tu2Epn8hq1mZTL",
+        "created": 1791329205280,
+        "deliveredAt": 1791329205290
       },
       {
         "type": "session.inbox.enqueued",
-        "id": "evt_1134f6c93001L3pJPv3MKkQdtU",
-        "created": 1791325334675,
-        "deliveredAt": 1791325334679
+        "id": "evt_1138a7c2c001mILxEvQdiRT7sH",
+        "created": 1791329205292,
+        "deliveredAt": 1791329205295
       },
       {
         "type": "session.execution.started",
-        "id": "evt_1134f6c98001My1JG2ntoSijH2",
-        "created": 1791325334680,
-        "deliveredAt": 1791325334727
+        "id": "evt_1138a7c2f001em22I4ydyYut3s",
+        "created": 1791329205295,
+        "deliveredAt": 1791329205329
       },
       {
         "type": "session.instructions.updated",
-        "id": "evt_1134f6ca2001uf5QSuIYF07hCE",
-        "created": 1791325334690,
-        "deliveredAt": 1791325334732
+        "id": "evt_1138a7c37001pOzs54XGVVhVtB",
+        "created": 1791329205303,
+        "deliveredAt": 1791329205333
       },
       {
         "type": "session.inbox.delivered",
-        "id": "evt_1134f6ca60018Nqubrr0KhlmUq",
-        "created": 1791325334694,
-        "deliveredAt": 1791325334733
+        "id": "evt_1138a7c39001afSP5LhhSEl9Yi",
+        "created": 1791329205305,
+        "deliveredAt": 1791329205333
       },
       {
         "type": "session.step.started",
-        "id": "evt_1134f6ce9001MLJESj0utTo0Lx",
-        "created": 1791325334761,
-        "deliveredAt": 1791325334775
+        "id": "evt_1138a7c590014z97PSRc1Uig0k",
+        "created": 1791329205337,
+        "deliveredAt": 1791329205345
       },
       {
         "type": "session.text.started",
-        "id": "evt_1134f6cec001GlunlrjYxgkg7o",
-        "created": 1791325334765,
-        "deliveredAt": 1791325334776
+        "id": "evt_1138a7c5b001vsk1OgEbffRK5l",
+        "created": 1791329205339,
+        "deliveredAt": 1791329205346
       },
       {
         "type": "session.text.ended",
-        "id": "evt_1134f6cf2002V2DI65IbGR5IuK",
-        "created": 1791325334770,
-        "deliveredAt": 1791325334776
+        "id": "evt_1138a7c5e002URITJzVfQdXEpD",
+        "created": 1791329205342,
+        "deliveredAt": 1791329205346
       },
       {
         "type": "session.step.ended",
-        "id": "evt_1134f6cfe001f7x8kW7ssf2YRU",
-        "created": 1791325334782,
-        "deliveredAt": 1791325334808
+        "id": "evt_1138a7c6a001YQnOQJuVeTRJ01",
+        "created": 1791329205354,
+        "deliveredAt": 1791329205373
       },
       {
         "type": "session.usage.updated",
-        "id": "evt_1134f6d03001ro5Nlmg6Oxztrk",
-        "created": 1791325334787,
-        "deliveredAt": 1791325334816
+        "id": "evt_1138a7c6d001uIsPWfCTN6Y64K",
+        "created": 1791329205357,
+        "deliveredAt": 1791329205379
       },
       {
         "type": "session.execution.succeeded",
-        "id": "evt_1134f6d050011IV3nrNjkZa92U",
-        "created": 1791325334789,
-        "deliveredAt": 1791325334817
+        "id": "evt_1138a7c6f001axhuBtPCCHdRK6",
+        "created": 1791329205359,
+        "deliveredAt": 1791329205380
       }
     ],
     "sessionCreated": [
       {
-        "id": "evt_1134f6c83001VkmBUONTlSpecH",
+        "id": "evt_1138a7c20001Tu2Epn8hq1mZTL",
         "type": "session.created",
         "data": {
-          "sessionID": "ses_eecb09387ffer9copbFmSJsx0u",
-          "projectID": "9b6eee87107b5f94c6be56eacdb526819ea2b321",
+          "sessionID": "ses_eec7583e4ffesp5DDVT0T21WUb",
+          "projectID": "a18430b54c7f0a9831f3c22ab421fb9a8af924fb",
           "location": {
-            "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project"
+            "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project"
           },
           "subpath": "",
-          "parentID": "ses_eecb0950bffeTVBAAFmKm7nQ6d",
-          "slug": "gentle-planet",
+          "parentID": "ses_eec758508ffef69ymrTyYlKV95",
+          "slug": "curious-lagoon",
           "title": "Find usages",
           "agent": "fast",
           "model": {
@@ -111,46 +111,46 @@
           "version": "2.0.22"
         },
         "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-6j9yhE\\project"
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-8FfNFG\\project"
         }
       }
     ],
     "executionEvents": [
       {
-        "id": "evt_1134f6c98001My1JG2ntoSijH2",
+        "id": "evt_1138a7c2f001em22I4ydyYut3s",
         "type": "session.execution.started",
         "data": {
-          "sessionID": "ses_eecb09387ffer9copbFmSJsx0u"
+          "sessionID": "ses_eec7583e4ffesp5DDVT0T21WUb"
         },
-        "deliveredAt": 1791325334727
+        "deliveredAt": 1791329205329
       },
       {
-        "id": "evt_1134f6d050011IV3nrNjkZa92U",
+        "id": "evt_1138a7c6f001axhuBtPCCHdRK6",
         "type": "session.execution.succeeded",
         "data": {
-          "sessionID": "ses_eecb09387ffer9copbFmSJsx0u"
+          "sessionID": "ses_eec7583e4ffesp5DDVT0T21WUb"
         },
-        "deliveredAt": 1791325334817
+        "deliveredAt": 1791329205380
       }
     ],
     "subagentHookRecords": [
       {
         "hook": "before",
-        "iid": "d8tr4r",
+        "iid": "ml6u8d",
         "callID": "toolu_smoke_1",
         "agent": "build",
-        "at": 1791325334640
+        "at": 1791329205270
       },
       {
         "hook": "after",
-        "iid": "d8tr4r",
+        "iid": "ml6u8d",
         "callID": "toolu_smoke_1",
         "agent": "build",
-        "at": 1791325334865
+        "at": 1791329205420
       }
     ],
-    "toolReturnedAt": 1791325334865
+    "toolReturnedAt": 1791329205420
   },
-  "assertionResult": "PASS: session.created data keys=sessionID,projectID,location,subpath,parentID,slug,title,agent,model,permissions,version parentID=ses_eecb0950bffeTVBAAFmKm7nQ6d agent=fast title=Find usages; execution events session.execution.started,session.execution.succeeded ids present=true; end delivered -48 ms vs the tool return",
+  "assertionResult": "PASS: session.created data keys=sessionID,projectID,location,subpath,parentID,slug,title,agent,model,permissions,version parentID=ses_eec758508ffef69ymrTyYlKV95 agent=fast title=Find usages; execution events session.execution.started,session.execution.succeeded ids present=true; end observed -40 ms before the probe's after-hook (one sample)",
   "notes": []
 }
