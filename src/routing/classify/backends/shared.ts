@@ -51,6 +51,67 @@ export function parseModelRef(ref: string): ModelRef | null {
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint safety (A18, QA-1.2-9)
+// ---------------------------------------------------------------------------
+
+/** `localhost`, `*.localhost`, 127.0.0.0/8 and ::1: traffic that never leaves the machine. */
+export function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "[::1]" || host === "::1") return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+export type BaseUrlCheck =
+  | { readonly ok: true; readonly host: string; readonly protocol: string; readonly loopback: boolean }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Validate a configured base URL. `hasKey`: an API key will be sent, which is
+ * refused over plain `http:` unless the host is loopback. Reasons name the host
+ * only: never the userinfo, path, query or key.
+ */
+export function checkBaseUrl(baseUrl: string, hasKey: boolean): BaseUrlCheck {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return { ok: false, reason: "classifier.baseUrl is not a valid URL" };
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { ok: false, reason: "classifier.baseUrl must be an http(s) URL" };
+  }
+  if (url.username !== "" || url.password !== "") {
+    return { ok: false, reason: "classifier.baseUrl must not embed credentials" };
+  }
+  const loopback = isLoopbackHost(url.hostname);
+  if (url.protocol === "http:" && hasKey && !loopback) {
+    return {
+      ok: false,
+      reason: `refusing to send the API key over plain http to non-loopback host ${url.hostname}`,
+    };
+  }
+  return { ok: true, host: url.hostname, protocol: url.protocol, loopback };
+}
+
+/** Logged once when a backend is created, so the effective destination of the state is visible. */
+export function logEffectiveHost(rt: BackendRuntime, baseUrl: string | null): void {
+  const text = baseUrl?.trim() ?? "";
+  if (text === "") {
+    safeWarn(rt.logger, `classifier ${rt.id}: effective host unavailable (classifier.baseUrl is not set)`);
+    return;
+  }
+  const check = checkBaseUrl(text, false);
+  if (!check.ok) {
+    safeWarn(rt.logger, `classifier ${rt.id}: effective host unavailable (${check.reason})`);
+    return;
+  }
+  safeWarn(
+    rt.logger,
+    `classifier ${rt.id}: effective host ${check.host} (${check.protocol.replace(":", "")}${check.loopback ? ", loopback" : ""})`,
+  );
+}
+// ---------------------------------------------------------------------------
 // Randomness
 // ---------------------------------------------------------------------------
 

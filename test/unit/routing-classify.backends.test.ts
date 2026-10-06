@@ -685,7 +685,8 @@ describe("openai-compatible backend", () => {
       }),
       logger,
     });
-    return { backend, fetchFn, logs };
+    const created = logs.splice(0, logs.length); // the one-time "effective host" line
+    return { backend, fetchFn, logs, created };
   }
 
   it("sends the chat request with json_schema first, bearer auth and the shuffled enum", async () => {
@@ -821,7 +822,7 @@ describe("openai-compatible backend", () => {
     const backend = createOpenAICompatibleBackend({
       fetch: hanging,
       env: { LLM_KEY: KEY },
-      settings: settings({ backend: "openai-compatible", baseUrl: "http://x/v1", apiKeyEnv: "LLM_KEY", timeoutMs: 100 }),
+      settings: settings({ backend: "openai-compatible", baseUrl: "https://x.example/v1", apiKeyEnv: "LLM_KEY", timeoutMs: 100 }),
       logger,
     });
     const started = performance.now();
@@ -910,7 +911,8 @@ describe("typesafe backend", () => {
       }),
       logger,
     });
-    return { backend, fetchFn, logs };
+    const created = logs.splice(0, logs.length); // the one-time "effective host" line
+    return { backend, fetchFn, logs, created };
   }
 
   const answer = (choice: string, confidence?: number) => ({ type: "choice", choice, ...(confidence === undefined ? {} : { confidence }) });
@@ -1208,5 +1210,119 @@ describe("hasCredentialSignal (QA-1.2-1 policy gate)", () => {
     ]) {
       expect(hasCredentialSignal(text), text).toBe(false);
     }
+  });
+});
+describe("A18: keys never travel over plain http to a remote host (QA-1.2-9)", () => {
+  const KEY = "k-0123456789abcdef";
+  const ok = (): Awaited<ReturnType<FetchLike>> => response(200, chatBody("search"));
+
+  function openai(baseUrl: string | null, overrides: Partial<ClassifierSettings> = {}) {
+    const { logger, logs } = makeLogger();
+    const fetchFn = vi.fn<FetchLike>(async () => ok());
+    const backend = createOpenAICompatibleBackend({
+      fetch: fetchFn,
+      env: { LLM_KEY: KEY },
+      settings: settings({ backend: "openai-compatible", model: "ollama/qwen3:8b", baseUrl, apiKeyEnv: "LLM_KEY", ...overrides }),
+      logger,
+    });
+    return { backend, fetchFn, logs };
+  }
+
+  it.each([
+    "http://localhost:11434/v1",
+    "http://LOCALHOST/v1",
+    "http://127.0.0.1:8080/v1",
+    "http://127.1.2.3/v1",
+    "http://[::1]:8080/v1",
+    "http://ollama.localhost/v1",
+    "https://api.example.com/v1",
+  ])("%s may carry the key", async (baseUrl) => {
+    const { backend, fetchFn } = openai(baseUrl);
+    expect((await backend.classify(stateOf("x"), callOptions(seeded(1)))).status).toBe("ok");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "http://api.example.com/v1",
+    "http://10.0.0.5/v1",
+    "http://192.168.1.10:11434/v1",
+    "http://127.0.0.1.evil.example/v1",
+    "http://localhost.evil.example/v1",
+  ])("%s with a key is refused (disabled, logged, nothing sent)", async (baseUrl) => {
+    const { backend, fetchFn, logs } = openai(baseUrl);
+    const result = await backend.classify(stateOf("x"), callOptions(seeded(1)));
+    expect(result.status).toBe("disabled");
+    expect(result.reason).toMatch(/^refusing to send the API key over plain http to non-loopback host /);
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(logs.some((l) => l.message.startsWith("classifier openai-compatible: disabled (refusing"))).toBe(true);
+    expect(JSON.stringify({ result, logs })).not.toContain(KEY);
+  });
+
+  it("plain http to a remote host is allowed when no key is configured (nothing secret is sent)", async () => {
+    const { backend, fetchFn } = openai("http://gpu-box.lan:8000/v1", { apiKeyEnv: null });
+    expect((await backend.classify(stateOf("x"), callOptions(seeded(1)))).status).toBe("ok");
+    expect(fetchFn.mock.calls[0]![1].headers).not.toHaveProperty("Authorization");
+  });
+
+  it("rejects unparsable URLs, other schemes and embedded credentials without echoing them", async () => {
+    for (const [baseUrl, reason] of [
+      ["not a url", "classifier.baseUrl is not a valid URL"],
+      ["ftp://example.com/v1", "classifier.baseUrl must be an http(s) URL"],
+      ["https://user:hunter2@example.com/v1", "classifier.baseUrl must not embed credentials"],
+    ] as const) {
+      const { backend, fetchFn, logs } = openai(baseUrl);
+      const result = await backend.classify(stateOf("x"), callOptions(seeded(1)));
+      expect(result.reason).toBe(reason);
+      expect(fetchFn).not.toHaveBeenCalled();
+      expect(JSON.stringify(logs)).not.toContain("hunter2");
+    }
+  });
+
+  it("typesafe always carries a key, so plain http to a remote host is refused there too", async () => {
+    const { logger } = makeLogger();
+    const fetchFn = vi.fn<FetchLike>(async () => response(200, "{}"));
+    const make = (baseUrl: string) =>
+      createTypeSafeBackend({
+        fetch: fetchFn,
+        env: { TS_KEY: KEY },
+        settings: settings({ backend: "typesafe", baseUrl, apiKeyEnv: "TS_KEY" }),
+        logger,
+      });
+    const refused = await make("http://typesafe.example.com").classify(stateOf("x"), callOptions(seeded(1)));
+    expect(refused.status).toBe("disabled");
+    expect(refused.reason).toContain("refusing to send the API key over plain http");
+    expect(fetchFn).not.toHaveBeenCalled();
+    const local = await make("http://localhost:9000").classify(stateOf("x"), callOptions(seeded(1)));
+    expect(local.status).not.toBe("disabled");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs the effective host once at creation, never the path, userinfo or key", () => {
+    const { logger, logs } = makeLogger();
+    const env = { LLM_KEY: KEY };
+    const fetchFn: FetchLike = async () => response(200, "");
+    createOpenAICompatibleBackend({
+      fetch: fetchFn,
+      env,
+      settings: settings({ backend: "openai-compatible", baseUrl: "https://api.example.com/secret/path?token=abc", apiKeyEnv: "LLM_KEY" }),
+      logger,
+    });
+    createOpenAICompatibleBackend({
+      fetch: fetchFn,
+      env,
+      settings: settings({ backend: "openai-compatible", baseUrl: "http://localhost:11434/v1", apiKeyEnv: null }),
+      logger,
+    });
+    createTypeSafeBackend({
+      fetch: fetchFn,
+      env,
+      settings: settings({ backend: "typesafe", baseUrl: null, apiKeyEnv: "LLM_KEY" }),
+      logger,
+    });
+    expect(logs.map((l) => l.message)).toEqual([
+      "classifier openai-compatible: effective host api.example.com (https)",
+      "classifier openai-compatible: effective host localhost (http, loopback)",
+      "classifier typesafe: effective host unavailable (classifier.baseUrl is not set)",
+    ]);
   });
 });

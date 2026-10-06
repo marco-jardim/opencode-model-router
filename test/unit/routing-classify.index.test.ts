@@ -585,7 +585,11 @@ describe("createClassifierBackend", () => {
     );
     expect(openai?.id).toBe("openai-compatible");
     expect(typesafe?.id).toBe("typesafe");
-    expect(logs.messages).toEqual([]);
+    // Only the one-time effective-host lines (QA-1.2-9); no missing-key complaint at build time.
+    expect(logs.messages).toEqual([
+      "classifier openai-compatible: effective host localhost (http, loopback)",
+      "classifier typesafe: effective host api.typesafe.ai (https)",
+    ]);
   });
 
   it("falls back to the global fetch and process.env when none are injected (nothing is called)", () => {

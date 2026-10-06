@@ -25,6 +25,7 @@ import {
   type TaskClass,
 } from "../types";
 import {
+  checkBaseUrl,
   createRuntime,
   cutRaw,
   disabled,
@@ -34,6 +35,7 @@ import {
   gatherSamples,
   guarded,
   guardedMany,
+  logEffectiveHost,
   parseBatchLabels,
   parseLabel,
   parseModelRef,
@@ -76,6 +78,7 @@ interface BatchAnswer {
 export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps): ClassifierBackend {
   const rt = createRuntime("openai-compatible", deps.logger, deps.now);
   const { settings } = deps;
+  logEffectiveHost(rt, settings.baseUrl);
   /** Instance memo: false once the server rejected `response_format`. */
   let jsonSchema = true;
 
@@ -86,11 +89,15 @@ export function createOpenAICompatibleBackend(deps: OpenAICompatibleBackendDeps)
     const ref = parseModelRef(settings.model ?? "");
     if (ref === null) return BAD_MODEL;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
+    let key: string | null = null;
     if (settings.apiKeyEnv) {
-      const key = deps.env[settings.apiKeyEnv];
-      if (key === undefined || key.trim() === "") return `apiKeyEnv ${settings.apiKeyEnv} is not set`;
-      headers.Authorization = `Bearer ${key}`;
+      const value = deps.env[settings.apiKeyEnv];
+      if (value === undefined || value.trim() === "") return `apiKeyEnv ${settings.apiKeyEnv} is not set`;
+      key = value;
+      headers.Authorization = `Bearer ${value}`;
     }
+    const safe = checkBaseUrl(baseUrl, key !== null);
+    if (!safe.ok) return safe.reason;
     return { url: baseUrl.replace(/\/+$/, "") + "/chat/completions", model: ref.id, headers };
   }
 

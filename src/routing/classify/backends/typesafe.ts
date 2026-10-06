@@ -36,6 +36,7 @@ import {
   type TaskClass,
 } from "../types";
 import {
+  checkBaseUrl,
   createRuntime,
   cutRaw,
   disabled,
@@ -45,6 +46,7 @@ import {
   gatherSamples,
   guarded,
   guardedMany,
+  logEffectiveHost,
   parseModelRef,
   reasonOf,
   renderBatchPrompt,
@@ -127,6 +129,7 @@ function oneOf<T extends string>(values: readonly T[], choice: string | null): T
 export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBackend {
   const rt = createRuntime("typesafe", deps.logger, deps.now);
   const { settings } = deps;
+  logEffectiveHost(rt, settings.baseUrl);
 
   /** Resolve URL, key and wire model at call time; a string is the `disabled` reason. */
   function endpoint(): Endpoint | string {
@@ -137,6 +140,8 @@ export function createTypeSafeBackend(deps: TypeSafeBackendDeps): ClassifierBack
     if (!settings.apiKeyEnv) return NO_KEY;
     const key = deps.env[settings.apiKeyEnv];
     if (key === undefined || key.trim() === "") return `apiKeyEnv ${settings.apiKeyEnv} is not set`;
+    const safe = checkBaseUrl(baseUrl, true);
+    if (!safe.ok) return safe.reason;
     return {
       url: baseUrl.replace(/\/+$/, "") + "/v1/systemone",
       model: ref.id,
