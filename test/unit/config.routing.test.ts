@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
+import { existsSync, readdirSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import {
@@ -41,18 +42,16 @@ const ROOT = resolve(__dirname, "..", "..");
 // Redirecting `process.env.HOME` / `USERPROFILE` is NOT enough: under
 // `--pool=threads` (worker threads) an env change does not reach `homedir()`, and
 // a test that writes "the global override" then writes the user's real file.
-// So `node:os`.homedir is mocked at module level, the env is redirected as well,
-// and a guard fails every test BEFORE it can write if either path is outside the
-// temporary home.
+// The global setup file test/setup/home-guard.ts mocks `node:os` homedir for every
+// test file (it follows the env redirect below in any pool). This file redirects
+// the env as well and a guard fails every test BEFORE it can write if either path
+// is outside the temporary home, so a missing or broken setup file cannot go unnoticed.
 // ---------------------------------------------------------------------------
 
-const fakeHome = vi.hoisted(() => ({ dir: undefined as string | undefined }));
-
-vi.mock("node:os", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:os")>();
-  const mockedHomedir = (): string => fakeHome.dir ?? actual.homedir();
-  return { ...actual, homedir: mockedHomedir, default: { ...actual, homedir: mockedHomedir } };
-});
+// What is real, captured before any test redirects anything.
+const realOs = await vi.importActual<typeof import("node:os")>("node:os");
+const REAL_HOME = realOs.homedir();
+const ORIGINAL_ENV = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
 
 let tmpHome = "";
 let restoreHomeEnv: () => void = () => {};
@@ -79,7 +78,6 @@ beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), "oc-mr-routing-"));
   process.env.HOME = tmpHome;
   process.env.USERPROFILE = tmpHome;
-  fakeHome.dir = tmpHome;
   // Before any test body can write: where the module under test would write.
   if (homedir() !== tmpHome) {
     throw new Error(`config.routing.test: os.homedir() is "${homedir()}", not the temporary home "${tmpHome}" (QA-1.1-1)`);
@@ -91,7 +89,6 @@ beforeEach(() => {
 
 afterEach(() => {
   restoreHomeEnv();
-  fakeHome.dir = undefined;
   if (tmpHome !== "") rmSync(tmpHome, { recursive: true, force: true });
   tmpHome = "";
   invalidateConfigCache();
@@ -1009,6 +1006,51 @@ describe("build-info", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The global home guard (test/setup/home-guard.ts; QA-1.1-17, amendment A14).
+// ---------------------------------------------------------------------------
+
+describe("home guard (test/setup/home-guard.ts)", () => {
+  const setEnv = (name: "HOME" | "USERPROFILE", value: string | undefined): void => {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  };
+
+  it("follows the HOME/USERPROFILE redirect of the test", () => {
+    expect(homedir()).toBe(tmpHome);
+    expect(overridePath().startsWith(tmpHome)).toBe(true);
+  });
+
+  it("follows a redirect of HOME alone, even where os.homedir() natively ignores HOME (Windows)", () => {
+    setEnv("USERPROFILE", ORIGINAL_ENV.USERPROFILE);
+    expect(homedir()).toBe(tmpHome);
+  });
+
+  it("follows a redirect of USERPROFILE alone", () => {
+    setEnv("HOME", ORIGINAL_ENV.HOME);
+    expect(homedir()).toBe(tmpHome);
+  });
+
+  it("gives a test that redirected nothing a private empty home, never the real one", () => {
+    setEnv("HOME", ORIGINAL_ENV.HOME);
+    setEnv("USERPROFILE", ORIGINAL_ENV.USERPROFILE);
+    const isolated = homedir();
+    expect(isolated).not.toBe(REAL_HOME);
+    expect(isolated).not.toBe(tmpHome);
+    expect(existsSync(isolated)).toBe(true);
+    expect(readdirSync(isolated)).toEqual([]);
+    expect(overridePath().startsWith(isolated)).toBe(true);
+  });
+
+  it("throws, before anything can be written, when a test resolves the real home", () => {
+    // A trailing slash: a different string than the starting env, the same directory.
+    setEnv("HOME", `${REAL_HOME}/`);
+    setEnv("USERPROFILE", `${REAL_HOME}/`);
+    expect(() => homedir()).toThrow(/home-guard: a test resolved the real home directory/);
+    expect(() => overridePath()).toThrow(/home-guard/);
+    expect(() => loadConfig()).toThrow(/home-guard/);
+  });
+});
 // ---------------------------------------------------------------------------
 // docs/CONFIG_REFERENCE.md must say what the code does (1.1.5): its defaults
 // block and every example are parsed here, so a drift fails the build.
