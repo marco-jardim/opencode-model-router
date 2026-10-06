@@ -123,10 +123,17 @@ describe("buildClassifierState (D14)", () => {
     expect(state.maxStateChars).toBe(300);
   });
 
-  it("clamps the budget to [200, 20000]", () => {
-    expect(buildClassifierState({ prompt: "x".repeat(500) }, 10).maxStateChars).toBe(200);
+  it("only the upper bound clamps: a small configured budget is honoured, never raised (QA-1.2-18)", () => {
+    const tiny = buildClassifierState({ description: "a description", prompt: "x".repeat(500) }, 10);
+    expect(tiny.maxStateChars).toBe(10);
+    expect(tiny.text.length).toBeLessThanOrEqual(10);
+    expect(tiny.truncated).toBe(true);
+    expect(buildClassifierState({ prompt: "x".repeat(500) }, 100).text.length).toBeLessThanOrEqual(100);
     expect(buildClassifierState({ prompt: "x" }, 1e9).maxStateChars).toBe(20_000);
+    expect(buildClassifierState({ prompt: "x" }, -5).maxStateChars).toBe(0);
+    expect(buildClassifierState({ prompt: "x" }, -5).text).toBe("");
     expect(buildClassifierState({ prompt: "x" }, Number.NaN).maxStateChars).toBe(200);
+    expect(buildClassifierState({ prompt: "x" }, 12.9).maxStateChars).toBe(12);
   });
 
   it("text.length <= maxStateChars over random inputs", () => {
@@ -1492,5 +1499,84 @@ describe("resilience: early majority, circuit breaker, abandoned cap (QA-1.2-10)
     expect((await backend.classifyMany(many, callOptions(seeded(1)))).every((r) => r.status === "error")).toBe(true);
     expect((await backend.classifyMany(many, callOptions(seeded(1)))).every((r) => r.status === "disabled")).toBe(true);
     expect(text).toHaveBeenCalledTimes(3);
+  });
+});
+describe("state: fences, truncation and long blobs (QA-1.2-11, QA-1.2-12)", () => {
+  const stateText = (prompt: string, max = 4000): string => buildClassifierState({ prompt }, max).text;
+
+  it("a closing fence at least as long as the opener closes it; a shorter one does not", () => {
+    expect(stateText("before\n```\nsecret code\n```\nafter")).toBe("Task:\nbefore\n[code block omitted]\nafter");
+    expect(stateText("before\n````\ncode\n```\nstill code\n`````\nafter")).toBe(
+      "Task:\nbefore\n[code block omitted]\nafter",
+    );
+    expect(stateText("before\n~~~\ncode\n~~~~~~\nafter")).toBe("Task:\nbefore\n[code block omitted]\nafter");
+  });
+
+  it("an unclosed fence runs to the end of the text", () => {
+    const text = stateText("do the thing\n```\nconst password = 1;\nmore code\nand more");
+    expect(text).toBe("Task:\ndo the thing\n[code block omitted]");
+    expect(text).not.toContain("more code");
+  });
+
+  it("mixed fence characters do not close each other; inline triple backticks are not fences", () => {
+    expect(stateText("a\n```\ncode\n~~~\nmore\n```\nb")).toBe("Task:\na\n[code block omitted]\nb");
+    expect(stateText("use ```x``` inline\nnext line")).toBe("Task:\nuse ```x``` inline\nnext line");
+  });
+
+  it("an indented fence of four spaces is not a fence", () => {
+    const text = stateText("a\n    ```\n    code\n    ```\nb");
+    expect(text).toContain("    code");
+  });
+
+  it("CRLF text is handled", () => {
+    expect(stateText("a\r\n```\r\ncode\r\n```\r\nb")).toBe("Task:\na\n[code block omitted]\nb");
+  });
+
+  it("only the head of a huge prompt is processed, quickly", () => {
+    const filler = "word ".repeat(600_000); // 3 MB
+    const started = performance.now();
+    const state = buildClassifierState({ prompt: `implement the parser\n${filler}tail-marker` }, 4000);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(state.text).toContain("implement the parser");
+    expect(state.text).not.toContain("tail-marker");
+    expect(state.truncated).toBe(true);
+  });
+
+  it("text beyond the first 20000 characters never reaches the state, so a secret there cannot", () => {
+    const secret = ["sk", "live", "51HxYzAbCdEfGhIjKlMnOpQrSt"].join("_");
+    const state = buildClassifierState({ prompt: `${"x ".repeat(12_000)}\n${secret}` }, 20_000);
+    expect(state.text).not.toContain(secret);
+    expect(state.text.length).toBeLessThanOrEqual(20_000);
+  });
+
+  it("a trailing [acceptance] block is still found past a long prompt", () => {
+    const block = "[acceptance]\ncheck: testsPass\n[/acceptance]";
+    const state = buildClassifierState({ prompt: `do it\n${"filler line\n".repeat(5_000)}${block}` }, 2000);
+    expect(state.acceptanceIncluded).toBe(true);
+    expect(state.text).toContain(block);
+    expect(state.text.length).toBeLessThanOrEqual(2000);
+    const upper = buildClassifierState({ prompt: "do it\n[ACCEPTANCE]\ncheck: x\n[/Acceptance]\nmore" }, 2000);
+    expect(upper.acceptanceIncluded).toBe(true);
+    expect(upper.text).not.toMatch(/Task:[\s\S]*\[ACCEPTANCE\]/);
+  });
+
+  it("an unclosed [acceptance] tag is ordinary text; many of them are linear", () => {
+    expect(stateText("a [acceptance] b")).toBe("Task:\na [acceptance] b");
+    const started = performance.now();
+    buildClassifierState({ prompt: "[acceptance]".repeat(50_000) }, 2000);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  it("a blob of 200+ path characters becomes a placeholder, not state", () => {
+    const text = stateText(`look at ${"a/".repeat(300)} please`);
+    expect(text).toBe("Task:\nlook at [long token omitted] please");
+  });
+
+  it("a long prompt of hostile shape is processed in linear time", () => {
+    for (const prompt of ["a".repeat(100_000), "a-".repeat(50_000), "`".repeat(100_000), "\n".repeat(100_000)]) {
+      const started = performance.now();
+      buildClassifierState({ prompt }, 4000);
+      expect(performance.now() - started).toBeLessThan(250);
+    }
   });
 });

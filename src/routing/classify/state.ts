@@ -10,26 +10,32 @@
  * file contents, no system prompt, no session history.
  */
 
+import { replaceFences } from "./fences";
+import { scrubState } from "./scrub";
+import { collapseLongRuns } from "./text";
 import {
   ACCEPTANCE_BLOCK_RE,
   CODE_BLOCK_PLACEHOLDER,
   DIRECTIVE_LINE_RES,
-  FENCED_CODE_RE,
+  RULES_MAX_CHARS,
   STATE_DESCRIPTION_MAX_CHARS,
   type ClassifierState,
 } from "./types";
-import { scrubState } from "./scrub";
 
-const MIN_STATE_CHARS = 200;
+/** Used when `maxStateChars` is not a finite number. */
+const FALLBACK_STATE_CHARS = 200;
+/** Upper bound of the budget; a smaller configured value is honoured as given. */
 const MAX_STATE_CHARS = 20_000;
 const TASK_HEADER = "Task:\n";
+const OPEN_TAG = "[acceptance]";
+const CLOSE_TAG = "[/acceptance]";
 
 const ACCEPTANCE_ALL_RE = new RegExp(ACCEPTANCE_BLOCK_RE.source, "gi");
-const FENCED_ALL_RE = new RegExp(FENCED_CODE_RE.source, "gm");
 
-function clamp(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.min(max, Math.max(min, Math.floor(value)));
+/** Only the upper bound clamps (QA-1.2-18): an operator who asks for 100 characters gets at most 100. */
+function budgetOf(value: number): number {
+  if (!Number.isFinite(value)) return FALLBACK_STATE_CHARS;
+  return Math.min(MAX_STATE_CHARS, Math.max(0, Math.floor(value)));
 }
 
 /** Neutralise the delimiter runs so state text can never close or forge a block. */
@@ -37,31 +43,64 @@ function neutralize(text: string): string {
   return text.replaceAll("<<<", "\u2039\u2039\u2039").replaceAll(">>>", "\u203a\u203a\u203a");
 }
 
-function dropDirectiveLines(prompt: string): string {
-  return prompt
+function dropDirectiveLines(text: string): string {
+  return text
     .split(/\r?\n/)
     .filter((line) => !DIRECTIVE_LINE_RES.some((re) => re.test(line)))
     .join("\n");
+}
+
+/**
+ * The first `[acceptance]` block and the text without any block, found with
+ * `indexOf` over the WHOLE prompt (an acceptance block conventionally sits at
+ * the end, past where the head of a long prompt is cut) in linear time.
+ */
+function splitAcceptance(text: string): { readonly first: string | null; readonly rest: string } {
+  const lower = text.toLowerCase();
+  if (lower.length !== text.length) {
+    // Case folding changed the length (rare Unicode): offsets are unusable, fall back to the bounded regex.
+    const head = text.slice(0, RULES_MAX_CHARS);
+    const match = ACCEPTANCE_BLOCK_RE.exec(head);
+    return { first: match === null ? null : match[0], rest: head.replace(ACCEPTANCE_ALL_RE, "") };
+  }
+  let first: string | null = null;
+  const parts: string[] = [];
+  let pos = 0;
+  for (;;) {
+    const open = lower.indexOf(OPEN_TAG, pos);
+    if (open === -1) break;
+    const close = lower.indexOf(CLOSE_TAG, open + OPEN_TAG.length);
+    if (close === -1) break; // an unclosed tag is ordinary text
+    const end = close + CLOSE_TAG.length;
+    if (first === null) first = text.slice(open, end);
+    parts.push(text.slice(pos, open));
+    pos = end;
+  }
+  parts.push(text.slice(pos));
+  return { first, rest: parts.join("") };
 }
 
 export function buildClassifierState(
   input: { description?: string; prompt: string },
   maxStateChars: number,
 ): ClassifierState {
-  const budget = clamp(maxStateChars, MIN_STATE_CHARS, MAX_STATE_CHARS);
+  const budget = budgetOf(maxStateChars);
 
-  const prompt = dropDirectiveLines(String(input.prompt ?? ""));
-  const acceptanceMatch = ACCEPTANCE_BLOCK_RE.exec(prompt);
-  const acceptanceRaw = acceptanceMatch === null ? null : acceptanceMatch[0];
-  const bodyRaw = prompt
-    .replace(ACCEPTANCE_ALL_RE, "")
-    .replace(FENCED_ALL_RE, CODE_BLOCK_PLACEHOLDER)
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  // Nothing below runs a regex over more than RULES_MAX_CHARS characters of the prompt (QA-1.2-11),
+  // except the linear indexOf scan that keeps a trailing acceptance block reachable.
+  const { first, rest } = splitAcceptance(String(input.prompt ?? ""));
+  const acceptanceRaw =
+    first === null || first.length > RULES_MAX_CHARS ? null : dropDirectiveLines(first);
+  const bodyRaw = collapseLongRuns(
+    replaceFences(dropDirectiveLines(rest.slice(0, RULES_MAX_CHARS)), CODE_BLOCK_PLACEHOLDER)
+      .replace(/\n{3,}/g, "\n\n")
+      .trim(),
+    "[long token omitted]",
+  );
 
   // Scrub first, then bound: a secret cut in half by the bound would no longer match a token shape.
   const description = neutralize(
-    scrubState(String(input.description ?? "").replace(/\s+/g, " ").trim()),
+    scrubState(String(input.description ?? "").slice(0, RULES_MAX_CHARS).replace(/\s+/g, " ").trim()),
   ).slice(0, STATE_DESCRIPTION_MAX_CHARS);
   const acceptance = acceptanceRaw === null ? null : neutralize(scrubState(acceptanceRaw));
   const body = neutralize(scrubState(bodyRaw));

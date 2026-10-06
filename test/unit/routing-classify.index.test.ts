@@ -822,3 +822,21 @@ describe("classifyMany stops after a failed chunk (QA-1.2-10)", () => {
     expect(deps.messages.some((m) => m.includes("skipping"))).toBe(false);
   });
 });
+describe("classify bounds its work on huge prompts (QA-1.2-11)", () => {
+  it("a 3 MB prompt is classified from its head in well under a second; stripped stays complete", async () => {
+    const prompt = `[route class=search]\ngrep for the handler\n${"filler word ".repeat(250_000)}`;
+    const started = performance.now();
+    const result = await classify(input(prompt), makeDeps(null));
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(result.facts.class).toBe("search");
+    expect(result.stripped).toBe(prompt.slice("[route class=search]\n".length));
+  });
+
+  it("with a backend, the state built from a huge prompt respects maxStateChars", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("search"));
+    const deps = makeDeps(backend, { settings: settings({ maxStateChars: 500 }) });
+    await classify(input(`hello\n${"filler word ".repeat(250_000)}`), deps);
+    const [state] = classifyFn.mock.calls[0]!;
+    expect(state.text.length).toBeLessThanOrEqual(500);
+  });
+});

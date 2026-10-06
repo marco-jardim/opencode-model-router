@@ -224,7 +224,9 @@ interface Prepared {
 function prepare(input: ClassifyInput, deps: ClassifyDeps): Prepared {
   const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "");
   const description = typeof input.description === "string" ? input.description.trim() : "";
-  const ruleText = [description, parsed.stripped].filter(Boolean).join("\n");
+  const ruleText = [description.slice(0, RULES_MAX_CHARS), parsed.stripped.slice(0, RULES_MAX_CHARS)]
+    .filter(Boolean)
+    .join("\n");
   const analysis = analyzeRules(ruleText, deps.cfg, { cwd: input.cwd });
   const rules = analysis.facts;
   const facts = parsed.line ? applyRouteLine(rules, parsed.line) : rules;
