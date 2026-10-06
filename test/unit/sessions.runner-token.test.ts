@@ -1,8 +1,9 @@
 // Phase 2.2 / 2.3 integration: the single-writer runner mark (QA-2.2-1) and the registry's `keepExecution` (QA-2.3-1a).
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  MAX_RUNNER_TOKENS, RUNNER_TOKEN_TTL_MS, awaitExecutionEnd, consumeRunnerDispatch, lastStepContext, markRunnerDispatch, noteExecutionEnded,
-  noteStepContext, rememberDispatch, resetDispatchRegistry, resetRunnerTokens, runnerTokenCount,
+  MAX_RUNNER_TOKENS, RUNNER_TOKEN_TTL_MS, RUNNER_VERIFICATION_DESCRIPTION, awaitExecutionEnd, consumeRunnerDispatch, consumeRunnerDispatchLoose,
+  lastStepContext, markRunnerDispatch, noteExecutionEnded, noteStepContext, rememberDispatch, resetDispatchRegistry, resetRunnerTokens,
+  runnerDescription, runnerTokenCount,
 } from "../../src/router/sessions";
 
 const FACTS = { class: "implement", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" };
@@ -72,6 +73,42 @@ describe("runner mark", () => {
   });
 });
 
+describe("runner mark: description, loose match and withdrawal ids (QA-INT-1, QA-INT-3)", () => {
+  it("runnerDescription is what the runner sends: the agent's delegation title, or the verification text without an agent", () => {
+    expect(runnerDescription("medium")).toBe("Router medium delegation");
+    expect(runnerDescription(undefined)).toBe(RUNNER_VERIFICATION_DESCRIPTION);
+    expect(RUNNER_VERIFICATION_DESCRIPTION).toBe("Router result verification");
+  });
+
+  it("a loose consumption spends the OLDEST live mark of the session and agent, whatever its prompt, and nothing of another session or agent", () => {
+    markRunnerDispatch(key({ prompt: "second" }), 10);
+    markRunnerDispatch(key({ prompt: "first" }), 5);
+    markRunnerDispatch(key({ agent: "fast", prompt: "first" }), 1);
+    markRunnerDispatch(key({ parentSessionID: "other", prompt: "first" }), 1);
+    expect(consumeRunnerDispatchLoose({ parentSessionID: "root", agent: "medium" }, 20)).toBe(true);
+    expect(consumeRunnerDispatch(key({ prompt: "first" }), 21)).toBe(false); // the oldest one went
+    expect(consumeRunnerDispatch(key({ prompt: "second" }), 21)).toBe(true);
+    expect(consumeRunnerDispatchLoose({ parentSessionID: "root", agent: "medium" }, 22)).toBe(false);
+    expect(runnerTokenCount(22)).toBe(2); // fast and other-session marks untouched
+  });
+
+  it("a loose consumption ignores expired marks", () => {
+    markRunnerDispatch(key(), 0);
+    expect(consumeRunnerDispatchLoose({ parentSessionID: "root", agent: "medium" }, RUNNER_TOKEN_TTL_MS + 1)).toBe(false);
+  });
+
+  it("withdrawal removes exactly its own mark, even when two identical marks expire at the same instant", () => {
+    const first = markRunnerDispatch(key(), 100);
+    const second = markRunnerDispatch(key(), 100); // same expiry instant as the first
+    expect(runnerTokenCount(100)).toBe(2);
+    first();
+    expect(runnerTokenCount(100)).toBe(1);
+    first(); // idempotent: it must not remove the second one
+    expect(runnerTokenCount(100)).toBe(1);
+    second();
+    expect(runnerTokenCount(100)).toBe(0);
+  });
+});
 describe("rememberDispatch keepExecution (QA-2.3-1a)", () => {
   const register = (child: string, over: Record<string, unknown> = {}) =>
     rememberDispatch(child, { facts: FACTS, agent: "medium", model: "p/m", variant: "medium", parentSessionID: "root", ...over });

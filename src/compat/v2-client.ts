@@ -3,7 +3,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import { ResumeRejectedError, type ChildSessionRunner } from "./child-session";
-import { markRunnerDispatch } from "../router/sessions";
+import { markRunnerDispatch, runnerDescription } from "../router/sessions";
 
 export const V2_GRADER_AGENT = "model-router-grader";
 const RETAINED_CONTEXT_LIMIT = 500;
@@ -143,7 +143,7 @@ export function createV2Runtime(ctx: Plugin.Context) {
         withdrawMark = markRunnerDispatch({ parentSessionID: toolContext.sessionID, agent: request.agent ?? V2_GRADER_AGENT, prompt: request.prompt });
         const result = await native.execute({
           agent: request.agent ?? V2_GRADER_AGENT,
-          description: request.agent ? `Router ${request.agent} delegation` : "Router result verification",
+          description: runnerDescription(request.agent),
           prompt: request.prompt,
           ...(model ? { model: `${model.providerID}/${model.modelID}${model.variant ? `#${model.variant}` : ""}` } : {}),
           ...(resumeID !== undefined ? { sessionID: resumeID } : {}),

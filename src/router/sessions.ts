@@ -858,17 +858,34 @@ export function resetDispatchRegistry(): void {
 // dispatch router must not touch them: the runner has already decided the agent and model#variant of the attempt, writes
 // the attempt's decision row and registers the child itself (one writer). The runner announces each native call here, just
 // before it makes it, keyed by the calling session, the agent and a hash of the prompt; the router consumes the mark when
-// the hook arrives and leaves the call alone. Marks expire and are bounded, and the runner withdraws its own mark when the
-// call returns, so a hook that never fires cannot leave a mark that would later swallow an orchestrator dispatch.
+// the hook arrives and leaves the call alone. The router only looks at a call that carries the runner's own `description`
+// (`runnerDescription`), so an orchestrator dispatch with the same agent and prompt can never spend the runner's mark
+// (QA-INT-1); if another plugin rewrote the prompt on the way, a runner-titled call still finds its mark by (session, agent).
+// Marks expire and are bounded, each has its own id for withdrawal (QA-INT-3), and the runner withdraws its own mark when
+// the call returns, so a hook that never fires cannot leave a mark that would later swallow an orchestrator dispatch.
 // ===========================================================================================================
 
 /** A runner mark is honoured for at most this long. */
 export const RUNNER_TOKEN_TTL_MS = 120_000;
-/** Bound on live marks (oldest key dropped first). */
+/** Bound on live mark keys (oldest key dropped first). */
 export const MAX_RUNNER_TOKENS = 256;
+/** The `description` of a runner verification (grader) call. */
+export const RUNNER_VERIFICATION_DESCRIPTION = "Router result verification";
 
-/** Marks per `parent \0 agent \0 sha1(prompt)`, each the expiry instant of one announced call. */
-const runnerTokens = new Map<string, number[]>();
+/** The `description` the runner sends with a native call: `Router <agent> delegation`, or the verification text (no agent). */
+export function runnerDescription(agent: string | undefined): string {
+  return agent ? `Router ${agent} delegation` : RUNNER_VERIFICATION_DESCRIPTION;
+}
+
+interface RunnerMark {
+  /** Unique per announcement: a withdrawal removes exactly its own mark (QA-INT-3). */
+  readonly id: number;
+  readonly expiresAt: number;
+}
+
+/** Marks per `parent \0 agent \0 sha1(prompt)`. */
+const runnerTokens = new Map<string, RunnerMark[]>();
+let runnerMarkSeq = 0;
 
 export interface RunnerDispatchKey {
   /** The session whose tool context the runner dispatches under (`ToolContext.sessionID`, `event.sessionID` in the hook). */
@@ -879,23 +896,28 @@ export interface RunnerDispatchKey {
   readonly prompt: string;
 }
 
-function runnerTokenKey(key: RunnerDispatchKey): string {
-  return `${key.parentSessionID}\u0000${key.agent}\u0000${createHash("sha1").update(key.prompt).digest("hex")}`;
+function runnerTokenPrefix(parentSessionID: string, agent: string): string {
+  return `${parentSessionID}\u0000${agent}\u0000`;
 }
 
-function liveMarks(marks: number[], nowMs: number): number[] {
-  return marks.filter((expiresAt) => expiresAt > nowMs);
+function runnerTokenKey(key: RunnerDispatchKey): string {
+  return `${runnerTokenPrefix(key.parentSessionID, key.agent)}${createHash("sha1").update(key.prompt).digest("hex")}`;
+}
+
+function liveMarks(marks: readonly RunnerMark[], nowMs: number): RunnerMark[] {
+  return marks.filter((mark) => mark.expiresAt > nowMs);
 }
 
 /**
  * The runner is about to make a native `subagent` call: announce it. Returns a function that withdraws this announcement
- * (call it when the native call has returned); withdrawing a mark that was consumed or expired is a no-op.
+ * (call it when the native call has returned); withdrawing a mark that was consumed or expired is a no-op, and it never
+ * removes another announcement's mark.
  */
 export function markRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.now()): () => void {
   const id = runnerTokenKey(key);
-  const expiresAt = nowMs + RUNNER_TOKEN_TTL_MS;
+  const mark: RunnerMark = { id: ++runnerMarkSeq, expiresAt: nowMs + RUNNER_TOKEN_TTL_MS };
   const marks = liveMarks(runnerTokens.get(id) ?? [], nowMs);
-  marks.push(expiresAt);
+  marks.push(mark);
   runnerTokens.delete(id);
   runnerTokens.set(id, marks);
   while (runnerTokens.size > MAX_RUNNER_TOKENS) {
@@ -906,13 +928,13 @@ export function markRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.
   return () => {
     const current = runnerTokens.get(id);
     if (current === undefined) return;
-    const at = current.indexOf(expiresAt);
+    const at = current.findIndex((candidate) => candidate.id === mark.id);
     if (at >= 0) current.splice(at, 1);
     if (current.length === 0) runnerTokens.delete(id);
   };
 }
 
-/** The hook for a native call arrived: true (and the mark is spent) when the runner announced it, else false. */
+/** The hook for a native call arrived: true (and the mark is spent) when the runner announced exactly this call, else false. */
 export function consumeRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Date.now()): boolean {
   const id = runnerTokenKey(key);
   const marks = runnerTokens.get(id);
@@ -925,6 +947,30 @@ export function consumeRunnerDispatch(key: RunnerDispatchKey, nowMs: number = Da
   live.shift();
   if (live.length === 0) runnerTokens.delete(id);
   else runnerTokens.set(id, live);
+  return true;
+}
+
+/**
+ * QA-INT-1: the call carries the runner's title but its prompt is not the announced one (another plugin rewrote it). Spend the
+ * oldest live mark of this session and agent, whatever its prompt; false when there is none.
+ */
+export function consumeRunnerDispatchLoose(key: { readonly parentSessionID: string; readonly agent: string }, nowMs: number = Date.now()): boolean {
+  const prefix = runnerTokenPrefix(key.parentSessionID, key.agent);
+  let bestKey: string | null = null;
+  let best: RunnerMark | null = null;
+  for (const [id, marks] of runnerTokens) {
+    if (!id.startsWith(prefix)) continue;
+    for (const mark of liveMarks(marks, nowMs)) {
+      if (best === null || mark.expiresAt < best.expiresAt) {
+        best = mark;
+        bestKey = id;
+      }
+    }
+  }
+  if (best === null || bestKey === null) return false;
+  const remaining = (runnerTokens.get(bestKey) ?? []).filter((mark) => mark.id !== best!.id);
+  if (remaining.length === 0) runnerTokens.delete(bestKey);
+  else runnerTokens.set(bestKey, remaining);
   return true;
 }
 

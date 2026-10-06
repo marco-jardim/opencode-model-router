@@ -14,7 +14,7 @@ import type { AttemptPlan } from "../../src/escalate/resume";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { assembleSystemPrompt, buildTaskTaxonomy } from "../../src/router/protocol";
 import {
-  dispatchCount, lastStepContext, lookupDispatch, markRunnerDispatch, noteExecutionEnded, noteStepContext, resetDispatchRegistry,
+  dispatchCount, lastStepContext, lookupDispatch, markRunnerDispatch, noteExecutionEnded, noteStepContext, rememberDispatch, resetDispatchRegistry,
   resetRunnerTokens, runnerTokenCount,
 } from "../../src/router/sessions";
 import { resetDispatchRouting } from "../../src/routing/wire/dispatch";
@@ -1028,26 +1028,53 @@ describe("single writer with the delegate runner (QA-2.2-1, QA-2.3-1)", () => {
     expect(rows.map((row) => [row.decisionID.startsWith("ladder-"), row.switched])).toEqual([[true, false], [false, true]]);
   });
 
-  it("a mark is spent by exactly one hook call: an identical orchestrator dispatch right after the runner's is routed", async () => {
+  const RUNNER_TITLE = "Router medium delegation";
+
+  it("a mark is spent by exactly one hook call: a second runner-titled call without a mark is routed", async () => {
     const { world } = await runnerWorld();
     await world.start();
     markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: IMPLEMENT() });
-    const first = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    const first = await routed(world, { agent: "medium", description: RUNNER_TITLE, prompt: IMPLEMENT() });
     expect(first).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // the announced call: untouched
-    const second = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    const second = await routed(world, { agent: "medium", description: RUNNER_TITLE, prompt: IMPLEMENT() });
     expect(second).toMatchObject({ agent: "heavy", prompt: "Implement the change in src/a.ts." });
     expect(await world.rows()).toHaveLength(1);
   });
 
-  it("a mark is keyed on session, agent and prompt: another prompt, agent or parent session is routed", async () => {
+  it("QA-INT-1: an orchestrator dispatch with the identical agent and prompt does not consume the runner's mark", async () => {
     const { world } = await runnerWorld();
     await world.start();
-    markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: `${IMPLEMENT()}\nvariant` });
+    markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: IMPLEMENT() });
+    const orchestrator = await routed(world, { agent: "medium", prompt: IMPLEMENT() }); // description "work item": not the runner's
+    expect(orchestrator).toMatchObject({ agent: "heavy", prompt: "Implement the change in src/a.ts." });
+    expect(runnerTokenCount()).toBe(1); // the mark is still there ...
+    const runner = await routed(world, { agent: "medium", description: RUNNER_TITLE, prompt: IMPLEMENT() });
+    expect(runner).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // ... for the runner's own call
+    expect(runnerTokenCount()).toBe(0);
+    expect(await world.rows()).toHaveLength(1);
+  });
+
+  it("QA-INT-1: a runner call whose prompt another plugin rewrote still finds its mark (by session, agent and title), with a warning", async () => {
+    const { world, runtime, runChild } = await runnerWorld();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // a foreign plugin's hook runs before ours and rewrites the prompt
+    world.allToolHooks["execute.before"] = [async (event: any) => { event.input.prompt = `[another plugin]\n${event.input.prompt}`; }];
+    await world.start({}, runtime);
+    await runChild({ agent: "medium", prompt: IMPLEMENT(), model: MODEL });
+    expect(world.native[0]).toMatchObject({ agent: "medium", model: `${SONNET}#medium`, prompt: `[another plugin]\n${IMPLEMENT()}` }); // not routed, not stripped
+    expect(await world.rows()).toHaveLength(1); // the recorder's
+    expect(runnerTokenCount()).toBe(0);
+    expect(warn.mock.calls.flat().join("\n")).toContain("another prompt than the one it announced");
+  });
+
+  it("a mark is keyed on session and agent (and the prompt, unless the call is runner-titled): other sessions and agents are routed", async () => {
+    const { world } = await runnerWorld();
+    await world.start();
     markRunnerDispatch({ parentSessionID: "root", agent: "fast", prompt: IMPLEMENT() });
     markRunnerDispatch({ parentSessionID: "other", agent: "medium", prompt: IMPLEMENT() });
-    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
-    expect(after).toMatchObject({ agent: "heavy" });
-    expect(runnerTokenCount()).toBe(3);
+    const routedAway = await routed(world, { agent: "medium", description: RUNNER_TITLE, prompt: IMPLEMENT() });
+    expect(routedAway).toMatchObject({ agent: "heavy" });
+    expect(runnerTokenCount()).toBe(2);
   });
 
   it("a mark expires: past its time limit the same dispatch is routed", async () => {
@@ -1057,14 +1084,13 @@ describe("single writer with the delegate runner (QA-2.2-1, QA-2.3-1)", () => {
     try {
       markRunnerDispatch({ parentSessionID: "root", agent: "medium", prompt: IMPLEMENT() });
       vi.setSystemTime(Date.now() + 121_000);
-      const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+      const after = await routed(world, { agent: "medium", description: RUNNER_TITLE, prompt: IMPLEMENT() });
       expect(after).toMatchObject({ agent: "heavy" });
       expect(runnerTokenCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
   });
-
   it("a grader call (the runner's verification child) is not routed and writes nothing", async () => {
     const { world, runtime, runChild } = await runnerWorld();
     await world.start({}, runtime);
@@ -1148,6 +1174,142 @@ describe("a correction keeps what the registry has seen of the execution (QA-2.3
     const [rowA] = await world.rows();
     expect(lookupDispatch("C")!.decisionID).toBe(rowA!.decisionID); // corrected ...
     expect(lastStepContext("C")).toBe(4321); // ... and the execution's state survived the re-registration
+  });
+});
+describe("round 2 (QA-2.2-R2-1, R2-2, R2-7)", () => {
+  const completed = (child: string) => ({ output: { sessionID: child, status: "completed", output: "" }, content: [], metadata: { sessionID: child, status: "completed" } });
+  const FACTS = { class: "implement", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" };
+
+  describe("R2-1: a resume the host rejects after the hooks keeps the live registration", () => {
+    it("restores the child's previous registration (facts, decision and attempt id) when the call ends without a result", async () => {
+      const world = await makeWorld({ engine: "shadow" });
+      await world.start();
+      const live = rememberDispatch("child-live", { facts: FACTS, agent: "fast", model: SONNET, variant: "low", tier: "fast", parentSessionID: "root", decisionID: "live-decision", step: "dispatch" });
+      const call = dispatch(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-live" });
+      await call.run();
+      expect(lookupDispatch("child-live")).toMatchObject({ agent: "medium", step: "dispatch" });
+      expect(lookupDispatch("child-live")!.decisionID).not.toBe("live-decision"); // the resume's own registration, made by commit
+      await world.toolHooks["execute.after"]({ id: call.event.id, tool: "subagent", status: "failed", sessionID: "root" }); // the host rejected it
+      const after = lookupDispatch("child-live")!;
+      expect(after).toMatchObject({ agent: "fast", model: SONNET, variant: "low", tier: "fast", decisionID: "live-decision", attemptId: live.attemptId });
+    });
+
+    it("forgets the registration of a resumed child that had none; keeps it when the resume completed", async () => {
+      const world = await makeWorld({ engine: "shadow" });
+      await world.start();
+      const unknown = dispatch(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-unknown" });
+      await unknown.run();
+      expect(lookupDispatch("child-unknown")).toBeDefined();
+      await world.toolHooks["execute.after"]({ id: unknown.event.id, tool: "subagent", status: "failed", sessionID: "root" });
+      expect(lookupDispatch("child-unknown")).toBeUndefined();
+      const ok = dispatch(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-ok" });
+      await ok.run();
+      await world.toolHooks["execute.after"]({ id: ok.event.id, tool: "subagent", status: "completed", sessionID: "root", result: completed("child-ok") });
+      expect(lookupDispatch("child-ok")).toMatchObject({ agent: "medium" });
+    });
+
+    it("leaves a registration someone else made in the meantime alone", async () => {
+      const world = await makeWorld({ engine: "shadow" });
+      await world.start();
+      const call = dispatch(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-taken" });
+      await call.run();
+      const theirs = rememberDispatch("child-taken", { facts: FACTS, agent: "heavy", model: OPUS, variant: "xhigh", parentSessionID: "root", decisionID: "ladder-theirs", step: "variant" });
+      await world.toolHooks["execute.after"]({ id: call.event.id, tool: "subagent", status: "failed", sessionID: "root" });
+      expect(lookupDispatch("child-taken")).toBe(theirs);
+    });
+
+    it("a hook chain that throws after a resume registration (onCallFinished) never reaches commit: nothing to undo", async () => {
+      const world = await makeWorld({ engine: "shadow" });
+      await world.start({ "tool.execute.before": async () => { throw new Error("depth limit"); } });
+      const live = rememberDispatch("child-live", { facts: FACTS, agent: "fast", model: SONNET, variant: "low", parentSessionID: "root", decisionID: "live-decision" });
+      await expect(dispatch(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-live" }).run()).rejects.toThrow("depth limit");
+      expect(lookupDispatch("child-live")).toBe(live);
+    });
+  });
+
+  describe("R2-2: the session decides which instance acts", () => {
+    async function twoLocations() {
+      const world = await makeWorld({ engine: "shadow", roles: {} });
+      const dirB = join(world.home, "projB");
+      mkdirSync(join(dirB, ".opencode"), { recursive: true });
+      writeFileSync(join(dirB, ".opencode", "opencode-model-router.overrides.jsonc"), JSON.stringify({ routing: { engine: "static" } }));
+      invalidateConfigCache();
+      expect(loadConfig(dirB).routing?.engine).toBe("static"); // B's location is static, A's (the global config) is shadow
+      expect(loadConfig(world.home).routing?.engine).toBe("shadow");
+      await world.start(); // instance A: world.home
+      const cleanupB = await registerV2Hooks({ ...world.ctx, location: { directory: dirB, project: { directory: dirB } } } as unknown as Context, {} as unknown as Hooks);
+      cleanups.push(cleanupB);
+      expect(world.allToolHooks["execute.before"]).toHaveLength(2);
+      return { world, dirB };
+    }
+
+    const inDirectory = (world: World, directory: string | undefined) => {
+      world.session.current = { id: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, permissions: [{ action: "subagent", resource: "*", effect: "allow" }], ...(directory === undefined ? {} : { location: { directory } }) };
+    };
+    const deliver = async (world: World, order: "A-first" | "B-first") => {
+      const hooks = order === "A-first" ? world.allToolHooks["execute.before"]! : [...world.allToolHooks["execute.before"]!].reverse();
+      const event: any = { tool: "subagent", input: { description: "d", agent: "medium", prompt: IMPLEMENT() }, sessionID: "root", agent: "build", messageID: "m", id: `call-two-${++seq}` };
+      for (const hook of hooks) await hook(event);
+      return event.input as Record<string, any>;
+    };
+
+    it("a session of the static location is not routed by the live instance of another location (either delivery order)", async () => {
+      for (const order of ["A-first", "B-first"] as const) {
+        const { world, dirB } = await twoLocations();
+        inDirectory(world, dirB);
+        const input = await deliver(world, order);
+        expect(input).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // not stripped, not rewritten
+        expect(await world.rows()).toEqual([]);
+        expect(lookupDispatch("anything")).toBeUndefined();
+        await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+        for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true }); }
+      }
+    });
+
+    it("a session of the live location is routed once, whichever instance sees the event first", async () => {
+      for (const order of ["A-first", "B-first"] as const) {
+        const { world } = await twoLocations();
+        inDirectory(world, world.home);
+        const input = await deliver(world, order);
+        expect(input).toMatchObject({ agent: "medium", prompt: "Implement the change in src/a.ts." });
+        expect(await world.rows()).toHaveLength(1);
+        await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+        for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true }); }
+      }
+    });
+
+    it("a session that names no directory falls back to the first live instance; the directory compares by value, not spelling", async () => {
+      const { world } = await twoLocations();
+      inDirectory(world, undefined);
+      expect(await deliver(world, "B-first")).toMatchObject({ prompt: "Implement the change in src/a.ts." });
+      const respelled = process.platform === "win32" ? `${world.home.toUpperCase()}\\` : `${world.home}/`;
+      inDirectory(world, respelled);
+      expect(await deliver(world, "A-first")).toMatchObject({ prompt: "Implement the change in src/a.ts." });
+      expect(await world.rows()).toHaveLength(2);
+    });
+  });
+
+  describe("R2-7: a mis-claimed child is marked, not forgotten, and its own dispatch's result takes it over", () => {
+    it("crossed claims where B's result comes first: the child B mis-claimed stays registered until A's result", async () => {
+      const world = await makeWorld({ engine: "shadow" });
+      await world.start();
+      const a = dispatch(world, { agent: "medium", description: "same", prompt: IMPLEMENT() });
+      const b = dispatch(world, { agent: "medium", description: "same", prompt: "[route class=debug risk=low scope=single]\nFix it." });
+      await a.run();
+      await b.run();
+      world.emit({ type: "session.created", data: { sessionID: "X", parentID: "root", agent: "medium", title: "same" } }); // claims A (wrong: X is B's)
+      world.emit({ type: "session.created", data: { sessionID: "C", parentID: "root", agent: "medium", title: "same" } }); // claims B (wrong: C is A's)
+      await vi.waitFor(() => { expect(lookupDispatch("C")).toBeDefined(); });
+      const [rowA, rowB] = await world.rows();
+      await world.toolHooks["execute.after"]({ id: b.event.id, tool: "subagent", status: "completed", sessionID: "root", result: completed("X") }); // B's result first
+      expect(lookupDispatch("X")!.decisionID).toBe(rowB!.decisionID); // B took X over
+      expect(lookupDispatch("C")).toBeDefined(); // ... and C, B's wrong claim, is NOT forgotten: its steps keep being counted
+      expect(lookupDispatch("C")!.decisionID).toBe(rowB!.decisionID);
+      await world.toolHooks["execute.after"]({ id: a.event.id, tool: "subagent", status: "completed", sessionID: "root", result: completed("C") }); // A's result
+      expect(lookupDispatch("C")!.decisionID).toBe(rowA!.decisionID); // A's own result took it over
+      expect(lookupDispatch("C")!.facts.class).toBe("implement");
+      expect(lookupDispatch("X")!.facts.class).toBe("debug");
+    });
   });
 });
 describe("latency", () => {

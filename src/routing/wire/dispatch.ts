@@ -43,8 +43,10 @@ import { classify } from "../classify";
 import type { ClassifyResult, TaskFacts } from "../classify/types";
 import type { RouterConfig } from "../../router/config";
 import {
-  consumeRunnerDispatch, forgetDispatch, lookupDispatch, rememberDispatch, type DetectionDepth, type DispatchInput,
+  consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
+  type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
+import { resolve as resolvePath } from "node:path";
 import {
   FLOOR_LIFT_REASON,
   LOG_ROW_VERSION,
@@ -119,6 +121,8 @@ export interface DispatchRouter {
   onCallFinished(callID: string): void;
   /** Dispatches still waiting to be claimed (diagnostics, tests). */
   pendingCount(): number;
+  /** Children registered by a wrong heuristic claim and not yet taken over by their own dispatch (diagnostics, tests). */
+  misclaimedCount(): number;
 }
 
 export interface DispatchRouterDeps {
@@ -156,6 +160,9 @@ interface Entry {
   readonly description: string | null;
   readonly input: DispatchInput;
   readonly at: number;
+  /** A resume: the child it was registered under, and what the registry held for it before (QA-2.2-R2-1). */
+  readonly resumeID?: string;
+  readonly previous?: DispatchRecord;
   /** `waiting`: no child yet; `claimed`: a `session.created` was matched to it; `resumed`: registered at commit. */
   state: "waiting" | "claimed" | "resumed";
   claimedChild?: string;
@@ -166,6 +173,15 @@ interface Entry {
  * claims the call; the others leave it alone (the first one already routed, logged and will register it).
  */
 const handledCalls = new Set<string>();
+
+/** QA-2.2-R2-2: the same directory, whatever the spelling (separators, trailing separator, case on Windows). */
+function sameDirectory(a: string, b: string): boolean {
+  const norm = (value: string): string => {
+    const resolved = resolvePath(value).replace(/[\\/]+$/, "");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return norm(a) === norm(b);
+}
 
 function claimCall(key: string): boolean {
   if (handledCalls.has(key)) return false;
@@ -270,6 +286,12 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const decided = new Map<string, Decided>();
   /** Committed dispatches, in insertion order, until their call ends. */
   const entries = new Map<string, Entry>();
+  /**
+   * QA-2.2-R2-7: children registered under a dispatch by a heuristic claim that the dispatch's own result then disowned (child →
+   * the wrong dispatch's decision). They stay registered (their steps keep being counted, under the wrong facts) until the
+   * result of the dispatch that really started them takes them over.
+   */
+  const misclaimed = new Map<string, string>();
   let sequence = 0;
 
   const trim = <T>(map: Map<string, T>, limit: number): void => {
@@ -281,6 +303,26 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       if (t - entry.at >= ENTRY_TTL_MS) entries.delete(callID);
     }
     trim(entries, MAX_PENDING);
+  };
+
+  /**
+   * QA-2.2-R2-1: the call of a resume ended without a result (the host rejected it after the hooks ran). Its registration was
+   * made for an execution that never started: drop it, and put back what the registry held for the child before, so a live
+   * child keeps its facts and its attempt id (what the registry had observed of the execution cannot be restored).
+   */
+  const undoResume = (entry: Entry): void => {
+    if (entry.state !== "resumed" || entry.resumeID === undefined) return;
+    if (lookupDispatch(entry.resumeID)?.decisionID !== entry.input.decisionID) return; // someone registered it since: theirs
+    const before = entry.previous;
+    if (before === undefined) {
+      forgetDispatch(entry.resumeID);
+      return;
+    }
+    register(entry.resumeID, {
+      facts: before.facts, agent: before.agent, model: before.model, variant: before.variant, tier: before.tier, acceptance: before.acceptance,
+      parentSessionID: before.parentSessionID, attemptId: before.attemptId, decisionID: before.decisionID, step: before.step,
+      outcomes: before.outcomes, keepExecution: true,
+    });
   };
 
   const claimable = (entry: Entry, t: number): boolean => entry.state === "waiting" && t - entry.at < PENDING_TTL_MS;
@@ -427,18 +469,24 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     async route(call): Promise<RouteOutcome> {
       try {
         const agent = str(call.args.agent);
-        // QA-2.2-1: a call the delegate runner announced is the runner's alone; spend the mark, and tell the other instances
-        // of this process (A3) that the call is handled, so none of them routes it either.
+        const callKey = `${call.sessionID}\u0000${call.callID}`;
+        // QA-2.2-1 / QA-INT-1: a call the delegate runner announced is the runner's alone. Only a call that carries the runner's own
+        // description can be one (an orchestrator dispatch with the same agent and prompt never spends the runner's mark); if the
+        // prompt is not the announced one (rewritten by another plugin) a runner-titled call still finds its mark by session and
+        // agent. The call is then marked handled, so no other instance of this process (A3) routes it either.
         if (agent !== null && typeof call.args.prompt === "string"
-          && consumeRunnerDispatch({ parentSessionID: call.sessionID, agent, prompt: call.args.prompt })) {
-          claimCall(`${call.sessionID}\u0000${call.callID}`);
-          return UNTOUCHED;
+          && call.args.description === runnerDescription(agent === deps.graderAgent ? undefined : agent)) {
+          const exact = consumeRunnerDispatch({ parentSessionID: call.sessionID, agent, prompt: call.args.prompt });
+          if (exact || consumeRunnerDispatchLoose({ parentSessionID: call.sessionID, agent })) {
+            if (!exact) deps.logger.warn("[router] routing: a runner call arrived with another prompt than the one it announced (rewritten by another plugin?); it was left alone", { agent });
+            claimCall(callKey);
+            return UNTOUCHED;
+          }
         }
         if (agent === null || agent === deps.graderAgent) return UNTOUCHED;
         const prepared = await deps.runtime.prepare(call.cfg);
         if (prepared === null) return UNTOUCHED; // static: nothing touched
-        // A3 (QA-2.2-12): another instance of this process already acted on this call.
-        if (!claimCall(`${call.sessionID}\u0000${call.callID}`)) return UNTOUCHED;
+        if (handledCalls.has(callKey)) return UNTOUCHED; // A3 (QA-2.2-12): another instance already acted on this call
         let session: SessionView;
         try {
           session = readSession(await deps.getSession(call.sessionID));
@@ -446,6 +494,10 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           deps.logger.warn("[router] routing: the dispatching session is unavailable; the dispatch proceeds as the orchestrator chose", { error: describeError(error) });
           return UNTOUCHED;
         }
+        // QA-2.2-R2-2: the session decides which instance acts. A session of another location belongs to that location's instance
+        // (which may be static); only a session that names no directory falls back to the first live instance.
+        if (session.directory !== null && !sameDirectory(session.directory, deps.directory)) return UNTOUCHED;
+        if (!claimCall(callKey)) return UNTOUCHED;
         // Only an orchestrator's own prompt is parsed (QA focus: a delegate must not be able to pin or steer).
         if (session.parentID !== null) return UNTOUCHED;
         const view = await deps.runtime.agents(session.agent ?? call.agent, session.rules);
@@ -495,7 +547,14 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         const t = now();
         sweep(t);
         const resumeID = str(final.sessionID);
-        const entry: Entry = { callID, parentSessionID: d.parentSessionID, agent, description: d.description, input: dispatched, at: t, state: resumeID === null ? "waiting" : "resumed" };
+        // QA-2.2-R2-1: remember what the registry held for a resumed child, in case the host then rejects the resume.
+        const previous = resumeID === null ? undefined : lookupDispatch(resumeID);
+        const entry: Entry = {
+          callID, parentSessionID: d.parentSessionID, agent, description: d.description, input: dispatched, at: t,
+          state: resumeID === null ? "waiting" : "resumed",
+          ...(resumeID === null ? {} : { resumeID }),
+          ...(previous === undefined ? {} : { previous }),
+        };
         if (resumeID !== null) register(resumeID, dispatched);
         entries.delete(callID);
         entries.set(callID, entry);
@@ -535,13 +594,22 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         decided.delete(callID);
         const entry = entries.get(callID);
         entries.delete(callID);
-        if (entry === undefined || childSessionID === null || entry.state === "resumed") return;
+        if (entry === undefined) return;
+        if (childSessionID === null) {
+          undoResume(entry); // the call ended without a result: a resume the host rejected leaves the child as it was
+          return;
+        }
+        if (entry.state === "resumed") return;
         // Still waiting (the event was missed, or the claim expired), or claimed for a different child: the result is the truth.
         // The same execution, corrected or completed: keep what the registry has seen of it (QA-2.3-1a).
+        misclaimed.delete(childSessionID); // a child this dispatch really started is no longer anyone's wrong claim
         if (lookupDispatch(childSessionID)?.decisionID !== entry.input.decisionID) register(childSessionID, { ...entry.input, keepExecution: true });
         if (entry.state === "claimed" && entry.claimedChild !== undefined && entry.claimedChild !== childSessionID
           && lookupDispatch(entry.claimedChild)?.decisionID === entry.input.decisionID) {
-          forgetDispatch(entry.claimedChild); // a wrong claim: that child belongs to another dispatch, which registers it from its own result
+          // A wrong claim: that child belongs to another dispatch. It stays registered (its steps keep being counted) and is marked;
+          // the result of the dispatch that really started it takes it over (R2-7).
+          misclaimed.set(entry.claimedChild, entry.input.decisionID ?? "");
+          trim(misclaimed, MAX_PENDING);
         }
       } catch (error) {
         deps.logger.warn("[router] routing: the child of a finished dispatch could not be registered", { error: describeError(error) });
@@ -550,8 +618,12 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
     onCallFinished(callID): void {
       decided.delete(callID);
+      const entry = entries.get(callID);
       entries.delete(callID);
+      if (entry !== undefined) undoResume(entry);
     },
+
+    misclaimedCount: () => misclaimed.size,
 
     pendingCount(): number {
       const t = now();
