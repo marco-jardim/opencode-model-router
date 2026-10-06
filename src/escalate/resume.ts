@@ -55,11 +55,15 @@ export interface AttemptModel {
  *
  * - `invalid-variant`: the target variant is not in the live catalog (D10 fallback, logged).
  * - `bare-model-after-variant` (1.5 R1): the escalation sends a bare `provider/model` to a child whose stored
- *   variant was set by an earlier step. 0.P never resumed with a bare model after a variant, so it is unknown
- *   whether the host stores `default` or keeps the old variant; a fresh child is the only path whose effort is known.
+ *   variant was set by an earlier step. MEASURED on 2.0.22 in Phase 3.2 (H7 and scenario 7): the host does not keep the old
+ *   variant, it stores `default` and sends the model's default effort (Anthropic sonnet-5-5: in-band `high`; opus-5-5: none; OpenAI
+ *   luna: in-band `medium`), which is what a fresh bare-model child would run with. The guard stays all the same: that was seen at the
+ *   host-to-provider boundary only, and PROVIDER ACCEPTANCE of in-band effort is unverified. Re-decide after a real-provider check.
  * - `effort-path` (1.5 QA-1.5-22): an escalation (agent switch) across a tier that configures
- *   `effort`/`thinking`/`reasoning`. Whether a resumed child keeps the previous agent's effort options is
- *   unverified, so the least trusted path starts fresh until 3.2 proves it.
+ *   `effort`/`thinking`/`reasoning`. MEASURED on 2.0.22 in Phase 3.2 (H7, H7b): after an agent switch on resume the request carries the
+ *   TARGET agent's effort option once and never the previous agent's (on a same-model switch the top level keeps the previous agent's
+ *   effort and the target's travels in-band), and the agent's `effort` option wins over the stored variant. The guard stays: provider
+ *   acceptance of in-band effort is unverified, so the least trusted path still starts fresh. Re-decide after a real-provider check.
  */
 export type FreshReason = "invalid-variant" | "bare-model-after-variant" | "effort-path";
 
@@ -176,6 +180,7 @@ export function planNextAttempt(input: NextAttemptInput): AttemptPlan {
       const storedVariant = stored !== undefined && stored !== "" && stored !== DEFAULT_VARIANT;
       const perTier = policy.variants?.perTier;
       const own = (name: string) => (perTier !== undefined && Object.prototype.hasOwnProperty.call(perTier, name) ? perTier[name] : undefined);
+      // Both guards are kept on purpose (Phase 3.2 measured the host side; provider acceptance of in-band effort is unverified).
       if (model !== undefined && model.variant === undefined && storedVariant) {
         fresh = "bare-model-after-variant";
       } else if (action.action === "escalate" && (own(previous.tier)?.effortConfigured === true || own(tier)?.effortConfigured === true)) {

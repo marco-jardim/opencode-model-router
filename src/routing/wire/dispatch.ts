@@ -25,13 +25,19 @@
  *     registered under it, and a heuristic claim that picked the wrong child is corrected before the verdict is
  *     recorded. A call that ends without a result, or whose hook chain throws, is dropped (`onCallFinished`).
  *  6. Single writer with the delegate runner (QA-2.2-1, QA-2.3-1): the runner (2.3) dispatches its producer and grader children
- *     through the same native tool, so the same hooks fire for them. It announces each call (`markRunnerDispatch`, keyed by
- *     the calling session, the agent and a hash of the prompt) and `route()` consumes the mark first: the call is left exactly
- *     as the runner wrote it (no rewrite, no route-line strip, no floor lift, no decision row, no registration). The runner's
- *     own recorder is the only writer for ladder attempts. A `session.created` that is the runner's child is never claimed
- *     for an orchestrator dispatch (already registered, or titled like a runner call).
- *  7. Multi-instance (A3): the same hook event may reach several plugin instances of the process; only the first
- *     instance whose engine is live acts on a call (a process-wide set of handled calls).
+ *     through the same native tool. It announces each call (`markRunnerDispatch`, keyed by the calling session, the agent and a hash of
+ *     the prompt) and `route()` consumes the mark first: the call is left exactly as the runner wrote it (no rewrite, no route-line
+ *     strip, no floor lift, no decision row, no registration). The runner's own recorder is the only writer for ladder attempts. A
+ *     `session.created` that is the runner's child is never claimed for an orchestrator dispatch (already registered, or titled like a
+ *     runner call). MEASURED on the real OpenCode 2.0.22 host (Phase 3.2, H4): the host does NOT run the plugin's `execute.before` /
+ *     `execute.after` hooks for calls made through `ctx.tool.list()` natives, so on 2.0.22 `route()` never sees a runner call and the mark
+ *     is withdrawn unconsumed (`v2-client.ts`). The mark and the "runner description" rule are defensive: they only matter on a host
+ *     that does hook such calls.
+ *  7. Multi-instance (A3): MEASURED on 2.0.22 (Phase 3.2, H2): the host hands a SESSION EVENT to the plugin instance of every live
+ *     location, but the TOOL HOOKS of a call only to the instance of the session's location. So the owner rules (`ownsSession`: exact
+ *     directory, deepest ancestor, first live instance) and the process-wide set of handled calls are defensive for hooks; what protects
+ *     the store from a duplicated EVENT is the event-id LRU of the ingest (`firstDelivery`) and of the registry. Only the first instance
+ *     whose engine is live acts on a call.
  */
 
 import {
