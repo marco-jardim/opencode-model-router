@@ -84,8 +84,9 @@ function verdict(id: string, at: string, key: OutcomeKey, outcome: VerdictRow["v
   return { v: 1, kind: "verdict", ts: at, sessionID: "s1", decisionID: id, childSessionID: `c-${id}`, attemptID: `c-${id}:0`, key, verdict: outcome, step };
 }
 
+/** A refusal of its own attempt (`:r`): it does not override the verdict row of the same decision (QA-2.1-3 has its own tests). */
 function refusal(id: string, at: string, key: OutcomeKey, step: RefusalRow["step"] = "dispatch"): RefusalRow {
-  return { v: 1, kind: "refusal", ts: at, sessionID: "s1", decisionID: id, childSessionID: `c-${id}`, attemptID: `c-${id}:0`, key, step };
+  return { v: 1, kind: "refusal", ts: at, sessionID: "s1", decisionID: id, childSessionID: `c-${id}`, attemptID: `c-${id}:r`, key, step };
 }
 
 /** The scenario documented in the comments of each test (window = SINCE ≤ ts < UNTIL). */
@@ -1027,5 +1028,43 @@ describe("scripts/routing-stats.ts (plain node)", () => {
   it("the script's own location and the helper dir are what the test thinks they are", () => {
     expect(basename(SCRIPT)).toBe("routing-stats.ts");
     expect(dirname(dirname(SCRIPT))).toBe(REPO_ROOT.replace(/[\\/]$/, ""));
+  });
+});
+
+describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", () => {
+  const at = (minute: number) => `2026-10-06T10:${String(minute).padStart(2, "0")}:00.000Z`;
+  const sameAttempt = (id: string, over: Partial<RefusalRow> = {}): RefusalRow => ({ ...refusal(id, at(2), A), attemptID: `c-${id}:0`, ...over });
+  const cell = (rows: LogRow[], key: OutcomeKey, window: { since: number | null; until: number | null } = { since: null, until: null }) =>
+    summarize(null, rows, window).byKey.find((row) => row.key === key);
+
+  it("moves the pass to a fail and counts the refusal (pass 0, fail 1, refusals 1), like the store", () => {
+    const rows = [decision("X1", at(0)), verdict("X1", at(1), A, "pass"), sameAttempt("X1", { overrides: "pass" })];
+    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1, passRate: { num: 0, den: 1, rate: 0 } });
+  });
+
+  it("also joins on the attempt id when the row carries no marker", () => {
+    const rows = [decision("X1", at(0)), verdict("X1", at(1), A, "pass"), sameAttempt("X1")];
+    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+  });
+
+  it("leaves a refusal of another attempt, and a refusal after a fail, as one refusal and no extra fail", () => {
+    const other = [decision("X1", at(0)), verdict("X1", at(1), A, "pass"), refusal("X1", at(2), A)];
+    expect(cell(other, A)).toMatchObject({ pass: 1, fail: 0, falseRefusals: 1 });
+    const afterFail = [decision("X2", at(0)), verdict("X2", at(1), A, "fail"), sameAttempt("X2")];
+    expect(cell(afterFail, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+  });
+
+  it("a pass outside the window is not subtracted, but its conversion is one fail of this window", () => {
+    const rows = [decision("X1", "2026-10-05T10:00:00.000Z"), verdict("X1", "2026-10-05T10:01:00.000Z", A, "pass"), sameAttempt("X1", { overrides: "pass", decisionID: null })];
+    expect(cell(rows, A, { since: Date.parse("2026-10-06T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+  });
+
+  it("variant step verdicts follow the conversion", () => {
+    const rows = [
+      decision("V1", at(0), { step: "variant" }),
+      verdict("V1", at(1), A, "pass", "variant"),
+      { ...refusal("V1", at(2), A, "variant"), attemptID: "c-V1:0", overrides: "pass" as const },
+    ];
+    expect(summarize(null, rows, { since: null, until: null }).variantSteps).toMatchObject({ taken: 1, passRate: { num: 0, den: 1, rate: 0 } });
   });
 });

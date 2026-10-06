@@ -11,6 +11,7 @@ import {
   DEFAULT_OUTCOME_TUNING,
   makeKey,
   nodePersistDeps,
+  summarize,
   type AcquireOutcomesOptions,
   type FlushScheduler,
   type OutcomeKey,
@@ -528,13 +529,71 @@ describe("verdicts and false refusals (D4, C5)", () => {
     expect(refusal[0]).toMatchObject({ childSessionID: "c1", attemptID: expect.stringMatching(/^c1:0:\d+$/), key: MEDIUM_KEY, decisionID: "d-1", step: "dispatch" });
   });
 
-  it("refusal before the verdict: the verdict does not score the attempt a second time", () => {
+  it("refusal before the verdict: the verdict does not score the attempt a second time, and writes no row", async () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
     ingest.onFalseRefusal("c1");
     ingest.onVerdict("c1", "pass");
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts).toMatchObject({ pass: 0, fail: 0, falseRefusals: 1 });
+    expect((await h.rows()).map((r) => r.kind)).toEqual(["refusal"]);
+  });
+
+  it("QA-2.1-3: a verdict the store did not take (the attempt was scored already) writes no row", async () => {
+    const h = harness();
+    const ingest = h.make();
+    dispatch("c1");
+    dispatch("c2");
+    ingest.onVerdict("c1", "fail");
+    ingest.onVerdict("c1", "pass"); // the store keeps the first terminal signal
+    ingest.onVerdict("c1", "unverifiable"); // scored: nothing to say
+    ingest.onVerdict("c2", "unverifiable");
+    ingest.onVerdict("c2", "unverifiable");
+    const rows = await h.rows();
+    expect(rows.map((r) => [r.childSessionID, r.verdict])).toEqual([["c1", "fail"], ["c2", "unverifiable"]]);
+    expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts).toMatchObject({ pass: 0, fail: 1 });
+  });
+
+  it("QA-2.1-3 (probe P3): pass then refusal: the refusal row overrides the pass, and routing:stats agrees with the store", async () => {
+    const h = harness();
+    const ingest = h.make();
+    dispatch("c1"); // no decision id: stats counts refusals without a decision row (QA-1.3-13), as 2.2-less runs have none
+    ingest.onVerdict("c1", "pass");
+    ingest.onFalseRefusal("c1");
+    const rows = await h.rows();
+    expect(rows.map((r) => [r.kind, r.overrides ?? null])).toEqual([["verdict", null], ["refusal", "pass"]]);
+    const counts = h.store().snapshot().entries[MEDIUM_KEY]?.counts;
+    expect(counts).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+    const table = summarize(h.store(), (await h.bundles[0]!.persister.readRows()).rows, { since: null, until: null });
+    const cell = table.byKey.find((row) => row.key === MEDIUM_KEY);
+    expect(cell).toMatchObject({ pass: counts!.pass, fail: counts!.fail, falseRefusals: counts!.falseRefusals, passRate: { num: 0, den: 1, rate: 0 } });
+  });
+
+  it("QA-2.1-3: fail then refusal is one fail and one refusal in the rows, as in the store", async () => {
+    const h = harness();
+    const ingest = h.make();
+    dispatch("c1");
+    ingest.onVerdict("c1", "fail");
+    ingest.onFalseRefusal("c1");
+    await h.rows(); // flush
+    const table = summarize(h.store(), (await h.bundles[0]!.persister.readRows()).rows, { since: null, until: null });
+    const counts = h.store().snapshot().entries[MEDIUM_KEY]?.counts;
+    expect(counts).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+    expect(table.byKey.find((row) => row.key === MEDIUM_KEY)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
+  });
+
+  it("QA-2.1-9: a repeated false refusal on one attempt reaches neither the store nor the log", async () => {
+    const h = harness();
+    const ingest = h.make();
+    dispatch("c1");
+    ingest.onFalseRefusal("c1");
+    ingest.onFalseRefusal("c1");
+    ingest.onFalseRefusal("c1");
+    expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.falseRefusals).toBe(1);
+    expect((await h.rows()).filter((r) => r.kind === "refusal")).toHaveLength(1);
+    dispatch("c1"); // a new attempt of the same child is a new refusal
+    ingest.onFalseRefusal("c1");
+    expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.falseRefusals).toBe(2);
   });
 
   it("refusal after a pass converts the pass into a failure (QA-1.3-6)", () => {

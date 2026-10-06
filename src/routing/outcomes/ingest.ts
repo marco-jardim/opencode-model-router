@@ -261,8 +261,20 @@ const WARNED_CAP = 500;
 
 const seenEvents = new Map<string, true>();
 const signalled = new Set<string>();
+/** What scored each attempt in the store (`pass`, `fail` or `refusal`), so a refusal knows whether it converts a pass. */
+const scored = new Map<string, "pass" | "fail" | "refusal">();
 const lastAttemptByChild = new Map<string, string>();
 const warnedUnkeyed = new Set<string>();
+
+function boundedSet<V>(map: Map<string, V>, key: string, value: V, cap: number): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > cap) {
+    const oldest = map.keys().next();
+    if (oldest.done === true) break;
+    map.delete(oldest.value);
+  }
+}
 
 function boundedAdd(set: Set<string>, value: string, cap: number): boolean {
   if (set.has(value)) return false;
@@ -308,6 +320,7 @@ export function resetIngestState(): void {
   resetCatalogPricing();
   seenEvents.clear();
   signalled.clear();
+  scored.clear();
   lastAttemptByChild.clear();
   warnedUnkeyed.clear();
 }
@@ -507,21 +520,27 @@ export function createIngest(deps: IngestDeps): Ingest {
         const { record, settings, key } = target;
         const bundle = bundleFor(settings);
         if (bundle === null) return;
-        // `unverifiable` updates nothing in the store (D4) but is still a row for the statistics.
-        bundle.store.recordVerdict(key, outcome, signalOf(record));
-        if (boundedAdd(signalled, `verdict|${outcome}|${record.attemptId}`, SIGNAL_CAP)) {
-          const row: VerdictRow = {
-            ...rowBase(record),
-            kind: "verdict",
-            decisionID: record.decisionID,
-            childSessionID,
-            attemptID: record.attemptId,
-            key,
-            verdict: outcome,
-            step: record.step,
-          };
-          bundle.flusher.enqueue(row);
+        const attempt = record.attemptId;
+        // Rows follow the store (QA-2.1-3): a verdict that moves nothing (the attempt was scored already, by a
+        // verdict or a refusal) writes no row, or `routing:stats` would count outcomes the store never saw.
+        // `unverifiable` moves nothing by design; it is a row only while the attempt is still unscored.
+        if (outcome === "unverifiable") {
+          if (scored.has(attempt) || !boundedAdd(signalled, `unverifiable|${attempt}`, SIGNAL_CAP)) return;
+        } else {
+          if (!bundle.store.recordVerdict(key, outcome, signalOf(record))) return;
+          boundedSet(scored, attempt, outcome, SIGNAL_CAP);
         }
+        const row: VerdictRow = {
+          ...rowBase(record),
+          kind: "verdict",
+          decisionID: record.decisionID,
+          childSessionID,
+          attemptID: attempt,
+          key,
+          verdict: outcome,
+          step: record.step,
+        };
+        bundle.flusher.enqueue(row);
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("verdict failed", error, { childSessionID });
@@ -533,28 +552,32 @@ export function createIngest(deps: IngestDeps): Ingest {
         const target = targetOf(childSessionID);
         if (target === null) return;
         const { record, settings, key } = target;
+        const attempt = record.attemptId;
+        // One refusal per attempt (QA-2.1-9): a repeat must not reach the store, whose lifetime counter would grow.
+        if (!boundedAdd(signalled, `refusal|${attempt}`, SIGNAL_CAP)) return;
         const bundle = bundleFor(settings);
         if (bundle === null) return;
-        // The store converts an earlier `pass` of the same attempt into a failure (C5, QA-1.3-6).
-        bundle.store.recordFalseRefusal(key, signalOf(record));
-        if (boundedAdd(signalled, `refusal|${record.attemptId}`, SIGNAL_CAP)) {
-          const row: RefusalRow = {
-            ...rowBase(record),
-            kind: "refusal",
-            decisionID: record.decisionID,
-            childSessionID,
-            attemptID: record.attemptId,
-            key,
-            step: record.step,
-          };
-          bundle.flusher.enqueue(row);
-        }
+        const prior = scored.get(attempt);
+        // The store converts an earlier `pass` of the same attempt into a failure (C5, QA-1.3-6); the row says so,
+        // and `routing:stats` moves that pass to a fail the same way.
+        const changed = bundle.store.recordFalseRefusal(key, signalOf(record));
+        boundedSet(scored, attempt, "refusal", SIGNAL_CAP);
+        const row: RefusalRow = {
+          ...rowBase(record),
+          kind: "refusal",
+          decisionID: record.decisionID,
+          childSessionID,
+          attemptID: attempt,
+          key,
+          step: record.step,
+          ...(prior === "pass" && changed ? { overrides: "pass" as const } : {}),
+        };
+        bundle.flusher.enqueue(row);
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("false refusal failed", error, { childSessionID });
       }
     },
-
     onSessionGone(sessionID: string): void {
       try {
         if (lookupDispatch(sessionID) !== undefined) {

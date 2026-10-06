@@ -516,6 +516,11 @@ export interface RefusalRow extends LogRowBase {
   readonly attemptID: string;
   readonly key: OutcomeKey;
   readonly step: LadderStepKind;
+  /**
+   * Set when this refusal turned an earlier `pass` verdict of the same attempt into a failure (C5, QA-1.3-6,
+   * QA-2.1-3). `routing:stats` then moves that pass to a fail, as the store did.
+   */
+  readonly overrides?: "pass";
 }
 
 export type LogRow = DecisionRow | VerdictRow | RefusalRow;

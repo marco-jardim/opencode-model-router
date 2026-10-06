@@ -110,13 +110,32 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     acc.attempts += 1;
     if (r.step === "dispatch") acc.dispatches += 1;
   }
-  for (const v of verdicts) slot(v.key)[v.verdict] += 1;
   // A refusal belongs to this window's refusal rate only when its decision row is in the window too
   // (QA-1.3-13); otherwise `falseRefusals / attempts` could pass 100 %. Refusals without a decision id stay.
   const windowDecisionIDs = new Set(decisions.map((r) => r.decisionID));
+  // QA-2.1-3: a refusal for an attempt that already has a `pass` row overrides it, exactly as the store does
+  // (pass → fail, `falseRefusals` + 1). The pass row may sit outside the window (or the log may have rotated), so the
+  // join looks at every row; a converted pass inside the window becomes a fail, and a conversion whose pass row is
+  // not in the window still counts as one fail for this window.
+  const passedAttempts = new Set<string>();
+  for (const row of rows) if (row.kind === "verdict" && row.verdict === "pass") passedAttempts.add(row.attemptID);
+  const converted = new Set<string>();
+  const effectiveVerdicts: Array<Pick<VerdictRow, "key" | "verdict" | "step" | "attemptID">> = [];
   for (const r of refusals) {
-    if (r.decisionID === null || windowDecisionIDs.has(r.decisionID)) slot(r.key).falseRefusals += 1;
+    if (r.decisionID !== null && !windowDecisionIDs.has(r.decisionID)) continue;
+    slot(r.key).falseRefusals += 1;
+    if (r.overrides === "pass" || passedAttempts.has(r.attemptID)) converted.add(r.attemptID);
   }
+  const windowPassed = new Set(verdicts.filter((v) => v.verdict === "pass").map((v) => v.attemptID));
+  for (const v of verdicts) {
+    effectiveVerdicts.push(v.verdict === "pass" && converted.has(v.attemptID) ? { ...v, verdict: "fail" } : v);
+  }
+  for (const r of refusals) {
+    if (converted.has(r.attemptID) && !windowPassed.has(r.attemptID) && (r.decisionID === null || windowDecisionIDs.has(r.decisionID))) {
+      effectiveVerdicts.push({ key: r.key, verdict: "fail", step: r.step, attemptID: r.attemptID });
+    }
+  }
+  for (const v of effectiveVerdicts) slot(v.key)[v.verdict] += 1;
   const byKey: KeyStatsRow[] = [...accs.keys()].sort(compareCodeUnits).map((key) => {
     const acc = accs.get(key) ?? { dispatches: 0, attempts: 0, pass: 0, fail: 0, unverifiable: 0, falseRefusals: 0 };
     const measured = store === null ? null : store.cost(key).measuredUSD;
@@ -171,7 +190,7 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   });
 
   // Variant steps.
-  const variantVerdicts = verdicts.filter((v) => v.step === "variant");
+  const variantVerdicts = effectiveVerdicts.filter((v) => v.step === "variant");
   const variantPass = variantVerdicts.filter((v) => v.verdict === "pass").length;
   const variantFail = variantVerdicts.filter((v) => v.verdict === "fail").length;
 
