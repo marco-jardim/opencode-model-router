@@ -94,7 +94,7 @@ For a `subagent` call on v2 with `engine != static`, the tool hook does this bef
 
 1. **Parse and strip** the optional first-line `[route …]` directive (also `CAP:` and `VERIFY:` are handled as before).
 2. **Classify** into task facts: rules first, then the route line's typed fields, then, only when the class confidence is below `routing.minClassConfidence` and a backend is configured, the model backend, then `unknown`.
-3. **Build the candidates**: **every router tier on the escalate ladder** (`enforcement.escalate.ladder`, default `fast → medium → heavy`; each tier contributes its rungs on the tier's own model), plus the agents of `routing.roles[class]`. Not only the tier the orchestrator picked: the pick is one of the candidates, and the others are what it is compared with. A `routing.roles` agent that is absent, hidden, primary, not permitted for the parent, or whose evaluated permissions do not cover `needs` is excluded when the ladder is built (it is not priced; the reason is kept for the log). Every router tier and every remaining role agent is **priced**; one that is below `enforcement.escalate.floorTier`, whose permissions do not cover `needs` (a router tier is checked here, not at build time), or that would be a move down on a high-risk dispatch with no detection **stays priced** (it appears in the row's `costs`) **but cannot be `best`**.
+3. **Build the candidates**: **every router tier on the escalate ladder** (`enforcement.escalate.ladder`, default `fast → medium → heavy`; each tier contributes its rungs on the tier's own model), plus the agents of `routing.roles[class]`. Not only the tier the orchestrator picked: the pick is one of the candidates, and the others are what it is compared with. A **router tier** whose agent is hidden, primary or not permitted for the parent is excluded when the ladder is built (reason `agent-unavailable`; the cost doctor reports it as `tier-agent-unavailable`); a tier the host's agent list does not mention at all is not excluded, but its permissions are unknown, so it covers no `needs`. A `routing.roles` agent that is absent, hidden, primary or not permitted is excluded the same way, and a role agent whose evaluated permissions do not cover `needs` is excluded there too (an excluded candidate is not priced; the reason is kept for the log). Every remaining router tier and role agent is **priced**; one that is below `enforcement.escalate.floorTier`, whose permissions do not cover `needs` (a router tier is checked here, not at build time), or that would be a move down on a high-risk dispatch with no detection **stays priced** (it appears in the row's `costs`) **but cannot be `best`**.
 4. **Price every candidate** with the [expected-cost formula](#the-expected-cost-formula) from the store's posteriors and measured costs.
 5. **Decide**: `best` is the cheapest eligible candidate; the decision is `kept` or `switched`.
 6. **Act by mode**: `shadow` and `advise` only log; `enforce` rewrites `event.input.agent` and `event.input.model` when the rules below allow it. The row is written either way.
@@ -111,7 +111,7 @@ The orchestrator (or `/annotate-plan`) may describe the work in one line:
 
 - It is recognised **only as the first non-empty line** of the dispatch prompt (A22). A `[route …]` anywhere else is plain text. On a conflict the first line's `pin` is kept. A line longer than 500 characters is not recognised as a route line.
 - Keys: `class`, `risk`, `scope`, `needs` (comma list), `d` (`deterministic`, `grader` or `none`: how deeply the result will be verified) and the bare flag `pin`. Every key is optional; an unknown value is ignored field by field.
-- The line is **stripped** before the subagent sees it (also in `shadow`; in `static` it passes through untouched).
+- The line is **stripped** before the subagent sees it (also in `shadow`; in `static` it passes through untouched). This applies to **`subagent` dispatches only**. A `delegate` task reaches its producer with the line **intact**, because on OpenCode 2.0.22 `execute.before` does not fire for the runner's own `subagent` calls; the runner still reads its facts from that line (`classifyDelegation`, rules only: the class, risk, scope, needs, `d` and `pin` the line names), so a `[route …]` line on a `delegate` task shapes the facts of the runner's decision rows and registry but is also visible to the producer.
 - `pin` means "do not switch this one" (D13). The plan convention is a pin on every `[tier:heavy]` step and on every QA review.
 - Inside constraint sections ("MUST NOT DO"), negated prohibitions ("never force-push") do not raise `risk` (A22).
 
@@ -155,13 +155,13 @@ Every assumption is stated, and the figures are the output of the real kernel (`
 - **Candidates:** `roles: {}`, so only the three router tiers: `fast` = `claude-sonnet-5-5#low` (`costRatio` 1), `medium` = `claude-sonnet-5-5#medium` (5), `heavy` = `claude-opus-5-5#xhigh` (20). Tiers are priced by `costRatio` (no USD), no measured tax.
 - **The task:** class `implement` (static tier `medium`), risk `medium`, `balanced` profile (`U = 15`), a grader-checked dispatch (`d = 0.7`), class confidence 1. The orchestrator picked `@medium`.
 
-The attempts the runner makes when every attempt fails and the failure is caught (the 4× ceiling ends each cascade):
+The attempts the runner makes when every attempt fails and the failure is caught. The cost ceiling ends the `fast` and `medium` cascades; `heavy`'s ends at the top of the ladder after its retry:
 
-| Start | Attempts |
-|---|---|
-| `fast` | `fast`, `fast` (the retry), `medium` |
-| `medium` | `medium`, `medium`, `heavy` |
-| `heavy` | `heavy`, `heavy` |
+| Start | Attempts | The cascade ends because |
+|---|---|---|
+| `fast` | `fast`, `fast` (the retry), `medium` | the cost ceiling: 1 + 1 + 5 = 7 > 4 × 1 |
+| `medium` | `medium`, `medium`, `heavy` | the cost ceiling: 5 + 5 + 20 = 30 > 4 × 5 |
+| `heavy` | `heavy`, `heavy` | the top of the ladder, after its retry (20 + 20 = 40 is within 4 × 20) |
 
 With **priors only** (`fast` one rank below the class's static tier: `p = 0.55`; `medium` `p = 0.80`; `heavy` one rank above: `p = 0.85`), evaluated from the last attempt backwards:
 
