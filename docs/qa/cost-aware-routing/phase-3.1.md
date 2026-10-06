@@ -167,6 +167,13 @@ Round 2 (heavy) failed on 2 major findings plus minors and nits. The first round
 - **To 3.4.** Fill the ADR "Evidence" section from `dogfood.md` (DF5 summary, D17 rule and counts, final mode, workload caveat); the changelog's Unreleased entry becomes the `2.3.0` entry; the "Requires OpenCode v2" and `static` notes in the guide stay.
 - **To the heavy QA of this phase.** Read the guide against `src\router\config.ts`, `src\routing\classify\scrub.ts` (the gate rule), `src\routing\outcomes\stats.ts` (the lines) and `src\routing\advisor\findings.ts` (the findings table, notify rule); check the worked example arithmetic; check that README, CHANGELOG and ADR do not repeat a claim the guide corrects.
 
+### Follow-ups from Phase 3.2 QA round 2
+
+| Id | Fix | Commit |
+|---|---|---|
+| QA-3.2-R2-3 | The guide's `effort-path` row no longer says the previous agent's effort is "never accumulated": on a same-model switch the previous agent's effort stays at the top level and the target's goes in-band, taking effect only if the provider honours in-band effort; on a model change the top level carries the target's. The ADR and the plan carry no such sentence (checked by search). The `src\escalate\resume.ts` comment of `car/p32` has the older "never the previous agent's" wording; it is a code comment in p32's write-set and is left for the merge | `docs(routing): address QA-3.2-R2-3 and R2-6 …` |
+| QA-3.2-R2-6 | Plan A30 (amended): the `kept:resume:pinned` prefix is named next to `kept:resume:running` | same commit |
+| `kept:unresolved` | The guide's Reasons paragraph lists `kept:unresolved` (the unresolved-pick row, `dispatch.ts:465`) ahead of `car/p32` adding it as a prefix. On this branch the row still reads `kept: the dispatched agent resolves to no model…`; `docs-drift` pins only the four policy prefix constants of `outcomes/types.ts` and the kernel codes, so it is unchanged and passes. The orchestrator reconciles the prefix at merge | same commit |
 ## Verdict
 
 Rounds 1 and 2 are fixed: QA-3.1-3 to QA-3.1-19, the code side note, A31–A33, R2-1 to R2-11. **Open findings known to the implementer: 0.** Round 3 of heavy QA has not run. Branch `car/p31` pushed; `car/main`'s Phase 3.2 (`86bc888`) is merged in (`0fb41b3`).
