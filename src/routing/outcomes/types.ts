@@ -755,7 +755,7 @@ export interface KeyStatsRow {
   readonly falseRefusals: number;
   /** falseRefusals / attempts. */
   readonly refusalRate: RatioCell;
-  /** Store `cost(key).measuredUSD` (lifetime, per attempt); null when n = 0. */
+  /** Store `cost(key).measuredUSD` (lifetime, per attempt, not windowed); null when n = 0. Rendered as USD/attempt (lifetime). */
   readonly measuredUSD: MeanStat | null;
 }
 
@@ -789,6 +789,8 @@ export interface StatsTable {
     readonly share: RatioCell;
     /** Switched rows whose attempt ended in a `fail` verdict or a false refusal (D17 input). */
     readonly failed: number;
+    /** Switched rows whose outcome is known (a pass/fail verdict or a refusal exists): the denominator that makes `failed` readable. */
+    readonly verified: number;
   };
   /** One entry per unit present in the window, sorted by unit name. */
   readonly savings: readonly SavingsRow[];

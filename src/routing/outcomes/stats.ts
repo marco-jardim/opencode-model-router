@@ -111,7 +111,12 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     if (r.step === "dispatch") acc.dispatches += 1;
   }
   for (const v of verdicts) slot(v.key)[v.verdict] += 1;
-  for (const r of refusals) slot(r.key).falseRefusals += 1;
+  // A refusal belongs to this window's refusal rate only when its decision row is in the window too
+  // (QA-1.3-13); otherwise `falseRefusals / attempts` could pass 100 %. Refusals without a decision id stay.
+  const windowDecisionIDs = new Set(decisions.map((r) => r.decisionID));
+  for (const r of refusals) {
+    if (r.decisionID === null || windowDecisionIDs.has(r.decisionID)) slot(r.key).falseRefusals += 1;
+  }
   const byKey: KeyStatsRow[] = [...accs.keys()].sort(compareCodeUnits).map((key) => {
     const acc = accs.get(key) ?? { dispatches: 0, attempts: 0, pass: 0, fail: 0, unverifiable: 0, falseRefusals: 0 };
     const measured = store === null ? null : store.cost(key).measuredUSD;
@@ -124,7 +129,7 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
       unverifiable: acc.unverifiable,
       passRate: ratio(acc.pass, acc.pass + acc.fail),
       falseRefusals: acc.falseRefusals,
-      refusalRate: ratio(acc.falseRefusals, acc.attempts),
+      refusalRate: ratio(Math.min(acc.falseRefusals, acc.attempts), acc.attempts),
       measuredUSD: measured !== null && measured.n > 0 ? { mean: measured.mean, n: measured.n } : null,
     };
   });
@@ -135,9 +140,15 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
 
   // Switched, and how many of those ended in a fail verdict or a false refusal (any window).
   const failedDecisionIDs = new Set<string>();
+  const decidedDecisionIDs = new Set<string>(); // a pass/fail verdict or a refusal exists: the outcome is known
   for (const row of rows) {
-    if (row.kind === "verdict" && row.verdict === "fail" && row.decisionID !== null) failedDecisionIDs.add(row.decisionID);
-    else if (row.kind === "refusal" && row.decisionID !== null) failedDecisionIDs.add(row.decisionID);
+    if (row.kind === "verdict" && row.decisionID !== null) {
+      if (row.verdict === "fail") failedDecisionIDs.add(row.decisionID);
+      if (row.verdict !== "unverifiable") decidedDecisionIDs.add(row.decisionID);
+    } else if (row.kind === "refusal" && row.decisionID !== null) {
+      failedDecisionIDs.add(row.decisionID);
+      decidedDecisionIDs.add(row.decisionID);
+    }
   }
   const switchedRows = nonPinned.filter((r) => r.switched);
 
@@ -182,6 +193,7 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
       count: switchedRows.length,
       share: ratio(switchedRows.length, nonPinned.length),
       failed: switchedRows.filter((r) => failedDecisionIDs.has(r.decisionID)).length,
+      verified: switchedRows.filter((r) => decidedDecisionIDs.has(r.decisionID)).length,
     },
     savings,
     variantSteps: {
@@ -233,7 +245,7 @@ export function renderMarkdown(table: StatsTable): string {
     `| Dispatches | ${table.dispatches} |`,
     `| Pinned | ${table.pinned} |`,
     `| Agreement (best == chosen, non-pinned) | ${fmtRatio(table.agreement)} |`,
-    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned (${fmtPercent(table.switched.share)}); failed ${table.switched.failed} |`,
+    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned (${fmtPercent(table.switched.share)}); failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.count}) |`,
     ...(table.savings.length === 0
       ? ["| Estimated savings | n/a |"]
       : table.savings.map(
@@ -252,7 +264,7 @@ export function renderMarkdown(table: StatsTable): string {
     table.byKey.length === 0
       ? "_none_"
       : [
-          "| Key | Dispatches | Attempts | Pass | Fail | Unverifiable | Pass rate | False refusals | Refusal rate | USD/dispatch |",
+          "| Key | Dispatches | Attempts | Pass | Fail | Unverifiable | Pass rate | False refusals | Refusal rate | USD/attempt (lifetime) |",
           "|---|---|---|---|---|---|---|---|---|---|",
           ...table.byKey.map(
             (r) =>
