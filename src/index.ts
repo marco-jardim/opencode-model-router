@@ -65,6 +65,15 @@ import type { Ingest } from "./routing/outcomes/ingest";
 import { verdictOf } from "./routing/outcomes/types";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import {
+  advisorSettings,
+  catalogFromModels,
+  createAdvisorNotifier,
+  formatFindings,
+  hostConfigFromAgents,
+  runAdvisor,
+} from "./routing/advisor";
+import type { AdvisorCatalogModel, HostConfigView } from "./routing/advisor";
+import {
   findOrphanedStrongPatterns,
   normalizeCatalog,
   validateModels,
@@ -530,6 +539,38 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     } catch {
       return null;
     }
+  };
+
+  // M8 (Phase 2.4): the cost doctor reads the host's agents and model catalog (v2 only, D1). Each call is bounded and failing
+  // one only leaves the checks that need it silent; nothing here ever throws into a session.
+  const ADVISOR_HOST_TIMEOUT_MS = 3_000;
+  const gatherAdvisorInputs = async (): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
+    const attempt = async (label: string, call: (() => Promise<readonly unknown[]>) | undefined): Promise<readonly unknown[] | null> => {
+      if (call === undefined) return null;
+      try {
+        return await withTimeout(call(), ADVISOR_HOST_TIMEOUT_MS, label);
+      } catch (error) {
+        logger.warn(`[router] cost doctor: the ${label} is unavailable`, { error: describeError(error) });
+        return null;
+      }
+    };
+    const [agents, models] = await Promise.all([attempt("host agent list", ctx.routerAgents), attempt("model catalog", ctx.routerCatalog)]);
+    return { host: agents === null ? null : hostConfigFromAgents(agents), catalog: models === null ? null : catalogFromModels(models) };
+  };
+  const advisorNotifier = ctx.routerHost === "v2"
+    ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2"), config: () => cfg, gather: gatherAdvisorInputs, logger })
+    : undefined;
+  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
+  const buildCostDoctorLines = async (): Promise<string[]> => {
+    const routing = resolveRouting(cfg, "v2");
+    if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
+    const { host, catalog } = await gatherAdvisorInputs();
+    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), { hostKnown: host !== null, catalogKnown: catalog !== null && catalog.length > 0 });
+    // Phase 2.3 handoff (decision 16): a ladder row's confidence is not the evidence share the dispatch rows carry.
+    if (routing.engine !== "static") {
+      lines.push("Decision log: a ladder-attempt row's confidence is the delegation's class confidence; a dispatch row's is the class confidence scaled by the winner's evidence (n/(n+5)).");
+    }
+    return lines;
   };
 
   // Deferred passive catalog check. The first orchestrator turn only STARTS the
@@ -2189,6 +2230,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
       output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
 
+      // 2.4.3: the cost doctor's throttled notice. `poll` is O(1) when nothing is due and never throws; in advise/enforce a notice that
+      // is ready is appended here (once per `routing.advisor.noticeIntervalHours`, across restarts), in static/shadow it is logged.
+      const advisorNotice = advisorNotifier?.poll() ?? null;
+      if (advisorNotice !== null) {
+        output.system.push(`Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${advisorNotice}`);
+      }
+
       // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
       // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
       // does not grow for sessions that never defer. Orchestrator path only: every child returned
@@ -2331,6 +2379,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 text += "\n\n" + formatModelIssues(issues);
               }
             }
+            // 2.4.3: the cost doctor (v2 only; the advisor needs the v2 agent list and catalog).
+            if (ctx.routerHost === "v2") text += "\n\n" + (await buildCostDoctorLines()).join("\n");
           }
         }
         output.parts.push({ type: "text" as const, text });

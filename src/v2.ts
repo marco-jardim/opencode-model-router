@@ -23,6 +23,7 @@ export default {
       // Step pricing reads the catalog the adapter already queries; the plugin's single telemetry ingest comes back
       // here so the event loop feeds the instance that also receives the verdicts (QA-2.1-7).
       routerCatalog: async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
+      routerAgents: async () => (await ctx.agent.list()).data,
       routerOnIngest: (created: Ingest) => { ingest = created; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);

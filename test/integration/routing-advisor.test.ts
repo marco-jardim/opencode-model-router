@@ -17,6 +17,9 @@ import { invalidateConfigCache, overridePath, validateConfig } from "../../src/r
 import { DECISIONS_FILE, acquireOutcomes, makeKey } from "../../src/routing/outcomes";
 import type { DecisionRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
+import { advisorSettings, createAdvisorNotifier } from "../../src/routing/advisor";
+import type { AdvisorNotifierDeps, AdvisorSettings } from "../../src/routing/advisor";
+import type { PersistFs } from "../../src/routing/outcomes";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { buildEscalatePolicy } from "../../src/escalate/ladder";
 import {
@@ -609,5 +612,391 @@ describe("/router stats and the checkpoint line", () => {
     writeFileSync(join(root, "docs", "qa", "cost-aware-routing", "dogfood.md"), "# Dogfood\n\n## DF0 — baseline\n\ntext ## DF9 not a heading\n\n## DF1 — after wave 1\n\n### DF7 sub\n\n## DF2 — after phase 2.2\n\n## Summary\n");
     expect(readLastCheckpoint(() => root)).toBe("DF2");
     expect(readLastCheckpoint(() => { throw new Error("no root"); })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The throttled notice (2.4.2)
+// ---------------------------------------------------------------------------
+
+function memoryFs(files: Map<string, string> = new Map(), options: { failWrites?: boolean } = {}): PersistFs & { files: Map<string, string> } {
+  return {
+    files,
+    async mkdirp() {},
+    async readText(path) {
+      return files.get(path) ?? null;
+    },
+    async writeDurable(path, data) {
+      if (options.failWrites === true) throw new Error("disk full");
+      files.set(path, data);
+    },
+    async appendText(path, data) {
+      files.set(path, (files.get(path) ?? "") + data);
+    },
+    async rename(from, to) {
+      files.set(to, files.get(from) ?? "");
+      files.delete(from);
+    },
+    async unlink(path) {
+      files.delete(path);
+    },
+    async stat() {
+      return null;
+    },
+    async readdir() {
+      return [];
+    },
+  };
+}
+
+describe("cost doctor: the throttled notice", () => {
+  const HOUR = 3_600_000;
+  const settings = (over: Partial<AdvisorSettings> = {}): AdvisorSettings => ({ dir: "/state", intervalMs: 24 * HOUR, deliver: "context", ...over });
+  const withFinding = async () => ({ host: TITLE_SUMMARY, catalog: CATALOG });
+  const without = async () => ({ host: noHost, catalog: CATALOG });
+
+  function notifier(fs: ReturnType<typeof memoryFs>, clock: { now: number }, extra: Partial<AdvisorNotifierDeps> = {}) {
+    const warn = vi.fn();
+    const gather = vi.fn(extra.gather ?? withFinding);
+    const instance = createAdvisorNotifier({
+      settings: () => settings(),
+      config: () => cfgOf({ routing: {} }),
+      logger: { warn },
+      now: () => clock.now,
+      fs,
+      sleep: async () => undefined,
+      ...extra,
+      gather,
+    });
+    return { instance, warn, gather };
+  }
+
+  it("fires once per interval: the check runs in the background, the notice is handed over once, and the state is persisted", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const { instance, gather } = notifier(fs, clock);
+    expect(instance.poll()).toBeNull(); // starts the check; never blocks the turn
+    await instance.settled();
+    const text = instance.poll();
+    expect(text).toContain("[model-router] Cost doctor:");
+    expect(text).toMatch(/\(\d+ warning, \d+ saving\)/);
+    await instance.settled();
+    expect(instance.poll()).toBeNull(); // handed over exactly once
+    expect(gather).toHaveBeenCalledTimes(1);
+    const state = JSON.parse(fs.files.get(join("/state", "advisor-notice.json")) ?? "null") as { version: number; lastRunAt: string; lastNoticeAt: string; fingerprint: string };
+    expect(state).toMatchObject({ version: 1, lastRunAt: "2026-10-06T12:00:00.000Z", lastNoticeAt: "2026-10-06T12:00:00.000Z" });
+    expect(state.fingerprint).toContain("title-model-unset:title");
+    clock.now += 23 * HOUR;
+    expect(instance.poll()).toBeNull();
+    await instance.settled();
+    expect(instance.poll()).toBeNull();
+    expect(gather).toHaveBeenCalledTimes(1); // still throttled
+    clock.now += 2 * HOUR; // 25 h after the first notice
+    expect(instance.poll()).toBeNull();
+    await instance.settled();
+    expect(instance.poll()).toContain("Cost doctor");
+    expect(gather).toHaveBeenCalledTimes(2);
+  });
+
+  it("is throttled across restarts: a new notifier over the same state neither checks nor notices inside the interval", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const first = notifier(fs, clock);
+    first.instance.poll();
+    await first.instance.settled();
+    expect(first.instance.poll()).not.toBeNull();
+    await first.instance.settled();
+    clock.now += 3 * HOUR;
+    const second = notifier(fs, clock); // a restart
+    second.instance.poll();
+    await second.instance.settled();
+    expect(second.instance.poll()).toBeNull();
+    expect(second.gather).not.toHaveBeenCalled();
+    clock.now += 22 * HOUR; // 25 h after the notice
+    const third = notifier(fs, clock);
+    third.instance.poll();
+    await third.instance.settled();
+    expect(third.instance.poll()).not.toBeNull();
+  });
+
+  it("log mode (static/shadow) logs the notice once and persists it; it never returns text", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const { instance, warn } = notifier(fs, clock, { settings: () => settings({ deliver: "log" }) });
+    expect(instance.poll()).toBeNull();
+    await instance.settled();
+    expect(instance.poll()).toBeNull();
+    expect(warn.mock.calls.filter(([m]) => String(m).startsWith("[model-router] Cost doctor:"))).toHaveLength(1);
+    expect(fs.files.has(join("/state", "advisor-notice.json"))).toBe(true);
+    const restarted = notifier(fs, clock, { settings: () => settings({ deliver: "log" }) });
+    restarted.instance.poll();
+    await restarted.instance.settled();
+    expect(restarted.warn.mock.calls.filter(([m]) => String(m).startsWith("[model-router] Cost doctor:"))).toHaveLength(0);
+  });
+
+  it("a check with nothing to say persists its time, so it does not run again inside the interval", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    // a ladder whose catalog matches and carries no effort: only informational findings, so nothing is worth a notice
+    const quiet = notifier(fs, clock, { gather: without, config: () => cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: {} }) });
+    quiet.instance.poll();
+    await quiet.instance.settled();
+    expect(quiet.instance.poll()).toBeNull();
+    expect(JSON.parse(fs.files.get(join("/state", "advisor-notice.json")) ?? "null")).toMatchObject({ lastNoticeAt: null });
+    clock.now += HOUR;
+    quiet.instance.poll();
+    await quiet.instance.settled();
+    expect(quiet.gather).toHaveBeenCalledTimes(1);
+  });
+
+  it("is inert when settings say so: no host call, no read, no write", async () => {
+    const fs = memoryFs();
+    const spy = vi.spyOn(fs, "readText");
+    const write = vi.spyOn(fs, "writeDurable");
+    const { instance, gather } = notifier(fs, { now: 0 }, { settings: () => null });
+    for (let i = 0; i < 3; i += 1) {
+      expect(instance.poll()).toBeNull();
+      await instance.settled();
+    }
+    expect(gather).not.toHaveBeenCalled();
+    expect(spy).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("a failing host call is logged, never thrown, nothing is written, and the next try waits for the back-off", async () => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    let fail = true;
+    const { instance, warn, gather } = notifier(fs, clock, { backoffMs: 10 * 60_000, gather: async () => { if (fail) throw new Error("host down"); return withFinding(); } });
+    expect(instance.poll()).toBeNull();
+    await instance.settled();
+    expect(warn.mock.calls.some(([m, extra]) => String(m).includes("the check failed") && JSON.stringify(extra).includes("host down"))).toBe(true);
+    expect(fs.files.size).toBe(0);
+    clock.now += 5 * 60_000;
+    instance.poll();
+    await instance.settled();
+    expect(gather).toHaveBeenCalledTimes(1); // inside the back-off
+    fail = false;
+    clock.now += 6 * 60_000;
+    instance.poll();
+    await instance.settled();
+    expect(gather).toHaveBeenCalledTimes(2);
+    expect(instance.poll()).not.toBeNull();
+  });
+
+  it("an unwritable state file is logged and the notice is still delivered", async () => {
+    const fs = memoryFs(new Map(), { failWrites: true });
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const { instance, warn } = notifier(fs, clock);
+    instance.poll();
+    await instance.settled();
+    expect(instance.poll()).toContain("Cost doctor");
+    await instance.settled();
+    expect(warn.mock.calls.some(([m]) => String(m).includes("could not save the notice state"))).toBe(true);
+  });
+
+  it("an unreadable state file is reported and treated as absent", async () => {
+    const fs = memoryFs(new Map([[join("/state", "advisor-notice.json"), "{not json"]]));
+    const { instance, warn } = notifier(fs, { now: Date.parse("2026-10-06T12:00:00Z") });
+    instance.poll();
+    await instance.settled();
+    expect(warn.mock.calls.some(([m]) => String(m).includes("notice state file is unreadable"))).toBe(true);
+    expect(instance.poll()).not.toBeNull();
+  });
+
+  it("a notice that waits for delivery goes to the log when the mode drops back to static/shadow meanwhile", async () => {
+    const fs = memoryFs();
+    let deliver: AdvisorSettings["deliver"] = "context";
+    const { instance, warn } = notifier(fs, { now: Date.parse("2026-10-06T12:00:00Z") }, { settings: () => settings({ deliver }) });
+    instance.poll();
+    await instance.settled();
+    deliver = "log";
+    expect(instance.poll()).toBeNull();
+    await instance.settled();
+    expect(warn.mock.calls.filter(([m]) => String(m).startsWith("[model-router] Cost doctor:"))).toHaveLength(1);
+  });
+
+  it("advisorSettings: inactive on v1, without a routing block and with advisor.enabled false; delivery follows the engine", () => {
+    const env = { tmpdir: "/tmp-x", homedir: "/home-x" };
+    expect(advisorSettings(cfgOf({ routing: {} }), "v1", env)).toBeNull();
+    expect(advisorSettings(cfgOf(), "v2", env)).toBeNull(); // no routing block: today's behaviour, byte for byte
+    expect(advisorSettings(cfgOf({ routing: { advisor: { enabled: false } } }), "v2", env)).toBeNull();
+    const shadow = advisorSettings(cfgOf({ routing: { engine: "shadow", advisor: { noticeIntervalHours: 2 } } }), "v2", env);
+    expect(shadow).toMatchObject({ deliver: "log", intervalMs: 2 * HOUR });
+    expect(shadow?.dir).toBe(join("/tmp-x", "opencode-model-router-trajectory"));
+    expect(advisorSettings(cfgOf({ routing: { engine: "advise" } }), "v2", env)?.deliver).toBe("context");
+    const absolute = process.platform === "win32" ? "C:\\data\\omr" : "/data/omr";
+    expect(advisorSettings(cfgOf({ routing: { engine: "enforce", outcomes: { path: absolute } } }), "v2", env)).toMatchObject({ deliver: "context", dir: absolute });
+    expect(advisorSettings(cfgOf({ routing: { engine: "static" } }), "v2", env)?.deliver).toBe("log");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// In the plugin: the /router section and the notice in the orchestrator's context
+// ---------------------------------------------------------------------------
+
+describe("cost doctor in the plugin", () => {
+  type Hooks = {
+    "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>;
+    "experimental.chat.system.transform"(input: unknown, output: { system: string[] }): Promise<void>;
+    dispose(): Promise<void>;
+  };
+  let home: string;
+  let store: string;
+  let savedHome: string | undefined;
+  let savedProfile: string | undefined;
+  const instances: Hooks[] = [];
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "router-doctor-"));
+    store = join(home, "store");
+    savedHome = process.env.HOME;
+    savedProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    invalidateConfigCache();
+  });
+
+  afterEach(async () => {
+    for (const hooks of instances.splice(0)) await hooks.dispose();
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
+    invalidateConfigCache();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  interface Host {
+    readonly agents?: () => Promise<readonly unknown[]>;
+    readonly catalog?: () => Promise<readonly unknown[]>;
+    readonly logs: string[];
+    readonly agentCalls: () => number;
+  }
+
+  /** Raw host records (Agent.Info / Model.Info) as the v2 adapter hands them over. */
+  const rawAgents = (titleModel?: { providerID: string; id: string }): unknown[] => [
+    { id: "title", mode: "primary", hidden: true, ...(titleModel === undefined ? {} : { model: titleModel }) },
+    { id: "summary", mode: "primary", hidden: true },
+    ...["fast", "medium", "heavy"].map((id) => ({ id, mode: "subagent", hidden: false })),
+  ];
+  const rawCatalog = (): unknown[] => [
+    ...CATALOG,
+    model("opencode-go/deepseek-v4.1-flash", { cost: [{ input: 0.15, output: 0.6, cache: { read: 0, write: 0 } }] }),
+  ];
+
+  async function plugin(over: { routing?: Record<string, unknown> | null; host?: "v1" | "v2"; agents?: Host["agents"]; catalog?: Host["catalog"] }): Promise<{ hooks: Hooks; host: Host }> {
+    const routing = over.routing === undefined ? null : over.routing;
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: "anthropic", ...(routing === null ? {} : { routing }) }));
+    invalidateConfigCache();
+    const logs: string[] = [];
+    let agentCalls = 0;
+    const agents = over.agents ?? (async () => rawAgents());
+    const ctx = {
+      directory: home,
+      worktree: home,
+      client: {
+        app: { log: async (request: { body: { message: string } }) => { logs.push(request.body.message); return {}; } },
+        session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) },
+      },
+      ...((over.host ?? "v2") === "v2"
+        ? {
+            routerHost: "v2" as const,
+            routerAgents: async () => { agentCalls += 1; return agents(); },
+            routerCatalog: over.catalog ?? (async () => rawCatalog()),
+          }
+        : {}),
+    };
+    const hooks = (await ModelRouterPlugin(ctx as unknown as RouterPluginInput)) as unknown as Hooks;
+    instances.push(hooks);
+    return { hooks, host: { logs, agentCalls: () => agentCalls } };
+  }
+
+  const ask = async (hooks: Hooks, args = ""): Promise<string> => {
+    const out = { parts: [] as Array<{ text: string }> };
+    await hooks["command.execute.before"]({ command: "router", arguments: args }, out);
+    return out.parts[0]?.text ?? "";
+  };
+  const turn = async (hooks: Hooks, sessionID = "root-1"): Promise<string[]> => {
+    const output = { system: [] as string[] };
+    await hooks["experimental.chat.system.transform"]({ sessionID, model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" } }, output);
+    return output.system;
+  };
+  async function until(condition: () => boolean, ms = 3_000): Promise<void> {
+    const end = Date.now() + ms;
+    while (!condition() && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(condition()).toBe(true);
+  }
+
+  it("/router shows the Cost doctor on v2: the title finding with its cheapest-model fix, from the host's own agents and catalog", async () => {
+    const { hooks } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
+    const text = await ask(hooks);
+    expect(text).toContain("Cost doctor: ");
+    expect(text).toContain("[saving] title-model-unset (title)");
+    expect(text).toContain(`fix: ${JSON.stringify({ agents: { title: { model: "opencode-go/deepseek-v4.1-flash" } } })}`);
+    expect(text).toContain("[warning] variant-effort"); // the bundled anthropic preset carries variant + effort (QA-2.3-13)
+    expect(text).toContain("Decision log: a ladder-attempt row's confidence"); // decision 16
+    expect(text.indexOf("router: engine=shadow")).toBeLessThan(text.indexOf("Cost doctor: "));
+  });
+
+  it("the finding clears once the host has a title model", async () => {
+    const { hooks } = await plugin({ routing: {}, agents: async () => [...rawAgents({ providerID: "openai", id: "gpt-6-luna" }).filter((a) => (a as { id: string }).id !== "summary"), { id: "summary", mode: "primary", hidden: true, model: { providerID: "openai", id: "gpt-6-luna" } }] });
+    const text = await ask(hooks);
+    expect(text).not.toContain("title-model-unset");
+    expect(text).not.toContain("summary-model-unset");
+  });
+
+  it("shows what was skipped when the host's agents or catalog are unavailable, and still prints the rest of /router", async () => {
+    const { hooks, host } = await plugin({ routing: {}, agents: async () => { throw new Error("agents down"); }, catalog: async () => { throw new Error("catalog down"); } });
+    const text = await ask(hooks);
+    expect(text).toContain("agent list and model catalog were unavailable");
+    expect(text).toContain("/router overrides");
+    expect(host.logs.some((m) => m.includes("the host agent list is unavailable"))).toBe(true);
+  });
+
+  it("routing.advisor.enabled false switches the section off, and v1 has no section at all", async () => {
+    expect(await ask((await plugin({ routing: { advisor: { enabled: false } } })).hooks)).toContain("Cost doctor: disabled");
+    const v1 = await plugin({ routing: {}, host: "v1" });
+    expect(await ask(v1.hooks)).not.toContain("Cost doctor");
+  });
+
+  it("advise: the notice reaches the orchestrator's context once (one turn after the check starts) and is not repeated after a restart", async () => {
+    const { hooks } = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
+    const first = await turn(hooks);
+    expect(first.filter((part) => part.includes("Cost doctor notice"))).toEqual([]); // the first turn only starts the check
+    let delivered: string[] = [];
+    await until(() => {
+      void turn(hooks).then((system) => { if (delivered.length === 0) delivered = system.filter((p) => p.includes("Cost doctor notice")); });
+      return delivered.length > 0;
+    });
+    expect(delivered[0]).toContain("[model-router] Cost doctor:");
+    expect(delivered[0]).toContain("say it once");
+    expect((await turn(hooks)).some((p) => p.includes("Cost doctor notice"))).toBe(false);
+    await until(() => readdirSync(store).includes("advisor-notice.json"));
+    // a restart: same directory, nothing is due
+    const again = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
+    for (let i = 0; i < 3; i += 1) {
+      expect((await turn(again.hooks, `s${i}`)).some((p) => p.includes("Cost doctor notice"))).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(again.host.agentCalls()).toBe(0); // throttled before any host call
+  });
+
+  it("shadow: the notice is logged, not injected", async () => {
+    const { hooks, host } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
+    await turn(hooks);
+    await until(() => host.logs.some((m) => m.startsWith("[model-router] Cost doctor:")));
+    const system = await turn(hooks);
+    expect(system.some((p) => p.includes("Cost doctor"))).toBe(false);
+  });
+
+  it("without a routing block nothing runs and nothing is written (§1.2): no host call, no log line, no file", async () => {
+    const { hooks, host } = await plugin({ routing: null });
+    const system = await turn(hooks);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await turn(hooks);
+    expect(system.some((p) => p.includes("Cost doctor"))).toBe(false);
+    expect(host.agentCalls()).toBe(0);
+    expect(host.logs.some((m) => m.includes("Cost doctor"))).toBe(false);
+    expect(readdirSync(home).sort()).not.toContain("store");
   });
 });

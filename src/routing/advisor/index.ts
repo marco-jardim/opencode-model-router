@@ -75,6 +75,31 @@ export function hostConfigFromAgents(raw: readonly unknown[]): HostConfigView {
   return { agents };
 }
 
+/**
+ * The advisor's view of `ctx.model.list().data` (host `Model.Info` records). Read defensively, field by field: a record without a
+ * string `providerID`/`id` is skipped, and a missing field stays missing (the checks treat an unknown `enabled`/`tools` as "not
+ * usable", never as usable).
+ */
+export function catalogFromModels(raw: readonly unknown[]): AdvisorCatalogModel[] {
+  const models: AdvisorCatalogModel[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry) || typeof entry.providerID !== "string" || typeof entry.id !== "string" || entry.providerID === "" || entry.id === "") continue;
+    const capabilities = isRecord(entry.capabilities) ? { tools: typeof entry.capabilities.tools === "boolean" ? entry.capabilities.tools : undefined } : null;
+    const limit = isRecord(entry.limit) ? { context: entry.limit.context, input: entry.limit.input, output: entry.limit.output } : null;
+    models.push({
+      providerID: entry.providerID,
+      id: entry.id,
+      ...(typeof entry.enabled === "boolean" ? { enabled: entry.enabled } : {}),
+      ...(typeof entry.status === "string" ? { status: entry.status } : {}),
+      capabilities,
+      variants: Array.isArray(entry.variants) ? (entry.variants as ReadonlyArray<{ readonly id?: unknown } | null | undefined>) : null,
+      cost: entry.cost,
+      limit,
+    });
+  }
+  return models;
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------

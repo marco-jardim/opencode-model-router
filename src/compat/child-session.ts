@@ -55,6 +55,11 @@ export type RouterPluginInput = PluginInput & {
    * and `limit`, lets the delegate ladder validate variants and size resumes (D10/D11, Phase 2.3).
    */
   routerCatalog?: () => Promise<readonly (CatalogModel & RunnerCatalogModel)[]>;
+  /**
+   * Set only by src/v2.ts: the host's agents (`ctx.agent.list().data`, Agent.Info records). The cost doctor (Phase 2.4) reads which
+   * agents have a model of their own (title, summary, the role agents) and which tier agents the host offers.
+   */
+  routerAgents?: () => Promise<readonly unknown[]>;
   /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */
   routerOnIngest?: (ingest: Ingest) => void;
 };
