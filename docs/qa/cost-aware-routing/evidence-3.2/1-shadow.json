@@ -1,24 +1,24 @@
 {
   "scenario": "1-shadow",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "cf2a914c-fbfc-4d83-bd5e-ffe6a54ce8cb",
-  "recordedAt": "2026-10-06T21:06:17.106Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:08:54.039Z",
   "harness": {
-    "headSha": "71815eb7ae9284877406788b67ffd30a259c620e",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "0986f6600810af83507b51dc01284457060c9ae3",
-      "test/smoke/helpers/routing-host.ts": "268c37bb32749fb37e3161c806856a205ebc0f8f"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "engine=shadow: the orchestrator's heavy pick on a search task runs unchanged on the host (agent heavy, opus xhigh), the [route …] line is stripped from the child's prompt, decisions.jsonl gets one decision row that says it WOULD switch (switched=true, best=fast) and outcomes.json gets a step record for the heavy key.",
   "observed": {
-    "rootID": "ses_eecf696a1ffeSoibHrnTdjlKu6",
-    "childID": "ses_eecf69575ffe3Hj8AHnqSRwPyd",
+    "rootID": "ses_eecbd4221ffe5tLpse7wH7Sl7j",
+    "childID": "ses_eecbd4041ffeT0pG4Krl375Yyp",
     "hookBeforeInput": {
       "agent": "heavy",
       "description": "Find usages",
-      "prompt": "[router] You are @heavy. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-shadow-DXh9Bh\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
+      "prompt": "[router] You are @heavy. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-shadow-x9Ek7g\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
       "background": false
     },
     "hostChild": {
@@ -28,7 +28,7 @@
         "providerID": "anthropic",
         "variant": "xhigh"
       },
-      "parentID": "ses_eecf696a1ffeSoibHrnTdjlKu6",
+      "parentID": "ses_eecbd4221ffe5tLpse7wH7Sl7j",
       "tokens": {
         "input": 7342,
         "output": 5,
@@ -42,7 +42,7 @@
       "title": "Find usages"
     },
     "childUserMessages": [
-      "{\"id\":\"msg_113096a91001wjTlxncWhejmNy\",\"time\":{\"created\":1791320746661},\"text\":\"You are a subagent spawned by another session.\\n[router] You are @heavy. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\\n\\nWorking directory: C:\\\\Users\\\\MARQUI~1\\\\App...[clipped, 1415 chars]"
+      "{\"id\":\"msg_11342bfcb001j6V3RSYEiCWbBf\",\"time\":{\"created\":1791324504041},\"text\":\"You are a subagent spawned by another session.\\n[router] You are @heavy. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\\n\\nWorking directory: C:\\\\Users\\\\MARQUI~1\\\\App...[clipped, 1415 chars]"
     ],
     "childWire": [
       {
@@ -57,10 +57,10 @@
     "rows": [
       {
         "v": 1,
-        "ts": "2026-10-06T21:05:46.580Z",
-        "sessionID": "ses_eecf696a1ffeSoibHrnTdjlKu6",
+        "ts": "2026-10-06T22:08:23.920Z",
+        "sessionID": "ses_eecbd4221ffe5tLpse7wH7Sl7j",
         "kind": "decision",
-        "decisionID": "ses_eecf696a1ffeSoibHrnTdjlKu6:1791320746577:1",
+        "decisionID": "ses_eecbd4221ffe5tLpse7wH7Sl7j:1791324503916:1",
         "mode": "shadow",
         "childSessionID": null,
         "facts": {
@@ -89,9 +89,9 @@
         "pinned": false,
         "unit": "ratio",
         "costs": {
-          "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645401903104349,
-          "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.78664473751054,
-          "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600221145953,
+          "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.16454022153856,
+          "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737512269,
+          "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600257433893,
           "search|host:explore|anthropic/claude-opus-4-7#default": 1.8226999999999998,
           "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
         },
@@ -112,7 +112,7 @@
     "storeFiles": [
       {
         "name": "decisions.jsonl",
-        "size": 1267
+        "size": 1266
       },
       {
         "name": "outcomes.json",
@@ -123,7 +123,7 @@
       "beta": {
         "alpha": 20,
         "beta": 0,
-        "updatedAt": 1791320744057
+        "updatedAt": 1791324500983
       },
       "counts": {
         "pass": 20,

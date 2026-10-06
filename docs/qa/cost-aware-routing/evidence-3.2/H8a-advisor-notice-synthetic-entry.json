@@ -1,15 +1,15 @@
 {
   "scenario": "H8a-advisor-notice-synthetic-entry",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "094eeab8-1169-4768-a8b8-b2b019720293",
-  "recordedAt": "2026-10-06T21:49:57.784Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:12:23.007Z",
   "harness": {
-    "headSha": "2c4b3754d93de37323eb1a96d425c8c0d5f4c9a6",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "a8bc521b7df02051eaa7210f40e3e01e43d5f8bd",
-      "test/smoke/helpers/routing-host.ts": "610d5c0e7fc56494aeae1c27021031b56700f8cf"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "In advise, a saving finding (title-model-unset, session on a provider without a small model) is delivered to the orchestrator as ONE synthetic transcript entry (resume:false, so it starts no turn), once, not repeated on later turns; the router's notice state file appears in the outcomes directory. Not exercised: a restart keeping the notice state (the file is keyed by the project path hash and each isolated host has a fresh path).",
   "observed": {
@@ -92,12 +92,12 @@
     ],
     "storeFiles": [
       {
-        "name": "advisor-notice.05365e5bcd19.json",
+        "name": "advisor-notice.37be25b865af.json",
         "size": 261
       }
     ],
     "hostErrors": []
   },
-  "assertionResult": "PASS: 1 synthetic cost-doctor entry after 4 turns (at index 3 of 13); notice state files: advisor-notice.05365e5bcd19.json",
+  "assertionResult": "PASS: 1 synthetic cost-doctor entry after 4 turns (at index 3 of 13); notice state files: advisor-notice.37be25b865af.json",
   "notes": []
 }

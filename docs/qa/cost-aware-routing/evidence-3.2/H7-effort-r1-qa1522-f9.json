@@ -1,15 +1,15 @@
 {
   "scenario": "H7-effort-r1-qa1522-f9",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "4cf9da2f-4d26-4f1f-9406-f4387d67cca2",
-  "recordedAt": "2026-10-06T21:48:27.451Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:12:11.079Z",
   "harness": {
-    "headSha": "6004e169a4048384581d2bfe7862e161f1a7c2b1",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "6ed2a821d267c8ae53281e746d7dff689e6e2bc6",
-      "test/smoke/helpers/routing-host.ts": "610d5c0e7fc56494aeae1c27021031b56700f8cf"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "Effort-configured tiers (variant AND effort per tier, like the shipped anthropic preset), no routing block: (QA-1.5-22) after a resume that switches the agent fast -> medium -> heavy the request carries the TARGET agent's effort once, not the previous agent's, and nothing stacks; (R1) a bare-model resume after a variant stores what the host stores and sends what it sends; (F9) a default (bare) start resumed at #high delivers high. All recorded as a table; the verdict asserts the two safety properties that let the runner stop starting fresh (target effort once; effective effort equals the stored variant's).",
   "observed": {
@@ -361,6 +361,6 @@
       ]
     }
   },
-  "assertionResult": "PASS: agent switch effective efforts low->medium->xhigh->low (stored low->medium->xhigh->low); bare sonnet after #high: stored low->default effective low->high; bare opus after sonnet#high: stored low->default effective low->undefined; default->high effective undefined->high",
+  "assertionResult": "PASS: agent switch effective efforts low->medium->xhigh->low (stored low->medium->xhigh->low); bare sonnet after #low: stored low->default effective low->high; bare opus after sonnet#low: stored low->default effective low->undefined; default->high effective undefined->high",
   "notes": []
 }

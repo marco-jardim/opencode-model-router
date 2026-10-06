@@ -1,0 +1,49 @@
+{
+  "scenario": "8-live-store-untouched",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:12:25.276Z",
+  "harness": {
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
+    },
+    "uncommittedChanges": false
+  },
+  "expectation": "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl names a session of this run. The user's config files are unchanged.",
+  "observed": {
+    "snapshotTakenAt": "2026-10-06T22:08:20.775Z",
+    "liveStore": {
+      "dir": "<tmpdir>/opencode-model-router-trajectory",
+      "filesBefore": 13979,
+      "filesAfter": 13980,
+      "bytesBefore": 4602892,
+      "bytesAfter": 4604487,
+      "added": 1,
+      "addedNonSession": [],
+      "removed": [],
+      "grownFiles": [
+        "decisions.jsonl"
+      ],
+      "grownSessionFiles": 1
+    },
+    "liveDecisionsLog": {
+      "appendedRows": 1,
+      "rowsNamingASessionOfThisRun": 0,
+      "sessionsOfThisRunSeen": 37
+    },
+    "liveConfig": {
+      "dir": "~/.config/opencode",
+      "fileCount": 30,
+      "changedSinceSnapshot": [],
+      "routerFilesUnchanged": [
+        "opencode.json",
+        "opencode-model-router.overrides.jsonc",
+        "opencode-model-router.state.json"
+      ]
+    }
+  },
+  "assertionResult": "PASS: live store 13979 -> 13980 files (+1 new, 1 of them ses_ scorecards, non-ses_ new: none); 1 row(s) appended to the live decisions.jsonl, 0 naming a session of this run (37 seen); config files changed: none",
+  "notes": []
+}

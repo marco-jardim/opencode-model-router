@@ -1,15 +1,15 @@
 {
   "scenario": "H4-runner-hooks-and-execution-events",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "b0e8bcf6-29cd-439c-ad8e-858b819796c1",
-  "recordedAt": "2026-10-06T21:25:17.926Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:11:15.968Z",
   "harness": {
-    "headSha": "af41c84ba16f2f87e01a85e2d88804c7b78d0ef6",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "276736fbeedb4c2172692b3682a9b9bac7cb8e9c",
-      "test/smoke/helpers/routing-host.ts": "2551155dae4037db9f896811b6648acd168f565b"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "(a) the plugin's execute.before/after hooks do NOT fire for the subagent calls the delegate runner makes through ctx.tool.list() (only the model-emitted delegate call is hooked); (b) session.execution.succeeded of the producer child, with an event id, reaches the plugin before the runner's second dispatch (the resume), and the runner's calls leave no decision row of the dispatch router (only the attempt recorder's two rows).",
   "observed": {
@@ -20,15 +20,15 @@
     "subagentHookCount": 0,
     "executionSucceeded": [
       {
-        "id": "evt_1131ae662001TJR73gQqOPv4Xb",
-        "deliveredAt": 1791321892458
+        "id": "evt_11344f99f001xeRPd6rj00i0i6",
+        "deliveredAt": 1791324649894
       },
       {
-        "id": "evt_1131aecfd001xK060fy6sC9cux",
-        "deliveredAt": 1791321894151
+        "id": "evt_11345002d002O3Yf8m6E5V7nRs",
+        "deliveredAt": 1791324651575
       }
     ],
-    "secondAttemptStartedAt": 1791321894091,
+    "secondAttemptStartedAt": 1791324651516,
     "rowsForProducer": [
       {
         "step": "dispatch",
@@ -52,6 +52,6 @@
       }
     ]
   },
-  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_1131ae662001TJR73gQqOPv4Xb,evt_1131aecfd001xK060fy6sC9cux delivered 1791321892458,1791321894151 before the resume's model.selected 1791321894091; producer rows 2",
+  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_11344f99f001xeRPd6rj00i0i6,evt_11345002d002O3Yf8m6E5V7nRs delivered 1791324649894,1791324651575 before the resume's model.selected 1791324651516; producer rows 2",
   "notes": []
 }

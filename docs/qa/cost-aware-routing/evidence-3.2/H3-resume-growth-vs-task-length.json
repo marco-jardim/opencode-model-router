@@ -1,15 +1,15 @@
 {
   "scenario": "H3-resume-growth-vs-task-length",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "b0e8bcf6-29cd-439c-ad8e-858b819796c1",
-  "recordedAt": "2026-10-06T21:25:17.924Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:11:15.966Z",
   "harness": {
-    "headSha": "af41c84ba16f2f87e01a85e2d88804c7b78d0ef6",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "276736fbeedb4c2172692b3682a9b9bac7cb8e9c",
-      "test/smoke/helpers/routing-host.ts": "2551155dae4037db9f896811b6648acd168f565b"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "The context a resumed attempt sends grows by about the forcing message plus the task prompt again (chars/4): with a 4 000-character task the second request is ~1 000 tokens larger than with an empty task, both against the first request. Token numbers are the scripted provider's own estimate (request body length / 4), not a real tokenizer; whether a real producer repeats its earlier work is NOT observable with a scripted model.",
   "observed": {

@@ -1,24 +1,24 @@
 {
   "scenario": "3-enforce",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "06f20716-67c9-44cb-a0e5-b3344b47d1be",
-  "recordedAt": "2026-10-06T21:11:42.507Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:09:28.600Z",
   "harness": {
-    "headSha": "43813327409b7f5d90cb8bf38ba067ce1775d6ac",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "ac47761cef93a73c040fb7ec4f8efe731540f169",
-      "test/smoke/helpers/routing-host.ts": "180045122a75b014eff9afe604b3d763c9ccd049"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "engine=enforce: the orchestrator asks for heavy on a search task with no acceptance block; the engine swaps it to fast (sonnet-5-5#low). The CHILD SESSION held by the host has agent fast and model sonnet-5-5 variant low, the provider received that model with effort low, the row says switched=true, and the step record lands under the fast key.",
   "observed": {
-    "rootID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
-    "childID": "ses_eecf19c98ffevNkToeGMx3SThk",
+    "rootID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
+    "childID": "ses_eecbcb910ffe41844NRLNgDUCY",
     "hookBeforeInput": {
       "agent": "fast",
       "description": "Find usages",
-      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
+      "prompt": "[router] You are @fast. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.\n\nWorking directory: <home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project. You are already there — do not ask permission to read or write inside it.\n\nTool names ...[clipped, 1244 chars]",
       "background": false,
       "model": "anthropic/claude-sonnet-5-5#low"
     },
@@ -29,7 +29,7 @@
         "providerID": "anthropic",
         "variant": "low"
       },
-      "parentID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
+      "parentID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
       "tokens": {
         "input": 7423,
         "output": 5,
@@ -42,7 +42,7 @@
     },
     "hostListedChildren": [
       {
-        "id": "ses_eecf19c98ffevNkToeGMx3SThk",
+        "id": "ses_eecbcb910ffe41844NRLNgDUCY",
         "agent": "fast",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -61,10 +61,10 @@
     ],
     "row": {
       "v": 1,
-      "ts": "2026-10-06T21:11:12.434Z",
-      "sessionID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
+      "ts": "2026-10-06T22:08:58.529Z",
+      "sessionID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
       "kind": "decision",
-      "decisionID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs:1791321072433:1",
+      "decisionID": "ses_eecbcbac0ffedLg2O6wHiu5a0d:1791324538528:1",
       "mode": "enforce",
       "childSessionID": null,
       "facts": {
@@ -93,9 +93,9 @@
       "pinned": false,
       "unit": "ratio",
       "costs": {
-        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645401648150124,
-        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737509124,
-        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600191436303,
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": 1.1645402330077312,
+        "search|router:medium|anthropic/claude-sonnet-5-5#medium": 5.786644737512904,
+        "search|router:heavy|anthropic/claude-opus-5-5#xhigh": 20.190600270757002,
         "search|host:explore|anthropic/claude-opus-4-7#default": 1.8226999999999998,
         "search|host:explore|anthropic/claude-sonnet-5-5#low": 1.8226999999999998
       },

@@ -1,22 +1,22 @@
 {
   "scenario": "4-ladder",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "b0e8bcf6-29cd-439c-ad8e-858b819796c1",
-  "recordedAt": "2026-10-06T21:24:48.222Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:10:46.002Z",
   "harness": {
-    "headSha": "af41c84ba16f2f87e01a85e2d88804c7b78d0ef6",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "276736fbeedb4c2172692b3682a9b9bac7cb8e9c",
-      "test/smoke/helpers/routing-host.ts": "2551155dae4037db9f896811b6648acd168f565b"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "delegate with a scripted verification that fails once then passes: the runner resumes the SAME child session (the host created ONE producer child, a second decision row has resume=true and the same childSessionID) with the next variant of the same model; the host's stored variant for that child moves low -> medium, its token totals and the context the provider receives grow, and the orchestrator gets the verified result.",
   "observed": {
     "storeAfterWait": {
       "files": [
         {
-          "name": "advisor-notice.8b15893b07c1.json",
+          "name": "advisor-notice.9359edcca748.json",
           "size": 214
         },
         {
@@ -33,7 +33,7 @@
           "beta": {
             "alpha": 0,
             "beta": 1,
-            "updatedAt": 1791321859581
+            "updatedAt": 1791324617828
           },
           "counts": {
             "pass": 0,
@@ -70,7 +70,7 @@
           "beta": {
             "alpha": 1,
             "beta": 0,
-            "updatedAt": 1791321861366
+            "updatedAt": 1791324619661
           },
           "counts": {
             "pass": 1,
@@ -106,7 +106,7 @@
       }
     },
     "shortRun": {
-      "rootID": "ses_eece5a23afferP2G9E0FfaNca1",
+      "rootID": "ses_eecbb8d3cfferCyLATLepSo0wq",
       "delegateResult": [
         {
           "type": "text",
@@ -115,32 +115,24 @@
       ],
       "sessionsCreatedUnderRoot": [
         {
-          "sessionID": "ses_eece5a10cffexuF1jdjMKbI7Qd",
+          "sessionID": "ses_eecbb8b86ffeK2fYor2KS5YlKH",
           "agent": "fast",
           "title": "Router fast delegation"
         },
         {
-          "sessionID": "ses_eece5a03fffel1TN1fOKvjnPvO",
+          "sessionID": "ses_eecbb8a37ffepojyr3EN2Etny6",
           "agent": "model-router-grader",
           "title": "Router result verification"
         },
         {
-          "sessionID": "ses_eece59961ffe3mippw8D6MvTah",
+          "sessionID": "ses_eecbb82c5ffe05R3o4wucs68iA",
           "agent": "model-router-grader",
           "title": "Router result verification"
         }
       ],
       "producerTimeline": [
         {
-          "at": 1791321857837,
-          "agent": "fast",
-          "model": "anthropic/claude-sonnet-5-5#low",
-          "input": 0,
-          "output": 0,
-          "cost": 0
-        },
-        {
-          "at": 1791321857985,
+          "at": 1791324616067,
           "agent": "fast",
           "model": "anthropic/claude-sonnet-5-5#low",
           "input": 7359,
@@ -148,7 +140,7 @@
           "cost": 0.014768
         },
         {
-          "at": 1791321859695,
+          "at": 1791324617979,
           "agent": "fast",
           "model": "anthropic/claude-sonnet-5-5#medium",
           "input": 14819,
@@ -158,10 +150,10 @@
       ],
       "graderTimelines": [
         {
-          "id": "ses_eece5a03fffel1TN1fOKvjnPvO",
+          "id": "ses_eecbb8a37ffepojyr3EN2Etny6",
           "snapshots": [
             {
-              "at": 1791321858127,
+              "at": 1791324616275,
               "agent": "model-router-grader",
               "model": "anthropic/claude-opus-5-5#default",
               "input": 0,
@@ -171,10 +163,10 @@
           ]
         },
         {
-          "id": "ses_eece59961ffe3mippw8D6MvTah",
+          "id": "ses_eecbb82c5ffe05R3o4wucs68iA",
           "snapshots": [
             {
-              "at": 1791321859829,
+              "at": 1791324618157,
               "agent": "model-router-grader",
               "model": "anthropic/claude-opus-5-5#default",
               "input": 0,
@@ -187,113 +179,113 @@
       "producerEvents": [
         {
           "type": "session.created",
-          "id": "evt_1131a5efa001kCvyLc6EPN7HO0",
-          "at": 1791321857800
+          "id": "evt_11344748c001cbkD0vF2avMb46",
+          "at": 1791324615838
         },
         {
           "type": "session.inbox.enqueued",
-          "id": "evt_1131a5f3f001AY9ato9QiVx4CT",
-          "at": 1791321857858
+          "id": "evt_1134474e9001UAvWJep7iCHm8K",
+          "at": 1791324615917
         },
         {
           "type": "session.execution.started",
-          "id": "evt_1131a5f4300157JDZC2ss8b8IS",
-          "at": 1791321857893
+          "id": "evt_1134474ee001NJAXyLM1bnS9RU",
+          "at": 1791324615975
         },
         {
           "type": "session.instructions.updated",
-          "id": "evt_1131a5f4c001tgWZtmD3MJwICR",
-          "at": 1791321857897
+          "id": "evt_1134474fa001GE851PRnSpifRK",
+          "at": 1791324615982
         },
         {
           "type": "session.inbox.delivered",
-          "id": "evt_1131a5f4e001cT7mZ8BhXnyH7r",
-          "at": 1791321857898
+          "id": "evt_1134474fe0018zCk4SB7k0ey23",
+          "at": 1791324615983
         },
         {
           "type": "session.step.started",
-          "id": "evt_1131a5f6e001xPegLcZcYgjqu2",
-          "at": 1791321857912
+          "id": "evt_113447542001C09rdLtE4Uo9LW",
+          "at": 1791324616019
         },
         {
           "type": "session.text.started",
-          "id": "evt_1131a5f71001ttIHfdlh5QJTuk",
-          "at": 1791321857913
+          "id": "evt_113447546001j4VZAQaHYUWaQF",
+          "at": 1791324616020
         },
         {
           "type": "session.text.ended",
-          "id": "evt_1131a5f75001BuPxgoeE30iSZt",
-          "at": 1791321857913
+          "id": "evt_11344754e001uUuXMLxqNfQuIA",
+          "at": 1791324616020
         },
         {
           "type": "session.step.ended",
-          "id": "evt_1131a5f7d001nsrRs6nvYFUzQL",
-          "at": 1791321857933
+          "id": "evt_11344755c001dFHyrEIlDV598V",
+          "at": 1791324616049
         },
         {
           "type": "session.usage.updated",
-          "id": "evt_1131a5f80001NZeqE83N9okiFR",
-          "at": 1791321857938
+          "id": "evt_113447560001xWP8b88YZxauVW",
+          "at": 1791324616057
         },
         {
           "type": "session.execution.succeeded",
-          "id": "evt_1131a5f82001TuibIKKd51bYvv",
-          "at": 1791321857939
+          "id": "evt_113447562001raXqOU3LWfPMK1",
+          "at": 1791324616059
         },
         {
           "type": "session.model.selected",
-          "id": "evt_1131a6605001k8le8tVEV3iCPY",
-          "at": 1791321859595
+          "id": "evt_113447c70001465sh87slhbQk3",
+          "at": 1791324617849
         },
         {
           "type": "session.inbox.enqueued",
-          "id": "evt_1131a6611001TeSVO5XymTD2XT",
-          "at": 1791321859604
+          "id": "evt_113447c820010nGT87ZGFxA6Nx",
+          "at": 1791324617863
         },
         {
           "type": "session.execution.started",
-          "id": "evt_1131a6614001A59oaGbcrd69Ri",
-          "at": 1791321859638
+          "id": "evt_113447c89001zL0KeVGrDerAPn",
+          "at": 1791324617917
         },
         {
           "type": "session.inbox.delivered",
-          "id": "evt_1131a661e001zaYhzPCf94gIBH",
-          "at": 1791321859644
+          "id": "evt_113447c99001YU7Nci5KPLA6iA",
+          "at": 1791324617923
         },
         {
           "type": "session.step.started",
-          "id": "evt_1131a66410018wtUpWWYo4wYlD",
-          "at": 1791321859661
+          "id": "evt_113447ccc0011rpScC2GUdsPrF",
+          "at": 1791324617946
         },
         {
           "type": "session.text.started",
-          "id": "evt_1131a6644001JE6zKqmqMb8Lc1",
-          "at": 1791321859661
+          "id": "evt_113447cd2001uBLJ4jwek5xJiV",
+          "at": 1791324617946
         },
         {
           "type": "session.text.ended",
-          "id": "evt_1131a6649001fuzVJf0dXS0Log",
-          "at": 1791321859662
+          "id": "evt_113447cd5002yHbYXHLnaMX2hu",
+          "at": 1791324617947
         },
         {
           "type": "session.step.ended",
-          "id": "evt_1131a6654001E4TbNrbOJjHran",
-          "at": 1791321859685
+          "id": "evt_113447ce2001YPsfS6IlpndQ6r",
+          "at": 1791324617972
         },
         {
           "type": "session.usage.updated",
-          "id": "evt_1131a6658001xyLj00BR5t7ffN",
-          "at": 1791321859686
+          "id": "evt_113447ce6001C05XyNwWnD59rq",
+          "at": 1791324617972
         },
         {
           "type": "session.execution.succeeded",
-          "id": "evt_1131a6659001nSiZyyhBk4dhSY",
-          "at": 1791321859686
+          "id": "evt_113447ce7001wwbhQK8JwTv9Be",
+          "at": 1791324617973
         },
         {
           "type": "session.deleted",
-          "id": "evt_1131a6cf8001ma9iISWc4oicoB",
-          "at": 1791321861370
+          "id": "evt_113448390001woIXzg5UP7DcRB",
+          "at": 1791324619667
         }
       ],
       "producerRequests": [
@@ -314,12 +306,12 @@
       ],
       "graderRequests": [
         {
-          "session": "ses_eece5a03fffel1TN1fOKvjnPvO",
+          "session": "ses_eecbb8a37ffepojyr3EN2Etny6",
           "agent": "model-router-grader",
           "catalogModel": "anthropic/claude-opus-5-5#default"
         },
         {
-          "session": "ses_eece59961ffe3mippw8D6MvTah",
+          "session": "ses_eecbb82c5ffe05R3o4wucs68iA",
           "agent": "model-router-grader",
           "catalogModel": "anthropic/claude-opus-5-5#default"
         }
@@ -328,20 +320,20 @@
     },
     "rows": [
       {
-        "decisionID": "ladder-62bc9736-1",
+        "decisionID": "ladder-d5eedc3c-1",
         "step": "dispatch",
         "resume": false,
-        "childSessionID": "ses_eece5a10cffexuF1jdjMKbI7Qd",
+        "childSessionID": "ses_eecbb8b86ffeK2fYor2KS5YlKH",
         "chosen": "search|router:fast|anthropic/claude-sonnet-5-5#low",
         "switched": false,
         "mode": "advise",
         "reason": "ladder dispatch on fast; fresh child"
       },
       {
-        "decisionID": "ladder-62bc9736-2",
+        "decisionID": "ladder-d5eedc3c-2",
         "step": "variant",
         "resume": true,
-        "childSessionID": "ses_eece5a10cffexuF1jdjMKbI7Qd",
+        "childSessionID": "ses_eecbb8b86ffeK2fYor2KS5YlKH",
         "chosen": "search|router:fast|anthropic/claude-sonnet-5-5#medium",
         "switched": false,
         "mode": "advise",
@@ -388,6 +380,6 @@
     ],
     "routerLogLines": []
   },
-  "assertionResult": "PASS: producer sessions=1; stored model timeline anthropic/claude-sonnet-5-5#low -> anthropic/claude-sonnet-5-5#medium; session input tokens 0 -> 7359 -> 14819; provider messages 1->4, est. input 7359->7460; rows dispatch, variant(resume); verdicts fail,pass",
+  "assertionResult": "PASS: producer sessions=1; stored model timeline anthropic/claude-sonnet-5-5#low -> anthropic/claude-sonnet-5-5#medium; session input tokens 7359 -> 14819; provider messages 1->4, est. input 7359->7460; rows dispatch, variant(resume); verdicts fail,pass",
   "notes": []
 }

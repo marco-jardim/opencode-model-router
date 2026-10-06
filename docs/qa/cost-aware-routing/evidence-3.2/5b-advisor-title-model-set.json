@@ -1,15 +1,15 @@
 {
   "scenario": "5b-advisor-title-model-set",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "d7513ac6-0488-4a1e-84d4-4d90f48b329f",
-  "recordedAt": "2026-10-06T21:29:59.055Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:11:22.127Z",
   "harness": {
-    "headSha": "b8aec76382d7b884ffdd3d358d57ca1a124c9f79",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "044bea85b89f9c5d32a9e10d2b08a5e1f52a5cdf",
-      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "With agents.title.model set in the host config the real title agent record carries that model and /router has NO title finding, even from a session of the provider without a small model.",
   "observed": {

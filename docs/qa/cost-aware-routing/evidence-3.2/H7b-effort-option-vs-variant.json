@@ -1,15 +1,15 @@
 {
   "scenario": "H7b-effort-option-vs-variant",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "4cf9da2f-4d26-4f1f-9406-f4387d67cca2",
-  "recordedAt": "2026-10-06T21:48:31.348Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:12:15.026Z",
   "harness": {
-    "headSha": "6004e169a4048384581d2bfe7862e161f1a7c2b1",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "6ed2a821d267c8ae53281e746d7dff689e6e2bc6",
-      "test/smoke/helpers/routing-host.ts": "610d5c0e7fc56494aeae1c27021031b56700f8cf"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "With medium configured as variant=medium but effort=xhigh, a child started on fast and resumed on medium: the wire shows whether the request follows the agent's effort OPTION (xhigh) or the stored VARIANT (medium), and that the previous agent's option (low) is not carried.",
   "observed": {
@@ -75,7 +75,7 @@
         "options": []
       }
     ],
-    "controlChild": "ses_eeccf7455ffeAjDcNBwE6V5AUB",
+    "controlChild": "ses_eecb9bab3ffeG1jEYT20q8CWNZ",
     "providerErrors": [],
     "reading": "resumed effective xhigh, fresh medium effective xhigh"
   },

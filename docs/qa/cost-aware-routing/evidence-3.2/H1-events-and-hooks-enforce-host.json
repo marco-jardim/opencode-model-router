@@ -1,99 +1,99 @@
 {
   "scenario": "H1-events-and-hooks-enforce-host",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "06f20716-67c9-44cb-a0e5-b3344b47d1be",
-  "recordedAt": "2026-10-06T21:11:42.855Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:09:28.617Z",
   "harness": {
-    "headSha": "43813327409b7f5d90cb8bf38ba067ce1775d6ac",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "ac47761cef93a73c040fb7ec4f8efe731540f169",
-      "test/smoke/helpers/routing-host.ts": "180045122a75b014eff9afe604b3d763c9ccd049"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "Host events for a subagent child: session.created carries parentID/agent/title; session.execution.* events carry an id and are delivered for the child before the tool call returns; the plugin's execute.before hook ran for the model-emitted subagent call.",
   "observed": {
     "childEventTypes": [
       {
         "type": "session.created",
-        "id": "evt_1130e636b001tsgKZz6myqlA37",
-        "created": 1791321072491,
-        "deliveredAt": 1791321072502
+        "id": "evt_1134346f5001l6eIXLaI735OtH",
+        "created": 1791324538613,
+        "deliveredAt": 1791324538626
       },
       {
         "type": "session.inbox.enqueued",
-        "id": "evt_1130e6377001JPRAT2wbavQAaI",
-        "created": 1791321072503,
-        "deliveredAt": 1791321072506
+        "id": "evt_113434703001V2YoobcIFvFeNi",
+        "created": 1791324538627,
+        "deliveredAt": 1791324538633
       },
       {
         "type": "session.execution.started",
-        "id": "evt_1130e637b001jXSN9CcDgSP0OS",
-        "created": 1791321072507,
-        "deliveredAt": 1791321072541
+        "id": "evt_11343470a001RIPUwvx36u1ELU",
+        "created": 1791324538634,
+        "deliveredAt": 1791324538685
       },
       {
         "type": "session.instructions.updated",
-        "id": "evt_1130e63830017aehbCH5HbXOq6",
-        "created": 1791321072515,
-        "deliveredAt": 1791321072546
+        "id": "evt_113434714001tHMygJQ0Ba4WGF",
+        "created": 1791324538644,
+        "deliveredAt": 1791324538692
       },
       {
         "type": "session.inbox.delivered",
-        "id": "evt_1130e6386001QF78xLR73nuuBn",
-        "created": 1791321072518,
-        "deliveredAt": 1791321072546
+        "id": "evt_113434717001hyUB3p0fuLlbtC",
+        "created": 1791324538647,
+        "deliveredAt": 1791324538693
       },
       {
         "type": "session.step.started",
-        "id": "evt_1130e63a6001tSZVaqy5Li56YU",
-        "created": 1791321072550,
-        "deliveredAt": 1791321072559
+        "id": "evt_11343475c001ukU9GG24JvUVhx",
+        "created": 1791324538716,
+        "deliveredAt": 1791324538729
       },
       {
         "type": "session.text.started",
-        "id": "evt_1130e63a9001PmeABORsLy63ue",
-        "created": 1791321072553,
-        "deliveredAt": 1791321072560
+        "id": "evt_11343475f0012meGyH3hA7ogyj",
+        "created": 1791324538719,
+        "deliveredAt": 1791324538729
       },
       {
         "type": "session.text.ended",
-        "id": "evt_1130e63ac002nXXUqJ5qDtNL80",
-        "created": 1791321072556,
-        "deliveredAt": 1791321072561
+        "id": "evt_113434763001qw0EUn5yx9WEGB",
+        "created": 1791324538723,
+        "deliveredAt": 1791324538730
       },
       {
         "type": "session.step.ended",
-        "id": "evt_1130e63b5001wqRYBufhf4970U",
-        "created": 1791321072565,
-        "deliveredAt": 1791321072585
+        "id": "evt_113434770001Adb9arQSjA95g6",
+        "created": 1791324538736,
+        "deliveredAt": 1791324538762
       },
       {
         "type": "session.usage.updated",
-        "id": "evt_1130e63b9001v5rRnnJ49Z0or3",
-        "created": 1791321072569,
-        "deliveredAt": 1791321072590
+        "id": "evt_113434774001O6ItBWHlnr2d1j",
+        "created": 1791324538740,
+        "deliveredAt": 1791324538771
       },
       {
         "type": "session.execution.succeeded",
-        "id": "evt_1130e63bb001HHf99IVaw5xXEW",
-        "created": 1791321072571,
-        "deliveredAt": 1791321072591
+        "id": "evt_113434776001sTBR1Tc154ta7D",
+        "created": 1791324538742,
+        "deliveredAt": 1791324538772
       }
     ],
     "sessionCreated": [
       {
-        "id": "evt_1130e636b001tsgKZz6myqlA37",
+        "id": "evt_1134346f5001l6eIXLaI735OtH",
         "type": "session.created",
         "data": {
-          "sessionID": "ses_eecf19c98ffevNkToeGMx3SThk",
-          "projectID": "b1a027a9252e61bb1f5874a74c9c9df363288b3b",
+          "sessionID": "ses_eecbcb910ffe41844NRLNgDUCY",
+          "projectID": "d6ee22d1599ae5539d2ea1a813cd63abd9ab8530",
           "location": {
-            "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project"
+            "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project"
           },
           "subpath": "",
-          "parentID": "ses_eecf19dc2ffeIrF7Nm79dOqQNs",
-          "slug": "sunny-cabin",
+          "parentID": "ses_eecbcbac0ffedLg2O6wHiu5a0d",
+          "slug": "stellar-engine",
           "title": "Find usages",
           "agent": "fast",
           "model": {
@@ -111,46 +111,46 @@
           "version": "2.0.22"
         },
         "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-pNd6d1\\project"
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-p32-enforce-WUfe4x\\project"
         }
       }
     ],
     "executionEvents": [
       {
-        "id": "evt_1130e637b001jXSN9CcDgSP0OS",
+        "id": "evt_11343470a001RIPUwvx36u1ELU",
         "type": "session.execution.started",
         "data": {
-          "sessionID": "ses_eecf19c98ffevNkToeGMx3SThk"
+          "sessionID": "ses_eecbcb910ffe41844NRLNgDUCY"
         },
-        "deliveredAt": 1791321072541
+        "deliveredAt": 1791324538685
       },
       {
-        "id": "evt_1130e63bb001HHf99IVaw5xXEW",
+        "id": "evt_113434776001sTBR1Tc154ta7D",
         "type": "session.execution.succeeded",
         "data": {
-          "sessionID": "ses_eecf19c98ffevNkToeGMx3SThk"
+          "sessionID": "ses_eecbcb910ffe41844NRLNgDUCY"
         },
-        "deliveredAt": 1791321072591
+        "deliveredAt": 1791324538772
       }
     ],
     "subagentHookRecords": [
       {
         "hook": "before",
-        "iid": "qbof4r",
+        "iid": "b2cxgr",
         "callID": "toolu_smoke_1",
         "agent": "build",
-        "at": 1791321072483
+        "at": 1791324538600
       },
       {
         "hook": "after",
-        "iid": "qbof4r",
+        "iid": "b2cxgr",
         "callID": "toolu_smoke_1",
         "agent": "build",
-        "at": 1791321072638
+        "at": 1791324538823
       }
     ],
-    "toolReturnedAt": 1791321072638
+    "toolReturnedAt": 1791324538823
   },
-  "assertionResult": "PASS: session.created data keys=sessionID,projectID,location,subpath,parentID,slug,title,agent,model,permissions,version parentID=ses_eecf19dc2ffeIrF7Nm79dOqQNs agent=fast title=Find usages; execution events session.execution.started,session.execution.succeeded ids present=true; end delivered -47 ms vs the tool return",
+  "assertionResult": "PASS: session.created data keys=sessionID,projectID,location,subpath,parentID,slug,title,agent,model,permissions,version parentID=ses_eecbcbac0ffedLg2O6wHiu5a0d agent=fast title=Find usages; execution events session.execution.started,session.execution.succeeded ids present=true; end delivered -51 ms vs the tool return",
   "notes": []
 }

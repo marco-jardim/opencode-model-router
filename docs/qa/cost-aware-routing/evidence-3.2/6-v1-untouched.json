@@ -1,15 +1,15 @@
 {
   "scenario": "6-v1-untouched",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "86eca0e5-48c7-4f5d-bc72-994770c7b5c5",
-  "recordedAt": "2026-10-06T21:40:50.871Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:11:24.330Z",
   "harness": {
-    "headSha": "474d6c1154cee3acc86419228f442e479a01fae8",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "a2f3ec93f538429278dedcf6e4b958ea8617aee5",
-      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly the smoke:routing line. The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).",
   "observed": {

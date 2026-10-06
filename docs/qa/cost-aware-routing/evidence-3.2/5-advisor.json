@@ -1,20 +1,20 @@
 {
   "scenario": "5-advisor",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "d7513ac6-0488-4a1e-84d4-4d90f48b329f",
-  "recordedAt": "2026-10-06T21:29:54.338Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:11:19.530Z",
   "harness": {
-    "headSha": "b8aec76382d7b884ffdd3d358d57ca1a124c9f79",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "044bea85b89f9c5d32a9e10d2b08a5e1f52a5cdf",
-      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "After QA-2.4-1 the summary finding is gone and `title-model-unset` fires only when agents.title.model is unset AND the host's Model.small pick finds nothing for the SESSION'S provider while a cheaper title-eligible model exists elsewhere. On the real host: /router from a session of the anthropic provider (which has a claude-haiku) has NO title finding; from a session of a provider without a small model it HAS one. (Divergence from plan 3.2 scenario 5, which still says 'title/summary'.)",
   "observed": {
     "anthropicSession": {
-      "rootID": "ses_eece08202ffeSf0l3SupZ4XA3m",
+      "rootID": "ses_eecba94d1ffeRVCkGcmFo3C20E",
       "commandLines": [
         "# Model Router",
         "Enforcement: **advisory**",
@@ -25,7 +25,7 @@
         "- `/router models [provider]` — list valid model ids from your configured providers",
         "- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats`)",
         "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
-        "router: engine=advise build=2.2.0+b8aec76",
+        "router: engine=advise build=2.2.0+bdf9aae",
         "router: last checkpoint=DF3",
         "",
         "Cost doctor: 2 findings (0 warning, 0 saving, 2 info)",
@@ -35,7 +35,7 @@
       ]
     },
     "smalllessSession": {
-      "rootID": "ses_eece07f93ffecHYlYFaXavYkG0",
+      "rootID": "ses_eecba935fffeKlmgAGJdmRfKtN",
       "commandLines": [
         "# Model Router",
         "Enforcement: **advisory**",
@@ -46,7 +46,7 @@
         "- `/router models [provider]` — list valid model ids from your configured providers",
         "- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats`)",
         "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
-        "router: engine=advise build=2.2.0+b8aec76",
+        "router: engine=advise build=2.2.0+bdf9aae",
         "router: last checkpoint=DF3",
         "",
         "Cost doctor: 3 findings (0 warning, 1 saving, 2 info)",

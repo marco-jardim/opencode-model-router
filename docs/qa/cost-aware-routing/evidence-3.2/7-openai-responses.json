@@ -1,15 +1,15 @@
 {
   "scenario": "7-openai-responses",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "cf901d4e-a983-4034-bd10-7b7ad51b763f",
-  "recordedAt": "2026-10-06T21:42:05.190Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:11:29.626Z",
   "harness": {
-    "headSha": "7324ca37dd4534a72b1a8dcc52ca4c28c088bdda",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "ed321de6246c520864933056413d1d2d83b5f219",
-      "test/smoke/helpers/routing-host.ts": "fb7b87d9a51eb2fcc5055efa81f9b535c78b8cfc"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "The scripted provider speaks the OpenAI Responses protocol (/v1/responses, SSE response.* events) for a gpt-6-class model with variants. A child started at #low and resumed at a higher variant of the SAME model: the host keeps the top-level reasoning.effort of the first request and delivers the change as an in-band configuration_update input item; the EFFECTIVE effort (last in-band value, else top-level) follows the stored variant. A `default` (bare model) start resumed at #high behaves the same (F9). A model change together with a variant is recorded, not asserted.",
   "observed": {

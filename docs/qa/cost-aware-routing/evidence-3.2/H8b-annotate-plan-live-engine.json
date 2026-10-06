@@ -1,15 +1,15 @@
 {
   "scenario": "H8b-annotate-plan-live-engine",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "094eeab8-1169-4768-a8b8-b2b019720293",
-  "recordedAt": "2026-10-06T21:49:58.205Z",
+  "runId": "bf21e691-fce8-42a8-ba69-4429528afffa",
+  "recordedAt": "2026-10-06T22:12:23.125Z",
   "harness": {
-    "headSha": "2c4b3754d93de37323eb1a96d425c8c0d5f4c9a6",
+    "headSha": "bdf9aae94f64ac18ff034202284ac11a374a0be7",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "a8bc521b7df02051eaa7210f40e3e01e43d5f8bd",
-      "test/smoke/helpers/routing-host.ts": "610d5c0e7fc56494aeae1c27021031b56700f8cf"
+      "test/smoke/routing-engine.smoke.test.ts": "fab543649ffbabe2fc11482461ee8ed4f015c330",
+      "test/smoke/helpers/routing-host.ts": "17246ef050b68cf52512a9329eebe366f0905244"
     },
-    "uncommittedChanges": true
+    "uncommittedChanges": false
   },
   "expectation": "With a live engine /annotate-plan hands the model, in the command's own prompt, the exact [route …] lines to insert for each step of the plan file; a numbered line inside a fenced block is not a step and gets none.",
   "observed": {
@@ -37,7 +37,7 @@
       "For each NON-TRIVIAL task, append an acceptance block immediately after the step so the router can verify the work:",
       "Prefer deterministic checks (testsPass/buildPasses/fileExists). testsPass means the tests affected by the producer's changes pass (the full suite is CI's job), so prefer it over a hand-written full-suite run command. Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
       "## Router route lines (model-router, engine=advise)",
-      "Computed by the router for <home>\\AppData\\Local\\Temp\\omr-p32-notice-uczxPS\\project\\plan.md: 3 steps found, 3 need an addition, 1 pinned by this annotation (a `[tier:heavy]` or QA step is never moved by the engine).",
+      "Computed by the router for <home>\\AppData\\Local\\Temp\\omr-p32-notice-rumGzR\\project\\plan.md: 3 steps found, 3 need an addition, 1 pinned by this annotation (a `[tier:heavy]` or QA step is never moved by the engine).",
       "Make exactly these changes, keeping every other line as it is. Line numbers are those of the file now: apply the list from the last step to the first (or find each line by its quoted text) so earlier insertions do not move the later ones. Each quoted string is the complete line to write. Where a tier tag is listed it replaces the template's tag rule for that step (it is already at the start, as the template says); never write a `[route …]` line inside a fenced code block, and do not invent others.",
       "- line 3 \"1. Find every usage of parseThing in the repository and list the files.\": rewrite line 3 as \"1. [tier:fast] Find every usage of parseThing in the repository and list the files.\"; insert directly below line 3 (outside any code fence) the line \"[route class=recon risk=low scope=multi d=none]\" [facts source: rules]",
       "- line 4 \"2. Implement the retry logic in src/client.ts with unit tests.\": rewrite line 4 as \"2. [tier:medium] Implement the retry logic in src/client.ts with unit tests.\"; insert directly below line 4 (outside any code fence) the line \"[route class=implement risk=medium scope=multi needs=edit d=none]\" [facts source: rules]",
