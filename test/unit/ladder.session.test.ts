@@ -227,7 +227,7 @@ describe("buildEscalatePolicy with session input", () => {
     );
   });
 
-  it("excludes an effort-configured tier, which keeps the effortBump path", () => {
+  it("gives an effort-configured tier an empty ladder, its budget and its model, and keeps its effortBump (QA-1.5-6, QA-1.5-8)", () => {
     const policy = buildEscalatePolicy(
       makeConfig({
         fast: { model: SONNET, effort: "low" },
@@ -236,13 +236,90 @@ describe("buildEscalatePolicy with session input", () => {
       }),
       V2,
     );
-    expect(Object.keys(policy.variants!.perTier)).toEqual(["medium"]);
+    expect(Object.keys(policy.variants!.perTier)).toEqual(["fast", "medium", "heavy"]);
+    for (const tier of ["fast", "heavy"]) {
+      const effortTier = policy.variants!.perTier[tier]!;
+      expect(effortTier.ladder).toMatchObject({ variants: [], source: "none" });
+      expect(effortTier.base).toBe(DEFAULT_VARIANT);
+    }
+    expect(policy.variants!.perTier.fast!.inputBudget).toBe(1_000_000);
+    expect(policy.variants!.perTier.heavy!.inputBudget).toBe(800_000);
+    expect(policy.variants!.perTier.medium!.ladder.variants).not.toEqual([]);
     expect(Object.keys(policy.effortBump?.perTier ?? {})).toContain("fast");
+    // exclusivity: a tier in both places never has a variant to step to
     for (const tier of Object.keys(policy.variants!.perTier)) {
-      expect(Object.keys(policy.effortBump?.perTier ?? {})).not.toContain(tier);
+      if (Object.keys(policy.effortBump?.perTier ?? {}).includes(tier)) {
+        expect(policy.variants!.perTier[tier]!.ladder.variants).toEqual([]);
+      }
     }
   });
 
+  it("an effort-configured tier retries with its effort bump and its model, never a variant step", () => {
+    const policy = buildEscalatePolicy(
+      makeConfig({ fast: { model: SONNET, effort: "low" }, medium: { model: OPUS, variant: "high" } }, { maxTotalAttempts: 10, costCeiling: { multiple: 1000 } }),
+      V2,
+    );
+    const retry = nextAction(sessionState({ currentVariant: null, nextModelContext: 1_000_000 }), fail, policy);
+    expect(retry).toMatchObject({ action: "retry", tier: "fast", effort: "medium", model: SONNET, resume: false });
+    expect(retry).not.toHaveProperty("variantStep");
+    expect(retry).not.toHaveProperty("variant");
+    // escalating into it knows its budget, so a resume can be decided
+    const escalate = nextAction(
+      sessionState({ currentTier: "medium", attemptsThisTier: 1, currentVariant: "high", childSessionID: "ses_a", lastStepTokens: 10 }),
+      fail,
+      buildEscalatePolicy(makeConfig({ fast: { model: OPUS, variant: "high" }, medium: { model: SONNET, effort: "low" } }), V2),
+    );
+    expect(escalate.resumeBasis).toMatchObject({ budget: null });
+  });
+
+  it("builds info with an empty ladder for a model whose catalog entry has no variants (QA-1.5-6)", () => {
+    const policy = buildEscalatePolicy(makeConfig({ fast: { model: PLAIN }, medium: { model: SONNET } }), V2);
+    expect(policy.variants!.perTier.fast).toMatchObject({
+      model: PLAIN,
+      base: DEFAULT_VARIANT,
+      inputBudget: 100_000,
+      ladder: { variants: [], source: "none" },
+    });
+    const retry = nextAction(sessionState({ attemptsThisTier: 0 }), fail, policy);
+    expect(retry).toMatchObject({ action: "retry", model: PLAIN });
+    expect(retry).not.toHaveProperty("variantStep");
+    const escalate = nextAction(sessionState({ attemptsThisTier: 1, childSessionID: "ses_a", lastStepTokens: 10 }), fail, policy);
+    expect(escalate.resumeBasis).toMatchObject({ budget: 1_000_000 }); // medium's own budget
+    const toPlain = nextAction(
+      sessionState({ currentTier: "medium", attemptsThisTier: 1, currentVariant: "xhigh", childSessionID: "ses_a", lastStepTokens: 10 }),
+      fail,
+      buildEscalatePolicy(makeConfig({ medium: { model: SONNET }, heavy: { model: PLAIN } }, { ladder: ["medium", "heavy"] }), V2),
+    );
+    expect(toPlain).toMatchObject({ action: "escalate", tier: "heavy", model: PLAIN });
+    expect(toPlain.resumeBasis).toMatchObject({ budget: 100_000, reason: "under-threshold" });
+  });
+
+  it("keeps the policy key off when every tier lacks a catalog entry, and omits only the tiers without one", () => {
+    expect(buildEscalatePolicy(makeConfig({ fast: { model: "x/unknown" } }), V2)).not.toHaveProperty("variants");
+    const policy = buildEscalatePolicy(makeConfig({ fast: { model: "x/unknown" }, medium: { model: SONNET } }), V2);
+    expect(Object.keys(policy.variants!.perTier)).toEqual(["medium"]);
+  });
+
+  it("treats a throwing catalog lookup as no catalog entry, logs it and keeps the other tiers (QA-1.5-15)", () => {
+    const warnings: string[] = [];
+    const policy = buildEscalatePolicy(makeConfig({ fast: { model: "x/boom" }, medium: { model: SONNET } }), {
+      host: "v2",
+      catalog: (model) => {
+        if (model === "x/boom") throw new Error("catalog exploded");
+        return lookup(model);
+      },
+      warn: (message) => warnings.push(message),
+    });
+    expect(Object.keys(policy.variants!.perTier)).toEqual(["medium"]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("x/boom");
+    expect(warnings[0]).toContain("catalog exploded");
+    // no logger, a logger that throws, and a thrown non-Error are all survivable
+    const throwing = { host: "v2", catalog: () => { throw "plain string"; } } satisfies LadderSessionPolicyInput;
+    expect(() => buildEscalatePolicy(makeConfig(OWNER), throwing)).not.toThrow();
+    expect(buildEscalatePolicy(makeConfig(OWNER), throwing)).not.toHaveProperty("variants");
+    expect(() => buildEscalatePolicy(makeConfig(OWNER), { ...throwing, warn: () => { throw new Error("logger down"); } })).not.toThrow();
+  });
   it("keeps a tier with both a variant and an effort on the variant path", () => {
     const policy = buildEscalatePolicy(makeConfig({ fast: { model: SONNET, variant: "low", effort: "low" } }), V2);
     expect(Object.keys(policy.variants!.perTier)).toEqual(["fast"]);
@@ -380,10 +457,14 @@ describe("newLadderState and recordAttempt on a session-aware policy", () => {
     expect(state.nextModelContext).toBe(800_000);
   });
 
-  it("uses a null budget when the start tier has no variant info", () => {
+  it("uses a null budget when the start tier has no catalog entry", () => {
     const policy = buildEscalatePolicy(makeConfig({ fast: { model: SONNET, effort: "low" }, medium: { model: SONNET } }), V2);
-    expect(newLadderState("fast", policy).nextModelContext).toBeNull();
+    // the effort tier now has info (an empty ladder), so its budget is known (QA-1.5-6)
+    expect(newLadderState("fast", policy).nextModelContext).toBe(1_000_000);
     expect(newLadderState("fast", policy)).toHaveProperty("childSessionID", null);
+    const unknown = buildEscalatePolicy(makeConfig({ fast: { model: "x/unknown" }, medium: { model: SONNET } }), V2);
+    expect(newLadderState("fast", unknown).nextModelContext).toBeNull();
+    expect(newLadderState("fast", unknown)).toHaveProperty("childSessionID", null);
   });
 
   it("adds no key without a variant policy", () => {
@@ -1321,9 +1402,11 @@ describe("property-based: session-aware loop", () => {
       });
       const policy = buildEscalatePolicy(config, { host: "v2", catalog: catalogLookup, maxContextFraction: pick([0.3, 0.6, 1]) });
 
-      // One effort delivery per tier: never in both.
+      // One effort delivery per tier: a tier on the effort bump never has a variant to step to.
       for (const tier of Object.keys(policy.variants?.perTier ?? {})) {
-        expect(Object.keys(policy.effortBump?.perTier ?? {})).not.toContain(tier);
+        if (Object.keys(policy.effortBump?.perTier ?? {}).includes(tier)) {
+          expect(policy.variants!.perTier[tier]!.ladder.variants).toEqual([]);
+        }
       }
 
       let state = newLadderState(names[0]!, policy);

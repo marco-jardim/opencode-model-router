@@ -128,8 +128,10 @@ export interface LadderSessionPolicyInput {
   variantSteps?: "auto" | "none";
   /** Default 0.6 (§1.4). */
   maxContextFraction?: number;
-  /** Catalog lookup for a "provider/model" id; must not throw. */
+  /** Catalog lookup for a "provider/model" id. A throwing lookup is treated as no catalog entry (QA-1.5-15). */
   catalog: (model: string) => CatalogModel | null | undefined;
+  /** Receives one line per failed catalog lookup; its own failures are swallowed. */
+  warn?: (message: string) => void;
 }
 
 export interface LadderVerdict {
@@ -530,6 +532,21 @@ function rungCostRatios(
   return Object.fromEntries(entries);
 }
 
+/** QA-1.5-15: a throwing catalog is "no catalog" for that model, logged once per lookup and never raised. */
+function lookupCatalog(session: LadderSessionPolicyInput, model: string): CatalogModel | null | undefined {
+  try {
+    return session.catalog(model);
+  } catch (error) {
+    try {
+      const reason = error instanceof Error ? error.message : String(error);
+      session.warn?.(`[router] ladder: catalog lookup for ${model} failed (${reason}); treating it as no catalog entry`);
+    } catch {
+      // logging must never break policy construction
+    }
+    return undefined;
+  }
+}
+
 function buildVariantPolicy(
   cfg: RouterConfig,
   session?: LadderSessionPolicyInput,
@@ -539,33 +556,38 @@ function buildVariantPolicy(
   const entries: Array<[string, TierVariantInfo]> = [];
   for (const [name, tier] of Object.entries(getActiveTiers(cfg) ?? {})) {
     if (tier === null || typeof tier !== "object" || typeof tier.model !== "string" || tier.model.length === 0) continue;
-    const configured = typeof tier.variant === "string" && tier.variant.length > 0 ? tier.variant : null;
-    // One effort delivery per tier (F3): effort/thinking/reasoning-configured tiers keep the effortBump path.
-    if (configured === null && (tier.effort !== undefined || tier.thinking !== undefined || tier.reasoning !== undefined)) continue;
-    const entry = session.catalog(tier.model);
+    // QA-1.5-6: every tier with a catalog entry gets variant info (and its input budget), whether or
+    // not it can step; a tier without an entry keeps today's behaviour (no info, fresh start).
+    const entry = lookupCatalog(session, tier.model);
+    if (entry === null || entry === undefined || typeof entry !== "object") continue;
     const ids = catalogVariantIds(entry);
-    if (ids === null) continue; // no catalog: today's behaviour for this tier
-    if (configured !== null && !ids.includes(configured)) continue; // invalid configured variant: never resume-switch it
+    const configured = typeof tier.variant === "string" && tier.variant.length > 0 ? tier.variant : null;
+    if (configured !== null && !(ids ?? []).includes(configured)) continue; // invalid configured variant: never resume-switch it
+    // One effort delivery per tier (F3, QA-1.5-8): effort/thinking/reasoning-configured tiers keep the
+    // effortBump path and get an empty variant ladder; they still carry their model and budget.
+    const effortConfigured =
+      configured === null && (tier.effort !== undefined || tier.thinking !== undefined || tier.reasoning !== undefined);
     const raw = (tier as { candidates?: unknown }).candidates; // raw config, never resolveCandidates() (F11)
     const base = configured ?? DEFAULT_VARIANT;
-    const ladder = buildVariantLadder({
-      model: tier.model,
-      catalog: entry,
-      candidates: Array.isArray(raw) ? raw : undefined,
-      maxEffort: max,
-    });
+    const ladder = effortConfigured
+      ? buildVariantLadder({ model: tier.model, catalog: null })
+      : buildVariantLadder({
+          model: tier.model,
+          catalog: entry,
+          candidates: Array.isArray(raw) ? raw : undefined,
+          maxEffort: max,
+        });
     entries.push([name, {
       model: tier.model,
       base,
       ladder,
-      inputBudget: inputBudget(entry?.limit),
+      inputBudget: inputBudget(entry.limit),
       costRatios: rungCostRatios(tier, raw, base, ladder),
     }]);
   }
   if (entries.length === 0) return null;
   return { maxContextFraction: session.maxContextFraction ?? 0.6, perTier: Object.fromEntries(entries) };
 }
-
 function buildEffortBump(cfg: RouterConfig): EffortBumpPolicy | null {
   const { enabled, max } = resolveEffortBump(cfg);
   if (!enabled) return null;
