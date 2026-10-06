@@ -211,6 +211,29 @@ describe("createAttemptRecorder", () => {
   });
 });
 
+describe("QA-2.3-11: the configuration of the delegation decides", () => {
+  it("record() and engineLive() use the runner's active config, not the recorder's own", async () => {
+    const h = harness();
+    const live = config({ engine: "shadow" }, h.outcomes);
+    const off = config({}, h.outcomes);
+    const recorder = createAttemptRecorder({ host: "v2", config: () => off, logger: h.logger, acquire: h.acquire, now: () => T0 });
+    try {
+      expect(recorder.engineLive()).toBe(false);
+      expect(recorder.engineLive(live)).toBe(true);
+      recorder.record(attempt({ childSessionID: "hot", config: live }));
+      expect(lookupDispatch("hot")?.outcomes).toBe(true);
+      expect(await h.rows()).toHaveLength(1);
+      const reverse = createAttemptRecorder({ host: "v2", config: () => live, logger: h.logger, acquire: h.acquire });
+      reverse.record(attempt({ childSessionID: "cold", config: off }));
+      expect(lookupDispatch("cold")?.outcomes).toBe(false);
+      expect(h.bundles).toHaveLength(1); // the second recorder acquired nothing
+      await reverse.dispose();
+    } finally {
+      await recorder.dispose();
+    }
+  });
+});
+
 describe("describeAttempt", () => {
   it("states the step, the child, the D11 numbers and a runner override", () => {
     expect(describeAttempt(attempt({ resumed: false, plan: plan({ step: "escalate", tier: "medium", fresh: "effort-path", resumeBasis: { resume: true, reason: "under-threshold", tokens: null, budget: 10, threshold: 6 } }) })))

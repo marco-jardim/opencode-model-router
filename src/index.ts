@@ -786,7 +786,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             let plan: AttemptPlan = planFirstAttempt(activeCfg, state.currentTier);
             // Registry entry + decision row per attempt: for the ladder's own resume decision (the child's last step
             // context) and for the outcome store. Without a routing block both are off and nothing is registered.
-            const recording = attemptRecorder !== undefined && (sessionAware || attemptRecorder.engineLive());
+            const recording = attemptRecorder !== undefined && (sessionAware || attemptRecorder.engineLive(activeCfg));
             const delegation: DelegationFacts | null = recording
               ? await classifyDelegation(activeCfg, host, args.task, args.acceptance, logger)
               : null;
@@ -853,6 +853,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     childSessionID: sid,
                     parentSessionID: toolCtx?.sessionID ?? null,
                     plan: attemptPlan,
+                    config: activeCfg,
                     facts: delegation.facts,
                     acceptance: delegation.acceptance,
                     resumed: sid === resumeTarget,
@@ -1215,9 +1216,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               }
               // retry or escalate
               forcing = action.forcingMessage ?? null;
-              rungCost = action.costRatio;
               state = advance(state, action);
               plan = planNextAttempt({ action, state, previous: plan, cfg: activeCfg, policy, catalog });
+              // The rung the plan actually dispatches (QA-2.3-8: not the action's when the plan fell back to the tier's model).
+              rungCost = plan.costRatio;
               // The child this attempt ran on is kept only when the next attempt resumes it (D11); otherwise it is
               // discarded now, so a long ladder never accumulates live sessions.
               if (sessionAware && plan.resumeSessionID !== producerSid) await disposeChildSession(producerSid);

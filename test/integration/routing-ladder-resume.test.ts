@@ -383,7 +383,9 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
     it("starts a fresh child on the bare model and delivers the step's effort through the effort override", async () => {
       const catalog = defaultCatalog();
       const t = await setup({
-        tiers: OWNER, routing: {}, verdicts: [false, true], catalog,
+        // `medium` is a priced rung of `fast` (5), but the fallback runs the tier's own model: it is charged 1 (QA-2.3-8).
+        tiers: { ...OWNER, fast: { model: SONNET, variant: "low", costRatio: 1, candidates: [{ variant: "low", costRatio: 1 }, { variant: "medium", costRatio: 5 }] } },
+        routing: {}, verdicts: [false, true], catalog,
         // The host's catalog changes under the delegation: `medium` disappears after the policy was built.
         during: (attempt) => { if (attempt === 1) Object.assign(catalog[0]!, { variants: [{ id: "low" }, { id: "high" }, { id: "xhigh" }] }); },
       });
@@ -393,6 +395,8 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
       expect(t.runs[1]!.options.effort).toBe("medium");
       expect(t.runs[0]!.options.effort).toBeUndefined();
       expect(t.disposed).toContain("child-1");
+      const scorecard = readFileSync(join(tmpdir(), "opencode-model-router-trajectory", "child-2.delegate.log"), "utf8");
+      expect(scorecard).toContain("cost=2"); // 1 + 1, not 1 + 5
     });
   });
 

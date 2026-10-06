@@ -47,6 +47,8 @@ export interface AttemptRecord {
   /** The orchestrator session that called `delegate`. */
   readonly parentSessionID: string | null;
   readonly plan: AttemptPlan;
+  /** The configuration this delegation runs under (the runner's hot-reloaded `activeCfg`); default: the recorder's own. */
+  readonly config?: RouterConfig;
   /** Typed facts of the delegated task (rules classifier). */
   readonly facts: DecisionFacts;
   /** The delegation's verification depth, from its `[acceptance]` block. */
@@ -57,7 +59,7 @@ export interface AttemptRecord {
 
 export interface AttemptRecorder {
   /** True when attempts are worth registering for the engine alone (any mode but `static`, on v2). */
-  engineLive(): boolean;
+  engineLive(config?: RouterConfig): boolean;
   /** Register the attempt and, when the engine is live, enqueue its decision row. Never throws. */
   record(attempt: AttemptRecord): void;
   /** Opportunistic maintenance: releases the outcomes bundle when the engine went back to `static`. */
@@ -112,7 +114,7 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
   let held: { readonly dir: string; readonly bundle: OutcomesBundle } | null = null;
   let disposed = false;
 
-  const settingsNow = (): IngestSettings | null => ingestSettings(deps.config(), deps.host);
+  const settingsNow = (config?: RouterConfig): IngestSettings | null => ingestSettings(config ?? deps.config(), deps.host);
 
   const release = (): void => {
     const current = held;
@@ -130,9 +132,9 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
   };
 
   return {
-    engineLive: () => {
+    engineLive: (config) => {
       try {
-        return settingsNow() !== null;
+        return settingsNow(config) !== null;
       } catch (error) {
         deps.logger.warn("[router] ladder attempts: reading the routing settings failed", { error: describe(error) });
         return false;
@@ -142,7 +144,7 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
     record(attempt) {
       try {
         const { plan } = attempt;
-        const settings = settingsNow();
+        const settings = settingsNow(attempt.config);
         const model = modelOf(plan);
         const decisionID = settings === null || model === null ? null : `ladder-${NONCE}-${++decisionSeq}`;
         rememberDispatch(attempt.childSessionID, {

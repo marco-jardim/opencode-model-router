@@ -203,6 +203,24 @@ describe("planNextAttempt: catalog validation before the call (D10 fallback)", (
     expect(next.plan.step).toBe("variant");
   });
 
+  it("QA-2.3-8: the invalid-variant fallback is charged at the tier's ratio, not at the ratio of the rung it could not run", () => {
+    const cfg = config({
+      fast: { model: SONNET, variant: "low", costRatio: 1, candidates: [{ variant: "low", costRatio: 1 }, { variant: "medium", costRatio: 5 }] },
+      medium: { model: SONNET, variant: "medium", costRatio: 5 },
+    });
+    const policy = buildEscalatePolicy(cfg, V2);
+    const shrunk: CatalogLookup = (model) => (model === SONNET ? entry(["low", "high"]) : lookup(model));
+    const recorded = recordAttempt(newLadderState("fast", policy), 1, { sessionID: "c", lastStepTokens: 1_000 });
+    const action = nextAction(recorded, FAIL, policy, { dispatchPromptChars: 10 });
+    expect(action.costRatio).toBe(5); // the ladder priced the rung `medium`
+    const invalid = planNextAttempt({ action, state: advance(recorded, action), previous: planFirstAttempt(cfg, "fast"), cfg, policy, catalog: shrunk });
+    expect(invalid.fresh).toBe("invalid-variant");
+    expect(invalid.costRatio).toBeUndefined();
+    // a valid catalog keeps the rung's ratio
+    const valid = planNextAttempt({ action, state: advance(recorded, action), previous: planFirstAttempt(cfg, "fast"), cfg, policy, catalog: lookup });
+    expect(valid.costRatio).toBe(5);
+  });
+
   it("a model the catalog no longer has is invalid too", () => {
     const cfg = config(OWNER);
     const policy = buildEscalatePolicy(cfg, V2);

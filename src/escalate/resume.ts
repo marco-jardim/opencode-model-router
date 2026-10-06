@@ -81,7 +81,7 @@ export interface AttemptPlan {
   readonly fresh?: FreshReason;
   /** Effort-bump override for the attempt's session (the ladder's, or the invalid-variant fallback). */
   readonly effort?: EffortLevel;
-  /** costRatio of the rung the attempt runs (A17); undefined = the tier's ratio. */
+  /** costRatio of the rung the attempt runs (A17); undefined = the tier's ratio (also for the `invalid-variant` fallback). */
   readonly costRatio?: number;
   /** The variant the dispatch asks for, for the next plan's R1 check (undefined = the model's default). */
   readonly variant?: string;
@@ -194,7 +194,9 @@ export function planNextAttempt(input: NextAttemptInput): AttemptPlan {
     ...(action.resumeBasis === undefined ? {} : { resumeBasis: action.resumeBasis }),
     ...(fresh === undefined ? {} : { fresh }),
     ...(effort === undefined ? {} : { effort }),
-    ...(costRatio === undefined ? {} : { costRatio }),
+    // The rung's ratio is the one the action priced for its own model#variant; the invalid-variant fallback runs the
+    // tier's configured model instead, so the runner charges the tier's ratio (QA-2.3-8).
+    ...(costRatio === undefined || fresh === "invalid-variant" ? {} : { costRatio }),
     ...(model?.variant === undefined ? {} : { variant: model.variant }),
   };
 }
