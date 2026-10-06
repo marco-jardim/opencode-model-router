@@ -106,6 +106,12 @@ export interface TierConfig {
   promptStyle?: PromptStyle;
   /** Optional use-case hints shown in `/tiers`. */
   whenToUse?: string[];
+  /**
+   * Ordered `(model, variant, costRatio)` rungs the routing engine may use for
+   * this tier. Absent or empty = the tier's own single `(model, variant,
+   * costRatio)`. See {@link resolveCandidates}.
+   */
+  candidates?: TierCandidate[];
 }
 
 export type Preset = Record<string, TierConfig>;
@@ -171,12 +177,112 @@ export interface EnforcementConfig {
     failureRecheck?: boolean;
     /** Budget for the reference re-run, in ms (integer >= 1). Default 60000. */
     recheckTimeoutMs?: number };
-  escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number };
-    /** Bump reasoning effort before escalating tiers. Default true. */
-    effortBump?: boolean;
-    /** Maximum reasoning effort for a bump. Default "xhigh". */
-    effortBumpMax?: EffortLevel };
+  escalate?: EscalateConfig;
   proportional?: { trivialBypass?: boolean; trivialClassifier?: string };
+}
+
+export interface EscalateConfig {
+  floorTier?: string | null;
+  ladder?: string[];
+  maxAttemptsPerTier?: number;
+  maxTotalAttempts?: number;
+  costCeiling?: { base?: string; multiple?: number };
+  /** Bump reasoning effort before escalating tiers. Default true. */
+  effortBump?: boolean;
+  /** Maximum reasoning effort for a bump. Default "xhigh". */
+  effortBumpMax?: EffortLevel;
+  /**
+   * Retry on the same model's next variant before escalating the model (D10).
+   * OpenCode v2 only; ignored on v1. Default "auto".
+   */
+  variantSteps?: VariantStepsMode;
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing (#74): the `routing` block, tier candidates, variant steps
+// ---------------------------------------------------------------------------
+
+/** `static` = the shipped taxonomy only; the others add the engine of #74. */
+export const ROUTING_ENGINES = ["static", "shadow", "advise", "enforce"] as const;
+export type RoutingEngine = (typeof ROUTING_ENGINES)[number];
+
+/** How much a wrong, undetected result is worth in the expected-cost formula (D8). */
+export const ROUTING_PROFILES = ["frugal", "balanced", "safe"] as const;
+export type RoutingProfile = (typeof ROUTING_PROFILES)[number];
+
+export const CLASSIFIER_BACKENDS = ["rules", "host", "openai-compatible", "typesafe"] as const;
+export type ClassifierBackend = (typeof CLASSIFIER_BACKENDS)[number];
+
+export const VARIANT_STEP_MODES = ["auto", "none"] as const;
+export type VariantStepsMode = (typeof VARIANT_STEP_MODES)[number];
+
+/** Which host runs the plugin; `v2` is OpenCode v2 (D1). */
+export type RouterHost = "v1" | "v2";
+
+/**
+ * One rung of a tier's ladder. `model` falls back to the tier's own model;
+ * `variant` is NOT inherited (omitted = the model's default variant); `costRatio`
+ * falls back to the tier's.
+ */
+export interface TierCandidate {
+  model?: string;
+  variant?: string;
+  costRatio?: number;
+}
+
+/** Verification-depth → probability that a wrong result is caught (D8). */
+export interface DetectionConfig {
+  deterministic?: number;
+  grader?: number;
+  none?: number;
+}
+
+/** Per-preset override of the classifier's `backend` / `model`. */
+export interface ClassifierPresetOverride {
+  backend?: ClassifierBackend;
+  model?: string | null;
+}
+
+export interface ClassifierConfig {
+  backend?: ClassifierBackend;
+  /** Catalog ref `provider/model[#variant]`; required when the effective backend is not `rules` (D3). */
+  model?: string | null;
+  /** `openai-compatible` / `typesafe` only. */
+  baseUrl?: string | null;
+  apiKeyEnv?: string | null;
+  timeoutMs?: number;
+  samples?: 1 | 3;
+  maxStateChars?: number;
+  presets?: Record<string, ClassifierPresetOverride>;
+}
+
+export interface OutcomesConfig {
+  path?: string | null;
+  halfLifeDays?: number;
+  maxEffectiveSamples?: number;
+}
+
+export interface SessionReuseConfig {
+  maxContextFraction?: number;
+}
+
+export interface AdvisorConfig {
+  enabled?: boolean;
+  noticeIntervalHours?: number;
+}
+
+export interface RoutingConfig {
+  engine?: RoutingEngine;
+  profile?: RoutingProfile;
+  margin?: number;
+  minClassConfidence?: number;
+  detection?: DetectionConfig;
+  classifier?: ClassifierConfig;
+  /** Task class → ordered agent ids. Absent = host default (D12); `{}` = none. */
+  roles?: Record<string, string[]>;
+  outcomes?: OutcomesConfig;
+  sessionReuse?: SessionReuseConfig;
+  advisor?: AdvisorConfig;
 }
 
 export interface RouterConfig {
@@ -253,6 +359,8 @@ export interface RouterConfig {
   subagentTiers?: Record<string, string>;
   /** Experimental, opt-in features. Off by default. */
   experimental?: { verifiedDelegateTool?: boolean };
+  /** Cost-aware routing engine (#74). Absent = today's static routing, byte for byte. */
+  routing?: RoutingConfig;
 }
 
 export interface RouterState {
