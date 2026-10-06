@@ -15,6 +15,7 @@
 
 import type { RouterConfig } from "../../router/config";
 import { normTaskKw } from "../../router/sessions";
+import { collapseLongRuns } from "./text";
 import {
   ACCEPTANCE_BLOCK_RE,
   CLASS_BASE_RISK,
@@ -59,6 +60,9 @@ import {
 } from "./types";
 
 type RulesConfig = Pick<RouterConfig, "taskPatterns">;
+
+/** Prefix of the class text measured by the shape gates (see analyzeRules). */
+const SHAPE_WINDOW_CHARS = 2000;
 
 // ---------------------------------------------------------------------------
 // Module-load compilation
@@ -245,7 +249,9 @@ function customPatterns(taskPatterns: RulesConfig["taskPatterns"]): readonly Cus
 // ---------------------------------------------------------------------------
 
 /** classifyTrivial's shape clauses 5–7, on the string given (R4). Length is reported, never a class signal. */
-export function shapeOf(raw: string): ShapeFacts {
+export function shapeOf(input: string): ShapeFacts {
+  // The shared gate regexes are quadratic on long runs of path characters; `chars` stays the true length.
+  const raw = collapseLongRuns(input);
   const lower = raw.toLowerCase();
   const paths = new Set<string>((lower.match(SHAPE_GATES.pathToken) ?? []).map((p) => p.trim()));
   for (const bare of raw.match(SHAPE_GATES.bareFilename) ?? []) paths.add(bare.toLowerCase());
@@ -262,14 +268,14 @@ export function shapeOf(raw: string): ShapeFacts {
     imperativeLines > 1 ||
     paths.size > SHAPE_GATES.maxSingleShotPaths;
   return {
-    chars: raw.length,
+    chars: input.length,
     paths: paths.size,
     multiStep,
     enumeration,
     distributive,
     imperativeLines,
     breadth,
-    singleShot: !breadth && raw.length <= SHAPE_GATES.maxSingleShotChars,
+    singleShot: !breadth && input.length <= SHAPE_GATES.maxSingleShotChars,
   };
 }
 
@@ -420,11 +426,14 @@ export function analyzeRules(
   cfg: RulesConfig,
   ctx?: { cwd?: string },
 ): RulesAnalysis {
-  const raw = String(text ?? "").slice(0, RULES_MAX_CHARS);
+  const raw = collapseLongRuns(String(text ?? "").slice(0, RULES_MAX_CHARS));
   const body = prepareBody(raw);
   const cwd = resolveCwd(body, ctx);
   const { templated, focusText, needsText } = splitSections(body);
-  const shape = shapeOf(focusText);
+  // The gates are quadratic in the longest run of path characters (a token just under the collapse
+  // threshold still costs ~its length squared), so only the head of a long prompt is measured; breadth
+  // markers show up long before 2000 characters. `chars` then reports the head, never the full length.
+  const shape = shapeOf(focusText.length > SHAPE_WINDOW_CHARS ? focusText.slice(0, SHAPE_WINDOW_CHARS) : focusText);
   const nonEnglish = isNonEnglish(focusText);
 
   // R6 — class candidates

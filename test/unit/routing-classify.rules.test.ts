@@ -713,3 +713,53 @@ describe("edit needs are imperative, not participles or nouns (QA-1.2-6)", () =>
     expect(facts.needs).toEqual(["shell"]);
   });
 });
+describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
+  /** Best of `runs` after a warm-up: immune to a GC pause or a busy CI core, still catches O(n²). */
+  const bestOf = (runs: number, fn: () => void): number => {
+    fn();
+    let best = Infinity;
+    for (let i = 0; i < runs; i++) {
+      const start = performance.now();
+      fn();
+      best = Math.min(best, performance.now() - start);
+    }
+    return best;
+  };
+
+  it.each([
+    ['"a" x 20000', "a".repeat(20_000)],
+    ['"a." x 10000', "a.".repeat(10_000)],
+    ['"a/" x 10000', "a/".repeat(10_000)],
+    ['"a-" x 10000', "a-".repeat(10_000)],
+    ['"a\\\\" x 10000', "a\\".repeat(10_000)],
+    ['"1.2.3." x 3000', "1.2.3.".repeat(3_000)],
+    ['"\\n" x 20000', "\n".repeat(20_000)],
+    ['" " x 20000', " ".repeat(20_000)],
+    ['"a," x 10000', "a,".repeat(10_000)],
+  ])("%s classifies in under 5 ms", (_label, text) => {
+    expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(5);
+    expect(classifyByRules(text, cfg).confidence).toBeLessThanOrEqual(0.5);
+  });
+
+  it("shapeOf alone is also linear on long runs", () => {
+    for (const text of ["a".repeat(20_000), "a.".repeat(10_000), "a/".repeat(10_000)]) {
+      expect(bestOf(5, () => shapeOf(text))).toBeLessThan(5);
+      expect(shapeOf(text).chars).toBe(text.length);
+    }
+  });
+
+  // Runs just under the collapse threshold are the worst case that remains. 5 ms is the budget on a quiet
+  // machine; the bound below is looser (10 ms) only so a loaded CI core cannot flake it.
+  it("runs of 199 characters, the worst case under the collapse threshold, stay under 10 ms", () => {
+    const text = ("a".repeat(199) + " ").repeat(100);
+    expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(10);
+    const dotted = ("a.".repeat(99) + "a ").repeat(100);
+    expect(bestOf(5, () => classifyByRules(dotted, cfg))).toBeLessThan(10);
+  });
+
+  it("collapsing keeps the class of the words around a long blob", () => {
+    const text = `grep for the handler ${"x".repeat(5000)} in src`;
+    expect(classifyByRules(text, cfg).class).toBe("search");
+    expect(shapeOf(`read ${"a/".repeat(3000)} please`).paths).toBe(0);
+  });
+});
