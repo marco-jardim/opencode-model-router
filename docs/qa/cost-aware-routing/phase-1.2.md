@@ -287,11 +287,11 @@ Plan decisions applied: A14 (default vitest pool only), A18 (HTTP backends and p
 | QA-1.2-14 | minor | `needs=shell, edit` lost `edit` | Whitespace around the commas of a needs list is normalised (`needs=shell, class=debug` keeps both fields) | `5ab1d94` |
 | QA-1.2-15 | minor | First `Working directory:` line won | Caller `cwd`, else the ENVIRONMENT section's line, else the last occurrence | `2e728b6` |
 | QA-1.2-16 | minor | Bare `push`/`publish`/`permissions`/`auth` over-fired | `push` needs git/remote context, `publish` npm/package/registry context; `permissions` alone and `src/auth/` paths are not high risk | `942bc20` |
-| QA-1.2-17 | minor | `ctx.generate.text` may prepend host instructions | Recorded as a DF3 check item (below) | this commit |
+| QA-1.2-17 | minor | `ctx.generate.text` may prepend host instructions | Recorded as a DF3 check item (below) | `62ce8db` |
 | QA-1.2-18 | nit | `maxStateChars` was clamped below as well as above | Only the upper bound (20 000) clamps; a smaller value is honoured | `19602d5` |
 | QA-1.2-19 | nit | The failure path returned the prompt with its route lines | Stripped in a separate `try` (plain line filter as the last resort); honours `routeLinePositions` | `802b63f` |
 | QA-1.2-20 | nit | `isValidResult` ignored source/risk/scope/bookkeeping | All fields validated | `802b63f` |
-| QA-1.2-21 | nit | "needs are never model-decided" was overstated | Wording fixed here and in `types.ts`: a model can only ADD needs | `9599807`, this commit |
+| QA-1.2-21 | nit | "needs are never model-decided" was overstated | Wording fixed here and in `types.ts`: a model can only ADD needs | `9599807`, `62ce8db` |
 
 Not fully fixed here (by design of the finding or of the phase): the enforcement of "route lines only at the edges" and of the project-layer classifier-key trust belong to Phase 2.2 / 1.1 (handoffs below; the classifier side — `routeLinePositions` and the plain-`http:` refusal — is done); QA-1.2-17 is a checklist item for DF3, not code.
 
