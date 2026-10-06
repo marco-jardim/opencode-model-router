@@ -736,8 +736,9 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 | `outcomes.halfLifeDays` | `number` | `14` | `[1, 365]` | Older verdicts weigh less. |
 | `outcomes.maxEffectiveSamples` | `number` | `50` | `[5, 1000]` | Cap on the effective sample size of one `(class × agent × model#variant)` posterior. |
 | `sessionReuse.maxContextFraction` | `number` | `0.6` | `(0, 0.95]` | A retry or escalation resumes the child session only while the next model's input budget has room under this fraction. |
-| `advisor.enabled` | `boolean` | `true` | | The cost doctor's findings and once-per-interval notice. |
-| `advisor.noticeIntervalHours` | `number` | `24` | `[1, 720]` | Minimum hours between notices. |
+| `advisor.enabled` | `boolean` | `true` | | The cost doctor's findings (the `/router` section) and its notice. |
+| `advisor.noticeIntervalHours` | `number` | `24` | `[1, 720]` | Hours between cost-doctor checks. A notice goes out only when the set of notice-worthy findings changed since the last one, or as a reminder after 7 days. |
+| `advisor.notify` | `boolean` | `true` | | `false` = never notify; the `/router` section stays. Findings on unmodified tiers of a bundled preset are never notified either way. |
 
 Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and compared with `resolveRouting`, so it cannot drift from the code; on v1 only `roles` differs: `{}`):
 
@@ -762,7 +763,7 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
   "roles": { "search": ["explore"], "implement": ["general"], "debug": ["general"], "review": ["general"] },
   "outcomes": { "path": null, "halfLifeDays": 14, "maxEffectiveSamples": 50 },
   "sessionReuse": { "maxContextFraction": 0.6 },
-  "advisor": { "enabled": true, "noticeIntervalHours": 24 }
+  "advisor": { "enabled": true, "noticeIntervalHours": 24, "notify": true }
 }
 ```
 

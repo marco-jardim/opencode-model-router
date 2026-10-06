@@ -63,6 +63,21 @@ import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
 import { verdictOf } from "./routing/outcomes/types";
+import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
+import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
+import type { HostAgentInfo } from "./routing/engine/types";
+import { createEngineRuntime } from "./routing/wire/runtime";
+import type { EngineRuntime } from "./routing/wire/runtime";
+import {
+  advisorSettings,
+  catalogFromProviders,
+  createAdvisorNotifier,
+  formatFindings,
+  hostConfigFromAgents,
+  runAdvisor,
+} from "./routing/advisor";
+import type { AdvisorCatalogModel, HostConfigView } from "./routing/advisor";
 import {
   findOrphanedStrongPatterns,
   normalizeCatalog,
@@ -207,6 +222,8 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string)
 
   return buildRouterHelp(
     resolveEnforcementMode({ config: cfg, env: process.env }).mode,
+    // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
+    { stats: cfg.routing !== undefined },
   );
 }
 
@@ -522,13 +539,118 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // Fetch and normalize opencode's live provider/model catalog. Best-effort:
   // returns null when the client call fails, e.g. the server is not ready yet.
   // The pure analysis (validateModels) lives in src/router/catalog.ts.
-  const fetchCatalog = async (): Promise<Catalog | null> => {
+  const fetchCatalogRaw = async (): Promise<{ catalog: Catalog; raw: unknown } | null> => {
     try {
       const res: any = await ctx.client.config.providers();
-      return normalizeCatalog(res?.data);
+      return { catalog: normalizeCatalog(res?.data), raw: res?.data };
     } catch {
       return null;
     }
+  };
+  const fetchCatalog = async (): Promise<Catalog | null> => (await fetchCatalogRaw())?.catalog ?? null;
+
+  // M8 (Phase 2.4): the cost doctor reads the host's agents and model catalog (v2 only, D1). Each call is bounded and failing
+  // one only leaves the checks that need it silent; nothing here ever throws into a session.
+  // The orchestrator's model as the last root-session turn reported it: the host's title pick depends on its provider (QA-2.4-1).
+  let lastPrimary: { providerID: string; modelID: string | null } | null = null;
+  const ADVISOR_HOST_TIMEOUT_MS = 3_000;
+  // The catalog comes from `config.providers()` (the call `/router` already makes for the model check, enriched with cost and capabilities
+  // by the v2 adapter), so the doctor does not ask the host for the model list a second time (QA-2.4-3). `prefetched` is that call's result
+  // when the caller already has it.
+  const gatherAdvisorInputs = async (
+    prefetched?: { raw: unknown } | null,
+  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
+    const attempt = async <T>(label: string, call: (() => Promise<T>) | undefined): Promise<T | null> => {
+      if (call === undefined) return null;
+      try {
+        return await withTimeout(call(), ADVISOR_HOST_TIMEOUT_MS, label);
+      } catch (error) {
+        logger.warn(`[router] cost doctor: the ${label} is unavailable`, { error: describeError(error) });
+        return null;
+      }
+    };
+    const [agents, providers] = await Promise.all([
+      attempt("host agent list", ctx.routerAgents),
+      prefetched !== undefined ? Promise.resolve(prefetched) : attempt("model catalog", fetchCatalogRaw),
+    ]);
+    return {
+      host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary),
+      catalog: providers === null ? null : catalogFromProviders(providers.raw),
+    };
+  };
+  const advisorNotifier = ctx.routerHost === "v2"
+    ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2", { project: projectDir }), config: () => cfg, gather: gatherAdvisorInputs, logger })
+    : undefined;
+  // `/annotate-plan` (Phase 2.4.4): its own engine runtime (agent list, catalog, classifier backend, outcome store), created on the first use
+  // and only on v2; with `routing.engine: static` its `prepare()` answers null before any host call, store or file.
+  let annotateRuntime: EngineRuntime | undefined;
+  const annotatePlanRuntime = (): EngineRuntime | undefined => {
+    if (ctx.routerHost !== "v2" || ctx.routerAgents === undefined || ctx.routerCatalog === undefined) return undefined;
+    annotateRuntime ??= createEngineRuntime({
+      loadConfig: () => cfg,
+      listAgents: ctx.routerAgents,
+      listModels: ctx.routerCatalog,
+      ...(ctx.routerGenerate === undefined ? {} : { generate: ctx.routerGenerate }),
+      logger,
+    });
+    return annotateRuntime;
+  };
+  // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()` and never fetched unless
+  // `routing.roles` is set explicitly. It is refreshed IN THE BACKGROUND (QA-2.4-13): a turn never waits for it. The first turn after start
+  // has no list yet and gets the baseline prompt; later turns use the last list, stale while the next one is fetched (every minute). A
+  // failed refresh keeps the last list and is logged; a list that was never fetched leaves the line as it is without roles.
+  const V1_AGENTS_TTL_MS = 60_000;
+  let v1Agents: { at: number; infos: HostAgentInfo[] | null } | null = null;
+  let v1AgentsRefresh: Promise<void> | null = null;
+  const refreshV1Agents = (): void => {
+    if (v1AgentsRefresh !== null) return;
+    const run = (async (): Promise<void> => {
+      try {
+        const res = await withTimeout(Promise.resolve(ctx.client.app.agents()), 2_000, "v1 agent list");
+        const data: unknown = (res as { data?: unknown } | undefined)?.data;
+        v1Agents = { at: Date.now(), infos: Array.isArray(data) ? v1AgentInfos(data) : (v1Agents?.infos ?? null) };
+      } catch (error) {
+        logger.warn("[router] routing.roles: the host's agent list is unavailable; the R: line keeps the last list, or stays without roles", { error: describeError(error) });
+        v1Agents = { at: Date.now(), infos: v1Agents?.infos ?? null }; // keep serving the stale list; try again after the interval
+      }
+    })().finally(() => {
+      if (v1AgentsRefresh === run) v1AgentsRefresh = null;
+    });
+    v1AgentsRefresh = run;
+  };
+  /** The last known v1 agent list (possibly stale, possibly `null`), starting a background refresh when it is due. Synchronous. */
+  const v1AgentsNow = (): HostAgentInfo[] | null => {
+    if (v1Agents === null || Date.now() - v1Agents.at >= V1_AGENTS_TTL_MS) refreshV1Agents();
+    return v1Agents?.infos ?? null;
+  };  /** Hand a notice to the orchestrator as a synthetic transcript entry (v2), or log it where there is no such call. Never throws, never waits. */
+  const deliverAdvisorNotice = (sessionID: string, notice: string): void => {
+    const synthetic = ctx.routerSynthetic;
+    if (synthetic === undefined) {
+      logger.warn(notice); // no synthetic-message call on this host: the log line is the whole delivery
+      return;
+    }
+    const text = `Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${notice}`;
+    void Promise.resolve()
+      .then(() => synthetic({ sessionID, text, description: "Model router cost doctor" }))
+      .catch((error: unknown) => {
+        logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
+      });
+  };
+  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
+  const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
+    const routing = resolveRouting(cfg, "v2");
+    if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
+    const { host, catalog } = await gatherAdvisorInputs(prefetched);
+    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), {
+      hostKnown: host !== null,
+      catalogKnown: catalog !== null && catalog.length > 0,
+      primaryKnown: lastPrimary !== null,
+    });
+    // Phase 2.3 handoff (decision 16): a ladder row's confidence is not the evidence share the dispatch rows carry.
+    if (routing.engine !== "static") {
+      lines.push("Decision log: a ladder-attempt row's confidence is the delegation's class confidence; a dispatch row's is the class confidence scaled by the winner's evidence (n/(n+5)).");
+    }
+    return lines;
   };
 
   // Deferred passive catalog check. The first orchestrator turn only STARTS the
@@ -682,6 +804,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await disposeVerification();
       // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
       await ingest?.dispose();
+      await annotateRuntime?.dispose();
       await attemptRecorder?.dispose();
       await logger.flush();
     },
@@ -1343,7 +1466,23 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
     "chat.message": async (input: any, output: any) => {
       if (bypassed) return;
-      // Re-read cfg so /preset switches take effect without restart
+      // 2.4.3 (QA-2.4-R2-1): the cost doctor's notice is NEVER part of the user's message (the prompt text stays byte for byte what the user
+      // typed). It is a synthetic transcript entry, through the same host call the adapter uses for the config-reload and narration notices
+      // (`ctx.session.synthetic({ …, resume: false })`, exposed as `routerSynthetic`): it enters the context of the orchestrator's next
+      // request without resuming or answering anything. Delivery is not awaited (the host may be admitting this very prompt); a failure is
+      // logged. A host without `routerSynthetic` (OpenCode v1 has no such call and no advisor either) gets a log line instead. Only a PROVEN
+      // root session takes it (never a subagent or a grader), and only when one may be waiting.
+      if (advisorNotifier !== undefined && advisorNotifier.maybePending() && typeof input?.sessionID === "string") {
+        const noticeSession: string = input.sessionID;
+        try {
+          if (!graderSessions.has(noticeSession) && !sessionStore.isSubagent(noticeSession) && (await lookupRootSession(noticeSession)) === true) {
+            const notice = await advisorNotifier.take();
+            if (notice !== null) deliverAdvisorNotice(noticeSession, notice);
+          }
+        } catch (error) {
+          logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
+        }
+      }      // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig(projectDir);
         warnConfigIssues(cfg, logger);
@@ -2183,10 +2322,29 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const providerID = _input?.model?.providerID ?? "";
       const modelID = _input?.model?.modelID ?? "";
       const orchestratorModel = providerID && modelID ? `${providerID}/${modelID}` : modelID;
+      if (providerID !== "") lastPrimary = { providerID, modelID: modelID === "" ? null : modelID };
 
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
-      output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
+      let systemPrompt = assembleSystemPrompt(cfg, orchestratorModel, enfOn);
+      // A28 (D1): on v1 only, and only with an explicit `routing.roles`, the `R:` line lists those agents as destinations (prose; no model
+      // override). Anything else leaves `systemPrompt` the very string it is: the v1 protocol stays byte-identical.
+      // Any failure leaves the baseline prompt (QA-2.4-13): the line is an extra, never a reason to lose the protocol.
+      if (ctx.routerHost !== "v2") {
+        const baseline = systemPrompt;
+        try {
+          if (hasExplicitV1Roles(cfg)) systemPrompt = applyV1Roles(baseline, cfg, v1AgentsNow());
+        } catch (error) {
+          systemPrompt = baseline;
+          logger.warn("[router] routing.roles: the R: line could not be extended; the protocol is unchanged", { error: describeError(error) });
+        }
+      }
+      output.system.push(systemPrompt);
+
+      // 2.4.3: the cost doctor's throttled check. `poll` is O(1) when nothing is due and never throws. In static/shadow a notice is logged
+      // from here; in advise/enforce it is delivered with the user's next turn (the `chat.message` hook below), never in the system prompt:
+      // a system part that changes would cost the orchestrator its prompt cache (QA-2.4-9).
+      advisorNotifier?.poll();
 
       // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
       // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
@@ -2226,6 +2384,31 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           type: "text" as const,
           text: buildTiersOutput(cfg),
         });
+      }
+
+      if (input.command === "annotate-plan") {
+        // 2.4.4: the template (registered in the config hook) is unchanged. With a live engine on v2 this adds ONE message part: the
+        // route lines the router computed for the plan's steps (one batched classification). Everything else is as before.
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        try {
+          const runtime = annotatePlanRuntime();
+          if (runtime !== undefined && ctx.routerAgents !== undefined) {
+            const directives = await buildAnnotateDirectives(input.arguments ?? "", {
+              cfg,
+              runtime,
+              listAgents: ctx.routerAgents,
+              dirs: [...new Set([ctx.directory, ctx.worktree].filter((dir): dir is string => typeof dir === "string" && dir !== ""))],
+              logger,
+            });
+            if (directives !== null) output.parts.push({ type: "text" as const, text: directives });
+          }
+        } catch (error) {
+          // No part: the command is then exactly what it was (QA-2.4-15).
+          logger.warn("[router] /annotate-plan: route lines unavailable; the plan is annotated without them", { error: describeError(error) });
+        }
       }
 
       if (input.command === "router-reload") {
@@ -2310,16 +2493,40 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           const catalog = await fetchCatalog();
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
           text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
+        } else if (sub === "stats") {
+          // 2.4.5 (D18): the table of `npm run routing:stats`, run by the very same driver over the configured store.
+          try {
+            text = formatStatsReply(await runStatsCommand(parts.slice(1).join(" "), { cfg, host: ctx.routerHost === "v2" ? "v2" : "v1", logger }));
+          } catch (error) {
+            logger.warn("[router] /router stats failed", { error: describeError(error) });
+            text = `routing-stats: ${describeError(error)}`;
+          }
         } else {
           text = buildRouterOutput(cfg, args, projectDir);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
-            const catalog = await fetchCatalog();
+            // 2.4.5: the last dogfood checkpoint recorded next to this code (omitted when there is none). Only with a `routing` block:
+            // without one `/router` is exactly what it was (QA-2.4-3, §1.2).
+            const optedIn = cfg.routing !== undefined;
+            const checkpoint = optedIn ? checkpointLine() : null;
+            if (checkpoint !== null) text += "\n" + checkpoint;
+            // One `config.providers()` call serves the model check below and the cost doctor.
+            const fetched = await fetchCatalogRaw();
+            const catalog = fetched?.catalog ?? null;
             if (catalog) {
               const issues = validateModels(cfg, catalog);
               if (issues.length > 0) {
                 text += "\n\n" + formatModelIssues(issues);
+              }
+            }
+            // 2.4.3: the cost doctor (v2 only, and only with a `routing` block; the advisor needs the v2 agent list and catalog).
+            if (ctx.routerHost === "v2" && optedIn) {
+              try {
+                text += "\n\n" + (await buildCostDoctorLines(fetched)).join("\n");
+              } catch (error) {
+                logger.warn("[router] cost doctor failed", { error: describeError(error) });
+                text += `\n\nCost doctor: unavailable (${describeError(error)}).`;
               }
             }
           }

@@ -423,6 +423,8 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
   let lastKnownMtime: number | null | undefined;
   let warnedForeignWriter = false;
   let warnedMerge = false;
+  /** Size of decisions.jsonl right after this persister's last append (a file that ends with a newline); `null` = not appended yet. */
+  let knownEnd: number | null = null;
   /** What this persister last loaded or wrote: the base for `disk − baseline` when another process writes (QA-1.3-4). */
   let baseline: OutcomeSnapshot | undefined;
 
@@ -643,9 +645,23 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
           await rotate();
           size = (await statOrNull(decisionsPath))?.size ?? 0;
         }
-        // QA-1.3-9: a crash can leave a torn last line without its newline; starting every batch on a fresh
-        // line keeps the next row from being glued to the fragment (readRows skips the blank/torn lines).
-        await fs.appendText(decisionsPath, (size > 0 ? "\n" : "") + body);
+        // QA-1.3-9: a crash can leave a torn last line without its newline; a batch that follows one starts on a fresh
+        // line, so the next row is not glued to the fragment (readRows skips the torn line). QA-2.4-R2-10: only then. A file
+        // that ends with a newline (every batch of this process does) takes the batch as it is, with no blank line between
+        // batches. The end of the file is only looked at when it is not where this process' last append left it: its first
+        // batch, or another process wrote since.
+        let lead = "";
+        if (size > 0 && size !== knownEnd) {
+          try {
+            const existing = await fs.readText(decisionsPath);
+            if (existing !== null && !existing.endsWith("\n")) lead = "\n";
+          } catch (readError) {
+            lead = "\n"; // cannot tell: a blank line is harmless, a glued row is not
+            logger.info?.("[router] decisions log end not checked", { error: describeError(readError) });
+          }
+        }
+        await fs.appendText(decisionsPath, lead + body);
+        knownEnd = size + Buffer.byteLength(lead + body, "utf8");
         return { ok: true };
       } catch (error) {
         return failure(error);

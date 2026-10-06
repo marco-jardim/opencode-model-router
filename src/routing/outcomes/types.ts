@@ -470,6 +470,20 @@ export const LOG_ROW_VERSION = 1;
  */
 export const FLOOR_LIFT_REASON = "lift:floor";
 
+/**
+ * Reason prefix of a decision row whose dispatch resumed an existing child (`task_id`/`sessionID`): the engine never switches such a
+ * dispatch in any mode (plan amendment A30), so `switched` is false and the kernel's own decision is only logged. `routing:stats` keeps
+ * these rows out of every routing metric and reports them on their own line.
+ */
+export const RESUME_REASON = "kept:resume";
+
+/**
+ * Reason prefix of a resume that repeats the orchestrator's original pick of a child the router moved (a floor lift, an evidence switch):
+ * the host would switch the child back to that pick, so `enforce` sends the resume to the agent/model the child runs (plan amendment A30,
+ * QA-2.4-R3-1). Still a `kept:resume` row (`startsWith(RESUME_REASON)`), `switched` false, outside every routing metric.
+ */
+export const RESUME_RUNNING_REASON = "kept:resume:running";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */
@@ -853,6 +867,19 @@ export interface StatsTable {
   };
   /** Fixed order: LADDER_STEP_KINDS. `renderMarkdown` leaves the `dispatch` row out (QA-2.3-7); the data keeps it. */
   readonly resumeVsFresh: readonly ResumeFreshRow[];
+  /**
+   * The orchestrator's own resumes (2.2: a `subagent` call with `task_id`/`sessionID` that reused a child), over the routed dispatch rows.
+   * Not ladder decisions, so they are reported on their own line and never in the D11 resume-vs-fresh table (QA-2.3-7, 2.4).
+   */
+  readonly orchestratorResumes: { readonly resumed: number; readonly total: number };
+  /**
+   * The evidence gate (A27) over the routed dispatch rows of the window: how many were kept because the cheapest option had no
+   * evidence yet (`kept:evidence`), and which keys that cheapest-but-unproven option was (`trace.argmin`), most frequent first.
+   */
+  readonly gate: {
+    readonly keptEvidence: number;
+    readonly argmin: ReadonlyArray<{ readonly key: OutcomeKey; readonly count: number }>;
+  };
 }
 
 /** What the CLI reads from a directory (a Persister satisfies it). */

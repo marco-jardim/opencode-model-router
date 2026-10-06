@@ -286,6 +286,8 @@ export interface SessionReuseConfig {
 export interface AdvisorConfig {
   enabled?: boolean;
   noticeIntervalHours?: number;
+  /** `false` = the cost doctor never notifies (the `/router` section stays). Default `true`. */
+  notify?: boolean;
 }
 
 export interface RoutingConfig {
@@ -1791,6 +1793,8 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
     const a: AdvisorConfig = {};
     const enabled = readBoolean(advisor, "enabled", "routing.advisor");
     if (enabled !== undefined) a.enabled = enabled;
+    const notify = readBoolean(advisor, "notify", "routing.advisor");
+    if (notify !== undefined) a.notify = notify;
     const noticeIntervalHours = readNumber(advisor, "noticeIntervalHours", "routing.advisor", {
       min: 1,
       max: 720,
@@ -2402,7 +2406,7 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
   preset: ["backend", "model"],
   outcomes: ["path", "halfLifeDays", "maxEffectiveSamples"],
   sessionReuse: ["maxContextFraction"],
-  advisor: ["enabled", "noticeIntervalHours"],
+  advisor: ["enabled", "noticeIntervalHours", "notify"],
 };
 
 /**
@@ -2819,7 +2823,7 @@ export const ROUTING_DEFAULTS = Object.freeze({
   }),
   outcomes: Object.freeze({ path: null, halfLifeDays: 14, maxEffectiveSamples: 50 }),
   sessionReuse: Object.freeze({ maxContextFraction: 0.6 }),
-  advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24 }),
+  advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24, notify: true }),
 });
 
 export interface ResolvedClassifier {
@@ -2955,6 +2959,7 @@ export function resolveRouting(
     advisor: Object.freeze({
       enabled: r.advisor?.enabled ?? d.advisor.enabled,
       noticeIntervalHours: r.advisor?.noticeIntervalHours ?? d.advisor.noticeIntervalHours,
+      notify: r.advisor?.notify ?? d.advisor.notify,
     }),
     applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
   });

@@ -198,6 +198,32 @@ async function routed(world: World, input: Record<string, unknown>, over: Record
   return call.event.input as Record<string, any>;
 }
 
+/**
+ * The fake host's children (QA-2.4-R3-1): what each one runs. A fresh dispatch starts a child on the agent (and model) its final arguments
+ * name; a resume that names a DIFFERENT agent switches the child to it and its model becomes that agent's, as the v2.0.22 host does
+ * (`switchAgent`, core/src/tool/plugin/subagent.ts:169-176).
+ */
+const hostChildren = new Map<string, { agent: string; model: string }>();
+const modelOfAgent = (world: World, agent: string): string => {
+  const model = world.agents[agent]?.model as { providerID: string; id: string; variant?: string } | undefined;
+  return model === undefined ? "?" : `${model.providerID}/${model.id}${model.variant === undefined ? "" : `#${model.variant}`}`;
+};
+
+async function hostStart(world: World, childID: string, input: Record<string, unknown>) {
+  const args = await routed(world, input);
+  hostChildren.set(childID, { agent: args.agent as string, model: typeof args.model === "string" ? args.model : modelOfAgent(world, args.agent as string) });
+  world.emit({ type: "session.created", data: { sessionID: childID, parentID: "root", agent: args.agent, title: "work item" } });
+  await vi.waitFor(() => { expect(lookupDispatch(childID)).toBeDefined(); });
+  return { args };
+}
+
+async function hostResume(world: World, childID: string, input: Record<string, unknown>) {
+  const args = await routed(world, { ...input, sessionID: childID });
+  const child = hostChildren.get(childID) ?? { agent: "?", model: "?" };
+  const switched = typeof args.agent === "string" && args.agent !== child.agent;
+  if (switched) hostChildren.set(childID, { agent: args.agent as string, model: modelOfAgent(world, args.agent as string) });
+  return { args, switched, child: { ...(hostChildren.get(childID) ?? child) } };
+}
 const IMPLEMENT = (extra = "") => `[route class=implement risk=high scope=single${extra}]\nImplement the change in src/a.ts.`;
 
 beforeEach(() => { vi.stubEnv("MODEL_ROUTER_ENFORCE", ""); });
@@ -208,6 +234,7 @@ afterEach(async () => {
     await world.bundle.release();
     rmSync(world.home, { recursive: true, force: true });
   }
+  hostChildren.clear();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   invalidateConfigCache();
@@ -415,22 +442,61 @@ describe("enforce", () => {
     expect(row).toMatchObject({ switched: false });
   });
 
-  it("an unrelated field survives the reassignment (sessionID, background) and a resume is registered at once", async () => {
+  it("an unrelated field survives the reassignment (background) on a fresh dispatch", async () => {
     const world = await makeWorld({ engine: "enforce", roles: {} });
     world.seed(KEYS.medium, 0, 20);
     world.seed(KEYS.heavy, 20, 0);
     await world.start();
-    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-7", background: true });
-    expect(after).toMatchObject({ agent: "heavy", sessionID: "child-7", background: true });
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT(), background: true });
+    expect(after).toMatchObject({ agent: "heavy", background: true });
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: true, resume: false, childSessionID: null });
+  });
+
+  it("A30 (QA-2.4-R2-3): a dispatch that resumes an existing child is never switched, in any mode: args unchanged, kept:resume, registered as dispatched", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0); // the same evidence that switches the fresh dispatch above
+    await world.start();
+    const input = { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-7", background: true };
+    const after = await routed(world, input);
+    expect(after).toMatchObject({ agent: "medium", sessionID: "child-7", background: true }); // untouched
+    expect(after.model).toBeUndefined(); // no model reassigned either
     expect(lookupDispatch("child-7")).toMatchObject({
-      agent: "heavy", model: OPUS, variant: "xhigh", tier: "heavy", parentSessionID: "root", step: "dispatch", acceptance: "none",
+      agent: "medium", model: SONNET, variant: "medium", tier: "medium", parentSessionID: "root", step: "dispatch", acceptance: "none",
       facts: { class: "implement" },
     });
     const [row] = await world.rows();
-    expect(row).toMatchObject({ resume: true, childSessionID: "child-7" });
+    expect(row).toMatchObject({ resume: true, childSessionID: "child-7", switched: false, mode: "enforce" });
+    expect(row!.reason.startsWith("kept:resume: ")).toBe(true);
+    expect(row!.reason).toContain("A30");
+    expect(row!.best).toMatchObject({ agent: "heavy" }); // the kernel's own decision is still logged
+    expect(row!.reason).toMatch(/engine decision: switched: /); // and what it was
     expect(lookupDispatch("child-7")!.decisionID).toBe(row!.decisionID);
   });
 
+  it("a resume is not moved by floorTier either, in enforce", async () => {
+    const world = await makeWorld({ engine: "enforce" }, { enforcement: { verify: { testBaseline: false }, escalate: { floorTier: "medium" } } });
+    await world.start();
+    const after = await routed(world, { agent: "fast", prompt: "[route class=search risk=low scope=single]\nFind it.", sessionID: "child-3" });
+    expect(after).toMatchObject({ agent: "fast", sessionID: "child-3" });
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: false, resume: true });
+    expect(row!.reason.startsWith("kept:resume")).toBe(true);
+  });
+
+  it("shadow and advise log a resume the same way (kept:resume, not a would-switch)", async () => {
+    for (const engine of ["shadow", "advise"] as const) {
+      const world = await makeWorld({ engine, roles: {} });
+      world.seed(KEYS.medium, 0, 20);
+      world.seed(KEYS.heavy, 20, 0);
+      await world.start();
+      await routed(world, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-2" });
+      const [row] = await world.rows();
+      expect(row, engine).toMatchObject({ switched: false, resume: true, mode: engine });
+      expect(row!.reason.startsWith("kept:resume"), engine).toBe(true);
+    }
+  });
   it("floorTier lifts a dispatch that starts below it, and the row says so (1.4 handoff)", async () => {
     const world = await makeWorld({ engine: "enforce" }, { enforcement: { verify: { testBaseline: false }, escalate: { floorTier: "medium" } } });
     await world.start();
@@ -442,6 +508,127 @@ describe("enforce", () => {
   });
 });
 
+describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", () => {
+  const SEARCH = "[route class=search risk=low scope=single]\nFind it.";
+  const FLOOR = (tier: string) => ({ enforcement: { verify: { testBaseline: false }, escalate: { floorTier: tier } } });
+  const resumeRows = async (world: World) => (await world.rows()).filter((row) => row.resume);
+
+  it("a floor-lifted child resumed with the orchestrator's original pick is sent to the agent it runs: the host does not switch it", async () => {
+    const world = await makeWorld({ engine: "enforce" }, FLOOR("medium"));
+    await world.start();
+    const first = await hostStart(world, "child-lift", { agent: "fast", prompt: SEARCH });
+    expect(first.args).toMatchObject({ agent: "medium" }); // lifted to the floor
+    expect(hostChildren.get("child-lift")).toMatchObject({ agent: "medium" });
+    expect(lookupDispatch("child-lift")).toMatchObject({ agent: "medium", picked: "fast", tier: "medium" });
+    const resumed = await hostResume(world, "child-lift", { agent: "fast", prompt: SEARCH });
+    expect(resumed.args).toMatchObject({ agent: "medium", model: `${SONNET}#medium`, sessionID: "child-lift" });
+    expect(resumed.switched).toBe(false); // the host finds the agent it already runs
+    expect(resumed.child).toMatchObject({ agent: "medium", model: `${SONNET}#medium` }); // not back on the cheaper fast
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, mode: "enforce", childSessionID: "child-lift", chosen: { agent: "fast" } });
+    expect(row!.reason.startsWith("kept:resume:running: ")).toBe(true);
+    expect(row!.reason).toContain("@medium");
+    expect(lookupDispatch("child-lift")).toMatchObject({ agent: "medium", model: SONNET, variant: "medium", picked: "fast", decisionID: row!.decisionID });
+    // and again: the pick is remembered across resumes
+    const again = await hostResume(world, "child-lift", { agent: "fast", prompt: SEARCH });
+    expect(again.args).toMatchObject({ agent: "medium" });
+    expect(again.switched).toBe(false);
+  });
+
+  it("an engine-switched child resumed with the original pick is sent to the agent it runs", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    await world.start();
+    const first = await hostStart(world, "child-sw", { agent: "medium", prompt: IMPLEMENT() });
+    expect(first.args).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh` }); // the evidence switch
+    expect(lookupDispatch("child-sw")).toMatchObject({ agent: "heavy", picked: "medium" });
+    const resumed = await hostResume(world, "child-sw", { agent: "medium", prompt: IMPLEMENT() });
+    expect(resumed.args).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh`, sessionID: "child-sw" });
+    expect(resumed.switched).toBe(false);
+    expect(resumed.child).toMatchObject({ agent: "heavy" });
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ switched: false, resume: true, chosen: { agent: "medium" }, best: { agent: "heavy" } });
+    expect(row!.reason.startsWith("kept:resume:running: ")).toBe(true);
+  });
+
+  it("a different agent named on purpose is honoured; below the floor it is lifted to it (never below the floor)", async () => {
+    const world = await makeWorld({ engine: "enforce" }, FLOOR("medium"));
+    await world.start();
+    await hostStart(world, "child-own", { agent: "fast", prompt: SEARCH }); // lifted to medium
+    // above the floor: honoured as named, the host switches the child (the orchestrator asked for it)
+    const up = await hostResume(world, "child-own", { agent: "heavy", prompt: SEARCH });
+    expect(up.args).toMatchObject({ agent: "heavy", sessionID: "child-own" });
+    expect(up.args.model).toBeUndefined();
+    expect(up.switched).toBe(true);
+    expect(up.child.agent).toBe("heavy");
+    expect(lookupDispatch("child-own")).toMatchObject({ agent: "heavy", picked: "heavy" });
+    // naming the agent it runs now changes nothing
+    const same = await hostResume(world, "child-own", { agent: "heavy", prompt: SEARCH });
+    expect(same.args).toMatchObject({ agent: "heavy" });
+    expect(same.switched).toBe(false);
+    // a different agent below the floor (its pick is now heavy; fast is neither that nor what it runs): lifted to the floor
+    const down = await hostResume(world, "child-own", { agent: "fast", prompt: SEARCH });
+    expect(down.args).toMatchObject({ agent: "medium", model: `${SONNET}#medium`, sessionID: "child-own" });
+    expect(down.child.agent).toBe("medium"); // what the orchestrator asked for, but not below the floor
+    const rows = await resumeRows(world);
+    const lastRow = rows.at(-1)!;
+    expect(lastRow.reason.startsWith("lift:floor")).toBe(true);
+    expect(lastRow).toMatchObject({ resume: true, chosen: { agent: "fast" }, best: { agent: "medium" } });
+    expect(rows[0]!.reason.startsWith("kept:resume: ")).toBe(true); // the honoured switch to heavy: plain A30 row, no evidence switch
+    expect(rows[0]).toMatchObject({ switched: false });
+    expect(rows.some((row) => row.reason.startsWith("kept:resume:running"))).toBe(false);
+  });
+
+  it("shadow and advise never change the arguments: the row says what enforce would do", async () => {
+    for (const engine of ["shadow", "advise"] as const) {
+      const world = await makeWorld({ engine, roles: {} });
+      await world.start();
+      // a child the router moved (a registration as enforce would have made it): the orchestrator picked fast, it runs medium
+      rememberDispatch("child-moved", {
+        facts: { class: "search", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" },
+        agent: "medium", model: SONNET, variant: "medium", tier: "medium", parentSessionID: "root", decisionID: "earlier", step: "dispatch", picked: "fast",
+      });
+      hostChildren.set("child-moved", { agent: "medium", model: modelOfAgent(world, "medium") });
+      const resumed = await hostResume(world, "child-moved", { agent: "fast", prompt: SEARCH });
+      expect(resumed.args, engine).toMatchObject({ agent: "fast", sessionID: "child-moved" }); // untouched
+      expect(resumed.args.model, engine).toBeUndefined();
+      expect(resumed.switched, engine).toBe(true); // (so the host switches it: that is what enforce prevents)
+      const [row] = await resumeRows(world);
+      expect(row, engine).toMatchObject({ resume: true, switched: false, mode: engine, chosen: { agent: "fast" } });
+      expect(row!.reason.startsWith("kept:resume:running: "), engine).toBe(true);
+      expect(row!.reason, engine).toContain(`would be sent to @medium (not applied in ${engine})`);
+      await world.bundle.release();
+      worlds.splice(worlds.indexOf(world), 1);
+      rmSync(world.home, { recursive: true, force: true });
+      hostChildren.clear();
+    }
+  });
+
+  it("nothing is corrected for a child the router did not move, one of another orchestrator, or one it knows nothing about", async () => {
+    const world = await makeWorld({ engine: "enforce" }, FLOOR("medium"));
+    await world.start();
+    // not moved: the orchestrator picked medium and it runs medium
+    await hostStart(world, "child-plain", { agent: "medium", prompt: IMPLEMENT() });
+    expect(lookupDispatch("child-plain")).toMatchObject({ agent: "medium", picked: "medium" });
+    const plain = await hostResume(world, "child-plain", { agent: "medium", prompt: IMPLEMENT() });
+    expect(plain.args).toMatchObject({ agent: "medium" });
+    expect(plain.switched).toBe(false);
+    // another orchestrator's child (the registry is process-wide): left alone
+    rememberDispatch("child-foreign", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" },
+      agent: "medium", model: SONNET, variant: "medium", tier: "medium", parentSessionID: "someone-else", decisionID: "theirs", step: "dispatch", picked: "fast",
+    });
+    expect((await routed(world, { agent: "fast", prompt: SEARCH, sessionID: "child-foreign" })).agent).toBe("fast");
+    // unknown to the registry (swept, or started before a restart): nothing is known to correct
+    expect((await routed(world, { agent: "fast", prompt: SEARCH, sessionID: "child-unknown" })).agent).toBe("fast");
+    // a pinned resume is the orchestrator's own order
+    await hostStart(world, "child-pin", { agent: "fast", prompt: SEARCH });
+    const pinned = await hostResume(world, "child-pin", { agent: "fast", prompt: "[route class=search risk=low scope=single pin]\nFind it." });
+    expect(pinned.args).toMatchObject({ agent: "fast" });
+    expect(pinned.switched).toBe(true);
+  });
+});
 describe("advise: input untouched, protocol and hint through the context hook", () => {
   async function adviseWorld(withEvidence: boolean) {
     const world = await makeWorld({ engine: "advise", margin: 0.1, roles: { search: ["explore"], recon: ["explore"] } });
@@ -895,10 +1082,13 @@ describe("a second plugin instance does not act on the same call (A3, QA-2.2-12)
     expect(world.allToolHooks["execute.before"]).toHaveLength(2);
     const event: any = { tool: "subagent", input: { description: "d", agent: "medium", prompt: IMPLEMENT(), sessionID: "child-two" }, sessionID: "root", agent: "build", messageID: "m", id: "call-two-instances" };
     for (const hook of world.allToolHooks["execute.before"]!) await hook(event); // the host hands the SAME event to each instance
-    expect(event.input).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh`, prompt: "Implement the change in src/a.ts.", sessionID: "child-two" });
+    // a resume is never switched (A30), but it is still stripped, logged once and registered once
+    expect(event.input).toMatchObject({ agent: "medium", prompt: "Implement the change in src/a.ts.", sessionID: "child-two" });
+    expect(event.input.model).toBeUndefined();
     const rows = await world.rows();
     expect(rows).toHaveLength(1);
-    expect(lookupDispatch("child-two")).toMatchObject({ agent: "heavy", decisionID: rows[0]!.decisionID });
+    expect(rows[0]).toMatchObject({ switched: false, resume: true });
+    expect(lookupDispatch("child-two")).toMatchObject({ agent: "medium", decisionID: rows[0]!.decisionID });
     // a static instance never claims a call another instance can act on
     expect(world.ctx.session.get).toHaveBeenCalledTimes(1);
   });

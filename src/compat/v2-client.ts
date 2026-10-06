@@ -48,7 +48,18 @@ export function createV2Runtime(ctx: Plugin.Context) {
               name: provider.name,
               models: Object.fromEntries(models.data
                 .filter(model => model.providerID === provider.id && model.enabled)
-                .map(model => [model.id, { id: model.id, status: model.status }])),
+                // `id` and `status` are what the v1 shape had; the rest lets the cost doctor (Phase 2.4) read the SAME call instead of a second
+                // `model.list` (QA-2.4-3). v1 consumers (`normalizeCatalog`) ignore the extra fields.
+                .map(model => [model.id, {
+                  id: model.id,
+                  status: model.status,
+                  enabled: model.enabled,
+                  family: model.family,
+                  capabilities: model.capabilities,
+                  cost: model.cost,
+                  variants: model.variants,
+                  limit: model.limit,
+                }])),
             })),
             default: defaultModel.data
               ? { [defaultModel.data.providerID]: defaultModel.data.id }

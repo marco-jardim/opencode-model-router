@@ -801,7 +801,28 @@ describe("persister: decisions.jsonl", () => {
     await small.appendRows([verdictRow(1)]);
     await small.appendRows([verdictRow(2)]);
     expect(mem.files.get(join(dir, "other", DECISIONS_FILE))?.text.split("\n").filter((l) => l !== "")).toHaveLength(2);
-    expect(mem.files.get(join(dir, "other", DECISIONS_FILE))?.text).toContain("\n\n{");
+    expect(mem.files.get(join(dir, "other", DECISIONS_FILE))?.text).not.toContain("\n\n"); // QA-2.4-R2-10: no blank line between batches
+  });
+
+  it("QA-2.4-R2-10: two flush batches leave no blank line; a torn last line, or a file another writer touched, is still handled", async () => {
+    const { mem, deps, dir } = setup();
+    const live = join(dir, DECISIONS_FILE);
+    const persister = createPersister(dir, deps);
+    await persister.appendRows([verdictRow(1), verdictRow(2)]);
+    await persister.appendRows([verdictRow(3)]);
+    await persister.appendRows([verdictRow(4)]);
+    expect(mem.files.get(live)?.text).toBe([1, 2, 3, 4].map((i) => `${JSON.stringify(verdictRow(i))}\n`).join(""));
+    // a restart over a file that ends with a newline: still no blank line (the end is looked at once)
+    const restarted = createPersister(dir, deps);
+    await restarted.appendRows([verdictRow(5)]);
+    expect(mem.files.get(live)?.text).not.toContain("\n\n");
+    expect(mem.files.get(live)?.text.endsWith(`${JSON.stringify(verdictRow(5))}\n`)).toBe(true);
+    // another writer left a fragment after this persister's last append: the next batch starts on a fresh line
+    await mem.fs.appendText(live, `{"v":1,"kind":"verdict","ts":"2026-10`);
+    await restarted.appendRows([verdictRow(6)]);
+    const read = await restarted.readRows();
+    expect(read.rows.map((r) => (r.kind === "verdict" ? r.attemptID : ""))).toEqual(["c1:0", "c2:0", "c3:0", "c4:0", "c5:0", "c6:0"]);
+    expect(read.skipped).toBe(1);
   });
 
   it("readRows on a missing directory is empty and an unreadable generation is skipped with a warning", async () => {

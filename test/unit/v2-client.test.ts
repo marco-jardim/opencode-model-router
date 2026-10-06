@@ -59,12 +59,28 @@ describe("v2 client compatibility", () => {
   it("preserves catalog aliases and defaults, excludes disabled models, and scopes lookup to the project", async () => {
     const { runtime, context } = fixture();
     await expect(runtime.client.config.providers()).resolves.toEqual({ data: {
-      providers: [{ id: "p", name: "Provider", models: { "aliased-model": { id: "aliased-model", status: "active" } } }],
+      providers: [{ id: "p", name: "Provider", models: { "aliased-model": { id: "aliased-model", status: "active", enabled: true } } }],
       default: { p: "aliased-model" },
     } });
     for (const method of [context.provider.list, context.model.list, context.model.default]) {
       expect(method).toHaveBeenCalledWith({ location: { directory: "/project" } });
     }
+  });
+
+  it("QA-2.4-3: passes the model's cost, capabilities, family, variants and limit through, so the cost doctor can reuse this one call", async () => {
+    const { runtime, context } = fixture();
+    const info = {
+      id: "m", modelID: "m", providerID: "p", status: "active", enabled: true, family: "claude-haiku",
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      cost: [{ input: 1, output: 5, cache: { read: 0.1, write: 1.25 } }],
+      variants: [{ id: "high" }],
+      limit: { context: 200_000, output: 64_000 },
+    };
+    context.model.list.mockResolvedValueOnce({ data: [info, { ...info, id: "off", enabled: false }] });
+    const result = await runtime.client.config.providers();
+    expect((result.data.providers[0]?.models as Record<string, unknown>)).toEqual({
+      m: { id: "m", status: "active", enabled: true, family: "claude-haiku", capabilities: info.capabilities, cost: info.cost, variants: info.variants, limit: info.limit },
+    });
   });
 
   it("propagates server errors instead of reporting an empty successful catalog or session", async () => {

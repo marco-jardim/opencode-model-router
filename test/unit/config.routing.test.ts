@@ -160,7 +160,7 @@ const V2_DEFAULTS = {
   roles: { search: ["explore"], implement: ["general"], debug: ["general"], review: ["general"] },
   outcomes: { path: null, halfLifeDays: 14, maxEffectiveSamples: 50 },
   sessionReuse: { maxContextFraction: 0.6 },
-  advisor: { enabled: true, noticeIntervalHours: 24 },
+  advisor: { enabled: true, noticeIntervalHours: 24, notify: true },
   applied: { host: "v2", requestedEngine: "static", engineCoerced: false, rolesSource: "default" },
 };
 
@@ -305,7 +305,7 @@ describe("resolveRouting — configured values", () => {
       roles: V2_DEFAULTS.roles,
       outcomes: { path: ABS_PATH, halfLifeDays: 30, maxEffectiveSamples: 50 },
       sessionReuse: { maxContextFraction: 0.95 },
-      advisor: { enabled: false, noticeIntervalHours: 24 },
+      advisor: { enabled: false, noticeIntervalHours: 24, notify: true },
       applied: { host: "v2", requestedEngine: "enforce", engineCoerced: false, rolesSource: "default" },
     });
   });

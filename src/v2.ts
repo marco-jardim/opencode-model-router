@@ -23,6 +23,14 @@ export default {
       // Step pricing reads the catalog the adapter already queries; the plugin's single telemetry ingest comes back
       // here so the event loop feeds the instance that also receives the verdicts (QA-2.1-7).
       routerCatalog: async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
+      // The agents of THIS plugin instance's location (QA-2.4-16): the host lists agents per location.
+      routerAgents: async () => (await ctx.agent.list({ location: { directory: ctx.location.directory } })).data,
+      ...(ctx.generate === undefined ? {} : { routerGenerate: ctx.generate }),
+      // The same host call the adapter uses for the config-reload and narration notices (src/compat/v2-hooks.ts): a transcript entry that
+      // does not resume the session (QA-2.4-R2-1).
+      routerSynthetic: async (notice: { sessionID: string; text: string; description: string }) => {
+        await ctx.session.synthetic({ sessionID: notice.sessionID, text: notice.text, description: notice.description, resume: false });
+      },
       routerOnIngest: (created: Ingest) => { ingest = created; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);

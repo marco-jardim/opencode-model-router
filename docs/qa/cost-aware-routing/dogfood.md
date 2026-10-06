@@ -39,14 +39,20 @@
 
 ## DF2 — after Phases 2.1, 2.2 and 2.3 (2026-10-06)
 
-**Status:** sync done, awaiting restart.
+**Status:** DF2 complete. Shadow period started at 2026-10-06T15:28:34Z.
 
-**Mode after checkpoint:** `static` until the restart; then `shadow` (override file `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` = `{"routing":{"engine":"shadow"}}`, created only after the liveness probe passes).
+**Mode after checkpoint:** `shadow` (override file `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` = `{"routing":{"engine":"shadow"}}`, created at 2026-10-06T15:28:34Z, after the liveness check below).
 
-**Sync:** `master` in the base checkout fast-forwarded to `car/main` @ `2878319` (Phase 2.1 `a08229c`, Phases 2.2 and 2.3 `2878319`; QA PASS on each, plan amendments A27–A29). Rollback tag `car/sync-2-prev` = previous `master` (`8ce54f2`). Capped full suite on `car/main` @ `2878319`: 137 files passed, 3 skipped; 11 387 tests passed, 66 skipped; 255 s.
+**Sync:** `master` in the base checkout fast-forwarded to `car/main` @ `2878319` (Phase 2.1 `a08229c`, Phases 2.2 and 2.3 `2878319`; QA PASS on each, plan amendments A27–A29). Rollback tag `car/sync-2-prev` = previous `master` (`8ce54f2`). The sync was done at 2026-10-06T15:22:43Z. Capped full suite on `car/main` @ `2878319`: 137 files passed, 3 skipped; 11 387 tests passed, 66 skipped; 255 s.
 
-**Liveness:** code sync requires a host restart (A8). Probe after restart: `/router` must show `engine=static` and build `2.2.0+2878319` (first 7 of the synced sha). Result: pending.
+**Liveness (inferred, not observed):** code sync requires a host restart (A8). The host restarted at 2026-10-06T15:27:38Z (`opencode.log`, run `998fe258`, `cli starting version=2.0.22`, cwd `D:\git\opencode-model-router`), after the sync at 15:22:43Z, so the synced code (`2.2.0+2878319`) was the code that loaded. The `/router` marker line itself was not captured: liveness was inferred from the restart timing, not read from the `engine=… build=…` line. The restart cost about 4 min 55 s between sync and restart (includes the human's idle time; not attributable to the restart alone).
 
-**`routing:stats`:** pending, after the restart: `node scripts/routing-stats.ts` (expect an empty or no store). The decision log and outcome store start writing once `shadow` is active; from then on every QA and `[tier:heavy]` dispatch carries `[route pin]`.
+**`routing:stats` before shadow:** `no outcome data`, every metric 0 (`Dispatches 0`, agreement `n/a`, no store, no decision log).
 
-**Open owner decision (QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume and variant steps exist only on the fast tier; use `candidates` or drop `effort` where `variant` is set. Phase 2.4's advisor surfaces it.
+**Override file:** created at 2026-10-06T15:28:34Z with `{"routing":{"engine":"shadow"}}` (hot reload, no restart).
+
+**First live shadow row:** at 2026-10-06T15:28:41Z, 7 s after the override, in `decisions.jsonl` of the D15 directory: `mode: "shadow"`, `switched: false`, `chosen` = `best` = `router:fast`. The row reached disk in ≈7 s.
+
+**Observation for DF3:** the rules classifier labelled a file-listing task as `review` with confidence 0.5. That is below `routing.minClassConfidence` (0.7), so the dispatch has a decision row but no verdict or refusal rows and nothing is recorded in the outcome store (QA-2.1-10: statistics cover trusted classes only). A listing task should read as `search`/`recon`: DF3 should check how many of the shadow period's rows are below the threshold (`Dispatches` against `Pass + Fail + Unverifiable` in `routing:stats`, and `/router stats`) before judging agreement or savings, and whether the rules need a listing keyword.
+
+**Open owner decision (QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume and variant steps exist only on the fast tier. Phase 2.4's cost doctor now reports it as the `variant-effort` finding in `/router` (suggesting `candidates` and dropping `effort`).

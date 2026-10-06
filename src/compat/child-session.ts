@@ -1,6 +1,7 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { RunnerCatalogModel } from "../escalate/resume";
 import type { CatalogModel, Ingest } from "../routing/outcomes/ingest";
+import type { HostGenerate } from "../routing/classify/types";
 
 /** Marks the legacy tool.execute.before output bag when verification starts for
  * that task call. V1 hosts read only output.args, so this symbol is invisible. */
@@ -55,6 +56,18 @@ export type RouterPluginInput = PluginInput & {
    * and `limit`, lets the delegate ladder validate variants and size resumes (D10/D11, Phase 2.3).
    */
   routerCatalog?: () => Promise<readonly (CatalogModel & RunnerCatalogModel)[]>;
+  /**
+   * Set only by src/v2.ts: the host's agents (`ctx.agent.list().data`, Agent.Info records). The cost doctor (Phase 2.4) reads which
+   * agents have a model of their own (title, summary, the role agents) and which tier agents the host offers.
+   */
+  routerAgents?: () => Promise<readonly unknown[]>;
+  /**
+   * Set only by src/v2.ts: the host's synthetic transcript entry (`ctx.session.synthetic`, `resume: false`), the call the adapter already uses
+   * for its config-reload and narration notices. The cost doctor's notice goes through it, never into the user's message.
+   */
+  routerSynthetic?: (input: { sessionID: string; text: string; description: string }) => Promise<void>;
+  /** Set only by src/v2.ts: the host `generate` (the `host` classifier backend of `/annotate-plan`, A4); absent when the host has none. */
+  routerGenerate?: HostGenerate;
   /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */
   routerOnIngest?: (ingest: Ingest) => void;
 };
