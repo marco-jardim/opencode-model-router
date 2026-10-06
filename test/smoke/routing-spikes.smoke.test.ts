@@ -63,6 +63,10 @@ interface EventRecord { type: string; data?: Obj; [key: string]: unknown }
 interface Capture {
   model?: string; catalogModel?: string; session?: string; agent?: string; kind?: string; stream: boolean;
   outputConfig?: unknown; thinking?: unknown; inputTokens: number; lastText: string; toolResult: boolean; reply: "dispatch" | "text";
+  /** Every top-level request field except messages/system/tools (those are reduced to their sizes). */
+  payload: Obj;
+  /** The request messages verbatim (S2b reads them to see how an effort change reaches the provider). */
+  messages?: RequestBody["messages"];
 }
 
 // -------------------------------------------------------------- helpers ----
@@ -74,6 +78,10 @@ function clip(value: unknown): unknown {
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, clip(v)]));
   return value;
 }
+/** Effort changes the host sends IN-BAND: {"role":"system","content":[],"output_config":{"effort":...}} messages. */
+const inBandEfforts = (c: Capture): unknown[] => (c.messages ?? []).map(m => obj(obj(m).output_config).effort).filter(e => e !== undefined);
+/** The effort the provider is actually told to use: the last in-band effort, else the top-level output_config.effort. */
+const effectiveEffort = (c: Capture): unknown => inBandEfforts(c).at(-1) ?? obj(c.outputConfig).effort;
 async function waitFor<T>(label: string, probe: () => Promise<T | undefined> | T | undefined, timeoutMs = 30_000, stepMs = 100): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -128,7 +136,9 @@ class SpikeProvider {
       const lastText = lastBlocks.filter(b => b.type === "text").map(b => b.text ?? "").join("\n");
       const call = toolResult ? undefined : /SPIKE_CALL=(\{[^\n]*\})/.exec(lastText)?.[1];
       const inputTokens = Math.max(10, Math.ceil(raw.length / 4));
+      const { messages: _messages, system: _system, tools: _tools, ...fields } = body;
       this.captures.push({
+        payload: { ...fields, "messages.length": _messages?.length, "tools.length": _tools?.length }, messages: _messages,
         model: body.model, catalogModel: header("x-proof-model"), session: header("x-proof-session"), agent: header("x-proof-agent"), kind: header("x-proof-kind"),
         stream: body.stream === true, outputConfig: body.output_config, thinking: body.thinking, inputTokens, lastText, toolResult, reply: call ? "dispatch" : "text",
       });
@@ -472,12 +482,77 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       const secondChild = await host.dispatch(rootID, { agent: "general", description: "S2 wire effort", prompt: "S2 effort start", model: `${base}#${high}` });
       await host.dispatch(rootID, { agent: "general", description: "S2 wire effort low", prompt: "S2 effort resume low", sessionID: secondChild.childID, model: `${base}#${low}` });
       await host.dispatch(rootID, { agent: "general", description: "S2 wire effort mid", prompt: "S2 effort resume mid", sessionID: secondChild.childID, model: `${base}#${mid}` });
-      const wire = (id: string) => host.provider.captures.filter(c => c.session === id && c.kind === "primary").map(c => ({ variantInRequestRef: c.catalogModel?.split("#")[1], effortOnWire: obj(c.outputConfig).effort, lastText: c.lastText.slice(-24) }));
+      const wire = (id: string) => host.provider.captures.filter(c => c.session === id && c.kind === "primary").map(c => ({ variantInRequestRef: c.catalogModel?.split("#")[1], topLevelEffort: obj(c.outputConfig).effort, inBandEfforts: inBandEfforts(c), effectiveEffort: effectiveEffort(c), lastText: c.lastText.slice(-24) }));
       s.observed.wireEffort = { firstChild: wire(childID), secondChild: wire(secondChild.childID), secondChildStored: await childState(host, secondChild.childID) };
-      const followsWire = [...wire(childID), ...wire(secondChild.childID)].every(w => w.variantInRequestRef === w.effortOnWire);
-      s.observed.derived = { wireEffortFollowsVariant: followsWire };
-      if (!followsWire) s.notes.push("WIRE FINDING: after a resume the stored session variant changes, but the effort the provider receives (output_config.effort) does not follow it on every request; see observed.wireEffort.");
+      const wires = [...wire(childID), ...wire(secondChild.childID)];
+      const followsWire = wires.every(w => w.variantInRequestRef === w.effectiveEffort);
+      const topLevelFollows = wires.every(w => w.variantInRequestRef === w.topLevelEffort);
+      s.observed.derived = { effectiveEffortFollowsVariant: followsWire, topLevelEffortFollowsVariant: topLevelFollows };
+      if (!followsWire) s.notes.push("WIRE FINDING: after a resume the stored session variant changes, but the effort the provider receives (top-level output_config.effort or the last in-band output_config.effort) does not follow it; see observed.wireEffort.");
+      else if (!topLevelFollows) s.notes.push("After a same-model resume the TOP-LEVEL output_config.effort stays at the first request value; the new effort is delivered in-band as a {role:system, output_config:{effort}} message (observed.wireEffort[].inBandEfforts). The EFFECTIVE effort follows the stored variant.");
       s.verdict(variantOk && historyOk && agentOk, `variant ${one.session.model?.variant}->${two.session.model?.variant} (wanted ${low}->${high}); messages ${one.messageCount}->${two.messageCount}->${three.messageCount}; agent ${one.session.agent}->${two.session.agent}->${three.session.agent}`);
+    });
+  }, 300_000);
+
+  it("S2b: resuming a child with a DIFFERENT model id moves the wire model; the wire effort is recorded for model-switch, variant-bump and fresh-child cases", async () => {
+    await spike("S2b", "Resuming a child with sessionID + a different model id makes the provider receive the new model (stored model == wire model); a later resume with a higher variant, and a fresh child started at that variant, show whether output_config.effort follows the variant. Control: a fresh child honours the variant on its first request.", async (s, host) => {
+      const catalog = (await host.client.model.list({ location: { directory: host.project } })).data;
+      const entry = (id: string) => catalog.find(m => m.providerID === "anthropic" && m.id === id && m.enabled);
+      const A = entry("claude-sonnet-5-5");
+      const B = ["claude-opus-5-5", "claude-opus-4-7"].map(entry).find(m => m !== undefined && m.variants.some(v => v.id === "low") && m.variants.some(v => v.id === "high"));
+      s.observed.catalogModels = { A: A && { id: A.id, variants: A.variants.map(v => v.id) }, B: B && { id: B.id, variants: B.variants.map(v => v.id) }, opus55InIsolatedCatalog: entry("claude-opus-5-5") !== undefined };
+      if (!A || !B || !A.variants.some(v => v.id === "low") || !A.variants.some(v => v.id === "high")) throw new Error("isolated catalog lacks the A/B models or their low/high variants");
+      const refA = `anthropic/${A.id}`;
+      const refB = `anthropic/${B.id}`;
+      const rootID = await host.root_("S2b root");
+      type Row = { case: string; request: number; asked: string | undefined; storedModelAfter: ModelRef | undefined; requestRef: string | undefined; wireModel: string | undefined; wireEffort: unknown; payload: Obj; messages: RequestBody["messages"]; inBandEfforts: unknown[]; effectiveEffort: unknown };
+      const table: Row[] = [];
+      const step = async (caseName: string, call: Obj) => {
+        const mark = host.provider.captures.length;
+        const d = await host.dispatch(rootID, { agent: "general", description: `S2b ${caseName}`, ...call });
+        const stored = await childState(host, d.childID);
+        const reqs = host.provider.captures.slice(mark).filter(c => c.session === d.childID && c.kind === "primary");
+        for (const c of reqs) table.push({ case: caseName, request: table.filter(r => r.case === caseName).length + 1, asked: typeof call.model === "string" ? call.model : undefined, storedModelAfter: stored.session.model, requestRef: c.catalogModel, wireModel: c.model, wireEffort: obj(c.outputConfig).effort, payload: c.payload, messages: c.messages, inBandEfforts: inBandEfforts(c), effectiveEffort: effectiveEffort(c) });
+        return { childID: d.childID, stored, reqs };
+      };
+      // Case 0 (the S2 situation): same model, variant bump on resume. Payload excerpts for point 4.
+      const c0 = await step("case0 same-model variant bump", { prompt: "S2b case0 start", model: `${refA}#low` });
+      await step("case0 same-model variant bump", { prompt: "S2b case0 resume", sessionID: c0.childID, model: `${refA}#high` });
+      // Case 1/2: model switch on resume, then a variant bump on the new model.
+      const c1 = await step("case1 model switch", { prompt: "S2b case1 start", model: `${refA}#low` });
+      await step("case1 model switch", { prompt: "S2b case1 resume other model", sessionID: c1.childID, model: `${refB}#low` });
+      await step("case2 variant bump after switch", { prompt: "S2b case2 resume higher variant", sessionID: c1.childID, model: `${refB}#high` });
+      // Case 4: model id AND variant both change on one resume (an escalation to a stronger model at higher effort).
+      const c4 = await step("case4 model and variant switch together", { prompt: "S2b case4 start", model: `${refA}#low` });
+      await step("case4 model and variant switch together", { prompt: "S2b case4 resume other model, higher variant", sessionID: c4.childID, model: `${refB}#high` });
+      // Case 3 (control): a fresh child started directly at the high variant.
+      const c3 = await step("case3 fresh child at high", { prompt: "S2b case3 fresh", model: `${refA}#high` });
+      const messages = await host.client.session.context({ sessionID: c1.childID });
+      s.observed.table = table;
+      s.observed.switchedChildMessages = {
+        modelSwitched: messages.filter(m => m.type === "model-switched").map(m => ({ model: m.model, previous: m.previous })),
+        assistantModels: messages.filter(m => m.type === "assistant").map(m => m.model),
+      };
+      s.observed.finalStored = { case1Child: await childState(host, c1.childID), case3Child: c3.stored };
+      const rowsOf = (name: string) => table.filter(r => r.case === name);
+      const sw = rowsOf("case1 model switch");
+      const bump = rowsOf("case2 variant bump after switch");
+      const fresh = rowsOf("case3 fresh child at high");
+      const wireFollowsModel = sw.length === 2 && sw[0]!.wireModel === A.id && sw[1]!.wireModel === B.id && bump[0]?.wireModel === B.id;
+      const storedFollowsModel = sw[1]?.storedModelAfter?.id === B.id && sw[1]?.storedModelAfter?.variant === "low" && bump[0]?.storedModelAfter?.variant === "high";
+      const freshHonoursVariant = fresh.length === 1 && fresh[0]!.wireEffort === "high";
+      const effortFollowsAfterSwitch = sw[1]?.effectiveEffort === "low" && bump[0]?.effectiveEffort === "high";
+      const allEffective = table.every(r => r.effectiveEffort === r.storedModelAfter?.variant);
+      const case0 = rowsOf("case0 same-model variant bump");
+      s.observed.derived = { wireFollowsModelSwitch: wireFollowsModel, storedFollowsModelSwitch: storedFollowsModel, freshChildHonoursVariant: freshHonoursVariant, effectiveEffortFollowsVariantAfterSwitch: effortFollowsAfterSwitch, allEffectiveEffortsFollowStoredVariant: allEffective, sameModelResumeTopLevelEffort: case0.map(r => r.wireEffort), sameModelResumeEffectiveEffort: case0.map(r => r.effectiveEffort) };
+      if (!effortFollowsAfterSwitch) s.notes.push("WIRE FINDING: after resuming with a different model and then a higher variant, the effective effort did not follow the stored variant; see observed.table.");
+      if (case0.map(r => r.wireEffort).join() !== "low,high") s.notes.push("Top-level output_config.effort did not change on a same-model variant bump (the S2 observation is confirmed); the bump is delivered in-band, see derived.requestsCarryingEffortInBand.");
+      const inBand = table.filter(r => r.inBandEfforts.length > 0).map(r => ({ row: `${r.case}/${r.request}`, topLevelEffort: r.wireEffort, inBandEfforts: r.inBandEfforts }));
+      const both = rowsOf("case4 model and variant switch together");
+      const lost = both.length === 2 && both[1]!.effectiveEffort !== "high";
+      s.observed.derived = { ...obj(s.observed.derived), requestsCarryingEffortInBand: inBand, modelAndVariantSwitchTogether: both.map(r => ({ wireModel: r.wireModel, topLevelEffort: r.wireEffort, inBandEfforts: r.inBandEfforts, stored: r.storedModelAfter })), effortLostOnModelAndVariantSwitch: lost };
+      if (inBand.length > 0) s.notes.push(`In-band effort: ${inBand.map(r => `${r.row} top-level ${String(r.topLevelEffort)} + in-band ${JSON.stringify(r.inBandEfforts)}`).join("; ")}. The effort change travels as a {"role":"system","output_config":{"effort":...}} message inside the request messages, not in the top-level output_config.effort. Host source: session/runner/to-llm-message.ts modelSwitched() emits Message.effort({effort, previous}) only when the model id is unchanged.`);
+      if (lost) s.notes.push("EFFORT LOST: resuming with a different model AND a higher variant sent neither a top-level nor an in-band effort of the requested value (modelSwitched() returns no effort message when the model id changes).");      s.verdict(wireFollowsModel && storedFollowsModel && freshHonoursVariant && allEffective, `wire model ${sw.map(r => r.wireModel).join("->")}->${bump.map(r => r.wireModel).join()} (stored ${sw.map(r => r.storedModelAfter?.id).join("->")}); effective effort by request [${table.map(r => String(r.effectiveEffort)).join(", ")}] vs stored variants [${table.map(r => r.storedModelAfter?.variant).join(", ")}]; fresh child top-level effort ${fresh.map(r => r.wireEffort).join()}`);
     });
   }, 300_000);
 

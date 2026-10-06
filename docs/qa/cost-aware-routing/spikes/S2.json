@@ -1,7 +1,7 @@
 {
   "spike": "S2",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "recordedAt": "2026-10-06T04:21:34.748Z",
+  "recordedAt": "2026-10-06T04:26:39.321Z",
   "hypothesis": "A subagent call with sessionID + model '<same model>#<higher variant>' switches the stored child's variant while its history grows; a further call with a different agent switches the stored agent.",
   "observed": {
     "target": {
@@ -18,8 +18,8 @@
     },
     "afterFirstDispatch": {
       "session": {
-        "id": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
-        "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+        "id": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+        "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
         "agent": "general",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -49,8 +49,8 @@
     },
     "afterVariantResume": {
       "session": {
-        "id": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
-        "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+        "id": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+        "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
         "agent": "general",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -84,8 +84,8 @@
     },
     "afterAgentResume": {
       "session": {
-        "id": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
-        "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+        "id": "ses_ef0895289ffeMEPS8ts8qQ88t8",
+        "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
         "agent": "explore",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -136,24 +136,24 @@
           "agent": "general",
           "description": "S2 resume variant",
           "prompt": "S2 second prompt",
-          "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+          "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
           "model": "anthropic/claude-sonnet-5-5#max"
         },
         "completed",
         {
           "output": {
-            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
             "status": "completed",
             "output": "CHILD_OK"
           },
           "content": [
             {
               "type": "text",
-              "text": "<subagent sessionID=\"ses_ef08df8b0ffeFeA1D3T5c7IPeb\" state=\"completed\">\nCHILD_OK\n</subagent>"
+              "text": "<subagent sessionID=\"ses_ef0895289ffeMEPS8ts8qQ88t8\" state=\"completed\">\nCHILD_OK\n</subagent>"
             }
           ],
           "metadata": {
-            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
             "status": "completed"
           }
         }
@@ -163,32 +163,32 @@
           "agent": "explore",
           "description": "S2 resume agent",
           "prompt": "S2 third prompt",
-          "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb"
+          "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8"
         },
         "completed",
         {
           "output": {
-            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
             "status": "completed",
             "output": "CHILD_OK"
           },
           "content": [
             {
               "type": "text",
-              "text": "<subagent sessionID=\"ses_ef08df8b0ffeFeA1D3T5c7IPeb\" state=\"completed\">\nCHILD_OK\n</subagent>"
+              "text": "<subagent sessionID=\"ses_ef0895289ffeMEPS8ts8qQ88t8\" state=\"completed\">\nCHILD_OK\n</subagent>"
             }
           ],
           "metadata": {
-            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "sessionID": "ses_ef0895289ffeMEPS8ts8qQ88t8",
             "status": "completed"
           }
         }
       ]
     },
     "sameChildEverywhere": [
-      "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
-      "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
-      "ses_ef08df8b0ffeFeA1D3T5c7IPeb"
+      "ses_ef0895289ffeMEPS8ts8qQ88t8",
+      "ses_ef0895289ffeMEPS8ts8qQ88t8",
+      "ses_ef0895289ffeMEPS8ts8qQ88t8"
     ],
     "providerCapturesForChild": [
       {
@@ -252,41 +252,62 @@
       "firstChild": [
         {
           "variantInRequestRef": "low",
-          "effortOnWire": "low",
+          "topLevelEffort": "low",
+          "inBandEfforts": [],
+          "effectiveEffort": "low",
           "lastText": "session.\nS2 first prompt"
         },
         {
           "variantInRequestRef": "max",
-          "effortOnWire": "low",
+          "topLevelEffort": "low",
+          "inBandEfforts": [
+            "max"
+          ],
+          "effectiveEffort": "max",
           "lastText": "S2 second prompt"
         },
         {
           "variantInRequestRef": "max",
-          "effortOnWire": "low",
+          "topLevelEffort": "low",
+          "inBandEfforts": [
+            "max"
+          ],
+          "effectiveEffort": "max",
           "lastText": "S2 third prompt"
         }
       ],
       "secondChild": [
         {
           "variantInRequestRef": "max",
-          "effortOnWire": "max",
+          "topLevelEffort": "max",
+          "inBandEfforts": [],
+          "effectiveEffort": "max",
           "lastText": "session.\nS2 effort start"
         },
         {
           "variantInRequestRef": "low",
-          "effortOnWire": "max",
+          "topLevelEffort": "max",
+          "inBandEfforts": [
+            "low"
+          ],
+          "effectiveEffort": "low",
           "lastText": "S2 effort resume low"
         },
         {
           "variantInRequestRef": "high",
-          "effortOnWire": "max",
+          "topLevelEffort": "max",
+          "inBandEfforts": [
+            "low",
+            "high"
+          ],
+          "effectiveEffort": "high",
           "lastText": "S2 effort resume mid"
         }
       ],
       "secondChildStored": {
         "session": {
-          "id": "ses_ef08df63dffejetv7ZE8m6fyu2",
-          "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+          "id": "ses_ef089508fffesrPCz1sF5k1eq8",
+          "parentID": "ses_ef08952baffeqDAkpMKdYeEGoq",
           "agent": "general",
           "model": {
             "id": "claude-sonnet-5-5",
@@ -324,13 +345,14 @@
       }
     },
     "derived": {
-      "wireEffortFollowsVariant": false
+      "effectiveEffortFollowsVariant": true,
+      "topLevelEffortFollowsVariant": false
     },
     "cleanup": {
       "removed": [
-        "ses_ef08df63dffejetv7ZE8m6fyu2",
-        "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
-        "ses_ef08df8eaffenXlo25oDEiXze6"
+        "ses_ef089508fffesrPCz1sF5k1eq8",
+        "ses_ef0895289ffeMEPS8ts8qQ88t8",
+        "ses_ef08952baffeqDAkpMKdYeEGoq"
       ],
       "errors": [],
       "orphans": []
@@ -339,6 +361,6 @@
   },
   "assertionResult": "PASS: variant low->max (wanted low->max); messages 3->7->11; agent general->general->explore",
   "notes": [
-    "WIRE FINDING: after a resume the stored session variant changes, but the effort the provider receives (output_config.effort) does not follow it on every request; see observed.wireEffort."
+    "After a same-model resume the TOP-LEVEL output_config.effort stays at the first request value; the new effort is delivered in-band as a {role:system, output_config:{effort}} message (observed.wireEffort[].inBandEfforts). The EFFECTIVE effort follows the stored variant."
   ]
 }
