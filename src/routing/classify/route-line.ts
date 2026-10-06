@@ -200,13 +200,22 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   };
 }
 
+export interface RouteLineOptions {
+  /**
+   * Recognise a route line only as the first or the last non-empty line of the
+   * text (where an orchestrator writes its directive); anywhere else it is text
+   * and stays in the prompt. Phase 2.2 sets this for the dispatch prompt.
+   */
+  readonly edgesOnly?: boolean;
+}
+
 /**
  * L1 + L2: find every recognisable route line, parse them, strip them. Route
  * lines are whole lines; the terminator that follows a dropped line goes with
  * it, everything else is kept byte for byte (including route-looking lines in
  * fences, indented code and quotes).
  */
-export function parseRouteLine(text: string): RouteLineParse {
+export function parseRouteLine(text: string, options: RouteLineOptions = {}): RouteLineParse {
   if (typeof text !== "string") {
     return { line: null, count: 0, stripped: "", conflict: false, edgeOnly: true };
   }
@@ -232,12 +241,13 @@ export function parseRouteLine(text: string): RouteLineParse {
   for (let i = 0; i < lines.length; i++) {
     const terminator = parts[2 * i + 1];
     const line = lines[i]!;
-    if (!isRecognisable(line, fenced[i]!)) {
+    const atEdge = i === firstNonEmpty || i === lastNonEmpty;
+    if (!isRecognisable(line, fenced[i]!) || (options.edgesOnly === true && !atEdge)) {
       kept.push(line);
       if (terminator !== undefined) kept.push(terminator);
       continue;
     }
-    if (i !== firstNonEmpty && i !== lastNonEmpty) edgeOnly = false;
+    if (!atEdge) edgeOnly = false;
     parsed.push(parseFields(ROUTE_LINE_RE.exec(line)?.[1] ?? ""));
   }
   if (parsed.length === 0) {

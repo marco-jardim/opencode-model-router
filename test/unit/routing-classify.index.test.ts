@@ -921,3 +921,38 @@ describe("a backend result is validated field by field (QA-1.2-20)", () => {
     expect(result.facts).toMatchObject({ class: "design", risk: "high", scope: "repo", source: "typesafe" });
   });
 });
+describe("routeLinePositions (QA-1.2-2 handoff to 2.2)", () => {
+  const prompt = "grep for foo\n[route class=design pin d=none]\nand more";
+
+  it("any (default): a route line in the middle is applied", async () => {
+    const result = await classify(input(prompt), makeDeps(null));
+    expect(result.facts).toMatchObject({ class: "design", source: "plan" });
+    expect(result.pin).toBe(true);
+  });
+
+  it("edges: a route line in the middle is plain text; the first or last line still works", async () => {
+    const deps = makeDeps(null, { routeLinePositions: "edges" });
+    const middle = await classify(input(prompt), deps);
+    expect(middle.facts).toMatchObject({ class: "search", source: "rules" });
+    expect(middle.pin).toBe(false);
+    expect(middle.stripped).toBe(prompt);
+    expect(middle.trace.routeLines.count).toBe(0);
+
+    const first = await classify(input("[route class=debug]\ngrep for foo"), deps);
+    expect(first.facts).toMatchObject({ class: "debug", source: "route-line" });
+    const last = await classify(input("grep for foo\n[route class=debug]"), deps);
+    expect(last.facts).toMatchObject({ class: "debug", source: "route-line" });
+  });
+
+  it("edges also applies on the failure path", async () => {
+    const hostile = {
+      prompt: "[route class=design]\nhello\n[route class=debug]\nmore",
+      get description(): string {
+        throw new Error("boom");
+      },
+    } as ClassifyInput;
+    const result = await classify(hostile, makeDeps(null, { routeLinePositions: "edges" }));
+    expect(result.facts).toBe(UNKNOWN_FACTS);
+    expect(result.stripped).toBe("hello\n[route class=debug]\nmore");
+  });
+});

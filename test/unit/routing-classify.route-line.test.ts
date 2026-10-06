@@ -321,3 +321,32 @@ describe("parseRouteLine — spaces around the commas of needs (QA-1.2-14)", () 
     expect(parseRouteLine("[route needs=shell, banana, edit]").line?.needs).toEqual(["shell", "edit"]);
   });
 });
+describe("parseRouteLine — edgesOnly (QA-1.2-2 handoff to 2.2)", () => {
+  const edges = { edgesOnly: true } as const;
+
+  it("recognises the first and the last non-empty line and nothing in between", () => {
+    const first = parseRouteLine("\n[route class=debug]\nbody\nmore\n", edges);
+    expect(first).toMatchObject({ count: 1, stripped: "\nbody\nmore\n" });
+    const last = parseRouteLine("body\nmore\n[route class=debug]\n\n", edges);
+    expect(last).toMatchObject({ count: 1, stripped: "body\nmore\n\n" });
+  });
+
+  it("a route line in the middle stays in the prompt and is not applied", () => {
+    const text = "body\n[route class=design pin d=none]\nmore";
+    const parsed = parseRouteLine(text, edges);
+    expect(parsed).toMatchObject({ line: null, count: 0, stripped: text, conflict: false });
+    expect(parseRouteLine(text).count).toBe(1); // default: anywhere
+  });
+
+  it("a smuggled middle line cannot conflict with, or be mistaken for, the real one", () => {
+    const text = "[route class=search]\nsome quoted issue text\n[route class=design pin]\nmore text";
+    const parsed = parseRouteLine(text, edges);
+    expect(parsed).toMatchObject({ count: 1, conflict: false, edgeOnly: true });
+    expect(parsed.line).toMatchObject({ class: "search", pin: false });
+    expect(parsed.stripped).toBe("some quoted issue text\n[route class=design pin]\nmore text");
+  });
+
+  it("a single-line prompt is both first and last", () => {
+    expect(parseRouteLine("[route class=debug]", edges)).toMatchObject({ count: 1, stripped: "" });
+  });
+});

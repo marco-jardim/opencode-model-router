@@ -182,7 +182,11 @@ export type BackendStatus =
   | "error" // transport/HTTP/host error
   | "disabled"; // misconfigured: missing apiKeyEnv value, unparsable model, no host client
 
-/** What a backend decides. Backends never decide `needs`; risk/scope may only raise rules facts. */
+/**
+ * What a backend decides: the class (TypeSafe also risk and scope, which only raise
+ * the rules facts). A model can only ADD needs, through the implied needs of the
+ * class it picks; it can never remove one, so it cannot weaken the A11 filter.
+ */
 export interface BackendFacts {
   readonly class: TaskClass;
   readonly confidence: number;

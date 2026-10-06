@@ -68,6 +68,12 @@ export interface ClassifyDeps {
   readonly logger: ClassifierLogger;
   /** Uniform [0, 1) source for the option shuffle and nonces; default `Math.random`. */
   readonly random?: () => number;
+  /**
+   * Where a `[route]` line is recognised: `any` (default) or `edges`, only as the
+   * first or last non-empty line of the prompt. Phase 2.2 passes `edges` for the
+   * orchestrator' prompt (QA-1.2-2).
+   */
+  readonly routeLinePositions?: "any" | "edges";
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +232,7 @@ function unknownResult(stripped: string): ClassifyResult {
 function strippedOf(input: ClassifyInput, deps: ClassifyDeps): string {
   const prompt = promptOf(input);
   try {
-    return parseRouteLine(prompt).stripped;
+    return parseRouteLine(prompt, routeLineOptions(deps)).stripped;
   } catch (error) {
     safeWarn(deps.logger, `classifier could not strip route lines: ${reasonOf(error)}`);
     return prompt
@@ -255,9 +261,13 @@ interface Prepared {
   readonly facts: TaskFacts;
 }
 
+function routeLineOptions(deps: ClassifyDeps): { readonly edgesOnly: boolean } {
+  return { edgesOnly: deps.routeLinePositions === "edges" };
+}
+
 /** Steps 1–3: route line, rules, route line applied. */
 function prepare(input: ClassifyInput, deps: ClassifyDeps): Prepared {
-  const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "");
+  const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "", routeLineOptions(deps));
   const description = typeof input.description === "string" ? input.description.trim() : "";
   const ruleText = [description.slice(0, RULES_MAX_CHARS), parsed.stripped.slice(0, RULES_MAX_CHARS)]
     .filter(Boolean)
