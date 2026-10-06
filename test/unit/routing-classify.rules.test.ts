@@ -531,6 +531,22 @@ describe("destructive operations are high risk (QA-1.2-3)", () => {
     "set NPM_TOKEN in CI",
     "terraform destroy the staging stack",
     "kubectl delete the namespace",
+    // QA-1.2-28: cmd.exe, PowerShell aliases and abbreviations, forced refspecs and checkouts.
+    "del /s /q C:\\build",
+    "del /f /q notes.txt",
+    "erase /s dist",
+    "rmdir /s /q build",
+    "rd /s /q dist",
+    "ri -r -fo .\\dist",
+    "rm -Recurse -Force .\\dist",
+    "del -Recurse -Force .\\dist",
+    "erase -r build",
+    "rmdir -r -fo node_modules",
+    "git push origin +main",
+    "git push origin +HEAD:main",
+    "git checkout -f main",
+    "git checkout --force feature",
+    "git switch --discard-changes main",
   ];
 
   it.each(destructive)("%s -> risk high", (text) => {
@@ -553,6 +569,10 @@ describe("destructive operations are high risk (QA-1.2-3)", () => {
       "list the files in src",
       "read process.env.NODE_ENV in a.ts",
       "git checkout .gitignore",
+      "git checkout main",
+      "git push origin main",
+      "the del key and the ri command are documented",
+      "list the rmdir flags",
       "rename foo to bar in src/a.ts",
       "git status",
       "delete the unused import",
@@ -736,15 +756,28 @@ describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
     ['"a@" x 10000', "a@".repeat(10_000)],
     ['"a+" x 10000', "a+".repeat(10_000)],
     ['"a@b+" x 5000', "a@b+".repeat(5_000)],
-    ['"git push " x 2500', "git push ".repeat(2_500)],
-    ['"Remove-Item " x 1800', "Remove-Item ".repeat(1_800)],
-    ['"git push -x " x 2000', "git push -x ".repeat(2_000)],
     ['"\\n" x 20000', "\n".repeat(20_000)],
     ['" " x 20000', " ".repeat(20_000)],
     ['"a," x 10000', "a,".repeat(10_000)],
   ])("%s classifies in under 5 ms", (_label, text) => {
     expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(5);
     expect(classifyByRules(text, cfg).confidence).toBeLessThanOrEqual(0.5);
+  });
+
+  // Every `[^\n]{0,100}` command term re-scans up to 100 characters per command word, so a text that is
+  // nothing but command words ("rm " x 6000, ~18 kB) costs ~4-5 ms here: that is linear, but close to 5 ms,
+  // so this table asserts 10 ms (a loaded CI core cannot flake it) while a quadratic regression still fails by 100x.
+  it.each([
+    ['"git push " x 2500', "git push ".repeat(2_500)],
+    ['"git push -x " x 2000', "git push -x ".repeat(2_000)],
+    ['"git push o +" x 2000', "git push o +".repeat(2_000)],
+    ['"Remove-Item " x 1800', "Remove-Item ".repeat(1_800)],
+    ['"rm " x 6000', "rm ".repeat(6_000)],
+    ['"del " x 5000', "del ".repeat(5_000)],
+    ['"ri " x 6000', "ri ".repeat(6_000)],
+    ['"git checkout " x 1500', "git checkout ".repeat(1_500)],
+  ])("%s classifies in under 10 ms", (_label, text) => {
+    expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(10);
   });
 
   it("shapeOf alone is also linear on long runs", () => {

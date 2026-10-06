@@ -988,8 +988,13 @@ export const HIGH_RISK_TERMS: readonly RegExp[] = [
   /\brm\s+-rf\b/i,
   // Destructive commands and operations (QA-1.2-3): never a cheap, confident `mechanical` label.
   /\brm\s+-[a-z]*[rf]/i,
-  /\bRemove-Item\b[^\n]{0,200}-(?:Recurse|Force)\b/i,
-  /\bgit\s+push\b[^\n]{0,200}\s(?:-f|--force)\b/i,
+  // PowerShell Remove-Item and its aliases (ri, rm, del, erase, rmdir, rd) with -r/-Recurse and -fo/-Force,
+  // abbreviations included; cmd.exe `del /s /q /f`, `rmdir /s`. One scan per command word, bounded.
+  /\b(?:Remove-Item|ri|rm)\b[^\n]{0,100}\s-(?:r\w*|fo\w*)\b/i,
+  /\b(?:del|erase|rmdir|rd)\b[^\n]{0,100}\s(?:-(?:r\w*|fo\w*)\b|\/[sqf]\b)/i,
+  // `-f` / `--force` and a leading `+` on a refspec (which forces the push).
+  /\bgit\s+push\b[^\n]{0,100}\s(?:-f\b|--force\b|\+\S)/i,
+  /\bgit\s+(?:checkout|switch)\b[^\n]{0,60}\s(?:-f|--force|--discard-changes)\b/i,
   /\bgit\s+clean\s+-/i,
   /\bgit\s+(?:checkout|restore)\s+(?:--\s+)?\.(?=\s|$|[\\/])/i,
   /\bgit\s+(?:rebase|filter-branch|filter-repo)\b/i,
