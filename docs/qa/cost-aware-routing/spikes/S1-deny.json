@@ -1,12 +1,12 @@
 {
   "spike": "S1-deny",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
-  "recordedAt": "2026-10-06T04:52:07.182Z",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:18.358Z",
   "harness": {
     "file": "test/smoke/routing-spikes.smoke.test.ts",
-    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
-    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
     "uncommittedChanges": true
   },
   "hypothesis": "With a permission rule that DENIES subagent 'explore' to the parent session, the execute.before swap general->explore does not yield an explore child: the host refuses the dispatch (permission is asserted after the hook, on the rewritten input).",
@@ -26,7 +26,7 @@
       }
     ],
     "control": {
-      "childID": "ses_ef071ffb2ffe1GyIxJWP3eWoZ9",
+      "childID": "ses_ef0624395ffejPYODS2MhV6Bwa",
       "status": "completed"
     },
     "hookBefore": {
@@ -44,7 +44,7 @@
     },
     "toolAfter": {
       "hook": "after",
-      "sessionID": "ses_ef071fff0ffecN9kU2wlQOLhLD",
+      "sessionID": "ses_ef06243c8ffeBTJUCdWM6CDfXW",
       "callID": "toolu_spike_7",
       "agent": "build",
       "tool": "subagent",
@@ -80,8 +80,8 @@
     },
     "childrenOfRoot": [
       {
-        "id": "ses_ef071ffb2ffe1GyIxJWP3eWoZ9",
-        "parentID": "ses_ef071fff0ffecN9kU2wlQOLhLD",
+        "id": "ses_ef0624395ffejPYODS2MhV6Bwa",
+        "parentID": "ses_ef06243c8ffeBTJUCdWM6CDfXW",
         "agent": "general",
         "model": {
           "id": "claude-opus-4-7",
@@ -109,7 +109,7 @@
         ]
       }
     ],
-    "providerRequestsForExplore": 1,
+    "providerRequestsForExploreDuringThisSpike": 0,
     "derived": {
       "rewriteApplied": true,
       "refused": true,
@@ -119,8 +119,8 @@
     },
     "cleanup": {
       "removed": [
-        "ses_ef071ffb2ffe1GyIxJWP3eWoZ9",
-        "ses_ef071fff0ffecN9kU2wlQOLhLD"
+        "ses_ef0624395ffejPYODS2MhV6Bwa",
+        "ses_ef06243c8ffeBTJUCdWM6CDfXW"
       ],
       "errors": [],
       "orphans": []

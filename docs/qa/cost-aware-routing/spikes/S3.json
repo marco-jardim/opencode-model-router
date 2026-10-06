@@ -1,130 +1,52 @@
 {
   "spike": "S3",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
-  "recordedAt": "2026-10-06T04:52:10.507Z",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:22.057Z",
   "harness": {
     "file": "test/smoke/routing-spikes.smoke.test.ts",
-    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
-    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
     "uncommittedChanges": true
   },
   "hypothesis": "ctx.event.subscribe in a plugin delivers a session.step.ended event for the CHILD session whose data carries cost and tokens {input, output, reasoning, cache{read,write}}.",
   "observed": {
     "counts": {
-      "rawChildEvents": 11,
-      "dedupedChildEvents": 11,
+      "rawSessionEvents": 11,
+      "dedupedSessionEvents": 11,
       "rawStepEnded": 1,
       "dedupedStepEnded": 1,
-      "distinctPluginInstancesSeen": 1
+      "pluginInstancesStartedDuringRun": 1,
+      "pluginInstancesDeliveringTheSessionsEvents": 1,
+      "pluginInstancesDeliveringStepEnded": 1
     },
     "rawStepEndedIdentity": [
       {
         "type": "session.step.ended",
-        "id": "evt_10f8e0e3a0010lD7FQAiRRfDmO",
+        "id": "evt_10f9dcbb9001gllPrydc2Ny67m",
         "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
         },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      }
-    ],
-    "rawChildEventIdentity": [
-      {
-        "type": "session.created",
-        "id": "evt_10f8e0e1a001tvhkvXRqRGR8lk",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.inbox.enqueued",
-        "id": "evt_10f8e0e1c001uHIP71rMLNcxAz",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.execution.started",
-        "id": "evt_10f8e0e1f0019w8NzWu39bofaL",
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.instructions.updated",
-        "id": "evt_10f8e0e23001rq8B2R2ZFNl0OC",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.inbox.delivered",
-        "id": "evt_10f8e0e24001Hkn2p9yvFxYu8n",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.step.started",
-        "id": "evt_10f8e0e34001dfrJcT9mK93bc7",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.text.started",
-        "id": "evt_10f8e0e36001zV9PiHilK4UVkr",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.text.ended",
-        "id": "evt_10f8e0e37002AMrBhIpoUF2rmw",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.step.ended",
-        "id": "evt_10f8e0e3a0010lD7FQAiRRfDmO",
-        "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-        },
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.usage.updated",
-        "id": "evt_10f8e0e3b001AIO5ERioaarK1d",
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
-      },
-      {
-        "type": "session.execution.succeeded",
-        "id": "evt_10f8e0e3c0010fKBNlt4CxJs4s",
-        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+        "pluginInstanceId": "c834sk"
       }
     ],
     "stepEndedEvents": [
       {
-        "id": "evt_10f8e0e3a0010lD7FQAiRRfDmO",
-        "created": 1791262330426,
+        "id": "evt_10f9dcbb9001gllPrydc2Ny67m",
+        "created": 1791263361977,
         "type": "session.step.ended",
         "durable": {
-          "aggregateID": "ses_ef071f1eaffeAFZ4FdGuXQZ8LY",
+          "aggregateID": "ses_ef0623467ffeAKbfUnY7o2HE1l",
           "seq": 9,
           "version": 1
         },
         "location": {
-          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
         },
         "data": {
-          "sessionID": "ses_ef071f1eaffeAFZ4FdGuXQZ8LY",
-          "assistantMessageID": "msg_10f8e0e28001q419b9ghJ6k8WG",
+          "sessionID": "ses_ef0623467ffeAKbfUnY7o2HE1l",
+          "assistantMessageID": "msg_10f9dcba8001R0bcOZfM3eTW03",
           "finish": "stop",
           "rawFinish": "end_turn",
           "cost": 0.01073,
@@ -138,7 +60,8 @@
             }
           }
         },
-        "__instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+        "__instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+        "__instanceId": "c834sk"
       }
     ],
     "childEventTypes": [
@@ -197,14 +120,14 @@
     },
     "cleanup": {
       "removed": [
-        "ses_ef071f1eaffeAFZ4FdGuXQZ8LY",
-        "ses_ef071f216ffet36WqaRlhVAlaO"
+        "ses_ef0623467ffeAKbfUnY7o2HE1l",
+        "ses_ef062348effe5BPFOI7cvYIn6w"
       ],
       "errors": [],
       "orphans": []
     },
     "providerErrors": []
   },
-  "assertionResult": "PASS: 1 session.step.ended event(s) for the child (1 raw line(s)); cost=0.01073 tokens={\"input\":5340,\"output\":5,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}",
+  "assertionResult": "PASS: 1 session.step.ended event(s) for the child (1 raw line(s) from 1 plugin instance(s)); cost=0.01073 tokens={\"input\":5340,\"output\":5,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}",
   "notes": []
 }

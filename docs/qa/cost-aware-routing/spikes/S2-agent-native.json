@@ -1,0 +1,431 @@
+{
+  "spike": "S2-agent-native",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:24.787Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "On a host with NO permission config (native agent defaults), resuming a child with a different agent changes the tool list and the system prompt the provider receives: explore is read-only (no edit/write/shell), general has the full set; a resume that only changes the variant changes neither.",
+  "observed": {
+    "permissionConfig": "none: opencode.json has no permissions key, so every agent keeps its native permission defaults; the root session only carries a session-level allow for subagent",
+    "nativeAgentPermissions": {
+      "build": {
+        "mode": "primary",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "question",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      },
+      "general": {
+        "mode": "subagent",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "question",
+            "resource": "*",
+            "effect": "deny"
+          },
+          {
+            "action": "subagent",
+            "resource": "*",
+            "effect": "deny"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      },
+      "explore": {
+        "mode": "subagent",
+        "permissions": [
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "*",
+            "resource": "*",
+            "effect": "deny"
+          },
+          {
+            "action": "grep",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "glob",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "webfetch",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "websearch",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "read",
+            "resource": "*",
+            "effect": "allow"
+          },
+          {
+            "action": "read",
+            "resource": "*.env",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.*",
+            "effect": "ask"
+          },
+          {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow"
+          },
+          {
+            "action": "subagent",
+            "resource": "*",
+            "effect": "deny"
+          },
+          {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\shell\\*\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\data\\opencode\\tool-output\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\tmp\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "external_directory",
+            "resource": "<home>\\AppData\\Local\\Temp\\omr-spikes-native-kN9A93\\config\\opencode\\*",
+            "effect": "allow"
+          },
+          {
+            "action": "browser",
+            "resource": "*",
+            "effect": "deny"
+          }
+        ]
+      }
+    },
+    "storedAgentAfterEachStep": [
+      "general",
+      "general",
+      "explore",
+      "general"
+    ],
+    "requests": [
+      {
+        "kind": "primary",
+        "agent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
+        "toolCount": 11,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ],
+        "systemSha256": "a5373be935ed09066b4ea77295500e6195a0d2c74f684ba998d1fe511e8db172",
+        "systemChars": 7989,
+        "lastText": "ther session.\nS2n first prompt"
+      },
+      {
+        "kind": "primary",
+        "agent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
+        "toolCount": 11,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ],
+        "systemSha256": "a5373be935ed09066b4ea77295500e6195a0d2c74f684ba998d1fe511e8db172",
+        "systemChars": 7989,
+        "lastText": "S2n second prompt"
+      },
+      {
+        "kind": "primary",
+        "agent": "explore",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
+        "toolCount": 6,
+        "toolNames": [
+          "glob",
+          "grep",
+          "read",
+          "subagent",
+          "webfetch",
+          "websearch"
+        ],
+        "systemSha256": "cfa0baff6477ed237368e51d1f6db519c315b78658c35a9374d2f8cf85a5312e",
+        "systemChars": 7003,
+        "lastText": "S2n third prompt"
+      },
+      {
+        "kind": "primary",
+        "agent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
+        "toolCount": 11,
+        "toolNames": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "shell",
+          "skill",
+          "subagent",
+          "webfetch",
+          "websearch",
+          "write",
+          "execute"
+        ],
+        "systemSha256": "a5373be935ed09066b4ea77295500e6195a0d2c74f684ba998d1fe511e8db172",
+        "systemChars": 7989,
+        "lastText": "S2n fourth prompt"
+      }
+    ],
+    "diffs": {
+      "controlVariantBumpOnly": {
+        "toolsChanged": false,
+        "systemPromptChanged": false,
+        "toolCountBefore": 11,
+        "toolCountAfter": 11,
+        "onlyBefore": [],
+        "onlyAfter": []
+      },
+      "generalToExplore": {
+        "toolsChanged": true,
+        "systemPromptChanged": true,
+        "toolCountBefore": 11,
+        "toolCountAfter": 6,
+        "onlyBefore": [
+          "edit",
+          "shell",
+          "skill",
+          "write",
+          "execute"
+        ],
+        "onlyAfter": []
+      },
+      "exploreBackToGeneral": {
+        "toolsChanged": true,
+        "systemPromptChanged": true,
+        "toolCountBefore": 6,
+        "toolCountAfter": 11,
+        "onlyBefore": [],
+        "onlyAfter": [
+          "edit",
+          "shell",
+          "skill",
+          "write",
+          "execute"
+        ]
+      }
+    },
+    "derived": {
+      "exploreOffersEditWriteShell": [],
+      "generalOffersEditWriteShell": [
+        "edit",
+        "write",
+        "shell"
+      ],
+      "toolsChangedOnSwitchToExplore": true,
+      "systemPromptChangedOnSwitchToExplore": true,
+      "toolsRestoredOnSwitchBackToGeneral": true,
+      "systemPromptRestoredOnSwitchBack": true
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef0622d16ffeJsLHDC8eEwBRN8",
+        "ses_ef0622dd1ffeHOEHCujrymiWzO"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: stored agents general->general->explore->general; general->explore: tools 11->6 (changed true), system prompt changed true; control variant bump: tools changed false, system changed false; explore offers edit/write/shell: []",
+  "notes": [
+    "Evidence for QA-0P-33: the earlier allow-all S2 host offered identical tools to general and explore; this host keeps the native agent permission defaults."
+  ]
+}

@@ -1,12 +1,12 @@
 {
   "spike": "S2b",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
-  "recordedAt": "2026-10-06T04:52:10.325Z",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:21.894Z",
   "harness": {
     "file": "test/smoke/routing-spikes.smoke.test.ts",
-    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
-    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
     "uncommittedChanges": true
   },
   "hypothesis": "Resuming a child with sessionID + a different model id makes the provider receive the new model (stored model == wire model); a later resume with a higher variant, and a fresh child started at that variant, show whether the effort the provider receives follows the variant. Control: a fresh child honours the variant on its first request. A later model switch to a higher variant (A#low -> A#high -> B#xhigh) delivers xhigh as the top-level effort with no new in-band message.",
@@ -1009,8 +1009,8 @@
     "finalStored": {
       "case1Child": {
         "session": {
-          "id": "ses_ef071f95cffeHxkg1EIFuxolEC",
-          "parentID": "ses_ef071fa91ffe2FdSSXZSE1BJlE",
+          "id": "ses_ef0623c90ffeLXkZjWjLxEph82",
+          "parentID": "ses_ef0623e3dffeCHKRo1pHsqChsX",
           "agent": "general",
           "model": {
             "id": "claude-opus-5-5",
@@ -1048,8 +1048,8 @@
       },
       "case3Child": {
         "session": {
-          "id": "ses_ef071f6abffe1NR3tvdJcpedY4",
-          "parentID": "ses_ef071fa91ffe2FdSSXZSE1BJlE",
+          "id": "ses_ef062395effe7HGKq5vzg3kU7l",
+          "parentID": "ses_ef0623e3dffeCHKRo1pHsqChsX",
           "agent": "general",
           "model": {
             "id": "claude-sonnet-5-5",
@@ -1248,14 +1248,14 @@
     },
     "cleanup": {
       "removed": [
-        "ses_ef071f33bffehbyj33nLa69dAH",
-        "ses_ef071f445ffenxc0EQBvR9wJ5Y",
-        "ses_ef071f620ffe1tf9C7e2WuSEIj",
-        "ses_ef071f6abffe1NR3tvdJcpedY4",
-        "ses_ef071f7c9ffeERtxX2scU341mj",
-        "ses_ef071f95cffeHxkg1EIFuxolEC",
-        "ses_ef071fa5dffeVj2oOkuiMCKdXK",
-        "ses_ef071fa91ffe2FdSSXZSE1BJlE"
+        "ses_ef06235bfffeHXrsEeAauEPjDL",
+        "ses_ef06236e7ffeAt7EadRZ54QYhN",
+        "ses_ef06238b2ffepk0oeMYImoDKsZ",
+        "ses_ef062395effe7HGKq5vzg3kU7l",
+        "ses_ef0623a7dffeZjTXm8b2gz5ltp",
+        "ses_ef0623c90ffeLXkZjWjLxEph82",
+        "ses_ef0623e11ffehEV5SOCGlPpY80",
+        "ses_ef0623e3dffeCHKRo1pHsqChsX"
       ],
       "errors": [],
       "orphans": []

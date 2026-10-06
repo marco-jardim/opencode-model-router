@@ -1,6 +1,6 @@
 /** Phase 0.P spike harness for the cost-aware routing plan (#74).
  *
- * Runs spikes S1-S6 (+ S1-deny, S2b) against a REAL OpenCode v2 host (2.0.22) and
+ * Runs spikes S1-S6 (+ S1-deny, S2b, S2-agent-native, S3b) against a REAL OpenCode v2 host (2.0.22) and
  * records the evidence for each one as JSON in docs/qa/cost-aware-routing/spikes/.
  * Assertions read HOST STATE (session get/list/context, catalog, the host's own
  * event stream, the provider's wire requests); never only the variables of the
@@ -10,20 +10,19 @@
  *     npx vitest run --config vitest.smoke.config.ts test/smoke/routing-spikes.smoke.test.ts
  *
  * - Without RUN_OC_SMOKE_V2_SPIKES=1 every test is skipped.
- * - S1-S3, S5 (scripted part), S6 start ONE isolated `opencode serve`: allowlisted
+ * - Every spike except S4 runs against an isolated `opencode serve`: allowlisted
  *   environment (no provider credentials), private HOME/XDG, a scripted Anthropic
  *   Messages provider, and a probe plugin that records hook, event and generate
- *   traffic. Nothing there calls a paid model. The host process tree is killed at
- *   the end (taskkill /T /F on Windows) and its port is asserted closed.
- * - RUN_OC_SPIKE_LIVE_CATALOG=1 additionally opts in to the user's REAL, already
- *   running OpenCode v2 service (URL/password come from the user's state dir and
- *   are never written to the evidence):
- *     S4  reads GET /api/model and /api/provider for an ALREADY-LIVE location and
- *         asserts the live location set is unchanged afterwards.
- *     S5  makes ONE <=10-token generate call to opencode-go/deepseek-v4.1-flash,
- *         but only if the location /api/experimental/generate resolves to (the
- *         global config directory) is already live; otherwise it records why it
- *         was skipped. No session is ever created or written on the live service.
+ *   traffic. Nothing there calls a paid model. S1-S3, S3b, S5, S6, S2b and S2 share
+ *   one host with a global allow-all permission rule; S2-agent-native uses a second
+ *   host with NO permission config (native agent defaults). Both process trees are
+ *   killed at the end (taskkill /T /F on Windows) and their ports asserted closed.
+ * - RUN_OC_SPIKE_LIVE_CATALOG=1 enables ONE thing: S4's read-only GETs against the
+ *   user's REAL, already running OpenCode v2 service (URL/password come from the
+ *   user's state dir and are never written to the evidence): GET /api/debug/location
+ *   (before and after), GET /api/model and GET /api/provider for an ALREADY-LIVE
+ *   location. No POST, no generate/model call, no session, no config write. Without
+ *   the gate, or when the preferred location is not live, S4 is skipped.
  * - Evidence JSON is written BEFORE each assertion so a disproven hypothesis still
  *   leaves its observation behind. Every file carries the run id, recordedAt and
  *   the harness git ids. Strings longer than 400 chars INSIDE `observed` are
@@ -74,17 +73,20 @@ interface HostClient {
   };
   model: { list(input?: { location?: { directory: string } }): Promise<{ data: ModelInfo[] }> };
   plugin: { list(): Promise<{ data: { id: string; state: { status: string; error?: string } }[] }> };
-  agent: { list(): Promise<{ data: { id: string; mode: string; model?: ModelRef }[] }> };
+  agent: { list(): Promise<{ data: { id: string; mode: string; model?: ModelRef; permissions?: unknown }[] }> };
   debug: { location: { list(): Promise<{ directory: string }[]>; evict(input: { location: { directory: string } }): Promise<void> } };
 }
 interface HookRecord { hook: "before" | "after"; sessionID: string; callID: string; agent: string; tool: string; before?: unknown; after?: unknown; status?: string; result?: unknown; error?: unknown }
-interface EventRecord { type: string; id?: string; location?: unknown; __instance?: string; data?: Obj; [key: string]: unknown }
+interface EventRecord { type: string; id?: string; location?: unknown; __instance?: string; __instanceId?: string; data?: Obj; [key: string]: unknown }
 interface Capture {
   model?: string; catalogModel?: string; session?: string; agent?: string; kind?: string; stream: boolean;
   outputConfig?: unknown; thinking?: unknown; inputTokens: number; lastText: string; toolResult: boolean; reply: "dispatch" | "text";
   /** Every top-level request field except messages/system/tools (those are reduced to their sizes). */
   payload: Obj;
   toolNames: string[];
+  /** SHA-256 and length of the system prompt text (all system blocks joined by a newline). */
+  systemSha256: string;
+  systemChars: number;
   /** The request messages verbatim (the S2/S2b cases read them to see how an effort change reaches the provider). */
   messages?: RequestBody["messages"];
 }
@@ -189,8 +191,10 @@ class SpikeProvider {
       const call = toolResult ? undefined : /SPIKE_CALL=(\{[^\n]*\})/.exec(lastText)?.[1];
       const inputTokens = Math.max(10, Math.ceil(raw.length / 4));
       const { messages: _messages, system: _system, tools: _tools, ...fields } = body;
+      const systemText = typeof _system === "string" ? _system : Array.isArray(_system) ? _system.map(part => String(obj(part).text ?? JSON.stringify(part))).join("\n") : JSON.stringify(_system ?? "");
       this.captures.push({
         payload: { ...fields, "messages.length": _messages?.length, "tools.length": _tools?.length }, messages: _messages, toolNames: (_tools ?? []).map(t => t.name),
+        systemSha256: createHash("sha256").update(systemText).digest("hex"), systemChars: systemText.length,
         model: body.model, catalogModel: header("x-proof-model"), session: header("x-proof-session"), agent: header("x-proof-agent"), kind: header("x-proof-kind"),
         stream: body.stream === true, outputConfig: body.output_config, thinking: body.thinking, inputTokens, lastText, toolResult, reply: call ? "dispatch" : "text",
       });
@@ -242,6 +246,8 @@ const rewriteSpec=()=>{try{return JSON.parse(readFileSync(process.env.SPIKE_REWR
 const ser=(error)=>{try{return {string:String(error),props:JSON.parse(JSON.stringify(error,Object.getOwnPropertyNames(error).filter(k=>k!=='stack')))};}catch{return {string:String(error)};}};
 export default {id:'routing-spike-probe',async setup(ctx){
  const instance=ctx.location&&ctx.location.directory;
+ const instanceId=Math.random().toString(36).slice(2,8);
+ log('SPIKE_EVENTS',{type:'probe.instance.started',__instance:instance,__instanceId:instanceId});
  await ctx.tool.hook('execute.before',async e=>{
   if(e.tool!=='subagent')return;
   const before=structuredClone(e.input);
@@ -267,8 +273,8 @@ export default {id:'routing-spike-probe',async setup(ctx){
  });
  (async()=>{
   try{for await(const event of ctx.event.subscribe({})){
-   if(typeof event.type==='string'&&event.type.startsWith('session.')&&!/(delta|streamed)/.test(event.type)) log('SPIKE_EVENTS',{...event,__instance:instance});
-  }}catch(error){log('SPIKE_EVENTS',{type:'probe.subscription.failed',error:String(error),__instance:instance});}
+   if(typeof event.type==='string'&&event.type.startsWith('session.')&&!/(delta|streamed)/.test(event.type)) log('SPIKE_EVENTS',{...event,__instance:instance,__instanceId:instanceId});
+  }}catch(error){log('SPIKE_EVENTS',{type:'probe.subscription.failed',error:String(error),__instance:instance,__instanceId:instanceId});}
  })();
 }};`;
 
@@ -298,7 +304,8 @@ class ScriptedHost {
   private child?: ChildProcess;
   private output = "";
   private teardown?: Promise<Teardown>;
-  constructor(readonly root: string) {}
+  /** `native`: write NO permission config, so the agents keep the host's native permission defaults (the root session gets a session-level allow for subagent instead). */
+  constructor(readonly root: string, readonly native = false) {}
 
   async start(): Promise<this> {
     const executable = v2Executable();
@@ -329,7 +336,7 @@ class ScriptedHost {
         // S6: an alias of the scripted model whose window is tiny. Its catalog id differs from the wire id.
         "spike-small": { modelID: ROOT_MODEL.id, name: "Spike Small Window", limit: { context: SMALL_CONTEXT, output: 1_000 } },
       } } },
-      permissions: [{ action: "*", resource: "*", effect: "allow" }],
+      ...(this.native ? {} : { permissions: [{ action: "*", resource: "*", effect: "allow" }] }),
     }));
     const password = randomBytes(24).toString("base64url");
     Object.assign(env, {
@@ -397,7 +404,8 @@ class ScriptedHost {
 
   /** The scripted root orchestrator: creates a root session on the scripted model. */
   async root_(title: string, permissions?: Rule[]): Promise<string> {
-    return (await this.client.session.create({ agent: "build", model: ROOT_MODEL, title, location: { directory: this.project }, ...(permissions ? { permissions } : {}) })).id;
+    const rules = permissions ?? (this.native ? [{ action: "subagent", resource: "*", effect: "allow" } satisfies Rule] : undefined);
+    return (await this.client.session.create({ agent: "build", model: ROOT_MODEL, title, location: { directory: this.project }, ...(rules ? { permissions: rules } : {}) })).id;
   }
 
   /** Prompts the root so that its scripted model emits one `subagent` call with `call` as input. The child id may be absent (a refused dispatch). */
@@ -454,39 +462,43 @@ async function jsonl<T>(file: string): Promise<T[]> {
   return (await readFile(file, "utf8")).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line) as T);
 }
 
-/** The user's real, already running OpenCode v2 service. Read-only helpers; never creates sessions or writes config. */
+/** The user's real, already running OpenCode v2 service. Read-only GET helpers only: no POST, no generate, no session, no config write. */
 async function liveService() {
   const file = path.join(homedir(), ".local", "state", "opencode", "service.json");
   if (!existsSync(file)) return undefined;
   const service = JSON.parse(await readFile(file, "utf8")) as { url: string; password: string; version?: string };
-  const call = async (method: "GET" | "POST", route: string, options: { directory?: string; body?: unknown } = {}) => {
+  /** The ONLY way the harness talks to the live service: a read-only GET. */
+  const get = async (route: string, options: { directory?: string } = {}) => {
     const url = new URL(route, service.url);
     if (options.directory) url.searchParams.set("location[directory]", options.directory);
     const started = performance.now();
-    const response = await fetch(url, { method, headers: { authorization: basic("opencode", service.password), ...(options.body ? { "content-type": "application/json" } : {}) }, ...(options.body ? { body: JSON.stringify(options.body) } : {}), signal: AbortSignal.timeout(60_000) });
+    const response = await fetch(url, { method: "GET", headers: { authorization: basic("opencode", service.password) }, signal: AbortSignal.timeout(60_000) });
     const text = await response.text();
     return { status: response.status, text, latencyMs: Math.round(performance.now() - started) };
   };
-  const locations = async () => JSON.parse((await call("GET", "/api/debug/location")).text) as { directory: string }[];
-  return { version: service.version, call, locations };
+  const locations = async () => JSON.parse((await get("/api/debug/location")).text) as { directory: string }[];
+  return { version: service.version, get, locations };
 }
 
 // ------------------------------------------------------------ spike runner ----
 /** `partial` marks a pass whose hypothesis only held in part; it is reported as PARTIAL-PASS in the evidence. */
 interface Spike { observed: Obj; notes: string[]; verdict(pass: boolean, detail: string, partial?: boolean): void; keep: Set<string> }
-let scriptedHost: Promise<ScriptedHost> | undefined;
-let hostRoot: string | undefined;
-const getHost = () => scriptedHost ??= (async () => {
-  hostRoot = await mkdtemp(path.join(tmpdir(), "omr-spikes-"));
-  const host = new ScriptedHost(hostRoot);
+/** "main": global allow-all permission rule; "native": no permission config (native agent defaults). */
+type HostKind = "main" | "native";
+const hostPromises: Partial<Record<HostKind, Promise<ScriptedHost>>> = {};
+const hostRoots: string[] = [];
+const startHost = (kind: HostKind) => hostPromises[kind] ??= (async () => {
+  const root = await mkdtemp(path.join(tmpdir(), kind === "native" ? "omr-spikes-native-" : "omr-spikes-"));
+  hostRoots.push(root);
+  const host = new ScriptedHost(root, kind === "native");
   try { return await host.start(); } catch (error) { await host.stop().catch(() => undefined); throw error; }
 })();
+const getHost = () => startHost("main");
 
 afterAll(async () => {
-  try { await (await scriptedHost)?.stop(); } catch { /* host never started */ }
-  if (hostRoot) await rm(hostRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  for (const started of Object.values(hostPromises)) { try { await (await started).stop(); } catch { /* host never started */ } }
+  for (const root of hostRoots) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 }, 60_000);
-
 let harnessIds: Obj | undefined;
 /** Git ids of the harness file used for THIS run: HEAD, the file's blob sha (matches `git ls-tree` once committed) and whether it differs from HEAD. */
 function harnessGitIds(): Obj {
@@ -504,9 +516,16 @@ async function writeEvidence(id: string, hypothesis: string, assertionResult: st
   await writeFile(path.join(EVIDENCE_DIR, `${id}.json`), `${JSON.stringify(redact(record), null, 2)}\n`);
 }
 
-/** Runs one spike: records evidence BEFORE asserting, sweeps the sessions it created, and fails on orphans. */
-async function spike(id: string, hypothesis: string, body: (s: Spike, host: ScriptedHost) => Promise<void>, scripted = true): Promise<void> {
-  const host = scripted ? await getHost() : undefined;
+/** Records a SKIPPED spike. With keepExistingResult, an earlier real result in the same file is never overwritten (a gate-off run must not destroy the evidence of a live run). */
+async function recordSkip(id: string, hypothesis: string, reason: string, observed: Obj, keepExistingResult: boolean): Promise<void> {
+  const file = path.join(EVIDENCE_DIR, `${id}.json`);
+  if (keepExistingResult && existsSync(file) && !String((JSON.parse(await readFile(file, "utf8")) as { assertionResult?: string }).assertionResult).startsWith("SKIPPED")) return;
+  await writeEvidence(id, hypothesis, `SKIPPED: ${reason}`, { observed: { skipped: reason, ...observed }, notes: [`skipped: ${reason}`], verdict: () => undefined, keep: new Set() });
+}
+
+/** Runs one spike: records evidence BEFORE asserting, sweeps the sessions it created on its host, and fails on orphans. */
+async function spike(id: string, hypothesis: string, body: (s: Spike, host: ScriptedHost) => Promise<void>, mode: HostKind | "none" = "main"): Promise<void> {
+  const host = mode === "none" ? undefined : await startHost(mode);
   const keep = new Set((await host?.everySession() ?? []).map(s => s.id));
   let verdict: { pass: boolean; detail: string; partial: boolean } | undefined;
   let failure: unknown;
@@ -536,6 +555,33 @@ async function childState(host: ScriptedHost, childID: string) {
     compactionMessages: messages.filter(m => m.type === "compaction").map(m => ({ status: m.status, reason: m.reason, error: m.error, cost: m.cost, tokens: m.tokens })),
   };
 }
+/** Raw vs deduplicated delivery of the events of ONE session, with every step.ended identified by id, location and plugin instance. */
+async function eventAccounting(host: ScriptedHost, sessionID: string) {
+  const all = await host.rawEvents();
+  const raw = all.filter(e => e.data?.sessionID === sessionID);
+  const deduped = (await host.events()).filter(e => e.data?.sessionID === sessionID);
+  const rawEnded = raw.filter(e => e.type === "session.step.ended");
+  const dedupedEnded = deduped.filter(e => e.type === "session.step.ended");
+  const distinct = (events: EventRecord[]) => [...new Set(events.map(e => e.__instanceId))];
+  return {
+    counts: {
+      rawSessionEvents: raw.length, dedupedSessionEvents: deduped.length, rawStepEnded: rawEnded.length, dedupedStepEnded: dedupedEnded.length,
+      pluginInstancesStartedDuringRun: distinct(all.filter(e => e.type === "probe.instance.started")).length,
+      pluginInstancesDeliveringTheSessionsEvents: distinct(raw).length, pluginInstancesDeliveringStepEnded: distinct(rawEnded).length,
+    },
+    rawStepEndedIdentity: rawEnded.map(e => ({ type: e.type, id: e.id, location: e.location, pluginInstance: e.__instance, pluginInstanceId: e.__instanceId })),
+    dedupedStepEnded: dedupedEnded,
+  };
+}
+const fmtTokens = (n: number) => n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+/** What a provider request says about the agent: tool list and system prompt (SHA-256), per request. */
+const requestView = (c: Capture) => ({ kind: c.kind, agent: c.agent, catalogModel: c.catalogModel, wireModel: c.model, toolCount: c.toolNames.length, toolNames: c.toolNames, systemSha256: c.systemSha256, systemChars: c.systemChars });
+/** Compares the request before an agent switch with the one after it. */
+function agentSwitchDiff(before: Capture | undefined, after: Capture | undefined) {
+  const a = before?.toolNames ?? [];
+  const b = after?.toolNames ?? [];
+  return { toolsChanged: a.join() !== b.join(), systemPromptChanged: before?.systemSha256 !== after?.systemSha256, toolCountBefore: a.length, toolCountAfter: b.length, onlyBefore: a.filter(t => !b.includes(t)), onlyAfter: b.filter(t => !a.includes(t)) };
+}
 /** First enabled anthropic catalog model with >=2 variants other than the root model (so the model really changes). */
 async function pickTarget(host: ScriptedHost) {
   const catalog = (await host.client.model.list({ location: { directory: host.project } })).data;
@@ -556,7 +602,6 @@ function variantOrder(variants: { id: string }[]) {
 
 // ------------------------------------------------------------------ spikes ----
 const d = RUN ? describe : describe.skip;
-const itLive = LIVE ? it : it.skip;
 d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
   it("S1: a plugin execute.before hook can reassign subagent agent+model and the host stores the child that way", async () => {
     await spike("S1", "tool.hook('execute.before') reassigning event.input of the subagent tool (agent general->explore, model -> provider/model#variant) makes the host create the CHILD session with the rewritten agent and model/variant.", async (s, host) => {
@@ -589,6 +634,7 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       const { target } = await pickTarget(host);
       if (!target) throw new Error("no catalog model with variants to rewrite to");
       const rewritten = `${target.providerID}/${target.id}#${target.variants.at(-1)!.id}`;
+      const captureMark = host.provider.captures.length; // only provider requests made during THIS spike are counted below
       // Session-level rule: permissions are merged [agent rules, session rules] and the LAST matching rule wins (permission.ts evaluate/findLast).
       const deny: Rule[] = [{ action: "subagent", resource: "explore", effect: "deny" }];
       const rootID = await host.root_("S1-deny root", deny);
@@ -604,7 +650,7 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       s.observed.hookBefore = denied.before.before; s.observed.hookAfterRewrite = denied.before.after; s.observed.toolAfter = denied.after;
       s.observed.childrenOfRoot = children;
       s.observed.deniedDispatchChildID = denied.childID;
-      s.observed.providerRequestsForExplore = host.provider.captures.filter(c => c.agent === "explore").length;
+      s.observed.providerRequestsForExploreDuringThisSpike = host.provider.captures.slice(captureMark).filter(c => c.agent === "explore").length;
       const refused = denied.after.status === "error";
       const exploreChild = children.find(c => c.id !== control.childID && c.agent === "explore");
       s.observed.derived = { rewriteApplied: obj(denied.before.after).agent === "explore", refused, errorMessage: obj(denied.after.error).message, exploreChildCreated: exploreChild !== undefined, controlAllowed: control.after.status === "completed" };
@@ -633,13 +679,13 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       s.observed.hooks = { first: [first.before.before, first.after.status], second: [second.before.before, second.after.status, second.after.result], third: [third.before.before, third.after.status, third.after.result] };
       s.observed.sameChildEverywhere = [first.childID, second.childID, third.childID];
       const childRequests = host.provider.captures.filter(c => c.session === childID);
-      s.observed.providerCapturesForChild = childRequests.map(c => ({ model: c.model, catalogModel: c.catalogModel, agent: c.agent, kind: c.kind, outputConfig: c.outputConfig, thinking: c.thinking, toolCount: c.toolNames.length, toolNames: c.toolNames, lastText: c.lastText.slice(0, 80) }));
+      s.observed.providerCapturesForChild = childRequests.map(c => ({ ...requestView(c), outputConfig: c.outputConfig, thinking: c.thinking, lastText: c.lastText.slice(0, 80) }));
       const primary = childRequests.filter(c => c.kind === "primary");
-      const generalTools = primary[1]?.toolNames ?? [];
-      const exploreTools = primary[2]?.toolNames ?? [];
-      s.observed.agentSwitchTools = { requestAfterVariantResume: { agent: primary[1]?.agent, toolCount: generalTools.length, toolNames: generalTools }, requestAfterAgentSwitch: { agent: primary[2]?.agent, toolCount: exploreTools.length, toolNames: exploreTools }, onlyUnderGeneral: generalTools.filter(t => !exploreTools.includes(t)), onlyUnderExplore: exploreTools.filter(t => !generalTools.includes(t)) };
+      const switchDiff = agentSwitchDiff(primary[1], primary[2]);
+      s.observed.agentSwitchTools = { permissionConfig: "global allow-all (main fixture host)", requestAfterVariantResume: requestView(primary[1]!), requestAfterAgentSwitch: requestView(primary[2]!), ...switchDiff };
       if (low === high) s.notes.push("model exposes a single variant: variant-switch part is unverifiable");
-      if (generalTools.join() === exploreTools.join()) s.notes.push("Under this fixture permission config (global allow-all) the request carries the SAME tool list for agent general and agent explore: switching the agent did not change the tools the provider is offered.");
+      if (!switchDiff.toolsChanged) s.notes.push("Under this host's global allow-all permission config the request carries the SAME tool list for agent general and agent explore; see S2-agent-native for the same switch with the native permission defaults.");
+      if (switchDiff.systemPromptChanged) s.notes.push("The system prompt DID change on the agent switch (different SHA-256).");
       const variantOk = low !== high && one.session.model?.variant === low && two.session.model?.variant === high;
       const historyOk = two.messageCount > one.messageCount && three.messageCount > two.messageCount && second.childID === childID;
       const agentOk = one.session.agent === "general" && two.session.agent === "general" && three.session.agent === "explore";
@@ -766,41 +812,79 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       const { childID } = await host.dispatch(rootID, { agent: "general", description: "S3 dispatch", prompt: "S3 child task", ...(target ? { model: `${target.providerID}/${target.id}` } : {}) });
       const ended = await waitFor("session.step.ended for the child", async () => { const found = (await host.events()).filter(e => e.type === "session.step.ended" && e.data?.sessionID === childID); return found.length > 0 ? found : undefined; }, 20_000).catch(() => []);
       const stored = await childState(host, childID);
-      const raw = (await host.rawEvents()).filter(e => e.data?.sessionID === childID);
-      const deduped = (await host.events()).filter(e => e.data?.sessionID === childID);
-      const rawEnded = raw.filter(e => e.type === "session.step.ended");
-      const idView = (e: EventRecord) => ({ type: e.type, id: e.id, location: e.location, pluginInstance: e.__instance });
-      s.observed.counts = { rawChildEvents: raw.length, dedupedChildEvents: deduped.length, rawStepEnded: rawEnded.length, dedupedStepEnded: ended.length, distinctPluginInstancesSeen: [...new Set((await host.rawEvents()).map(e => e.__instance))].length };
-      s.observed.rawStepEndedIdentity = rawEnded.map(idView);
-      s.observed.rawChildEventIdentity = raw.map(idView);
+      const accounting = await eventAccounting(host, childID);
+      s.observed.counts = accounting.counts;
+      s.observed.rawStepEndedIdentity = accounting.rawStepEndedIdentity;
       s.observed.stepEndedEvents = ended;
-      s.observed.childEventTypes = deduped.map(e => e.type);
+      s.observed.childEventTypes = (await host.events()).filter(e => e.data?.sessionID === childID).map(e => e.type);
       s.observed.storedChildTotals = { cost: stored.session.cost, tokens: stored.session.tokens };
       s.observed.catalogCost = target && { id: target.id, cost: target.cost };
       const data = obj(ended[0]?.data);
       const tokens = obj(data.tokens);
       const shape = ended.length > 0 && Object.hasOwn(data, "cost") && ["input", "output", "reasoning"].every(k => Object.hasOwn(tokens, k)) && ["read", "write"].every(k => Object.hasOwn(obj(tokens.cache), k));
       s.observed.derived = { events: ended.length, costType: typeof data.cost, costValue: data.cost, costPositive: typeof data.cost === "number" ? data.cost > 0 : undefined, tokenKeys: Object.keys(tokens), cacheKeys: Object.keys(obj(tokens.cache)) };
-      if (raw.length !== deduped.length) s.notes.push(`${raw.length - deduped.length} duplicate event line(s) were removed by id: the same host event reached the probe once per live plugin instance (see rawStepEndedIdentity[].pluginInstance).`);
+      if (accounting.counts.rawSessionEvents !== accounting.counts.dedupedSessionEvents) s.notes.push(`${accounting.counts.rawSessionEvents - accounting.counts.dedupedSessionEvents} duplicate event line(s) were removed by id (see S3b for the multi-instance case).`);
       if (!(typeof data.cost === "number" && data.cost > 0)) s.notes.push("cost is not > 0: the model has no catalog pricing here, so cost is a zero/unpriced value (hypothesis says that yields 0)");
-      s.verdict(shape, `${ended.length} session.step.ended event(s) for the child (${rawEnded.length} raw line(s)); cost=${JSON.stringify(data.cost)} tokens=${JSON.stringify(data.tokens)}`);
+      s.verdict(shape, `${ended.length} session.step.ended event(s) for the child (${accounting.counts.rawStepEnded} raw line(s) from ${accounting.counts.pluginInstancesDeliveringStepEnded} plugin instance(s)); cost=${JSON.stringify(data.cost)} tokens=${JSON.stringify(data.tokens)}`);
     });
   }, 240_000);
 
-  itLive("S4: the real host catalog (live, opt-in) lists variants[].id, cost and limit.context for the candidate models", async () => {
-    await spike("S4", "The host model catalog (GET /api/model, the call behind ctx.model.list) of an already-live location of the user's running service exposes variants[].id in the host's effort order, cost (all tiers) and limit for anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, opencode/deepseek-v4.1-flash and every gpt-6-luna* model (including gpt-6-luna-fast, the @fast tier model).", async (s) => {
-      s.observed.source = "the user's running OpenCode v2 service: read-only GET /api/debug/location, /api/model and /api/provider for an ALREADY-LIVE location; no session, no generation, no config write";
-      const live = await liveService();
-      if (!live) { s.notes.push("ABORTED: the user's service.json does not exist, so there is no live service with the real config"); s.verdict(false, "no live real-config host"); return; }
+  it("S2-agent-native: with the native permission defaults, an agent switch on resume changes the tools and the system prompt", async () => {
+    await spike("S2-agent-native", "On a host with NO permission config (native agent defaults), resuming a child with a different agent changes the tool list and the system prompt the provider receives: explore is read-only (no edit/write/shell), general has the full set; a resume that only changes the variant changes neither.", async (s, host) => {
+      const { target } = await pickTarget(host);
+      if (!target) throw new Error("no catalog model with variants");
+      const low = target.variants[0]!.id;
+      const high = target.variants.at(-1)!.id;
+      const base = `${target.providerID}/${target.id}`;
+      s.observed.permissionConfig = "none: opencode.json has no permissions key, so every agent keeps its native permission defaults; the root session only carries a session-level allow for subagent";
+      s.observed.nativeAgentPermissions = Object.fromEntries((await host.client.agent.list()).data.filter(a => ["build", "general", "explore"].includes(a.id)).map(a => [a.id, { mode: a.mode, permissions: a.permissions }]));
+      const rootID = await host.root_("S2-agent-native root");
+      const first = await host.dispatch(rootID, { agent: "general", description: "S2n general start", prompt: "S2n first prompt", model: `${base}#${low}` });
+      const childID = first.childID;
+      const one = await childState(host, childID);
+      await host.dispatch(rootID, { agent: "general", description: "S2n general variant bump", prompt: "S2n second prompt", sessionID: childID, model: `${base}#${high}` });
+      const two = await childState(host, childID);
+      await host.dispatch(rootID, { agent: "explore", description: "S2n switch to explore", prompt: "S2n third prompt", sessionID: childID });
+      const three = await childState(host, childID);
+      await host.dispatch(rootID, { agent: "general", description: "S2n switch back to general", prompt: "S2n fourth prompt", sessionID: childID });
+      const four = await childState(host, childID);
+      const primary = host.provider.captures.filter(c => c.session === childID && c.kind === "primary");
+      s.observed.storedAgentAfterEachStep = [one, two, three, four].map(x => x.session.agent);
+      s.observed.requests = primary.map(c => ({ ...requestView(c), lastText: c.lastText.slice(-30) }));
+      const control = agentSwitchDiff(primary[0], primary[1]);
+      const toExplore = agentSwitchDiff(primary[1], primary[2]);
+      const backToGeneral = agentSwitchDiff(primary[2], primary[3]);
+      s.observed.diffs = { controlVariantBumpOnly: control, generalToExplore: toExplore, exploreBackToGeneral: backToGeneral };
+      const exploreTools = primary[2]?.toolNames ?? [];
+      const generalTools = primary[1]?.toolNames ?? [];
+      const writeLike = ["edit", "write", "shell"];
+      s.observed.derived = { exploreOffersEditWriteShell: writeLike.filter(t => exploreTools.includes(t)), generalOffersEditWriteShell: writeLike.filter(t => generalTools.includes(t)), toolsChangedOnSwitchToExplore: toExplore.toolsChanged, systemPromptChangedOnSwitchToExplore: toExplore.systemPromptChanged, toolsRestoredOnSwitchBackToGeneral: backToGeneral.toolsChanged && backToGeneral.onlyAfter.length > 0, systemPromptRestoredOnSwitchBack: backToGeneral.systemPromptChanged && primary[3]?.systemSha256 === primary[1]?.systemSha256 };
+      s.notes.push("Evidence for QA-0P-33: the earlier allow-all S2 host offered identical tools to general and explore; this host keeps the native agent permission defaults.");
+      const stored = [one, two, three, four].map(x => x.session.agent).join() === "general,general,explore,general";
+      s.verdict(primary.length === 4 && stored && !control.toolsChanged && !control.systemPromptChanged && toExplore.toolsChanged && toExplore.systemPromptChanged && writeLike.every(t => !exploreTools.includes(t)) && writeLike.every(t => generalTools.includes(t)), `stored agents ${[one, two, three, four].map(x => x.session.agent).join("->")}; general->explore: tools ${toExplore.toolCountBefore}->${toExplore.toolCountAfter} (changed ${toExplore.toolsChanged}), system prompt changed ${toExplore.systemPromptChanged}; control variant bump: tools changed ${control.toolsChanged}, system changed ${control.systemPromptChanged}; explore offers edit/write/shell: ${JSON.stringify(writeLike.filter(t => exploreTools.includes(t)))}`);
+    }, "native");
+  }, 300_000);
+  it("S4: the real host catalog (live, opt-in) lists variants[].id, cost and limit.context for the candidate models", async ctx => {
+    const hypothesis = "The host model catalog (GET /api/model, the call behind ctx.model.list) of an already-live location of the user's running service exposes variants[].id in the host's effort order, cost (all tiers) and limit for anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, opencode/deepseek-v4.1-flash and every gpt-6-luna* model (including gpt-6-luna-fast, the @fast tier model).";
+    // A gate that is off, a missing service or a preferred location that is not live is a SKIP (recorded in S4.json), never a failure.
+    const skipS4 = async (reason: string, observed: Obj = {}): Promise<never> => {
+      await recordSkip("S4", hypothesis, reason, observed, !LIVE);
+      return ctx.skip(`skipped: ${reason}`);
+    };
+    if (!LIVE) return skipS4("RUN_OC_SPIKE_LIVE_CATALOG is not 1, so the read-only live catalog check is not enabled");
+    const live = await liveService();
+    if (!live) return skipS4("the user's service.json does not exist, so there is no live service with the real config");
+    const before = await live.locations();
+    const preferred = ["D:\\git\\opencode-model-router", "D:\\git\\Claude-model-router"];
+    const chosen = before.find(l => preferred.some(p => samePath(p, l.directory)));
+    if (!chosen) return skipS4(`neither ${preferred.join(" nor ")} is a live location, and reading another location could start a plugin instance on the user's service`, { liveLocations: { count: before.length, digest: setDigest(before) } });
+    await spike("S4", hypothesis, async (s) => {
+      s.observed.source = "the user's running OpenCode v2 service: read-only GET /api/debug/location, /api/model and /api/provider for an ALREADY-LIVE location; no POST, no session, no generation, no config write";
       s.observed.serviceVersion = live.version;
-      const before = await live.locations();
-      const preferred = ["D:\\git\\opencode-model-router", "D:\\git\\Claude-model-router"];
-      const chosen = before.find(l => preferred.some(p => samePath(p, l.directory)));
       s.observed.liveLocationsBefore = { count: before.length, digest: setDigest(before) };
-      if (!chosen) { s.notes.push(`ABORTED: neither ${preferred.join(" nor ")} is a live location, and reading another location could start a plugin instance on the user's service`); s.verdict(false, "no preferred live location"); return; }
       s.observed.readLocation = chosen.directory;
-      const models = await live.call("GET", "/api/model", { directory: chosen.directory });
-      const providers = await live.call("GET", "/api/provider", { directory: chosen.directory });
+      const models = await live.get("/api/model", { directory: chosen.directory });
+      const providers = await live.get("/api/provider", { directory: chosen.directory });
       const after = await live.locations();
       const unchanged = JSON.stringify(locationSet(before)) === JSON.stringify(locationSet(after));
       s.observed.liveLocationsAfter = { count: after.length, digest: setDigest(after), setUnchanged: unchanged };
@@ -837,12 +921,11 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       s.observed.variantsOutOfHostEffortOrder = outOfOrder;
       const complete = recorded.every(m => Array.isArray(m.variants) && Array.isArray(m.cost) && typeof m.limit.context === "number");
       if (s.observed.absentExact && (s.observed.absentExact as string[]).length > 0) s.notes.push("Some requested ids are absent under that exact provider/id; see sameIdOtherProviders for where the host actually lists them.");
-      if (unpriced.length > 0) s.notes.push(`UNPRICED (cost list empty or every field 0): ${[...new Set(unpriced)].join(", ")}. For these the host reports cost 0 per step; a router must not treat 0 as cheap.`);
+      if (unpriced.length > 0) s.notes.push(`UNPRICED (catalog cost list empty or every field 0): ${[...new Set(unpriced)].join(", ")}. This is INFERRED from the catalog prices only: the harness ran no step on these models, so it did not observe a reported cost. A router must not treat a price of 0 as cheap.`);
       if (luna.filter(m => m.id === "gpt-6-luna-fast").length === 0) s.notes.push("gpt-6-luna-fast is not listed by any provider at this location.");
       s.verdict(models.status === 200 && present.length > 0 && complete && outOfOrder.length === 0 && unchanged, `${present.length}/${wanted.length} requested ids exist under that exact provider/id (${present.join(", ")}); absent: ${(s.observed.absentExact as string[]).join(", ") || "none"}; gpt-6-luna* entries: ${luna.map(m => `${m.providerID}/${m.id}`).join(", ") || "none"}; every recorded entry exposes variants[], cost[] and limit.context; variants in host effort order: ${outOfOrder.length === 0}; live location set unchanged by the read: ${unchanged}`, present.length < wanted.length);
-    }, false);
+    }, "none");
   }, 120_000);
-
   it("S5: ctx.generate.text from a plugin (and POST /api/experimental/generate) returns non-empty text for the scripted model", async () => {
     await spike("S5", "A plugin calling ctx.generate.text({ prompt, model }) (the PLUGIN path) returns non-empty text using the scripted provider model; the raw POST /api/experimental/generate route (which the host source runs against the server base-configuration location) is recorded as a secondary path, including what a cold base location does.", async (s, host) => {
       const rootID = await host.root_("S5 root");
@@ -913,28 +996,42 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       };
       if (e1.ok !== true) s.notes.push(`The plugin-path cold call failed: ${JSON.stringify(e1.error ?? e1)}`);
       if (e2First.status !== 200 || e3First.status !== 200) s.notes.push(`Raw route, cold base location: ${e3First.status} ${String(e3First.rawBody)}. Retry after a catalog read at the base location (the read took ${catalogReadMs} ms): ${e3Retry.status}. Without any catalog read: immediate retry ${e2Immediate.status}, retry after the same ${catalogReadMs} ms pause ${e2Retry.status}.`);
-      // Optional live check (opt-in): ONE <=10-token generate call through the user's running service, only if its base location is already live.
-      if (LIVE) {
-        const live = await liveService();
-        if (!live) s.observed.live = { skipped: "no live service (service.json missing)" };
-        else {
-          const baseDir = path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "opencode");
-          const before = await live.locations();
-          const baseIsLive = before.some(l => samePath(l.directory, baseDir));
-          if (!baseIsLive) s.observed.live = { skipped: "skipped: base location not live, would start a plugin instance", baseLocationChecked: baseDir, liveLocationCount: before.length, liveLocationsDigest: setDigest(before) };
-          else {
-            const request = { prompt: "Reply with the single word: ok", model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" } };
-            const result = await live.call("POST", "/api/experimental/generate", { body: request });
-            const after = await live.locations();
-            s.observed.live = { baseLocationChecked: baseDir, request, status: result.status, latencyMs: result.latencyMs, rawBody: result.text, credentialsUnavailable503: result.status === 503 || /credentials are unavailable/i.test(result.text), liveLocationSetUnchanged: JSON.stringify(locationSet(before)) === JSON.stringify(locationSet(after)) };
-          }
-        }
-      }
+      s.observed.liveGenerate = "not performed: this harness makes no generate or model call against the user's running service (the live-service check is deferred to A4)";
       if (e1.ok === true && !e1Cold.baseLocationLiveAfterEvict) s.notes.push(`The plugin path succeeded on its FIRST call while the base config location was not live before it (it was ${e1LiveAfter ? "live" : "still not live"} right after the call), whereas the raw route returned the cold 400 from the same state. It was issued from the plugin instance of ${String(e1.instance)}.`);
-      s.verdict(pluginOk && rawOk, `plugin path: cold ${e1.ok === true ? "ok" : "failed"}, warm ${pluginWarm.map(r => `${r.ok === true ? "ok" : "failed"} ${JSON.stringify(obj(r.result).text)} ${r.latencyMs}ms`).join(" / ")}; raw route: cold ${e2First.status}, retry without catalog read ${e2Retry.status}, retry after catalog read ${e3Retry.status}, warm ${rawWarm.map(r => r.status).join(",")}${LIVE ? `; live: ${JSON.stringify(obj(s.observed.live).skipped ?? obj(s.observed.live).status)}` : ""}`);
+      s.verdict(pluginOk && rawOk, `plugin path: cold ${e1.ok === true ? "ok" : "failed"}, warm ${pluginWarm.map(r => `${r.ok === true ? "ok" : "failed"} ${JSON.stringify(obj(r.result).text)} ${r.latencyMs}ms`).join(" / ")}; raw route: cold ${e2First.status}, retry without catalog read ${e2Retry.status}, retry after catalog read ${e3Retry.status}, warm ${rawWarm.map(r => r.status).join(",")}`);
     });
   }, 300_000);
 
+  it("S3b: with several live plugin instances the same step.ended is logged once per instance (raw vs deduplicated)", async () => {
+    await spike("S3b", "After S5 has made the server base-configuration location live there are >=2 plugin instances; one child dispatch then yields ONE host session.step.ended event (one id) that the probe logs once per delivering instance, and de-duplication by event id collapses the raw lines to exactly that one event.", async (s, host) => {
+      const baseLive = async () => (await host.client.debug.location.list()).some(l => samePath(l.directory, host.configDir));
+      s.observed.baseLocationLiveBefore = await baseLive();
+      if (!(await baseLive())) {
+        // S5 normally leaves it live; if it does not, a catalog read at that location makes it live.
+        const catalogUrl = new URL("/api/model", host.baseUrl);
+        catalogUrl.searchParams.set("location[directory]", host.configDir);
+        await waitFor("base-config catalog to list the scripted model", async () => {
+          const response = await fetch(catalogUrl, { headers: { authorization: host.authorization }, signal: AbortSignal.timeout(30_000) });
+          return ((obj(JSON.parse(await response.text())).data ?? []) as ModelInfo[]).some(m => m.providerID === ROOT_MODEL.providerID && m.id === ROOT_MODEL.id && m.enabled) ? true : undefined;
+        }, 30_000, 250);
+        s.notes.push("The base config location was not live when S3b started; it was made live by a catalog read.");
+      }
+      s.observed.liveLocationsOfTheIsolatedHost = (await host.client.debug.location.list()).map(l => l.directory);
+      const rootID = await host.root_("S3b root");
+      const { childID } = await host.dispatch(rootID, { agent: "general", description: "S3b dispatch", prompt: "S3b child task" });
+      await waitFor("session.step.ended lines for the child", async () => (await host.rawEvents()).some(e => e.type === "session.step.ended" && e.data?.sessionID === childID) ? true : undefined, 20_000);
+      await delay(2_000); // let every plugin instance deliver
+      const accounting = await eventAccounting(host, childID);
+      s.observed.counts = accounting.counts;
+      s.observed.rawStepEndedIdentity = accounting.rawStepEndedIdentity;
+      s.observed.dedupedStepEnded = accounting.dedupedStepEnded;
+      const ids = new Set(accounting.rawStepEndedIdentity.map(e => e.id));
+      const instances = new Set(accounting.rawStepEndedIdentity.map(e => e.pluginInstanceId));
+      s.observed.derived = { distinctEventIds: ids.size, distinctDeliveringPluginInstances: instances.size, linesPerDeliveringInstance: Object.fromEntries([...instances].map(i => [String(i), accounting.rawStepEndedIdentity.filter(e => e.pluginInstanceId === i).length])) };
+      if (accounting.counts.rawStepEnded > accounting.counts.dedupedStepEnded) s.notes.push(`${accounting.counts.rawStepEnded} raw session.step.ended lines carry ${ids.size} distinct event id(s): a consumer that subscribes in every plugin instance sees each event once per instance and must de-duplicate by event id.`);
+      s.verdict(accounting.counts.dedupedStepEnded === 1 && ids.size === 1 && instances.size >= 2 && accounting.counts.rawStepEnded === instances.size, `${accounting.counts.rawStepEnded} raw step.ended line(s), ${accounting.counts.dedupedStepEnded} deduplicated, ${ids.size} distinct event id(s), delivered by ${instances.size} plugin instance(s) (${accounting.counts.pluginInstancesStartedDuringRun} instance(s) started during the run)`);
+    });
+  }, 240_000);
   it("S6: switching a child to a smaller-context model and sending an oversize prompt triggers compaction or surfaces an error", async () => {
     await spike("S6", "Resuming a child with a model whose limit.context is far below the prompt size results in a host reaction (compaction request/message or a surfaced error) rather than silently sending the oversize request unchanged.", async (s, host) => {
       const small = (await host.client.model.list({ location: { directory: host.project } })).data.find(m => m.providerID === "anthropic" && m.id === "spike-small");
@@ -964,21 +1061,30 @@ d("routing spikes S1-S6 on the real OpenCode v2 host", () => {
       const compaction = kinds.includes("compaction") || after.messageTypes.includes("compaction") || childEvents.some(e => /compact/.test(e.type));
       const error = second.after.status === "error" || after.session.outcome === "failed" || childEvents.some(e => /(step|execution)\.failed/.test(e.type));
       const oversize = childCaptures.filter(c => c.kind === "primary" && c.inputTokens > SMALL_CONTEXT);
+      const accounting = await eventAccounting(host, childID);
+      s.observed.eventAccounting = { ...accounting.counts, rawStepEndedIdentity: accounting.rawStepEndedIdentity };
+      s.observed.inputTokensNote = "childRequests[].inputTokens is an ESTIMATE made by the scripted provider (request body length / 4), not a host or provider measurement.";
       s.observed.derived = { compaction, error, requestKinds: kinds, oversizePrimaryRequestsSent: oversize.length };
       if (!compaction && !error) s.notes.push("Neither compaction nor an error was observed: the host sent the oversize request to the provider unchanged.");
-      if (compaction && oversize.length > 0) s.notes.push(`Compaction ran BEFORE the primary request, but it did not make the request fit: ${oversize.length} primary request(s) of ${oversize.map(c => c.inputTokens).join("/")} tokens still reached the provider against limit.context ${SMALL_CONTEXT} (the oversize user message is kept as recent context).`);
-      s.verdict(compaction || error, `compaction=${compaction} errorSurfaced=${error}; request kinds ${JSON.stringify(kinds)}; ${oversize.length} oversize primary request(s) (> ${SMALL_CONTEXT} tokens) reached the provider`);
+      if (compaction && oversize.length > 0) s.notes.push(`Compaction ran BEFORE the primary request, but it did not make the request fit: ${oversize.length} primary request(s) of ≈${oversize.map(c => fmtTokens(c.inputTokens)).join(" / ")} tokens (estimated by the scripted provider from body length) still reached the provider against limit.context ${fmtTokens(SMALL_CONTEXT)} (the oversize user message is kept as recent context).`);
+      s.verdict(compaction || error, `compaction=${compaction} errorSurfaced=${error}; request kinds ${JSON.stringify(kinds)}; ${oversize.length} primary request(s) estimated above ${fmtTokens(SMALL_CONTEXT)} tokens (scripted provider estimate from body length) reached the provider`);
     });
   }, 300_000);
 
-  it("cleanup: no orphan sessions remain; the host process tree is killed and its port is closed", async () => {
-    await spike("cleanup", "After every spike swept its sessions, the scripted host has no session left, and tearing it down (taskkill /T /F on Windows) leaves its port closed.", async (s) => {
-      const host = await getHost();
-      const remaining = (await host.everySession()).map(sessionView);
-      s.observed.remainingSessions = remaining;
-      const teardown = await host.stop();
-      s.observed.teardown = teardown;
-      s.verdict(remaining.length === 0 && teardown.hostPortClosed && teardown.providerStopped, `${remaining.length} session(s) remain; ${teardown.method} (exit ${String(teardown.exitCode)}); host port ${teardown.hostPort} closed=${teardown.hostPortClosed}; provider stopped=${teardown.providerStopped}`);
-    }, false);
-  }, 90_000);
-});
+  it("cleanup: no orphan sessions remain; every host process tree is killed and its port is closed", async () => {
+    await spike("cleanup", "After every spike swept its sessions, each scripted host has no session left, and tearing it down (taskkill /T /F on Windows) leaves its port closed.", async (s) => {
+      const results: Obj[] = [];
+      for (const kind of ["main", "native"] as const) {
+        const started = hostPromises[kind];
+        if (!started) { results.push({ host: kind, started: false }); continue; }
+        const host = await started;
+        const remaining = (await host.everySession()).map(sessionView);
+        const teardown = await host.stop();
+        results.push({ host: kind, started: true, remainingSessions: remaining, teardown });
+      }
+      s.observed.hosts = results;
+      const started = results.filter(r => r.started === true);
+      const ok = started.length > 0 && started.every(r => (r.remainingSessions as unknown[]).length === 0 && obj(r.teardown).hostPortClosed === true && obj(r.teardown).providerStopped === true);
+      s.verdict(ok, started.map(r => `${String(r.host)}: ${(r.remainingSessions as unknown[]).length} session(s) remain; ${String(obj(r.teardown).method)} (exit ${String(obj(r.teardown).exitCode)}); port ${String(obj(r.teardown).hostPort)} closed=${String(obj(r.teardown).hostPortClosed)}; provider stopped=${String(obj(r.teardown).providerStopped)}`).join(" | "));
+    }, "none");
+  }, 90_000);});

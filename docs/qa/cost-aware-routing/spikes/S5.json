@@ -1,17 +1,17 @@
 {
   "spike": "S5",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
-  "recordedAt": "2026-10-06T04:52:12.825Z",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:27.067Z",
   "harness": {
     "file": "test/smoke/routing-spikes.smoke.test.ts",
-    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
-    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
     "uncommittedChanges": true
   },
   "hypothesis": "A plugin calling ctx.generate.text({ prompt, model }) (the PLUGIN path) returns non-empty text using the scripted provider model; the raw POST /api/experimental/generate route (which the host source runs against the server base-configuration location) is recorded as a secondary path, including what a cold base location does.",
   "observed": {
-    "baseConfigLocation": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\config\\opencode",
+    "baseConfigLocation": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\config\\opencode",
     "baseLocationLiveAtStart": false,
     "experiments": {
       "E1_pluginPathCold": {
@@ -26,7 +26,7 @@
           "result": {
             "text": "CHILD_OK"
           },
-          "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+          "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
         },
         "baseLocationLiveAfterPluginCall": false
       },
@@ -45,10 +45,10 @@
             }
           },
           "status": 400,
-          "latencyMs": 34,
+          "latencyMs": 33,
           "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
         },
-        "catalogReadMs": 261,
+        "catalogReadMs": 272,
         "retry": {
           "phase": "raw retry after catalog read",
           "request": {
@@ -78,7 +78,7 @@
             }
           },
           "status": 400,
-          "latencyMs": 27,
+          "latencyMs": 26,
           "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
         },
         "immediateRetry": {
@@ -91,11 +91,11 @@
             }
           },
           "status": 400,
-          "latencyMs": 3,
+          "latencyMs": 2,
           "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
         },
         "retryAfterSamePause": {
-          "phase": "raw retry after the same 261ms pause, no catalog read",
+          "phase": "raw retry after the same 272ms pause, no catalog read",
           "request": {
             "prompt": "S5 raw retry without catalog read",
             "model": {
@@ -107,18 +107,18 @@
           "latencyMs": 8,
           "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
         },
-        "pauseMs": 261
+        "pauseMs": 272
       }
     },
     "pluginPathWarm": [
       {
         "label": "plugin-warm-1",
         "ok": true,
-        "latencyMs": 9,
+        "latencyMs": 6,
         "result": {
           "text": "CHILD_OK"
         },
-        "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
       },
       {
         "label": "plugin-warm-2",
@@ -127,7 +127,7 @@
         "result": {
           "text": "CHILD_OK"
         },
-        "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project"
+        "instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
       }
     ],
     "rawRouteWarm": [
@@ -141,7 +141,7 @@
           }
         },
         "status": 200,
-        "latencyMs": 8,
+        "latencyMs": 7,
         "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
       },
       {
@@ -154,7 +154,7 @@
           }
         },
         "status": 200,
-        "latencyMs": 10,
+        "latencyMs": 15,
         "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
       }
     ],
@@ -177,7 +177,7 @@
         "status": 400
       },
       {
-        "phase": "raw retry after the same 261ms pause, no catalog read",
+        "phase": "raw retry after the same 272ms pause, no catalog read",
         "status": 200,
         "text": "CHILD_OK"
       },
@@ -235,35 +235,30 @@
       "rawRetryAfterSamePauseWithoutCatalogReadFixesCold": true,
       "rawRetryAfterCatalogReadFixesCold": true,
       "pluginWarmLatencyMs": [
-        9,
+        6,
         6
       ],
       "rawWarmLatencyMs": [
-        8,
-        10
+        7,
+        15
       ]
     },
-    "live": {
-      "skipped": "skipped: base location not live, would start a plugin instance",
-      "baseLocationChecked": "<home>\\.config\\opencode",
-      "liveLocationCount": 13,
-      "liveLocationsDigest": "edb028dccf0d41ef"
-    },
+    "liveGenerate": "not performed: this harness makes no generate or model call against the user's running service (the live-service check is deferred to A4)",
     "cleanup": {
       "removed": [
-        "ses_ef071e953ffewttDv1QMZlSBQA",
-        "ses_ef071ea42ffeIwUGZZ42YsACDg",
-        "ses_ef071efc1ffeLN5X91ZfUNuRZu",
-        "ses_ef071f133ffebyJcR3D3RUNWwq"
+        "ses_ef06220f7ffenwQ44AddPcfo1W",
+        "ses_ef06221d4ffe94ovXsfNgHk1aH",
+        "ses_ef062275effeKTeM1Pia8ngVAR",
+        "ses_ef06228cfffeTZTbVMJ6E5CzZ6"
       ],
       "errors": [],
       "orphans": []
     },
     "providerErrors": []
   },
-  "assertionResult": "PASS: plugin path: cold ok, warm ok \"CHILD_OK\" 9ms / ok \"CHILD_OK\" 6ms; raw route: cold 400, retry without catalog read 200, retry after catalog read 200, warm 200,200; live: \"skipped: base location not live, would start a plugin instance\"",
+  "assertionResult": "PASS: plugin path: cold ok, warm ok \"CHILD_OK\" 6ms / ok \"CHILD_OK\" 6ms; raw route: cold 400, retry without catalog read 200, retry after catalog read 200, warm 200,200",
   "notes": [
-    "Raw route, cold base location: 400 {\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}. Retry after a catalog read at the base location (the read took 261 ms): 200. Without any catalog read: immediate retry 400, retry after the same 261 ms pause 200.",
-    "The plugin path succeeded on its FIRST call while the base config location was not live before it (it was still not live right after the call), whereas the raw route returned the cold 400 from the same state. It was issued from the plugin instance of <home>\\AppData\\Local\\Temp\\omr-spikes-j1XBYQ\\project."
+    "Raw route, cold base location: 400 {\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}. Retry after a catalog read at the base location (the read took 272 ms): 200. Without any catalog read: immediate retry 400, retry after the same 272 ms pause 200.",
+    "The plugin path succeeded on its FIRST call while the base config location was not live before it (it was still not live right after the call), whereas the raw route returned the cold 400 from the same state. It was issued from the plugin instance of <home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project."
   ]
 }

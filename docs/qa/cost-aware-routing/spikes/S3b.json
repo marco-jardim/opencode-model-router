@@ -1,0 +1,103 @@
+{
+  "spike": "S3b",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:29.330Z",
+  "harness": {
+    "file": "test/smoke/routing-spikes.smoke.test.ts",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
+    "uncommittedChanges": true
+  },
+  "hypothesis": "After S5 has made the server base-configuration location live there are >=2 plugin instances; one child dispatch then yields ONE host session.step.ended event (one id) that the probe logs once per delivering instance, and de-duplication by event id collapses the raw lines to exactly that one event.",
+  "observed": {
+    "baseLocationLiveBefore": true,
+    "liveLocationsOfTheIsolatedHost": [
+      "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+      "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\config\\opencode"
+    ],
+    "counts": {
+      "rawSessionEvents": 22,
+      "dedupedSessionEvents": 11,
+      "rawStepEnded": 2,
+      "dedupedStepEnded": 1,
+      "pluginInstancesStartedDuringRun": 3,
+      "pluginInstancesDeliveringTheSessionsEvents": 2,
+      "pluginInstancesDeliveringStepEnded": 2
+    },
+    "rawStepEndedIdentity": [
+      {
+        "type": "session.step.ended",
+        "id": "evt_10f9de013001Nk0XabsdNAD268",
+        "location": {
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+        },
+        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+        "pluginInstanceId": "c834sk"
+      },
+      {
+        "type": "session.step.ended",
+        "id": "evt_10f9de013001Nk0XabsdNAD268",
+        "location": {
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+        },
+        "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\config\\opencode",
+        "pluginInstanceId": "6phjgu"
+      }
+    ],
+    "dedupedStepEnded": [
+      {
+        "id": "evt_10f9de013001Nk0XabsdNAD268",
+        "created": 1791263367188,
+        "type": "session.step.ended",
+        "durable": {
+          "aggregateID": "ses_ef0622025ffep1woheJk6RI7Uf",
+          "seq": 9,
+          "version": 1
+        },
+        "location": {
+          "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+        },
+        "data": {
+          "sessionID": "ses_ef0622025ffep1woheJk6RI7Uf",
+          "assistantMessageID": "msg_10f9ddff5001wD5rdwcFVIxByC",
+          "finish": "stop",
+          "rawFinish": "end_turn",
+          "cost": 0.026705,
+          "tokens": {
+            "input": 5316,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        },
+        "__instance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+        "__instanceId": "c834sk"
+      }
+    ],
+    "derived": {
+      "distinctEventIds": 1,
+      "distinctDeliveringPluginInstances": 2,
+      "linesPerDeliveringInstance": {
+        "c834sk": 1,
+        "6phjgu": 1
+      }
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef0622025ffep1woheJk6RI7Uf",
+        "ses_ef062205bffeVTNKx332DdZUVi"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: 2 raw step.ended line(s), 1 deduplicated, 1 distinct event id(s), delivered by 2 plugin instance(s) (3 instance(s) started during the run)",
+  "notes": [
+    "2 raw session.step.ended lines carry 1 distinct event id(s): a consumer that subscribes in every plugin instance sees each event once per instance and must de-duplicate by event id."
+  ]
+}

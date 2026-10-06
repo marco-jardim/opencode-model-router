@@ -1,12 +1,12 @@
 {
   "spike": "S2",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
-  "recordedAt": "2026-10-06T04:52:08.161Z",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:19.413Z",
   "harness": {
     "file": "test/smoke/routing-spikes.smoke.test.ts",
-    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
-    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
     "uncommittedChanges": true
   },
   "hypothesis": "A subagent call with sessionID + model '<same model>#<higher variant>' switches the stored child's variant while its history grows; a further call with a different agent switches the stored agent.",
@@ -25,8 +25,8 @@
     },
     "afterFirstDispatch": {
       "session": {
-        "id": "ses_ef071fe37ffedG7BPKQkX2Q50U",
-        "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
+        "id": "ses_ef062422bffemMTvhksRrPABs5",
+        "parentID": "ses_ef062425effev9JWtKOOs9th2p",
         "agent": "general",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -56,8 +56,8 @@
     },
     "afterVariantResume": {
       "session": {
-        "id": "ses_ef071fe37ffedG7BPKQkX2Q50U",
-        "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
+        "id": "ses_ef062422bffemMTvhksRrPABs5",
+        "parentID": "ses_ef062425effev9JWtKOOs9th2p",
         "agent": "general",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -91,8 +91,8 @@
     },
     "afterAgentResume": {
       "session": {
-        "id": "ses_ef071fe37ffedG7BPKQkX2Q50U",
-        "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
+        "id": "ses_ef062422bffemMTvhksRrPABs5",
+        "parentID": "ses_ef062425effev9JWtKOOs9th2p",
         "agent": "explore",
         "model": {
           "id": "claude-sonnet-5-5",
@@ -143,24 +143,24 @@
           "agent": "general",
           "description": "S2 resume variant",
           "prompt": "S2 second prompt",
-          "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+          "sessionID": "ses_ef062422bffemMTvhksRrPABs5",
           "model": "anthropic/claude-sonnet-5-5#max"
         },
         "completed",
         {
           "output": {
-            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+            "sessionID": "ses_ef062422bffemMTvhksRrPABs5",
             "status": "completed",
             "output": "CHILD_OK"
           },
           "content": [
             {
               "type": "text",
-              "text": "<subagent sessionID=\"ses_ef071fe37ffedG7BPKQkX2Q50U\" state=\"completed\">\nCHILD_OK\n</subagent>"
+              "text": "<subagent sessionID=\"ses_ef062422bffemMTvhksRrPABs5\" state=\"completed\">\nCHILD_OK\n</subagent>"
             }
           ],
           "metadata": {
-            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+            "sessionID": "ses_ef062422bffemMTvhksRrPABs5",
             "status": "completed"
           }
         }
@@ -170,49 +170,39 @@
           "agent": "explore",
           "description": "S2 resume agent",
           "prompt": "S2 third prompt",
-          "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U"
+          "sessionID": "ses_ef062422bffemMTvhksRrPABs5"
         },
         "completed",
         {
           "output": {
-            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+            "sessionID": "ses_ef062422bffemMTvhksRrPABs5",
             "status": "completed",
             "output": "CHILD_OK"
           },
           "content": [
             {
               "type": "text",
-              "text": "<subagent sessionID=\"ses_ef071fe37ffedG7BPKQkX2Q50U\" state=\"completed\">\nCHILD_OK\n</subagent>"
+              "text": "<subagent sessionID=\"ses_ef062422bffemMTvhksRrPABs5\" state=\"completed\">\nCHILD_OK\n</subagent>"
             }
           ],
           "metadata": {
-            "sessionID": "ses_ef071fe37ffedG7BPKQkX2Q50U",
+            "sessionID": "ses_ef062422bffemMTvhksRrPABs5",
             "status": "completed"
           }
         }
       ]
     },
     "sameChildEverywhere": [
-      "ses_ef071fe37ffedG7BPKQkX2Q50U",
-      "ses_ef071fe37ffedG7BPKQkX2Q50U",
-      "ses_ef071fe37ffedG7BPKQkX2Q50U"
+      "ses_ef062422bffemMTvhksRrPABs5",
+      "ses_ef062422bffemMTvhksRrPABs5",
+      "ses_ef062422bffemMTvhksRrPABs5"
     ],
     "providerCapturesForChild": [
       {
-        "model": "claude-sonnet-5-5",
-        "catalogModel": "anthropic/claude-sonnet-5-5#low",
-        "agent": "general",
         "kind": "primary",
-        "outputConfig": {
-          "effort": "low"
-        },
-        "thinking": {
-          "type": "adaptive",
-          "display": "summarized",
-          "block_binding": {
-            "prefix_mismatch_behavior": "drop_block"
-          }
-        },
+        "agent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "wireModel": "claude-sonnet-5-5",
         "toolCount": 12,
         "toolNames": [
           "edit",
@@ -228,23 +218,25 @@
           "write",
           "execute"
         ],
+        "systemSha256": "a3533bc7b3e244fbf88889c8f4c84a185c6c65415d272693bdf6b712f5050015",
+        "systemChars": 7968,
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
         "lastText": "You are a subagent spawned by another session.\nS2 first prompt"
       },
       {
-        "model": "claude-sonnet-5-5",
-        "catalogModel": "anthropic/claude-sonnet-5-5#max",
-        "agent": "general",
         "kind": "primary",
-        "outputConfig": {
-          "effort": "low"
-        },
-        "thinking": {
-          "type": "adaptive",
-          "display": "summarized",
-          "block_binding": {
-            "prefix_mismatch_behavior": "drop_block"
-          }
-        },
+        "agent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
         "toolCount": 12,
         "toolNames": [
           "edit",
@@ -260,23 +252,25 @@
           "write",
           "execute"
         ],
+        "systemSha256": "a3533bc7b3e244fbf88889c8f4c84a185c6c65415d272693bdf6b712f5050015",
+        "systemChars": 7968,
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
         "lastText": "S2 second prompt"
       },
       {
-        "model": "claude-sonnet-5-5",
-        "catalogModel": "anthropic/claude-sonnet-5-5#max",
-        "agent": "explore",
         "kind": "primary",
-        "outputConfig": {
-          "effort": "low"
-        },
-        "thinking": {
-          "type": "adaptive",
-          "display": "summarized",
-          "block_binding": {
-            "prefix_mismatch_behavior": "drop_block"
-          }
-        },
+        "agent": "explore",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
         "toolCount": 12,
         "toolNames": [
           "edit",
@@ -292,12 +286,28 @@
           "write",
           "execute"
         ],
+        "systemSha256": "9c5b5a5e35d64541a3baeabd5b3e57cadb5790265f14872e14d9ff0e201d797f",
+        "systemChars": 6982,
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
         "lastText": "S2 third prompt"
       }
     ],
     "agentSwitchTools": {
+      "permissionConfig": "global allow-all (main fixture host)",
       "requestAfterVariantResume": {
+        "kind": "primary",
         "agent": "general",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
         "toolCount": 12,
         "toolNames": [
           "edit",
@@ -312,10 +322,15 @@
           "websearch",
           "write",
           "execute"
-        ]
+        ],
+        "systemSha256": "a3533bc7b3e244fbf88889c8f4c84a185c6c65415d272693bdf6b712f5050015",
+        "systemChars": 7968
       },
       "requestAfterAgentSwitch": {
+        "kind": "primary",
         "agent": "explore",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "wireModel": "claude-sonnet-5-5",
         "toolCount": 12,
         "toolNames": [
           "edit",
@@ -330,10 +345,16 @@
           "websearch",
           "write",
           "execute"
-        ]
+        ],
+        "systemSha256": "9c5b5a5e35d64541a3baeabd5b3e57cadb5790265f14872e14d9ff0e201d797f",
+        "systemChars": 6982
       },
-      "onlyUnderGeneral": [],
-      "onlyUnderExplore": []
+      "toolsChanged": false,
+      "systemPromptChanged": true,
+      "toolCountBefore": 12,
+      "toolCountAfter": 12,
+      "onlyBefore": [],
+      "onlyAfter": []
     },
     "checks": {
       "variantOk": true,
@@ -398,8 +419,8 @@
       ],
       "secondChildStored": {
         "session": {
-          "id": "ses_ef071fc8affe5fDmd4SV8pny99",
-          "parentID": "ses_ef071fe67ffeyE8IWzsOpAOLVg",
+          "id": "ses_ef062400affepMYlF5CNluthX2",
+          "parentID": "ses_ef062425effev9JWtKOOs9th2p",
           "agent": "general",
           "model": {
             "id": "claude-sonnet-5-5",
@@ -442,9 +463,9 @@
     },
     "cleanup": {
       "removed": [
-        "ses_ef071fc8affe5fDmd4SV8pny99",
-        "ses_ef071fe37ffedG7BPKQkX2Q50U",
-        "ses_ef071fe67ffeyE8IWzsOpAOLVg"
+        "ses_ef062400affepMYlF5CNluthX2",
+        "ses_ef062422bffemMTvhksRrPABs5",
+        "ses_ef062425effev9JWtKOOs9th2p"
       ],
       "errors": [],
       "orphans": []
@@ -453,7 +474,8 @@
   },
   "assertionResult": "PASS: variant low->max (wanted low->max); messages 3->7->11; agent general->general->explore",
   "notes": [
-    "Under this fixture permission config (global allow-all) the request carries the SAME tool list for agent general and agent explore: switching the agent did not change the tools the provider is offered.",
+    "Under this host's global allow-all permission config the request carries the SAME tool list for agent general and agent explore; see S2-agent-native for the same switch with the native permission defaults.",
+    "The system prompt DID change on the agent switch (different SHA-256).",
     "After a same-model resume the TOP-LEVEL output_config.effort stays at the first request value; the new effort is delivered in-band as a {role:system, output_config:{effort}} message (observed.wireEffort[].inBandEfforts). The EFFECTIVE effort follows the stored variant.",
     "CAVEAT: the in-band {role:system, output_config:{effort}} message is how the host LOWERS an effort change for the Anthropic Messages protocol. It was observed against a scripted provider only; whether api.anthropic.com honours it was NOT verified. The host emits it only for same-model changes (to-llm-message.ts modelSwitched) and, per the host source, only for models that support effort updates: see the haiku case in S2b."
   ]

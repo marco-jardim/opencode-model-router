@@ -1,12 +1,12 @@
 {
   "spike": "S6",
   "host": "opencode v2.0.22 (native v2 plugin API)",
-  "runId": "697eba92-c808-4847-b5ee-c8a27e0e141e",
-  "recordedAt": "2026-10-06T04:52:16.289Z",
+  "runId": "14487af3-8e39-4c68-9580-2ada78ff2d00",
+  "recordedAt": "2026-10-06T05:09:32.710Z",
   "harness": {
     "file": "test/smoke/routing-spikes.smoke.test.ts",
-    "headSha": "b75fea9de799ba33789fcc35a07c743247e1d426",
-    "blobSha": "ea0ae580be66a9f6809a7ac23fa0641783d7930e",
+    "headSha": "1409f3adf34987631900a014d157ce5b329288b3",
+    "blobSha": "c6d20542e47922d8c36f6e189a6fdafe22a68252",
     "uncommittedChanges": true
   },
   "hypothesis": "Resuming a child with a model whose limit.context is far below the prompt size results in a host reaction (compaction request/message or a surfaced error) rather than silently sending the oversize request unchanged.",
@@ -38,8 +38,8 @@
     "smallContextTokens": 12000,
     "beforeResume": {
       "session": {
-        "id": "ses_ef071e815ffe4JjI1F1fmpSILO",
-        "parentID": "ses_ef071e853ffeuWYjUminUNHu7n",
+        "id": "ses_ef0621753ffeoNeaizpNtWc3um",
+        "parentID": "ses_ef062177dffe31sF9QADbnyngC",
         "agent": "general",
         "model": {
           "id": "claude-opus-4-7",
@@ -69,8 +69,8 @@
     },
     "afterResume": {
       "session": {
-        "id": "ses_ef071e815ffe4JjI1F1fmpSILO",
-        "parentID": "ses_ef071e853ffeuWYjUminUNHu7n",
+        "id": "ses_ef0621753ffeoNeaizpNtWc3um",
+        "parentID": "ses_ef062177dffe31sF9QADbnyngC",
         "agent": "general",
         "model": {
           "id": "spike-small",
@@ -115,25 +115,25 @@
     },
     "toolAfter": {
       "hook": "after",
-      "sessionID": "ses_ef071e853ffeuWYjUminUNHu7n",
-      "callID": "toolu_spike_94",
+      "sessionID": "ses_ef062177dffe31sF9QADbnyngC",
+      "callID": "toolu_spike_97",
       "agent": "build",
       "tool": "subagent",
       "status": "completed",
       "result": {
         "output": {
-          "sessionID": "ses_ef071e815ffe4JjI1F1fmpSILO",
+          "sessionID": "ses_ef0621753ffeoNeaizpNtWc3um",
           "status": "completed",
           "output": "CHILD_OK"
         },
         "content": [
           {
             "type": "text",
-            "text": "<subagent sessionID=\"ses_ef071e815ffe4JjI1F1fmpSILO\" state=\"completed\">\nCHILD_OK\n</subagent>"
+            "text": "<subagent sessionID=\"ses_ef0621753ffeoNeaizpNtWc3um\" state=\"completed\">\nCHILD_OK\n</subagent>"
           }
         ],
         "metadata": {
-          "sessionID": "ses_ef071e815ffe4JjI1F1fmpSILO",
+          "sessionID": "ses_ef0621753ffeoNeaizpNtWc3um",
           "status": "completed"
         }
       }
@@ -170,7 +170,7 @@
       {
         "type": "session.compaction.started",
         "data": {
-          "sessionID": "ses_ef071e815ffe4JjI1F1fmpSILO",
+          "sessionID": "ses_ef0621753ffeoNeaizpNtWc3um",
           "reason": "auto",
           "recent": "[User]: S6 oversize lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor ...[clipped, 72029 chars]"
         }
@@ -181,7 +181,7 @@
       {
         "type": "session.compaction.ended",
         "data": {
-          "sessionID": "ses_ef071e815ffe4JjI1F1fmpSILO",
+          "sessionID": "ses_ef0621753ffeoNeaizpNtWc3um",
           "reason": "auto",
           "model": {
             "id": "spike-small",
@@ -214,8 +214,8 @@
       {
         "type": "session.step.ended",
         "data": {
-          "sessionID": "ses_ef071e815ffe4JjI1F1fmpSILO",
-          "assistantMessageID": "msg_10f8e18c3001wRVAWPaiVpCZYL",
+          "sessionID": "ses_ef0621753ffeoNeaizpNtWc3um",
+          "assistantMessageID": "msg_10f9de967001DutWoRRi5GbKG8",
           "finish": "stop",
           "rawFinish": "end_turn",
           "cost": 0.116855,
@@ -237,6 +237,54 @@
         "type": "session.execution.succeeded"
       }
     ],
+    "eventAccounting": {
+      "rawSessionEvents": 48,
+      "dedupedSessionEvents": 24,
+      "rawStepEnded": 4,
+      "dedupedStepEnded": 2,
+      "pluginInstancesStartedDuringRun": 3,
+      "pluginInstancesDeliveringTheSessionsEvents": 2,
+      "pluginInstancesDeliveringStepEnded": 2,
+      "rawStepEndedIdentity": [
+        {
+          "type": "session.step.ended",
+          "id": "evt_10f9de8d6001gtEJz8bmOWf8Q7",
+          "location": {
+            "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+          },
+          "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+          "pluginInstanceId": "c834sk"
+        },
+        {
+          "type": "session.step.ended",
+          "id": "evt_10f9de8d6001gtEJz8bmOWf8Q7",
+          "location": {
+            "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+          },
+          "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\config\\opencode",
+          "pluginInstanceId": "6phjgu"
+        },
+        {
+          "type": "session.step.ended",
+          "id": "evt_10f9de989001xUwrQbsFUu0oaJ",
+          "location": {
+            "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+          },
+          "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project",
+          "pluginInstanceId": "c834sk"
+        },
+        {
+          "type": "session.step.ended",
+          "id": "evt_10f9de989001xUwrQbsFUu0oaJ",
+          "location": {
+            "directory": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\project"
+          },
+          "pluginInstance": "<home>\\AppData\\Local\\Temp\\omr-spikes-kuH9Jm\\config\\opencode",
+          "pluginInstanceId": "6phjgu"
+        }
+      ]
+    },
+    "inputTokensNote": "childRequests[].inputTokens is an ESTIMATE made by the scripted provider (request body length / 4), not a host or provider measurement.",
     "derived": {
       "compaction": true,
       "error": false,
@@ -248,16 +296,16 @@
     },
     "cleanup": {
       "removed": [
-        "ses_ef071e815ffe4JjI1F1fmpSILO",
-        "ses_ef071e853ffeuWYjUminUNHu7n"
+        "ses_ef0621753ffeoNeaizpNtWc3um",
+        "ses_ef062177dffe31sF9QADbnyngC"
       ],
       "errors": [],
       "orphans": []
     },
     "providerErrors": []
   },
-  "assertionResult": "PASS: compaction=true errorSurfaced=false; request kinds [\"compaction\",\"primary\"]; 1 oversize primary request(s) (> 12000 tokens) reached the provider",
+  "assertionResult": "PASS: compaction=true errorSurfaced=false; request kinds [\"compaction\",\"primary\"]; 1 primary request(s) estimated above 12 000 tokens (scripted provider estimate from body length) reached the provider",
   "notes": [
-    "Compaction ran BEFORE the primary request, but it did not make the request fit: 1 primary request(s) of 23346 tokens still reached the provider against limit.context 12000 (the oversize user message is kept as recent context)."
+    "Compaction ran BEFORE the primary request, but it did not make the request fit: 1 primary request(s) of ≈23 346 tokens (estimated by the scripted provider from body length) still reached the provider against limit.context 12 000 (the oversize user message is kept as recent context)."
   ]
 }
