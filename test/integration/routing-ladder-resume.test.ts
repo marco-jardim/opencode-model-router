@@ -14,7 +14,7 @@ import ModelRouterPlugin from "../../src/index";
 import { ResumeRejectedError, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath, type EnforcementConfig, type TierConfig } from "../../src/router/config";
 import { dispatchCount, lookupDispatch, resetDispatchRegistry } from "../../src/router/sessions";
-import { acquireOutcomes, makeKey } from "../../src/routing/outcomes";
+import { acquireOutcomes, makeKey, type DecisionRow, type VerdictRow } from "../../src/routing/outcomes";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import type { RunnerCatalogModel } from "../../src/escalate/resume";
 
@@ -264,6 +264,20 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
       expect(lookupDispatch("child-1")).toMatchObject({ step: "escalate", agent: "medium", tier: "medium", model: OPUS, variant: "high" });
     });
 
+    it("A17a: an escalation into a tier whose base the child already covered resumes it at the first rung above, with the new agent", async () => {
+      // Default budget (4 attempts, 4x): after two attempts on fast only one remains for the two tiers above, so the
+      // ladder escalates; `medium` is sonnet#medium, which fast already ran, so it is entered at `high` (carryVariant).
+      const t = await setup({ tiers: OWNER, routing: {}, verdicts: [false, false, true] });
+      const result = await t.run();
+      expect(result).toContain("[router ✓ verified:");
+      expect(t.runs.map((r) => [r.sid, r.agent, r.model?.modelID, r.model?.variant, r.resumeSessionID])).toEqual([
+        ["child-1", "fast", "claude-sonnet-5-5", "low", undefined],
+        ["child-1", "fast", "claude-sonnet-5-5", "medium", "child-1"],
+        ["child-1", "medium", "claude-sonnet-5-5", "high", "child-1"],
+      ]);
+      expect(lookupDispatch("child-1")).toMatchObject({ step: "escalate", agent: "medium", tier: "medium", variant: "high" });
+      expect(t.created).toEqual(["child-1"]);
+    });
     it("starts a fresh child over the threshold of the next model, and discards the old one before the next attempt", async () => {
       const t = await setup({
         tiers: { fast: { model: SONNET, variant: "xhigh", costRatio: 1 }, medium: { model: OPUS, variant: "high", costRatio: 5 } },
@@ -433,20 +447,20 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
       const bundle = acquireOutcomes({ dir: outcomes, tuning: {}, logger: { warn: () => undefined } });
       try {
         await bundle.flusher.flushNow();
-        const rows = (await bundle.persister.readRows()).rows as unknown as Array<Record<string, any>>;
-        const decisions = rows.filter((r) => r.kind === "decision");
+        const rows = (await bundle.persister.readRows()).rows;
+        const decisions = rows.filter((r): r is DecisionRow => r.kind === "decision");
         expect(decisions.map((r) => [r.step, r.resume, r.childSessionID, r.chosen.variant, r.mode, r.switched, r.best])).toEqual([
           ["dispatch", false, "child-1", "low", "shadow", false, null],
           ["variant", true, "child-1", "medium", "shadow", false, null],
         ]);
         expect(decisions[1]!.reason).toContain("D11 under-threshold");
         expect(decisions[0]!.decisionID).not.toBe(decisions[1]!.decisionID);
-        const verdicts = rows.filter((r) => r.kind === "verdict");
+        const verdicts = rows.filter((r): r is VerdictRow => r.kind === "verdict");
         expect(verdicts.map((r) => [r.step, r.verdict, r.decisionID])).toEqual([
           ["dispatch", "fail", decisions[0]!.decisionID],
           ["variant", "pass", decisions[1]!.decisionID],
         ]);
-        const cls = decisions[0]!.facts.class as string;
+        const cls = decisions[0]!.facts.class;
         const lowKey = makeKey(cls, { origin: "router", id: "fast" }, "anthropic", "claude-sonnet-5-5", "low");
         const mediumKey = makeKey(cls, { origin: "router", id: "fast" }, "anthropic", "claude-sonnet-5-5", "medium");
         expect(bundle.store.snapshot().entries[lowKey]?.counts).toMatchObject({ fail: 1, pass: 0 });

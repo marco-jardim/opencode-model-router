@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
+import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache } from "../../src/router/config";
 // These tests isolate model/gate clocks. The temp directories are not Git
 // checkouts; model the unavailable snapshot without introducing real processes
@@ -680,7 +681,7 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     const log: string[] = [];
     let producerRuns = 0;
     let ingest: { onStepEnded(event: unknown): Promise<void> } | undefined;
-    const hooks: any = await ModelRouterPlugin({
+    const hooks = await ModelRouterPlugin({
       directory: dir, worktree: dir,
       client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
       routerHost: "v2",
@@ -689,7 +690,7 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
       // ladder's resume decision (D11) reads the child's context from what the ingest saw.
       routerOnIngest: (created: typeof ingest) => { ingest = created; },
       routerChildRunner: {
-        run: async (request: any) => {
+        run: async (request: ChildSessionRequest) => {
           if (request.system !== undefined) {
             const sid = `grader-${sessionCounter++}`;
             await request.onCreated(sid);
@@ -703,15 +704,15 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
             await ingest?.onStepEnded({ id: `step-${sid}`, type: "session.step.ended", data: { sessionID: sid, finish: "stop", cost: 0, tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } } });
           }
           if (producerRuns === 2) {
-            await new Promise<void>((_resolve, reject) => request.signal.addEventListener("abort", () => { log.push(`aborted:${sid}`); reject(request.signal.reason); }, { once: true }));
+            await new Promise<void>((_resolve, reject) => request.signal?.addEventListener("abort", () => { log.push(`aborted:${sid}`); reject(request.signal?.reason); }, { once: true }));
           }
           return { sessionID: sid, text: "producer output" };
         },
         dispose: async (sid: string) => { log.push(`dispose:${sid}`); },
       },
-    } as any);
+    } as unknown as RouterPluginInput) as unknown as { tool: { delegate: { execute(args: Record<string, unknown>, ctx?: { sessionID?: string }): Promise<string> } }; dispose(): Promise<void> };
 
-    const pending: Promise<string> = hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    const pending = hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
     await vi.advanceTimersByTimeAsync(DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS + 1_000);
     const result = await pending;
     await hooks.dispose();

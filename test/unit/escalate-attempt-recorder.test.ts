@@ -16,6 +16,7 @@ import {
   acquireOutcomes,
   nodePersistDeps,
   type AcquireOutcomesOptions,
+  type DecisionRow,
   type FlushScheduler,
   type OutcomesBundle,
 } from "../../src/routing/outcomes";
@@ -55,7 +56,7 @@ interface Harness {
   readonly bundles: OutcomesBundle[];
   readonly outcomes: string;
   readonly acquire: (options: AcquireOutcomesOptions) => OutcomesBundle;
-  rows(): Promise<Array<Record<string, any>>>;
+  rows(): Promise<DecisionRow[]>;
 }
 
 function harness(): Harness {
@@ -80,7 +81,7 @@ function harness(): Harness {
       const bundle = bundles[0];
       if (bundle === undefined) throw new Error("no bundle");
       await bundle.flusher.flushNow();
-      return (await bundle.persister.readRows()).rows as unknown as Array<Record<string, any>>;
+      return (await bundle.persister.readRows()).rows.filter((row): row is DecisionRow => row.kind === "decision");
     },
   };
 }
