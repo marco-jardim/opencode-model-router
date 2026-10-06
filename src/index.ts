@@ -16,7 +16,7 @@ import {
   resolveDepthLimit,
   resolveRouting,
   routerStatusLines,
-  warnDeprecatedVerifyKeys,
+  warnConfigIssues,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
@@ -483,7 +483,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
 
-  warnDeprecatedVerifyKeys(cfg, logger);
+  warnConfigIssues(cfg, logger);
 
   // Fetch and normalize opencode's live provider/model catalog. Best-effort:
   // returns null when the client call fails, e.g. the server is not ready yet.
@@ -647,7 +647,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             let activeCfg = cfg;
             try {
               activeCfg = loadConfig(projectDir);
-              warnDeprecatedVerifyKeys(activeCfg, logger);
+              warnConfigIssues(activeCfg, logger);
             } catch {
               activeCfg = cfg;
             }
@@ -1124,7 +1124,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig(projectDir);
-        warnDeprecatedVerifyKeys(cfg, logger);
+        warnConfigIssues(cfg, logger);
       } catch {}
       try {
         sweepIdleStores();
@@ -1905,7 +1905,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (bypassed) return;
       try {
         cfg = loadConfig(projectDir); // Returns cache unless invalidated
-        warnDeprecatedVerifyKeys(cfg, logger);
+        warnConfigIssues(cfg, logger);
       } catch {
         // Use last known config if file read fails
       }
@@ -1995,7 +1995,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input.command === "tiers") {
         try {
           cfg = loadConfig(projectDir);
-          warnDeprecatedVerifyKeys(cfg, logger);
+          warnConfigIssues(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -2038,7 +2038,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input.command === "preset") {
         try {
           cfg = loadConfig(projectDir);
-          warnDeprecatedVerifyKeys(cfg, logger);
+          warnConfigIssues(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -2064,7 +2064,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input.command === "budget") {
         try {
           cfg = loadConfig(projectDir);
-          warnDeprecatedVerifyKeys(cfg, logger);
+          warnConfigIssues(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -2075,7 +2075,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input.command === "router") {
         try {
           cfg = loadConfig(projectDir);
-          warnDeprecatedVerifyKeys(cfg, logger);
+          warnConfigIssues(cfg, logger);
         } catch {}
         const args = (input.arguments ?? "").trim();
         const parts = args.split(/\s+/).filter(Boolean);

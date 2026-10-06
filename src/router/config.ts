@@ -2046,21 +2046,43 @@ function collectOverrideLayers(
   return layers;
 }
 
-/**
- * Notices already reported to the console, so a rebuild with the same files does
- * not repeat itself: a notice about a file is reported once per (file, text); one
- * about the merged config, once per config fingerprint.
- */
-const warnedNotices = new Set<string>();
+/** The notices of the build that produced each config object (the cache hands the same object back until a reload). */
+const noticesByConfig = new WeakMap<RouterConfig, readonly ConfigNotice[]>();
 
-function warnNoticesOnce(fingerprint: string, notices: readonly ConfigNotice[]): void {
-  for (const notice of notices) {
-    const key = `${notice.source ?? fingerprint}\n${notice.message}`;
-    if (warnedNotices.has(key)) continue;
-    if (warnedNotices.size >= 256) warnedNotices.clear();
-    warnedNotices.add(key);
-    console.warn(`[model-router] ${notice.message}`);
+/** Notice texts already logged in this process (bounded); see {@link warnConfigNotices}. */
+const loggedNoticeTexts = new Set<string>();
+
+/**
+ * Log, through the plugin logger, each notice of `cfg` whose text has not been
+ * logged yet in this process (QA-1.1-23). `config.ts` itself never writes
+ * notices to the console: `console.warn` from a plugin paints over the TUI, and
+ * keying on the config fingerprint made a state-file write (`/preset`,
+ * `/budget`) re-log a typo that had not changed. The dedupe key is the text,
+ * which already names the file or the keys concerned.
+ */
+export function warnConfigNotices(
+  cfg: RouterConfig | undefined,
+  logger: Pick<PluginLogger, "warn">,
+): void {
+  if (cfg === undefined) return;
+  for (const notice of noticesByConfig.get(cfg) ?? []) {
+    if (loggedNoticeTexts.has(notice.message)) continue;
+    if (loggedNoticeTexts.size >= 256) loggedNoticeTexts.clear();
+    loggedNoticeTexts.add(notice.message);
+    logger.warn(notice.message, notice.source === undefined ? undefined : { source: notice.source });
   }
+}
+
+/**
+ * What to log after every `loadConfig()`: the once-per-process deprecation
+ * warning and any new config notices, both through the plugin logger.
+ */
+export function warnConfigIssues(
+  cfg: RouterConfig | undefined,
+  logger: PluginLogger,
+): void {
+  warnDeprecatedVerifyKeys(cfg, logger);
+  warnConfigNotices(cfg, logger);
 }
 
 /**
@@ -2189,7 +2211,7 @@ export function loadConfig(dir?: string): RouterConfig {
   entry.reloadError = null;
   entry.warnedFingerprint = null;
   entry.notices = notices;
-  warnNoticesOnce(fingerprint, notices);
+  noticesByConfig.set(cfg, notices);
   return cfg;
 }
 
@@ -2680,7 +2702,7 @@ let warnedEngineIgnoredOnV1 = false;
 /** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
 export function resetRoutingWarnings(): void {
   warnedEngineIgnoredOnV1 = false;
-  warnedNotices.clear();
+  loggedNoticeTexts.clear();
 }
 
 /** Roles as fresh, de-duplicated, frozen arrays; never aliases the config. */

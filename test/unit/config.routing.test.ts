@@ -17,6 +17,8 @@ import {
   getConfigNotices,
   getConfigReloadError,
   hasExplicitCandidates,
+  warnConfigNotices,
+  writeState,
   invalidateConfigCache,
   loadConfig,
   overridePath,
@@ -772,9 +774,21 @@ describe("hot reload of the global override file with a routing block", () => {
   // The temporary home, the env redirect, the os.homedir() mock and the guard
   // come from the file-level hooks above.
   let warnSpy: ReturnType<typeof vi.spyOn>;
+  /** Stands in for the plugin logger: where config notices go (QA-1.1-23). */
+  let logger = { warn: vi.fn() };
+  /** loadConfig + what the plugin does after every load: log the new notices through the logger. */
+  const reload = (dir?: string): RouterConfig => {
+    const cfg = loadConfig(dir);
+    warnConfigNotices(cfg, logger);
+    return cfg;
+  };
+  /** Messages given to the logger that contain `needle`. */
+  const logged = (needle: string): string[] =>
+    logger.warn.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes(needle));
 
   beforeEach(() => {
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    logger = { warn: vi.fn() };
     resetRoutingWarnings();
     invalidateConfigCache();
   });
@@ -945,43 +959,91 @@ describe("hot reload of the global override file with a routing block", () => {
     expect(getConfigReloadError()).toBeNull();
   });
 
-  describe("config notices through loadConfig (QA-1.1-10, -14, -18)", () => {
+  describe("config notices through loadConfig (QA-1.1-10, -14, -18, -23)", () => {
     const noticeMessages = (): string[] => getConfigNotices().map((n) => n.message);
-    const warned = (needle: string): string[] =>
-      warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes(needle));
+    const consoleNotices = (): string[] =>
+      warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("routing key"));
 
-    it("loads a config with unknown routing keys, lists them, and warns once", () => {
+    it("loads a config with unknown routing keys, lists them, and logs them once through the logger", () => {
       editOverride({ routing: { engine: "shadow", margn: 0.5, classifier: { bakend: "host" }, outcomes: { pth: "x" } } });
-      const cfg = loadConfig();
+      const cfg = reload();
       expect(resolveRouting(cfg, "v2").engine).toBe("shadow");
       expect(getConfigReloadError()).toBeNull();
       expect(noticeMessages()).toEqual([
         "ignoring unknown routing keys: routing.margn, routing.classifier.bakend, routing.outcomes.pth",
       ]);
-      expect(warned("ignoring unknown routing keys")).toEqual([
-        "[model-router] ignoring unknown routing keys: routing.margn, routing.classifier.bakend, routing.outcomes.pth",
+      expect(logged("ignoring unknown routing keys")).toEqual([
+        "ignoring unknown routing keys: routing.margn, routing.classifier.bakend, routing.outcomes.pth",
       ]);
-      // Same files, rebuilt: one warning per config fingerprint.
+      // Same files, rebuilt: not again.
       invalidateConfigCache();
-      loadConfig();
-      expect(warned("ignoring unknown routing keys")).toHaveLength(1);
+      reload();
+      expect(logged("ignoring unknown routing keys")).toHaveLength(1);
     });
 
-    it("warns again when the file changes and the typo is still there", () => {
+    it("never writes a notice to the console itself: loading is silent, the plugin logs", () => {
       editOverride({ routing: { margn: 0.5 } });
       loadConfig();
-      editOverride({ routing: { margn: 0.5, engine: "advise" } });
+      invalidateConfigCache();
       loadConfig();
-      expect(warned("ignoring unknown routing key")).toHaveLength(2);
+      expect(consoleNotices()).toEqual([]);
+      expect(logger.warn).not.toHaveBeenCalled();
     });
 
-    it("keeps warning correctly across hundreds of distinct configs (the reported-notice set is bounded)", () => {
+    it("logs a notice once per text: a state write and two more reloads do not repeat it (QA-1.1-23)", () => {
+      editOverride({ routing: { margn: 0.5 } });
+      const first = reload();
+      expect(logged("routing.margn")).toHaveLength(1);
+
+      // /preset, /budget, /router enforce … write the state file: a new fingerprint, a rebuilt config.
+      writeState({ activePreset: "openai" });
+      const second = reload();
+      expect(second).not.toBe(first);
+      invalidateConfigCache();
+      const third = reload();
+      expect(third).not.toBe(second);
+
+      expect(logged("routing.margn")).toHaveLength(1);
+      expect(consoleNotices()).toEqual([]);
+    });
+
+    it("does not repeat the text when the file changes but the typo stays, and logs a different text when another appears", () => {
+      editOverride({ routing: { margn: 0.5 } });
+      reload();
+      editOverride({ routing: { margn: 0.5, engine: "advise" } });
+      reload();
+      expect(logged("ignoring unknown routing key")).toEqual(["ignoring unknown routing key: routing.margn"]);
+      editOverride({ routing: { margn: 0.5, profil: "safe" } });
+      reload();
+      expect(logged("ignoring unknown routing key")).toEqual([
+        "ignoring unknown routing key: routing.margn",
+        "ignoring unknown routing keys: routing.margn, routing.profil",
+      ]);
+    });
+
+    it("keeps logging correctly across hundreds of distinct notices (the logged-text set is bounded)", () => {
       for (let i = 0; i < 260; i++) {
         editOverride({ routing: { [`typo${i}`]: 1 } });
-        loadConfig();
+        reload();
       }
-      expect(warned("ignoring unknown routing key: routing.typo")).toHaveLength(260);
+      expect(logged("ignoring unknown routing key: routing.typo")).toHaveLength(260);
       expect(noticeMessages()).toEqual(["ignoring unknown routing key: routing.typo259"]);
+    });
+
+    it("passes the source file along with a notice that concerns one", () => {
+      const project = mkdtempSync(join(tmpdir(), "oc-mr-routing-src-"));
+      try {
+        mkdirSync(join(project, ".git"), { recursive: true });
+        mkdirSync(join(project, ".opencode"), { recursive: true });
+        const file = join(project, ".opencode", "opencode-model-router.overrides.jsonc");
+        writeFileSync(file, JSON.stringify({ routing: { classifier: { baseUrl: "http://evil.example/v1" } } }), "utf-8");
+        reload(project);
+        const call = logger.warn.mock.calls.find((c: unknown[]) => String(c[0]).includes("only the global override may set it"));
+        expect(call).toBeDefined();
+        expect((call![1] as { source: string }).source).toContain(".opencode");
+      } finally {
+        rmSync(project, { recursive: true, force: true });
+      }
     });
 
     it("drops the notice once the typo is fixed", () => {
@@ -1016,6 +1078,13 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(loadConfig()).toBe(good);
       expect(noticeMessages()).toEqual(["ignoring unknown routing key: routing.margn"]);
     });
+
+    it("logs nothing for a config without notices, or when given no config", () => {
+      editOverride({ routing: { engine: "shadow" } });
+      reload();
+      warnConfigNotices(undefined, logger);
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
   });
   describe("project layer trust (A18, QA-1.1-2)", () => {
     let project: string;
@@ -1024,8 +1093,7 @@ describe("hot reload of the global override file with a routing block", () => {
       writeFileSync(projectFile(), JSON.stringify(data), "utf-8");
       invalidateConfigCache();
     };
-    const projectWarnings = (): string[] =>
-      warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("only the global override may set it"));
+    const projectWarnings = (): string[] => logged("only the global override may set it");
 
     beforeEach(() => {
       project = mkdtempSync(join(tmpdir(), "oc-mr-routing-proj-"));
@@ -1054,7 +1122,7 @@ describe("hot reload of the global override file with a routing block", () => {
           outcomes: { path: resolve(tmpdir(), "stolen"), halfLifeDays: 20 },
         },
       });
-      const resolved = resolveRouting(loadConfig(project), "v2");
+      const resolved = resolveRouting(reload(project), "v2");
       expect(resolved.classifier).toMatchObject({
         backend: "rules",
         model: null,
@@ -1073,18 +1141,19 @@ describe("hot reload of the global override file with a routing block", () => {
       );
       expect(warnings[0]).toContain(projectFile());
       expect(warnings[0]).toMatch(/: only the global override may set it$/);
-      expect(getConfigNotices(project).map((n) => n.message)).toEqual([warnings[0]!.replace("[model-router] ", "")]);
+      expect(getConfigNotices(project).map((n) => n.message)).toEqual([warnings[0]]);
+      expect(warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("only the global override"))).toEqual([]);
 
-      // Same files, rebuilt: reported once per path, not again.
+      // Same files, rebuilt: logged once, not again.
       invalidateConfigCache();
-      loadConfig(project);
+      reload(project);
       expect(projectWarnings()).toHaveLength(1);
     });
 
     it("says `routing.classifier.baseUrl` in the message of a lone baseUrl", () => {
       writeProject({ routing: { classifier: { baseUrl: "http://evil.example/v1" } } });
-      expect(resolveRouting(loadConfig(project), "v2").classifier.baseUrl).toBeNull();
-      expect(projectWarnings()[0]).toMatch(/^\[model-router\] ignoring routing\.classifier\.baseUrl from .+: only the global override may set it$/);
+      expect(resolveRouting(reload(project), "v2").classifier.baseUrl).toBeNull();
+      expect(projectWarnings()[0]).toMatch(/^ignoring routing\.classifier\.baseUrl from .+: only the global override may set it$/);
     });
 
     it("lets the global layer set them, and the project layer cannot override the global values", () => {
@@ -1112,13 +1181,13 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(loadConfig(project).tierCaps?.fast).toBe(9);
       writeProject({ routing: "not an object" });
       expect(getConfigReloadError(project)).toBeNull();
-      loadConfig(project); // the layer is invalid as a whole and is dropped; the strip must not throw first
+      reload(project); // the layer is invalid as a whole and is dropped; the strip must not throw first
       expect(projectWarnings()).toHaveLength(0);
     });
 
     it("says nothing about a project layer that does not set them", () => {
       writeProject({ routing: { engine: "shadow", classifier: { timeoutMs: 2000 } } });
-      expect(resolveRouting(loadConfig(project), "v2")).toMatchObject({ engine: "shadow" });
+      expect(resolveRouting(reload(project), "v2")).toMatchObject({ engine: "shadow" });
       expect(projectWarnings()).toHaveLength(0);
       expect(getConfigNotices(project)).toEqual([]);
     });
@@ -1132,7 +1201,8 @@ describe("hot reload of the global override file with a routing block", () => {
     });
   });
 
-  describe("through the /router command", () => {    type CommandHook = (
+  describe("through the /router command", () => {
+    type CommandHook = (
       input: { command: string; arguments: string },
       output: { parts: Array<{ type: string; text?: string }> },
     ) => Promise<void>;
@@ -1168,6 +1238,20 @@ describe("hot reload of the global override file with a routing block", () => {
     it("lists no notice lines for a clean config", async () => {
       editOverride({ routing: { engine: "advise" } });
       expect((await runRouter("v2")).split("\n").filter((l) => l.startsWith("router: config notice:"))).toEqual([]);
+    });
+
+    it("logs a config notice once per process through the plugin logger, across state writes and reloads (QA-1.1-23)", async () => {
+      editOverride({ routing: { engine: "advise", margn: 0.5 } });
+      const count = (): number =>
+        warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("routing.margn")).length;
+      await runRouter("v2");
+      expect(count()).toBe(1);
+      writeState({ activePreset: "openai" });
+      await runRouter("v2");
+      await runRouter("v2");
+      expect(count()).toBe(1);
+      // ...while /router keeps listing it every time.
+      expect(await runRouter("v2")).toContain("router: config notice: ignoring unknown routing key: routing.margn");
     });
 
     it("does not add the line to the other /router views", async () => {
