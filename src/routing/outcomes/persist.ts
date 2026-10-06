@@ -599,11 +599,15 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       if (rows.length === 0) return { ok: true };
       try {
         await fs.mkdirp(dir);
-        const data = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
-        const bytes = Buffer.byteLength(data, "utf8");
-        const size = (await statOrNull(decisionsPath))?.size ?? 0;
-        if (size > 0 && size + bytes > maxBytes) await rotate();
-        await fs.appendText(decisionsPath, data);
+        const body = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+        let size = (await statOrNull(decisionsPath))?.size ?? 0;
+        if (size > 0 && size + Buffer.byteLength(body, "utf8") + 1 > maxBytes) {
+          await rotate();
+          size = (await statOrNull(decisionsPath))?.size ?? 0;
+        }
+        // QA-1.3-9: a crash can leave a torn last line without its newline; starting every batch on a fresh
+        // line keeps the next row from being glued to the fragment (readRows skips the blank/torn lines).
+        await fs.appendText(decisionsPath, (size > 0 ? "\n" : "") + body);
         return { ok: true };
       } catch (error) {
         return failure(error);

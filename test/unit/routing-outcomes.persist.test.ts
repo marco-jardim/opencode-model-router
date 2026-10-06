@@ -754,6 +754,36 @@ describe("persister: decisions.jsonl", () => {
     expect(read.skipped).toBe(2);
   });
 
+  it("QA-1.3-9: a torn last line does not swallow the next batch (d3 survives)", async () => {
+    const { mem, deps, dir } = setup();
+    const persister = createPersister(dir, deps);
+    const live = join(dir, DECISIONS_FILE);
+    await persister.appendRows([verdictRow(1), verdictRow(2)]);
+    const whole = JSON.stringify(verdictRow(99));
+    await mem.fs.appendText(live, whole.slice(0, whole.length - 25)); // crash mid-line: no trailing newline
+    await persister.appendRows([verdictRow(3)]);
+    await persister.appendRows([verdictRow(4), verdictRow(5)]);
+    const read = await persister.readRows();
+    expect(read.rows.map((r) => (r.kind === "verdict" ? r.attemptID : ""))).toEqual(["c1:0", "c2:0", "c3:0", "c4:0", "c5:0"]);
+    expect(read.skipped).toBe(1); // only the torn fragment
+  });
+
+  it("QA-1.3-9: the first batch of a (re)created live file has no leading newline, batches after it do", async () => {
+    const { mem, deps, dir } = setup();
+    const persister = createPersister(dir, deps, { maxBytes: 400, maxGenerations: 1 });
+    const live = join(dir, DECISIONS_FILE);
+    await persister.appendRows([verdictRow(1)]);
+    expect(mem.files.get(live)?.text.startsWith("{")).toBe(true);
+    await persister.appendRows([verdictRow(2)]); // rotates (would pass maxBytes): the new live file starts clean
+    expect(mem.files.get(live)?.text.startsWith("{")).toBe(true);
+    expect((await persister.readRows()).rows).toHaveLength(2);
+    const small = createPersister(join(dir, "other"), deps);
+    await small.appendRows([verdictRow(1)]);
+    await small.appendRows([verdictRow(2)]);
+    expect(mem.files.get(join(dir, "other", DECISIONS_FILE))?.text.split("\n").filter((l) => l !== "")).toHaveLength(2);
+    expect(mem.files.get(join(dir, "other", DECISIONS_FILE))?.text).toContain("\n\n{");
+  });
+
   it("readRows on a missing directory is empty and an unreadable generation is skipped with a warning", async () => {
     const { mem, deps, dir, logger } = setup();
     const persister = createPersister(dir, deps, { maxBytes: 100, maxGenerations: 5 });
