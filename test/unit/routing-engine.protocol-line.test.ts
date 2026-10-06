@@ -138,8 +138,9 @@ describe("D2 degenerate case: no evidence ⇒ the generated line IS the shipped 
     ["an empty store", () => createOutcomeStore()],
   ];
   const modes: ReadonlyArray<readonly [string, RouterHost, RouterConfig["routing"]]> = [
-    ["v2 with routing.roles = {}", "v2", { roles: {} }],
-    ["v2 with the D12 default roles", "v2", undefined],
+    ["v2 enforce with routing.roles = {}", "v2", { engine: "enforce", roles: {} }],
+    ["v2 enforce with the D12 default roles", "v2", { engine: "enforce" }],
+    ["v2 static (the default engine)", "v2", undefined],
     ["v1 without routing", "v1", undefined],
   ];
 
@@ -155,7 +156,7 @@ describe("D2 degenerate case: no evidence ⇒ the generated line IS the shipped 
 
           // The 2.2 seam: swap the generated line into the protocol; both texts stay byte-identical.
           const protocol = buildDelegationProtocol(cfg);
-          const swapped = protocol.replace(base, generated);
+          const swapped = protocol.replace(base, () => generated);
           expect(sha256(swapped)).toBe(D2[preset]!.raw);
           expect(sha256(v2Instructions(swapped))).toBe(D2[preset]!.v2);
           expect(protocol.split("\n").find((line) => line.startsWith("R:"))).toBe(generated);
@@ -165,7 +166,7 @@ describe("D2 degenerate case: no evidence ⇒ the generated line IS the shipped 
   }
 
   it("priors alone never move a class, even when the kernel would switch (margin 0)", () => {
-    const cfg = shipped("anthropic", { margin: 0 });
+    const cfg = shipped("anthropic", { engine: "enforce", margin: 0 });
     const routing = resolveRouting(cfg, "v2");
     // Not vacuous: on priors alone the kernel's argmin for `implement` is another rung at margin 0, and only the
     // A24 evidence gate (no recorded outcomes) keeps it from switching.
@@ -202,17 +203,32 @@ function storeWith(passesOnExplore: number, failsOnFast: number) {
 
 describe("evidence moves search to explore when listed in roles", () => {
   const roles = { search: ["explore"] };
+  /** The engine that acts on the line (QA-1.4-5): `advise` and `enforce` only. */
+  const enforce = (extra: Partial<NonNullable<RouterConfig["routing"]>> = {}): NonNullable<RouterConfig["routing"]> => ({ engine: "enforce", roles, ...extra });
 
   it("≥ 5 strong outcomes move the class; the suffix follows the unchanged R: line", () => {
-    const cfg = shipped("anthropic", { roles });
+    const cfg = shipped("anthropic", enforce());
     const base = buildTaskTaxonomy(cfg);
     const store = storeWith(20, 20);
     expect(store.posterior(EXPLORE_KEY).n).toBeGreaterThanOrEqual(MIN_EVIDENCE_TO_MOVE);
     expect(taxonomy(cfg, "v2", store)).toBe(`${base} | by class: search→@explore`);
+    expect(taxonomy(shipped("anthropic", enforce({ engine: "advise" })), "v2", store)).toBe(`${base} | by class: search→@explore`);
+  });
+
+  it("QA-1.4-5: engine static or shadow never touches the protocol text, whatever the evidence", () => {
+    const store = storeWith(20, 20);
+    for (const engine of ["static", "shadow"] as const) {
+      const cfg = shipped("anthropic", enforce({ engine }));
+      expect(resolveRouting(cfg, "v2").engine).toBe(engine);
+      expect(taxonomy(cfg, "v2", store)).toBe(buildTaskTaxonomy(cfg));
+    }
+    // The default engine (no `engine` key) is `static`.
+    const defaulted = shipped("anthropic", { roles });
+    expect(taxonomy(defaulted, "v2", store)).toBe(buildTaskTaxonomy(defaulted));
   });
 
   it("the evidence gate: the same winner with fewer than 5 effective outcomes leaves the line static", () => {
-    const cfg = shipped("anthropic", { roles });
+    const cfg = shipped("anthropic", enforce());
     expect(MIN_EVIDENCE_TO_MOVE).toBe(5);
     const base = buildTaskTaxonomy(cfg);
     // Four passes on explore and nothing else: explore is cheaper but has n = 4 < 5.
@@ -221,17 +237,18 @@ describe("evidence moves search to explore when listed in roles", () => {
 
   it("the same store without roles, or on v1, or without agents, keeps the line", () => {
     const store = storeWith(20, 20);
-    const noRoles = shipped("anthropic", { roles: {} });
+    const noRoles = shipped("anthropic", enforce({ roles: {} }));
     expect(taxonomy(noRoles, "v2", store)).toBe(buildTaskTaxonomy(noRoles));
     const configured = shipped("anthropic", { roles });
     expect(taxonomy(configured, "v1", store)).toBe(buildTaskTaxonomy(configured) + " | by class: search→@explore"); // v1 prose comes from roles, not the store
     expect(taxonomy(configured, "v1", null)).toBe(taxonomy(configured, "v1", store));
     // Agents unavailable: the role candidate cannot exist, so nothing can move.
-    expect(taxonomy(configured, "v2", store, null)).toBe(buildTaskTaxonomy(configured));
+    const enforced = shipped("anthropic", enforce());
+    expect(taxonomy(enforced, "v2", store, null)).toBe(buildTaskTaxonomy(enforced));
   });
 
   it("a role agent that cannot cover the class needs never moves it", () => {
-    const cfg = shipped("anthropic", { roles: { mechanical: ["explore"] } });
+    const cfg = shipped("anthropic", enforce({ roles: { mechanical: ["explore"] } }));
     // mechanical implies `edit`, which explore (web only) does not grant.
     const store = createOutcomeStore();
     const key = `mechanical|host:explore|${HAIKU}#default` as OutcomeKey;
@@ -240,12 +257,34 @@ describe("evidence moves search to explore when listed in roles", () => {
   });
 
   it("an empty taskPatterns config yields `R: by class: …` only when a class moves", () => {
-    const cfg = { ...shipped("anthropic", { roles }), taskPatterns: {} };
+    const cfg = { ...shipped("anthropic", enforce()), taskPatterns: {} };
     expect(taxonomy(cfg, "v2", createOutcomeStore())).toBe("");
     expect(taxonomy(cfg, "v2", storeWith(20, 20))).toBe("R: by class: search→@explore");
   });
-});
 
+  it("QA-1.4-11: a bare `R:` base (every pattern list empty) becomes `R: by class: …`, never `R: | by class: …`", () => {
+    const cfg = { ...shipped("anthropic", enforce()), taskPatterns: { fast: [] as string[], medium: [] as string[] } };
+    expect(buildTaskTaxonomy(cfg)).toBe("R:");
+    expect(taxonomy(cfg, "v2", createOutcomeStore())).toBe("R:");
+    expect(taxonomy(cfg, "v2", storeWith(20, 20))).toBe("R: by class: search→@explore");
+    expect(taxonomy({ ...cfg, routing: { roles } }, "v1", null)).toBe("R: by class: search→@explore");
+  });
+
+  it("QA-1.4-11: a function replacer substitutes the line verbatim, `$` sequences in agent ids included", () => {
+    const tricky = "ex$&plo$1re$$";
+    const cfg = shipped("anthropic", { roles: { search: [tricky] } });
+    const agents: HostAgentInfo[] = [...tierAgents(), native(tricky, HAIKU, ["web"])];
+    const generated = taxonomy(cfg, "v1", null, agents);
+    expect(generated).toBe(`${buildTaskTaxonomy(cfg)} | by class: search→@${tricky}`);
+    const protocol = buildDelegationProtocol(cfg);
+    const base = buildTaskTaxonomy(cfg);
+    // A string replacement would expand `$&` / `$1` / `$$`; the function replacer does not.
+    expect(protocol.replace(base, generated)).not.toContain(generated);
+    const swapped = protocol.replace(base, () => generated);
+    expect(swapped).toContain(generated);
+    expect(swapped.split("\n").find((line) => line.startsWith("R:"))).toBe(generated);
+  });
+});
 // ---------------------------------------------------------------------------
 // v1 roles prose
 // ---------------------------------------------------------------------------

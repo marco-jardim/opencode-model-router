@@ -104,17 +104,30 @@ function v2Segments(input: TaxonomyInput, store: EngineStoreView): string[] {
 
 /**
  * The `R:` line the protocol should carry: `buildTaskTaxonomy(cfg)` unchanged unless a class has somewhere
- * better to go, then `<base> | by class: c→@agent …` (`R: by class: …` when the base is empty). Classes are
- * listed in `TASK_CLASSES` order, so the text depends on the inputs and never on key order.
+ * better to go, then `<base> | by class: c→@agent …` (`R: by class: …` when the base is empty or the bare
+ * `R:` header). Classes are listed in `TASK_CLASSES` order, so the text depends on the inputs and never on
+ * key order.
+ *
+ * Engine gate (QA-1.4-5, D1): on v2 the line only changes when the resolved engine is `advise` or `enforce`;
+ * `static` and `shadow` never touch the protocol text. On v1 the engine is always `static`; the text-only
+ * opt-in is an explicitly configured `routing.roles` (D1), which is what the v1 branch reads.
+ *
+ * Handoff to 2.2 (QA-1.4-11): (1) substitute with a FUNCTION replacer, `protocol.replace(base, () => line)`:
+ * the line carries agent ids, and a string replacement would expand `$&`, `$1` or `$$` inside them;
+ * (2) when `buildTaskTaxonomy(cfg)` is empty the protocol has no `R:` line to replace: insert the generated
+ * line (`R: by class: …`) where the taxonomy would go, and only when it is non-empty.
  */
 export function generateTaxonomy(input: TaxonomyInput): string {
   const base = buildTaskTaxonomy(input.cfg);
-  const segments = input.host === "v1"
-    ? v1Segments(input)
-    : input.store === null
-      ? []
-      : v2Segments(input, input.store);
+  let segments: string[];
+  if (input.host === "v1") {
+    segments = v1Segments(input);
+  } else if (input.routing.engine !== "advise" && input.routing.engine !== "enforce") {
+    return base; // static or shadow: the shipped text, byte for byte
+  } else {
+    segments = input.store === null ? [] : v2Segments(input, input.store);
+  }
   if (segments.length === 0) return base;
   const suffix = `by class: ${segments.join(" ")}`;
-  return base === "" ? `R: ${suffix}` : `${base} | ${suffix}`;
+  return base === "" || base === "R:" ? `R: ${suffix}` : `${base} | ${suffix}`;
 }
