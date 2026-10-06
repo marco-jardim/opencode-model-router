@@ -718,9 +718,9 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 |---|---|---|---|---|
 | `engine` | `string` | `"static"` | `static \| shadow \| advise \| enforce` | See [Engine modes](#engine-modes). Forced to `static` on v1. |
 | `profile` | `string` | `"balanced"` | `frugal \| balanced \| safe` | Price of giving up on a task, per risk level, in cost units where `fast = 1`: `frugal` {low 3, medium 8, high 20}, `balanced` {5, 15, 40}, `safe` {10, 30, 100}. |
-| `margin` | `number` | `0.2` | `[0, 0.9]` | `enforce` only: the engine replaces the orchestrator's choice only if `C(best) ≤ (1 − margin) · C(chosen)`. |
-| `minClassConfidence` | `number` | `0.7` | `[0, 1]` | Below this the engine does not trust the task class and keeps the orchestrator's choice. |
-| `detection.deterministic` | `number` | `0.95` | `[0, 1]` | Probability that a wrong result is caught, by verification depth: a deterministic `[acceptance]` check is present. |
+| `margin` | `number` | `0.2` | `[0, 0.9]` | `enforce` only: the engine replaces the orchestrator's choice only if `C(best) < (1 − margin) · C(chosen)` — **strictly** less: exactly at the boundary the choice is kept, and a `best` equal to the `chosen` is never a switch. |
+| `minClassConfidence` | `number` | `0.7` | `[0, 1]` | Below this the engine does not trust the task class: it asks the classifier backend (when one is configured) and otherwise keeps the orchestrator's choice. The extremes: `0` never calls the backend (the rules class is always trusted); `1` calls it on every dispatch, each call bounded by `classifier.timeoutMs`. |
+| `detection.deterministic` | `number` | `0.95` | `[0, 1]` | Probability that a wrong result is caught, by verification depth: a deterministic `[acceptance]` check is present. The three values must satisfy `deterministic ≥ grader ≥ none` (a deeper check cannot catch less), compared on the effective values, defaults included. |
 | `detection.grader` | `number` | `0.7` | `[0, 1]` | …an LLM grader is scheduled. |
 | `detection.none` | `number` | `0.3` | `[0, 1]` | …neither. |
 | `classifier.backend` | `string` | `"rules"` | `rules \| host \| openai-compatible \| typesafe` | Where an uncertain task class is decided. `rules` is local and free. The classifier is never an agent and never appears in the protocol. |
@@ -732,7 +732,7 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 | `classifier.maxStateChars` | `integer` | `2000` | `[200, 20000]` | How much of the prompt a model backend may see; never file contents. |
 | `classifier.presets` | `Record<string, { backend?, model? }>` | `{}` | each entry as above | Per-preset override of `backend` / `model`. The key is matched to the active preset like `/preset` matches names (exact, then case-insensitive); a key that matches no preset is accepted (switching presets never bricks startup) but noticed. Each entry, merged over the top level, must itself satisfy the model / `baseUrl` rule. |
 | `roles` | `Record<string, string[]>` | v2: see [Roles](#roles); v1: `{}` | class → array of agent ids | Classes: `search \| recon \| mechanical \| implement \| debug \| design \| review \| other` (`ROUTING_TASK_CLASSES`). Agent ids match `^[A-Za-z0-9][A-Za-z0-9_./-]*$`, case-sensitive (`ContextScout`, `team/helper`). An empty array means no native candidates for that class. See [Roles](#roles). |
-| `outcomes.path` | `string \| null` | `null` | non-empty string | Where the outcome store persists. `null` = the directory that already holds the `*.scorecard.log` files. |
+| `outcomes.path` | `string \| null` | `null` | absolute path | Where the outcome store persists. Must be absolute; a leading `~` (`~`, `~/dir`) means the home directory and is expanded when the block is resolved. `null` = the directory that already holds the `*.scorecard.log` files. Only the global override may set it (see Trust). |
 | `outcomes.halfLifeDays` | `number` | `14` | `[1, 365]` | Older verdicts weigh less. |
 | `outcomes.maxEffectiveSamples` | `number` | `50` | `[5, 1000]` | Cap on the effective sample size of one `(class × agent × model#variant)` posterior. |
 | `sessionReuse.maxContextFraction` | `number` | `0.6` | `(0, 0.95]` | A retry or escalation resumes the child session only while the next model's input budget has room under this fraction. |
@@ -803,7 +803,7 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 }
 ```
 
-**`enforce`** — as `advise`, and the engine reassigns the dispatch's `model` / `agent` when its choice is cheaper by at least `margin`, the class confidence reaches `minClassConfidence`, the candidate agent's permissions cover what the task needs and the candidate is not below `floorTier`. A dispatch carrying `[route pin]` is never switched.
+**`enforce`** — as `advise`, and the engine reassigns the dispatch's `model` / `agent` when its choice is cheaper by more than `margin` (strictly), the class confidence reaches `minClassConfidence`, the candidate agent's permissions cover what the task needs and the candidate is not below `floorTier`. A dispatch carrying `[route pin]` is never switched.
 
 <!-- routing-example: enforce -->
 ```jsonc

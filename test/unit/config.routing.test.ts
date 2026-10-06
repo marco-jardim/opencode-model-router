@@ -40,6 +40,8 @@ import { parseJsonc } from "../../src/router/jsonc";
 import { readFileSync } from "node:fs";
 
 const ROOT = resolve(__dirname, "..", "..");
+/** An absolute path on any platform (routing.outcomes.path must be absolute). */
+const ABS_PATH = resolve(tmpdir(), "omr-outcomes");
 
 // ---------------------------------------------------------------------------
 // Isolation from the real home directory (QA-1.1-1).
@@ -272,7 +274,7 @@ describe("resolveRouting — configured values", () => {
             samples: 3,
             maxStateChars: 200,
           },
-          outcomes: { path: "D:/omr", halfLifeDays: 30 },
+          outcomes: { path: ABS_PATH, halfLifeDays: 30 },
           sessionReuse: { maxContextFraction: 0.95 },
           advisor: { enabled: false },
         },
@@ -296,11 +298,19 @@ describe("resolveRouting — configured values", () => {
         presets: {},
       },
       roles: V2_DEFAULTS.roles,
-      outcomes: { path: "D:/omr", halfLifeDays: 30, maxEffectiveSamples: 50 },
+      outcomes: { path: ABS_PATH, halfLifeDays: 30, maxEffectiveSamples: 50 },
       sessionReuse: { maxContextFraction: 0.95 },
       advisor: { enabled: false, noticeIntervalHours: 24 },
       applied: { host: "v2", requestedEngine: "enforce", engineCoerced: false, rolesSource: "default" },
     });
+  });
+
+  it("expands a leading ~ in outcomes.path to the home directory (QA-1.1-15)", () => {
+    const pathOf = (path: string) => resolveRouting(cfgOf({ routing: { outcomes: { path } } }), "v2").outcomes.path;
+    expect(pathOf("~")).toBe(tmpHome);
+    expect(pathOf("~/omr-data")).toBe(join(tmpHome, "omr-data"));
+    expect(pathOf("~\\omr-data")).toBe(join(tmpHome, "omr-data"));
+    expect(pathOf(ABS_PATH)).toBe(ABS_PATH); // an absolute path is left alone
   });
 
   it("keeps explicit nulls for the nullable keys", () => {

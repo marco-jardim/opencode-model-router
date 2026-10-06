@@ -388,6 +388,8 @@ describe("validateConfig — subagentTiers", () => {
 // `enforcement.escalate.variantSteps`.
 // ---------------------------------------------------------------------------
 
+import { resolve } from "node:path";
+
 /** A raw config carrying the given `routing` block. */
 function withRouting(routing: unknown): Record<string, unknown> {
   return validRaw({ routing });
@@ -836,16 +838,23 @@ describe("validateConfig — routing.outcomes / sessionReuse / advisor", () => {
     );
   });
 
-  it("accepts outcomes.path as null or a non-empty string and rejects the rest", () => {
+  it("accepts outcomes.path as null, an absolute path, or a home-relative one (~, ~/x)", () => {
+    const abs = resolve("data", "omr");
     expect(validateConfig(withRouting({ outcomes: { path: null } })).routing?.outcomes?.path).toBeNull();
-    expect(validateConfig(withRouting({ outcomes: { path: "D:/data/omr" } })).routing?.outcomes?.path).toBe("D:/data/omr");
-    for (const path of ["", 5, {}]) {
-      expect(() => validateConfig(withRouting({ outcomes: { path } }))).toThrow(
-        /routing\.outcomes\.path must be null or a non-empty string/,
-      );
+    expect(validateConfig(withRouting({ outcomes: { path: abs } })).routing?.outcomes?.path).toBe(abs);
+    for (const path of ["~", "~/omr", "~\\omr"]) {
+      expect(validateConfig(withRouting({ outcomes: { path } })).routing?.outcomes?.path).toBe(path);
     }
   });
 
+  it.each(["", "data/omr", "./omr", "../omr", "omr", "~user/omr", " /abs", 5, {}])(
+    "rejects outcomes.path %j: it must be absolute (QA-1.1-15)",
+    (path) => {
+      expect(() => validateConfig(withRouting({ outcomes: { path } }))).toThrow(
+        /routing\.outcomes\.path must be null or an absolute path; a leading ~ means the home directory/,
+      );
+    },
+  );
   it.each([0.01, 0.6, 0.95])("accepts sessionReuse.maxContextFraction %s", (maxContextFraction) => {
     expect(
       validateConfig(withRouting({ sessionReuse: { maxContextFraction } })).routing?.sessionReuse?.maxContextFraction,
@@ -1065,5 +1074,30 @@ describe("validateConfig — tiers.<t>.candidates: own rung and escalation order
 
   it("accepts equal costRatios (non-decreasing, not strictly increasing)", () => {
     expect(() => validateConfig(withCandidates([{}, { variant: "high", costRatio: 1 }, { variant: "max", costRatio: 1 }]))).not.toThrow();
+  });
+});
+describe("validateConfig — routing.detection order (QA-1.1-13)", () => {
+  it("accepts a non-increasing order, equal values included", () => {
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 0.9, grader: 0.9, none: 0.9 } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 1, grader: 0.5, none: 0 } }))).not.toThrow();
+    expect(() => validateConfig(withRouting({ detection: { grader: 0.6, none: 0.2 } }))).not.toThrow();
+  });
+
+  it("rejects grader above deterministic and none above grader, naming the values", () => {
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 0.5, grader: 0.7 } }))).toThrow(
+      /routing\.detection must satisfy deterministic >= grader >= none, because .*\(got deterministic 0\.5, grader 0\.7, none 0\.3\)/,
+    );
+    expect(() => validateConfig(withRouting({ detection: { grader: 0.2, none: 0.4 } }))).toThrow(
+      /\(got deterministic 0\.95, grader 0\.2, none 0\.4\)/,
+    );
+  });
+
+  it("compares against the defaults of the keys you leave out", () => {
+    // grader 0.98 > the default deterministic 0.95
+    expect(() => validateConfig(withRouting({ detection: { grader: 0.98 } }))).toThrow(/deterministic 0\.95, grader 0\.98/);
+    // none 0.8 > the default grader 0.7
+    expect(() => validateConfig(withRouting({ detection: { none: 0.8 } }))).toThrow(/grader 0\.7, none 0\.8/);
+    // raising deterministic alone keeps the order
+    expect(() => validateConfig(withRouting({ detection: { deterministic: 1 } }))).not.toThrow();
   });
 });

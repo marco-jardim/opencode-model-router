@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
@@ -1479,6 +1479,11 @@ function readBlock(
   return value;
 }
 
+/** An absolute path, or `~` / `~/…` / `~\...` (the home directory; expanded by resolveRouting). */
+function isAbsoluteOrHomePath(value: string): boolean {
+  return isAbsolute(value) || value === "~" || /^~[\\/]/.test(value);
+}
+
 /** `provider/model` or `provider/model#variant` (a catalog reference). */
 function isCatalogRef(value: unknown): value is string {
   if (typeof value !== "string") return false;
@@ -1671,6 +1676,19 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
       const v = readNumber(detection, key, "routing.detection", { min: 0, max: 1 });
       if (v !== undefined) d[key] = v;
     }
+    // A deeper check cannot catch less than a shallower one (QA-1.1-13); compared
+    // on the effective values, so one key can break the order against a default.
+    const dd = ROUTING_DEFAULTS.detection;
+    const effective = {
+      deterministic: d.deterministic ?? dd.deterministic,
+      grader: d.grader ?? dd.grader,
+      none: d.none ?? dd.none,
+    };
+    if (!(effective.deterministic >= effective.grader && effective.grader >= effective.none)) {
+      throw new Error(
+        `tiers.json: routing.detection must satisfy deterministic >= grader >= none, because a deeper check cannot catch less than a shallower one (got deterministic ${effective.deterministic}, grader ${effective.grader}, none ${effective.none})`,
+      );
+    }
     out.detection = d;
   }
 
@@ -1684,9 +1702,9 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
     const o: OutcomesConfig = {};
     const path = outcomes.path;
     if (path !== undefined) {
-      if (path !== null && (typeof path !== "string" || path === "")) {
+      if (path !== null && (typeof path !== "string" || !isAbsoluteOrHomePath(path))) {
         throw new Error(
-          `tiers.json: routing.outcomes.path must be null or a non-empty string (got ${describeValue(path)})`,
+          `tiers.json: routing.outcomes.path must be null or an absolute path; a leading ~ means the home directory (got ${describeValue(path)})`,
         );
       }
       o.path = path;
@@ -2650,6 +2668,13 @@ export interface ResolvedRouting {
   readonly applied: RoutingApplied;
 }
 
+/** `~` and `~/x` become paths under the home directory; anything else is returned as is. */
+function expandHomePath(value: string | null): string | null {
+  if (value === null) return null;
+  if (value === "~") return homedir();
+  return /^~[\\/]/.test(value) ? join(homedir(), value.slice(2)) : value;
+}
+
 let warnedEngineIgnoredOnV1 = false;
 
 /** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
@@ -2727,7 +2752,7 @@ export function resolveRouting(
     }),
     roles,
     outcomes: Object.freeze({
-      path: r.outcomes?.path ?? d.outcomes.path,
+      path: expandHomePath(r.outcomes?.path ?? d.outcomes.path),
       halfLifeDays: r.outcomes?.halfLifeDays ?? d.outcomes.halfLifeDays,
       maxEffectiveSamples: r.outcomes?.maxEffectiveSamples ?? d.outcomes.maxEffectiveSamples,
     }),
