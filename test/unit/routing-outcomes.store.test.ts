@@ -1033,23 +1033,27 @@ describe("mergeForeign (QA-1.3-4)", () => {
   });
 
   it("QA-1.3-17: only the combined result is clamped at 0", () => {
-    const baseOrigin = createOutcomeStore({ now: clock().now });
-    baseOrigin.recordStep(K(), step("b0", { cost: 5, final: true }));
-    const baseline = baseOrigin.snapshot(); // n = 1, mean 5
-    const foreign = createOutcomeStore({ now: clock().now });
-    foreign.fromSnapshot(baseline);
-    foreign.recordStep(K(), step("f0", { cost: 0, final: true }));
-    foreign.recordStep(K(), step("f1", { cost: 0, final: true })); // n = 3, mean 5/3
-    const mine = createOutcomeStore({ now: clock().now });
-    mine.recordStep(K(), step("m0", { cost: 0, final: true })); // n = 1, mean 0; (0·1 + 5 − 5)/3 = 0 ≥ 0 anyway
-    mine.mergeForeign(foreign.snapshot(), baseline);
+    const origin = createOutcomeStore({ now: clock().now });
+    origin.recordStep(K(), step("b0", { cost: 5, final: true }));
+    const baseline = origin.snapshot(); // n = 1, mean 5
+    // A disk entry that descends from it (counters and n did not shrink) but whose mean is far lower than the
+    // arithmetic allows (an EWMA that moved on): disk 0.5 · n 2 − base 5 · n 1 is negative.
+    const forged = JSON.parse(JSON.stringify(origin.snapshot())) as { entries: Record<string, { cost: { measuredUSD: { mean: number; n: number } } }> };
+    const forgedEntry = forged.entries[K()];
+    if (!forgedEntry) throw new Error("fixture");
+    forgedEntry.cost.measuredUSD = { mean: 0.5, n: 2 };
+    const mine = createOutcomeStore({ now: clock().now }); // holds nothing of its own for this key
+    expect(mine.mergeForeign(forged as unknown as OutcomeSnapshot, baseline)).toEqual({ accepted: 1, dropped: 0 });
     const cost = mine.snapshot().entries[K()]?.cost.measuredUSD;
-    expect(cost?.n).toBe(1 + 3 - 1);
-    expect(cost?.mean).toBeGreaterThanOrEqual(0);
-    expect(Number.isFinite(cost?.mean ?? Number.NaN)).toBe(true);
-    expect(cost?.mean).toBeCloseTo(((5 / 3) * 3) / 3 - 5 / 3, 9); // (0·1 + (5/3)·3 − 5·1) / 3 = 0
-  });
+    expect(cost).toEqual({ mean: 0, n: 1 }); // (0.5·2 − 5·1) / 1 = −4 → 0, not a NaN or a negative mean
 
+    // with live work the same parts add up to something positive: nothing was clamped on the way
+    const busy = createOutcomeStore({ now: clock().now });
+    busy.recordStep(K(), step("m0", { cost: 8, final: true })); // n = 1, mean 8
+    busy.mergeForeign(forged as unknown as OutcomeSnapshot, baseline);
+    expect(busy.snapshot().entries[K()]?.cost.measuredUSD.n).toBe(2);
+    expect(busy.snapshot().entries[K()]?.cost.measuredUSD.mean).toBeCloseTo((8 * 1 + 0.5 * 2 - 5 * 1) / 2, 12); // 2
+  });
   it("invalid disk entries are dropped and counted", () => {
     const baseline = sharedStart();
     const mine = loaded(baseline);
