@@ -61,6 +61,11 @@ export type RouterPluginInput = PluginInput & {
    * agents have a model of their own (title, summary, the role agents) and which tier agents the host offers.
    */
   routerAgents?: () => Promise<readonly unknown[]>;
+  /**
+   * Set only by src/v2.ts: the host's synthetic transcript entry (`ctx.session.synthetic`, `resume: false`), the call the adapter already uses
+   * for its config-reload and narration notices. The cost doctor's notice goes through it, never into the user's message.
+   */
+  routerSynthetic?: (input: { sessionID: string; text: string; description: string }) => Promise<void>;
   /** Set only by src/v2.ts: the host `generate` (the `host` classifier backend of `/annotate-plan`, A4); absent when the host has none. */
   routerGenerate?: HostGenerate;
   /** Set only by src/v2.ts: receives this plugin instance's telemetry ingest, whose step events the v2 adapter feeds (QA-2.1-7). */

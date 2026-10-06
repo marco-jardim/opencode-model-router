@@ -1090,6 +1090,8 @@ describe("cost doctor in the plugin", () => {
     readonly providerCalls: () => number;
     /** `routerCatalog` calls: the doctor no longer makes any. */
     readonly catalogCalls: () => number;
+    /** What the plugin handed to the host's synthetic-message call (`ctx.session.synthetic`). */
+    readonly synthetic: Array<{ sessionID: string; text: string; description: string }>;
   }
 
   /** Raw host records (Agent.Info / Model.Info) as the v2 adapter hands them over. */
@@ -1103,7 +1105,7 @@ describe("cost doctor in the plugin", () => {
     model("opencode-go/deepseek-v4.1-flash", { cost: [{ input: 0.15, output: 0.6, cache: { read: 0, write: 0 } }] }),
   ];
 
-  async function plugin(over: { routing?: Record<string, unknown> | null; host?: "v1" | "v2"; agents?: Host["agents"]; catalog?: Host["catalog"]; parents?: Record<string, string> }): Promise<{ hooks: Hooks; host: Host }> {
+  async function plugin(over: { routing?: Record<string, unknown> | null; host?: "v1" | "v2"; agents?: Host["agents"]; catalog?: Host["catalog"]; parents?: Record<string, string>; synthetic?: boolean | "fail" }): Promise<{ hooks: Hooks; host: Host }> {
     const routing = over.routing === undefined ? null : over.routing;
     mkdirSync(dirname(overridePath()), { recursive: true });
     writeFileSync(overridePath(), JSON.stringify({ activePreset: "anthropic", ...(routing === null ? {} : { routing }) }));
@@ -1112,6 +1114,7 @@ describe("cost doctor in the plugin", () => {
     let agentCalls = 0;
     let providerCalls = 0;
     let catalogCalls = 0;
+    const synthetic: Host["synthetic"] = [];
     const agents = over.agents ?? (async () => rawAgents());
     const catalog = over.catalog ?? (async () => rawCatalog());
     /** The v2 adapter's `config.providers()` payload: enabled models per provider, with cost and capabilities. */
@@ -1139,12 +1142,20 @@ describe("cost doctor in the plugin", () => {
             routerHost: "v2" as const,
             routerAgents: async () => { agentCalls += 1; return agents(); },
             routerCatalog: async () => { catalogCalls += 1; return catalog(); },
+            ...(over.synthetic === false
+              ? {}
+              : {
+                  routerSynthetic: async (notice: { sessionID: string; text: string; description: string }) => {
+                    if (over.synthetic === "fail") throw new Error("session is gone");
+                    synthetic.push(notice);
+                  },
+                }),
           }
         : {}),
     };
     const hooks = (await ModelRouterPlugin(ctx as unknown as RouterPluginInput)) as unknown as Hooks;
     instances.push(hooks);
-    return { hooks, host: { logs, agentCalls: () => agentCalls, providerCalls: () => providerCalls, catalogCalls: () => catalogCalls } };
+    return { hooks, host: { logs, agentCalls: () => agentCalls, providerCalls: () => providerCalls, catalogCalls: () => catalogCalls, synthetic } };
   }
 
   const ask = async (hooks: Hooks, args = ""): Promise<string> => {
@@ -1212,30 +1223,37 @@ describe("cost doctor in the plugin", () => {
     expect(await ask(v1.hooks)).not.toContain("Cost doctor");
   });
 
-  it("advise: the notice rides with the user's next turn as a message part, once, never in the system prompt, and not again after a restart (QA-2.4-9)", async () => {
-    const { hooks } = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
+  it("advise: the notice is a synthetic transcript entry, once; the user's prompt is byte-identical; the system prompt never carries it (QA-2.4-R2-1)", async () => {
+    const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
     const first = await turn(hooks);
     expect(first.some((p) => p.includes("Cost doctor"))).toBe(false); // the first turn only starts the check
-    let parts: Array<{ type?: string; text: string; synthetic?: boolean }> = [];
+    let seen = 0;
     await until(() => {
-      void userMessage(hooks, "root-1", "hello").then((p) => { if (parts.length === 0) parts = p.slice(1); });
-      return parts.length > 0;
+      void userMessage(hooks, "root-1", "hello").then((parts) => {
+        seen += 1;
+        expect(parts).toEqual([{ type: "text", text: "hello" }]); // the user's message is untouched, with or without a pending notice
+      });
+      return host.synthetic.length > 0;
     });
-    expect(parts).toHaveLength(1);
-    expect(parts[0]).toMatchObject({ type: "text", synthetic: true });
-    expect(parts[0]!.text).toContain("[model-router] Cost doctor:");
-    expect(parts[0]!.text).toContain("say it once");
-    expect((await userMessage(hooks, "root-1", "again")).length).toBe(1); // handed over once: the user's own part only
+    expect(host.synthetic).toHaveLength(1);
+    expect(host.synthetic[0]).toMatchObject({ sessionID: "root-1", description: "Model router cost doctor" });
+    expect(host.synthetic[0]!.text).toContain("[model-router] Cost doctor:");
+    expect(host.synthetic[0]!.text).toContain("say it once");
+    expect(seen).toBeGreaterThan(0);
+    const parts = await userMessage(hooks, "root-1", "again");
+    expect(parts).toEqual([{ type: "text", text: "again" }]);
+    expect(host.synthetic).toHaveLength(1); // handed over once
     expect((await turn(hooks)).some((p) => p.includes("Cost doctor"))).toBe(false); // and the system prompt never carries it
     await until(() => (existsSync(store) ? readdirSync(store) : []).includes("advisor-notice.json"));
-    expect(readdirSync(store)).not.toContain("advisor-notice.lock"); // the lock is released
+    expect(readdirSync(store).filter((name) => name.endsWith(".lock"))).toEqual([]); // the lock is released
     // a restart: same directory, nothing is due and nothing is pending
     const again = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
     for (let i = 0; i < 3; i += 1) {
-      expect((await userMessage(again.hooks, `s${i}`, "hi")).length).toBe(1);
+      expect(await userMessage(again.hooks, `s${i}`, "hi")).toEqual([{ type: "text", text: "hi" }]);
       await turn(again.hooks, `s${i}`);
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    expect(again.host.synthetic).toHaveLength(0);
     expect(again.host.agentCalls()).toBe(0); // throttled before any host call
   });
 
@@ -1244,7 +1262,7 @@ describe("cost doctor in the plugin", () => {
     await turn(first.hooks);
     await until(() => {
       try {
-        return (JSON.parse(readFileSync(join(store, "advisor-notice.json"), "utf-8")) as { pendingText: string | null }).pendingText !== null;
+        return (JSON.parse(readFileSync(join(store, readdirSync(store).find((n) => n.startsWith("advisor-notice") && n.endsWith(".json"))!), "utf-8")) as { pendingText: string | null }).pendingText !== null;
       } catch {
         return false; // not written yet
       }
@@ -1252,34 +1270,58 @@ describe("cost doctor in the plugin", () => {
     await first.hooks.dispose();
     instances.splice(instances.indexOf(first.hooks), 1);
     const second = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
-    const parts = await userMessage(second.hooks, "root-9", "first message");
-    expect(parts).toHaveLength(2);
-    expect(parts[1]!.text).toContain("Cost doctor");
+    expect(await userMessage(second.hooks, "root-9", "first message")).toEqual([{ type: "text", text: "first message" }]);
+    await until(() => second.host.synthetic.length > 0);
+    expect(second.host.synthetic[0]).toMatchObject({ sessionID: "root-9", description: "Model router cost doctor" });
+    expect(second.host.synthetic[0]!.text).toContain("Cost doctor");
     expect(second.host.agentCalls()).toBe(0);
   });
 
   it("a subagent's or a grader's message never takes the notice; the root session still gets it afterwards", async () => {
-    const { hooks } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, parents: { "child-1": "root-1" } });
+    const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, parents: { "child-1": "root-1" } });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).includes("advisor-notice.json"));
-    expect((await userMessage(hooks, "child-1", "do the thing")).length).toBe(1);
-    expect((await userMessage(hooks, "root-1", "hello")).length).toBe(2);
+    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    expect(await userMessage(hooks, "child-1", "do the thing")).toEqual([{ type: "text", text: "do the thing" }]);
+    expect(host.synthetic).toHaveLength(0);
+    await userMessage(hooks, "root-1", "hello");
+    await until(() => host.synthetic.length === 1);
+    expect(host.synthetic[0]!.sessionID).toBe("root-1");
   });
 
-  it("shadow: the notice is logged, never injected into the user's turn or the system prompt", async () => {
+  it("without a synthetic-message call on the host (v1, an older adapter) the notice is a log line, once, and the user's message is untouched", async () => {
+    const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, synthetic: false });
+    await turn(hooks);
+    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    expect(await userMessage(hooks, "root-1", "hello")).toEqual([{ type: "text", text: "hello" }]);
+    expect(host.logs.filter((m) => m.startsWith("[model-router] Cost doctor:"))).toHaveLength(1);
+    await userMessage(hooks, "root-1", "again");
+    expect(host.logs.filter((m) => m.startsWith("[model-router] Cost doctor:"))).toHaveLength(1);
+  });
+
+  it("a failing synthetic call is logged and never reaches the turn", async () => {
+    const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, synthetic: "fail" });
+    await turn(hooks);
+    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    expect(await userMessage(hooks, "root-1", "hello")).toEqual([{ type: "text", text: "hello" }]);
+    await until(() => host.logs.some((m) => m.includes("notice not delivered")));
+  });
+
+  it("shadow: the notice is logged, never delivered into the session", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
     await turn(hooks);
     await until(() => host.logs.some((m) => m.startsWith("[model-router] Cost doctor:")));
-    expect((await userMessage(hooks, "root-1", "hi")).length).toBe(1);
+    expect(await userMessage(hooks, "root-1", "hi")).toEqual([{ type: "text", text: "hi" }]);
+    expect(host.synthetic).toHaveLength(0);
     expect((await turn(hooks)).some((p) => p.includes("Cost doctor"))).toBe(false);
-    expect(existsSync(store) ? readdirSync(store) : []).not.toContain("advisor-notice.json"); // log mode writes no state file (QA-2.4-10)
+    expect((existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice"))).toBe(false); // log mode writes no state file (QA-2.4-10)
   });
 
   it("routing.advisor.notify: false silences the notice in every mode, and the /router section stays", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store }, advisor: { notify: false } } });
     await turn(hooks);
     await new Promise((resolve) => setTimeout(resolve, 60));
-    expect((await userMessage(hooks, "root-1", "hi")).length).toBe(1);
+    expect(await userMessage(hooks, "root-1", "hi")).toEqual([{ type: "text", text: "hi" }]);
+    expect(host.synthetic).toHaveLength(0);
     expect(host.logs.some((m) => m.includes("Cost doctor:"))).toBe(false);
     expect(existsSync(store) ? readdirSync(store) : []).toEqual([]);
     expect(await ask(hooks)).toContain("Cost doctor: ");

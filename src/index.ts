@@ -622,7 +622,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const v1AgentsNow = (): HostAgentInfo[] | null => {
     if (v1Agents === null || Date.now() - v1Agents.at >= V1_AGENTS_TTL_MS) refreshV1Agents();
     return v1Agents?.infos ?? null;
-  };  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
+  };  /** Hand a notice to the orchestrator as a synthetic transcript entry (v2), or log it where there is no such call. Never throws, never waits. */
+  const deliverAdvisorNotice = (sessionID: string, notice: string): void => {
+    const synthetic = ctx.routerSynthetic;
+    if (synthetic === undefined) {
+      logger.warn(notice); // no synthetic-message call on this host: the log line is the whole delivery
+      return;
+    }
+    const text = `Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${notice}`;
+    void Promise.resolve()
+      .then(() => synthetic({ sessionID, text, description: "Model router cost doctor" }))
+      .catch((error: unknown) => {
+        logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
+      });
+  };
+  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
   const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
     const routing = resolveRouting(cfg, "v2");
     if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
@@ -1452,27 +1466,23 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
     "chat.message": async (input: any, output: any) => {
       if (bypassed) return;
-      // 2.4.3 (QA-2.4-9): the cost doctor's notice rides with the user's own turn, as one more text part of the message being created.
-      // OpenCode v2 joins a message's parts into the prompt text, so there it lands at the end of the latest user turn; the system prompt
-      // is never touched. Only a PROVEN root session takes it (never a subagent or a grader), and only when one may be waiting.
+      // 2.4.3 (QA-2.4-R2-1): the cost doctor's notice is NEVER part of the user's message (the prompt text stays byte for byte what the user
+      // typed). It is a synthetic transcript entry, through the same host call the adapter uses for the config-reload and narration notices
+      // (`ctx.session.synthetic({ …, resume: false })`, exposed as `routerSynthetic`): it enters the context of the orchestrator's next
+      // request without resuming or answering anything. Delivery is not awaited (the host may be admitting this very prompt); a failure is
+      // logged. A host without `routerSynthetic` (OpenCode v1 has no such call and no advisor either) gets a log line instead. Only a PROVEN
+      // root session takes it (never a subagent or a grader), and only when one may be waiting.
       if (advisorNotifier !== undefined && advisorNotifier.maybePending() && typeof input?.sessionID === "string") {
         const noticeSession: string = input.sessionID;
         try {
           if (!graderSessions.has(noticeSession) && !sessionStore.isSubagent(noticeSession) && (await lookupRootSession(noticeSession)) === true) {
             const notice = await advisorNotifier.take();
-            if (notice !== null && Array.isArray(output?.parts)) {
-              output.parts.push({
-                type: "text" as const,
-                synthetic: true,
-                text: `Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${notice}`,
-              });
-            }
+            if (notice !== null) deliverAdvisorNotice(noticeSession, notice);
           }
         } catch (error) {
           logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
         }
-      }
-      // Re-read cfg so /preset switches take effect without restart
+      }      // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig(projectDir);
         warnConfigIssues(cfg, logger);
