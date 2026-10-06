@@ -818,6 +818,12 @@ export interface StatsTable {
   /** ISO strings of the window bounds; null = unbounded. */
   readonly window: { readonly since: string | null; readonly until: string | null };
   readonly dispatches: number;
+  /** Dispatch rows written by the 2.2 router (QA-INT-2): every dispatch row but the delegate runner's first attempts. */
+  readonly routed: number;
+  /** First attempts of `delegate` (the runner's recorder rows, decision ids `ladder-…`): not routed by the engine. */
+  readonly delegateFirstAttempts: number;
+  /** Dispatches lifted to `floorTier` by the adapter (`lift:floor`, QA-2.2-R2-3): policy, outside the switched and savings numbers. */
+  readonly floorLifts: number;
   readonly pinned: number;
   readonly byClass: readonly ClassStatsRow[];
   readonly byKey: readonly KeyStatsRow[];
