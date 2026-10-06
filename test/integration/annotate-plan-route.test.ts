@@ -18,7 +18,7 @@ import { classifyMany as realClassifyMany } from "../../src/routing/classify";
 import { fenceMask } from "../../src/routing/classify/fences";
 import { parseRouteLine } from "../../src/routing/classify/route-line";
 import type { ClassifierBackend, ClassifyInput, ClassifyResult } from "../../src/routing/classify/types";
-import { agentInfosForPlan, annotatePlanText, applyAdditions, locatePlan, renderDirectives, splitPlan, withTagAtStart } from "../../src/routing/commands/annotate-plan";
+import { agentInfosForPlan, annotatePlanText, applyAdditions, locatePlan, renderDirectives, splitPlan, structureMask, withTagAtStart } from "../../src/routing/commands/annotate-plan";
 import type { AnnotateDeps } from "../../src/routing/engine";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
 
@@ -386,6 +386,67 @@ describe("splitPlan", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// A code block ends with its list item; comments hide their lists (QA-2.4-12)
+// ---------------------------------------------------------------------------
+
+describe("splitPlan: fences that end with their item, and HTML comments (QA-2.4-12)", () => {
+  /** `closerWithInfo`: the closing line carries an info string, so it is not a closer; the next top-level item still ends the block. */
+  const CLOSER_WITH_INFO = ["1. run the build", "   ```sh", "   npm run build", "   ```sh", "2. run the tests", "3. ship it"].join("\n");
+  const DEDENT = ["- first", "  ```", "  code", "not indented", "- second"].join("\n");
+  const COMMENTED = ["- real one", "<!--", "- hidden one", "- hidden two", "-->", "- real two", "", "<!-- - single line, hidden -->", "- real three"].join("\n");
+
+  it("a closer with an info string no longer absorbs every later step: the next item at the item's own level ends the code block", async () => {
+    expect(splitPlan(CLOSER_WITH_INFO).map((s) => s.line)).toEqual([1, 5, 6]);
+    expect(splitPlan(CLOSER_WITH_INFO)[0]!.text).toBe("1. run the build\n   ```sh\n   npm run build\n   ```sh\n");
+    const result = await annotatePlanText(CLOSER_WITH_INFO, makeDeps().deps);
+    expect(result.additions.map((a) => a.line)).toEqual([1, 5, 6]); // all three steps are annotated, not only the first
+    const mask = structureMask(CLOSER_WITH_INFO.split("\n"));
+    expect(mask).toEqual([false, true, true, true, false, false]);
+    // the shared scanner (used inside one step) would have called lines 5 and 6 code: that is the absorption this fixes
+    expect(fenceMask(CLOSER_WITH_INFO.split("\n"))).toEqual([false, true, true, true, true, true]);
+  });
+
+  it("a non-blank line indented less than the item closes its fence; a fence at the top level still runs to its closer or the end", () => {
+    expect(splitPlan(DEDENT).map((s) => s.line)).toEqual([1, 5]);
+    expect(structureMask(DEDENT.split("\n"))).toEqual([false, true, true, false, false]);
+    // blank lines inside the block, and lines indented as the item's content, stay in it
+    expect(splitPlan(["- a", "  ```", "", "  - looks like a step", "", "  ```", "- b"].join("\n")).map((s) => s.line)).toEqual([1, 7]);
+    // a fence at column 0 after an item is not part of the item: unclosed, it hides the rest of the text, as before
+    expect(splitPlan("- unclosed\n```\n- never a step\n").map((s) => s.line)).toEqual([1]);
+    expect(splitPlan("intro\n\n```\n- never a step\n").map((s) => s.line)).toEqual([]);
+  });
+
+  it("a list inside an HTML comment is never a step, whether the comment spans lines or one", async () => {
+    expect(splitPlan(COMMENTED).map((s) => s.line)).toEqual([1, 6, 9]);
+    expect(structureMask(COMMENTED.split("\n"))).toEqual([false, true, true, true, true, false, false, true, false]);
+    const result = await annotatePlanText(COMMENTED, makeDeps().deps);
+    expect(result.additions.map((a) => a.line)).toEqual([1, 6, 9]);
+    expect(result.text).toContain("<!--\n- hidden one\n- hidden two\n-->"); // the comment itself is untouched
+    expect(splitPlan("<!--\n- a\n- b\n-->\n").map((s) => s.line)).toEqual([]);
+    expect(splitPlan("- a\n<!-- never closed\n- b\n").map((s) => s.line)).toEqual([1]);
+  });
+
+  it.each([
+    ["closerWithInfo", CLOSER_WITH_INFO],
+    ["dedent closes the fence", DEDENT],
+    ["commented lists", COMMENTED],
+  ])("%s: the instructions carried out literally give the annotated text, and no insertion point is inside code or a comment", async (_name, plan) => {
+    const result = await annotatePlanText(plan, makeDeps().deps);
+    const text = renderDirectives(result, { path: "p.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } });
+    const { text: done, anchors } = carryOut(plan, text);
+    expect(done).toBe(result.text);
+    const original = plan.split("\n");
+    const masked = structureMask(original);
+    for (const { line, quoted } of anchors) {
+      expect(original[line - 1]).toBe(quoted);
+      expect(masked[line - 1], `line ${line} is inside code or a comment`).toBe(false);
+    }
+    // every line of every masked region is still there, unchanged and in order
+    const kept = original.filter((_, i) => masked[i]);
+    expect(done.split("\n").filter((l) => kept.includes(l))).toEqual(expect.arrayContaining(kept));
+  });
+});
 // ---------------------------------------------------------------------------
 // Locating the plan, agents, rendering
 // ---------------------------------------------------------------------------

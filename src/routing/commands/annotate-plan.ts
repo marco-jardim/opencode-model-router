@@ -61,6 +61,82 @@ function indentOf(line: string): number {
   return columns;
 }
 
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
+/**
+ * Which lines are code or comment, the way the step scanner needs it (QA-2.4-12). Like the shared `fenceMask` (an opener, a closer of the
+ * same character at least as long, nothing but whitespace after it) with two differences that matter inside a plan:
+ *  - a fence opened inside a list item ends where the item does: a non-blank line indented less than the item's content column closes it
+ *    (CommonMark), so a closer that is not valid (`closerWithInfo`: ``` followed by an info string) can no longer swallow every later
+ *    step to the end of the file;
+ *  - an HTML comment block (`<!--` … `-->`) is masked, so a list inside one is never a step.
+ * A fence at the top level (not inside an item) still runs to its closer, or to the end of the text.
+ */
+export function structureMask(lines: readonly string[]): boolean[] {
+  const mask: boolean[] = new Array<boolean>(lines.length).fill(false);
+  let fence: { readonly char: string; readonly length: number; readonly itemOffset: number | null } | null = null;
+  let comment = false;
+  let itemOffset: number | null = null; // content column of the list item we are in, if any
+  let gap = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] as string;
+    if (fence !== null) {
+      const closer = FENCE_CLOSE_RE.exec(line);
+      if (closer !== null && (closer[1] as string)[0] === fence.char && (closer[1] as string).length >= fence.length) {
+        mask[i] = true;
+        fence = null;
+        continue;
+      }
+      if (line.trim() === "" || fence.itemOffset === null || indentOf(line) >= fence.itemOffset) {
+        mask[i] = true;
+        continue;
+      }
+      fence = null; // the item ended: so did its code block; this line is an ordinary line
+    }
+    if (comment) {
+      mask[i] = true;
+      if (line.includes("-->")) comment = false;
+      continue;
+    }
+    if (line.trim() === "") {
+      gap = true;
+      continue;
+    }
+    if (HEADING_RE.test(line) || THEMATIC_RE.test(line)) {
+      itemOffset = null;
+      gap = false;
+      continue;
+    }
+    const open = FENCE_OPEN_RE.exec(line);
+    const run = open?.[1];
+    if (open !== null && run !== undefined && !(run[0] === "`" && (open[2] ?? "").includes("`"))) {
+      if (itemOffset !== null && indentOf(line) < itemOffset) itemOffset = null; // not indented as the item's content: not part of it
+      mask[i] = true;
+      fence = { char: run[0] as string, length: run.length, itemOffset };
+      gap = false;
+      continue;
+    }
+    if (line.trimStart().startsWith("<!--")) {
+      if (itemOffset !== null && indentOf(line) < itemOffset) itemOffset = null;
+      mask[i] = true;
+      comment = !line.slice(line.indexOf("<!--") + 4).includes("-->");
+      gap = false;
+      continue;
+    }
+    const item = LIST_ITEM_RE.exec(line);
+    if (item !== null) {
+      const indent = indentOf(line);
+      if (itemOffset === null || indent < itemOffset) itemOffset = indent + (item[2] as string).length + indentOf(item[3] as string);
+      gap = false;
+      continue;
+    }
+    if (itemOffset !== null && gap && indentOf(line) < itemOffset) itemOffset = null; // a paragraph after a blank line ends the item
+    gap = false;
+  }
+  return mask;
+}
+
 interface Run {
   start: number;
   end: number;
@@ -178,7 +254,7 @@ export function splitPlan(text: string): PlacedStep[] {
     }
     at += part.length;
   });
-  const fenced = fenceMask(lines);
+  const fenced = structureMask(lines);
   let runs = listRuns(lines, fenced);
   if (runs.length === 0) runs = headingRuns(lines, fenced);
   return runs.map((run) => {
