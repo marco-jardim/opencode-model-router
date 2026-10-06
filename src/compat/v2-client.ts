@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
-import type { ChildSessionRunner } from "./child-session";
+import { ResumeRejectedError, type ChildSessionRunner } from "./child-session";
 
 export const V2_GRADER_AGENT = "model-router-grader";
 const RETAINED_CONTEXT_LIMIT = 500;
@@ -82,14 +82,40 @@ export function createV2Runtime(ctx: Plugin.Context) {
         ...(request.signal ? [request.signal] : []),
       ]);
       signal.throwIfAborted();
-      let childID: string | undefined;
+      const resumeID = request.resumeSessionID;
+      if (resumeID !== undefined) {
+        // The host resumes any session id it is given, so ours checks that the child exists and belongs to the
+        // calling session before anything is sent. Whatever the lookup says other than "my child", the caller
+        // falls back to a fresh child.
+        const parent = scope.context.sessionID;
+        let info: { parentID?: unknown } | undefined;
+        try {
+          info = await ctx.session.get({ sessionID: resumeID }, { signal });
+        } catch (error) {
+          signal.throwIfAborted();
+          throw new ResumeRejectedError(resumeID, `session lookup failed (${error instanceof Error ? error.message : String(error)})`);
+        }
+        if (info?.parentID !== parent) throw new ResumeRejectedError(resumeID, `it is not a child of session ${parent}`);
+      }
+      // A resumed child is known up front: the host does not create one, and a progress event for another id is an error.
+      let childID: string | undefined = resumeID;
+      if (resumeID !== undefined) {
+        activeChildren.set(resumeID, controller);
+        if (request.system) childSystems.set(resumeID, request.system);
+      }
       const model = request.model;
       try {
+        // A resumed child is registered here, before the host can run it, exactly like a created one is in `progress`.
+        if (resumeID !== undefined) {
+          await request.onCreated(resumeID);
+          signal.throwIfAborted();
+        }
         const result = await native.execute({
           agent: request.agent ?? V2_GRADER_AGENT,
           description: request.agent ? `Router ${request.agent} delegation` : "Router result verification",
           prompt: request.prompt,
           ...(model ? { model: `${model.providerID}/${model.modelID}${model.variant ? `#${model.variant}` : ""}` } : {}),
+          ...(resumeID !== undefined ? { sessionID: resumeID } : {}),
           background: false,
         }, {
           ...toolContext,
@@ -97,7 +123,18 @@ export function createV2Runtime(ctx: Plugin.Context) {
           async progress(metadata) {
             const sessionID = metadata.sessionID;
             if (typeof sessionID === "string" && sessionID !== childID) {
-              if (childID) throw new Error("[model-router] native subagent changed its child session ID");
+              if (childID) {
+                // The host started another child than the one this call is about (a resume that did not resume, or a
+                // second child): no caller knows its id, so it is stopped and removed here before the error, or it
+                // would live until the host is restarted (QA-2.3-5). The original child is interrupted below.
+                let cleanup = "";
+                try {
+                  await childRunner.dispose(sessionID);
+                } catch (error) {
+                  cleanup = `; removing it failed (${error instanceof Error ? error.message : String(error)})`;
+                }
+                throw new Error(`[model-router] native subagent changed its child session ID (${childID} -> ${sessionID}${cleanup})`);
+              }
               childID = sessionID;
               activeChildren.set(sessionID, controller);
               if (request.system) childSystems.set(sessionID, request.system);

@@ -845,7 +845,7 @@ export interface StatsTable {
     /** pass / (pass + fail) over windowed verdict rows of `variant` attempts. */
     readonly passRate: RatioCell;
   };
-  /** Fixed order: LADDER_STEP_KINDS. */
+  /** Fixed order: LADDER_STEP_KINDS. `renderMarkdown` leaves the `dispatch` row out (QA-2.3-7); the data keeps it. */
   readonly resumeVsFresh: readonly ResumeFreshRow[];
 }
 

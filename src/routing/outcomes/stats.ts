@@ -317,10 +317,13 @@ export function renderMarkdown(table: StatsTable): string {
           ),
         ].join("\n");
 
+  // QA-2.3-7: the rendered table is the ladder's. `dispatch` counts first dispatches (always fresh for `delegate`) and the
+  // `sessionID`/`task_id` resumes of dispatched subagents, neither of which is a D11 ladder decision, so its row is left out
+  // here; `resumeVsFresh` itself (and `--json`) keeps it, so those numbers stay countable.
   const resumeTable = [
     "| Step | Resume | Fresh |",
     "|---|---|---|",
-    ...table.resumeVsFresh.map((r) => `| ${r.step} | ${r.resume} | ${r.fresh} |`),
+    ...table.resumeVsFresh.filter((r) => r.step !== "dispatch").map((r) => `| ${r.step} | ${r.resume} | ${r.fresh} |`),
   ].join("\n");
 
   const blocks = [

@@ -30,9 +30,12 @@ import {
   forgetDispatch,
   forgetDispatchesOf,
   lookupDispatch,
+  noteExecutionEnded,
+  noteStepContext,
   sweepDispatches,
   touchDispatch,
 } from "../../router/sessions";
+import { stepContextTokens } from "../../escalate/variants";
 import type { DispatchRecord } from "../../router/sessions";
 import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
@@ -486,6 +489,8 @@ export function createIngest(deps: IngestDeps): Ingest {
     // (the orchestrator's own), and the settings may cost a config fingerprint check.
     const record = lookupDispatch(childSessionID);
     if (record === undefined) return null;
+    // Registered where ingestion was off (QA-2.3-6): another instance's configuration decides, not this one's.
+    if (record.outcomes === false) return null;
     const settings = deps.settings();
     if (settings === null) return null;
     const confidence = record.facts.confidence;
@@ -588,6 +593,13 @@ export function createIngest(deps: IngestDeps): Ingest {
         const data = event.data;
         const sessionID = data.sessionID;
         if (typeof sessionID !== "string") return;
+        // Phase 2.3 (D11): the delegate ladder decides resume vs fresh from the child's context size, in every engine
+        // mode, so this runs before the settings gate. It only updates the in-memory registry (nothing is written)
+        // and ignores children that are not registered.
+        if (!failed && lookupDispatch(sessionID) !== undefined) {
+          const context = stepContextTokens(isRecord(data.tokens) ? data.tokens : undefined);
+          if (context !== null) noteStepContext(sessionID, context, safeNow(now));
+        }
         const first = targetOf(sessionID);
         if (first === null) return;
         const tokens = isRecord(data.tokens) ? (data.tokens as unknown as StepEndedTokens) : undefined;
@@ -646,6 +658,9 @@ export function createIngest(deps: IngestDeps): Ingest {
     onExecutionEnded(childSessionID: string): void {
       try {
         if (lookupDispatch(childSessionID) === undefined) return;
+        // Phase 2.3 (QA-2.3-2): every step event of this registration has been noted, whatever the engine mode; the
+        // delegate ladder reads the child's context only after this.
+        noteExecutionEnded(childSessionID, safeNow(now));
         closeLastAttempt(childSessionID);
       } catch (error) {
         warn("execution end failed", error, { childSessionID });

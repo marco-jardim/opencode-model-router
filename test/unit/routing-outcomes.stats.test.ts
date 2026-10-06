@@ -533,7 +533,6 @@ describe("renderMarkdown", () => {
     "",
     "| Step | Resume | Fresh |",
     "|---|---|---|",
-    "| dispatch | 1 | 6 |",
     "| variant | 2 | 1 |",
     "| retry | 0 | 2 |",
     "| escalate | 0 | 0 |",
@@ -554,7 +553,7 @@ describe("renderMarkdown", () => {
     expect(out.startsWith("## Routing stats\n\nWindow: ")).toBe(true);
   });
 
-  it("an empty table prints a valid report: n/a, _none_ in place of empty tables, four zero rows", () => {
+  it("an empty table prints a valid report: n/a, _none_ in place of empty tables, three zero ladder rows", () => {
     const out = renderMarkdown(summarize(null, [], NONE));
     expect(out).toBe(
       [
@@ -583,7 +582,6 @@ describe("renderMarkdown", () => {
         "",
         "| Step | Resume | Fresh |",
         "|---|---|---|",
-        "| dispatch | 0 | 0 |",
         "| variant | 0 | 0 |",
         "| retry | 0 | 0 |",
         "| escalate | 0 | 0 |",
@@ -592,6 +590,16 @@ describe("renderMarkdown", () => {
     );
   });
 
+  it("QA-2.3-7: the rendered resume table is the ladder's (variant, retry, escalate); the data keeps the dispatch row", () => {
+    const out = renderMarkdown(fixed);
+    const section = out.slice(out.indexOf("### Resume vs fresh"));
+    expect(section).not.toContain("| dispatch |");
+    expect(section.match(/^\| (dispatch|variant|retry|escalate) \|/gm)).toEqual(["| variant |", "| retry |", "| escalate |"]);
+    // 2.2's sessionID/task_id resumes are `dispatch` rows with resume true: still countable from the data and --json
+    expect(fixed.resumeVsFresh.map((r) => r.step)).toEqual(["dispatch", "variant", "retry", "escalate"]);
+    expect(fixed.resumeVsFresh[0]).toEqual({ step: "dispatch", resume: 1, fresh: 6 });
+    expect(summarize(null, [], NONE).resumeVsFresh.map((r) => r.step)).toEqual(["dispatch", "variant", "retry", "escalate"]);
+  });
   it("rows shuffled → identical output; the snapshot of the scenario is stable", () => {
     const rows = scenario();
     const reference = renderMarkdown(summarize(storeWithMeasuredA(), rows, WINDOW));

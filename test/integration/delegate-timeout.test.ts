@@ -19,7 +19,10 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
+import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache } from "../../src/router/config";
+import { resetDispatchRegistry } from "../../src/router/sessions";
+import { resetIngestState } from "../../src/routing/outcomes/ingest";
 // These tests isolate model/gate clocks. The temp directories are not Git
 // checkouts; model the unavailable snapshot without introducing real processes
 // into a fake-timer test (which would make grader start times wall-clock dependent).
@@ -616,6 +619,223 @@ describe("delegate time-boxes (fake timers)", () => {
       expect(createdDeadlines[0]!.signal.aborted).toBe(true);
     } finally {
       treeDelay.ms = 0;
+    }
+  });
+});
+
+describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", () => {
+  let dir: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mrto-resume-"));
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    process.env.HOME = dir;
+    process.env.USERPROFILE = dir;
+    delete process.env.MODEL_ROUTER_ENFORCE;
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
+    resetDispatchRegistry();
+    resetIngestState();
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (savedHome !== undefined) process.env.HOME = savedHome;
+    else delete process.env.HOME;
+    if (savedUserProfile !== undefined) process.env.USERPROFILE = savedUserProfile;
+    else delete process.env.USERPROFILE;
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
+    resetDispatchRegistry();
+    resetIngestState();
+    invalidateConfigCache();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  function writeResumeOverrides(): void {
+    const p = path.join(dir, ".config/opencode/opencode-model-router.overrides.jsonc");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tier = (model: string, variant: string, costRatio: number) => ({ model, variant, costRatio, description: "test tier", whenToUse: ["testing"] });
+    fs.writeFileSync(p, JSON.stringify({
+      activePreset: "tst",
+      presets: { tst: {
+        fast: tier("anthropic/claude-sonnet-5-5", "low", 1),
+        medium: tier("anthropic/claude-sonnet-5-5", "medium", 5),
+        heavy: tier("anthropic/claude-opus-5-5", "xhigh", 20),
+      } },
+      routing: {},
+      enforcement: { escalate: { maxTotalAttempts: 8, costCeiling: { multiple: 100 } } },
+    }), "utf-8");
+    invalidateConfigCache();
+  }
+
+  const catalog = ["anthropic/claude-sonnet-5-5", "anthropic/claude-opus-5-5"].map((ref) => {
+    const [providerID, id] = ref.split("/");
+    return { providerID: providerID!, id: id!, variants: ["low", "medium", "high", "xhigh"].map((v) => ({ id: v })), limit: { input: 1_000_000, context: 1_000_000, output: 4_096 } };
+  });
+
+  it("cuts a resumed child that never answers off at the producer ceiling, aborts its signal, and carries on fresh", async () => {
+    writeResumeOverrides();
+    const verdicts = [false, true];
+    const log: string[] = [];
+    let producerRuns = 0;
+    let ingest: { onStepEnded(event: unknown): Promise<void>; onExecutionEnded(sessionID: string): void } | undefined;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: async () => catalog,
+      // The plugin's own telemetry ingest: the host publishes a finished step's usage on the event stream, and the
+      // ladder's resume decision (D11) reads the child's context from what the ingest saw.
+      routerOnIngest: (created: typeof ingest) => { ingest = created; },
+      routerChildRunner: {
+        run: async (request: ChildSessionRequest) => {
+          if (request.system !== undefined) {
+            const sid = `grader-${sessionCounter++}`;
+            await request.onCreated(sid);
+            return { sessionID: sid, text: JSON.stringify({ pass: verdicts.shift() ?? false, reasons: ["scripted verdict"] }) };
+          }
+          producerRuns += 1;
+          const sid = request.resumeSessionID ?? `resume-child-${producerRuns}`;
+          log.push(`${request.resumeSessionID === undefined ? "create" : "resume"}:${sid}:${request.model?.variant}`);
+          await request.onCreated(sid);
+          if (producerRuns === 1) {
+            await ingest?.onStepEnded({ id: `step-${sid}`, type: "session.step.ended", data: { sessionID: sid, finish: "stop", cost: 0, tokens: { input: 5_000, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } } });
+            ingest?.onExecutionEnded(sid); // the host's session.execution.* event, after the last step
+          }
+          if (producerRuns === 2) {
+            await new Promise<void>((_resolve, reject) => request.signal?.addEventListener("abort", () => { log.push(`aborted:${sid}`); reject(request.signal?.reason); }, { once: true }));
+          }
+          return { sessionID: sid, text: "producer output" };
+        },
+        dispose: async (sid: string) => { log.push(`dispose:${sid}`); },
+      },
+    } as unknown as RouterPluginInput) as unknown as { tool: { delegate: { execute(args: Record<string, unknown>, ctx?: { sessionID?: string }): Promise<string> } }; dispose(): Promise<void> };
+
+    const pending = hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    await vi.advanceTimersByTimeAsync(DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS + 1_000);
+    const result = await pending;
+    await hooks.dispose();
+
+    expect(result).toContain("[router ✓ verified:");
+    // attempt 1 fresh, attempt 2 resumed the child with the next variant and hung, attempt 3 fresh (a producer that
+    // timed out reports no trustworthy context, D11), still stepping the variant.
+    expect(log.filter((e) => !e.startsWith("dispose:"))).toEqual([
+      "create:resume-child-1:low",
+      "resume:resume-child-1:medium",
+      "aborted:resume-child-1",
+      "create:resume-child-3:high",
+    ]);
+    expect(log.indexOf("dispose:resume-child-1")).toBeLessThan(log.indexOf("create:resume-child-3:high"));
+  });
+
+  type DelegateHooks = { tool: { delegate: { execute(args: Record<string, unknown>, ctx?: { sessionID?: string }): Promise<string> } }; dispose(): Promise<void> };
+
+  function immediateRunner(created: string[]) {
+    return {
+      run: async (request: ChildSessionRequest) => {
+        const sid = `quick-${sessionCounter++}`;
+        created.push(sid);
+        await request.onCreated(sid);
+        return { sessionID: sid, text: request.system !== undefined ? '{"pass":true,"reasons":[]}' : "producer output" };
+      },
+      dispose: async () => undefined,
+    };
+  }
+
+  it("QA-2.3-3: a catalog that never answers costs the first delegation one timeout, no later one anything, and is logged once", async () => {
+    writeResumeOverrides();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let listCalls = 0;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: () => { listCalls += 1; return new Promise<never>(() => undefined); },
+      routerChildRunner: immediateRunner([]),
+    } as unknown as RouterPluginInput) as unknown as DelegateHooks;
+    const execute = () => hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    const settles = (promise: Promise<string>) => { const state = { done: false }; void promise.then(() => { state.done = true; }); return state; };
+    const unavailable = () => warn.mock.calls.filter(([message]) => String(message).includes("model catalog is unavailable")).length;
+    try {
+      // The first delegation waits for the catalog's own timeout (3 s), then carries on without variant info.
+      const first = execute();
+      const firstState = settles(first);
+      await vi.advanceTimersByTimeAsync(2_900);
+      expect(firstState.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(firstState.done).toBe(true);
+      expect(await first).toContain("[router ✓ verified:");
+      expect(listCalls).toBe(1);
+      expect(unavailable()).toBe(1);
+      // Within the TTL the negative answer is served at once: no wait, no second list() call, no second log line.
+      for (let n = 0; n < 2; n++) {
+        const later = execute();
+        const state = settles(later);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(state.done).toBe(true);
+        expect(await later).toContain("[router ✓ verified:");
+      }
+      expect(listCalls).toBe(1);
+      expect(unavailable()).toBe(1);
+      // After the TTL the first call is still outstanding: nothing starts behind it, and nothing waits.
+      await vi.advanceTimersByTimeAsync(20_000);
+      const afterTtl = execute();
+      const afterTtlState = settles(afterTtl);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(afterTtlState.done).toBe(true);
+      await afterTtl;
+      expect(listCalls).toBe(1);
+      // A call abandoned for good (60 s) is replaced; it hangs too, so that delegation waits once more, and the
+      // failure streak is still one log line.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const replaced = execute();
+      const replacedState = settles(replaced);
+      await vi.advanceTimersByTimeAsync(3_200);
+      expect(replacedState.done).toBe(true);
+      await replaced;
+      expect(listCalls).toBe(2);
+      expect(unavailable()).toBe(1);
+    } finally {
+      warn.mockRestore();
+      await hooks.dispose();
+    }
+  });
+
+  it("QA-2.3-3: concurrent delegations share one catalog load, and a late answer still fills the cache", async () => {
+    writeResumeOverrides();
+    let listCalls = 0;
+    let answer!: (models: typeof catalog) => void;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: () => { listCalls += 1; return new Promise<typeof catalog>((resolve) => { answer = resolve; }); },
+      routerChildRunner: immediateRunner([]),
+    } as unknown as RouterPluginInput) as unknown as DelegateHooks;
+    const execute = () => hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    try {
+      const a = execute();
+      const b = execute();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(listCalls).toBe(1); // one shared in-flight load for both
+      answer(catalog);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await a).toContain("[router ✓ verified:");
+      expect(await b).toContain("[router ✓ verified:");
+      const c = execute();
+      await vi.advanceTimersByTimeAsync(100);
+      await c;
+      expect(listCalls).toBe(1); // the positive answer is cached for the TTL
+    } finally {
+      await hooks.dispose();
     }
   });
 });
