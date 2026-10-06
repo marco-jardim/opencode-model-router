@@ -21,6 +21,8 @@ import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache } from "../../src/router/config";
+import { resetDispatchRegistry } from "../../src/router/sessions";
+import { resetIngestState } from "../../src/routing/outcomes/ingest";
 // These tests isolate model/gate clocks. The temp directories are not Git
 // checkouts; model the unavailable snapshot without introducing real processes
 // into a fake-timer test (which would make grader start times wall-clock dependent).
@@ -635,6 +637,8 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     process.env.USERPROFILE = dir;
     delete process.env.MODEL_ROUTER_ENFORCE;
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
+    resetDispatchRegistry();
+    resetIngestState();
     invalidateConfigCache();
   });
 
@@ -645,6 +649,8 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     if (savedUserProfile !== undefined) process.env.USERPROFILE = savedUserProfile;
     else delete process.env.USERPROFILE;
     delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
+    resetDispatchRegistry();
+    resetIngestState();
     invalidateConfigCache();
     try {
       fs.rmSync(dir, { recursive: true, force: true });
