@@ -20,7 +20,7 @@ import {
 } from "./backends/shared";
 import { createTypeSafeBackend } from "./backends/typesafe";
 import { applyRouteLine, parseRouteLine } from "./route-line";
-import { classifyByRules } from "./rules";
+import { analyzeRules } from "./rules";
 import { hasCredentialSignal } from "./scrub";
 import { buildClassifierState } from "./state";
 import {
@@ -114,27 +114,62 @@ function isValidResult(value: unknown): value is BackendResult {
   return true;
 }
 
-/** Step 5 merge: what a backend result does to the rules facts. */
-function mergeBackend(facts: TaskFacts, result: BackendResult): TaskFacts {
-  if (result.status === "ok") {
-    const taskClass = result.facts.class;
-    const confidence =
-      taskClass === facts.class && taskClass !== "other"
-        ? Math.max(result.facts.confidence, CONFIDENCE.backendAgreesWithRules)
-        : result.facts.confidence;
-    return {
+/** The classes a backend may pick: those the rules matched (search and recon are one family); null = any. */
+function allowedClasses(matched: readonly TaskClass[]): ReadonlySet<TaskClass> | null {
+  if (matched.length === 0) return null;
+  const allowed = new Set<TaskClass>(matched);
+  if (allowed.has("search") || allowed.has("recon")) {
+    allowed.add("search");
+    allowed.add("recon");
+  }
+  return allowed;
+}
+
+interface MergeContext {
+  readonly matched: readonly TaskClass[];
+  readonly minClassConfidence: number;
+  /** `classifyMany`: a label that does not agree with the rules is capped at CONFIDENCE.backendBatchCap. */
+  readonly batch: boolean;
+}
+
+/**
+ * Step 5 merge: what a backend result does to the rules facts (A19). A label
+ * replaces the rules class only when the rules matched it (or matched nothing);
+ * its confidence stays below `minClassConfidence` unless it agrees with the
+ * rules, so a backend alone can never clear the bar the rules failed.
+ */
+function mergeBackend(
+  facts: TaskFacts,
+  result: BackendResult,
+  ctx: MergeContext,
+): { readonly facts: TaskFacts; readonly rejected: boolean } {
+  if (result.status === "disagree") return { facts: { ...facts, confidence: 0 }, rejected: false };
+  if (result.status !== "ok") return { facts, rejected: false };
+
+  const taskClass = result.facts.class;
+  const allowed = allowedClasses(ctx.matched);
+  if (allowed !== null && !allowed.has(taskClass)) return { facts, rejected: true };
+
+  const agrees = taskClass === facts.class && taskClass !== "other";
+  let confidence = result.facts.confidence;
+  if (agrees) {
+    confidence = Math.max(confidence, CONFIDENCE.backendAgreesWithRules);
+  } else {
+    confidence = Math.min(confidence, Math.max(0, round2(ctx.minClassConfidence - 0.01)));
+    if (ctx.batch) confidence = Math.min(confidence, CONFIDENCE.backendBatchCap);
+  }
+  return {
+    facts: {
       class: taskClass,
       risk: maxOf<Risk>(RISKS, facts.risk, CLASS_BASE_RISK[taskClass], result.facts.risk ?? "low"),
       scope: maxOf<Scope>(SCOPES, facts.scope, result.facts.scope ?? "single"),
       needs: orderedNeeds([...facts.needs, ...CLASS_IMPLIED_NEEDS[taskClass]]),
       confidence,
       source: result.facts.source,
-    };
-  }
-  if (result.status === "disagree") return { ...facts, confidence: 0 };
-  return facts;
+    },
+    rejected: false,
+  };
 }
-
 /** Step 6 invariants: every path ends here. */
 function finalize(facts: TaskFacts): TaskFacts {
   let confidence = Number.isFinite(facts.confidence) ? Math.min(1, Math.max(0, facts.confidence)) : 0;
@@ -180,6 +215,8 @@ interface Prepared {
   readonly input: ClassifyInput;
   readonly parsed: RouteLineParse;
   readonly rules: TaskFacts;
+  /** Classes the rules matched (A19), highest cost first. */
+  readonly matched: readonly TaskClass[];
   readonly facts: TaskFacts;
 }
 
@@ -188,9 +225,10 @@ function prepare(input: ClassifyInput, deps: ClassifyDeps): Prepared {
   const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "");
   const description = typeof input.description === "string" ? input.description.trim() : "";
   const ruleText = [description, parsed.stripped].filter(Boolean).join("\n");
-  const rules = classifyByRules(ruleText, deps.cfg, { cwd: input.cwd });
+  const analysis = analyzeRules(ruleText, deps.cfg, { cwd: input.cwd });
+  const rules = analysis.facts;
   const facts = parsed.line ? applyRouteLine(rules, parsed.line) : rules;
-  return { input, parsed, rules, facts };
+  return { input, parsed, rules, matched: analysis.matched, facts };
 }
 
 /** Step 4: only unsure rules facts go to a backend. */
@@ -216,11 +254,20 @@ function resultOf(
   prepared: Prepared,
   backend: ClassifierBackend | null,
   outcome: BackendResult | null,
-  skipped?: "credentials",
+  deps: ClassifyDeps,
+  options: { readonly skipped?: "credentials"; readonly batch?: boolean } = {},
 ): ClassifyResult {
-  const merged = outcome === null ? prepared.facts : mergeBackend(prepared.facts, outcome);
+  const skipped = options.skipped;
+  const merged =
+    outcome === null
+      ? { facts: prepared.facts, rejected: false }
+      : mergeBackend(prepared.facts, outcome, {
+          matched: prepared.matched,
+          minClassConfidence: deps.minClassConfidence,
+          batch: options.batch === true,
+        });
   return {
-    facts: finalize(merged),
+    facts: finalize(merged.facts),
     pin: prepared.parsed.line?.pin ?? false,
     detection: prepared.parsed.line?.detection ?? null,
     stripped: prepared.parsed.stripped,
@@ -242,6 +289,7 @@ function resultOf(
               ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
               latencyMs: outcome.latencyMs,
               calls: outcome.calls,
+              ...(merged.rejected ? { rejected: true as const } : {}),
             },
     },
   };
@@ -266,8 +314,8 @@ export async function classify(input: ClassifyInput, deps: ClassifyDeps): Promis
   try {
     const prepared = prepare(input, deps);
     const backend = deps.backend;
-    if (backend === null || !isGated(prepared.facts, deps)) return resultOf(prepared, null, null);
-    if (mentionsCredentials(prepared)) return resultOf(prepared, null, null, "credentials");
+    if (backend === null || !isGated(prepared.facts, deps)) return resultOf(prepared, null, null, deps);
+    if (mentionsCredentials(prepared)) return resultOf(prepared, null, null, deps, { skipped: "credentials" });
 
     const state = buildClassifierState(
       { description: input.description, prompt: prepared.parsed.stripped },
@@ -292,7 +340,7 @@ export async function classify(input: ClassifyInput, deps: ClassifyDeps): Promis
             : synthetic("timeout", `backend did not settle within ${budget} ms`, budget);
       logSynthetic(deps, backend, outcome);
     }
-    return resultOf(prepared, backend, outcome);
+    return resultOf(prepared, backend, outcome, deps);
   } catch (error) {
     safeWarn(deps.logger, `classifier failed: ${reasonOf(error)}`);
     return unknownResult(promptOf(input));
@@ -384,7 +432,10 @@ export async function classifyMany(
 
     prepared.forEach((item, index) => {
       if (item === undefined) return;
-      results[index] = resultOf(item, backend, outcomes.get(index) ?? null, skipped.has(index) ? "credentials" : undefined);
+      results[index] = resultOf(item, backend, outcomes.get(index) ?? null, deps, {
+        batch: true,
+        ...(skipped.has(index) ? { skipped: "credentials" as const } : {}),
+      });
     });
   } catch (error) {
     safeWarn(deps.logger, `classifier failed: ${reasonOf(error)}`);
@@ -393,7 +444,7 @@ export async function classifyMany(
   return results.map((result, index) => {
     if (result !== undefined) return result;
     const item = prepared[index];
-    return item === undefined ? unknownResult(promptOf(list[index]!)) : resultOf(item, null, null);
+    return item === undefined ? unknownResult(promptOf(list[index]!)) : resultOf(item, null, null, deps, { batch: true });
   });
 }
 

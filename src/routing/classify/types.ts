@@ -342,6 +342,8 @@ export interface ClassifyTrace {
     readonly reason?: string;
     readonly latencyMs: number;
     readonly calls: number;
+    /** The backend answered `ok` but its class is not one the rules matched: the rules class stands (A19). */
+    readonly rejected?: true;
   } | null;
 }
 
@@ -1081,6 +1083,8 @@ export const CONFIDENCE = {
   backendSingleSample: 0.6,
   /** A backend label equal to the rules' winning class (not `other`). */
   backendAgreesWithRules: 0.8,
+  /** Cap on a backend label that does not agree with the rules, in a batch (A19). */
+  backendBatchCap: 0.6,
 } as const;
 
 /** Facts returned when classification itself failed (index.ts catch-all). Confidence 0: never switches (D9). */
