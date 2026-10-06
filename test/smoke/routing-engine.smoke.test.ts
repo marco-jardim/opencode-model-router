@@ -15,6 +15,8 @@
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
 import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
 import type { RouterConfig } from "../../src/router/config";
@@ -624,6 +626,58 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       } finally {
         expect((await distinct.stop()).hostPortClosed).toBe(true);
       }
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 400_000);
+  it("H8 notice and annotate-plan: the cost-doctor notice reaches a real orchestrator as one synthetic entry; /annotate-plan hands the model route lines with a live engine", async () => {
+    const host = await RoutingHost.start("notice", {
+      routing: { engine: "advise" },
+      providers: { smallless: { name: "Smallless", package: "@opencode/ai/providers/anthropic", settings: { baseURL: "$BASE_URL", apiKey: "keyless-smoke-fake" }, models: { "big-1": { name: "Big One", limit: { context: 200_000, output: 8_000 } } } } },
+    });
+    try {
+      await runScenario("H8a-advisor-notice-synthetic-entry", "In advise, a saving finding (title-model-unset, session on a provider without a small model) is delivered to the orchestrator as ONE synthetic transcript entry (resume:false, so it starts no turn), once, not repeated on later turns; the router's notice state file appears in the outcomes directory. Not exercised: a restart keeping the notice state (the file is keyed by the project path hash and each isolated host has a fresh path).", async s => {
+        const rootID = await host.newRoot("notice root", { providerID: "smallless", id: "big-1" });
+        const snapshots: Obj[] = [];
+        for (const turn of ["turn one", "turn two", "turn three", "turn four"]) {
+          await host.prompt(rootID, turn);
+          await new Promise(resolve => setTimeout(resolve, 1_000)); // the notice is handed over off the hot path
+          const messages = await host.client.session.context({ sessionID: rootID });
+          snapshots.push({ turn, types: messages.map(m => String(m.type)) });
+        }
+        const messages = await host.client.session.context({ sessionID: rootID });
+        const notices = messages.map((m, index) => ({ index, type: String(m.type), text: String(m.text ?? ""), description: m.description, metadata: m.metadata })).filter(m => m.type === "synthetic" && /Cost doctor notice/.test(m.text));
+        const listing = await host.storeListing();
+        s.observed.typesAfterEachTurn = snapshots;
+        s.observed.notices = notices.map(n => ({ index: n.index, description: n.description, text: n.text.slice(0, 700) }));
+        s.observed.allTypes = messages.map((m, index) => `${index}:${String(m.type)}`);
+        s.observed.storeFiles = listing;
+        s.observed.hostErrors = host.errorLines();
+        const lastIndex = messages.length - 1;
+        const ok = notices.length === 1 && /title-model-unset|agents\.title\.model|title/.test(notices[0]!.text) && notices[0]!.index < lastIndex && listing.some(f => /^advisor-notice\..+\.json$/.test(f.name)) && host.errorLines().length === 0;
+        s.verdict(ok, `${notices.length} synthetic cost-doctor entr${notices.length === 1 ? "y" : "ies"} after 4 turns (at index ${notices.map(n => n.index).join(",")} of ${messages.length}); notice state files: ${listing.filter(f => /^advisor-notice/.test(f.name)).map(f => f.name).join(",")}`);
+      });
+      const plan = ["# Plan", "", "1. Find every usage of parseThing in the repository and list the files.", "2. Implement the retry logic in src/client.ts with unit tests.", "3. Review the security of the token handling in src/auth.ts.", "", "```bash", "1. this is shell output, not a step", "```", ""].join("\n");
+      await writeFile(path.join(host.project, "plan.md"), plan);
+      await runScenario("H8b-annotate-plan-live-engine", "With a live engine /annotate-plan hands the model, in the command's own prompt, the exact [route …] lines to insert for each step of the plan file; a numbered line inside a fenced block is not a step and gets none.", async s => {
+        const rootID = await host.newRoot("annotate root");
+        await host.client.session.command({ sessionID: rootID, name: "annotate-plan", text: "plan.md" });
+        await host.settle(rootID);
+        const request = host.requestsOf(rootID).find(r => r.kind === "primary");
+        const text = request?.lastText ?? "";
+        s.observed.promptChars = text.length;
+        s.observed.routeLines = text.split(/\r?\n/).filter(l => /\[route /.test(l));
+        s.observed.promptHead = text.split(/\r?\n/).slice(0, 8);
+        s.observed.promptRouterPart = text.split(/\r?\n/).filter(l => /route|step|fence|code block/i.test(l)).slice(0, 40);
+        s.observed.planFileUnchanged = (await readFile(path.join(host.project, "plan.md"), "utf8")) === plan;
+        s.observed.hostErrors = host.errorLines();
+        const routeLines = text.split(/\r?\n/).filter(l => /^- line \d+ /.test(l) && /\[route class=/.test(l));
+        const inserted = routeLines.map(l => /the line "(\[route [^"]*\])"/.exec(l)?.[1] ?? "");
+        s.observed.insertedRouteLines = inserted;
+        const ok = routeLines.length === 3 && /3 steps found/.test(text) && /class=recon/.test(inserted[0] ?? "") && /class=implement/.test(inserted[1] ?? "") && /class=design .*pin\]$/.test(inserted[2] ?? "") && !routeLines.some(l => /shell output/.test(l)) && s.observed.planFileUnchanged === true && host.errorLines().length === 0;
+        s.verdict(ok, `${routeLines.length} step(s) annotated in the command prompt: ${inserted.join(" | ")}; the plan file is not written by the hook: ${String(s.observed.planFileUnchanged)}`);
+      });
     } finally {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);

@@ -1,0 +1,103 @@
+{
+  "scenario": "H8a-advisor-notice-synthetic-entry",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "094eeab8-1169-4768-a8b8-b2b019720293",
+  "recordedAt": "2026-10-06T21:49:57.784Z",
+  "harness": {
+    "headSha": "2c4b3754d93de37323eb1a96d425c8c0d5f4c9a6",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "a8bc521b7df02051eaa7210f40e3e01e43d5f8bd",
+      "test/smoke/helpers/routing-host.ts": "610d5c0e7fc56494aeae1c27021031b56700f8cf"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "In advise, a saving finding (title-model-unset, session on a provider without a small model) is delivered to the orchestrator as ONE synthetic transcript entry (resume:false, so it starts no turn), once, not repeated on later turns; the router's notice state file appears in the outcomes directory. Not exercised: a restart keeping the notice state (the file is keyed by the project path hash and each isolated host has a fresh path).",
+  "observed": {
+    "typesAfterEachTurn": [
+      {
+        "turn": "turn one",
+        "types": [
+          "user",
+          "assistant",
+          "idle"
+        ]
+      },
+      {
+        "turn": "turn two",
+        "types": [
+          "user",
+          "assistant",
+          "idle",
+          "synthetic",
+          "user",
+          "assistant",
+          "idle"
+        ]
+      },
+      {
+        "turn": "turn three",
+        "types": [
+          "user",
+          "assistant",
+          "idle",
+          "synthetic",
+          "user",
+          "assistant",
+          "idle",
+          "user",
+          "assistant",
+          "idle"
+        ]
+      },
+      {
+        "turn": "turn four",
+        "types": [
+          "user",
+          "assistant",
+          "idle",
+          "synthetic",
+          "user",
+          "assistant",
+          "idle",
+          "user",
+          "assistant",
+          "idle",
+          "user",
+          "assistant",
+          "idle"
+        ]
+      }
+    ],
+    "notices": [
+      {
+        "index": 3,
+        "description": "Model router cost doctor",
+        "text": "Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n[model-router] Cost doctor: 1 finding worth a look (0 warning, 1 saving). First: agents.title.model is unset and the host finds no small model of smallless in your catalog (it looks for gpt-luna, gemini-flash-lite, gemin… Run /router for details and config snippets."
+      }
+    ],
+    "allTypes": [
+      "0:user",
+      "1:assistant",
+      "2:idle",
+      "3:synthetic",
+      "4:user",
+      "5:assistant",
+      "6:idle",
+      "7:user",
+      "8:assistant",
+      "9:idle",
+      "10:user",
+      "11:assistant",
+      "12:idle"
+    ],
+    "storeFiles": [
+      {
+        "name": "advisor-notice.05365e5bcd19.json",
+        "size": 261
+      }
+    ],
+    "hostErrors": []
+  },
+  "assertionResult": "PASS: 1 synthetic cost-doctor entry after 4 turns (at index 3 of 13); notice state files: advisor-notice.05365e5bcd19.json",
+  "notes": []
+}
