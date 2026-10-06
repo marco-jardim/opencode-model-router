@@ -735,4 +735,107 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     ]);
     expect(log.indexOf("dispose:resume-child-1")).toBeLessThan(log.indexOf("create:resume-child-3:high"));
   });
+
+  type DelegateHooks = { tool: { delegate: { execute(args: Record<string, unknown>, ctx?: { sessionID?: string }): Promise<string> } }; dispose(): Promise<void> };
+
+  function immediateRunner(created: string[]) {
+    return {
+      run: async (request: ChildSessionRequest) => {
+        const sid = `quick-${sessionCounter++}`;
+        created.push(sid);
+        await request.onCreated(sid);
+        return { sessionID: sid, text: request.system !== undefined ? '{"pass":true,"reasons":[]}' : "producer output" };
+      },
+      dispose: async () => undefined,
+    };
+  }
+
+  it("QA-2.3-3: a catalog that never answers costs the first delegation one timeout, no later one anything, and is logged once", async () => {
+    writeResumeOverrides();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let listCalls = 0;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: () => { listCalls += 1; return new Promise<never>(() => undefined); },
+      routerChildRunner: immediateRunner([]),
+    } as unknown as RouterPluginInput) as unknown as DelegateHooks;
+    const execute = () => hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    const settles = (promise: Promise<string>) => { const state = { done: false }; void promise.then(() => { state.done = true; }); return state; };
+    const unavailable = () => warn.mock.calls.filter(([message]) => String(message).includes("model catalog is unavailable")).length;
+    try {
+      // The first delegation waits for the catalog's own timeout (3 s), then carries on without variant info.
+      const first = execute();
+      const firstState = settles(first);
+      await vi.advanceTimersByTimeAsync(2_900);
+      expect(firstState.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(firstState.done).toBe(true);
+      expect(await first).toContain("[router ✓ verified:");
+      expect(listCalls).toBe(1);
+      expect(unavailable()).toBe(1);
+      // Within the TTL the negative answer is served at once: no wait, no second list() call, no second log line.
+      for (let n = 0; n < 2; n++) {
+        const later = execute();
+        const state = settles(later);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(state.done).toBe(true);
+        expect(await later).toContain("[router ✓ verified:");
+      }
+      expect(listCalls).toBe(1);
+      expect(unavailable()).toBe(1);
+      // After the TTL the first call is still outstanding: nothing starts behind it, and nothing waits.
+      await vi.advanceTimersByTimeAsync(20_000);
+      const afterTtl = execute();
+      const afterTtlState = settles(afterTtl);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(afterTtlState.done).toBe(true);
+      await afterTtl;
+      expect(listCalls).toBe(1);
+      // A call abandoned for good (60 s) is replaced; it hangs too, so that delegation waits once more, and the
+      // failure streak is still one log line.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const replaced = execute();
+      const replacedState = settles(replaced);
+      await vi.advanceTimersByTimeAsync(3_200);
+      expect(replacedState.done).toBe(true);
+      await replaced;
+      expect(listCalls).toBe(2);
+      expect(unavailable()).toBe(1);
+    } finally {
+      warn.mockRestore();
+      await hooks.dispose();
+    }
+  });
+
+  it("QA-2.3-3: concurrent delegations share one catalog load, and a late answer still fills the cache", async () => {
+    writeResumeOverrides();
+    let listCalls = 0;
+    let answer!: (models: typeof catalog) => void;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir,
+      client: { session: { get: async ({ path: p }: { path: { id: string } }) => ({ data: { id: p.id } }) } },
+      routerHost: "v2",
+      routerCatalog: () => { listCalls += 1; return new Promise<typeof catalog>((resolve) => { answer = resolve; }); },
+      routerChildRunner: immediateRunner([]),
+    } as unknown as RouterPluginInput) as unknown as DelegateHooks;
+    const execute = () => hooks.tool.delegate.execute({ task: "VERIFY:required\ndo x", tier: "fast", acceptance: ACCEPTANCE }, { sessionID: "orchestrator" });
+    try {
+      const a = execute();
+      const b = execute();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(listCalls).toBe(1); // one shared in-flight load for both
+      answer(catalog);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await a).toContain("[router ✓ verified:");
+      expect(await b).toContain("[router ✓ verified:");
+      const c = execute();
+      await vi.advanceTimersByTimeAsync(100);
+      await c;
+      expect(listCalls).toBe(1); // the positive answer is cached for the TTL
+    } finally {
+      await hooks.dispose();
+    }
+  });
 });

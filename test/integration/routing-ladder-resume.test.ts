@@ -6,7 +6,7 @@
  * ingest fed with `session.step.ended` events. No network, no host, no live models. Every directory is a temp
  * directory; HOME is redirected so config files never touch ~/.config/opencode.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -396,6 +396,62 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", () => {
     });
   });
 
+  describe("log levels (QA-2.3-4): warn is for anomalies", () => {
+    const ladderLines = (spy: { mock: { calls: unknown[][] } }): string[] =>
+      spy.mock.calls.map(([message]) => String(message)).filter((message) => message.includes("[router] ladder "));
+
+    it("a routine resume and a start over the threshold are not logged; unknown context and a refused resume are", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const routine = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true] });
+        await routine.run();
+        expect(routine.runs[1]!.resumeSessionID).toBe("child-1");
+        expect(ladderLines(warn)).toEqual([]);
+
+        warn.mockClear();
+        resetDispatchRegistry();
+        const over = await setup({
+          tiers: { fast: { model: SONNET, variant: "xhigh", costRatio: 1 }, medium: { model: OPUS, variant: "high", costRatio: 5 } },
+          routing: {}, escalate: { maxAttemptsPerTier: 0, maxTotalAttempts: 6, costCeiling: { multiple: 100 } }, verdicts: [false, true],
+          catalog: [model(SONNET, ["low", "medium", "high", "xhigh"], 1_000_000), model(OPUS, ["low", "medium", "high", "xhigh"], 20_000)],
+          contextTokens: () => 15_000,
+        });
+        await over.run();
+        expect(over.runs[1]!.resumeSessionID).toBeUndefined();
+        expect(ladderLines(warn)).toEqual([]); // at-or-over-threshold is the ladder doing its job
+
+        warn.mockClear();
+        resetDispatchRegistry();
+        const unknown = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true], contextTokens: () => Number.NaN });
+        await unknown.run();
+        expect(ladderLines(warn)).toHaveLength(1);
+        expect(ladderLines(warn)[0]).toContain("unknown-tokens");
+
+        warn.mockClear();
+        resetDispatchRegistry();
+        const refused = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true], rejectResume: true });
+        await refused.run();
+        expect(ladderLines(warn).some((line) => line.includes("cannot resume child session child-1"))).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("the existing debug flag brings the routine lines back", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      process.env.MODEL_ROUTER_TRAJECTORY_DEBUG = "1";
+      try {
+        const t = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true] });
+        await t.run();
+        const lines = ladderLines(warn);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain("resuming the child session (under-threshold; tokens=");
+      } finally {
+        delete process.env.MODEL_ROUTER_TRAJECTORY_DEBUG;
+        warn.mockRestore();
+      }
+    });
+  });
   describe("host refusal of a resume", () => {
     it("is not a failed attempt: the same attempt starts on a fresh child, and the refused one is disposed", async () => {
       const t = await setup({ tiers: OWNER, routing: {}, verdicts: [false, true], rejectResume: true });

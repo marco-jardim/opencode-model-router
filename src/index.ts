@@ -600,30 +600,67 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
 
   /**
-   * Phase 2.3: the host model catalog as the delegate ladder reads it (variants and limits per model), cached for
-   * a few seconds so a burst of delegations asks the host once. Best effort: a missing, failing or slow catalog is
-   * `undefined`, and the ladder then behaves exactly as without variant info (fresh sessions, tier ratios).
+   * Phase 2.3: the host model catalog as the delegate ladder reads it (variants and limits per model). Best effort: a
+   * missing, failing or slow catalog is `undefined`, and the ladder then behaves exactly as without variant info
+   * (fresh sessions, tier ratios). QA-2.3-3: the answer, positive or negative, is cached for the TTL; delegations that
+   * ask while a load is running share it; a call that outlived its timeout is not repeated behind itself (a late answer
+   * still fills the cache); and a failure is logged once per streak, until a load succeeds. So with a hung catalog the
+   * first delegation waits for the timeout and every later one answers at once.
    */
   /** How long a failed ladder attempt waits for its child's execution end before it starts fresh (QA-2.3-2). */
   const RESUME_END_WAIT_MS = 1_000;
   const RUNNER_CATALOG_TTL_MS = 15_000;
   const RUNNER_CATALOG_TIMEOUT_MS = 3_000;
-  let runnerCatalog: { at: number; lookup: CatalogLookup } | undefined;
-  const loadRunnerCatalog = async (): Promise<CatalogLookup | undefined> => {
-    if (!ctx.routerCatalog) return undefined;
-    const nowMs = Date.now();
-    if (runnerCatalog !== undefined && nowMs - runnerCatalog.at < RUNNER_CATALOG_TTL_MS) return runnerCatalog.lookup;
-    try {
-      const list = await withTimeout(ctx.routerCatalog(), RUNNER_CATALOG_TIMEOUT_MS, "model catalog");
-      const lookup = createCatalogLookup(list);
-      runnerCatalog = { at: nowMs, lookup };
-      return lookup;
-    } catch (error) {
-      logger.warn("[router] ladder: the model catalog is unavailable; variant steps and resume are off for this delegation", { error: describeError(error) });
-      return undefined;
+  /** A catalog call still pending after this long is abandoned: a new one may start behind it. */
+  const RUNNER_CATALOG_ABANDON_MS = 60_000;
+  /** The last answer, valid for the TTL; `lookup` undefined = the catalog was unavailable. */
+  let runnerCatalog: { at: number; lookup: CatalogLookup | undefined } | undefined;
+  /** The load in progress (bounded by the timeout), shared by every delegation that asks meanwhile. */
+  let runnerCatalogLoad: Promise<CatalogLookup | undefined> | undefined;
+  /** When the outstanding `routerCatalog()` call started; it may outlive its timeout. */
+  let runnerCatalogCallAt: number | undefined;
+  let runnerCatalogFailing = false;
+  const runnerCatalogFailed = (error: unknown): undefined => {
+    runnerCatalog = { at: Date.now(), lookup: undefined };
+    if (!runnerCatalogFailing) {
+      runnerCatalogFailing = true;
+      logger.warn("[router] ladder: the model catalog is unavailable; variant steps and resume are off until it answers", { error: describeError(error) });
     }
+    return undefined;
   };
-
+  const loadRunnerCatalog = (): Promise<CatalogLookup | undefined> => {
+    const list = ctx.routerCatalog;
+    if (!list) return Promise.resolve(undefined);
+    const nowMs = Date.now();
+    if (runnerCatalog !== undefined && nowMs - runnerCatalog.at < RUNNER_CATALOG_TTL_MS) return Promise.resolve(runnerCatalog.lookup);
+    if (runnerCatalogLoad !== undefined) return runnerCatalogLoad;
+    if (runnerCatalogCallAt !== undefined && nowMs - runnerCatalogCallAt < RUNNER_CATALOG_ABANDON_MS) {
+      // An earlier call timed out and is still outstanding: no second `list()` behind it.
+      runnerCatalog = { at: nowMs, lookup: undefined };
+      return Promise.resolve(undefined);
+    }
+    runnerCatalogCallAt = nowMs;
+    const answer = Promise.resolve().then(() => list()).then(
+      (models) => {
+        runnerCatalogCallAt = undefined;
+        const lookup = createCatalogLookup(models);
+        runnerCatalog = { at: Date.now(), lookup };
+        runnerCatalogFailing = false;
+        return lookup;
+      },
+      (error: unknown) => {
+        runnerCatalogCallAt = undefined;
+        return runnerCatalogFailed(error);
+      },
+    );
+    const load: Promise<CatalogLookup | undefined> = withTimeout(answer, RUNNER_CATALOG_TIMEOUT_MS, "model catalog")
+      .catch((error: unknown) => runnerCatalogFailed(error))
+      .finally(() => {
+        if (runnerCatalogLoad === load) runnerCatalogLoad = undefined;
+      });
+    runnerCatalogLoad = load;
+    return load;
+  };
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
@@ -848,13 +885,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
               const model = tierModel(activeCfg, tier) ?? undefined;
               if (sessionAware && attemptPlan.step !== "dispatch") {
-                // D11: the decision and both numbers are logged; so is every place the runner starts fresh anyway.
+                // D11: the decision and both numbers are in the decision row (engine != static). The log line is for
+                // anomalies (QA-2.3-4): a fresh start the ladder did not choose by the threshold (unknown context, no
+                // budget, a runner override). The routine ones (a resume, a start over the threshold) are only logged
+                // with the existing opt-in debug flag.
                 const basis = attemptPlan.resumeBasis;
-                logger.warn(
-                  `[router] ladder ${attemptPlan.step} on ${tier}: ${resumeTarget !== undefined ? "resuming the child session" : "fresh child session"}` +
-                  `${basis ? ` (${basis.reason}; tokens=${basis.tokens} budget=${basis.budget} threshold=${basis.threshold})` : ""}` +
-                  `${attemptPlan.fresh ? `; runner: ${attemptPlan.fresh}` : ""}`,
-                );
+                const routine = resumeTarget !== undefined || basis?.reason === "at-or-over-threshold";
+                if (!routine || process.env.MODEL_ROUTER_TRAJECTORY_DEBUG === "1") {
+                  logger.warn(
+                    `[router] ladder ${attemptPlan.step} on ${tier}: ${resumeTarget !== undefined ? "resuming the child session" : "fresh child session"}` +
+                    `${basis ? ` (${basis.reason}; tokens=${basis.tokens} budget=${basis.budget} threshold=${basis.threshold})` : ""}` +
+                    `${attemptPlan.fresh ? `; runner: ${attemptPlan.fresh}` : ""}`,
+                  );
+                }
               }
               let producerText = "";
               // Provider-failover vs quality-escalation precedence (Phase 3.3):
