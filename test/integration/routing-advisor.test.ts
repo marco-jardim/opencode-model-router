@@ -5,11 +5,18 @@
  * agent lists (pure, no host). Nothing here touches the real user directories: HOME and the temp directory are
  * redirected by the test setup, and every state directory is a fresh temp directory.
  */
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
-import { validateConfig } from "../../src/router/config";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import ModelRouterPlugin from "../../src/index";
+import type { RouterPluginInput } from "../../src/compat/child-session";
+import { invalidateConfigCache, overridePath, validateConfig } from "../../src/router/config";
+import { DECISIONS_FILE, acquireOutcomes, makeKey } from "../../src/routing/outcomes";
+import type { DecisionRow } from "../../src/routing/outcomes";
+import { readLastCheckpoint } from "../../src/routing/commands/stats";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { buildEscalatePolicy } from "../../src/escalate/ladder";
 import {
@@ -426,5 +433,181 @@ describe("cost doctor: failure policy and rendering", () => {
       { id: "title", model: null, mode: "primary", hidden: true },
       { id: "explore", model: "anthropic/claude-haiku-4-5#high", mode: "subagent", hidden: false },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /router stats and the checkpoint line (2.4.5, D18)
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const SCRIPT = join(REPO_ROOT, "scripts", "routing-stats.ts");
+const KEY_MEDIUM = makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5");
+const KEY_EXPLORE = makeKey("search", { origin: "host", id: "explore" }, "anthropic", "claude-haiku-4-5");
+
+function choiceOf(key: string, agent: string, origin: "router" | "host", model: string) {
+  return { key: key as DecisionRow["chosen"]["key"], agent, origin, model, variant: "default" };
+}
+
+function decisionRow(id: string, ts: string, over: Partial<DecisionRow> = {}): DecisionRow {
+  return {
+    v: 1,
+    kind: "decision",
+    ts,
+    sessionID: "s1",
+    decisionID: id,
+    mode: "shadow",
+    childSessionID: null,
+    facts: { class: "implement", risk: "low", scope: "single", needs: ["edit"], confidence: 0.9, source: "rules" },
+    chosen: choiceOf(KEY_MEDIUM, "medium", "router", "anthropic/claude-sonnet-5-5"),
+    best: choiceOf(KEY_EXPLORE, "explore", "host", "anthropic/claude-haiku-4-5"),
+    switched: true,
+    pinned: false,
+    unit: "ratio",
+    costs: { [KEY_MEDIUM]: 5, [KEY_EXPLORE]: 2 },
+    confidence: 0.7,
+    reason: "switched: cheaper",
+    step: "dispatch",
+    resume: false,
+    ...over,
+  };
+}
+
+describe("/router stats and the checkpoint line", () => {
+  type Hooks = { "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>; dispose(): Promise<void> };
+  let home: string;
+  let store: string;
+  let savedHome: string | undefined;
+  let savedProfile: string | undefined;
+  const instances: Hooks[] = [];
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "router-stats-"));
+    store = join(home, "store");
+    mkdirSync(store, { recursive: true });
+    savedHome = process.env.HOME;
+    savedProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    invalidateConfigCache();
+  });
+
+  afterEach(async () => {
+    for (const hooks of instances.splice(0)) await hooks.dispose();
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
+    invalidateConfigCache();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  async function plugin(routing: Record<string, unknown> | null, host: "v2" | "v1" = "v2"): Promise<Hooks> {
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify(routing === null ? {} : { routing }));
+    invalidateConfigCache();
+    const ctx = { directory: home, worktree: home, client: {}, ...(host === "v2" ? { routerHost: "v2" as const } : {}) };
+    const hooks = (await ModelRouterPlugin(ctx as unknown as RouterPluginInput)) as unknown as Hooks;
+    instances.push(hooks);
+    return hooks;
+  }
+
+  const ask = async (hooks: Hooks, args: string): Promise<string> => {
+    const out = { parts: [] as Array<{ text: string }> };
+    await hooks["command.execute.before"]({ command: "router", arguments: args }, out);
+    return out.parts[0]?.text ?? "";
+  };
+
+  const script = (...args: string[]) => {
+    const result = spawnSync(process.execPath, [SCRIPT, ...args], { cwd: REPO_ROOT, encoding: "utf8", timeout: 60_000 });
+    return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+  };
+
+  function seed(...rows: DecisionRow[]): void {
+    writeFileSync(join(store, DECISIONS_FILE), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  }
+
+  const ROWS = [
+    decisionRow("D0", "2026-10-05T10:00:00.000Z"), // before the window
+    decisionRow("D1", "2026-10-06T10:00:00.000Z", { reason: "kept:evidence: the cheapest option needs 5 outcomes", switched: false, trace: { routeLines: { count: 0, conflict: false, edgeOnly: true }, backend: null, argmin: choiceOf(KEY_EXPLORE, "explore", "host", "anthropic/claude-haiku-4-5") } }),
+    decisionRow("D2", "2026-10-06T11:00:00.000Z", { resume: true }),
+  ];
+
+  it("prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
+    seed(...ROWS);
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const since = "2026-10-06T00:00:00Z";
+    const reference = script("--dir", store, "--since", since);
+    expect(reference.status).toBe(0);
+    const text = await ask(hooks, `stats --since ${since}`);
+    expect(`${text}\n`).toBe(reference.stdout);
+    expect(text).toContain("| Dispatches | 2 |"); // D0 is outside the window
+    expect(text).toContain("| Kept for lack of evidence (A27) | 1 of 2 routed dispatches |");
+    expect(text).toContain("| Orchestrator resumes (task_id / sessionID; not a ladder step) | 1 of 2 routed dispatches |");
+    expect(text).toContain(`| ${KEY_EXPLORE.replace(/\|/g, "\\|")} | 1 |`); // the trace.argmin table (A27, DF3)
+    expect(text).toContain("cover trusted classes only"); // QA-2.1-10
+    // no window: all three rows; and the JSON form is the script's too
+    expect(`${await ask(hooks, "stats")}\n`).toBe(script("--dir", store).stdout);
+    expect(`${await ask(hooks, "stats --json")}\n`).toBe(script("--dir", store, "--json").stdout);
+  });
+
+  it("flushes the rows still queued in memory first, so the table is current", async () => {
+    seed(ROWS[1]!);
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const bundle = acquireOutcomes({ dir: store, tuning: {}, logger: { warn: () => undefined } });
+    try {
+      await bundle.ready;
+      bundle.flusher.enqueue(decisionRow("Q1", "2026-10-06T12:00:00.000Z"));
+      expect(bundle.flusher.pendingRows).toBe(1);
+      const text = await ask(hooks, "stats");
+      expect(text).toContain("| Dispatches | 2 |");
+      expect(bundle.flusher.pendingRows).toBe(0);
+    } finally {
+      await bundle.release();
+    }
+  });
+
+  it("static: reads the directory without creating or quarantining anything, and --dir overrides the configured store", async () => {
+    seed(ROWS[1]!, ROWS[2]!);
+    const before = readdirSync(store).sort();
+    const hooks = await plugin(null); // no routing block: the engine is static
+    const text = await ask(hooks, `stats --dir ${store}`);
+    expect(text).toContain("| Dispatches | 2 |");
+    expect(readdirSync(store).sort()).toEqual(before); // read-only: no outcomes.json, no temp files
+    expect(`${text}\n`).toBe(script("--dir", store).stdout);
+  });
+
+  it("a usage error comes back as the script prints it, and an empty store says so", async () => {
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const bad = await ask(hooks, "stats --bogus");
+    expect(bad).toContain("routing-stats: unknown argument: --bogus");
+    expect(bad).toContain("Usage: node scripts/routing-stats.ts");
+    const empty = await ask(hooks, "stats");
+    expect(empty).toContain("| Dispatches | 0 |");
+    expect(empty).toContain(`routing-stats: no outcome data in ${store}`);
+    const dir = join(home, "elsewhere");
+    expect(await ask(hooks, `stats --dir ${dir}`)).toContain("routing-stats: no outcome data in");
+  });
+
+  it("works on a v1 host too (read-only over the configured directory)", async () => {
+    seed(ROWS[1]!);
+    const hooks = await plugin({ outcomes: { path: store } }, "v1");
+    expect(await ask(hooks, "stats")).toContain("| Dispatches | 1 |");
+    expect(readdirSync(store)).toEqual([DECISIONS_FILE]);
+  });
+
+  it("the help lists /router stats, and the bare /router shows the marker and the last checkpoint", async () => {
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const bare = await ask(hooks, "");
+    expect(bare).toContain("`/router stats [--since <ISO>]`");
+    expect(bare).toMatch(/^router: engine=shadow build=\S+\+\S+$/m);
+    expect(bare).toMatch(/^router: last checkpoint=DF\d+$/m);
+  });
+
+  it("readLastCheckpoint takes the last `## DF<n>` heading, and is null without a record", () => {
+    const root = join(home, "plugin");
+    mkdirSync(join(root, "docs", "qa", "cost-aware-routing"), { recursive: true });
+    expect(readLastCheckpoint(() => root)).toBeNull();
+    writeFileSync(join(root, "docs", "qa", "cost-aware-routing", "dogfood.md"), "# Dogfood\n\n## DF0 — baseline\n\ntext ## DF9 not a heading\n\n## DF1 — after wave 1\n\n### DF7 sub\n\n## DF2 — after phase 2.2\n\n## Summary\n");
+    expect(readLastCheckpoint(() => root)).toBe("DF2");
+    expect(readLastCheckpoint(() => { throw new Error("no root"); })).toBeNull();
   });
 });

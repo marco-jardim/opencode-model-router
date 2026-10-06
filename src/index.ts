@@ -63,6 +63,7 @@ import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
 import { verdictOf } from "./routing/outcomes/types";
+import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import {
   findOrphanedStrongPatterns,
   normalizeCatalog,
@@ -2310,11 +2311,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           const catalog = await fetchCatalog();
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
           text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
+        } else if (sub === "stats") {
+          // 2.4.5 (D18): the table of `npm run routing:stats`, run by the very same driver over the configured store.
+          text = formatStatsReply(
+            await runStatsCommand(parts.slice(1).join(" "), { cfg, host: ctx.routerHost === "v2" ? "v2" : "v1", logger }),
+          );
         } else {
           text = buildRouterOutput(cfg, args, projectDir);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
+            // 2.4.5: the last dogfood checkpoint recorded next to this code (omitted when there is none).
+            const checkpoint = checkpointLine();
+            if (checkpoint !== null) text += "\n" + checkpoint;
             const catalog = await fetchCatalog();
             if (catalog) {
               const issues = validateModels(cfg, catalog);

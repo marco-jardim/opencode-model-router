@@ -220,6 +220,7 @@ export function buildRouterHelp(current: string): string {
     "- `/router enforce <off|advisory|enforced>` — set hard-block enforcement (persisted)",
     "- `/router overrides` — show the global + project override file paths and precedence",
     "- `/router models [provider]` — list valid model ids from your configured providers",
+    "- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats`)",
     "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
   ].join("\n");
 }
