@@ -487,6 +487,11 @@ export interface DecisionTrace {
     readonly disagrees?: true;
   } | null;
   readonly backendSkipped?: "credentials";
+  /**
+   * A27: the argmin BEFORE the evidence filter, written only when the filter removed it (it differs from `best`): the
+   * cheapest option the engine could not trust yet. `routing:stats` counts these to show where the gate holds it back.
+   */
+  readonly argmin?: RouteChoice;
 }
 
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */

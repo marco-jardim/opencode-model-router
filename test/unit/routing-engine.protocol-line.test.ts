@@ -180,7 +180,8 @@ describe("D2 degenerate case: no evidence ⇒ the generated line IS the shipped 
       routing,
       store: createOutcomeStore(),
     });
-    expect(decision.best?.agent).not.toBe("medium");
+    expect(decision.argmin?.key).not.toBe(decision.chosen.key);
+    expect(decision.best?.key).toBe(decision.chosen.key); // A27: the argmin has no recorded outcomes, so it is not `best`
     expect(decision.reasonCode).toBe("kept:evidence");
     expect(decision.switched).toBe(false);
     expect(taxonomy(cfg, "v2", createOutcomeStore())).toBe(buildTaskTaxonomy(cfg));

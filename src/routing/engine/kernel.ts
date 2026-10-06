@@ -210,6 +210,7 @@ export function decide(input: DecisionInput): Decision {
     return freezeDecision({
       chosen,
       best: null,
+      argmin: null,
       switched: false,
       pinned,
       confidence: 0,
@@ -389,6 +390,9 @@ export function decide(input: DecisionInput): Decision {
   const neverDown = facts.risk === "high" && input.detection === "none";
   const ineligible: Record<string, IneligibleReason> = {};
   let best = chosenPriced ? chosenIndex : -1;
+  // A27: `argmin` is what the old single-argmin-then-gate rule would have picked; `best` is drawn only from the candidates
+  // that survive the evidence filter as well (evidence, or a strictly higher rank than the pick).
+  let argmin = best;
   for (let k = 0; k < n; k++) {
     if (k === chosenIndex || keys[k] === chosenKey) continue;
     const cand = cands[k]!;
@@ -402,15 +406,28 @@ export function decide(input: DecisionInput): Decision {
       continue;
     }
     // Strict: ties keep the pick (considered first), then the earlier rung.
+    if (argmin < 0 || C[k]! < C[argmin]!) argmin = k;
+    if (!(chosenRank !== null && cand.rank > chosenRank) && !hasMinEvidence(evidence[k]!)) {
+      if (!Object.prototype.hasOwnProperty.call(ineligible, keys[k]!)) ineligible[keys[k]!] = "evidence";
+      continue;
+    }
     if (best < 0 || C[k]! < C[best]!) best = k;
   }
 
   const bestIndex = best >= 0 ? best : null;
+  const argminIndex = argmin >= 0 ? argmin : null;
+  const argminChoice = argminIndex === null ? null : routeChoice(keys[argminIndex]!, cands[argminIndex]!.agent, parts[argminIndex]!);
   const bestChoice = bestIndex === null ? null : routeChoice(keys[bestIndex]!, cands[bestIndex]!.agent, parts[bestIndex]!);
   const bestCost = bestIndex === null ? Number.NaN : C[bestIndex]!;
   const chosenCost = chosenPriced ? C[chosenIndex]! : Number.NaN;
 
-  // --- D9 (A16) ---------------------------------------------------------------------------------
+  // --- D9 (A16), A27 ------------------------------------------------------------------------------
+  // `gated`: the evidence filter removed a cheaper candidate, so `best` fell back to the pick. The margin, class-confidence
+  // and config checks then judge that cheaper candidate (the one the old argmin-then-gate rule would have judged), so the
+  // reason codes keep their precedence; only the last step differs (`kept:evidence` instead of a switch).
+  const gated = bestIndex !== null && bestIndex === chosenIndex && argminIndex !== null && argminIndex !== chosenIndex;
+  const decidingIndex = gated ? argminIndex : bestIndex;
+  const decidingCost = decidingIndex === null ? Number.NaN : C[decidingIndex]!;
   const marginValid = isFiniteNumber(margin) && margin >= 0 && margin < 1;
   const threshold = marginValid ? (1 - margin) * chosenCost : Number.NaN;
   let reasonCode: DecisionReasonCode;
@@ -424,7 +441,7 @@ export function decide(input: DecisionInput): Decision {
   } else if (!chosenPriced) {
     reasonCode = "kept:chosen-not-candidate";
     reason = `kept: the chosen ${chosenKey} is not a priced candidate`;
-  } else if (bestIndex === chosenIndex) {
+  } else if (bestIndex === chosenIndex && !gated) {
     reasonCode = "kept:best-is-chosen";
     reason = `kept: the chosen dispatch is the cheapest (${fmt(chosenCost)} ${unit})`;
   } else if (!marginValid || !isFiniteNumber(minConfidence)) {
@@ -433,17 +450,16 @@ export function decide(input: DecisionInput): Decision {
   } else if (classConfidence < minConfidence) {
     reasonCode = "kept:class-confidence";
     reason = `kept: class confidence ${fmt(classConfidence)} < minClassConfidence ${fmt(minConfidence)}`;
-  } else if (!(bestCost < threshold)) {
+  } else if (!(decidingCost < threshold)) {
     reasonCode = "kept:margin";
-    reason = `kept: C(best)=${fmt(bestCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
-  } else if (!isStrictlyHigher(cands, bestIndex, chosenIndex) && !hasMinEvidence(evidence[bestIndex]!)) {
+    reason = `kept: C(best)=${fmt(decidingCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
+  } else if (gated) {
     reasonCode = "kept:evidence";
-    reason = `kept: moving to ${bestChoice!.key} (rank ${cands[bestIndex]!.rank}, the pick is rank ${cands[chosenIndex]!.rank}) needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[bestIndex]!)}`;
+    reason = `kept: the cheapest option ${argminChoice!.key} (${fmt(decidingCost)} ${unit}, rank ${cands[argminIndex!]!.rank}, the pick is rank ${cands[chosenIndex]!.rank}) needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[argminIndex!]!)}; the chosen dispatch is the cheapest eligible (${fmt(chosenCost)} ${unit})`;
   } else {
     reasonCode = "switched";
     reason = `switched: C(best)=${fmt(bestCost)} < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
   }
-
   // QA-1.4-17: a pick below `floorTier` is not what the runner would start on; say so, and say what was priced.
   if (floorRank !== null && chosenRank !== null && chosenRank < floorRank) {
     const lifted = chosenIndex >= 0 && pathCache[chosenIndex] !== null && pathCache[chosenIndex]![0] !== chosenIndex;
@@ -460,6 +476,7 @@ export function decide(input: DecisionInput): Decision {
   return freezeDecision({
     chosen,
     best: bestChoice,
+    argmin: argminChoice,
     switched: reasonCode === "switched",
     pinned,
     confidence,
@@ -470,11 +487,6 @@ export function decide(input: DecisionInput): Decision {
     ineligible,
     target: bestIndex === null ? null : cands[bestIndex]!,
   });
-}
-
-/** A24 (QA-1.4-15): `best` is ranked strictly above the pick; the only switch the evidence gate lets through unaided. */
-function isStrictlyHigher(cands: readonly Candidate[], best: number, chosen: number): boolean {
-  return cands[best]!.rank > cands[chosen]!.rank;
 }
 
 /**

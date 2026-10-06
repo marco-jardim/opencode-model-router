@@ -144,7 +144,7 @@ function factsOf(facts: TaskFacts): DecisionRow["facts"] {
   return { class: facts.class, risk: facts.risk, scope: facts.scope, needs: [...facts.needs], confidence: facts.confidence, source: facts.source };
 }
 
-function traceOf(result: ClassifyResult): DecisionTrace {
+function traceOf(result: ClassifyResult, argmin: RouteChoice | null): DecisionTrace {
   const { routeLines, backend, backendSkipped } = result.trace;
   return {
     routeLines: { count: routeLines.count, conflict: routeLines.conflict, edgeOnly: routeLines.edgeOnly },
@@ -159,6 +159,7 @@ function traceOf(result: ClassifyResult): DecisionTrace {
           ...(backend.disagrees === true ? { disagrees: true as const } : {}),
         },
     ...(backendSkipped === undefined ? {} : { backendSkipped }),
+    ...(argmin === null ? {} : { argmin }),
   };
 }
 
@@ -242,6 +243,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
     const chosen = resolveChosen({ cfg: prepared.cfg, agents: infos, agent, model: callModel, parentModel: session.model });
     let decision: Decision | null = null;
+    let argmin: RouteChoice | null = null; // A27: the cheapest option the evidence filter removed, when it did
     let row: Pick<DecisionRow, "chosen" | "best" | "switched" | "pinned" | "unit" | "costs" | "confidence" | "reason">;
     let final: { agent: string; model: string; variant: string | null; tier: string | null } | null = null;
     let outcome: RouteOutcome = { mode, ...(stripped === undefined ? {} : { prompt: stripped }), decisionID };
@@ -266,6 +268,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       decision = decide({
         facts, chosen, ladder, detection, pin, routing: prepared.routing, store: prepared.store, floorRank: floorRankOf(prepared.cfg),
       });
+      argmin = decision.argmin !== null && decision.argmin.key !== decision.best?.key ? decision.argmin : null;
       row = {
         chosen: decision.chosen, best: decision.best, switched: decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence, reason: `${decision.reasonCode}: ${decision.reason}`,
@@ -305,7 +308,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       ...row,
       step: "dispatch",
       resume: resumeID !== null,
-      trace: traceOf(result),
+      trace: traceOf(result, argmin),
     });
 
     if (final !== null) {

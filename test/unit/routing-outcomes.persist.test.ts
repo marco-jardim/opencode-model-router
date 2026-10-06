@@ -883,6 +883,7 @@ describe("parseLogLine", () => {
       routeLines: { count: 2, conflict: true, edgeOnly: false },
       backend: { id: "host", status: "disagree", latencyMs: 12, label: "debug", disagrees: true as const },
       backendSkipped: "credentials" as const,
+      argmin: decisionRow(9).chosen, // A27
     };
     expect(roundTrip(decisionRow(1, { trace }))).toEqual(decisionRow(1, { trace }));
     expect(roundTrip(decisionRow(2, { trace: { routeLines: { count: 0, conflict: false, edgeOnly: false }, backend: null } }))?.kind).toBe("decision");

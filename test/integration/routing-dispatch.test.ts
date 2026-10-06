@@ -343,6 +343,34 @@ describe("enforce", () => {
     expect(rows[1]!.facts.needs).toEqual(["shell"]);
   });
 
+  it("A27 (QA-2.2-4): with the D12 default roles an unevidenced `general` no longer blocks the upward switch to heavy", async () => {
+    const world = await makeWorld({ engine: "enforce" }); // default roles: implement -> general
+    world.seed(KEYS.medium, 0, 20);
+    world.seed(KEYS.heavy, 20, 0);
+    await world.start();
+    const after = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(after).toMatchObject({ agent: "heavy", model: `${OPUS}#xhigh` });
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: true, best: { agent: "heavy" } });
+    // the cheaper `general` rung is logged as the unfiltered argmin
+    expect(row!.trace?.argmin).toMatchObject({ agent: "general", origin: "host" });
+  });
+
+  it("A27: without a cheaper eligible candidate the pick is kept and the gated argmin is in the trace; with evidence the cheapest eligible wins", async () => {
+    const world = await makeWorld({ engine: "enforce" });
+    await world.start();
+    const kept = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(kept).toMatchObject({ agent: "medium" });
+    expect(kept.model).toBeUndefined();
+    const general = makeKey("implement", { origin: "host", id: "general" }, "anthropic", "claude-sonnet-5-5", "medium");
+    world.seed(general, 20, 0);
+    const switched = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
+    expect(switched).toMatchObject({ agent: "general", model: `${SONNET}#medium` });
+    const rows = await world.rows();
+    expect(rows[0]).toMatchObject({ switched: false });
+    expect(rows[1]).toMatchObject({ switched: true, best: { agent: "general" } });
+    expect(rows[1]!.trace?.argmin).toBeUndefined(); // nothing was filtered: argmin == best
+  });
   it("never switches a high-risk dispatch without verification down a rank", async () => {
     const world = await makeWorld({ engine: "enforce", margin: 0, roles: {} });
     world.seed(KEYS.heavy, 0, 20);

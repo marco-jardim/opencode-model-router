@@ -282,10 +282,12 @@ function readTrace(x: unknown): DecisionTrace | undefined {
       ...(b.disagrees === true ? { disagrees: true as const } : {}),
     };
   }
+  const argmin = readChoice(x.argmin);
   return {
     routeLines: { count, conflict, edgeOnly },
     backend,
     ...(x.backendSkipped === "credentials" ? { backendSkipped: "credentials" as const } : {}),
+    ...(argmin === null ? {} : { argmin }),
   };
 }
 function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {
