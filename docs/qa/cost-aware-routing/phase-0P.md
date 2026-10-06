@@ -1,8 +1,8 @@
 # Phase 0.P — Execution pre-flight (cost-aware routing engine, #74)
 
 > Worktree `D:\git\omr-car-p0p` (branch `car/p0p`, created from `car/main` @ `8e7a890`). Base directory `D:\git\opencode-model-router`.
-> Spike harness: `D:\git\opencode-model-router\test\smoke\routing-spikes.smoke.test.ts` — gated by `RUN_OC_SMOKE_V2_SPIKES=1` (isolated host) and additionally `RUN_OC_SPIKE_LIVE_CATALOG=1` (read-only reads of the user's running service); skipped otherwise.
-> Evidence: `D:\git\opencode-model-router\docs\qa\cost-aware-routing\spikes\{S1,S1-deny,S2,S2b,S3,S4,S5,S6,cleanup}.json`, all from **one run** (`runId 697eba92-…`, `recordedAt` 2026-10-06T04:52:06Z–04:52:16Z, harness blob `ea0ae580be66a9f6809a7ac23fa0641783d7930e`, committed in `5113977`).
+> Spike harness: `D:\git\opencode-model-router\test\smoke\routing-spikes.smoke.test.ts` — gated by `RUN_OC_SMOKE_V2_SPIKES=1` (isolated hosts); S4 additionally needs the manual opt-in `RUN_OC_SPIKE_LIVE_CATALOG=1` (read-only GETs of the user's running service; no generation); skipped otherwise.
+> Evidence: `D:\git\opencode-model-router\docs\qa\cost-aware-routing\spikes\*.json`, all from one run (`runId 14487af3-…`, harness blob `c6d2054`, commit `d9e2358`).
 
 ## Pre-flight
 
@@ -91,91 +91,116 @@ The host loads a plugin with a plain dynamic `import()`: `packages/plugin/src/ho
 
 ### 0.P.1 / 0.P.4 — Spikes and verdicts
 
-Harness: one isolated `opencode serve` (private HOME/XDG, **allowlisted environment** — no provider credentials reach it, asserted), a scripted Anthropic-Messages provider, and a probe plugin that rewrites `subagent` input in `tool.hook("execute.before")`, records `ctx.event.subscribe` deliveries (tagged by plugin instance) and tags provider requests. Child sessions are read back through the host client (`session.get` / `session.list({parentID})` / `session.context`, `model.list`); S3 reads the probe plugin's subscription log by design (that is the hypothesis); the child id is taken from the tool result and the dispatch fails unless exactly one child is identified. Each spike deletes its sessions; the `cleanup` test asserts 0 sessions remain, kills the host tree with `taskkill /T /F` and asserts the port is closed.
+Harness: isolated `opencode serve` hosts (private HOME/XDG, **allowlisted environment** — no provider credentials reach them, asserted) with a scripted Anthropic-Messages provider and a probe plugin that rewrites `subagent` input in `tool.hook("execute.before")`, records `ctx.event.subscribe` deliveries tagged by plugin instance, can call `ctx.generate.text`, and tags provider requests. The main host runs with a global allow-all permission fixture; a second host (S2-agent-native) runs with the host's **native** agent permissions. Child sessions are read back through the host client (`session.get` / `session.list({parentID})` / `session.context`, `model.list`); S3/S3b read the probe plugin's subscription log by design (that is the hypothesis); the child id is taken from the tool result and a dispatch fails unless exactly one child is identified. Each spike deletes its sessions; `cleanup` asserts 0 sessions remain, kills each host tree with `taskkill /T /F` and asserts the port is closed. The harness makes **no** live generate call; `RUN_OC_SPIKE_LIVE_CATALOG=1` enables only S4's read-only GETs (`/api/debug/location`, `/api/model`, `/api/provider`) of the user's running service.
 
-Run: `npx cross-env RUN_OC_SMOKE_V2_SPIKES=1 RUN_OC_SPIKE_LIVE_CATALOG=1 npx vitest run --config vitest.smoke.config.ts test/smoke/routing-spikes.smoke.test.ts --reporter=verbose` → `Tests 9 passed (9)`, 12.73 s. Without the env vars: `Tests 9 skipped (9)`.
+Committed evidence: one run, `runId 14487af3-8e39-4c68-9580-2ada78ff2d00`, harness blob `c6d20542e47922d8c36f6e189a6fdafe22a68252`, commit `d9e2358`.
+
+| Run | Command | Result |
+|---|---|---|
+| evidence run | `npx cross-env RUN_OC_SMOKE_V2_SPIKES=1 RUN_OC_SPIKE_LIVE_CATALOG=1 npx vitest run --config vitest.smoke.config.ts test/smoke/routing-spikes.smoke.test.ts --reporter=verbose` | `Tests 11 passed (11)`, 18.85 s |
+| acceptance check | same without `RUN_OC_SPIKE_LIVE_CATALOG` | `Tests 10 passed \| 1 skipped (11)` (S4 skipped), 17.35 s |
+| no env | — | `Tests 11 skipped (11)` |
 
 | Spike | Observed (host state / wire) | Verdict |
 |---|---|---|
-| **S1** swapped `agent`+`model` in `execute.before` | hook: `agent general→explore`, `model anthropic/claude-sonnet-5-5#max`; stored child: `agent "explore"`, model `{anthropic, claude-sonnet-5-5, variant "max"}`; wire effort `max` | **confirmed** (scripted provider, allow-all permissions) |
-| **S1-deny** same swap with `{subagent, explore, deny}` for the parent | rewrite applied, then the host refused: `Subagent denied: explore` (`Permission.BlockedError`); no `explore` child; control `general` dispatch completed | **host re-checks permissions after the rewrite** → A11 |
-| **S2** resume with `sessionID` + higher variant; agent switch on resume | stored variant `low→max` on the same child; message count 3→7→11; resume with `agent: explore` → stored agent `general→explore`, model unchanged. Wire: top-level effort unchanged, new effort in an in-band `{"role":"system","content":[],"output_config":{"effort":…}}` message (`session/runner/to-llm-message.ts` `modelSwitched()`). Both agents received the same 12 tools under allow-all | **confirmed with caveat**: in-band delivery is the host's request building; acceptance by the real provider API is unverified |
-| **S2b** model switch on resume; mixed sequences | `sonnet#low → opus#low` on resume: wire model `claude-opus-5-5`; `→ opus#high`: in-band `high`; model+variant together: top-level `high`; fresh child at `#high`: top-level `high`; **A#low → A#high → B#xhigh**: req 3 `claude-opus-5-5`, top-level `xhigh`, no new in-band message; **no variant**: stored `variant "default"`, no effort sent (top-level or in-band), resume to `#high` → in-band `high`; **`claude-haiku-4-5` high→max**: no `output_config.effort` at all, no in-band message, `thinking.budget_tokens` `16000 → 31999` (top level) | **confirmed with caveats** → A7, A9 |
-| **S3** `session.step.ended` for children reaches the plugin | raw child events 11 = deduped 11; `session.step.ended` raw 1 = deduped 1; one plugin instance; `evt_10f8e0e3a0010lD7FQAiRRfDmO` at the isolated project location; `cost 0.01073`, `tokens {input 5340, output 5, reasoning 0, cache {read 0, write 0}}` (= 5340×2e-6 + 5×1e-5 at the isolated catalog price) | **confirmed**. Multi-instance duplicate delivery was **not observed** in the recorded run (an earlier unrecorded run suggested it) → A3 is a design guard, not a finding |
-| **S4** catalog variants/cost/context (live service, read-only) | read with explicit location `D:\git\opencode-model-router` (already live); live locations 13 before = 13 after (unchanged, asserted). `anthropic/claude-sonnet-5-5`, `claude-opus-5-5`: variants `low, medium, high, xhigh, max`, one cost entry with **every field 0**, context 1 000 000; `anthropic/claude-haiku-4-5`: `high, max`, all-zero cost, context 200 000; `openai/gpt-6-luna`: `none, low, medium, high, xhigh, max`, cost `[]`, context 400 000 / input 272 000; **`openai/gpt-6-luna-fast`** (the live @fast model): same variants, cost `[]`, context 400 000 / input 272 000 / output 128 000; `opencode/deepseek-v4.1-flash` absent, `opencode-go/deepseek-v4.1-flash` present (`low, high, max`, input 0.15 / output 0.6, tiered entries). Every variant list is in host effort order (asserted). Unpriced: all five `anthropic`/`openai` models above | **confirmed with caveats** → A1, A2, A10 |
-| **S5** `generate` with explicit `model` | **plugin path** `ctx.generate.text({prompt, model})` from the probe plugin: succeeded cold (7 ms), warm 9 / 6 ms; did not make the base location live. **Raw route** `POST /api/experimental/generate`: cold 400 `Model unavailable`; immediate retry 400; retry after 261 ms without any catalog read 200 → the 400 is lazy base-location initialisation, time-based. **Live credentials**: skipped by design — the base location of the live service was not live, and a call would start a plugin instance there | **confirmed for the plugin client** (isolated host); **real-credential path unverified** → A4 |
-| **S6** switch to a smaller context, oversize prompt | alias `anthropic/spike-small` (`limit.context` 12 000), 72 021-char prompt: host ran auto compaction (`session.compaction.started/ended`, `reason: "auto"`) before the primary request; the primary request still exceeded the limit (≈23 000 tokens **estimated by the scripted provider** from body length, not a host count) because the oversize incoming message is kept as recent context; child finished. The scripted provider never returns an overflow error, so the error branch was not observable | **confirmed** (the hypothesis "compacts or errors predictably" holds: it compacts) → A5 |
+| **S1** swapped `agent`+`model` in `execute.before` | hook: `agent general→explore`, `model anthropic/claude-sonnet-5-5#max`; stored child: `agent "explore"`, model `{anthropic, claude-sonnet-5-5, variant "max"}`; wire effort `max` | **confirmed** (scripted provider, allow-all fixture) |
+| **S1-deny** same swap with `{subagent, explore, deny}` for the parent | rewrite applied, then the host refused: `Subagent denied: explore` (`Permission.BlockedError`); no `explore` child; 0 provider requests for `explore` during the spike; control `general` dispatch completed | **host re-checks permissions after the rewrite** → A11 |
+| **S2** resume with `sessionID` + higher variant; agent switch on resume (allow-all fixture) | stored variant `low→max` on the same child; message count 3→7→11; resume with `agent: explore` → stored agent `general→explore`, model unchanged; wire: top-level effort unchanged, new effort in an in-band `{"role":"system","content":[],"output_config":{"effort":…}}` message (`session/runner/to-llm-message.ts` `modelSwitched()`); tools 12/12/12, system-prompt hash changes on the agent switch | **confirmed with caveat**: in-band delivery is the host's request building; acceptance by the real provider API is unverified |
+| **S2-agent-native** agent switch under native permissions | stored agents `general, general, explore, general`; tools 11 → 11 → **6** → 11; `general`: `edit, glob, grep, read, shell, skill, subagent, webfetch, websearch, write, execute`; `explore`: `glob, grep, read, subagent, webfetch, websearch`; system-prompt SHA-256 `a5373be9…` (7 989 chars) → `cfa0baff…` (7 003 chars) on the switch and back to `a5373be9…` on the return; a variant-only resume changes neither | **confirmed**: an agent switch on resume changes tools and system prompt → A11 |
+| **S2b** model switch on resume; mixed sequences | `sonnet#low → opus#low` on resume: wire model `claude-opus-5-5`; `→ opus#high`: in-band `high`; model+variant together: top-level `high`; fresh child at `#high`: top-level `high`; **A#low → A#high → B#xhigh**: req 3 `claude-opus-5-5`, top-level `xhigh`, no new in-band message; **no variant**: stored `variant "default"`, no effort sent, resume to `#high` → in-band `high` and the top-level `thinking` object changes; **`claude-haiku-4-5` high→max**: no `output_config.effort`, no in-band message, top-level `thinking.budget_tokens` `16000 → 31999` | **confirmed with caveats** → A7, A9 |
+| **S3** `session.step.ended` reaches the plugin (one plugin instance) | `session.step.ended` raw 1 = deduped 1; `cost 0.01073`, `tokens {input 5340, output 5, reasoning 0, cache {read 0, write 0}}` (= 5340×2e-6 + 5×1e-5 at the isolated catalog price) | **confirmed** |
+| **S3b** same, with two live locations (after S5) | raw session events 22 → deduped 11; `session.step.ended` raw 2 → deduped 1; both deliveries carry the **same event id**, one per plugin instance (project location and the config location) | **confirmed: one delivery per live location instance** → A3 |
+| **S4** catalog variants/cost/context (live service, read-only, opt-in) | explicit already-live location `D:\git\opencode-model-router`; live location set unchanged (asserted). `anthropic/claude-sonnet-5-5`, `claude-opus-5-5`: variants `low, medium, high, xhigh, max`, one cost entry with **every field 0**, context 1 000 000; `anthropic/claude-haiku-4-5`: `high, max`, all-zero cost, context 200 000; `openai/gpt-6-luna` and **`openai/gpt-6-luna-fast`** (live @fast): `none, low, medium, high, xhigh, max`, cost `[]`, context 400 000 / input 272 000 / output 128 000; `opencode/deepseek-v4.1-flash` absent, `opencode-go/deepseek-v4.1-flash` present (`low, high, max`, input 0.15 / output 0.6); `opencode-go/gpt-6-luna` 0.1 / 0.5. Every variant list in host effort order (asserted). Unpriced flags set for all five `anthropic`/`openai` models above. Tool-call support not checked | **confirmed with caveats** → A1, A2, A10 |
+| **S5** `generate` with explicit `model` | **plugin path** `ctx.generate.text({prompt, model})`: succeeded on the first call (7 ms), then 9 / 6 ms; the base location stayed not live — the plugin path resolves at the dispatching (already warm) location. **Raw route** `POST /api/experimental/generate`: first call 400 `Model unavailable`; immediate retry 400; retry after 261 ms without a catalog read 200 → time-based lazy init of the base location. **No live call** (removed, QA-0P-27) | **confirmed for the plugin client on the isolated host**; real-credential path → checkpoint DF3 (A4) |
+| **S6** switch to a smaller context, oversize prompt | alias `anthropic/spike-small` (`limit.context` 12 000), 72 021-char prompt: auto compaction (`session.compaction.started/ended`, `reason: "auto"`) ran before the primary request; the primary request still exceeded the limit (≈23 346 tokens **estimated by the scripted provider** from body length) because the oversize incoming message is kept as recent context; child finished. Events: raw 48 → deduped 24, `step.ended` raw 4 → deduped 2 (two instances). The scripted provider never returns an overflow error, so the error branch was not observable | **confirmed** (it compacts) → A5 |
 | **S7** code liveness | see 0.P.7 | **disproven** → A8 |
 
 ## Implementation notes
 
-The amendments are recorded verbatim in the plan, §1.5 "Amended during implementation"; ids and targets are identical in both places.
+The amendment texts are canonical in the plan, §1.5 "Amended during implementation" (same ids A1–A12); this list gives only the evidence behind each.
 
-- **A1 → D5/D6.** *Unpriced* = `cost` empty, or every field of every cost entry (all tiers) is 0. Observed: `anthropic/claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5` (all-zero), `openai/gpt-6-luna`, `openai/gpt-6-luna-fast` (empty). Their step costs will be 0 (inference from the host's catalog-price computation seen in S3; not measured on the live host) and are stored as `null`. **Consequence for the dogfood:** every tier model of the live `hybrid-2` preset is unpriced, so DF1–DF5 decisions and savings are in `costRatio` units, never USD.
-- **A2 → F4/2.4.** Suggestions come from the live catalog; the cheapest priced tool-capable model here is `opencode-go/deepseek-v4.1-flash`. Variant sets differ per model.
-- **A3 → M6/2.1.** Design guard: ingestion dedupes `session.step.ended` by event id **at module (process) scope** and only records events whose session is in the dispatch registry; the outcome store has a single writer per process.
-- **A4 → M2 `host` backend.** The backend uses the plugin client `ctx.generate.text({prompt, model})` (worked cold on the isolated host). It treats any error — including `Model unavailable` and a credentials error such as `Generation credentials are unavailable` — as `unknown` within `timeoutMs`, no retry loop; the `openai-compatible` backend remains the alternative. The real-credential path is verified in Phase 3.2 (live smoke) before `host` is documented as supported.
-- **A5 → D11.** Resume when `lastStepTokens + estimatedTokens(nextPrompt) < sessionReuse.maxContextFraction × (limit.input ?? limit.context)` of the **next** model; otherwise fresh. `estimatedTokens` = chars/4 of the forcing message plus the dispatch prompt. (Replaces the earlier `min(current, next)` wording.)
-- **A6 → §0.11 / §2.** Checkpoints edit `routing.*` in `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`, not the bundled `tiers.json` (base checkout, §0.6.8; would also block `--ff-only` syncs). Phase 1.1.4 proves the hot-reload path re-reads that layer.
-- **A7 → D10 / 3.2.** Variant effort delivery depends on the provider route: for the owner's `claude-sonnet-5-5`/`claude-opus-5-5` on Anthropic Messages the host sends a same-model variant change in-band and keeps the top-level effort (prompt cache preserved); for `claude-haiku-4-5` the variant maps to `thinking.budget_tokens` at the top level (cache prefix changes); the OpenAI Responses route (live @fast) was not exercised — host source gates in-band updates on model support. Provider acceptance of in-band effort is unverified. Tests assert the *effective* effort (last in-band value, else top level, else thinking budget).
-- **A8 → §0.11.** Plugin code is loaded once per process; each code sync (DF1–DF4) requires a host restart.
-- **A9 → D10/1.5.** A child dispatched without a variant is stored as `variant "default"`, which is not in `variants[]`, and no effort is sent. Phase 1.5.1 defines the rank of `default` (constraint: the ladder never emits a variant absent from `variants[]`; a `default` rung's first variant step must be a listed variant).
-- **A10 → D5/D11.** `cost[]` may hold context-tiered entries (`tier: {type: "context", size: 272000}`): price lookup picks the entry by input size. Context checks use `limit.input ?? limit.context`.
-- **A11 → D9/D12.** The host re-checks permissions after `execute.before` rewrites `agent` (S1-deny: `Subagent denied: explore`). `enforce` must apply the permission filter **before** swapping; a swap to a denied agent would make the dispatch fail instead of falling back.
-- **A12 → §0.6.8.** Phase 0.P work lives in `D:\git\omr-car-p0p`, merges into `car/main`, and `master` is fast-forwarded to `car/main` (docs and a gated smoke test only; no plugin code; no restart). This satisfies the 0.P write-set note "Committed on `master`".
-- **0.P.4 executor.** Verdicts issued by the orchestrator (Opus) per router rule 9; producer (`@medium` harness) ≠ judge. Phase QA is a separate `@heavy` dispatch.
+- **A1 (D5/D6, unpriced = empty or all-zero)** — S4 cost entries. Live step costs of 0 are inferred from the host's catalog-price computation (S3), not measured on the live host. Consequence: the dogfood is in `costRatio` units.
+- **A2 (F4, catalog-only suggestions; "cheapest" defined)** — S4 prices; tool support not checked by S4.
+- **A3 (M6, process-scope dedupe, module-scope registry, single writer)** — S3b, S6 event counts.
+- **A4 (M2 `host` backend via `ctx.generate.text`, errors → `unknown`, live check at DF3)** — S5.
+- **A5 (D11 resume rule with `inputBudget`)** — S6; S4 `limit.output` 128 000 on the wire (S2b `max_tokens`).
+- **A6 (checkpoints edit the global override file)** — 0.P.6.
+- **A7 (effort delivery per provider route)** — S2, S2b (including haiku and `default`).
+- **A8 (restart per code sync)** — 0.P.7.
+- **A9 (`default` variant)** — S2b no-variant case.
+- **A10 (tiered prices, `inputBudget`)** — S4 `gpt-6-luna*` entries.
+- **A11 (permission re-check; evaluated permissions for `needs`)** — S1-deny, S2-agent-native.
+- **A12 (0.P merges via `car/main`, then `master` fast-forward)** — §0.6.8.
+- **0.P.4 executor.** Verdicts issued by the orchestrator (Opus) per router rule 9; producer (`@medium` harness) ≠ judge. QA is a separate `@heavy` dispatch.
 
 ## Findings
 
-QA round 1 (`@heavy`, adversarial): 0 blocking, 1 critical, 8 major, 11 minor, 5 nit. All fixed in round 1.
+**Round 1** (`@heavy`, adversarial): 0 blocking, 1 critical, 8 major, 11 minor, 5 nit. Round 2 judged 20 resolved and 5 partially resolved (QA-0P-1, 3, 17, 18, 20); the partial ones were completed in round 2 (see the resolution column).
 
 | Id | Sev. | Where | Finding | Resolution |
 |---|---|---|---|---|
-| QA-0P-1 | critical | harness S5 | S5 used the raw HTTP route, not the plugin client | probe calls `ctx.generate.text`; raw route kept as secondary; live call gated and skipped when it would start a location — `5113977`; A4 rewritten |
-| QA-0P-2 | major | harness S4 | live read not opt-in; could start a location | `RUN_OC_SPIKE_LIVE_CATALOG=1`; explicit already-live location; before/after location set asserted unchanged — `5113977` |
-| QA-0P-3 | major | S3 / A3 | duplicate delivery unrecorded; per-instance dedupe insufficient | raw vs deduped counts + location + instance recorded (`5113977`); A3 rewritten (process-scope dedupe, registry filter, single writer) |
-| QA-0P-4 | major | S1 | permission re-check after rewrite untested | `S1-deny` added — host refuses (`5113977`); A11 |
-| QA-0P-5 | major | A7 | in-band effort generalised beyond evidence | haiku case added (`5113977`); A7 rewritten per route |
-| QA-0P-6 | major | A5 | `min()` rule not derived from S6 | S6 verdict "confirmed"; A5 rewritten (next-prompt estimate, next model's limit) |
-| QA-0P-7 | major | — | `default` variant missing | no-variant case recorded (`5113977`); A9 |
-| QA-0P-8 | major | S4 / dogfood | live @fast model unchecked; dogfood unit unstated | `gpt-6-luna-fast` recorded (unpriced) (`5113977`); A1 + `dogfood.md` state `costRatio` units |
-| QA-0P-9 | major | `dogfood.md` | zero-tool contradiction unexplained | scorecards are written only with guard state (`src\index.ts:1710–1713`); row renamed, bias stated |
-| QA-0P-10 | minor | A1 | inference stated as fact; tiered cost and `limit.input` missing | A1 wording; A10 |
-| QA-0P-11 | minor | evidence | evidence from two runs | single run, `runId` + harness blob in every file — `5113977` |
-| QA-0P-12 | minor | harness S3 | `waitFor` returned on `[]` | fixed — `5113977` |
-| QA-0P-13 | minor | harness S5 | "catalog read fixes it" unproven | retry without catalog read recorded: time-based lazy init — `5113977` |
-| QA-0P-14 | minor | harness S4 | order not asserted; empty cost accepted | order asserted; `unpriced` flag — `5113977` |
-| QA-0P-15 | minor | harness env | denylist let credentials through | allowlist + assertion — `5113977` |
-| QA-0P-16 | minor | harness teardown | `child.kill()` leaves the tree on Windows | `taskkill /T /F` + port-closed assertion — `5113977` |
-| QA-0P-17 | minor | plan 0.P acceptance | check command could not exercise the spikes | plan acceptance block amended |
-| QA-0P-18 | minor | docs | amendment ids/targets misaligned; §2 still named `tiers.json` | ids aligned (A1–A12 identical in plan and here); §2 row amended |
-| QA-0P-19 | minor | harness S2b | variant-then-model order untested | case added and asserted — `5113977` |
-| QA-0P-20 | minor | harness S2 | agent switch tool set unrecorded | tools per request recorded — `5113977` |
-| QA-0P-21 | nit | harness | `clip()` truncated notes | only `observed` clipped — `5113977` |
-| QA-0P-22 | nit | this file | "never the hook's own variables" overstated | harness description reworded |
-| QA-0P-23 | nit | this file | template-mismatch run unlogged | logged in `run-log.md` |
-| QA-0P-24 | nit | harness | `data[0]` child fallback | exactly-one-child assertion — `5113977` |
-| QA-0P-25 | nit | evidence | username path and provider list exposed | redacted (`<home>`, `<user>`, relevant providers only) — `5113977` |
+| QA-0P-1 | critical | harness S5 | S5 used the raw HTTP route, not the plugin client | probe calls `ctx.generate.text` (`5113977`); live check given an owner: checkpoint DF3 (QA-0P-26) |
+| QA-0P-2 | major | harness S4 | live read not opt-in; could start a location | opt-in gate, explicit already-live location, location set asserted unchanged — `5113977` |
+| QA-0P-3 | major | S3 / A3 | duplicate delivery unrecorded | counts recorded (`5113977`); duplicate delivery demonstrated by S3b (`d9e2358`); A3 rewritten |
+| QA-0P-4 | major | S1 | permission re-check after rewrite untested | `S1-deny` — `5113977`; A11 |
+| QA-0P-5 | major | A7 | in-band effort generalised | haiku case (`5113977`); A7 per route |
+| QA-0P-6 | major | A5 | `min()` rule not derived from S6 | A5 rewritten |
+| QA-0P-7 | major | — | `default` variant missing | no-variant case (`5113977`); A9 |
+| QA-0P-8 | major | S4 / dogfood | live @fast model unchecked; unit unstated | `gpt-6-luna-fast` recorded (`5113977`); A1 + `dogfood.md` |
+| QA-0P-9 | major | `dogfood.md` | zero-tool contradiction | scorecard written only with guard state (`src\index.ts:1710–1713`); bias stated |
+| QA-0P-10 | minor | A1 | inference as fact; tiered cost, `limit.input` | A1 wording; A10 |
+| QA-0P-11 | minor | evidence | two runs | single run with `runId` + harness blob — `d9e2358` |
+| QA-0P-12 | minor | harness S3 | `waitFor` returned on `[]` | `5113977` |
+| QA-0P-13 | minor | harness S5 | catalog-read claim unproven | time-based lazy init shown — `5113977` |
+| QA-0P-14 | minor | harness S4 | order not asserted | asserted; `unpriced` flag — `5113977` |
+| QA-0P-15 | minor | harness env | denylist | allowlist + assertion — `5113977` |
+| QA-0P-16 | minor | teardown | Windows tree kill | `taskkill /T /F` + port check — `5113977` |
+| QA-0P-17 | minor | plan 0.P acceptance | vacuous check | deterministic isolated-host `check:` + manual live criterion (QA-0P-30) |
+| QA-0P-18 | minor | docs | ids/targets misaligned; §2 / §0.11 step 5 named `tiers.json` | plan canonical, this file references it; §2 row and §0.11 step 5 amended; handover rewritten |
+| QA-0P-19 | minor | harness S2b | variant-then-model order | `5113977` |
+| QA-0P-20 | minor | harness S2 | agent switch tools unrecorded | S2-agent-native under native permissions (`d9e2358`) |
+| QA-0P-21 | nit | harness | `clip()` truncated notes | `5113977` |
+| QA-0P-22 | nit | this file | overstated harness description | reworded |
+| QA-0P-23 | nit | this file | template-mismatch run unlogged | `run-log.md` |
+| QA-0P-24 | nit | harness | `data[0]` fallback | exactly-one-child assertion — `5113977` |
+| QA-0P-25 | nit | evidence | username path, provider list | redacted — `5113977` |
+
+**Round 2** (`@heavy`, re-review of the fixes): 0 blocking, 0 critical, 3 major, 7 minor, 2 nit. All fixed in round 2.
+
+| Id | Sev. | Where | Finding | Resolution |
+|---|---|---|---|---|
+| QA-0P-26 | major | plan A4/A7, 3.1, 3.2 | deferred checks had no owner; docs come before 3.2 | A4 live check owned by checkpoint DF3 (before 3.1); Phase 3.2 scenario 7 (OpenAI Responses effort); §2 row allows `routing.classifier` at DF3 |
+| QA-0P-27 | major | harness, docs | live gate also unlocked a paid generate | live generate branch removed; gate documented as read-only GETs — `d9e2358` |
+| QA-0P-28 | major | plan §0.11 step 5, handover | still said "edit the active `tiers.json`" | step 5 amended to the override file; handover rewritten at 0.P close |
+| QA-0P-29 | minor | S3/S6, A3 | condition for duplicates never set up; registry scope | S3b (two instances) and S6 counts (`d9e2358`); A3 states module scope for dedupe set and registry |
+| QA-0P-30 | minor | plan acceptance; harness S4 | no `check:`; S4 failed when not live | `check:` line runs isolated spikes; S4 skips with a recorded reason — `d9e2358` |
+| QA-0P-31 | minor | A7 | "cache preserved" unobserved | qualified as host intent; `default` → variant changes top-level `thinking` |
+| QA-0P-32 | minor | A5 | `max_tokens` ignored without `limit.input` | `inputBudget = limit.input ?? (limit.context − limit.output)` |
+| QA-0P-33 | minor | S2 / D12 | allow-all hid tool differences | S2-agent-native — `d9e2358`; A11 + handoff to 2.2 |
+| QA-0P-34 | minor | A2 | "cheapest" contradicted by S4; "tiered" wrong | "cheapest" defined; examples corrected |
+| QA-0P-35 | minor | A4 | "worked cold" overstated; resolution location | A4 + S5 row: resolves at the dispatching location; handoff to 1.2 |
+| QA-0P-36 | nit | harness S1-deny | run-wide capture count | spike-scoped count — `d9e2358` |
+| QA-0P-37 | nit | harness notes, this file, run-log | wording; row order | S6 "estimated", S4 "inferred" (`d9e2358`); "verbatim"/"all fixed in round 1" removed; run-log reordered |
 
 ## Deferred by plan
 
 - `tsx` absent → `routing:stats` invocation decided in Phase 1.3 (plan troubleshooting row).
 - DF0 limits (no verdicts / false-refusal flags; zero-tool children write no scorecard) → measured from DF2 on by the decision log and outcome store (Phases 1.3, 2.1, 2.2).
-- Real-credential `generate` path (A4) → Phase 3.2 live smoke.
-- OpenAI Responses effort delivery for the live @fast model (A7) → Phase 3.2.
+- Real-credential `host` classifier path (A4) → checkpoint DF3.
+- OpenAI Responses effort delivery (A7) → Phase 3.2 scenario 7.
 
 ## Handoffs
 
-- **to 1.1** — 1.1.4: test that a change to the global override file is picked up by hot reload (A6). 1.1.6: runtime `.git` read only.
-- **to 1.2** — `host` backend via `ctx.generate.text`, errors → `unknown` (A4).
+- **to 1.1** — 1.1.4: test that a change to the global override file is picked up by hot reload (A6). 1.1.6: runtime `.git` read only. Config validation must accept `routing.classifier` with `backend: "host"` + a catalog model (used at DF3).
+- **to 1.2** — `host` backend via `ctx.generate.text`; the classifier model must resolve at the dispatching location; errors → `unknown` (A4).
 - **to 1.3** — `tsx` not installed; unpriced = empty or all-zero, all tiers; tiered price lookup (A1, A10).
-- **to 1.4** — D2 snapshot pins the raw builder output (SHA-256 above) and the v2-adapted text; kernel unit = `costRatio` for every live candidate today (A1).
-- **to 1.5** — D11 formula (A5, A10); rank of `default` (A9); variant catalogs differ per model; haiku variants are thinking budgets (A7).
-- **to 2.1** — process-scope dedupe, registry filter, single writer (A3).
-- **to 2.2** — permission filter before any `enforce` swap (A11).
-- **to 2.4** — advisor: unpriced per A1; suggestion from the live catalog (A2).
-- **to 3.2** — effective-effort assertions (A7); live `generate` credential check (A4); OpenAI route effort check (A7).
+- **to 1.4** — D2 snapshot pins the raw builder output (SHA-256 above) and the v2-adapted text; every live candidate compares in `costRatio` today (A1).
+- **to 1.5** — D11 rule with `inputBudget` (A5, A10); rank of `default` (A9); variant catalogs differ per model; haiku variants are thinking budgets (A7).
+- **to 2.1** — module-scope dedupe set and registry; single writer (A3).
+- **to 2.2** — permission filter before any `enforce` swap; `needs` from evaluated permissions, not agent ids (A11).
+- **to 2.4** — advisor: unpriced per A1; suggestions per A2.
+- **to 3.2** — effective-effort assertions (A7); scenario 7.
 
 ## Verdict
 
-_Pending QA round 2._
+_Pending QA round 3 (re-review of round-2 fixes; from round 3 only blocking/critical/major are fixed)._
