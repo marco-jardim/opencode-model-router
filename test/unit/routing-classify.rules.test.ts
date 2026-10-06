@@ -357,7 +357,7 @@ describe("dispatch templates (R2)", () => {
     "2. EXPECTED OUTCOME: the symbol is renamed everywhere it is used",
     "3. TOOLS: read/search/write, pwsh for tests",
     "4. MUST DO: keep the diff small",
-    "5. MUST NOT DO: do not publish anything, do not refactor",
+    "5. MUST NOT DO: do not touch the lockfile, do not refactor",
     "6. CONTEXT: background about the repo and its history",
     "7. ENVIRONMENT: Working directory: D:\\git\\repo. Platform: win32. Shell: pwsh",
   ].join("\n");
@@ -568,5 +568,60 @@ describe("destructive operations are high risk (QA-1.2-3)", () => {
     const facts = classifyByRules("rename the column user_name to username", cfg);
     expect(facts.class).toBe("mechanical");
     expect(facts.risk).toBe("medium");
+  });
+});
+describe("risk scans the whole body; excluded sections end at a blank line (QA-1.2-4)", () => {
+  it("CONTEXT that names production, billing or credentials still raises risk", () => {
+    const text = [
+      "TASK: rename getFoo to fetchFoo in src/a.ts",
+      "CONTEXT: this service runs in production billing and handles credentials",
+    ].join("\n");
+    const analysis = analyzeRules(text, cfg);
+    expect(analysis.templated).toBe(true);
+    expect(analysis.facts.class).toBe("mechanical");
+    expect(analysis.facts.risk).toBe("high");
+    expect(analysis.facts.confidence).toBe(0.5);
+  });
+
+  it("text after the blank line that ends ENVIRONMENT is task text again", () => {
+    const text = [
+      "TASK: rename getFoo to fetchFoo in src/a.ts",
+      "ENVIRONMENT: Platform: win32",
+      "Shell: pwsh",
+      "",
+      "then deploy it to production and refactor the module",
+    ].join("\n");
+    const facts = classifyByRules(text, cfg);
+    expect(facts.risk).toBe("high");
+    expect(facts.class).toBe("implement"); // the refactor after the blank line counts
+  });
+
+  it("a TOOLS line followed by task text: risk is high even though the class stays with TASK", () => {
+    const glued = [
+      "TASK: report the current state",
+      "TOOLS: read/search/write",
+      "refactor the auth module and deploy it to production",
+    ].join("\n");
+    expect(classifyByRules(glued, cfg).risk).toBe("high");
+    const separated = [
+      "TASK: report the current state",
+      "TOOLS: read/search/write",
+      "",
+      "refactor the auth module and deploy it to production",
+    ].join("\n");
+    const facts = classifyByRules(separated, cfg);
+    expect(facts.risk).toBe("high");
+    expect(facts.class).toBe("implement");
+  });
+
+  it("an excluded section's own paragraph still never feeds the class or the needs", () => {
+    const text = [
+      "TASK: list the exports of src/a.ts",
+      "TOOLS: read, grep, refactor",
+      "ENVIRONMENT: Shell: pwsh",
+    ].join("\n");
+    const facts = classifyByRules(text, cfg);
+    expect(facts.class).toBe("search");
+    expect(facts.needs).not.toContain("shell");
   });
 });

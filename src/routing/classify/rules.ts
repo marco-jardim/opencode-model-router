@@ -274,7 +274,11 @@ interface Sections {
   readonly needsText: string;
 }
 
-/** R2: split a dispatch template into sections; text outside templates is used whole. */
+/**
+ * R2: split a dispatch template into sections; text outside templates is used
+ * whole. Excluded sections hide only their own paragraph: the text after the
+ * first blank line of such a section is included again.
+ */
 function splitSections(body: string): Sections {
   const lines = body.split("\n");
   const headers: Array<{ line: number; label: string; prefixLength: number }> = [];
@@ -298,11 +302,13 @@ function splitSections(body: string): Sections {
   for (let h = 0; h < headers.length; h++) {
     const header = headers[h]!;
     const end = h + 1 < headers.length ? headers[h + 1]!.line : lines.length;
-    const content = [lines[header.line]!.slice(header.prefixLength), ...lines.slice(header.line + 1, end)].join(
-      "\n",
-    );
-    if (!CLASS_EXCLUDED.has(header.label)) focus.push(content);
-    if (!NEEDS_EXCLUDED.has(header.label)) needs.push(content);
+    const content = [lines[header.line]!.slice(header.prefixLength), ...lines.slice(header.line + 1, end)];
+    // An excluded section ends at its first blank line: whatever follows is task text again (QA-1.2-4).
+    const blank = content.findIndex((line, i) => i > 0 && line.trim() === "");
+    const afterBlank = blank === -1 ? "" : content.slice(blank + 1).join("\n");
+    const whole = content.join("\n");
+    focus.push(CLASS_EXCLUDED.has(header.label) ? afterBlank : whole);
+    needs.push(NEEDS_EXCLUDED.has(header.label) ? afterBlank : whole);
   }
   return { templated: true, focusText: focus.join("\n"), needsText: needs.join("\n") };
 }
@@ -458,8 +464,10 @@ export function analyzeRules(
 
   // R11 — risk (negation ignored for the high-risk vocabulary)
   let risk: Risk = CLASS_BASE_RISK[taskClass];
-  if (hasHit(HIGH_RISK_RES, focusText, false)) risk = "high";
-  else if (hasHit(MEDIUM_RISK_RES, focusText, false)) risk = maxRisk(risk, "medium");
+  // Risk vocabulary is scanned over the WHOLE body, every section included: a section header must
+  // not hide "production", "credentials" or "deploy" from the risk estimate (QA-1.2-4).
+  if (hasHit(HIGH_RISK_RES, body, false)) risk = "high";
+  else if (hasHit(MEDIUM_RISK_RES, body, false)) risk = maxRisk(risk, "medium");
   if (
     (scope === "repo" && needs.has("edit")) ||
     (needs.has("external_dir") && needs.has("edit")) ||
