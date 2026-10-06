@@ -303,6 +303,9 @@ describe("shadow: log, never change", () => {
     expect(rows[0]!.trace).toMatchObject({ routeLines: { count: 1, conflict: false }, backend: null });
     expect(Object.keys(rows[0]!.costs).length).toBeGreaterThan(1);
     expect(rows[0]!.unit).toBe("ratio");
+    // QA-3.2-12: the reason code leads once; the kernel's own leading word is not repeated
+    expect(rows[0]!.reason).toMatch(/^switched: C\(best\)=/);
+    expect(rows[0]!.reason).not.toContain("switched: switched");
   });
 
   it("with no evidence the decision is a kept row whose best is the orchestrator's pick", async () => {
@@ -312,6 +315,7 @@ describe("shadow: log, never change", () => {
     const [row] = await world.rows();
     expect(row).toMatchObject({ switched: false, pinned: false, chosen: { agent: "medium" } });
     expect(row!.reason).toMatch(/^kept:/);
+    expect(row!.reason).toMatch(/^kept:[a-z-]+: (?!kept: )/); // QA-3.2-12: `kept:best-is-chosen: the chosen dispatch …`, not `kept:best-is-chosen: kept: …`
   });
 
   it("shadow leaves the system prompt exactly as the legacy hook built it", async () => {
@@ -370,6 +374,7 @@ describe("enforce", () => {
     const [row] = await world.rows();
     expect(row).toMatchObject({ pinned: true, switched: false, chosen: { agent: "medium" }, best: { agent: "heavy" } });
     expect(row!.reason).toMatch(/^kept:pinned/);
+    expect(row!.reason).toMatch(/^kept:pinned: pinned dispatch \(best /); // QA-3.2-12: no doubled `kept:`
     expect(Object.keys(row!.costs).length).toBeGreaterThan(1);
   });
 
@@ -632,9 +637,11 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     // 3.2 smoke (real host): the row of a pinned resume must not claim it was sent to the running agent, because it was sent as named
     const pinnedRow = (await resumeRows(world)).at(-1);
     expect(pinnedRow).toMatchObject({ resume: true, pinned: true, switched: false, childSessionID: "child-pin", chosen: { agent: "fast" } });
-    expect(pinnedRow!.reason.startsWith("kept:resume:running: ")).toBe(true);
+    expect(pinnedRow!.reason.startsWith("kept:resume:pinned: ")).toBe(true); // QA-3.2-12: its own prefix, still a kept:resume row
+    expect(pinnedRow!.reason.startsWith("kept:resume")).toBe(true);
     expect(pinnedRow!.reason).toContain("pinned, so it is sent as named and NOT rewritten (the host moves the child to @fast)");
     expect(pinnedRow!.reason).not.toContain("sent to @medium");
+    expect(pinnedRow!.reason).not.toContain("kept:resume:running");
   });
 });
 describe("advise: input untouched, protocol and hint through the context hook", () => {

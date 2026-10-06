@@ -51,6 +51,7 @@ import {
   FLOOR_LIFT_REASON,
   RESUME_REASON,
   RESUME_RUNNING_REASON,
+  RESUME_PINNED_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -316,6 +317,15 @@ function depthOf(detection: string): DetectionDepth {
   return detection === "deterministic" || detection === "grader" ? detection : "none";
 }
 
+/**
+ * The row's reason for the kernel's decision: its reason CODE, then the kernel's text without the leading word the text carries itself
+ * (`kept: …`, `switched: …`), so a row reads `switched: C(best)=…` and `kept:best-is-chosen: the chosen dispatch …`, not `switched: switched: …` /
+ * `kept:best-is-chosen: kept: …` (QA-3.2-12). The code stays the first token: `routing:stats` reads `kept:evidence` and `lift:floor` by prefix.
+ */
+function reasonText(decision: Pick<Decision, "reasonCode" | "reason">): string {
+  return `${decision.reasonCode}: ${decision.reason.replace(/^(?:kept|switched): /, "")}`;
+}
+
 /** A pick the engine cannot resolve to a model: logged as kept, never priced (1.4 handoff). */
 function unresolvedChoice(cls: string, agent: string, routerIds: readonly string[]): RouteChoice {
   const origin = classifyAgentOrigin(agent, routerIds);
@@ -473,10 +483,13 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
         reason: running !== null
-          ? `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${decision.pinned ? "pinned, so it is sent as named and NOT rewritten (the host moves the child to @" + agent + ")" : mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${decision.reasonCode}: ${decision.reason}`
+          ? decision.pinned
+            // A pinned resume is sent as named (`kept:resume:pinned`): it was NOT rewritten, so the row must not claim it was.
+            ? `${RESUME_PINNED_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; pinned, so it is sent as named and NOT rewritten (the host moves the child to @${agent}); engine decision: ${reasonText(decision)}`
+            : `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${reasonText(decision)}`
           : resuming
-            ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
-            : `${decision.reasonCode}: ${decision.reason}`,
+            ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${reasonText(decision)}`
+            : reasonText(decision),
       };
       final = { agent, model: chosen.model, variant: chosen.variant };
 

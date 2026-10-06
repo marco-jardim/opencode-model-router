@@ -484,6 +484,13 @@ export const RESUME_REASON = "kept:resume";
  */
 export const RESUME_RUNNING_REASON = "kept:resume:running";
 
+/**
+ * Reason prefix of a PINNED resume that repeats the original pick of a child the router moved (QA-3.2-12, found on the real host in 3.2): the
+ * dispatch is sent as named and the host moves the child, so the row says `kept:resume:pinned` and not that it was sent to the running agent.
+ * Still a `kept:resume` row (`startsWith(RESUME_REASON)`), `switched` false, outside every routing metric.
+ */
+export const RESUME_PINNED_REASON = "kept:resume:pinned";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */

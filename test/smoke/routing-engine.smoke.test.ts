@@ -19,7 +19,7 @@ import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
+import { FLOOR_LIFT_REASON, RESUME_PINNED_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
 import {
   MODELS, ROOT, RoutingHost, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, type HookRecord, type ModelRef, type Obj, type Rule, type Seed, type WireRequest,
 } from "./helpers/routing-host";
@@ -548,7 +548,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           && down.after.agent === "medium" && down.after.model === medium && rootRows[3]?.reason.startsWith(FLOOR_LIFT_REASON) === true
           && foreign.after.status === "error" && String(obj(foreign.after.error).string).includes("is not a child of the current session") && afterForeign.agent === "medium"
           && again.after.agent === "medium" && again.after.model === medium && obj(again.d.before.input).agent === "medium" && rootRows[4]?.reason.startsWith(RESUME_RUNNING_REASON) === true && rootRows[4]?.reason.includes("sent to @medium") === true
-          && pinned.after.agent === "fast" && pinned.after.model === `${MODELS.sonnet}#low` && rootRows[5]?.pinned === true && rootRows[5]?.reason.startsWith(RESUME_RUNNING_REASON) === true && rootRows[5]?.reason.includes("NOT rewritten") === true && !rootRows[5]?.reason.includes("sent to @medium")
+          && pinned.after.agent === "fast" && pinned.after.model === `${MODELS.sonnet}#low` && rootRows[5]?.pinned === true && rootRows[5]?.reason.startsWith(RESUME_PINNED_REASON) === true && rootRows[5]?.reason.includes("NOT rewritten") === true && !rootRows[5]?.reason.includes("sent to @medium")
           && String(obj(denied.after.error).string).includes("Subagent denied: heavy") && afterDenied.agent === "medium"
           && host.errorLines().length === 0;
         s.verdict(ok, `fresh fast -> ${first.after.agent}; resume naming fast -> ${keep.after.agent}; resume naming heavy -> ${up.after.agent}/${up.after.model}; resume naming fast after heavy -> ${down.after.agent}; pinned resume naming fast -> ${pinned.after.agent}/${pinned.after.model}; foreign resume status ${String(foreign.after.status)}; denied resume status ${String(denied.after.status)}`);
