@@ -1225,6 +1225,57 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
   });
 });
 
+describe("cost doctor: effort-variant-mismatch (QA-3.2, O-32-5)", () => {
+  const SHADOW = { engine: "shadow" } as const;
+  const mismatched = (): RouterConfig => cfgOf({
+    preset: "tst",
+    presets: { tst: { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } },
+    routing: SHADOW,
+  });
+
+  it("fires for a tier whose effort differs from its variant, and says the wire runs the effort while keys and stats name the variant", () => {
+    const found = find(runAdvisor(mismatched(), noHost, CATALOG), "effort-variant-mismatch", "medium");
+    expect(found?.severity).toBe("warning");
+    expect(found?.target).toBe("router");
+    expect(found?.message).toContain("sets variant medium but effort xhigh");
+    expect(found?.message).toContain("the request runs effort xhigh");
+    expect(found?.message).toContain(`${SONNET}#medium`);
+    expect(found?.message).toContain("routing:stats");
+    expect(JSON.parse(found?.snippet ?? "null")).toEqual({ presets: { tst: { medium: { variant: "xhigh" } } } });
+    expect(found?.bundledTier).toBe(false); // the user's own preset: it notifies
+    expect(found?.notify).toBe(true);
+    // the other tiers (no effort) are not flagged
+    expect(runAdvisor(mismatched(), noHost, CATALOG).filter((f) => f.id === "effort-variant-mismatch").map((f) => f.subject)).toEqual(["medium"]);
+  });
+
+  it("is silent when effort and variant agree (the shipped anthropic preset), when only one is set, and while the engine is static", () => {
+    expect(find(runAdvisor(cfgOf({ preset: "anthropic", routing: SHADOW }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
+    expect(find(runAdvisor(cfgOf({ preset: "tst", presets: { tst: OWNER }, routing: SHADOW }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
+    const effortOnly = cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, effort: "xhigh", costRatio: 5 } } }, routing: SHADOW });
+    expect(find(runAdvisor(effortOnly, noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
+    const stat = cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } }, routing: { engine: "static" } });
+    expect(find(runAdvisor(stat, noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined();
+    expect(find(runAdvisor(cfgOf({ preset: "tst", presets: { tst: { ...OWNER, medium: { model: SONNET, variant: "medium", effort: "xhigh", costRatio: 5 } } } }), noHost, CATALOG), "effort-variant-mismatch")).toBeUndefined(); // no routing block
+  });
+
+  it("offers no variant snippet when the catalog does not offer the effort as a variant of the model", () => {
+    const narrow = [model(SONNET, { variants: [{ id: "low" }, { id: "medium" }] }), model(OPUS)];
+    const found = find(runAdvisor(mismatched(), noHost, narrow), "effort-variant-mismatch", "medium");
+    expect(found?.snippet).toBeNull();
+    expect(found?.message).not.toContain("(snippet)");
+    expect(found?.message).toContain("drop the effort setting");
+  });
+
+  it("on an unmodified tier of a bundled preset it is listed but never notifies (a configuration finding)", () => {
+    const modified = structuredClone(shipped.presets as Record<string, Record<string, Partial<TierConfig>>>).anthropic!;
+    const bundled = cfgOf({ preset: "anthropic", routing: SHADOW });
+    expect(runAdvisor(bundled, noHost, CATALOG).filter((f) => f.id === "effort-variant-mismatch")).toEqual([]);
+    modified.medium = { ...modified.medium!, effort: "high" }; // the user's change: now variant medium, effort high
+    const changed = runAdvisor(cfgOf({ preset: "anthropic", presets: { anthropic: modified }, routing: SHADOW }), noHost, CATALOG);
+    expect(find(changed, "effort-variant-mismatch", "medium")).toMatchObject({ severity: "warning", notify: true, bundledTier: false });
+    expect(formatFindings(changed).some((l) => l.includes("[warning] effort-variant-mismatch (medium)"))).toBe(true);
+  });
+});
 describe("cost doctor: findings on bundled tiers never notify (QA-2.4-5)", () => {
   it("variant-effort on the unmodified bundled anthropic preset is listed (bundledTier) but is not notice-worthy", () => {
     const findings = runAdvisor(cfgOf({ preset: "anthropic", routing: {} }), noHost, CATALOG);
