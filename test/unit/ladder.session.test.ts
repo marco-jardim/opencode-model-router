@@ -1669,6 +1669,36 @@ describe("goldens replay byte-identically with variants off", () => {
     expect(bytes(replayCost((recorded) => ({ ...recorded, variants: null })))).toBe(read(costUrl));
   });
 
+  describe("with tiers that have catalog variants (QA-1.5-9)", () => {
+    const withVariantTiers = (cfg: RouterConfig): RouterConfig => ({ ...cfg, activePreset: "anthropic", presets: { anthropic: OWNER } });
+    const recordedPolicy = (name: string) => golden.policies.find((p) => p.name === name)!.policy;
+
+    for (const [label, session] of [
+      ["v1", { host: "v1", catalog: lookup }],
+      ["none", { host: "v2", variantSteps: "none", catalog: lookup }],
+      ["no catalog entry", { host: "v2", catalog: () => undefined }],
+    ] as const) {
+      it(`replays golden v2.0.0 byte-identically with buildEscalatePolicy(cfg-with-variant-tiers, ${label})`, () => {
+        for (const [name, cfg] of Object.entries(configs)) {
+          const policy = buildEscalatePolicy(withVariantTiers(cfg), session);
+          expect(policy).not.toHaveProperty("variants");
+          expect(JSON.stringify(policy)).toBe(JSON.stringify(recordedPolicy(name)));
+        }
+        const actual = replayGolden((recorded) => buildEscalatePolicy(withVariantTiers(configs[recorded.name]!), session));
+        expect(bytes(actual)).toBe(read(goldenUrl));
+      });
+    }
+
+    it("control: with variantSteps auto the same tiers change the policy and the replay", () => {
+      for (const [name, cfg] of Object.entries(configs)) {
+        const policy = buildEscalatePolicy(withVariantTiers(cfg), V2);
+        expect(policy.variants).toBeDefined();
+        expect(JSON.stringify(policy)).not.toBe(JSON.stringify(recordedPolicy(name)));
+      }
+      const actual = replayGolden((recorded) => buildEscalatePolicy(withVariantTiers(configs[recorded.name]!), V2));
+      expect(bytes(actual)).not.toBe(read(goldenUrl));
+    });
+  });
   it("ignores a session argument when the policy has no variants", () => {
     for (const e of cost.matrix.slice(0, 200)) {
       const withArg = nextAction(e.input.state, e.input.verdict, e.input.policy, { dispatchPromptChars: 123_456 });
