@@ -6,8 +6,10 @@ import { classifyTrivial, normTaskKw } from "../../src/router/sessions";
 import { validateConfig } from "../../src/router/config";
 import { analyzeRules, classifyByRules, shapeOf } from "../../src/routing/classify/rules";
 import {
+  HIGH_RISK_CASE_SENSITIVE_TERMS,
   HIGH_RISK_TERMS,
   KEYWORD_RULES,
+  MEDIUM_RISK_TERMS,
   NEED_RULES,
   REPO_SCOPE_TERMS,
   type Need,
@@ -58,6 +60,8 @@ describe("rules table integrity", () => {
     const others = [
       ...NEED_RULES.flatMap((rule) => rule.terms),
       ...HIGH_RISK_TERMS,
+      ...HIGH_RISK_CASE_SENSITIVE_TERMS,
+      ...MEDIUM_RISK_TERMS,
       ...REPO_SCOPE_TERMS,
     ];
     for (const term of others) expect(term.flags, term.source).not.toMatch(/[gy]/);
@@ -494,5 +498,75 @@ describe("determinism and budget (R14)", () => {
     expect(classifyByRules("", cfg).confidence).toBe(0.2);
     const huge = "x ".repeat(50_000);
     expect(classifyByRules(huge, cfg).class).toBe("other");
+  });
+});
+
+describe("destructive operations are high risk (QA-1.2-3)", () => {
+  const destructive: readonly string[] = [
+    "rm -rf node_modules",
+    "rm -r build",
+    "rm -f package-lock.json",
+    "Remove-Item -Recurse -Force .\\dist",
+    "git push origin main --force",
+    "git push -f origin main",
+    "git clean -fdx",
+    "git checkout .",
+    "git restore .",
+    "git checkout -- .",
+    "git rebase main",
+    "git filter-repo --path secrets.txt",
+    "git filter-branch --tree-filter x",
+    "git branch -D old-feature",
+    "commit with --no-verify",
+    "delete from users where id = 1",
+    "truncate table logs",
+    "drop the users table",
+    "drop table users",
+    "drop the legacy column",
+    "unpublish the package",
+    "update the .env file",
+    "rotate the ssh keys",
+    "regenerate the private key",
+    "export GITHUB_TOKEN before running",
+    "set NPM_TOKEN in CI",
+    "terraform destroy the staging stack",
+    "kubectl delete the namespace",
+  ];
+
+  it.each(destructive)("%s -> risk high", (text) => {
+    expect(classifyByRules(text, cfg).risk).toBe("high");
+  });
+
+  it.each(destructive)("a mechanical edit that also does '%s' is never low-risk, nor 0.8 confident", (text) => {
+    const facts = classifyByRules(`rename foo to bar in src/a.ts and ${text}`, cfg);
+    expect(facts.risk).toBe("high");
+    if (facts.class === "mechanical") expect(facts.confidence).toBeLessThanOrEqual(0.5);
+    expect(facts.class === "mechanical" && facts.risk === "low" && facts.confidence === 0.8).toBe(false);
+  });
+
+  it("negation does not hide a destructive term", () => {
+    expect(classifyByRules("rename foo to bar; do not rm -rf anything", cfg).risk).toBe("high");
+  });
+
+  it("controls: ordinary uses stay low risk", () => {
+    for (const text of [
+      "list the files in src",
+      "read process.env.NODE_ENV in a.ts",
+      "git checkout .gitignore",
+      "rename foo to bar in src/a.ts",
+      "git status",
+      "delete the unused import",
+    ]) {
+      expect(classifyByRules(text, cfg).risk, text).not.toBe("high");
+    }
+  });
+
+  it("a column rename or an alter is at least medium", () => {
+    for (const text of ["rename the column user_name to username", "rename column a to b in the users table", "alter the lookup order"]) {
+      expect(classifyByRules(text, cfg).risk, text).not.toBe("low");
+    }
+    const facts = classifyByRules("rename the column user_name to username", cfg);
+    expect(facts.class).toBe("mechanical");
+    expect(facts.risk).toBe("medium");
   });
 });

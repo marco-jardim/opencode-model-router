@@ -25,8 +25,10 @@ import {
   CWD_LINE_RE,
   DIRECTIVE_LINE_RES,
   ENGLISH_MARKERS,
+  HIGH_RISK_CASE_SENSITIVE_TERMS,
   HIGH_RISK_TERMS,
   KEYWORD_RULES,
+  MEDIUM_RISK_TERMS,
   NEED_RULES,
   NEEDS,
   NEEDS_EXCLUDED_SECTIONS,
@@ -107,7 +109,11 @@ const COMPILED_NEEDS: readonly CompiledNeed[] = NEED_RULES.map((rule) => ({
   res: rule.terms.map(globalCopy),
 }));
 
-const HIGH_RISK_RES: readonly RegExp[] = HIGH_RISK_TERMS.map(globalCopy);
+const HIGH_RISK_RES: readonly RegExp[] = [
+  ...HIGH_RISK_TERMS.map(globalCopy),
+  ...HIGH_RISK_CASE_SENSITIVE_TERMS.map((re) => new RegExp(re.source, "g")),
+];
+const MEDIUM_RISK_RES: readonly RegExp[] = MEDIUM_RISK_TERMS.map(globalCopy);
 const REPO_SCOPE_RES: readonly RegExp[] = REPO_SCOPE_TERMS.map(globalCopy);
 const ABS_PATH_RES: readonly RegExp[] = [WINDOWS_ABS_PATH_RE, POSIX_ABS_PATH_RE].map(globalCopy);
 const ACCEPTANCE_ALL_RE = new RegExp(ACCEPTANCE_BLOCK_RE.source, "gi");
@@ -453,6 +459,7 @@ export function analyzeRules(
   // R11 — risk (negation ignored for the high-risk vocabulary)
   let risk: Risk = CLASS_BASE_RISK[taskClass];
   if (hasHit(HIGH_RISK_RES, focusText, false)) risk = "high";
+  else if (hasHit(MEDIUM_RISK_RES, focusText, false)) risk = maxRisk(risk, "medium");
   if (
     (scope === "repo" && needs.has("edit")) ||
     (needs.has("external_dir") && needs.has("edit")) ||

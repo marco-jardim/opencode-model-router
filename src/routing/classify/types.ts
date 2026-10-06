@@ -966,6 +966,22 @@ export const HIGH_RISK_TERMS: readonly RegExp[] = [
   /\bvulnerab\w*/i,
   /\binjection\b/i,
   /\brm\s+-rf\b/i,
+  // Destructive commands and operations (QA-1.2-3): never a cheap, confident `mechanical` label.
+  /\brm\s+-[a-z]*[rf]/i,
+  /\bRemove-Item\b[^\n]*-(?:Recurse|Force)\b/i,
+  /\bgit\s+push\b[^\n]*\s(?:-f|--force)\b/i,
+  /\bgit\s+clean\s+-/i,
+  /\bgit\s+(?:checkout|restore)\s+(?:--\s+)?\.(?=\s|$|[\\/])/i,
+  /\bgit\s+(?:rebase|filter-branch|filter-repo)\b/i,
+  /\bgit\s+(?:branch\s+-D|stash\s+(?:drop|clear)|reflog\s+expire)\b/i,
+  /--no-verify\b/i,
+  /\bdelete\s+from\b/i,
+  /\btruncate\s+table\b/i,
+  /\bdrop\s+(?:the\s+)?\w+\s+(?:table|database|column|schema)\b/i,
+  /\bunpublish\b/i,
+  /(?<![\w])\.env\b/i,
+  /\b(?:private|ssh|signing)\s+keys?\b/i,
+  /\b(?:terraform\s+destroy|kubectl\s+delete|docker\s+system\s+prune)\b/i,
   /\bforce[- ]push\b/i,
   /--force\b/i,
   /\breset\s+--hard\b/i,
@@ -982,6 +998,23 @@ export const HIGH_RISK_TERMS: readonly RegExp[] = [
   /\bprod\b/i,
   /\bpayments?\b/i,
   /\bbilling\b/i,
+];
+
+/**
+ * Case-SENSITIVE high-risk terms (flags exactly ""; rules.ts compiles them with
+ * `g` only): environment variable names that hold a secret, e.g. `GITHUB_TOKEN`.
+ * The case-insensitive vocabulary cannot see them (`_` is a word character, so
+ * `\bsecrets?\b` does not match inside `GITHUB_SECRET`).
+ */
+export const HIGH_RISK_CASE_SENSITIVE_TERMS: readonly RegExp[] = [
+  /\b[A-Z][A-Z0-9_]*_(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)\b/,
+];
+
+/** Any hit (negation IGNORED) raises risk to at least medium: schema changes that look mechanical. */
+export const MEDIUM_RISK_TERMS: readonly RegExp[] = [
+  /\brenam\w*\b[^\n]{0,40}\bcolumns?\b/i,
+  /\bcolumns?\b[^\n]{0,40}\brenam\w*/i,
+  /\balter\b/i,
 ];
 
 /** Repository-wide phrasing → scope "repo" (negation applies). */
