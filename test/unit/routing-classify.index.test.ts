@@ -1,0 +1,599 @@
+import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { validateConfig } from "../../src/router/config";
+import {
+  classify,
+  classifyMany,
+  createClassifierBackend,
+  CLASS_OPTIONS,
+  INDEX_TIMEOUT_GRACE_MS,
+  UNKNOWN_FACTS,
+  type BackendResult,
+  type BackendStatus,
+  type ClassifierBackend,
+  type ClassifierSettings,
+  type ClassifyDeps,
+  type ClassifyInput,
+  type FetchLike,
+  type HostGenerate,
+  type TaskClass,
+} from "../../src/routing/classify";
+import { createHostBackend } from "../../src/routing/classify/backends/host";
+import { createTypeSafeBackend } from "../../src/routing/classify/backends/typesafe";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const cfg = validateConfig(JSON.parse(readFileSync(join(here, "../../tiers.json"), "utf-8")));
+
+function settings(overrides: Partial<ClassifierSettings> = {}): ClassifierSettings {
+  return {
+    backend: "host",
+    model: "opencode-go/deepseek-v4.1-flash",
+    baseUrl: null,
+    apiKeyEnv: null,
+    timeoutMs: 100,
+    samples: 1,
+    maxStateChars: 2000,
+    ...overrides,
+  };
+}
+
+interface Logs {
+  readonly logger: { warn(message: string, extra?: Record<string, unknown>): void };
+  readonly messages: string[];
+}
+
+function makeLogs(): Logs {
+  const messages: string[] = [];
+  return { logger: { warn: (message) => void messages.push(message) }, messages };
+}
+
+function okResult(
+  taskClass: TaskClass,
+  confidence = 0.6,
+  extra: { risk?: "low" | "medium" | "high"; scope?: "single" | "multi" | "repo" } = {},
+): BackendResult {
+  return {
+    facts: { class: taskClass, confidence, source: "host", ...extra },
+    raw: null,
+    status: "ok",
+    latencyMs: 5,
+    calls: 1,
+  };
+}
+
+function failResult(status: Exclude<BackendStatus, "ok" | "disagree">, reason = "why"): BackendResult {
+  return {
+    facts: { class: "other", confidence: 0, source: "unknown" },
+    raw: null,
+    status,
+    reason,
+    latencyMs: 7,
+    calls: status === "disabled" ? 0 : 1,
+  };
+}
+
+const disagreeResult: BackendResult = {
+  facts: { class: "other", confidence: 0, source: "host" },
+  raw: null,
+  status: "disagree",
+  reason: "samples disagree",
+  latencyMs: 9,
+  calls: 3,
+};
+
+function fakeBackend(
+  single: (n: number) => BackendResult | Promise<BackendResult>,
+  many?: (count: number) => BackendResult[] | Promise<BackendResult[]> | unknown,
+) {
+  const classifyFn = vi.fn(async (..._args: Parameters<ClassifierBackend["classify"]>) => single(classifyFn.mock.calls.length));
+  const classifyManyFn = vi.fn(async (...args: Parameters<ClassifierBackend["classifyMany"]>) => {
+    const count = args[0].length;
+    return (many ? await many(count) : Array.from({ length: count }, () => okResult("implement"))) as BackendResult[];
+  });
+  const backend: ClassifierBackend = { id: "host", classify: classifyFn, classifyMany: classifyManyFn };
+  return { backend, classifyFn, classifyManyFn };
+}
+
+function makeDeps(backend: ClassifierBackend | null, overrides: Partial<ClassifyDeps> = {}): ClassifyDeps & Logs {
+  const logs = makeLogs();
+  return {
+    cfg,
+    settings: settings(),
+    minClassConfidence: 0.7,
+    backend,
+    logger: logs.logger,
+    random: () => 0.5,
+    ...overrides,
+    messages: logs.messages,
+  };
+}
+
+const input = (prompt: string, extra: Partial<ClassifyInput> = {}): ClassifyInput => ({ prompt, ...extra });
+
+describe("classify — rules only", () => {
+  it("classifies by rules without a backend and passes stripped/pin/detection through", async () => {
+    const deps = makeDeps(null);
+    const result = await classify(input("grep for classifyTrivial in src"), deps);
+    expect(result.facts).toMatchObject({ class: "search", confidence: 0.8, source: "rules" });
+    expect(result.pin).toBe(false);
+    expect(result.detection).toBeNull();
+    expect(result.stripped).toBe("grep for classifyTrivial in src");
+    expect(result.trace).toEqual({ rules: result.facts, routeLine: null, backend: null });
+  });
+
+  it("uses the description as part of the rule text and cwd for external_dir", async () => {
+    const deps = makeDeps(null);
+    const byDescription = await classify({ description: "grep for foo", prompt: "" }, deps);
+    expect(byDescription.facts.class).toBe("search");
+    const external = await classify(
+      input("write the log to C:\\Users\\me\\x.log", { cwd: "D:\\work\\repo" }),
+      deps,
+    );
+    expect(external.facts.needs).toContain("external_dir");
+  });
+
+  it("a route line overrides the rules, is stripped, and reports pin and detection", async () => {
+    const deps = makeDeps(null);
+    const result = await classify(
+      input("[route class=design risk=high scope=repo needs=network pin d=grader]\nplan the migration"),
+      deps,
+    );
+    expect(result.facts).toMatchObject({
+      class: "design",
+      risk: "high",
+      scope: "repo",
+      confidence: 0.9,
+      source: "plan",
+    });
+    expect(result.facts.needs).toEqual(["shell", "network"]);
+    expect(result.pin).toBe(true);
+    expect(result.detection).toBe("grader");
+    expect(result.stripped).toBe("plan the migration");
+    expect(result.trace.routeLine?.class).toBe("design");
+    expect(result.trace.rules.source).toBe("rules");
+  });
+
+  it("route line facts keep the rules' view of the stripped prompt", async () => {
+    const result = await classify(input("[route risk=high]\ngrep for foo"), makeDeps(null));
+    expect(result.facts).toMatchObject({ class: "search", risk: "high", source: "rules", confidence: 0.8 });
+  });
+});
+
+describe("classify — backend gate", () => {
+  it("does not call the backend when the rules are confident", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+    const result = await classify(input("grep for foo"), makeDeps(backend));
+    expect(classifyFn).not.toHaveBeenCalled();
+    expect(result.facts.class).toBe("search");
+    expect(result.trace.backend).toBeNull();
+  });
+
+  it("does not call the backend when a route line carries a class, even above minClassConfidence 0.95", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+    const deps = makeDeps(backend, { minClassConfidence: 0.95 });
+    const result = await classify(input("[route class=implement]\nhello there"), deps);
+    expect(classifyFn).not.toHaveBeenCalled();
+    expect(result.facts).toMatchObject({ class: "implement", confidence: 0.9, source: "route-line" });
+  });
+
+  it("does not call the backend when settings.backend is rules or there is no backend", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("design"));
+    await classify(input("hello"), makeDeps(backend, { settings: settings({ backend: "rules" }) }));
+    await classify(input("hello"), makeDeps(null));
+    expect(classifyFn).not.toHaveBeenCalled();
+  });
+
+  it("calls the backend when the rules are unsure, with a state built from the stripped prompt", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("implement"));
+    const random = () => 0.25;
+    const deps = makeDeps(backend, { random });
+    const result = await classify(input("[route risk=low]\nhello world", { description: "Say hi" }), deps);
+    expect(classifyFn).toHaveBeenCalledTimes(1);
+    const [state, options] = classifyFn.mock.calls[0]!;
+    expect(state.text).toBe("Description: Say hi\nTask:\nhello world");
+    expect(options.choices).toBe(CLASS_OPTIONS);
+    expect(options.random).toBe(random);
+    expect(result.trace.backend).toEqual({ id: "host", status: "ok", latencyMs: 5, calls: 1 });
+  });
+
+  it("a route line without a class does not stop the backend", async () => {
+    const { backend, classifyFn } = fakeBackend(() => okResult("debug"));
+    await classify(input("[route risk=high]\nhello"), makeDeps(backend));
+    expect(classifyFn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("classify — merging the backend answer", () => {
+  it("agreement with the rules class raises confidence to 0.8", async () => {
+    const { backend } = fakeBackend(() => okResult("implement", 0.6));
+    const result = await classify(input("refactor and rename the module"), makeDeps(backend));
+    expect(result.facts).toMatchObject({ class: "implement", confidence: 0.8, source: "host" });
+    expect(result.trace.rules.confidence).toBe(0.5);
+  });
+
+  it("agreement never lowers a higher backend confidence", async () => {
+    const { backend } = fakeBackend(() => okResult("implement", 0.95));
+    const result = await classify(input("refactor and rename the module"), makeDeps(backend));
+    expect(result.facts.confidence).toBe(0.95);
+  });
+
+  it("a different class takes the backend's class, confidence and source; risk, scope and needs only grow", async () => {
+    const { backend } = fakeBackend(() => okResult("design", 0.6, { risk: "high", scope: "repo" }));
+    const result = await classify(input("refactor and rename the module"), makeDeps(backend));
+    expect(result.facts).toMatchObject({ class: "design", confidence: 0.6, source: "host", risk: "high", scope: "repo" });
+    expect(result.facts.needs).toEqual(["edit"]);
+  });
+
+  it("backend risk and scope never lower the rules facts", async () => {
+    const { backend } = fakeBackend(() => okResult("search", 0.6, { risk: "low", scope: "single" }));
+    const result = await classify(input("rename the auth token variable across the repo and remove the legacy keys"), makeDeps(backend));
+    expect(result.trace.rules.risk).toBe("high");
+    expect(result.facts.risk).toBe("high");
+    expect(result.facts.scope).toBe("repo");
+  });
+
+  it("class-implied needs are added; the backend never decides needs", async () => {
+    const { backend } = fakeBackend(() => okResult("debug"));
+    const result = await classify(input("hello"), makeDeps(backend));
+    expect(result.facts.class).toBe("debug");
+    expect(result.facts.needs).toEqual(["shell", "edit"]);
+  });
+
+  it("a backend 'other' that agrees with rules 'other' is not boosted", async () => {
+    const { backend } = fakeBackend(() => okResult("other", 0.6));
+    expect((await classify(input("hello"), makeDeps(backend))).facts.confidence).toBe(0.6);
+  });
+
+  it("disagree keeps the rules class with confidence 0", async () => {
+    const { backend } = fakeBackend(() => disagreeResult);
+    const result = await classify(input("refactor and rename the module"), makeDeps(backend));
+    expect(result.facts).toMatchObject({ class: "implement", confidence: 0, source: "rules" });
+    expect(result.trace.backend).toMatchObject({ status: "disagree", reason: "samples disagree" });
+  });
+
+  for (const status of ["error", "timeout", "invalid", "disabled"] as const) {
+    it(`a ${status} backend result leaves the rules facts unchanged`, async () => {
+      const { backend } = fakeBackend(() => failResult(status));
+      const result = await classify(input("refactor and rename the module"), makeDeps(backend));
+      expect(result.facts).toEqual(result.trace.rules);
+      expect(result.trace.backend).toMatchObject({ id: "host", status, reason: "why" });
+    });
+  }
+});
+
+describe("classify — final invariants", () => {
+  it("mechanical + high risk is capped at 0.5 from rules, route line and backend", async () => {
+    const fromRules = await classify(input("rename the auth token variable across the repo"), makeDeps(null));
+    expect(fromRules.facts).toMatchObject({ class: "mechanical", risk: "high" });
+    expect(fromRules.facts.confidence).toBeLessThanOrEqual(0.5);
+
+    const fromRouteLine = await classify(input("[route class=mechanical risk=high]\nrename a to b"), makeDeps(null));
+    expect(fromRouteLine.facts).toMatchObject({ class: "mechanical", risk: "high", source: "route-line" });
+    expect(fromRouteLine.facts.confidence).toBe(0.5);
+
+    const { backend } = fakeBackend(() => okResult("mechanical", 0.95, { risk: "high" }));
+    const fromBackend = await classify(input("hello"), makeDeps(backend));
+    expect(fromBackend.facts).toMatchObject({ class: "mechanical", risk: "high", source: "host" });
+    expect(fromBackend.facts.confidence).toBe(0.5);
+  });
+
+  it("confidence is clamped and rounded; needs are unique and in order", async () => {
+    const { backend } = fakeBackend(() => okResult("debug", 0.123456));
+    const result = await classify(input("hello"), makeDeps(backend));
+    expect(result.facts.confidence).toBe(0.12);
+    expect(result.facts.needs).toEqual(["shell", "edit"]);
+  });
+});
+
+describe("classify — never throws, never hangs", () => {
+  it("a throwing backend leaves the rules facts and is logged", async () => {
+    const sync = fakeBackend(() => {
+      throw new Error("backend exploded");
+    });
+    const deps = makeDeps(sync.backend);
+    const result = await classify(input("refactor and rename the module"), deps);
+    expect(result.facts).toEqual(result.trace.rules);
+    expect(result.trace.backend).toMatchObject({ status: "error", reason: "backend exploded" });
+    expect(deps.messages).toEqual(["classifier host: error (backend exploded)"]);
+  });
+
+  it("a rejecting backend leaves the rules facts", async () => {
+    const { backend } = fakeBackend(() => Promise.reject(new Error("rejected")));
+    const result = await classify(input("hello"), makeDeps(backend));
+    expect(result.facts).toEqual(result.trace.rules);
+    expect(result.trace.backend?.status).toBe("error");
+  });
+
+  it("a malformed backend result is treated as invalid", async () => {
+    for (const bad of [
+      null,
+      { status: "ok" },
+      { status: "bogus", facts: { class: "debug", confidence: 0.5, source: "host" } },
+      { status: "ok", facts: { class: "banana", confidence: 0.5, source: "host" } },
+      { status: "ok", facts: { class: "debug", confidence: 7, source: "host" } },
+      { status: "ok", facts: { class: "debug", confidence: Number.NaN, source: "host" } },
+    ]) {
+      const { backend } = fakeBackend(() => bad as unknown as BackendResult);
+      const result = await classify(input("hello"), makeDeps(backend));
+      expect(result.facts, JSON.stringify(bad)).toEqual(result.trace.rules);
+      expect(result.trace.backend?.status).toBe("invalid");
+    }
+  });
+
+  it("a hung backend settles within timeoutMs + INDEX_TIMEOUT_GRACE_MS + 50 ms with the rules facts", async () => {
+    const { backend } = fakeBackend(() => new Promise<BackendResult>(() => undefined));
+    const deps = makeDeps(backend, { settings: settings({ timeoutMs: 100 }) });
+    const started = performance.now();
+    const result = await classify(input("refactor and rename the module"), deps);
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeLessThan(100 + INDEX_TIMEOUT_GRACE_MS + 50);
+    expect(elapsed).toBeGreaterThanOrEqual(100);
+    expect(result.facts).toEqual(result.trace.rules);
+    expect(result.trace.backend).toMatchObject({ status: "timeout" });
+    expect(deps.messages[0]).toContain("classifier host: timeout");
+  });
+
+  it("a throwing input (forced via a getter) gives UNKNOWN_FACTS and never throws", async () => {
+    const hostile = {
+      get prompt(): string {
+        throw new Error("getter boom");
+      },
+    } as ClassifyInput;
+    const deps = makeDeps(null);
+    const result = await classify(hostile, deps);
+    expect(result.facts).toBe(UNKNOWN_FACTS);
+    expect(result.facts).toMatchObject({ class: "other", confidence: 0, source: "unknown" });
+    expect(result.stripped).toBe("");
+    expect(result.pin).toBe(false);
+    expect(result.trace).toEqual({ rules: UNKNOWN_FACTS, routeLine: null, backend: null });
+    expect(deps.messages).toEqual(["classifier failed: getter boom"]);
+  });
+
+  it("a prompt that is not a string is treated as empty", async () => {
+    const result = await classify({ prompt: undefined as unknown as string }, makeDeps(null));
+    expect(result.facts.class).toBe("other");
+    expect(result.stripped).toBe("");
+  });
+});
+
+describe("classifyMany", () => {
+  const items = (n: number, prefix = "hello"): ClassifyInput[] =>
+    Array.from({ length: n }, (_, i) => input(`${prefix} ${i}`));
+
+  it("returns results in input order and merges per item", async () => {
+    const { backend, classifyManyFn } = fakeBackend(
+      () => okResult("search"),
+      () => [okResult("debug"), failResult("invalid")],
+    );
+    const results = await classifyMany(
+      [input("hello"), input("grep for foo"), input("hello again"), input("[route class=design]\nx")],
+      makeDeps(backend),
+    );
+    expect(results).toHaveLength(4);
+    expect(classifyManyFn).toHaveBeenCalledTimes(1);
+    expect(classifyManyFn.mock.calls[0]![0]).toHaveLength(2);
+    expect(results[0]!.facts).toMatchObject({ class: "debug", source: "host" });
+    expect(results[1]!.facts).toMatchObject({ class: "search", source: "rules" });
+    expect(results[2]!.facts).toMatchObject({ class: "other", source: "rules" });
+    expect(results[2]!.trace.backend?.status).toBe("invalid");
+    expect(results[3]!.facts).toMatchObject({ class: "design", source: "route-line" });
+    expect(results[3]!.trace.backend).toBeNull();
+    expect(results[3]!.stripped).toBe("x");
+  });
+
+  it("chunks gated items by 50, sequentially and in input order", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const sizes: number[] = [];
+    const { backend, classifyManyFn } = fakeBackend(
+      () => okResult("search"),
+      async (count) => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        sizes.push(count);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active--;
+        return Array.from({ length: count }, () => okResult("review"));
+      },
+    );
+    const results = await classifyMany(items(120), makeDeps(backend, { settings: settings({ timeoutMs: 500 }) }));
+    expect(sizes).toEqual([50, 50, 20]);
+    expect(maxActive).toBe(1);
+    expect(classifyManyFn).toHaveBeenCalledTimes(3);
+    expect(results.map((r) => r.stripped)).toEqual(items(120).map((i) => i.prompt));
+    expect(results.every((r) => r.facts.class === "review")).toBe(true);
+  });
+
+  it("no gated item means no backend call", async () => {
+    const { backend, classifyManyFn } = fakeBackend(() => okResult("search"));
+    const results = await classifyMany(
+      [input("grep for foo"), input("[route class=debug]\nx"), input("rename a to b in c.ts")],
+      makeDeps(backend),
+    );
+    expect(classifyManyFn).not.toHaveBeenCalled();
+    expect(results.map((r) => r.facts.class)).toEqual(["search", "debug", "mechanical"]);
+    expect(await classifyMany([], makeDeps(backend))).toEqual([]);
+  });
+
+  describe("request counts with the real backends (fake generate / fetch)", () => {
+    function hostCounting(samples: 1 | 3) {
+      const calls: number[] = [];
+      const generate: HostGenerate = {
+        text: async (request) => {
+          calls.push((request.prompt.match(/<<<ITEM \d+ /g) ?? []).length);
+          return { text: "" };
+        },
+      };
+      const logs = makeLogs();
+      const config = settings({ samples, timeoutMs: 2000 });
+      const backend = createHostBackend({ generate, settings: config, logger: logs.logger });
+      return { calls, deps: makeDeps(backend, { settings: config }) };
+    }
+
+    it("50 gated items with samples 1 make exactly one request; 51 make two; 0 make none", async () => {
+      const fifty = hostCounting(1);
+      await classifyMany(items(50), fifty.deps);
+      expect(fifty.calls).toEqual([50]);
+
+      const fiftyOne = hostCounting(1);
+      await classifyMany(items(51), fiftyOne.deps);
+      expect(fiftyOne.calls).toEqual([50, 1]);
+
+      const none = hostCounting(1);
+      await classifyMany(items(5, "grep for foo in file"), none.deps);
+      expect(none.calls).toEqual([]);
+    });
+
+    it("samples 3 triples the host request count", async () => {
+      const three = hostCounting(3);
+      await classifyMany(items(51), three.deps);
+      expect(three.calls.sort((a, b) => a - b)).toEqual([1, 1, 1, 50, 50, 50]);
+    });
+
+    it("typesafe makes ceil(gated / 50) requests whatever `samples` is", async () => {
+      let requests = 0;
+      const fetchFn: FetchLike = async () => {
+        requests++;
+        return { ok: true, status: 200, text: async () => "{}" };
+      };
+      const logs = makeLogs();
+      const config = settings({
+        backend: "typesafe",
+        samples: 3,
+        baseUrl: "https://api.typesafe.ai",
+        apiKeyEnv: "TS_KEY",
+        timeoutMs: 2000,
+      });
+      const backend = createTypeSafeBackend({ fetch: fetchFn, env: { TS_KEY: "k-123456" }, settings: config, logger: logs.logger });
+      await classifyMany(items(101), makeDeps(backend, { settings: config }));
+      expect(requests).toBe(3);
+    });
+  });
+
+  it("an item whose preparation fails gets UNKNOWN_FACTS; the others are unaffected", async () => {
+    const hostile = {
+      get prompt(): string {
+        throw new Error("item boom");
+      },
+    } as ClassifyInput;
+    const deps = makeDeps(null);
+    const results = await classifyMany([input("grep for foo"), hostile, input("rename a to b in c.ts")], deps);
+    expect(results.map((r) => r.facts.class)).toEqual(["search", "other", "mechanical"]);
+    expect(results[1]!.facts).toBe(UNKNOWN_FACTS);
+    expect(deps.messages).toEqual(["classifier failed: item boom"]);
+  });
+
+  it("a hung batch settles within the budget with the rules facts for every item", async () => {
+    const { backend } = fakeBackend(
+      () => okResult("search"),
+      () => new Promise<BackendResult[]>(() => undefined),
+    );
+    const deps = makeDeps(backend, { settings: settings({ timeoutMs: 100 }) });
+    const started = performance.now();
+    const results = await classifyMany(items(3), deps);
+    expect(performance.now() - started).toBeLessThan(100 + INDEX_TIMEOUT_GRACE_MS + 50);
+    expect(results.map((r) => r.trace.backend?.status)).toEqual(["timeout", "timeout", "timeout"]);
+    expect(results.every((r) => r.facts.source === "rules")).toBe(true);
+    expect(deps.messages).toHaveLength(1);
+  });
+
+  it("a rejecting batch leaves the rules facts", async () => {
+    const { backend } = fakeBackend(
+      () => okResult("search"),
+      () => Promise.reject(new Error("batch down")),
+    );
+    const results = await classifyMany(items(2), makeDeps(backend));
+    expect(results.map((r) => r.trace.backend?.status)).toEqual(["error", "error"]);
+    expect(results.every((r) => r.facts.source === "rules")).toBe(true);
+  });
+
+  it("validates the returned array: wrong length or non-array means every item is invalid", async () => {
+    for (const bad of [[okResult("debug")], "nope", null, {}]) {
+      const { backend } = fakeBackend(() => okResult("search"), () => bad);
+      const results = await classifyMany(items(3), makeDeps(backend));
+      expect(results.map((r) => r.trace.backend?.status), JSON.stringify(bad)).toEqual(["invalid", "invalid", "invalid"]);
+      expect(results.every((r) => r.facts.source === "rules")).toBe(true);
+    }
+  });
+
+  it("validates each entry: a bad entry invalidates only its item", async () => {
+    const entries = [
+      okResult("debug"),
+      { status: "ok", facts: { class: "banana", confidence: 0.5, source: "host" } },
+      okResult("review", 2),
+      { ...okResult("design"), status: "bogus" },
+      okResult("design", 0.6),
+    ];
+    const { backend } = fakeBackend(() => okResult("search"), () => entries);
+    const results = await classifyMany(items(5), makeDeps(backend));
+    expect(results.map((r) => r.trace.backend?.status)).toEqual(["ok", "invalid", "invalid", "invalid", "ok"]);
+    expect(results.map((r) => r.facts.class)).toEqual(["debug", "other", "other", "other", "design"]);
+  });
+
+  it("applies the same final invariants per item", async () => {
+    const { backend } = fakeBackend(
+      () => okResult("search"),
+      () => [okResult("mechanical", 0.9, { risk: "high" })],
+    );
+    const [only] = await classifyMany(items(1), makeDeps(backend));
+    expect(only!.facts).toMatchObject({ class: "mechanical", risk: "high", confidence: 0.5 });
+  });
+});
+
+describe("createClassifierBackend", () => {
+  it("rules → null", () => {
+    const logs = makeLogs();
+    expect(createClassifierBackend(settings({ backend: "rules" }), { logger: logs.logger })).toBeNull();
+    expect(logs.messages).toEqual([]);
+  });
+
+  it("host without generate → null and one log line", () => {
+    const logs = makeLogs();
+    expect(createClassifierBackend(settings({ backend: "host" }), { logger: logs.logger })).toBeNull();
+    expect(logs.messages).toEqual(["classifier: host classifier needs the v2 plugin context; using rules"]);
+  });
+
+  it("host with generate → the host backend", () => {
+    const logs = makeLogs();
+    const generate: HostGenerate = { text: async () => ({ text: "search" }) };
+    expect(createClassifierBackend(settings({ backend: "host" }), { generate, logger: logs.logger })?.id).toBe("host");
+  });
+
+  it("HTTP backends are built with injected fetch/env and do not check the key at build time", () => {
+    const logs = makeLogs();
+    const fetchFn: FetchLike = async () => ({ ok: true, status: 200, text: async () => "{}" });
+    const common = { fetch: fetchFn, env: {}, logger: logs.logger };
+    const openai = createClassifierBackend(
+      settings({ backend: "openai-compatible", baseUrl: "http://localhost:11434/v1", apiKeyEnv: "MISSING" }),
+      common,
+    );
+    const typesafe = createClassifierBackend(
+      settings({ backend: "typesafe", baseUrl: "https://api.typesafe.ai", apiKeyEnv: "MISSING" }),
+      common,
+    );
+    expect(openai?.id).toBe("openai-compatible");
+    expect(typesafe?.id).toBe("typesafe");
+    expect(logs.messages).toEqual([]);
+  });
+
+  it("falls back to the global fetch and process.env when none are injected (nothing is called)", () => {
+    const logs = makeLogs();
+    const backend = createClassifierBackend(
+      settings({ backend: "openai-compatible", baseUrl: "http://localhost:1/v1" }),
+      { logger: logs.logger },
+    );
+    expect(backend?.id).toBe("openai-compatible");
+  });
+
+  it("an end-to-end classify through the real host backend with a fake generate", async () => {
+    const generate: HostGenerate = { text: vi.fn(async () => ({ text: "debug" })) };
+    const logs = makeLogs();
+    const config = settings({ backend: "host", timeoutMs: 500 });
+    const backend = createClassifierBackend(config, { generate, logger: logs.logger });
+    const result = await classify(input("hello"), makeDeps(backend, { settings: config }));
+    expect(result.facts).toMatchObject({ class: "debug", confidence: 0.6, source: "host" });
+    expect(result.trace.backend).toMatchObject({ id: "host", status: "ok", calls: 1 });
+  });
+});
