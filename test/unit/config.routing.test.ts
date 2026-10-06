@@ -32,6 +32,7 @@ import {
 import {
   buildInfo,
   formatRouterLine,
+  loadBuildInfo,
   readBuildInfo,
   readGitSha,
   readPackageVersion,
@@ -1328,6 +1329,13 @@ describe("build-info", () => {
       ["a .git file without gitdir:", () => write(".git", "something else\n")],
       ["a .git file pointing at a missing directory", () => write(".git", `gitdir: ${join(dir, "nowhere")}\n`)],
       ["an empty .git directory", () => mkdirSync(join(dir, ".git"), { recursive: true })],
+      [
+        "a reftable repository (stub HEAD, refs in binary tables; not read)",
+        () => {
+          write(".git/HEAD", "ref: refs/heads/.invalid\n");
+          write(".git/reftable/tables.list", "0x000000000001-0x000000000001-abcdef01.ref\n");
+        },
+      ],
     ])('returns "unknown" for %s, without throwing', (_label, setup) => {
       setup();
       expect(() => readGitSha(dir)).not.toThrow();
@@ -1368,6 +1376,20 @@ describe("build-info", () => {
       const info = readBuildInfo(dir);
       expect(info).toEqual({ version: "1.2.3", sha: SHA_A });
       expect(Object.isFrozen(info)).toBe(true);
+    });
+
+    it("loadBuildInfo degrades to unknown when locating the checkout throws (QA-1.1-20)", () => {
+      const info = loadBuildInfo(() => {
+        throw new Error("import.meta.url is not a file: URL");
+      });
+      expect(info).toEqual({ version: "unknown", sha: "unknown" });
+      expect(Object.isFrozen(info)).toBe(true);
+    });
+
+    it("loadBuildInfo reads the checkout it is pointed at", () => {
+      write("package.json", JSON.stringify({ version: "4.5.6" }));
+      write(".git/HEAD", `${SHA_A}\n`);
+      expect(loadBuildInfo(() => dir)).toEqual({ version: "4.5.6", sha: SHA_A });
     });
 
     it("degrades each part independently", () => {

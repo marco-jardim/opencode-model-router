@@ -72,6 +72,10 @@ function resolveGitDir(root: string): string | undefined {
  * file it names (in the worktree's own git dir, then in the common dir that its
  * `commondir` file points at), then `packed-refs`. A detached `HEAD` holds the
  * sha itself. Returns `"unknown"` for anything else, and never throws.
+ *
+ * Not read: the `reftable` ref format (`git init --ref-format=reftable`), which
+ * keeps `HEAD` as the stub `ref: refs/heads/.invalid` and the real refs in binary
+ * tables under `.git/reftable/`. Such a checkout reports `"unknown"` (QA-1.1-20).
  */
 export function readGitSha(root: string): string {
   try {
@@ -121,8 +125,21 @@ export function readBuildInfo(root: string): BuildInfo {
   return Object.freeze({ version: readPackageVersion(root), sha: readGitSha(root) });
 }
 
+/**
+ * Build info of the plugin checkout found by `root()`. If even locating it throws
+ * (`import.meta.url` is not a `file:` URL when the module is bundled or loaded
+ * remotely, QA-1.1-20), there is no checkout to read: both parts are `"unknown"`.
+ */
+export function loadBuildInfo(root: () => string = pluginRoot): BuildInfo {
+  try {
+    return readBuildInfo(root());
+  } catch {
+    return Object.freeze({ version: UNKNOWN, sha: UNKNOWN });
+  }
+}
+
 /** The running plugin's build info, read once when this module loads. */
-export const buildInfo: BuildInfo = readBuildInfo(pluginRoot());
+export const buildInfo: BuildInfo = loadBuildInfo();
 
 /**
  * The marker line `/router` prints: `router: engine=<mode> build=<version>+<sha7>`.
