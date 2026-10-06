@@ -447,27 +447,44 @@ describe("resolveClassifierForPreset", () => {
   });
 });
 
-describe("resolveVariantSteps", () => {
-  const steps = (value: string | undefined) =>
-    cfgOf(value === undefined ? {} : { enforcement: { escalate: { variantSteps: value } } });
+describe("resolveVariantSteps (A15, QA-1.1-4)", () => {
+  const withSteps = (variantSteps: string, extra: Record<string, unknown> = {}) =>
+    cfgOf({ enforcement: { escalate: { variantSteps } }, ...extra });
 
-  it("defaults to auto on v2", () => {
-    expect(resolveVariantSteps(steps(undefined), "v2")).toBe("auto");
-    expect(resolveVariantSteps(undefined, "v2")).toBe("auto");
-    expect(resolveVariantSteps(cfgOf({ enforcement: { mode: "off" } }), "v2")).toBe("auto");
+  it("is none on v2 when the config has no routing block: today's ladder, byte for byte (D2)", () => {
+    expect(resolveVariantSteps(cfgOf(), "v2")).toBe("none");
+    expect(resolveVariantSteps(undefined, "v2")).toBe("none");
+    expect(resolveVariantSteps(cfgOf({ enforcement: { mode: "off" } }), "v2")).toBe("none");
+    expect(resolveVariantSteps(cfgOf({ enforcement: { escalate: { effortBump: false } } }), "v2")).toBe("none");
   });
 
-  it("honours none and auto on v2", () => {
-    expect(resolveVariantSteps(steps("none"), "v2")).toBe("none");
-    expect(resolveVariantSteps(steps("auto"), "v2")).toBe("auto");
+  it("is auto on v2 once the config has a routing block, even an empty one", () => {
+    expect(resolveVariantSteps(cfgOf({ routing: {} }), "v2")).toBe("auto");
+    expect(resolveVariantSteps(cfgOf({ routing: { engine: "static" } }), "v2")).toBe("auto");
+    expect(resolveVariantSteps(cfgOf({ routing: { engine: "enforce" }, enforcement: { mode: "off" } }), "v2")).toBe("auto");
   });
 
-  it("is always none on v1: variant steps are ignored there", () => {
-    expect(resolveVariantSteps(steps("auto"), "v1")).toBe("none");
-    expect(resolveVariantSteps(steps(undefined), "v1")).toBe("none");
+  it("lets an explicit value win on v2, with or without a routing block", () => {
+    expect(resolveVariantSteps(withSteps("auto"), "v2")).toBe("auto");
+    expect(resolveVariantSteps(withSteps("none"), "v2")).toBe("none");
+    expect(resolveVariantSteps(withSteps("none", { routing: {} }), "v2")).toBe("none");
+    expect(resolveVariantSteps(withSteps("auto", { routing: {} }), "v2")).toBe("auto");
+  });
+
+  it("is always none on v1: variant steps are ignored there (D1)", () => {
+    expect(resolveVariantSteps(withSteps("auto"), "v1")).toBe("none");
+    expect(resolveVariantSteps(withSteps("auto", { routing: {} }), "v1")).toBe("none");
+    expect(resolveVariantSteps(cfgOf({ routing: { engine: "enforce" } }), "v1")).toBe("none");
+    expect(resolveVariantSteps(cfgOf(), "v1")).toBe("none");
+    expect(resolveVariantSteps(undefined, "v1")).toBe("none");
+  });
+
+  it("follows the routing block through a hot reload of the global override", () => {
+    // loadConfig() on the shipped tiers.json has no routing block.
+    invalidateConfigCache();
+    expect(resolveVariantSteps(loadConfig(), "v2")).toBe("none");
   });
 });
-
 describe("resolveCandidates", () => {
   it("returns exactly one entry for a tier without candidates: its own (model, variant, costRatio)", () => {
     const cfg = cfgOf();

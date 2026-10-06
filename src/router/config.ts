@@ -2623,12 +2623,19 @@ export function resolveClassifierForPreset(
 }
 
 /**
- * `enforcement.escalate.variantSteps` for one host: `auto` by default, and
- * always `none` on v1, where variant steps do not exist (D1).
+ * `enforcement.escalate.variantSteps` for one host (A15, QA-1.1-4).
+ *
+ * - On v1 it is always `none`: variant steps do not exist there (D1), so even an
+ *   explicit value is ignored.
+ * - On v2 an explicit value always wins. Absent, the default is `auto` when the
+ *   config has a `routing` block and `none` when it has not, so that a config
+ *   without `routing` keeps today's ladder byte for byte (D2).
  */
 export function resolveVariantSteps(cfg: RouterConfig | undefined, host: RouterHost): VariantStepsMode {
   if (host === "v1") return "none";
-  return cfg?.enforcement?.escalate?.variantSteps ?? "auto";
+  const explicit = cfg?.enforcement?.escalate?.variantSteps;
+  if (explicit !== undefined) return explicit;
+  return cfg?.routing !== undefined ? "auto" : "none";
 }
 
 /** One rung of a tier's ladder, fully resolved. */

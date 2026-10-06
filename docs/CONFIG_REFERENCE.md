@@ -558,7 +558,7 @@ produces no notice. `background` and `pendingTtlMs` are read at plugin start, so
 | `maxTotalAttempts` | `number` | `4` | Hard ceiling across all tiers and retries. Must be integer ≥ 1. |
 | `effortBump` | `boolean` | `true` | Retry a failed router-ladder attempt on the same tier one effort level higher before escalating. `false` restores the previous ladder exactly. |
 | `effortBumpMax` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"xhigh"` | Upper bound for bumped attempts, further clamped per model. |
-| `variantSteps` | `"auto" \| "none"` | `"auto"` | OpenCode v2 only: retry on the same model's next variant before escalating the model. Always `none` on v1. See [`escalate.variantSteps`](#escalatevariantsteps). |
+| `variantSteps` | `"auto" \| "none"` | `"auto"` with a `routing` block (v2), else `"none"` | OpenCode v2 only: retry on the same model's next variant before escalating the model. Always `none` on v1. See [`escalate.variantSteps`](#escalatevariantsteps). |
 | `costCeiling.base` | `string` | `"firstAttemptCostUnits"` | Reference point for cost ceiling. `"firstAttemptCostUnits"` = cost of the first producing attempt. |
 | `costCeiling.multiple` | `number` | `4` | Ceiling = first-attempt cost × multiple. Must be > 0. Further retries/escalation halt once recorded cumulative cost exceeds this. |
 
@@ -864,7 +864,7 @@ A tier may list the `(model, variant, costRatio)` rungs the engine can use for i
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `enforcement.escalate.variantSteps` | `"auto" \| "none"` | `"auto"` | OpenCode v2 only. `auto`: a failed verification first retries on the same model's next variant (resuming the child session) before the ladder escalates the model; variant steps do not consume `maxAttemptsPerTier` but do count toward `maxTotalAttempts` and the cost ceiling. `none`: the previous behaviour. Always `none` on v1, where the `effortBump` path stays as is. |
+| `enforcement.escalate.variantSteps` | `"auto" \| "none"` | `"auto"` when the config has a `routing` block, otherwise `"none"` | OpenCode v2 only; an explicit value always wins. Without a `routing` block the default is `none`, so the ladder is exactly that of 2.2.0. `auto`: a failed verification first retries on the same model's next variant (resuming the child session) before the ladder escalates the model; variant steps do not consume `maxAttemptsPerTier` but do count toward `maxTotalAttempts` and the cost ceiling. `none`: the previous behaviour. Always `none` on v1 (an explicit value is ignored there), where the `effortBump` path stays as is. `resolveVariantSteps(cfg, host)` applies this rule. |
 
 ---
 
