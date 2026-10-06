@@ -29,6 +29,12 @@ import {
 } from "./types";
 
 const ROUTE_MENTION_RE = /\[route/i;
+/**
+ * `needs=shell, edit , network`: whitespace around the commas of a needs list is
+ * not a separator (QA-1.2-14). A word followed by `=` starts the next field, so
+ * `needs=shell, class=debug` keeps its two fields.
+ */
+const NEEDS_LIST_RE = /(\bneeds=[a-z_]*)((?:\s*,\s*[a-z_]+(?![a-z_]|\s*=))+)/gi;
 const LINE_SPLIT_RE = /(\r\n|\n|\r)/;
 
 function isMember<T extends string>(values: readonly T[], value: string): value is T {
@@ -70,6 +76,7 @@ function parseFields(body: string): RouteLine {
 
   const tokens = body
     .replace(/\s*=\s*/g, "=")
+    .replace(NEEDS_LIST_RE, (_whole, head: string, tail: string) => head + tail.replace(/\s+/g, ""))
     .split(/\s+/)
     .filter((token) => token !== "");
   for (const token of tokens) {

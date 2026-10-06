@@ -288,3 +288,36 @@ describe("parseRouteLine — smuggling defences (QA-1.2-2)", () => {
     expect(parseRouteLine("no directive here").edgeOnly).toBe(true);
   });
 });
+describe("parseRouteLine — spaces around the commas of needs (QA-1.2-14)", () => {
+  it.each([
+    "[route needs=shell, edit]",
+    "[route needs=shell ,edit]",
+    "[route needs = shell , edit]",
+    "[route needs=shell,  edit]",
+    "[route needs=shell,\tedit]",
+  ])("%s -> shell, edit", (text) => {
+    const parsed = parseRouteLine(text);
+    expect(parsed.line?.needs).toEqual(["shell", "edit"]);
+    expect(parsed.line?.ignored).toEqual([]);
+  });
+
+  it("three items and NEEDS order", () => {
+    expect(parseRouteLine("[route needs=external_dir, edit , shell]").line?.needs).toEqual([
+      "shell",
+      "edit",
+      "external_dir",
+    ]);
+  });
+
+  it("a comma before the next field does not swallow it", () => {
+    const parsed = parseRouteLine("[route needs=shell, class=debug risk=high]");
+    expect(parsed.line).toMatchObject({ needs: ["shell"], class: "debug", risk: "high" });
+    expect(parsed.line?.ignored).toEqual([]);
+    const spaced = parseRouteLine("[route class=debug, needs=shell, edit, risk=high]");
+    expect(spaced.line).toMatchObject({ needs: ["shell", "edit"], class: "debug", risk: "high" });
+  });
+
+  it("an invalid word in the list is dropped, the valid ones stay", () => {
+    expect(parseRouteLine("[route needs=shell, banana, edit]").line?.needs).toEqual(["shell", "edit"]);
+  });
+});
