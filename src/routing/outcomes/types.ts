@@ -804,7 +804,7 @@ export interface StatsTable {
 }
 
 /** What the CLI reads from a directory (a Persister satisfies it). */
-export type StatsSource = Pick<Persister, "load" | "readRows">;
+export type StatsSource = Pick<Persister, "dir" | "load" | "readRows">;
 
 export interface StatsCliIO {
   /** `resolveOutcomesDir(null, ...)`, used when `--dir` is absent. */

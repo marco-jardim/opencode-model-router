@@ -311,11 +311,15 @@ export type ParseStatsResult =
   | { readonly ok: false; readonly error: string };
 
 export const USAGE = [
-  "Usage: npm run routing:stats -- [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]",
+  "Usage: node scripts/routing-stats.ts [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]",
+  "   or: npm run routing:stats -- [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]",
+  `       (PowerShell swallows a bare "--": write npm run routing:stats '--' --since <ISO>)`,
   "  --since <ISO>  include rows with ts >= since (YYYY-MM-DD, or date-time with Z or an offset)",
   "  --until <ISO>  include rows with ts < until",
   "  --json         print the StatsTable as JSON",
-  "  --dir <path>   outcome directory (default: <os tmpdir>/opencode-model-router-trajectory)",
+  "  --dir <path>   outcome directory, resolved like routing.outcomes.path: ~ is the home directory and a",
+  "                 relative path is taken under <os tmpdir>/opencode-model-router-trajectory",
+  "                 (default: <os tmpdir>/opencode-model-router-trajectory)",
   "",
 ].join("\n");
 
@@ -435,6 +439,10 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Prom
     const store = createOutcomeStore();
     if (loaded.status === "ok") store.fromSnapshot(loaded.snapshot);
     const read = await source.readRows();
+    if (loaded.status === "missing" && read.files.length === 0) {
+      // Not an error (a fresh install has nothing yet), but a typo in --dir looks exactly like this (QA-1.3-5).
+      io.stderr(`routing-stats: no outcome data in ${source.dir}\n`);
+    }
     if (read.skipped > 0) io.stderr(`routing-stats: skipped ${read.skipped} unreadable decision-log line(s)\n`);
     if (read.generations > 0 && read.oldestTs !== null && (args.since === null || args.since < Date.parse(read.oldestTs))) {
       // The log keeps a bounded number of generations: history before the oldest retained row is gone (QA-1.3-10).

@@ -706,7 +706,7 @@ function fakeIo(source: Partial<StatsSource> = {}) {
   const errs: string[] = [];
   const load = vi.fn<StatsSource["load"]>(source.load ?? (async () => loadResult()));
   const readRows = vi.fn<StatsSource["readRows"]>(source.readRows ?? (async (): Promise<ReadRowsResult> => readResult()));
-  const open = vi.fn<StatsCliIO["open"]>(() => ({ load, readRows }));
+  const open = vi.fn<StatsCliIO["open"]>((dir) => ({ dir, load, readRows }));
   const io: StatsCliIO = { defaultDir: "/default/dir", open, stdout: (t) => void out.push(t), stderr: (t) => void errs.push(t) };
   return { io, out, errs, load, readRows, open };
 }
@@ -718,8 +718,15 @@ describe("runStatsCli", () => {
     expect(out.join("")).toBe(USAGE);
     expect(errs).toEqual([]);
     expect(open).not.toHaveBeenCalled();
-    expect(USAGE.startsWith("Usage: npm run routing:stats -- [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]\n")).toBe(true);
+    expect(USAGE.startsWith("Usage: node scripts/routing-stats.ts [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]\n")).toBe(true);
     expect(USAGE.endsWith("\n")).toBe(true);
+  });
+
+  it("QA-1.3-8: USAGE documents the plain-node form (any shell) and the PowerShell form of the npm script", () => {
+    expect(USAGE).toContain("node scripts/routing-stats.ts");
+    expect(USAGE).toContain("npm run routing:stats -- [--since <ISO>]");
+    expect(USAGE).toContain(`PowerShell swallows a bare "--": write npm run routing:stats '--' --since <ISO>`);
+    expect(USAGE).toContain("resolved like routing.outcomes.path");
   });
 
   it("a usage error prints the error and USAGE on stderr and exits 2", async () => {
@@ -737,7 +744,19 @@ describe("runStatsCli", () => {
     expect(open).toHaveBeenCalledWith("/default/dir");
     expect(load).toHaveBeenCalledWith({ quarantine: false });
     expect(out.join("")).toBe(renderMarkdown(summarize(createOutcomeStore(), [], NONE)));
-    expect(errs).toEqual([]);
+    expect(errs).toEqual(["routing-stats: no outcome data in /default/dir\n"]); // QA-1.3-5: exit 0, but say so
+  });
+
+  it("QA-1.3-5: the `no outcome data` note appears only when there is neither a store nor any decision-log file", async () => {
+    const withLog = fakeIo({ readRows: async () => readResult({ rows: scenario(), files: ["decisions.jsonl"] }) });
+    expect(await runStatsCli([], withLog.io)).toBe(0);
+    expect(withLog.errs).toEqual([]);
+    const withStore = fakeIo({ load: async () => loadResult({ status: "ok" }) });
+    expect(await runStatsCli(["--dir", "somewhere"], withStore.io)).toBe(0);
+    expect(withStore.errs).toEqual([]);
+    const named = fakeIo();
+    await runStatsCli(["--dir", "/typo/dir"], named.io);
+    expect(named.errs).toEqual(["routing-stats: no outcome data in /typo/dir\n"]);
   });
 
   it("--dir overrides the default directory", async () => {
@@ -780,10 +799,10 @@ describe("runStatsCli", () => {
     expect(await warning(oldest)()).toBe(""); // the window starts at the oldest retained row: nothing is missing
     expect(await warning("2026-10-06")()).toBe("");
     // no rotated generation, or no rows: nothing to warn about
-    const never = fakeIo({ readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: 0 }) });
+    const never = fakeIo({ readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: 0, files: ["live"] }) });
     await runStatsCli([], never.io);
     expect(never.errs).toEqual([]);
-    const empty = fakeIo({ readRows: async () => readResult({ generations: 1 }) });
+    const empty = fakeIo({ readRows: async () => readResult({ generations: 1, files: ["g1"] }) });
     await runStatsCli([], empty.io);
     expect(empty.errs).toEqual([]);
   });
@@ -902,12 +921,30 @@ describe("scripts/routing-stats.ts (plain node)", () => {
     expect(result.stdout.toString("utf8")).toBe(expected);
   }, 60_000);
 
-  it("resolves a relative --dir against the working directory", async () => {
+  it("QA-1.3-5: a relative --dir resolves like routing.outcomes.path: under the default directory, not the cwd", async () => {
     const parent = await parentDir();
-    await writeFixture(join(parent, "rel-outcomes"));
-    const result = run(["--dir", "rel-outcomes", "--since", SINCE, "--until", UNTIL], { cwd: parent });
+    const cwdParent = await parentDir();
+    const underDefault = join(parent, "opencode-model-router-trajectory", "rel-outcomes");
+    await writeFixture(underDefault);
+    await mkdir(join(cwdParent, "rel-outcomes"), { recursive: true }); // a decoy in the working directory
+    const env = { ...process.env, TEMP: parent, TMP: parent, TMPDIR: parent };
+    const result = run(["--dir", "rel-outcomes", "--since", SINCE, "--until", UNTIL], { cwd: cwdParent, env });
     expect(result.status).toBe(0);
-    expect(result.stdout.toString("utf8")).toBe(await expectedFor(join(parent, "rel-outcomes"), iso(SINCE), iso(UNTIL)));
+    expect(result.stderr).toBe("");
+    expect(result.stdout.toString("utf8")).toBe(await expectedFor(underDefault, iso(SINCE), iso(UNTIL)));
+    expect(await readdir(join(cwdParent, "rel-outcomes"))).toEqual([]);
+  }, 60_000);
+
+  it("QA-1.3-5: --dir ~/x expands ~ to the home directory, like routing.outcomes.path", async () => {
+    const home = await parentDir();
+    await writeFixture(join(home, "stats-fixture"));
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const result = run(["--dir", "~/stats-fixture", "--since", SINCE, "--until", UNTIL], { env });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.toString("utf8")).toBe(await expectedFor(join(home, "stats-fixture"), iso(SINCE), iso(UNTIL)));
+    const tilde = run(["--dir", "~\\stats-fixture", "--since", SINCE, "--until", UNTIL], { env });
+    if (process.platform === "win32") expect(tilde.stdout.toString("utf8")).toBe(result.stdout.toString("utf8"));
   }, 60_000);
 
   it("without --dir it reads <os tmpdir>/opencode-model-router-trajectory (here: a private tmpdir)", async () => {
@@ -932,7 +969,7 @@ describe("scripts/routing-stats.ts (plain node)", () => {
     for (const dir of [missing, empty]) {
       const result = run(["--dir", dir]);
       expect(result.status).toBe(0);
-      expect(result.stderr).toBe("");
+      expect(result.stderr).toBe(`routing-stats: no outcome data in ${dir}\n`); // QA-1.3-5
       expect(result.stdout.toString("utf8")).toBe(expected);
     }
     await expect(stat(missing)).rejects.toMatchObject({ code: "ENOENT" });
