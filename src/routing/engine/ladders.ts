@@ -158,8 +158,12 @@ export interface LadderBuildInput {
   readonly facts: Pick<TaskFacts, "class" | "needs">;
   /** Router tier agents included. null = unavailable: router grants null, no role candidates. */
   readonly agents: readonly HostAgentInfo[] | null;
-  /** Catalog pricing of "provider/model"; must not throw (wrap it); undefined = unpriced (A1). */
+  /** Catalog pricing of "provider/model"; a throwing lookup prices as unpriced (QA-1.4-10, A1). */
   readonly pricing?: (model: string) => ModelPricing;
+  /** The orchestrator's model: the model of a role agent that has none configured (QA-1.4-4). */
+  readonly parentModel?: string | null;
+  /** Receives one line per failed pricing lookup; its own failures are swallowed. */
+  readonly logger?: { warn(message: string): void };
 }
 
 function normalizedVariant(variant: string | null | undefined): string | null {
@@ -170,13 +174,37 @@ function sameRung(a: { readonly model: string; readonly variant: string | null }
   return a.model === b.model && normalizeVariant(a.variant) === normalizeVariant(b.variant);
 }
 
+/** Never throws: logging failures are reported through the return value, not raised (QA-1.4-10). */
+function tryWarn(logger: LadderBuildInput["logger"], message: string): boolean {
+  if (logger === undefined) return false;
+  try {
+    logger.warn(message);
+    return true;
+  } catch {
+    return false; // a broken logger must not break the decision
+  }
+}
+
+/** QA-1.4-10: the catalog lookup is the caller's code; a failure makes the model unpriced (A1), never a throw. */
 function priced(input: LadderBuildInput, model: string): { readonly pricing?: ModelPricing } {
-  return input.pricing === undefined ? {} : { pricing: input.pricing(model) };
+  if (input.pricing === undefined) return {};
+  try {
+    return { pricing: input.pricing(model) };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    tryWarn(input.logger, `[router] ladder: pricing lookup for ${model} failed (${reason}); treating it as unpriced`);
+    return {};
+  }
 }
 
 function ownRoles(roles: Readonly<Record<string, readonly string[]>>, cls: string): readonly string[] {
   const list = Object.hasOwn(roles, cls) ? roles[cls] : undefined;
   return Array.isArray(list) ? [...new Set(list)] : [];
+}
+
+/** A host agent unusable as a dispatch target: `mode: primary`, hidden or not permitted for the parent. */
+function agentUnavailable(info: HostAgentInfo): boolean {
+  return info.mode === "primary" || info.hidden || !info.permitted;
 }
 
 /**
@@ -192,13 +220,27 @@ export function roleAgentExclusion(
 ): "duplicate" | "agent-unavailable" | null {
   if (routerIds.includes(id)) return "duplicate";
   if ((ROUTING_RESERVED_AGENTS as readonly string[]).includes(id)) return "agent-unavailable";
-  if (info === undefined || info.mode === "primary" || info.hidden || !info.permitted) return "agent-unavailable";
+  if (info === undefined || agentUnavailable(info)) return "agent-unavailable";
   return null;
+}
+
+/** The model a host agent runs on: its configured one, else the parent's (host precedence, QA-1.4-4). */
+function modelOfAgent(info: HostAgentInfo, parentModel: string | null | undefined): string | null {
+  return nonEmpty(info.model) ?? nonEmpty(parentModel);
 }
 
 /**
  * Build the candidate graph of one decision (§3): the router rungs of the escalate ladder, then the role
- * agents of `facts.class` (D12) with their own-model rung and the owning tier's rungs (D7 inherited rank).
+ * agents of `facts.class` (D12) with their own-model rung and the owning tier's rungs.
+ *
+ * Own-model rung of a role agent (D7, A25): when its `(model, variant)` matches a rung of the preset it takes
+ * that rung's price AND `min(owningRank, matched.rank)` (an agent on the fast tier's model is a fast-ranked
+ * candidate, whatever class it serves); the inherited rank of the owning tier applies only when no rung
+ * matches. An agent without a configured model runs on the parent's model and gets its own-model rung there.
+ *
+ * Router rungs of a tier whose agent is `mode: primary`, hidden or not permitted are excluded
+ * (`agent-unavailable`): they can never be `best`.
+ *
  * Never throws for well-typed input; an unknown preset or a ladder with no resolvable tier yields an empty
  * ladder (the kernel then reports `kept:no-candidates`).
  */
@@ -208,14 +250,28 @@ export function buildLadder(input: LadderBuildInput): Ladder {
   const routerIds = routerTierIds(cfg);
   const owningTier = Object.hasOwn(CLASS_STATIC_TIER, facts.class) ? CLASS_STATIC_TIER[facts.class] : null;
   const owningRank = tierRankOf(cfg, owningTier);
+  const excluded: ExcludedCandidate[] = [];
+  const excludedOf = (id: string, why: ExclusionReason, info: HostAgentInfo | undefined): void => {
+    const ref = typeof info?.model === "string" ? splitModelRef(info.model) : null;
+    excluded.push({
+      agent: { origin: classifyAgentOrigin(id, routerIds), id },
+      model: ref === null ? (info?.model ?? "") : `${ref.provider}/${ref.model}`,
+      variant: ref?.variant ?? null,
+      why,
+    });
+  };
 
   // --- router block --------------------------------------------------------------------------------
+  /** Every rung of the preset (available or not): the price/rank table of the own-model rungs. */
+  const presetRungs: Candidate[] = [];
   const candidates: Candidate[] = [];
   const next: (number | null)[] = [];
   order.forEach((tier, rank) => {
-    const grants = agents?.find((agent) => agent.id === tier)?.grants ?? null;
+    const info = agents?.find((agent) => agent.id === tier);
+    const unavailable = info !== undefined && agentUnavailable(info);
+    const grants = info?.grants ?? null;
     for (const rung of resolveCandidates(tier, cfg)) {
-      candidates.push({
+      const candidate: Candidate = {
         agent: { origin: "router", id: tier },
         model: rung.model,
         variant: normalizedVariant(rung.variant),
@@ -225,7 +281,13 @@ export function buildLadder(input: LadderBuildInput): Ladder {
         source: "tier",
         grants,
         ...priced(input, rung.model),
-      });
+      };
+      presetRungs.push(candidate);
+      if (unavailable) {
+        excluded.push({ agent: candidate.agent, model: candidate.model, variant: candidate.variant, why: "agent-unavailable" });
+      } else {
+        candidates.push(candidate);
+      }
     }
   });
   const routerCount = candidates.length;
@@ -239,18 +301,6 @@ export function buildLadder(input: LadderBuildInput): Ladder {
   }
 
   // --- role chains ---------------------------------------------------------------------------------
-  const excluded: ExcludedCandidate[] = [];
-  const excludedOf = (id: string, why: ExclusionReason, info: HostAgentInfo | undefined): void => {
-    const ref = typeof info?.model === "string" ? splitModelRef(info.model) : null;
-    const origin = classifyAgentOrigin(id, routerIds);
-    excluded.push({
-      agent: { origin, id },
-      model: ref === null ? (info?.model ?? "") : `${ref.provider}/${ref.model}`,
-      variant: ref?.variant ?? null,
-      why,
-    });
-  };
-
   const roleIds = ownRoles(input.routing.roles, facts.class);
   const tierRungs = owningTier !== null && owningRank !== null ? resolveCandidates(owningTier, cfg) : [];
   const firstTierRung = tierRungs[0];
@@ -274,19 +324,20 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     const chainStart = candidates.length;
     const chain: Candidate[] = [];
     let own: Candidate | null = null;
-    const ref = typeof info.model === "string" ? splitModelRef(info.model) : null;
+    const modelRef = modelOfAgent(info, input.parentModel);
+    const ref = modelRef === null ? null : splitModelRef(modelRef);
     if (ref !== null) {
       const model = `${ref.provider}/${ref.model}`;
-      const sameRatio = candidates
-        .slice(0, routerCount)
-        .find((rung) => sameRung(rung, { model, variant: ref.variant }));
+      const matched = presetRungs.find((rung) => sameRung(rung, { model, variant: ref.variant }));
+      // A25: price and rank come from the matching preset rung; the owning tier's rank only caps it.
+      const lowered = matched !== undefined && matched.rank < owningRank;
       own = {
         agent,
         model,
         variant: ref.variant,
-        costRatio: sameRatio?.costRatio ?? firstTierRung.costRatio,
-        rank: owningRank,
-        tier: owningTier,
+        costRatio: matched?.costRatio ?? firstTierRung.costRatio,
+        rank: lowered ? matched.rank : owningRank,
+        tier: lowered ? matched.tier : owningTier,
         source: "role-own-model",
         grants: info.grants,
         ...priced(input, model),
@@ -329,7 +380,6 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     excluded,
   };
 }
-
 // ---------------------------------------------------------------------------
 // resolveChosen
 // ---------------------------------------------------------------------------

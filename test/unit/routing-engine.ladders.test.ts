@@ -14,6 +14,8 @@ import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { CLASS_STATIC_TIER, NEEDS, TASK_CLASSES } from "../../src/routing/classify/types";
 import type { Need, TaskClass, TaskFacts } from "../../src/routing/classify/types";
 import type { ModelPricing } from "../../src/routing/outcomes/types";
+import { createOutcomeStore } from "../../src/routing/outcomes/store";
+import type { DecisionInput } from "../../src/routing/engine/types";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -436,6 +438,168 @@ describe("resolveChosen", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// QA-1.4 round 1: ranks of own-model rungs, tier availability, parent model, pricing failures
+// ---------------------------------------------------------------------------
+
+const ROUTING = { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection: { deterministic: 0.95, grader: 0.7, none: 0.3 } } as const;
+
+function decisionInput(over: Partial<DecisionInput> & Pick<DecisionInput, "ladder" | "chosen">): DecisionInput {
+  return {
+    facts: { class: "implement", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" },
+    detection: "none",
+    pin: false,
+    routing: ROUTING,
+    store: createOutcomeStore(),
+    ...over,
+  };
+}
+
+describe("QA-1.4-1: an own-model rung takes the price AND the rank of the matching preset rung (A25)", () => {
+  const agents = [...routerAgents(), nativeAgent("general", `${SONNET}#low`, ["shell", "web", "edit", "network"])];
+  const roles = { implement: ["general"] };
+
+  it("general on fast's model is a fast-ranked rung of the fast tier, not a medium-ranked one", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents });
+    const own = ladder.candidates.find((c) => c.source === "role-own-model")!;
+    expect(own).toMatchObject({ model: SONNET, variant: "low", costRatio: 1, rank: 0, tier: "fast" });
+    expect(ladder.classRank).toBe(1);
+  });
+
+  it("the owning tier's rank only caps it: a match on a higher tier keeps the inherited rank", () => {
+    const heavy = nativeAgent("general", `${OPUS}#xhigh`, ["shell", "web", "edit", "network"]);
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents: [...routerAgents(), heavy] });
+    const own = ladder.candidates.find((c) => c.source === "role-own-model")!;
+    expect(own).toMatchObject({ costRatio: 20, rank: 1, tier: "medium" }); // price from heavy's rung, rank capped by the owning tier
+  });
+
+  it("inherited rank and the owning tier's first ratio apply only when no rung matches", () => {
+    const other = nativeAgent("general", `${SONNET}#max`, ["shell", "web", "edit", "network"]);
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents: [...routerAgents(), other] });
+    expect(ladder.candidates.find((c) => c.source === "role-own-model")).toMatchObject({ costRatio: 5, rank: 1, tier: "medium" });
+  });
+
+  it("probe: risk high, d none, empty store → the cheaper own-model rung is never-down ineligible and nothing switches", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents });
+    const chosen = resolveChosen({ cfg: plainCfg(), agents, agent: "medium" })!;
+    const decision = decide(decisionInput({ ladder, chosen, facts: { class: "implement", risk: "high", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } }));
+    expect(decision.switched).toBe(false);
+    expect(Object.values(decision.ineligible)).toContain("never-down");
+    expect(decision.ineligible["implement|host:general|anthropic/claude-sonnet-5-5#low"]).toBe("never-down");
+    expect(decision.best?.agent).toBe("medium");
+  });
+
+  it("floor tier: the fast-ranked own-model rung is below a medium floor and never best", () => {
+    const cfg = plainCfg({ enforcement: { escalate: { floorTier: "medium" } } });
+    const ladder = buildLadder({ cfg, routing: { roles }, facts: facts("implement", ["edit"]), agents });
+    const chosen = resolveChosen({ cfg, agents, agent: "medium" })!;
+    const decision = decide(decisionInput({ ladder, chosen, floorRank: floorRankOf(cfg), detection: "deterministic", facts: { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } }));
+    expect(decision.ineligible["implement|host:general|anthropic/claude-sonnet-5-5#low"]).toBe("floor");
+    expect(decision.ineligible["implement|router:fast|anthropic/claude-sonnet-5-5#low"]).toBe("floor");
+    expect(decision.switched).toBe(false);
+  });
+});
+
+describe("QA-1.4-3: router tier rungs honour permitted, hidden and mode", () => {
+  const unavailable: ReadonlyArray<readonly [string, Partial<HostAgentInfo>]> = [
+    ["not permitted", { permitted: false }],
+    ["hidden", { hidden: true }],
+    ["mode primary", { mode: "primary" }],
+  ];
+  for (const [name, over] of unavailable) {
+    it(`a ${name} tier agent is excluded as agent-unavailable and can never be best`, () => {
+      const agents = routerAgents().map((a) => (a.id === "fast" ? { ...a, ...over } : a));
+      const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("search"), agents });
+      expect(ladder.candidates.map((c) => c.agent.id)).toEqual(["medium", "heavy"]);
+      expect(ladder.excluded).toEqual([{ agent: { origin: "router", id: "fast" }, model: SONNET, variant: "low", why: "agent-unavailable" }]);
+      expect(ladder.classRank).toBe(0); // ranks stay the escalate ladder's
+      expect(ladder.candidates.map((c) => c.rank)).toEqual([1, 2]);
+      const chosen = resolveChosen({ cfg: plainCfg(), agents, agent: "medium" })!;
+      const decision = decide(decisionInput({ ladder, chosen, facts: { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" } }));
+      expect(decision.best?.agent).not.toBe("fast");
+      expect(Object.keys(decision.costs).some((key) => key.includes("router:fast"))).toBe(false);
+    });
+  }
+
+  it("a tier absent from the agent list is not excluded (grants stay unknown)", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("search"), agents: routerAgents(["medium", "heavy"]) });
+    expect(ladder.candidates.map((c) => [c.agent.id, c.grants === null])).toEqual([["fast", true], ["medium", false], ["heavy", false]]);
+    expect(ladder.excluded).toEqual([]);
+  });
+
+  it("an unavailable tier's rung still prices the own-model rung that matches it", () => {
+    const agents = [...routerAgents().map((a) => (a.id === "fast" ? { ...a, hidden: true } : a)), nativeAgent("general", `${SONNET}#low`, ["edit"])];
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: { implement: ["general"] } }, facts: facts("implement", ["edit"]), agents });
+    expect(ladder.candidates.find((c) => c.source === "role-own-model")).toMatchObject({ costRatio: 1, rank: 0 });
+  });
+});
+
+describe("QA-1.4-4: an agent without a configured model runs on the parent's model", () => {
+  const parentModel = `${OPUS}#xhigh`;
+  const bare = nativeAgent("general", null, ["shell", "web", "edit", "network"]);
+  const agents = [...routerAgents(), bare];
+  const roles = { implement: ["general"] };
+
+  it("gets an own-model rung on the parent's model, priced and ranked by the matching rung", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents, parentModel });
+    const own = ladder.candidates.find((c) => c.source === "role-own-model")!;
+    expect(own).toMatchObject({ agent: { origin: "host", id: "general" }, model: OPUS, variant: "xhigh", costRatio: 20, rank: 1, tier: "medium" });
+  });
+
+  it("without a parent model there is no own rung", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents });
+    expect(ladder.candidates.filter((c) => c.source === "role-own-model")).toEqual([]);
+    expect(ladder.candidates.filter((c) => c.source === "role-tier-rung")).toHaveLength(1);
+  });
+
+  it("the configured model wins over the parent's", () => {
+    const configured = [...routerAgents(), nativeAgent("general", HAIKU, ["edit"])];
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents: configured, parentModel });
+    expect(ladder.candidates.find((c) => c.source === "role-own-model")?.model).toBe(HAIKU);
+  });
+
+  it("chosen `general` on opus#xhigh resolves to a candidate (no kept:chosen-not-candidate)", () => {
+    const ladder = buildLadder({ cfg: plainCfg(), routing: { roles }, facts: facts("implement", ["edit"]), agents, parentModel });
+    const chosen = resolveChosen({ cfg: plainCfg(), agents, agent: "general", parentModel })!;
+    expect(chosen).toEqual({ agent: { origin: "host", id: "general" }, model: OPUS, variant: "xhigh" });
+    const decision = decide(decisionInput({ ladder, chosen, facts: { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } }));
+    expect(decision.reasonCode).not.toBe("kept:chosen-not-candidate");
+    expect(decision.chosen.key).toBe("implement|host:general|anthropic/claude-opus-5-5#xhigh");
+    expect(Object.keys(decision.costs)).toContain(decision.chosen.key);
+  });
+});
+
+describe("QA-1.4-10: a failing pricing lookup prices as unpriced", () => {
+  const input = { cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() } as const;
+
+  it("a throwing lookup leaves that model unpriced, logs once per lookup, and never throws", () => {
+    const warnings: string[] = [];
+    const priced: ModelPricing = [{ input: 3, output: 15 }];
+    const ladder = buildLadder({
+      ...input,
+      pricing: (model) => {
+        if (model === OPUS) throw new Error("catalog exploded");
+        return priced;
+      },
+      logger: { warn: (message) => void warnings.push(message) },
+    });
+    expect(ladder.candidates.map((c) => c.pricing)).toEqual([priced, priced, undefined]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(OPUS);
+    expect(warnings[0]).toContain("catalog exploded");
+  });
+
+  it("works without a logger, with a throwing logger and with a non-Error throw", () => {
+    expect(() => buildLadder({ ...input, pricing: () => { throw "plain string"; } })).not.toThrow();
+    const ladder = buildLadder({
+      ...input,
+      pricing: () => { throw new Error("x"); },
+      logger: { warn: () => { throw new Error("logger broke"); } },
+    });
+    expect(ladder.candidates.every((c) => c.pricing === undefined)).toBe(true);
+    expect(ladder.candidates).toHaveLength(3);
+  });
+});
 // ---------------------------------------------------------------------------
 // Property: no cycle can exist (plan "cycle impossible")
 // ---------------------------------------------------------------------------
