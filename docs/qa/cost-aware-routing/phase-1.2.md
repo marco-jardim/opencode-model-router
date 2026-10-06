@@ -357,63 +357,12 @@ Limits worth knowing: the command-word risk terms are linear but cost ≈ 3–4 
 
 ## Verdict
 
-Design (1.2.1) complete; `types.ts` compiles and `classifyTrivial` is unchanged (export-only diff, its tests pass). Phase verdict pending tasks 1.2.2–1.2.5 and QA-1.2.
+**PASS — open findings: 0.** Phase 1.2 (task classifier, M2) completed three adversarial QA rounds by `@heavy`.
 
-## Implementation notes (1.2.2–1.2.5)
+- Round 1: 2 critical, 7 major, 8 minor, 4 nit (QA-1.2-1…21) — fixed in `efe58fc`…`9599807` (A14, A18, A19).
+- Round 2: 1 critical, 2 major, 6 minor, 3 nit (QA-1.2-22…33) — fixed in `aa58343`…`f7269dd` (A22); QA-1.2-1 and QA-1.2-2 completed.
+- Round 3: no blocking, critical or major findings. Re-probed secret strings (every named/shaped secret redacted and the backend skipped; 32-char hex keys 2000/2000), smuggled last line (ignored under the default `first`), conflict-unpin (first line's `pin` kept), backend label injection (rules class stands), ReDoS (≤ 8 ms on adversarial 20 kB inputs).
 
-Implemented on `car/p12` after the design above; commits `feat(routing): …`, each green and pushed: rules (`4c9dd81`), route line (`c41b1fc`), state + backends (`e44785c`), composition (`fa3b73c`).
+Accepted minors (§0.7): QA-1.2-34 (lowercase/camelCase key names not redacted; document in 3.1), -35 (guess-based redaction does not skip the backend; `%`-split fragment), -36 (letters-only 32+ char secrets), -37 (TypeSafe risk/scope with a disagreeing class discarded), -38 (0.5 cap from excluded-section class words fires on routine CONTEXT wording; measure in DF2), -39 (`edges`/`any` still trust a later route line; tests/tooling only), -40 ("the key is …" and "tokens" over-trigger the skip), -41 (4-space-indented list text omitted from the state).
 
-### Files
-
-| File | Exports |
-|---|---|
-| `src\routing\classify\rules.ts` | `shapeOf`, `analyzeRules`, `classifyByRules` |
-| `src\routing\classify\route-line.ts` | `parseRouteLine`, `applyRouteLine` |
-| `src\routing\classify\state.ts` | `buildClassifierState` |
-| `src\routing\classify\backends\shared.ts` | the design's helpers plus `gatherSamples`, `resolveOutcome`, `buildResult`, `finish`, `finishMany`, `logResults`, `safeWarn`, `createRuntime`, `disabled`, `guarded` (shared plumbing of the three backends) |
-| `src\routing\classify\backends\host.ts` | `createHostBackend` |
-| `src\routing\classify\backends\openai-compatible.ts` | `createOpenAICompatibleBackend` |
-| `src\routing\classify\backends\typesafe.ts` | `createTypeSafeBackend`, `TYPESAFE_DEFAULT_BASE_URL` |
-| `src\routing\classify\index.ts` | `classify`, `classifyMany`, `createClassifierBackend`, `ClassifyDeps`, `ClassifierBackendDeps`, re-export of `types.ts` |
-| `test\unit\routing-classify.{rules,route-line,backends,index}.test.ts` | the design's test map, §7 |
-
-Logging uses the `ClassifierLogger` of `types.ts` (structurally `PluginLogger.warn`); every call goes through `safeWarn`, so a throwing logger cannot break the never-throws contract (it falls back to `console.error`, as `logger.ts` itself falls back to the console).
-
-### Design deviations
-
-1. **Stem term of a shared pattern (R6).** `read` anchors two rules (`search` and `recon`). The stem term `\bread\b` is compiled for the first one only. With a stem per rule, every "read X" credited `recon` too and the design's own fixture "read package.json and tell me the version → search" could not hold.
-2. **Fixture "do not implement anything; count the call sites of normTaskKw → search" does not hold under R4.** `;` is a `MULTI_STEP_RE` marker, so `shape.breadth` is true and R7 resolves the lookup family to `recon`. R4 is normative (it reproduces `classifyTrivial`), so the implementation keeps R4: that string classifies `recon` (needs still without `edit`), and the comma variant "do not implement anything, count the call sites of normTaskKw" classifies `search`. Both are asserted in `routing-classify.rules.test.ts`. The same effect appears for `then`, `;` and a second imperative line ("grep for the handler then refactor it" has `recon` in `matched`, not `search`).
-3. **`scrubText` before the description cut (D14 step 3/4).** The design cuts the description to 200 characters and then scrubs it; a key straddling the cut would survive as an unmatched fragment. The implementation collapses whitespace, scrubs, neutralises, then cuts (the neutralisation keeps the length).
-4. **`applyRouteLine` adds `shell` when `network` is present** (`types.ts` documents `network ⇒ shell`; L3 only says "union + class-implied needs"). A route line `needs=network` therefore yields `shell, network`.
-5. **TypeSafe without `baseUrl` is `disabled`** ("classifier.baseUrl is not set"). The design says "default documented as `https://api.typesafe.ai`"; sending the state to a host the user never configured is the wrong default for D14. The constant is exported (`TYPESAFE_DEFAULT_BASE_URL`) for the 1.1 resolver / docs to fill the setting explicitly.
-6. **Batch logging.** A batch logs one line per distinct (status, reason) with `{ latencyMs, calls, items }`, not one line per item; `disabled` is still once per instance and reason.
-7. **Status mapping when the vote cannot decide.** `timeout` when the group timer fired, else `error` when any request failed (first reason), else `invalid` (reason from the answer: "non-JSON response", "missing message content", or "answer is not one of the labels"). The design only fixed the vote itself.
-8. **`renderBatchPrompt` also returns `nonce` and `blocks`** (TypeSafe sends the item blocks as `state`); `RenderedPrompt` is generic over the label type so no cast is needed.
-9. **Table-integrity test scope.** The `&&` term of `NEED_RULES.shell` has flags `""`, so "every term has flags exactly `i`" is asserted for `KEYWORD_RULES`; the other vocabularies are asserted free of `g`/`y` (the property the module relies on).
-10. **Synthetic backend results in `index.ts`** (timeout/error/invalid from a misbehaving backend) use `timeoutMs + INDEX_TIMEOUT_GRACE_MS` (timeout) or 0 as `latencyMs`: `index.ts` has no clock by design.
-11. **A route line inside a code fence is still a route line** (L1: whole lines; the parser does not track fences). Documented by a test; QA-1.2 may want to decide whether fenced `[route …]` examples need an exemption.
-
-### Findings for QA-1.2
-
-| Id | Severity | File:line | Description | Resolution |
-|---|---|---|---|---|
-| I-1 | minor | `types.ts` `NEED_RULES.shell` (`\bgit\b`) | A path segment named `git` (e.g. `D:\git\repo\a.ts`) is a `shell` need. Over-restrictive, never unsafe (an extra need can only narrow the candidate agents). Not changed: `types.ts` is the 1.2.1 contract. | fixed in round 1 (QA-1.2-5: path-free needs text and path-aware lookarounds) |
-| I-2 | minor | `rules.ts` negation (R5) | `.` is a clause boundary, so a dotted file name inside a negation window ("do not touch a.ts and refactor") ends the window early and the later verb is not negated. Per design (R5 lists `.`). | fixed in round 1 (QA-1.2-13: `.` is a boundary only before whitespace/end) |
-| I-3 | info | `rules.ts` R6 | A shipped entry listed under another tier than its anchor tier (`medium: ["search"]`) is a custom pattern of that tier, per the design's "(pattern === kw && tier === t)" wording. | by design |
-
-### Verification
-
-- `npx vitest run test/unit/routing-classify.rules.test.ts test/unit/routing-classify.route-line.test.ts test/unit/routing-classify.backends.test.ts test/unit/routing-classify.index.test.ts --pool=threads` → 4 files, 226 tests pass (rules 80, route line 30, backends 70, index 46).
-- `npx vitest related src/router/sessions.ts --run` → 50 files passed, 3 skipped, 1245 tests passed, 55 skipped (includes `sessions.test.ts` and `sessions-resume.test.ts`; `classifyTrivial` and `src\router\sessions.ts` untouched by 1.2.2–1.2.5).
-- `npm run typecheck` green before each commit.
-- Mutation spot checks (reverted): neutralising off in `state.ts` → 3 backend tests fail; mechanical cap and the `source === "rules"` gate off in `index.ts` → 3 index tests fail.
-- No network in unit tests: host backends use a fake `ctx.generate`; HTTP backends use an injected `fetch`; the host test also asserts `globalThis.fetch` is never called.
-
-### Round 1 verification
-
-- `npm run typecheck` green; default vitest pool only (A14).
-- `npx vitest run test/unit/routing-classify.rules.test.ts test/unit/routing-classify.route-line.test.ts test/unit/routing-classify.backends.test.ts test/unit/routing-classify.index.test.ts` → 4 files, 444 tests pass (rules 180, route line 53, backends 127, index 84; 226 before round 1).
-- `npx vitest related src/router/sessions.ts --run` → 50 files passed, 3 skipped, 1463 tests passed, 55 skipped; `src\router\sessions.ts`, `src\guard\scrub.ts` and `classifyTrivial` untouched.
-- Rules timing, best of 10 after a warm-up (QA-1.2-7): `"a"×20000` 0.087 ms, `"a."×10000` 0.067 ms, `"a/"×10000` 0.065 ms (before the fix: ≈ 590 ms, 950 ms and 950 ms; 230 ms for 20 000 newlines); 2 kB prose 0.40 ms; 10 kB prose 1.28 ms. Worst remaining shape (runs of 199 characters just under the collapse threshold, 100 of them) 3.8 ms, asserted under 10 ms because 5 ms flakes on a loaded CI core; the three required strings are asserted under 5 ms.
-- `scrubState` on 20 000-character hostile runs (`a`, `a-`, `A_`, `token`) stays linear (asserted under 100 ms; the first draft took 260 ms on `a-`×10000 because of an unbounded scheme prefix).
-- Secret-shaped fixtures are assembled at run time (`["sk", "live", …].join("_")`): GitHub push protection rejected the literal Stripe-shaped string in the first QA-1.2-1 commit, which was amended before it reached the remote.
+Deferred by plan: live `host` check and QA-1.2-17 items at DF3 (A4, A13); wiring, A22 protocol text and decision-log fields in 2.2; project-layer classifier-key drop (A18) lands with 1.1; below-threshold outcome rule in 1.3/2.1; D14 user docs (incl. QA-1.2-34/36) in 3.1. Verification: four `routing-classify.*` files + `sessions*.test.ts`, 633 tests, default pool (A14); `classifyTrivial` and `src\guard\scrub.ts` untouched.
