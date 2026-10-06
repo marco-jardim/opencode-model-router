@@ -101,7 +101,7 @@ export async function registerV2Hooks(
     logger: ingestLogger,
     pricing: createCatalogPricing(
       async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
-      { logger: ingestLogger },
+      { logger: ingestLogger, cacheKey: ctx.location.directory, signal: abort.signal },
     ),
   });
   // An ingestion error is logged and the loop carries on: it must never cost the router an event.

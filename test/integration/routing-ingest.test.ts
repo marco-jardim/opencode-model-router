@@ -1,7 +1,7 @@
 // Phase 2.1 (M6): telemetry ingestion into the outcome store. Temp directories only: every outcomes directory
 // is a fresh mkdtemp under the OS temp dir, injected through the settings; the real trajectory directory and
 // ~/.config/opencode are never touched.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ import {
 import {
   createCatalogPricing,
   createIngest,
+  resetCatalogPricing,
   ingestSettings,
   resetIngestState,
   SEEN_EVENT_CAP,
@@ -425,6 +426,42 @@ describe("duplicate delivery (A3, S3b)", () => {
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
   });
 
+  it("QA-2.1-2 (probe P4): a slow pricing lookup on one instance does not cost another instance the duplicate it needs", async () => {
+    const h = harness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const slow: PricingLookup = async () => { await gate; return [{ input: 3, output: 15 }]; };
+    const a = h.make({ pricing: slow });
+    const b = h.make({ pricing: PRICED });
+    dispatch("c1");
+    const first = step("p4-1", "c1", { finish: "tool-calls", cost: 0.01, output: 100 });
+    const last = step("p4-2", "c1", { finish: "stop", cost: 0.02, output: 333 });
+    const aLoop = (async () => { await a.onStepEnded(first); await a.onStepEnded(last); })();
+    await b.onStepEnded(first);
+    await b.onStepEnded(last);
+    release();
+    await aLoop;
+    const cost = h.store().cost(MEDIUM_KEY);
+    expect(cost.steps).toMatchObject({ n: 1, mean: 2 }); // both steps of the attempt, each once
+    expect(cost.finalMessageTokens.mean).toBe(333);
+    expect(cost.measuredUSD.mean).toBeCloseTo(0.03, 9);
+  });
+
+  it("QA-2.1-8: the same event id is recorded once per outcomes directory", async () => {
+    const one = harness();
+    const two = harness();
+    const a = one.make({ pricing: PRICED });
+    const b = two.make({ pricing: PRICED });
+    dispatch("c1");
+    const event = step("shared-id", "c1", { finish: "stop", cost: 0.02 });
+    await a.onStepEnded(event);
+    await b.onStepEnded(event);
+    await a.onStepEnded(event);
+    expect(one.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+    expect(two.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+    expect(one.store()).not.toBe(two.store());
+  });
+
   it("falls back to a content key when an event carries no id, and the LRU stays bounded", async () => {
     const h = harness();
     const a = h.make({ pricing: PRICED });
@@ -744,10 +781,10 @@ describe("flush scheduling (D15)", () => {
 });
 
 describe("catalog pricing lookup", () => {
-  it("shares one in-flight load, trusts it for the TTL and reloads afterwards", async () => {
+  it("shares one in-flight load, serves a loaded table at once, and reloads in the background after the TTL", async () => {
     const clock = { t: T0 };
     let loads = 0;
-    const lookup = createCatalogPricing(async () => { loads += 1; return [{ providerID: "p", id: "m", cost: [{ input: 1, output: 2 }] }]; }, { now: () => clock.t, ttlMs: 1000 });
+    const lookup = createCatalogPricing(async () => { loads += 1; return [{ providerID: "p", id: "m", cost: [{ input: loads, output: 2 }] }]; }, { now: () => clock.t, ttlMs: 1000 });
     const results = await Promise.all([lookup("p", "m"), lookup("p", "m"), lookup("p", "other")]);
     expect(loads).toBe(1);
     expect(results[0]).toEqual([{ input: 1, output: 2 }]);
@@ -755,8 +792,10 @@ describe("catalog pricing lookup", () => {
     await lookup("p", "m");
     expect(loads).toBe(1);
     clock.t += 1000;
-    await lookup("p", "m");
-    expect(loads).toBe(2);
+    // stale-while-revalidate: the old table answers immediately, the reload runs behind it
+    expect(await lookup("p", "m")).toEqual([{ input: 1, output: 2 }]);
+    await vi.waitFor(() => expect(loads).toBe(2));
+    expect(await lookup("p", "m")).toEqual([{ input: 2, output: 2 }]);
   });
 
   it("a failed load is logged once, treated as unpriced, and retried after the back-off", async () => {
@@ -773,8 +812,59 @@ describe("catalog pricing lookup", () => {
     clock.t += 5000;
     expect(await lookup("p", "m")).toEqual([{ input: 1, output: 2 }]);
   });
-});
 
+  it("QA-2.1-2: lookups with the same cache key share one table and one load, process-wide; other keys do not", async () => {
+    let loadsA = 0;
+    let loadsB = 0;
+    let loadsC = 0;
+    const entry = [{ providerID: "p", id: "m", cost: [{ input: 1, output: 2 }] }];
+    const a = createCatalogPricing(async () => { loadsA += 1; return entry; }, { cacheKey: "/project" });
+    const b = createCatalogPricing(async () => { loadsB += 1; return entry; }, { cacheKey: "/project" });
+    const c = createCatalogPricing(async () => { loadsC += 1; return entry; }, { cacheKey: "/other" });
+    await Promise.all([a("p", "m"), b("p", "m"), c("p", "m")]);
+    await b("p", "m");
+    expect([loadsA, loadsB, loadsC]).toEqual([1, 0, 1]);
+    // a lookup created after a reset starts from an empty cache
+    resetCatalogPricing();
+    let loadsD = 0;
+    const d = createCatalogPricing(async () => { loadsD += 1; return entry; }, { cacheKey: "/project" });
+    await d("p", "m");
+    expect(loadsD).toBe(1);
+  });
+
+  it("QA-2.1-5: a catalog that never answers costs one bounded wait, then lookups answer unpriced at once", async () => {
+    const clock = { t: T0 };
+    const warnings: string[] = [];
+    let loads = 0;
+    const lookup = createCatalogPricing(() => { loads += 1; return new Promise<never>(() => {}); }, {
+      now: () => clock.t, loadTimeoutMs: 20, retryMs: 5000, logger: { warn: (m) => { warnings.push(m); } },
+    });
+    const started = performance.now();
+    expect(await lookup("p", "m")).toBeUndefined();
+    expect(performance.now() - started).toBeGreaterThanOrEqual(15);
+    const second = performance.now();
+    expect(await lookup("p", "m")).toBeUndefined();
+    expect(performance.now() - second).toBeLessThan(15);
+    expect(loads).toBe(1);
+    expect(warnings).toHaveLength(1);
+    // after the back-off a hung load is replaced
+    clock.t += 5000;
+    await lookup("p", "m");
+    expect(loads).toBe(2);
+  });
+
+  it("QA-2.1-5: an abort releases a waiting lookup at once, without cancelling the shared load", async () => {
+    const abort = new AbortController();
+    let resolveList!: (models: Array<{ providerID: string; id: string; cost: unknown }>) => void;
+    const lookup = createCatalogPricing(() => new Promise((resolve) => { resolveList = resolve; }), { signal: abort.signal, loadTimeoutMs: 60_000 });
+    const waiting = lookup("p", "m");
+    abort.abort();
+    expect(await waiting).toBeUndefined();
+    expect(await lookup("p", "m")).toBeUndefined(); // already aborted: no wait at all
+    resolveList([{ providerID: "p", id: "m", cost: [{ input: 1, output: 2 }] }]);
+    await vi.waitFor(async () => { expect(await lookup("p", "m")).toEqual([{ input: 1, output: 2 }]); });
+  });
+});
 describe("throughput", () => {
   it("ingests 1 000 step events in under 100 ms", async () => {
     const h = harness();

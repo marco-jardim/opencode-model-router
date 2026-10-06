@@ -115,10 +115,41 @@ export type PricingLookup = (provider: string, model: string) => Promise<ModelPr
 export interface CatalogPricingOptions {
   readonly now?: Clock;
   readonly logger?: OutcomeLogger;
-  /** How long a loaded catalog is trusted (default 60 s). */
+  /** How long a loaded catalog is fresh (default 60 s); after that it is served stale while it reloads in the background. */
   readonly ttlMs?: number;
-  /** After a failed load, wait this long before trying again (default 15 s). */
+  /** After a failed or timed-out load, wait this long before trying again (default 15 s). */
   readonly retryMs?: number;
+  /** The longest a lookup waits for the very first load of a catalog (default 2 s); then it answers `unpriced` (QA-2.1-5). */
+  readonly loadTimeoutMs?: number;
+  /** Shutdown: lookups waiting for a load return at once. The shared load itself is not cancelled. */
+  readonly signal?: AbortSignal;
+  /**
+   * Share the table, the in-flight load and the back-off with every lookup created with the same key, in the whole
+   * process (QA-2.1-2): the location directory. The first creator's `list` serves them all. Without a key the lookup
+   * has a private cache.
+   */
+  readonly cacheKey?: string;
+}
+
+interface CatalogLoad {
+  readonly promise: Promise<void>;
+  readonly startedAt: number;
+  /** A lookup stopped waiting for it (timeout): later lookups do not wait for it again. */
+  abandoned: boolean;
+}
+
+interface CatalogState {
+  table: Map<string, ModelPricing>;
+  loadedAt: number | null;
+  failedAt: number | null;
+  loading: CatalogLoad | null;
+}
+
+const sharedCatalogs = new Map<string, CatalogState>();
+
+/** Test-only: forget every shared catalog cache. */
+export function resetCatalogPricing(): void {
+  sharedCatalogs.clear();
 }
 
 function asPricing(value: unknown): ModelPricing {
@@ -126,9 +157,13 @@ function asPricing(value: unknown): ModelPricing {
 }
 
 /**
- * Cached `provider/model → catalog cost` lookup over `list`. A model that is absent or a failed load gives
- * `undefined`, which {@link pricingState} reads as `unpriced` (A1): a `0` cost is then stored as unknown and
- * only a positive host-reported cost is kept. Concurrent callers share one in-flight load; never rejects.
+ * Cached `provider/model → catalog cost` lookup over `list`. A model that is absent, a failed or slow first load, or
+ * a lookup that was aborted gives `undefined`, which {@link pricingState} reads as `unpriced` (A1): a `0` cost is then
+ * stored as unknown and only a positive host-reported cost is kept.
+ *
+ * It never blocks the serial event loop for long (QA-2.1-5): once a table has loaded it is served immediately, stale
+ * after the TTL while it reloads in the background; only the first lookup of a cold catalog waits, for at most
+ * `loadTimeoutMs` and never past `signal`; a failed or timed-out load backs off for `retryMs`. Never rejects.
  */
 export function createCatalogPricing(
   list: () => Promise<readonly CatalogModel[]>,
@@ -137,41 +172,80 @@ export function createCatalogPricing(
   const now = options.now ?? Date.now;
   const ttlMs = options.ttlMs ?? 60_000;
   const retryMs = options.retryMs ?? 15_000;
-  let table = new Map<string, ModelPricing>();
-  let loadedAt: number | null = null;
-  let failedAt: number | null = null;
-  let loading: Promise<void> | null = null;
+  const loadTimeoutMs = options.loadTimeoutMs ?? 2_000;
+  const { signal, logger } = options;
+  let state: CatalogState | undefined = options.cacheKey === undefined ? undefined : sharedCatalogs.get(options.cacheKey);
+  if (state === undefined) {
+    state = { table: new Map(), loadedAt: null, failedAt: null, loading: null };
+    if (options.cacheKey !== undefined) sharedCatalogs.set(options.cacheKey, state);
+  }
+  const shared = state;
 
-  const load = async (): Promise<void> => {
-    try {
-      const models = await list();
-      const next = new Map<string, ModelPricing>();
-      for (const model of models) next.set(`${model.providerID}/${model.id}`, asPricing(model.cost));
-      table = next;
-      loadedAt = safeNow(now);
-      failedAt = null;
-    } catch (error) {
-      failedAt = safeNow(now);
-      options.logger?.warn("[router] outcome ingestion: model catalog unavailable; step costs treated as unpriced", {
-        error: describe(error),
-      });
-    }
+  const startLoad = (t: number): CatalogLoad => {
+    const run = async (): Promise<void> => {
+      try {
+        const models = await list();
+        const next = new Map<string, ModelPricing>();
+        for (const model of models) next.set(`${model.providerID}/${model.id}`, asPricing(model.cost));
+        shared.table = next;
+        shared.loadedAt = safeNow(now);
+        shared.failedAt = null;
+      } catch (error) {
+        shared.failedAt = safeNow(now);
+        logger?.warn("[router] outcome ingestion: model catalog unavailable; step costs treated as unpriced", {
+          error: describe(error),
+        });
+      }
+    };
+    const load: CatalogLoad = {
+      startedAt: t,
+      abandoned: false,
+      promise: run().finally(() => {
+        if (shared.loading === load) shared.loading = null;
+      }),
+    };
+    shared.loading = load;
+    return load;
+  };
+
+  /** Wait for `load`, but not longer than `loadTimeoutMs` and not past an abort. */
+  const waitFor = (load: CatalogLoad): Promise<"done" | "timeout" | "aborted"> => {
+    if (signal?.aborted === true) return Promise.resolve("aborted");
+    return new Promise<"done" | "timeout" | "aborted">((resolve) => {
+      const onAbort = (): void => finish("aborted");
+      const timer = setTimeout(() => finish("timeout"), loadTimeoutMs);
+      timer.unref();
+      const finish = (outcome: "done" | "timeout" | "aborted"): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(outcome);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      void load.promise.then(() => finish("done"));
+    });
   };
 
   return async (provider, model) => {
     const t = safeNow(now);
-    const fresh = loadedAt !== null && t - loadedAt < ttlMs;
-    const backingOff = failedAt !== null && t - failedAt < retryMs;
-    if (!fresh && !backingOff) {
-      loading ??= load().finally(() => {
-        loading = null;
-      });
-      await loading;
+    const fresh = shared.loadedAt !== null && t - shared.loadedAt < ttlMs;
+    if (!fresh) {
+      const backingOff = shared.failedAt !== null && t - shared.failedAt < retryMs;
+      let load = shared.loading;
+      // A load that hung is replaced once the back-off has passed.
+      if (load !== null && load.abandoned && t - load.startedAt >= retryMs) load = null;
+      if (load === null && !backingOff) load = startLoad(t);
+      if (shared.loadedAt === null && load !== null && !load.abandoned) {
+        const outcome = await waitFor(load);
+        if (outcome === "timeout" && shared.loadedAt === null) {
+          load.abandoned = true;
+          shared.failedAt = safeNow(now);
+          logger?.warn("[router] outcome ingestion: model catalog is slow; step costs treated as unpriced", { loadTimeoutMs });
+        }
+      }
     }
-    return table.get(`${provider}/${model}`);
+    return shared.table.get(`${provider}/${model}`);
   };
 }
-
 // ---------------------------------------------------------------------------
 // Module-scope state (A3: shared by every plugin instance of the process)
 // ---------------------------------------------------------------------------
@@ -231,6 +305,7 @@ function rememberAttempt(child: string, attemptId: string): string | undefined {
 
 /** Test-only: drop the module-scope dedupe and attempt state (the dispatch registry has its own reset). */
 export function resetIngestState(): void {
+  resetCatalogPricing();
   seenEvents.clear();
   signalled.clear();
   lastAttemptByChild.clear();
@@ -386,22 +461,29 @@ export function createIngest(deps: IngestDeps): Ingest {
         const data = event.data;
         const sessionID = data.sessionID;
         if (typeof sessionID !== "string") return;
-        const target = targetOf(sessionID);
-        if (target === null) return;
-        const { record, settings, key } = target;
-        // Dedupe only a step that is about to be recorded: an instance whose own settings are static must not
-        // consume the event another instance (another location, another config) will record.
+        const first = targetOf(sessionID);
+        if (first === null) return;
         const tokens = isRecord(data.tokens) ? (data.tokens as unknown as StepEndedTokens) : undefined;
         const eventKey =
           typeof event.id === "string" && event.id !== ""
             ? event.id
             : `${sessionID}|${String(data.assistantMessageID)}|${String(data.cost)}|${tokens?.input}|${tokens?.output}`;
-        if (!firstDelivery(eventKey)) return;
-        const bundle = bundleFor(settings);
-        if (bundle === null) return;
-        const ref = splitModelRef(record.model ?? "");
+        // Pricing first (cached, or bounded by the catalog's own load timeout): a slow lookup must not decide
+        // which instance owns the event (QA-2.1-2).
+        const ref = splitModelRef(first.record.model ?? "");
         const pricing = ref === null || deps.pricing === undefined ? undefined : await deps.pricing(ref.provider, ref.model);
         if (disposed) return;
+        // From here on everything is synchronous, so the check and the record of an event id cannot interleave
+        // with another instance. The registry and the settings may have changed during the await.
+        const target = targetOf(sessionID);
+        if (target === null) return;
+        const { record, settings, key } = target;
+        // Dedupe only a step that is about to be recorded: an instance whose own settings are static must not
+        // consume the event another instance (another location, another config) will record. The directory is
+        // part of the key (QA-2.1-8): a store in another directory is a different recording.
+        if (!firstDelivery(`${settings.outcomesDir}|${eventKey}`)) return;
+        const bundle = bundleFor(settings);
+        if (bundle === null) return;
         const superseded = rememberAttempt(sessionID, record.attemptId);
         if (superseded !== undefined && superseded !== record.attemptId) bundle.store.closeAttempt(superseded);
         bundle.store.recordStep(key, {
@@ -418,7 +500,6 @@ export function createIngest(deps: IngestDeps): Ingest {
         warn("session.step.ended failed", error);
       }
     },
-
     onVerdict(childSessionID: string, outcome: Verdict): void {
       try {
         const target = targetOf(childSessionID);
