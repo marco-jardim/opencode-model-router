@@ -519,3 +519,30 @@ The `final_tier` suffix becomes `currentEffort ? "@"+effort : currentVariant ? "
 - The `ladder.ts` extension is specified implementer-ready in §3–§11, with the golden proof obligation (§11) and a full test map (§13).
 - `ladder.ts` and the fixtures are untouched. `npm run typecheck` is green.
 - The phase verdict is pending 1.5.2 and the phase QA.
+
+## Implementation notes (1.5.2)
+
+**Delivered.** `src\escalate\ladder.ts` now implements §3–§10 as written: `TierVariantInfo`/`VariantPolicy`, the optional `LadderState`/`LadderAction`/`EscalatePolicy` fields, `buildEscalatePolicy(cfg, session?)` with `buildVariantPolicy`, `newLadderState`, `recordAttempt(state, cost, child?)`, `nextAction(state, verdict, policy, session?)` with step 5V, the attachments on retry and escalate, `skipCoveredTiers`, `advance` with `applySession`, and the `#variant` scorecard suffix. `resumeDecision` is re-exported from `variants.ts`. Nothing was changed in `variants.ts`, `config.ts`, the fixtures or `ladder.test.ts`.
+
+**Commits** (`car/p15`, pushed, each with a green `npm run typecheck`): types/state/policy builder → `nextAction`/`advance`/scorecard → tests.
+
+**Tests.** `test\unit\ladder.session.test.ts` (new file, 202 tests, rows of §13 marked 1.5.2):
+
+- `buildEscalatePolicy` session input: one case per row of the §13 "(design) `buildEscalatePolicy` session input" row, plus null tiers, bad models and a non-array `candidates`.
+- `newLadderState`, `recordAttempt`, scorecard and deep-frozen purity.
+- Variant steps: variant steps vs `maxTotalAttempts`, the cost ceiling (above → `give_up`, at → step) and `maxAttemptsPerTier` (hand-built `attemptsThisTier === maxAttemptsPerTier` still steps); `maxAttemptsPerTier` 1 → `retry(variantStep)`, `retry`, `escalate`, and 0 → `retry(variantStep)`, `escalate`; §9 counter table per action kind.
+- Resume decisions: under/at/over the threshold computed from the real `forcingMessage.length`; the next model's budget (1 000 000 → 800 000); no child; unknown budget (target without info → `agent` set, no `model`); stale child after a fresh advance.
+- `skipCoveredTiers`, including the duplicate ladder `["fast", "fast"]` and the owner preset traces (`fast#low … fast#xhigh` then `give_up "max total attempts (4) reached"`; ×40 → lands on `heavy`).
+- 120 seeded property runs over random ladders and catalogs (termination within `maxTotalAttempts`, variant steps per visit ≤ ladder length, no `default` or absent variant, no `retry`/`escalate` above the cost ceiling, variant-vs-effortBump exclusivity, counter accounting).
+- Golden replay (§11 point 8): both fixtures are rebuilt from the recorded inputs and compared byte-for-byte (`JSON.stringify(…, null, 2) + "\n"` against the file) with (a) the recorded policy plus `variants: null` (also with `effortBump: null`), (b) `buildEscalatePolicy(cfg, s)` for `s` in `{v1, variantSteps none, no catalog}`, first asserting policy-JSON equality with the one-argument policy and with the recorded policy, (c) the one-argument policy. A temporary mutation of `advance` was caught by these replays and reverted.
+
+**Verification.** `npm run typecheck` green; `npx vitest run test/unit/ladder.session.test.ts test/unit/ladder.test.ts test/unit/escalate-variants.test.ts` → 3 files, 419 tests passed (217 existing + 202 new); `npx vitest related src/escalate/ladder.ts --run` → 37 files passed, 3 skipped.
+
+**Deviations and observations.**
+
+| Id | Topic | Note |
+|---|---|---|
+| D1 | Test file | The dispatch said to append to the ladder test files. §0/§13 and the golden proof obligation require `ladder.test.ts` to stay unmodified, so the 1.5.2 tests went into the new `ladder.session.test.ts` (matches `ladder*.test.ts`). `escalate-variants.test.ts` needed no additions: every row it owns was already green. |
+| O1 | Default-based same-model tiers | `skipCoveredTiers` treats `default` (3.5) as covering another same-model `default`-base tier ("at or below"), so two `default`-base tiers on one model never escalate between themselves. This follows §7 literally and is pinned by a test; it is the safe reading because the second tier would rerun the same variant. |
+| O2 | `candidates` access | `(tier as { candidates?: unknown })` is used as in §4; it type-checks without a double cast because 1.1 has not added the field to `TierConfig`. When 1.1 lands, the cast can become a plain read. |
+| O3 | F5 pinned | The owner preset spends the whole default budget on `fast` variant steps; the trace is asserted as designed. |
