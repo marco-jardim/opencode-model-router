@@ -1377,3 +1377,102 @@ describe("awaitExecutionEnd (QA-2.3-2): the runner's bounded, abortable barrier"
     await expect(awaitExecutionEnd("c1", 0)).resolves.toBe(false);
   });
 });
+
+describe("a duplicate execution-end event (QA-2.3-R2-1, A3: every plugin instance receives every event)", () => {
+  const stepOf = (id: string, sessionID: string, input: number): IngestEvent => ({
+    id, type: "session.step.ended",
+    data: { sessionID, assistantMessageID: `m-${id}`, finish: "stop", cost: 0, tokens: { input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  });
+
+  it("the same end id, delivered by a second instance after the child was registered again, does not mark the new registration ended", async () => {
+    vi.useFakeTimers();
+    try {
+      const a = harness();
+      a.settings = null;
+      const instanceA = a.make({ pricing: PRICED });
+      const b = harness();
+      b.settings = null;
+      const instanceB = b.make({ pricing: PRICED });
+      dispatch("X");
+      await instanceA.onStepEnded(stepOf("s1", "X", 300_000));
+      instanceA.onExecutionEnded("X", "end-1");
+      expect(lastStepContext("X")).toBe(300_000);
+      dispatch("X"); // the runner resumes X: attempt N+1
+      expect(lastStepContext("X")).toBeNull();
+      instanceB.onExecutionEnded("X", "end-1"); // the lagging instance delivers the SAME event of attempt N
+      await instanceA.onStepEnded(stepOf("s2", "X", 310_000));
+      const waiting = awaitExecutionEnd("X", 1_000);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(lastStepContext("X")).toBeNull(); // N+1's final, larger step and its own end are still queued
+      await vi.advanceTimersByTimeAsync(2);
+      await expect(waiting).resolves.toBe(false); // so the runner starts fresh instead of trusting 310 000
+      // N+1's own end has another id and is applied, by whichever instance delivers it first
+      instanceB.onExecutionEnded("X", "end-2");
+      expect(lastStepContext("X")).toBe(310_000);
+      instanceA.onExecutionEnded("X", "end-2"); // its copy is ignored too
+      expect(lastStepContext("X")).toBe(310_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an end without an id cannot be told apart and is applied every time", () => {
+    dispatch("X");
+    const instance = harness().make({ pricing: PRICED });
+    instance.onExecutionEnded("X");
+    noteStepContext("X", 5);
+    expect(lastStepContext("X")).toBe(5);
+    dispatch("X");
+    noteStepContext("X", 6);
+    instance.onExecutionEnded("X"); // no id: the legacy behaviour
+    expect(lastStepContext("X")).toBe(6);
+  });
+
+  it("the end ids are remembered in a bounded set, oldest first", () => {
+    dispatch("X");
+    noteExecutionEnded("X", T0, "first");
+    expect(lastStepContext("X")).toBeNull(); // ended, but no step noted
+    noteStepContext("X", 1);
+    expect(lastStepContext("X")).toBe(1);
+    for (let n = 0; n < 2_100; n++) noteExecutionEnded("other", T0, `end-${n}`); // evicts "first" (cap 2 048)
+    dispatch("X"); // not ended again
+    noteStepContext("X", 2);
+    expect(lastStepContext("X")).toBeNull();
+    noteExecutionEnded("X", T0, "first"); // forgotten: applied again (a copy this late is not expected)
+    expect(lastStepContext("X")).toBe(2);
+    dispatch("X");
+    noteStepContext("X", 3);
+    noteExecutionEnded("X", T0, "end-2099"); // still remembered: it was applied to "other" and is ignored here
+    expect(lastStepContext("X")).toBeNull();
+  });
+  it("a stale copy does not fold the new attempt early when ingestion is live (the fold is deduped per outcomes directory)", async () => {
+    const h = harness();
+    const a = h.make({ pricing: PRICED });
+    const b = h.make({ pricing: PRICED });
+    dispatch("c1");
+    await a.onStepEnded(stepOf("e1", "c1", 1_000));
+    a.onExecutionEnded("c1", "x1"); // attempt N folds with its held final step
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+    dispatch("c1"); // attempt N+1
+    await a.onStepEnded(stepOf("e2", "c1", 2_000)); // its final step is held until its own end
+    b.onExecutionEnded("c1", "x1"); // the lagging copy of N's end
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1); // N+1 is not folded yet
+    a.onExecutionEnded("c1", "x2");
+    expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(2);
+  });
+
+  it("an instance that cannot record does not consume the end another instance folds with", async () => {
+    const live = harness();
+    const off = harness();
+    off.settings = null;
+    const instanceOff = off.make({ pricing: PRICED });
+    const instanceLive = live.make({ pricing: PRICED });
+    dispatch("c1");
+    await instanceLive.onStepEnded(stepOf("e1", "c1", 1_000));
+    instanceOff.onExecutionEnded("c1", "x1"); // arrives first, cannot record: marks the registry, folds nothing
+    expect(live.store().cost(MEDIUM_KEY).steps.n).toBe(0);
+    expect(lastStepContext("c1")).toBe(1_000);
+    instanceLive.onExecutionEnded("c1", "x1"); // the instance that can record still folds
+    expect(live.store().cost(MEDIUM_KEY).steps.n).toBe(1);
+  });
+});

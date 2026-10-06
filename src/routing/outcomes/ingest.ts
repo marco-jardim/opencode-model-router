@@ -393,8 +393,13 @@ export interface Ingest {
    * only the cached catalog lookup, bounded by its load timeout. Never rejects.
    */
   onStepEnded(event: IngestEvent): Promise<void>;
-  /** The child's execution ended (succeeded, failed or interrupted): its open attempt is folded (QA-2.1-6). */
-  onExecutionEnded(childSessionID: string): void;
+  /**
+   * The child's execution ended (succeeded, failed or interrupted): its open attempt is folded (QA-2.1-6) and its
+   * registration is marked ended for the delegate ladder (QA-2.3-2). `eventId` is the host event's id: a copy of the
+   * same event delivered again (to another plugin instance, perhaps after the child was registered again) is ignored
+   * (QA-2.3-R2-1). Without an id every delivery is applied.
+   */
+  onExecutionEnded(childSessionID: string, eventId?: unknown): void;
   /** A verifier verdict for the child's current attempt. Never throws. */
   onVerdict(childSessionID: string, outcome: Verdict): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
@@ -655,12 +660,18 @@ export function createIngest(deps: IngestDeps): Ingest {
         warn("session.step.ended failed", error);
       }
     },
-    onExecutionEnded(childSessionID: string): void {
+    onExecutionEnded(childSessionID: string, eventId?: unknown): void {
       try {
         if (lookupDispatch(childSessionID) === undefined) return;
+        const id = typeof eventId === "string" && eventId !== "" ? eventId : undefined;
         // Phase 2.3 (QA-2.3-2): every step event of this registration has been noted, whatever the engine mode; the
-        // delegate ladder reads the child's context only after this.
-        noteExecutionEnded(childSessionID, safeNow(now));
+        // delegate ladder reads the child's context only after this. The registry applies an end id once per process.
+        noteExecutionEnded(childSessionID, safeNow(now), id);
+        // The fold is per outcomes directory, like the step events' dedupe: an instance that cannot record (static, or
+        // another directory) must not consume the end another instance folds with. A stale copy delivered after the
+        // child was registered again would otherwise fold the NEW attempt early (QA-2.3-R2-1).
+        const dir = currentDir();
+        if (id !== undefined && dir !== null && !firstDelivery(`${dir}|end|${id}`)) return;
         closeLastAttempt(childSessionID);
       } catch (error) {
         warn("execution end failed", error, { childSessionID });

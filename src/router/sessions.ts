@@ -646,6 +646,9 @@ interface DispatchSlot {
 
 /** Hard bound on remembered children; the oldest registration is dropped first. */
 export const MAX_DISPATCH_RECORDS = 2000;
+/** Execution-end event ids already applied (`noteExecutionEnded`), bounded, oldest first. */
+const SEEN_END_CAP = 2048;
+const seenEnds = new Set<string>();
 
 const dispatchRegistry = new Map<string, DispatchSlot>();
 /**
@@ -740,7 +743,19 @@ export function noteStepContext(childSessionID: string, tokens: number, nowMs: n
  * that is not registered is ignored. Only a registration made after an earlier end can be marked by a later one,
  * because a re-registration starts with `ended: false`.
  */
-export function noteExecutionEnded(childSessionID: string, nowMs: number = Date.now()): void {
+export function noteExecutionEnded(childSessionID: string, nowMs: number = Date.now(), eventId?: string): void {
+  // QA-2.3-R2-1: the host delivers the same event to the plugin instance of every live location (A3), and a lagging
+  // instance can deliver it after the child was registered again; that stale copy must not mark the new registration
+  // as ended. An event id is applied once per process; an event without an id cannot be told apart and is applied.
+  if (typeof eventId === "string" && eventId !== "") {
+    if (seenEnds.has(eventId)) return;
+    seenEnds.add(eventId);
+    while (seenEnds.size > SEEN_END_CAP) {
+      const oldest = seenEnds.values().next();
+      if (oldest.done === true) break;
+      seenEnds.delete(oldest.value);
+    }
+  }
   const slot = dispatchRegistry.get(childSessionID);
   if (slot === undefined) return;
   slot.ended = true;
@@ -818,5 +833,6 @@ export function dispatchCount(): number {
 
 /** Test-only: drop every registration. */
 export function resetDispatchRegistry(): void {
+  seenEnds.clear();
   for (const id of [...dispatchRegistry.keys()]) dropDispatch(id);
 }
