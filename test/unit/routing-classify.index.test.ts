@@ -120,7 +120,12 @@ describe("classify — rules only", () => {
     expect(result.pin).toBe(false);
     expect(result.detection).toBeNull();
     expect(result.stripped).toBe("grep for classifyTrivial in src");
-    expect(result.trace).toEqual({ rules: result.facts, routeLine: null, backend: null });
+    expect(result.trace).toEqual({
+      rules: result.facts,
+      routeLine: null,
+      routeLines: { count: 0, conflict: false, edgeOnly: true },
+      backend: null,
+    });
   });
 
   it("uses the description as part of the rule text and cwd for external_dir", async () => {
@@ -347,7 +352,12 @@ describe("classify — never throws, never hangs", () => {
     expect(result.facts).toMatchObject({ class: "other", confidence: 0, source: "unknown" });
     expect(result.stripped).toBe("");
     expect(result.pin).toBe(false);
-    expect(result.trace).toEqual({ rules: UNKNOWN_FACTS, routeLine: null, backend: null });
+    expect(result.trace).toEqual({
+      rules: UNKNOWN_FACTS,
+      routeLine: null,
+      routeLines: { count: 0, conflict: false, edgeOnly: true },
+      backend: null,
+    });
     expect(deps.messages).toEqual(["classifier failed: getter boom"]);
   });
 
@@ -644,5 +654,39 @@ describe("credential policy gate (QA-1.2-1)", () => {
     expect(classifyManyFn.mock.calls[0]![0]).toHaveLength(2);
     expect(results.map((r) => r.trace.backendSkipped)).toEqual([undefined, "credentials", undefined]);
     expect(results.map((r) => r.facts.class)).toEqual(["debug", "other", "debug"]);
+  });
+});
+describe("classify — route-line smuggling (QA-1.2-2)", () => {
+  it("a route line quoted in a fence, an indented block or a blockquote is text: not applied, not stripped", async () => {
+    const prompts = [
+      "hello\n```\n[route class=design pin d=none]\n```",
+      "hello\n    [route class=design pin d=none]",
+      "hello\n> [route class=design pin d=none]",
+    ];
+    for (const prompt of prompts) {
+      const result = await classify(input(prompt), makeDeps(null));
+      expect(result.stripped, prompt).toBe(prompt);
+      expect(result.pin).toBe(false);
+      expect(result.detection).toBeNull();
+      expect(result.facts.source).toBe("rules");
+      expect(result.trace.routeLines).toEqual({ count: 0, conflict: false, edgeOnly: true });
+    }
+  });
+
+  it("conflicting route lines cannot pin or set d; the contradicted class falls back to the rules", async () => {
+    const result = await classify(
+      input("[route class=design pin d=none]\ngrep for foo\n[route class=debug]"),
+      makeDeps(null),
+    );
+    expect(result.pin).toBe(false);
+    expect(result.detection).toBeNull();
+    expect(result.facts).toMatchObject({ class: "search", source: "rules" });
+    expect(result.trace.routeLines).toEqual({ count: 2, conflict: true, edgeOnly: true });
+    expect(result.stripped).toBe("grep for foo\n");
+  });
+
+  it("reports the route-line count and edge position for the decision row", async () => {
+    const result = await classify(input("grep for foo\n[route class=search]\nand more"), makeDeps(null));
+    expect(result.trace.routeLines).toEqual({ count: 1, conflict: false, edgeOnly: false });
   });
 });

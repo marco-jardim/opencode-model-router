@@ -283,12 +283,20 @@ export interface RouteLine {
 }
 
 export interface RouteLineParse {
-  /** The FIRST route line, or null when the text has none. */
+  /**
+   * The effective route line, or null when the text has none. With several
+   * differing lines (`conflict`) it is the FIRST line minus every field another
+   * line contradicts, and without `d` and `pin`.
+   */
   readonly line: RouteLine | null;
-  /** How many route lines were found (all of them are stripped). */
+  /** How many route lines were recognised (all of them are stripped). */
   readonly count: number;
-  /** Input with every route line (and its line terminator) removed; otherwise byte-identical. */
+  /** Input with every recognised route line (and its line terminator) removed; otherwise byte-identical. */
   readonly stripped: string;
+  /** Two or more recognised route lines that differ in any field (QA-1.2-2). */
+  readonly conflict: boolean;
+  /** Every recognised route line is the first or the last non-empty line of the text (trusted positions). */
+  readonly edgeOnly: boolean;
 }
 
 /** Structural facts from the classifyTrivial shape gates (rules.ts `shapeOf`). */
@@ -324,6 +332,8 @@ export interface RulesAnalysis {
 export interface ClassifyTrace {
   readonly rules: TaskFacts;
   readonly routeLine: RouteLine | null;
+  /** Route lines seen in the prompt, for the decision row (QA-1.2-2). */
+  readonly routeLines: { readonly count: number; readonly conflict: boolean; readonly edgeOnly: boolean };
   /** The backend was not consulted although the rules were unsure: the task names a credential (QA-1.2-1). */
   readonly backendSkipped?: "credentials";
   readonly backend: {
@@ -1079,6 +1089,13 @@ export const CODE_BLOCK_PLACEHOLDER = "[code block omitted]";
 // ---------------------------------------------------------------------------
 // Route line (D13)
 // ---------------------------------------------------------------------------
+
+/**
+ * A line longer than this is never a route line (also bounds the regex below).
+ * Lines inside fenced blocks, indented 4+ columns or starting with `>` are not
+ * recognised either (route-line.ts, QA-1.2-2).
+ */
+export const ROUTE_LINE_MAX_CHARS = 500;
 
 /** Tested against ONE line (no terminator). Group 1 = the field list. */
 export const ROUTE_LINE_RE = /^[ \t]*\[route(?:[ \t]+([^\]\r\n]*?))?[ \t]*\][ \t]*$/i;

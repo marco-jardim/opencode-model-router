@@ -157,7 +157,12 @@ function unknownResult(stripped: string): ClassifyResult {
     pin: false,
     detection: null,
     stripped,
-    trace: { rules: UNKNOWN_FACTS, routeLine: null, backend: null },
+    trace: {
+      rules: UNKNOWN_FACTS,
+      routeLine: null,
+      routeLines: { count: 0, conflict: false, edgeOnly: true },
+      backend: null,
+    },
   };
 }
 
@@ -222,6 +227,11 @@ function resultOf(
     trace: {
       rules: prepared.rules,
       routeLine: prepared.parsed.line,
+      routeLines: {
+        count: prepared.parsed.count,
+        conflict: prepared.parsed.conflict,
+        edgeOnly: prepared.parsed.edgeOnly,
+      },
       ...(skipped ? { backendSkipped: skipped } : {}),
       backend:
         backend === null || outcome === null

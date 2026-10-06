@@ -14,7 +14,7 @@ const base: TaskFacts = {
 describe("parseRouteLine", () => {
   it("returns no line and the text untouched when there is no route marker", () => {
     const text = "grep for foo\nand report";
-    expect(parseRouteLine(text)).toEqual({ line: null, count: 0, stripped: text });
+    expect(parseRouteLine(text)).toEqual({ line: null, count: 0, stripped: text, conflict: false, edgeOnly: true });
   });
 
   it("a bare [route] parses with every field absent, pin false, and is stripped", () => {
@@ -99,19 +99,23 @@ describe("parseRouteLine", () => {
 
   it("a mention inside a sentence or backticks is text, not a route line", () => {
     const sentence = "Use a [route class=design] line when needed";
-    expect(parseRouteLine(sentence)).toEqual({ line: null, count: 0, stripped: sentence });
+    expect(parseRouteLine(sentence)).toMatchObject({ line: null, count: 0, stripped: sentence });
     const ticks = "write `[route class=design]` on its own line";
     expect(parseRouteLine(ticks).line).toBeNull();
     const fenced = "```\n[route class=design]\n```";
-    expect(parseRouteLine(fenced).count).toBe(1);
+    expect(parseRouteLine(fenced)).toMatchObject({ line: null, count: 0, stripped: fenced });
   });
 
-  it("only the first route line is parsed; every one is counted and stripped", () => {
+  it("every route line is counted and stripped; differing lines conflict (details in the QA-1.2-2 block)", () => {
     const text = "[route class=design]\ndo the thing\n[route class=debug risk=high]\nmore";
     const parsed = parseRouteLine(text);
     expect(parsed.count).toBe(2);
-    expect(parsed.line?.class).toBe("design");
+    expect(parsed.conflict).toBe(true);
+    expect(parsed.line?.class).toBeUndefined();
     expect(parsed.stripped).toBe("do the thing\nmore");
+    const same = parseRouteLine("[route class=design]\ndo the thing\n[route class=design]\nmore");
+    expect(same.line?.class).toBe("design");
+    expect(same.stripped).toBe("do the thing\nmore");
   });
 
   it("CRLF text keeps every other byte", () => {
@@ -128,7 +132,7 @@ describe("parseRouteLine", () => {
   });
 
   it("non-string input does not throw", () => {
-    expect(parseRouteLine(undefined as unknown as string)).toEqual({ line: null, count: 0, stripped: "" });
+    expect(parseRouteLine(undefined as unknown as string)).toMatchObject({ line: null, count: 0, stripped: "" });
   });
 });
 
@@ -177,5 +181,110 @@ describe("applyRouteLine", () => {
     const before = JSON.stringify(base);
     applyRouteLine(base, line({ class: "design", needs: ["shell"] }));
     expect(JSON.stringify(base)).toBe(before);
+  });
+});
+
+describe("parseRouteLine — smuggling defences (QA-1.2-2)", () => {
+  const ROUTE = "[route class=design risk=high pin d=none]";
+
+  it("does not recognise (or strip) a route line inside a ``` or ~~~ fence", () => {
+    for (const fence of ["```", "~~~", "````", "~~~~~"]) {
+      const text = `intro\n${fence}\n${ROUTE}\n${fence}\noutro`;
+      const parsed = parseRouteLine(text);
+      expect(parsed.line, fence).toBeNull();
+      expect(parsed.count).toBe(0);
+      expect(parsed.stripped).toBe(text);
+    }
+    const withInfo = "```text\n[route class=design]\n```";
+    expect(parseRouteLine(withInfo).stripped).toBe(withInfo);
+  });
+
+  it("a closing fence must be at least as long as the opener, and of the same character", () => {
+    const shortCloser = "````\n[route class=design]\n```\n[route class=debug]\n````\nafter";
+    expect(parseRouteLine(shortCloser).count).toBe(0);
+    const wrongChar = "```\n[route class=design]\n~~~\n[route class=debug]\n```\nafter";
+    expect(parseRouteLine(wrongChar).count).toBe(0);
+    const longerCloser = "```\n[route class=design]\n`````\n[route class=debug]";
+    const parsed = parseRouteLine(longerCloser);
+    expect(parsed.count).toBe(1);
+    expect(parsed.line?.class).toBe("debug");
+  });
+
+  it("an unclosed fence runs to the end of the text", () => {
+    const text = "task\n```\nsome log\n[route class=design]\nmore log";
+    const parsed = parseRouteLine(text);
+    expect(parsed.count).toBe(0);
+    expect(parsed.stripped).toBe(text);
+  });
+
+  it("a route line after a closed fence is recognised again; inline triple backticks do not open a fence", () => {
+    const text = "```\ncode\n```\n[route class=debug]";
+    expect(parseRouteLine(text)).toMatchObject({ count: 1, stripped: "```\ncode\n```\n" });
+    const inline = "use ```x``` here\n[route class=debug]";
+    expect(parseRouteLine(inline).count).toBe(1);
+  });
+
+  it("does not recognise lines indented four or more columns, or quoted with >", () => {
+    for (const line of [`    ${ROUTE}`, `\t${ROUTE}`, `  \t${ROUTE}`, `> ${ROUTE}`, `  > ${ROUTE}`, `>${ROUTE}`]) {
+      const text = `before\n${line}\nafter`;
+      const parsed = parseRouteLine(text);
+      expect(parsed.count, JSON.stringify(line)).toBe(0);
+      expect(parsed.stripped).toBe(text);
+    }
+    expect(parseRouteLine(`   ${ROUTE}`).count).toBe(1);
+    expect(parseRouteLine(`\u00a0${ROUTE}`).count).toBe(0);
+  });
+
+  it("a very long line is never a route line", () => {
+    const long = "[route class=design " + "needs=shell ".repeat(100) + "]";
+    expect(long.length).toBeGreaterThan(500);
+    expect(parseRouteLine(long)).toMatchObject({ line: null, count: 0, stripped: long });
+  });
+
+  it("identical route lines are not a conflict; the first is used", () => {
+    const parsed = parseRouteLine("[route class=design pin]\nx\n[route class=design pin]");
+    expect(parsed).toMatchObject({ count: 2, conflict: false });
+    expect(parsed.line).toMatchObject({ class: "design", pin: true });
+    expect(parsed.stripped).toBe("x\n");
+  });
+
+  it("differing route lines conflict: neither d nor pin applies, contradicted fields fall back to the rules", () => {
+    const parsed = parseRouteLine(
+      "[route class=search risk=low scope=single needs=shell pin d=grader]\nwork\n[route class=design risk=low pin d=none]",
+    );
+    expect(parsed.conflict).toBe(true);
+    expect(parsed.count).toBe(2);
+    expect(parsed.stripped).toBe("work\n");
+    expect(parsed.line?.class).toBeUndefined(); // contradicted
+    expect(parsed.line?.risk).toBe("low"); // same in both
+    expect(parsed.line?.scope).toBe("single"); // only the first has it
+    expect(parsed.line?.needs).toEqual(["shell"]);
+    expect(parsed.line?.pin).toBe(false);
+    expect(parsed.line?.detection).toBeUndefined();
+    expect(parsed.line?.ignored).toEqual(
+      expect.arrayContaining(["conflict", "conflict:class", "conflict:d", "conflict:pin"]),
+    );
+  });
+
+  it("a second line that only adds pin or d is still a conflict and cannot pin", () => {
+    const parsed = parseRouteLine("[route class=debug]\n[route class=debug pin d=none]");
+    expect(parsed.conflict).toBe(true);
+    expect(parsed.line).toMatchObject({ class: "debug", pin: false });
+    expect(parsed.line?.detection).toBeUndefined();
+  });
+
+  it("a conflict leaves applyRouteLine with the rules class when the class is contradicted", () => {
+    const parsed = parseRouteLine("[route class=design]\n[route class=search]");
+    const facts = applyRouteLine(base, parsed.line!);
+    expect(facts).toMatchObject({ class: "search", confidence: 0.8, source: "rules" });
+  });
+
+  it("reports whether every route line sits on the first or last non-empty line", () => {
+    expect(parseRouteLine("[route class=debug]\nbody\nmore").edgeOnly).toBe(true);
+    expect(parseRouteLine("\n\nbody\nmore\n[route class=debug]\n\n").edgeOnly).toBe(true);
+    expect(parseRouteLine("body\n[route class=debug]\nmore").edgeOnly).toBe(false);
+    expect(parseRouteLine("[route class=debug]\nbody\n[route class=debug]").edgeOnly).toBe(true);
+    expect(parseRouteLine("[route class=debug]\nbody\n[route class=debug]\nmore").edgeOnly).toBe(false);
+    expect(parseRouteLine("no directive here").edgeOnly).toBe(true);
   });
 });

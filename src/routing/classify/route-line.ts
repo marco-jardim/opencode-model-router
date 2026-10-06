@@ -7,12 +7,14 @@
  * inside a sentence is text) and every route line is stripped from the prompt.
  */
 
+import { fenceMask } from "./fences";
 import {
   CLASS_IMPLIED_NEEDS,
   CONFIDENCE,
   DETECTIONS,
   NEEDS,
   RISKS,
+  ROUTE_LINE_MAX_CHARS,
   ROUTE_LINE_RE,
   SCOPES,
   TASK_CLASSES,
@@ -128,34 +130,121 @@ function parseFields(body: string): RouteLine {
   };
 }
 
+/** Leading whitespace of 4+ columns (tabs count 4): an indented code block, not a directive. */
+const INDENTED_CODE_RE = /^(?: {0,3}\t| {4})/;
+const QUOTED_RE = /^\s*>/;
+
 /**
- * L1 + L2: find every route line, parse the first, strip all of them. Route
+ * Only a plain, unquoted, unindented, outside-any-fence, short line can be a
+ * route line: anything else is text quoted or pasted into the prompt (a file,
+ * a log, an issue) and must neither steer routing nor be stripped.
+ */
+function isRecognisable(line: string, inFence: boolean): boolean {
+  return (
+    !inFence &&
+    line.length <= ROUTE_LINE_MAX_CHARS &&
+    !INDENTED_CODE_RE.test(line) &&
+    !QUOTED_RE.test(line) &&
+    ROUTE_LINE_RE.test(line)
+  );
+}
+
+function canonical(line: RouteLine): string {
+  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin]);
+}
+
+/**
+ * Several route lines: when they differ in any field the parse is a conflict.
+ * The effective line keeps the FIRST line's class/risk/scope/needs only where no
+ * other line carries a different value for the same field, and never `d` or
+ * `pin` (those would let a smuggled second line pin a model or skip checks).
+ */
+function resolveConflict(lines: readonly RouteLine[]): RouteLine {
+  const first = lines[0]!;
+  const ignored = [...first.ignored, "conflict"];
+  const contradicted = (pick: (l: RouteLine) => unknown): boolean => {
+    const mine = JSON.stringify(pick(first));
+    return lines.some((other) => {
+      const theirs = pick(other);
+      return theirs !== undefined && JSON.stringify(theirs) !== mine;
+    });
+  };
+  const keep = <T>(field: string, value: T | undefined, pick: (l: RouteLine) => unknown): T | undefined => {
+    if (value === undefined) return undefined;
+    if (contradicted(pick)) {
+      ignored.push(`conflict:${field}`);
+      return undefined;
+    }
+    return value;
+  };
+  const taskClass = keep("class", first.class, (l) => l.class);
+  const risk = keep("risk", first.risk, (l) => l.risk);
+  const scope = keep("scope", first.scope, (l) => l.scope);
+  const needs = keep("needs", first.needs, (l) => l.needs);
+  if (lines.some((l) => l.detection !== undefined)) ignored.push("conflict:d");
+  if (lines.some((l) => l.pin)) ignored.push("conflict:pin");
+  return {
+    ...(taskClass ? { class: taskClass } : {}),
+    ...(risk ? { risk } : {}),
+    ...(scope ? { scope } : {}),
+    ...(needs ? { needs } : {}),
+    pin: false,
+    ignored,
+  };
+}
+
+/**
+ * L1 + L2: find every recognisable route line, parse them, strip them. Route
  * lines are whole lines; the terminator that follows a dropped line goes with
- * it, everything else is kept byte for byte.
+ * it, everything else is kept byte for byte (including route-looking lines in
+ * fences, indented code and quotes).
  */
 export function parseRouteLine(text: string): RouteLineParse {
-  if (typeof text !== "string" || !ROUTE_MENTION_RE.test(text)) {
-    return { line: null, count: 0, stripped: typeof text === "string" ? text : "" };
+  if (typeof text !== "string") {
+    return { line: null, count: 0, stripped: "", conflict: false, edgeOnly: true };
+  }
+  if (!ROUTE_MENTION_RE.test(text)) {
+    return { line: null, count: 0, stripped: text, conflict: false, edgeOnly: true };
   }
   const parts = text.split(LINE_SPLIT_RE);
+  const lines: string[] = [];
+  for (let i = 0; i < parts.length; i += 2) lines.push(parts[i]!);
+  const fenced = fenceMask(lines);
+
+  let firstNonEmpty = -1;
+  let lastNonEmpty = -1;
+  lines.forEach((line, i) => {
+    if (line.trim() === "") return;
+    if (firstNonEmpty === -1) firstNonEmpty = i;
+    lastNonEmpty = i;
+  });
+
   const kept: string[] = [];
-  let line: RouteLine | null = null;
-  let count = 0;
-  for (let i = 0; i < parts.length; i += 2) {
-    const part = parts[i]!;
-    const terminator = parts[i + 1];
-    const m = ROUTE_LINE_RE.exec(part);
-    if (m === null) {
-      kept.push(part);
+  const parsed: RouteLine[] = [];
+  let edgeOnly = true;
+  for (let i = 0; i < lines.length; i++) {
+    const terminator = parts[2 * i + 1];
+    const line = lines[i]!;
+    if (!isRecognisable(line, fenced[i]!)) {
+      kept.push(line);
       if (terminator !== undefined) kept.push(terminator);
       continue;
     }
-    count++;
-    if (line === null) line = parseFields(m[1] ?? "");
+    if (i !== firstNonEmpty && i !== lastNonEmpty) edgeOnly = false;
+    parsed.push(parseFields(ROUTE_LINE_RE.exec(line)?.[1] ?? ""));
   }
-  return { line, count, stripped: kept.join("") };
+  if (parsed.length === 0) {
+    return { line: null, count: 0, stripped: kept.join(""), conflict: false, edgeOnly: true };
+  }
+  const conflict = new Set(parsed.map(canonical)).size > 1;
+  return {
+    line: conflict ? resolveConflict(parsed) : parsed[0]!,
+    count: parsed.length,
+    stripped: kept.join(""),
+    conflict,
+    edgeOnly,
+  };
 }
-
 const RISK_ORDER: readonly Risk[] = RISKS;
 
 function maxRisk(a: Risk, b: Risk): Risk {
