@@ -16,7 +16,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { makeKey } from "../../src/routing/outcomes";
 import {
-  MODELS, RoutingHost, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
+  MODELS, RoutingHost, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Seed,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -219,7 +219,121 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
-  }, 300_000);});
+  }, 300_000);
+  it("4 ladder: a failing verification resumes the SAME child with the next variant and passes; one producer session, tokens grow", async () => {
+    const host = await RoutingHost.start("ladder", {
+      routing: { engine: "advise" },
+      overrides: {
+        experimental: { verifiedDelegateTool: true },
+        enforcement: {
+          mode: "advisory",
+          verify: { require: "always", defaultVerify: "required", minGraderTier: "heavy", preferDeterministic: false, background: false },
+          escalate: { maxAttemptsPerTier: 2, maxTotalAttempts: 4, costCeiling: { multiple: 100 } },
+        },
+      },
+    });
+    try {
+      host.provider.graderDelayMs = 1_500;
+      const acceptance = "[acceptance]\ncriteria: the reply says CHILD_DONE\n[/acceptance]";
+      /** One delegation whose first verification fails and the second passes; the host's sessions are sampled while it runs. */
+      const delegation = async (label: string, filler: number) => {
+        host.provider.graderVerdicts.push(false);
+        const rootID = await host.newRoot(`ladder root ${label}`);
+        const mark = host.provider.requests.length;
+        const hookMark = (await host.hooks()).length;
+        const watcher = host.watchSessions();
+        const delegated = await host.call(rootID, "delegate", { tier: "fast", task: `[route class=search risk=low scope=single]\nVERIFY:required\nCHILD_DONE ${"x".repeat(filler)}`, acceptance }, 180_000);
+        const timeline = await watcher.stop();
+        const sessions = [...timeline.values()].filter(t => t.id !== rootID && t.parentID === rootID);
+        const producer = sessions.find(t => t.snapshots.some(x => x.agent === "fast"));
+        const graders = sessions.filter(t => t !== producer);
+        const requests = host.provider.requests.slice(mark);
+        const producerRequests = requests.filter(r => r.session === producer?.id && r.kind === "primary");
+        const events = (await host.events()).filter(e => e.__t !== undefined && ((obj(e.data).sessionID === producer?.id) || (e.type === "session.created" && obj(e.data).parentID === rootID)));
+        return { label, rootID, delegated, timeline, sessions, producer, graders, requests, producerRequests, events, hooks: (await host.hooks()).slice(hookMark) };
+      };
+      await runScenario("4-ladder", "delegate with a scripted verification that fails once then passes: the runner resumes the SAME child session (the host created ONE producer child, a second decision row has resume=true and the same childSessionID) with the next variant of the same model; the host's stored variant for that child moves low -> medium, its token totals and the context the provider receives grow, and the orchestrator gets the verified result.", async s => {
+        const short = await delegation("short", 0);
+        const producerID = short.producer?.id ?? "";
+        const created = short.events.filter(e => e.type === "session.created" && obj(e.data).parentID === short.rootID).map(e => ({ sessionID: obj(e.data).sessionID, agent: obj(e.data).agent, title: obj(e.data).title }));
+        const snapshots = short.producer?.snapshots ?? [];
+        const variants = snapshots.map(x => x.model).filter((m, i, all) => m !== undefined && m !== all[i - 1]);
+        const rows = await host.waitForRows("both attempt rows", r => r.filter(x => x.childSessionID === producerID).length >= 2, 70_000);
+        const logRows = await host.waitForLogRows("both verdict rows", r => r.filter(x => x.kind === "verdict").length >= 2).catch(() => host.logRows());
+        s.observed.storeAfterWait = { files: await host.storeListing(), entries: await host.outcomeEntries() };
+        const [first, second] = short.producerRequests;
+        s.observed.shortRun = {
+          rootID: short.rootID, delegateResult: obj(short.delegated.after.result).content,
+          sessionsCreatedUnderRoot: created,
+          producerTimeline: snapshots, graderTimelines: short.graders.map(g => ({ id: g.id, snapshots: g.snapshots })),
+          producerEvents: short.events.filter(e => obj(e.data).sessionID === producerID).map(e => ({ type: e.type, id: e.id, at: e.__t })),
+          producerRequests: short.producerRequests.map(r => ({ catalogModel: r.catalogModel, effort: effectiveEffort(r), messages: r.messages.length, inputTokens: r.inputTokens, lastText: r.lastText.slice(0, 400) })),
+          graderRequests: short.requests.filter(r => r.reply === "grader").map(r => ({ session: r.session, agent: r.agent, catalogModel: r.catalogModel })),
+          providerErrors: host.provider.errors,
+        };
+        s.observed.rows = rows.map(r => ({ decisionID: r.decisionID, step: r.step, resume: r.resume, childSessionID: r.childSessionID, chosen: r.chosen.key, switched: r.switched, mode: r.mode, reason: r.reason.slice(0, 220) }));
+        s.observed.logRowKinds = logRows.map(r => ({ kind: r.kind, step: r.step, verdict: r.kind === "verdict" ? r.verdict : undefined, key: r.kind === "verdict" ? r.key : undefined }));
+        s.observed.allHooksDuringDelegation = short.hooks.map(h => ({ hook: h.hook, tool: h.tool, sessionID: h.sessionID === short.rootID ? "<root>" : h.sessionID, agent: h.agent, callID: h.callID }));
+        s.observed.routerLogLines = host.routerLogLines();
+        const text = JSON.stringify(obj(short.delegated.after.result).content);
+        const ok = producerID !== "" && created.filter(c => c.agent === "fast").length === 1
+          && variants.length >= 2 && variants[0] === `${MODELS.sonnet}#low` && variants.at(-1) !== variants[0] && variants.every(v => v?.startsWith(`${MODELS.sonnet}#`))
+          && snapshots.at(-1)!.input > snapshots[0]!.input && short.producerRequests.length === 2
+          && second!.messages.length > first!.messages.length && second!.inputTokens > first!.inputTokens
+          && rows.filter(r => r.childSessionID === producerID).length === 2 && rows[0]!.step === "dispatch" && rows[0]!.resume === false && rows[1]!.resume === true && rows[1]!.step === "variant"
+          && logRows.filter(r => r.kind === "verdict").map(r => r.kind === "verdict" ? r.verdict : "").join() === "fail,pass" && text.includes("verified")
+          && host.routerLogLines().length === 0;
+        s.verdict(ok, `producer sessions=${created.filter(c => c.agent === "fast").length}; stored model timeline ${variants.join(" -> ")}; session input tokens ${snapshots.map(x => x.input).join(" -> ")}; provider messages ${first?.messages.length}->${second?.messages.length}, est. input ${first?.inputTokens}->${second?.inputTokens}; rows ${rows.map(r => `${r.step}${r.resume ? "(resume)" : ""}`).join(", ")}; verdicts ${logRows.filter(r => r.kind === "verdict").map(r => r.kind === "verdict" ? r.verdict : "").join(",")}`);
+      });
+
+      // ---- handoff (QA-2.3-R2-7): the growth of a resumed attempt against the length of its task, same host ----
+      let handoff: { short: Awaited<ReturnType<typeof delegation>>; long: Awaited<ReturnType<typeof delegation>> } | undefined;
+      await runScenario("H3-resume-growth-vs-task-length", "The context a resumed attempt sends grows by about the forcing message plus the task prompt again (chars/4): with a 4 000-character task the second request is ~1 000 tokens larger than with an empty task, both against the first request. Token numbers are the scripted provider's own estimate (request body length / 4), not a real tokenizer; whether a real producer repeats its earlier work is NOT observable with a scripted model.", async s => {
+        const short = await delegation("short-2", 0);
+        const long = await delegation("long", 4_000);
+        handoff = { short, long };
+        const delta = (d: { producerRequests: { inputTokens: number }[] }) => d.producerRequests.length === 2 ? d.producerRequests[1]!.inputTokens - d.producerRequests[0]!.inputTokens : Number.NaN;
+        const rows = await host.waitForRows("the attempt rows of the long run", r => r.filter(x => x.childSessionID === long.producer?.id).length >= 2, 70_000);
+        const d11 = (id: string | undefined) => rows.filter(r => r.childSessionID === id).map(r => /tokens=(\d+) budget=(\d+) threshold=(\d+)/.exec(r.reason)?.slice(1).map(Number));
+        s.observed.short = { requests: short.producerRequests.map(r => ({ inputTokens: r.inputTokens, messages: r.messages.length, lastTextChars: r.lastText.length })), delta: delta(short), d11: d11(short.producer?.id), sessionInputTotals: short.producer?.snapshots.map(x => x.input) };
+        s.observed.long = { requests: long.producerRequests.map(r => ({ inputTokens: r.inputTokens, messages: r.messages.length, lastTextChars: r.lastText.length })), delta: delta(long), d11: d11(long.producer?.id), sessionInputTotals: long.producer?.snapshots.map(x => x.input) };
+        s.observed.expectedExtraFromTask = 4_000 / 4;
+        s.observed.measuredExtra = delta(long) - delta(short);
+        s.observed.starterOver = "unverifiable with a scripted model: the producer's replies are fixed, so whether a real model repeats its earlier work and tool calls cannot be observed here";
+        const extra = delta(long) - delta(short);
+        const predicted = d11(long.producer?.id)[1]?.[0];
+        s.observed.routerEstimateOfNextContext = predicted;
+        s.observed.wireSecondRequest = long.producerRequests[1]?.inputTokens;
+        const ok = Number.isFinite(extra) && extra > 800 && extra < 1_300 && predicted !== undefined && long.producerRequests[1] !== undefined && predicted <= long.producerRequests[1].inputTokens;
+        s.verdict(ok, `second-request growth short=${delta(short)} long=${delta(long)} (+${extra} for a 4 000-char task, expected about ${4_000 / 4}); router's D11 estimate of the next context ${String(predicted)} vs ${long.producerRequests[1]?.inputTokens} on the wire`);
+      });
+
+      // ---- handoff (2.2 / 2.3): hooks for the runner's native.execute, and execution events before the resume ----
+      await runScenario("H4-runner-hooks-and-execution-events", "(a) the plugin's execute.before/after hooks do NOT fire for the subagent calls the delegate runner makes through ctx.tool.list() (only the model-emitted delegate call is hooked); (b) session.execution.succeeded of the producer child, with an event id, reaches the plugin before the runner's second dispatch (the resume), and the runner's calls leave no decision row of the dispatch router (only the attempt recorder's two rows).", async s => {
+        const { long } = handoff!;
+        const producerID = long.producer?.id ?? "";
+        const producerEvents = long.events.filter(e => obj(e.data).sessionID === producerID);
+        const succeeded = producerEvents.filter(e => e.type === "session.execution.succeeded");
+        const selected = producerEvents.find(e => e.type === "session.model.selected");
+        const subagentHooks = long.hooks.filter(h => h.tool === "subagent");
+        const toolsHooked = [...new Set(long.hooks.map(h => `${h.hook}:${h.tool}`))];
+        const rows = (await host.decisionRows()).filter(r => r.childSessionID === producerID);
+        s.observed.toolsHookedDuringDelegation = toolsHooked;
+        s.observed.subagentHookCount = subagentHooks.length;
+        s.observed.executionSucceeded = succeeded.map(e => ({ id: e.id, deliveredAt: e.__t }));
+        s.observed.secondAttemptStartedAt = selected?.__t;
+        s.observed.rowsForProducer = rows.map(r => ({ step: r.step, resume: r.resume, mode: r.mode }));
+        s.observed.modelEmittedToolCalls = long.requests.filter(r => r.session === long.rootID).map(r => ({ lastText: r.lastText.slice(0, 60), toolResult: r.toolResult }));
+        const ok = subagentHooks.length === 0 && toolsHooked.every(h => h.endsWith(":delegate")) && succeeded.length === 2 && succeeded.every(e => typeof e.id === "string")
+          && selected !== undefined && succeeded[0]!.__t! <= selected.__t! && rows.length === 2;
+        s.verdict(ok, `hooked tools during the delegation: ${toolsHooked.join(", ")} (subagent hooks: ${subagentHooks.length}); execution.succeeded ids ${succeeded.map(e => e.id).join(",")} delivered ${succeeded.map(e => e.__t).join(",")} before the resume's model.selected ${String(selected?.__t)}; producer rows ${rows.length}`);
+      });
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 400_000);
+});
 
 void str;
 void MODELS;

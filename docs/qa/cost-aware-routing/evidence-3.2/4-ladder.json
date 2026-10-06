@@ -1,0 +1,393 @@
+{
+  "scenario": "4-ladder",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "b0e8bcf6-29cd-439c-ad8e-858b819796c1",
+  "recordedAt": "2026-10-06T21:24:48.222Z",
+  "harness": {
+    "headSha": "af41c84ba16f2f87e01a85e2d88804c7b78d0ef6",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "276736fbeedb4c2172692b3682a9b9bac7cb8e9c",
+      "test/smoke/helpers/routing-host.ts": "2551155dae4037db9f896811b6648acd168f565b"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "delegate with a scripted verification that fails once then passes: the runner resumes the SAME child session (the host created ONE producer child, a second decision row has resume=true and the same childSessionID) with the next variant of the same model; the host's stored variant for that child moves low -> medium, its token totals and the context the provider receives grow, and the orchestrator gets the verified result.",
+  "observed": {
+    "storeAfterWait": {
+      "files": [
+        {
+          "name": "advisor-notice.8b15893b07c1.json",
+          "size": 214
+        },
+        {
+          "name": "decisions.jsonl",
+          "size": 2039
+        },
+        {
+          "name": "outcomes.json",
+          "size": 1665
+        }
+      ],
+      "entries": {
+        "search|router:fast|anthropic/claude-sonnet-5-5#low": {
+          "beta": {
+            "alpha": 0,
+            "beta": 1,
+            "updatedAt": 1791321859581
+          },
+          "counts": {
+            "pass": 0,
+            "fail": 1,
+            "falseRefusals": 0,
+            "variantPass": 0,
+            "variantFail": 0
+          },
+          "cost": {
+            "measuredUSD": {
+              "mean": 0.014768,
+              "n": 1
+            },
+            "unpricedAttempts": 0,
+            "tokens": {
+              "n": 1,
+              "input": 7359,
+              "output": 5,
+              "reasoning": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "steps": {
+              "mean": 1,
+              "n": 1
+            },
+            "finalMessageTokens": {
+              "mean": 5,
+              "n": 1
+            }
+          }
+        },
+        "search|router:fast|anthropic/claude-sonnet-5-5#medium": {
+          "beta": {
+            "alpha": 1,
+            "beta": 0,
+            "updatedAt": 1791321861366
+          },
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "falseRefusals": 0,
+            "variantPass": 1,
+            "variantFail": 0
+          },
+          "cost": {
+            "measuredUSD": {
+              "mean": 0.01497,
+              "n": 1
+            },
+            "unpricedAttempts": 0,
+            "tokens": {
+              "n": 1,
+              "input": 7460,
+              "output": 5,
+              "reasoning": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "steps": {
+              "mean": 1,
+              "n": 1
+            },
+            "finalMessageTokens": {
+              "mean": 5,
+              "n": 1
+            }
+          }
+        }
+      }
+    },
+    "shortRun": {
+      "rootID": "ses_eece5a23afferP2G9E0FfaNca1",
+      "delegateResult": [
+        {
+          "type": "text",
+          "text": "CHILD_DONE\n\n[router ✓ verified: checker]"
+        }
+      ],
+      "sessionsCreatedUnderRoot": [
+        {
+          "sessionID": "ses_eece5a10cffexuF1jdjMKbI7Qd",
+          "agent": "fast",
+          "title": "Router fast delegation"
+        },
+        {
+          "sessionID": "ses_eece5a03fffel1TN1fOKvjnPvO",
+          "agent": "model-router-grader",
+          "title": "Router result verification"
+        },
+        {
+          "sessionID": "ses_eece59961ffe3mippw8D6MvTah",
+          "agent": "model-router-grader",
+          "title": "Router result verification"
+        }
+      ],
+      "producerTimeline": [
+        {
+          "at": 1791321857837,
+          "agent": "fast",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "input": 0,
+          "output": 0,
+          "cost": 0
+        },
+        {
+          "at": 1791321857985,
+          "agent": "fast",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "input": 7359,
+          "output": 5,
+          "cost": 0.014768
+        },
+        {
+          "at": 1791321859695,
+          "agent": "fast",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "input": 14819,
+          "output": 10,
+          "cost": 0.029738
+        }
+      ],
+      "graderTimelines": [
+        {
+          "id": "ses_eece5a03fffel1TN1fOKvjnPvO",
+          "snapshots": [
+            {
+              "at": 1791321858127,
+              "agent": "model-router-grader",
+              "model": "anthropic/claude-opus-5-5#default",
+              "input": 0,
+              "output": 0,
+              "cost": 0
+            }
+          ]
+        },
+        {
+          "id": "ses_eece59961ffe3mippw8D6MvTah",
+          "snapshots": [
+            {
+              "at": 1791321859829,
+              "agent": "model-router-grader",
+              "model": "anthropic/claude-opus-5-5#default",
+              "input": 0,
+              "output": 0,
+              "cost": 0
+            }
+          ]
+        }
+      ],
+      "producerEvents": [
+        {
+          "type": "session.created",
+          "id": "evt_1131a5efa001kCvyLc6EPN7HO0",
+          "at": 1791321857800
+        },
+        {
+          "type": "session.inbox.enqueued",
+          "id": "evt_1131a5f3f001AY9ato9QiVx4CT",
+          "at": 1791321857858
+        },
+        {
+          "type": "session.execution.started",
+          "id": "evt_1131a5f4300157JDZC2ss8b8IS",
+          "at": 1791321857893
+        },
+        {
+          "type": "session.instructions.updated",
+          "id": "evt_1131a5f4c001tgWZtmD3MJwICR",
+          "at": 1791321857897
+        },
+        {
+          "type": "session.inbox.delivered",
+          "id": "evt_1131a5f4e001cT7mZ8BhXnyH7r",
+          "at": 1791321857898
+        },
+        {
+          "type": "session.step.started",
+          "id": "evt_1131a5f6e001xPegLcZcYgjqu2",
+          "at": 1791321857912
+        },
+        {
+          "type": "session.text.started",
+          "id": "evt_1131a5f71001ttIHfdlh5QJTuk",
+          "at": 1791321857913
+        },
+        {
+          "type": "session.text.ended",
+          "id": "evt_1131a5f75001BuPxgoeE30iSZt",
+          "at": 1791321857913
+        },
+        {
+          "type": "session.step.ended",
+          "id": "evt_1131a5f7d001nsrRs6nvYFUzQL",
+          "at": 1791321857933
+        },
+        {
+          "type": "session.usage.updated",
+          "id": "evt_1131a5f80001NZeqE83N9okiFR",
+          "at": 1791321857938
+        },
+        {
+          "type": "session.execution.succeeded",
+          "id": "evt_1131a5f82001TuibIKKd51bYvv",
+          "at": 1791321857939
+        },
+        {
+          "type": "session.model.selected",
+          "id": "evt_1131a6605001k8le8tVEV3iCPY",
+          "at": 1791321859595
+        },
+        {
+          "type": "session.inbox.enqueued",
+          "id": "evt_1131a6611001TeSVO5XymTD2XT",
+          "at": 1791321859604
+        },
+        {
+          "type": "session.execution.started",
+          "id": "evt_1131a6614001A59oaGbcrd69Ri",
+          "at": 1791321859638
+        },
+        {
+          "type": "session.inbox.delivered",
+          "id": "evt_1131a661e001zaYhzPCf94gIBH",
+          "at": 1791321859644
+        },
+        {
+          "type": "session.step.started",
+          "id": "evt_1131a66410018wtUpWWYo4wYlD",
+          "at": 1791321859661
+        },
+        {
+          "type": "session.text.started",
+          "id": "evt_1131a6644001JE6zKqmqMb8Lc1",
+          "at": 1791321859661
+        },
+        {
+          "type": "session.text.ended",
+          "id": "evt_1131a6649001fuzVJf0dXS0Log",
+          "at": 1791321859662
+        },
+        {
+          "type": "session.step.ended",
+          "id": "evt_1131a6654001E4TbNrbOJjHran",
+          "at": 1791321859685
+        },
+        {
+          "type": "session.usage.updated",
+          "id": "evt_1131a6658001xyLj00BR5t7ffN",
+          "at": 1791321859686
+        },
+        {
+          "type": "session.execution.succeeded",
+          "id": "evt_1131a6659001nSiZyyhBk4dhSY",
+          "at": 1791321859686
+        },
+        {
+          "type": "session.deleted",
+          "id": "evt_1131a6cf8001ma9iISWc4oicoB",
+          "at": 1791321861370
+        }
+      ],
+      "producerRequests": [
+        {
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "effort": "low",
+          "messages": 1,
+          "inputTokens": 7359,
+          "lastText": "You are a subagent spawned by another session.\n[route class=search risk=low scope=single]\nVERIFY:required\nCHILD_DONE "
+        },
+        {
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "effort": "medium",
+          "messages": 4,
+          "inputTokens": 7460,
+          "lastText": "[router escalation] previous attempt did not pass verification:\n- scripted verification failure\nNEXT: retry with these failures addressed.\n\n[route class=search risk=low scope=single]\nVERIFY:required\nCHILD_DONE "
+        }
+      ],
+      "graderRequests": [
+        {
+          "session": "ses_eece5a03fffel1TN1fOKvjnPvO",
+          "agent": "model-router-grader",
+          "catalogModel": "anthropic/claude-opus-5-5#default"
+        },
+        {
+          "session": "ses_eece59961ffe3mippw8D6MvTah",
+          "agent": "model-router-grader",
+          "catalogModel": "anthropic/claude-opus-5-5#default"
+        }
+      ],
+      "providerErrors": []
+    },
+    "rows": [
+      {
+        "decisionID": "ladder-62bc9736-1",
+        "step": "dispatch",
+        "resume": false,
+        "childSessionID": "ses_eece5a10cffexuF1jdjMKbI7Qd",
+        "chosen": "search|router:fast|anthropic/claude-sonnet-5-5#low",
+        "switched": false,
+        "mode": "advise",
+        "reason": "ladder dispatch on fast; fresh child"
+      },
+      {
+        "decisionID": "ladder-62bc9736-2",
+        "step": "variant",
+        "resume": true,
+        "childSessionID": "ses_eece5a10cffexuF1jdjMKbI7Qd",
+        "chosen": "search|router:fast|anthropic/claude-sonnet-5-5#medium",
+        "switched": false,
+        "mode": "advise",
+        "reason": "ladder variant on fast; resumed child; D11 under-threshold (tokens=7416 budget=872000 threshold=523200); rung costRatio 1"
+      }
+    ],
+    "logRowKinds": [
+      {
+        "kind": "decision",
+        "step": "dispatch"
+      },
+      {
+        "kind": "verdict",
+        "step": "dispatch",
+        "verdict": "fail",
+        "key": "search|router:fast|anthropic/claude-sonnet-5-5#low"
+      },
+      {
+        "kind": "decision",
+        "step": "variant"
+      },
+      {
+        "kind": "verdict",
+        "step": "variant",
+        "verdict": "pass",
+        "key": "search|router:fast|anthropic/claude-sonnet-5-5#medium"
+      }
+    ],
+    "allHooksDuringDelegation": [
+      {
+        "hook": "before",
+        "tool": "delegate",
+        "sessionID": "<root>",
+        "agent": "build",
+        "callID": "toolu_smoke_1"
+      },
+      {
+        "hook": "after",
+        "tool": "delegate",
+        "sessionID": "<root>",
+        "agent": "build",
+        "callID": "toolu_smoke_1"
+      }
+    ],
+    "routerLogLines": []
+  },
+  "assertionResult": "PASS: producer sessions=1; stored model timeline anthropic/claude-sonnet-5-5#low -> anthropic/claude-sonnet-5-5#medium; session input tokens 0 -> 7359 -> 14819; provider messages 1->4, est. input 7359->7460; rows dispatch, variant(resume); verdicts fail,pass",
+  "notes": []
+}

@@ -63,6 +63,7 @@ export interface HostClient {
 }
 export interface HookRecord { __t: number; hook: "before" | "after"; iid: string; instance?: string; sessionID: string; callID: string; agent?: string; tool: string; input?: Obj; status?: string; result?: Obj; error?: Obj }
 export interface EventRecord { __t?: number; id?: string; type: string; created?: number; location?: unknown; data?: Obj; __instance?: string; __iid?: string; [key: string]: unknown }
+export interface SessionTimeline { id: string; parentID?: string; firstSeen: number; snapshots: { at: number; agent?: string; model?: string; input: number; output: number; cost: number }[] }
 export interface Dispatched { before: HookRecord; after: HookRecord; childID: string | undefined; callID: string }
 
 // ------------------------------------------------------------------ helpers ----
@@ -168,6 +169,8 @@ export class RoutingProvider {
   readonly errors: string[] = [];
   readonly graderVerdicts: boolean[] = [];
   graders = 0;
+  /** Held before a grader answers, so a poller can see the producer child between two attempts (the runner removes its children when the delegation ends). */
+  graderDelayMs = 0;
   private sequence = 0;
   private server = createServer((req, res) => { void this.handle(req, res); });
   async start(): Promise<string> { return `http://127.0.0.1:${await listenOnFetchSafePort(this.server)}/v1`; }
@@ -215,6 +218,7 @@ export class RoutingProvider {
         text = JSON.stringify({ pass, reasons: [pass ? "CHILD_DONE observed" : "scripted verification failure"] });
       }
       const input = toolInput ? JSON.parse(toolInput) as Obj : undefined;
+      if (grader && this.graderDelayMs > 0) await delay(this.graderDelayMs);
       if (responses) this.sendResponses(res, request, inputTokens, text, toolName, input);
       else this.sendAnthropic(res, request, inputTokens, text, toolName, input);
     } catch (error) {
@@ -503,6 +507,26 @@ export class RoutingHost {
     await waitFor("a second plugin instance", async () => new Set((await this.rawEvents()).filter(e => e.type === "probe.instance.started").map(e => e.__iid)).size >= 2 ? true : undefined, 30_000, 250);
     return base;
   }
+  /** Polls every session of the host while a delegation runs (the runner removes its producer and grader children when it ends). */
+  watchSessions(everyMs = 120): { stop(): Promise<Map<string, SessionTimeline>> } {
+    const timeline = new Map<string, SessionTimeline>();
+    let running = true;
+    const loop = (async () => {
+      while (running) {
+        try {
+          for (const s of await this.everySession()) {
+            const view = { agent: s.agent, model: s.model ? ref(s.model) : undefined, input: s.tokens?.input ?? 0, output: s.tokens?.output ?? 0, cost: s.cost ?? 0 };
+            const entry = timeline.get(s.id) ?? { id: s.id, parentID: s.parentID, firstSeen: Date.now(), snapshots: [] };
+            timeline.set(s.id, entry);
+            const last = entry.snapshots.at(-1);
+            if (last === undefined || last.agent !== view.agent || last.model !== view.model || last.input !== view.input || last.output !== view.output) entry.snapshots.push({ at: Date.now(), ...view });
+          }
+        } catch { /* a session removed between list and get */ }
+        await delay(everyMs);
+      }
+    })();
+    return { stop: async () => { running = false; await loop; return timeline; } };
+  }
   /** The events of one session (de-duplicated by event id). */
   async eventsOf(sessionID: string): Promise<EventRecord[]> { return (await this.events()).filter(e => obj(e.data).sessionID === sessionID); }
   tail(chars = 3_000): string { return this.output.slice(-chars); }
@@ -581,6 +605,9 @@ export class RoutingHost {
   /** The persister flushes the first write at once and then at most every 30 s (D15): poll for what the host has written. */
   async waitForRows(label: string, predicate: (rows: DecisionRow[]) => boolean, timeoutMs = 60_000): Promise<DecisionRow[]> {
     return waitFor(label, async () => { const rows = await this.decisionRows(); return predicate(rows) ? rows : undefined; }, timeoutMs, 500);
+  }
+  async waitForLogRows(label: string, predicate: (rows: LogRow[]) => boolean, timeoutMs = 70_000): Promise<LogRow[]> {
+    return waitFor(label, async () => { const rows = await this.logRows(); return predicate(rows) ? rows : undefined; }, timeoutMs, 500);
   }
   async waitForEntries(label: string, predicate: (entries: Record<string, OutcomeEntrySnapshot>) => boolean, timeoutMs = 60_000): Promise<Record<string, OutcomeEntrySnapshot>> {
     return waitFor(label, async () => { const entries = await this.outcomeEntries(); return predicate(entries) ? entries : undefined; }, timeoutMs, 500);

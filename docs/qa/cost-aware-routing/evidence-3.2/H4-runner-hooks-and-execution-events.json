@@ -1,0 +1,57 @@
+{
+  "scenario": "H4-runner-hooks-and-execution-events",
+  "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
+  "runId": "b0e8bcf6-29cd-439c-ad8e-858b819796c1",
+  "recordedAt": "2026-10-06T21:25:17.926Z",
+  "harness": {
+    "headSha": "af41c84ba16f2f87e01a85e2d88804c7b78d0ef6",
+    "blobShas": {
+      "test/smoke/routing-engine.smoke.test.ts": "276736fbeedb4c2172692b3682a9b9bac7cb8e9c",
+      "test/smoke/helpers/routing-host.ts": "2551155dae4037db9f896811b6648acd168f565b"
+    },
+    "uncommittedChanges": true
+  },
+  "expectation": "(a) the plugin's execute.before/after hooks do NOT fire for the subagent calls the delegate runner makes through ctx.tool.list() (only the model-emitted delegate call is hooked); (b) session.execution.succeeded of the producer child, with an event id, reaches the plugin before the runner's second dispatch (the resume), and the runner's calls leave no decision row of the dispatch router (only the attempt recorder's two rows).",
+  "observed": {
+    "toolsHookedDuringDelegation": [
+      "before:delegate",
+      "after:delegate"
+    ],
+    "subagentHookCount": 0,
+    "executionSucceeded": [
+      {
+        "id": "evt_1131ae662001TJR73gQqOPv4Xb",
+        "deliveredAt": 1791321892458
+      },
+      {
+        "id": "evt_1131aecfd001xK060fy6sC9cux",
+        "deliveredAt": 1791321894151
+      }
+    ],
+    "secondAttemptStartedAt": 1791321894091,
+    "rowsForProducer": [
+      {
+        "step": "dispatch",
+        "resume": false,
+        "mode": "advise"
+      },
+      {
+        "step": "variant",
+        "resume": true,
+        "mode": "advise"
+      }
+    ],
+    "modelEmittedToolCalls": [
+      {
+        "lastText": "SPIKE_DELEGATE={\"tier\":\"fast\",\"task\":\"[route class=search ri",
+        "toolResult": false
+      },
+      {
+        "lastText": "",
+        "toolResult": true
+      }
+    ]
+  },
+  "assertionResult": "PASS: hooked tools during the delegation: before:delegate, after:delegate (subagent hooks: 0); execution.succeeded ids evt_1131ae662001TJR73gQqOPv4Xb,evt_1131aecfd001xK060fy6sC9cux delivered 1791321892458,1791321894151 before the resume's model.selected 1791321894091; producer rows 2",
+  "notes": []
+}
