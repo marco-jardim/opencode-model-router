@@ -290,7 +290,7 @@ export interface RouteLineParse {
   /**
    * The effective route line, or null when the text has none. With several
    * differing lines (`conflict`) it is the FIRST line minus every field another
-   * line contradicts, and without `d` and `pin`.
+   * line contradicts and minus `d`; the first line's own `pin` is kept (A22).
    */
   readonly line: RouteLine | null;
   /** How many route lines were recognised (all of them are stripped). */

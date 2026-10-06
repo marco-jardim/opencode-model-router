@@ -163,8 +163,9 @@ function canonical(line: RouteLine): string {
 /**
  * Several route lines: when they differ in any field the parse is a conflict.
  * The effective line keeps the FIRST line's class/risk/scope/needs only where no
- * other line carries a different value for the same field, and never `d` or
- * `pin` (those would let a smuggled second line pin a model or skip checks).
+ * other line carries a different value for the same field, keeps the first
+ * line's own `pin` (a later line can neither add one nor take it away, A22) and
+ * never keeps `d` (a conflict must not be able to switch verification off).
  */
 function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   const first = lines[0]!;
@@ -189,13 +190,13 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   const scope = keep("scope", first.scope, (l) => l.scope);
   const needs = keep("needs", first.needs, (l) => l.needs);
   if (lines.some((l) => l.detection !== undefined)) ignored.push("conflict:d");
-  if (lines.some((l) => l.pin)) ignored.push("conflict:pin");
   return {
     ...(taskClass ? { class: taskClass } : {}),
     ...(risk ? { risk } : {}),
     ...(scope ? { scope } : {}),
     ...(needs ? { needs } : {}),
-    pin: false,
+    // The first line is the directive; a later line cannot take its pin away or add one (A22).
+    pin: first.pin,
     ignored,
   };
 }

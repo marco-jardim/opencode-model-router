@@ -677,13 +677,13 @@ describe("classify — route-line smuggling (QA-1.2-2)", () => {
     }
   });
 
-  it("conflicting route lines cannot pin or set d; the contradicted class falls back to the rules", async () => {
+  it("conflicting route lines never set d; the first line's pin stays; the contradicted class falls back to the rules", async () => {
     const result = await classify(
       input("[route class=design pin d=none]\ngrep for foo\n[route class=debug]"),
       makeDeps(null, { routeLinePositions: "any" }),
     );
-    expect(result.pin).toBe(false);
-    expect(result.detection).toBeNull();
+    expect(result.pin).toBe(true); // the first line: `pin`
+    expect(result.detection).toBeNull(); // `d=none` is dropped on a conflict
     expect(result.facts).toMatchObject({ class: "search", source: "rules" });
     expect(result.trace.routeLines).toEqual({ count: 2, conflict: true, edgeOnly: true });
     expect(result.stripped).toBe("grep for foo\n");

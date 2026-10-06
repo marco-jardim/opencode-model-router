@@ -248,7 +248,7 @@ describe("parseRouteLine — smuggling defences (QA-1.2-2)", () => {
     expect(parsed.stripped).toBe("x\n");
   });
 
-  it("differing route lines conflict: neither d nor pin applies, contradicted fields fall back to the rules", () => {
+  it("differing route lines conflict: no d, the first line's pin stays, contradicted fields fall back to the rules", () => {
     const parsed = parseRouteLine(
       "[route class=search risk=low scope=single needs=shell pin d=grader]\nwork\n[route class=design risk=low pin d=none]",
     );
@@ -259,18 +259,25 @@ describe("parseRouteLine — smuggling defences (QA-1.2-2)", () => {
     expect(parsed.line?.risk).toBe("low"); // same in both
     expect(parsed.line?.scope).toBe("single"); // only the first has it
     expect(parsed.line?.needs).toEqual(["shell"]);
-    expect(parsed.line?.pin).toBe(false);
+    expect(parsed.line?.pin).toBe(true); // the FIRST line asked for it (A22)
     expect(parsed.line?.detection).toBeUndefined();
-    expect(parsed.line?.ignored).toEqual(
-      expect.arrayContaining(["conflict", "conflict:class", "conflict:d", "conflict:pin"]),
-    );
+    expect(parsed.line?.ignored).toEqual(expect.arrayContaining(["conflict", "conflict:class", "conflict:d"]));
+    expect(parsed.line?.ignored).not.toContain("conflict:pin");
   });
 
-  it("a second line that only adds pin or d is still a conflict and cannot pin", () => {
+  it("a second line that only adds pin or d is still a conflict; it cannot pin and its d is dropped", () => {
     const parsed = parseRouteLine("[route class=debug]\n[route class=debug pin d=none]");
     expect(parsed.conflict).toBe(true);
     expect(parsed.line).toMatchObject({ class: "debug", pin: false });
     expect(parsed.line?.detection).toBeUndefined();
+  });
+
+  it("a second line cannot take the first line's pin away either (A22)", () => {
+    const parsed = parseRouteLine("[route class=debug pin]\n[route class=debug risk=high]");
+    expect(parsed.conflict).toBe(true);
+    expect(parsed.line).toMatchObject({ class: "debug", pin: true });
+    expect(parseRouteLine("[route class=debug pin]\n[route class=design]").line).toMatchObject({ pin: true });
+    expect(parseRouteLine("[route class=debug pin d=grader]\n[route class=design]").line?.detection).toBeUndefined();
   });
 
   it("a conflict leaves applyRouteLine with the rules class when the class is contradicted", () => {
