@@ -2006,13 +2006,23 @@ function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
   const routing = data.routing;
   if (!isPlainObject(routing)) return [];
   const dropped: string[] = [];
+  const touched = new Set<string>();
   for (const [block, key] of GLOBAL_ONLY_ROUTING_KEYS) {
     const target = routing[block];
     if (isPlainObject(target) && Object.hasOwn(target, key)) {
       delete target[key];
       dropped.push(`routing.${block}.${key}`);
+      touched.add(block);
     }
   }
+  // A block that stripping left empty goes too, and so does an emptied `routing`:
+  // any `routing` block, however empty, changes behaviour (variantSteps defaults
+  // to `auto` under one, A15), and the project file must not do that by accident.
+  for (const block of touched) {
+    const target = routing[block];
+    if (isPlainObject(target) && Object.keys(target).length === 0) delete routing[block];
+  }
+  if (dropped.length > 0 && Object.keys(routing).length === 0) delete data.routing;
   return dropped;
 }
 

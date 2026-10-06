@@ -702,7 +702,7 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 
 ## `routing` — cost-aware routing engine (#74)
 
-The `routing` block configures the cost-aware routing engine: typed task decisions, outcome-calibrated tiers and session-aware effort bumps. It is **entirely optional**. With no `routing` block (or `engine: "static"`) every behaviour is exactly that of the static taxonomy: identical protocol text, identical `R:` line, identical ladder decisions. The block lives in `tiers.json` or, like everything else, in an overrides file; the global file `~/.config/opencode/opencode-model-router.overrides.jsonc` is the usual place, and a change to it is picked up by the normal hot reload (no restart, no `/router` command).
+The `routing` block configures the cost-aware routing engine: typed task decisions, outcome-calibrated tiers and session-aware effort bumps. It is **entirely optional**. With **no `routing` block at all** every behaviour is exactly that of 2.2.0: identical protocol text, identical `R:` line, identical ladder decisions. `engine: "static"` keeps the protocol text and the `R:` line, but **any `routing` block, even `{ "engine": "static" }` or `{}`, turns variant steps on for OpenCode v2** (`enforcement.escalate.variantSteps` then defaults to `auto`, see below); write `"variantSteps": "none"` to keep the 2.2.0 ladder under a `routing` block. The block lives in `tiers.json` or, like everything else, in an overrides file; the global file `~/.config/opencode/opencode-model-router.overrides.jsonc` is the usual place, and a change to it is picked up by the normal hot reload (no restart, no `/router` command).
 
 > **Status.** The configuration surface — parsing, validation, defaults and `/router` reporting — is implemented. The engine that consumes it lands in later phases of the same release; until then `engine` selects nothing by itself. This note goes away when the engine does.
 
@@ -770,13 +770,13 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 
 ### Trust: which file may set what
 
-`routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}` and `routing.outcomes.path` decide where task text is sent and where outcome data is written, so a file that arrives with a repository must not be able to set them. They are honoured from the bundled `tiers.json` and from the **global** override file only. In the **project-local** override (`<repo>/.opencode/opencode-model-router.overrides.jsonc`) they are dropped before the layers are merged, with one log line per process and text, e.g. `ignoring routing.classifier.baseUrl from <path>: only the global override may set it`; every other key of that file still applies, and `/router` lists the notice. The HTTP classifier backends additionally refuse to send an API key over plain `http:` to a non-loopback host.
+`routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}` and `routing.outcomes.path` decide where task text is sent and where outcome data is written, so a file that arrives with a repository must not be able to set them. They are honoured from the bundled `tiers.json` and from the **global** override file only. In the **project-local** override (`<repo>/.opencode/opencode-model-router.overrides.jsonc`) they are dropped before the layers are merged (a `classifier` or `outcomes` block, or a `routing` block, left empty by that is removed too, so a project file whose only `routing` content was forbidden does not switch variant steps on), with one log line per process and text, e.g. `ignoring routing.classifier.baseUrl from <path>: only the global override may set it`; every other key of that file still applies, and `/router` lists the notice. The HTTP classifier backends additionally refuse to send an API key over plain `http:` to a non-loopback host.
 
 ### Engine modes
 
 `engine` is the one switch. Modes are raised one step at a time; each is a config-only change.
 
-**`static`** (default) — the shipped taxonomy only. Equivalent to having no `routing` block.
+**`static`** (default) — the shipped taxonomy only: no decisions are made or recorded, and the protocol text and `R:` line are those of 2.2.0. It is **not** the same as having no `routing` block: the block itself switches `variantSteps` to `auto` on v2 unless you set it to `none`.
 
 <!-- routing-example: static -->
 ```jsonc
@@ -864,7 +864,7 @@ A tier may list the `(model, variant, costRatio)` rungs the engine can use for i
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `enforcement.escalate.variantSteps` | `"auto" \| "none"` | `"auto"` when the config has a `routing` block, otherwise `"none"` | OpenCode v2 only; an explicit value always wins. Without a `routing` block the default is `none`, so the ladder is exactly that of 2.2.0. `auto`: a failed verification first retries on the same model's next variant (resuming the child session) before the ladder escalates the model; variant steps do not consume `maxAttemptsPerTier` but do count toward `maxTotalAttempts` and the cost ceiling. `none`: the previous behaviour. Always `none` on v1 (an explicit value is ignored there), where the `effortBump` path stays as is. `resolveVariantSteps(cfg, host)` applies this rule. |
+| `enforcement.escalate.variantSteps` | `"auto" \| "none"` | `"auto"` when the config has a `routing` block, otherwise `"none"` | OpenCode v2 only; an explicit value always wins. Only the **absence of a `routing` block** preserves the 2.2.0 ladder (default `none`); any `routing` block, even `{}` or `engine: "static"`, makes the default `auto` on v2 unless you write `"variantSteps": "none"`. `auto`: a failed verification first retries on the same model's next variant (resuming the child session) before the ladder escalates the model; variant steps do not consume `maxAttemptsPerTier` but do count toward `maxTotalAttempts` and the cost ceiling. `none`: the previous behaviour. Always `none` on v1 (an explicit value is ignored there), where the `effortBump` path stays as is. `resolveVariantSteps(cfg, host)` applies this rule. |
 
 ---
 

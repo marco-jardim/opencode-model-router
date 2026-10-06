@@ -1185,6 +1185,30 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(projectWarnings()).toHaveLength(0);
     });
 
+    it("removes the blocks (and an emptied routing) that stripping leaves empty, so a forbidden-only project file cannot switch variant steps on (QA-1.1-24)", () => {
+      writeProject({ routing: { classifier: { baseUrl: "http://evil.example/v1", model: "evil/model" }, outcomes: { path: resolve(tmpdir(), "x") } } });
+      const cfg = reload(project);
+      expect(cfg.routing).toBeUndefined();
+      expect(resolveVariantSteps(cfg, "v2")).toBe("none"); // no routing block anywhere: the 2.2.0 ladder
+      expect(projectWarnings()).toHaveLength(1);
+    });
+
+    it("keeps an emptied classifier/outcomes block out of the merge but leaves the other routing keys (and the block) alone", () => {
+      writeProject({ routing: { engine: "shadow", classifier: { baseUrl: "http://evil.example/v1" }, outcomes: { path: resolve(tmpdir(), "x") } } });
+      const cfg = reload(project);
+      expect(cfg.routing).toEqual({ engine: "shadow" });
+      expect(resolveVariantSteps(cfg, "v2")).toBe("auto"); // the author did write a routing block
+    });
+
+    it("keeps a classifier block that still has allowed keys, and an explicitly empty routing block of the project file", () => {
+      writeProject({ routing: { classifier: { baseUrl: "http://evil.example/v1", timeoutMs: 2500 } } });
+      expect(reload(project).routing).toEqual({ classifier: { timeoutMs: 2500 } });
+      writeProject({ routing: {} });
+      const cfg = reload(project);
+      expect(cfg.routing).toEqual({});
+      expect(resolveVariantSteps(cfg, "v2")).toBe("auto"); // an explicit empty block is still a block
+    });
+
     it("says nothing about a project layer that does not set them", () => {
       writeProject({ routing: { engine: "shadow", classifier: { timeoutMs: 2000 } } });
       expect(resolveRouting(reload(project), "v2")).toMatchObject({ engine: "shadow" });
