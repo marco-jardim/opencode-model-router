@@ -1153,7 +1153,3 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     });
   });
 });
-
-function readdirSyncSafe(dir: string): string[] {
-  try { return readdirSync(dir); } catch { return []; }
-}
