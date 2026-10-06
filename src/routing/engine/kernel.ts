@@ -452,7 +452,10 @@ export function decide(input: DecisionInput): Decision {
     reason = `kept: class confidence ${fmt(classConfidence)} < minClassConfidence ${fmt(minConfidence)}`;
   } else if (!(decidingCost < threshold)) {
     reasonCode = "kept:margin";
-    reason = `kept: C(best)=${fmt(decidingCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
+    // R2-4: when the evidence filter left `best` at the pick, the cost compared is the cheapest option's (the gated one), and the reason says so.
+    reason = gated
+      ? `kept: C(cheapest)=${fmt(decidingCost)} (${argminChoice!.key}, gated by evidence) is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`
+      : `kept: C(best)=${fmt(decidingCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
   } else if (gated) {
     reasonCode = "kept:evidence";
     reason = `kept: the cheapest option ${argminChoice!.key} (${fmt(decidingCost)} ${unit}, rank ${cands[argminIndex!]!.rank}, the pick is rank ${cands[chosenIndex]!.rank}) needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[argminIndex!]!)}; the chosen dispatch is the cheapest eligible (${fmt(chosenCost)} ${unit})`;

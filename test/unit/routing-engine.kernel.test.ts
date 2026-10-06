@@ -544,6 +544,34 @@ describe("A24 evidence gate: a down switch needs ≥ 5 recorded outcomes on best
         store: fakeStore({ p: { [keyOf(noShell)]: 0.99, ...mediumFailing } }),
       }));
       expect(d.ineligible[keyOf(noShell)]).toBe("needs");
+      // QA-2.2-R2-5: floor and never-down also keep their own reasons for a candidate that has no evidence either
+      const lower = rung("general", "anthropic/claude-sonnet-5-5", "low", 1, 0, { agent: { origin: "host", id: "general" }, source: "role-tier-rung", tier: "fast" });
+      const lowerLadder = routerLadder([lower, MEDIUM, HEAVY]);
+      const cheap = fakeStore({ p: { [keyOf(lower)]: 0.99, ...mediumFailing } });
+      const floor = decide(input({ ladder: lowerLadder, chosen: chosenOf(MEDIUM), detection: "deterministic", facts: facts({ risk: "medium" }), store: cheap, floorRank: 1 }));
+      expect(floor.ineligible[keyOf(lower)]).toBe("floor");
+      const neverDown = decide(input({ ladder: lowerLadder, chosen: chosenOf(MEDIUM), detection: "none", facts: facts({ risk: "high" }), store: cheap }));
+      expect(neverDown.ineligible[keyOf(lower)]).toBe("never-down");
+      // without either filter the same candidate is only held back by the missing evidence
+      const plain = decide(input({ ladder: lowerLadder, chosen: chosenOf(MEDIUM), detection: "deterministic", facts: facts({ risk: "medium" }), store: cheap }));
+      expect(plain.ineligible[keyOf(lower)]).toBe("evidence");
+    });
+
+    it("QA-2.2-R2-4: a gated cheapest option that does not clear the margin is named in the kept:margin reason as C(cheapest)", () => {
+      const d = run({ p: { [keyOf(MEDIUM)]: 0.9, [keyOf(GENERAL)]: 0.92, [keyOf(HEAVY)]: 0.95 }, n: { [keyOf(MEDIUM)]: 20 } });
+      expect(d.argmin?.key).toBe(keyOf(GENERAL));
+      expect(d.best?.key).toBe(keyOf(MEDIUM));
+      expect(d.reasonCode).toBe("kept:margin");
+      expect(d.reason).toContain("C(cheapest)=");
+      expect(d.reason).toContain(keyOf(GENERAL));
+      expect(d.reason).toContain("gated by evidence");
+      expect(d.reason).not.toContain("C(best)=");
+      // the ordinary margin reason keeps C(best)
+      const { ladder: pair, a, b } = pairLadder(7, 8);
+      const plain = decide(input({ ladder: pair, store: fakeStore({ p: { [keyOf(a)]: 1, [keyOf(b)]: 1 }, n: { [keyOf(a)]: 10, [keyOf(b)]: 10 } }), chosen: chosenOf(b) }));
+      expect(plain.best?.key).toBe(keyOf(a)); // evidence on both: nothing was gated
+      expect(plain.reasonCode).toBe("kept:margin");
+      expect(plain.reason).toContain("C(best)=");
     });
   });
   it("hasMinEvidence: the strength of a prior, with only float jitter forgiven", () => {
