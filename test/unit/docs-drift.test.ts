@@ -13,6 +13,7 @@ import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { buildLadder, resolveChosen } from "../../src/routing/engine/ladders";
 import { candidateKey, decide } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
+import { advance, buildEscalatePolicy, newLadderState, nextAction, recordAttempt } from "../../src/escalate/ladder";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
 import type { Need, TaskFacts } from "../../src/routing/classify/types";
 import {
@@ -361,6 +362,52 @@ describe("docs drift: the worked example is the real kernel's output (QA-3.1-3)"
     expect(withEvidence.best?.agent).toBe("fast");
   });
 
+  /** The guide's Attempts table: tier -> [the attempts it lists, why the cascade ends]. */
+  const attemptsTable = (): Map<string, { attempts: string[]; ends: string }> => {
+    const rows = new Map<string, { attempts: string[]; ends: string }>();
+    for (const line of section().split("\n")) {
+      if (!/^\| `(?:fast|medium|heavy)` \|/.test(line)) continue;
+      const cells = line.split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim());
+      const attempts = [...cells[1]!.replace(/\([^)]*\)/g, "").matchAll(/`([a-z]+)`/g)].map((m) => m[1]!);
+      rows.set(cells[0]!.replace(/`/g, ""), { attempts, ends: cells[2] ?? "" });
+    }
+    return rows;
+  };
+
+  /** Replays the runner from `start` with a failing verdict after every attempt and returns why it gives up. */
+  const endReason = (start: string): string => {
+    const policy = buildEscalatePolicy(cfg);
+    const ratios: Record<string, number> = { fast: 1, medium: 5, heavy: 20 };
+    let state = newLadderState(start, policy);
+    for (let i = 0; i < 20; i++) {
+      state = recordAttempt(state, ratios[state.currentTier]!);
+      const action = nextAction(state, { pass: false, outcome: "fail", reasons: [] }, policy);
+      if (action.action === "give_up") return action.reason;
+      if (action.action !== "retry" && action.action !== "escalate") break;
+      state = advance(state, action);
+    }
+    throw new Error(`the runner never gave up from ${start}`);
+  };
+
+  it("the guide's Attempts table is ladder.paths, and says why each cascade ends (QA-3.1-R2-4, R2-7)", () => {
+    const table = attemptsTable();
+    const labelled = (index: number): string => (index < ladder.candidates.length ? ladder.candidates[index]! : ladder.reachable![index - ladder.candidates.length]!).tier;
+    for (const [k, candidate] of ladder.candidates.entries()) {
+      const row = table.get(candidate.tier);
+      expect(row, `row ${candidate.tier}`).toBeDefined();
+      expect(row!.attempts, candidate.tier).toEqual((ladder.paths?.[k] ?? []).map(labelled));
+    }
+    expect([...table.keys()].sort()).toEqual(["fast", "heavy", "medium"]);
+    // the real end reasons: the ceiling ends fast and medium, the top of the ladder ends heavy after its retry
+    expect(endReason("fast")).toBe("cost ceiling exceeded");
+    expect(endReason("medium")).toBe("cost ceiling exceeded");
+    expect(endReason("heavy")).toMatch(/top of ladder/);
+    expect(table.get("fast")!.ends).toMatch(/cost ceiling/);
+    expect(table.get("medium")!.ends).toMatch(/cost ceiling/);
+    expect(table.get("heavy")!.ends).toMatch(/top of the ladder/);
+    expect(section()).toContain("The cost ceiling ends the `fast` and `medium` cascades; `heavy`'s ends at the top of the ladder after its retry");
+  });
+
   it("the guide prints exactly those figures and states the policy it assumes", () => {
     const text = section();
     const printed = [
@@ -371,7 +418,17 @@ describe("docs drift: the worked example is the real kernel's output (QA-3.1-3)"
       costOf(withEvidence, "fast"),
     ].map((c) => c.toFixed(3));
     expect(printed).toEqual(["23.011", "7.162", "4.772", "5.730", "2.742"]);
-    for (const figure of printed) expect(text, figure).toContain(figure);
+    // Each figure in its own context (QA-3.1-R2-7): a number that merely appears somewhere else does not satisfy the guide.
+    const fig = (value: number): string => value.toFixed(3).replace(".", "\\.");
+    expect(text).toMatch(new RegExp(`C\\(heavy\\)\\s*=\\s*${fig(costOf(priors, "heavy"))}`));
+    expect(text).toMatch(new RegExp(`C\\(medium\\)\\s*=\\s*${fig(costOf(priors, "medium"))}`));
+    expect(text).toMatch(new RegExp(`C\\(fast\\)\\s*=\\s*${fig(costOf(priors, "fast"))}`));
+    expect(text).toMatch(new RegExp(`0\\.8 · C\\(medium\\) = 0\\.8 · ${fig(costOf(priors, "medium"))} = ${fig(0.8 * costOf(priors, "medium"))}`));
+    expect(text).toMatch(new RegExp(`C\\(fast\\)\\s*=\\s*${fig(costOf(withEvidence, "fast"))}`));
+    // the priors figures come before the after-evidence one
+    expect(text.search(new RegExp(`C\\(fast\\)\\s*=\\s*${fig(costOf(priors, "fast"))}`))).toBeLessThan(
+      text.search(new RegExp(`C\\(fast\\)\\s*=\\s*${fig(costOf(withEvidence, "fast"))}`)),
+    );
     expect(text).toContain("`roles: {}`");
     expect(text).toContain("`maxAttemptsPerTier: 1`");
     expect(text).toContain("`maxTotalAttempts: 4`");
@@ -455,6 +512,10 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     expect(accepts(withValue(block, field, hi + (integer ? 1 : 0.001))), `${key} above ${hi}`).toBe(false);
     expect(accepts(withValue(block, field, loExcluded ? lo : lo - (integer ? 1 : 0.001))), `${key} below ${lo}`).toBe(false);
     expect(accepts(withValue(block, field, loExcluded ? lo + 0.001 : lo)), `${key} = ${lo}`).toBe(true);
+    // integer-only keys reject a fractional value inside the range, the others accept it, and the Type column says which (QA-3.1-R2-7)
+    const half = lo + 0.5;
+    expect(accepts(withValue(block, field, half)), `${key} = ${half}`).toBe(!integer);
+    expect(cells![1], `${key} type`).toBe(integer ? "`integer`" : "`number`");
   });
 
   it("the three detection probabilities share the documented [0, 1] range and must not increase with a weaker check", () => {
