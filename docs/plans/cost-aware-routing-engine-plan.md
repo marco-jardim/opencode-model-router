@@ -281,16 +281,20 @@ The workload that calibrates the scoreboard is **this plan's own execution**. As
 - **D17 — The plan dogfoods itself, and the final mode is decided by its own numbers.** Modes are raised at the checkpoints of §0.11 and never skipped. At DF5 the active config is left at `enforce` if, during the enforce period (DF4→DF5), no **switched** dispatch ended in a `fail` verdict; otherwise it is left at `advise`. The rule, the counts and the resulting mode are written in `dogfood.md`, and the human is told in the final status (not asked).
 - **D18 — Observability is a deliverable, not a debug aid.** The decision log, the outcome store, `npm run routing:stats` and `/router stats` are part of the release, documented in `docs\ROUTING_ENGINE.md`, tested, and used by the checkpoints. A checkpoint without a `routing:stats` summary is not complete.
 
-#### Amended during implementation (Phase 0.P spike verdicts; evidence in `D:\git\opencode-model-router\docs\qa\cost-aware-routing\phase-0P.md`)
+#### Amended during implementation (Phase 0.P spike verdicts; evidence and rationale in `D:\git\opencode-model-router\docs\qa\cost-aware-routing\phase-0P.md`, same ids)
 
-- **A1 → D5/D6.** A catalog model is *unpriced* when its `cost` is empty **or every price field is 0**. The owner's `anthropic/claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5` report zero prices (S4); their measured step costs are 0 and stored as `null`.
-- **A2 → F4/2.4.** Cheapest-model suggestions come from the live catalog only; on this machine the example is `opencode-go/deepseek-v4.1-flash` (not `opencode/…`). Variant sets differ per model (`claude-haiku-4-5`: `high, max`).
-- **A3 → M6/2.1.** `session.step.ended` may be delivered to several location plugin instances (S3); ingestion dedupes by event id.
-- **A4 → M2 `host` backend.** `POST /api/experimental/generate` resolves models in the base (global config) location, which initialises lazily (S5): on `400 Model unavailable` the backend does one catalog read at that location and retries once within `timeoutMs`.
-- **A5 → D11.** The resume threshold uses `min(limit.context(current), limit.context(next))`; host auto-compaction runs but does not guarantee fit (S6; §1.7 S6 alternative adopted).
-- **A6 → §0.11 / 0.P.6.** The active config is the bundled `D:\git\opencode-model-router\tiers.json` plus `activePreset` from `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json`. Checkpoints edit `routing.*` in the global override layer `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` instead of the bundled file (which lives in the base checkout, §0.6.8).
-- **A7 → D10 / 3.2.** For a same-model variant change on resume, the host keeps the top-level effort and sends the new effort in-band (`{"role":"system","output_config":{"effort":…}}`); tests assert the effective effort.
-- **A8 → §0.11 S7.** Plugin code is loaded once per process by dynamic `import()`; every code sync (DF1–DF4) requires a host restart.
+- **A1 → D5/D6.** *Unpriced* = catalog `cost` empty, or every field of every cost entry (all tiers) is 0. Observed unpriced: `anthropic/claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5` (all-zero), `openai/gpt-6-luna`, `openai/gpt-6-luna-fast` (empty). Their step costs are stored as `null`. Every tier model of the live `hybrid-2` preset is unpriced, so the dogfood (DF1–DF5) measures decisions and savings in `costRatio` units.
+- **A2 → F4/2.4.** Suggestions come from the live catalog only; here the cheapest priced tool-capable model is `opencode-go/deepseek-v4.1-flash` (not `opencode/…`). Variant sets differ per model.
+- **A3 → M6/2.1.** Ingestion dedupes `session.step.ended` by event id at module (process) scope, records only sessions in the dispatch registry, and the outcome store has a single writer per process.
+- **A4 → M2 `host` backend.** Uses the plugin client `ctx.generate.text({prompt, model})`; any error (including `Model unavailable` or a credentials error) → `unknown` within `timeoutMs`, no retry loop. The real-credential path is verified in Phase 3.2 before `host` is documented as supported.
+- **A5 → D11.** Resume when `lastStepTokens + estimatedTokens(nextPrompt) < sessionReuse.maxContextFraction × (limit.input ?? limit.context)` of the **next** model (estimate = chars/4 of forcing message + dispatch prompt); otherwise fresh. Host auto-compaction runs but does not guarantee fit (S6).
+- **A6 → §0.11 / §2.** Checkpoints edit `routing.*` in `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (global override layer), never the bundled `D:\git\opencode-model-router\tiers.json`. Phase 1.1.4 proves hot reload re-reads that layer.
+- **A7 → D10 / 3.2.** Effort delivery depends on the provider route: same-model variant changes on `claude-sonnet-5-5`/`claude-opus-5-5` (Anthropic Messages) travel in-band (`{"role":"system","output_config":{"effort":…}}`) with the top-level effort unchanged; `claude-haiku-4-5` variants map to `thinking.budget_tokens` at the top level; the OpenAI Responses route was not exercised. Provider acceptance of in-band effort is unverified. Tests assert the effective effort.
+- **A8 → §0.11.** Plugin code is loaded once per process by dynamic `import()`; every code sync (DF1–DF4) requires a host restart.
+- **A9 → D10 / 1.5.** A child without a variant is stored as `variant "default"` (not in `variants[]`) and sends no effort. Phase 1.5.1 defines its rank; the ladder never emits a variant absent from `variants[]`.
+- **A10 → D5 / D11.** `cost[]` may hold context-tiered entries; price lookup picks the entry by input size. Context checks use `limit.input ?? limit.context`.
+- **A11 → D9 / D12.** The host re-checks permissions after `execute.before` rewrites `agent` (`Subagent denied: explore`). `enforce` applies the permission filter before any swap.
+- **A12 → §0.6.8.** Phase 0.P work is merged via `car/p0p` → `car/main`, then `master` is fast-forwarded to `car/main` (docs and a gated smoke test only; no plugin code; no restart).
 
 ### 1.6 Target flows
 
@@ -323,7 +327,7 @@ One owner per file per wave. "New" files are created by their owner. Everything 
 | Phase | Write-set (full paths under `D:\git\opencode-model-router\`) |
 |---|---|
 | 0.P | `docs\qa\cost-aware-routing\phase-0P.md`, `docs\qa\cost-aware-routing\run-log.md`, `docs\qa\cost-aware-routing\dogfood.md` (new; DF0 baseline), `docs\plans\cost-aware-routing-engine-handover.md` (exists; rewritten), `test\smoke\routing-spikes.smoke.test.ts` (new; spike harness kept as a test). Committed on `master` (the §0.6.8 exception). |
-| orchestrator only | `docs\plans\cost-aware-routing-engine-handover.md` and `docs\qa\cost-aware-routing\dogfood.md` after 0.P (rewritten at every checkpoint, committed on `master` with the sync); the **active `tiers.json`** of the running host (path from 0.P.6; only `routing.engine`, `routing.profile`, `routing.margin` are ever edited, only at checkpoints) |
+| orchestrator only | `docs\plans\cost-aware-routing-engine-handover.md` and `docs\qa\cost-aware-routing\dogfood.md` after 0.P (rewritten at every checkpoint, committed on `master` with the sync); the **active router config** of the running host — per amendment A6 the global override `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (only `routing.engine`, `routing.profile`, `routing.margin` are ever edited, only at checkpoints) |
 | 1.1 | `src\router\config.ts`, `src\router\build-info.ts` (new; version + git sha marker), `docs\CONFIG_REFERENCE.md`, `test\unit\config.routing.test.ts` (new), `test\unit\config.validate.test.ts` (append only) |
 | 1.2 | `src\routing\classify\types.ts`, `src\routing\classify\rules.ts`, `src\routing\classify\route-line.ts`, `src\routing\classify\backends\host.ts`, `src\routing\classify\backends\openai-compatible.ts`, `src\routing\classify\backends\typesafe.ts`, `src\routing\classify\index.ts` (all new), `src\router\sessions.ts` (only to export the shape-gate regexes and `normTaskKw`; `classifyTrivial` behaviour unchanged), `test\unit\routing-classify*.test.ts` (new) |
 | 1.3 | `src\routing\outcomes\store.ts`, `src\routing\outcomes\beta.ts`, `src\routing\outcomes\cost.ts`, `src\routing\outcomes\persist.ts`, `src\routing\outcomes\stats.ts`, `src\routing\outcomes\index.ts` (new), `scripts\routing-stats.ts` (new), `package.json` (Wave 1 owner: the `routing:stats` script line only), `test\unit\routing-outcomes*.test.ts` (new) |
@@ -384,7 +388,7 @@ Wave 1: 1.1, 1.2, 1.3, 1.5 start in parallel after 0.P; 1.4 starts when 1.1, 1.2
 ```
 [acceptance]
 cwd: D:\git\omr-car-p0p
-check: run command="npx vitest run test/smoke/routing-spikes.smoke.test.ts" expect=passed
+criteria: spikes run with `npx cross-env RUN_OC_SMOKE_V2_SPIKES=1 RUN_OC_SPIKE_LIVE_CATALOG=1 npx vitest run --config vitest.smoke.config.ts test/smoke/routing-spikes.smoke.test.ts` (amended, QA-0P-17); every evidence file carries the same runId and a fresh recordedAt
 criteria: seven spikes executed against the real host; phase-0P.md holds verbatim evidence and a heavy verdict per hypothesis; scorecard directory and active config path recorded; plan, index and handover committed on master; DF0 written
 deliverable: D:\git\omr-car-p0p\docs\qa\cost-aware-routing\phase-0P.md
 [/acceptance]
