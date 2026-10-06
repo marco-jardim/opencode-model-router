@@ -1,40 +1,50 @@
 /**
- * Dispatch-time routing on v2 (M7, Phase 2.2.1): `routeDispatch` composes M2 (classify) → ladders → M4 (decide) for
- * one `subagent` call, applies the engine mode, writes the decision row and registers the child with the 2.1
- * dispatch-facts registry so ingestion sees it.
+ * Dispatch-time routing on v2 (M7, Phase 2.2.1): `route()` composes M2 (classify) → ladders → M4 (decide) for one
+ * `subagent` call, applies the engine mode and writes the decision row; `commit()` registers the dispatch with the 2.1
+ * dispatch-facts registry once the FINAL input is known, so ingestion sees what really ran.
  *
- * Design (the order the adapter calls it in, `src/compat/v2-hooks.ts` `execute.before`):
+ * Design (the order the adapter calls it in, `src/compat/v2-hooks.ts` `execute.before` / `execute.after`):
  *
  *  1. Engine first. `route()` runs before the `subagentTiers` override and before the legacy `tool.execute.before`.
  *     `subagentTiers` only fills a MISSING `model`: the engine sees the model it would fill (`callModel`) when it
  *     resolves the orchestrator's pick, and when it switches it always writes a model of its own, so the override
  *     never fires after a switch. The legacy hook runs last, so headers and the depth banner see the final agent.
  *  2. Modes (§1.2): `static` returns before any host call, allocation or disk access. `shadow` classifies, decides and
- *     logs (a `switched` row is a would-switch); the input is untouched except that `[route …]` lines are stripped.
- *     `advise` is `shadow` plus the protocol/hint of the context hook. `enforce` additionally writes `agent` and
- *     `model#variant` when the kernel switches (D9, A16, A24) and the dispatch is not pinned.
+ *     logs (a `switched` row is a would-switch); the input is untouched except that the first-line `[route …]` is
+ *     stripped. `advise` is `shadow` plus the protocol/hint of the context hook. `enforce` additionally writes `agent`
+ *     and `model#variant` when the kernel switches (D9, A16, A24, A27) and the dispatch is not pinned.
  *  3. Only the orchestrator's own prompt is parsed: the session must be a root session, and the route line only counts
- *     on the first non-empty line of the prompt (A22). A subagent's dispatch is left exactly as it is.
+ *     on the first non-empty line of the prompt (A22); every other byte of the prompt passes through unchanged. A
+ *     subagent's dispatch is left exactly as it is.
  *  4. Errors never reach the session: any failure is logged and the dispatch proceeds as the orchestrator wrote it.
- *  5. Registration (2.1 handoff, QA-2.1-R2-10): once per execution of a child. A resume (`sessionID` given) is
- *     registered at once; a fresh child does not exist yet, so the dispatch waits in a per-parent queue and is claimed
- *     by the `session.created` event of the child (parent, agent and title decide which one), or dropped when the tool
- *     call finishes.
+ *  5. Registration (2.1 handoff, QA-2.1-R2-10; QA-2.2-2/3): once per execution of a child, from the FINAL input.
+ *     `route()` only decides and logs. After the legacy hook has had its say, the adapter calls `commit(callID, input)`
+ *     with the input the host will execute: a resume (`sessionID` given) is registered at once; a fresh child does not
+ *     exist yet, so the dispatch waits and is claimed by the `session.created` event of the child (parent, agent and
+ *     title decide which one). `execute.after` then names the child (`onCallResult`): a dispatch still waiting is
+ *     registered under it, and a heuristic claim that picked the wrong child is corrected before the verdict is
+ *     recorded. A call that ends without a result, or whose hook chain throws, is dropped (`onCallFinished`).
+ *  6. Multi-instance (A3): the same hook event may reach several plugin instances of the process; only the first
+ *     instance whose engine is live acts on a call (a process-wide set of handled calls).
  */
 
-import { buildLadder, candidateKey, decide, detectionOf, escalateLadder, floorRankOf, resolveChosen, tierRankOf } from "../engine";
+import {
+  buildLadder, candidateKey, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, resolveChosen, tierRankOf,
+} from "../engine";
 import { routerTierIds } from "../engine/ladders";
 import type { ChosenDispatch, Decision, HostAgentInfo } from "../engine/types";
 import { classify } from "../classify";
 import type { ClassifyResult, TaskFacts } from "../classify/types";
 import type { RouterConfig } from "../../router/config";
-import { rememberDispatch, type DetectionDepth, type DispatchInput } from "../../router/sessions";
+import { forgetDispatch, lookupDispatch, rememberDispatch, type DetectionDepth, type DispatchInput } from "../../router/sessions";
 import {
+  FLOOR_LIFT_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
   normalizeVariant,
   safeNow,
+  splitModelRef,
   type DecisionRow,
   type DecisionTrace,
   type RouteChoice,
@@ -42,10 +52,14 @@ import {
 import { agentModelRef, type AgentView } from "./host-info";
 import { sessionRulesOf, type EngineRuntime, type Prepared, type WireLogger } from "./runtime";
 
-/** A dispatch waits at most this long for its child's `session.created` event before it is forgotten. */
+/** A fresh dispatch can be claimed by a `session.created` event for at most this long. */
 export const PENDING_TTL_MS = 120_000;
-/** Bound on dispatches waiting for a child (oldest dropped first). */
+/** Bound on dispatches kept for claiming and for the result (oldest dropped first). */
 export const MAX_PENDING = 200;
+/** A dispatch whose result never arrives is forgotten after this long (the registry's own idle TTL). */
+export const ENTRY_TTL_MS = 3_600_000;
+/** Bound on the process-wide set of handled calls (LRU). */
+export const MAX_HANDLED_CALLS = 4096;
 
 export interface RouteCall {
   /** The tool call id (`event.id`): the dispatch ends with the call. */
@@ -64,7 +78,7 @@ export interface RouteCall {
 
 export interface RouteOutcome {
   readonly mode: "static" | "shadow" | "advise" | "enforce";
-  /** The prompt without its `[route …]` line(s); only when something was stripped. */
+  /** The prompt without its first-line `[route …]`; only when something was stripped. */
   readonly prompt?: string;
   /** `enforce`: the agent to dispatch instead (never for a pinned dispatch). */
   readonly agent?: string;
@@ -76,13 +90,20 @@ export interface RouteOutcome {
 const UNTOUCHED: RouteOutcome = Object.freeze({ mode: "static" });
 
 export interface DispatchRouter {
-  /** Route one `subagent` call. Never throws. */
+  /** Decide and log one `subagent` call. Registers nothing (see `commit`). Never throws. */
   route(call: RouteCall): Promise<RouteOutcome>;
-  /** A `session.created` event: claim the pending dispatch of this child, if there is one. Never throws. */
+  /**
+   * The input the host is about to execute (`event.input` after the legacy hook ran): register the dispatch from it.
+   * A call `route()` did not act on is ignored. Never throws.
+   */
+  commit(callID: string, input: unknown): void;
+  /** A `session.created` event: claim the waiting dispatch of this child, if there is one. Never throws. */
   onSessionCreated(created: { readonly sessionID: unknown; readonly parentID: unknown; readonly agent: unknown; readonly title: unknown }): void;
-  /** The tool call ended: its dispatch can no longer be claimed. */
+  /** `execute.after`: the call's result names the child (or `null`). Registers/corrects, then forgets the call. Never throws. */
+  onCallResult(callID: string, childSessionID: string | null): void;
+  /** The call ended without a result, or its hook chain failed: forget it. */
   onCallFinished(callID: string): void;
-  /** Dispatches still waiting for a child (diagnostics, tests). */
+  /** Dispatches still waiting to be claimed (diagnostics, tests). */
   pendingCount(): number;
 }
 
@@ -98,13 +119,50 @@ export interface DispatchRouterDeps {
   readonly now?: () => number;
 }
 
-interface Pending {
+/** What `route()` decided, until `commit()` has the final input. */
+interface Decided {
+  readonly parentSessionID: string;
+  readonly decisionID: string;
+  readonly facts: DecisionRow["facts"];
+  readonly acceptance: DetectionDepth;
+  readonly description: string | null;
+  /** What the engine dispatches: the fallback for what the final input leaves out. */
+  readonly final: { readonly agent: string; readonly model: string; readonly variant: string | null };
+  readonly routerIds: readonly string[];
+  /** Resolve an agent the legacy hook switched to (the same resolution the engine used for the pick). */
+  readonly resolve: (agent: string) => ChosenDispatch | null;
+  readonly at: number;
+}
+
+/** A committed dispatch, kept until its call ends. */
+interface Entry {
   readonly callID: string;
   readonly parentSessionID: string;
   readonly agent: string;
   readonly description: string | null;
   readonly input: DispatchInput;
   readonly at: number;
+  /** `waiting`: no child yet; `claimed`: a `session.created` was matched to it; `resumed`: registered at commit. */
+  state: "waiting" | "claimed" | "resumed";
+  claimedChild?: string;
+}
+
+/**
+ * A3: every plugin instance of the process may be handed the same hook event. The first instance whose engine is live
+ * claims the call; the others leave it alone (the first one already routed, logged and will register it).
+ */
+const handledCalls = new Set<string>();
+
+function claimCall(key: string): boolean {
+  if (handledCalls.has(key)) return false;
+  handledCalls.add(key);
+  while (handledCalls.size > MAX_HANDLED_CALLS) handledCalls.delete(handledCalls.values().next().value as string);
+  return true;
+}
+
+/** Test-only: forget which calls were handled. */
+export function resetDispatchRouting(): void {
+  handledCalls.clear();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -117,6 +175,15 @@ function describeError(error: unknown): string {
 
 function str(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
+}
+
+/** The child session a finished `subagent` call names (`result.output.sessionID`, else `result.metadata.sessionID`; spike S1). */
+export function childSessionOf(result: unknown): string | null {
+  if (!isRecord(result)) return null;
+  const output = result.output;
+  const fromOutput = isRecord(output) ? str(output.sessionID) : null;
+  if (fromOutput !== null) return fromOutput;
+  return isRecord(result.metadata) ? str(result.metadata.sessionID) : null;
 }
 
 interface SessionView {
@@ -185,15 +252,24 @@ function unresolvedChoice(cls: string, agent: string, routerIds: readonly string
 
 export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const now = deps.now ?? (() => Date.now());
-  const pending: Pending[] = [];
+  /** Between `route()` and `commit()`. */
+  const decided = new Map<string, Decided>();
+  /** Committed dispatches, in insertion order, until their call ends. */
+  const entries = new Map<string, Entry>();
   let sequence = 0;
 
-  const sweepPending = (t: number): void => {
-    for (let i = pending.length - 1; i >= 0; i--) {
-      if (t - (pending[i] as Pending).at >= PENDING_TTL_MS) pending.splice(i, 1);
-    }
-    while (pending.length > MAX_PENDING) pending.shift();
+  const trim = <T>(map: Map<string, T>, limit: number): void => {
+    while (map.size > limit) map.delete(map.keys().next().value as string);
   };
+
+  const sweep = (t: number): void => {
+    for (const [callID, entry] of entries) {
+      if (t - entry.at >= ENTRY_TTL_MS) entries.delete(callID);
+    }
+    trim(entries, MAX_PENDING);
+  };
+
+  const claimable = (entry: Entry, t: number): boolean => entry.state === "waiting" && t - entry.at < PENDING_TTL_MS;
 
   const register = (childSessionID: string, input: DispatchInput): void => {
     try {
@@ -205,9 +281,11 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
   /**
    * The orchestrator's pick lifted to `floorTier` (handoff 1.4, QA-1.4-17): `enforce` starts the dispatch on
-   * `max(pick, floor)`, so the row prices what runs. Only router tiers have a rank; a host agent is never lifted.
+   * `max(pick, floor)`, so the row prices what runs. Only router tiers have a rank; a host agent is never lifted. The floor
+   * tier must be startable by the parent AND cover the task's needs (QA-2.2-7): a lift must not send a shell task to an
+   * agent without a shell.
    */
-  const floorLift = (prepared: Prepared, chosen: ChosenDispatch, infos: readonly HostAgentInfo[] | null): ChosenDispatch | null => {
+  const floorLift = (prepared: Prepared, chosen: ChosenDispatch, infos: readonly HostAgentInfo[] | null, facts: TaskFacts): ChosenDispatch | null => {
     const floorRank = floorRankOf(prepared.cfg);
     if (floorRank === null || chosen.agent.origin !== "router") return null;
     const rank = tierRankOf(prepared.cfg, chosen.agent.id);
@@ -216,8 +294,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     if (floorTier === undefined) return null;
     const lifted = resolveChosen({ cfg: prepared.cfg, agents: infos, agent: floorTier });
     const info = infos?.find((agent) => agent.id === floorTier);
-    // The host must be able to start it: a floor tier the parent may not dispatch stays a note, not a swap.
-    return lifted !== null && info !== undefined && info.permitted && info.mode !== "primary" && !info.hidden ? lifted : null;
+    if (lifted === null || info === undefined) return null;
+    if (!info.permitted || info.mode === "primary" || info.hidden) return null;
+    return coversNeeds(info.grants, facts.needs) ? lifted : null;
   };
 
   const decideAndRecord = async (call: RouteCall, prepared: Prepared, session: SessionView, view: AgentView | null): Promise<RouteOutcome> => {
@@ -236,6 +315,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const facts = result.facts;
     const detection = result.detection ?? detectionOf(prompt);
     const pin = result.pin;
+    // `classify` removes only the first-line route line and returns every other byte unchanged (probe, QA-2.2-5).
     const stripped = result.stripped !== prompt ? result.stripped : undefined;
     const callModel = str(args.model) ?? call.tierModel ?? null;
     const resumeID = str(args.sessionID);
@@ -245,7 +325,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     let decision: Decision | null = null;
     let argmin: RouteChoice | null = null; // A27: the cheapest option the evidence filter removed, when it did
     let row: Pick<DecisionRow, "chosen" | "best" | "switched" | "pinned" | "unit" | "costs" | "confidence" | "reason">;
-    let final: { agent: string; model: string; variant: string | null; tier: string | null } | null = null;
+    let final: { agent: string; model: string; variant: string | null } | null = null;
     let outcome: RouteOutcome = { mode, ...(stripped === undefined ? {} : { prompt: stripped }), decisionID };
 
     if (chosen === null) {
@@ -273,23 +353,24 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         chosen: decision.chosen, best: decision.best, switched: decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence, reason: `${decision.reasonCode}: ${decision.reason}`,
       };
-      final = { agent, model: chosen.model, variant: chosen.variant, tier: chosen.agent.origin === "router" ? agent : null };
+      final = { agent, model: chosen.model, variant: chosen.variant };
 
       if (mode === "enforce" && !decision.pinned) {
         if (decision.switched && decision.target !== null) {
           const target = decision.target;
           outcome = { ...outcome, agent: target.agent.id, model: refOf(target.model, target.variant) };
-          final = { agent: target.agent.id, model: target.model, variant: target.variant, tier: target.tier };
+          final = { agent: target.agent.id, model: target.model, variant: target.variant };
         } else {
-          const lifted = floorLift(prepared, chosen, infos);
+          const lifted = floorLift(prepared, chosen, infos, facts);
           if (lifted !== null) {
             outcome = { ...outcome, agent: lifted.agent.id, model: refOf(lifted.model, lifted.variant) };
-            final = { agent: lifted.agent.id, model: lifted.model, variant: lifted.variant, tier: lifted.agent.id };
+            final = { agent: lifted.agent.id, model: lifted.model, variant: lifted.variant };
             row = {
               ...row,
               best: choiceOf(facts.class, lifted),
               switched: true,
-              reason: `${row.reason} [floorTier: dispatch lifted from @${agent} to @${lifted.agent.id}]`,
+              // Its own reason code (QA-2.2-7): a floor lift is policy, not an evidence-based switch; D17 does not count it.
+              reason: `${FLOOR_LIFT_REASON}: dispatch lifted from @${agent} to @${lifted.agent.id} by enforcement.escalate.floorTier; engine decision: ${row.reason}`,
             };
           }
         }
@@ -312,32 +393,18 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     });
 
     if (final !== null) {
-      const input: DispatchInput = {
-        facts: factsOf(facts),
-        agent: final.agent,
-        model: final.model,
-        variant: final.variant,
-        tier: final.tier,
-        acceptance: depthOf(detection),
+      decided.set(call.callID, {
         parentSessionID: call.sessionID,
         decisionID,
-        step: "dispatch",
-      };
-      if (resumeID !== null) {
-        register(resumeID, input);
-      } else {
-        const t = now();
-        sweepPending(t);
-        pending.push({
-          callID: call.callID,
-          parentSessionID: call.sessionID,
-          agent: final.agent,
-          description: typeof args.description === "string" && args.description !== "" ? args.description : null,
-          input,
-          at: t,
-        });
-        sweepPending(t);
-      }
+        facts: factsOf(facts),
+        acceptance: depthOf(detection),
+        description: typeof args.description === "string" && args.description !== "" ? args.description : null,
+        final,
+        routerIds,
+        resolve: (target) => resolveChosen({ cfg: prepared.cfg, agents: infos, agent: target, parentModel: session.model }),
+        at: now(),
+      });
+      trim(decided, MAX_PENDING);
     }
     return outcome;
   };
@@ -349,6 +416,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         if (agent === null || agent === deps.graderAgent) return UNTOUCHED;
         const prepared = await deps.runtime.prepare(call.cfg);
         if (prepared === null) return UNTOUCHED; // static: nothing touched
+        // A3 (QA-2.2-12): another instance of this process already acted on this call.
+        if (!claimCall(`${call.sessionID}\u0000${call.callID}`)) return UNTOUCHED;
         let session: SessionView;
         try {
           session = readSession(await deps.getSession(call.sessionID));
@@ -366,32 +435,104 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       }
     },
 
+    commit(callID, input): void {
+      try {
+        const d = decided.get(callID);
+        if (d === undefined) return;
+        decided.delete(callID);
+        const final = isRecord(input) ? input : {};
+        // The agent and model the host will run, after the legacy hook: they win over what the engine decided.
+        const agent = str(final.agent) ?? d.final.agent;
+        const ref = str(final.model);
+        let model: string;
+        let variant: string | null;
+        if (ref !== null) {
+          const parts = splitModelRef(ref);
+          if (parts === null) return;
+          model = `${parts.provider}/${parts.model}`;
+          variant = parts.variant;
+        } else if (agent === d.final.agent) {
+          model = d.final.model;
+          variant = d.final.variant;
+        } else {
+          const resolved = d.resolve(agent);
+          if (resolved === null) return; // nothing to record a step against
+          model = resolved.model;
+          variant = resolved.variant;
+        }
+        const dispatched: DispatchInput = {
+          facts: d.facts,
+          agent,
+          model,
+          variant,
+          tier: classifyAgentOrigin(agent, d.routerIds) === "router" ? agent : null,
+          acceptance: d.acceptance,
+          parentSessionID: d.parentSessionID,
+          decisionID: d.decisionID,
+          step: "dispatch",
+        };
+        const t = now();
+        sweep(t);
+        const resumeID = str(final.sessionID);
+        const entry: Entry = { callID, parentSessionID: d.parentSessionID, agent, description: d.description, input: dispatched, at: t, state: resumeID === null ? "waiting" : "resumed" };
+        if (resumeID !== null) register(resumeID, dispatched);
+        entries.delete(callID);
+        entries.set(callID, entry);
+        trim(entries, MAX_PENDING);
+      } catch (error) {
+        deps.logger.warn("[router] routing: the dispatch could not be committed for ingestion", { error: describeError(error) });
+      }
+    },
+
     onSessionCreated(created): void {
       try {
         const sessionID = str(created.sessionID);
         const parentID = str(created.parentID);
-        if (sessionID === null || parentID === null || pending.length === 0) return;
-        sweepPending(now());
+        if (sessionID === null || parentID === null || entries.size === 0) return;
+        const t = now();
+        sweep(t);
         const agent = str(created.agent);
         const title = str(created.title);
-        const mine = pending.filter((entry) => entry.parentSessionID === parentID);
+        const mine = [...entries.values()].filter((entry) => entry.parentSessionID === parentID && claimable(entry, t));
         const sameAgent = agent === null ? mine : mine.filter((entry) => entry.agent === agent);
         if (sameAgent.length === 0) return;
         const claimed = (title === null ? undefined : sameAgent.find((entry) => entry.description === title)) ?? sameAgent[0];
         if (claimed === undefined) return;
-        pending.splice(pending.indexOf(claimed), 1);
+        claimed.state = "claimed";
+        claimed.claimedChild = sessionID;
         register(sessionID, claimed.input);
       } catch (error) {
         deps.logger.warn("[router] routing: a new child session could not be matched to its dispatch", { error: describeError(error) });
       }
     },
 
-    onCallFinished(callID): void {
-      for (let i = pending.length - 1; i >= 0; i--) {
-        if ((pending[i] as Pending).callID === callID) pending.splice(i, 1);
+    onCallResult(callID, childSessionID): void {
+      try {
+        decided.delete(callID);
+        const entry = entries.get(callID);
+        entries.delete(callID);
+        if (entry === undefined || childSessionID === null || entry.state === "resumed") return;
+        // Still waiting (the event was missed, or the claim expired), or claimed for a different child: the result is the truth.
+        if (lookupDispatch(childSessionID)?.decisionID !== entry.input.decisionID) register(childSessionID, entry.input);
+        if (entry.state === "claimed" && entry.claimedChild !== undefined && entry.claimedChild !== childSessionID
+          && lookupDispatch(entry.claimedChild)?.decisionID === entry.input.decisionID) {
+          forgetDispatch(entry.claimedChild); // a wrong claim: that child belongs to another dispatch, which registers it from its own result
+        }
+      } catch (error) {
+        deps.logger.warn("[router] routing: the child of a finished dispatch could not be registered", { error: describeError(error) });
       }
     },
 
-    pendingCount: () => pending.length,
+    onCallFinished(callID): void {
+      decided.delete(callID);
+      entries.delete(callID);
+    },
+
+    pendingCount(): number {
+      const t = now();
+      let count = 0;
+      for (const entry of entries.values()) if (claimable(entry, t)) count += 1;
+      return count;
+    },
   };
 }

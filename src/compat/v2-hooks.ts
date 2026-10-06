@@ -16,7 +16,7 @@ import { GRADER_SYSTEM } from "../verify/checker";
 import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
-import { createDispatchRouter } from "../routing/wire/dispatch";
+import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
 import { createSystemAugmenter } from "../routing/wire/hint";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -380,30 +380,39 @@ export async function registerV2Hooks(
         if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
       }
       // After routing: the prompt the legacy hook starts from is the one the engine left (a stripped route line is not "added" text).
-      const original = args && typeof args === "object" ? { ...args } : args;
-      const output = { args };
-      await within(hookContext(event), async () => {
-        await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
-      });
-      const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
-      const banner = (output as Record<PropertyKey, unknown>)[DEPTH_BANNER];
-      if (typeof banner === "string") {
-        depthBanners.delete(event.id);
-        depthBanners.set(event.id, banner);
-        while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+      try {
+        const original = args && typeof args === "object" ? { ...args } : args;
+        const output = { args };
+        await within(hookContext(event), async () => {
+          await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
+        });
+        const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
+        const banner = (output as Record<PropertyKey, unknown>)[DEPTH_BANNER];
+        if (typeof banner === "string") {
+          depthBanners.delete(event.id);
+          depthBanners.set(event.id, banner);
+          while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+        }
+        if (verifying) {
+          verifyingCalls.add(event.id);
+          while (verifyingCalls.size > 1000) verifyingCalls.delete(verifyingCalls.values().next().value!);
+        }
+        if (event.tool === "subagent" && typeof output.args?.prompt === "string") {
+          const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
+          output.args.prompt = translateAdded(prompt, output.args.prompt);
+        }
+        event.input = nativeArgs(event.tool, output.args, original, verifying);
+      } catch (error) {
+        dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
+        throw error;
       }
-      if (verifying) {
-        verifyingCalls.add(event.id);
-        while (verifyingCalls.size > 1000) verifyingCalls.delete(verifyingCalls.values().next().value!);
-      }
-      if (event.tool === "subagent" && typeof output.args?.prompt === "string") {
-        const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
-        output.args.prompt = translateAdded(prompt, output.args.prompt);
-      }
-      event.input = nativeArgs(event.tool, output.args, original, verifying);
+      // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
+      dispatchRouter.commit(event.id, event.input);
     }));
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
-      dispatchRouter.onCallFinished(event.id); // a dispatch that never produced a child can no longer be claimed (2.2)
+      // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
+      // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
+      dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
       const banner = depthBanners.get(event.id);
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
