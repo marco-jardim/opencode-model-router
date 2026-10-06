@@ -7,8 +7,10 @@
  * catalog, no agent list) says nothing instead of guessing, and a check that throws is skipped and logged by
  * {@link runChecks}'s caller (`runAdvisor`), never raised into a session.
  *
- * Never invents a model: a suggested model always comes from the catalog it was given, is enabled, supports tool calls
- * and is priced (A1/A2). Config snippets are JSON that can be pasted into the override file as is.
+ * Never invents a model: a suggested model always comes from the catalog it was given, is enabled, active and priced (A1/A2), and
+ * for the host's title agent it passes the host's own `Model.small` predicate (text in and out). A finding says where its fix goes:
+ * `target: "host"` = the user's `opencode.json`, `target: "router"` = `opencode-model-router.overrides.jsonc`; a snippet is JSON for that
+ * file, nothing else.
  */
 
 import type { RouterConfig, TierConfig } from "../../router/config";
@@ -30,7 +32,6 @@ export type FindingSeverity = "warning" | "saving" | "info";
 
 export const FINDING_IDS = [
   "title-model-unset",
-  "summary-model-unset",
   "model-not-in-catalog",
   "no-tool-support",
   "variant-not-offered",
@@ -49,16 +50,46 @@ export const FINDING_IDS = [
 ] as const;
 export type FindingId = (typeof FINDING_IDS)[number];
 
+/** Whose configuration the fix belongs to: the host's own (`opencode.json`) or this plugin's (`opencode-model-router.overrides.jsonc`). */
+export type FindingTarget = "host" | "router";
+
+/** Only the title agent's model is the host's; everything else is this plugin's configuration. */
+export const FINDING_TARGET: Readonly<Record<FindingId, FindingTarget>> = {
+  "title-model-unset": "host",
+  "model-not-in-catalog": "router",
+  "no-tool-support": "router",
+  "variant-not-offered": "router",
+  "effort-not-offered": "router",
+  "variant-effort": "router",
+  "rejected-candidates": "router",
+  "foreign-candidates": "router",
+  "covered-tier": "router",
+  "variant-ladder-budget": "router",
+  "attempts-without-variants": "router",
+  "unpriced-model": "router",
+  "subscription-pricing": "router",
+  "native-role-unmatched-rung": "router",
+  "tier-agent-unavailable": "router",
+  "classifier-model-missing": "router",
+};
+
 export interface Finding {
   readonly id: FindingId;
   readonly severity: FindingSeverity;
+  /** Which file the fix is for. */
+  readonly target: FindingTarget;
   /** The agent, tier or model the finding is about (`""` for a global finding). */
   readonly subject: string;
   /** What is wrong and what it costs, in one or two sentences. */
   readonly message: string;
-  /** A JSON config snippet that fixes it, or `null` when there is nothing safe to suggest. */
+  /** A JSON snippet for the `target` file that fixes it, or `null` when there is nothing safe to suggest. */
   readonly snippet: string | null;
+  /** The OpenCode v1 spelling of a host-target snippet (`agent.title.model` / `small_model`), or `null`. */
+  readonly snippetV1: string | null;
 }
+
+/** What a check produces: `runChecks` adds `target` (and a null `snippetV1`). */
+type RawFinding = Omit<Finding, "target" | "snippetV1"> & { readonly snippetV1?: string | null };
 
 /** The slice of a host `Model.Info` the checks read (structural; extra fields are ignored). */
 export interface AdvisorCatalogModel {
@@ -66,7 +97,9 @@ export interface AdvisorCatalogModel {
   readonly id: string;
   readonly enabled?: boolean;
   readonly status?: string;
-  readonly capabilities?: { readonly tools?: boolean } | null;
+  /** Model family (`claude-haiku`, `gpt-luna`, …): the host's small-model pick is by family. */
+  readonly family?: string;
+  readonly capabilities?: { readonly tools?: boolean; readonly input?: readonly string[]; readonly output?: readonly string[] } | null;
   readonly variants?: ReadonlyArray<{ readonly id?: unknown } | null | undefined> | null;
   readonly cost?: unknown;
   readonly limit?: { readonly context?: unknown; readonly input?: unknown; readonly output?: unknown } | null;
@@ -80,9 +113,11 @@ export interface HostAgentView {
   readonly hidden: boolean;
 }
 
-/** What the checks need to know of the host's own configuration: its agents (a missing `model` = unset). */
+/** What the checks need to know of the host's own configuration: its agents (a missing `model` = unset) and the session's model. */
 export interface HostConfigView {
   readonly agents: readonly HostAgentView[];
+  /** The orchestrator's model (the host's "primary"); `null`/absent when not known yet. The host's title pick depends on its provider. */
+  readonly primary?: { readonly providerID: string; readonly modelID: string | null } | null;
 }
 
 /** Providers whose catalog prices are relative weights, not what is billed (D6). */
@@ -123,13 +158,44 @@ function pricePerMillion(model: AdvisorCatalogModel): number | null {
 }
 
 /**
- * A2: the cheapest model the user can actually use for a text-only side task: enabled, not deprecated, supporting tool
- * calls, and priced. Ties break on `provider/id`, so the answer is stable. `null` when the catalog has none.
+ * The host's own candidate test for a title model (`Model.small` at v2.0.22, `core/src/model.ts`): enabled, `status: "active"`, and text
+ * in AND out. Tool calls are not needed (a title is one text generation), so they are not required here (QA-2.4-11).
  */
-export function cheapestToolModel(catalog: readonly AdvisorCatalogModel[]): { ref: string; model: AdvisorCatalogModel; price: number } | null {
+function titleEligible(model: AdvisorCatalogModel): boolean {
+  const input = model.capabilities?.input;
+  const output = model.capabilities?.output;
+  return (
+    model.enabled === true &&
+    model.status === "active" &&
+    Array.isArray(input) && input.some((item) => typeof item === "string" && item.startsWith("text")) &&
+    Array.isArray(output) && output.some((item) => typeof item === "string" && item.startsWith("text"))
+  );
+}
+
+/** The families the host's `Model.small` looks for, in its order of preference. */
+export const HOST_SMALL_MODEL_FAMILIES: readonly string[] = ["gpt-luna", "gemini-flash-lite", "gemini-flash", "claude-haiku"];
+
+/**
+ * What `Model.small(providerID)` would answer for this catalog: among the provider's eligible models, the first of
+ * {@link HOST_SMALL_MODEL_FAMILIES} that has one. `null` = the host finds none and a title is generated with the session's own model.
+ */
+export function hostSmallModel(catalog: readonly AdvisorCatalogModel[], providerID: string): AdvisorCatalogModel | null {
+  const models = catalog.filter((model) => model.providerID === providerID && titleEligible(model));
+  for (const family of HOST_SMALL_MODEL_FAMILIES) {
+    const hit = models.find((model) => model.family === family);
+    if (hit !== undefined) return hit;
+  }
+  return null;
+}
+
+/**
+ * A2: the cheapest priced model the host would accept for the title agent (`titleEligible`). Ties break on `provider/id`, so the
+ * answer is stable. `null` when the catalog has none.
+ */
+export function cheapestTitleModel(catalog: readonly AdvisorCatalogModel[]): { ref: string; model: AdvisorCatalogModel; price: number } | null {
   let best: { ref: string; model: AdvisorCatalogModel; price: number } | null = null;
   for (const model of catalog) {
-    if (!usable(model) || model.capabilities?.tools !== true) continue;
+    if (!titleEligible(model)) continue;
     const price = pricePerMillion(model);
     if (price === null) continue;
     const ref = `${model.providerID}/${model.id}`;
@@ -172,53 +238,53 @@ interface CheckInput {
   readonly byRef: ReadonlyMap<string, AdvisorCatalogModel> | null;
 }
 
-type Check = (input: CheckInput) => Finding[];
+type Check = (input: CheckInput) => RawFinding[];
 
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
 
-/** F4: `agents.title.model` / `agents.summary.model` unset → the orchestrator's model writes titles and summaries. */
-const sideModels: Check = ({ host, catalog }) => {
-  if (host === null) return [];
-  const findings: Finding[] = [];
-  const cheapest = catalog === null || catalog.length === 0 ? null : cheapestToolModel(catalog);
-  for (const id of ["title", "summary"] as const) {
-    const agent = host.agents.find((a) => a.id === id);
-    if (agent === undefined || agent.model !== null) continue;
-    const base = `agents.${id}.model is unset: the host generates ${id === "title" ? "session titles" : "summaries"} with the session's own (orchestrator) model, which is the most expensive model in the session.`;
-    if (cheapest === null) {
-      findings.push({
-        id: id === "title" ? "title-model-unset" : "summary-model-unset",
-        severity: "saving",
-        subject: id,
-        message: `${base} ${
-          catalog === null || catalog.length === 0
-            ? "The host's model catalog was unavailable, so no model is suggested"
-            : "Your model catalog has no enabled, priced model that supports tool calls to suggest"
-        }; set it to a cheap model you have access to.`,
-        snippet: null,
-      });
-      continue;
-    }
-    const subscription = SUBSCRIPTION_PROVIDERS.includes(cheapest.model.providerID);
-    findings.push({
-      id: id === "title" ? "title-model-unset" : "summary-model-unset",
-      severity: "saving",
-      subject: id,
-      message: `${base} The cheapest priced model with tool support in your catalog is ${cheapest.ref} (${fmtPrice(cheapest.model)})${
-        subscription ? `; ${cheapest.model.providerID} is a subscription provider, so its catalog prices are relative weights, not billed amounts` : ""
-      }.`,
-      snippet: json({ agents: { [id]: { model: cheapest.ref } } }),
-    });
-  }
-  return findings;
+/**
+ * F4, QA-2.4-1: the host picks a session title's model as `agents.title.model`, else `Model.small(<session's provider>)` (a small model of
+ * the SAME provider: gpt-luna, gemini-flash-lite, gemini-flash or claude-haiku), else the session's own model (v2.0.22
+ * `core/src/session/context.ts` `selectTitle`). So the only case where leaving it unset costs anything is the last one: the provider has
+ * no such model in the catalog. Everything else is silent: with a small model present the host already picks a cheap one, and without
+ * knowing the session's provider (or the catalog) the pick cannot be predicted. No consumer of a `summary` model was found in the host,
+ * so none is reported.
+ */
+const titleModel: Check = ({ host, catalog }) => {
+  if (host === null || catalog === null) return [];
+  const title = host.agents.find((a) => a.id === "title");
+  if (title === undefined || title.model !== null) return [];
+  const primary = host.primary;
+  if (primary === null || primary === undefined) return [];
+  if (hostSmallModel(catalog, primary.providerID) !== null) return [];
+  // The host falls back to the primary itself, so that is the price to beat (never when the primary is unpriced: then no saving is claimed).
+  const cheapest = cheapestTitleModel(catalog);
+  if (cheapest === null) return [];
+  const primaryEntry = primary.modelID === null ? undefined : catalog.find((m) => m.providerID === primary.providerID && m.id === primary.modelID);
+  const primaryPrice = primaryEntry === undefined ? null : pricePerMillion(primaryEntry);
+  if (primaryPrice !== null && cheapest.price >= primaryPrice) return [];
+  const primaryRef = primary.modelID === null ? primary.providerID : `${primary.providerID}/${primary.modelID}`;
+  const subscription = SUBSCRIPTION_PROVIDERS.includes(cheapest.model.providerID);
+  return [{
+    id: "title-model-unset",
+    severity: "saving",
+    subject: "title",
+    message: `agents.title.model is unset and the host finds no small model of ${primary.providerID} in your catalog (it looks for ${HOST_SMALL_MODEL_FAMILIES.join(", ")} of the session's provider), so session titles are generated with the session's own model, ${primaryRef}${
+      primaryPrice === null ? "" : ` (${fmtPrice(primaryEntry as AdvisorCatalogModel)})`
+    }. The cheapest priced model the host accepts for it in your catalog is ${cheapest.ref} (${fmtPrice(cheapest.model)})${
+      subscription ? `; ${cheapest.model.providerID} is a subscription provider, so its catalog prices are relative weights, not billed amounts` : ""
+    }.`,
+    snippet: json({ agents: { title: { model: cheapest.ref } } }),
+    snippetV1: `${json({ agent: { title: { model: cheapest.ref } } })} or ${json({ small_model: cheapest.ref })}`,
+  }];
 };
 
 /** QA-1.1-9: every rung of every tier against the live catalog (existence, tool support, variant). */
 const ladderCatalog: Check = ({ cfg, byRef }) => {
   if (byRef === null) return [];
-  const findings: Finding[] = [];
+  const findings: RawFinding[] = [];
   const seen = new Set<string>();
   for (const rung of rungsOf(cfg)) {
     const entry = byRef.get(rung.model);
@@ -287,7 +353,7 @@ function variantInfos(cfg: RouterConfig, byRef: ReadonlyMap<string, AdvisorCatal
 /** A20 / QA-2.3-13: a tier that sets `variant` AND `effort`/`thinking`/`reasoning` has an empty variant ladder. */
 const variantWithEffort: Check = ({ cfg, byRef }) => {
   if (resolveVariantSteps(cfg, "v2") !== "auto") return [];
-  const findings: Finding[] = [];
+  const findings: RawFinding[] = [];
   for (const [name, tier] of activeTierEntries(cfg)) {
     if (typeof tier.variant !== "string" || tier.variant === "" || !isEffortConfigured(tier)) continue;
     const entry = byRef?.get(tier.model);
@@ -327,7 +393,7 @@ function stepsFrom(ladder: VariantLadder, base: string): string[] {
 const variantLadders: Check = ({ cfg, byRef }) => {
   const infos = variantInfos(cfg, byRef);
   if (infos === null) return [];
-  const findings: Finding[] = [];
+  const findings: RawFinding[] = [];
   for (const [name, info] of Object.entries(infos.perTier)) {
     if (info.effortConfigured === true) continue; // reported by variantWithEffort
     if (info.ladder.rejected.length > 0) {
@@ -404,7 +470,7 @@ const attemptsWithoutVariants: Check = ({ cfg }) => {
 /** D5 / D6: unpriced ladder models and subscription providers. */
 const pricing: Check = ({ cfg, byRef }) => {
   if (byRef === null) return [];
-  const findings: Finding[] = [];
+  const findings: RawFinding[] = [];
   const models = [...new Set(rungsOf(cfg).map((r) => r.model))];
   const unpriced = models.filter((m) => {
     const entry = byRef.get(m);
@@ -438,7 +504,7 @@ const nativeRoles: Check = ({ cfg, host }) => {
   const routing = resolveRouting(cfg, "v2");
   if (routing.engine === "static") return [];
   const rungKeys = new Set(rungsOf(cfg).map((r) => `${r.model}#${r.variant ?? DEFAULT_VARIANT}`));
-  const findings: Finding[] = [];
+  const findings: RawFinding[] = [];
   const reported = new Set<string>();
   for (const [taskClass, agents] of Object.entries(routing.roles)) {
     for (const id of agents) {
@@ -464,7 +530,7 @@ const nativeRoles: Check = ({ cfg, host }) => {
 /** 2.2 handoff: the engine routes to agents by id; a tier agent the host does not offer makes it inert for that tier. */
 const tierAgents: Check = ({ cfg, host }) => {
   if (host === null || host.agents.length === 0) return [];
-  const findings: Finding[] = [];
+  const findings: RawFinding[] = [];
   for (const [name] of activeTierEntries(cfg)) {
     const agent = host.agents.find((a) => a.id === name);
     if (agent !== undefined && agent.mode !== "primary" && !agent.hidden) continue;
@@ -498,7 +564,7 @@ const classifierModel: Check = ({ cfg, byRef }) => {
 };
 
 const CHECKS: ReadonlyArray<readonly [string, Check]> = [
-  ["side-models", sideModels],
+  ["title-model", titleModel],
   ["ladder-catalog", ladderCatalog],
   ["variant-effort", variantWithEffort],
   ["variant-ladders", variantLadders],
@@ -525,7 +591,9 @@ export function runChecks(
   let order = 0;
   for (const [name, check] of CHECKS) {
     try {
-      for (const finding of check(input)) out.push({ finding, order: order++ });
+      for (const raw of check(input)) {
+        out.push({ finding: { ...raw, target: FINDING_TARGET[raw.id], snippetV1: raw.snippetV1 ?? null }, order: order++ });
+      }
     } catch (error) {
       onError(name, error);
     }

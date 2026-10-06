@@ -19,10 +19,10 @@ import { nodePersistFs, renameWithRetry, resolveOutcomesDir } from "../outcomes/
 import type { PersistFs } from "../outcomes/types";
 import { agentModelRef } from "../wire/host-info";
 import { runChecks } from "./findings";
-import type { AdvisorCatalogModel, Finding, HostAgentView, HostConfigView } from "./findings";
+import type { AdvisorCatalogModel, Finding, FindingTarget, HostAgentView, HostConfigView } from "./findings";
 
-export { FINDING_IDS, SUBSCRIPTION_PROVIDERS, cheapestToolModel, splitModelRef } from "./findings";
-export type { AdvisorCatalogModel, Finding, FindingId, FindingSeverity, HostAgentView, HostConfigView } from "./findings";
+export { FINDING_IDS, FINDING_TARGET, HOST_SMALL_MODEL_FAMILIES, SUBSCRIPTION_PROVIDERS, cheapestTitleModel, hostSmallModel, splitModelRef } from "./findings";
+export type { AdvisorCatalogModel, Finding, FindingId, FindingSeverity, FindingTarget, HostAgentView, HostConfigView } from "./findings";
 
 export interface AdvisorLogger {
   warn(message: string, extra?: Record<string, unknown>): void;
@@ -60,8 +60,11 @@ export function runAdvisor(
   }
 }
 
-/** The view of `ctx.agent.list().data` the advisor reads. Entries without a string id are skipped. */
-export function hostConfigFromAgents(raw: readonly unknown[]): HostConfigView {
+/**
+ * The view of `ctx.agent.list().data` the advisor reads (entries without a string id are skipped), plus the session's own model when the
+ * caller knows it (the host's title pick depends on its provider).
+ */
+export function hostConfigFromAgents(raw: readonly unknown[], primary: HostConfigView["primary"] = null): HostConfigView {
   const agents: HostAgentView[] = [];
   for (const entry of raw) {
     if (!isRecord(entry) || typeof entry.id !== "string" || entry.id === "") continue;
@@ -72,7 +75,7 @@ export function hostConfigFromAgents(raw: readonly unknown[]): HostConfigView {
       hidden: entry.hidden === true,
     });
   }
-  return { agents };
+  return { agents, primary };
 }
 
 /**
@@ -84,13 +87,21 @@ export function catalogFromModels(raw: readonly unknown[]): AdvisorCatalogModel[
   const models: AdvisorCatalogModel[] = [];
   for (const entry of raw) {
     if (!isRecord(entry) || typeof entry.providerID !== "string" || typeof entry.id !== "string" || entry.providerID === "" || entry.id === "") continue;
-    const capabilities = isRecord(entry.capabilities) ? { tools: typeof entry.capabilities.tools === "boolean" ? entry.capabilities.tools : undefined } : null;
+    const strings = (value: unknown): string[] | undefined => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined);
+    const capabilities = isRecord(entry.capabilities)
+      ? {
+          tools: typeof entry.capabilities.tools === "boolean" ? entry.capabilities.tools : undefined,
+          input: strings(entry.capabilities.input),
+          output: strings(entry.capabilities.output),
+        }
+      : null;
     const limit = isRecord(entry.limit) ? { context: entry.limit.context, input: entry.limit.input, output: entry.limit.output } : null;
     models.push({
       providerID: entry.providerID,
       id: entry.id,
       ...(typeof entry.enabled === "boolean" ? { enabled: entry.enabled } : {}),
       ...(typeof entry.status === "string" ? { status: entry.status } : {}),
+      ...(typeof entry.family === "string" ? { family: entry.family } : {}),
       capabilities,
       variants: Array.isArray(entry.variants) ? (entry.variants as ReadonlyArray<{ readonly id?: unknown } | null | undefined>) : null,
       cost: entry.cost,
@@ -107,11 +118,19 @@ export function catalogFromModels(raw: readonly unknown[]): AdvisorCatalogModel[
 export interface DoctorContext {
   readonly hostKnown: boolean;
   readonly catalogKnown: boolean;
+  /** The session's model is known (the title check needs its provider); absent = not asked about. */
+  readonly primaryKnown?: boolean;
 }
+
+/** The file each finding target's snippet belongs in. */
+const FIX_FILE: Readonly<Record<FindingTarget, string>> = {
+  host: "opencode.json",
+  router: "opencode-model-router.overrides.jsonc",
+};
 
 /** The `/router` section "Cost doctor": a header, then one block per finding with its optional fix snippet. */
 export function formatFindings(findings: readonly Finding[], context: DoctorContext = { hostKnown: true, catalogKnown: true }): string[] {
-  const skipped =
+  const base =
     !context.hostKnown && !context.catalogKnown
       ? "the host's agent list and model catalog were unavailable, so those checks were skipped"
       : !context.hostKnown
@@ -119,13 +138,19 @@ export function formatFindings(findings: readonly Finding[], context: DoctorCont
         : !context.catalogKnown
           ? "the host's model catalog was unavailable, so those checks were skipped"
           : null;
+  const skipped =
+    context.hostKnown && context.catalogKnown && context.primaryKnown === false
+      ? "the session's model is not known yet, so the title-model check was skipped (ask again after the first turn)"
+      : base;
   if (findings.length === 0) return [`Cost doctor: no findings${skipped === null ? "" : ` (${skipped})`}.`];
   const count = (severity: Finding["severity"]): number => findings.filter((f) => f.severity === severity).length;
   const header = `Cost doctor: ${findings.length} finding${findings.length === 1 ? "" : "s"} (${count("warning")} warning, ${count("saving")} saving, ${count("info")} info)${skipped === null ? "" : `; ${skipped}`}`;
   const lines = [header];
   for (const finding of findings) {
     lines.push(`  [${finding.severity}] ${finding.id}${finding.subject === "" ? "" : ` (${finding.subject})`}: ${finding.message}`);
-    if (finding.snippet !== null) lines.push(`      fix: ${finding.snippet}`);
+    // QA-2.4-2: say whose file the fix belongs to; a host fix also has a v1 spelling.
+    if (finding.snippet !== null) lines.push(`      fix (${FIX_FILE[finding.target]}): ${finding.snippet}`);
+    if (finding.snippet !== null && finding.snippetV1 !== null) lines.push(`      v1 form (opencode.json): ${finding.snippetV1}`);
   }
   return lines;
 }

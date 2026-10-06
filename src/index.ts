@@ -548,6 +548,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
   // M8 (Phase 2.4): the cost doctor reads the host's agents and model catalog (v2 only, D1). Each call is bounded and failing
   // one only leaves the checks that need it silent; nothing here ever throws into a session.
+  // The orchestrator's model as the last root-session turn reported it: the host's title pick depends on its provider (QA-2.4-1).
+  let lastPrimary: { providerID: string; modelID: string | null } | null = null;
   const ADVISOR_HOST_TIMEOUT_MS = 3_000;
   const gatherAdvisorInputs = async (): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
     const attempt = async (label: string, call: (() => Promise<readonly unknown[]>) | undefined): Promise<readonly unknown[] | null> => {
@@ -560,7 +562,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
     };
     const [agents, models] = await Promise.all([attempt("host agent list", ctx.routerAgents), attempt("model catalog", ctx.routerCatalog)]);
-    return { host: agents === null ? null : hostConfigFromAgents(agents), catalog: models === null ? null : catalogFromModels(models) };
+    return { host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary), catalog: models === null ? null : catalogFromModels(models) };
   };
   const advisorNotifier = ctx.routerHost === "v2"
     ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2"), config: () => cfg, gather: gatherAdvisorInputs, logger })
@@ -601,7 +603,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const routing = resolveRouting(cfg, "v2");
     if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
     const { host, catalog } = await gatherAdvisorInputs();
-    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), { hostKnown: host !== null, catalogKnown: catalog !== null && catalog.length > 0 });
+    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), {
+      hostKnown: host !== null,
+      catalogKnown: catalog !== null && catalog.length > 0,
+      primaryKnown: lastPrimary !== null,
+    });
     // Phase 2.3 handoff (decision 16): a ladder row's confidence is not the evidence share the dispatch rows carry.
     if (routing.engine !== "static") {
       lines.push("Decision log: a ladder-attempt row's confidence is the delegation's class confidence; a dispatch row's is the class confidence scaled by the winner's evidence (n/(n+5)).");
@@ -2262,6 +2268,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const providerID = _input?.model?.providerID ?? "";
       const modelID = _input?.model?.modelID ?? "";
       const orchestratorModel = providerID && modelID ? `${providerID}/${modelID}` : modelID;
+      if (providerID !== "") lastPrimary = { providerID, modelID: modelID === "" ? null : modelID };
 
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}

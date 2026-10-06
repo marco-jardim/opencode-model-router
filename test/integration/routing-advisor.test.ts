@@ -23,10 +23,12 @@ import type { PersistFs } from "../../src/routing/outcomes";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { buildEscalatePolicy } from "../../src/escalate/ladder";
 import {
-  cheapestToolModel,
+  HOST_SMALL_MODEL_FAMILIES,
+  cheapestTitleModel,
   formatFindings,
   formatNotice,
   hostConfigFromAgents,
+  hostSmallModel,
   noticeWorthy,
   runAdvisor,
 } from "../../src/routing/advisor";
@@ -76,7 +78,7 @@ function model(ref: string, over: Partial<AdvisorCatalogModel> = {}): AdvisorCat
     id: rest.join("/"),
     enabled: true,
     status: "active",
-    capabilities: { tools: true },
+    capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
     variants: ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id })),
     cost: [{ input: 3, output: 15, cache: { read: 0.3, write: 3.75 } }],
     limit: { context: 1_000_000, output: 64_000 },
@@ -88,10 +90,13 @@ const CATALOG: AdvisorCatalogModel[] = [model(SONNET), model(OPUS, { cost: [{ in
 
 const noHost: HostConfigView = { agents: [] };
 const hostWith = (...agents: Array<Record<string, unknown>>): HostConfigView => hostConfigFromAgents(agents);
-const TITLE_SUMMARY = hostWith(
-  { id: "title", mode: "primary", hidden: true },
-  { id: "summary", mode: "primary", hidden: true },
+/** An anthropic session (priced Sonnet) whose title agent has no model; with CATALOG_CHEAP the host finds no small model for it. */
+const TITLE_HOST = hostConfigFromAgents(
+  [{ id: "title", mode: "primary", hidden: true }, { id: "summary", mode: "primary", hidden: true }],
+  { providerID: "anthropic", modelID: "claude-sonnet-5-5" },
 );
+const CHEAP = model("x/cheap", { cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }] });
+const CATALOG_CHEAP: AdvisorCatalogModel[] = [...CATALOG, CHEAP];
 
 function ids(findings: readonly Finding[]): FindingId[] {
   return findings.map((f) => f.id);
@@ -101,96 +106,128 @@ function find(findings: readonly Finding[], id: FindingId, subject?: string): Fi
 }
 
 // ---------------------------------------------------------------------------
-// Title / summary models and the cheapest-model suggestion (F4, A2)
+// The title model and the cheapest-model suggestion (F4, A2)
 // ---------------------------------------------------------------------------
 
-describe("cost doctor: title and summary models", () => {
+describe("cost doctor: the title model (QA-2.4-1, QA-2.4-2, QA-2.4-11)", () => {
   const cheap = model("opencode-go/deepseek-v4.1-flash", { cost: [{ input: 0.15, output: 0.6, cache: { read: 0, write: 0 } }] });
+  const haiku = model("anthropic/claude-haiku-4-5", { family: "claude-haiku", cost: [{ input: 1, output: 5, cache: { read: 0.1, write: 1.25 } }] });
+  /** An anthropic session on a priced Sonnet; the title agent has no model of its own. */
+  const host = (primary: { providerID: string; modelID: string | null } | null = { providerID: "anthropic", modelID: "claude-sonnet-5-5" }): HostConfigView =>
+    hostConfigFromAgents([{ id: "title", mode: "primary", hidden: true }, { id: "summary", mode: "primary", hidden: true }], primary);
+  const doctor = (catalog: AdvisorCatalogModel[], hostView: HostConfigView | null = host()) => runAdvisor(cfgOf({ routing: {} }), hostView, catalog);
 
-  it("fires for each unset model and suggests the cheapest priced, enabled, tool-capable model of the catalog", () => {
-    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, [...CATALOG, cheap]);
+  it("does NOT fire when the host's own pick finds a small model of the session's provider (a claude-haiku for an anthropic session)", () => {
+    expect(find(doctor([...CATALOG, haiku, cheap]), "title-model-unset")).toBeUndefined();
+    // …for each family the host looks for, in any order of the catalog
+    for (const family of HOST_SMALL_MODEL_FAMILIES) {
+      const small = model("anthropic/some-small", { family });
+      expect(hostSmallModel([...CATALOG, small], "anthropic")?.family).toBe(family);
+      expect(find(doctor([...CATALOG, small, cheap]), "title-model-unset")).toBeUndefined();
+    }
+  });
+
+  it("the host's pick is by family order and by provider, and only among eligible models (enabled, active, text in and out)", () => {
+    const luna = model("anthropic/lunar", { family: "gpt-luna" });
+    const flash = model("anthropic/flashy", { family: "gemini-flash" });
+    expect(hostSmallModel([flash, haiku, luna], "anthropic")?.id).toBe("lunar"); // gpt-luna first
+    expect(hostSmallModel([haiku, flash], "anthropic")?.id).toBe("flashy"); // gemini-flash before claude-haiku
+    expect(hostSmallModel([model("openai/claude-haiku-x", { family: "claude-haiku" })], "anthropic")).toBeNull(); // another provider's
+    for (const broken of [
+      { ...haiku, enabled: false },
+      { ...haiku, status: "beta" },
+      { ...haiku, status: "deprecated" },
+      { ...haiku, capabilities: { tools: true, input: ["image"], output: ["text"] } },
+      { ...haiku, capabilities: { tools: true, input: ["text"], output: ["image"] } },
+      { ...haiku, capabilities: null },
+    ]) {
+      expect(hostSmallModel([broken], "anthropic"), JSON.stringify(broken.status ?? broken.capabilities)).toBeNull();
+    }
+    expect(hostSmallModel([model("anthropic/plain", { family: "something-else" })], "anthropic")).toBeNull();
+  });
+
+  it("fires when the host would find no small model for the session's provider, with the cheapest eligible priced model and the right target", () => {
+    const findings = doctor([...CATALOG, cheap]);
     const title = find(findings, "title-model-unset", "title");
-    const summary = find(findings, "summary-model-unset", "summary");
     expect(title?.severity).toBe("saving");
+    expect(title?.target).toBe("host"); // QA-2.4-2: this fix is for opencode.json, not the router overrides
     expect(title?.snippet).toBe(JSON.stringify({ agents: { title: { model: "opencode-go/deepseek-v4.1-flash" } } }));
-    expect(summary?.snippet).toBe(JSON.stringify({ agents: { summary: { model: "opencode-go/deepseek-v4.1-flash" } } }));
+    expect(title?.snippetV1).toBe(`${JSON.stringify({ agent: { title: { model: "opencode-go/deepseek-v4.1-flash" } } })} or ${JSON.stringify({ small_model: "opencode-go/deepseek-v4.1-flash" })}`);
+    expect(title?.message).toContain("finds no small model of anthropic");
+    expect(title?.message).toContain("gpt-luna, gemini-flash-lite, gemini-flash, claude-haiku");
+    expect(title?.message).toContain("anthropic/claude-sonnet-5-5"); // what is paid today: the session's own model
     expect(title?.message).toContain("subscription provider"); // D6: opencode-go prices are relative weights
+    expect(title?.message).not.toContain("most expensive model in the session"); // the old, wrong claim
   });
 
-  it("clears when the host agent has a model, per agent", () => {
-    const set = hostWith({ id: "title", mode: "primary", hidden: true, model: { providerID: "openai", id: "gpt-6-luna", variant: "low" } }, { id: "summary", mode: "primary", hidden: true });
-    const findings = runAdvisor(cfgOf({ routing: {} }), set, [...CATALOG, cheap]);
-    expect(find(findings, "title-model-unset")).toBeUndefined();
-    expect(find(findings, "summary-model-unset")).toBeDefined();
+  it("never reports a summary model: the host has no consumer of one", () => {
+    expect(ids(doctor([...CATALOG, cheap])).filter((id) => String(id).includes("summary"))).toEqual([]);
+    expect(find(doctor([...CATALOG, cheap]), "title-model-unset", "summary")).toBeUndefined();
   });
 
-  it("says nothing about an agent the host does not list, and nothing at all without an agent list", () => {
-    expect(ids(runAdvisor(cfgOf({ routing: {} }), noHost, [...CATALOG, cheap])).filter((id) => id.endsWith("model-unset"))).toEqual([]);
-    expect(ids(runAdvisor(cfgOf({ routing: {} }), null, [...CATALOG, cheap])).filter((id) => id.endsWith("model-unset"))).toEqual([]);
+  it("stays silent when the title agent has a model, is not listed, or the session's provider or the catalog is unknown", () => {
+    const set = hostConfigFromAgents([{ id: "title", mode: "primary", hidden: true, model: { providerID: "openai", id: "gpt-6-luna", variant: "low" } }], { providerID: "anthropic", modelID: "claude-sonnet-5-5" });
+    expect(find(doctor([...CATALOG, cheap], set), "title-model-unset")).toBeUndefined();
+    expect(find(doctor([...CATALOG, cheap], hostConfigFromAgents([], { providerID: "anthropic", modelID: "x" })), "title-model-unset")).toBeUndefined();
+    expect(find(doctor([...CATALOG, cheap], host(null)), "title-model-unset")).toBeUndefined(); // the pick cannot be predicted
+    expect(find(runAdvisor(cfgOf({ routing: {} }), host(), null), "title-model-unset")).toBeUndefined();
+    expect(find(doctor([...CATALOG, cheap], null), "title-model-unset")).toBeUndefined();
   });
 
-  it("ignores models without tool calls, unpriced, all-zero priced, disabled and deprecated ones", () => {
-    const cheaper = [
-      model("x/no-tools", { capabilities: { tools: false }, cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
+  it("claims no saving when the session's own model is already the cheapest, or when nothing priced can be suggested", () => {
+    const cheapSession = [model(SONNET, { cost: [{ input: 0.1, output: 0.1, cache: { read: 0, write: 0 } }] }), model(OPUS), cheap];
+    expect(find(doctor(cheapSession), "title-model-unset")).toBeUndefined();
+    expect(find(doctor([model("x/unpriced", { cost: [] }), ...CATALOG.map((m) => ({ ...m, cost: [] }))]), "title-model-unset")).toBeUndefined();
+  });
+
+  it("suggests with the host's test (enabled, active, text in and out), not with tool support; skips disabled, beta, text-less and unpriced models", () => {
+    const noTools = model("x/no-tools", { capabilities: { tools: false, input: ["text"], output: ["text"] }, cost: [{ input: 0.2, output: 0.2, cache: { read: 0, write: 0 } }] });
+    expect(cheapestTitleModel([...CATALOG, noTools, cheap])?.ref).toBe("x/no-tools"); // tools are not needed for a title
+    const ineligible = [
+      model("x/disabled", { enabled: false, cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
+      model("x/enabled-unset", { enabled: undefined as unknown as boolean, cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
+      model("x/beta", { status: "beta", cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
+      model("x/old", { status: "deprecated", cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
+      model("x/image-out", { capabilities: { tools: true, input: ["text"], output: ["image"] }, cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
       model("x/no-capabilities", { capabilities: null, cost: [{ input: 0.01, output: 0.01, cache: { read: 0, write: 0 } }] }),
       model("x/unpriced", { cost: [] }),
       model("x/zero", { cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }] }),
-      model("x/disabled", { enabled: false, cost: [{ input: 0.02, output: 0.02, cache: { read: 0, write: 0 } }] }),
-      model("x/enabled-unset", { enabled: undefined as unknown as boolean, cost: [{ input: 0.02, output: 0.02, cache: { read: 0, write: 0 } }] }),
-      model("x/old", { status: "deprecated", cost: [{ input: 0.03, output: 0.03, cache: { read: 0, write: 0 } }] }),
     ];
-    const pick = cheapestToolModel([...cheaper, ...CATALOG, cheap]);
-    expect(pick?.ref).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(cheapestToolModel(cheaper)).toBeNull();
+    expect(cheapestTitleModel([...ineligible, ...CATALOG, cheap])?.ref).toBe("opencode-go/deepseek-v4.1-flash");
+    expect(cheapestTitleModel(ineligible)).toBeNull();
   });
 
-  it("with no usable model it still reports the finding but suggests nothing", () => {
-    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, [model("x/unpriced", { cost: [] })]);
-    const title = find(findings, "title-model-unset");
-    expect(title?.snippet).toBeNull();
-    expect(title?.message).toContain("no enabled, priced model");
-  });
-
-  it("with an unknown catalog it does not claim the catalog is empty and suggests nothing", () => {
-    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, null);
-    const title = find(findings, "title-model-unset");
-    expect(title?.snippet).toBeNull();
-    expect(title?.message).toContain("unavailable");
-  });
-
-  it("never suggests a model that is not in the catalog it was given (randomised catalogs)", () => {
+  it("never suggests a model that is not in the catalog it was given (randomised catalogs), and never when the host already has a small model", () => {
     let seed = 7;
     const next = (): number => {
       seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
       return seed / 2_147_483_648;
     };
-    for (let round = 0; round < 200; round += 1) {
+    const families = [...HOST_SMALL_MODEL_FAMILIES, "other"];
+    for (let round = 0; round < 300; round += 1) {
       const catalog = Array.from({ length: 1 + Math.floor(next() * 8) }, (_, n) =>
         model(`p${Math.floor(next() * 3)}/m${n}`, {
+          family: families[Math.floor(next() * families.length)]!,
           enabled: next() > 0.3,
-          status: next() > 0.8 ? "deprecated" : "active",
-          capabilities: next() > 0.4 ? { tools: next() > 0.3 } : null,
+          status: next() > 0.8 ? "deprecated" : next() > 0.8 ? "beta" : "active",
+          capabilities: next() > 0.4 ? { tools: next() > 0.3, input: next() > 0.2 ? ["text"] : ["image"], output: next() > 0.2 ? ["text"] : ["image"] } : null,
           cost: next() > 0.3 ? [{ input: Math.floor(next() * 20) / 4, output: Math.floor(next() * 40) / 4, cache: { read: 0, write: 0 } }] : [],
         }),
       );
-      const pick = cheapestToolModel(catalog);
-      if (pick === null) continue;
-      const entry = catalog.find((m) => `${m.providerID}/${m.id}` === pick.ref);
+      const providerID = `p${Math.floor(next() * 3)}`;
+      const finding = find(runAdvisor(cfgOf({ routing: {} }), hostConfigFromAgents([{ id: "title", mode: "primary", hidden: true }], { providerID, modelID: null }), catalog), "title-model-unset");
+      if (finding === undefined) continue;
+      expect(hostSmallModel(catalog, providerID)).toBeNull(); // fires only when the host would find nothing
+      const ref = (JSON.parse(finding.snippet ?? "null") as { agents: { title: { model: string } } }).agents.title.model;
+      const entry = catalog.find((m) => `${m.providerID}/${m.id}` === ref);
       expect(entry).toBeDefined();
       expect(entry?.enabled).toBe(true);
-      expect(entry?.capabilities?.tools).toBe(true);
-      expect(entry?.status).not.toBe("deprecated");
-      expect(pick.price).toBeGreaterThan(0);
-      for (const other of catalog) {
-        if (other.enabled !== true || other.status === "deprecated" || other.capabilities?.tools !== true) continue;
-        const entryPrice = other.cost as Array<{ input: number; output: number }>;
-        if (entryPrice.length === 0 || (entryPrice[0]!.input === 0 && entryPrice[0]!.output === 0)) continue;
-        expect(entryPrice[0]!.input + entryPrice[0]!.output).toBeGreaterThanOrEqual(pick.price);
-      }
+      expect(entry?.status).toBe("active");
+      expect(entry?.capabilities?.input?.some((i) => i.startsWith("text"))).toBe(true);
+      expect(entry?.capabilities?.output?.some((o) => o.startsWith("text"))).toBe(true);
     }
   });
 });
-
 // ---------------------------------------------------------------------------
 // Ladder against the catalog (QA-1.1-9)
 // ---------------------------------------------------------------------------
@@ -384,35 +421,37 @@ describe("cost doctor: failure policy and rendering", () => {
     const poisoned = model("x/poison", {});
     Object.defineProperty(poisoned, "capabilities", { get: () => { throw new Error("catalog getter exploded"); } });
     const warn = vi.fn();
-    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, [...CATALOG, poisoned], { warn });
+    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_HOST, [...CATALOG, poisoned], { warn });
     expect(warn).toHaveBeenCalled();
-    expect(String(warn.mock.calls[0]![0])).toContain("check side-models failed");
+    expect(String(warn.mock.calls[0]![0])).toContain("check title-model failed");
     expect(JSON.stringify(warn.mock.calls[0]![1])).toContain("exploded");
     expect(find(findings, "variant-effort")).toBeDefined(); // a later check still ran
-    expect(() => runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, [...CATALOG, poisoned])).not.toThrow(); // and with no logger
+    expect(() => runAdvisor(cfgOf({ routing: {} }), TITLE_HOST, [...CATALOG, poisoned])).not.toThrow(); // and with no logger
   });
 
   it("findings are sorted warning, saving, info", () => {
-    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, [...CATALOG, model("x/cheap", { cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }] })]);
+    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_HOST, CATALOG_CHEAP);
     const order = findings.map((f) => f.severity);
     expect(order).toEqual([...order].sort((a, b) => ["warning", "saving", "info"].indexOf(a) - ["warning", "saving", "info"].indexOf(b)));
     expect(new Set(order).size).toBeGreaterThan(1);
   });
 
   it("formatFindings renders a header, one line per finding and the fix snippet, and says what was skipped", () => {
-    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_SUMMARY, [...CATALOG, model("x/cheap", { cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }] })]);
+    const findings = runAdvisor(cfgOf({ routing: {} }), TITLE_HOST, CATALOG_CHEAP);
     const lines = formatFindings(findings);
     expect(lines[0]).toMatch(/^Cost doctor: \d+ findings? \(\d+ warning, \d+ saving, \d+ info\)$/);
     expect(lines.some((l) => l.startsWith("  [saving] title-model-unset (title): "))).toBe(true);
-    expect(lines).toContain(`      fix: ${JSON.stringify({ agents: { title: { model: "x/cheap" } } })}`);
+    expect(lines).toContain(`      fix (opencode.json): ${JSON.stringify({ agents: { title: { model: "x/cheap" } } })}`); // a host fix names the host file
+    expect(lines.some((l) => l.startsWith("      v1 form (opencode.json): ") && l.includes("small_model"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("      fix (opencode-model-router.overrides.jsonc): "))).toBe(true); // a router fix names the overrides file
     expect(formatFindings([])).toEqual(["Cost doctor: no findings."]);
     expect(formatFindings([], { hostKnown: false, catalogKnown: false })[0]).toContain("agent list and model catalog were unavailable");
     expect(formatFindings([], { hostKnown: true, catalogKnown: false })[0]).toContain("model catalog was unavailable");
   });
 
   it("the notice is one line, mentions /router, and exists only when a warning or a saving does", () => {
-    const warning: Finding = { id: "variant-effort", severity: "warning", subject: "medium", message: "x".repeat(400), snippet: null };
-    const info: Finding = { id: "unpriced-model", severity: "info", subject: "", message: "just so you know", snippet: null };
+    const warning: Finding = { id: "variant-effort", severity: "warning", target: "router", subject: "medium", message: "x".repeat(400), snippet: null, snippetV1: null };
+    const info: Finding = { id: "unpriced-model", severity: "info", target: "router", subject: "", message: "just so you know", snippet: null, snippetV1: null };
     expect(noticeWorthy([info])).toBe(false);
     expect(formatNotice([info])).toBeNull();
     expect(noticeWorthy([info, warning])).toBe(true);
@@ -652,7 +691,7 @@ function memoryFs(files: Map<string, string> = new Map(), options: { failWrites?
 describe("cost doctor: the throttled notice", () => {
   const HOUR = 3_600_000;
   const settings = (over: Partial<AdvisorSettings> = {}): AdvisorSettings => ({ dir: "/state", intervalMs: 24 * HOUR, deliver: "context", ...over });
-  const withFinding = async () => ({ host: TITLE_SUMMARY, catalog: CATALOG });
+  const withFinding = async () => ({ host: TITLE_HOST, catalog: CATALOG_CHEAP });
   const without = async () => ({ host: noHost, catalog: CATALOG });
 
   function notifier(fs: ReturnType<typeof memoryFs>, clock: { now: number }, extra: Partial<AdvisorNotifierDeps> = {}) {
@@ -929,20 +968,31 @@ describe("cost doctor in the plugin", () => {
 
   it("/router shows the Cost doctor on v2: the title finding with its cheapest-model fix, from the host's own agents and catalog", async () => {
     const { hooks } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
+    await turn(hooks); // the host's title pick depends on the session's provider: the first orchestrator turn tells the router which
     const text = await ask(hooks);
     expect(text).toContain("Cost doctor: ");
     expect(text).toContain("[saving] title-model-unset (title)");
-    expect(text).toContain(`fix: ${JSON.stringify({ agents: { title: { model: "opencode-go/deepseek-v4.1-flash" } } })}`);
+    expect(text).toContain(`fix (opencode.json): ${JSON.stringify({ agents: { title: { model: "opencode-go/deepseek-v4.1-flash" } } })}`);
+    expect(text).toContain("v1 form (opencode.json): ");
+    expect(text).toContain("small_model");
     expect(text).toContain("[warning] variant-effort"); // the bundled anthropic preset carries variant + effort (QA-2.3-13)
     expect(text).toContain("Decision log: a ladder-attempt row's confidence"); // decision 16
     expect(text.indexOf("router: engine=shadow")).toBeLessThan(text.indexOf("Cost doctor: "));
   });
 
   it("the finding clears once the host has a title model", async () => {
-    const { hooks } = await plugin({ routing: {}, agents: async () => [...rawAgents({ providerID: "openai", id: "gpt-6-luna" }).filter((a) => (a as { id: string }).id !== "summary"), { id: "summary", mode: "primary", hidden: true, model: { providerID: "openai", id: "gpt-6-luna" } }] });
+    const { hooks } = await plugin({ routing: {}, agents: async () => rawAgents({ providerID: "openai", id: "gpt-6-luna" }) });
+    await turn(hooks);
     const text = await ask(hooks);
     expect(text).not.toContain("title-model-unset");
     expect(text).not.toContain("summary-model-unset");
+  });
+
+  it("before the first orchestrator turn the title check is skipped and says so (the session's provider is not known yet)", async () => {
+    const { hooks } = await plugin({ routing: {} });
+    const text = await ask(hooks);
+    expect(text).not.toContain("title-model-unset");
+    expect(text).toContain("the session's model is not known yet");
   });
 
   it("shows what was skipped when the host's agents or catalog are unavailable, and still prints the rest of /router", async () => {
