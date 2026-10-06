@@ -675,12 +675,13 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       const rows: LogRow[] = [];
       const files: string[] = [];
       let skipped = 0;
+      let generations = 0;
       let names: string[] = [];
       try {
         names = await fs.readdir(dir);
       } catch (error) {
         logger.warn("[router] decision log directory unreadable", { dir, error: describeError(error) });
-        return { rows, skipped, files };
+        return { rows, skipped, files, oldestTs: null, generations: 0 };
       }
       for (const name of [...rotatedNames(names), DECISIONS_FILE]) {
         const path = join(dir, name);
@@ -693,6 +694,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         }
         if (text === null) continue;
         files.push(path);
+        if (name !== DECISIONS_FILE) generations += 1;
         for (const line of (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r?\n/)) {
           if (line.trim() === "") continue;
           const row = parseLogLine(line);
@@ -700,7 +702,16 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
           else rows.push(row);
         }
       }
-      return { rows, skipped, files };
+      let oldestTs: string | null = null;
+      let oldestMs = Number.POSITIVE_INFINITY;
+      for (const row of rows) {
+        const t = Date.parse(row.ts);
+        if (t < oldestMs) {
+          oldestMs = t;
+          oldestTs = row.ts;
+        }
+      }
+      return { rows, skipped, files, oldestTs, generations };
     },
   };
 }

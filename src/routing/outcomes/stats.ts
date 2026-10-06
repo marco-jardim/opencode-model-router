@@ -424,6 +424,14 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Prom
     if (loaded.status === "ok") store.fromSnapshot(loaded.snapshot);
     const read = await source.readRows();
     if (read.skipped > 0) io.stderr(`routing-stats: skipped ${read.skipped} unreadable decision-log line(s)\n`);
+    if (read.generations > 0 && read.oldestTs !== null && (args.since === null || args.since < Date.parse(read.oldestTs))) {
+      // The log keeps a bounded number of generations: history before the oldest retained row is gone (QA-1.3-10).
+      io.stderr(
+        `routing-stats: warning: the decision log has rotated; its oldest retained row is ${read.oldestTs}, so ${
+          args.since === null ? "an unbounded" : "this"
+        } window may be incomplete\n`,
+      );
+    }
 
     const table = summarize(store, read.rows, { since: args.since, until: args.until });
     io.stdout(args.json ? JSON.stringify(table, null, 2) + "\n" : renderMarkdown(table));

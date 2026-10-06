@@ -724,6 +724,25 @@ describe("persister: decisions.jsonl", () => {
     expect(read.rows.map((r) => (r.kind === "verdict" ? r.attemptID : ""))).toEqual(["c0:0", "c1:0", "c2:0", "c3:0", "c4:0"]);
   });
 
+  it("QA-1.3-10: readRows reports the oldest row timestamp and how many rotated generations it read", async () => {
+    const { deps, dir } = setup();
+    const persister = createPersister(dir, deps, { maxBytes: 300, maxGenerations: 5 });
+    expect(await persister.readRows()).toMatchObject({ oldestTs: null, generations: 0 });
+    await persister.appendRows([verdictRow(5)]);
+    expect(await persister.readRows()).toMatchObject({ oldestTs: ts(5), generations: 0 });
+    for (const i of [9, 3, 7, 1, 8]) await persister.appendRows([verdictRow(i)]); // rows are not in timestamp order
+    const read = await persister.readRows();
+    expect(read.generations).toBeGreaterThanOrEqual(2);
+    expect(read.generations).toBe(read.files.length - 1);
+    expect(read.oldestTs).toBe(ts(1));
+    // pruned history is gone: the oldest *retained* row moves forward
+    const pruning = createPersister(join(dir, "pruning"), deps, { maxBytes: 100, maxGenerations: 1 });
+    for (const i of [1, 2, 3, 4]) await pruning.appendRows([verdictRow(i)]);
+    const pruned = await pruning.readRows();
+    expect(pruned.generations).toBe(1);
+    expect(pruned.oldestTs).toBe(ts(3));
+  });
+
   it("never rotates an empty live file, so one oversized batch is written whole", async () => {
     const { mem, deps, dir } = setup();
     const persister = createPersister(dir, deps, { maxBytes: 50 });
@@ -788,7 +807,7 @@ describe("persister: decisions.jsonl", () => {
   it("readRows on a missing directory is empty and an unreadable generation is skipped with a warning", async () => {
     const { mem, deps, dir, logger } = setup();
     const persister = createPersister(dir, deps, { maxBytes: 100, maxGenerations: 5 });
-    expect(await persister.readRows()).toEqual({ rows: [], skipped: 0, files: [] });
+    expect(await persister.readRows()).toEqual({ rows: [], skipped: 0, files: [], oldestTs: null, generations: 0 });
     for (let i = 0; i < 3; i++) await persister.appendRows([verdictRow(i)]);
     mem.hooks.readText = (path) => {
       if (DECISIONS_ROTATED_RE.test(basename(path))) throw fsError("EIO", "bad sector");
@@ -799,7 +818,7 @@ describe("persister: decisions.jsonl", () => {
     mem.hooks.readdir = () => {
       throw new Error("gone");
     };
-    expect(await persister.readRows()).toEqual({ rows: [], skipped: 0, files: [] });
+    expect(await persister.readRows()).toEqual({ rows: [], skipped: 0, files: [], oldestTs: null, generations: 0 });
   });
 
   it("an ENOENT while rotating (another process rotated first) is ignored and the append proceeds", async () => {

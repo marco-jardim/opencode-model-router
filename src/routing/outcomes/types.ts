@@ -637,6 +637,10 @@ export interface ReadRowsResult {
   /** Lines that failed JSON parsing or row validation (a torn last line after a crash is expected). */
   readonly skipped: number;
   readonly files: string[];
+  /** Earliest `ts` among the valid rows (the log keeps only the newest generations, so older history is gone); null without rows. */
+  readonly oldestTs: string | null;
+  /** Rotated generations that were read (0 = the log never rotated, or its older generations were pruned and none remain). */
+  readonly generations: number;
 }
 
 /** The other writer's view of `outcomes.json` and the state this process last synced with it (QA-1.3-4). */

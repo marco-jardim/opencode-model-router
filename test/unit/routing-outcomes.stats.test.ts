@@ -651,11 +651,15 @@ function loadResult(partial: Partial<LoadResult> = {}): LoadResult {
   return { status: "missing", snapshot: { version: 1, entries: {} }, dropped: 0, savedAt: null, message: null, ...partial };
 }
 
+function readResult(partial: Partial<ReadRowsResult> = {}): ReadRowsResult {
+  return { rows: [], skipped: 0, files: [], oldestTs: null, generations: 0, ...partial };
+}
+
 function fakeIo(source: Partial<StatsSource> = {}) {
   const out: string[] = [];
   const errs: string[] = [];
   const load = vi.fn<StatsSource["load"]>(source.load ?? (async () => loadResult()));
-  const readRows = vi.fn<StatsSource["readRows"]>(source.readRows ?? (async (): Promise<ReadRowsResult> => ({ rows: [], skipped: 0, files: [] })));
+  const readRows = vi.fn<StatsSource["readRows"]>(source.readRows ?? (async (): Promise<ReadRowsResult> => readResult()));
   const open = vi.fn<StatsCliIO["open"]>(() => ({ load, readRows }));
   const io: StatsCliIO = { defaultDir: "/default/dir", open, stdout: (t) => void out.push(t), stderr: (t) => void errs.push(t) };
   return { io, out, errs, load, readRows, open };
@@ -708,18 +712,41 @@ describe("runStatsCli", () => {
   it("dropped entries and skipped log lines are warnings; the table is still printed", async () => {
     const { io, out, errs } = fakeIo({
       load: async () => loadResult({ status: "ok", dropped: 2, message: "X: 2 invalid entries dropped" }),
-      readRows: async () => ({ rows: scenario(), skipped: 3, files: [] }),
+      readRows: async () => readResult({ rows: scenario(), skipped: 3 }),
     });
     expect(await runStatsCli(["--since", SINCE, "--until", UNTIL], io)).toBe(0);
     expect(errs).toEqual(["routing-stats: warning: X: 2 invalid entries dropped\n", "routing-stats: skipped 3 unreadable decision-log line(s)\n"]);
     expect(out.join("")).toBe(renderMarkdown(summarize(createOutcomeStore(), scenario(), WINDOW)));
   });
 
+  it("QA-1.3-10: warns when the log has rotated and the window starts before (or without) its oldest retained row", async () => {
+    const oldest = "2026-10-05T08:00:00.000Z";
+    const rotated = { readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: 2, files: ["g1", "g2", "live"] }) };
+    const warning = (since?: string) => async () => {
+      const { io, errs, out } = fakeIo(rotated);
+      expect(await runStatsCli(since === undefined ? [] : ["--since", since], io)).toBe(0);
+      expect(out.join("")).toContain("## Routing stats");
+      return errs.join("");
+    };
+    expect(await warning()()).toBe(`routing-stats: warning: the decision log has rotated; its oldest retained row is ${oldest}, so an unbounded window may be incomplete\n`);
+    expect(await warning("2026-10-01")()).toContain("so this window may be incomplete");
+    expect(await warning("2026-10-05T07:59:59Z")()).toContain("may be incomplete");
+    expect(await warning(oldest)()).toBe(""); // the window starts at the oldest retained row: nothing is missing
+    expect(await warning("2026-10-06")()).toBe("");
+    // no rotated generation, or no rows: nothing to warn about
+    const never = fakeIo({ readRows: async () => readResult({ rows: scenario(), oldestTs: oldest, generations: 0 }) });
+    await runStatsCli([], never.io);
+    expect(never.errs).toEqual([]);
+    const empty = fakeIo({ readRows: async () => readResult({ generations: 1 }) });
+    await runStatsCli([], empty.io);
+    expect(empty.errs).toEqual([]);
+  });
+
   it("--json prints the StatsTable as indented JSON", async () => {
     const snapshot = storeWithMeasuredA().snapshot();
     const { io, out } = fakeIo({
       load: async () => loadResult({ status: "ok", snapshot }),
-      readRows: async () => ({ rows: scenario(), skipped: 0, files: [] }),
+      readRows: async () => readResult({ rows: scenario() }),
     });
     expect(await runStatsCli(["--json", "--since", SINCE, "--until", UNTIL], io)).toBe(0);
     const text = out.join("");
