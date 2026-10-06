@@ -217,10 +217,59 @@ export function buildLadderForcingMessage(reasons: string[]): string {
   );
 }
 
+/** A variant may be emitted only when it is the tier's validated base or a ladder member, never default. */
+function emittable(info: TierVariantInfo, v: string): string | undefined {
+  return v !== DEFAULT_VARIANT && (v === info.base || info.ladder.variants.includes(v)) ? v : undefined;
+}
+
+/** D11: the resume decision and both numbers for the attempt this action leads to. */
+function sessionFields(
+  state: LadderState,
+  variants: VariantPolicy,
+  target: TierVariantInfo | undefined,
+  forcingMessage: string,
+  session?: LadderSessionInput,
+): Pick<LadderAction, "resume" | "resumeBasis"> {
+  const resumeBasis = resumeDecision(
+    {
+      childSessionID: state.childSessionID,
+      lastStepTokens: state.lastStepTokens,
+      nextModelContext: target?.inputBudget ?? null, // the NEXT model's budget (A5)
+    },
+    {
+      maxContextFraction: variants.maxContextFraction,
+      nextPromptTokens: estimateTokensFromChars(forcingMessage.length + (session?.dispatchPromptChars ?? 0)),
+    },
+  );
+  return { resume: resumeBasis.resume, resumeBasis };
+}
+
+/** D10 "escalate the model": skip next tiers on the same model whose base the current tier already covered. */
+function skipCoveredTiers(
+  next: string | null,
+  state: LadderState,
+  policy: EscalatePolicy,
+  from: TierVariantInfo,
+): string | null {
+  const reached = variantPosition(state.currentVariant ?? from.base);
+  if (reached === null) return next;
+  let hops = 0;
+  while (next != null) {
+    const to = ownTierInfo(policy, next);
+    if (!to || to.model !== from.model) return next;
+    const position = variantPosition(to.base);
+    if (position === null || position > reached) return next;
+    if (++hops >= policy.ladder.length) return null; // guard: duplicate ladder entries cannot spin
+    next = nextTierAfter(next, policy);
+  }
+  return null;
+}
+
 export function nextAction(
   state: LadderState,
   verdict: LadderVerdict | null | undefined,
   policy: EscalatePolicy,
+  session?: LadderSessionInput,
 ): LadderAction {
   // (1) pass
   if (verdict?.pass === true) {
@@ -251,6 +300,27 @@ export function nextAction(
     return { action: "give_up", reason: "cost ceiling exceeded" };
   }
 
+  const variants = policy.variants ?? null;
+  const info = variants ? ownTierInfo(policy, state.currentTier) : undefined;
+
+  // (5V) variant step (D10): not gated by attemptsThisTier; steps 3 and 4 above
+  // already bound it by maxTotalAttempts and the cost ceiling.
+  if (variants && info) {
+    const variant = nextVariant(info.ladder, state.currentVariant ?? info.base);
+    if (variant !== null) {
+      const forcingMessage = buildLadderForcingMessage(verdict?.reasons ?? []);
+      return {
+        action: "retry",
+        tier: state.currentTier,
+        forcingMessage,
+        variantStep: true,
+        model: info.model,
+        variant,
+        ...sessionFields(state, variants, info, forcingMessage, session),
+      };
+    }
+  }
+
   // (5) retry within tier
   if (state.attemptsThisTier < policy.maxAttemptsPerTier) {
     const action: LadderAction = {
@@ -271,38 +341,75 @@ export function nextAction(
         ?? (state.currentEffort == null ? undefined : startingEffort);
       if (effort !== undefined) action.effort = effort;
     }
+    if (variants) {
+      if (info) {
+        action.model = info.model;
+        const v = emittable(info, state.currentVariant ?? info.base);
+        if (v !== undefined) action.variant = v; // keeps the reached variant on a fresh retry
+      }
+      Object.assign(action, sessionFields(state, variants, info, action.forcingMessage!, session));
+    }
     return action;
   }
 
   // (6) escalate or give_up
-  const next = nextTierAfter(state.currentTier, policy);
+  let next = nextTierAfter(state.currentTier, policy);
+  if (variants && info) next = skipCoveredTiers(next, state, policy, info);
   if (next == null) {
     return {
       action: "give_up",
       reason: "no higher tier (already at top of ladder)",
     };
   }
-  return {
+  const action: LadderAction = {
     action: "escalate",
     tier: next,
     forcingMessage: buildLadderForcingMessage(verdict?.reasons ?? []),
   };
+  if (variants) {
+    const target = ownTierInfo(policy, next);
+    action.agent = next; // D11: the role changes on escalation
+    if (target) {
+      action.model = target.model;
+      const v = emittable(target, target.base);
+      if (v !== undefined) action.variant = v;
+    }
+    Object.assign(action, sessionFields(state, variants, target, action.forcingMessage!, session));
+  }
+  return action;
+}
+
+/** Session bookkeeping of an advance; a no-op on states that are not session-aware. */
+function applySession(next: LadderState, action: LadderAction): void {
+  if (next.childSessionID === undefined) return; // not session-aware: shape unchanged
+  if (action.resume !== true) next.childSessionID = null; // fresh start: clear the stale child
+  next.lastStepTokens = null; // must be re-observed after the next attempt
+  next.nextModelContext = action.resumeBasis?.budget ?? null;
 }
 
 export function advance(state: LadderState, action: LadderAction): LadderState {
   if (action.action === "retry") {
-    const next = { ...state, attemptsThisTier: state.attemptsThisTier + 1 };
+    const next: LadderState = { ...state };
+    if (action.variantStep === true) {
+      next.currentVariant = action.variant ?? null;
+      next.variantSteps = (state.variantSteps ?? 0) + 1; // does NOT touch attemptsThisTier
+    } else {
+      next.attemptsThisTier = state.attemptsThisTier + 1;
+    }
     if (action.effort !== undefined) next.currentEffort = action.effort;
+    applySession(next, action);
     return next;
   }
   if (action.action === "escalate") {
-    const next = {
+    const next: LadderState = {
       ...state,
       currentTier: action.tier!,
       attemptsThisTier: 0,
       escalations: state.escalations + 1,
     };
     if (next.currentEffort !== undefined) next.currentEffort = null;
+    if (next.currentVariant !== undefined) next.currentVariant = null; // new tier starts at its base
+    applySession(next, action);
     return next;
   }
   // accept / give_up — terminal, return unchanged
@@ -389,7 +496,7 @@ export function formatLadderScorecard(
   method: string,
 ): string {
   return (
-    `[router delegate scorecard | final_tier=${state.currentTier}${state.currentEffort ? `@${state.currentEffort}` : ""} | ` +
+    `[router delegate scorecard | final_tier=${state.currentTier}${state.currentEffort ? `@${state.currentEffort}` : state.currentVariant ? `#${state.currentVariant}` : ""} | ` +
     `attempts=${state.totalAttempts} | escalations=${state.escalations} | ` +
     `cost=${state.cumulativeCost} | verdict=${accepted ? "PASS" : "UNMET"} | ` +
     `method=${method}]`
