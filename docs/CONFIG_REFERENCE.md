@@ -557,7 +557,7 @@ produces no notice. `background` and `pendingTtlMs` are read at plugin start, so
 | `maxAttemptsPerTier` | `number` | `1` | Same-tier retries after the initial attempt at each rung. Must be integer ≥ 0. |
 | `maxTotalAttempts` | `number` | `4` | Hard ceiling across all tiers and retries. Must be integer ≥ 1. |
 | `effortBump` | `boolean` | `true` | Retry a failed router-ladder attempt on the same tier one effort level higher before escalating. `false` restores the previous ladder exactly. |
-| `effortBumpMax` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"xhigh"` | Upper bound for bumped attempts, further clamped per model. |
+| `effortBumpMax` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"xhigh"` | Upper bound for bumped attempts, further clamped per model. On v2 it also caps the variant ladders read from the model catalog (see [`escalate.variantSteps`](#escalatevariantsteps)). |
 | `variantSteps` | `"auto" \| "none"` | `"auto"` with a `routing` block (v2), else `"none"` | OpenCode v2 only: retry on the same model's next variant before escalating the model. Always `none` on v1. See [`escalate.variantSteps`](#escalatevariantsteps). |
 | `costCeiling.base` | `string` | `"firstAttemptCostUnits"` | Reference point for cost ceiling. `"firstAttemptCostUnits"` = cost of the first producing attempt. |
 | `costCeiling.multiple` | `number` | `4` | Ceiling = first-attempt cost × multiple. Must be > 0. Further retries/escalation halt once recorded cumulative cost exceeds this. |
@@ -704,7 +704,7 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 
 The `routing` block configures the cost-aware routing engine: typed task decisions, outcome-calibrated tiers and session-aware effort bumps. It is **entirely optional**. With **no `routing` block at all** every behaviour is exactly that of 2.2.0: identical protocol text, identical `R:` line, identical ladder decisions. `engine: "static"` keeps the protocol text and the `R:` line, but **any `routing` block, even `{ "engine": "static" }` or `{}`, turns variant steps on for OpenCode v2** (`enforcement.escalate.variantSteps` then defaults to `auto`, see below); write `"variantSteps": "none"` to keep the 2.2.0 ladder under a `routing` block. The block lives in `tiers.json` or, like everything else, in an overrides file; the global file `~/.config/opencode/opencode-model-router.overrides.jsonc` is the usual place, and a change to it is picked up by the normal hot reload (no restart, no `/router` command).
 
-> **Status.** The configuration surface — parsing, validation, defaults and `/router` reporting — is implemented. The engine that consumes it lands in later phases of the same release; until then `engine` selects nothing by itself. This note goes away when the engine does.
+This section is the reference: every key, its type, default and range. What the engine does with them (the four modes, the expected-cost formula, the classifier backends, roles, the session-aware ladder, the cost doctor, privacy) is in [`ROUTING_ENGINE.md`](./ROUTING_ENGINE.md); the decisions behind them are in [ADR 0005](./adr/0005-cost-aware-routing-engine.md).
 
 **Host.** The engine, the ladder's variant/session steps, telemetry ingestion and the advisor run on **OpenCode v2** only (D1). On **v1** the block is still parsed and validated, but `routing.engine` is coerced to `static` with one logged line per process, `[model-router] routing.engine ignored on OpenCode v1`, and `enforcement.escalate.variantSteps` is ignored. The single v1 effect, opt-in only, is [`roles`](#roles).
 
@@ -723,21 +723,21 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 | `detection.deterministic` | `number` | `0.95` | `[0, 1]` | Probability that a wrong result is caught, by verification depth: a deterministic `[acceptance]` check is present. The three values must satisfy `deterministic ≥ grader ≥ none` (a deeper check cannot catch less), compared on the effective values, defaults included. |
 | `detection.grader` | `number` | `0.7` | `[0, 1]` | …an LLM grader is scheduled. |
 | `detection.none` | `number` | `0.3` | `[0, 1]` | …neither. |
-| `classifier.backend` | `string` | `"rules"` | `rules \| host \| openai-compatible \| typesafe` | Where an uncertain task class is decided. `rules` is local and free. The classifier is never an agent and never appears in the protocol. |
+| `classifier.backend` | `string` | `"rules"` | `rules \| host \| openai-compatible \| typesafe` | Where an uncertain task class is decided. `rules` is local and free. The classifier is never an agent and never appears in the protocol. **`host` is experimental** (its live check could not be completed; see [Known limits](./ROUTING_ENGINE.md#known-limits-and-experimental-parts)). Examples for Ollama, OpenCode Go and TypeSafe: [Classifier backends](./ROUTING_ENGINE.md#the-classifier-and-its-backends). |
 | `classifier.model` | `string \| null` | `null` | `provider/model` or `provider/model#variant` | **Required** (non-empty) whenever the effective backend is not `rules`; the classifier model is never picked automatically. |
 | `classifier.baseUrl` | `string \| null` | `null` | `http(s)` URL | **Required** for `openai-compatible` and `typesafe`; validated whenever set. |
 | `classifier.apiKeyEnv` | `string \| null` | `null` | environment variable name, `[A-Za-z_][A-Za-z0-9_]*` | Optional; the key itself is never stored in the config. |
 | `classifier.timeoutMs` | `integer` | `1500` | `[100, 30000]` | A backend that does not answer in time yields an `unknown` class; it never blocks a dispatch. |
-| `classifier.samples` | `integer` | `1` | `1` or `3` | Samples per classification. |
-| `classifier.maxStateChars` | `integer` | `2000` | `[200, 20000]` | How much of the prompt a model backend may see; never file contents. |
+| `classifier.samples` | `integer` | `1` | `1` or `3` | Samples per classification. `3` takes a majority vote and uses the agreement as confidence; the `typesafe` backend ignores it (it returns its own calibrated confidence). |
+| `classifier.maxStateChars` | `integer` | `2000` | `[200, 20000]` | How much of the prompt a model backend may see (the description, the first `[acceptance]` block and the prompt head, scrubbed, code blocks replaced by a placeholder); never file contents. See [Privacy](./ROUTING_ENGINE.md#privacy). |
 | `classifier.presets` | `Record<string, { backend?, model? }>` | `{}` | each entry as above | Per-preset override of `backend` / `model`. The key is matched to the active preset like `/preset` matches names (exact, then case-insensitive); a key that matches no preset is accepted (switching presets never bricks startup) but noticed. Each entry, merged over the top level, must itself satisfy the model / `baseUrl` rule. |
 | `roles` | `Record<string, string[]>` | v2: see [Roles](#roles); v1: `{}` | class → array of agent ids | Classes: `search \| recon \| mechanical \| implement \| debug \| design \| review \| other` (`ROUTING_TASK_CLASSES`). Agent ids match `^[A-Za-z0-9][A-Za-z0-9_./-]*$`, case-sensitive (`ContextScout`, `team/helper`). An empty array means no native candidates for that class. See [Roles](#roles). |
 | `outcomes.path` | `string \| null` | `null` | absolute path | Where the outcome store persists. Must be absolute (on Windows: a drive letter, `C:\dir` or `C:/dir`, or a UNC path, `\\server\share`; a rooted `\dir` without a drive is refused); a leading `~` (`~`, `~/dir`) means the home directory and is expanded when the block is resolved. `null` = the directory that already holds the `*.scorecard.log` files. Only the global override may set it (see Trust). |
 | `outcomes.halfLifeDays` | `number` | `14` | `[1, 365]` | Older verdicts weigh less. |
 | `outcomes.maxEffectiveSamples` | `number` | `50` | `[5, 1000]` | Cap on the effective sample size of one `(class × agent × model#variant)` posterior. |
 | `sessionReuse.maxContextFraction` | `number` | `0.6` | `(0, 0.95]` | A retry or escalation resumes the child session only while the next model's input budget has room under this fraction. |
-| `advisor.enabled` | `boolean` | `true` | | The cost doctor's findings (the `/router` section) and its notice. |
-| `advisor.noticeIntervalHours` | `number` | `24` | `[1, 720]` | Hours between cost-doctor checks. A notice goes out only when the set of notice-worthy findings changed since the last one, or as a reminder after 7 days. |
+| `advisor.enabled` | `boolean` | `true` | | The cost doctor's findings (the `/router` section) and its notice. Inert without a `routing` block. See [The cost doctor](./ROUTING_ENGINE.md#the-cost-doctor). |
+| `advisor.noticeIntervalHours` | `number` | `24` | `[1, 720]` | Hours between cost-doctor checks (never more often than hourly). A notice goes out only when a notice-worthy finding the user was not told about appears, or as a reminder after 7 days; a set that only shrank is not news. |
 | `advisor.notify` | `boolean` | `true` | | `false` = never notify; the `/router` section stays. Findings on unmodified tiers of a bundled preset are never notified either way. |
 
 Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and compared with `resolveRouting`, so it cannot drift from the code; on v1 only `roles` differs: `{}`):
@@ -791,7 +791,7 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 { "routing": { "engine": "shadow", "profile": "balanced" } }
 ```
 
-**`advise`** — as `shadow`, and the engine's generated `R:` line and a short per-turn hint reach the orchestrator, which still decides.
+**`advise`** — as `shadow`, and the engine's generated `R:` line and a short per-turn hint reach the orchestrator, which still decides. (The example below uses the experimental `host` classifier backend; leave `classifier` out to stay on the local rules.)
 
 <!-- routing-example: advise -->
 ```jsonc
@@ -868,6 +868,16 @@ A tier may list the `(model, variant, costRatio)` rungs the engine can use for i
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enforcement.escalate.variantSteps` | `"auto" \| "none"` | `"auto"` when the config has a `routing` block, otherwise `"none"` | OpenCode v2 only; an explicit value always wins. Only the **absence of a `routing` block** preserves the 2.2.0 ladder (default `none`); any `routing` block, even `{}` or `engine: "static"`, makes the default `auto` on v2 unless you write `"variantSteps": "none"`. `auto`: a failed verification first retries on the same model's next variant (resuming the child session) before the ladder escalates the model; variant steps do not consume `maxAttemptsPerTier` but do count toward `maxTotalAttempts` and the cost ceiling. `none`: the previous behaviour. Always `none` on v1 (an explicit value is ignored there), where the `effortBump` path stays as is. `resolveVariantSteps(cfg, host)` applies this rule. |
+
+How the variant ladder is built and bounded:
+
+- **Source.** The ladder of a tier is its explicit [`candidates`](#tier-candidates) when it has any, otherwise the variants the live catalog lists for the tier's model, in catalog order.
+- **`effortBumpMax` caps catalog ladders.** `enforcement.escalate.effortBumpMax` (default `xhigh`) caps a **catalog** ladder on v2 **independently of `effortBump`**: with `effortBump: false` the cap still applies. With the default, a model whose catalog ladder is `[high, max]` (the live `claude-haiku-4-5`) loses `max` and has the single rung `high`. Set `effortBumpMax: "max"`, or list `max` in `candidates`, to use it. **Explicit `candidates` are not capped.**
+- **`variantSteps: "none"` disables both** the variant steps **and** the session resume that goes with them: every attempt starts a fresh child, as in `2.2.0`.
+- **A tier that sets both `variant` and `effort`/`thinking`/`reasoning`** has an empty variant ladder (effort is never delivered twice) and stays on the effort-bump path; list `candidates` and drop `effort` if you want variant steps on it. The cost doctor reports it as `variant-effort`.
+- **A same-model tier is skipped on escalation** only when the tier already tried covered its base **and** it has no variant above the one reached; a covered tier with headroom is entered at the reached variant. The ladder never re-runs a `(model, variant)` that already failed in the same ladder.
+- **Budget reserve.** With variant steps on, a variant step or a plain retry is taken only if `maxTotalAttempts − totalAttempts − 1` is at least the number of tiers above the current one; otherwise the ladder escalates.
+- **Resume.** A retry or escalation resumes the child instead of starting a new one while the next model's input budget has room under [`sessionReuse.maxContextFraction`](#keys); the reasons a resume is refused are in [the ladder guide](./ROUTING_ENGINE.md#the-session-aware-ladder).
 
 ---
 
