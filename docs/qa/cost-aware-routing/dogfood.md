@@ -56,3 +56,84 @@
 **Observation for DF3:** the rules classifier labelled a file-listing task as `review` with confidence 0.5. That is below `routing.minClassConfidence` (0.7), so the dispatch has a decision row but no verdict or refusal rows and nothing is recorded in the outcome store (QA-2.1-10: statistics cover trusted classes only). A listing task should read as `search`/`recon`: DF3 should check how many of the shadow period's rows are below the threshold (`Dispatches` against `Pass + Fail + Unverifiable` in `routing:stats`, and `/router stats`) before judging agreement or savings, and whether the rules need a listing keyword.
 
 **Open owner decision (QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume and variant steps exist only on the fast tier. Phase 2.4's cost doctor now reports it as the `variant-effort` finding in `/router` (suggesting `candidates` and dropping `effort`).
+## DF3
+
+**Shadow period:** 2026-10-06T15:28:34Z (DF2 override) to 2026-10-06T18:40:09Z, recorded with `node scripts/routing-stats.ts --since 2026-10-06T15:28:34Z` from car/main @ 3d1080d (2.4 stats: resumes and lifts excluded, A30).
+
+**Reading:**
+- 63 decision rows, of which 12 are orchestrator resumes (outside every routing metric) and 3 pinned. Agreement 50/50 (100%); would-switch 0 (0%); estimated savings 0.00 ratio units (every live hybrid-2 model is unpriced, so ratio units only).
+- A27 evidence gate: 1 of 51 fresh dispatches kept for lack of evidence. The `trace.argmin` table (16 rows) counts every row in which a cheaper candidate without evidence existed, including rows where the chosen dispatch was best anyway; it is not the same quantity as the `kept:evidence` line.
+- Verdicts: 1 pass on `recon|router:medium`; no fails, no false refusals. Most dispatches carry no verdict because they were deferred (router_verify wiring is a 3.x handoff) or below `minClassConfidence`.
+- Classifier (rules): `design` 24 of 51 fresh — the QA/review dispatches with long briefs lean to `design`; DF2 already noted a file listing classified `review` at 0.5. Input for 3.x classifier tuning, not a blocker.
+- Conclusion: in shadow the engine would not have changed any orchestrator choice; with no priced models and almost no verdicts there is no evidence yet to justify a switch. Moving to `advise` per plan.
+
+```
+## Routing stats
+
+Window: 2026-10-06T15:28:34.000Z → open
+
+| Metric | Value |
+|---|---|
+| Dispatches | 63 |
+| Routed dispatches | 63 |
+| Delegate first attempts | 0 |
+| Floor lifts | 0 |
+| Pinned | 3 |
+| Agreement (best == chosen, non-pinned) | 50/50 (100.0%) |
+| Switched | 0 of 50 non-pinned routed (0.0%); enforced 0; failed 0 (verified 0 of 0 enforced) |
+| Estimated savings (ratio) | 0.00 over 50 rows |
+| Variant steps | 0 taken; pass n/a |
+| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 12 of 63 routed dispatches |
+| Kept for lack of evidence (A27, fresh dispatches) | 1 of 51 fresh routed dispatches |
+
+### By class
+
+| Class | Dispatches |
+|---|---|
+| debug | 3 |
+| design | 24 |
+| implement | 8 |
+| recon | 8 |
+| review | 8 |
+
+### By key
+
+| Key | Dispatches | Attempts | Pass | Fail | Unverifiable | Pass rate | False refusals | Refusal rate | USD/attempt (lifetime) |
+|---|---|---|---|---|---|---|---|---|---|
+| debug\|router:fast\|openai/gpt-6-luna-fast#medium | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| debug\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |
+| debug\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| design\|router:fast\|openai/gpt-6-luna-fast#medium | 9 | 9 | 0 | 0 | 0 | n/a | 0 | 0/9 (0.0%) | n/a |
+| design\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 9 | 9 | 0 | 0 | 0 | n/a | 0 | 0/9 (0.0%) | n/a |
+| design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 6 | 7 | 0 | 0 | 0 | n/a | 0 | 0/7 (0.0%) | n/a |
+| implement\|router:fast\|openai/gpt-6-luna-fast#medium | 5 | 5 | 0 | 0 | 0 | n/a | 0 | 0/5 (0.0%) | n/a |
+| implement\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| implement\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 2 | 6 | 0 | 0 | 0 | n/a | 0 | 0/6 (0.0%) | n/a |
+| recon\|router:fast\|openai/gpt-6-luna-fast#medium | 8 | 8 | 0 | 0 | 0 | n/a | 0 | 0/8 (0.0%) | n/a |
+| recon\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 0 | 2 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/2 (0.0%) | n/a |
+| review\|router:fast\|openai/gpt-6-luna-fast#medium | 2 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| review\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 6 | 6 | 0 | 0 | 0 | n/a | 0 | 0/6 (0.0%) | n/a |
+| review\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 0 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+
+### Gated by evidence (trace.argmin)
+
+| Cheapest key held back | Rows |
+|---|---|
+| design\|router:fast\|openai/gpt-6-luna-fast#medium | 4 |
+| design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 4 |
+| review\|router:fast\|openai/gpt-6-luna-fast#medium | 4 |
+| implement\|router:fast\|openai/gpt-6-luna-fast#medium | 2 |
+| debug\|router:fast\|openai/gpt-6-luna-fast#medium | 1 |
+| implement\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 |
+
+### Resume vs fresh
+
+| Step | Resume | Fresh |
+|---|---|---|
+| variant | 0 | 0 |
+| retry | 0 | 0 |
+| escalate | 0 | 0 |
+
+_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._
+
+```
