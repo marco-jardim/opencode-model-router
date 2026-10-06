@@ -133,6 +133,53 @@ export function buildDelegationProtocol(cfg: RouterConfig): string {
 }
 
 // ---------------------------------------------------------------------------
+// Routing engine seams (Phase 2.2; v2 `advise`/`enforce` only, never called for `static`/`shadow`)
+// ---------------------------------------------------------------------------
+
+/** First line of {@link buildDelegationProtocol}: how the adapter recognises the protocol text among the system parts. */
+export const DELEGATION_PROTOCOL_HEADING = "## Model Delegation Protocol (MANDATORY)";
+
+/**
+ * Swap the taxonomy (`R:`) line of an assembled protocol text for `line` (the generated line of the routing engine,
+ * `generateTaxonomy`). The base line is `buildTaskTaxonomy(cfg)`; when it is empty the protocol carries no `R:` line and
+ * `line` is inserted where the taxonomy would go (before the decomposition hint, else before `Rules:`).
+ *
+ * Handoff 1.4 (QA-1.4-11): the text is spliced, never passed to `String.replace` with a string replacement, because the
+ * line carries agent ids and `$&`, `$1` or `$$` inside one would be expanded. A text that does not contain the base line
+ * (a child's stripped protocol, a user-edited prompt) is returned unchanged.
+ */
+export function swapTaxonomyLine(protocol: string, cfg: RouterConfig, line: string): string {
+  const base = buildTaskTaxonomy(cfg);
+  if (line === base || line === "") return protocol;
+  if (base !== "") {
+    const at = protocol.indexOf(base);
+    return at < 0 ? protocol : protocol.slice(0, at) + line + protocol.slice(at + base.length);
+  }
+  for (const anchor of [buildDecomposeHint(cfg), "Rules: "]) {
+    if (anchor === "") continue;
+    const at = protocol.indexOf(`\n${anchor}`);
+    if (at >= 0) return `${protocol.slice(0, at + 1)}${line}\n\n${protocol.slice(at + 1)}`;
+  }
+  return protocol;
+}
+
+/**
+ * The paragraph `advise` and `enforce` append to the delegation protocol (D13, A22): the optional first-line route
+ * directive, the `pin` flag, and how to read the per-turn hint. It never asks the orchestrator to pick a model
+ * (§0.10.11): the engine writes models itself. `static` and `shadow` never receive it (the text stays byte-identical).
+ */
+export function buildRouteLineProtocol(mode: "advise" | "enforce"): string {
+  return [
+    "Routing line (optional): when the FIRST line of a dispatch prompt is `[route class=<c> risk=<r> scope=<s> needs=<n,..> pin]`, the router reads it as the description of the work and removes it before the subagent sees it. Values: class = search|recon|mechanical|implement|debug|design|review|other; risk = low|medium|high; scope = single|multi|repo; needs = shell|web|edit|network|external_dir. Every field is optional and an unknown value is ignored. A route line anywhere but the first line is plain text.",
+    "Add the bare flag `pin` when a plan tag or policy mandates the tier (a `[tier:X]` step, a QA review): a pinned dispatch is never switched.",
+    mode === "enforce"
+      ? "The router may start a dispatch on another agent than the one you name when recorded outcomes show it is cheaper or safer for that kind of work."
+      : "The router does not change your dispatches; a `Route hint` line, when present, shows where recorded outcomes suggest sending the next one.",
+    "Treat a `Route hint` as advice: follow it when it fits the task.",
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Claude-model adversarial prefixes
 //
 // Anthropic models (direct or via other providers) are served with a large
