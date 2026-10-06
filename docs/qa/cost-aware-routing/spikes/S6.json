@@ -1,0 +1,256 @@
+{
+  "spike": "S6",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "recordedAt": "2026-10-06T04:21:39.030Z",
+  "hypothesis": "Resuming a child with a model whose limit.context is far below the prompt size results in a host reaction (compaction request/message or a surfaced error) rather than silently sending the oversize request unchanged.",
+  "observed": {
+    "catalog": {
+      "small": {
+        "id": "spike-small",
+        "limit": {
+          "context": 12000,
+          "output": 1000
+        },
+        "variants": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "big": {
+        "id": "claude-opus-4-7",
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        }
+      }
+    },
+    "oversizePromptChars": 72021,
+    "smallContextTokens": 12000,
+    "beforeResume": {
+      "session": {
+        "id": "ses_ef08df194ffe3gLMGGfNSncwcv",
+        "parentID": "ses_ef08df1f4ffePrNyhUKFVDrsxp",
+        "agent": "general",
+        "model": {
+          "id": "claude-opus-4-7",
+          "providerID": "anthropic",
+          "variant": "default"
+        },
+        "cost": 0.02671,
+        "tokens": {
+          "input": 5317,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S6 dispatch"
+      },
+      "messageCount": 3,
+      "messageTypes": [
+        "user",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": []
+    },
+    "afterResume": {
+      "session": {
+        "id": "ses_ef08df194ffe3gLMGGfNSncwcv",
+        "parentID": "ses_ef08df1f4ffePrNyhUKFVDrsxp",
+        "agent": "general",
+        "model": {
+          "id": "spike-small",
+          "providerID": "anthropic",
+          "variant": "default"
+        },
+        "cost": 0.17352499999999998,
+        "tokens": {
+          "input": 34630,
+          "output": 15,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S6 dispatch"
+      },
+      "messageCount": 3,
+      "messageTypes": [
+        "compaction",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": [
+        {
+          "status": "completed",
+          "reason": "auto",
+          "cost": 0.02996,
+          "tokens": {
+            "input": 5967,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        }
+      ]
+    },
+    "toolAfter": {
+      "hook": "after",
+      "sessionID": "ses_ef08df1f4ffePrNyhUKFVDrsxp",
+      "callID": "toolu_spike_30",
+      "agent": "build",
+      "tool": "subagent",
+      "status": "completed",
+      "result": {
+        "output": {
+          "sessionID": "ses_ef08df194ffe3gLMGGfNSncwcv",
+          "status": "completed",
+          "output": "CHILD_OK"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<subagent sessionID=\"ses_ef08df194ffe3gLMGGfNSncwcv\" state=\"completed\">\nCHILD_OK\n</subagent>"
+          }
+        ],
+        "metadata": {
+          "sessionID": "ses_ef08df194ffe3gLMGGfNSncwcv",
+          "status": "completed"
+        }
+      }
+    },
+    "childRequests": [
+      {
+        "kind": "compaction",
+        "catalogModel": "anthropic/spike-small#default",
+        "wireModel": "claude-opus-4-7",
+        "inputTokens": 5967,
+        "lastText": "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the wo"
+      },
+      {
+        "kind": "primary",
+        "catalogModel": "anthropic/spike-small#default",
+        "wireModel": "claude-opus-4-7",
+        "inputTokens": 23346,
+        "lastText": "<conversation-checkpoint>\nThe following is a summary and serialized record of earlier conversation. Treat it as historic"
+      }
+    ],
+    "childEvents": [
+      {
+        "type": "session.model.selected"
+      },
+      {
+        "type": "session.inbox.enqueued"
+      },
+      {
+        "type": "session.execution.started"
+      },
+      {
+        "type": "session.inbox.delivered"
+      },
+      {
+        "type": "session.compaction.started",
+        "data": {
+          "sessionID": "ses_ef08df194ffe3gLMGGfNSncwcv",
+          "reason": "auto",
+          "recent": "[User]: S6 oversize lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor ...[clipped, 72029 chars]"
+        }
+      },
+      {
+        "type": "session.usage.updated"
+      },
+      {
+        "type": "session.compaction.ended",
+        "data": {
+          "sessionID": "ses_ef08df194ffe3gLMGGfNSncwcv",
+          "reason": "auto",
+          "model": {
+            "id": "spike-small",
+            "providerID": "anthropic",
+            "variant": "default"
+          },
+          "text": "## Objective\nspike\n## Requirements\nnone\n## Decisions\nnone\n## Work State\n### Completed\nnone\n### Active\nnone\n### Blocked\nnone\n## Next Move\nreply\n## Relevant Files\nnone\n## Important Context\nnone",
+          "recent": "[User]: S6 oversize lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor ...[clipped, 72029 chars]",
+          "cost": 0.02996,
+          "tokens": {
+            "input": 5967,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "session.step.started"
+      },
+      {
+        "type": "session.text.started"
+      },
+      {
+        "type": "session.text.ended"
+      },
+      {
+        "type": "session.step.ended",
+        "data": {
+          "sessionID": "ses_ef08df194ffe3gLMGGfNSncwcv",
+          "assistantMessageID": "msg_10f720fdb001357ueBBFKLun00",
+          "finish": "stop",
+          "rawFinish": "end_turn",
+          "cost": 0.116855,
+          "tokens": {
+            "input": 23346,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "session.usage.updated"
+      },
+      {
+        "type": "session.execution.succeeded"
+      }
+    ],
+    "derived": {
+      "compaction": true,
+      "error": false,
+      "requestKinds": [
+        "compaction",
+        "primary"
+      ],
+      "oversizePrimaryRequestsSent": 1
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef08df194ffe3gLMGGfNSncwcv",
+        "ses_ef08df1f4ffePrNyhUKFVDrsxp"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: compaction=true errorSurfaced=false; request kinds [\"compaction\",\"primary\"]; 1 oversize primary request(s) (> 12000 tokens) reached the provider",
+  "notes": [
+    "Compaction ran BEFORE the primary request, but it did not make the request fit: 1 primary request(s) of 23346 tokens still reached the provider against limit.context 12000 (the oversize user message is kept as recent context)."
+  ]
+}

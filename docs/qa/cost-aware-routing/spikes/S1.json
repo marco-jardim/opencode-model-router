@@ -1,0 +1,194 @@
+{
+  "spike": "S1",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "recordedAt": "2026-10-06T04:21:33.562Z",
+  "hypothesis": "tool.hook('execute.before') reassigning event.input of the subagent tool (agent general->explore, model -> provider/model#variant) makes the host create the CHILD session with the rewritten agent and model/variant.",
+  "observed": {
+    "catalogRootModel": {
+      "id": "claude-opus-4-7",
+      "variants": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "cost": [
+        {
+          "input": 5,
+          "output": 25,
+          "cache": {
+            "read": 0.5,
+            "write": 6.25
+          }
+        }
+      ],
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      }
+    },
+    "target": {
+      "ref": "anthropic/claude-sonnet-5-5#max",
+      "variants": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "agents": [
+      {
+        "id": "build",
+        "mode": "primary"
+      },
+      {
+        "id": "general",
+        "mode": "subagent"
+      },
+      {
+        "id": "explore",
+        "mode": "subagent"
+      },
+      {
+        "id": "compaction",
+        "mode": "primary"
+      },
+      {
+        "id": "title",
+        "mode": "primary"
+      },
+      {
+        "id": "summary",
+        "mode": "primary"
+      },
+      {
+        "id": "plan",
+        "mode": "primary"
+      }
+    ],
+    "hookBefore": {
+      "agent": "general",
+      "description": "S1 dispatch",
+      "prompt": "S1_MARK reply briefly",
+      "background": false
+    },
+    "hookAfterRewrite": {
+      "agent": "explore",
+      "description": "S1 dispatch",
+      "prompt": "S1_MARK reply briefly",
+      "background": false,
+      "model": "anthropic/claude-sonnet-5-5#max"
+    },
+    "toolAfter": {
+      "hook": "after",
+      "sessionID": "ses_ef08dfa89ffeVq0RQphmWiTn1A",
+      "callID": "toolu_spike_1",
+      "agent": "build",
+      "tool": "subagent",
+      "status": "completed",
+      "result": {
+        "output": {
+          "sessionID": "ses_ef08df9d5fferCMG4vmvqGvr8X",
+          "status": "completed",
+          "output": "CHILD_OK"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<subagent sessionID=\"ses_ef08df9d5fferCMG4vmvqGvr8X\" state=\"completed\">\nCHILD_OK\n</subagent>"
+          }
+        ],
+        "metadata": {
+          "sessionID": "ses_ef08df9d5fferCMG4vmvqGvr8X",
+          "status": "completed"
+        }
+      }
+    },
+    "storedChild": {
+      "session": {
+        "id": "ses_ef08df9d5fferCMG4vmvqGvr8X",
+        "parentID": "ses_ef08dfa89ffeVq0RQphmWiTn1A",
+        "agent": "explore",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "cost": 0.010264,
+        "tokens": {
+          "input": 5107,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S1 dispatch"
+      },
+      "messageCount": 3,
+      "messageTypes": [
+        "user",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": []
+    },
+    "listedChildren": [
+      {
+        "id": "ses_ef08df9d5fferCMG4vmvqGvr8X",
+        "parentID": "ses_ef08dfa89ffeVq0RQphmWiTn1A",
+        "agent": "explore",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "cost": 0.010264,
+        "tokens": {
+          "input": 5107,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S1 dispatch"
+      }
+    ],
+    "providerCapturesForChild": [
+      {
+        "model": "claude-sonnet-5-5",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "agent": "explore",
+        "kind": "primary",
+        "outputConfig": {
+          "effort": "max"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        }
+      }
+    ],
+    "cleanup": {
+      "removed": [
+        "ses_ef08df9d5fferCMG4vmvqGvr8X",
+        "ses_ef08dfa89ffeVq0RQphmWiTn1A"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: child stored as agent=explore model={\"id\":\"claude-sonnet-5-5\",\"providerID\":\"anthropic\",\"variant\":\"max\"} (wanted explore {\"providerID\":\"anthropic\",\"id\":\"claude-sonnet-5-5\",\"variant\":\"max\"})",
+  "notes": []
+}

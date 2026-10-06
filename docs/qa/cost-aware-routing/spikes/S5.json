@@ -1,0 +1,78 @@
+{
+  "spike": "S5",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "recordedAt": "2026-10-06T04:21:35.327Z",
+  "hypothesis": "POST /api/experimental/generate with { prompt, model } returns data.text (non-empty) using the scripted provider model.",
+  "observed": {
+    "runs": [
+      {
+        "phase": "cold (base-config location not yet initialised)",
+        "request": {
+          "prompt": "S5 cold probe",
+          "model": {
+            "providerID": "anthropic",
+            "id": "claude-opus-4-7"
+          }
+        },
+        "status": 400,
+        "latencyMs": 37,
+        "rawBody": "{\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}"
+      },
+      {
+        "phase": "warm",
+        "request": {
+          "prompt": "S5 generate probe one",
+          "model": {
+            "providerID": "anthropic",
+            "id": "claude-opus-4-7"
+          }
+        },
+        "status": 200,
+        "latencyMs": 9,
+        "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
+      },
+      {
+        "phase": "warm",
+        "request": {
+          "prompt": "S5 generate probe two",
+          "model": {
+            "providerID": "anthropic",
+            "id": "claude-opus-4-7"
+          }
+        },
+        "status": 200,
+        "latencyMs": 8,
+        "rawBody": "{\"data\":{\"text\":\"CHILD_OK\"}}"
+      }
+    ],
+    "baseConfigLocation": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-spikes-gMw1z1\\config\\opencode",
+    "baseConfigCatalogWarmedAfterMs": 283,
+    "providerCaptures": [
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 generate probe one"
+      },
+      {
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "lastText": "S5 generate probe two"
+      }
+    ],
+    "extractedText": [
+      null,
+      "CHILD_OK",
+      "CHILD_OK"
+    ],
+    "cleanup": {
+      "removed": [],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: cold 400; warm status 200,200; data.text [\"CHILD_OK\",\"CHILD_OK\"]; warm latency 9/8 ms",
+  "notes": [
+    "The cold call failed (400 {\"_tag\":\"InvalidRequestError\",\"message\":\"Model unavailable: anthropic/claude-opus-4-7\"}): the route resolves models in the server base-configuration location, which must be initialised first (a catalog read at that location does it)."
+  ]
+}

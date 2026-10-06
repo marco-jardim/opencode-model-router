@@ -1,0 +1,344 @@
+{
+  "spike": "S2",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "recordedAt": "2026-10-06T04:21:34.748Z",
+  "hypothesis": "A subagent call with sessionID + model '<same model>#<higher variant>' switches the stored child's variant while its history grows; a further call with a different agent switches the stored agent.",
+  "observed": {
+    "target": {
+      "id": "anthropic/claude-sonnet-5-5",
+      "variants": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "low": "low",
+      "high": "max"
+    },
+    "afterFirstDispatch": {
+      "session": {
+        "id": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+        "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+        "agent": "general",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "low"
+        },
+        "cost": 0.010758,
+        "tokens": {
+          "input": 5354,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S2 dispatch"
+      },
+      "messageCount": 3,
+      "messageTypes": [
+        "user",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": []
+    },
+    "afterVariantResume": {
+      "session": {
+        "id": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+        "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+        "agent": "general",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "cost": 0.021618,
+        "tokens": {
+          "input": 10759,
+          "output": 10,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S2 dispatch"
+      },
+      "messageCount": 7,
+      "messageTypes": [
+        "user",
+        "assistant",
+        "idle",
+        "model-switched",
+        "user",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": []
+    },
+    "afterAgentResume": {
+      "session": {
+        "id": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+        "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+        "agent": "explore",
+        "model": {
+          "id": "claude-sonnet-5-5",
+          "providerID": "anthropic",
+          "variant": "max"
+        },
+        "cost": 0.032048,
+        "tokens": {
+          "input": 15949,
+          "output": 15,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "outcome": "succeeded",
+        "title": "S2 dispatch"
+      },
+      "messageCount": 11,
+      "messageTypes": [
+        "user",
+        "assistant",
+        "idle",
+        "model-switched",
+        "user",
+        "assistant",
+        "idle",
+        "agent-switched",
+        "user",
+        "assistant",
+        "idle"
+      ],
+      "compactionMessages": []
+    },
+    "hooks": {
+      "first": [
+        {
+          "agent": "general",
+          "description": "S2 dispatch",
+          "prompt": "S2 first prompt",
+          "model": "anthropic/claude-sonnet-5-5#low"
+        },
+        "completed"
+      ],
+      "second": [
+        {
+          "agent": "general",
+          "description": "S2 resume variant",
+          "prompt": "S2 second prompt",
+          "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+          "model": "anthropic/claude-sonnet-5-5#max"
+        },
+        "completed",
+        {
+          "output": {
+            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "status": "completed",
+            "output": "CHILD_OK"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "<subagent sessionID=\"ses_ef08df8b0ffeFeA1D3T5c7IPeb\" state=\"completed\">\nCHILD_OK\n</subagent>"
+            }
+          ],
+          "metadata": {
+            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "status": "completed"
+          }
+        }
+      ],
+      "third": [
+        {
+          "agent": "explore",
+          "description": "S2 resume agent",
+          "prompt": "S2 third prompt",
+          "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb"
+        },
+        "completed",
+        {
+          "output": {
+            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "status": "completed",
+            "output": "CHILD_OK"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "<subagent sessionID=\"ses_ef08df8b0ffeFeA1D3T5c7IPeb\" state=\"completed\">\nCHILD_OK\n</subagent>"
+            }
+          ],
+          "metadata": {
+            "sessionID": "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+            "status": "completed"
+          }
+        }
+      ]
+    },
+    "sameChildEverywhere": [
+      "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+      "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+      "ses_ef08df8b0ffeFeA1D3T5c7IPeb"
+    ],
+    "providerCapturesForChild": [
+      {
+        "model": "claude-sonnet-5-5",
+        "catalogModel": "anthropic/claude-sonnet-5-5#low",
+        "agent": "general",
+        "kind": "primary",
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "lastText": "You are a subagent spawned by another session.\nS2 first prompt"
+      },
+      {
+        "model": "claude-sonnet-5-5",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "agent": "general",
+        "kind": "primary",
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "lastText": "S2 second prompt"
+      },
+      {
+        "model": "claude-sonnet-5-5",
+        "catalogModel": "anthropic/claude-sonnet-5-5#max",
+        "agent": "explore",
+        "kind": "primary",
+        "outputConfig": {
+          "effort": "low"
+        },
+        "thinking": {
+          "type": "adaptive",
+          "display": "summarized",
+          "block_binding": {
+            "prefix_mismatch_behavior": "drop_block"
+          }
+        },
+        "lastText": "S2 third prompt"
+      }
+    ],
+    "checks": {
+      "variantOk": true,
+      "historyOk": true,
+      "agentOk": true
+    },
+    "wireEffort": {
+      "firstChild": [
+        {
+          "variantInRequestRef": "low",
+          "effortOnWire": "low",
+          "lastText": "session.\nS2 first prompt"
+        },
+        {
+          "variantInRequestRef": "max",
+          "effortOnWire": "low",
+          "lastText": "S2 second prompt"
+        },
+        {
+          "variantInRequestRef": "max",
+          "effortOnWire": "low",
+          "lastText": "S2 third prompt"
+        }
+      ],
+      "secondChild": [
+        {
+          "variantInRequestRef": "max",
+          "effortOnWire": "max",
+          "lastText": "session.\nS2 effort start"
+        },
+        {
+          "variantInRequestRef": "low",
+          "effortOnWire": "max",
+          "lastText": "S2 effort resume low"
+        },
+        {
+          "variantInRequestRef": "high",
+          "effortOnWire": "max",
+          "lastText": "S2 effort resume mid"
+        }
+      ],
+      "secondChildStored": {
+        "session": {
+          "id": "ses_ef08df63dffejetv7ZE8m6fyu2",
+          "parentID": "ses_ef08df8eaffenXlo25oDEiXze6",
+          "agent": "general",
+          "model": {
+            "id": "claude-sonnet-5-5",
+            "providerID": "anthropic",
+            "variant": "high"
+          },
+          "cost": 0.032584,
+          "tokens": {
+            "input": 16217,
+            "output": 15,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          },
+          "outcome": "succeeded",
+          "title": "S2 wire effort"
+        },
+        "messageCount": 11,
+        "messageTypes": [
+          "user",
+          "assistant",
+          "idle",
+          "model-switched",
+          "user",
+          "assistant",
+          "idle",
+          "model-switched",
+          "user",
+          "assistant",
+          "idle"
+        ],
+        "compactionMessages": []
+      }
+    },
+    "derived": {
+      "wireEffortFollowsVariant": false
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef08df63dffejetv7ZE8m6fyu2",
+        "ses_ef08df8b0ffeFeA1D3T5c7IPeb",
+        "ses_ef08df8eaffenXlo25oDEiXze6"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: variant low->max (wanted low->max); messages 3->7->11; agent general->general->explore",
+  "notes": [
+    "WIRE FINDING: after a resume the stored session variant changes, but the effort the provider receives (output_config.effort) does not follow it on every request; see observed.wireEffort."
+  ]
+}

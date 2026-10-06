@@ -1,0 +1,233 @@
+{
+  "spike": "S4",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "recordedAt": "2026-10-06T04:21:34.982Z",
+  "hypothesis": "The host model catalog (GET /api/model, the call behind ctx.model.list) exposes variants[].id in order, cost and limit.context for the real configured models anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna, opencode/deepseek-v4.1-flash.",
+  "observed": {
+    "source": "the user's running OpenCode v2 service (read-only GET /api/model and /api/provider; no session, no generation)",
+    "serviceVersion": "2.0.22",
+    "status": {
+      "model": 200,
+      "provider": 200
+    },
+    "location": {
+      "directory": "C:\\Users\\Marquinho"
+    },
+    "providerActivation": [
+      "anthropic:enabled",
+      "cohere:auto",
+      "openrouter:auto",
+      "google:auto",
+      "fireworks-ai:auto",
+      "github-copilot:auto",
+      "opencode-go:auto",
+      "opencode:enabled",
+      "mistral:auto",
+      "amazon-bedrock:enabled",
+      "openai:enabled"
+    ],
+    "catalogProviders": [
+      "openrouter",
+      "opencode",
+      "amazon-bedrock",
+      "openai",
+      "anthropic",
+      "opencode-go",
+      "fireworks-ai",
+      "cohere",
+      "google",
+      "mistral"
+    ],
+    "requested": {
+      "anthropic/claude-sonnet-5-5": {
+        "exact": {
+          "ref": "anthropic/claude-sonnet-5-5",
+          "enabled": true,
+          "variants": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "cost": [
+            {
+              "input": 0,
+              "output": 0,
+              "cache": {
+                "read": 0,
+                "write": 0
+              }
+            }
+          ],
+          "limitContext": 1000000,
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          }
+        },
+        "sameIdOtherProviders": []
+      },
+      "anthropic/claude-opus-5-5": {
+        "exact": {
+          "ref": "anthropic/claude-opus-5-5",
+          "enabled": true,
+          "variants": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "cost": [
+            {
+              "input": 0,
+              "output": 0,
+              "cache": {
+                "read": 0,
+                "write": 0
+              }
+            }
+          ],
+          "limitContext": 1000000,
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          }
+        },
+        "sameIdOtherProviders": []
+      },
+      "anthropic/claude-haiku-4-5": {
+        "exact": {
+          "ref": "anthropic/claude-haiku-4-5",
+          "enabled": true,
+          "variants": [
+            "high",
+            "max"
+          ],
+          "cost": [
+            {
+              "input": 0,
+              "output": 0,
+              "cache": {
+                "read": 0,
+                "write": 0
+              }
+            }
+          ],
+          "limitContext": 200000,
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          }
+        },
+        "sameIdOtherProviders": []
+      },
+      "openai/gpt-6-luna": {
+        "exact": {
+          "ref": "openai/gpt-6-luna",
+          "enabled": true,
+          "variants": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "cost": [],
+          "limitContext": 400000,
+          "limit": {
+            "context": 400000,
+            "input": 272000,
+            "output": 128000
+          }
+        },
+        "sameIdOtherProviders": [
+          {
+            "ref": "opencode-go/gpt-6-luna",
+            "enabled": true,
+            "variants": [
+              "none",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "cost": [
+              {
+                "input": 0.1,
+                "output": 0.5,
+                "cache": {
+                  "read": 0.01,
+                  "write": 0.125
+                }
+              },
+              {
+                "tier": {
+                  "type": "context",
+                  "size": 272000
+                },
+                "input": 0.2,
+                "output": 0.75,
+                "cache": {
+                  "read": 0.02,
+                  "write": 0.25
+                }
+              }
+            ],
+            "limitContext": 1050000,
+            "limit": {
+              "context": 1050000,
+              "input": 922000,
+              "output": 128000
+            }
+          }
+        ]
+      },
+      "opencode/deepseek-v4.1-flash": {
+        "exact": "ABSENT from the catalog",
+        "sameIdOtherProviders": [
+          {
+            "ref": "opencode-go/deepseek-v4.1-flash",
+            "enabled": true,
+            "variants": [
+              "low",
+              "high",
+              "max"
+            ],
+            "cost": [
+              {
+                "input": 0.15,
+                "output": 0.6,
+                "cache": {
+                  "read": 0.003,
+                  "write": 0
+                }
+              }
+            ],
+            "limitContext": 1000000,
+            "limit": {
+              "context": 1000000,
+              "output": 384000
+            }
+          }
+        ]
+      }
+    },
+    "presentExact": [
+      "anthropic/claude-sonnet-5-5",
+      "anthropic/claude-opus-5-5",
+      "anthropic/claude-haiku-4-5",
+      "openai/gpt-6-luna"
+    ],
+    "absentExact": [
+      "opencode/deepseek-v4.1-flash"
+    ]
+  },
+  "assertionResult": "PARTIAL-PASS: 4/5 requested ids exist under that exact provider/id (anthropic/claude-sonnet-5-5, anthropic/claude-opus-5-5, anthropic/claude-haiku-4-5, openai/gpt-6-luna); absent: opencode/deepseek-v4.1-flash; every present entry exposes variants[], cost[] and limit.context",
+  "notes": [
+    "Some requested ids are absent under that exact provider/id; see sameIdOtherProviders for where the host actually lists them."
+  ]
+}

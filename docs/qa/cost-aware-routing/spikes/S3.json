@@ -1,0 +1,104 @@
+{
+  "spike": "S3",
+  "host": "opencode v2.0.22 (native v2 plugin API)",
+  "recordedAt": "2026-10-06T04:21:34.933Z",
+  "hypothesis": "ctx.event.subscribe in a plugin delivers a session.step.ended event for the CHILD session whose data carries cost and tokens {input, output, reasoning, cache{read,write}}.",
+  "observed": {
+    "stepEndedEvents": [
+      {
+        "id": "evt_10f720c0b001btWlvILgaKuFIE",
+        "created": 1791260494859,
+        "type": "session.step.ended",
+        "durable": {
+          "aggregateID": "ses_ef08df41cffes5f3Tm25BgZShW",
+          "seq": 9,
+          "version": 1
+        },
+        "location": {
+          "directory": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-spikes-gMw1z1\\project"
+        },
+        "data": {
+          "sessionID": "ses_ef08df41cffes5f3Tm25BgZShW",
+          "assistantMessageID": "msg_10f720bf8001vN11ZBqybv7Qjl",
+          "finish": "stop",
+          "rawFinish": "end_turn",
+          "cost": 0.01073,
+          "tokens": {
+            "input": 5340,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "read": 0,
+              "write": 0
+            }
+          }
+        }
+      }
+    ],
+    "childEventTypes": [
+      "session.created",
+      "session.inbox.enqueued",
+      "session.execution.started",
+      "session.instructions.updated",
+      "session.inbox.delivered",
+      "session.step.started",
+      "session.text.started",
+      "session.text.ended",
+      "session.step.ended",
+      "session.usage.updated",
+      "session.execution.succeeded"
+    ],
+    "storedChildTotals": {
+      "cost": 0.01073,
+      "tokens": {
+        "input": 5340,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    "catalogCost": {
+      "id": "claude-sonnet-5-5",
+      "cost": [
+        {
+          "input": 2,
+          "output": 10,
+          "cache": {
+            "read": 0.2,
+            "write": 2.5
+          }
+        }
+      ]
+    },
+    "derived": {
+      "events": 1,
+      "costType": "number",
+      "costValue": 0.01073,
+      "costPositive": true,
+      "tokenKeys": [
+        "input",
+        "output",
+        "reasoning",
+        "cache"
+      ],
+      "cacheKeys": [
+        "read",
+        "write"
+      ]
+    },
+    "cleanup": {
+      "removed": [
+        "ses_ef08df41cffes5f3Tm25BgZShW",
+        "ses_ef08df453ffe0tBBaOZB0VmlhZ"
+      ],
+      "errors": [],
+      "orphans": []
+    },
+    "providerErrors": []
+  },
+  "assertionResult": "PASS: 1 session.step.ended event(s) for the child; cost=0.01073 tokens={\"input\":5340,\"output\":5,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}",
+  "notes": []
+}
