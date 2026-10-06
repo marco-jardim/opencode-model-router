@@ -109,10 +109,22 @@ export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
   let classifierMemo: { key: string; settings: ClassifierSettings; backend: ClassifierBackend | null } | null = null;
   let disposed = false;
 
-  const release = (target: Held): void => {
-    void target.bundle.release().catch((error: unknown) => {
-      deps.logger.warn("[router] routing: releasing the outcome store failed", { error: describeError(error) });
-    });
+  /**
+   * Let go of a store without making the caller wait (a hot reload to static, a moved directory). The release is tracked, so `dispose()`
+   * can wait for it: the last holder's release is the final flush of the decision log (QA-2.4-17). Never rejects.
+   */
+  const releasing = new Set<Promise<void>>();
+  const release = (target: Held): Promise<void> => {
+    const job: Promise<void> = target.bundle
+      .release()
+      .catch((error: unknown) => {
+        deps.logger.warn("[router] routing: releasing the outcome store failed", { error: describeError(error) });
+      })
+      .finally(() => {
+        releasing.delete(job);
+      });
+    releasing.add(job);
+    return job;
   };
 
   const waitReady = async (target: Held): Promise<void> => {
@@ -233,13 +245,10 @@ export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
       disposed = true;
       const previous = held;
       held = null;
-      if (previous !== null) {
-        try {
-          await previous.bundle.release();
-        } catch (error) {
-          deps.logger.warn("[router] routing: releasing the outcome store failed", { error: describeError(error) });
-        }
-      }
+      if (previous !== null) await release(previous);
+      // Releases started earlier (hot reload to static, another outcomes directory) may still be flushing: wait for them too, so that
+      // when `dispose()` resolves every queued row is on disk and no holder of this runtime is left.
+      while (releasing.size > 0) await Promise.allSettled([...releasing]);
     },
   };
 }
