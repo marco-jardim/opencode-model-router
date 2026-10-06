@@ -804,7 +804,7 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 }
 ```
 
-**`enforce`** — as `advise`, and the engine reassigns the dispatch's `model` / `agent` when its choice is cheaper by more than `margin` (strictly), the class confidence reaches `minClassConfidence`, the candidate agent's permissions cover what the task needs and the candidate is not below `floorTier`. A dispatch carrying `[route pin]` is never switched.
+**`enforce`** — as `advise`, and the engine reassigns the dispatch's `model` / `agent` when its choice is cheaper by more than `margin` (strictly), the class confidence reaches `minClassConfidence`, the candidate agent's permissions cover what the task needs, the candidate is not below `floorTier`, and it has at least 5 **effective** outcomes on its own key (decayed by `outcomes.halfLifeDays`, capped by `outcomes.maxEffectiveSamples`) or ranks above the orchestrator's pick. A dispatch carrying `[route pin]` is never switched.
 
 <!-- routing-example: enforce -->
 ```jsonc
