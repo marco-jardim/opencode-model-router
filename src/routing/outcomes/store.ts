@@ -26,7 +26,7 @@ import type {
   Verdict,
 } from "./types";
 import { OUTCOMES_SCHEMA_ID, OUTCOMES_SCHEMA_VERSION, parseKey, safeNow } from "./types";
-import { SAME_RANK_PRIOR, capEvidence, decayFactor, decayTo, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
+import { MIN_TINY, SAME_RANK_PRIOR, capEvidence, decayFactor, decayTo, mergeBeta, observe, posteriorOf, sanitizeTuning } from "./beta";
 import {
   addTokens,
   cleanTokenSample,
@@ -181,6 +181,79 @@ function addCounts(a: OutcomeCounts, b: OutcomeCounts): OutcomeCounts {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Foreign-writer deltas (QA-1.3-4): disk − baseline, per entry
+// ---------------------------------------------------------------------------
+
+/** `disk − base` of a running mean: exact arithmetic while neither side has passed the effective-sample cap. */
+function subMean(disk: MeanStat, base: MeanStat): MeanStat {
+  const n = disk.n - base.n;
+  if (n <= 0) return { mean: 0, n: 0 };
+  return { mean: Math.max(0, (disk.mean * disk.n - base.mean * base.n) / n), n };
+}
+
+function subTokenMeans(disk: TokenMeans, base: TokenMeans): TokenMeans {
+  const n = disk.n - base.n;
+  if (n <= 0) return { n: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const part = (d: number, b: number): number => Math.max(0, (d * disk.n - b * base.n) / n);
+  return {
+    n,
+    input: part(disk.input, base.input),
+    output: part(disk.output, base.output),
+    reasoning: part(disk.reasoning, base.reasoning),
+    cacheRead: part(disk.cacheRead, base.cacheRead),
+    cacheWrite: part(disk.cacheWrite, base.cacheWrite),
+  };
+}
+
+/**
+ * What another writer added to an entry since `base` was synced: counters and attempt-weighted means
+ * subtract exactly (means while n ≤ maxEffectiveSamples, then they are EWMAs and the delta is approximate);
+ * the Beta evidence is subtracted at a common instant and floored at 0.
+ */
+function subtractEntry(disk: Entry, base: Entry, tuning: OutcomeTuning): Entry {
+  const t = Math.max(disk.beta.updatedAt, base.beta.updatedAt);
+  const d = decayTo(disk.beta, t, tuning);
+  const b = decayTo(base.beta, t, tuning);
+  let alpha = Math.max(0, d.alpha - b.alpha);
+  let beta = Math.max(0, d.beta - b.beta);
+  if (alpha + beta < MIN_TINY) {
+    alpha = 0;
+    beta = 0;
+  }
+  const dc = disk.counts;
+  const bc = base.counts;
+  return {
+    cls: disk.cls,
+    beta: { alpha, beta, updatedAt: t },
+    counts: {
+      pass: Math.max(0, dc.pass - bc.pass),
+      fail: Math.max(0, dc.fail - bc.fail),
+      falseRefusals: Math.max(0, dc.falseRefusals - bc.falseRefusals),
+      variantPass: Math.max(0, dc.variantPass - bc.variantPass),
+      variantFail: Math.max(0, dc.variantFail - bc.variantFail),
+    },
+    cost: {
+      measuredUSD: subMean(disk.cost.measuredUSD, base.cost.measuredUSD),
+      unpricedAttempts: Math.max(0, disk.cost.unpricedAttempts - base.cost.unpricedAttempts),
+      tokens: subTokenMeans(disk.cost.tokens, base.cost.tokens),
+      steps: subMean(disk.cost.steps, base.cost.steps),
+      finalMessageTokens: subMean(disk.cost.finalMessageTokens, base.cost.finalMessageTokens),
+    },
+  };
+}
+
+function isEmptyEntry(e: Entry): boolean {
+  const c = e.counts;
+  const k = e.cost;
+  return (
+    e.beta.alpha + e.beta.beta === 0 &&
+    c.pass + c.fail + c.falseRefusals + c.variantPass + c.variantFail === 0 &&
+    k.unpricedAttempts === 0 &&
+    k.measuredUSD.n + k.tokens.n + k.steps.n + k.finalMessageTokens.n === 0
+  );
+}
+
 export type ParseSnapshotResult =
   | { readonly ok: true; readonly snapshot: OutcomeSnapshot; readonly dropped: number }
   | { readonly ok: false; readonly reason: "unsupported-version" | "corrupt"; readonly message: string };
@@ -266,6 +339,20 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
     if (entry === null) return;
     entry.cost = foldAttempt(entry.cost, attempt, tuning.maxEffectiveSamples);
     revision += 1;
+  }
+
+  /** Add one validated persisted entry to the live state (new key: taken as is). */
+  function absorb(key: OutcomeKey, incoming: Entry, t: number): void {
+    // QA-1.3-7: evidence stamped after "now" (a clock that was ahead when it was written) is re-stamped.
+    if (incoming.beta.updatedAt > t) incoming.beta = { alpha: incoming.beta.alpha, beta: incoming.beta.beta, updatedAt: t };
+    const live = entries.get(key);
+    if (live === undefined) {
+      entries.set(key, incoming);
+      return;
+    }
+    live.beta = mergeBeta(live.beta, incoming.beta, t, tuning);
+    live.counts = addCounts(live.counts, incoming.counts);
+    live.cost = mergeCostStats(live.cost, incoming.cost);
   }
 
   function markClosed(attemptID: string): void {
@@ -482,20 +569,31 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       const hadEntries = entries.size > 0;
       if (mode === "replace") entries.clear();
       const t = clockNow();
-      for (const [key, disk] of accepted) {
-        // QA-1.3-7: evidence stamped after "now" (a clock that was ahead when it was written) is re-stamped.
-        if (disk.beta.updatedAt > t) disk.beta = { alpha: disk.beta.alpha, beta: disk.beta.beta, updatedAt: t };
-        const live = mode === "merge" ? entries.get(key) : undefined;
-        if (live === undefined) {
-          entries.set(key, disk);
-          continue;
-        }
-        live.beta = mergeBeta(live.beta, disk.beta, t, tuning);
-        live.counts = addCounts(live.counts, disk.counts);
-        live.cost = mergeCostStats(live.cost, disk.cost);
-      }
+      for (const [key, disk] of accepted) absorb(key, disk, t);
       if (accepted.size > 0 || (mode === "replace" && hadEntries)) revision += 1;
       return { accepted: accepted.size, dropped };
+    },
+
+    mergeForeign(disk: OutcomeSnapshot, baseline: OutcomeSnapshot): SnapshotLoadReport {
+      const diskEntries: Record<string, unknown> = isRec(disk?.entries) ? disk.entries : {};
+      const baseEntries: Record<string, unknown> = isRec(baseline?.entries) ? baseline.entries : {};
+      const t = clockNow();
+      let accepted = 0;
+      let dropped = 0;
+      for (const [key, value] of Object.entries(diskEntries)) {
+        const current = readEntry(key, value);
+        if (current === null) {
+          dropped += 1;
+          continue;
+        }
+        const base = key in baseEntries ? readEntry(key, baseEntries[key]) : null;
+        const delta = base === null ? current : subtractEntry(current, base, tuning);
+        if (isEmptyEntry(delta)) continue;
+        absorb(key as OutcomeKey, delta, t);
+        accepted += 1;
+      }
+      if (accepted > 0) revision += 1;
+      return { accepted, dropped };
     },
   };
 

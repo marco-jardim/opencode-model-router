@@ -13,6 +13,7 @@ import { isAbsolute, join, normalize, resolve } from "node:path";
 import type {
   DecisionRow,
   FlusherDeps,
+  ForeignWrites,
   FlusherOptions,
   FlushScheduler,
   LoadResult,
@@ -389,6 +390,9 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
   /** mtime of outcomes.json at the last load/save; `undefined` until the first load (no foreign-writer check). */
   let lastKnownMtime: number | null | undefined;
   let warnedForeignWriter = false;
+  let warnedMerge = false;
+  /** What this persister last loaded or wrote: the base for `disk − baseline` when another process writes (QA-1.3-4). */
+  let baseline: OutcomeSnapshot | undefined;
 
   async function statOrNull(path: string): Promise<PersistStat | null> {
     try {
@@ -479,6 +483,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       }
     }
 
+    baseline = result.snapshot;
     lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
     if (quarantine) await cleanStaleTemps();
     return result;
@@ -583,6 +588,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         };
         await fs.writeDurable(tmp, JSON.stringify(file, null, 2) + "\n");
         await renameWithRetry(fs, tmp, outcomesPath, sleep, delays);
+        baseline = snapshot;
         lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
         return { ok: true };
       } catch (error) {
@@ -611,6 +617,57 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         return { ok: true };
       } catch (error) {
         return failure(error);
+      }
+    },
+
+    async readForeignWrites(): Promise<ForeignWrites | null> {
+      try {
+        if (readOnlyReason !== null || lastKnownMtime === undefined) return null;
+        const current = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
+        if (current === lastKnownMtime) return null;
+        lastKnownMtime = current; // handled here, so the save that follows does not report it again
+        if (current === null) return null; // removed: the next save recreates it
+        const text = await withRetry(() => fs.readText(outcomesPath), sleep, delays);
+        if (text === null) return null;
+        let json: unknown;
+        try {
+          json = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+        } catch (error) {
+          logger.warn("[router] another process left an unreadable outcomes.json; the next save replaces it", {
+            path: outcomesPath,
+            error: describeError(error),
+          });
+          return null;
+        }
+        const parsed = parseSnapshot(json);
+        if (!parsed.ok) {
+          if (parsed.reason === "unsupported-version") {
+            readOnlyReason = "unrecognized outcome store on disk";
+            logger.warn("[router] another process replaced outcomes.json with a file this plugin does not own; not overwriting it", {
+              path: outcomesPath,
+              reason: parsed.message,
+            });
+          } else {
+            logger.warn("[router] another process left a malformed outcomes.json; the next save replaces it", {
+              path: outcomesPath,
+              reason: parsed.message,
+            });
+          }
+          return null;
+        }
+        const previous = baseline ?? emptySnapshot();
+        baseline = parsed.snapshot;
+        const detail = { path: outcomesPath };
+        if (warnedMerge) {
+          logger.info?.("[router] merged another process's outcome changes", detail);
+        } else {
+          warnedMerge = true;
+          logger.warn("[router] another process writes this outcome directory; its changes are merged into this process's before each save", detail);
+        }
+        return { disk: parsed.snapshot, baseline: previous };
+      } catch (error) {
+        logger.warn("[router] could not check outcomes.json for another writer", { path: outcomesPath, error: describeError(error) });
+        return null;
       }
     },
 
@@ -653,8 +710,8 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
 // ---------------------------------------------------------------------------
 
 export function createFlusher(
-  store: Pick<OutcomeStore, "revision" | "snapshot">,
-  persister: Pick<Persister, "saveSnapshot" | "appendRows">,
+  store: Pick<OutcomeStore, "revision" | "snapshot"> & Partial<Pick<OutcomeStore, "mergeForeign">>,
+  persister: Pick<Persister, "saveSnapshot" | "appendRows"> & Partial<Pick<Persister, "readForeignWrites">>,
   deps: FlusherDeps,
   options: FlusherOptions = {},
 ): OutcomeFlusher {
@@ -733,11 +790,22 @@ export function createFlusher(
     }
   }
 
+  async function absorbForeignWrites(): Promise<void> {
+    if (persister.readForeignWrites === undefined || store.mergeForeign === undefined) return;
+    try {
+      const foreign = await persister.readForeignWrites();
+      if (foreign !== null) store.mergeForeign(foreign.disk, foreign.baseline);
+    } catch (error) {
+      logger.warn("[router] another process's outcome changes could not be merged", { error: describeError(error) });
+    }
+  }
+
   async function doFlush(): Promise<void> {
     if (deps.ready !== undefined) await deps.ready;
     let ok = true;
-    const revision = store.revision;
-    if (!snapshotBlocked && revision !== writtenRevision) {
+    if (!snapshotBlocked && store.revision !== writtenRevision) {
+      await absorbForeignWrites(); // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
+      const revision = store.revision;
       const result = await persister.saveSnapshot(store.snapshot());
       if (result.ok) {
         writtenRevision = revision;

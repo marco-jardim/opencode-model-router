@@ -853,6 +853,102 @@ describe("snapshot / fromSnapshot / parseSnapshot", () => {
   });
 });
 
+describe("mergeForeign (QA-1.3-4)", () => {
+  /** A store that loaded `base`, as another process would after reading the file. */
+  function loaded(base: OutcomeSnapshot) {
+    const store = createOutcomeStore({ now: clock().now });
+    store.fromSnapshot(base);
+    return store;
+  }
+
+  function sharedStart() {
+    const origin = createOutcomeStore({ now: clock().now });
+    origin.recordVerdict(K(), "pass", signal("o1"));
+    origin.recordVerdict(K(), "pass", signal("o2"));
+    origin.recordVerdict(K(), "pass", signal("o3"));
+    origin.recordVerdict(K(), "fail", signal("o4"));
+    origin.recordVerdict(K(), "fail", signal("o5"));
+    for (const [i, cost] of [0.1, 0.3].entries()) {
+      origin.recordStep(K(), step(`os${i}`, { cost, tokens: tokens({ input: 100, output: 10 }), final: true }));
+    }
+    return origin.snapshot();
+  }
+
+  it("adds disk − baseline to the live state: counters, Beta and attempt-weighted means all stay exact", () => {
+    const baseline = sharedStart();
+    const foreign = loaded(baseline); // the other process
+    foreign.recordVerdict(K(), "pass", signal("f1"));
+    foreign.recordVerdict(K(), "pass", signal("f2"));
+    for (const [i, cost] of [0.5, 0.7].entries()) {
+      foreign.recordStep(K(), step(`fs${i}`, { cost, tokens: tokens({ input: 300, output: 30 }), final: true }));
+    }
+    const mine = loaded(baseline); // this process, which also did its own work
+    mine.recordVerdict(K(), "fail", signal("m1"));
+    mine.recordStep(K(), step("ms0", { cost: 0.9, tokens: tokens({ input: 500, output: 50 }), final: true }));
+    const revision = mine.revision;
+
+    expect(mine.mergeForeign(foreign.snapshot(), baseline)).toEqual({ accepted: 1, dropped: 0 });
+    expect(mine.revision).toBe(revision + 1);
+    const entry = mine.snapshot().entries[K()];
+    expect(entry?.counts).toEqual({ pass: 5, fail: 3, falseRefusals: 0, variantPass: 0, variantFail: 0 });
+    expect(entry?.beta.alpha).toBeCloseTo(5, 12);
+    expect(entry?.beta.beta).toBeCloseTo(3, 12);
+    expect(entry?.cost.measuredUSD.n).toBe(5);
+    expect(entry?.cost.measuredUSD.mean).toBeCloseTo((0.1 + 0.3 + 0.5 + 0.7 + 0.9) / 5, 12);
+    expect(entry?.cost.tokens.n).toBe(5);
+    expect(entry?.cost.tokens.input).toBeCloseTo((100 + 100 + 300 + 300 + 500) / 5, 12);
+    expect(entry?.cost.steps).toEqual({ mean: 1, n: 5 });
+  });
+
+  it("a key the other process created is taken whole; unchanged keys and a zero delta change nothing", () => {
+    const baseline = sharedStart();
+    const foreign = loaded(baseline);
+    foreign.recordVerdict(K("search", host("explore")), "pass", signal("n1"));
+    const mine = loaded(baseline);
+    const before = JSON.stringify(mine.snapshot());
+    const revision = mine.revision;
+    expect(mine.mergeForeign(foreign.snapshot(), baseline)).toEqual({ accepted: 1, dropped: 0 });
+    expect(mine.keys()).toEqual([K(), K("search", host("explore"))].sort());
+    expect(mine.snapshot().entries[K()]).toEqual(JSON.parse(before).entries[K()]);
+    expect(mine.revision).toBe(revision + 1);
+
+    const nothing = loaded(baseline);
+    const r = nothing.revision;
+    expect(nothing.mergeForeign(baseline, baseline)).toEqual({ accepted: 0, dropped: 0 });
+    expect(nothing.revision).toBe(r);
+    expect(nothing.snapshot()).toEqual(loaded(baseline).snapshot());
+  });
+
+  it("deltas are floored at 0 when the disk has less than the baseline, and invalid disk entries are dropped", () => {
+    const baseline = sharedStart();
+    const mine = loaded(baseline);
+    const shrunk = createOutcomeStore({ now: clock().now });
+    shrunk.recordVerdict(K(), "pass", signal("only"));
+    const snapshot = JSON.stringify(mine.snapshot());
+    expect(mine.mergeForeign(shrunk.snapshot(), baseline)).toEqual({ accepted: 0, dropped: 0 });
+    expect(JSON.stringify(mine.snapshot())).toBe(snapshot);
+    const junk = { version: 1, entries: { "not a key": {}, ...shrunk.snapshot().entries } } as unknown as OutcomeSnapshot;
+    expect(mine.mergeForeign(junk, baseline)).toEqual({ accepted: 0, dropped: 1 });
+  });
+
+  it("Beta evidence is subtracted at a common instant (decay in between does not leak into the delta)", () => {
+    const c0 = clock();
+    const origin = createOutcomeStore({ now: c0.now });
+    for (let i = 0; i < 4; i++) origin.recordVerdict(K(), "pass", signal(`o${i}`));
+    const baseline = origin.snapshot(); // alpha 4 at T0
+    const c1 = clock(T0 + 14 * DAY_MS);
+    const foreign = createOutcomeStore({ now: c1.now });
+    foreign.fromSnapshot(baseline);
+    foreign.recordVerdict(K(), "pass", signal("f1")); // 4 → 2 (one half-life), +1 → alpha 3 at T0 + 14 d
+    const mine = createOutcomeStore({ now: c1.now });
+    mine.fromSnapshot(baseline);
+    mine.mergeForeign(foreign.snapshot(), baseline);
+    // disk 3 − baseline 4 decayed to the same instant (2) = +1: only the new pass, on top of the decayed 2
+    expect(mine.snapshot().entries[K()]?.beta.alpha).toBeCloseTo(2 + 1, 9);
+    expect(mine.snapshot().entries[K()]?.counts.pass).toBe(5);
+  });
+});
+
 describe("performance", () => {
   it("10 000 mixed records over 50 keys stay under 50 ms", () => {
     const c = clock();

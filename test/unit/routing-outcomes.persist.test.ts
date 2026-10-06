@@ -13,6 +13,7 @@ import {
   resolveOutcomesDir,
 } from "../../src/routing/outcomes/persist";
 import { acquireOutcomes } from "../../src/routing/outcomes/index";
+import { emptyTokenSample } from "../../src/routing/outcomes/cost";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import {
   DECISIONS_FILE,
@@ -1517,6 +1518,158 @@ describe("flusher: failures, drops, flushNow, dispose", () => {
     mutate();
     await flusher.dispose();
     expect(sched.pending()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Two processes on one directory (QA-1.3-4): disk + (memory − baseline), never plain memory over it
+// ---------------------------------------------------------------------------
+
+describe("foreign writers (QA-1.3-4)", () => {
+  function twoProcesses() {
+    const base = setup("omr-foreign");
+    const make = (pid: number) => {
+      const deps: PersistDeps = { ...base.deps, pid };
+      const store = createOutcomeStore({ now: base.c.now });
+      const persister = createPersister(base.dir, deps);
+      const sched = manualScheduler();
+      const flusher = createFlusher(store, persister, { now: base.c.now, scheduler: sched.scheduler, logger: base.logger });
+      let n = 0;
+      const record = (verdict: "pass" | "fail") => store.recordVerdict(KEY, verdict, { attemptID: `p${pid}-${n++}`, step: "dispatch" });
+      return { store, persister, flusher, record };
+    };
+    const a = make(1);
+    const b = make(2);
+    const onDisk = async () => (await createPersister(base.dir, base.deps).load({ quarantine: false })).snapshot.entries[KEY];
+    return { ...base, a, b, onDisk };
+  }
+
+  it("A saves 5 passes, B saves 3 fails, A saves again: the disk keeps B's fails and A's new passes", async () => {
+    const { a, b, c, onDisk, logger } = twoProcesses();
+    await a.persister.load();
+    await b.persister.load();
+    for (let i = 0; i < 5; i++) a.record("pass");
+    await a.flusher.flushNow();
+    expect((await onDisk())?.counts).toMatchObject({ pass: 5, fail: 0 });
+
+    c.advance(1000);
+    for (let i = 0; i < 3; i++) b.record("fail");
+    await b.flusher.flushNow(); // B notices A's write: it merges instead of overwriting
+    expect((await onDisk())?.counts).toMatchObject({ pass: 5, fail: 3 });
+    expect(b.store.snapshot().entries[KEY]?.counts).toMatchObject({ pass: 5, fail: 3 });
+
+    c.advance(1000);
+    for (let i = 0; i < 2; i++) a.record("pass");
+    await a.flusher.flushNow(); // A notices B's write
+    const disk = await onDisk();
+    expect(disk?.counts).toMatchObject({ pass: 7, fail: 3 });
+    expect(disk?.beta.alpha).toBeCloseTo(7, 3);
+    expect(disk?.beta.beta).toBeCloseTo(3, 3);
+    expect(a.store.snapshot().entries[KEY]?.counts).toMatchObject({ pass: 7, fail: 3 });
+
+    // B is stale until its next write, which brings in A's two passes (and nothing is counted twice)
+    c.advance(1000);
+    b.record("fail");
+    await b.flusher.flushNow();
+    expect((await onDisk())?.counts).toMatchObject({ pass: 7, fail: 4 });
+    c.advance(1000);
+    await a.flusher.flushNow(); // clean: nothing to write, nothing to merge
+    a.record("pass");
+    await a.flusher.flushNow();
+    expect((await onDisk())?.counts).toMatchObject({ pass: 8, fail: 4 });
+    expect(logger.warn.mock.calls.filter((call) => String(call[0]).includes("another process writes"))).toHaveLength(2); // once per process
+  });
+
+  it("cost statistics merge exactly while under the cap (attempt-weighted means)", async () => {
+    const { a, b, c, onDisk } = twoProcesses();
+    const tokens = { ...emptyTokenSample(), input: 100, output: 10 };
+    const attempt = (who: typeof a, id: string, cost: number) => who.store.recordStep(KEY, { attemptID: id, cost, pricing: "priced", tokens, final: true });
+    await a.persister.load();
+    await b.persister.load();
+    attempt(a, "a1", 0.1);
+    attempt(a, "a2", 0.3);
+    await a.flusher.flushNow();
+    c.advance(1000);
+    attempt(b, "b1", 0.5);
+    attempt(b, "b2", 0.7);
+    await b.flusher.flushNow();
+    c.advance(1000);
+    attempt(a, "a3", 0.9);
+    await a.flusher.flushNow();
+    const cost = (await onDisk())?.cost;
+    expect(cost?.measuredUSD.n).toBe(5);
+    expect(cost?.measuredUSD.mean).toBeCloseTo(0.5, 12);
+    expect(cost?.tokens.n).toBe(5);
+    expect(cost?.tokens.input).toBeCloseTo(100, 12);
+  });
+
+  it("an unchanged file is not read: no merge, no warning, one write per dirty flush", async () => {
+    const { a, mem, logger, c } = twoProcesses();
+    await a.persister.load();
+    a.record("pass");
+    await a.flusher.flushNow();
+    c.advance(1000);
+    a.record("pass");
+    const readsBefore = mem.touched.filter((t) => t.op === "readText").length;
+    await a.flusher.flushNow();
+    expect(mem.touched.filter((t) => t.op === "readText").length).toBe(readsBefore);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("readForeignWrites: null until someone else writes, then the file and the baseline to diff against", async () => {
+    const { a, b, c, deps, dir } = twoProcesses();
+    expect(await a.persister.readForeignWrites()).toBeNull(); // never loaded: nothing to compare with
+    await a.persister.load();
+    expect(await a.persister.readForeignWrites()).toBeNull();
+    b.record("pass");
+    c.advance(1000);
+    await b.persister.saveSnapshot(b.store.snapshot());
+    const foreign = await a.persister.readForeignWrites();
+    expect(foreign?.baseline).toEqual({ version: 1, entries: {} });
+    expect(foreign?.disk).toEqual(b.store.snapshot());
+    expect(await a.persister.readForeignWrites()).toBeNull(); // already handled
+    // after our own save the baseline is what we wrote
+    a.record("fail");
+    await a.persister.saveSnapshot(a.store.snapshot());
+    expect(await a.persister.readForeignWrites()).toBeNull();
+    c.advance(1000);
+    await createPersister(dir, { ...deps, pid: 9 }).saveSnapshot(snapshotOf("pass", "pass"));
+    expect((await a.persister.readForeignWrites())?.baseline).toEqual(a.store.snapshot());
+  });
+
+  it("a foreign file that is unreadable is replaced (with a warning); one that is not ours is never overwritten", async () => {
+    const { a, mem, dir, c, logger } = twoProcesses();
+    await a.persister.load();
+    a.record("pass");
+    await a.flusher.flushNow();
+    const path = join(dir, OUTCOMES_FILE);
+
+    c.advance(1000);
+    mem.files.set(path, { text: "{ torn", mtimeMs: c.now() });
+    a.record("pass");
+    await a.flusher.flushNow();
+    expect(logger.warn.mock.calls.some((call) => String(call[0]).includes("unreadable outcomes.json"))).toBe(true);
+    expect(JSON.parse(mem.files.get(path)?.text ?? "null").entries[KEY].counts.pass).toBe(2);
+
+    c.advance(1000);
+    const theirs = JSON.stringify({ schema: "someone-else", version: 1 });
+    mem.files.set(path, { text: theirs, mtimeMs: c.now() });
+    a.record("pass");
+    await a.flusher.flushNow();
+    expect(mem.files.get(path)?.text).toBe(theirs); // refused
+    expect(await a.persister.saveSnapshot(a.store.snapshot())).toMatchObject({ ok: false, readOnly: true });
+  });
+
+  it("a removed file is simply recreated", async () => {
+    const { a, mem, dir, c, onDisk } = twoProcesses();
+    await a.persister.load();
+    a.record("pass");
+    await a.flusher.flushNow();
+    mem.files.delete(join(dir, OUTCOMES_FILE));
+    c.advance(1000);
+    a.record("pass");
+    await a.flusher.flushNow();
+    expect((await onDisk())?.counts.pass).toBe(2);
   });
 });
 

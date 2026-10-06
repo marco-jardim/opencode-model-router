@@ -428,6 +428,11 @@ export interface OutcomeStore {
   snapshot(): OutcomeSnapshot;
   /** `replace` (default) swaps the persisted state; `merge` adds disk evidence to in-memory evidence. */
   fromSnapshot(snapshot: OutcomeSnapshot, options?: { readonly mode?: "replace" | "merge" }): SnapshotLoadReport;
+  /**
+   * QA-1.3-4: another process rewrote the store file. Adds `disk − baseline` (what the other writer added since
+   * this process last synced, `baseline`) to the live state, so the next save writes `disk + (memory − baseline)`.
+   */
+  mergeForeign(disk: OutcomeSnapshot, baseline: OutcomeSnapshot): SnapshotLoadReport;
 }
 
 /** What stats needs from a store. */
@@ -634,6 +639,14 @@ export interface ReadRowsResult {
   readonly files: string[];
 }
 
+/** The other writer's view of `outcomes.json` and the state this process last synced with it (QA-1.3-4). */
+export interface ForeignWrites {
+  /** The file as another process left it. */
+  readonly disk: OutcomeSnapshot;
+  /** What this process last loaded or wrote: `disk − baseline` is what the other writer added. */
+  readonly baseline: OutcomeSnapshot;
+}
+
 export interface Persister {
   readonly dir: string;
   readonly outcomesPath: string;
@@ -650,6 +663,11 @@ export interface Persister {
   appendRows(rows: readonly LogRow[]): Promise<WriteResult>;
   /** Every generation, oldest first. Never throws. */
   readRows(): Promise<ReadRowsResult>;
+  /**
+   * `outcomes.json` changed on disk since this persister last loaded or wrote it (another process): its content
+   * and the baseline to diff it against; `null` when nothing changed or the file cannot be merged. Never throws.
+   */
+  readForeignWrites(): Promise<ForeignWrites | null>;
 }
 
 /** Injected timers; the real implementation `unref()`s them so they never keep a process alive. */
