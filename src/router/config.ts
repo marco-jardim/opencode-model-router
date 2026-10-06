@@ -738,6 +738,7 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
           `tiers.json: preset '${presetName}' tier '${tierName}': promptStyle must be one of ${PROMPT_STYLES.join("|")}`,
         );
       }
+      validateTierCandidates(t, `${presetName}.${tierName}`);
     }
   }
 
@@ -1194,7 +1195,13 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
           `tiers.json: enforcement.escalate.effortBumpMax must be one of ${EFFORT_LEVELS.join("|")} (got ${describeValue(effortBumpMax)})`,
         );
       }
-      snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax });
+      const variantSteps = escalate.variantSteps;
+      if (variantSteps !== undefined && !pickEnum(VARIANT_STEP_MODES, variantSteps)) {
+        throw new Error(
+          `tiers.json: enforcement.escalate.variantSteps must be one of ${VARIANT_STEP_MODES.join("|")} (got ${describeValue(variantSteps)})`,
+        );
+      }
+      snapshots.escalate = withValidatedSnapshots(escalate, { effortBump, effortBumpMax, variantSteps });
       if (
         escalate.costCeiling !== undefined &&
         typeof escalate.costCeiling === "object" &&
@@ -1331,6 +1338,405 @@ function validateEnforcement(value: unknown): Record<string, unknown> | undefine
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cost-aware routing validation (#74)
+//
+// Unknown keys inside `routing` are ignored, not rejected: that is the policy of
+// every other block in this file (see modelGenerations), so a config written for
+// a newer release still loads on an older one. The only keys refused are the
+// prototype-reparenting ones (rejectPrototypeKeys), as for `enforcement`.
+// Validators read every value exactly once and return a plain snapshot of what
+// they validated, so a config object cannot change between check and use.
+// ---------------------------------------------------------------------------
+
+/** Agent ids and task-class names in `routing.roles`. */
+const ROUTING_ID_PATTERN = /^[a-z0-9_-]+$/;
+/** Environment variable names (`classifier.apiKeyEnv`). */
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** A variant id: non-empty, no whitespace, no `#` (the ref separator). */
+const VARIANT_ID_PATTERN = /^[^\s#]+$/;
+
+/** `value` as a member of `allowed`, narrowed without a cast. */
+function pickEnum<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
+  return allowed.find((candidate) => candidate === value);
+}
+
+function readEnum<T extends string>(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+  allowed: readonly T[],
+): T | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  const hit = pickEnum(allowed, value);
+  if (hit === undefined) {
+    throw new Error(
+      `tiers.json: ${path}.${key} must be one of ${allowed.join("|")} (got ${describeValue(value)})`,
+    );
+  }
+  return hit;
+}
+
+interface NumberRule {
+  min: number;
+  max: number;
+  /** `min` itself is not allowed (an open lower bound). */
+  minExclusive?: boolean;
+  integer?: boolean;
+}
+
+function readNumber(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+  rule: NumberRule,
+): number | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  const inRange =
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    (!rule.integer || Number.isInteger(value)) &&
+    (rule.minExclusive ? value > rule.min : value >= rule.min) &&
+    value <= rule.max;
+  if (typeof value !== "number" || !inRange) {
+    const lower = rule.minExclusive ? `> ${rule.min}` : `>= ${rule.min}`;
+    throw new Error(
+      `tiers.json: ${path}.${key} must be ${rule.integer ? "an integer" : "a number"} ${lower} and <= ${rule.max} (got ${describeValue(value)})`,
+    );
+  }
+  return value;
+}
+
+function readBoolean(
+  obj: Record<string, unknown>,
+  key: string,
+  path: string,
+): boolean | undefined {
+  const value = obj[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`tiers.json: ${path}.${key} must be a boolean (got ${describeValue(value)})`);
+  }
+  return value;
+}
+
+/** A nested object block; `null` and arrays are refused (an override `null` would erase a block). */
+function readBlock(
+  parent: Record<string, unknown>,
+  key: string,
+  path: string,
+): Record<string, unknown> | undefined {
+  const value = parent[key];
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value)) {
+    throw new Error(`tiers.json: ${path}.${key} must be an object (got ${describeValue(value)})`);
+  }
+  rejectPrototypeKeys(value, `${path}.${key}`);
+  return value;
+}
+
+/** `provider/model` or `provider/model#variant` (a catalog reference). */
+function isCatalogRef(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const hash = value.indexOf("#");
+  if (hash === -1) return parseModelRef(value) !== undefined;
+  return VARIANT_ID_PATTERN.test(value.slice(hash + 1)) && parseModelRef(value.slice(0, hash)) !== undefined;
+}
+
+/** `model` / `backend` pair read from a classifier block or a per-preset override. */
+function readClassifierModel(obj: Record<string, unknown>, path: string): string | null | undefined {
+  const model = obj.model;
+  if (model === undefined || model === null) return model;
+  if (!isCatalogRef(model)) {
+    throw new Error(
+      `tiers.json: ${path}.model must be null or a 'provider/model[#variant]' string (got ${describeValue(model)})`,
+    );
+  }
+  return model;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** D3: a backend other than `rules` needs a model; the HTTP backends also need a URL. */
+function assertClassifierUsable(
+  path: string,
+  backend: ClassifierBackend,
+  model: string | null | undefined,
+  baseUrl: string | null | undefined,
+  modelKeys: string,
+): void {
+  if (backend === "rules") return;
+  if (typeof model !== "string" || model === "") {
+    throw new Error(
+      `tiers.json: ${modelKeys} must be a non-empty 'provider/model[#variant]' string when ${path}.backend is "${backend}" (the classifier is never picked automatically)`,
+    );
+  }
+  if ((backend === "openai-compatible" || backend === "typesafe") && !baseUrl) {
+    throw new Error(
+      `tiers.json: routing.classifier.baseUrl must be an http(s) URL when ${path}.backend is "${backend}"`,
+    );
+  }
+}
+
+function validateClassifier(routing: Record<string, unknown>): ClassifierConfig | undefined {
+  const c = readBlock(routing, "classifier", "routing");
+  if (c === undefined) return undefined;
+  const path = "routing.classifier";
+  const out: ClassifierConfig = {};
+
+  const backend = readEnum(c, "backend", path, CLASSIFIER_BACKENDS);
+  if (backend !== undefined) out.backend = backend;
+
+  const model = readClassifierModel(c, path);
+  if (model !== undefined) out.model = model;
+
+  const baseUrl = c.baseUrl;
+  if (baseUrl !== undefined && baseUrl !== null) {
+    if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
+      throw new Error(
+        `tiers.json: ${path}.baseUrl must be null or an http(s) URL (got ${describeValue(baseUrl)})`,
+      );
+    }
+  }
+  if (baseUrl !== undefined) out.baseUrl = baseUrl;
+
+  const apiKeyEnv = c.apiKeyEnv;
+  if (apiKeyEnv !== undefined && apiKeyEnv !== null) {
+    if (typeof apiKeyEnv !== "string" || !ENV_NAME_PATTERN.test(apiKeyEnv)) {
+      throw new Error(
+        `tiers.json: ${path}.apiKeyEnv must be null or an environment variable name (got ${describeValue(apiKeyEnv)})`,
+      );
+    }
+  }
+  if (apiKeyEnv !== undefined) out.apiKeyEnv = apiKeyEnv;
+
+  const timeoutMs = readNumber(c, "timeoutMs", path, { min: 100, max: 30_000, integer: true });
+  if (timeoutMs !== undefined) out.timeoutMs = timeoutMs;
+
+  const samples = c.samples;
+  if (samples !== undefined) {
+    if (samples !== 1 && samples !== 3) {
+      throw new Error(`tiers.json: ${path}.samples must be 1 or 3 (got ${describeValue(samples)})`);
+    }
+    out.samples = samples;
+  }
+
+  const maxStateChars = readNumber(c, "maxStateChars", path, { min: 200, max: 20_000, integer: true });
+  if (maxStateChars !== undefined) out.maxStateChars = maxStateChars;
+
+  const presets = readBlock(c, "presets", path);
+  if (presets !== undefined) {
+    const snapshot: Record<string, ClassifierPresetOverride> = {};
+    for (const [presetName, entry] of Object.entries(presets)) {
+      const entryPath = `${path}.presets.'${presetName}'`;
+      if (!isPlainObject(entry)) {
+        throw new Error(`tiers.json: ${entryPath} must be an object (got ${describeValue(entry)})`);
+      }
+      rejectPrototypeKeys(entry, entryPath);
+      const override: ClassifierPresetOverride = {};
+      const entryBackend = readEnum(entry, "backend", entryPath, CLASSIFIER_BACKENDS);
+      if (entryBackend !== undefined) override.backend = entryBackend;
+      const entryModel = readClassifierModel(entry, entryPath);
+      if (entryModel !== undefined) override.model = entryModel;
+      snapshot[presetName] = override;
+    }
+    out.presets = snapshot;
+  }
+
+  // The top level and every per-preset override must each resolve to a usable
+  // classifier, whichever layer supplied which key.
+  const effectiveBackend = out.backend ?? "rules";
+  assertClassifierUsable(path, effectiveBackend, out.model, out.baseUrl, `${path}.model`);
+  for (const [presetName, override] of Object.entries(out.presets ?? {})) {
+    const entryPath = `${path}.presets.'${presetName}'`;
+    assertClassifierUsable(
+      entryPath,
+      override.backend ?? effectiveBackend,
+      override.model !== undefined ? override.model : out.model,
+      out.baseUrl,
+      `${path}.model or ${entryPath}.model`,
+    );
+  }
+  return out;
+}
+
+function validateRoles(routing: Record<string, unknown>): Record<string, string[]> | undefined {
+  const roles = readBlock(routing, "roles", "routing");
+  if (roles === undefined) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const [taskClass, agents] of Object.entries(roles)) {
+    if (!ROUTING_ID_PATTERN.test(taskClass)) {
+      throw new Error(
+        `tiers.json: routing.roles class '${taskClass}' must match ${ROUTING_ID_PATTERN.source}`,
+      );
+    }
+    if (!Array.isArray(agents) || agents.length === 0) {
+      throw new Error(
+        `tiers.json: routing.roles.'${taskClass}' must be a non-empty array of agent ids (got ${describeValue(agents)})`,
+      );
+    }
+    const ids: string[] = [];
+    for (const agent of agents as unknown[]) {
+      if (typeof agent !== "string" || !ROUTING_ID_PATTERN.test(agent)) {
+        throw new Error(
+          `tiers.json: routing.roles.'${taskClass}' entries must be agent ids matching ${ROUTING_ID_PATTERN.source} (got ${describeValue(agent)})`,
+        );
+      }
+      ids.push(agent);
+    }
+    out[taskClass] = ids;
+  }
+  return out;
+}
+
+/**
+ * Validate `routing` and return a snapshot of the validated values (or
+ * `undefined` when absent). Defaults are NOT applied here; see resolveRouting.
+ */
+function validateRouting(value: unknown): RoutingConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value)) {
+    throw new Error(`tiers.json: 'routing' must be an object (got ${describeValue(value)})`);
+  }
+  rejectPrototypeKeys(value, "routing");
+  const routing = value;
+  const out: RoutingConfig = {};
+
+  const engine = readEnum(routing, "engine", "routing", ROUTING_ENGINES);
+  if (engine !== undefined) out.engine = engine;
+  const profile = readEnum(routing, "profile", "routing", ROUTING_PROFILES);
+  if (profile !== undefined) out.profile = profile;
+  const margin = readNumber(routing, "margin", "routing", { min: 0, max: 0.9 });
+  if (margin !== undefined) out.margin = margin;
+  const minClassConfidence = readNumber(routing, "minClassConfidence", "routing", { min: 0, max: 1 });
+  if (minClassConfidence !== undefined) out.minClassConfidence = minClassConfidence;
+
+  const detection = readBlock(routing, "detection", "routing");
+  if (detection !== undefined) {
+    const d: DetectionConfig = {};
+    for (const key of ["deterministic", "grader", "none"] as const) {
+      const v = readNumber(detection, key, "routing.detection", { min: 0, max: 1 });
+      if (v !== undefined) d[key] = v;
+    }
+    out.detection = d;
+  }
+
+  const classifier = validateClassifier(routing);
+  if (classifier !== undefined) out.classifier = classifier;
+  const roles = validateRoles(routing);
+  if (roles !== undefined) out.roles = roles;
+
+  const outcomes = readBlock(routing, "outcomes", "routing");
+  if (outcomes !== undefined) {
+    const o: OutcomesConfig = {};
+    const path = outcomes.path;
+    if (path !== undefined) {
+      if (path !== null && (typeof path !== "string" || path === "")) {
+        throw new Error(
+          `tiers.json: routing.outcomes.path must be null or a non-empty string (got ${describeValue(path)})`,
+        );
+      }
+      o.path = path;
+    }
+    const halfLifeDays = readNumber(outcomes, "halfLifeDays", "routing.outcomes", { min: 1, max: 365 });
+    if (halfLifeDays !== undefined) o.halfLifeDays = halfLifeDays;
+    const maxEffectiveSamples = readNumber(outcomes, "maxEffectiveSamples", "routing.outcomes", {
+      min: 5,
+      max: 1000,
+    });
+    if (maxEffectiveSamples !== undefined) o.maxEffectiveSamples = maxEffectiveSamples;
+    out.outcomes = o;
+  }
+
+  const sessionReuse = readBlock(routing, "sessionReuse", "routing");
+  if (sessionReuse !== undefined) {
+    const s: SessionReuseConfig = {};
+    const maxContextFraction = readNumber(sessionReuse, "maxContextFraction", "routing.sessionReuse", {
+      min: 0,
+      max: 0.95,
+      minExclusive: true,
+    });
+    if (maxContextFraction !== undefined) s.maxContextFraction = maxContextFraction;
+    out.sessionReuse = s;
+  }
+
+  const advisor = readBlock(routing, "advisor", "routing");
+  if (advisor !== undefined) {
+    const a: AdvisorConfig = {};
+    const enabled = readBoolean(advisor, "enabled", "routing.advisor");
+    if (enabled !== undefined) a.enabled = enabled;
+    const noticeIntervalHours = readNumber(advisor, "noticeIntervalHours", "routing.advisor", {
+      min: 1,
+      max: 720,
+    });
+    if (noticeIntervalHours !== undefined) a.noticeIntervalHours = noticeIntervalHours;
+    out.advisor = a;
+  }
+
+  return out;
+}
+
+/**
+ * `tiers.<t>.candidates`: ordered rungs of a tier's ladder. `model` falls back
+ * to the tier's own, and no two rungs may name the same effective
+ * `(model, variant)` (an omitted variant is the model's default variant).
+ */
+function validateTierCandidates(tier: Record<string, unknown>, label: string): void {
+  const candidates = tier.candidates;
+  if (candidates === undefined) return;
+  if (!Array.isArray(candidates)) {
+    throw new Error(`tiers.json: '${label}.candidates' must be an array`);
+  }
+  const seen = new Map<string, number>();
+  for (let i = 0; i < candidates.length; i++) {
+    const entry: unknown = candidates[i];
+    const where = `${label}.candidates[${i}]`;
+    if (!isPlainObject(entry)) {
+      throw new Error(`tiers.json: '${where}' must be an object`);
+    }
+    rejectPrototypeKeys(entry, `${label}.candidates[${i}]`);
+    const model = entry.model;
+    if (model !== undefined && (typeof model !== "string" || !parseModelRef(model))) {
+      throw new Error(
+        `tiers.json: '${where}.model' must be 'provider/model' (got ${describeValue(model)})`,
+      );
+    }
+    const variant = entry.variant;
+    if (variant !== undefined && (typeof variant !== "string" || !VARIANT_ID_PATTERN.test(variant))) {
+      throw new Error(
+        `tiers.json: '${where}.variant' must be a non-empty string without whitespace or '#' (got ${describeValue(variant)})`,
+      );
+    }
+    const costRatio = entry.costRatio;
+    if (
+      costRatio !== undefined &&
+      (typeof costRatio !== "number" || !Number.isFinite(costRatio) || costRatio <= 0)
+    ) {
+      throw new Error(
+        `tiers.json: '${where}.costRatio' must be a number > 0 (got ${describeValue(costRatio)})`,
+      );
+    }
+    const effectiveModel = typeof model === "string" ? model : String(tier.model);
+    const key = `${effectiveModel}\u0000${typeof variant === "string" ? variant : ""}`;
+    const first = seen.get(key);
+    if (first !== undefined) {
+      throw new Error(
+        `tiers.json: '${where}' repeats (model, variant) = (${effectiveModel}, ${typeof variant === "string" ? variant : "default"}) of candidates[${first}]`,
+      );
+    }
+    seen.set(key, i);
+  }
+}
+
 /**
  * Validate a raw parsed config. Strict and throwing by design: the bundled
  * tiers.json must be valid on its own, and loadConfig turns a throw from an
@@ -1369,9 +1775,10 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateDispatchHeader(obj);
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
+  const routing = validateRouting(obj.routing);
 
   const cfg = raw as RouterConfig;
-  return withValidatedSnapshots(cfg, { enforcement });
+  return withValidatedSnapshots(cfg, { enforcement, routing });
 }
 
 /**
