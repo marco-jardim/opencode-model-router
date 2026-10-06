@@ -360,6 +360,8 @@ export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonl
 export interface Teardown { pid?: number; method: string; taskkill?: Obj; exitCode: number | null | undefined; hostPort: number; hostPortClosed: boolean; providerStopped: boolean; rootRemoved: boolean }
 
 const liveHosts = new Set<RoutingHost>();
+/** Every session id any isolated host of this run held (roots and children), kept so the live-store check can show none of them reached the user's store. */
+export const seenSessionIDs = new Set<string>();
 
 export class RoutingHost {
   readonly provider = new RoutingProvider();
@@ -481,6 +483,7 @@ export class RoutingHost {
   private async doStop(): Promise<Teardown> {
     const child = this.child;
     const pid = child?.pid;
+    if (child && child.exitCode === null) { try { for (const s of await this.everySession()) seenSessionIDs.add(s.id); } catch { /* the host is already gone */ } }
     let method = "none (never started or already exited)";
     let taskkill: Obj | undefined;
     if (child && child.exitCode === null && child.signalCode === null) {

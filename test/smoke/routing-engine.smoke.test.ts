@@ -13,15 +13,17 @@
  *   own session context, the requests the provider received, and the files the plugin inside the host wrote; never only the
  *   plugin's own variables or logs. Evidence is written to docs/qa/cost-aware-routing/evidence-3.2/ BEFORE each assertion.
  */
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { FLOOR_LIFT_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
 import { catalogFromModels, hostConfigFromAgents, runAdvisor } from "../../src/routing/advisor";
 import type { RouterConfig } from "../../src/router/config";
 import {
-  MODELS, ROOT, RoutingHost, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
+  MODELS, ROOT, RoutingHost, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, str, type HookRecord, type ModelRef, type Obj, type Seed, type WireRequest,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
@@ -47,6 +49,21 @@ const SEARCH_SEED: readonly Seed[] = [{ key: key.searchFast, pass: 20, fail: 0 }
 const SEARCH_PROMPT = "[route class=search risk=low scope=single]\nFind every usage of parseThing in the repository and list the files.";
 
 afterAll(async () => { await stopAllHosts(); }, 60_000);
+
+// ---- the user's live store and live config: read-only snapshots taken before the first scenario and compared after the last ----
+const LIVE_STORE = path.join(tmpdir(), "opencode-model-router-trajectory");
+const LIVE_CONFIG = path.join(homedir(), ".config", "opencode");
+interface FileStat { size: number; mtimeMs: number }
+async function listDir(dir: string): Promise<Record<string, FileStat>> {
+  if (!existsSync(dir)) return {};
+  const out: Record<string, FileStat> = {};
+  for (const name of await readdir(dir)) { try { const st = await stat(path.join(dir, name)); if (st.isFile()) out[name] = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* removed meanwhile */ } }
+  return out;
+}
+let liveBefore: { store: Record<string, FileStat>; config: Record<string, FileStat>; at: string } | undefined;
+beforeAll(async () => {
+  if (RUN) liveBefore = { store: await listDir(LIVE_STORE), config: await listDir(LIVE_CONFIG), at: new Date().toISOString() };
+}, 60_000);
 
 const sameModel = (m: ModelRef | undefined, want: { providerID: string; id: string }, variant?: string) =>
   m?.providerID === want.providerID && m.id === want.id && m.variant === variant;
@@ -590,7 +607,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         // The two properties the runner needs: the effective effort of every agent-switch request is the TARGET tier's configured effort (low, medium, xhigh, low) and the in-band list never grows past one entry per change.
         const targetEfforts = ["low", "medium", "xhigh", "low"];
         const effortOk = A.length === 4 && A.every((r, i) => r.effective === targetEfforts[i] || (r.effective === stored(r) && stored(r) === targetEfforts[i]));
-        s.verdict(effortOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `agent switch effective efforts ${A.map(r => String(r.effective)).join("->")} (stored ${A.map(stored).join("->")}); bare sonnet after #high: stored ${R1.map(stored).join("->")} effective ${R1.map(r => String(r.effective)).join("->")}; bare opus after sonnet#high: stored ${R1b.map(stored).join("->")} effective ${R1b.map(r => String(r.effective)).join("->")}; default->high effective ${F9.map(r => String(r.effective)).join("->")}`);
+        s.verdict(effortOk && host.errorLines().length === 0 && host.provider.errors.length === 0, `agent switch effective efforts ${A.map(r => String(r.effective)).join("->")} (stored ${A.map(stored).join("->")}); bare sonnet after #low: stored ${R1.map(stored).join("->")} effective ${R1.map(r => String(r.effective)).join("->")}; bare opus after sonnet#low: stored ${R1b.map(stored).join("->")} effective ${R1b.map(r => String(r.effective)).join("->")}; default->high effective ${F9.map(r => String(r.effective)).join("->")}`);
       });
 
       // QA-1.5-22, distinguishing: the tier's `effort` differs from its `variant`, so the wire shows which of the two the request follows.
@@ -682,7 +699,41 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const teardown = await host.stop();
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
-  }, 400_000);});
+  }, 400_000);
+  it("8 live store and live config: nothing of this run reached the user's outcomes store or OpenCode config", async () => {
+    await runScenario("8-live-store-untouched", "The user's live outcomes store (<tmpdir>/opencode-model-router-trajectory) and OpenCode config (~/.config/opencode) are read only here. Every isolated host used its own HOME/TEMP and a temp outcomes path, so the only growth of the live store comes from the user's own running host: new files are `ses_` scorecards (or the live host's own files), and no row appended to the live decisions.jsonl names a session of this run. The user's config files are unchanged.", async s => {
+      const before = liveBefore!;
+      const after = { store: await listDir(LIVE_STORE), config: await listDir(LIVE_CONFIG) };
+      const added = Object.keys(after.store).filter(n => !(n in before.store));
+      const removed = Object.keys(before.store).filter(n => !(n in after.store));
+      const grown = Object.keys(after.store).filter(n => n in before.store && after.store[n]!.size !== before.store[n]!.size);
+      const addedNonSession = added.filter(n => !/^ses_/.test(n));
+      // rows appended to the live decisions.jsonl since the snapshot: none may belong to a session of this run
+      let appended = 0;
+      let foreignRows = 0;
+      const decisions = after.store["decisions.jsonl"];
+      if (decisions && before.store["decisions.jsonl"] && decisions.size > before.store["decisions.jsonl"].size) {
+        const handle = await open(path.join(LIVE_STORE, "decisions.jsonl"), "r");
+        try {
+          const length = decisions.size - before.store["decisions.jsonl"].size;
+          const buffer = Buffer.alloc(length);
+          await handle.read(buffer, 0, length, before.store["decisions.jsonl"].size);
+          for (const line of buffer.toString("utf8").split(/\r?\n/).filter(Boolean)) {
+            appended += 1;
+            try { if (seenSessionIDs.has(String(JSON.parse(line).sessionID))) foreignRows += 1; } catch { /* a partial last line */ }
+          }
+        } finally { await handle.close(); }
+      }
+      const configChanged = Object.keys(after.config).filter(n => !(n in before.config) || after.config[n]!.size !== before.config[n]!.size || after.config[n]!.mtimeMs !== before.config[n]!.mtimeMs);
+      const routerFiles = ["opencode.json", "opencode-model-router.overrides.jsonc", "opencode-model-router.state.json"].filter(n => n in before.config || n in after.config);
+      s.observed.snapshotTakenAt = before.at;
+      s.observed.liveStore = { dir: "<tmpdir>/opencode-model-router-trajectory", filesBefore: Object.keys(before.store).length, filesAfter: Object.keys(after.store).length, bytesBefore: Object.values(before.store).reduce((n, f) => n + f.size, 0), bytesAfter: Object.values(after.store).reduce((n, f) => n + f.size, 0), added: added.length, addedNonSession, removed, grownFiles: grown.filter(n => !/^ses_/.test(n)), grownSessionFiles: grown.filter(n => /^ses_/.test(n)).length };
+      s.observed.liveDecisionsLog = { appendedRows: appended, rowsNamingASessionOfThisRun: foreignRows, sessionsOfThisRunSeen: seenSessionIDs.size };
+      s.observed.liveConfig = { dir: "~/.config/opencode", files: Object.keys(after.config), changedSinceSnapshot: configChanged, routerFilesUnchanged: routerFiles.filter(n => !configChanged.includes(n)) };
+      const ok = foreignRows === 0 && seenSessionIDs.size > 0 && routerFiles.every(n => !configChanged.includes(n));
+      s.verdict(ok, `live store ${Object.keys(before.store).length} -> ${Object.keys(after.store).length} files (+${added.length} new, ${added.length - addedNonSession.length} of them ses_ scorecards, non-ses_ new: ${addedNonSession.join(",") || "none"}); ${appended} row(s) appended to the live decisions.jsonl, ${foreignRows} naming a session of this run (${seenSessionIDs.size} seen); config files changed: ${configChanged.join(",") || "none"}`);
+    });
+  });});
 
 void str;
 void MODELS;
