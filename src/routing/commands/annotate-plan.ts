@@ -21,7 +21,6 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { RouterConfig } from "../../router/config";
 import { classifyMany as classifyManyWith, type ClassifyDeps } from "../classify";
-import { fenceMask } from "../classify/fences";
 import { parseRouteLine } from "../classify/route-line";
 import type { ClassifyInput, ClassifyResult } from "../classify/types";
 import { annotateSteps } from "../engine";
@@ -61,16 +60,25 @@ function indentOf(line: string): number {
   return columns;
 }
 
-const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+/** A fence run at the start of `text` (indentation already measured): the character and length, or `null` (a backtick run's info string may not hold a backtick). */
+function fenceRunOf(text: string): { readonly char: string; readonly length: number } | null {
+  const match = /^(`{3,}|~{3,})(.*)$/.exec(text);
+  const run = match?.[1];
+  if (match === null || run === undefined || (run[0] === "`" && (match[2] ?? "").includes("`"))) return null;
+  return { char: run[0] as string, length: run.length };
+}
 
 /**
- * Which lines are code or comment, the way the step scanner needs it (QA-2.4-12). Like the shared `fenceMask` (an opener, a closer of the
- * same character at least as long, nothing but whitespace after it) with two differences that matter inside a plan:
+ * Which lines are code or comment, the way the step scanner needs it (QA-2.4-12, QA-2.4-R2-2, -R2-8, -R2-9). Like the shared `fenceMask`
+ * (an opener, a closer of the same character at least as long, nothing but whitespace after it) with differences that matter inside a plan:
  *  - a fence opened inside a list item ends where the item does: a non-blank line indented less than the item's content column closes it
  *    (CommonMark), so a closer that is not valid (`closerWithInfo`: ``` followed by an info string) can no longer swallow every later
  *    step to the end of the file;
- *  - an HTML comment block (`<!--` … `-->`) is masked, so a list inside one is never a step.
+ *  - indentation is measured from the container: a fence (and its closer, and a comment) inside an item may be indented up to 3 columns
+ *    PAST the item's content column (`10. step` has its content at column 4), not 3 columns from the margin;
+ *  - an item whose content STARTS with a fence opener (`1. ```bash`) opens the fence on its own line: the item line stays a step line (it
+ *    is not masked), everything after it up to the closer is code;
+ *  - an HTML comment block (`<!--` … `-->`, at most 3 columns from its container) is masked, so a list inside one is never a step.
  * A fence at the top level (not inside an item) still runs to its closer, or to the end of the text.
  */
 export function structureMask(lines: readonly string[]): boolean[] {
@@ -79,10 +87,13 @@ export function structureMask(lines: readonly string[]): boolean[] {
   let comment = false;
   let itemOffset: number | null = null; // content column of the list item we are in, if any
   let gap = false;
+  /** The column a line is measured from: the item's content column when the line reaches it, else the margin. */
+  const baseOf = (line: string, offset: number | null): number => (offset !== null && indentOf(line) >= offset ? offset : 0);
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i] as string;
     if (fence !== null) {
-      const closer = FENCE_CLOSE_RE.exec(line);
+      const relative = indentOf(line) - (fence.itemOffset ?? 0);
+      const closer = relative >= 0 && relative <= 3 ? /^(`{3,}|~{3,})[ \t]*$/.exec(line.trimStart()) : null;
       if (closer !== null && (closer[1] as string)[0] === fence.char && (closer[1] as string).length >= fence.length) {
         mask[i] = true;
         fence = null;
@@ -108,16 +119,16 @@ export function structureMask(lines: readonly string[]): boolean[] {
       gap = false;
       continue;
     }
-    const open = FENCE_OPEN_RE.exec(line);
-    const run = open?.[1];
-    if (open !== null && run !== undefined && !(run[0] === "`" && (open[2] ?? "").includes("`"))) {
+    const relative = indentOf(line) - baseOf(line, itemOffset);
+    const run = relative <= 3 ? fenceRunOf(line.trimStart()) : null;
+    if (run !== null) {
       if (itemOffset !== null && indentOf(line) < itemOffset) itemOffset = null; // not indented as the item's content: not part of it
       mask[i] = true;
-      fence = { char: run[0] as string, length: run.length, itemOffset };
+      fence = { ...run, itemOffset };
       gap = false;
       continue;
     }
-    if (line.trimStart().startsWith("<!--")) {
+    if (relative <= 3 && line.trimStart().startsWith("<!--")) {
       if (itemOffset !== null && indentOf(line) < itemOffset) itemOffset = null;
       mask[i] = true;
       comment = !line.slice(line.indexOf("<!--") + 4).includes("-->");
@@ -127,7 +138,12 @@ export function structureMask(lines: readonly string[]): boolean[] {
     const item = LIST_ITEM_RE.exec(line);
     if (item !== null) {
       const indent = indentOf(line);
-      if (itemOffset === null || indent < itemOffset) itemOffset = indent + (item[2] as string).length + indentOf(item[3] as string);
+      const spaces = indentOf(item[3] as string);
+      const own = indent + (item[2] as string).length + spaces; // this item's content column
+      if (itemOffset === null || indent < itemOffset) itemOffset = own;
+      // `1. ```bash`: the item's content opens a code block on the item line itself (QA-2.4-R2-2)
+      const opened = spaces <= 4 ? fenceRunOf(line.slice((item[1] as string).length + (item[2] as string).length + (item[3] as string).length)) : null;
+      if (opened !== null) fence = { ...opened, itemOffset: own };
       gap = false;
       continue;
     }
@@ -137,6 +153,12 @@ export function structureMask(lines: readonly string[]): boolean[] {
   return mask;
 }
 
+/** The step's first line is a list item whose content opens a code block (`1. ```bash`): a tag or a route line cannot be added to it. */
+export function opensCodeBlock(line: string): boolean {
+  const item = LIST_ITEM_RE.exec(line);
+  if (item === null || indentOf(item[3] as string) > 4) return false;
+  return fenceRunOf(line.slice((item[1] as string).length + (item[2] as string).length + (item[3] as string).length)) !== null;
+}
 interface Run {
   start: number;
   end: number;
@@ -294,6 +316,22 @@ export interface PlanAddition {
   readonly source: string;
 }
 
+/**
+ * A step that would have changed but cannot take an addition: its first line is a list item whose content opens a code block
+ * (`1. ```bash`), so a tag after the marker would corrupt the fence opener and a route line below it would be inside the code
+ * (QA-2.4-R2-2). Skipped, never guessed at, and reported so the user can annotate it by hand.
+ */
+export interface SkippedStep {
+  /** 1-based line of the step's first line. */
+  readonly line: number;
+  /** That line, verbatim. */
+  readonly anchor: string;
+  /** The tier the engine would have written, for the by-hand edit. */
+  readonly tier: string;
+  /** The route line the engine would have written, for the by-hand edit. */
+  readonly routeLine: string;
+}
+
 export interface AnnotatedPlanText {
   /** The whole plan with every step annotated; equal to the input when nothing had to change. */
   readonly text: string;
@@ -303,6 +341,8 @@ export interface AnnotatedPlanText {
   readonly pinnedCount: number;
   /** What was added, step by step (only steps that change). */
   readonly additions: readonly PlanAddition[];
+  /** Steps that start with a code block: nothing was added to them (see {@link SkippedStep}). */
+  readonly skipped: readonly SkippedStep[];
 }
 
 const TAG_SLOT_RE = /^(?: {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+(?:\[[ xX]\][ \t]+)?| {0,3}#{1,6}[ \t]+)/;
@@ -314,18 +354,26 @@ export function withTagAtStart(line: string, tier: string): string {
   return rest === "" ? `${prefix}[tier:${tier}]` : `${prefix}[tier:${tier}] ${rest}`;
 }
 
-function additionsOf(placed: readonly PlacedStep[], steps: readonly AnnotatedStep[]): PlanAddition[] {
+function additionsOf(placed: readonly PlacedStep[], steps: readonly AnnotatedStep[]): { additions: PlanAddition[]; skipped: SkippedStep[]; pinned: number } {
   const out: PlanAddition[] = [];
+  const skipped: SkippedStep[] = [];
+  let pinned = 0;
   placed.forEach((where, index) => {
     const step = steps[index] as AnnotatedStep;
     if (!step.changed) return;
     const original = where.text.split(LINE_SPLIT_RE).filter((_, i) => i % 2 === 0);
     const annotated = step.text.split(LINE_SPLIT_RE).filter((_, i) => i % 2 === 0);
     const anchor = original[0] ?? "";
+    if (opensCodeBlock(anchor)) {
+      skipped.push({ line: where.line, anchor, tier: step.tier, routeLine: step.routeLine });
+      return;
+    }
+    if (step.pin && (step.routeEdited || step.routeSource === "engine")) pinned += 1;
     let replaceRoute: PlanAddition["replaceRoute"] = null;
     if (step.routeEdited) {
-      // The engine edited an existing, unfenced route line in place: the same line index in both texts.
-      const mask = fenceMask(original);
+      // The engine edited an existing, unfenced route line in place: the same line index in both texts. The mask is the scanner's own
+      // (indentation measured from the item's content column, QA-2.4-R2-8), so a route line inside a code block is never the one edited.
+      const mask = structureMask(original);
       const at = original.findIndex((line, i) => mask[i] !== true && parseRouteLine(line, { positions: "any" }).count > 0);
       if (at >= 0 && annotated[at] !== undefined && annotated[at] !== original[at]) {
         replaceRoute = { line: where.line + at, before: original[at] as string, text: annotated[at] as string };
@@ -340,7 +388,7 @@ function additionsOf(placed: readonly PlacedStep[], steps: readonly AnnotatedSte
       source: step.facts.source,
     });
   });
-  return out;
+  return { additions: out, skipped, pinned };
 }
 
 /** Apply additions to the plan they were computed for: the mechanical meaning of {@link PlanAddition}. Line endings are the file's own. */
@@ -373,7 +421,7 @@ export function applyAdditions(text: string, additions: readonly PlanAddition[])
  */
 export async function annotatePlanText(text: string, deps: AnnotateDeps): Promise<AnnotatedPlanText> {
   const placed = splitPlan(text);
-  if (placed.length === 0) return { text, placed, steps: [], pinnedCount: 0, additions: [] };
+  if (placed.length === 0) return { text, placed, steps: [], pinnedCount: 0, additions: [], skipped: [] };
   // A step that ends the text has no terminator of its own: give it the file's, so the engine joins an inserted route line with the same
   // line ending as everything else (only its tier, route and pin DECISIONS are used from the engine, not its text).
   const eol = /\r\n|\n|\r/.exec(text)?.[0] ?? "\n";
@@ -382,8 +430,9 @@ export async function annotatePlanText(text: string, deps: AnnotateDeps): Promis
     deps,
   );
   const steps = [...annotated];
-  const additions = additionsOf(placed, steps);
-  return { text: applyAdditions(text, additions), placed, steps, pinnedCount: annotated.pinnedCount, additions };
+  const { additions, skipped, pinned } = additionsOf(placed, steps);
+  // `pinned` is the engine's figure minus the steps that were skipped (nothing was written for them, so nothing was pinned)
+  return { text: applyAdditions(text, additions), placed, steps, pinnedCount: pinned, additions, skipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,17 +463,23 @@ export function renderDirectives(
   result: AnnotatedPlanText,
   info: { readonly path: string; readonly engine: string; readonly classification: ClassificationReport },
 ): string {
-  const { steps, additions } = result;
+  const { steps, additions, skipped } = result;
   const sources = new Map<string, number>();
   for (const step of steps) sources.set(step.facts.source, (sources.get(step.facts.source) ?? 0) + 1);
   const statuses = Object.entries(info.classification.statuses).map(([status, count]) => `${status} ${count}`).join(", ");
   const lines = [
     `## Router route lines (model-router, engine=${info.engine})`,
-    `Computed by the router for ${info.path}: ${steps.length} step${steps.length === 1 ? "" : "s"} found, ${additions.length} need${additions.length === 1 ? "s" : ""} an addition, ${result.pinnedCount} pinned by this annotation (a \`[tier:heavy]\` or QA step is never moved by the engine).`,
+    `Computed by the router for ${info.path}: ${steps.length} step${steps.length === 1 ? "" : "s"} found, ${additions.length} need${additions.length === 1 ? "s" : ""} an addition${skipped.length === 0 ? "" : ` (${skipped.length} more start${skipped.length === 1 ? "s" : ""} with a code block and ${skipped.length === 1 ? "is" : "are"} skipped)`}, ${result.pinnedCount} pinned by this annotation (a \`[tier:heavy]\` or QA step is never moved by the engine).`,
     `Classification: backend=${info.classification.backend}; sources: ${[...sources].map(([source, count]) => `${source} ${count}`).join(", ") || "none"}${statuses === "" ? "" : `; backend outcomes: ${statuses}`}${info.classification.latencyMs === null ? "" : `; backend latency ${info.classification.latencyMs} ms`}${info.classification.error === null ? "" : `; first error: ${info.classification.error}`}.`,
   ];
+  // A step whose first line is a list item that opens a code block (`1. ```bash`) takes neither a tag (it would break the fence opener)
+  // nor a route line below (it would be inside the code): skipped, and said so (QA-2.4-R2-2).
+  const skippedLines = skipped.slice(0, MAX_LISTED_STEPS).map(
+    (step) => `- line ${step.line} ${q(step.anchor)}: step at line ${step.line} starts with a code block: add nothing to it here; to annotate it by hand, put ${q(`[tier:${step.tier}]`)} and ${q(step.routeLine)} on their own lines directly above the list item, or after the closing fence.`,
+  );
   if (additions.length === 0) {
-    lines.push("Every step already carries its tier and route line: add nothing.");
+    lines.push(skipped.length === 0 ? "Every step already carries its tier and route line: add nothing." : "No step can take an addition automatically. Make no change to the file for these steps:");
+    lines.push(...skippedLines);
     return lines.join("\n");
   }
   lines.push(
@@ -438,6 +493,7 @@ export function renderDirectives(
     lines.push(`- line ${addition.line} ${q(addition.anchor)}: ${pieces.join("; ")} [facts source: ${addition.source}]`);
   }
   if (additions.length > MAX_LISTED_STEPS) lines.push(`- … ${additions.length - MAX_LISTED_STEPS} more steps: run /annotate-plan again after applying these.`);
+  if (skippedLines.length > 0) lines.push("Make no change to these steps (each starts with a code block; a tag or a route line cannot be added to its first line):", ...skippedLines);
   return lines.join("\n");
 }
 

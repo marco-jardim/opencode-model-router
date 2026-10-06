@@ -427,10 +427,83 @@ describe("splitPlan: fences that end with their item, and HTML comments (QA-2.4-
     expect(splitPlan("- a\n<!-- never closed\n- b\n").map((s) => s.line)).toEqual([1]);
   });
 
+  // QA-2.4-R2-2: an item whose content STARTS with a fence opener opens the fence on its own line
+  const OPENS_CODE = ["1. ```bash", "   npm run build", "   ```", "2. Find the config files", "3. ~~~sh", "   - hidden", "   ~~~", "4. Update the changelog"].join("\n");
+  // QA-2.4-R2-8: indentation is measured from the item's content column (`10. ` is column 4), not from the margin
+  const TWO_DIGIT = ["10. Run the build", "    ```sh", "    npm run build", "    ```", "11. Run the tests", "       ```sh", "       npm test", "       ```", "12. Ship it", "        ```sh", "        - plain"].join("\n");
+  // QA-2.4-R2-9: `<!--` opens a comment only up to 3 columns from its container
+  const INDENTED_COMMENT = ["- first", "      <!--", "- second", "      -->", "- third"].join("\n");
+
+  it("R2-2: a step whose first line opens a code block is skipped and reported, never tagged; the block stays code and the other steps are annotated", async () => {
+    const lines = OPENS_CODE.split("\n");
+    expect(structureMask(lines)).toEqual([false, true, true, false, false, true, true, false]);
+    expect(splitPlan(OPENS_CODE).map((s) => s.line)).toEqual([1, 4, 5, 8]);
+    expect(splitPlan(OPENS_CODE)[0]!.text).toBe("1. ```bash\n   npm run build\n   ```\n");
+    const result = await annotatePlanText(OPENS_CODE, makeDeps().deps);
+    expect(result.skipped.map((s) => s.line)).toEqual([1, 5]);
+    expect(result.skipped[0]).toMatchObject({ anchor: "1. ```bash" });
+    expect(result.additions.map((a) => a.line)).toEqual([4, 8]);
+    const out = result.text.split("\n");
+    expect(out.slice(0, 3)).toEqual(lines.slice(0, 3)); // untouched: no tag after the marker, no route line below the opener
+    expect(out.slice(5, 8)).toEqual(["3. ~~~sh", "   - hidden", "   ~~~"]); // step 2 gained its tag line and route line above it
+    expect(result.text).not.toMatch(/```bash\n\s*\[route/);
+    const text = renderDirectives(result, { path: "p.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } });
+    expect(text).toContain("step at line 1 starts with a code block");
+    expect(text).toContain("step at line 5 starts with a code block");
+    expect(text).toContain("2 more start with a code block and are skipped");
+    expect(text).not.toMatch(/rewrite line 1 as|insert directly below line 1 /);
+    // applying the directives literally gives the annotated text, which leaves the skipped steps as they were
+    expect(carryOut(OPENS_CODE, text).text).toBe(result.text);
+  });
+
+  it("R2-2: a plan with only such steps says so and changes nothing; an annotated plan is idempotent", async () => {
+    const only = ["1. ```bash", "   make", "   ```", "2. ~~~", "   make test", "   ~~~"].join("\n");
+    const result = await annotatePlanText(only, makeDeps().deps);
+    expect(result.text).toBe(only);
+    expect(result.additions).toEqual([]);
+    expect(result.skipped.map((s) => s.line)).toEqual([1, 4]);
+    const text = renderDirectives(result, { path: "p.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } });
+    expect(text).toContain("No step can take an addition automatically");
+    expect(text).not.toContain("add nothing.");
+    const again = await annotatePlanText((await annotatePlanText(OPENS_CODE, makeDeps().deps)).text, makeDeps().deps);
+    expect(again.additions).toEqual([]);
+    expect(again.skipped.map((s) => s.line)).toEqual([1, 6]); // still skipped, and still reported (the lines moved by the two lines step 2 gained)
+  });
+
+  it("R2-8: fence indentation is relative to the item's content column (a two-digit marker), and the steps stay intact", async () => {
+    const lines = TWO_DIGIT.split("\n");
+    expect(structureMask(lines)).toEqual([false, true, true, true, false, true, true, true, false, false, false]);
+    expect(splitPlan(TWO_DIGIT).map((s) => s.line)).toEqual([1, 5, 9]);
+    const result = await annotatePlanText(TWO_DIGIT, makeDeps().deps);
+    expect(result.additions.map((a) => a.line)).toEqual([1, 5, 9]);
+    expect(result.skipped).toEqual([]);
+    const text = renderDirectives(result, { path: "p.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } });
+    const { text: done, anchors } = carryOut(TWO_DIGIT, text);
+    expect(done).toBe(result.text);
+    const masked = structureMask(lines);
+    for (const { line } of anchors) expect(masked[line - 1], `line ${line}`).toBe(false);
+    // the code lines are all still there, in order
+    expect(done.split("\n").filter((l) => lines.includes(l) && masked[lines.indexOf(l)])).toEqual(lines.filter((_, i) => masked[i]));
+  });
+
+  it("R2-9: `<!--` indented 4+ columns from its container is code, not a comment: the steps after it are still steps", async () => {
+    expect(structureMask(INDENTED_COMMENT.split("\n"))).toEqual([false, false, false, false, false]);
+    expect(splitPlan(INDENTED_COMMENT).map((s) => s.line)).toEqual([1, 3, 5]);
+    expect(splitPlan(["intro", "", "    <!--", "- b", "-->"].join("\n")).map((s) => s.line)).toEqual([4]);
+    // up to 3 columns from the container it still is one
+    expect(splitPlan(["- first", "  <!--", "  - hidden", "  -->", "- second"].join("\n")).map((s) => s.line)).toEqual([1, 5]);
+    expect(splitPlan(["- first", "     <!--", "  - hidden", "  -->", "- second"].join("\n")).map((s) => s.line)).toEqual([1, 5]); // 5 = 2 + 3
+    const result = await annotatePlanText(INDENTED_COMMENT, makeDeps().deps);
+    expect(result.additions.map((a) => a.line)).toEqual([1, 3, 5]);
+  });
+
   it.each([
     ["closerWithInfo", CLOSER_WITH_INFO],
     ["dedent closes the fence", DEDENT],
     ["commented lists", COMMENTED],
+    ["steps that open a code block", OPENS_CODE],
+    ["twoDigit", TWO_DIGIT],
+    ["an indented comment opener", INDENTED_COMMENT],
   ])("%s: the instructions carried out literally give the annotated text, and no insertion point is inside code or a comment", async (_name, plan) => {
     const result = await annotatePlanText(plan, makeDeps().deps);
     const text = renderDirectives(result, { path: "p.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } });
