@@ -391,6 +391,8 @@ interface ConfigCacheEntry {
   reloadError: string | null;
   /** Fingerprint a reload-failure warning was last emitted for (warn once each). */
   warnedFingerprint: string | null;
+  /** Non-fatal findings of the build that produced `config` (see {@link getConfigNotices}). */
+  notices: ConfigNotice[];
 }
 
 /** Keyed by {@link normalizeProjectDir}. */
@@ -407,6 +409,7 @@ function getCacheEntry(key: string): ConfigCacheEntry {
       tolerated: new Set<string>(),
       reloadError: null,
       warnedFingerprint: null,
+      notices: [],
     };
     _configCaches.set(key, entry);
   }
@@ -433,6 +436,24 @@ function realpathOrSelf(p: string): string {
  */
 function normalizeProjectDir(dir?: string): string {
   return realpathOrSelf(dir ? resolvePath(dir) : process.cwd());
+}
+
+/**
+ * A non-fatal finding of a config build: something was ignored or looks wrong,
+ * but the config still loaded. `source` is the file concerned, when one is.
+ */
+export interface ConfigNotice {
+  source?: string;
+  message: string;
+}
+
+/**
+ * The notices of the config last built for `dir` (default: the working
+ * directory): keys dropped from the project layer, unknown `routing` keys, and
+ * the like. Empty when there are none. `/router` lists them.
+ */
+export function getConfigNotices(dir?: string): readonly ConfigNotice[] {
+  return _configCaches.get(normalizeProjectDir(dir))?.notices ?? [];
 }
 
 /**
@@ -1877,17 +1898,81 @@ export interface OverrideLayer {
   data: Record<string, unknown>;
 }
 
-function collectOverrideLayers(dir: string, failures?: SourceFailure[]): OverrideLayer[] {
+/**
+ * `routing` keys that decide where task text is sent or where outcome data is
+ * written. A repository-controlled file must not be able to set them (A18,
+ * QA-1.1-2): cloning a project would otherwise let its author point the
+ * classifier at their own server. Only the global override may.
+ */
+const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: string]> = [
+  ["classifier", "backend"],
+  ["classifier", "model"],
+  ["classifier", "baseUrl"],
+  ["classifier", "apiKeyEnv"],
+  ["classifier", "presets"],
+  ["outcomes", "path"],
+];
+
+/** Remove the global-only `routing` keys from a project layer; returns what was dropped. */
+function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
+  const routing = data.routing;
+  if (!isPlainObject(routing)) return [];
+  const dropped: string[] = [];
+  for (const [block, key] of GLOBAL_ONLY_ROUTING_KEYS) {
+    const target = routing[block];
+    if (isPlainObject(target) && Object.hasOwn(target, key)) {
+      delete target[key];
+      dropped.push(`routing.${block}.${key}`);
+    }
+  }
+  return dropped;
+}
+
+function collectOverrideLayers(
+  dir: string,
+  failures?: SourceFailure[],
+  notices?: ConfigNotice[],
+): OverrideLayer[] {
   const layers: OverrideLayer[] = [];
   // Lowest priority first: global, then project-local (found by upward search
   // from the project directory).
-  const paths = [overridePath(), walkForProjectOverride(dir)];
-  for (const p of paths) {
+  const sources = [
+    { path: overridePath(), project: false },
+    { path: walkForProjectOverride(dir), project: true },
+  ];
+  for (const { path: p, project } of sources) {
     if (!p) continue;
     const data = readOverridesAt(p, failures);
-    if (data) layers.push({ path: p, data });
+    if (!data) continue;
+    if (project) {
+      const dropped = stripGlobalOnlyRoutingKeys(data);
+      if (dropped.length > 0) {
+        notices?.push({
+          source: p,
+          message: `ignoring ${dropped.join(", ")} from ${p}: only the global override may set it`,
+        });
+      }
+    }
+    layers.push({ path: p, data });
   }
   return layers;
+}
+
+/**
+ * Notices already reported to the console, so a rebuild with the same files does
+ * not repeat itself: a notice about a file is reported once per (file, text); one
+ * about the merged config, once per config fingerprint.
+ */
+const warnedNotices = new Set<string>();
+
+function warnNoticesOnce(fingerprint: string, notices: readonly ConfigNotice[]): void {
+  for (const notice of notices) {
+    const key = `${notice.source ?? fingerprint}\n${notice.message}`;
+    if (warnedNotices.has(key)) continue;
+    if (warnedNotices.size >= 256) warnedNotices.clear();
+    warnedNotices.add(key);
+    console.warn(`[model-router] ${notice.message}`);
+  }
 }
 
 /**
@@ -1973,9 +2058,10 @@ export function loadConfig(dir?: string): RouterConfig {
     entry.config !== null && sourceKey === entry.sourceKey ? entry.config : null;
 
   const failures: SourceFailure[] = [];
+  const notices: ConfigNotice[] = [];
   let cfg: RouterConfig;
   try {
-    cfg = buildConfig(projectDir, failures);
+    cfg = buildConfig(projectDir, failures, notices);
   } catch (err) {
     // First load: unchanged behaviour — throw. Reload: keep the last good one.
     if (!previous) throw err;
@@ -2009,6 +2095,8 @@ export function loadConfig(dir?: string): RouterConfig {
   entry.dirty = false;
   entry.reloadError = null;
   entry.warnedFingerprint = null;
+  entry.notices = notices;
+  warnNoticesOnce(fingerprint, notices);
   return cfg;
 }
 
@@ -2041,9 +2129,13 @@ function keepLastValidConfig(
  * Throws only when tiers.json itself is unreadable/invalid. Override and state
  * problems are warned about, skipped, and appended to `failures`.
  */
-function buildConfig(dir: string, failures: SourceFailure[]): RouterConfig {
+function buildConfig(
+  dir: string,
+  failures: SourceFailure[],
+  notices: ConfigNotice[],
+): RouterConfig {
   const base = JSON.parse(readFileSync(configPath(), "utf-8"));
-  const layers = collectOverrideLayers(dir, failures);
+  const layers = collectOverrideLayers(dir, failures, notices);
 
   // Bundled config must be valid on its own — throw otherwise (unchanged
   // behaviour). Override layers are then applied on top.
@@ -2371,6 +2463,7 @@ let warnedEngineIgnoredOnV1 = false;
 /** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
 export function resetRoutingWarnings(): void {
   warnedEngineIgnoredOnV1 = false;
+  warnedNotices.clear();
 }
 
 /** Roles as fresh, de-duplicated, frozen arrays; never aliases the config. */

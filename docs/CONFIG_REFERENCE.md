@@ -768,6 +768,10 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
 
 **Unknown keys** inside `routing` (and its blocks) are ignored, not rejected, like every other block of this file, so a config written for a newer release still loads. Only the prototype-reparenting keys `__proto__`, `constructor` and `prototype` are refused. A value of the wrong type or outside its range throws; in an overrides file that drops the layer with a warning, and a reload that turns invalid keeps serving the last valid config and logs why.
 
+### Trust: which file may set what
+
+`routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}` and `routing.outcomes.path` decide where task text is sent and where outcome data is written, so a file that arrives with a repository must not be able to set them. They are honoured from the bundled `tiers.json` and from the **global** override file only. In the **project-local** override (`<repo>/.opencode/opencode-model-router.overrides.jsonc`) they are dropped before the layers are merged, with one warning per file and text, e.g. `[model-router] ignoring routing.classifier.baseUrl from <path>: only the global override may set it`; every other key of that file still applies, and `/router` lists the notice. The HTTP classifier backends additionally refuse to send an API key over plain `http:` to a non-loopback host.
+
 ### Engine modes
 
 `engine` is the one switch. Modes are raised one step at a time; each is a config-only change.

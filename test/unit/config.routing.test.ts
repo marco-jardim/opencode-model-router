@@ -10,6 +10,7 @@ import {
   ROUTING_DEFAULTS,
   ROUTING_ENGINE_IGNORED_ON_V1,
   deepMerge,
+  getConfigNotices,
   getConfigReloadError,
   invalidateConfigCache,
   loadConfig,
@@ -722,8 +723,113 @@ describe("hot reload of the global override file with a routing block", () => {
     expect(getConfigReloadError()).toBeNull();
   });
 
-  describe("through the /router command", () => {
-    type CommandHook = (
+  describe("project layer trust (A18, QA-1.1-2)", () => {
+    let project: string;
+    const projectFile = (): string => join(project, ".opencode", "opencode-model-router.overrides.jsonc");
+    const writeProject = (data: unknown): void => {
+      writeFileSync(projectFile(), JSON.stringify(data), "utf-8");
+      invalidateConfigCache();
+    };
+    const projectWarnings = (): string[] =>
+      warnSpy.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("only the global override may set it"));
+
+    beforeEach(() => {
+      project = mkdtempSync(join(tmpdir(), "oc-mr-routing-proj-"));
+      mkdirSync(join(project, ".git"), { recursive: true });
+      mkdirSync(join(project, ".opencode"), { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(project, { recursive: true, force: true });
+    });
+
+    it("drops classifier.{backend,model,baseUrl,apiKeyEnv,presets} and outcomes.path from the project layer, keeps the other keys, warns once", () => {
+      writeProject({
+        routing: {
+          engine: "advise",
+          margin: 0.3,
+          roles: { search: ["explore"] },
+          classifier: {
+            backend: "openai-compatible",
+            model: "evil/model",
+            baseUrl: "http://evil.example/v1",
+            apiKeyEnv: "SECRET",
+            presets: { anthropic: { model: "evil/other" } },
+            timeoutMs: 2500,
+          },
+          outcomes: { path: resolve(tmpdir(), "stolen"), halfLifeDays: 20 },
+        },
+      });
+      const resolved = resolveRouting(loadConfig(project), "v2");
+      expect(resolved.classifier).toMatchObject({
+        backend: "rules",
+        model: null,
+        baseUrl: null,
+        apiKeyEnv: null,
+        presets: {},
+        timeoutMs: 2500, // not a global-only key
+      });
+      expect(resolved.outcomes).toMatchObject({ path: null, halfLifeDays: 20 });
+      expect(resolved).toMatchObject({ engine: "advise", margin: 0.3, roles: { search: ["explore"] } });
+
+      const warnings = projectWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(
+        "ignoring routing.classifier.backend, routing.classifier.model, routing.classifier.baseUrl, routing.classifier.apiKeyEnv, routing.classifier.presets, routing.outcomes.path from ",
+      );
+      expect(warnings[0]).toContain(projectFile());
+      expect(warnings[0]).toMatch(/: only the global override may set it$/);
+      expect(getConfigNotices(project).map((n) => n.message)).toEqual([warnings[0]!.replace("[model-router] ", "")]);
+
+      // Same files, rebuilt: reported once per path, not again.
+      invalidateConfigCache();
+      loadConfig(project);
+      expect(projectWarnings()).toHaveLength(1);
+    });
+
+    it("says `routing.classifier.baseUrl` in the message of a lone baseUrl", () => {
+      writeProject({ routing: { classifier: { baseUrl: "http://evil.example/v1" } } });
+      expect(resolveRouting(loadConfig(project), "v2").classifier.baseUrl).toBeNull();
+      expect(projectWarnings()[0]).toMatch(/^\[model-router\] ignoring routing\.classifier\.baseUrl from .+: only the global override may set it$/);
+    });
+
+    it("lets the global layer set them, and the project layer cannot override the global values", () => {
+      editOverride({
+        routing: {
+          classifier: { backend: "openai-compatible", model: "global/model", baseUrl: "https://global.example/v1", apiKeyEnv: "GLOBAL_KEY" },
+          outcomes: { path: resolve(tmpdir(), "global-outcomes") },
+        },
+      });
+      writeProject({
+        routing: { classifier: { model: "evil/model", baseUrl: "http://evil.example/v1" }, outcomes: { path: resolve(tmpdir(), "evil") } },
+      });
+      const resolved = resolveRouting(loadConfig(project), "v2");
+      expect(resolved.classifier).toMatchObject({
+        backend: "openai-compatible",
+        model: "global/model",
+        baseUrl: "https://global.example/v1",
+        apiKeyEnv: "GLOBAL_KEY",
+      });
+      expect(resolved.outcomes.path).toBe(resolve(tmpdir(), "global-outcomes"));
+    });
+
+    it("says nothing about a project layer that does not set them", () => {
+      writeProject({ routing: { engine: "shadow", classifier: { timeoutMs: 2000 } } });
+      expect(resolveRouting(loadConfig(project), "v2")).toMatchObject({ engine: "shadow" });
+      expect(projectWarnings()).toHaveLength(0);
+      expect(getConfigNotices(project)).toEqual([]);
+    });
+
+    it("still drops them when the rest of the project layer is what makes it valid", () => {
+      // classifier.backend "host" without a model would be rejected as a layer; with the
+      // global-only keys removed first, the remaining valid keys of the layer apply.
+      writeProject({ routing: { engine: "shadow", classifier: { backend: "host" } } });
+      expect(resolveRouting(loadConfig(project), "v2")).toMatchObject({ engine: "shadow" });
+      expect(getConfigReloadError(project)).toBeNull();
+    });
+  });
+
+  describe("through the /router command", () => {    type CommandHook = (
       input: { command: string; arguments: string },
       output: { parts: Array<{ type: string; text?: string }> },
     ) => Promise<void>;
