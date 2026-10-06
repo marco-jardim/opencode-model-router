@@ -36,8 +36,10 @@ This directory holds design/implementation plans for `opencode-model-router`.
   per (class × agent × model#variant), an expected-cost decision kernel behind
   `routing.engine: static | shadow | advise | enforce`, same-session variant
   bumps before model escalation, and a cost doctor for host-side waste.
-  Decision record: `../adr/0005-cost-aware-routing-engine.md` (written in
-  Phase 3.1). QA reports: `../qa/cost-aware-routing/`.
+  Decision record: [`../adr/0005-cost-aware-routing-engine.md`](../adr/0005-cost-aware-routing-engine.md).
+  User guide: [`../ROUTING_ENGINE.md`](../ROUTING_ENGINE.md) (config keys:
+  [`../CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md#routing--cost-aware-routing-engine-74)).
+  QA reports: [`../qa/cost-aware-routing/`](../qa/cost-aware-routing/).
   - Handover: [`cost-aware-routing-engine-handover.md`](./cost-aware-routing-engine-handover.md)
     — kickoff prompt, execution state, planning-session considerations,
     troubleshooting, and the resume point after every host restart.
@@ -46,4 +48,6 @@ This directory holds design/implementation plans for `opencode-model-router`.
 
 - Architecture decision records: [`../adr/`](../adr/)
   - `0000-spike-results.md` — Phase 0.0 enforcement-primitives capability spike.
+  - [`0005-cost-aware-routing-engine.md`](../adr/0005-cost-aware-routing-engine.md) —
+    cost-aware routing engine (#74): decisions D1–D18, alternatives, consequences.
 - QA reports: `../qa/` (added during Wave 5).
