@@ -29,6 +29,7 @@ import { sessionRulesOf, type EngineRuntime, type Prepared, type WireLogger } fr
 
 /** The generated line is recomputed at most this often (and whenever the config object changes). */
 export const TAXONOMY_TTL_MS = 60_000;
+const TAXONOMY_MEMO_LIMIT = 16;
 /** The user text the hint classifies is cut to this many characters. */
 export const HINT_MAX_USER_CHARS = 4_000;
 const HINT_MEMO_LIMIT = 100;
@@ -42,11 +43,13 @@ function oneLine(text: string, max: number): string {
 
 /**
  * The hint text (≤ 2 lines) for a decision that wants to leave the orchestrator's usual agent, or `null` when there is
- * nothing to say: no switch, no target, or a pinned decision.
+ * nothing to say: no switch, no target, a pinned decision, or a switch inside the same agent (a variant change of the pick
+ * says nothing the orchestrator can act on, QA-2.2-6).
  */
 export function buildHint(decision: Decision, facts: Pick<TaskFacts, "class">, descriptions: ReadonlyMap<string, string>): string | null {
   const { target, best, chosen } = decision;
   if (!decision.switched || decision.pinned || target === null || best === null) return null;
+  if (target.agent.id === chosen.agent) return null;
   const described = descriptions.get(target.agent.id);
   const destination = `@${target.agent.id}${described === undefined ? "" : ` (${oneLine(described, DESCRIPTION_MAX)})`}`;
   return [
@@ -104,14 +107,15 @@ function describeError(error: unknown): string {
 
 export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmenter {
   const now = deps.now ?? (() => Date.now());
-  let taxonomyMemo: { cfg: Prepared["cfg"]; agent: string; at: number; line: string } | null = null;
+  // QA-2.2-9: the line depends on the config, the dispatching agent, its (and its session's) permissions and the orchestrator's model.
+  const taxonomyMemo = new Map<string, { cfg: Prepared["cfg"]; at: number; line: string }>();
   const hints = new Map<string, { key: string; hint: string | null }>();
 
   const taxonomyLine = (prepared: Prepared, view: AgentView, input: ContextInput): string => {
     const t = now();
-    if (taxonomyMemo !== null && taxonomyMemo.cfg === prepared.cfg && taxonomyMemo.agent === input.agent && t - taxonomyMemo.at < TAXONOMY_TTL_MS) {
-      return taxonomyMemo.line;
-    }
+    const memoKey = `${input.agent}\u0000${input.parentModel ?? ""}\u0000${JSON.stringify(view.parentRules)}`;
+    const memo = taxonomyMemo.get(memoKey);
+    if (memo !== undefined && memo.cfg === prepared.cfg && t - memo.at < TAXONOMY_TTL_MS) return memo.line;
     const line = generateTaxonomy({
       cfg: prepared.cfg,
       routing: prepared.routing,
@@ -123,7 +127,9 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
       parentModel: input.parentModel,
       logger: deps.logger,
     });
-    taxonomyMemo = { cfg: prepared.cfg, agent: input.agent, at: t, line };
+    taxonomyMemo.delete(memoKey);
+    taxonomyMemo.set(memoKey, { cfg: prepared.cfg, at: t, line });
+    while (taxonomyMemo.size > TAXONOMY_MEMO_LIMIT) taxonomyMemo.delete(taxonomyMemo.keys().next().value as string);
     return line;
   };
 

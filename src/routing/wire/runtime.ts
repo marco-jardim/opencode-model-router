@@ -156,6 +156,9 @@ export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
         }
         const current = held;
         await Promise.all([waitReady(current), catalog.ensure()]);
+        // QA-2.2-13: the runtime was disposed, or the config went static / moved to another directory, while we waited: the
+        // holder we read from is no longer ours, and a decision made on a released store must not be logged.
+        if (disposed || held !== current) return null;
         const routing = routingOf(cfg);
         return {
           cfg,
