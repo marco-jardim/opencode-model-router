@@ -151,3 +151,8 @@ The adversarial `[tier:heavy]` QA of §0.7: round 1 raised 13 findings (all fixe
 ## Verdict
 
 **PASS — round 2: 0 blocking/critical/major; all R2 findings fixed or handed off.** Round 1: 13 of 13 fixed. Round 2: QA-2.1-R2-1…R2-11 fixed (R2-10 is the 2.2 handoff). Verification: typecheck green at `HEAD`; the three ingest files 175 tests, the five routing-outcomes unit files plus `tmp-guard` and `tree` 425 tests, `test/integration` 513 tests (30 files, 3 skipped) and `vitest related` over the touched sources and the setup file (the whole suite: 130 files, 11 153 tests) green on the default pool; the real override file is absent and the real trajectory directory holds no `outcomes*`/`decisions*`; no guard directory is left in the real temp dir; branch `car/p21` pushed.
+## Round 3 (scoped regression, major+ only)
+
+Reviewer re-ran probes P2-P8 at `2b95893`: all match the store; global teardown deletes only run-tagged guard dirs (probe5). Findings at major or above: none. Minor observations recorded in the review session, no fix requested (plan section 0: from round 3 only blocking/critical/major are fixed).
+
+**Final verdict: PASS - merged into car/main as `a08229c`.**
