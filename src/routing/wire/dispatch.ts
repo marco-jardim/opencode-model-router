@@ -473,7 +473,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
         reason: running !== null
-          ? `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${mode === "enforce" ? "sent to @" + running.agent : "would be sent to @" + running.agent + " (not applied in " + mode + ")"} so the host does not switch it back (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
+          ? `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${decision.pinned ? "pinned, so it is sent as named and NOT rewritten (the host moves the child to @" + agent + ")" : mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${decision.reasonCode}: ${decision.reason}`
           : resuming
             ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${decision.reasonCode}: ${decision.reason}`
             : `${decision.reasonCode}: ${decision.reason}`,
