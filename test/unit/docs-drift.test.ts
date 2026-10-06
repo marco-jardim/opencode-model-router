@@ -10,6 +10,11 @@ import {
 } from "../../src/router/config";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
+import { buildLadder, resolveChosen } from "../../src/routing/engine/ladders";
+import { candidateKey, decide } from "../../src/routing/engine/kernel";
+import { createOutcomeStore } from "../../src/routing/outcomes/store";
+import type { HostAgentInfo } from "../../src/routing/engine/types";
+import type { Need, TaskFacts } from "../../src/routing/classify/types";
 import {
   assembleSystemPrompt,
   buildDelegationProtocol,
@@ -233,7 +238,10 @@ describe("docs drift: cost-aware routing engine", () => {
       const parsed = parseJsonc(body!) as Record<string, unknown>;
       const cfg = validateConfig({ ...bundled, ...parsed });
       const engine = resolveRouting(cfg, "v2").engine;
+      const written = (parsed.routing as { engine?: unknown }).engine;
       expect(ROUTING_ENGINES, `example ${name}`).toContain(engine);
+      // QA-3.1-18: the example sets the engine it claims to, and the resolved config says the same.
+      expect(engine, `example ${name}`).toBe(written);
     }
   });
 
@@ -262,5 +270,234 @@ describe("docs drift: cost-aware routing engine", () => {
       "docs/a.md:3: b.md#nothing (no such heading)",
     ]);
     expect(brokenLinks(["docs/missing.md"], read)).toEqual(["docs/missing.md: file missing"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA-3.1-3 / QA-3.1-18: the docs' numbers, defaults, ranges, ids and severities are the code's.
+// ---------------------------------------------------------------------------
+
+/** Cells of the row of the `routing` keys table whose first cell is `` `key` `` (unescaped pipes only). */
+function keyRow(doc: string, key: string): string[] | undefined {
+  const line = doc.split(/\r?\n/).find((l) => l.startsWith(`| \`${key}\` |`));
+  return line?.split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim());
+}
+
+/** The default cell as the doc writes it: JSON for strings, numbers and booleans, `null`, `{}` for an empty map. */
+function defaultCell(value: unknown): string {
+  if (value === null) return "`null`";
+  if (typeof value === "string") return `\`"${value}"\``;
+  if (typeof value === "object") return "`{}`";
+  return `\`${String(value)}\``;
+}
+
+describe("docs drift: the worked example is the real kernel's output (QA-3.1-3)", () => {
+  const SONNET = "anthropic/claude-sonnet-5-5";
+  const OPUS = "anthropic/claude-opus-5-5";
+  // The fixture the guide states: default escalate policy, `roles: {}`, no catalog (no variant steps), ratios 1 / 5 / 20.
+  const cfg = {
+    activePreset: "p",
+    presets: {
+      p: {
+        fast: { model: SONNET, variant: "low", costRatio: 1 },
+        medium: { model: SONNET, variant: "medium", costRatio: 5 },
+        heavy: { model: OPUS, variant: "xhigh", costRatio: 20 },
+      },
+    },
+    rules: [],
+    defaultTier: "medium",
+    routing: { engine: "advise", roles: {} },
+  } as unknown as RouterConfig;
+  const needs: readonly Need[] = ["shell", "web", "edit", "network", "external_dir"];
+  const agents: HostAgentInfo[] = ["fast", "medium", "heavy"].map((id) => ({ id, mode: "subagent", hidden: false, permitted: true, grants: needs }));
+  const facts: TaskFacts = { class: "implement", risk: "medium", scope: "single", needs: ["edit"], confidence: 1, source: "rules" } as TaskFacts;
+  const routing = resolveRouting(cfg, "v2");
+  const ladder = buildLadder({ cfg, routing: { roles: routing.roles }, facts, agents });
+  const chosen = resolveChosen({ cfg, agents, agent: "medium" })!;
+  const decideWith = (store: ReturnType<typeof createOutcomeStore>) =>
+    decide({ facts, chosen, ladder, detection: "grader", pin: false, routing, store });
+  const costOf = (d: ReturnType<typeof decide>, tier: string): number => {
+    const index = ladder.candidates.findIndex((c) => c.tier === tier);
+    return d.costs[candidateKey("implement", ladder.candidates[index]!)]!;
+  };
+
+  const priors = decideWith(createOutcomeStore({ now: () => 1_000 }));
+  const seasoned = createOutcomeStore({ now: () => 1_000 });
+  const fast = ladder.candidates.find((c) => c.tier === "fast")!;
+  for (let i = 0; i < 10; i++) seasoned.recordVerdict(candidateKey("implement", fast), "pass", { attemptID: `p${i}`, step: "dispatch" });
+  for (let i = 0; i < 2; i++) seasoned.recordVerdict(candidateKey("implement", fast), "fail", { attemptID: `f${i}`, step: "dispatch" });
+  const withEvidence = decideWith(seasoned);
+
+  const section = (): string => {
+    const doc = read("docs/ROUTING_ENGINE.md");
+    return doc.slice(doc.indexOf("### Worked example"), doc.indexOf("## Cost units and zero-cost models"));
+  };
+
+  it("the router tiers' simulated attempts are the ones the guide tabulates", () => {
+    const labelled = (index: number): string => (index < ladder.candidates.length ? ladder.candidates[index]! : ladder.reachable![index - ladder.candidates.length]!).tier;
+    expect(ladder.candidates.map((c) => c.tier)).toEqual(["fast", "medium", "heavy"]);
+    expect(ladder.candidates.map((_, k) => (ladder.paths?.[k] ?? []).map(labelled))).toEqual([
+      ["fast", "fast", "medium"],
+      ["medium", "medium", "heavy"],
+      ["heavy", "heavy"],
+    ]);
+  });
+
+  it("prices heavy 23.011, medium 7.162 and fast 4.772 on priors, and keeps the pick for lack of evidence", () => {
+    expect(priors.unit).toBe("ratio");
+    expect([costOf(priors, "heavy"), costOf(priors, "medium"), costOf(priors, "fast")].map((c) => c.toFixed(3))).toEqual(["23.011", "7.162", "4.772"]);
+    expect(0.8 * costOf(priors, "medium")).toBeCloseTo(5.73, 3);
+    expect(priors.reasonCode).toBe("kept:evidence");
+    expect(priors.switched).toBe(false);
+    expect(priors.argmin?.agent).toBe("fast");
+    expect(priors.best?.agent).toBe("medium");
+  });
+
+  it("after 10 passes and 2 failures fast costs 2.742, below 0.8 · C(medium) = 5.730, and the decision switches", () => {
+    expect(costOf(withEvidence, "fast").toFixed(3)).toBe("2.742");
+    expect(costOf(withEvidence, "medium").toFixed(3)).toBe("7.162");
+    expect((0.8 * costOf(withEvidence, "medium")).toFixed(3)).toBe("5.730");
+    expect(withEvidence.reasonCode).toBe("switched");
+    expect(withEvidence.best?.agent).toBe("fast");
+  });
+
+  it("the guide prints exactly those figures and states the policy it assumes", () => {
+    const text = section();
+    const printed = [
+      costOf(priors, "heavy"),
+      costOf(priors, "medium"),
+      costOf(priors, "fast"),
+      0.8 * costOf(priors, "medium"),
+      costOf(withEvidence, "fast"),
+    ].map((c) => c.toFixed(3));
+    expect(printed).toEqual(["23.011", "7.162", "4.772", "5.730", "2.742"]);
+    for (const figure of printed) expect(text, figure).toContain(figure);
+    expect(text).toContain("`roles: {}`");
+    expect(text).toContain("`maxAttemptsPerTier: 1`");
+    expect(text).toContain("`maxTotalAttempts: 4`");
+    expect(text).toContain("`kept` with reason `evidence`");
+  });
+});
+
+describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
+  const defaults = resolveRouting(validateConfig(JSON.parse(read("tiers.json"))), "v2");
+
+  it("the Default column of the routing keys table is what resolveRouting applies", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md");
+    const expected: Record<string, unknown> = {
+      engine: defaults.engine,
+      profile: defaults.profile,
+      margin: defaults.margin,
+      minClassConfidence: defaults.minClassConfidence,
+      "detection.deterministic": defaults.detection.deterministic,
+      "detection.grader": defaults.detection.grader,
+      "detection.none": defaults.detection.none,
+      "classifier.backend": defaults.classifier.backend,
+      "classifier.model": defaults.classifier.model,
+      "classifier.baseUrl": defaults.classifier.baseUrl,
+      "classifier.apiKeyEnv": defaults.classifier.apiKeyEnv,
+      "classifier.timeoutMs": defaults.classifier.timeoutMs,
+      "classifier.samples": defaults.classifier.samples,
+      "classifier.maxStateChars": defaults.classifier.maxStateChars,
+      "classifier.presets": defaults.classifier.presets,
+      "outcomes.path": defaults.outcomes.path,
+      "outcomes.halfLifeDays": defaults.outcomes.halfLifeDays,
+      "outcomes.maxEffectiveSamples": defaults.outcomes.maxEffectiveSamples,
+      "sessionReuse.maxContextFraction": defaults.sessionReuse.maxContextFraction,
+      "advisor.enabled": defaults.advisor.enabled,
+      "advisor.noticeIntervalHours": defaults.advisor.noticeIntervalHours,
+      "advisor.notify": defaults.advisor.notify,
+    };
+    const wrong: string[] = [];
+    for (const [key, value] of Object.entries(expected)) {
+      const cells = keyRow(doc, key);
+      if (cells?.[2] !== defaultCell(value)) wrong.push(`${key}: doc ${cells?.[2] ?? "(no row)"}, code ${defaultCell(value)}`);
+    }
+    expect(wrong).toEqual([]);
+    // every leaf of the resolved defaults is in the table above, so a new defaulted key cannot be forgotten here
+    const { roles: _roles, applied: _applied, ...rest } = defaults as unknown as Record<string, unknown>;
+    expect(leafPaths(rest).filter((key) => !(key in expected) && key !== "classifier.presets")).toEqual([]);
+  });
+
+  /** `[0, 0.9]`, `(0, 0.95]`: the lower and upper bound of a documented range and whether the lower one is excluded. */
+  function parseRange(cell: string): { lo: number; hi: number; loExcluded: boolean } {
+    const match = /^([[(])\s*(-?[\d.]+),\s*(-?[\d.]+)\s*\]$/.exec(cell.replace(/`/g, ""));
+    if (match === null) throw new Error(`not a range: ${cell}`);
+    return { lo: Number(match[2]), hi: Number(match[3]), loExcluded: match[1] === "(" };
+  }
+
+  const ranged: ReadonlyArray<readonly [key: string, block: string, field: string, integer: boolean]> = [
+    ["margin", "", "margin", false],
+    ["minClassConfidence", "", "minClassConfidence", false],
+    ["classifier.timeoutMs", "classifier", "timeoutMs", true],
+    ["classifier.maxStateChars", "classifier", "maxStateChars", true],
+    ["outcomes.halfLifeDays", "outcomes", "halfLifeDays", false],
+    ["outcomes.maxEffectiveSamples", "outcomes", "maxEffectiveSamples", false],
+    ["sessionReuse.maxContextFraction", "sessionReuse", "maxContextFraction", false],
+    ["advisor.noticeIntervalHours", "advisor", "noticeIntervalHours", false],
+  ];
+  const bundled = JSON.parse(read("tiers.json")) as Record<string, unknown>;
+  const accepts = (routing: Record<string, unknown>): boolean => {
+    try {
+      validateConfig({ ...bundled, routing });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const withValue = (block: string, field: string, value: number): Record<string, unknown> => (block === "" ? { [field]: value } : { [block]: { [field]: value } });
+
+  it.each(ranged)("the documented range of %s is the range validateConfig enforces", (key, block, field, integer) => {
+    const cells = keyRow(read("docs/CONFIG_REFERENCE.md"), key);
+    expect(cells, `row ${key}`).toBeDefined();
+    const { lo, hi, loExcluded } = parseRange(cells![3]!);
+    expect(accepts(withValue(block, field, hi)), `${key} = ${hi}`).toBe(true);
+    expect(accepts(withValue(block, field, hi + (integer ? 1 : 0.001))), `${key} above ${hi}`).toBe(false);
+    expect(accepts(withValue(block, field, loExcluded ? lo : lo - (integer ? 1 : 0.001))), `${key} below ${lo}`).toBe(false);
+    expect(accepts(withValue(block, field, loExcluded ? lo + 0.001 : lo)), `${key} = ${lo}`).toBe(true);
+  });
+
+  it("the three detection probabilities share the documented [0, 1] range and must not increase with a weaker check", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md");
+    for (const key of ["detection.deterministic", "detection.grader", "detection.none"]) {
+      const { lo, hi } = parseRange(keyRow(doc, key)![3]!);
+      expect([lo, hi]).toEqual([0, 1]);
+    }
+    const all = (v: number) => ({ detection: { deterministic: v, grader: v, none: v } });
+    expect(accepts(all(0))).toBe(true);
+    expect(accepts(all(1))).toBe(true);
+    expect(accepts(all(1.001))).toBe(false);
+    expect(accepts(all(-0.001))).toBe(false);
+    expect(accepts({ detection: { deterministic: 0.5, grader: 0.7, none: 0.3 } })).toBe(false);
+    expect(read("docs/CONFIG_REFERENCE.md")).toContain("`deterministic ≥ grader ≥ none`");
+  });
+
+  it("the sample count is 1 or 3, as documented", () => {
+    const cells = keyRow(read("docs/CONFIG_REFERENCE.md"), "classifier.samples");
+    expect(cells![3]).toBe("`1` or `3`");
+    const withSamples = (samples: number) => ({ classifier: { samples } });
+    expect([1, 3].map((n) => accepts(withSamples(n)))).toEqual([true, true]);
+    expect([0, 2, 4].map((n) => accepts(withSamples(n)))).toEqual([false, false, false]);
+  });
+
+  it("ADR 0005 has one `### D<n> —` heading for each of D1 to D18, in order", () => {
+    const adr = read("docs/adr/0005-cost-aware-routing-engine.md");
+    const numbers = [...adr.matchAll(/^### D(\d+) — /gm)].map((m) => Number(m[1]));
+    expect(numbers).toEqual(Array.from({ length: 18 }, (_, i) => i + 1));
+    for (const amendment of ["A31", "A32", "A33"]) expect(adr, amendment).toContain(amendment);
+  });
+
+  it("the cost-doctor table of the guide lists every finding with the severity the code gives it", () => {
+    const source = read("src/routing/advisor/findings.ts");
+    const severities = new Map([...source.matchAll(/id: "([a-z-]+)",\s*severity: "(warning|saving|info)"/g)].map((m) => [m[1]!, m[2]!] as const));
+    expect([...severities.keys()].sort()).toEqual([...FINDING_IDS].sort());
+    const doc = read("docs/ROUTING_ENGINE.md");
+    const wrong: string[] = [];
+    for (const id of FINDING_IDS) {
+      const row = doc.split(/\r?\n/).find((line) => line.startsWith(`| \`${id}\` |`));
+      const cells = row?.split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim());
+      if (cells?.[1] !== severities.get(id)) wrong.push(`${id}: doc ${cells?.[1] ?? "(no row)"}, code ${severities.get(id)}`);
+    }
+    expect(wrong).toEqual([]);
   });
 });
