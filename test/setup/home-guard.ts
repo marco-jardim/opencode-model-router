@@ -34,7 +34,7 @@
  * `homedir: guardedHomedir` (see `test/unit/tree.test.ts`); the `beforeEach`
  * below fails every test of a file whose `os.homedir()` resolves the real home.
  */
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, realpathSync, rmdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterAll, beforeEach, vi } from "vitest";
 
@@ -45,6 +45,8 @@ const guard = vi.hoisted(() => ({
   realTmp: "",
   isolatedTmp: "",
   originalTmp: {} as Record<string, string | undefined>,
+  /** Why a stale guard directory could not be removed (kept so the catch below is not empty). */
+  tidyNotes: [] as string[],
 }));
 
 /** Environment variables `os.tmpdir()` reads, in the platform's own order. */
@@ -177,11 +179,20 @@ beforeEach(async () => {
   assertTmpIsGuarded(os.tmpdir);
 });
 
-// A skipped test file never runs `afterAll`, but its setup file did create these dirs: remove them when the worker exits.
-process.once("exit", () => {
-  rmSync(guard.isolatedHome, { recursive: true, force: true });
-  rmSync(guard.isolatedTmp, { recursive: true, force: true });
-});
+// A skipped test file never runs `afterAll` and its worker is not always given the chance to exit cleanly, but its setup
+// file did create these dirs. Remove what an earlier run left: only EMPTY guard dirs (`rmdir` refuses anything else)
+// that are old enough not to belong to a worker that is starting right now.
+const STALE_GUARD_DIR_MS = 10 * 60_000;
+for (const name of readdirSync(guard.realTmp)) {
+  if (!/^omr-(home|tmp)-guard-/.test(name)) continue;
+  const path = join(guard.realTmp, name);
+  if (sameDir(path, guard.isolatedHome) || sameDir(path, guard.isolatedTmp)) continue;
+  try {
+    if (Date.now() - statSync(path).mtimeMs > STALE_GUARD_DIR_MS) rmdirSync(path);
+  } catch (error) {
+    guard.tidyNotes.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 afterAll(() => {
   rmSync(guard.isolatedHome, { recursive: true, force: true });
