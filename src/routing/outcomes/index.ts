@@ -70,6 +70,9 @@ export {
   resolveOutcomesDir,
 } from "./persist";
 
+export { USAGE, parseStatsArgs, renderMarkdown, runStatsCli, summarize } from "./stats";
+export type { ParseStatsResult, StatsArgs } from "./stats";
+
 export interface AcquireOutcomesOptions {
   /** Outcomes directory (already resolved with `resolveOutcomesDir`). */
   readonly dir: string;
