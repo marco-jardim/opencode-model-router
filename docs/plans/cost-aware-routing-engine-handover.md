@@ -67,7 +67,11 @@ directives, which are binding and override your defaults. The rules that matter 
 | Current `routing` block | none (engine = `static` by absence) |
 | Scorecard / D15 directory | `C:\Users\Marquinho\AppData\Local\Temp\opencode-model-router-trajectory` |
 | Host | OpenCode `v2.0.22`; source `anomalyco/opencode` @ `527f0b931d1f9b3ebd34e106c51b31ce5db5b075`; `@opencode/plugin` 2.0.22 |
-| Open QA findings | see `docs\qa\cost-aware-routing\phase-0P.md` Verdict |
+| Open QA findings | Phase 0.P: see `docs\qa\cost-aware-routing\phase-0P.md` Verdict (round 3 majors QA-0P-38/39/40 fixed; round-3 re-review of those three only, then close) |
+| 0.P close-out steps | 1) round-3 re-review of QA-0P-38/39/40 → write `## Verdict` (open findings: 0); 2) merge `car/p0p` into `car/main` in `D:\git\omr-car-main`, capped full suite; 3) `git -C D:\git\opencode-model-router merge --ff-only car/main` (A12, no restart); 4) remove `D:\git\omr-car-p0p`; 5) comment on #74 (Phase 0.P done, Wave 1 starting); 6) rewrite this table: next task id 1.1.1 / 1.2.1 / 1.3.1 / 1.5.1 |
+| Owner decisions pending | **Classifier model for the DF3 live check (A13)** — asked at 0.P close; until answered, the DF3 check is skipped. Record the answer here. |
+| Spike evidence hygiene | Any spike re-run that is not meant to replace the evidence: `git -C <worktree> checkout -- docs/qa/cost-aware-routing/spikes` afterwards (QA-0P-42) |
+| Liveness probe / slash commands | The orchestrator has no tool to type `/router` or `/annotate-plan`; at DF1 find the host API route that runs a session command (host source at the pinned sha) or ask the human to type it |
 | Last `routing:stats` | n/a (script arrives in Phase 1.3); DF0 baseline from scorecards |
 | Sentence for the human | n/a (no restart pending) |
 

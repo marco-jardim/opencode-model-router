@@ -111,7 +111,7 @@ Committed evidence: one run, `runId 14487af3-8e39-4c68-9580-2ada78ff2d00`, harne
 | **S3** `session.step.ended` reaches the plugin (one plugin instance) | `session.step.ended` raw 1 = deduped 1; `cost 0.01073`, `tokens {input 5340, output 5, reasoning 0, cache {read 0, write 0}}` (= 5340×2e-6 + 5×1e-5 at the isolated catalog price) | **confirmed** |
 | **S3b** same, with two live locations (after S5) | raw session events 22 → deduped 11; `session.step.ended` raw 2 → deduped 1; both deliveries carry the **same event id**, one per plugin instance (project location and the config location) | **confirmed: one delivery per live location instance** → A3 |
 | **S4** catalog variants/cost/context (live service, read-only, opt-in) | explicit already-live location `D:\git\opencode-model-router`; live location set unchanged (asserted). `anthropic/claude-sonnet-5-5`, `claude-opus-5-5`: variants `low, medium, high, xhigh, max`, one cost entry with **every field 0**, context 1 000 000; `anthropic/claude-haiku-4-5`: `high, max`, all-zero cost, context 200 000; `openai/gpt-6-luna` and **`openai/gpt-6-luna-fast`** (live @fast): `none, low, medium, high, xhigh, max`, cost `[]`, context 400 000 / input 272 000 / output 128 000; `opencode/deepseek-v4.1-flash` absent, `opencode-go/deepseek-v4.1-flash` present (`low, high, max`, input 0.15 / output 0.6); `opencode-go/gpt-6-luna` 0.1 / 0.5. Every variant list in host effort order (asserted). Unpriced flags set for all five `anthropic`/`openai` models above. Tool-call support not checked | **confirmed with caveats** → A1, A2, A10 |
-| **S5** `generate` with explicit `model` | **plugin path** `ctx.generate.text({prompt, model})`: succeeded on the first call (7 ms), then 9 / 6 ms; the base location stayed not live — the plugin path resolves at the dispatching (already warm) location. **Raw route** `POST /api/experimental/generate`: first call 400 `Model unavailable`; immediate retry 400; retry after 261 ms without a catalog read 200 → time-based lazy init of the base location. **No live call** (removed, QA-0P-27) | **confirmed for the plugin client on the isolated host**; real-credential path → checkpoint DF3 (A4) |
+| **S5** `generate` with explicit `model` | **plugin path** `ctx.generate.text({prompt, model})`: succeeded on the first call (7 ms), then 6 / 6 ms; the base location stayed not live — the plugin path resolves at the dispatching (already warm) location. **Raw route** `POST /api/experimental/generate`: first call 400 `Model unavailable`; immediate retry 400; retry after 272 ms without a catalog read 200 → time-based lazy init of the base location. **No live call** (removed, QA-0P-27) | **confirmed for the plugin client on the isolated host**; real-credential path → checkpoint DF3 (A4) |
 | **S6** switch to a smaller context, oversize prompt | alias `anthropic/spike-small` (`limit.context` 12 000), 72 021-char prompt: auto compaction (`session.compaction.started/ended`, `reason: "auto"`) ran before the primary request; the primary request still exceeded the limit (≈23 346 tokens **estimated by the scripted provider** from body length) because the oversize incoming message is kept as recent context; child finished. Events: raw 48 → deduped 24, `step.ended` raw 4 → deduped 2 (two instances). The scripted provider never returns an overflow error, so the error branch was not observable | **confirmed** (it compacts) → A5 |
 | **S7** code liveness | see 0.P.7 | **disproven** → A8 |
 
@@ -131,6 +131,7 @@ The amendment texts are canonical in the plan, §1.5 "Amended during implementat
 - **A10 (tiered prices, `inputBudget`)** — S4 `gpt-6-luna*` entries.
 - **A11 (permission re-check; evaluated permissions for `needs`)** — S1-deny, S2-agent-native.
 - **A12 (0.P merges via `car/main`, then `master` fast-forward)** — §0.6.8.
+- **A13 (owner names the live classifier model; DF3 check is a bounded one-shot, then restored)** — QA-0P-38/39.
 - **0.P.4 executor.** Verdicts issued by the orchestrator (Opus) per router rule 9; producer (`@medium` harness) ≠ judge. QA is a separate `@heavy` dispatch.
 
 ## Findings
@@ -182,6 +183,19 @@ The amendment texts are canonical in the plan, §1.5 "Amended during implementat
 | QA-0P-36 | nit | harness S1-deny | run-wide capture count | spike-scoped count — `d9e2358` |
 | QA-0P-37 | nit | harness notes, this file, run-log | wording; row order | S6 "estimated", S4 "inferred" (`d9e2358`); "verbatim"/"all fixed in round 1" removed; run-log reordered |
 
+**Round 3** (`@heavy`, re-review of the round-2 fixes): all 12 round-2 findings and the 5 round-1 partials resolved; new: 0 blocking, 0 critical, 3 major, 3 minor, 2 nit. Per §0.7 only the majors must be fixed; the minors and nits that are factual corrections to the plan were fixed anyway, the rest are accepted.
+
+| Id | Sev. | Where | Finding | Resolution |
+|---|---|---|---|---|
+| QA-0P-38 | major | plan DF3, A4, §2 | live classifier check picked the provider automatically, wrote the global override, never reverted, no owner consent | A13: the owner names the model or the check is skipped; one-shot with immediate restore of `routing.classifier`; DF3 text rewritten |
+| QA-0P-39 | major | plan DF3 | check might never trigger (`[route …]` overrides rules); 1.5 s timeout; 3.1 not blocked | deterministic trigger (`/annotate-plan` on a two-step sample, one batched backend call), `timeoutMs: 10000` for the check, 3.1.1 blocked until `## DF3` holds the result or the skip line |
+| QA-0P-40 | major | plan 1.2.4 | task text still said raw `/api/experimental/generate` | 1.2.4 now specifies `ctx.generate.text` (A4) with a fake `ctx.generate` in unit tests |
+| QA-0P-41 | minor | plan 3.2 | "all six green"; write-set too narrow for scenario 7 | fixed: "1–6 green, 7 green or `unverifiable`"; write-set allows an OpenAI-Responses script mode |
+| QA-0P-42 | minor | harness `:516`, `:520` | every acceptance run rewrites tracked evidence files with a new runId | accepted — QA round limit: the handover instructs `git checkout -- docs/qa/cost-aware-routing/spikes` after any re-run that is not an evidence run |
+| QA-0P-43 | minor | handover, Handoffs | close-out steps, "to 3.1" handoff | fixed: handover close-out list and "to 3.1" handoff |
+| QA-0P-44 | nit | harness `:877` | stale `service.json` with the live gate on throws instead of skipping | accepted — QA round limit (only reachable with the manual live opt-in) |
+| QA-0P-45 | nit | plan A10, this file S5 row, A4 vs DF3 | wrong tiered-cost example; stale latencies; experimental wording mismatch | fixed: A10 example, S5 6/6 ms and 272 ms, A4/DF3 aligned |
+
 ## Deferred by plan
 
 - `tsx` absent → `routing:stats` invocation decided in Phase 1.3 (plan troubleshooting row).
@@ -199,7 +213,8 @@ The amendment texts are canonical in the plan, §1.5 "Amended during implementat
 - **to 2.1** — module-scope dedupe set and registry; single writer (A3).
 - **to 2.2** — permission filter before any `enforce` swap; `needs` from evaluated permissions, not agent ids (A11).
 - **to 2.4** — advisor: unpriced per A1; suggestions per A2.
-- **to 3.2** — effective-effort assertions (A7); scenario 7.
+- **to 3.1** — document `host` as *experimental* unless `dogfood.md` `## DF3` shows the live check passed (A4, A13); do not start 3.1.1 before `## DF3` holds the result or the skip line.
+- **to 3.2** — effective-effort assertions (A7); scenario 7 (green or `unverifiable` with reason).
 
 ## Verdict
 
