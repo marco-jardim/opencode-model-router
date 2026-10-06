@@ -430,7 +430,7 @@ The cost doctor looks for money and reliability problems **outside** the routing
 | `foreign-candidates` | info | Candidate rungs on other models, which variant steps never walk (the engine prices them as dispatch options only). |
 | `covered-tier` | info | A tier is skipped on escalation because an earlier tier on the same model already covers its base. |
 | `variant-ladder-budget` | info | A tier has at least `maxTotalAttempts − 1` variant steps: a failing delegation can spend its whole budget on that tier's variants (the reserve still keeps an escalation reachable). |
-| `attempts-without-variants` | info | `maxAttemptsPerTier` is 1 (its default) and variant steps resolve to `none`: every failure escalates straight to a bigger model. Needs an `enforcement.escalate` block. |
+| `attempts-without-variants` | info | `maxAttemptsPerTier` is 1 (its default) and variant steps resolve to `none`: a failed verification re-runs the same rung once in a fresh child, then escalates to the next, more expensive tier; variant steps would retry a higher variant on the same session first (A33: the one retry comes first, the ladder does not escalate straight away). Needs an `enforcement.escalate` block. |
 | `unpriced-model` | info | A model in a ladder is unpriced (D6). |
 | `subscription-pricing` | info | A model's provider is a subscription provider; catalog prices are relative weights. |
 | `native-role-unmatched-rung` | info | A role agent's own model matches no preset rung, so it is priced at the owning tier's first rung (live engine only). |
