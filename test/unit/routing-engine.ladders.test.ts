@@ -149,6 +149,13 @@ describe("buildLadder — router rungs and the simulated runner (A25)", () => {
     expect(buildEscalatePolicy(explicit, { host: "v2", catalog }).variants?.perTier.fast?.costRatios.medium).toBe(2);
   });
 
+  it("R2-4: an effort-configured tier floors catalog pricing in the simulated runner too", () => {
+    const cfg = cfgOf({ fast: tier(SONNET, "low", 1), medium: { model: SONNET, effort: "medium", costRatio: 5 } });
+    expect(buildEscalatePolicy(cfg, { host: "v2", catalog }).variants?.perTier.fast?.costRatios.medium).toBe(5);
+    const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session: { host: "v2", catalog } });
+    expect(pathsOf(ladder)[0]).toEqual(["fast#low", "~fast#medium"]);
+  });
+
   it("single-candidate tiers: one rung per tier, each priced through the runner's own cascade", () => {
     const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
     expect(summary(ladder)).toEqual([

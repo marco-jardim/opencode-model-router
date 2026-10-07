@@ -626,7 +626,7 @@ function rungCostRatios(
     let ratio = own.get(rung) ?? tierRatio;
     if (ladder.source === "catalog" && rung !== base) {
       for (const other of presetTiers) {
-        if (other === tier || other.model !== tier.model || (other.variant ?? DEFAULT_VARIANT) !== rung) continue;
+        if (other === tier || other.model !== tier.model || (other.variant ?? other.effort ?? DEFAULT_VARIANT) !== rung) continue;
         const otherRatio = validCostRatio(other.costRatio);
         if (otherRatio !== undefined) ratio = Math.max(ratio ?? 0, otherRatio);
       }

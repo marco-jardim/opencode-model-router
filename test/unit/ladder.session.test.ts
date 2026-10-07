@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { simulateRunner, type RunnerRung } from "../../src/routing/engine/simulate";
 import {
   advance,
   buildEscalatePolicy,
@@ -1415,6 +1416,23 @@ describe("reserve fallback when no tier above can run (QA-1.5-19)", () => {
 describe("owner preset trace", () => {
   const ratios = (tiers: Record<string, TierConfig>) => ({ charge: chargeBy(tiers) });
   const GENEROUS = { costCeiling: { multiple: 1000 } };
+
+  it("R2-4: an effort-configured medium tier floors the fast catalog step in the runner", () => {
+    const tiers: Record<string, TierConfig> = { ...OWNER, medium: { model: SONNET, effort: "medium", costRatio: 5 } };
+    const policy = buildEscalatePolicy(makeConfig(tiers), V2);
+    const run = runLoop(policy, ratios(tiers));
+    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`]);
+    expect(run.state.cumulativeCost).toBe(6);
+    expect(run.actions[1]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+    const base = (id: string): RunnerRung | undefined => {
+      const tier = Object.entries(tiers).find(([name]) => name === id)?.[1];
+      return tier === undefined ? undefined : { tier: id, model: tier.model, variant: tier.variant ?? null, costRatio: tier.costRatio ?? 1 };
+    };
+    const simulated = simulateRunner(policy, base, base("fast")!);
+    expect(simulated.map((rung) => `${rung.model}#${rung.variant}`)).toEqual(attemptTrace(policy, run));
+    expect(simulated.map((rung) => rung.costRatio)).toEqual([1, 5]);
+    expect(simulated.reduce((sum, rung) => sum + rung.costRatio, 0)).toBe(run.state.cumulativeCost);
+  });
 
   it("QA-G-B7: anthropic preset, default budget: sonnet#low then sonnet#medium at its preset ratio crosses the ceiling", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
