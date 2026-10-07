@@ -16,7 +16,7 @@ Three parallel reviewers covered areas **A**, **B** and **C**. This report recor
 
 The reviewer examined outcome persistence and cross-process writes, log/statistics fidelity, smoke-test isolation, plan annotation, packaging, and the reproducibility/completeness of dogfood and user-facing documentation. Major findings were a lost-update race in snapshot persistence (the deterministic p3b interleave recorded ten passes but retained seven), smoke writes reaching the real temporary directory, and an incomplete DF3 checkpoint record. Minor findings covered duplicate rows, rotation races, timing-sensitive tests, unsafe inline-code annotation, and documentation omissions.
 
-**Status:** C1–C13 addressed, including the C7 follow-up correction below. N1/N2/N3/N5/N7/N10 fixed; N4/N6/N8 accepted. **N11 remains open for an owner decision:** its proposed acceptance premise is false in this checkout. Scoped tests are green. The filtered scenario-8 smoke is not independently runnable with its existing positive-control requirements; its failed run is reported below rather than counted as a pass.
+**Status:** C1–C13 addressed, including the C7 follow-up correction below. N1/N2/N3/N5/N7/N10 fixed; N4/N6/N8/N11 accepted. Scoped tests are green. The filtered scenario-8 smoke is not independently runnable with its existing positive-control requirements; its failed run is reported below rather than counted as a pass.
 
 ### Fixes and commits
 
@@ -44,12 +44,12 @@ The reviewer examined outcome persistence and cross-process writes, log/statisti
 
 `0b0ac3b` initially kept the first verdict for each `(kind, decisionID, attemptID)` regardless of outcome. That regressed **QA-2.1-R2-9** by discarding a later pass/fail after `unverifiable`. **Do not retain that interpretation.** `b5fdede` keeps the first decision for a decisionID, and suppresses verdict/refusal signals only when the same identity **and outcome** was already seen. For verdicts the outcome is `verdict`; for refusals it includes the `overrides` marker. Existing aggregation then excludes an unverifiable row when a decisive verdict for that attempt is present in the window. The restored regression tests both pass and fail replacements, reverse order, and duplicated replacement batches. The general duplicated-batch test remains.
 
-### Accepted limits and unresolved nit
+### Accepted limits
 
 - **N4 — accepted:** `--dir` accepts relative and driveless paths, which `outcomes.path` refuses. It is a repo-only CLI flag, documented as such.
 - **N6 — accepted:** an orphaned advisor tmp file after a crash, and the stale-lock rename not retried on EPERM. Both are best effort and documented here; cleanup/recovery is not a durability guarantee.
 - **N8 — accepted:** appendRows reads up to 5 MiB to check the last byte after a foreign write. That is a bounded cost and only happens after another process wrote. More precisely, the first append after startup also checks a pre-existing file, and the nominal 5 MiB rotation threshold can be exceeded by a batch/concurrent append.
-- **N11 — NOT accepted on the proposed premise:** `splitPlan()` in `src/routing/commands/annotate-plan.ts` explicitly falls back to `headingRuns()` when `listRuns()` is empty. Thus a heading can be a step, and adding `[tier:X]` can change its anchor slug. Existing heading-only-plan tests also cover that fallback. Owner decision needed: accept and document slug changes, or separately change heading annotation behavior. No annotation changes were made for this nit.
+- **N11 — accepted (corrected rationale, owner decision):** heading-only plans can contain heading steps through `headingRuns()`, and inserting `[tier:X]` in a heading can change its anchor slug. Tier tagging is pre-existing 2.2.0 template behavior: `v2.2.0:src/index.ts` instructs “Place `[tier:X]` at the START of each step, before the description” and rewrites the plan with tags without exempting headings. The new 2.3.0 route line is separate: `additionsOf()` keeps `tag` and `insertRoute` distinct, and `applyAdditions()` emits the route after the heading's line terminator. That route line does not itself alter the heading slug. The earlier “headings are never steps” premise was rejected; no annotation change is needed for this accepted pre-existing tag behavior.
 - **C1 residual:** stale reclamation uses a 30-second mtime lease, not fencing. A process suspended beyond the lease, or competing stale-lock recovery, can still race. Foreign EWMA deltas beyond the sample cap remain approximate. See [Known limits](../../ROUTING_ENGINE.md#known-limits-and-experimental-parts).
 
 ### Verification
