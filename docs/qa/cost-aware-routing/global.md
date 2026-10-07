@@ -181,3 +181,50 @@ config files changed: none
 No provider smoke was started to satisfy those controls. The generated scenario-8 evidence file was restored so the previous complete-run evidence was not replaced by this filtered run. Temp/home isolation itself is covered by unit tests that launch a native Node child. The filtered smoke is **not** reported as green.
 
 **Dogfood safety:** DF3/DF4 stats were read from a copy of live `decisions.jsonl` and `outcomes.json`, never written to the live store. Source bounds, copy location and complete outputs are in [dogfood.md](dogfood.md). No live service or user configuration was changed.
+
+## Round 2
+
+**PASS — round 2: 0 blocking/critical/major; all round-2 findings fixed**
+
+The heavy review of `d775ad1` found **7 minor and 5 nit** findings. The fixes below close all twelve. This verdict is scoped to round-2 QA; global acceptance criteria #12/#13 still await DF5 / Phase 3.4, and the previously accepted limits remain in force.
+
+| Finding | Fix and regression evidence | Commit |
+|---|---|---|
+| QA-G-R2-1 | Removed the always-true ownership check, its unused instance registry and misleading “another location owns” diagnostic. The receiving instance still acts and call claims de-duplicate. Known limits now explain that a project's static opt-out relies on once-only tool-hook delivery, measured on 2.0.22/2.0.24. Unrelated-directory single-instance regression verifies no invented ownership log. | `03a5d66` |
+| QA-G-R2-2 | Any host result naming the resumed child confirms its deferred row before completed-result validation or cancellation checks, including failed/aborted/timeout results. The ladder confirms again before recording a verdict as an idempotent fallback. Adapter tests cover all three statuses; integration tests cover unconfirmed failure, one row per attempt, matching verdict IDs, and the unchanged stray-resume fresh fallback. | `bdb099c` |
+| QA-G-R2-3 | Inherited classifier ceilings must be valid in-range integers (samples 1 or 3); otherwise the default ceiling applies. Invalid string `"500"`, below/above-range and fractional max-state values with a project request of 8000 clamp to 2000 and emit a notice. | `ee7c61c` |
+| QA-G-R2-4 | Catalog-rung price floors recognize an effort-configured same-model tier. Fast has variant low and no effort; medium has effort medium and ratio 5. The catalog retry costs 5, yielding total cost 6 and a cost-ceiling stop. Tests explicitly compare simulation with the runner trace and cost, using the supported session-policy/catalog input. | `3edff5e` |
+| QA-G-R2-5 | The A27 strictly-up exemption now requires preset capability above the pick, not just a higher role candidate rank. Off-preset general@haiku versus fast on high-risk work needs evidence; a seeded-evidence control remains eligible. Capability ranks are indexed once per decision to retain linear scaling. | `3007490` |
+| QA-G-R2-6 | Smoke temp teardown catches rmSync failure, warns and still restores TEMP/TMP/TMPDIR and the saved real-temp variable. A forced-EPERM regression verifies restoration. | `0cb9a93` |
+| QA-G-R2-7 | D17 reports `n/a (0 enforced switches)` when the window contains no enforced switches; statistics expectations and documentation drift pins updated. | `0cb9a93` |
+| QA-G-R2-8 | Inspected state.ts: it finds the first acceptance block across the whole prompt, but omits a raw block over RULES_MAX_CHARS and includes the scrubbed block only when it fits the state budget. The credential gate now follows that exact inclusion result and shares directive/cwd filtering. Single/batch regressions cover raw-limit omission, budget omission and removed cwd; B4's credential in a sent trailing acceptance block beyond the 20k prompt head stays gated. | `e7d18df` |
+| QA-G-R2-9 | Canonical capability/same-model comparisons fold provider/model case, consistently with variant normalization. Mixed-case model tests cover capability rank and lower-effort detection. | `3007490` |
+| QA-G-R2-10 | Removed the orphaned route-field JSDoc and replaced stale advisor lock-lease commentary with the busy-backoff description it actually documents. | `0cb9a93` |
+| QA-G-R2-11 | A failed put-back rename of a freshly replaced lock warns and leaves the caller busy rather than throwing. Regression verifies no transaction runs. | `0cb9a93` |
+| QA-G-R2-12 | Each dispatch-router instance adds a random 8-byte nonce to its decision IDs. Two instances with equal timestamps and first sequence numbers produce distinct rows. | `03a5d66` |
+
+### Verification and implementation corrections
+
+All commands used the **default pool**, `--maxWorkers=2`, and private test fixtures. Typecheck passed before each fix-group commit, and each group was pushed separately with `Refs #74`.
+
+| Verification | Result |
+|---|---|
+| Explicit group 1: routing-engine.kernel, routing-engine.ladders, ladder, ladder.session, escalate-resume, escalate-attempt-recorder, routing-ladder-resume, v2-client | **8 files / 679 tests passed** |
+| Explicit group 2: routing-dispatch, config.routing, config.validate, routing-classify.index, routing-outcomes.stats, docs-drift, tmp-guard, file-lock | **8 files / 875 tests passed, 1 test skipped** |
+| Related run for all changed production sources below | **98 files passed, 3 skipped; 9241 tests passed, 56 skipped** |
+| Additional exec isolation | **1 file; 42 tests passed, 2 skipped** |
+| Typecheck and whitespace | `npm run typecheck` and `git diff --check` passed |
+
+```text
+npx vitest run test/unit/routing-engine.kernel.test.ts test/unit/routing-engine.ladders.test.ts test/unit/ladder.test.ts test/unit/ladder.session.test.ts test/unit/escalate-resume.test.ts test/unit/escalate-attempt-recorder.test.ts test/integration/routing-ladder-resume.test.ts test/unit/v2-client.test.ts --maxWorkers=2
+npx vitest run test/integration/routing-dispatch.test.ts test/unit/config.routing.test.ts test/unit/config.validate.test.ts test/unit/routing-classify.index.test.ts test/unit/routing-outcomes.stats.test.ts test/unit/docs-drift.test.ts test/unit/tmp-guard.test.ts test/unit/file-lock.test.ts --maxWorkers=2
+npx vitest related src/routing/wire/dispatch.ts src/index.ts src/compat/v2-client.ts src/router/config.ts src/escalate/ladder.ts src/routing/engine/kernel.ts src/routing/outcomes/stats.ts src/routing/classify/index.ts src/routing/classify/state.ts src/routing/classify/types.ts src/routing/advisor/index.ts src/routing/file-lock.ts --run --maxWorkers=2
+```
+
+Initial implementation runs exposed fixture/type errors: unsupported `buildLadder.catalog` (corrected to session input), a missing declared confirmation callback on the attempt result, and a missing mock output string. The initial combined run hit its 120-second shell deadline. A longer run then identified an actual quadratic implementation regression in the new evidence check: the 20,000-rung kernel test took approximately 133.6 seconds against its unchanged 2-second bound. Indexing capability ranks once per decision fixed it; the full kernel file and all requested related tests subsequently passed. No timeout or performance assertion was weakened.
+
+### Pre-existing exec timing flake
+
+The reviewer/orchestrator reported that the two `test/unit/exec.test.ts` **lowPriority** tests failed once in the capped full run on `d775ad1`, which otherwise had **11656 tests passed**, and that the file passed **42/42 runnable tests in isolation**. This is recorded as a **load-dependent, pre-existing flake, not caused by this work**. `git diff --exit-code v2.2.0 -- test/unit/exec.test.ts src/verify/exec.ts` confirmed both files are unchanged since 2.2.0. This follow-up independently reran that file: **42 passed, 2 skipped**. No full suite was rerun here and the historical full-run result is attributed to the reviewer, not represented as a new run.
+
+No live store, user configuration or service was modified, and no keyed-provider smoke was run for round 2.
