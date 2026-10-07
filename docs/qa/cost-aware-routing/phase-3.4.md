@@ -102,14 +102,16 @@ The optional additional local-tarball real-host run was **not performed**: the e
 
 ### Round 2 — PR, CI history and regression-check repair
 
-[PR #76](https://github.com/marco-jardim/opencode-model-router/pull/76) was created **2026-10-07T04:49:57Z** after the owner advanced `car/main`. Its release title is **`release: 2.3.0 — cost-aware routing engine (DF5 evidence, CI portability)`**. The maintained body now explicitly distinguishes original design budgets from relaxed CI ceilings. The prior “no PR created” and pending initial-matrix statements above have been corrected, not carried forward as current status.
+[PR #76](https://github.com/marco-jardim/opencode-model-router/pull/76) was created **2026-10-07T04:49:57Z** after the owner advanced `car/main`. Its release title, updated in Round 3, is **`release: 2.3.0 — cost-aware routing engine (DF5 evidence, CI portability, runtime safety)`**. The maintained body explicitly distinguishes original design budgets from relaxed CI ceilings and now includes the runtime fixes found during release QA. The prior “no PR created” and pending initial-matrix statements above have been corrected, not carried forward as current status.
 
 | Test workflow run | Head | Result / remediation |
 |---|---|---|
 | [37573344694](https://github.com/marco-jardim/opencode-model-router/actions/runs/37573344694) | `285ea9d` | Failed: exec tree cleanup `EBUSY`, `del ` × 5000 at 10.30 ms versus 10 ms, and the cost-doctor wait. `e695353` increased cleanup retry delay, fixed notice-readiness timing and replaced tight classifier bounds. |
 | [37575249402](https://github.com/marco-jardim/opencode-model-router/actions/runs/37575249402) | `e695353` | Failed: `npm pack` exceeded the default 5 s test timeout; coverage-instrumented 2 kB rules took 1.056 ms versus 1 ms. `e8f0d63` systematically added CI margins and process/disk timeouts. |
 | [37576763320](https://github.com/marco-jardim/opencode-model-router/actions/runs/37576763320) | `e8f0d63` | **12/12 jobs green**, including Node 20/22/24 on Windows/Linux, coverage, e2e, Bun smoke and merged coverage gate. Confirmed through the Actions API, not inferred from local tests. |
-| Post-Round-2 run | `339df40` plus this documentation group | **Awaiting owner fast-forward/push of `car/main` to the final `car/p34` tip.** At the Round 2 check, PR head remains `e8f0d63`; pushing `car/p34` alone does not trigger `test.yml`, which has no `workflow_dispatch`. Record the new run ID/URL and exact SHA here when triggered; do not inherit the previous run's green verdict. |
+| [37609350779](https://github.com/marco-jardim/opencode-model-router/actions/runs/37609350779) | `f247332` | Post-Round-2 run failed: Windows ingest cleanup `ENOTEMPTY`, fixed by `a95427d`; unrelated pre-existing resource-budget timing flake left unchanged. |
+| [37611223061](https://github.com/marco-jardim/opencode-model-router/actions/runs/37611223061) | `a95427d` | Windows cost-doctor cleanup still raced background state writes; fixed by notifier disposal in `71ae7d8`. |
+| [37613324910](https://github.com/marco-jardim/opencode-model-router/actions/runs/37613324910) | `71ae7d8` | **12/12 jobs green, attempt 1**, confirmed through the Actions API during Round 3. This result does not cover the subsequent credential-redaction change. |
 
 **R2-1 — regression-check redesign.** The earlier n-versus-4n median check could miss expensive fixed-width windows and superlinear cost inside fixed-length runs. The replacement uses **minimum-of-20 interleaved batches, three calls per batch**, after warming both inputs. Every pathological input (capped at 20 kB) must cost **at most 4× ordinary prose of exactly the same length** and **at most 200 ms**. A separate equal-total-length comparison requires 199-character runs to cost **at most 2× 50-character runs**, for both plain and dotted tokens. Thus linear-in-total-length but expensive-per-run implementations cannot hide behind a total-length scaling ratio. The minimum is a noise-resistant measurement, not a claim that CI can prove a hard real-time deadline.
 
@@ -132,8 +134,28 @@ All synthetic costs above are **below 200 ms**: the relative checks reject them 
 
 **R2-6 — optional code-scanning workflow:** GitHub-hosted [“Code scanning AI findings on PR #76”, run 37576766820](https://github.com/marco-jardim/opencode-model-router/actions/runs/37576766820) **failed with exit 1**; its log reports **monthly quota exceeded**. `gh pr checks 76 --required` reports no required checks, so this dynamic workflow is not a required check. Alert scope matters: the API reports **0 open alerts for `refs/pull/76/head`**, but **9 open alerts on `refs/heads/master`** at this verification. The unqualified review premise “0 open code-scanning alerts” is therefore not true repository-wide. No alert was dismissed and no scanning configuration or branch protection was changed.
 
+### Round 3 — credential-safe diagnostics and corrected release scope
+
+**Reviewed commit history:**
+
+| Commit | Release QA change |
+|---|---|
+| `339df40` | Stronger pathological-input performance guards, target/ceiling titles and tmp-path aliases. |
+| `f247332` | Round-2 evidence, A36, CI history and release checklist corrections. |
+| `a95427d` | Await retired/current ingest bundle releases and retry guarded temp-directory cleanup on Windows. |
+| `71ae7d8` | Runtime fix: plugin disposal drains cost-doctor checks and notice claims, including writes and lock release; asynchronous test polling is awaited. |
+| `3aa9526` | Runtime fix (R3-1): config diagnostics never echo secret-capable values; regression tests reject complete and eight-character partial credential echoes. |
+
+**R3-1 — credential echo.** The open CodeQL `js/clear-text-logging` alerts **#10, #11 and #12** identify `src/router/config.ts` logging sinks at lines **2385, 2571 and 2591** in the scanned version. An invalid `classifier.apiKeyEnv` previously reached those sinks through the validation error, and could also reach the `/router-reload` transcript. The `apiKeyEnv` and `baseUrl` errors now omit values entirely (including URL userinfo and query). The shared invalid-value formatter now reports only shape, never string contents or serialized objects/arrays: this also protects classifier/TypeSafe fields and malformed blocks containing `apiKey`, `token` or `headers`. These latter names are not supported classifier options; unknown-key notices report names, not their values. No alert was dismissed; closure remains subject to a fresh scan of the updated branch.
+
+**R3-2 — release record and runtime scope.** This release preparation now includes two runtime fixes, not only documentation and test portability. The dispose drain's host wait is bounded by the **3 s advisor host timeout** (`ADVISOR_HOST_TIMEOUT_MS = 3_000`); agent and provider calls run concurrently. This is a bound on host calls, not a hard three-second guarantee for filesystem writes/lock release or the entire plugin teardown. The Round-3 minor observations are **accepted**, with no additional scope expansion.
+
+**CI:** run **37613324910**, exact head `71ae7d8c90fad0adec1a33f1359f5ddadc0e5798`, passed **12/12 jobs on attempt 1**. **Post-Round-3 run: pending owner fast-forward/push of `car/main` to the final `car/p34` tip.** PR #76 still uses `car/main`; `test.yml` has no manual dispatch and a `car/p34` push alone cannot start this matrix. Record the new exact-SHA run ID, URL, attempt and result here once triggered; the prior green matrix must not be presented as approval of `3aa9526` or this documentation group.
+
+**Local verification:** typecheck passed; config.validate, config.routing and docs-drift passed **589 tests, with one existing skip**, using the default pool. The first config-related run (`--maxWorkers=2`) exceeded the 200 s command deadline after three `v2-hooks` advisory-banner cases hit their 5 s test timeouts; those three cases subsequently passed in isolation. A related-run retry is in progress with a 900 s command deadline; its result is not yet verified. No test timeout, skip or unrelated flaky test was changed for this round.
+
 ## Handoff and boundaries
 
 Release preparation only: the engine's default remains unchanged, and no live state is changed here. D17 recommends **enforce** because failed switched dispatches = 0, not because savings or switching safety has been demonstrated. All models in these windows are unpriced; savings are ratio units, not measured dollars. The owner/orchestrator retains merge, tag, publication, GitHub release and live-override authority.
 
-Checkpoint commit **`1114352`**, `docs(routing): record DF5 checkpoint and bounded dogfood evidence`, was pushed to `origin/car/p34` before beginning the version bump. Release preparation is committed separately as `chore(release): 2.3.0`, with `Refs #74`. Changed areas: dogfood/run log/ADR evidence, this six-section report, PR body, clean-install helper, package/lock/changelog and docs-drift guards. No runtime source changes, no tags, and no publication.
+Checkpoint commit **`1114352`**, `docs(routing): record DF5 checkpoint and bounded dogfood evidence`, was pushed to `origin/car/p34` before beginning the version bump. Release preparation is committed separately as `chore(release): 2.3.0`, with `Refs #74`. Changed areas: dogfood/run log/ADR evidence, this report, PR body, clean-install helper, package/lock/changelog, docs-drift guards and CI portability tests. Subsequent release QA also changed runtime source: cost-doctor disposal (`71ae7d8`) and secret-safe config validation (`3aa9526`). No tags and no publication.

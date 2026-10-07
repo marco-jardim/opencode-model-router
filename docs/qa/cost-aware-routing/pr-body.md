@@ -5,7 +5,11 @@ Closes #73
 
 ## What changes
 
-**Head branch: `car/main`; base: `master`.** PR #76 was opened on 2026-10-07; the orchestrator keeps `car/main` fast-forwarded to the reviewed `car/p34` tip. This PR adds the **DF5 evidence, CI portability fixes and 2.3.0 release metadata**, not the entire engine implementation: the dogfood syncs already pushed the engine to remote master, a deviation from the plan's local-only sync procedure.
+**Head branch: `car/main`; base: `master`.** PR #76 was opened on 2026-10-07; the orchestrator keeps `car/main` fast-forwarded to the reviewed `car/p34` tip. This PR adds the **DF5 evidence, CI portability fixes, runtime safety fixes and 2.3.0 release metadata**, not the entire engine implementation: the dogfood syncs already pushed the engine to remote master, a deviation from the plan's local-only sync procedure.
+
+Includes two runtime fixes found during release QA: plugin dispose now drains in-flight cost-doctor checks and claims (bounded by the 3 s host timeout), and config validation never echoes secret-capable values (CodeQL #10–#12).
+
+The timeout bounds advisor host calls; filesystem completion and the rest of plugin teardown are not a hard 3 s deadline. Test workflow [37613324910](https://github.com/marco-jardim/opencode-model-router/actions/runs/37613324910) passed **12/12 jobs, attempt 1**, on `71ae7d8`. The post-Round-3 exact-SHA matrix remains pending the owner's `car/main` update; that earlier green run does not cover credential redaction.
 
 CI-safety margins loosened absolute performance budgets in tests (A36); the original budgets remain design targets, while relative run-length scaling, same-length pathological/prose ratios and deterministic timer-scheduling checks remain regression guards.
 
