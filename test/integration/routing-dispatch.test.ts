@@ -145,6 +145,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
     command: { reload: vi.fn(async () => {}), transform: vi.fn(async () => register()) },
     model: { list: vi.fn(async () => ({ data: catalog() })) },
     generate: { text: generate },
+    permission: { hook: vi.fn(async () => register()) },
     tool: {
       list: vi.fn(async () => [{ id: "subagent", execute: hostSubagent }]),
       transform: vi.fn(async () => register()),
@@ -153,6 +154,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
     session: {
       get: vi.fn(async () => { if (session.current instanceof Error) throw session.current; return session.current; }),
       context: vi.fn(async () => [] as unknown[]),
+      update: vi.fn(async () => {}),
       prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
       interrupt: vi.fn(async () => ({ interrupted: true })), remove: vi.fn(async () => {}), move: vi.fn(async () => {}),
       hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),

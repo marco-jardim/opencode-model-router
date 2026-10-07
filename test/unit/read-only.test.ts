@@ -6,7 +6,7 @@ import type { Config } from "@opencode-ai/sdk";
 import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath, validateConfig } from "../../src/router/config";
-import { CONTEXT7_DOC_TOOLS, isReadOnlyTier, legacyReadOnlyTools, mergePermissions, permissionRules, readOnlyPermissions, type PermissionRule } from "../../src/router/read-only";
+import { CONTEXT7_DOC_TOOLS, evaluatePermission, isReadOnlyTier, legacyReadOnlyTools, mergePermissions, permissionMatches, permissionRules, publishReadOnlyPermissions, READ_ONLY_CANARIES, readOnlyPermissions, type PermissionRule } from "../../src/router/read-only";
 
 const roots: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); invalidateConfigCache(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
@@ -16,6 +16,58 @@ function effect(rules: PermissionRule[], action: string, resource = "*") {
 }
 
 describe("read-only tier policy", () => {
+  // Deliberately hard-coded: importing Agent.Info.default here repeats P1's bug.
+  const host: PermissionRule[] = [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "external_directory", resource: "*", effect: "ask" },
+    { action: "read", resource: "*.env", effect: "ask" },
+    { action: "read", resource: "*.env.*", effect: "ask" },
+    { action: "read", resource: "*.env.example", effect: "allow" },
+  ];
+  const drift: Record<string, PermissionRule[]> = {
+    identical: host,
+    "appended-allow": [...host, { action: "websearch", resource: "*", effect: "allow" }],
+    "inserted-mid": [host[0]!, { action: "question", resource: "*", effect: "allow" }, ...host.slice(1)],
+    respelled: [host[0]!, host[1]!, { action: "read", resource: "**/*.env", effect: "ask" }, ...host.slice(3)],
+    dropped: [host[0]!, ...host.slice(2)],
+  };
+  it.each(Object.entries(drift))("fails closed for hard-coded host sequence: %s", (name, inherited) => {
+    const warn = vi.fn();
+    const rules = publishReadOnlyPermissions("fast", permissionRules(readOnlyPermissions()), inherited, warn);
+    for (const action of READ_ONLY_CANARIES) for (const resource of ["*", "src/a.ts", "echo x > f", "medium", "q"]) expect(evaluatePermission(rules, action, resource)).toBe("deny");
+    expect(evaluatePermission(rules, "read", "src/a.ts")).toBe("allow");
+    expect(evaluatePermission(rules, "read", ".env")).toBe("ask");
+    expect(rules).not.toContainEqual({ action: "*", resource: "*", effect: "allow" });
+    if (name === "identical") expect(warn).not.toHaveBeenCalled();
+    else expect(warn).toHaveBeenCalledWith("host default permissions not recognised for fast; inherited allow rules dropped");
+  });
+  it("canaries reject scoped and ask grants; permitted resource overrides remain", () => {
+    const warn = vi.fn();
+    const rules = publishReadOnlyPermissions("fast", permissionRules(readOnlyPermissions()), [...host,
+      { action: "shell", resource: "echo *", effect: "allow" }, { action: "browser", resource: "*", effect: "ask" },
+      { action: "read", resource: "blocked/*", effect: "deny" }, { action: "read", resource: "*.env", effect: "deny" },
+      { action: "read", resource: "safe.env", effect: "allow" }, { action: "external_directory", resource: "*", effect: "deny" },
+    ], warn);
+    expect(warn).toHaveBeenCalledWith("read-only permission canary failed for fast; inherited grants restricted");
+    expect(evaluatePermission(rules, "shell", "echo hello")).toBe("deny");
+    expect(evaluatePermission(rules, "browser", "page")).toBe("deny");
+    expect(evaluatePermission(rules, "read", "blocked/a.ts")).toBe("deny");
+    expect(evaluatePermission(rules, "read", "safe.env")).toBe("allow");
+    expect(evaluatePermission(rules, "external_directory", "*")).toBe("deny");
+  });
+  it("matches the host's wildcard semantics", () => {
+    expect(permissionMatches("C:\\repo\\file.ts", "C:/repo/*.ts")).toBe(true);
+    expect(permissionMatches("ab\n", "a??")).toBe(true);
+    expect(permissionMatches("git", "git *")).toBe(true);
+    expect(permissionMatches("READ", "read")).toBe(process.platform === "win32");
+    expect(evaluatePermission([], "unknown", "*")).toBe("ask");
+  });
+  it("projects inherited wildcard ask onto the permitted surface, keeping unknown actions denied", () => {
+    const rules = publishReadOnlyPermissions("fast", permissionRules(readOnlyPermissions()), [...host, { action: "*", resource: "*", effect: "ask" }], vi.fn());
+    expect(evaluatePermission(rules, "another_new_tool", "*")).toBe("deny");
+    expect(evaluatePermission(rules, "shell", "echo hi")).toBe("deny");
+    expect(evaluatePermission(rules, "read", "file.ts")).toBe("ask");
+  });
   it("defaults only fast to read-only and supports explicit opt-in and opt-out", () => {
     expect(isReadOnlyTier("fast", {})).toBe(true);
     expect(isReadOnlyTier("fast", { readOnly: false })).toBe(false);

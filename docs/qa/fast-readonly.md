@@ -12,6 +12,9 @@
   `git show v2.0.22:...` (the host source checkout's current HEAD is newer).
 - All edits are in the feature worktree. No live config/store edits, master
   merge, release, or AI commit attribution.
+- Permission-review follow-up: branch `fast-ro/perm`, worktree
+  `D:\git\omr-fast-perm`, based on `1c977ad`. This round does not modify
+  `src/router/git-tools.ts` or its tests; P3/P8/G8 remain separate work.
 
 ## 2. Implementation and policy decisions
 
@@ -28,10 +31,19 @@
   all eight presets explicitly opt fast in. Override `readOnly: false` is
   layer-mergeable. Other tier definitions/prompts are not changed.
 - V1 merges user permission resources after baseline and publishes legacy tool
-  booleans. V2 replaces the exact leading `Agent.Info.default` rule sequence,
-  then preserves explicit configured rules after the new baseline. Removing
-  only the default prefix is essential: blindly prepending leaves the host's
-  default allow-all in force. A later user allow-all is intentionally preserved.
+  booleans. Arbitrary v1 permission actions/resources remain **unverified**;
+  hosts honouring only `tools` cannot enforce sensitive `read` asks.
+- QA-77-P1/P4 supersede the original v2 prefix-only implementation: reviewed
+  hard-coded defaults, conservative inherited-rule filtering and last-match
+  canaries fail closed on host drift, including appended grants. Warnings are
+  deduplicated. Inherited allow-all is no longer preserved; opt out with
+  `readOnly: false`. Agent resource overrides on permitted actions survive.
+- QA-77-P2 preserves agent-own denies in the permission-evaluate hook, removes
+  child-session allows before prompting/context construction, and filters stale
+  denied tools from the catalog. Parent-session grants cannot reopen denies.
+  `--auto`/`--yolo` auto-answer prompts, not denied permissions.
+- QA-77-P7: global-rule precedence on newly created router agents is unverified;
+  the supported restriction guidance is agent-specific configuration.
 - Only the explicitly named Context7 documentation actions are allowed, only
   when configured; v2 exposes them directly rather than through denied Code Mode.
   Action naming was checked against `packages/core/src/tool/mcp.ts` at the
@@ -40,6 +52,22 @@
   OS sandbox or a content-confidentiality policy; Git/grep can reveal secrets.
 
 ## 3. Tests and verification
+
+### Permission-review follow-up (QA-77-P1/P2/P4/P5/P6/P7/P9/P10)
+
+- `npm run typecheck`: passed.
+- Explicit read-only, evidence-redaction, v2-hooks, v1-roles-line,
+  routing-engine.protocol-line and `test/golden` run: **228 passed / 12 files**.
+  Command: `npx vitest run test/unit/read-only.test.ts test/unit/readonly-evidence.test.ts test/unit/v2-hooks.test.ts test/integration/v1-roles-line.test.ts test/unit/routing-engine.protocol-line.test.ts test/golden --maxWorkers=2 --testTimeout=30000`.
+- `npx vitest related src/compat/v2-hooks.ts src/router/read-only.ts --run --maxWorkers=2 --testTimeout=30000`:
+  **1123 passed, 55 skipped / 41 passed files, 3 skipped** (46.63 s).
+  Both runs use the default pool. No snapshot updates in this round.
+- Hard-coded host fixtures cover identical, appended allow, inserted-middle,
+  respelled and dropped defaults; no SDK-generated drift fixtures. Tests also
+  cover wildcard semantics, canary fallback, warning deduplication, inherited
+  session grants, multi-resource denies, safe overrides and stale tool catalogs.
+
+### Original implementation verification (historical)
 
 - Initial Git implementation: typecheck passed; 32 focused Git tests passed;
   related tests passed **996 tests / 39 files**, with 55 tests / 3 files skipped.
@@ -78,6 +106,24 @@
   medium/heavy definition and prompt is identical, and fast's prompt is append-only.
 
 ## 4. Real-host smoke and evidence
+
+- Permission-review follow-up smoke passed: **1 passed, 12 unrelated scenarios
+  skipped**, 13.87 s, **12 fresh-child probes**. Command:
+  `RUN_OC_SMOKE_ROUTING=1 OMR_UPDATE_READONLY_EVIDENCE=1 npx vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts -t '77 fast read-only' --maxWorkers=2`
+  (environment variables were set with PowerShell syntax).
+- Added parent `shell` allow and parent `*` allow probes: shell remains absent
+  and host-refused. Added an **advertised** read with an agent-specific resource
+  deny and inherited parent read allow: host reports `Permission denied`,
+  exercising permission assertion / BlockedError rather than missing-tool
+  refusal. All probes assert no published `*:*:allow` and no child-session allow.
+- P10: normal smoke runs write only to the isolated harness directory. Updating
+  tracked evidence requires `OMR_UPDATE_READONLY_EVIDENCE=1`. The committed JSON
+  was regenerated with this flag and scrubbed: absolute path resources, embedded
+  Windows user directories and short names are replaced by placeholders. A unit
+  test covers long/short Windows paths, embedded user paths and POSIX paths.
+
+The following records the original nine-probe run; its session-inheritance
+limitation is superseded by the follow-up above.
 
 - Gated scenario: `77 fast read-only: host refuses shell edit execute subagent
   and permits inspection` in `test/smoke/routing-engine.smoke.test.ts`.
@@ -147,11 +193,13 @@ substring, proving every other byte remains identical.
 
 ## 6. Limitations and handoff
 
-- User/parent session permissions can intentionally override the policy.
+- V2 agent resource overrides on permitted actions survive; inherited session
+  allows cannot override own denies. Broad inherited allow-all is dropped.
 - Sensitive-file `ask` rules belong to `read`, not Git or grep content filtering.
 - No OS sandbox, network Git operations, arbitrary flags, or writable Git tools.
 - V1 permission registration/merge is unit-tested; no claim of a real-v1
-  negative-probe smoke unless explicitly recorded later.
+  negative-probe smoke unless explicitly recorded later. Arbitrary actions on
+  v1 are unverified; tool-boolean-only hosts cannot enforce sensitive-read asks.
 - Verification is scoped/related, default Vitest pool, maximum two workers;
   the full suite was not requested or run. No release or master merge.
 - Implementation and tests were committed/pushed incrementally:

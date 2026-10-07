@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
+- **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
   Code Mode, delegation and unspecified MCP tools are denied by default, even
   for existing configs without the new optional tier `readOnly` boolean.
   Opt out by setting `presets.<preset>.fast.readOnly: false` in a router override
-  file. Explicit host/user rules retain precedence; other tiers are unchanged.
+  file. V2 inherited session grants no longer override the agent's own denies;
+  drifted host defaults fail closed. Agent-specific resource overrides on
+  permitted actions remain supported; other tiers are unchanged. Legacy v1
+  hosts that honour only tool booleans cannot enforce sensitive-read approval.
   `rename` moves from the fast taxonomy to medium. Fast prompts distinguish
   direct tools from the separate Code Mode catalog.
 

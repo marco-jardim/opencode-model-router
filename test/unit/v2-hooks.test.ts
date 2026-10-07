@@ -21,7 +21,8 @@ import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { appendRouterFooter } from "../../src/verify/pending";
-import { readOnlyPermissions } from "../../src/router/read-only";
+import { evaluatePermission, READ_ONLY_CANARIES, readOnlyPermissions } from "../../src/router/read-only";
+import type { PermissionEvaluation } from "@opencode/plugin/promise/permission";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -34,6 +35,7 @@ function fixture() {
   const registrations: Array<{ dispose: ReturnType<typeof vi.fn> }> = [];
   const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
   const toolHooks: Record<string, (event: any) => Promise<void>> = {};
+  const permissionHooks: Record<string, (event: PermissionEvaluation) => Promise<void>> = {};
   const agents: Record<string, any> = {
     explore: { id: "explore", mode: "subagent", model: { providerID: "old", id: "old" }, permissions: [{ action: "write", effect: "deny" }], request: { settings: {}, headers: {}, body: {} } },
     build: { id: "build", mode: "primary", request: { settings: {}, headers: {}, body: {} } },
@@ -59,10 +61,12 @@ function fixture() {
     },
     session: {
       get: vi.fn(async () => ({ id: "child", parentID: "root", agent: "fast" })),
+      update: vi.fn(async (_input: unknown) => {}),
       context: vi.fn(async () => [] as any[]),
       prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
       hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),
     },
+    permission: { hook: vi.fn(async (name: string, cb: (event: PermissionEvaluation) => Promise<void>) => { permissionHooks[name] = cb; return register(); }) },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       signal.addEventListener("abort", () => wake(), { once: true });
       while (!signal.aborted) {
@@ -72,7 +76,7 @@ function fixture() {
     } },
   };
   return {
-    ctx, agents, commands, tools, transforms, editors, sessionHooks, toolHooks, registrations,
+    ctx, agents, commands, tools, transforms, editors, sessionHooks, toolHooks, permissionHooks, registrations,
     emit(event: any) { eventQueue.push(event); wake(); },
     async start(hooks: Record<string, any> = {}, runtime?: any) {
       const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, runtime);
@@ -125,15 +129,56 @@ describe("OpenCode 2 hook adapter", () => {
     await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { mode: "subagent" }; } });
     expect(f.agents.fast.permissions).toEqual(permissions);
   });
-  it("preserves an explicit user allow-all AFTER replacing the host's default prefix", async () => {
+  it("fails closed on an allow-all appended after the host's default prefix", async () => {
     const f = fixture();
     f.agents.fast = { id: "fast", permissions: [...Agent.Info.default(Agent.ID.make("fast")).permissions,
       { action: "*", resource: "*", effect: "allow" }] };
     await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: { "*": "deny", read: "allow" } }; } });
-    expect(f.agents.fast.permissions).toEqual([
-      { action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" },
-      { action: "*", resource: "*", effect: "allow" },
-    ]);
+    for (const action of READ_ONLY_CANARIES) expect(evaluatePermission(f.agents.fast.permissions, action, "*")).toBe("deny");
+    expect(f.agents.fast.permissions).not.toContainEqual({ action: "*", resource: "*", effect: "allow" });
+  });
+  it("warns once per agent/diagnostic across registry rebuilds", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const f = fixture();
+    const drifted = [{ action: "*", resource: "*", effect: "allow" }];
+    f.agents.fast = { id: "fast", permissions: structuredClone(drifted) };
+    try {
+      await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+      f.agents.fast.permissions = structuredClone(drifted);
+      f.transforms.agent(f.editors.agent);
+      expect(warn.mock.calls.filter(args => String(args[0]).includes("host default permissions not recognised for fast; inherited allow rules dropped"))).toHaveLength(1);
+    } finally { warn.mockRestore(); }
+  });
+  it("enforces own resource denies against session allows, retaining safe agent overrides", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { permission: { "*": "deny", read: { "*": "allow", "*/blocked.txt": "deny" } } };
+    } });
+    const event = (action: string, resources: string[], effect: "allow" | "deny" = "allow"): PermissionEvaluation => ({
+      sessionID: "child" as PermissionEvaluation["sessionID"], agent: "fast" as PermissionEvaluation["agent"], action, resources, effect,
+    });
+    for (const action of READ_ONLY_CANARIES) {
+      const e = event(action, ["anything"]); await f.permissionHooks.evaluate(e); expect(e.effect).toBe("deny");
+    }
+    const blocked = event("read", ["src/allowed.txt", "src/blocked.txt"]);
+    await f.permissionHooks.evaluate(blocked); expect(blocked.effect).toBe("deny");
+    const allowed = event("read", ["src/allowed.txt"]);
+    await f.permissionHooks.evaluate(allowed); expect(allowed.effect).toBe("allow");
+    const narrowed = event("read", ["src/allowed.txt"], "deny");
+    await f.permissionHooks.evaluate(narrowed); expect(narrowed.effect).toBe("deny");
+    const medium = { ...event("shell", ["echo hi"]), agent: "medium" as PermissionEvaluation["agent"] };
+    await f.permissionHooks.evaluate(medium); expect(medium.effect).toBe("allow");
+  });
+  it("narrows inherited session grants before prompting and hides stale catalog grants", async () => {
+    const f = fixture();
+    const permissions = [{ action: "shell", resource: "*", effect: "allow" }, { action: "read", resource: "private/*", effect: "deny" }, { action: "glob", resource: "*", effect: "ask" }];
+    f.ctx.session.get.mockResolvedValue({ id: "child", parentID: "root", agent: "fast", ...{ permissions } });
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    await f.sessionHooks.prompt({ sessionID: "child", prompt: { text: "inspect" } });
+    expect(f.ctx.session.update).toHaveBeenCalledWith({ sessionID: "child", permissions: permissions.slice(1) });
+    const e = { ...call, model: {}, options: {}, system: [], messages: [], tools: { shell: {}, execute: {}, write: {}, read: {} } };
+    await f.sessionHooks.context(e);
+    expect(Object.keys(e.tools)).toEqual(["read"]);
   });
   it("applies the real ladder retry's effort through context without nesting options or changing grader temperature", async () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-effort-"));

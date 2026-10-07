@@ -141,23 +141,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -166,7 +171,8 @@
       }
     ],
     "statuses": [],
-    "hostRefusal": true
+    "hostRefusal": true,
+    "permissionDenied": false
   },
   {
     "tool": "edit",
@@ -310,23 +316,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -335,7 +346,8 @@
       }
     ],
     "statuses": [],
-    "hostRefusal": true
+    "hostRefusal": true,
+    "permissionDenied": false
   },
   {
     "tool": "execute",
@@ -479,23 +491,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -504,7 +521,8 @@
       }
     ],
     "statuses": [],
-    "hostRefusal": true
+    "hostRefusal": true,
+    "permissionDenied": false
   },
   {
     "tool": "subagent",
@@ -648,23 +666,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -673,7 +696,8 @@
       }
     ],
     "statuses": [],
-    "hostRefusal": true
+    "hostRefusal": true,
+    "permissionDenied": false
   },
   {
     "tool": "read",
@@ -817,23 +841,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -844,7 +873,8 @@
     "statuses": [
       "completed"
     ],
-    "hostRefusal": false
+    "hostRefusal": false,
+    "permissionDenied": false
   },
   {
     "tool": "grep",
@@ -988,23 +1018,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -1015,7 +1050,8 @@
     "statuses": [
       "completed"
     ],
-    "hostRefusal": false
+    "hostRefusal": false,
+    "permissionDenied": false
   },
   {
     "tool": "glob",
@@ -1159,23 +1195,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -1186,7 +1227,8 @@
     "statuses": [
       "completed"
     ],
-    "hostRefusal": false
+    "hostRefusal": false,
+    "permissionDenied": false
   },
   {
     "tool": "router_git_status",
@@ -1330,23 +1372,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -1357,7 +1404,8 @@
     "statuses": [
       "completed"
     ],
-    "hostRefusal": false
+    "hostRefusal": false,
+    "permissionDenied": false
   },
   {
     "tool": "router_git_diff",
@@ -1501,23 +1549,28 @@
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\shell\\*\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\data\\opencode\\tool-output\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\Marquinho\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\tmp\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp\\omr-smoke-tmp-48460-1791387644897\\omr-p32-fast-readonly-f7PMCh\\config\\opencode\\*",
+        "resource": "<absolute-path>",
         "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
       },
       {
         "action": "browser",
@@ -1526,6 +1579,537 @@
       }
     ],
     "statuses": [],
-    "hostRefusal": true
+    "hostRefusal": true,
+    "permissionDenied": false
+  },
+  {
+    "tool": "shell",
+    "allowed": false,
+    "parentAllow": "shell",
+    "advertised": [
+      "glob",
+      "grep",
+      "read",
+      "router_git_blame",
+      "router_git_diff",
+      "router_git_log",
+      "router_git_ls_files",
+      "router_git_show",
+      "router_git_status"
+    ],
+    "permissions": [
+      {
+        "action": "*",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "read",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.key",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "glob",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "grep",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_status",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_log",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_diff",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_show",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_blame",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_ls_files",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
+      },
+      {
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      }
+    ],
+    "statuses": [],
+    "hostRefusal": true,
+    "permissionDenied": false
+  },
+  {
+    "tool": "shell",
+    "allowed": false,
+    "parentAllow": "*",
+    "advertised": [
+      "glob",
+      "grep",
+      "read",
+      "router_git_blame",
+      "router_git_diff",
+      "router_git_log",
+      "router_git_ls_files",
+      "router_git_show",
+      "router_git_status"
+    ],
+    "permissions": [
+      {
+        "action": "*",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "read",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.key",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "glob",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "grep",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_status",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_log",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_diff",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_show",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_blame",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_ls_files",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
+      },
+      {
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      }
+    ],
+    "statuses": [],
+    "hostRefusal": true,
+    "permissionDenied": false
+  },
+  {
+    "tool": "read",
+    "allowed": false,
+    "parentAllow": "read",
+    "advertised": [
+      "glob",
+      "grep",
+      "read",
+      "router_git_blame",
+      "router_git_diff",
+      "router_git_log",
+      "router_git_ls_files",
+      "router_git_show",
+      "router_git_status"
+    ],
+    "permissions": [
+      {
+        "action": "*",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "read",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.key",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "glob",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "grep",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_status",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_log",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_diff",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_show",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_blame",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_ls_files",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
+      },
+      {
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      }
+    ],
+    "statuses": [
+      "error"
+    ],
+    "hostRefusal": true,
+    "permissionDenied": true
   }
 ]

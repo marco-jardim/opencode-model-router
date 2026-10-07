@@ -21,6 +21,7 @@ import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { FLOOR_LIFT_REASON, RESUME_PINNED_REASON, RESUME_RUNNING_REASON, makeKey } from "../../src/routing/outcomes";
 import { noticeFiles } from "../../src/routing/advisor";
+import { scrubReadOnlyEvidence } from "./helpers/readonly-evidence";
 import {
   MODELS, ROOT, RoutingHost, seenProjectDirs, seenSessionIDs, inBandEfforts, SMOKE_PRESET, arr, effectiveEffort, obj, ref, runScenario, stopAllHosts, type HookRecord, type ModelRef, type Obj, type Rule, type Seed, type WireRequest,
 } from "./helpers/routing-host";
@@ -75,13 +76,17 @@ const inputOf = (h: HookRecord | undefined) => obj(h?.input);
 
 d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
   it("77 fast read-only: host refuses shell edit execute subagent and permits inspection", async () => {
-    const host = await RoutingHost.start("fast-readonly", { routing: null });
+    const host = await RoutingHost.start("fast-readonly", { routing: null, hostConfig: {
+      agents: { fast: { permissions: [{ action: "read", resource: "*readonly-blocked.txt", effect: "deny" }] } },
+    } });
     const evidence: Obj[] = [];
     try {
       execFileSync("git", ["init", "-q", host.project], { shell: false, windowsHide: true });
       const target = path.join(host.project, "readonly-probe.txt");
+      const blocked = path.join(host.project, "readonly-blocked.txt");
       await writeFile(target, "READ_ONLY_ORIGINAL\n");
-      const probes: Array<{ tool: string; input: Obj; allowed: boolean }> = [
+      await writeFile(blocked, "BLOCKED_CONTENT\n");
+      const probes: Array<{ tool: string; input: Obj; allowed: boolean; parentAllow?: string; blocked?: boolean }> = [
         { tool: "shell", input: { command: "echo WRITE_ATTEMPT > readonly-probe.txt", workdir: host.project }, allowed: false },
         { tool: "edit", input: { path: target, oldString: "READ_ONLY_ORIGINAL", newString: "WRITE_ATTEMPT" }, allowed: false },
         { tool: "execute", input: { code: "return 'WRITE_ATTEMPT'" }, allowed: false },
@@ -91,11 +96,13 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         { tool: "glob", input: { pattern: "*.txt", path: host.project }, allowed: true },
         { tool: "router_git_status", input: {}, allowed: true },
         { tool: "router_git_diff", input: { ref: "--output=readonly-probe.txt" }, allowed: false },
+        { tool: "shell", input: { command: "echo WRITE_ATTEMPT > readonly-probe.txt", workdir: host.project }, allowed: false, parentAllow: "shell" },
+        { tool: "shell", input: { command: "echo WRITE_ATTEMPT > readonly-probe.txt", workdir: host.project }, allowed: false, parentAllow: "*" },
+        { tool: "read", input: { path: blocked }, allowed: false, blocked: true, parentAllow: "read" },
       ];
       for (const probe of probes) {
-        // No allow-all session rule: v2 inherits parent session rules AFTER the
-        // agent's rules, and an explicit allow-all intentionally overrides policy.
-        const root = await host.newRoot(`readonly ${probe.tool}`, undefined, host.project, []);
+        const root = await host.newRoot(`readonly ${probe.tool}`, undefined, host.project,
+          probe.parentAllow ? [{ action: probe.parentAllow, resource: "*", effect: "allow" }] : []);
         const result = await host.dispatch(root, { agent: "fast", description: `readonly ${probe.tool}`, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool: probe.tool, input: probe.input })}`, background: false });
         const requests = host.requestsOf(result.childID).filter(r => r.kind === "primary");
         const names = requests[0]?.toolNames ?? [];
@@ -104,12 +111,26 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const states = messages.flatMap(message => arr(obj(message).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
         const context = JSON.stringify(states);
         const agent = (await host.client.agent.list()).data.find(a => a.id === "fast");
-        evidence.push({ tool: probe.tool, allowed: probe.allowed, advertised: names, permissions: agent?.permissions,
-          statuses: hooks.map(h => h.status), hostRefusal: states.some(state => state.status === "error") });
-        await writeFile(path.join(ROOT, "docs", "qa", "fast-readonly-smoke.json"), JSON.stringify(evidence, null, 2) + "\n");
+        expect(arr(agent?.permissions).some(rule => obj(rule).action === "*" && obj(rule).resource === "*" && obj(rule).effect === "allow")).toBe(false);
+        const child = await host.client.session.get({ sessionID: result.childID });
+        expect(child.permissions?.some(rule => rule.effect === "allow") ?? false).toBe(false);
+        evidence.push({ tool: probe.tool, allowed: probe.allowed, parentAllow: probe.parentAllow, advertised: names, permissions: agent?.permissions,
+          statuses: hooks.map(h => h.status), hostRefusal: states.some(state => state.status === "error"),
+          permissionDenied: states.some(state => /Permission denied/i.test(String(obj(state.error).message))) });
+        // Normal runs leave tracked evidence untouched. Opt in deliberately to
+        // refresh the redacted artifact after inspecting the probe results.
+        const evidencePath = process.env.OMR_UPDATE_READONLY_EVIDENCE === "1"
+          ? path.join(ROOT, "docs", "qa", "fast-readonly-smoke.json") : path.join(host.root, "fast-readonly-smoke.json");
+        await writeFile(evidencePath, JSON.stringify(scrubReadOnlyEvidence(evidence), null, 2) + "\n");
         if (probe.allowed) {
           expect(names).toContain(probe.tool);
           expect(hooks.some(h => h.status === "completed"), JSON.stringify(hooks)).toBe(true);
+        } else if (probe.blocked) {
+          // Advertised read, but denied resource: this reaches the host's
+          // Permission.assert / BlockedError path, not the missing-tool path.
+          expect(names).toContain("read");
+          expect(states.some(state => state.status === "error" && /Permission denied/i.test(String(obj(state.error).message))), context).toBe(true);
+          expect(hooks.some(h => h.status === "completed")).toBe(false);
         } else if (probe.tool === "router_git_diff") {
           // QA-77-G12: the tool reports its refusal as output instead of throwing
           // into the session, so the host state holds the redacted error text.
