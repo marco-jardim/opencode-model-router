@@ -1,7 +1,6 @@
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { Agent } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
@@ -19,7 +18,7 @@ import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
 import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
 import { createSystemAugmenter } from "../routing/wire/hint";
-import { CONTEXT7_DOC_TOOLS, permissionRules } from "../router/read-only";
+import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -167,6 +166,13 @@ export async function registerV2Hooks(
     let config: LegacyConfig = { agent: {}, command: {} };
     let originals = new Map<string, string>();
     let agentOptions = new Map<string, Record<string, unknown>>();
+    const warnedPermissions = new Set<string>();
+    const warnPermissionOnce = (message: string) => {
+      if (warnedPermissions.has(message)) return;
+      warnedPermissions.add(message);
+      ingestLogger.warn(message);
+    };
+    const protectedAgent = (name: string | undefined) => name !== undefined && config.agent[name]?.permission?.["*"] === "deny";
     let lastConfig: unknown;
     // Returns the router config the registry state was built from; the caller
     // advances `lastConfig` only once the host registries have reloaded from it.
@@ -223,19 +229,31 @@ export async function registerV2Hooks(
           if (definition.prompt !== undefined) agent.system = v2Instructions(definition.prompt);
           if (definition.color !== undefined) agent.color = definition.color;
           if (definition.steps !== undefined) agent.steps = definition.steps;
-          // Config-agent runs first, after Agent.Info.default's permissive
-          // prefix. Replace ONLY that exact prefix, never a matching user rule
-          // later in the list. Explicit global/agent rules still win last.
           if (definition.permission) {
-            const existing = agent.permissions ?? [];
-            const defaults = Agent.Info.default(Agent.ID.make(name)).permissions;
-            const hasDefaults = defaults.every((rule, i) => existing[i]?.action === rule.action
-              && existing[i]?.resource === rule.resource && existing[i]?.effect === rule.effect);
-            agent.permissions = [...permissionRules(definition.permission), ...existing.slice(hasDefaults ? defaults.length : 0)];
+            agent.permissions = publishReadOnlyPermissions(name, permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce);
           }
         });
       }
     }));
+
+    // QA-77-P2: the host merges session/saved allows AFTER agent rules. Preserve
+    // the agent's own deny at the permission assertion, not just in the catalog.
+    registrations.push(await ctx.permission.hook("evaluate", async event => {
+      const name = event.agent ?? (await ctx.session.get({ sessionID: event.sessionID })).agent;
+      if (!protectedAgent(name)) return;
+      const agent = (await ctx.agent.list()).data.find(agent => agent.id === name);
+      if (!agent || event.resources.some(resource => evaluatePermission(agent.permissions, event.action, resource) === "deny")) {
+        event.effect = "deny";
+        event.message = `Permission denied by read-only agent ${name}: ${event.action}`;
+      }
+    }));
+
+    const narrowSession = async (sessionID: Parameters<typeof ctx.session.get>[0]["sessionID"]) => {
+      const session = await ctx.session.get({ sessionID });
+      if (protectedAgent(session.agent) && session.permissions?.some(rule => rule.effect === "allow")) {
+        await ctx.session.update({ sessionID, permissions: session.permissions.filter(rule => rule.effect !== "allow") });
+      }
+    };
 
     registrations.push(await ctx.command.transform((editor) => {
       for (const [name, definition] of Object.entries(config.command)) editor.add({
@@ -310,8 +328,21 @@ export async function registerV2Hooks(
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
       if (loadConfig(ctx.location.directory) !== lastConfig) await refresh();
+      await narrowSession(event.sessionID);
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
+      if (protectedAgent(event.agent)) {
+        await narrowSession(event.sessionID);
+        // A context snapshot can predate narrowing (or a later session update).
+        // Hide wholly denied actions here as well. Resource-specific denies
+        // remain advertised and are enforced by the permission evaluate hook.
+        const agent = (await ctx.agent.list()).data.find(agent => agent.id === event.agent);
+        for (const name of Object.keys(event.tools ?? {})) {
+          const action = name === "write" || name === "patch" ? "edit" : name;
+          if (!agent || (evaluatePermission(agent.permissions, action, "*") === "deny"
+            && !agent.permissions.some(rule => rule.effect !== "deny" && rule.action === action && rule.resource !== "*"))) delete event.tools[name];
+        }
+      }
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };
       // V2 consumes per-turn options, not Agent.Info.request.settings.
       for (const [key, value] of Object.entries(agentOptions.get(event.agent) ?? {})) {

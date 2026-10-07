@@ -28,7 +28,9 @@ strand them in its separate catalog. Configuration is not proof of connectivity.
 V1 publishes both a deny-by-default `permission` object and legacy `tools`
 booleans (`"*": false`, explicit allowed tools). The installed v1 SDK supports
 `tools: Record<string, boolean>` and a narrower set of named permission fields;
-current v1 hosts additionally support arbitrary permission actions/resources.
+support for arbitrary permission actions/resources on v1 hosts is **unverified**.
+Hosts which only honour `tools` do **not** enforce sensitive `read` approval:
+their read boolean allows the entire tool, not resource-specific `ask` rules.
 Existing `agent.<tier>.permission` entries are merged **after** the router
 baseline, retaining the order of resource rules; existing `tools` entries win
 over the generated booleans. A user wildcard is moved to the end, not silently
@@ -36,18 +38,27 @@ left at the baseline's earlier position.
 
 V2's config-agent transform runs before external plugins. The host initializes
 agents with `Agent.Info.default`'s permissive rules, then appends configured rules.
-The router replaces only the exact leading default-rules sequence with its
-baseline; explicit global/agent host rules therefore come **last** and win.
-It never removes a matching allow-all later in the list (that is a user override).
-This preserves native `agents.<tier>.permissions` and migrated v1
-`agent.<tier>.permission` rules. The transform runs against fresh host state on
-reload, so it does not stack old router policies. Existing built-in agent rules
-also take precedence if you deliberately reuse a built-in name for a tier.
+The router recognises a reviewed, hard-coded leading default sequence, not the
+bundled SDK's assertion about the running host. Unknown sequences fail closed:
+only inherited deny/ask rules and allows on permitted actions survive. An
+appended allow outside that surface is also dropped. A last-match canary check
+tests shell/edit/execute/delegation/network/browser and a random action, warning
+once per agent/diagnostic and restricting inherited grants on a breach.
+Resource overrides on permitted actions in native `agents.<tier>.permissions`
+are preserved. Broad inherited allow-all is not a supported opt-out: the host
+does not expose provenance to distinguish a new default from a user grant.
+Use `readOnly: false` instead. The transform runs against fresh host state on
+reload. Global-rule precedence for newly created router agents is **unverified**;
+use agent-specific rules for restrictions such as `external_directory: deny`.
 
-**An explicit user/global `* → allow`, or a session-level allow-all, overrides
-this policy.** V2 session rules are evaluated after agent rules and inherited by
-children. Do not grant parent session allow-all when you want restricted
-children. This is intentional user control, not an immutable security boundary.
+V2 normally evaluates inherited session rules after agent rules. The router's
+permission-evaluate hook preserves the agent's **own deny** for every requested
+resource, so parent/session grants cannot override it. Read-only child session
+allows are removed before prompting/context construction, and stale denied
+tools are removed from the catalog. Agent-level resource overrides remain
+effective; session rules can narrow, not widen, the agent's denied surface.
+CLI `--auto`/`--yolo` only auto-answer prompts; they do not override denies.
+This is host enforcement, not an immutable security boundary or OS sandbox.
 For external directories, use `external_directory: "deny"` or scoped `ask`
 rules in host agent configuration. Read-only does not mean confined to the
 project by default.

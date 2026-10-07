@@ -39,7 +39,10 @@ The policy allows external-directory lookups by default. To tighten that, set
 host `agent.fast.permission.external_directory: "deny"` (v1-compatible config),
 or append native v2 `agents.fast.permissions` rules with
 `{ "action": "external_directory", "resource": "*", "effect": "deny" }`.
-Host/user rules take precedence as described in [Read-only tiers](READ_ONLY_TIERS.md).
+Agent-specific resource rules on permitted actions retain precedence as described
+in [Read-only tiers](READ_ONLY_TIERS.md). V2 inherited session allows cannot
+override agent-own denies; broad inherited allow-all is dropped. Global-rule
+precedence for newly created router agents is unverified: use agent-specific rules.
 This changes the default capabilities even when an existing config has neither
 `readOnly` nor an enforcement block.
 

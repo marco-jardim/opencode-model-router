@@ -1,9 +1,64 @@
 import type { TierConfig } from "./config";
 import { GIT_TOOL_NAMES } from "./git-tools";
+import { randomUUID } from "node:crypto";
 
 export type PermissionEffect = "allow" | "deny" | "ask";
 export type PermissionMap = Record<string, PermissionEffect | Record<string, PermissionEffect>>;
 export interface PermissionRule { action: string; resource: string; effect: PermissionEffect }
+
+/** Reviewed host shape, not a call into the plugin's bundled SDK pretending to
+ * describe the running host. Unknown shapes take the conservative branch. */
+const KNOWN_HOST_DEFAULTS: readonly PermissionRule[] = [
+  { action: "*", resource: "*", effect: "allow" },
+  { action: "external_directory", resource: "*", effect: "ask" },
+  { action: "read", resource: "*.env", effect: "ask" },
+  { action: "read", resource: "*.env.*", effect: "ask" },
+  { action: "read", resource: "*.env.example", effect: "allow" },
+];
+export const READ_ONLY_CANARIES = ["shell", "bash", "edit", "write", "patch", "execute", "subagent", "task", "webfetch", "websearch", "browser",
+  `router_readonly_canary_${randomUUID()}`];
+
+/** Mirrors host v2.0.22 Permission.evaluate + util/wildcard.ts: last match,
+ * slash normalization, ? and *, dotall, Windows case folding, default ask. */
+export function permissionMatches(input: string, pattern: string): boolean {
+  let escaped = pattern.replaceAll("\\", "/").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  if (escaped.endsWith(" .*")) escaped = escaped.slice(0, -3) + "( .*)?";
+  return new RegExp(`^${escaped}$`, process.platform === "win32" ? "si" : "s").test(input.replaceAll("\\", "/"));
+}
+
+export function evaluatePermission(rules: readonly PermissionRule[], action: string, resource: string): PermissionEffect {
+  for (let i = rules.length - 1; i >= 0; i--) {
+    const rule = rules[i]!;
+    if (permissionMatches(action, rule.action) && permissionMatches(resource, rule.resource)) return rule.effect;
+  }
+  return "ask";
+}
+
+/** No provenance API distinguishes a newly appended host default from a user
+ * grant. While readOnly is true, neither can widen the policy's action surface.
+ * Resource overrides on permitted actions, and inherited deny/ask, survive. */
+export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void): PermissionRule[] {
+  const recognised = KNOWN_HOST_DEFAULTS.every((rule, i) => inherited[i]?.action === rule.action
+    && inherited[i]?.resource === rule.resource && inherited[i]?.effect === rule.effect);
+  const tail = inherited.slice(recognised ? KNOWN_HOST_DEFAULTS.length : 0);
+  const allowed = new Set(policy.filter(rule => rule.effect === "allow" && rule.action !== "*").map(rule => rule.action));
+  const safe = tail.filter(rule => rule.effect !== "allow" || allowed.has(rule.action));
+  if (!recognised || safe.length !== tail.length) warn(`host default permissions not recognised for ${name}; inherited allow rules dropped`);
+  // Probe before discarding suspicious tail grants too, so appended defaults
+  // cannot silently defeat a correctly recognised five-rule prefix.
+  const candidate = [...policy, ...(recognised ? tail : safe)];
+  const resources = new Set(["*", "src/file.ts", "echo probe", ...tail.map(rule => rule.resource)]);
+  const breached = READ_ONLY_CANARIES.some(action => [...resources].some(resource => evaluatePermission(candidate, action, resource) !== "deny"));
+  if (breached) {
+    warn(`read-only permission canary failed for ${name}; inherited grants restricted`);
+    // A wildcard ask must not turn every future action into a confirmable
+    // capability. Project it onto known permitted actions; keep all denies.
+    const restricted = safe.flatMap(rule => rule.effect === "deny" ? [rule]
+      : [...allowed].filter(action => permissionMatches(action, rule.action)).map(action => ({ ...rule, action })));
+    return [...policy, ...restricted];
+  }
+  return [...policy, ...safe];
+}
 // MCP effective names are <sanitized-server>_<sanitized-tool>; hyphens survive
 // sanitization on both hosts. Never allow context7_* (future tools may write).
 export const CONTEXT7_DOC_TOOLS = ["context7_resolve-library-id", "context7_query-docs", "context7_get-library-docs"];
