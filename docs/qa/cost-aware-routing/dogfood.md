@@ -137,3 +137,12 @@ Window: 2026-10-06T15:28:34.000Z → open
 _Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._
 
 ```
+
+## DF4
+
+**Sync:** `master` 71815eb → 64e523a at 2026-10-07T00:15:38Z (rollback tag `car/sync-4-prev` = 71815eb). A restart during `npm ci` left the plugin unloaded (incident in `run-log.md`); the owner restarted again.
+**Liveness (inferred):** host `cli starting` at 2026-10-07T00:51:16Z with no `failed to load plugin` line for the router afterwards; the router's `fast` agent resolved again. **Host version changed: 2.0.24** (it was 2.0.22 for DF1–DF3 and the Phase 3.2 smoke).
+**Advise period** (`node scripts/routing-stats.ts --since 2026-10-06T20:32:23Z`, read before the switch): 112 decision rows, 28 orchestrator resumes, 20 pinned; agreement 67/67 (100%); switched 0; estimated savings 0.00 ratio units; kept for lack of evidence 23 of 84 fresh routed dispatches. `pinned && switched` = 0 over all 191 decision rows.
+**Mode after checkpoint:** override `{"routing":{"engine":"enforce","profile":"balanced","margin":0.2}}` written at ≈00:52Z.
+**First enforce row:** 2026-10-07T00:51:45Z, `mode=enforce`, class `search` (0.8), chosen = best = `router:fast` (gpt-6-luna-fast#medium), `switched=false`, reason `kept:best-is-chosen`. No switch, so no child-model check was needed; the next switched row will be verified during 3.3/3.4.
+**Status:** DF4 complete; enforce period started 2026-10-07T00:52Z.
