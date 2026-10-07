@@ -50,3 +50,14 @@ Startup evidence was read, not modified, from `C:\Users\Marquinho\.local\share\o
 | When (UTC) | Phase / task | Event | Action |
 |---|---|---|---|
 | 2026-10-07T03:40:45Z | Phase 3.3 / sync 5 | Base `master` fast-forwarded to `93db126`; rollback tag `car/sync-5-prev` = `64e523a`. | No `npm ci` was run because `package-lock.json` is unchanged. Awaiting the owner's restart (A8); after restart and liveness confirmation, the Phase 3.3 never-down and privacy fixes are live in `enforce`. Next: Phase 3.4 / DF5. |
+
+### DF5 liveness and timing correction
+
+The Phase 3.4 handoff records that the host file watcher reloaded the plugin within approximately 20 seconds of sync 5: the first row carrying the Phase 3.3 audit fields is **2026-10-07T03:41:05Z**. The owner then restarted at **2026-10-07T04:11:34Z**, on host **2.0.24**. Thus the historical “awaiting restart” row above is superseded: the new code was already observed before the owner restart. The copied decision log confirms the audit-field boundary; the owner-restart time is supplied by the orchestrator, not a new service probe in Phase 3.4.
+
+| Restart / reload | Code sync | Observation | Sync → observation | Qualification |
+|---|---|---|---|---|
+| DF5 watcher reload (not a restart) | 2026-10-07T03:40:45Z | 2026-10-07T03:41:05Z | ≈20s | First audit-bearing decision row; code liveness, not measured downtime. |
+| DF5 owner restart | 2026-10-07T03:40:45Z | 2026-10-07T04:11:34Z | 30m49s | Handoff timestamp, host 2.0.24; includes human idle time and the period already running the new code. Restart-only time lost is unmeasured. |
+
+For the DF1–DF5 summary: DF1 1 planned restart; DF2 1; DF3 1; DF4 2 starts (one failed, one successful); DF5 2 restarts (the Phase 3.3 unplanned 02:17:33Z restart and this owner restart). The failed DF4 start's 29 seconds is **inside**, not in addition to, its 35m38s total. No duration is assigned to the second Phase 3.3 interruption because it was not a host restart. These are lifecycle observations, not routing-stat counters.

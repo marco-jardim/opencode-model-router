@@ -1,6 +1,116 @@
 # Dogfood — the cost-aware routing plan measures itself (#74)
 
+Final checkpoint and cross-period table: [DF5](#df5), [Summary](#summary). The routing store is host-wide; the final report distinguishes it from the plan orchestrator's session-only cache measurement.
+
 > Workload caveat: the workload is this plan's own execution (implementation-heavy, QA-heavy, pinned heavy dispatches). The numbers are evidence of behaviour, not a benchmark.
+
+## DF5
+
+**Snapshot / window.** Live `decisions.jsonl*` and `outcomes.json` were copied to `C:\Users\Marquinho\AppData\Local\Temp\opencode\p34-1791346419` at the start of Phase 3.4. Every stats invocation uses `--dir <copy>`. The fixed enforce window is **[2026-10-07T00:51:45Z, 2026-10-07T04:13:39.877Z)**. Files copied: one `decisions.jsonl` (SHA-256 `f8ecad2b9d703befe3e07b711fa4a0db159c45fe2dc800d96d402d6a22ceef9e`) and `outcomes.json` (`6e948cb7aeaeb7b47ce5982ffedb2754da71cefe82e0343bfcd61afe2d4f6d80`). The local snapshot and the bounded `.json`/`.md` CLI outputs are retained in that directory; private raw stores are not committed.
+
+**D17 rule and result.** Leave `enforce` if zero switched dispatches ended in a `fail` verdict during the enforce period; otherwise use `advise`. Floor lifts, resumes, pins and shadow/advise would-switches do not count. The copied period has **0 enforced switches, 0 verified enforced switches, 0 failed switched dispatches**. The exact CLI line is:
+
+```text
+| D17 mode (use the DF4→DF5 enforce-period window) | n/a (0 enforced switches) |
+```
+
+`d17Mode` intentionally reports no switching evidence. Nevertheless, D17's literal **zero switched+fail** condition holds, so the resulting mode is **enforce**. This is a safety-rule result, not evidence that switching saves money or succeeds. **No live override was edited here; the orchestrator applies/retains the resulting mode.** The CLI joins switched decisions to verdicts across the snapshot (including later verdicts), while dispatch windows are half-open. With zero switches, this distinction does not change this result.
+
+**Sync 5 / code boundary.** `master` → `93db126` at **2026-10-07T03:40:45Z**. Per the orchestrator handoff, the file watcher reloaded the plugin within approximately 20 seconds; the first decision row with the 3.3 audit fields is **03:41:05Z**. The owner restart was **04:11:34Z**, host **2.0.24**. Rows before 03:41:05Z ran pre-3.3 code; a restart-only boundary would incorrectly label the earlier audit-bearing rows. Restart timing and its limitations are in [run-log.md](run-log.md#df5-liveness-and-timing-correction).
+
+| Enforce slice (UTC, half-open) | Dispatches | Resumes | Pinned | Agreement | Switched / enforced / failed | Savings | False refusals | Variant steps / pass |
+|---|---:|---:|---:|---|---|---|---:|---|
+| 00:51:45 → 03:41:05, pre-3.3 | 53 | 11 | 11 | 21/21 (100%) | 0 / 0 / 0 | 0.00 ratio over 21 rows | 0 | 0 / n/a |
+| 03:41:05 → 04:13:39.877, post-3.3 | 3 | 0 | 0 | 3/3 (100%) | 0 / 0 / 0 | 0.00 ratio over 3 rows | 0 | 0 / n/a |
+| Whole DF4 → DF5 window | 56 | 11 | 11 | 24/24 (100%) | 0 / 0 / 0 | 0.00 ratio over 24 rows | 0 | 0 / n/a |
+
+**Post-3.3 never-down audit (expected 0):**
+
+```text
+| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | 0 of 2 recorded |
+```
+
+Pre-3.3: `n/a (no row records detection and capability)`, not a retroactive safety pass. **`pinned && switched` = 0 over ALL 247 decision rows** in the copied log (not just DF5). Whole-window kept-for-evidence: 2 of 45 fresh dispatches. Verdicts on all keys: 2 pass, 1 fail, 2 unverifiable; that fail is **not** a switched-dispatch failure. Dollar measurements remain n/a (unpriced).
+
+### Cache-read share — QA-G-A1 / QA-2.2-10
+
+**Read-only discovery:** `opencode session --help` confirms `list` and `export`; current v2 CLI docs also describe `opencode stats --json`. Those data commands connect to the service, so none was run. Instead, `opencode.db` and its WAL from `C:\Users\Marquinho\.local\share\opencode` were copied to `<copy>\session-copy` (approximately 7.6 GB database); only the copy was opened with Node's SQLite API. `PRAGMA quick_check` on the copy returned `ok`. No service/API request, live database write, or credential file read was made.
+
+The plan's root session is `ses_ef09ca71effe2FoiBgxxJuCg6W` (`session_v2.parent_id IS NULL`, directory `D:/git/opencode-model-router`). It was the only root session in that directory updated during the measured period. Children, graders, other projects, synthetic messages and compactions are excluded. Select `session_message.type = 'assistant'` with **`data.time.completed` in the half-open window**; use per-message usage, not lifetime session totals. The host records non-cache input separately, so **total input = `tokens.input + tokens.cache.read + tokens.cache.write`**; the numerator is `tokens.cache.read`. Output and reasoning tokens are not part of the denominator.
+
+| Mode / window (same DF3–DF5 bounds below) | Completed assistant records | Records with usable tokens | Non-cache input | Cache read | Cache write | Total input denominator | Cache-read share (usable records) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shadow | 25 | 25 | 50 | 3,813,758 | 351,895 | 4,165,703 | 91.55% |
+| advise | 55 | 52 | 116 | 12,176,648 | 1,072,271 | 13,249,035 | 91.91% |
+| enforce | 34 | 33 | 80 | 11,134,968 | 687,870 | 11,822,918 | 94.18% |
+
+**Qualification:** the observed-token subset is measurable, but full-window advise/enforce shares are **unverifiable**: three advise records and one enforce record lack `tokens` (two advise errors and two records without a finish value across those windows). They are excluded, **not assumed zero**. A live DB/WAL file copy is not an atomic database backup; the copy passed structural validation, but this is observational evidence, not a transactionally certified capture. The advise window used the **old per-turn hint**, not the stable A1 fix. Post-3.3 enforce emits **no hint at all**; the whole enforce window includes the pre-fix period, as split above. Session growth, compactions, changing work and host versions confound comparisons. These percentages do not establish a causal hint/cache improvement and do not validate the stable advise hint.
+
+Reproduce the cache table on the **copy only** with Node 24 (save this as a temporary `.mjs`, then `node <script> <copy>/session-copy/opencode.db`):
+
+```js
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2], { readOnly: true });
+const windows = [
+  ['shadow', '2026-10-06T15:28:34Z', '2026-10-06T20:32:23Z'],
+  ['advise', '2026-10-06T20:32:23Z', '2026-10-07T00:51:45Z'],
+  ['enforce', '2026-10-07T00:51:45Z', '2026-10-07T04:13:39.877Z'],
+];
+for (const [mode, since, until] of windows) {
+  const rows = db.prepare(`SELECT data FROM session_message
+    WHERE session_id = ? AND type = 'assistant'
+    AND json_extract(data, '$.time.completed') >= ?
+    AND json_extract(data, '$.time.completed') < ?`).all(
+      'ses_ef09ca71effe2FoiBgxxJuCg6W', Date.parse(since), Date.parse(until));
+  let usable = 0, input = 0, read = 0, write = 0;
+  for (const row of rows) {
+    const t = JSON.parse(row.data).tokens;
+    if (!t || ![t.input, t.cache?.read, t.cache?.write].every(Number.isFinite)) continue;
+    usable++; input += t.input; read += t.cache.read; write += t.cache.write;
+  }
+  const totalInput = input + read + write;
+  console.log({ mode, since, until, records: rows.length, usable,
+    input, read, write, totalInput, share: totalInput ? read / totalInput : null });
+}
+db.close();
+```
+
+## Summary
+
+| Checkpoint / measured mode | Dispatches | Agreement | Switched | Estimated savings per unit | Measured USD | False refusals | Variant steps / pass rate | Restarts / time lost (wall-clock proxy) |
+|---|---:|---|---:|---|---|---|---|---|
+| DF1 / static | 0 recorded | n/a | 0 | n/a (no rows) | n/a, unpriced | 0 recorded; unmeasured | 0 / n/a | 1 / ≈2h06m54s |
+| DF2 / static, before shadow | 0 recorded | n/a | 0 | n/a (no rows) | n/a, unpriced | 0 recorded; unmeasured | 0 / n/a | 1 / 4m55s |
+| DF3 / shadow | 79 | 65/65 (100%) | 0 | 0.00 ratio / 65 rows | n/a, unpriced | 0 | 0 / n/a | 1 / 1h50m56s |
+| DF4 / advise | 112 | 67/67 (100%) | 0 | 0.00 ratio / 67 rows | n/a, unpriced | 0 | 0 / n/a | 2 starts (1 failed) / 35m38s total |
+| DF5 / enforce | 56 | 24/24 (100%) | 0 | 0.00 ratio / 24 rows | n/a, unpriced | 0 | 0 / n/a | 2 / 30m49s sync→owner restart + unmeasured unplanned restart |
+
+**Reading the table:** these are the periods *ending* at each checkpoint, not the mode enabled *after* it. Dispatches are decision rows; agreement excludes pins, orchestrator resumes and decisions without a eligible best/chosen pair. Savings are totals in the indicated unit over eligible rows, not USD or a percentage reduction. False refusals are summed over `byKey` and cover trusted classes only. DF1/DF2 zeros mean no decision instrumentation, not zero actual work/refusals (see DF0 bias). Variant pass rate has no denominator. Restart counts and durations come from [run-log.md](run-log.md#restart-timing-ledger-acceptance-13-qa-g-b10), not `routing:stats`: they include human idle time, and the DF5 code reload was already observed at +20s. Actual restart-only time lost remains unmeasured. The DF5 restart column also includes the unplanned Phase 3.3 restart at 02:17:33Z; the second interruption was not a restart.
+
+**Bounded reproduction commands** (PowerShell; the seven runs generated `<copy>/df*.json` and `.md`; omit/add `--json` for the two renderings):
+
+```powershell
+$copy = 'C:\Users\Marquinho\AppData\Local\Temp\opencode\p34-1791346419'
+# DF1, DF2: empty instrumentation windows, not estimates of actual dispatch count
+node scripts/routing-stats.ts --dir $copy --since 2026-10-06T01:00:00Z --until 2026-10-06T11:41:54Z
+node scripts/routing-stats.ts --dir $copy --since 2026-10-06T11:41:54Z --until 2026-10-06T15:28:34Z
+node scripts/routing-stats.ts --dir $copy --since 2026-10-06T15:28:34Z --until 2026-10-06T20:32:23Z
+node scripts/routing-stats.ts --dir $copy --since 2026-10-06T20:32:23Z --until 2026-10-07T00:51:45Z
+node scripts/routing-stats.ts --dir $copy --since 2026-10-07T00:51:45Z --until 2026-10-07T04:13:39.877Z
+# DF5 code-boundary split
+node scripts/routing-stats.ts --dir $copy --since 2026-10-07T00:51:45Z --until 2026-10-07T03:41:05Z
+node scripts/routing-stats.ts --dir $copy --since 2026-10-07T03:41:05Z --until 2026-10-07T04:13:39.877Z
+# Raw invariant across ALL copied decision rows, outside windowed stats
+$rows = @(Get-ChildItem "$copy/decisions.jsonl*" | ForEach-Object {
+  Get-Content $_ | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json }
+} | Where-Object kind -eq decision)
+$rows.Count # 247
+@($rows | Where-Object { $_.pinned -and $_.switched }).Count # 0
+```
+
+All routing numbers in the summary are reproduced by these bounded commands; restart numbers are independently timestamped ledger facts, and cache shares use the separate bounded SQLite query above. The snapshot cutoff excludes later work on this phase.
+
+**Workload caveat (§0.11):** one owner, one machine; the intended workload is this plan itself, implementation- and QA-heavy, with pinned heavy dispatches. The models are unpriced. These are observations, **not a benchmark**. Moreover, the host-wide decision store includes six root sessions: only one belongs to this repository, with the others belonging to concurrent projects. The CLI windows above deliberately preserve that host-wide checkpoint scope; they must not be described as exclusively plan-session dispatches. The cache table, unlike routing stats, is filtered to the plan orchestrator only. Neither measured dollar savings nor switched-dispatch success has been demonstrated.
 
 ## DF0 — baseline (Phase 0.P, 2026-10-06)
 
