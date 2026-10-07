@@ -562,6 +562,32 @@ export interface DecisionRow extends LogRowBase {
   readonly resume: boolean;
   /** Classifier trace of a routed dispatch (2.2; Phase 1.2 handoff): route-line count/conflict and the backend outcome. */
   readonly trace?: DecisionTrace;
+  /** A34 (QA-G-B8): the verification depth the dispatch was decided with. Absent on older rows and on ladder attempts. */
+  readonly detection?: DecisionDetection;
+  /** A34 (QA-G-B8): capability ranks of the pick and of what the host was handed. Absent on older rows and on ladder attempts. */
+  readonly capability?: DecisionCapability;
+}
+
+/** The `[acceptance]` depth vocabulary of 1.2 (`Detection`), restated here so this module keeps no runtime import. */
+export type LoggedDetection = "deterministic" | "grader" | "none";
+
+/** A34 (QA-G-B8): what detection a routed dispatch was decided with. */
+export interface DecisionDetection {
+  /** The value the kernel used: the weaker of the route line's `d=` and the prompt's own `[acceptance]` block (QA-G-B2). */
+  readonly effective: LoggedDetection;
+  /** The route line's `d=` claim, written only when it differs from `effective` (a claim the prompt did not back). */
+  readonly claimed?: LoggedDetection;
+}
+
+/**
+ * A34 (QA-G-B8): capability ranks (`kernel.capabilityRank`, positions on the escalate ladder). `pick`: the orchestrator's pick (the
+ * highest preset rank of its model, never below its candidate rank). `dispatched`: what the host was handed (the final input after the
+ * legacy hook). `null` = unknown (no preset rung on that model and not a candidate, or nothing resolvable). `routing:stats` counts the
+ * high-risk `d=none` rows whose `dispatched < pick` (D9 never-down: expected 0).
+ */
+export interface DecisionCapability {
+  readonly pick: number | null;
+  readonly dispatched: number | null;
 }
 
 export interface VerdictRow extends LogRowBase {
@@ -905,6 +931,13 @@ export interface StatsTable {
     readonly keptEvidence: number;
     readonly argmin: ReadonlyArray<{ readonly key: OutcomeKey; readonly count: number }>;
   };
+  /**
+   * A34 (QA-G-B8), D9 never-down audit over the routed dispatch rows (fresh and resumed) of the window: `below` = rows with
+   * `facts.risk == high` and `detection.effective == none` whose `capability.dispatched < capability.pick` (expected 0); `recorded` =
+   * such high-risk `d=none` rows that carry both ranks. Rows without `detection`/`capability` (older rows, or a reader that drops the
+   * fields) are not counted in either.
+   */
+  readonly neverDown: { readonly below: number; readonly recorded: number };
 }
 
 /** What the CLI reads from a directory (a Persister satisfies it). */

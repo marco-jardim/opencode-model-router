@@ -2,7 +2,7 @@
 // context hook; these tests drive the real `registerV2Hooks` over a fake v2 context, a real outcome store (A3 bundle) and
 // real config files. Temp directories only: HOME and the outcomes path are redirected, nothing touches the user's files.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
@@ -22,6 +22,7 @@ import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, make
 import { RESUME_NAMED_NEEDS_REASON, RESUME_NAMED_NEVER_DOWN_REASON, RESUME_REASON } from "../../src/routing/outcomes/types";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
+import { summarize } from "../../src/routing/outcomes/stats";
 
 const logger = { warn: vi.fn() };
 
@@ -769,6 +770,42 @@ describe("A34 (QA-G-B3): the A30 running rewrite requires needs coverage and nev
     const [row] = await resumeRows(world);
     expect(row!.reason.startsWith(`${RESUME_NAMED_NEEDS_REASON}: `)).toBe(true);
     expect(row!.reason).not.toContain("would be sent to @explore");
+  });
+});
+
+describe("A34 (QA-G-B8): the decision row records detection and capability ranks", () => {
+  /** The rows exactly as written to decisions.jsonl (the reader keeps only the fields it knows). */
+  const rawRows = async (world: World): Promise<Array<Record<string, any>>> => {
+    await world.bundle.flusher.flushNow();
+    const file = join(world.outcomes, "decisions.jsonl");
+    return readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, any>)
+      .filter((row) => row.kind === "decision");
+  };
+  const CLAIMED = "[route class=implement risk=high scope=single d=deterministic]\nRotate the production signing key and deploy.";
+  const CHECKED_MEDIUM = "[route class=implement risk=medium scope=single]\nImplement the parser change in src/a.ts.\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+
+  it("an unbacked d= claim is logged as claimed next to the effective none; a kept high-risk dispatch runs at the pick's rank", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    await routed(world, { agent: "heavy", prompt: CLAIMED });
+    await routed(world, { agent: "heavy", prompt: CHECKED_MEDIUM });
+    const [kept, switched] = await rawRows(world);
+    expect(kept).toMatchObject({ detection: { effective: "none", claimed: "deterministic" }, capability: { pick: 2, dispatched: 2 }, switched: false });
+    expect(switched).toMatchObject({ detection: { effective: "deterministic" }, capability: { pick: 2, dispatched: 1 }, switched: true });
+    expect(switched!.detection.claimed).toBeUndefined(); // no claim that differs
+  });
+
+  it("the ranks are those of what the host was handed (after the legacy hook), and summarize audits them: 0 below on high-risk d=none", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start({
+      "tool.execute.before": async (_input: unknown, output: { args: Record<string, unknown> }) => { output.args.subagent_type = "fast"; },
+    });
+    await routed(world, { agent: "heavy", prompt: "[route class=implement risk=high scope=single]\nRotate the key." });
+    const [row] = await rawRows(world);
+    expect(row).toMatchObject({ detection: { effective: "none" }, capability: { pick: 2, dispatched: 0 } }); // the legacy hook moved it to fast
+    expect(summarize(null, [row as unknown as DecisionRow], { since: null, until: null }).neverDown).toEqual({ below: 1, recorded: 1 });
   });
 });
 

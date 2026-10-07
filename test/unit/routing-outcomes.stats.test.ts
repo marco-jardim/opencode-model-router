@@ -183,6 +183,7 @@ describe("summarize", () => {
       ],
       orchestratorResumes: { resumed: 0, total: 0 },
       gate: { keptEvidence: 0, argmin: [] },
+      neverDown: { below: 0, recorded: 0 },
     });
     const text = JSON.stringify(table) + renderMarkdown(table);
     expect(text).not.toMatch(/NaN|undefined|Infinity/);
@@ -564,6 +565,7 @@ describe("renderMarkdown", () => {
         { key: "implement|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey, count: 1 },
       ],
     },
+    neverDown: { below: 0, recorded: 2 },
   };
 
   /** QA-2.1-10: the footnote both `routing:stats` and `/router stats` carry. */
@@ -589,6 +591,7 @@ describe("renderMarkdown", () => {
     "| Variant steps | 3 taken; pass 1/2 (50.0%) |",
     "| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 1 of 7 routed dispatches |",
     "| Kept for lack of evidence (A27, fresh dispatches) | 3 of 6 fresh routed dispatches |",
+    "| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | 0 of 2 recorded |",
     "",
     "### By class",
     "",
@@ -658,6 +661,7 @@ describe("renderMarkdown", () => {
         "| Variant steps | 0 taken; pass n/a |",
         "| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 0 of 0 routed dispatches |",
         "| Kept for lack of evidence (A27, fresh dispatches) | 0 of 0 fresh routed dispatches |",
+        "| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | n/a (no row records detection and capability) |",
         "",
         "### By class",
         "",
@@ -1255,6 +1259,33 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
     expect(summarize(null, rows, { since: null, until: null }).variantSteps).toMatchObject({ taken: 1, passRate: { num: 0, den: 1, rate: 0 } });
   });
 });
+describe("summarize: the D9 never-down audit (A34, QA-G-B8)", () => {
+  const high = { class: "implement", risk: "high", scope: "single", needs: [] as string[], confidence: 0.9, source: "route-line" };
+  const at = "2026-10-06T12:00:00.000Z";
+
+  it("counts high-risk d=none rows that ran below the pick's capability rank, over the rows that record both ranks", () => {
+    const rows: LogRow[] = [
+      decision("N1", at, { facts: high, detection: { effective: "none" }, capability: { pick: 2, dispatched: 2 } }),
+      decision("N2", at, { facts: high, detection: { effective: "none", claimed: "deterministic" }, capability: { pick: 2, dispatched: 1 } }), // below
+      decision("N3", at, { facts: high, detection: { effective: "none" }, capability: { pick: 1, dispatched: 2 }, resume: true }), // up, a resume
+      decision("N4", at, { facts: high, detection: { effective: "deterministic" }, capability: { pick: 2, dispatched: 0 } }), // detected: not audited
+      decision("N5", at, { detection: { effective: "none" }, capability: { pick: 2, dispatched: 0 } }), // low risk: not audited
+      decision("N6", at, { facts: high, detection: { effective: "none" }, capability: { pick: null, dispatched: 1 } }), // unknown pick
+      decision("N7", at, { facts: high }), // a row written before A34: tolerated, not counted
+      decision("ladder-N8", at, { facts: high, detection: { effective: "none" }, capability: { pick: 2, dispatched: 0 } }), // the runner's own row
+    ];
+    const table = summarize(null, rows, NONE);
+    expect(table.neverDown).toEqual({ below: 1, recorded: 3 });
+    expect(renderMarkdown(table)).toContain("| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | 1 of 3 recorded |");
+  });
+
+  it("old rows only: n/a, never a misleading 0", () => {
+    const table = summarize(null, [decision("O1", at, { facts: high })], NONE);
+    expect(table.neverDown).toEqual({ below: 0, recorded: 0 });
+    expect(renderMarkdown(table)).toContain("| n/a (no row records detection and capability) |");
+  });
+});
+
 describe("summarize: the 2.4 additions (orchestrator resumes, the evidence gate)", () => {
   const trace = (argmin?: OutcomeKey) => ({ routeLines: { count: 0, conflict: false, edgeOnly: true }, backend: null, ...(argmin === undefined ? {} : { argmin: choice(argmin) }) });
   const all = { since: null, until: null };

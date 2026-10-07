@@ -262,6 +262,17 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     .sort((a, b) => b[1] - a[1] || compareCodeUnits(a[0], b[0]))
     .map(([key, count]) => ({ key, count }));
 
+  // A34 (QA-G-B8): D9 never-down audit. High-risk rows decided without detection that record both capability ranks; `below` = those that
+  // ran below the pick's capability rank. Rows written before A34 (no `detection`/`capability`) are tolerated and left out.
+  const isRank = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+  const audited: Array<{ readonly pick: number; readonly dispatched: number }> = [];
+  for (const r of routedDispatches) {
+    const capability = r.capability;
+    if (r.facts.risk !== "high" || r.detection?.effective !== "none" || capability === undefined) continue;
+    if (isRank(capability.pick) && isRank(capability.dispatched)) audited.push({ pick: capability.pick, dispatched: capability.dispatched });
+  }
+  const neverDownBelow = audited.filter((ranks) => ranks.dispatched < ranks.pick).length;
+
   return {
     version: 1,
     window: { since: isoOrNull(since), until: isoOrNull(until) },
@@ -288,6 +299,7 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
     resumeVsFresh,
     orchestratorResumes: { resumed: routedDispatches.filter((r) => r.resume).length, total: routedDispatches.length },
     gate: { keptEvidence: routedFresh.filter((r) => r.reason.startsWith("kept:evidence")).length, argmin },
+    neverDown: { below: neverDownBelow, recorded: audited.length },
   };
 }
 
@@ -346,6 +358,10 @@ export function renderMarkdown(table: StatsTable): string {
     // 2.4: not ladder decisions, so they are not rows of the D11 table below (QA-2.3-7).
     `| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | ${table.orchestratorResumes.resumed} of ${table.orchestratorResumes.total} routed dispatches |`,
     `| Kept for lack of evidence (A27, fresh dispatches) | ${table.gate.keptEvidence} of ${table.orchestratorResumes.total - table.orchestratorResumes.resumed} fresh routed dispatches |`,
+    // A34 (QA-G-B8): the never-down audit. `n/a` when no row of the window records detection and both capability ranks.
+    `| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | ${
+      table.neverDown.recorded === 0 ? "n/a (no row records detection and capability)" : `${table.neverDown.below} of ${table.neverDown.recorded} recorded`
+    } |`,
   ];
 
   const classTable =
