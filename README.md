@@ -1122,7 +1122,7 @@ OpenCode v1 is unchanged: the `routing` block is validated and `engine` is force
 | `/router overrides` | Show the global + project override file paths and merge precedence |
 | `/router models [provider]` | List valid model ids from your configured providers (with defaults and deprecated flags) |
 | `/router enforce <off\|advisory\|enforced>` | Set delegation-enforcement mode (persisted) |
-| `/router stats [--since <ISO>] [--until <ISO>] [--json]` | Routing engine statistics for a time window (dispatches, agreement, switches, savings estimate, verdict and false-refusal rates per key); same table as `npm run routing:stats` in a clone |
+| `/router stats [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]` | Routing engine statistics for a time window (dispatches, agreement, switches, savings estimate, verdict and false-refusal rates per key); same table as `npm run routing:stats` in a clone. The script does not read config: pass `--dir <routing.outcomes.path>` when set. |
 | `/router` | With no subcommand — or an unrecognized one — prints the `/router` help and the current enforcement mode, plus the line `router: engine=<mode> build=<version>+<sha7>` (the engine in force and the build of the running code; on v1 it also prints, always as `engine=static`) and, on v2 with a `routing` block, the cost doctor's findings |
 | `/bypass [on\|off]` | Toggle the router off/on for the session |
 

@@ -400,6 +400,8 @@ Everything is written under one directory, `routing.outcomes.path` (global overr
 
 ### `/router stats` and `npm run routing:stats`
 
+**The script does not read the router config.** When `routing.outcomes.path` is set, pass `--dir <routing.outcomes.path>` explicitly (for example `node scripts/routing-stats.ts --dir "D:\\routing-outcomes"`); otherwise it reads the default temp trajectory directory, not your configured store.
+
 Both print the same table for a time window and produce the same text for the same store and window. `/router stats [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]` flushes the live store first, then renders; `npm run routing:stats -- --since <ISO>` (PowerShell swallows a bare `--`: write `npm run routing:stats '--' --since <ISO>`) reads the files. The script is plain Node with type stripping (**Node 22.18 / 23.6 or newer**; the plugin itself still runs on Node 20), is a repository tool and is **not part of the npm package**; `/router stats` is the in-session equivalent. `--dir` means what `routing.outcomes.path` means.
 
 | Line | Meaning |
@@ -463,6 +465,8 @@ OpenCode v1 is unchanged in every mode (D1). With no `routing` block nothing dif
 - `/annotate-plan` adds nothing for the engine on v1 (and none under `static`): `[route …]` lines are emitted only where the engine will strip and honour them.
 
 ## Known limits and experimental parts
+
+- **Hard exits can lose buffered data.** Up to ≈30 s of queued decision/verdict/refusal rows plus an unsaved snapshot can be lost on a hard exit. Graceful `dispose()` flushes; persistence errors or a busy snapshot lock can still prevent that final best-effort save.
 
 - **Cross-process snapshots use a bounded file lock.** `outcomes.json.lock` covers the read/merge/write/rename transaction; a busy lock leaves the snapshot pending for the next flush, without blocking dispatch. Like the advisor lock, a lock older than 30 s by mtime is reclaimed. A process suspended for more than that lease (or competing stale-lock recovery) can still race; this is not a distributed/fenced lock. Foreign EWMA deltas past the sample cap remain approximate.
 

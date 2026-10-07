@@ -39,10 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A cost doctor: findings in `/router` (title model, unpriced and missing
     models, impossible variants, subscription pricing) and at most one notice,
     delivered as a synthetic transcript entry, throttled per project.
+    `variant-effort` reports an empty variant ladder when a tier also sets effort
+    options; it fires on bundled `hybrid-2`/`anthropic` once a `routing` block
+    exists (unless variant steps are explicitly off). `effort-variant-mismatch`
+    reports different `variant` and `effort` values with a live engine and variant
+    steps off: the wire effort and learned outcome key would differ.
+    Throttle/pending state is stored as `advisor-notice.<hash>.json` with an
+    `advisor-notice.<hash>.lock` file in the outcomes directory, per project.
   - `/router stats` and `npm run routing:stats` (the script needs Node 22.18 / 23.6 or
     newer and is not part of the package); `/annotate-plan` emits `[route …]`
     lines and pins `[tier:heavy]` steps when the engine is live; the bare
     `/router` view prints `router: engine=<mode> build=<version>+<sha7>`.
+    It also prints `router: config notice:` lines for findings from the last
+    config load. A18: `routing.outcomes.path`, like classifier backend settings,
+    is accepted only from bundled config or the global override; project-local
+    values are dropped with a one-time warning.
   - Documentation: `docs/ROUTING_ENGINE.md`, `docs/adr/0005-cost-aware-routing-engine.md`
     and the `routing` section of `docs/CONFIG_REFERENCE.md`.
 
