@@ -58,43 +58,48 @@
 **Open owner decision (QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume and variant steps exist only on the fast tier. Phase 2.4's cost doctor now reports it as the `variant-effort` finding in `/router` (suggesting `candidates` and dropping `effort`).
 ## DF3
 
-**Shadow period:** 2026-10-06T15:28:34Z (DF2 override) to 2026-10-06T18:40:09Z, recorded with `node scripts/routing-stats.ts --since 2026-10-06T15:28:34Z` from car/main @ 3d1080d (2.4 stats: resumes and lifts excluded, A30).
+**Sync:** `master` to `71815eb` at 2026-10-06T18:41:27Z; rollback tag `car/sync-3-prev` = `2878319`.
+
+**Mode after checkpoint:** `advise`. The switch occurred after the host restart at 2026-10-06T20:32:23Z and no later than the first advise row at 2026-10-06T20:32:57.803Z (exact override write time was not captured).
+
+**Shadow period:** 2026-10-06T15:28:34Z (DF2 override) to 2026-10-06T20:32:23Z. Reproduced with `node scripts/routing-stats.ts --since 2026-10-06T15:28:34Z --until 2026-10-06T20:32:23Z --dir <copy>` (resumes and lifts excluded, A30). For both DF3 and DF4 below, `decisions.jsonl` and `outcomes.json` were copied from the live trajectory directory to `C:\Users\MARQUI~1\AppData\Local\Temp\opencode\p33-stats-1791339553946`; commands read only that copy. These bounded outputs supersede the earlier open-ended readings and include the 16 previously omitted shadow rows.
 
 **Reading:**
-- 63 decision rows, of which 12 are orchestrator resumes (outside every routing metric) and 3 pinned. Agreement 50/50 (100%); would-switch 0 (0%); estimated savings 0.00 ratio units (every live hybrid-2 model is unpriced, so ratio units only).
-- A27 evidence gate: 1 of 51 fresh dispatches kept for lack of evidence. The `trace.argmin` table (16 rows) counts every row in which a cheaper candidate without evidence existed, including rows where the chosen dispatch was best anyway; it is not the same quantity as the `kept:evidence` line.
+- 79 decision rows, of which 13 are orchestrator resumes (outside every routing metric) and 3 pinned. Agreement 65/65 (100%); would-switch 0 (0%); estimated savings 0.00 ratio units (every live hybrid-2 model is unpriced, so ratio units only).
+- A27 evidence gate: 1 of 66 fresh dispatches kept for lack of evidence. The `trace.argmin` table (21 rows) counts every row in which a cheaper candidate without evidence existed, including rows where the chosen dispatch was best anyway; it is not the same quantity as the `kept:evidence` line.
 - Verdicts: 1 pass on `recon|router:medium`; no fails, no false refusals. Most dispatches carry no verdict because they were deferred (router_verify wiring is a 3.x handoff) or below `minClassConfidence`.
-- Classifier (rules): `design` 24 of 51 fresh — the QA/review dispatches with long briefs lean to `design`; DF2 already noted a file listing classified `review` at 0.5. Input for 3.x classifier tuning, not a blocker.
+- Classifier (rules): `design` 33 of 66 fresh — the QA/review dispatches with long briefs lean to `design`; DF2 already noted a file listing classified `review` at 0.5. Input for 3.x classifier tuning, not a blocker.
 - Conclusion: in shadow the engine would not have changed any orchestrator choice; with no priced models and almost no verdicts there is no evidence yet to justify a switch. Moving to `advise` per plan.
 
 ```
 ## Routing stats
 
-Window: 2026-10-06T15:28:34.000Z → open
+Window: 2026-10-06T15:28:34.000Z → 2026-10-06T20:32:23.000Z
 
 | Metric | Value |
 |---|---|
-| Dispatches | 63 |
-| Routed dispatches | 63 |
+| Dispatches | 79 |
+| Routed dispatches | 79 |
 | Delegate first attempts | 0 |
 | Floor lifts | 0 |
 | Pinned | 3 |
-| Agreement (best == chosen, non-pinned) | 50/50 (100.0%) |
-| Switched | 0 of 50 non-pinned routed (0.0%); enforced 0; failed 0 (verified 0 of 0 enforced) |
-| Estimated savings (ratio) | 0.00 over 50 rows |
+| Agreement (best == chosen, non-pinned) | 65/65 (100.0%) |
+| Switched | 0 of 65 non-pinned routed (0.0%); enforced 0; failed 0 (verified 0 of 0 enforced) |
+| Estimated savings (ratio) | 0.00 over 65 rows |
 | Variant steps | 0 taken; pass n/a |
-| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 12 of 63 routed dispatches |
-| Kept for lack of evidence (A27, fresh dispatches) | 1 of 51 fresh routed dispatches |
+| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 13 of 79 routed dispatches |
+| Kept for lack of evidence (A27, fresh dispatches) | 1 of 66 fresh routed dispatches |
 
 ### By class
 
 | Class | Dispatches |
 |---|---|
-| debug | 3 |
-| design | 24 |
+| debug | 4 |
+| design | 33 |
 | implement | 8 |
-| recon | 8 |
-| review | 8 |
+| recon | 9 |
+| review | 11 |
+| search | 1 |
 
 ### By key
 
@@ -102,29 +107,32 @@ Window: 2026-10-06T15:28:34.000Z → open
 |---|---|---|---|---|---|---|---|---|---|
 | debug\|router:fast\|openai/gpt-6-luna-fast#medium | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
 | debug\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |
-| debug\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| debug\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 2 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |
 | design\|router:fast\|openai/gpt-6-luna-fast#medium | 9 | 9 | 0 | 0 | 0 | n/a | 0 | 0/9 (0.0%) | n/a |
-| design\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 9 | 9 | 0 | 0 | 0 | n/a | 0 | 0/9 (0.0%) | n/a |
-| design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 6 | 7 | 0 | 0 | 0 | n/a | 0 | 0/7 (0.0%) | n/a |
+| design\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 16 | 16 | 0 | 0 | 0 | n/a | 0 | 0/16 (0.0%) | n/a |
+| design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 8 | 9 | 0 | 0 | 0 | n/a | 0 | 0/9 (0.0%) | n/a |
 | implement\|router:fast\|openai/gpt-6-luna-fast#medium | 5 | 5 | 0 | 0 | 0 | n/a | 0 | 0/5 (0.0%) | n/a |
 | implement\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
 | implement\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 2 | 6 | 0 | 0 | 0 | n/a | 0 | 0/6 (0.0%) | n/a |
 | recon\|router:fast\|openai/gpt-6-luna-fast#medium | 8 | 8 | 0 | 0 | 0 | n/a | 0 | 0/8 (0.0%) | n/a |
+| recon\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
 | recon\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 0 | 2 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/2 (0.0%) | n/a |
 | review\|router:fast\|openai/gpt-6-luna-fast#medium | 2 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
-| review\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 6 | 6 | 0 | 0 | 0 | n/a | 0 | 0/6 (0.0%) | n/a |
-| review\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 0 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| review\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 9 | 9 | 0 | 0 | 0 | n/a | 0 | 0/9 (0.0%) | n/a |
+| review\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 0 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |
+| search\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
 
 ### Gated by evidence (trace.argmin)
 
 | Cheapest key held back | Rows |
 |---|---|
-| design\|router:fast\|openai/gpt-6-luna-fast#medium | 4 |
+| review\|router:fast\|openai/gpt-6-luna-fast#medium | 6 |
+| design\|router:fast\|openai/gpt-6-luna-fast#medium | 5 |
 | design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 4 |
-| review\|router:fast\|openai/gpt-6-luna-fast#medium | 4 |
+| debug\|router:fast\|openai/gpt-6-luna-fast#medium | 2 |
 | implement\|router:fast\|openai/gpt-6-luna-fast#medium | 2 |
-| debug\|router:fast\|openai/gpt-6-luna-fast#medium | 1 |
 | implement\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 |
+| search\|router:fast\|openai/gpt-6-luna-fast#medium | 1 |
 
 ### Resume vs fresh
 
@@ -138,11 +146,104 @@ _Verdict and false-refusal rates cover trusted classes only: dispatches whose cl
 
 ```
 
+### Classifier credential check (A4/A13)
+
+**Override used (2026-10-06, set by the orchestrator, global file):** `{"routing":{"engine":"advise","classifier":{"backend":"host","model":"opencode-go/deepseek-v4.1-flash","timeoutMs":10000}}}` (the model the owner named, A13). **Restored to `{"routing":{"engine":"advise"}}` at ≈20:35Z** (read back afterwards: the file holds exactly that; last written 2026-10-06T20:34:58Z).
+
+**Probe:** a dispatch to `fast` from session `ses_ef09ca71effe2FoiBgxxJuCg6W`, description `DF3 classifier probe 2`, prompt `Which word is longer, "alpha" or "omega"? Reply with one word only, no tools.` The rows of that session in `decisions.jsonl`:
+
+| Time (UTC) | Row |
+|---|---|
+| 20:32:57.803Z (probe 1) | `mode=advise`, `search`, confidence 0.8, `source=rules`, `trace.backend=null`, no `backendSkipped`. At or above `minClassConfidence` (0.7): no backend is consulted by design. |
+| **20:34:08.917Z (probe 2)** | `mode=advise`, `other` / `medium` / `single` / no needs, confidence 0.2, `source=rules`, **`trace.backend={"id":"host","status":"ok","latencyMs":1688,"label":"other"}`**, no `backendSkipped`. Below 0.7, so the backend was consulted, and it answered. |
+
+**Correction to the first reading.** The first reading took the rows at 20:34:26.940Z and 20:34:35.001Z as the probe's (`class` `design` / `implement`, confidence 0.5, `trace.backend=null`, `trace.backendSkipped="credentials"`) and concluded a credential-gate false positive. They are not the probe's. They belong to session `ses_ef099b1e0ffe7BcoD9Trb0TpTm`, which wrote three consecutive rows at 20:34:13Z, 20:34:26Z and 20:34:35Z (`design`/`heavy`, `design`/`heavy`, `implement`/`medium`; `risk=high`, `scope=multi`, needs `shell`/`edit`…): long task briefs, not a one-line probe. `decisions.jsonl` is one file for every host session (D15), so reading its tail mixes sessions. The probe's own facts (`other`/`medium`/`single`/no needs/0.2) are reproduced exactly by the rules on the probe inputs in a unit test; a one-line prompt cannot produce `design`/`high`/`multi`.
+
+**Result:** the credential gate did **not** block the probe and there is **no false positive on it**. The gate skipped the other session's briefs because it found a credential signal in their text (D14, working as designed); the rows store no prompt text, so which word fired cannot be re-read. The host backend **was consulted live once** with `opencode-go/deepseek-v4.1-flash` through `ctx.generate.text` (A4): `status=ok` in 1688 ms, label `other`. It was **not** verified in the form the plan's pass criterion asks for: `facts.source` stays `rules` because a backend answer of `other` never changes the rules facts (`mergeBackend`), and `/annotate-plan` on a two-step sample (the batched `classifyMany` path, F3) was not run. **`source: "host"` for both steps was not observed, so `host` stays documented as *experimental* (A4) until that run is done; the single-call path is live-verified, the batched path is not.**
+
+**Root cause and fix:** no defect in the gate. The patterns and the scrubber do not match the probe, the adapter passes `args.prompt` unchanged (`route()` runs before the legacy hook; `taskArgs` spreads the input), and the earlier `search` probe was simply above the threshold. Fix commit: `e99330c` `test(routing): pin the credential gate on the DF3 probe, ordinary prompts and real secrets` (regression tests, plus a comment in `scrub.ts` stating the rule). Details and the ten-prompt judgement: `docs/qa/cost-aware-routing/phase-df3-credential-gate.md`.
+
+**Liveness after the DF3 restart (inferred, not observed):** the host logged `cli starting` at 2026-10-06T20:32:23Z, after the sync at 18:41:27Z, so the synced code is what loaded; the first row with `mode=advise` is at 20:32:57Z (confirmed in `decisions.jsonl`). The `/router` marker line (`engine=… build=…`) was not read, so liveness rests on the restart timing and on that first `advise` row. The `cli starting` time is as recorded by the orchestrator; `opencode.log` was not re-read here.
+The 20:34:08.917Z probe is the only backend row in the observed log; the override was restored afterwards. See [the credential-gate report](phase-df3-credential-gate.md). **Host remains EXPERIMENTAL**: the plan's `source: host` for both steps was not observed.
+
 ## DF4
 
 **Sync:** `master` 71815eb → 64e523a at 2026-10-07T00:15:38Z (rollback tag `car/sync-4-prev` = 71815eb). A restart during `npm ci` left the plugin unloaded (incident in `run-log.md`); the owner restarted again.
 **Liveness (inferred):** host `cli starting` at 2026-10-07T00:51:16Z with no `failed to load plugin` line for the router afterwards; the router's `fast` agent resolved again. **Host version changed: 2.0.24** (it was 2.0.22 for DF1–DF3 and the Phase 3.2 smoke).
-**Advise period** (`node scripts/routing-stats.ts --since 2026-10-06T20:32:23Z`, read before the switch): 112 decision rows, 28 orchestrator resumes, 20 pinned; agreement 67/67 (100%); switched 0; estimated savings 0.00 ratio units; kept for lack of evidence 23 of 84 fresh routed dispatches. `pinned && switched` = 0 over all 191 decision rows.
-**Mode after checkpoint:** override `{"routing":{"engine":"enforce","profile":"balanced","margin":0.2}}` written at ≈00:52Z.
+**Restart time lost:** 00:15:38Z → 00:51:16Z, **35m38s**, including the incident and human idle time, not just restart execution.
+**Advise period** (`node scripts/routing-stats.ts --since 2026-10-06T20:32:23Z --until 2026-10-07T00:51:45Z --dir <copy>`): 112 decision rows, 28 orchestrator resumes, 20 pinned; agreement 67/67 (100%); switched 0; estimated savings 0.00 ratio units; kept for lack of evidence 23 of 84 fresh routed dispatches. `pinned && switched` = 0 over the original 191 decision rows.
+**Mode after checkpoint:** override `{"routing":{"engine":"enforce","profile":"balanced","margin":0.2}}` written just before 2026-10-07T00:51:45Z (not ≈00:52Z).
 **First enforce row:** 2026-10-07T00:51:45Z, `mode=enforce`, class `search` (0.8), chosen = best = `router:fast` (gpt-6-luna-fast#medium), `switched=false`, reason `kept:best-is-chosen`. No switch, so no child-model check was needed; the next switched row will be verified during 3.3/3.4.
-**Status:** DF4 complete; enforce period started 2026-10-07T00:52Z.
+**Status:** DF4 complete; enforce period started by 2026-10-07T00:51:45Z.
+
+```
+## Routing stats
+
+Window: 2026-10-06T20:32:23.000Z → 2026-10-07T00:51:45.000Z
+
+| Metric | Value |
+|---|---|
+| Dispatches | 112 |
+| Routed dispatches | 112 |
+| Delegate first attempts | 0 |
+| Floor lifts | 0 |
+| Pinned | 20 |
+| Agreement (best == chosen, non-pinned) | 67/67 (100.0%) |
+| Switched | 0 of 67 non-pinned routed (0.0%); enforced 0; failed 0 (verified 0 of 0 enforced) |
+| Estimated savings (ratio) | 0.00 over 67 rows |
+| Variant steps | 0 taken; pass n/a |
+| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 28 of 112 routed dispatches |
+| Kept for lack of evidence (A27, fresh dispatches) | 23 of 84 fresh routed dispatches |
+
+### By class
+
+| Class | Dispatches |
+|---|---|
+| debug | 2 |
+| design | 10 |
+| implement | 21 |
+| mechanical | 12 |
+| other | 1 |
+| recon | 19 |
+| review | 18 |
+| search | 1 |
+
+### By key
+
+| Key | Dispatches | Attempts | Pass | Fail | Unverifiable | Pass rate | False refusals | Refusal rate | USD/attempt (lifetime) |
+|---|---|---|---|---|---|---|---|---|---|
+| debug\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| debug\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 | 7 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/7 (0.0%) | n/a |
+| design\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 10 | 11 | 0 | 0 | 0 | n/a | 0 | 0/11 (0.0%) | n/a |
+| design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 0 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| implement\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 1 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/1 (0.0%) | n/a |
+| implement\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 20 | 20 | 7 | 1 | 4 | 7/8 (87.5%) | 0 | 0/20 (0.0%) | n/a |
+| mechanical\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 12 | 12 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/12 (0.0%) | n/a |
+| other\|router:fast\|openai/gpt-6-luna-fast#medium | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| recon\|router:fast\|openai/gpt-6-luna-fast#medium | 5 | 5 | 0 | 0 | 0 | n/a | 0 | 0/5 (0.0%) | n/a |
+| recon\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 14 | 17 | 0 | 1 | 0 | 0/1 (0.0%) | 0 | 0/17 (0.0%) | n/a |
+| review\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 17 | 19 | 0 | 0 | 0 | n/a | 0 | 0/19 (0.0%) | n/a |
+| review\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 1 | 14 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/14 (0.0%) | n/a |
+| search\|router:fast\|openai/gpt-6-luna-fast#medium | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+
+### Gated by evidence (trace.argmin)
+
+| Cheapest key held back | Rows |
+|---|---|
+| implement\|router:fast\|openai/gpt-6-luna-fast#medium | 14 |
+| design\|router:medium\|anthropic/claude-sonnet-5-5#xhigh | 8 |
+| recon\|router:fast\|openai/gpt-6-luna-fast#medium | 6 |
+| mechanical\|router:fast\|openai/gpt-6-luna-fast#medium | 4 |
+| review\|router:fast\|openai/gpt-6-luna-fast#medium | 4 |
+| implement\|host:general\|anthropic/claude-opus-5-5#default | 2 |
+
+### Resume vs fresh
+
+| Step | Resume | Fresh |
+|---|---|---|
+| variant | 0 | 0 |
+| retry | 0 | 0 |
+| escalate | 0 | 0 |
+
+_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._
+```

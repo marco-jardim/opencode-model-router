@@ -187,7 +187,14 @@ export function scrubAndCut(text: string, max: number, options: ScrubOptions = {
 /**
  * Words and shapes that mean the text is about, or contains, a credential.
  * Whole words only ("tokenizer" is not a hit); env-style names such as
- * `GITHUB_TOKEN` are.
+ * `GITHUB_TOKEN` are. `token(s)` is a hit in its LLM sense too ("fix the token
+ * counter"): the text cannot tell the two apart, a false skip costs only the
+ * rules facts, a false pass sends a credential off the machine (D14). A lone
+ * `key` is prose ("cache key", "primary key") unless it is assigned ("the key is
+ * …", `SORT_KEY=…`, caught by the scrubber below); only api/access/private/ssh/
+ * signing key and capitalised `*_KEY` names are hits as words. The DF3 probe
+ * ("Which word is longer, …") is not a hit: see
+ * test/unit/routing-classify.index.test.ts.
  */
 const CREDENTIAL_WORD_RE =
   /\b(?:passwords?|passwd|passphrases?|secrets?|credentials?|api[_ -]?keys?|access[_ -]?keys?|private[_ -]?keys?|ssh[_ -]?keys?|signing[_ -]?keys?|tokens?|bearer|authorization|oauth)\b|[A-Za-z0-9]_(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)\b|-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)|(?<![\w])\.env\b/i;
