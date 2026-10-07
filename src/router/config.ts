@@ -14,6 +14,7 @@ import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
 import type { PluginLogger } from "./logger";
+import { sanitizePluginAgents, type PluginAgentConfig } from "./plugin-agents";
 
 /**
  * Filename of the optional user overrides file (global and project copies share
@@ -378,6 +379,15 @@ export interface RouterConfig {
    * subagents; a primary agent is the orchestrator.
    */
   subagentTiers?: Record<string, string>;
+  /**
+   * Subagents defined by the router config instead of opencode.json (#81):
+   * name → tier, description, optional prompt/steps and a router-published
+   * permission policy (`readOnly` and/or `permission`, plus `allowTools`).
+   * Only tiers.json and the global override may set it (A18). Validated per
+   * entry after merge: a bad entry is dropped with a config notice, never the
+   * layer. Absent ⇒ nothing is registered.
+   */
+  agents?: Record<string, PluginAgentConfig>;
   /** Experimental, opt-in features. Off by default. */
   experimental?: { verifiedDelegateTool?: boolean };
   /** Cost-aware routing engine (#74). Absent = today's static routing, byte for byte. */
@@ -2205,6 +2215,15 @@ function collectOverrideLayers(
           message: `ignoring ${dropped.join(", ")} from ${p}: only the global override may set it`,
         });
       }
+      // A18 (#81): a cloned repository must not register agents, let alone
+      // ones with permissions. The rest of the project layer still applies.
+      if (Object.hasOwn(data, "agents")) {
+        delete data.agents;
+        notices?.push({
+          source: p,
+          message: `ignoring agents from ${p}: only tiers.json or the global override may define agents (A18)`,
+        });
+      }
     }
     layers.push({ path: p, data, project });
   }
@@ -2654,7 +2673,32 @@ function buildConfig(
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
   for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
   dropIgnoredCandidates(cfg);
+  applyPluginAgents(cfg, layers, notices);
   return cfg;
+}
+
+/**
+ * Validate the merged `agents` block per entry against the active preset (#81).
+ * Runs after the persisted preset is applied, so a `/preset` rebuild re-checks
+ * every `tier`. A bad entry is removed with a notice naming its key path and
+ * file; the other entries, the layer and `routing` are kept (#80).
+ */
+function applyPluginAgents(cfg: RouterConfig, layers: readonly OverrideLayer[], notices: ConfigNotice[]): void {
+  if (!Object.hasOwn(cfg, "agents")) return;
+  const tiers = cfg.presets[cfg.activePreset] ?? Object.values(cfg.presets)[0] ?? {};
+  const { agents, issues } = sanitizePluginAgents(cfg.agents, { activePreset: cfg.activePreset, tiers });
+  // Project layers never carry `agents` (stripped while collecting), so the
+  // source is the global override when it names the entry, else tiers.json.
+  const globalAgents = layers.find((layer) => !layer.project)?.data.agents;
+  for (const issue of issues) {
+    const name = issue.name;
+    const source = isPlainObject(globalAgents) && (name === undefined || Object.hasOwn(globalAgents, name))
+      ? layers.find((layer) => !layer.project)!.path
+      : configPath();
+    notices.push({ source, message: `${issue.path}: ${issue.message} (${source})` });
+  }
+  if (agents === undefined) delete cfg.agents;
+  else cfg.agents = agents;
 }
 
 /**
@@ -3116,6 +3160,30 @@ export function routerStatusLines(
 ): string[] {
   return [
     formatRouterLine(resolveRouting(cfg, host, logger).engine),
+    ...pluginAgentLines(cfg),
     ...getConfigNotices(dir).map((notice) => `router: config notice: ${notice.message}`),
+  ];
+}
+
+/**
+ * The `/router` "Plugin agents" listing (#81): one line per agent of the
+ * `agents` block. Empty without the block, so `/router` output is unchanged.
+ */
+export function pluginAgentLines(cfg: RouterConfig): string[] {
+  const agents = cfg.agents;
+  if (agents === undefined) return [];
+  const names = Object.keys(agents);
+  if (names.length === 0) return [];
+  const presetName = resolvePresetName(cfg, cfg.activePreset);
+  const preset = presetName !== undefined && Object.hasOwn(cfg.presets, presetName) ? cfg.presets[presetName] : undefined;
+  return [
+    "router: Plugin agents:",
+    ...names.map((name) => {
+      const agent = agents[name];
+      const tier = preset !== undefined && Object.hasOwn(preset, agent.tier) ? preset[agent.tier] : undefined;
+      const policy = agent.readOnly === true ? "read-only" : "custom permission";
+      const model = tier === undefined ? "?" : `${tier.model}${tier.variant ? `#${tier.variant}` : ""}`;
+      return `router:   ${name} → ${agent.tier} (${model}), ${policy}`;
+    }),
   ];
 }
