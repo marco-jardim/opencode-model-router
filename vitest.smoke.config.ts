@@ -10,6 +10,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    globalSetup: ["test/setup/smoke-tmp-guard.ts"],
     root: ".",
     include: ["test/smoke/**/*.test.ts"],
     exclude: ["node_modules/**", "dist/**", "tmp/**"],

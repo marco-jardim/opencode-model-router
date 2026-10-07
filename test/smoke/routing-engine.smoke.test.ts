@@ -52,7 +52,7 @@ const SEARCH_PROMPT = "[route class=search risk=low scope=single]\nFind every us
 afterAll(async () => { await stopAllHosts(); }, 60_000);
 
 // ---- the user's live store and live config: read-only snapshots taken before the first scenario and compared after the last ----
-const LIVE_STORE = path.join(tmpdir(), "opencode-model-router-trajectory");
+const LIVE_STORE = path.join(process.env.OMR_SMOKE_REAL_TMPDIR ?? tmpdir(), "opencode-model-router-trajectory");
 const LIVE_CONFIG = path.join(homedir(), ".config", "opencode");
 interface FileStat { size: number; mtimeMs: number }
 async function listDir(dir: string): Promise<Record<string, FileStat>> {

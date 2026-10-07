@@ -19,6 +19,7 @@ import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { keyedSmokeEnv } from "../setup/smoke-tmp-guard";
 
 const RUN = process.env.RUN_OC_SMOKE === "1";
 const d = RUN ? describe : describe.skip;
@@ -168,7 +169,7 @@ function runEnforced(prompt: string, outFile: string) {
     ],
     {
       cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_ENFORCE: "1" },
+      env: { ...keyedSmokeEnv(), MODEL_ROUTER_ENFORCE: "1" },
       encoding: "utf8",
       maxBuffer: 20 * 1024 * 1024,
       timeout: 180_000,

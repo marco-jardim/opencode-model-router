@@ -27,6 +27,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { keyedSmokeEnv } from "../setup/smoke-tmp-guard";
 import {
   prepareFixtureRepo,
   type FixtureRepo,
@@ -198,7 +199,7 @@ d("layer-2 acceptance gate smoke", () => {
           ],
           {
             cwd: REPO_ROOT,
-            env: { ...process.env, MODEL_ROUTER_ENFORCE: "1" },
+            env: { ...keyedSmokeEnv(), MODEL_ROUTER_ENFORCE: "1" },
             encoding: "utf8",
             maxBuffer: 20 * 1024 * 1024,
             timeout: 180_000,
@@ -446,7 +447,7 @@ function runOpencode(project: VerifyProject, prompt: string): OcRun {
       {
         cwd: project.repo.dir,
         env: {
-          ...process.env,
+          ...keyedSmokeEnv(),
           MODEL_ROUTER_ENFORCE: "1",
           MODEL_ROUTER_DISPATCH_DEBUG: "1",
           OPENCODE_CONFIG: TEMP_CONFIG,

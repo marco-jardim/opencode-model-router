@@ -8,6 +8,8 @@ import { DEFAULT_OUTCOMES_DIRNAME } from "../../src/routing/outcomes/types";
 import { resolveOutcomesDir } from "../../src/routing/outcomes/persist";
 import { assertTmpIsGuarded, guardedTmpdir, REAL_TMPDIR_ENV, RUN_ID_ENV, sameDir } from "../setup/home-guard";
 import { removeRunGuardDirs } from "../setup/global-guard";
+import { keyedSmokeEnv, setup as setupSmoke, teardown as teardownSmoke } from "../setup/smoke-tmp-guard";
+import { execFileSync } from "node:child_process";
 
 const realTmp = (): string => {
   const value = process.env[REAL_TMPDIR_ENV];
@@ -18,6 +20,28 @@ const realTmp = (): string => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("temp directory guard", () => {
+  it("QA-G-C2/C10: smoke setup isolates native child temp and keyed home, teardown restores env", () => {
+    const names = ["TEMP", "TMP", "TMPDIR", "OMR_SMOKE_REAL_TMPDIR"];
+    const before = names.map((name) => process.env[name]);
+    const real = tmpdir();
+    let privateTmp = "";
+    try {
+      setupSmoke();
+      privateTmp = process.env.TEMP ?? "";
+      expect(process.env.OMR_SMOKE_REAL_TMPDIR).toBe(real);
+      expect(privateTmp).toContain("omr-smoke-tmp-");
+      expect(existsSync(privateTmp)).toBe(true);
+      const env = keyedSmokeEnv();
+      expect(env.HOME).toBe(env.USERPROFILE);
+      expect(env.HOME).not.toBe(homedir());
+      expect(env.XDG_CONFIG_HOME).toBe(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"));
+      expect(env.XDG_DATA_HOME).toBe(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"));
+      const native = JSON.parse(execFileSync(process.execPath, ["-e", "console.log(JSON.stringify({home:require('node:os').homedir(),tmp:require('node:os').tmpdir()}))"], { env, encoding: "utf8" })) as { home: string; tmp: string };
+      expect(native).toEqual({ home: env.HOME, tmp: privateTmp });
+    } finally { teardownSmoke(); }
+    expect(existsSync(privateTmp)).toBe(false);
+    expect(names.map((name) => process.env[name])).toEqual(before);
+  });
   it("os.tmpdir(), named and default, is the guarded private dir and never the real one", () => {
     expect(tmpdir).toBe(guardedTmpdir);
     expect(os.tmpdir).toBe(guardedTmpdir);
