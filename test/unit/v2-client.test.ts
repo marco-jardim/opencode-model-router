@@ -390,6 +390,7 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
     const { runtime, toolContext, execute, context } = fixture();
     const order: string[] = [];
     const onCreated = vi.fn(async (sessionID: string) => { order.push(`created:${sessionID}`); });
+    const onConfirmed = vi.fn(async (sessionID: string) => { order.push(`confirmed:${sessionID}`); });
     execute.mockImplementationOnce(async (input, childContext) => {
       order.push("execute");
       expect(input).toEqual({
@@ -402,9 +403,10 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
     });
     await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
       parentSessionID: "parent", agent: "medium", prompt: "[router escalation] retry", cwd: "/artifact",
-      model: { providerID: "p", modelID: "model", variant: "xhigh" }, resumeSessionID: "child", onCreated,
+      model: { providerID: "p", modelID: "model", variant: "xhigh" }, resumeSessionID: "child", onCreated, onConfirmed,
     }))).resolves.toEqual({ sessionID: "child", text: "resumed result" });
-    expect(order).toEqual(["created:child", "execute"]);
+    expect(order).toEqual(["created:child", "execute", "confirmed:child"]);
+    expect(onConfirmed).toHaveBeenCalledOnce();
     expect(onCreated).toHaveBeenCalledTimes(1);
     expect(context.session.get).toHaveBeenCalledWith({ sessionID: "child" }, { signal: expect.any(AbortSignal) });
     expect(context.session.move).not.toHaveBeenCalled();
@@ -412,15 +414,18 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
 
   it("a bare model and no variant resumes with a bare model ref", async () => {
     const { runtime, toolContext, execute } = fixture();
+    const onConfirmed = vi.fn(async () => {});
     execute.mockImplementationOnce(async (input) => {
+      expect(onConfirmed).not.toHaveBeenCalled();
       expect(input).toEqual({
         agent: "heavy", description: "Router heavy delegation", prompt: "go", sessionID: "child", model: "p/model", background: false,
       });
       return { output: { sessionID: "child", status: "completed", output: "ok" } };
     });
     await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
-      parentSessionID: "parent", agent: "heavy", prompt: "go", model: { providerID: "p", modelID: "model" }, resumeSessionID: "child", onCreated: async () => {},
+      parentSessionID: "parent", agent: "heavy", prompt: "go", model: { providerID: "p", modelID: "model" }, resumeSessionID: "child", onCreated: async () => {}, onConfirmed,
     }))).resolves.toEqual({ sessionID: "child", text: "ok" });
+    expect(onConfirmed).toHaveBeenCalledExactlyOnceWith("child");
   });
 
   it("refuses a session that is not a child of the calling session before sending anything", async () => {
@@ -458,16 +463,29 @@ describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
 
   it("a host that answers with another child id is an error and the resumed child is interrupted", async () => {
     const { runtime, toolContext, execute, context } = fixture();
+    const onConfirmed = vi.fn(async () => {});
     execute.mockImplementationOnce(async (_input, childContext) => {
       await childContext.progress({ sessionID: "another", status: "running" });
       return { output: { sessionID: "another", status: "completed", output: "x" } };
     });
     await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
-      prompt: "go", resumeSessionID: "child", onCreated: async () => {},
+      prompt: "go", resumeSessionID: "child", onCreated: async () => {}, onConfirmed,
     }))).rejects.toMatchObject({ name: "ResumeRejectedError", sessionID: "child", message: expect.stringContaining("the host started another child (another) instead") });
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
     // QA-2.3-5: the child the host started instead is stopped and removed too, not left running
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "another" }, undefined);
+    expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "another" });
+    expect(onConfirmed).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stray resume result without progress, without confirming the original child", async () => {
+    const { runtime, toolContext, execute, context } = fixture();
+    const onConfirmed = vi.fn(async () => {});
+    execute.mockImplementationOnce(async () => ({ output: { sessionID: "another", status: "completed", output: "x" } }));
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "go", resumeSessionID: "child", onCreated: async () => {}, onConfirmed,
+    }))).rejects.toBeInstanceOf(ResumeRejectedError);
+    expect(onConfirmed).not.toHaveBeenCalled();
     expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "another" });
   });
 

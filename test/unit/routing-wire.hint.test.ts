@@ -26,11 +26,10 @@ function decision(over: Partial<Decision> = {}): Decision {
 describe("buildHint", () => {
   const descriptions = new Map([["heavy", "Opus for architecture and hard debugging"]]);
 
-  it("names the destination agent with its description, the pick it replaces and the reason, in two lines", () => {
+  it("names only the class and destination, without live decision numbers or the previous pick", () => {
     const hint = buildHint(decision(), { class: "implement" }, descriptions)!;
-    expect(hint.split("\n")).toHaveLength(2);
-    expect(hint).toContain("Route hint: for implement work like this turn, prefer @heavy (Opus for architecture and hard debugging) over @medium.");
-    expect(hint).toContain("Why: switched: C(best)=5");
+    expect(hint).toBe("Route hint: for implement work like this turn, prefer @heavy (Opus for architecture and hard debugging).");
+    expect(buildHint(decision({ reason: "different costs: 12345", confidence: 0.99, chosen: choice("fast", "low") }), { class: "implement" }, descriptions)).toBe(hint);
   });
 
   it("says nothing when nothing would switch, the dispatch is pinned, or there is no target", () => {
@@ -44,11 +43,12 @@ describe("buildHint", () => {
     expect(buildHint(decision({ best: choice("medium", "high"), target: target("medium", "high") }), { class: "implement" }, descriptions)).toBeNull();
   });
 
-  it("an agent without a description is named alone; a long description or reason is cut to one line", () => {
+  it("an agent without a description is named alone; a long description is cut to one line and the reason is omitted", () => {
     const plain = buildHint(decision({ target: target("general", null), best: choice("general", "default") }), { class: "debug" }, new Map())!;
-    expect(plain).toContain("prefer @general over @medium.");
+    expect(plain).toContain("prefer @general.");
     const long = buildHint(decision({ reason: `${"why ".repeat(200)}\nmore` }), { class: "implement" }, new Map([["heavy", `${"x".repeat(200)}\nsecond line`]]))!;
-    expect(long.split("\n")).toHaveLength(2);
+    expect(long.split("\n")).toHaveLength(1);
+    expect(long).not.toContain("why");
     expect(long.length).toBeLessThan(400);
   });
 });

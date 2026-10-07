@@ -13,6 +13,7 @@ import { resolveRouting, type RouterConfig } from "../../router/config";
 import { swapTaxonomyLine } from "../../router/protocol";
 import { generateTaxonomy } from "../engine/protocol-line";
 import type { HostAgentInfo } from "../engine/types";
+import type { PluginLogger } from "../../router/logger";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -46,8 +47,8 @@ export function v1AgentInfos(raw: readonly unknown[]): HostAgentInfo[] {
  * True when the config carries an explicit `routing.roles` that names at least one agent (the only thing that can make the v1 line differ
  * from today's). `roles: {}` is an explicit "none": nothing to list, so nothing is fetched or changed.
  */
-export function hasExplicitV1Roles(cfg: RouterConfig): boolean {
-  const routing = resolveRouting(cfg, "v1");
+export function hasExplicitV1Roles(cfg: RouterConfig, logger?: Pick<PluginLogger, "warn">): boolean {
+  const routing = resolveRouting(cfg, "v1", logger);
   return routing.applied.rolesSource === "configured" && Object.values(routing.roles).some((agents) => agents.length > 0);
 }
 
@@ -55,9 +56,9 @@ export function hasExplicitV1Roles(cfg: RouterConfig): boolean {
  * `prompt` (the assembled system prompt) with its `R:` line extended by the configured roles. Returns `prompt` itself when the roles are not
  * explicit, when the agent list is unknown, or when no configured agent is usable (`generateTaxonomy` then answers the shipped line).
  */
-export function applyV1Roles(prompt: string, cfg: RouterConfig, agents: readonly HostAgentInfo[] | null): string {
-  if (!hasExplicitV1Roles(cfg) || agents === null) return prompt;
-  const routing = resolveRouting(cfg, "v1");
+export function applyV1Roles(prompt: string, cfg: RouterConfig, agents: readonly HostAgentInfo[] | null, logger?: Pick<PluginLogger, "warn">): string {
+  if (!hasExplicitV1Roles(cfg, logger) || agents === null) return prompt;
+  const routing = resolveRouting(cfg, "v1", logger);
   const line = generateTaxonomy({ cfg, routing, host: "v1", store: null, agents });
   return swapTaxonomyLine(prompt, cfg, line);
 }

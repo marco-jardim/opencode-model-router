@@ -26,3 +26,21 @@ Delegation incidents, take-overs (§0.10.2), restarts and sync incidents, in tim
 - Root cause: process, not code. `npm ci` deletes `node_modules` first, and this sync ran it although `package-lock.json` did not change (only two `package.json` scripts were added: `smoke:routing`, `smoke:v1`).
 - Mitigation (sync procedure from now on): run `npm ci` only when `package-lock.json` differs between the rollback tag and the new head, and finish it BEFORE asking for a restart; never sync while a restart may be pending.
 - Advise-period stats (`--since 2026-10-06T20:32:23Z`, recorded before the incident): 112 decision rows, 28 resumes, 20 pinned, agreement 67/67, switched 0, kept for lack of evidence 23 of 84 fresh; `pinned && switched` = 0 over all 191 decision rows.
+
+## Restart timing ledger (acceptance #13, QA-G-B10)
+
+All times below are **UTC**, unlike the early local-time incident rows above. Duration is wall time from sync to the probe (or host-start proxy); it is **not** measured service downtime. DF2–DF4 liveness is inferred, not a read of the `/router` build marker. This ledger supersedes the DF2 row's historical "awaiting restart" status.
+
+| Restart | Code sync | Probe / host-start proxy | Sync → probe duration | Evidence / qualification |
+|---|---|---|---|---|
+| DF1 | ≈2026-10-06T09:35:00Z | 2026-10-06T11:41:54Z | ≈2h 06m 54s | `/router` read: `engine=static build=2.2.0+8ce54f2`. Includes human idle time before the probe, not just restart time. Host start: 11:41:18.199Z. |
+| DF2 | 2026-10-06T15:22:43Z | 2026-10-06T15:27:38Z | 4m 55s | Host-start proxy (log: 15:27:38.029Z); liveness inferred, `/router` marker not read. |
+| DF3 | 2026-10-06T18:41:27Z | 2026-10-06T20:32:23Z | 1h 50m 56s | Host-start proxy (log: 20:32:23.782Z); liveness inferred, `/router` marker not read. |
+| DF4 — failed start | 2026-10-07T00:15:38Z | 2026-10-07T00:16:07Z | 29s (to failed start) | Plugin failed to load during `npm ci`; not a successful liveness probe. Host 2.0.22; multiple concurrent `serve` startup lines at 00:16:06.884Z–00:16:07.028Z belong to this incident. |
+| DF4 — good start | 2026-10-07T00:15:38Z | 2026-10-07T00:51:16Z | **35m 38s total**, including the incident | Host-start proxy (log: 00:51:16.123Z); liveness inferred from successful agent resolution/no router load failure, marker not read. **Host is now 2.0.24.** |
+| Phase 3.3 — unplanned restart 1 | n/a (no code sync) | 2026-10-07T02:17:33.326Z | Not measured | `cli starting`, `serve --service`, host 2.0.24. Subagent runs interrupted, resumed by session id, no merged work redone. |
+| Phase 3.3 — unplanned restart 2 (reported) | n/a (no code sync) | Later start time **unverified** | Not measured | Subagent runs interrupted, resumed by session id, no merged work redone (dispatch report). The read-only scan below contained no later matching host-start line; do not invent a timestamp. |
+
+Startup evidence was read, not modified, from `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`, filtering actual `message="cli starting"` lines containing `serve` (not `spawning process` lines that merely quote a search command). The latest matching start available during this fix was `2026-10-07T02:17:33.326Z`. The orchestrator must supply/confirm the second unplanned restart's timestamp before acceptance #13 is fully evidenced.
+
+**DF5 handoff (QA-G-A1 / QA-2.2-10):** measure the orchestrator's cache-read share with the stable `advise` hint enabled against the `shadow` baseline; include token totals, the denominator and sample windows. The dropped DF3 measurement is still outstanding. `enforce` now emits no per-turn hint.

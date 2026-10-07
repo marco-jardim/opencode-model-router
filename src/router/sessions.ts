@@ -863,8 +863,8 @@ export function resetDispatchRegistry(): void {
 // Phase 2.2 / 2.3 integration — the single-writer runner token (QA-2.2-1, QA-2.3-1). Self-contained block.
 //
 // The delegate runner (2.3) dispatches producer and grader children through the host's native `subagent` tool, and the
-// host runs the plugin's `tool.execute.before` hook for those calls exactly as it does for the orchestrator's own. The 2.2
-// dispatch router must not touch them: the runner has already decided the agent and model#variant of the attempt, writes
+// host does NOT run `tool.execute.before` for those calls on measured versions 2.0.22 and 2.0.24. The mark is defensive
+// for hosts that do: the dispatch router must not touch them, since the runner has already decided the agent and model#variant, writes
 // the attempt's decision row and registers the child itself (one writer). The runner announces each native call here, just
 // before it makes it, keyed by the calling session, the agent and a hash of the prompt; the router consumes the mark when
 // the hook arrives and leaves the call alone. The router only looks at a call that carries the runner's own `description`

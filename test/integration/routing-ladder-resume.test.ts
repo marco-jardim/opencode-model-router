@@ -50,6 +50,8 @@ interface Scenario {
   readonly catalog?: RunnerCatalogModel[];
   /** The fake host refuses every resume (not a child / gone). */
   readonly rejectResume?: boolean;
+  /** Reject after the early registry callback, as a host that unexpectedly starts another child does. */
+  readonly strayResume?: boolean;
   /** Run `fn` while attempt `n` runs (n = 1-based producer attempt). */
   readonly during?: (attempt: number, sid: string) => void;
   /** Never settle the producer of attempt `n` (it only ends when its signal aborts). */
@@ -176,6 +178,8 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
           events.push(`create:${sid}`);
         }
         await request.onCreated(sid);
+        if (resume !== undefined && s.strayResume === true) throw new ResumeRejectedError(resume, "the host started another child instead");
+        await request.onConfirmed?.(sid);
         const options = await params(sid, request.agent, request.model);
         runs.push({ kind: "producer", sid, agent: request.agent, model: request.model, resumeSessionID: resume, prompt: request.prompt, options });
         s.during?.(attempt, sid);
@@ -614,6 +618,24 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
   });
 
   describe("telemetry (engine shadow)", () => {
+    it("a stray resume writes only the fresh fallback row for that attempt", async () => {
+      const outcomes = mkdtempSync(join(tmpdir(), "ladder-stray-outcomes-"));
+      dirs.push(outcomes);
+      const t = await setup({ tiers: OWNER, routing: { engine: "shadow", minClassConfidence: 0, outcomes: { path: outcomes } }, verdicts: [false, true], strayResume: true });
+      await t.run();
+      const bundle = acquireOutcomes({ dir: outcomes, tuning: {}, logger: { warn: () => undefined } });
+      try {
+        await bundle.flusher.flushNow();
+        const decisions = (await bundle.persister.readRows()).rows.filter((r): r is DecisionRow => r.kind === "decision");
+        expect(decisions.map((r) => [r.step, r.resume, r.childSessionID])).toEqual([
+          ["dispatch", false, "child-1"], ["variant", false, "child-2"],
+        ]);
+        expect(t.runs).toHaveLength(2);
+      } finally {
+        await bundle.release();
+      }
+    });
+
     it("writes one decision row per attempt with its step label and resume flag, and scores the variant attempt", async () => {
       const outcomes = mkdtempSync(join(tmpdir(), "ladder-resume-outcomes-"));
       dirs.push(outcomes);

@@ -665,11 +665,19 @@ describe("/router stats and the checkpoint line", () => {
   it("static: reads the directory without creating or quarantining anything, and --dir overrides the configured store", async () => {
     seed(ROWS[1]!, ROWS[2]!);
     const before = readdirSync(store).sort();
-    const hooks = await plugin(null); // no routing block: the engine is static
+    const hooks = await plugin({ engine: "static" });
     const text = await ask(hooks, `stats --dir ${store}`);
     expect(text).toContain("| Dispatches | 2 |");
     expect(readdirSync(store).sort()).toEqual(before); // read-only: no outcomes.json, no temp files
     expect(`${text}\n`).toBe(script("--dir", store).stdout);
+  });
+
+  it.each(["v1", "v2"] as const)("without a routing block /router stats is the legacy help on %s (D1)", async (host) => {
+    const hooks = await plugin(null, host);
+    const before = readdirSync(store).sort();
+    expect(await ask(hooks, `stats --dir ${store}`)).toBe(await ask(hooks, "help"));
+    expect(await ask(hooks, "stats")).not.toContain("/router stats");
+    expect(readdirSync(store).sort()).toEqual(before);
   });
 
   it("a usage error comes back as the script prints it, and an empty store says so", async () => {

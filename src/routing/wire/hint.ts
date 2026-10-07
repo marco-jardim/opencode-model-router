@@ -5,7 +5,7 @@
  *  - swap the taxonomy line of the delegation protocol for `generateTaxonomy(...)` (a class moves only when the winner
  *    has ≥ 5 recorded outcomes, so the line stays the shipped one until evidence exists, D2), and append the route-line
  *    paragraph of `protocol.ts`;
- *  - add one extra system part, the per-turn hint: at most two lines, `agent id (description) — reason`, computed from the
+ *  - in advise only, add one extra system part, the per-turn hint: stable class and destination text, computed from the
  *    latest user message with the RULES classifier only (a hint never costs a model call) and cached for the turn, so the
  *    system prompt does not change between the steps of one turn.
  *
@@ -34,7 +34,6 @@ const TAXONOMY_MEMO_LIMIT = 16;
 export const HINT_MAX_USER_CHARS = 4_000;
 const HINT_MEMO_LIMIT = 100;
 const DESCRIPTION_MAX = 60;
-const REASON_MAX = 200;
 
 function oneLine(text: string, max: number): string {
   const collapsed = text.replace(/\s+/g, " ").trim();
@@ -42,7 +41,7 @@ function oneLine(text: string, max: number): string {
 }
 
 /**
- * The hint text (≤ 2 lines) for a decision that wants to leave the orchestrator's usual agent, or `null` when there is
+ * Stable one-line class/destination text for a decision that wants to leave the orchestrator's usual agent, or `null` when there is
  * nothing to say: no switch, no target, a pinned decision, or a switch inside the same agent (a variant change of the pick
  * says nothing the orchestrator can act on, QA-2.2-6).
  */
@@ -52,10 +51,7 @@ export function buildHint(decision: Decision, facts: Pick<TaskFacts, "class">, d
   if (target.agent.id === chosen.agent) return null;
   const described = descriptions.get(target.agent.id);
   const destination = `@${target.agent.id}${described === undefined ? "" : ` (${oneLine(described, DESCRIPTION_MAX)})`}`;
-  return [
-    `Route hint: for ${facts.class} work like this turn, prefer ${destination} over @${chosen.agent}.`,
-    `Why: ${oneLine(decision.reason, REASON_MAX)}`,
-  ].join("\n");
+  return `Route hint: for ${facts.class} work like this turn, prefer ${destination}.`;
 }
 
 /** Text of the latest user message that is the user's own (not a synthetic `Instructions from:` attachment). */
@@ -198,7 +194,7 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
           added.add(rewritten);
           system[index] = rewritten;
         }
-        const hint = await hintFor(prepared, view, input);
+        const hint = mode === "advise" ? await hintFor(prepared, view, input) : null;
         if (hint !== null) {
           added.add(hint);
           system.push(hint);

@@ -965,6 +965,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               let producerSid: string | undefined;
               /** The child this attempt actually runs on; a resume the host refuses starts a fresh one instead. */
               let resumeTarget: string | undefined = attemptPlan.resumeSessionID;
+              let confirmProducer: (() => void) | undefined;
               const registerProducer = async (sid: string) => {
                 producerSid = sid;
                 if (!producerSessions.includes(sid)) producerSessions.push(sid);
@@ -976,9 +977,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   if (tierCfg) effortOverrides.set(sid, tier, attemptPlan.fresh === "invalid-variant" ? { ...tierCfg, variant: undefined, effort } : tierCfg, effort);
                 }
                 // Phase 2.3: a distinct attempt in the dispatch registry (with its step label) and, when the engine is
-                // live, a decision row. Before the child can run, so its first step event finds the registration.
+                // live, a decision row. Register before the first step; a resume's row waits for host identity confirmation.
                 if (recording && delegation !== null) {
-                  attemptRecorder?.record({
+                  confirmProducer = attemptRecorder?.record({
                     childSessionID: sid,
                     parentSessionID: toolCtx?.sessionID ?? null,
                     plan: attemptPlan,
@@ -986,7 +987,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     facts: delegation.facts,
                     acceptance: delegation.acceptance,
                     resumed: sid === resumeTarget,
-                  });
+                  }, ctx.routerChildRunner !== undefined && sid === resumeTarget);
                 }
                 // Keep the ORIGINAL dispatch reference across retries/escalations:
                 // recapturing after a failed attempt would excuse its regression.
@@ -1058,6 +1059,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   signal: childAbort!.signal,
                   ...(resume === undefined ? {} : { resumeSessionID: resume }),
                   onCreated: registerProducer,
+                  ...(resume === undefined ? {} : {
+                    onConfirmed: async (sid: string) => { if (sid === producerSid) confirmProducer?.(); },
+                  }),
                 });
                 const res: any = await withTimeout<unknown>(
                   ctx.routerChildRunner ? (async () => {
@@ -2333,7 +2337,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (ctx.routerHost !== "v2") {
         const baseline = systemPrompt;
         try {
-          if (hasExplicitV1Roles(cfg)) systemPrompt = applyV1Roles(baseline, cfg, v1AgentsNow());
+          if (hasExplicitV1Roles(cfg, logger)) systemPrompt = applyV1Roles(baseline, cfg, v1AgentsNow(), logger);
         } catch (error) {
           systemPrompt = baseline;
           logger.warn("[router] routing.roles: the R: line could not be extended; the protocol is unchanged", { error: describeError(error) });
@@ -2493,7 +2497,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           const catalog = await fetchCatalog();
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
           text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
-        } else if (sub === "stats") {
+        } else if (sub === "stats" && cfg.routing !== undefined) {
           // 2.4.5 (D18): the table of `npm run routing:stats`, run by the very same driver over the configured store.
           try {
             text = formatStatsReply(await runStatsCommand(parts.slice(1).join(" "), { cfg, host: ctx.routerHost === "v2" ? "v2" : "v1", logger }));

@@ -216,16 +216,18 @@ const loggedFallbacks = new Set<string>();
  * Instances that share a directory both qualify; the claim of the call (A3) lets the first one act.
  */
 function ownsSession(mine: string, sessionDirectory: string, logger: { debug?: (message: string, extra?: Record<string, unknown>) => void }): boolean {
+  // Directory preference is diagnostic only (QA-G-A6): the receiving instance must act even if the preferred one
+  // is live, because measured hosts deliver tool hooks only once. claimCall, not directory ownership, de-duplicates.
   const target = normalizeDirectory(sessionDirectory);
   const directories = [...liveInstances.values()].map(normalizeDirectory);
   const own = normalizeDirectory(mine);
-  if (directories.includes(target)) return own === target;
+  if (directories.includes(target) && own === target) return true;
   const ancestors = directories.filter((directory) => isSameOrInside(directory, target));
-  if (ancestors.length > 0) return own === ancestors.reduce((deepest, directory) => (directory.length > deepest.length ? directory : deepest));
+  if (ancestors.length > 0 && own === ancestors.reduce((deepest, directory) => (directory.length > deepest.length ? directory : deepest))) return true;
   if (!loggedFallbacks.has(target)) {
     loggedFallbacks.add(target);
     while (loggedFallbacks.size > 64) loggedFallbacks.delete(loggedFallbacks.values().next().value as string);
-    logger.debug?.("[router] routing: no plugin instance owns the session directory; the first live instance acts", { sessionDirectory });
+    logger.debug?.("[router] routing: the receiving instance acts even when another location owns the session; claimCall de-duplicates", { sessionDirectory });
   }
   return true;
 }
@@ -601,8 +603,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           deps.logger.warn("[router] routing: the dispatching session is unavailable; the dispatch proceeds as the orchestrator chose", { error: describeError(error) });
           return UNTOUCHED;
         }
-        // QA-2.2-R2-2: the session decides which instance acts (exact directory, else the deepest ancestor, else the first live
-        // instance, see `ownsSession`); a session that names no directory also falls to the first live instance.
+        // QA-G-A6: only the session location receives tool hooks on measured hosts. Never defer to an instance that
+        // may receive no hook; the process-wide call claim below remains the single-writer guard.
         if (session.directory !== null && !ownsSession(deps.directory, session.directory, deps.logger)) return UNTOUCHED;
         if (!claimCall(callKey)) return UNTOUCHED;
         // Only an orchestrator's own prompt is parsed (QA focus: a delegate must not be able to pin or steer).

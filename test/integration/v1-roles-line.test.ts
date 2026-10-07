@@ -108,6 +108,21 @@ describe("v1: the text-only roles line (A28, D1)", () => {
   const rLine = (prompt: string): string => prompt.split("\n").find((line) => line.startsWith("R:")) ?? "";
   const sha = (text: string): string => createHash("sha256").update(text).digest("hex");
 
+  it("QA-G-A3: adding a live engine by hot reload logs v1 coercion through the plugin, never console.warn", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { hooks, logs } = await plugin(null);
+      await turn(hooks);
+      writeFileSync(overridePath(), JSON.stringify({ activePreset: "anthropic", routing: { engine: "enforce", roles: { search: ["explore"] } } }));
+      invalidateConfigCache();
+      await turn(hooks);
+      await until(() => logs.some((message) => message.includes("routing.engine ignored on OpenCode v1")));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("with routing.roles set explicitly, the R: line lists the available agents per class (snapshot), and nothing else changes", async () => {
     const { hooks } = await plugin({ roles: { search: ["explore"], implement: ["general", "reviewer"], review: ["reviewer"], debug: ["ghost", "build", "missing", "fast"], design: [] } });
     const prompt = await withRoles(hooks);
