@@ -532,12 +532,13 @@ describe("splitPlan: fences that end with their item, and HTML comments (QA-2.4-
 // Locating the plan, agents, rendering
 // ---------------------------------------------------------------------------
 
-describe("locatePlan, agentInfosForPlan, renderDirectives", () => {
+// Includes directory scans and the >1 MB on-disk plan rejection fixture.
+describe("locatePlan, agentInfosForPlan, renderDirectives", { timeout: 60_000 }, () => {
   let dir: string;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "annotate-locate-"));
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   it("uses the named file (quotes stripped; relative to the project), else PLAN.md, plan.md, then the newest *plan*.md", async () => {
     expect(await locatePlan("", [dir])).toBeNull(); // nothing there yet
@@ -567,7 +568,7 @@ describe("locatePlan, agentInfosForPlan, renderDirectives", () => {
       writeFileSync(join(other, "p.md"), "- z");
       expect((await locatePlan("p.md", [dir, other]))?.path).toBe(join(other, "p.md"));
     } finally {
-      rmSync(other, { recursive: true, force: true });
+      rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -722,7 +723,7 @@ describe("/annotate-plan in the plugin", () => {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   const model = (ref: string) => {

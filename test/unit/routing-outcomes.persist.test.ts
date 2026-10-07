@@ -253,7 +253,9 @@ describe("resolveOutcomesDir (D15)", () => {
   it("~ resolves against the home directory", () => {
     expect(resolveOutcomesDir("~", env)).toBe(env.homedir);
     expect(resolveOutcomesDir("~/outcomes", env)).toBe(join(env.homedir, "outcomes"));
-    expect(resolveOutcomesDir("~\\outcomes\\x", env)).toBe(join(env.homedir, "outcomes", "x"));
+    expect(resolveOutcomesDir("~/outcomes/x", env)).toBe(join(env.homedir, "outcomes", "x"));
+    // Only Windows treats interior backslashes as separators; POSIX preserves them as filename characters.
+    expect(resolveOutcomesDir("~\\outcomes\\x", env)).toBe(join(env.homedir, "outcomes\\x"));
   });
 
   it("an absolute path is normalised; `~name` is not a home reference", () => {
@@ -1064,10 +1066,10 @@ describe("coexistence with *.scorecard.log (D15)", () => {
 // The real node fs
 // ---------------------------------------------------------------------------
 
-describe("nodePersistFs and a real directory", () => {
+describe("nodePersistFs and a real directory", { timeout: 60_000 }, () => {
   const made: string[] = [];
   afterEach(async () => {
-    while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true });
+    while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   async function tempDir(): Promise<string> {

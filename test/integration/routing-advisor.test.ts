@@ -6,6 +6,7 @@
  * redirected by the test setup, and every state directory is a fresh temp directory.
  */
 import { spawnSync } from "node:child_process";
+import { supportsPlainNodeTypeScript } from "../helpers/node-typescript";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -570,7 +571,8 @@ function decisionRow(id: string, ts: string, over: Partial<DecisionRow> = {}): D
   };
 }
 
-describe("D18 /router stats and the checkpoint line", () => {
+// Includes plain-node CLI subprocesses and real persisted fixtures.
+describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () => {
   type Hooks = { "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>; dispose(): Promise<void> };
   let home: string;
   let store: string;
@@ -594,7 +596,7 @@ describe("D18 /router stats and the checkpoint line", () => {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   async function plugin(routing: Record<string, unknown> | null, host: "v2" | "v1" = "v2"): Promise<Hooks> {
@@ -628,7 +630,8 @@ describe("D18 /router stats and the checkpoint line", () => {
     decisionRow("D2", "2026-10-06T11:00:00.000Z", { resume: true }),
   ];
 
-  it("D18: prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
+  // The subprocess needs default TS stripping; module-level stats tests still run on Node 20.
+  it.skipIf(!supportsPlainNodeTypeScript())("D18: prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
     seed(...ROWS);
     const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
     const since = "2026-10-06T00:00:00Z";
@@ -662,7 +665,7 @@ describe("D18 /router stats and the checkpoint line", () => {
     }
   });
 
-  it("static: reads the directory without creating or quarantining anything, and --dir overrides the configured store", async () => {
+  it.skipIf(!supportsPlainNodeTypeScript())("static: reads the directory without creating or quarantining anything, and --dir overrides the configured store", async () => {
     seed(ROWS[1]!, ROWS[2]!);
     const before = readdirSync(store).sort();
     const hooks = await plugin({ engine: "static" });
@@ -821,6 +824,61 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     await n.instance.settled();
     return n.instance.take();
   }
+
+  it.each(["check", "claim"] as const)("dispose waits for an in-flight %s write and its lock release", async (phase) => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const n = notifier(fs, clock);
+    if (phase === "claim") {
+      n.instance.poll();
+      await n.instance.settled();
+    }
+    let releaseWrite!: () => void;
+    let releaseUnlock!: () => void;
+    let enteredWrite!: () => void;
+    let enteredUnlock!: () => void;
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const unlockGate = new Promise<void>((resolve) => { releaseUnlock = resolve; });
+    const writing = new Promise<void>((resolve) => { enteredWrite = resolve; });
+    const unlocking = new Promise<void>((resolve) => { enteredUnlock = resolve; });
+    const write = fs.writeDurable.bind(fs);
+    const unlink = fs.unlink.bind(fs);
+    fs.writeDurable = async (path, data) => { enteredWrite(); await writeGate; await write(path, data); };
+    fs.unlink = async (path) => {
+      if (path === LOCK_PATH) { enteredUnlock(); await unlockGate; }
+      await unlink(path);
+    };
+    const operation = phase === "claim" ? n.instance.take() : (n.instance.poll(), n.instance.settled());
+    await writing;
+    let done = false;
+    const disposed = n.instance.dispose();
+    const completed = disposed.then(() => { done = true; });
+    try {
+      expect(n.instance.dispose()).toBe(disposed);
+      await Promise.resolve();
+      expect(done).toBe(false);
+      expect(fs.files.has(LOCK_PATH)).toBe(true);
+      releaseWrite();
+      await unlocking;
+      expect(done).toBe(false);
+      expect(fs.files.has(LOCK_PATH)).toBe(true);
+    } finally {
+      releaseWrite();
+      releaseUnlock();
+      await Promise.all([operation, completed]);
+    }
+    expect(done).toBe(true);
+    expect(fs.files.has(LOCK_PATH)).toBe(false);
+    const calls = n.gather.mock.calls.length;
+    const persisted = [...fs.files.entries()];
+    clock.now += 8 * 24 * HOUR;
+    n.instance.poll();
+    expect(n.instance.maybePending()).toBe(false);
+    expect(await n.instance.take()).toBeNull();
+    await n.instance.settled();
+    expect(n.gather).toHaveBeenCalledTimes(calls);
+    expect([...fs.files.entries()]).toEqual(persisted);
+  });
 
   it("fires once: the check runs in the background, the notice is handed over once, and the state records what the user was told", async () => {
     const fs = memoryFs();
@@ -1370,7 +1428,8 @@ describe("cost doctor: findings on bundled tiers never notify (QA-2.4-5)", () =>
 // In the plugin: the /router section and the notice in the orchestrator's context
 // ---------------------------------------------------------------------------
 
-describe("cost doctor in the plugin", () => {
+// A test may await several background checks; keep its timeout above the combined polling deadlines.
+describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
   type Hooks = {
     "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>;
     "experimental.chat.system.transform"(input: unknown, output: { system: string[] }): Promise<void>;
@@ -1398,7 +1457,7 @@ describe("cost doctor in the plugin", () => {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   interface Host {
@@ -1494,11 +1553,23 @@ describe("cost doctor in the plugin", () => {
     await hooks["chat.message"]({ sessionID, agent: "build" }, output);
     return output.parts;
   };
-  async function until(condition: () => boolean, ms = 3_000): Promise<void> {
+  async function until(condition: () => boolean | Promise<boolean>, ms = 15_000): Promise<void> {
     const end = Date.now() + ms;
-    while (!condition() && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(condition()).toBe(true);
+    while (Date.now() < end) {
+      if (await condition()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(await condition()).toBe(true);
   }
+
+  // The atomic rename makes the state file visible BEFORE checkContext updates its
+  // in-memory pending notice. The producer releases its lock only after that update.
+  // Waiting for both avoids consuming a root message in the middle of production.
+  const noticeStateReady = (): boolean => {
+    const names = existsSync(store) ? readdirSync(store) : [];
+    return names.some((n) => n.startsWith("advisor-notice.") && n.endsWith(".json"))
+      && !names.some((n) => n.startsWith("advisor-notice.") && n.endsWith(".lock"));
+  };
 
   it("/router shows the Cost doctor on v2: the title finding with its cheapest-model fix, from the host's own agents and catalog", async () => {
     const { hooks } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
@@ -1548,11 +1619,10 @@ describe("cost doctor in the plugin", () => {
     const first = await turn(hooks);
     expect(first.some((p) => p.includes("Cost doctor"))).toBe(false); // the first turn only starts the check
     let seen = 0;
-    await until(() => {
-      void userMessage(hooks, "root-1", "hello").then((parts) => {
-        seen += 1;
-        expect(parts).toEqual([{ type: "text", text: "hello" }]); // the user's message is untouched, with or without a pending notice
-      });
+    await until(async () => {
+      const parts = await userMessage(hooks, "root-1", "hello");
+      seen += 1;
+      expect(parts).toEqual([{ type: "text", text: "hello" }]); // unchanged, with or without a pending notice
       return host.synthetic.length > 0;
     });
     expect(host.synthetic).toHaveLength(1);
@@ -1564,7 +1634,7 @@ describe("cost doctor in the plugin", () => {
     expect(parts).toEqual([{ type: "text", text: "again" }]);
     expect(host.synthetic).toHaveLength(1); // handed over once
     expect((await turn(hooks)).some((p) => p.includes("Cost doctor"))).toBe(false); // and the system prompt never carries it
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice.") && n.endsWith(".json"))); // one state file per project (QA-2.4-R2-5)
+    await until(noticeStateReady); // one state file per project (QA-2.4-R2-5), producer/claim lock released
     expect(readdirSync(store).filter((name) => name.endsWith(".lock"))).toEqual([]); // the lock is released
     // a restart: same directory, nothing is due and nothing is pending
     const again = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
@@ -1575,6 +1645,32 @@ describe("cost doctor in the plugin", () => {
     }
     expect(again.host.synthetic).toHaveLength(0);
     expect(again.host.agentCalls()).toBe(0); // throttled before any host call
+  });
+
+  it("plugin dispose drains a background advisor check before its store can be removed", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const { hooks } = await plugin({
+      routing: { engine: "advise", outcomes: { path: store } },
+      agents: async () => { started(); await gate; return rawAgents(); },
+    });
+    await turn(hooks);
+    await entered;
+    let done = false;
+    const disposal = hooks.dispose().then(() => { done = true; });
+    try {
+      // Drain microtasks so an incorrectly immediate disposal would have resolved.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(done).toBe(false);
+    } finally {
+      release();
+      await disposal;
+    }
+    expect(done).toBe(true);
+    expect(noticeStateReady()).toBe(true);
+    expect(readdirSync(store).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"))).toEqual([]);
   });
 
   it("QA-2.4-8 / R2-5: a notice a previous process left pending is delivered by the next one only after its own check has confirmed it is still current", async () => {
@@ -1593,8 +1689,8 @@ describe("cost doctor in the plugin", () => {
     expect(await userMessage(second.hooks, "root-9", "first message")).toEqual([{ type: "text", text: "first message" }]);
     expect(second.host.synthetic).toHaveLength(0); // not yet: it is only a notice from the file until this process has looked at the host itself
     await turn(second.hooks); // the confirming check runs in the background
-    await until(() => {
-      void userMessage(second.hooks, "root-9", "next message");
+    await until(async () => {
+      await userMessage(second.hooks, "root-9", "next message");
       return second.host.synthetic.length > 0;
     });
     expect(second.host.synthetic[0]).toMatchObject({ sessionID: "root-9", description: "Model router cost doctor" });
@@ -1604,7 +1700,7 @@ describe("cost doctor in the plugin", () => {
   it("a subagent's or a grader's message never takes the notice; the root session still gets it afterwards", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, parents: { "child-1": "root-1" } });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    await until(noticeStateReady);
     expect(await userMessage(hooks, "child-1", "do the thing")).toEqual([{ type: "text", text: "do the thing" }]);
     expect(host.synthetic).toHaveLength(0);
     await userMessage(hooks, "root-1", "hello");
@@ -1615,7 +1711,7 @@ describe("cost doctor in the plugin", () => {
   it("without a synthetic-message call on the host (v1, an older adapter) the notice is a log line, once, and the user's message is untouched", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, synthetic: false });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    await until(noticeStateReady);
     expect(await userMessage(hooks, "root-1", "hello")).toEqual([{ type: "text", text: "hello" }]);
     expect(host.logs.filter((m) => m.startsWith("[model-router] Cost doctor:"))).toHaveLength(1);
     await userMessage(hooks, "root-1", "again");
@@ -1625,7 +1721,7 @@ describe("cost doctor in the plugin", () => {
   it("a failing synthetic call is logged and never reaches the turn", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, synthetic: "fail" });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    await until(noticeStateReady);
     expect(await userMessage(hooks, "root-1", "hello")).toEqual([{ type: "text", text: "hello" }]);
     await until(() => host.logs.some((m) => m.includes("notice not delivered")));
   });

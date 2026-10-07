@@ -1048,6 +1048,17 @@ function describeValue(value: unknown): string {
   return `${description.slice(0, end)}…`;
 }
 
+/** Opt-in redaction for credential-capable paths, without changing legacy diagnostics. */
+function describeRoutingValue(value: unknown, path: string): string {
+  const secretPath = /(?:^|\.)(?:classifier|typesafe|apiKey[^.]*|token|headers?)(?:\.|$)/i.test(path);
+  // A malformed routing container can itself contain a nested classifier block.
+  const routingContainer = path === "routing" && value !== null && typeof value === "object";
+  if (!secretPath && !routingContainer) return describeValue(value);
+  if (value === null) return "null";
+  const kind = Array.isArray(value) ? "array" : typeof value;
+  return `${kind}; value not shown`;
+}
+
 /** Copy without invoking accessors again; include defined get-only Proxy values. */
 function withValidatedSnapshots<T extends object>(
   obj: T,
@@ -1463,7 +1474,7 @@ function readEnum<T extends string>(
   const hit = pickEnum(allowed, value);
   if (hit === undefined) {
     throw new Error(
-      `tiers.json: ${path}.${key} must be one of ${allowed.join("|")} (got ${describeValue(value)})`,
+      `tiers.json: ${path}.${key} must be one of ${allowed.join("|")} (got ${describeRoutingValue(value, `${path}.${key}`)})`,
     );
   }
   return hit;
@@ -1494,7 +1505,7 @@ function readNumber(
   if (typeof value !== "number" || !inRange) {
     const lower = rule.minExclusive ? `> ${rule.min}` : `>= ${rule.min}`;
     throw new Error(
-      `tiers.json: ${path}.${key} must be ${rule.integer ? "an integer" : "a number"} ${lower} and <= ${rule.max} (got ${describeValue(value)})`,
+      `tiers.json: ${path}.${key} must be ${rule.integer ? "an integer" : "a number"} ${lower} and <= ${rule.max} (got ${describeRoutingValue(value, `${path}.${key}`)})`,
     );
   }
   return value;
@@ -1508,7 +1519,7 @@ function readBoolean(
   const value = obj[key];
   if (value === undefined) return undefined;
   if (typeof value !== "boolean") {
-    throw new Error(`tiers.json: ${path}.${key} must be a boolean (got ${describeValue(value)})`);
+    throw new Error(`tiers.json: ${path}.${key} must be a boolean (got ${describeRoutingValue(value, `${path}.${key}`)})`);
   }
   return value;
 }
@@ -1522,7 +1533,7 @@ function readBlock(
   const value = parent[key];
   if (value === undefined) return undefined;
   if (!isPlainObject(value)) {
-    throw new Error(`tiers.json: ${path}.${key} must be an object (got ${describeValue(value)})`);
+    throw new Error(`tiers.json: ${path}.${key} must be an object (got ${describeRoutingValue(value, `${path}.${key}`)})`);
   }
   rejectPrototypeKeys(value, `${path}.${key}`);
   return value;
@@ -1555,7 +1566,7 @@ function readClassifierModel(obj: Record<string, unknown>, path: string): string
   if (model === undefined || model === null) return model;
   if (!isCatalogRef(model)) {
     throw new Error(
-      `tiers.json: ${path}.model must be null or a 'provider/model[#variant]' string (got ${describeValue(model)})`,
+      `tiers.json: ${path}.model must be null or a 'provider/model[#variant]' string (got ${describeRoutingValue(model, `${path}.model`)})`,
     );
   }
   return model;
@@ -1607,7 +1618,7 @@ function validateClassifier(routing: Record<string, unknown>): ClassifierConfig 
   if (baseUrl !== undefined && baseUrl !== null) {
     if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
       throw new Error(
-        `tiers.json: ${path}.baseUrl must be null or an http(s) URL (got ${describeValue(baseUrl)})`,
+        `tiers.json: ${path}.baseUrl must be null or an http(s) URL (value not shown)`,
       );
     }
   }
@@ -1617,7 +1628,7 @@ function validateClassifier(routing: Record<string, unknown>): ClassifierConfig 
   if (apiKeyEnv !== undefined && apiKeyEnv !== null) {
     if (typeof apiKeyEnv !== "string" || !ENV_NAME_PATTERN.test(apiKeyEnv)) {
       throw new Error(
-        `tiers.json: ${path}.apiKeyEnv must be null or an environment variable name (got ${describeValue(apiKeyEnv)})`,
+        `tiers.json: ${path}.apiKeyEnv must be null or an environment variable name (value not shown)`,
       );
     }
   }
@@ -1629,7 +1640,7 @@ function validateClassifier(routing: Record<string, unknown>): ClassifierConfig 
   const samples = c.samples;
   if (samples !== undefined) {
     if (samples !== 1 && samples !== 3) {
-      throw new Error(`tiers.json: ${path}.samples must be 1 or 3 (got ${describeValue(samples)})`);
+      throw new Error(`tiers.json: ${path}.samples must be 1 or 3 (got ${describeRoutingValue(samples, `${path}.samples`)})`);
     }
     out.samples = samples;
   }
@@ -1643,7 +1654,7 @@ function validateClassifier(routing: Record<string, unknown>): ClassifierConfig 
     for (const [presetName, entry] of Object.entries(presets)) {
       const entryPath = `${path}.presets.'${presetName}'`;
       if (!isPlainObject(entry)) {
-        throw new Error(`tiers.json: ${entryPath} must be an object (got ${describeValue(entry)})`);
+        throw new Error(`tiers.json: ${entryPath} must be an object (got ${describeRoutingValue(entry, entryPath)})`);
       }
       rejectPrototypeKeys(entry, entryPath);
       const override: ClassifierPresetOverride = {};
@@ -1711,7 +1722,7 @@ function validateRoles(routing: Record<string, unknown>): Record<string, string[
 function validateRouting(value: unknown): RoutingConfig | undefined {
   if (value === undefined) return undefined;
   if (!isPlainObject(value)) {
-    throw new Error(`tiers.json: 'routing' must be an object (got ${describeValue(value)})`);
+    throw new Error(`tiers.json: 'routing' must be an object (got ${describeRoutingValue(value, "routing")})`);
   }
   rejectPrototypeKeys(value, "routing");
   const routing = value;

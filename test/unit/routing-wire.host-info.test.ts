@@ -177,8 +177,15 @@ describe("createWireCatalog", () => {
     expect(Date.now() - started).toBeLessThan(1000);
     expect(warn).toHaveBeenCalledTimes(1);
     const again = Date.now();
-    await catalog.ensure();
-    expect(Date.now() - again).toBeLessThan(15);
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await catalog.ensure();
+      // A second 20 ms wait must fail even though CI gets a generous wall-clock margin.
+      expect(timers.mock.calls.filter(([, ms]) => ms === 20)).toEqual([]);
+    } finally {
+      timers.mockRestore();
+    }
+    expect(Date.now() - again).toBeLessThan(150); // <15 ms target, 10x CI/coverage margin
     expect(list).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,7 +1,8 @@
 // Phase 2.1 (M6): the plugin's verdict and false-refusal call sites feed the outcome store, on v2 and only
 // when routing.engine != static. Temp directories only (HOME is redirected; outcomes path is injected).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
@@ -113,7 +114,7 @@ afterEach(async () => {
   resetDispatchRegistry();
   resetIngestState();
   logger.warn.mockReset();
-  rmSync(home, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 describe("false-refusal call site", () => {

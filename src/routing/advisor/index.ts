@@ -342,8 +342,10 @@ export interface AdvisorNotifier {
    * Never throws.
    */
   take(): Promise<string | null>;
-  /** Resolves when the check in flight (if any) has finished. */
+  /** Resolves when checks and notice claims in flight have finished, including lock release. */
   settled(): Promise<void>;
+  /** Stop accepting work and await every outstanding check/claim. Idempotent. */
+  dispose(): Promise<void>;
 }
 
 export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifier {
@@ -355,6 +357,9 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
   let nextDueAt: number | null = null;
   let blockedUntil = 0;
   let inFlight: Promise<void> | null = null;
+  const claims = new Set<Promise<string | null>>();
+  let disposed = false;
+  let disposal: Promise<void> | undefined;
   let loaded: Promise<void> | null = null;
   /** `verified`: produced by a check of this process, or confirmed by one; a notice read from the state file is not, until then. */
   let pending: { readonly text: string; readonly keys: readonly string[]; readonly verified: boolean } | null = null;
@@ -515,8 +520,15 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
     inFlight = run;
   };
 
+  const settled = async (): Promise<void> => {
+    while (inFlight !== null || claims.size > 0) {
+      await Promise.all([inFlight, ...claims]);
+    }
+  };
+
   return {
     poll(): void {
+      if (disposed) return;
       try {
         const settings = deps.settings();
         if (settings === null || inFlight !== null || now() < blockedUntil) return;
@@ -530,6 +542,7 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
     },
 
     maybePending(): boolean {
+      if (disposed) return false;
       try {
         const settings = deps.settings();
         return settings !== null && settings.deliver === "context" && (pending !== null || loaded === null);
@@ -538,46 +551,56 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
       }
     },
 
-    async take(): Promise<string | null> {
-      try {
-        const settings = deps.settings();
-        if (settings === null || settings.deliver !== "context") return null;
-        await ensureLoaded(settings);
-        const mine = pending;
-        if (mine === null || !mine.verified) return null;
-        if (!pendingPersisted) {
-          pending = null; // it never reached the state file (no coordination possible): deliver it
-          return mine.text;
-        }
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          const claim = await withLock(settings, async (): Promise<string | null> => {
-            const { state: fresh, failed } = await readState(settings);
-            if (failed) return mine.text; // the state cannot be read: no coordination, deliver
-            if (fresh === null || fresh.pendingText === null) return null; // another process delivered it
-            await writeState(settings, {
-              ...fresh,
-              lastNoticeAt: new Date(now()).toISOString(),
-              noticedKeys: fresh.pendingKeys ?? fresh.noticedKeys,
-              pendingText: null,
-              pendingKeys: null,
-            });
-            return fresh.pendingText;
-          });
-          if (claim.status === "ran") {
-            pending = null;
-            return claim.value;
+    take(): Promise<string | null> {
+      if (disposed) return Promise.resolve(null);
+      const run = (async (): Promise<string | null> => {
+        try {
+          const settings = deps.settings();
+          if (settings === null || settings.deliver !== "context") return null;
+          await ensureLoaded(settings);
+          const mine = pending;
+          if (mine === null || !mine.verified) return null;
+          if (!pendingPersisted) {
+            pending = null; // it never reached the state file (no coordination possible): deliver it
+            return mine.text;
           }
-          await sleep(25); // another process holds the lock for a few milliseconds
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            const claim = await withLock(settings, async (): Promise<string | null> => {
+              const { state: fresh, failed } = await readState(settings);
+              if (failed) return mine.text; // the state cannot be read: no coordination, deliver
+              if (fresh === null || fresh.pendingText === null) return null; // another process delivered it
+              await writeState(settings, {
+                ...fresh,
+                lastNoticeAt: new Date(now()).toISOString(),
+                noticedKeys: fresh.pendingKeys ?? fresh.noticedKeys,
+                pendingText: null,
+                pendingKeys: null,
+              });
+              return fresh.pendingText;
+            });
+            if (claim.status === "ran") {
+              pending = null;
+              return claim.value;
+            }
+            await sleep(25); // another process holds the lock for a few milliseconds
+          }
+          return null; // still busy: the notice stays pending for the next turn
+        } catch (error) {
+          deps.logger.warn("[router] cost doctor: could not take the notice", { error: describeError(error) });
+          return null;
         }
-        return null; // still busy: the notice stays pending for the next turn
-      } catch (error) {
-        deps.logger.warn("[router] cost doctor: could not take the notice", { error: describeError(error) });
-        return null;
-      }
+      })();
+      claims.add(run);
+      // Use both handlers rather than an ignored rejecting finally() promise.
+      void run.then(() => { claims.delete(run); }, () => { claims.delete(run); });
+      return run;
     },
 
-    async settled(): Promise<void> {
-      while (inFlight !== null) await inFlight;
+    settled,
+    dispose(): Promise<void> {
+      disposed = true;
+      disposal ??= settled();
+      return disposal;
     },
   };
 }

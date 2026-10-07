@@ -40,11 +40,12 @@ describe("packaging: published tarball excludes tests and dev config (plan C4)",
     };
     expect(missingImports(Object.keys(files), (p) => files[p]!)).toEqual(["src/helper.ts -> ./omitted"]);
   });
-  it("npm pack --dry-run ships only the allowlisted files", () => {
+  it("npm pack --dry-run ships only the allowlisted files", { timeout: 60_000 }, () => {
     const raw = execSync("npm pack --dry-run --json", {
       cwd: process.cwd(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: 60_000,
     });
     // npm's --json shape is NOT stable across majors: through npm 11 this is an
     // array of package entries, and npm 12 returns an object keyed by package

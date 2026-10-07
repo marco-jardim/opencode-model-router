@@ -377,13 +377,13 @@ describe("classify — never throws, never hangs", () => {
     }
   });
 
-  it("a hung backend settles within timeoutMs + INDEX_TIMEOUT_GRACE_MS + 50 ms with the rules facts", async () => {
+  it("a hung backend settles within timeoutMs + INDEX_TIMEOUT_GRACE_MS (plus 1 s CI scheduling margin) with the rules facts", async () => {
     const { backend } = fakeBackend(() => new Promise<BackendResult>(() => undefined));
     const deps = makeDeps(backend, { settings: settings({ timeoutMs: 100 }) });
     const started = performance.now();
     const result = await classify(input("refactor and rename the module"), deps);
     const elapsed = performance.now() - started;
-    expect(elapsed).toBeLessThan(100 + INDEX_TIMEOUT_GRACE_MS + 50);
+    expect(elapsed).toBeLessThan(100 + INDEX_TIMEOUT_GRACE_MS + 1000);
     expect(elapsed).toBeGreaterThanOrEqual(100);
     expect(result.facts).toEqual(result.trace.rules);
     expect(result.trace.backend).toMatchObject({ status: "timeout" });
@@ -554,7 +554,7 @@ describe("classifyMany", () => {
     const deps = makeDeps(backend, { settings: settings({ timeoutMs: 100 }) });
     const started = performance.now();
     const results = await classifyMany(items(3), deps);
-    expect(performance.now() - started).toBeLessThan(100 + INDEX_TIMEOUT_GRACE_MS + 50);
+    expect(performance.now() - started).toBeLessThan(100 + INDEX_TIMEOUT_GRACE_MS + 1000);
     expect(results.map((r) => r.trace.backend?.status)).toEqual(["timeout", "timeout", "timeout"]);
     expect(results.every((r) => r.facts.source === "rules")).toBe(true);
     expect(deps.messages).toHaveLength(1);

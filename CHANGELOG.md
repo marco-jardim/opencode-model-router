@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-07
+
 ### Added
 
 - **Cost-aware routing engine (#74), OpenCode v2, opt-in.** A `routing` block
@@ -18,10 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a routing step that decides who does it); implemented from scratch with the
   decision kept in code, and TypeSafe supported as an optional classifier backend.
   - `routing.engine`: `static` (default), `shadow` (decide and record), `advise`
-    (generated `R:` line and a per-turn `Route hint`) and `enforce` (reroute under
+    (generated `R:` line and a stable one-line `Route hint`, advise only) and `enforce` (no hint; reroute under
     a strict margin, an evidence gate of 5 effective (decayed) outcomes on the
     candidate's own key, permission and
-    floor rules; a dispatch carrying `[route … pin]` is never rerouted).
+    floor rules, and the D9 never-down gate: high-risk work without detection
+    cannot run below the pick's capability rank or at lower effort on the same
+    model; detection uses the weaker route-line/acceptance claim. A dispatch
+    carrying `[route … pin]` is never rerouted).
   - A task classifier (rules, an optional first-line `[route …]` directive, and
     optional `host`, `openai-compatible` and `typesafe` backends; `host` is
     experimental). Backends see a bounded, scrubbed excerpt only, never a task

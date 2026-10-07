@@ -37,7 +37,7 @@ describe("smoke:v1 preflight", () => {
     }
   });
 
-  it("exits 1 with a message that says what to change when there is no opencode on PATH", () => {
+  it("exits 1 with a message that says what to change when there is no opencode on PATH", { timeout: 60_000 }, () => {
     const empty = mkdtempSync(path.join(tmpdir(), "omr-preflight-"));
     try {
       const run = spawnSync(process.execPath, [SCRIPT], { encoding: "utf8", env: { ...process.env, PATH: empty, Path: empty }, timeout: 30_000, windowsHide: true });
@@ -46,7 +46,7 @@ describe("smoke:v1 preflight", () => {
       expect(run.stderr).toContain("no `opencode` executable was found on PATH");
       expect(run.stderr).toContain("first on PATH");
     } finally {
-      rmSync(empty, { recursive: true, force: true });
+      rmSync(empty, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

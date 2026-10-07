@@ -2,7 +2,7 @@
 // live outcome store and decision log of a running OpenCode session. The guard lives in test/setup/home-guard.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import os, { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { DEFAULT_OUTCOMES_DIRNAME } from "../../src/routing/outcomes/types";
 import { resolveOutcomesDir } from "../../src/routing/outcomes/persist";
@@ -20,7 +20,8 @@ const realTmp = (): string => {
 
 afterEach(() => vi.unstubAllEnvs());
 
-describe("temp directory guard", () => {
+// Includes native Node subprocesses and isolated-directory creation/cleanup.
+describe("temp directory guard", { timeout: 60_000 }, () => {
   it("R2-6: smoke cleanup failure warns but restores the environment", () => {
     const names = ["TEMP", "TMP", "TMPDIR", "OMR_SMOKE_REAL_TMPDIR"];
     const before = names.map((name) => process.env[name]);
@@ -35,7 +36,7 @@ describe("temp directory guard", () => {
     } finally {
       remove.mockRestore();
       warn.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
   it("N10: native child homedir inherits the private home, not just the os mock", () => {
@@ -108,7 +109,12 @@ describe("temp directory guard", () => {
   it("assertTmpIsGuarded accepts the private dir and the real dir under another spelling is still rejected", () => {
     expect(() => assertTmpIsGuarded(tmpdir)).not.toThrow();
     expect(() => assertTmpIsGuarded(() => `${realTmp()}${process.platform === "win32" ? "\\" : "/"}`)).toThrow(/real temp directory/);
-    expect(() => assertTmpIsGuarded(() => join(realTmp(), "..", "Temp"))).toThrow(/real temp directory/);
+    expect(() => assertTmpIsGuarded(() => `${realTmp()}${sep}nested${sep}..`)).toThrow(/real temp directory/);
+    if (process.platform === "win32") {
+      expect(() => assertTmpIsGuarded(() => realTmp().toUpperCase())).toThrow(/real temp directory/);
+    }
+    // Case folding is a Windows spelling alias, not a POSIX filesystem rule.
+    expect(sameDir(join(realTmp(), "CaseProbe"), join(realTmp(), "caseprobe"))).toBe(process.platform === "win32");
   });
 });
 
@@ -130,7 +136,7 @@ describe("global guard teardown (QA-2.1-R2-6)", () => {
       expect(logs).toEqual([]);
       expect(removeRunGuardDirs(root, "")).toBe(0); // no run id: never guess
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -150,7 +156,7 @@ describe("global guard teardown (QA-2.1-R2-6)", () => {
       expect(removeRunGuardDirs(join(root, "nope"), "RUN1", (message) => missing.push(message))).toBe(0);
       expect(missing[0]).toMatch(/cannot list/);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

@@ -796,6 +796,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // Stop new advisor work and finish state/claim writes and lock removal before teardown.
+      await advisorNotifier?.dispose();
       // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
       background?.dispose();
       // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).

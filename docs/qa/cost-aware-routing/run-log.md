@@ -50,3 +50,18 @@ Startup evidence was read, not modified, from `C:\Users\Marquinho\.local\share\o
 | When (UTC) | Phase / task | Event | Action |
 |---|---|---|---|
 | 2026-10-07T03:40:45Z | Phase 3.3 / sync 5 | Base `master` fast-forwarded to `93db126`; rollback tag `car/sync-5-prev` = `64e523a`. | No `npm ci` was run because `package-lock.json` is unchanged. Awaiting the owner's restart (A8); after restart and liveness confirmation, the Phase 3.3 never-down and privacy fixes are live in `enforce`. Next: Phase 3.4 / DF5. |
+
+### DF5 liveness and timing correction
+
+**Corrected after QA-3.4-13:** the new code was live **without a restart by 2026-10-07T03:41:05.545Z**, the first copied decision row with Phase 3.3 audit fields. The mechanism is not proven to be a file watcher. Read-only inspection of `C:\Users\Marquinho\.local\share\opencode\log\opencode.log` found router `msg="loading plugin"` entries at **03:40:41.517Z / 03:40:41.546Z**, under the already-running **`ed92edfe`** server run. These precede the handoff's **03:40:45Z** sync-completion record by about 3.5 seconds: that record is not the exact instant files changed or loading began. The first audit row is about 20.5 seconds after the recorded sync completion, not a measured watcher latency. The same log directly records the owner's restart at **04:11:34.806Z**, `message="cli starting"`, `version=2.0.24`, `args=["serve","--service"]`, run **`b5f6e377`**. Thus the historical “awaiting restart” row is superseded, with log evidence rather than inferred watcher causality.
+
+| Restart / reload | Code sync | Observation | Sync → observation | Qualification |
+|---|---|---|---|---|
+| DF5 code live without restart | 2026-10-07T03:40:45Z (completion record) | 2026-10-07T03:41:05.545Z | ≈20s | First audit-bearing decision row; plugin loading already logged at 03:40:41.517Z. Not watcher latency or downtime. |
+| DF5 owner restart | 2026-10-07T03:40:45Z | 2026-10-07T04:11:34.806Z | ≈30m49s (second-precision ledger) | Direct `opencode.log` evidence, host 2.0.24; includes human idle time and the period already running the new code. Restart-only time lost is unmeasured. |
+
+For the DF1–DF5 summary: DF1 1 planned restart; DF2 1; DF3 1; DF4 2 starts (one failed, one successful); DF5 2 restarts (the Phase 3.3 unplanned 02:17:33Z restart and this owner restart). The failed DF4 start's 29 seconds is **inside**, not in addition to, its 35m38s total. No duration is assigned to the second Phase 3.3 interruption because it was not a host restart. These are lifecycle observations, not routing-stat counters.
+
+### QA-3.4-2 — remote-master sync deviation
+
+The plan permitted **local** master fast-forwards for dogfood, but the orchestrator also pushed master. At QA round 1, `git ls-remote origin refs/heads/master refs/heads/car/main` confirms both remote refs are **`e6c6d60c4005e28a698179041586fe5e8c90036f`**: the engine implementation is already on remote master. Do not represent the release-preparation PR as introducing that entire implementation. The orchestrator will fast-forward **`car/main` to the reviewed `car/p34` tip**, then open the remaining DF5/CI-fix/2.3.0-metadata PR against master, closing #74/#73. Full feature review uses [v2.2.0...car/main](https://github.com/marco-jardim/opencode-model-router/compare/v2.2.0...car/main). No history rewrite or rollback was attempted to hide this deviation.

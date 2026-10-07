@@ -1,6 +1,6 @@
 # ADR 0005 — Cost-Aware Routing Engine
 
-> **Status:** Accepted (evidence section pending, see [Evidence](#evidence)) **Date:** 2026-10-06 **Wave/Phase:** Cost-Aware Routing Engine, Phase 3.1
+> **Status:** Accepted (DF5 evidence recorded, see [Evidence](#evidence)) **Date:** 2026-10-06 **Wave/Phase:** Cost-Aware Routing Engine, Phase 3.1
 > **Supersedes:** none **Depends on:** ADR 0002 (acceptance gate: the verdicts are the engine's only source of probabilities), ADR 0003 (deferred verification), ADR 0004 (delegation depth guard and effort bump: the ladder this engine extends, and the depth the engine never raises)
 > **Deciders:** owner (Marco Jardim); implementation amendments and adversarial QA recorded in the plan and phase reports
 > **Plan:** [`../plans/cost-aware-routing-engine-plan.md`](../plans/cost-aware-routing-engine-plan.md) **User guide:** [`../ROUTING_ENGINE.md`](../ROUTING_ENGINE.md)
@@ -141,7 +141,7 @@ The decisions above rest on spikes run against OpenCode `2.0.22` before any code
 - **The rules classifier is crude on long briefs.** Backends (`host`, `openai-compatible`, `typesafe`) can help but send bounded task text off the machine.
 - **The `host` backend is experimental.** The live criterion of the DF3 checkpoint (`source: "host"` for both steps of a batched `/annotate-plan` sample) was not observed. The backend was consulted live (status `ok`, label `other`, no `backendSkipped`), but an answer that only confirms `other` does not change the rules' facts, so the run proves the transport, not the benefit. The credential policy gate (D14) skips the backend for credential words, including `token`, by design. Effort delivery is proven at the host's edge only (A7, [Phase 3.2](../qa/cost-aware-routing/phase-3.2.md)): what the host sends was measured for the Anthropic Messages and OpenAI Responses routes against scripted providers, and a provider's acceptance of the in-band effort is unverified. A tier whose `effort` differs from its `variant` runs the effort while its keys name the variant (the cost doctor reports it as `variant-effort` while variant steps are on and as `effort-variant-mismatch` when they are off, one warning per tier).
 - **v2 only.** v1 users get one prose line and nothing else.
-- **A code change needs a host restart** (the plugin is loaded once per process); a configuration change does not.
+- **Plan for a host restart after code sync**; at DF5 the new code was live without a restart by **03:41:05.545Z**. The host log shows plugin loading at **03:40:41.517Z**, before the **03:40:45Z** sync-completion record, under existing run `ed92edfe`; watcher causality/latency is not established. The owner restart is logged at **04:11:34.806Z**, host 2.0.24. See the corrected run log. This is observed liveness, not a general guarantee of hot reload. A configuration change does not require a restart.
 - **The docs are not in the npm tarball.** This ADR and the guide live in the repository.
 
 ## Alternatives rejected
@@ -162,4 +162,18 @@ The decisions above rest on spikes run against OpenCode `2.0.22` before any code
 
 ## Evidence
 
-> **Placeholder — completed in Phase 3.4 (checkpoint DF5).** This section receives the dogfood summary table across DF1–DF5 (dispatches, agreement, switched, estimated savings per unit, measured USD where available, false refusals, variant steps and pass rate, restarts and time lost), the D17 rule with its counts and the resulting final mode, and the workload caveat (the workload is this plan's own execution, implementation- and QA-heavy with pinned heavy dispatches: the numbers are evidence of behaviour, not a benchmark). The interim periods are in [`../qa/cost-aware-routing/dogfood.md`](../qa/cost-aware-routing/dogfood.md).
+Copied from the [dogfood Summary](../qa/cost-aware-routing/dogfood.md#summary), cutoff **2026-10-07T04:13:39.877Z**. That report includes the fixed-window commands, snapshot hashes, the pre-/post-3.3 split and cache-read-share measurement. Restart facts come from the [run log](../qa/cost-aware-routing/run-log.md), not routing statistics.
+
+| Checkpoint / measured mode | Dispatches | Agreement | Switched | Estimated savings per unit | Measured USD | False refusals | Variant steps / pass rate | Restarts / time lost (wall-clock proxy) |
+|---|---:|---|---:|---|---|---|---|---|
+| DF1 / static | 0 recorded | n/a | 0 | n/a (no rows) | n/a, unpriced | 0 recorded; unmeasured | 0 / n/a | 1 / ≈2h06m54s |
+| DF2 / static, before shadow | 0 recorded | n/a | 0 | n/a (no rows) | n/a, unpriced | 0 recorded; unmeasured | 0 / n/a | 1 / 4m55s |
+| DF3 / shadow | 79 | 65/65 (100%) | 0 | 0.00 ratio / 65 rows | n/a, unpriced | 0 | 0 / n/a | 1 / 1h50m56s |
+| DF4 / advise | 112 | 67/67 (100%) | 0 | 0.00 ratio / 67 rows | n/a, unpriced | 0 | 0 / n/a | 2 starts (1 failed) / 35m38s total |
+| DF5 / enforce | 56 | 24/24 (100%) | 0 | 0.00 ratio / 24 rows | n/a, unpriced | 0 | 0 / n/a | 2 / 30m49s sync→owner restart + unmeasured unplanned restart |
+
+DF1/DF2 zeros are empty instrumentation, not absence of work or false refusals. Agreement excludes pinned/resumed/ineligible rows. Savings are ratio totals, never measured dollars; variant pass rate is n/a because no steps were taken. Restart durations include human idle time and are not measured service downtime.
+
+**D17:** the bounded enforce period has **0 enforced switches, 0 verified switches and 0 failed switched dispatches**. The CLI reports `n/a (0 enforced switches)`, but the literal zero-switched-fail rule retains **enforce**. The orchestrator owns the live override; Phase 3.4 did not edit it. Post-3.3 never-down audit: **0 of 2 recorded** (pre-3.3 rows lack the fields). **`switched` is false on all 247 decision rows**; `pinned && switched` is therefore zero, a vacuous invariant here. This does not establish that switching works or saves money.
+
+**Workload caveat (§0.11):** one owner, one machine, the intended workload is this plan itself (implementation- and QA-heavy, pinned heavy dispatches), and models are unpriced. The host-wide store also includes concurrent projects: six root sessions, only one for this repository. The checkpoint CLI windows are host-wide, not exclusively plan-session statistics. These are observations, not a benchmark. The separately filtered plan-orchestrator cache-read shares are 91.55% shadow, 91.91% advise and 94.18% enforce on records with usage; full advise/enforce shares are **unverifiable** because some records lack tokens. Advise ran the old hint, and post-3.3 enforce emits none; no causal cache benefit is claimed.

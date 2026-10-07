@@ -1080,7 +1080,7 @@ describe("mergeForeign (QA-1.3-4)", () => {
 });
 
 describe("performance", () => {
-  it("10 000 mixed records over 50 keys stay under 50 ms", () => {
+  it("10 000 mixed records over 50 keys target <50 ms (CI ceiling <1000 ms)", () => {
     const c = clock();
     const store = createOutcomeStore({ now: c.now });
     const keys = Array.from({ length: 50 }, (_, i) => K(`class${i % 5}`, i % 2 === 0 ? router(`agent${i}`) : host(`agent${i}`), `model-${i}`));

@@ -100,7 +100,7 @@ beforeEach(() => {
 
 afterEach(() => {
   restoreHomeEnv();
-  if (tmpHome !== "") rmSync(tmpHome, { recursive: true, force: true });
+  if (tmpHome !== "") rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   tmpHome = "";
   invalidateConfigCache();
 });
@@ -981,7 +981,7 @@ describe("hot reload of the global override file with a routing block", () => {
       const merged = resolveRouting(loadConfig(project), "v2");
       expect(merged).toMatchObject({ engine: "advise", margin: 0.3, roles: { search: ["explore"] } });
     } finally {
-      rmSync(project, { recursive: true, force: true });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -1018,7 +1018,7 @@ describe("hot reload of the global override file with a routing block", () => {
         review: ["general"],
       });
     } finally {
-      rmSync(project, { recursive: true, force: true });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -1032,7 +1032,7 @@ describe("hot reload of the global override file with a routing block", () => {
       invalidateConfigCache();
       expect(resolveRouting(loadConfig(project), "v2").roles).toEqual({});
     } finally {
-      rmSync(project, { recursive: true, force: true });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -1154,7 +1154,7 @@ describe("hot reload of the global override file with a routing block", () => {
         expect(call).toBeDefined();
         expect((call![1] as { source: string }).source).toContain(".opencode");
       } finally {
-        rmSync(project, { recursive: true, force: true });
+        rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });
 
@@ -1219,7 +1219,7 @@ describe("hot reload of the global override file with a routing block", () => {
     });
 
     afterEach(() => {
-      rmSync(project, { recursive: true, force: true });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     });
 
     it("drops classifier.{backend,model,baseUrl,apiKeyEnv,presets} and outcomes.path from the project layer, keeps the other keys, warns once", () => {
@@ -1505,7 +1505,7 @@ describe("build-info", () => {
   });
 
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   function write(rel: string, content: string): string {
@@ -1697,7 +1697,8 @@ describe("build-info", () => {
 
   describe("buildInfo (this checkout)", () => {
     const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8")) as { version: string };
-    const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" });
+    // Collection-time subprocess: bound it independently of individual test timeouts.
+    const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8", timeout: 60_000 });
     const gitHead = git.status === 0 ? git.stdout.trim() : undefined;
 
     it("has the package version", () => {
@@ -1849,10 +1850,10 @@ describe("docs/CONFIG_REFERENCE.md — routing section", () => {
   const docs = readFileSync(join(ROOT, "docs", "CONFIG_REFERENCE.md"), "utf-8");
 
   /** The JSONC fence that directly follows `<!-- <marker> -->`. */
-  function blockAfter(marker: string): unknown {
-    const at = docs.indexOf(`<!-- ${marker} -->`);
+  function blockAfter(marker: string, source = docs): unknown {
+    const at = source.indexOf(`<!-- ${marker} -->`);
     expect(at, `marker ${marker}`).toBeGreaterThanOrEqual(0);
-    const match = /```jsonc\n([\s\S]*?)\n```/.exec(docs.slice(at));
+    const match = /```jsonc\r?\n([\s\S]*?)\r?\n```/.exec(source.slice(at));
     expect(match, `fence after ${marker}`).not.toBeNull();
     return parseJsonc(match![1]!);
   }
@@ -1860,6 +1861,11 @@ describe("docs/CONFIG_REFERENCE.md — routing section", () => {
   it("documents exactly the v2 defaults that resolveRouting applies", () => {
     const { applied: _applied, ...resolved } = resolveRouting(cfgOf(), "v2");
     expect(blockAfter("routing-defaults: v2")).toEqual(resolved);
+  });
+
+  it.each(["\n", "\r\n"])("parses the documented defaults with %j line endings", (eol) => {
+    const { applied: _applied, ...resolved } = resolveRouting(cfgOf(), "v2");
+    expect(blockAfter("routing-defaults: v2", docs.replace(/\r?\n/g, eol))).toEqual(resolved);
   });
 
   it("lists every defaulted key in the keys table", () => {

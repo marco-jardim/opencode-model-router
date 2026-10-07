@@ -25,6 +25,48 @@ function validRaw(extra: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
+describe("validateConfig — secret-safe diagnostics", () => {
+  const secret = "sk-proj-Q7x9V2m8K4z6P1w3SECRET";
+  const credentials = { apiKey: secret, token: secret, headers: { Authorization: `Bearer ${secret}` } };
+  const classifierCases: Array<[string, unknown]> = [
+    ["apiKeyEnv", secret],
+    ["apiKeyEnv", credentials],
+    ["baseUrl", `ftp://${secret}:${secret}@example.invalid/?token=${secret}`],
+    ["baseUrl", credentials],
+    ["backend", secret],
+    ["model", secret],
+    ["timeoutMs", secret],
+    ["samples", secret],
+    ["maxStateChars", secret],
+    ["presets", [credentials]],
+    ["presets", { anthropic: [credentials] }],
+    ["presets", { anthropic: { model: secret } }],
+    ["presets", { anthropic: { backend: secret } }],
+  ];
+  const cases: Array<[string, unknown]> = [
+    ...classifierCases.map(([key, value]): [string, unknown] => [key, { classifier: { [key]: value } }]),
+    ["classifier block", { classifier: [credentials] }],
+    ["routing block", [{ classifier: credentials }]],
+    ["nested headers in numeric field", { classifier: { timeoutMs: credentials } }],
+  ];
+
+  it.each(cases)("never echoes credentials from %s", (_label, routing) => {
+    let message = "";
+    try {
+      validateConfig(validRaw({ routing }));
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      message = error.message;
+    }
+    expect(message).toContain("value not shown");
+    expect(message).not.toContain(secret);
+    // Reject partial/truncated echoes too, not just the complete credential.
+    for (let offset = 0; offset <= secret.length - 8; offset++) {
+      expect(message).not.toContain(secret.slice(offset, offset + 8));
+    }
+  });
+});
+
 describe("validateConfig — happy path", () => {
   it("accepts a minimal valid config and leaves enforcement undefined when absent", () => {
     const cfg = validateConfig(validRaw());
