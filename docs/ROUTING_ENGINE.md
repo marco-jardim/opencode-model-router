@@ -322,6 +322,7 @@ What a classifier backend may send off your machine is bounded by D14, and by tr
 - **Option order is shuffled** per call, options always include `other`/`unknown`, and a disagreement between two orders lowers the confidence to 0. Instructions and option descriptions are English.
 - **Transport.** An API key is never sent over plain `http:` to a non-loopback host; `baseUrl` must be `http(s)` without embedded credentials; the effective host is logged once at creation.
 - **Who may configure it (A18).** `routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}` and `routing.outcomes.path` are honoured only from the bundled `tiers.json` and the **global** override file. In a project-local override (`<repo>/.opencode/opencode-model-router.overrides.jsonc`) they are dropped with a one-time warning, so cloning a repository cannot point your task text at someone else's server.
+- **Project budgets (A35).** A project may only tighten `routing.classifier.maxStateChars`, `routing.classifier.samples` and `routing.classifier.timeoutMs`: the effective value is `min(lower-layer value or default, project value)`. Widening attempts are clamped with an A18 notice. `routing.engine`, `routing.profile` and `routing.margin` remain project-configurable because they choose among the user's configured tiers and D9 never-down guards hold in every mode.
 - **What `host` adds.** The `host` backend calls the host's `generate` with an explicit model, under your credentials, with the prompt the plugin renders. Whether the host prepends anything of its own to that request was not verified (QA-1.2-17); the D14 bound above covers what the plugin sends, not what the host might add.
 - **The files the engine writes** (below) hold typed facts, keys, reason codes and counts, not the task text.
 
@@ -402,6 +403,8 @@ Everything is written under one directory, `routing.outcomes.path` (global overr
 **Deferred verification is invisible to the rates.** The verdicts of deferred verification (`VERIFY:deferred`, `finishDeferred`) and of `router_verify` replays are not recorded, so a deferred dispatch has a decision row and no verdict row. Only synchronous verifications feed the scoreboard.
 
 ### `/router stats` and `npm run routing:stats`
+
+The statistics report includes **D17 mode (use the DF4→DF5 enforce-period window)**: `enforce` with zero failed enforced switches, otherwise `advise`. At DF5, run `routing:stats` with the enforce period's `--since` / `--until` boundaries; this line is a recommendation from that window, not an automatic config change or proof that unverified dispatches passed. Failures of shadow/advise would-switches, pinned dispatches, resumes and policy floor lifts do not decide D17.
 
 **The script does not read the router config.** When `routing.outcomes.path` is set, pass `--dir <routing.outcomes.path>` explicitly (for example `node scripts/routing-stats.ts --dir "D:\\routing-outcomes"`); otherwise it reads the default temp trajectory directory, not your configured store.
 

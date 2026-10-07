@@ -570,7 +570,7 @@ function decisionRow(id: string, ts: string, over: Partial<DecisionRow> = {}): D
   };
 }
 
-describe("/router stats and the checkpoint line", () => {
+describe("D18 /router stats and the checkpoint line", () => {
   type Hooks = { "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>; dispose(): Promise<void> };
   let home: string;
   let store: string;
@@ -628,7 +628,7 @@ describe("/router stats and the checkpoint line", () => {
     decisionRow("D2", "2026-10-06T11:00:00.000Z", { resume: true }),
   ];
 
-  it("prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
+  it("D18: prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
     seed(...ROWS);
     const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
     const since = "2026-10-06T00:00:00Z";

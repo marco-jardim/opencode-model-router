@@ -616,6 +616,22 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     for (const amendment of ["A31", "A32", "A33"]) expect(adr, amendment).toContain(amendment);
   });
 
+  it("D16: the release contract is version 2.3.0 in one PR closing both #74 and #73", () => {
+    // Phase 3.4 executes the release; do not prematurely bump the current package during QA.
+    const plan = read("docs/plans/cost-aware-routing-engine-plan.md");
+    expect(plan).toContain("**D16 — Release `2.3.0`**, one PR, closes #74 and #73.");
+    const adr = read("docs/adr/0005-cost-aware-routing-engine.md");
+    const decision = adr.split("### D16 — ")[1]?.split("### D17 — ")[0];
+    expect(decision).toContain("Release `2.3.0`, one PR");
+    expect(decision).toContain("One pull request closes #74 and #73. Target version `2.3.0`.");
+  });
+
+  it("D17: the guide documents the stats mode line and the enforce-period window", () => {
+    const guide = read("docs/ROUTING_ENGINE.md");
+    expect(guide).toContain("D17 mode (use the DF4→DF5 enforce-period window)");
+    expect(guide).toContain("zero failed enforced switches");
+  });
+
   it("the cost-doctor table of the guide lists every finding with the severity the code gives it", () => {
     const source = read("src/routing/advisor/findings.ts");
     const severities = new Map([...source.matchAll(/id: "([a-z-]+)",\s*severity: "(warning|saving|info)"/g)].map((m) => [m[1]!, m[2]!] as const));

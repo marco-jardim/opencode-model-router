@@ -96,6 +96,13 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("buildClassifierState (D14)", () => {
+  it("QA-G-B11: omits cwd lines from acceptance without losing the criteria", () => {
+    const state = buildClassifierState({ prompt: "Fix the loader.\n[acceptance]\ncwd: D:\\private\\repo\n  CWD: /private/repo\ncheck: testsPass\ncriteria: injected cache works\n[/acceptance]" }, 2000);
+    expect(state.acceptanceIncluded).toBe(true);
+    expect(state.text).not.toMatch(/cwd|private/i);
+    expect(state.text).toContain("check: testsPass\ncriteria: injected cache works");
+  });
+
   it("is description + acceptance + task head, in that order", () => {
     const state = buildClassifierState(
       {

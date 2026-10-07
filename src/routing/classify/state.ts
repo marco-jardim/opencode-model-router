@@ -80,6 +80,20 @@ function splitAcceptance(text: string): { readonly first: string | null; readonl
   return { first, rest: parts.join("") };
 }
 
+/** The raw text sources shared by the credential gate and state builder, before scrubbing. */
+export function classifierStateRawParts(input: { description?: string; prompt: string }): {
+  readonly description: string;
+  readonly acceptance: string | null;
+  readonly body: string;
+} {
+  const { first, rest } = splitAcceptance(String(input.prompt ?? ""));
+  return {
+    description: String(input.description ?? "").slice(0, RULES_MAX_CHARS),
+    acceptance: first,
+    body: rest.slice(0, RULES_MAX_CHARS),
+  };
+}
+
 export function buildClassifierState(
   input: { description?: string; prompt: string },
   maxStateChars: number,
@@ -88,12 +102,14 @@ export function buildClassifierState(
 
   // Nothing below runs a regex over more than RULES_MAX_CHARS characters of the prompt (QA-1.2-11),
   // except the linear indexOf scan that keeps a trailing acceptance block reachable.
-  const { first, rest } = splitAcceptance(String(input.prompt ?? ""));
+  const raw = classifierStateRawParts(input);
   const acceptanceRaw =
-    first === null || first.length > RULES_MAX_CHARS ? null : dropDirectiveLines(first);
+    raw.acceptance === null || raw.acceptance.length > RULES_MAX_CHARS
+      ? null
+      : dropDirectiveLines(raw.acceptance).split(/\r?\n/).filter((line) => !/^\s*cwd\s*:/i.test(line)).join("\n");
   const bodyRaw = collapseLongRuns(
     replaceIndentedBlocks(
-      replaceFences(dropDirectiveLines(rest.slice(0, RULES_MAX_CHARS)), CODE_BLOCK_PLACEHOLDER),
+      replaceFences(dropDirectiveLines(raw.body), CODE_BLOCK_PLACEHOLDER),
       CODE_BLOCK_PLACEHOLDER,
     )
       .replace(/\n{3,}/g, "\n\n")
@@ -103,7 +119,7 @@ export function buildClassifierState(
 
   // Scrub first, then bound: a secret cut in half by the bound would no longer match a token shape.
   const description = neutralize(
-    scrubState(String(input.description ?? "").slice(0, RULES_MAX_CHARS).replace(/\s+/g, " ").trim()),
+    scrubState(raw.description.replace(/\s+/g, " ").trim()),
   ).slice(0, STATE_DESCRIPTION_MAX_CHARS);
   const acceptance = acceptanceRaw === null ? null : neutralize(scrubState(acceptanceRaw));
   const body = neutralize(scrubState(bodyRaw));

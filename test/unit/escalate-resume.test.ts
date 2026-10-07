@@ -108,7 +108,7 @@ describe("planNextAttempt: variant steps and escalations on a session-aware poli
     expect(next.plan).toMatchObject({
       step: "variant", tier: "fast", agent: "fast", resumeSessionID: "child-1",
       model: { providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "medium" },
-      variant: "medium", costRatio: 1, // the tier's ratio: no candidate prices this rung
+      variant: "medium", costRatio: 5, // QA-G-B7: this catalog step reaches the medium preset rung
     });
     expect(next.plan.resumeBasis).toMatchObject({ resume: true, reason: "under-threshold" });
     expect(next.plan.fresh).toBeUndefined();

@@ -289,9 +289,9 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
     });
 
     it("A17a: an escalation into a tier whose base the child already covered resumes it at the first rung above, with the new agent", async () => {
-      // Default budget (4 attempts, 4x): after two attempts on fast only one remains for the two tiers above, so the
+      // Default attempt budget (4), generous cost ceiling: after two attempts on fast only one remains for the two tiers above, so the
       // ladder escalates; `medium` is sonnet#medium, which fast already ran, so it is entered at `high` (carryVariant).
-      const t = await setup({ tiers: OWNER, routing: {}, verdicts: [false, false, true] });
+      const t = await setup({ tiers: OWNER, routing: {}, escalate: { costCeiling: { multiple: 100 } }, verdicts: [false, false, true] });
       const result = await t.run();
       expect(result).toContain("[router ✓ verified:");
       expect(t.runs.map((r) => [r.sid, r.agent, r.model?.modelID, r.model?.variant, r.resumeSessionID])).toEqual([

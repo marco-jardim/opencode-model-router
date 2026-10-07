@@ -22,7 +22,7 @@ import { createTypeSafeBackend } from "./backends/typesafe";
 import { applyRouteLine, parseRouteLine, type RouteLinePositions } from "./route-line";
 import { analyzeRules } from "./rules";
 import { hasCredentialSignal } from "./scrub";
-import { buildClassifierState } from "./state";
+import { buildClassifierState, classifierStateRawParts } from "./state";
 import {
   BACKEND_IDS,
   CLASS_BASE_RISK,
@@ -298,7 +298,8 @@ function isGated(facts: TaskFacts, deps: ClassifyDeps): boolean {
  */
 function mentionsCredentials(prepared: Prepared): boolean {
   const description = typeof prepared.input.description === "string" ? prepared.input.description : "";
-  return hasCredentialSignal(description.slice(0, RULES_MAX_CHARS) + "\n" + prepared.parsed.stripped.slice(0, RULES_MAX_CHARS));
+  const raw = classifierStateRawParts({ description, prompt: prepared.parsed.stripped });
+  return [raw.description, raw.acceptance, raw.body].some((part) => part !== null && hasCredentialSignal(part));
 }
 
 function resultOf(

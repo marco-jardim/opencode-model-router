@@ -1416,24 +1416,19 @@ describe("owner preset trace", () => {
   const ratios = (tiers: Record<string, TierConfig>) => ({ charge: chargeBy(tiers) });
   const GENEROUS = { costCeiling: { multiple: 1000 } };
 
-  it("anthropic preset, default budget and real ratios: sonnet#low, sonnet#medium, sonnet#high (medium role), then the ceiling stops it", () => {
+  it("QA-G-B7: anthropic preset, default budget: sonnet#low then sonnet#medium at its preset ratio crosses the ceiling", () => {
     const policy = buildEscalatePolicy(makeConfig(OWNER), V2);
     expect(policy.maxTotalAttempts).toBe(4);
     expect(policy.costMultiple).toBe(4);
     const run = runLoop(policy, ratios(OWNER));
-    // The reserve (A17) escalates after fast#medium. The medium tier is the same model and its base is the rung
-    // already tried, but its ladder has rungs above it, so it is entered at the first one above the tried rung
-    // (A17a, QA-1.5-17): sonnet#high, never sonnet#medium again. Its ratio 5 takes the cumulative cost to
-    // 1 + 1 + 5 = 7 > 1 × 4.
-    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`, `${SONNET}#high`]);
+    // The catalog step reaches the medium preset rung: 1 + max(1, 5) = 6 > 1 × 4.
+    expect(attemptTrace(policy, run)).toEqual([`${SONNET}#low`, `${SONNET}#medium`]);
     expect(run.actions.map((a) => [a.action, a.tier, a.variantStep === true, a.costRatio])).toEqual([
-      ["retry", "fast", true, 1],
-      ["escalate", "medium", false, 5],
+      ["retry", "fast", true, 5],
       ["give_up", undefined, false, undefined],
     ]);
-    expect(run.actions[1]).toMatchObject({ variant: "high", carryVariant: true, rung: { model: SONNET, variant: "high" } });
-    expect(run.actions[2]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
-    expect(run.state.cumulativeCost).toBe(7);
+    expect(run.actions[1]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
+    expect(run.state.cumulativeCost).toBe(6);
   });
 
   it("anthropic preset, default budget without the cost ceiling: sonnet#low, sonnet#medium, sonnet#high, opus#xhigh", () => {
@@ -1469,12 +1464,12 @@ describe("owner preset trace", () => {
     const escalation = run.actions[4]!;
     expect(escalation).toMatchObject({ agent: "heavy", model: OPUS, costRatio: 20 });
     // heavy sits at its base (the top of the capped catalog ladder), so it only retries once; that second
-    // heavy attempt costs 20 and the cumulative cost (5 + 20 + 20 = 45) crosses the ×40 ceiling.
+    // heavy attempt costs 20 and the cumulative cost (9 + 20 + 20 = 49) crosses the ×40 ceiling.
     expect(run.actions.slice(5).map((a) => a.action)).toEqual(["retry", "give_up"]);
     expect(run.actions[5]).toMatchObject({ tier: "heavy", model: OPUS, variant: "xhigh", costRatio: 20 });
     expect(run.actions[5]).not.toHaveProperty("variantStep");
     expect(run.actions[6]).toEqual({ action: "give_up", reason: "cost ceiling exceeded" });
-    expect(run.state.cumulativeCost).toBe(45);
+    expect(run.state.cumulativeCost).toBe(49);
     expect(run.state.escalations).toBe(1);
     expect(run.state.currentTier).toBe("heavy");
     expect(run.state.currentVariant).toBeNull();
