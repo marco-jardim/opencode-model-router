@@ -323,7 +323,7 @@ export async function annotateSteps(steps: readonly PlanStep[], deps: AnnotateDe
     const parsed = parseRouteLine(step.text, { positions: "any" });
     const routePins = result.pin === true || parsed.line?.pin === true;
 
-    const detection: Detection = result.detection ?? detectionOf(step.text);
+    const detection = weakerDetection(result.detection, detectionOf(step.text));
     // A `[tier:heavy]` step and a QA step are pinned (D13): the engine never moves them.
     const qaStep = isQaLine(taskLine);
     const decisionPin = routePins || existingTier === "heavy" || qaStep;

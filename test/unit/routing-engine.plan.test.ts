@@ -294,7 +294,7 @@ describe("annotateSteps — existing [tier:X] and [route …] are preserved", ()
     expect(a.routeSource).toBe("existing");
     expect(a.routeLine).toBe("[route class=search risk=low scope=single d=deterministic]");
     expect(a.text).toBe("Search the repo [tier:fast]\n[route class=search risk=low scope=single d=deterministic]\ndetails");
-    expect(a.detection).toBe("deterministic"); // `d=` on the route line wins
+    expect(a.detection).toBe("none"); // A34: the preserved d= claim is not backed by an acceptance check
     expect(parseRouteLine(a.text, { positions: "any" }).count).toBe(1);
   });
 
@@ -410,6 +410,23 @@ describe("annotateSteps — evidence moves the engine tier", () => {
     const out = await annotateSteps([step("a", "Design the new cache architecture")], stubDeps(designFacts, { store: storeWith(20, 20) }));
     expect(out[0]!.tier).toBe("heavy");
     expect(out[0]!.decision?.switched).toBe(false);
+  });
+
+  it("B2 handoff: an unsupported plan d= claim cannot authorize a downgrade", async () => {
+    const route = "[route class=design risk=high scope=single d=deterministic]";
+    const store = storeWith(20, 20);
+    const inputs = [
+      step("static", `Design the new cache architecture\n${route}`),
+      step("tagged", `[tier:medium] Design the new cache architecture\n${route}`),
+    ];
+    const out = await annotateSteps(inputs, deps({ store }));
+    expect(out.map((row) => row.detection)).toEqual(["none", "none"]);
+    expect(out.map((row) => row.tier)).toEqual(["heavy", "medium"]);
+    expect(out.every((row) => row.decision?.switched === false)).toBe(true);
+    // The same claim backed by real checks permits the existing evidence-based switch.
+    const verified = await annotateSteps([step("verified", `${inputs[0]!.text}\n${ACCEPT_TESTS}`)], deps({ store }));
+    expect(verified[0]!.detection).toBe("deterministic");
+    expect(verified[0]!.tier).toBe("medium");
   });
 
   it("an untrusted class (confidence below minClassConfidence) keeps the static tier", async () => {
