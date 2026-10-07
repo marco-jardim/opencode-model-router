@@ -249,6 +249,22 @@ describe("shell-free git inspection", () => {
     expect(await inspect("show")).not.toContain("withheld");
   }, 30_000);
 
+  it("keeps path-limited log subjects equal to plain Git despite unrelated sensitive-only commits (R3-1)", async () => {
+    repository();
+    for (const [subject, path] of [["A", "app.ts"], ["B", "other.ts"], ["C", "app.ts"], ["D", ".env"], ["E", "app.ts"]] as const) {
+      writeFileSync(join(root, path), `${subject}\n`);
+      git("add", "--", path); git("commit", "-qm", subject);
+    }
+    for (const path of ["app.ts", "other.ts"]) {
+      for (const limit of [1, 20]) {
+        const output = await inspect("log", { path, limit });
+        const subjects = [...output.matchAll(/^    (.+)$/gm)].map(match => match[1]);
+        expect(subjects).toEqual(plain(root, "log", `--max-count=${limit}`, "--format=%s", "--", path).trim().split("\n"));
+        expect(output).not.toContain("withheld");
+      }
+    }
+  }, 30_000);
+
   describe("marker matrix: repository-configured programs never run (G1, G2, G14)", () => {
     /** Two commits, a signed tip, .gitattributes naming every driver, stale worktree changes. */
     function vectorRepository() {

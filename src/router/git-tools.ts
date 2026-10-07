@@ -164,7 +164,8 @@ export function gitArgv(operation: GitOperation, input: GitInput, root: string,
   const args = [...hardeningArgs(), ...(extra.config ?? [])];
   switch (operation) {
     case "status": args.push("status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=all"); break;
-    case "log": args.push("log", "--sparse", "--full-history", "--patch", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--no-show-signature", "--no-ext-diff", "--no-textconv", `--max-count=${input.limit ?? 20}`, "--format=medium", ...(ref ? [ref] : [])); break;
+    // Exclusion-only logs retain sensitive-only commits; explicit paths keep Git's normal file-history limiting.
+    case "log": args.push("log", ...(input.path === undefined ? ["--sparse", "--full-history"] : []), "--patch", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--no-show-signature", "--no-ext-diff", "--no-textconv", `--max-count=${input.limit ?? 20}`, "--format=medium", ...(ref ? [ref] : [])); break;
     case "diff": args.push("diff", "--src-prefix=a/", "--dst-prefix=b/", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--submodule=short",
       ...(input.mode && input.mode !== "patch" ? [`--${input.mode}`] : []), ...(ref ? [ref] : [])); break;
     case "show": args.push("show", "--sparse", "--src-prefix=a/", "--dst-prefix=b/", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--format=medium", "--submodule=short", ref ?? "HEAD"); break;
