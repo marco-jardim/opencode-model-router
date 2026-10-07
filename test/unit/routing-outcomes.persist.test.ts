@@ -253,7 +253,9 @@ describe("resolveOutcomesDir (D15)", () => {
   it("~ resolves against the home directory", () => {
     expect(resolveOutcomesDir("~", env)).toBe(env.homedir);
     expect(resolveOutcomesDir("~/outcomes", env)).toBe(join(env.homedir, "outcomes"));
-    expect(resolveOutcomesDir("~\\outcomes\\x", env)).toBe(join(env.homedir, "outcomes", "x"));
+    expect(resolveOutcomesDir("~/outcomes/x", env)).toBe(join(env.homedir, "outcomes", "x"));
+    // Only Windows treats interior backslashes as separators; POSIX preserves them as filename characters.
+    expect(resolveOutcomesDir("~\\outcomes\\x", env)).toBe(join(env.homedir, "outcomes\\x"));
   });
 
   it("an absolute path is normalised; `~name` is not a home reference", () => {

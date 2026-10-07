@@ -6,6 +6,7 @@
  * redirected by the test setup, and every state directory is a fresh temp directory.
  */
 import { spawnSync } from "node:child_process";
+import { supportsPlainNodeTypeScript } from "../helpers/node-typescript";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -628,7 +629,8 @@ describe("D18 /router stats and the checkpoint line", () => {
     decisionRow("D2", "2026-10-06T11:00:00.000Z", { resume: true }),
   ];
 
-  it("D18: prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
+  // The subprocess needs default TS stripping; module-level stats tests still run on Node 20.
+  it.skipIf(!supportsPlainNodeTypeScript())("D18: prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
     seed(...ROWS);
     const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
     const since = "2026-10-06T00:00:00Z";
@@ -662,7 +664,7 @@ describe("D18 /router stats and the checkpoint line", () => {
     }
   });
 
-  it("static: reads the directory without creating or quarantining anything, and --dir overrides the configured store", async () => {
+  it.skipIf(!supportsPlainNodeTypeScript())("static: reads the directory without creating or quarantining anything, and --dir overrides the configured store", async () => {
     seed(ROWS[1]!, ROWS[2]!);
     const before = readdirSync(store).sort();
     const hooks = await plugin({ engine: "static" });

@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { spawnSync } from "node:child_process";
+import { supportsPlainNodeTypeScript } from "../helpers/node-typescript";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -1024,7 +1025,17 @@ describe("D18 runStatsCli", () => {
 // The script, against a real directory
 // ---------------------------------------------------------------------------
 
-describe("D18 scripts/routing-stats.ts (plain node)", () => {
+describe("plain-node TypeScript support boundary", () => {
+  it.each([
+    ["20.20.0", false], ["22.17.0", false], ["22.18.0", true],
+    ["23.0.0", false], ["23.5.0", false], ["23.6.0", true], ["24.0.0", true],
+  ] as const)("Node %s supports default TS stripping: %s", (version, expected) => {
+    expect(supportsPlainNodeTypeScript(version)).toBe(expected);
+  });
+});
+
+// Skip subprocess checks only: Node <22.18 / 23.0–23.5 cannot run this TS CLI without flags.
+describe.skipIf(!supportsPlainNodeTypeScript())("D18 scripts/routing-stats.ts (plain node; requires default TS stripping)", () => {
   const made: string[] = [];
   afterEach(async () => {
     while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true });

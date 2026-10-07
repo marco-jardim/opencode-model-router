@@ -108,7 +108,9 @@ describe("temp directory guard", () => {
   it("assertTmpIsGuarded accepts the private dir and the real dir under another spelling is still rejected", () => {
     expect(() => assertTmpIsGuarded(tmpdir)).not.toThrow();
     expect(() => assertTmpIsGuarded(() => `${realTmp()}${process.platform === "win32" ? "\\" : "/"}`)).toThrow(/real temp directory/);
-    expect(() => assertTmpIsGuarded(() => join(realTmp(), "..", "Temp"))).toThrow(/real temp directory/);
+    expect(() => assertTmpIsGuarded(() => join(realTmp(), "nested", ".."))).toThrow(/real temp directory/);
+    // Case folding is a Windows spelling alias, not a POSIX filesystem rule.
+    expect(sameDir(join(realTmp(), "CaseProbe"), join(realTmp(), "caseprobe"))).toBe(process.platform === "win32");
   });
 });
 

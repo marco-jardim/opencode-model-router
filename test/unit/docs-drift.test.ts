@@ -246,10 +246,10 @@ describe("docs drift: cost-aware routing engine", () => {
     expect(undocumentedKeys(doc, names)).toEqual([]);
   });
 
-  it("keeps every engine-example block of ROUTING_ENGINE.md a valid configuration", () => {
-    const doc = read("docs/ROUTING_ENGINE.md");
+  it.each(["\n", "\r\n"])("keeps every engine-example block of ROUTING_ENGINE.md valid with %j line endings", (eol) => {
+    const doc = read("docs/ROUTING_ENGINE.md").replace(/\r?\n/g, eol);
     const bundled = JSON.parse(read("tiers.json")) as Record<string, unknown>;
-    const examples = [...doc.matchAll(/<!-- engine-example: ([\w-]+) -->\s*```jsonc\n([\s\S]*?)\n```/g)];
+    const examples = [...doc.matchAll(/<!-- engine-example: ([\w-]+) -->\s*```jsonc\r?\n([\s\S]*?)\r?\n```/g)];
     // shadow, enforce, ollama, opencode-go-host, opencode-go-http, typesafe
     expect(examples.map((m) => m[1])).toEqual(
       expect.arrayContaining(["shadow", "enforce", "ollama", "opencode-go-host", "opencode-go-http", "typesafe"]),

@@ -1849,10 +1849,10 @@ describe("docs/CONFIG_REFERENCE.md — routing section", () => {
   const docs = readFileSync(join(ROOT, "docs", "CONFIG_REFERENCE.md"), "utf-8");
 
   /** The JSONC fence that directly follows `<!-- <marker> -->`. */
-  function blockAfter(marker: string): unknown {
-    const at = docs.indexOf(`<!-- ${marker} -->`);
+  function blockAfter(marker: string, source = docs): unknown {
+    const at = source.indexOf(`<!-- ${marker} -->`);
     expect(at, `marker ${marker}`).toBeGreaterThanOrEqual(0);
-    const match = /```jsonc\n([\s\S]*?)\n```/.exec(docs.slice(at));
+    const match = /```jsonc\r?\n([\s\S]*?)\r?\n```/.exec(source.slice(at));
     expect(match, `fence after ${marker}`).not.toBeNull();
     return parseJsonc(match![1]!);
   }
@@ -1860,6 +1860,11 @@ describe("docs/CONFIG_REFERENCE.md — routing section", () => {
   it("documents exactly the v2 defaults that resolveRouting applies", () => {
     const { applied: _applied, ...resolved } = resolveRouting(cfgOf(), "v2");
     expect(blockAfter("routing-defaults: v2")).toEqual(resolved);
+  });
+
+  it.each(["\n", "\r\n"])("parses the documented defaults with %j line endings", (eol) => {
+    const { applied: _applied, ...resolved } = resolveRouting(cfgOf(), "v2");
+    expect(blockAfter("routing-defaults: v2", docs.replace(/\r?\n/g, eol))).toEqual(resolved);
   });
 
   it("lists every defaulted key in the keys table", () => {
