@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
+import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
@@ -20,6 +21,7 @@ import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { appendRouterFooter } from "../../src/verify/pending";
+import { readOnlyPermissions } from "../../src/router/read-only";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -83,6 +85,56 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  it.each([true, false])("Context7 lookup permissions and direct exposure require configured MCP: %s", async configured => {
+    const f = fixture();
+    Object.assign(f.ctx, { mcp: { list: async () => ({ data: configured ? [{ name: "context7", status: { status: "connected" } }] : [] }) } });
+    f.tools["context7_query-docs"] = { options: { namespace: "context7", codemode: true } };
+    Object.assign(f.editors.tool, { update: (id: string, update: (definition: { options?: { namespace?: string; codemode?: boolean } }) => void) => {
+      if (f.tools[id]) update(f.tools[id]);
+    } });
+    await f.start({ config: async (cfg: { mcp?: unknown; agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { permission: readOnlyPermissions(Boolean(cfg.mcp)) };
+    } });
+    expect(f.agents.fast.permissions.some((rule: { action: string }) => rule.action === "context7_query-docs")).toBe(configured);
+    expect(f.tools["context7_query-docs"].options.codemode).toBe(!configured);
+  });
+
+  it("prepends read-only policy before explicit host rules, without changing other tiers", async () => {
+    const f = fixture();
+    f.agents.fast = { id: "fast", mode: "subagent", permissions: [...Agent.Info.default(Agent.ID.make("fast")).permissions,
+      { action: "external_directory", resource: "*", effect: "deny" }], request: {} };
+    const before = structuredClone(f.agents.explore);
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { mode: "subagent", permission: { "*": "deny", read: "allow", router_git_status: "allow" } };
+      cfg.agent.medium = { mode: "subagent" };
+    } });
+    expect(f.agents.fast.permissions).toEqual([
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "read", resource: "*", effect: "allow" },
+      { action: "router_git_status", resource: "*", effect: "allow" },
+      { action: "external_directory", resource: "*", effect: "deny" },
+    ]);
+    expect(f.agents.medium.permissions).toBeUndefined();
+    expect(f.agents.explore).toEqual(before);
+  });
+
+  it("leaves user permissions intact when the tier policy is opted out", async () => {
+    const f = fixture();
+    const permissions = [{ action: "shell", resource: "*", effect: "deny" }];
+    f.agents.fast = { id: "fast", permissions: structuredClone(permissions) };
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { mode: "subagent" }; } });
+    expect(f.agents.fast.permissions).toEqual(permissions);
+  });
+  it("preserves an explicit user allow-all AFTER replacing the host's default prefix", async () => {
+    const f = fixture();
+    f.agents.fast = { id: "fast", permissions: [...Agent.Info.default(Agent.ID.make("fast")).permissions,
+      { action: "*", resource: "*", effect: "allow" }] };
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: { "*": "deny", read: "allow" } }; } });
+    expect(f.agents.fast.permissions).toEqual([
+      { action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" },
+      { action: "*", resource: "*", effect: "allow" },
+    ]);
+  });
   it("applies the real ladder retry's effort through context without nesting options or changing grader temperature", async () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-effort-"));
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);

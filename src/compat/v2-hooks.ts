@@ -1,6 +1,7 @@
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
+import { Agent } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
@@ -18,6 +19,7 @@ import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
 import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
 import { createSystemAugmenter } from "../routing/wire/hint";
+import { CONTEXT7_DOC_TOOLS, permissionRules } from "../router/read-only";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -31,7 +33,7 @@ export function v2Instructions(text: string): string {
 }
 
 type LegacyAgent = Record<string, any>;
-type LegacyConfig = { agent: Record<string, LegacyAgent>; command: Record<string, any> };
+type LegacyConfig = { agent: Record<string, LegacyAgent>; command: Record<string, any>; mcp?: Parameters<NonNullable<Hooks["config"]>>[0]["mcp"] };
 type LegacyHook = (input: any, output: any) => Promise<void>;
 
 function modelRef(value: string, variant?: string): any {
@@ -170,6 +172,9 @@ export async function registerV2Hooks(
     // advances `lastConfig` only once the host registries have reloaded from it.
     const buildConfig = async (): Promise<unknown> => {
       const next: LegacyConfig = { agent: JSON.parse(JSON.stringify(baseSeed)), command: {} };
+      const context7 = ctx.mcp && (await ctx.mcp.list()).data.some(server => server.name === "context7" && server.status.status !== "disabled");
+      // Presence-only bridge input, never registered as an MCP definition.
+      if (context7) next.mcp = { context7: { type: "local", command: [], enabled: true } };
       const nextOriginals = new Map(Object.entries(next.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
       await hooks.config?.(next);
       const nextOptions = new Map<string, Record<string, unknown>>();
@@ -218,6 +223,16 @@ export async function registerV2Hooks(
           if (definition.prompt !== undefined) agent.system = v2Instructions(definition.prompt);
           if (definition.color !== undefined) agent.color = definition.color;
           if (definition.steps !== undefined) agent.steps = definition.steps;
+          // Config-agent runs first, after Agent.Info.default's permissive
+          // prefix. Replace ONLY that exact prefix, never a matching user rule
+          // later in the list. Explicit global/agent rules still win last.
+          if (definition.permission) {
+            const existing = agent.permissions ?? [];
+            const defaults = Agent.Info.default(Agent.ID.make(name)).permissions;
+            const hasDefaults = defaults.every((rule, i) => existing[i]?.action === rule.action
+              && existing[i]?.resource === rule.resource && existing[i]?.effect === rule.effect);
+            agent.permissions = [...permissionRules(definition.permission), ...existing.slice(hasDefaults ? defaults.length : 0)];
+          }
         });
       }
     }));
@@ -252,6 +267,12 @@ export async function registerV2Hooks(
     }));
 
     registrations.push(await ctx.tool.transform((editor) => {
+      // execute is denied for read-only tiers. Keep the explicitly allowed docs
+      // lookups directly callable rather than stranding them in Code Mode.
+      if (config.mcp?.context7) for (const name of CONTEXT7_DOC_TOOLS) editor.update(name, definition => {
+        const { pinned: _pinned, ...options } = definition.options ?? {};
+        definition.options = { ...options, codemode: false };
+      });
       for (const [name, definition] of Object.entries(hooks.tool ?? {})) editor.add({
         name,
         description: v2Instructions(definition.description),
@@ -259,9 +280,12 @@ export async function registerV2Hooks(
         // Router tools must remain directly callable, matching v1 tool exposure.
         options: { codemode: false },
         execute: async (args, context) => within(context, async () => {
+          const directory = name.startsWith("router_git_")
+            ? (await ctx.session.get({ sessionID: context.sessionID })).location?.directory ?? ctx.location.directory
+            : ctx.location.directory;
           const result = await definition.execute(args, {
             sessionID: context.sessionID, messageID: context.messageID, agent: context.agent,
-            directory: ctx.location.directory, worktree: ctx.location.project.directory,
+            directory, worktree: ctx.location.project.directory,
             abort: context.signal,
             metadata: (metadata) => { void context.progress(metadata); },
             ask: async () => { throw new Error("[model-router] This tool cannot request v1 permissions on OpenCode 2"); },

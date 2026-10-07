@@ -128,7 +128,7 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     const prompt = await withRoles(hooks);
     const before = baseline();
     expect(prompt).not.toBe(before);
-    expect(rLine(prompt)).toMatchInlineSnapshot(`"R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca | by class: search→@explore implement→@general/@reviewer review→@reviewer"`);
+    expect(rLine(prompt)).toMatchInlineSnapshot(`"R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca | by class: search→@explore implement→@general/@reviewer review→@reviewer"`);
     // only the R: line moved: put the shipped line back and the prompt is the baseline again
     expect(prompt.replace(rLine(prompt), () => rLine(before))).toBe(before);
     // prose only: the engine's route-line paragraph (advise/enforce) is not added on v1
@@ -163,7 +163,10 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     const { hooks, agentsCall } = await plugin(routing as Record<string, unknown> | null);
     const system = await turn(hooks);
     expect(system).toHaveLength(1); // the whole array, not just its first part
-    expect(system.map((part) => ({ sha256: sha(part), length: part.length }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
+    // #77 deliberately moves rename to medium. Invert exactly that text delta
+    // before checking the historical hash: NO other prompt byte may change.
+    expect(system[0]).toContain("exists-check @medium→rename/impl-feature");
+    expect(system.map((part) => ({ sha256: sha(part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature")), length: part.length }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
     expect(system[0]).toBe(baseline()); // and the current assembleSystemPrompt agrees with that commit's output
     expect(agentsCall).not.toHaveBeenCalled(); // the agent list is not even fetched
   });

@@ -22,6 +22,7 @@ import {
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { gitTools } from "./router/git-tools";
+import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
 import { buildDispatchHeader } from "./router/dispatch-header";
@@ -2164,6 +2165,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           prompt: finalPrompt,
           color: tier.color,
         };
+        if (isReadOnlyTier(name, tier)) {
+          const permission = mergePermissions(readOnlyPermissions(Boolean(opencodeConfig.mcp?.context7)
+            && opencodeConfig.mcp.context7.enabled !== false), opencodeConfig.agent[name]?.permission);
+          agentDef.permission = permission;
+          agentDef.tools = { ...legacyReadOnlyTools(permission), ...opencodeConfig.agent[name]?.tools };
+        } else if (name === "fast" || tier.readOnly === false) {
+          // Opt-out removes OUR policy, not restrictions the user supplied.
+          for (const key of ["permission", "tools"]) {
+            if (opencodeConfig.agent[name]?.[key] !== undefined) agentDef[key] = opencodeConfig.agent[name][key];
+          }
+        }
 
         // Apply variant (thinking/reasoning mode)
         if (tier.variant) {

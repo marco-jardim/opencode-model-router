@@ -85,6 +85,8 @@ export const DEFAULT_STRONG_MODEL_PATTERNS = [
 
 export interface TierConfig {
   model: string;
+  /** Host-enforced read-only tools. Defaults to true for fast, false otherwise. */
+  readOnly?: boolean;
   variant?: string;
   /**
    * Provider-agnostic effort. Loses to an explicit `thinking` budget on
@@ -728,6 +730,9 @@ function validatePresets(obj: Record<string, unknown>): Record<string, unknown> 
         );
       }
       const t = tier as Record<string, unknown>;
+      if (t.readOnly !== undefined && typeof t.readOnly !== "boolean") {
+        throw new Error(`tiers.json: '${presetName}.${tierName}.readOnly' must be a boolean`);
+      }
       // `model` is the only required tier field — so an overrides file can define
       // a new preset/tier with just `{ "model": "..." }`. The rest are optional
       // and only type-checked when present.
