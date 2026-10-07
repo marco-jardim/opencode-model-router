@@ -35,8 +35,8 @@
  *     is withdrawn unconsumed (`v2-client.ts`). The mark and the "runner description" rule are defensive: they only matter on a host
  *     that does hook such calls.
  *  7. Multi-instance (A3): MEASURED on 2.0.22 (Phase 3.2, H2): the host hands a SESSION EVENT to the plugin instance of every live
- *     location, but the TOOL HOOKS of a call only to the instance of the session's location. So the owner rules (`ownsSession`: exact
- *     directory, deepest ancestor, first live instance) and the process-wide set of handled calls are defensive for hooks; what protects
+ *     location, but the TOOL HOOKS of a call only to the instance of the session's location. The receiving instance acts; the
+ *     process-wide set of handled calls is defensive for hooks. What protects
  *     the store from a duplicated EVENT is the event-id LRU of the ingest (`firstDelivery`) and of the registry. Only the first instance
  *     whose engine is live acts on a call.
  */
@@ -54,7 +54,7 @@ import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
   type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
-import { resolve as resolvePath, sep } from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   FLOOR_LIFT_REASON,
   RESUME_REASON,
@@ -201,51 +201,6 @@ interface Entry {
  */
 const handledCalls = new Set<string>();
 
-/** A directory in comparable form: absolute, no trailing separator, lower case on Windows (separators, spelling and case then compare by value). */
-function normalizeDirectory(value: string): string {
-  const resolved = resolvePath(value).replace(/[\\/]+$/, "");
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
-function isSameOrInside(parent: string, child: string): boolean {
-  return child === parent || child.startsWith(`${parent}${sep}`);
-}
-
-/**
- * QA-2.2-R2-2 (and its fallback): every dispatch router of the process, with the directory of its plugin instance (A3: one instance
- * per location). Which of them acts on a session is decided by the session's directory alone, see `ownsSession`.
- */
-const liveInstances = new Map<number, string>();
-let instanceSeq = 0;
-/** Directories whose "no instance owns this" fallback was already logged (bounded). */
-const loggedFallbacks = new Set<string>();
-
-/**
- * Does the instance with directory `mine` act on a session that lives in `sessionDirectory`?
- *  1. a live instance whose directory IS the session's directory acts (so a static instance of that location is never overridden);
- *  2. otherwise the live instance whose directory is the deepest ANCESTOR of the session's (a session in a subdirectory of the
- *     project, or of a sub-project, belongs to the nearest project root);
- *  3. otherwise (a moved session, a path the host spells differently): the first live instance to claim the call acts, as it did
- *     before instance selection existed; it is logged once per directory at debug level.
- * Instances that share a directory both qualify; the claim of the call (A3) lets the first one act.
- */
-function ownsSession(mine: string, sessionDirectory: string, logger: { debug?: (message: string, extra?: Record<string, unknown>) => void }): boolean {
-  // Directory preference is diagnostic only (QA-G-A6): the receiving instance must act even if the preferred one
-  // is live, because measured hosts deliver tool hooks only once. claimCall, not directory ownership, de-duplicates.
-  const target = normalizeDirectory(sessionDirectory);
-  const directories = [...liveInstances.values()].map(normalizeDirectory);
-  const own = normalizeDirectory(mine);
-  if (directories.includes(target) && own === target) return true;
-  const ancestors = directories.filter((directory) => isSameOrInside(directory, target));
-  if (ancestors.length > 0 && own === ancestors.reduce((deepest, directory) => (directory.length > deepest.length ? directory : deepest))) return true;
-  if (!loggedFallbacks.has(target)) {
-    loggedFallbacks.add(target);
-    while (loggedFallbacks.size > 64) loggedFallbacks.delete(loggedFallbacks.values().next().value as string);
-    logger.debug?.("[router] routing: the receiving instance acts even when another location owns the session; claimCall de-duplicates", { sessionDirectory });
-  }
-  return true;
-}
-
 function claimCall(key: string): boolean {
   if (handledCalls.has(key)) return false;
   handledCalls.add(key);
@@ -256,8 +211,6 @@ function claimCall(key: string): boolean {
 /** Test-only: forget which calls were handled. */
 export function resetDispatchRouting(): void {
   handledCalls.clear();
-  liveInstances.clear();
-  loggedFallbacks.clear();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -393,8 +346,7 @@ function ranOf(
 
 export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const now = deps.now ?? (() => Date.now());
-  const instanceID = ++instanceSeq;
-  liveInstances.set(instanceID, deps.directory);
+  const instanceNonce = randomBytes(8).toString("hex");
   /** Between `route()` and `commit()`. */
   const decided = new Map<string, Decided>();
   /** Committed dispatches, in insertion order, until their call ends. */
@@ -529,7 +481,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const stripped = result.stripped !== prompt ? result.stripped : undefined;
     const callModel = str(args.model) ?? call.tierModel ?? null;
     const resumeID = str(args.sessionID);
-    const decisionID = `${call.sessionID}:${safeNow(now)}:${++sequence}`;
+    const decisionID = `${call.sessionID}:${safeNow(now)}:${instanceNonce}:${++sequence}`;
 
     const chosen = resolveChosen({ cfg: prepared.cfg, agents: infos, agent, model: callModel, parentModel: session.model });
     let decision: Decision | null = null;
@@ -712,7 +664,6 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         }
         // QA-G-A6: only the session location receives tool hooks on measured hosts. Never defer to an instance that
         // may receive no hook; the process-wide call claim below remains the single-writer guard.
-        if (session.directory !== null && !ownsSession(deps.directory, session.directory, deps.logger)) return UNTOUCHED;
         if (!claimCall(callKey)) return UNTOUCHED;
         // Only an orchestrator's own prompt is parsed (QA focus: a delegate must not be able to pin or steer).
         if (session.parentID !== null) return UNTOUCHED;
@@ -836,7 +787,6 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     misclaimedCount: () => misclaimed.size,
 
     dispose(): void {
-      liveInstances.delete(instanceID);
     },
 
     pendingCount(): number {

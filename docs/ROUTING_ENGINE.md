@@ -474,6 +474,8 @@ OpenCode v1 is unchanged in every mode (D1). With no `routing` block nothing dif
 
 ## Known limits and experimental parts
 
+- **Project static opt-out (QA-G-R2-1):** a project's `engine: static` opt-out depends on the host delivering each tool call once to that project's plugin instance, as measured on 2.0.22/2.0.24. The receiving live instance acts; directory ownership does not suppress it. Process-wide call claims prevent duplicate live routing, but cannot enforce a static project's opt-out on a host that also delivers its call to another live location.
+
 - **The advise hint can still affect the prompt cache.** For a given class and unchanged agent description, the hint changes only when the recommended destination changes (including gaining or losing a recommendation), not when live outcome numbers change. A different class also changes its class label. It is absent in `enforce`. The cache-read share remains unmeasured; DF5 must compare the orchestrator's cache-read share with the hint on against the `shadow` baseline (QA-2.2-10 / QA-G-A1).
 - **Credential-skip diagnostics are coarse.** `backendSkipped: "credentials"` records that the backend was skipped, but does not identify which credential-detection signal fired.
 - **`delegate` producers have no false-refusal detection.** `onFalseRefusal` is wired only on the native-subagent result path, not the runner's `delegate` producers; zero-call capability hand-backs there do not feed refusal outcomes.

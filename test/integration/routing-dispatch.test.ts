@@ -1778,6 +1778,21 @@ describe("instance selection: the receiving live instance acts; call claims de-d
   };
   const stripped = "Implement the change in src/a.ts.";
 
+  it("R2-12: separate instances at the same clock tick and sequence emit distinct decision IDs", async () => {
+    const world = await makeWorld({ engine: "shadow", roles: {} });
+    await world.start();
+    await instanceAt(world, join(world.home, "other"));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    try {
+      await deliver(world, "in-order");
+      await deliver(world, "reversed");
+      const rows = await world.rows();
+      expect(rows).toHaveLength(2);
+      expect(rows[0]!.decisionID).not.toBe(rows[1]!.decisionID);
+      expect(rows.every((row) => /:[a-f0-9]{16}:1$/.test(row.decisionID))).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
   it("one instance, the session in a subdirectory of its project: routed", async () => {
     const world = await makeWorld({ engine: "shadow", roles: {} });
     await world.start();
@@ -1786,7 +1801,7 @@ describe("instance selection: the receiving live instance acts; call claims de-d
     expect(await world.rows()).toHaveLength(1);
   });
 
-  it("one instance, a session directory unrelated to it: routed by the fallback, logged once at debug", async () => {
+  it("R2-1: one instance routes an unrelated session directory without inventing another owner", async () => {
     const world = await makeWorld({ engine: "shadow", roles: {} });
     const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
     await world.start();
@@ -1795,7 +1810,7 @@ describe("instance selection: the receiving live instance acts; call claims de-d
     expect(await deliver(world)).toMatchObject({ prompt: stripped });
     expect(await world.rows()).toHaveLength(2);
     const lines = debug.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("the receiving instance acts"));
-    expect(lines).toHaveLength(1); // once per directory, not per dispatch
+    expect(lines).toHaveLength(0);
   });
 
   it("two live instances: the first receiving instance acts, even if another owns the directory", async () => {
