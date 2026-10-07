@@ -617,7 +617,7 @@ permissions: `readOnly: true` reuses the read-only policy, or give an explicit `
 ```
 
 Project overrides cannot define `agents`. `opencode.json` wins for the fields it sets when it defines the same
-name. `subagentTiers` no longer creates agents that do not exist. See
+name. `subagentTiers` no longer creates agents that do not exist (host built-ins such as `explore` still map). `allowTools` never grants edit, delegation, Code Mode or shell. See
 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md#agents--router-defined-subagents-81).
 ### Read-only call caps
 

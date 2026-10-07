@@ -58,8 +58,25 @@ agents (unit test: "publishes the v2 vocabulary").
 - `allowTools` and shell patterns are permission rules, not a sandbox (see `docs/READ_ONLY_TIERS.md`).
 - A host agent with the same name as a plugin agent that the host registers **after** the router's setup cannot
   be told apart from the router's own agent; the same-name notice is based on the setup-time agent list.
-- Host-seed fields win: for a same-name host agent, `mode`, `model`, `variant` and `description` read from the
+- Host-seed fields win: for a same-name host agent, `mode`, `model` and `variant` read from the
   host at setup override the router's values (opencode.json wins for the fields it sets).
 - A `readOnly` agent whose `permission` only adds deny/ask rules cannot grant anything; grants go in `allowTools`.
-- Wildcard read grants other than `*` get the sensitive globs denied at that position (stricter than needed).
+- Wildcard read grants other than `*` get the sensitive globs denied at that position (global, not just stricter): it overrides earlier asks and an explicit `*.env: allow`.
 - v2 `ctx.agent.list()` is called per prompt only while a `subagentTiers` name is still pending.
+## 7. Round 1 fixes
+
+| QA | Fix | Commit |
+|---|---|---|
+| QA-81-1 | v2 copies only inherited denies; monotonicity check replaces `exempt` | 6241353 |
+| QA-81-2 | grep redaction for plugin agents on v1 (session recorded at `chat.message`) | b59b9e1 |
+| QA-81-3 | grep redaction for explicit-permission plugin agents, v1 and v2 | b59b9e1 |
+| QA-81-4 | v1 `subagentTiers` still maps host built-ins such as `explore` | 7c2f593 |
+| QA-81-5 | `allowTools` never grants edit, delegation or Code Mode (`multiedit`, `apply_patch`, `execute`, `delegate`; leading wildcards rejected) | b407b36 |
+| QA-81-6 | no legacy `tools` booleans from `allowTools` | b407b36 |
+| QA-81-7 | v2 seed drops `description`; non-subagent host collisions skipped; notice names its real source | 7804dad |
+| QA-81-8 | stale plugin agents removed on reload (marker plus closure state) | b92e798 |
+| QA-81-9 | one preset resolver (`resolveActiveTiers`) | b92e798 |
+| QA-81-10 | docs match the code (order of `{effect:[patterns]}` groups, runner denies, mode `all` on v1 / `primary` on v2) | this commit |
+| QA-81-11 | shared dedupe key for the "missing subagentTiers" notice | b92e798 |
+| QA-81-12 | v2 deny/ask wording by agent kind | 7804dad |
+| QA-81-13 | docs: narrow wildcard read grant denies sensitive globs globally | this commit |

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Plugin agents round-1 fixes (#81).** `allowTools` can no longer grant edit, delegation, Code Mode `execute` or shell, rejects leading wildcards and never reaches the legacy `tools` booleans; grep output is redacted for every plugin agent on v1 and v2; v1 `subagentTiers` still maps host built-ins such as `explore`; stale plugin agents are removed on reload; one preset resolver; v2 skips colliding non-subagent host agents. See `docs/qa/plugin-agents.md`.
 - `subagentTiers` no longer creates phantom primary, allow-all agents for names that no agent defines; such
   names are skipped with a notice. On v2 the router re-checks at the first prompt, so `opencode.json` agents
   registered after startup still get the tier model.
