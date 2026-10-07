@@ -52,10 +52,14 @@ export const RESERVED_AGENT_NAMES: readonly string[] = [
 ];
 
 /**
- * Actions a plugin agent's `allowTools` may never match. Shell, edits and delegation are what
- * makes an agent read-only or not; `read` carries the sensitive-path asks. They belong in `permission`.
+ * Actions a plugin agent's `allowTools` may never match. Shell, edits, code execution and delegation
+ * are what makes an agent read-only or not; `read` carries the sensitive-path asks. They belong in
+ * `permission`. `multiedit`/`apply_patch` are edit tools (the v1 host maps legacy edit tools to the
+ * `edit` permission); `execute` is Code Mode; `delegate` is the router's delegation tool.
  */
-export const POLICY_ACTIONS: readonly string[] = ["shell", "bash", "edit", "write", "patch", "subagent", "task", "read"];
+export const POLICY_ACTIONS: readonly string[] = [
+  "shell", "bash", "edit", "write", "patch", "multiedit", "apply_patch", "execute", "subagent", "task", "delegate", "read",
+];
 
 /** The capabilities a read-only agent's own `permission` may never ask for (only deny). */
 const HARD_ACTIONS: readonly string[] = ["shell", "bash", "edit", "write", "patch", "subagent", "task"];
@@ -171,6 +175,8 @@ export function validatePluginAgent(
     tools = [];
     for (const [i, tool] of allowTools.entries()) {
       if (typeof tool !== "string" || tool === "" || tool === "__proto__") return fail(`${at}.allowTools[${i}]`, "must be a non-empty tool name");
+      // A leading wildcard (`*_*`, `?x`) matches tools the router cannot enumerate, including future host tools.
+      if (tool[0] === "*" || tool[0] === "?") return fail(`${at}.allowTools[${i}]`, `'${tool}' starts with a wildcard; name the tool or a prefix such as 'context7_*'`);
       const hit = POLICY_ACTIONS.find((action) => permissionMatches(action, tool));
       if (hit !== undefined) return fail(`${at}.allowTools[${i}]`, `'${tool}' matches '${hit}'; shell, edit, delegation and read rules belong in 'permission'`);
       tools.push(tool);
@@ -348,6 +354,10 @@ export function buildPluginAgentDefinition(
   opts: { context7: boolean; host: "v1" | "v2" },
 ): Record<string, unknown> {
   const policy = pluginAgentPolicy(entry, opts);
+  // Legacy `tools` booleans never carry `allowTools` (QA-81-5): the v1 host maps legacy `write|edit|patch`
+  // tools to the `edit` permission, and the permission rules already grant every allowTools entry.
+  const { allowTools: _granted, ...withoutGrants } = entry;
+  const legacy = pluginAgentPolicy(withoutGrants, opts).permission;
   const steps = entry.steps ?? tier.steps;
   const definition: Record<string, unknown> = {
     model: tier.model,
@@ -357,7 +367,7 @@ export function buildPluginAgentDefinition(
     ...(steps === undefined ? {} : { steps, maxSteps: steps }),
     ...(tier.variant ? { variant: tier.variant } : {}),
     permission: policy.permission,
-    tools: legacyReadOnlyTools(policy.permission),
+    tools: legacyReadOnlyTools(legacy),
   };
   const marker: PluginAgentMarker = { tier: entry.tier, readOnly: entry.readOnly === true };
   Object.defineProperty(definition, PLUGIN_AGENT, { value: marker, enumerable: false, configurable: true });

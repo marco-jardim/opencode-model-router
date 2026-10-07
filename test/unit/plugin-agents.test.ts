@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { getConfigNotices, invalidateConfigCache, loadConfig, pluginAgentLines, OVERRIDE_FILENAME } from "../../src/router/config";
 import type { Preset } from "../../src/router/config";
 import {
-  GRADER_AGENT_NAME, pluginAgentPolicy, sanitizePluginAgents, validatePluginAgent,
+  GRADER_AGENT_NAME, buildPluginAgentDefinition, pluginAgentPolicy, sanitizePluginAgents, validatePluginAgent,
 } from "../../src/router/plugin-agents";
 import {
   evaluatePermission, isMonotone, permissionRules, publishReadOnlyPermissions, READ_ONLY_CANARIES, type PermissionRule,
@@ -64,6 +64,24 @@ describe("plugin agents: validation", () => {
     expect(validatePluginAgent("r", { ...ok, allowTools: [tool] }, ctx).ok).toBe(false);
   });
 
+  it.each(["multiedit", "apply_patch", "execute", "delegate", "*_*", "?ebfetch"])("allowTools rejects %s (QA-81-5/6)", (tool) => {
+    expect(validatePluginAgent("r", { ...ok, allowTools: [tool] }, ctx).ok).toBe(false);
+  });
+
+  it.each(["web*", "router_git_*", "context7_*"])("allowTools accepts prefix wildcard %s", (tool) => {
+    expect(validatePluginAgent("r", { ...ok, allowTools: [tool] }, ctx).ok).toBe(true);
+  });
+
+  it("v1 definition tools never carry allowTools keys nor enable edit tools for readOnly", () => {
+    const def = buildPluginAgentDefinition(
+      { tier: "scout", description: "d", readOnly: true, allowTools: ["webfetch", "context7_*"] },
+      tiers.scout, { context7: false, host: "v1" },
+    );
+    const t = (def.tools ?? {}) as Record<string, boolean>;
+    expect(Object.keys(t)).not.toContain("webfetch");
+    expect(Object.keys(t)).not.toContain("context7_*");
+    for (const k of ["write", "edit", "patch", "multiedit"]) expect(t[k]).not.toBe(true);
+  });
   it("allowTools accepts MCP and webfetch names", () => {
     expect(validatePluginAgent("r", { ...ok, allowTools: ["webfetch", "context7_*"] }, ctx).ok).toBe(true);
   });
