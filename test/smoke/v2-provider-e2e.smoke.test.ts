@@ -35,7 +35,7 @@ afterEach(async () => {
     if (path.dirname(fixture.root) !== parent || !path.basename(fixture.root).startsWith("omr-v2-e2e-")) {
       throw new Error(`Unexpected v2 e2e fixture path: ${fixture.root}`);
     }
-    await rm(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }, 30_000);
 

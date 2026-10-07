@@ -68,7 +68,7 @@ describe("concurrency isolation", () => {
     }
     delete process.env.MODEL_ROUTER_ENFORCE;
     invalidateConfigCache();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("per-session read budget is isolated", async () => {

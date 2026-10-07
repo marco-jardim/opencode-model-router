@@ -134,7 +134,7 @@ beforeAll(() => {
 
 afterAll(() => {
   for (const dir of [projectDir, homeDir]) {
-    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    if (dir) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 

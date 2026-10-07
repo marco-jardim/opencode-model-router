@@ -69,7 +69,7 @@ suite("e2e fixtures self-check", () => {
 
   afterAll(async () => {
     for (const r of repos) await r.dispose();
-    await rm(ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }, TIMEOUT);
 
   for (const c of CASES) {

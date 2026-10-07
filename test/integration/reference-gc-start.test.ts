@@ -41,7 +41,7 @@ describe("reference GC at plugin start", () => {
       else delete process.env[key];
     }
     invalidateConfigCache();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const ctx = (logs: unknown[]) => ({
     directory: dir, worktree: dir, project: {}, serverUrl: new URL("http://localhost"), $: () => {},
@@ -70,7 +70,7 @@ describe("reference GC at plugin start", () => {
   it("the project directory can be removed right after start, and plugin dispose cancels the pending GC", async () => {
     const hooks = await start([]);
     // The start spawned no git child in `dir`, so nothing holds it.
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     expect(fs.existsSync(dir)).toBe(false);
     fs.mkdirSync(dir);
     await hooks.dispose?.();

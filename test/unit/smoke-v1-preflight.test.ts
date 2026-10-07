@@ -46,7 +46,7 @@ describe("smoke:v1 preflight", () => {
       expect(run.stderr).toContain("no `opencode` executable was found on PATH");
       expect(run.stderr).toContain("first on PATH");
     } finally {
-      rmSync(empty, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(empty, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 });

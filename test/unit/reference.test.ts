@@ -212,7 +212,7 @@ afterEach(async () => {
     expect(await worktreeCount(repo)).toBe(1);
     expect(await refDirsIn(tmp)).toEqual([]);
   } finally {
-    await fsp.rm(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    await fsp.rm(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -538,7 +538,7 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     const result = await materialize(await capture(), undefined, new AbortController().signal, deps({ randomSuffix: () => suffix }));
     expect(result).toMatchObject({ ok: false, reason: "unsafe-path" });
     expect(await fsp.readFile(join(existing, "foreign.txt"), "utf8")).toBe("not ours");
-    await fsp.rm(existing, { recursive: true });
+    await fsp.rm(existing, { recursive: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("dispose twice returns the same promise and never rejects", async () => {
@@ -553,7 +553,7 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
   it("dispose after the dir was deleted externally drops the admin entry", async () => {
     const handle = await mat(await capture());
     for (const link of handle.links) await fsp.unlink(link);
-    await fsp.rm(handle.dir, { recursive: true, force: true });
+    await fsp.rm(handle.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     await handle.dispose();
     expect(await worktreeCount(repo)).toBe(1);
     expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
@@ -1101,7 +1101,7 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
 
     // Test cleanup of the kept worktrees (not the module under test).
     for (const wt of [live, ownFresh, lookalike, userWt]) await git(repo, "worktree", "remove", "--force", wt);
-    await fsp.rm(plainLookalike, { recursive: true });
+    await fsp.rm(plainLookalike, { recursive: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("QA-1.5-5: GC lifts only an 'initializing' lock, and only for a dead owner", async () => {
@@ -1171,7 +1171,7 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     const LIVE = 222222;
     const gone = join(tmp, `omr-ref-${LIVE}-00000000000000e1`);
     await git(repo, "worktree", "add", "-q", "--detach", "--lock", "--reason", referenceLockReason(LIVE), gone, "HEAD");
-    await fsp.rm(gone, { recursive: true, force: true }); // junction-free test worktree
+    await fsp.rm(gone, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); // junction-free test worktree
     const report = await gcStaleReferences(repo, deps({ isAlive: () => true, now: () => Date.now() + 30 * 24 * 60 * 60 * 1000 }));
     expect(report.removed.map((d) => d.toLowerCase())).toEqual([gone.toLowerCase()]);
     expect(report.failed).toEqual([]);
@@ -1294,7 +1294,7 @@ describe("8.3 short paths (E2E-2)", { timeout: 60_000 }, () => {
       expect(warnings).toEqual([]);
     } finally {
       if ((await fsp.lstat(junction).catch(() => undefined))?.isSymbolicLink()) await fsp.unlink(junction);
-      await fsp.rm(longRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      await fsp.rm(longRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 });

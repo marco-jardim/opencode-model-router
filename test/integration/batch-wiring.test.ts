@@ -371,8 +371,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-  if (state.refRoot !== "") rmSync(state.refRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  rmSync(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  if (state.refRoot !== "") rmSync(state.refRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 describe("batch coordinator behind the verification wiring (2.2.3)", () => {

@@ -117,7 +117,7 @@ describe("tree snapshot against a real git repository", { timeout: REAL_GIT_TIME
       git("mv", "a.test.ts", "b.test.ts");
       await body(repo);
     } finally {
-      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   };
   const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
@@ -166,7 +166,7 @@ describe("shell edits to files already dirty at dispatch, against a real git rep
       writeFileSync(join(repo, "src", "a.js"), WIP);
       await body(repo, git);
     } finally {
-      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   };
   /** The real wiring and store over the real snapshotTree (the capture stays mocked: git-only, no test run). */
@@ -282,7 +282,7 @@ describe("commits made since dispatch, against a real git repository (QA-2.1-12)
       git("add", "-A"); git("commit", "-q", "-m", "init");
       await body(repo, git);
     } finally {
-      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   };
   /** The real snapshotTree, and the argv seam running real git (every call is still recorded). */
@@ -772,7 +772,7 @@ describe("gate seams", () => {
       await expect(fs.unlink("b.txt")).resolves.toBeUndefined();
       await expect(fs.unlink("dir")).rejects.toThrow();
     } finally {
-      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 
@@ -849,7 +849,7 @@ describe("gate seams", () => {
         const hits = await s.findByContent(dir, "mod02", [":(glob)**/test_*.py", ":(glob)**/*_test.py", ":(glob)**/conftest.py"], { word: true });
         expect([...(hits ?? [])].sort()).toEqual(Object.keys(corpus).map(k => resolve(dir, `tests/test_${k}.py`)).sort());
       } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       }
     });
     it("QA-G-3: findByName brackets glob metacharacters, so a name is matched literally", async () => {
@@ -872,7 +872,7 @@ describe("gate seams", () => {
         });
         expect(await s.findByName(dir, ["test_mod0[1-2]_[1-3].py"])).toEqual([resolve(dir, "tests/test_mod0[1-2]_[1-3].py")]);
       } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       }
     });
     it("QA-G-19: real git finds a nested conftest.py by content", async () => {
@@ -896,7 +896,7 @@ describe("gate seams", () => {
         const hits = await s.findByContent(dir, "helpers", [":(glob)**/test_*.py", ":(glob)**/*_test.py", ":(glob)**/conftest.py"]);
         expect([...(hits ?? [])].sort()).toEqual([resolve(dir, "tests/api/conftest.py"), resolve(dir, "tests/unit/test_unit.py")]);
       } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       }
     });
     it("a deadline bounds each search and a spent or aborted one runs no git", async () => {

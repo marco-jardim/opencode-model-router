@@ -156,7 +156,7 @@ afterAll(() => {
         recursive: true,
         force: true,
         maxRetries: 10,
-        retryDelay: 300,
+        retryDelay: 200,
       });
     }
   }

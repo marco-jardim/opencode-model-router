@@ -36,7 +36,7 @@ describe("temp directory guard", { timeout: 60_000 }, () => {
     } finally {
       remove.mockRestore();
       warn.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
   it("N10: native child homedir inherits the private home, not just the os mock", () => {
@@ -136,7 +136,7 @@ describe("global guard teardown (QA-2.1-R2-6)", () => {
       expect(logs).toEqual([]);
       expect(removeRunGuardDirs(root, "")).toBe(0); // no run id: never guess
     } finally {
-      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 
@@ -156,7 +156,7 @@ describe("global guard teardown (QA-2.1-R2-6)", () => {
       expect(removeRunGuardDirs(join(root, "nope"), "RUN1", (message) => missing.push(message))).toBe(0);
       expect(missing[0]).toMatch(/cannot list/);
     } finally {
-      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 });

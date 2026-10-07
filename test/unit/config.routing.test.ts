@@ -100,7 +100,7 @@ beforeEach(() => {
 
 afterEach(() => {
   restoreHomeEnv();
-  if (tmpHome !== "") rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  if (tmpHome !== "") rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   tmpHome = "";
   invalidateConfigCache();
 });
@@ -981,7 +981,7 @@ describe("hot reload of the global override file with a routing block", () => {
       const merged = resolveRouting(loadConfig(project), "v2");
       expect(merged).toMatchObject({ engine: "advise", margin: 0.3, roles: { search: ["explore"] } });
     } finally {
-      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 
@@ -1018,7 +1018,7 @@ describe("hot reload of the global override file with a routing block", () => {
         review: ["general"],
       });
     } finally {
-      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 
@@ -1032,7 +1032,7 @@ describe("hot reload of the global override file with a routing block", () => {
       invalidateConfigCache();
       expect(resolveRouting(loadConfig(project), "v2").roles).toEqual({});
     } finally {
-      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 
@@ -1154,7 +1154,7 @@ describe("hot reload of the global override file with a routing block", () => {
         expect(call).toBeDefined();
         expect((call![1] as { source: string }).source).toContain(".opencode");
       } finally {
-        rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       }
     });
 
@@ -1219,7 +1219,7 @@ describe("hot reload of the global override file with a routing block", () => {
     });
 
     afterEach(() => {
-      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     });
 
     it("drops classifier.{backend,model,baseUrl,apiKeyEnv,presets} and outcomes.path from the project layer, keeps the other keys, warns once", () => {
@@ -1505,7 +1505,7 @@ describe("build-info", () => {
   });
 
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   function write(rel: string, content: string): string {

@@ -41,7 +41,7 @@ describe("v1 roles line: a failure leaves the baseline protocol (QA-2.4-13)", ()
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("a throwing applyV1Roles is logged and the system prompt is exactly the baseline", async () => {

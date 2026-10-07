@@ -60,7 +60,7 @@ afterEach(() => {
   state.taskkillFails = false;
   state.lastChild = undefined;
   state.standInPid = 0;
-  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 function alive(pid: number): boolean {

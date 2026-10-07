@@ -488,7 +488,7 @@ async function main(): Promise<number> {
       }
     }
     await unlinkLinks(work);
-    await rm(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch((e: unknown) => {
+    await rm(work, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).catch((e: unknown) => {
       console.log(`WARN could not remove ${work}: ${String(e)}`);
     });
   }

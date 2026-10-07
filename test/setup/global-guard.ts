@@ -19,7 +19,7 @@ export function removeRunGuardDirs(
   root: string,
   runId: string,
   log: (message: string) => void = (message) => console.warn(message),
-  remove: (path: string) => void = (path) => rmSync(path, { recursive: true, force: true }),
+  remove: (path: string) => void = (path) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }),
 ): number {
   if (runId === "") return 0;
   let names: string[];

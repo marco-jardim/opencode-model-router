@@ -100,7 +100,7 @@ describe("delegation depth plugin wiring", () => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
     invalidateConfigCache();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   async function setup(ctx: ReturnType<typeof makeCtx> & Pick<RouterPluginInput, "routerChildRunner" | "routerHost"> = makeCtx(dir)) {

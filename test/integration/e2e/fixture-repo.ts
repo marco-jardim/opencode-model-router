@@ -242,7 +242,7 @@ export async function prepareFixtureRepo(
     await writeFile(p, content, "utf8");
   };
   const remove = async (rel: string): Promise<void> => {
-    await rm(join(dir, rel), { recursive: true, force: true });
+    await rm(join(dir, rel), { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   };
 
   if (opts.preexisting) {
@@ -258,7 +258,7 @@ export async function prepareFixtureRepo(
       throw e;
     });
     if (st?.isSymbolicLink()) await unlink(nm);
-    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   };
 
   return { dir, name, testCommand: spec.testCommand, write, remove, git, commit, head, sentinelPath, dispose };

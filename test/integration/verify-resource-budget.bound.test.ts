@@ -404,7 +404,7 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", { concurrent: fa
     }
     // FixtureRepo.dispose unlinks a node_modules junction before removing the tree.
     for (const r of repos) await r.dispose();
-    if (bundleDir !== "") await rm(bundleDir, { recursive: true, force: true });
+    if (bundleDir !== "") await rm(bundleDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     if (root !== "") await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }, 180_000);
 

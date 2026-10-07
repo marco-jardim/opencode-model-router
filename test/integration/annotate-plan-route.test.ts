@@ -538,7 +538,7 @@ describe("locatePlan, agentInfosForPlan, renderDirectives", { timeout: 60_000 },
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "annotate-locate-"));
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
   it("uses the named file (quotes stripped; relative to the project), else PLAN.md, plan.md, then the newest *plan*.md", async () => {
     expect(await locatePlan("", [dir])).toBeNull(); // nothing there yet
@@ -568,7 +568,7 @@ describe("locatePlan, agentInfosForPlan, renderDirectives", { timeout: 60_000 },
       writeFileSync(join(other, "p.md"), "- z");
       expect((await locatePlan("p.md", [dir, other]))?.path).toBe(join(other, "p.md"));
     } finally {
-      rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 
@@ -723,7 +723,7 @@ describe("/annotate-plan in the plugin", () => {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   const model = (ref: string) => {

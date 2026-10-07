@@ -53,7 +53,7 @@ describe("shared sensitive paths", () => {
       expect(names).toEqual([...ordinary].sort());
       const diff = git("diff", "--cached", "--", ...sensitiveGitPathspecs());
       expect(diff).not.toContain("PRIVATE_MARKER"); expect(diff).toContain("PUBLIC_MARKER");
-    } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+    } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
   });
   it("keeps grep truncation notices even after a final sensitive block", () => {
     const notice = "(Results are truncated: showing first 1 results. Consider using a more specific path or pattern.)";

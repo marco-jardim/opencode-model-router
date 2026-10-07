@@ -71,7 +71,7 @@ describe("plugin hookups of the batch coordinator (QA-2.2-20)", () => {
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
     invalidateConfigCache();
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("the idle sweeper calls sweepVerification, and plugin dispose awaits disposeVerification", async () => {

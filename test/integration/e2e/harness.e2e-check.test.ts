@@ -178,7 +178,7 @@ suite("e2e harness self-check", () => {
   });
 
   afterAll(() => {
-    for (const dir of [repo, home]) if (dir !== "") rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    for (const dir of [repo, home]) if (dir !== "") rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("defers a real task dispatch, lists it for the orchestrator, and samples the machine", async () => {

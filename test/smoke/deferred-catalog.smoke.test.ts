@@ -230,7 +230,7 @@ afterAll(async () => {
         recursive: true,
         force: true,
         maxRetries: 10,
-        retryDelay: 250,
+        retryDelay: 200,
       });
     } catch {
       // a leftover temp dir is not worth failing the run over

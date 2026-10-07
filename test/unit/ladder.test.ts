@@ -102,7 +102,7 @@ describe("additional golden v2.0.0 cost coverage", () => {
         const reference: CostGoldenLadder = await import(/* @vite-ignore */ pathToFileURL(modulePath).href);
         writeFileSync(fixtureUrl, `${JSON.stringify(generateCostGolden(reference), null, 2)}\n`, "utf8");
       } finally {
-        rmSync(directory, { recursive: true, force: true });
+        rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       }
     }
     const actual = generateCostGolden({ newLadderState, recordAttempt, nextAction, advance, formatLadderScorecard });

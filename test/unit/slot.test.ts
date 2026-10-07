@@ -205,7 +205,7 @@ afterAll(() => {
   // retry, and never let one busy directory strand the rest (omr-slot-* leaked otherwise).
   for (const d of dirs.splice(0)) {
     try {
-      rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // Best effort: a directory still busy after the retries is left to the OS temp cleanup.
     }
@@ -1253,11 +1253,11 @@ describe("slot: file-system errors never reject (QA-1.4-22)", () => {
     const warns: string[] = [];
     const deps = fast(dir, { logger: { warn: (m) => warns.push(m) } });
     await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     await held(await acquireSlot({ max: 1, waitMs: 500, meta }, deps)).release(); // the ticket path re-creates it too
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     expect(await withSlot({ max: 1, waitMs: 0, meta }, async () => 7, deps)).toEqual({ value: 7 });
     expect(warns).toEqual([]);
   });
@@ -1282,7 +1282,7 @@ describe("slot: file-system errors never reject (QA-1.4-22)", () => {
     const warns2: string[] = [];
     const deps2 = fast(gone, { logger: { warn: (m) => warns2.push(m) } });
     await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2)).release();
-    rmSync(gone, { recursive: true, force: true });
+    rmSync(gone, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     writeFileSync(gone, "");
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2)).toEqual({ busy: true });
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2));

@@ -168,7 +168,7 @@ describe("accept() — outside-directory safety net", () => {
       expect(r.verdict.outcome).toBe("pass");
       expect(exec).toHaveBeenCalled();
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 

@@ -254,7 +254,7 @@ describe("stripDelegateInstructions default filesystem reader", () => {
   });
 
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("reads the named file and removes exactly its contents", () => {

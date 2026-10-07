@@ -80,7 +80,7 @@ describe("Layer-2 wiring", () => {
     invalidateConfigCache();
     // Best-effort temp dir removal.
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // ignore
     }

@@ -25,7 +25,7 @@ afterEach(async () => {
     if (path.dirname(fixture.root) !== path.resolve(tmpdir()) || !path.basename(fixture.root).startsWith("omr-v2-")) {
       throw new Error(`Unexpected smoke fixture path: ${fixture.root}`);
     }
-    await rm(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    await rm(fixture.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }, 30_000);
 

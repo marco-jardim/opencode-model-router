@@ -484,7 +484,7 @@ describe("shell-free git inspection", () => {
     mkdirSync(join(outside, "jdir", "deep"), { recursive: true });
     writeFileSync(join(outside, "jdir", "secret.txt"), "TOPSECRET_OUTSIDE\n");
     writeFileSync(join(outside, "jdir", "deep", "more.txt"), "TOPSECRET_DEEP\n");
-    rmSync(join(root, "escape"), { recursive: true });
+    rmSync(join(root, "escape"), { recursive: true, maxRetries: 10, retryDelay: 200 });
     symlinkSync(join(outside, "jdir"), join(root, "escape"), WIN ? "junction" : "dir");
     writeFileSync(join(root, "ok.txt"), "ok changed\n");
     if (WIN) expect(plain(root, "diff")).toContain("TOPSECRET"); // positive control: plain git reads through the junction

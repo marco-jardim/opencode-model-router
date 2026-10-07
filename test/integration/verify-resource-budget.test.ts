@@ -252,7 +252,7 @@ async function removeTree(dir: string): Promise<void> {
     if (st.isSymbolicLink()) await unlink(p);
     else if (st.isDirectory()) await removeTree(p);
   }
-  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
 beforeAll(async () => {

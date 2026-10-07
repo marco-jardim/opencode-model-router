@@ -9,7 +9,7 @@ import { invalidateConfigCache, overridePath, validateConfig } from "../../src/r
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, isReadOnlyTier, legacyReadOnlyTools, mergePermissions, permissionMatches, permissionRules, publishReadOnlyPermissions, READ_ONLY_CANARIES, readOnlyPermissions, type PermissionRule } from "../../src/router/read-only";
 
 const roots: string[] = [];
-afterEach(() => { vi.unstubAllEnvs(); invalidateConfigCache(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+afterEach(() => { vi.unstubAllEnvs(); invalidateConfigCache(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
 function effect(rules: PermissionRule[], action: string, resource = "*") {
   const matches = (pattern: string, value: string) => new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`).test(value);
   return [...rules].reverse().find(rule => matches(rule.action, action) && matches(rule.resource, resource))?.effect;

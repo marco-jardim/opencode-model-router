@@ -176,7 +176,7 @@ beforeEach(() => {
 afterEach(async () => {
   for (const dispose of disposers.splice(0)) await dispose();
   await Promise.all(releases.splice(0));
-  for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   resetDispatchRegistry();
   resetIngestState();
 });

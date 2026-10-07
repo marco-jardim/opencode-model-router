@@ -771,7 +771,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     delete process.env.MODEL_ROUTER_ENFORCE;
     delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
-    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   /**

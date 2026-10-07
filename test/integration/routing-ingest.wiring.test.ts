@@ -114,7 +114,7 @@ afterEach(async () => {
   resetDispatchRegistry();
   resetIngestState();
   logger.warn.mockReset();
-  await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 describe("false-refusal call site", () => {

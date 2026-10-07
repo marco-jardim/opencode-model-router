@@ -514,7 +514,7 @@ export class RoutingHost {
     const providerStopped = await this.provider.stop().then(() => true, () => false);
     const hostPortClosed = this.port === 0 ? true : await waitFor("host port to close", async () => (await portOpen(this.port)) ? undefined : true, 10_000, 200).catch(() => false);
     liveHosts.delete(this);
-    const rootRemoved = await rm(this.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }).then(() => !existsSync(this.root), () => false);
+    const rootRemoved = await rm(this.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).then(() => !existsSync(this.root), () => false);
     return { pid, method, taskkill, exitCode: child?.exitCode, hostPort: this.port, hostPortClosed, providerStopped, rootRemoved };
   }
 

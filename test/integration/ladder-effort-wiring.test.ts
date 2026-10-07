@@ -67,7 +67,7 @@ describe("effort bump plugin wiring", () => {
     vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks();
     invalidateConfigCache();
     for (const file of scorecards.splice(0)) rmSync(file, { force: true });
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   function configure(preset = "fable-effort", effortBump = true, verify: Record<string, unknown> = {}) {

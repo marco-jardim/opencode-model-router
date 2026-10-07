@@ -497,7 +497,7 @@ const getHost = () => startHost("main");
 
 afterAll(async () => {
   for (const started of Object.values(hostPromises)) { try { await (await started).stop(); } catch { /* host never started */ } }
-  for (const root of hostRoots) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  for (const root of hostRoots) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }, 60_000);
 let harnessIds: Obj | undefined;
 /** Git ids of the harness file used for THIS run: HEAD, the file's blob sha (matches `git ls-tree` once committed) and whether it differs from HEAD. */
