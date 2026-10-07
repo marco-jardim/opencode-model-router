@@ -11,6 +11,8 @@ Includes two runtime fixes found during release QA: plugin dispose now drains in
 
 The timeout bounds advisor host calls; filesystem completion and the rest of plugin teardown are not a hard 3 s deadline. Test workflow [37613324910](https://github.com/marco-jardim/opencode-model-router/actions/runs/37613324910) passed **12/12 jobs, attempt 1**, on `71ae7d8`. The post-Round-3 exact-SHA matrix remains pending the owner's `car/main` update; that earlier green run does not cover credential redaction.
 
+Round-3 local verification: typecheck passed; the four config/docs test files passed **685 tests** (one existing skip); config-related tests passed **8,785 tests in 92 files** (56 existing skipped tests / 3 skipped files), using the default pool with `--maxWorkers=2` for the related run. Legacy diagnostic expectations now enforce redaction rather than value echoes; all validation cases remain covered.
+
 CI-safety margins loosened absolute performance budgets in tests (A36); the original budgets remain design targets, while relative run-length scaling, same-length pathological/prose ratios and deterministic timer-scheduling checks remain regression guards.
 
 For full feature review, use [the v2.2.0 → car/main comparison](https://github.com/marco-jardim/opencode-model-router/compare/v2.2.0...car/main). The release as a whole includes the opt-in OpenCode v2 cost-aware routing engine, learned outcome statistics, same-session variant escalation, native-agent candidates, a cost doctor, `/router stats` and route annotations. Decisions stay in code and use verified outcomes rather than classifier confidence as a success probability. Version: **2.3.0**.
