@@ -168,6 +168,18 @@ describe("classify — rules only", () => {
 });
 
 describe("classify — backend gate", () => {
+  it.each(["classify", "classifyMany"] as const)("D14 QA-G-B4: %s blocks credentials in acceptance past the prompt head with zero fetches", async (method) => {
+    const fetch = vi.fn<FetchLike>();
+    const config = settings({ backend: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1" });
+    const backend = createClassifierBackend(config, { fetch, env: {}, logger: makeLogs().logger });
+    const deps = makeDeps(backend, { settings: config });
+    const task = input("Find where the cache is built and refactor the loader.\n" + "lorem ipsum dolor sit amet ".repeat(800)
+      + "\n[acceptance]\ncriteria: log in as admin with the password hunter2 and the cache loads\n[/acceptance]");
+    const results = method === "classify" ? [await classify(task, deps)] : await classifyMany([task, task], deps);
+    for (const result of results) expect(result.trace.backendSkipped).toBe("credentials");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("does not call the backend when the rules are confident", async () => {
     const { backend, classifyFn } = fakeBackend(() => okResult("design"));
     const result = await classify(input("grep for foo"), makeDeps(backend));
