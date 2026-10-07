@@ -324,6 +324,23 @@ describe("renameWithRetry (Windows sharing violations)", () => {
 // ---------------------------------------------------------------------------
 
 describe("persister: saveSnapshot (atomic write)", () => {
+  it("N5: exhausted EPERM on a confirmed read-only target disables further snapshots", async () => {
+    const { mem, deps, dir, sleeps } = setup();
+    const persister = createPersister(dir, deps);
+    await persister.saveSnapshot(snapshotOf("pass"));
+    const originalStat = mem.fs.stat;
+    mem.fs.stat = async (path) => {
+      const value = await originalStat(path);
+      return value === null ? null : { ...value, mode: 0o444 };
+    };
+    failTimes(mem.hooks, "rename", "EPERM", 6);
+    expect(await persister.saveSnapshot(snapshotOf("fail"))).toMatchObject({ ok: false, readOnly: true, code: "EPERM" });
+    expect(sleeps).toEqual([15, 30, 60, 120, 240]);
+    const writes = mem.touched.length;
+    expect(await persister.saveSnapshot(snapshotOf("pass"))).toMatchObject({ ok: false, readOnly: true });
+    expect(mem.touched).toHaveLength(writes);
+    expect(await persister.appendRows([verdictRow(1)])).toEqual({ ok: true });
+  });
   it("writes a deterministic envelope through a temp file and leaves no temp behind", async () => {
     const { mem, deps, dir, c } = setup();
     const persister = createPersister(dir, deps);
@@ -1296,6 +1313,28 @@ describe("flusher: coalescing and throttling (D15)", () => {
 });
 
 describe("flusher: failures, drops, flushNow, dispose", () => {
+  it("N7: snapshot and log failures have independent warning and recovery streaks", async () => {
+    const { flusher, fake, logger, mutate } = flusherSetup();
+    fake.results.save = { ok: false, error: "snapshot denied" };
+    fake.results.append = { ok: false, error: "append denied" };
+    mutate();
+    flusher.enqueue(verdictRow(1));
+    await flusher.flushNow();
+    await flusher.flushNow();
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    fake.results.save = { ok: true };
+    await flusher.flushNow();
+    expect(logger.info).toHaveBeenCalledWith("[router] outcome persistence recovered", { what: "snapshot" });
+    fake.results.save = { ok: false, error: "snapshot denied again" };
+    mutate();
+    await flusher.flushNow();
+    expect(logger.warn).toHaveBeenCalledTimes(3);
+    fake.results.append = { ok: true };
+    await flusher.flushNow();
+    expect(logger.info).toHaveBeenCalledWith("[router] outcome persistence recovered", { what: "decision log" });
+    fake.results.save = { ok: true };
+    await flusher.dispose();
+  });
   it("a failing snapshot warns once per streak, keeps retrying, and logs one info on recovery", async () => {
     const { flusher, sched, fake, logger, mutate } = flusherSetup();
     fake.results.save = { ok: false, error: "disk full", code: "ENOSPC" };

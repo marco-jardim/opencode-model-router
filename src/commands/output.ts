@@ -221,7 +221,7 @@ export function buildRouterHelp(current: string, options: { stats?: boolean } = 
     "- `/router overrides` — show the global + project override file paths and precedence",
     "- `/router models [provider]` — list valid model ids from your configured providers",
     ...(options.stats === true
-      ? ["- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats`)"]
+      ? ["- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats` (in a clone))"]
       : []),
     "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
   ].join("\n");

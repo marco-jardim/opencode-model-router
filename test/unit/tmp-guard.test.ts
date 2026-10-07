@@ -20,6 +20,22 @@ const realTmp = (): string => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("temp directory guard", () => {
+  it("N10: native child homedir inherits the private home, not just the os mock", () => {
+    expect(process.env.HOME).toBe(homedir());
+    expect(process.env.USERPROFILE).toBe(homedir());
+    const child = execFileSync(process.execPath, ["-e", "process.stdout.write(require('node:os').homedir())"], { encoding: "utf8" });
+    expect(child).toBe(homedir());
+    expect(child).toContain("omr-home-guard-");
+  });
+
+  it("N10: a test can still redirect only HOME or only USERPROFILE", () => {
+    const other = join(tmpdir(), "custom-home");
+    vi.stubEnv("HOME", other);
+    expect(homedir()).toBe(other);
+    vi.unstubAllEnvs();
+    vi.stubEnv("USERPROFILE", other);
+    expect(homedir()).toBe(other);
+  });
   it("QA-G-C2/C10: smoke setup isolates native child temp and keyed home, teardown restores env", () => {
     const names = ["TEMP", "TMP", "TMPDIR", "OMR_SMOKE_REAL_TMPDIR"];
     const before = names.map((name) => process.env[name]);

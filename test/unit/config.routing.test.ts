@@ -41,7 +41,7 @@ import {
   readPackageVersion,
 } from "../../src/router/build-info";
 import { parseJsonc } from "../../src/router/jsonc";
-import { assertHomeIsGuarded, guardedHomedir, sameDir } from "../setup/home-guard";
+import { assertHomeIsGuarded, guardedHomedir, sameDir, REAL_HOME } from "../setup/home-guard";
 import { readFileSync } from "node:fs";
 
 const ROOT = resolve(__dirname, "..", "..");
@@ -61,9 +61,7 @@ const ABS_PATH = resolve(tmpdir(), "omr-outcomes");
 // is outside the temporary home, so a missing or broken setup file cannot go unnoticed.
 // ---------------------------------------------------------------------------
 
-// What is real, captured before any test redirects anything.
-const realOs = await vi.importActual<typeof import("node:os")>("node:os");
-const REAL_HOME = realOs.homedir();
+// REAL_HOME was captured by setup before it exported the private home to native children.
 const ORIGINAL_ENV = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
 
 let tmpHome = "";

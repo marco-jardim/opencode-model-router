@@ -86,7 +86,7 @@ export function guardedHomedir(): string {
   let resolved = guard.isolatedHome;
   for (const name of names) {
     const value = process.env[name];
-    if (value !== undefined && value !== "" && value !== guard.original[name]) {
+    if (value !== undefined && value !== "" && value !== guard.original[name] && value !== guard.isolatedHome) {
       resolved = value;
       break;
     }
@@ -162,6 +162,8 @@ vi.mock("node:os", async (importOriginal) => {
 // Runs once per test file, before it is imported: capture what is real.
 const realOs = await vi.importActual<typeof import("node:os")>("node:os");
 guard.realHome = realOs.homedir();
+/** Captured before exporting the private HOME/USERPROFILE; native homedir() afterwards is intentionally private. */
+export const REAL_HOME = guard.realHome;
 guard.original = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
 // The real temp dir is read once per process: after the first file the environment already points at a private dir.
 guard.realTmp = process.env[REAL_TMPDIR_ENV] ?? realOs.tmpdir();
@@ -171,6 +173,8 @@ process.env[REAL_TMPDIR_ENV] = guard.realTmp;
 const runTag = process.env[RUN_ID_ENV] === undefined || process.env[RUN_ID_ENV] === "" ? "" : `${process.env[RUN_ID_ENV]}-`;
 guard.isolatedHome = mkdtempSync(join(guard.realTmp, `omr-home-guard-${runTag}`));
 guard.isolatedTmp = mkdtempSync(join(guard.realTmp, `omr-tmp-guard-${runTag}`));
+// Native os.homedir() in child processes does not see the Vitest mock.
+for (const name of ["HOME", "USERPROFILE"]) process.env[name] = guard.isolatedHome;
 for (const name of ["TEMP", "TMP", "TMPDIR"]) {
   guard.originalTmp[name] = process.env[name];
   process.env[name] = guard.isolatedTmp;
@@ -203,6 +207,10 @@ for (const name of readdirSync(guard.realTmp)) {
 afterAll(() => {
   rmSync(guard.isolatedHome, { recursive: true, force: true });
   rmSync(guard.isolatedTmp, { recursive: true, force: true });
+  for (const [name, value] of Object.entries(guard.original)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
   for (const [name, value] of Object.entries(guard.originalTmp)) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;

@@ -17,6 +17,8 @@ import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { advance, buildEscalatePolicy, newLadderState, nextAction, recordAttempt } from "../../src/escalate/ladder";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
 import { FLOOR_LIFT_REASON, RESUME_PINNED_REASON, RESUME_REASON, RESUME_RUNNING_REASON } from "../../src/routing/outcomes/types";
+import { DECISIONS_MAX_BYTES, DECISIONS_MAX_GENERATIONS, FLUSH_MIN_INTERVAL_MS, FLUSH_BATCH_ROWS, MAX_QUEUED_ROWS, MAX_CORRUPT_COPIES, RENAME_RETRY_DELAYS_MS, STALE_TMP_MS } from "../../src/routing/outcomes/types";
+import { LOCK_STALE_MS } from "../../src/routing/file-lock";
 import type { Need, TaskFacts } from "../../src/routing/classify/types";
 import {
   assembleSystemPrompt,
@@ -48,6 +50,19 @@ const nestedEnforcementKeys = [
 ];
 
 describe("docs drift", () => {
+  it("N1: pins persistence limits behind the documented storage and flush guarantees", () => {
+    expect({ DECISIONS_MAX_BYTES, DECISIONS_MAX_GENERATIONS, FLUSH_MIN_INTERVAL_MS, FLUSH_BATCH_ROWS, MAX_QUEUED_ROWS, MAX_CORRUPT_COPIES, RENAME_RETRY_DELAYS_MS, STALE_TMP_MS, LOCK_STALE_MS }).toEqual({
+      DECISIONS_MAX_BYTES: 5 * 1024 * 1024, DECISIONS_MAX_GENERATIONS: 3,
+      FLUSH_MIN_INTERVAL_MS: 30_000, FLUSH_BATCH_ROWS: 1000, MAX_QUEUED_ROWS: 5000,
+      MAX_CORRUPT_COPIES: 3, RENAME_RETRY_DELAYS_MS: [15, 30, 60, 120, 240],
+      STALE_TMP_MS: 3_600_000, LOCK_STALE_MS: 30_000,
+    });
+    const doc = read("docs/ROUTING_ENGINE.md");
+    expect(doc).toContain("about 5 MiB");
+    expect(doc).toContain("3 generations kept");
+    expect(doc).toContain("at most every 30 s");
+    expect(doc).toContain("newest 3 are kept");
+  });
   it("documents every tiers.json top-level key in CONFIG_REFERENCE.md", () => {
     const tiers = JSON.parse(read("tiers.json")) as Record<string, unknown>;
     const doc = read("docs/CONFIG_REFERENCE.md");

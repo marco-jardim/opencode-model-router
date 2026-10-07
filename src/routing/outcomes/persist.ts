@@ -169,10 +169,10 @@ export function nodePersistFs(): PersistFs {
         if (errorCode(error) !== "ENOENT") throw error;
       }
     },
-    async stat(path: string): Promise<PersistStat | null> {
+    async stat(path: string): Promise<(PersistStat & { readonly mode: number }) | null> {
       try {
         const s = await stat(path);
-        return { size: s.size, mtimeMs: s.mtimeMs };
+        return { size: s.size, mtimeMs: s.mtimeMs, mode: s.mode };
       } catch (error) {
         if (errorCode(error) === "ENOENT") return null;
         throw error;
@@ -649,6 +649,15 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         } catch (cleanupError) {
           logger.info?.("[router] outcome temp file not removed", { tmp, error: describeError(cleanupError) });
         }
+        // Exhausted Windows rename retries may mean a read-only target, not a transient sharing violation.
+        // Node stat exposes its mode; injected filesystems without that evidence remain retryable.
+        if (errorCode(error) === "EPERM") {
+          const target = await statOrNull(outcomesPath);
+          if (target !== null && "mode" in target && typeof target.mode === "number" && (target.mode & 0o222) === 0) {
+            readOnlyReason = `outcome store at ${resolve(outcomesPath)} is read-only (EPERM)`;
+            return { ok: false, code: "EPERM", error: readOnlyReason, readOnly: true };
+          }
+        }
         return failure(error);
       }
     },
@@ -826,7 +835,7 @@ export function createFlusher(
   let disposed = false;
   let disposing: Promise<void> | null = null;
   let droppedRows = 0;
-  let failing = false;
+  const failing = new Set<"snapshot" | "decision log" | "flush">();
   /** The snapshot cannot be written (read-only store): it is no longer pending work (QA-1.3-2). */
   let snapshotBlocked = false;
   /** `requestFlush` callers, released when the next flush attempt finishes, whether it succeeded or not. */
@@ -846,10 +855,14 @@ export function createFlusher(
     }
   }
 
-  function noteFailure(what: string, error: string): void {
-    if (failing) return;
-    failing = true;
+  function noteFailure(what: "snapshot" | "decision log" | "flush", error: string): void {
+    if (failing.has(what)) return;
+    failing.add(what);
     logger.warn(`[router] outcome ${what} write failed; will retry`, { error });
+  }
+
+  function noteRecovery(what: "snapshot" | "decision log" | "flush"): void {
+    if (failing.delete(what)) logger.info?.("[router] outcome persistence recovered", { what });
   }
 
   /**
@@ -910,35 +923,33 @@ export function createFlusher(
 
   async function doFlush(): Promise<void> {
     if (deps.ready !== undefined) await deps.ready;
-    let ok = true;
     if (!snapshotBlocked && store.revision !== writtenRevision) {
       const transaction = async (): Promise<void> => {
-      // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
-      const checked = await absorbForeignWrites();
-      const revision = store.revision;
-      const result = checked ? await persister.saveSnapshot(store.snapshot()) : null;
-      if (result === null) {
-        ok = false; // skipped, already reported; the snapshot stays pending
-      } else if (result.ok) {
-        writtenRevision = revision;
-      } else if (result.readOnly === true) {
-        snapshotBlocked = true;
-        logger.warn("[router] outcome snapshots are not written: the store on disk is read-only for this plugin", { error: result.error });
-      } else {
-        ok = false;
-        noteFailure("snapshot", result.error);
-      }
+        // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
+        const checked = await absorbForeignWrites();
+        const revision = store.revision;
+        const result = checked ? await persister.saveSnapshot(store.snapshot()) : null;
+        if (result === null) {
+          // Skipped, already reported; the snapshot stays pending.
+        } else if (result.ok) {
+          writtenRevision = revision;
+          noteRecovery("snapshot");
+        } else if (result.readOnly === true) {
+          snapshotBlocked = true;
+          failing.delete("snapshot"); // disabled, not recovered
+          logger.warn("[router] outcome snapshots are not written: the store on disk is read-only for this plugin", { error: result.error });
+        } else {
+          noteFailure("snapshot", result.error);
+        }
       };
       try {
         const acquired = persister.withSnapshotLock === undefined
           ? (await transaction(), true)
           : await persister.withSnapshotLock(transaction);
         if (!acquired) {
-          ok = false;
           noteFailure("snapshot", "outcomes.json.lock is busy; snapshot remains pending");
         }
       } catch (error) {
-        ok = false;
         noteFailure("snapshot", describeError(error));
       }
     }
@@ -948,7 +959,6 @@ export function createFlusher(
       if (!result.ok) {
         queue = batch.concat(queue);
         trimQueue();
-        ok = false;
         noteFailure("decision log", result.error);
         break;
       }
@@ -957,10 +967,8 @@ export function createFlusher(
       logger.warn("[router] outcome decision rows were dropped (queue limit)", { dropped: droppedRows });
       droppedRows = 0;
     }
-    if (ok && failing) {
-      failing = false;
-      logger.info?.("[router] outcome persistence recovered");
-    }
+    if (queue.length === 0) noteRecovery("decision log");
+    noteRecovery("flush");
   }
 
   function startFlush(): Promise<void> {
