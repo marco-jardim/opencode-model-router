@@ -44,3 +44,9 @@ All times below are **UTC**, unlike the early local-time incident rows above. Du
 Startup evidence was read, not modified, from `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`, filtering actual `message="cli starting"` lines containing `serve` (not `spawning process` lines that merely quote a search command). There was **one unplanned host restart during Phase 3.3**, at `2026-10-07T02:17:33.326Z` (02:17:33Z at second precision). The orchestrator confirmed that the second interruption aborted subagent runs **without a host restart**; there is no missing second restart timestamp. Acceptance #13 remains pending the final DF5 / Phase 3.4 checkpoint, not a second restart investigation.
 
 **DF5 handoff (QA-G-A1 / QA-2.2-10):** measure the orchestrator's cache-read share with the stable `advise` hint enabled against the `shadow` baseline; include token totals, the denominator and sample windows. The dropped DF3 measurement is still outstanding. `enforce` now emits no per-turn hint.
+
+## Sync 5 (2026-10-07)
+
+| When (UTC) | Phase / task | Event | Action |
+|---|---|---|---|
+| 2026-10-07T03:40:45Z | Phase 3.3 / sync 5 | Base `master` fast-forwarded to `93db126`; rollback tag `car/sync-5-prev` = `64e523a`. | No `npm ci` was run because `package-lock.json` is unchanged. Awaiting the owner's restart (A8); after restart and liveness confirmation, the Phase 3.3 never-down and privacy fixes are live in `enforce`. Next: Phase 3.4 / DF5. |

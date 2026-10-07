@@ -1,7 +1,7 @@
 # Handover — Cost-Aware Routing Engine (#74)
 
-> **Revision:** 4 — checkpoint DF2, code sync done, awaiting the owner's restart (2026-10-06). Rewritten by the executing orchestrator at every checkpoint (DF0–DF5) and before every restart request (plan §0.11).
-> **Plan:** `D:\git\opencode-model-router\docs\plans\cost-aware-routing-engine-plan.md` (revision 2 + "Amended during implementation" A1–A29 in §1.5). Read it in full before doing anything.
+> **Revision:** 5 — Phase 3.3 complete, sync 5 done, awaiting the owner's restart; next: Phase 3.4 (2026-10-07). Rewritten by the executing orchestrator at every checkpoint (DF0–DF5) and before every restart request (plan §0.11).
+> **Plan:** `D:\git\opencode-model-router\docs\plans\cost-aware-routing-engine-plan.md` (revision 2 + "Amended during implementation" A1–A35 in §1.5). Read it in full before doing anything.
 > **Issues:** [#74](https://github.com/marco-jardim/opencode-model-router/issues/74) (this work), [#73](https://github.com/marco-jardim/opencode-model-router/issues/73) (inspiration; close together with #74).
 
 ---
@@ -10,7 +10,7 @@
 
 ```text
 You are the executing orchestrator for the plan
-D:\git\opencode-model-router\docs\plans\cost-aware-routing-engine-plan.md (revision 2, amendments A1–A29).
+D:\git\opencode-model-router\docs\plans\cost-aware-routing-engine-plan.md (revision 2, amendments A1–A35).
 Resume point and operating notes: D:\git\opencode-model-router\docs\plans\cost-aware-routing-engine-handover.md.
 
 Read both files completely before acting. Then resume from the "next task id" in handover §2 and
@@ -20,7 +20,8 @@ directives, which are binding and override your defaults. The rules that matter 
 1. Iterate continuously, phase after phase, wave after wave. Stop ONLY for: an ambiguity only the
    human can settle; a critical problem (security, data loss, broken artifact); a blocking problem;
    or a dogfood checkpoint whose code sync is not live and needs a host restart (§0.1.4 / §0.11).
-   Spike S7 proved every code sync needs a restart (amendment A8): expect one at DF1–DF4.
+   Spike S7 proved every code sync needs a restart (amendment A8): sync 5 is awaiting one.
+   Run npm ci only if package-lock.json changed, and finish it before asking for a restart.
 2. If the model-router blocks you repeatedly (zero-tool hand-backs, "no tools" claims, cap banners,
    the same dispatch failing twice) re-dispatch once with an explicit "attempt the work first"
    instruction; if that fails, take over MOMENTARILY, log it in
@@ -55,27 +56,35 @@ directives, which are binding and override your defaults. The rules that matter 
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **DF2 sync done, awaiting the owner's restart** (liveness probe pending); Wave 2 in progress — Phases 2.1, 2.2 and 2.3 merged |
+| Checkpoint reached | **Phase 3.3 complete; sync 5 done, awaiting the owner's restart** (liveness probe pending). DF4 is in `enforce`; next: **Phase 3.4**. |
 | Done (Wave 2) | **Phase 2.1:** merged `a08229c`, QA PASS round 3 (report: `docs\qa\cost-aware-routing\phase-2.1.md`). **Phases 2.2 and 2.3:** integrated on `car/p22` and merged into `car/main` as `2878319`; QA: 2.2 round 2 PASS; integration round 1 PASS with all fixes applied; 2.3 round 3 PASS. **Plan amendments:** A27 (evidence filter before argmin), A28 (2.4 owns the v1 `R:` line hunk), A29 (largest step for resume context). **Capped suite on `car/main` @ `2878319`:** 137 files passed, 3 skipped; 11387 tests passed, 66 skipped; 255 s. |
-| **Next task id** | **DF2 in progress.** After the owner restarts OpenCode v2 and says "retomar": (1) liveness probe — `/router` must show build `2.2.0+2878319` and `engine=static`; (2) `node scripts/routing-stats.ts` (expect an empty or no store); (3) create `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` with `{"routing":{"engine":"shadow"}}`; (4) from then on add `[route pin]` to every QA and `[tier:heavy]` dispatch. **Next after DF2:** **Phase 2.4** (advisor / `/router stats`) — it owns the A28 v1 `R:` line hunk and the handoffs from `phase-2.1.md`, `phase-2.2.md` and `phase-2.3.md` ("to 2.4"); read all three before starting. |
-| `master` | fast-forwarded to `car/main` @ `2878319` at DF2 (rollback tag `car/sync-2-prev` = `8ce54f2`; previous sync: DF1, tag `car/sync-1-prev` = `3b3dba4`) |
-| `car/main` | Wave 1 merged (`88847cb`) + Phase 2.1 (`a08229c`) + Phases 2.2/2.3 (`2878319`) |
+| Done (DF3 / Wave 3) | **DF3:** `advise` at 2026-10-06T20:32Z; host classifier consulted once, recorded **EXPERIMENTAL**. **Phase 3.1:** docs, ADR 0005 and changelog; QA PASS after 3 rounds. **Phase 3.2:** real-host smoke 12/12 on OpenCode 2.0.22, re-run 12/12 on 2.0.24; QA PASS after 2 rounds. |
+| Done (DF4) | `enforce` since 2026-10-07T00:52Z, profile `balanced`, margin `0.2` (precise enforce-period start: **2026-10-07T00:51:45Z**). Host is now OpenCode **2.0.24**. A restart during `npm ci` caused a sync incident; details and recovery are in `docs\qa\cost-aware-routing\run-log.md`. |
+| Done (Phase 3.3) | Global QA by three parallel heavy reviewers (areas A/B/C). Round 1: 1 critical, 8 major and the minors; all fixed. Round 2: 0 major+, all findings fixed. Round 3: **PASS**. **A34:** never-down capability rank, weaker detection, A30 rewrite preconditions. **A35:** project layer may only tighten classifier bounds. Report: `docs\qa\cost-aware-routing\global.md`. **Capped suite on `84c3434`: 146 files / 11675 tests green.** `exec.test.ts` lowPriority is a known load flake that predates this work. |
+| Sync 5 | Base `master` fast-forwarded to **`93db126`** at **2026-10-07T03:40:45Z**; rollback tag **`car/sync-5-prev` = `64e523a`**. No `npm ci` was run because `package-lock.json` is unchanged. **Awaiting the owner's restart.** This sync makes the Phase 3.3 never-down and privacy fixes live in `enforce` after the restart. |
+| **Next task id** | **Phase 3.4**, after the owner's restart and a liveness probe confirming sync 5 (`93db126`) and `engine=enforce`. **3.4.1 / DF5:** run `routing:stats` with bounded windows; the enforce period starts **2026-10-07T00:51:45Z**. Apply D17 using the new `d17Mode` line. Measure the cache-read share (QA-G-A1 handoff in `run-log.md`, including token totals, denominator and sample windows). Write the dogfood Summary table **DF1–DF5** and copy it into **ADR 0005 Evidence**. |
+| Next (3.4.2 / release) | Version **2.3.0**, CHANGELOG release entry, PR `car/main` → `master` closing **#74 and #73**, tag `v2.3.0`, publish per `docs\MIGRATION.md` / release notes, clean-install check, remove the `omr-car-*` worktrees and `car/sync-*-prev` tags, final capped suite on `master`, closing comments. |
+| `master` | Sync 5: `93db126`; rollback tag `car/sync-5-prev` = `64e523a`. |
+| `car/main` | Phase 3.3 merged; `93db126` at sync 5 (this revision is a subsequent docs-only checkpoint). |
 | Base directory | `D:\git\opencode-model-router` (branch `master`); the session alias `D:\git\Claude-model-router` is the same repository — always use the `D:\git\opencode-model-router` form in dispatches |
-| Integration worktree | `D:\git\omr-car-main` on `car/main` (base `D:\git\opencode-model-router`; `npm ci` done; capped suite green at `2878319`: 137 files passed, 3 skipped; 11387 tests passed, 66 skipped) |
-| Phase worktrees | `D:\git\omr-car-p21`, `D:\git\omr-car-p22` and `D:\git\omr-car-p23` are merged and can be removed (p11–p15 were removed earlier). Integration worktree `D:\git\omr-car-main` stays. |
+| Integration worktree | `D:\git\omr-car-main` on `car/main` (base `D:\git\opencode-model-router`); capped suite green on `84c3434`: 146 files / 11675 tests. |
+| Phase worktrees | `D:\git\omr-car-p21`, `omr-car-p22`, `omr-car-p23`, `omr-car-p24`, `omr-car-p31`, `omr-car-p32`, `omr-car-p33`, `omr-car-p33b`, `omr-car-p33c`, `omr-car-p33d` and `omr-car-pcred` (all under `D:\git`) are merged and can be removed at Phase 3.4. p11–p15 and p0p were removed earlier. Keep integration worktree `D:\git\omr-car-main` until release cleanup. |
 | Other worktrees on the machine (not ours; never touch) | `D:\git\opencode-model-router-v2` (`fix/gate-task-cwd`), `D:\git\opencode-model-router-release` (`release/1.13.0`), `D:\git\opencode-model-router-agent-options-gate` (`fix/agent-options-provider-gate`), detached worktrees under `C:\Users\Marquinho\AppData\Local\Temp\` |
-| Active router config | Plugin loaded from `D:\git\opencode-model-router` (`C:\Users\Marquinho\.config\opencode\opencode.json:189`); bundled `D:\git\opencode-model-router\tiers.json` + state `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json` (`activePreset: hybrid-2`, `activeMode: normal`, `enforcementMode: advisory`); no override files yet. **Checkpoint edit target:** `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (create at DF2, after the restart and the liveness probe, with only the `routing` block) |
-| Current `routing` block | none (engine = `static` by absence); becomes `{"engine":"shadow"}` at DF2 after the restart |
+| Active router config | Plugin loaded from `D:\git\opencode-model-router`; bundled `tiers.json` + global state. **Checkpoint edit target:** `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`; do not change bundled `tiers.json` for dogfood mode switches. |
+| Current routing settings | Engine `enforce`, profile `balanced`, margin `0.2`. Preserve unrelated override settings. |
 | Scorecard / D15 directory | `C:\Users\Marquinho\AppData\Local\Temp\opencode-model-router-trajectory` |
-| Host | OpenCode `v2.0.22`; source `anomalyco/opencode` @ `527f0b931d1f9b3ebd34e106c51b31ce5db5b075`; `@opencode/plugin` 2.0.22 |
-| Open QA findings | none blocking. Plan amendments A1–A29 in §1.5. Handoffs to 2.4 are in the "to 2.4" sections of `docs\qa\cost-aware-routing\phase-2.1.md`, `phase-2.2.md` and `phase-2.3.md` (and the earlier `phase-1.x.md` "Handoffs" sections) — read them before starting Phase 2.4. |
+| Host | OpenCode **2.0.24**; Phase 3.2 real-host smoke re-run: 12/12. |
+| Open QA findings | Global QA round 3 **PASS**; no open major+ findings. Plan amendments A1–A35 in §1.5. Read `docs\qa\cost-aware-routing\global.md` and the DF5 handoff in `run-log.md` before Phase 3.4; cache-read share measurement remains outstanding (QA-G-A1 / QA-2.2-10). |
 | 0.P close-out | done: QA PASS, `car/p0p` merged into `car/main`, capped suite green, `master` fast-forwarded, `D:\git\omr-car-p0p` removed, Wave-1 comment posted on #74 |
-| Owner decisions | **DF3 live classifier check model (A13): `opencode-go/deepseek-v4.1-flash`** — decided by the owner on 2026-10-06. Use it in the DF3 one-shot (`routing.classifier = { "backend": "host", "model": "opencode-go/deepseek-v4.1-flash", "timeoutMs": 10000 }`), then restore. **Open (from QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume (effort path) and variant steps exist only on the fast tier. The owner should decide whether to use `candidates` or drop `effort` where `variant` is set; Phase 2.4's advisor surfaces it. |
-| Sessions | Producers (@medium): 2.1 `ses_eeef71487ffe8FQQl2PlSiwF0W`, 2.2 `ses_eeeaa3f76ffebBSSN9hHLkra3l`, 2.3 `ses_eeeaa08e4ffe0LW8ICV6EHtuB4`. Reviewers (@heavy): 2.1 `ses_eeee7ae8bffeF09wshQ4Asc3dd`, 2.2 `ses_eee825213ffegXmVJzL8FmU4Hk`, 2.3 `ses_eee821e23ffeELNWIF0SpGl6kW`. |
+| Owner decisions | **DF3 live classifier check model (A13): `opencode-go/deepseek-v4.1-flash`** — decided by the owner on 2026-10-06; one-shot completed, recorded EXPERIMENTAL. **Open (from QA-2.3-13), not blocking:** on `hybrid-2` and `anthropic` the medium/heavy tiers carry `effort`, so ladder escalations never resume (effort path) and variant steps exist only on the fast tier. The owner should decide whether to use `candidates` or drop `effort` where `variant` is set; Phase 2.4's advisor surfaces it. |
+| Sessions — global QA | Area A `ses_eebd8b1dcffeLJmDfL3DOVKa9y`; B `ses_eebd89074ffe4ot426iFHDqH9P`; C `ses_eec25975affeVHygmODlDSRYxj`; rounds 2–3 `ses_eebab6bfaffevZEkEpiFOKJzvw`. |
+| Sessions — fix producers | C/integration `ses_eebd8265fffedp6hRQY9wpI19D`; never-down (@heavy) `ses_eebca0bf2fferJb0AydKkDHZa2`; privacy `ses_eebc9cd46ffeJhanBXDON5Edyl`; adapter `ses_eebc9774affeFw4Y706lHAvx7h`. |
+| Sessions — Phase 3 producers | 3.1 `ses_eed10fba7ffeR0CNi3jebIFOVL`; 3.2 `ses_eed02d357ffeI6JbqM9B1u0yYY`. |
 | Spike evidence hygiene | Any spike re-run that is not meant to replace the evidence: `git -C <worktree> checkout -- docs/qa/cost-aware-routing/spikes` afterwards (QA-0P-42) |
-| Liveness probe / slash commands | The orchestrator has no tool to type `/router` or `/annotate-plan`; at DF1 find the host API route that runs a session command (host source at the pinned sha) or ask the human to type it |
-| Last `routing:stats` | DF1: `no outcome data` (all zeros). DF2 run pending, after the restart (expect an empty or no store). |
-| Sentence for the human | "Sync DF2 concluído; o código novo não está ativo na sessão. Reinicie o OpenCode v2 e diga 'retomar'." (restart pending) |
+| Liveness probe / slash commands | If the orchestrator cannot type `/router` or `/annotate-plan`, use the host API route for a session command or ask the human to type it. Sync 5 liveness is pending; do not treat the file sync as proof that the running host loaded it. |
+| Recorded `routing:stats` | Advise-period stats (`--since 2026-10-06T20:32:23Z`, before the DF4 incident): 112 decision rows, 28 resumes, 20 pinned, agreement 67/67, switched 0, kept for lack of evidence 23 of 84 fresh. `pinned && switched` = 0 over all 191 decision rows. DF5 must use bounded windows and the new `d17Mode` line. |
+| Sync procedure rule | Run `npm ci` **only if `package-lock.json` changed** between the rollback tag and the new head, and always finish it **before asking for a restart**. Never sync while a restart may be pending (DF4 incident, `run-log.md`). |
+| Sentence for the human | "Sync 5 concluído; as correções da fase 3.3 ainda precisam do reinício para ficar ativas. Reinicie o OpenCode v2 e diga 'retomar'." (restart pending) |
 
 ---
 
@@ -107,6 +116,7 @@ directives, which are binding and override your defaults. The rules that matter 
 | `router_verify pending: true` shows `unverifiable` | Re-run `npx vitest run --maxWorkers=2 <files>` yourself; record in the phase QA report. |
 | After a dogfood sync, `/router` does not show `build=<new sha>` | Expected (A8). Rewrite §2 with the exact next task id; tell the human: "Sync DF<n> concluído; o código novo não está ativo na sessão. Reinicie o OpenCode v2 e diga 'retomar'." Stop. On resume, probe again first. |
 | After a sync the plugin misbehaves | 1) set `routing.engine: static` in the override file (hot reload); 2) if still broken: `git -C D:\git\opencode-model-router reset --hard car/sync-<n>-prev`, request a restart, log it, open `QA-DF<n>-1` (critical). |
+| A restart races with `npm ci` | Follow the DF4 incident mitigation in `run-log.md`: run `npm ci` only if `package-lock.json` changed, finish it before requesting a restart, and never sync while a restart may be pending. |
 | Config change not reflected by `/router` | You edited the wrong file: the target is the global override file (A6). |
 | Full suite slow or flaky under parallel worktrees | Capped (`--maxWorkers=2`) and serialized; smoke tests serial; `npm ci` one worktree at a time. |
 | Merge conflict in `src\index.ts` / `src\compat\v2-hooks.ts` | Single-owner files per wave; only the orchestrator merges, in `D:\git\omr-car-main`, one phase at a time. |
@@ -118,4 +128,4 @@ directives, which are binding and override your defaults. The rules that matter 
 - **Never run vitest with `--pool=threads`** (A14): a Phase 1.1 test wrote the user's real `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (`{"routing":{"engine":"enforce"}}`) under threads; the orchestrator deleted it at ≈03:25. Phase 1.1 adds a global home guard (`test\setup\home-guard.ts`).
 - Delegates frequently end a turn mid-task ("Tools are available again…"); resume the same session with "finish, do not end your turn until committed/pushed/clean". The router grader's "NOT ACCEPTED" verdicts on those were based on a truncated injected criterion, not the deliverable — do not escalate on them.
 - Reviewer sessions (@heavy): 1.1 `ses_ef023787effeEObHxLv3MGeGY3`, 1.2 `ses_ef0234eb4ffevS1GTHmwcKeFUl`, 1.3 `ses_ef0231f14ffekDb3IRcSoChUDO`, 1.5 `ses_ef022ef72ffeAqMqtMr0BJxicE`. Producer sessions (@medium): 1.1 `ses_ef0521c71ffehscJXwyETnXMvV`, 1.2 `ses_ef03cb9e0ffe2SaokGGLv5GoPT`, 1.3 `ses_ef03c8de2ffekddgvTJIIsof1p`, 1.5 `ses_ef03c5af9ffeuuv113Ch6t0O7A`.
-- Owner decision still pending: classifier model for the DF3 live check (A13).
+- Owner decision resolved: `opencode-go/deepseek-v4.1-flash` for the DF3 live check (A13); the one-shot is complete and recorded EXPERIMENTAL (see §2).
