@@ -9,7 +9,7 @@ Closes #73
 
 Includes two runtime fixes found during release QA: plugin dispose now drains in-flight cost-doctor checks and claims (bounded by the 3 s host timeout), and config validation never echoes secret-capable values (CodeQL #10–#12).
 
-The timeout bounds advisor host calls; filesystem completion and the rest of plugin teardown are not a hard 3 s deadline. Test workflow [37613324910](https://github.com/marco-jardim/opencode-model-router/actions/runs/37613324910) passed **12/12 jobs, attempt 1**, on `71ae7d8`. The post-Round-3 exact-SHA matrix remains pending the owner's `car/main` update; that earlier green run does not cover credential redaction.
+The timeout bounds advisor host calls; filesystem completion and the rest of plugin teardown are not a hard 3 s deadline. Test workflow [37613324910](https://github.com/marco-jardim/opencode-model-router/actions/runs/37613324910) passed **12/12 jobs, attempt 1**, on `71ae7d8`. Post-Round-3 run [37617504281](https://github.com/marco-jardim/opencode-model-router/actions/runs/37617504281) is **in progress** on `b4c6621`, excluding the diagnostic-contract repair `9cc4946`. The final-tip matrix still requires the owner's `car/main` update; the earlier green run does not cover credential redaction.
 
 Round-3 local verification: typecheck passed; the four config/docs test files passed **685 tests** (one existing skip); config-related tests passed **8,785 tests in 92 files** (56 existing skipped tests / 3 skipped files), using the default pool with `--maxWorkers=2` for the related run. Legacy diagnostic expectations now enforce redaction rather than value echoes; all validation cases remain covered.
 
