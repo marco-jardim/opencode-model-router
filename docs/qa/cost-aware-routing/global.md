@@ -228,3 +228,9 @@ Initial implementation runs exposed fixture/type errors: unsupported `buildLadde
 The reviewer/orchestrator reported that the two `test/unit/exec.test.ts` **lowPriority** tests failed once in the capped full run on `d775ad1`, which otherwise had **11656 tests passed**, and that the file passed **42/42 runnable tests in isolation**. This is recorded as a **load-dependent, pre-existing flake, not caused by this work**. `git diff --exit-code v2.2.0 -- test/unit/exec.test.ts src/verify/exec.ts` confirmed both files are unchanged since 2.2.0. This follow-up independently reran that file: **42 passed, 2 skipped**. No full suite was rerun here and the historical full-run result is attributed to the reviewer, not represented as a new run.
 
 No live store, user configuration or service was modified, and no keyed-provider smoke was run for round 2.
+
+## Round 3 (scoped regression, major+ only)
+
+Reviewer re-ran p1-neverdown (plus a hybrid-2 live-preset probe on old vs new tree: identical), p4-privacy (24 gating combinations, hunter2 never sent), p6-simulate (diffs 0), the resume probes and 17 explicit test files (1385 tests). Findings at major or above: none. Capped full suite on 84c3434: 146 files / 11675 tests green.
+
+**Final verdict: PASS - Phase 3.3 global QA closed with zero open blocking/critical/major findings.**
