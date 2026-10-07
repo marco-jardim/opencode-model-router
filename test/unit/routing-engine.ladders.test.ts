@@ -138,6 +138,17 @@ describe("grantsFromTools (A11)", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildLadder — router rungs and the simulated runner (A25)", () => {
+  it("QA-G-B7: catalog steps charge max(tierRatio, matching same-model preset rung), not another model's ratio", () => {
+    const cfg = plainCfg();
+    const policy = buildEscalatePolicy(cfg, { host: "v2", catalog });
+    expect(policy.variants?.perTier.fast?.costRatios).toMatchObject({ low: 1, medium: 5, high: 1, xhigh: 1 });
+    expect(policy.variants?.perTier.medium?.costRatios).toMatchObject({ low: 5, medium: 5, high: 5 });
+    const cheaper = cfgOf({ fast: tier(SONNET, "low", 8), medium: tier(SONNET, "medium", 5) });
+    expect(buildEscalatePolicy(cheaper, { host: "v2", catalog }).variants?.perTier.fast?.costRatios.medium).toBe(8);
+    const explicit = cfgOf({ fast: tier(SONNET, "low", 1, { candidates: [{ variant: "low" }, { variant: "medium", costRatio: 2 }] }), medium: tier(SONNET, "medium", 5) });
+    expect(buildEscalatePolicy(explicit, { host: "v2", catalog }).variants?.perTier.fast?.costRatios.medium).toBe(2);
+  });
+
   it("single-candidate tiers: one rung per tier, each priced through the runner's own cascade", () => {
     const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents() });
     expect(summary(ladder)).toEqual([
@@ -220,9 +231,9 @@ describe("buildLadder — router rungs and the simulated runner (A25)", () => {
     it("the runner steps variants before escalating: the rungs only it reaches are `reachable`, never candidates", () => {
       const ladder = buildLadder({ cfg: plainCfg(), routing: { roles: {} }, facts: facts("implement"), agents: routerAgents(), session });
       expect(ladder.candidates).toHaveLength(3);
-      expect(pathsOf(ladder)[0]).toEqual(["fast#low", "~fast#medium", "~medium#high"]);
+      expect(pathsOf(ladder)[0]).toEqual(["fast#low", "~fast#medium"]); // 1 + 5 crosses the default ×4 ceiling
       expect(ladder.reachable!.map((c) => `${c.tier}#${c.variant} x${c.costRatio} r${c.rank}`)).toEqual(
-        expect.arrayContaining(["fast#medium x1 r0", "medium#high x5 r1"]),
+        expect.arrayContaining(["fast#medium x5 r0", "medium#high x5 r1"]),
       );
       expect(ladder.reachable!.every((c) => c.source === "tier" && c.agent.origin === "router")).toBe(true);
     });

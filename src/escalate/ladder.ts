@@ -599,6 +599,7 @@ function validCostRatio(value: unknown): number | undefined {
 /**
  * A17: the costRatio of every rung a tier can run (its base and its ladder): a candidate of the same
  * model naming that variant (no variant = `default`) with its own `costRatio`, else the tier's.
+ * Catalog steps that reach another preset tier's rung on the same model cost at least that rung.
  * Rungs without any ratio are omitted, so the runner falls back to the tier's `costRatio`.
  */
 function rungCostRatios(
@@ -606,6 +607,7 @@ function rungCostRatios(
   rawCandidates: readonly TierCandidate[] | undefined,
   base: string,
   ladder: VariantLadder,
+  presetTiers: readonly TierConfig[],
 ): Record<string, number> {
   const tierRatio = validCostRatio(tier.costRatio);
   const own = new Map<string, number>();
@@ -621,7 +623,14 @@ function rungCostRatios(
   }
   const entries: Array<[string, number]> = [];
   for (const rung of new Set([base, ...ladder.variants])) {
-    const ratio = own.get(rung) ?? tierRatio;
+    let ratio = own.get(rung) ?? tierRatio;
+    if (ladder.source === "catalog" && rung !== base) {
+      for (const other of presetTiers) {
+        if (other === tier || other.model !== tier.model || (other.variant ?? DEFAULT_VARIANT) !== rung) continue;
+        const otherRatio = validCostRatio(other.costRatio);
+        if (otherRatio !== undefined) ratio = Math.max(ratio ?? 0, otherRatio);
+      }
+    }
     if (ratio !== undefined) entries.push([rung, ratio]);
   }
   return Object.fromEntries(entries);
@@ -649,7 +658,9 @@ function buildVariantPolicy(
   if (!session || session.host !== "v2" || (session.variantSteps ?? "auto") === "none") return null; // D1, D10
   const { max } = resolveEffortBump(cfg); // cap for catalog ladders (F2)
   const entries: Array<[string, TierVariantInfo]> = [];
-  for (const [name, tier] of Object.entries(getActiveTiers(cfg) ?? {})) {
+  const tiers = getActiveTiers(cfg) ?? {};
+  const presetTiers = Object.values(tiers).filter((tier) => tier !== null && typeof tier === "object");
+  for (const [name, tier] of Object.entries(tiers)) {
     if (tier === null || typeof tier !== "object" || typeof tier.model !== "string" || tier.model.length === 0) continue;
     // QA-1.5-6: every tier with a catalog entry gets variant info (and its input budget), whether or
     // not it can step; a tier without an entry keeps today's behaviour (no info, fresh start).
@@ -679,7 +690,7 @@ function buildVariantPolicy(
       base,
       ladder,
       inputBudget: inputBudget(entry.limit),
-      costRatios: rungCostRatios(tier, raw, base, ladder),
+      costRatios: rungCostRatios(tier, raw, base, ladder, presetTiers),
       ...(effortConfigured ? { effortConfigured: true as const } : {}),
     }]);
   }
