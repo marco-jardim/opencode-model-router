@@ -152,6 +152,13 @@ function shuffled<T>(items: readonly T[], seed: number): T[] {
 // ---------------------------------------------------------------------------
 
 describe("summarize", () => {
+  it("QA-G-C7: a duplicated batch has exactly the original statistics", () => {
+    const batch = scenario();
+    expect(summarize(null, [...batch, ...batch], WINDOW)).toEqual(summarize(null, batch, WINDOW));
+    const first = decision("first", SINCE);
+    expect(summarize(null, [first, { ...first, ts: UNTIL, switched: true }], NONE))
+      .toEqual(summarize(null, [first], NONE));
+  });
   it("empty window → every count 0, every rate null, no NaN anywhere", () => {
     const table = summarize(null, [], NONE);
     expect(table).toEqual({
@@ -362,7 +369,7 @@ describe("summarize", () => {
     expect(summarize(null, rows.slice(0, 4), { since: iso(SINCE), until: iso(UNTIL) }).byKey).toEqual([]);
     // even a duplicated refusal for one attempt cannot push the rate above 100 %
     const duplicated = summarize(null, [decision("d", SINCE), refusal("d", SINCE, A), refusal("d", SINCE, A)], NONE).byKey[0];
-    expect(duplicated?.falseRefusals).toBe(2);
+    expect(duplicated?.falseRefusals).toBe(1);
     expect(duplicated?.refusalRate).toEqual(rate(1, 1));
   });
 
@@ -1182,7 +1189,7 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
       sameAttempt("X1", { overrides: "pass" }),
       { ...sameAttempt("X1", { overrides: "pass" }), ts: at(3) },
     ];
-    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 2, passRate: { num: 0, den: 1, rate: 0 } });
+    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1, passRate: { num: 0, den: 1, rate: 0 } });
     // the same with the pass in an earlier window: the synthetic fail is added once
     const split = [
       decision("X2", "2026-10-05T10:00:00.000Z"),
@@ -1190,7 +1197,7 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
       sameAttempt("X2", { overrides: "pass", decisionID: null }),
       { ...sameAttempt("X2", { overrides: "pass", decisionID: null }), ts: at(3) },
     ];
-    expect(cell(split, A, { since: Date.parse("2026-10-06T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 2 });
+    expect(cell(split, A, { since: Date.parse("2026-10-06T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
   });
 
   it("QA-2.1-R2-2 (P5): pass in the window, refusal after it: the pass is not a pass, and no fail is invented", () => {
@@ -1202,10 +1209,10 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
     expect(cell(later, A, { since: Date.parse("2026-10-07T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
   });
 
-  it("QA-2.1-R2-9: a later pass/fail row replaces an earlier unverifiable row of the same attempt", () => {
+  it("QA-G-C7: first verdict per decision/attempt wins, including unverifiable", () => {
     const attempt = (row: VerdictRow): VerdictRow => ({ ...row, attemptID: "c-U:0" });
     const rows = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, "pass"))];
-    expect(cell(rows, A)).toMatchObject({ pass: 1, fail: 0, unverifiable: 0 });
+    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 0, unverifiable: 1 });
     const reversed = [rows[0]!, rows[2]!, rows[1]!];
     expect(cell(reversed, A)).toMatchObject({ pass: 1, unverifiable: 0 });
     const still = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, "unverifiable"))];

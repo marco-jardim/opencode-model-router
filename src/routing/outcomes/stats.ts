@@ -82,6 +82,17 @@ interface KeyAcc {
  * denominator is `null`, never NaN.
  */
 export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[], window: StatsWindow): StatsTable {
+  // An append may reach disk before reporting failure; retrying that batch must not inflate rates.
+  // First row wins, before windowing and before the cross-window outcome joins.
+  const seen = new Set<string>();
+  rows = rows.filter((row) => {
+    const id = JSON.stringify(row.kind === "decision"
+      ? [row.kind, row.decisionID]
+      : [row.kind, row.decisionID, row.attemptID]);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
   const since = finiteOrNull(window.since);
   const until = finiteOrNull(window.until);
   const inWindow = (row: LogRow): boolean => {

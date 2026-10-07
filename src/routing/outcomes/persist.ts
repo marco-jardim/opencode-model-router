@@ -585,6 +585,9 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       if (newestMs !== null && ms <= newestMs) ms = newestMs + 1; // names stay unique and chronological
       const target = join(dir, `decisions.${compactStamp(ms)}-${pid}.jsonl`);
       try {
+        // Another process may have rotated while we listed generations. Do not rotate its small new file.
+        const current = await fs.stat(decisionsPath);
+        if (current === null || current.size < maxBytes) return;
         await renameWithRetry(fs, decisionsPath, target, sleep, delays);
       } catch (error) {
         if (errorCode(error) !== "ENOENT") throw error; // ENOENT: another process rotated first

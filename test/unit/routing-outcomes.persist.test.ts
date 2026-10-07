@@ -680,6 +680,19 @@ describe("persister: load", () => {
 // ---------------------------------------------------------------------------
 
 describe("persister: decisions.jsonl", () => {
+  it("QA-G-C8: re-stats just before rotation and leaves a new small live file alone", async () => {
+    const { mem, deps, dir } = setup();
+    const live = join(dir, DECISIONS_FILE);
+    const persister = createPersister(dir, deps, { maxBytes: 100 });
+    await persister.appendRows([verdictRow(1)]);
+    mem.hooks.readdir = () => {
+      mem.files.set(live, { text: "\n", mtimeMs: T0 }); // another rotator has replaced the file
+    };
+    await persister.appendRows([verdictRow(2)]);
+    expect(mem.touched.filter((t) => t.op === "rename")).toEqual([]);
+    delete mem.hooks.readdir;
+    expect((await persister.readRows()).rows).toEqual([verdictRow(2)]);
+  });
   it("appends one JSON line per row with a single appendText call per batch", async () => {
     const { mem, deps, dir } = setup();
     const persister = createPersister(dir, deps);
