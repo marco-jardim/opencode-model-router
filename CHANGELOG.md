@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
+  Code Mode, delegation and unspecified MCP tools are denied by default, even
+  for existing configs without the new optional tier `readOnly` boolean.
+  Opt out by setting `presets.<preset>.fast.readOnly: false` in a router override
+  file. Explicit host/user rules retain precedence; other tiers are unchanged.
+  `rename` moves from the fast taxonomy to medium. Fast prompts distinguish
+  direct tools from the separate Code Mode catalog.
+
+### Added
+
+- Six shell-free `router_git_*` inspection tools: status, log, diff, show, blame,
+  ls_files. Fixed hardened argv, strict paths/refs, bounded output, timeout/tree
+  cancellation, and remote-URL userinfo redaction; no write commands or arbitrary
+  options. Read-only tiers can also use configured Context7 docs lookups.
+  See [Read-only tiers](docs/READ_ONLY_TIERS.md) for policy, overrides and limits
+  (not an OS sandbox).
+
 ## [2.3.0] - 2026-10-07
 
 ### Added

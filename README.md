@@ -8,6 +8,16 @@ An [OpenCode](https://opencode.ai) plugin that routes every coding task to the r
 
 ## Why it's different
 
+**`fast` is now host-enforced read-only (behaviour change, #77).** It can use
+`read`, `glob`, `grep`, the six shell-free `router_git_*` inspection tools, and
+configured Context7 documentation lookups—not shell, edits, Code Mode, or child
+agents. `rename` belongs to `medium`. This applies even to older configs without
+the new field. To opt out for a preset, layer
+`{ "presets": { "anthropic": { "fast": { "readOnly": false } } } }` in your
+router override file (substitute your preset). Other tiers are unchanged.
+See [Read-only tiers](docs/READ_ONLY_TIERS.md) for permission precedence,
+configurable external-directory access, Git limits, and why this is **not an OS sandbox**.
+
 Most AI coding tools give you one model for everything. You pay Opus prices to run `grep`. opencode-model-router changes that with a stack of interlocking ideas:
 
 **Use a mid-tier model as orchestrator.**
