@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -105,25 +105,27 @@ describe("plugin agents on v1 (config hook)", () => {
 
   it("an opencode.json entry wins for the fields it sets, its permission goes after ours, one notice", async () => {
     writeGlobal({ agents: agentsBlock });
-    const warnings: string[] = [];
-    const logger = { warn: (m: string) => warnings.push(m) };
-    void logger;
-    const { opencodeConfig, hooks } = await run({
-      agent: { scout: { description: "Mine", permission: { webfetch: "deny" }, tools: { custom: true } } },
-    });
-    const def = opencodeConfig.agent.scout;
-    expect(def.description).toBe("Mine");
-    expect(def.prompt).toBe("SCOUT PROMPT");
-    const keys = Object.keys(def.permission);
-    expect(keys.indexOf("webfetch")).toBeGreaterThanOrEqual(0);
-    expect(def.permission.webfetch).toBe("deny");
-    expect(def.tools.custom).toBe(true);
-    // re-running the hook (preset refresh) rebuilds without re-merging our own output as a user entry
-    await hooks.config(opencodeConfig);
-    expect(opencodeConfig.agent.scout.description).toBe("Mine");
-    expect(opencodeConfig.agent.scout.permission.webfetch).toBe("deny");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { opencodeConfig, hooks } = await run({
+        agent: { scout: { description: "Mine", permission: { webfetch: "deny" }, tools: { custom: true } } },
+      });
+      const def = opencodeConfig.agent.scout;
+      expect(def.description).toBe("Mine");
+      expect(def.prompt).toBe("SCOUT PROMPT");
+      expect(def.permission.webfetch).toBe("deny");
+      expect(def.tools.custom).toBe(true);
+      // re-running the hook (preset refresh) rebuilds without re-merging our own output as a user entry
+      await hooks.config(opencodeConfig);
+      expect(opencodeConfig.agent.scout.description).toBe("Mine");
+      expect(opencodeConfig.agent.scout.permission.webfetch).toBe("deny");
+      const notices = warn.mock.calls.map((args) => String(args[0]))
+        .filter((text) => text.includes("agent scout is defined both in the router `agents` block and in opencode.json; opencode.json wins for the fields it sets"));
+      expect(notices).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
-
   it("agents.<name>.tier wins over subagentTiers[name]", async () => {
     writeGlobal({ agents: agentsBlock, subagentTiers: { scout: "heavy" } });
     const cfg = loadConfig();
@@ -137,19 +139,21 @@ describe("plugin agents on v1 (config hook)", () => {
     expect(opencodeConfig.agent.ghost).toBeUndefined();
   });
 
-  it("a preset switch updates the model on the next hook run", async () => {
-    writeGlobal({ agents: agentsBlock });
-    const cfg = loadConfig();
-    const other = Object.keys(cfg.presets).find((name) => name !== cfg.activePreset
-      && cfg.presets[name].medium?.model !== cfg.presets[cfg.activePreset].medium.model);
-    if (other === undefined) return;
+  it("a preset switch updates the model and variant on the next hook run", async () => {
+    const presetTiers = (prefix: string, variant?: string) => Object.fromEntries(["fast", "medium", "heavy"].map((name) => [name, {
+      model: `${prefix}/${name}`, costRatio: 1, description: name, whenToUse: ["anything"],
+      ...(name === "medium" && variant ? { variant } : {}),
+    }]));
+    const block = { alpha: presetTiers("alpha"), beta: presetTiers("beta", "deep") };
+    writeGlobal({ presets: block, activePreset: "alpha", agents: agentsBlock });
     const { opencodeConfig, hooks } = await run({});
-    expect(opencodeConfig.agent.scout.model).toBe(cfg.presets[cfg.activePreset].medium.model);
-    writeGlobal({ agents: agentsBlock, activePreset: other });
+    expect(opencodeConfig.agent.scout.model).toBe("alpha/medium");
+    expect(opencodeConfig.agent.scout.variant).toBeUndefined();
+    writeGlobal({ presets: block, activePreset: "beta", agents: agentsBlock });
     await hooks.config(opencodeConfig);
-    expect(opencodeConfig.agent.scout.model).toBe(cfg.presets[other].medium.model);
+    expect(opencodeConfig.agent.scout.model).toBe("beta/medium");
+    expect(opencodeConfig.agent.scout.variant).toBe("deep");
   });
-
   it("the grep post-filter covers a readOnly plugin agent but not an explicit-permission one", async () => {
     writeGlobal({
       agents: {

@@ -48,6 +48,7 @@ import {
 } from "./commands/output";
 import {
   resolveSubagentOverrides,
+  DEFER_MISSING_SUBAGENT_NOTICE,
   mergeSubagentOverride,
 } from "./router/subagents";
 import { fingerprintToolCall } from "./guard/fingerprint";
@@ -2244,7 +2245,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         existingAgents: opencodeConfig.agent,
         pluginAgents: cfg.agents,
         onSkip: (agentName, reason) =>
-          warnAgentOptionsEffortOnce(
+          reason === "missing" && opencodeConfig[DEFER_MISSING_SUBAGENT_NOTICE] === true
+            ? undefined
+            : warnAgentOptionsEffortOnce(
             `subagent-tiers:${reason}:${agentName}`,
             reason === "missing"
               ? `subagentTiers: '${agentName}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`

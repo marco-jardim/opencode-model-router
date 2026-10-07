@@ -9,7 +9,8 @@ import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
 import { isAbsolute, resolve } from "node:path";
 import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
-import { resolveSubagentOverrides } from "../router/subagents";
+import { DEFER_MISSING_SUBAGENT_NOTICE, resolveSubagentOverrides } from "../router/subagents";
+import { pluginAgentMarker } from "../router/plugin-agents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
@@ -163,6 +164,7 @@ export async function registerV2Hooks(
       mode: agent.mode,
       model: agent.model && `${agent.model.providerID}/${agent.model.id}`,
       variant: agent.model?.variant,
+      ...(agent.description ? { description: agent.description } : {}),
     };
     let config: LegacyConfig = { agent: {}, command: {} };
     let originals = new Map<string, string>();
@@ -173,7 +175,37 @@ export async function registerV2Hooks(
       warnedPermissions.add(message);
       ingestLogger.warn(message);
     };
-    const protectedAgent = (name: string | undefined) => name !== undefined && config.agent[name]?.permission?.["*"] === "deny";
+    // Plugin agents (#81) are protected like read-only tiers: readOnly ones and explicit-permission ones
+    // (which start from `* deny`) both keep their own deny/ask rules against inherited session grants.
+    const protectedAgent = (name: string | undefined) => name !== undefined
+      && (config.agent[name]?.permission?.["*"] === "deny" || pluginAgentMarker(config.agent[name]) !== undefined);
+    // Host agents appear after setup (the host's config-agent plugin activates after the router). Names
+    // the router created itself never count as host agents, or a tier would look like an existing one.
+    const routerCreated = new Set<string>();
+    let promptChecked = false;
+    const pendingSubagentNames = (): string[] => {
+      const routerConfig = loadConfig(ctx.location.directory);
+      const tiers = getActiveTiers(routerConfig);
+      return Object.keys(routerConfig.subagentTiers ?? {}).filter((name) =>
+        !Object.hasOwn(tiers, name) && !Object.hasOwn(routerConfig.agents ?? {}, name) && !Object.hasOwn(baseSeed, name));
+    };
+    /** Adds host agents that appeared since setup to the seed; true when the seed grew. */
+    const discoverHostAgents = async (): Promise<boolean> => {
+      const pending = pendingSubagentNames();
+      if (pending.length === 0) return false;
+      let grew = false;
+      for (const agent of (await ctx.agent.list()).data) {
+        if (!pending.includes(agent.id) || routerCreated.has(agent.id) || Object.hasOwn(baseSeed, agent.id)) continue;
+        baseSeed[agent.id] = {
+          mode: agent.mode,
+          model: agent.model && `${agent.model.providerID}/${agent.model.id}`,
+          variant: agent.model?.variant,
+          ...(agent.description ? { description: agent.description } : {}),
+        };
+        grew = true;
+      }
+      return grew;
+    };
     let lastConfig: unknown;
     // Returns the router config the registry state was built from; the caller
     // advances `lastConfig` only once the host registries have reloaded from it.
@@ -183,7 +215,10 @@ export async function registerV2Hooks(
       // Presence-only bridge input, never registered as an MCP definition.
       if (context7) next.mcp = { context7: { type: "local", command: [], enabled: true } };
       const nextOriginals = new Map(Object.entries(next.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
+      // The "no such agent" notice for `subagentTiers` waits for the first prompt-time check (see the prompt hook).
+      Object.defineProperty(next, DEFER_MISSING_SUBAGENT_NOTICE, { value: !promptChecked, enumerable: false });
       await hooks.config?.(next);
+      for (const name of Object.keys(next.agent)) if (!Object.hasOwn(baseSeed, name)) routerCreated.add(name);
       const nextOptions = new Map<string, Record<string, unknown>>();
       for (const [name, definition] of Object.entries(next.agent)) {
         if (nextOriginals.get(name) === JSON.stringify(definition) || !definition.options) continue;
@@ -227,11 +262,15 @@ export async function registerV2Hooks(
           if (definition.model) agent.model = modelRef(definition.model, definition.variant);
           if (definition.mode) agent.mode = definition.mode;
           if (definition.description !== undefined) agent.description = definition.description;
-          if (definition.prompt !== undefined) agent.system = v2Instructions(definition.prompt);
+          // A plugin agent's prompt is the user's own text: used verbatim, never rewritten for the host vocabulary.
+          const marker = pluginAgentMarker(definition);
+          if (definition.prompt !== undefined) agent.system = marker ? definition.prompt : v2Instructions(definition.prompt);
           if (definition.color !== undefined) agent.color = definition.color;
           if (definition.steps !== undefined) agent.steps = definition.steps;
           if (definition.permission) {
-            agent.permissions = publishReadOnlyPermissions(name, permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce);
+            agent.permissions = publishReadOnlyPermissions(
+              name, permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce, marker?.exempt ?? [],
+            );
           }
         });
       }
@@ -335,7 +374,15 @@ export async function registerV2Hooks(
       const output = { message: { agent: session.agent }, parts: [{ type: "text", text: event.prompt.text }] };
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
-      if (loadConfig(ctx.location.directory) !== lastConfig) await refresh();
+      // Host agents defined in opencode.json appear after setup: refresh once a pending `subagentTiers` name shows up.
+      const discovered = await discoverHostAgents();
+      if (loadConfig(ctx.location.directory) !== lastConfig || discovered) await refresh();
+      if (!promptChecked) {
+        promptChecked = true;
+        for (const name of pendingSubagentNames()) {
+          warnPermissionOnce(`subagentTiers: '${name}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`);
+        }
+      }
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
       if (protectedAgent(event.agent)) {
@@ -431,7 +478,7 @@ export async function registerV2Hooks(
           if (cfg.subagentTiers?.[args.agent]) {
             const actual = await ctx.agent.list();
             const overrides = actual.data.some((agent) => agent.id === args.agent) ? resolveSubagentOverrides({
-              subagentTiers: cfg.subagentTiers, tiers: getActiveTiers(cfg),
+              subagentTiers: cfg.subagentTiers, tiers: getActiveTiers(cfg), pluginAgents: cfg.agents,
               existingAgents: Object.fromEntries(actual.data.map((agent) => [agent.id, { mode: agent.mode }])),
             }) : {};
             const override = overrides[args.agent];

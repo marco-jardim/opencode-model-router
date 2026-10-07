@@ -39,7 +39,9 @@ export function evaluatePermission(rules: readonly PermissionRule[], action: str
  * grant. While readOnly is true, neither can widen the policy's action surface.
  * Resource overrides on permitted actions and inherited denies survive.
  * Inherited asks cannot create auto-approvable capabilities outside that set. */
-export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void): PermissionRule[] {
+export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void, exempt: readonly string[] = []): PermissionRule[] {
+  // Actions a plugin agent's own config grants (#81, `allowTools` and its permission) are not canaries for that agent.
+  const canaries = exempt.length === 0 ? READ_ONLY_CANARIES : READ_ONLY_CANARIES.filter(canary => !exempt.some(pattern => permissionMatches(canary, pattern)));
   const recognised = KNOWN_HOST_DEFAULTS.every((rule, i) => inherited[i]?.action === rule.action
     && inherited[i]?.resource === rule.resource && inherited[i]?.effect === rule.effect);
   const tail = inherited.slice(recognised ? KNOWN_HOST_DEFAULTS.length : 0);
@@ -54,11 +56,11 @@ export function publishReadOnlyPermissions(name: string, policy: readonly Permis
   // Check the final projected list, including policy rules, with last-match semantics.
   const candidate = [...policy, ...safe];
   const resources = new Set(["*", "src/file.ts", "echo probe", ...tail.map(rule => rule.resource)]);
-  const breached = READ_ONLY_CANARIES.some(action => [...resources].some(resource => evaluatePermission(candidate, action, resource) !== "deny"));
+  const breached = canaries.some(action => [...resources].some(resource => evaluatePermission(candidate, action, resource) !== "deny"));
   if (breached) {
     warn(`read-only permission canary failed for ${name}; inherited grants restricted`);
     return [{ action: "*", resource: "*", effect: "deny" }, ...candidate.filter(rule => rule.effect === "deny"
-      || (rule.action !== "*" && !READ_ONLY_CANARIES.some(action => permissionMatches(action, rule.action))))];
+      || (rule.action !== "*" && !canaries.some(action => permissionMatches(action, rule.action))))];
   }
   return candidate;
 }

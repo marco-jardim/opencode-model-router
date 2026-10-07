@@ -11,6 +11,13 @@ export interface SubagentOverride {
   variant: string | undefined;
 }
 
+/**
+ * Set (non-enumerable, `true`) on the config object the v2 adapter hands to the
+ * `config` hook while host agents may still be missing: the "no such agent"
+ * notice then waits for its first prompt-time check.
+ */
+export const DEFER_MISSING_SUBAGENT_NOTICE = Symbol.for("opencode-model-router.defer-missing-subagent-notice");
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
