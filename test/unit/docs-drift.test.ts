@@ -10,6 +10,7 @@ import {
 } from "../../src/router/config";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
+import { runAdvisor } from "../../src/routing/advisor";
 import { buildLadder, resolveChosen } from "../../src/routing/engine/ladders";
 import { candidateKey, decide } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
@@ -550,13 +551,43 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     for (const code of ["switched", "kept:best-is-chosen", "kept:margin", "kept:evidence", "kept:pinned", "kept:class-confidence", "kept:no-candidates"]) expect(doc, code).toContain(`\`${code}\``);
   });
 
+  it("effort-variant-mismatch and variant-effort are documented as the real advisor produces them: one warning per tier, by variant steps (QA-3.1-R3-1)", () => {
+    const bundled = JSON.parse(read("tiers.json")) as Record<string, any>;
+    const fixture = (variantSteps: "none" | undefined): RouterConfig => {
+      const raw = structuredClone(bundled);
+      raw.activePreset = "anthropic";
+      raw.routing = { engine: "advise" };
+      // medium = { variant: medium, effort: xhigh }: the effort differs from the variant
+      raw.presets.anthropic.medium = { ...raw.presets.anthropic.medium, variant: "medium", effort: "xhigh" };
+      if (variantSteps !== undefined) raw.enforcement.escalate = { ...raw.enforcement.escalate, variantSteps };
+      return validateConfig(raw) as unknown as RouterConfig;
+    };
+    const idsOfMedium = (cfg: RouterConfig): string[] =>
+      runAdvisor(cfg, { agents: [] }, null)
+        .filter((f) => f.subject === "medium" && (f.id === "variant-effort" || f.id === "effort-variant-mismatch"))
+        .map((f) => f.id);
+    // a routing block, no explicit variantSteps: variant steps are on, `variant-effort` speaks and the mismatch finding stays silent
+    expect(idsOfMedium(fixture(undefined))).toEqual(["variant-effort"]);
+    // variant steps off: the other way round
+    expect(idsOfMedium(fixture("none"))).toEqual(["effort-variant-mismatch"]);
+    expect(runAdvisor(fixture("none"), { agents: [] }, null).filter((f) => f.id === "effort-variant-mismatch").map((f) => f.subject)).toEqual(["medium"]);
+
+    const guide = read("docs/ROUTING_ENGINE.md");
+    const row = guide.split(/\r?\n/).find((line) => line.startsWith("| `effort-variant-mismatch` |")) ?? "";
+    expect(row).toContain("**and variant steps are off**");
+    expect(row).toContain("`variant-effort` fires for the same tier instead");
+    expect(row).toContain("one warning per tier");
+    expect(guide).toContain("as `variant-effort` while variant steps are on");
+    expect(guide).toContain("as `effort-variant-mismatch` when they are off");
+    const adr = read("docs/adr/0005-cost-aware-routing-engine.md");
+    expect(adr).toContain("as `variant-effort` while variant steps are on and as `effort-variant-mismatch` when they are off");
+  });
   it("the guide documents the A7 effort evidence of Phase 3.2 and keeps the provider-acceptance caveat", () => {
     const doc = read("docs/ROUTING_ENGINE.md");
     expect(doc).toContain('{"type":"configuration_update","reasoning":{"effort"');
     expect(doc).toContain("host emission only");
     expect(doc).toMatch(/api\.openai\.com or api\.anthropic\.com honour the in-band effort is \*\*unverified\*\*/);
     expect(doc).not.toContain("The OpenAI Responses route was not exercised");
-    expect(doc).toContain("`effort-variant-mismatch`");
   });
   it("ADR 0005 has one `### D<n> —` heading for each of D1 to D18, in order", () => {
     const adr = read("docs/adr/0005-cost-aware-routing-engine.md");
