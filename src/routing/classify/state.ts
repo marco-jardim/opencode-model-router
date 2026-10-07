@@ -80,7 +80,7 @@ function splitAcceptance(text: string): { readonly first: string | null; readonl
   return { first, rest: parts.join("") };
 }
 
-/** The raw text sources shared by the credential gate and state builder, before scrubbing. */
+/** The text sources shared by the credential gate and state builder, before secret scrubbing. */
 export function classifierStateRawParts(input: { description?: string; prompt: string }): {
   readonly description: string;
   readonly acceptance: string | null;
@@ -89,7 +89,9 @@ export function classifierStateRawParts(input: { description?: string; prompt: s
   const { first, rest } = splitAcceptance(String(input.prompt ?? ""));
   return {
     description: String(input.description ?? "").slice(0, RULES_MAX_CHARS),
-    acceptance: first,
+    acceptance: first === null || first.length > RULES_MAX_CHARS
+      ? null
+      : dropDirectiveLines(first).split(/\r?\n/).filter((line) => !/^\s*cwd\s*:/i.test(line)).join("\n"),
     body: rest.slice(0, RULES_MAX_CHARS),
   };
 }
@@ -103,10 +105,7 @@ export function buildClassifierState(
   // Nothing below runs a regex over more than RULES_MAX_CHARS characters of the prompt (QA-1.2-11),
   // except the linear indexOf scan that keeps a trailing acceptance block reachable.
   const raw = classifierStateRawParts(input);
-  const acceptanceRaw =
-    raw.acceptance === null || raw.acceptance.length > RULES_MAX_CHARS
-      ? null
-      : dropDirectiveLines(raw.acceptance).split(/\r?\n/).filter((line) => !/^\s*cwd\s*:/i.test(line)).join("\n");
+  const acceptanceRaw = raw.acceptance;
   const bodyRaw = collapseLongRuns(
     replaceIndentedBlocks(
       replaceFences(dropDirectiveLines(raw.body), CODE_BLOCK_PLACEHOLDER),

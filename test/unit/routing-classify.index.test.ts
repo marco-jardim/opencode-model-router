@@ -168,6 +168,20 @@ describe("classify — rules only", () => {
 });
 
 describe("classify — backend gate", () => {
+  it.each(["classify", "classifyMany"] as const)("R2-8: %s gates only the acceptance text the state includes", async (method) => {
+    for (const acceptance of [
+      "ordinary words ".repeat(2000) + "password hunter2", // exceeds RULES_MAX_CHARS
+      "ordinary words ".repeat(100) + "password hunter2", // omitted by state budget
+      "cwd: /password/hunter2\ncriteria: the result is correct", // cwd is never sent
+    ]) {
+      const { backend, classifyFn, classifyManyFn } = fakeBackend(() => okResult("review"));
+      const deps = makeDeps(backend);
+      const task = input(`Find where the cache is built and refactor the loader.\n[acceptance]\n${acceptance}\n[/acceptance]`);
+      const results = method === "classify" ? [await classify(task, deps)] : await classifyMany([task], deps);
+      expect(results[0]!.trace.backendSkipped).not.toBe("credentials");
+      expect(classifyFn.mock.calls.length + classifyManyFn.mock.calls.length).toBeGreaterThan(0);
+    }
+  });
   it.each(["classify", "classifyMany"] as const)("D14 QA-G-B4: %s blocks credentials in acceptance past the prompt head with zero fetches", async (method) => {
     const fetch = vi.fn<FetchLike>();
     const config = settings({ backend: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1" });

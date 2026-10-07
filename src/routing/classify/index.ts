@@ -296,10 +296,10 @@ function isGated(facts: TaskFacts, deps: ClassifyDeps): boolean {
  * Policy gate (QA-1.2-1): a task that names a credential, or contains something
  * the scrubber had to redact, never reaches a backend; the rules facts stand.
  */
-function mentionsCredentials(prepared: Prepared): boolean {
+function mentionsCredentials(prepared: Prepared, acceptanceIncluded: boolean): boolean {
   const description = typeof prepared.input.description === "string" ? prepared.input.description : "";
   const raw = classifierStateRawParts({ description, prompt: prepared.parsed.stripped });
-  return [raw.description, raw.acceptance, raw.body].some((part) => part !== null && hasCredentialSignal(part));
+  return [raw.description, acceptanceIncluded ? raw.acceptance : null, raw.body].some((part) => part !== null && hasCredentialSignal(part));
 }
 
 function resultOf(
@@ -364,12 +364,11 @@ export async function classify(input: ClassifyInput, deps: ClassifyDeps): Promis
     const prepared = prepare(input, deps);
     const backend = deps.backend;
     if (backend === null || !isGated(prepared.facts, deps)) return resultOf(prepared, null, null);
-    if (mentionsCredentials(prepared)) return resultOf(prepared, null, null, { skipped: "credentials" });
-
     const state = buildClassifierState(
       { description: input.description, prompt: prepared.parsed.stripped },
       deps.settings.maxStateChars,
     );
+    if (mentionsCredentials(prepared, state.acceptanceIncluded)) return resultOf(prepared, null, null, { skipped: "credentials" });
     const random = deps.random ?? Math.random;
     const budget = hangBudget(deps);
     const raced = await raceTimeout(
@@ -431,15 +430,15 @@ export async function classifyMany(
     prepared.forEach((item, index) => {
       if (item === undefined || backend === null || !isGated(item.facts, deps)) return;
       try {
-        if (mentionsCredentials(item)) {
-          skipped.add(index);
-          return;
-        }
         const input = list[index]!;
         const state = buildClassifierState(
           { description: input.description, prompt: item.parsed.stripped },
           deps.settings.maxStateChars,
         );
+        if (mentionsCredentials(item, state.acceptanceIncluded)) {
+          skipped.add(index);
+          return;
+        }
         gated.push({ index, prepared: item, state });
       } catch (error) {
         safeWarn(deps.logger, `classifier failed: ${reasonOf(error)}`);
