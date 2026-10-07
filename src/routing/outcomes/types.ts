@@ -621,6 +621,8 @@ export interface PersistStat {
 
 /** Injected file system. Thrown errors carry a Node `code` (`ENOENT`, `EPERM`, `EBUSY`, ...). */
 export interface PersistFs {
+  /** Exclusive create (`wx`); false only when already present. */
+  createExclusive(path: string, data: string): Promise<boolean>;
   /** `mkdir -p`; an existing directory is not an error. */
   mkdirp(dir: string): Promise<void>;
   /** UTF-8 content; null when the file does not exist. */
@@ -712,6 +714,8 @@ export type ForeignCheck =
   | { readonly status: "skip"; readonly reason: string };
 
 export interface Persister {
+  /** Serialize the entire read/merge/save transaction, not just its final rename. */
+  withSnapshotLock(run: () => Promise<void>): Promise<boolean>;
   readonly dir: string;
   readonly outcomesPath: string;
   readonly decisionsPath: string;
@@ -732,7 +736,7 @@ export interface Persister {
    * recorded only after the new content was read and parsed; an unparseable file is moved aside (quarantined)
    * before it can be overwritten; a read failure is `skip`. Never throws.
    */
-  readForeignWrites(): Promise<ForeignCheck>;
+  readForeignWrites(force?: boolean): Promise<ForeignCheck>;
 }
 
 /** Injected timers; the real implementation `unref()`s them so they never keep a process alive. */

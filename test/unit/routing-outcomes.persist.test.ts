@@ -86,6 +86,12 @@ function createMemFs(now: () => number) {
   const hooks: { [K in keyof PersistFs]?: Hook } = {};
 
   const fs: PersistFs = {
+    async createExclusive(path, data) {
+      await hooks.createExclusive?.(path, data);
+      if (files.has(path)) return false;
+      files.set(path, { text: data, mtimeMs: now() });
+      return true;
+    },
     async mkdirp(dir) {
       touched.push({ op: "mkdirp", path: dir });
       await hooks.mkdirp?.(dir);
@@ -1605,6 +1611,34 @@ describe("foreign writers (QA-1.3-4)", () => {
     return { ...base, a, b, onDisk };
   }
 
+  it("QA-G-C1: interleaved writers retain all ten passes, even with identical mtimes", async () => {
+    const { a, b, mem, onDisk, logger } = twoProcesses();
+    await a.persister.load();
+    await b.persister.load();
+    for (let i = 0; i < 5; i++) a.record("pass");
+    await a.flusher.flushNow();
+    for (let i = 0; i < 3; i++) b.record("pass");
+    let entered!: () => void;
+    let release!: () => void;
+    const writing = new Promise<void>((resolve) => { entered = resolve; });
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    mem.hooks.writeDurable = async () => { entered(); await hold; };
+    const bFlush = b.flusher.flushNow();
+    await writing; // B has read/merged, but not yet renamed its snapshot.
+    a.record("pass");
+    a.record("pass");
+    await a.flusher.flushNow(); // must not overwrite B's in-flight transaction
+    await a.flusher.flushNow(); // bounded failure, log only once
+    expect(logger.warn.mock.calls.filter(([message]) => message.includes("snapshot write failed"))).toHaveLength(1);
+    release();
+    await bFlush;
+    delete mem.hooks.writeDurable;
+    await a.flusher.flushNow(); // pending snapshot absorbs B then saves all ten
+    expect((await onDisk())?.counts.pass).toBe(10);
+    await a.flusher.dispose();
+    await b.flusher.dispose();
+  });
+
   it("A saves 5 passes, B saves 3 fails, A saves again: the disk keeps B's fails and A's new passes", async () => {
     const { a, b, c, onDisk, logger } = twoProcesses();
     await a.persister.load();
@@ -1712,7 +1746,7 @@ describe("foreign writers (QA-1.3-4)", () => {
     expect(cost?.mean).toBeLessThan(0.51); // the old clamp-then-merge gave 0.714
   });
 
-  it("an unchanged file is not read: no merge, no warning, one write per dirty flush", async () => {
+  it("an unchanged file is checked under the lock without merging or warning", async () => {
     const { a, mem, logger, c } = twoProcesses();
     await a.persister.load();
     a.record("pass");
@@ -1721,7 +1755,7 @@ describe("foreign writers (QA-1.3-4)", () => {
     a.record("pass");
     const readsBefore = mem.touched.filter((t) => t.op === "readText").length;
     await a.flusher.flushNow();
-    expect(mem.touched.filter((t) => t.op === "readText").length).toBe(readsBefore);
+    expect(mem.touched.filter((t) => t.op === "readText").length).toBe(readsBefore + 1);
     expect(logger.warn).not.toHaveBeenCalled();
   });
 

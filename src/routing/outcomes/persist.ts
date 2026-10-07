@@ -61,6 +61,7 @@ import {
   safeNow,
 } from "./types";
 import { parseSnapshot } from "./store";
+import { withLock } from "../file-lock";
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -126,6 +127,15 @@ export function resolveOutcomesDir(
 
 export function nodePersistFs(): PersistFs {
   return {
+    async createExclusive(path, data) {
+      let handle;
+      try { handle = await open(path, "wx"); } catch (error) {
+        if (errorCode(error) === "EEXIST") return false;
+        throw error;
+      }
+      try { await handle.writeFile(data, "utf8"); } finally { await handle.close(); }
+      return true;
+    },
     async mkdirp(dir: string): Promise<void> {
       await mkdir(dir, { recursive: true });
     },
@@ -597,6 +607,11 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
     outcomesPath,
     decisionsPath,
 
+    async withSnapshotLock(run): Promise<boolean> {
+      const result = await withLock(fs, dir, `${outcomesPath}.lock`, now, logger, run);
+      return result.status === "ran";
+    },
+
     async load(opts?: { readonly quarantine?: boolean }): Promise<LoadResult> {
       try {
         return await loadInner(opts?.quarantine ?? true);
@@ -668,13 +683,13 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       }
     },
 
-    async readForeignWrites(): Promise<ForeignCheck> {
+    async readForeignWrites(force = false): Promise<ForeignCheck> {
       try {
         if (readOnlyReason !== null || lastKnownMtime === undefined) return { status: "unchanged" };
         // Strict stat/read: a failure here is "we do not know what is on disk", never "nothing changed".
         const st = await fs.stat(outcomesPath);
         const current = st?.mtimeMs ?? null;
-        if (current === lastKnownMtime) return { status: "unchanged" };
+        if (!force && current === lastKnownMtime) return { status: "unchanged" };
         if (current === null) {
           lastKnownMtime = null; // removed: the next save recreates it (its entries are then a new lineage, QA-1.3-16)
           return { status: "unchanged" };
@@ -693,6 +708,10 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
         }
         const parsed = unparseable === null ? parseSnapshot(json) : null;
         if (parsed !== null && parsed.ok) {
+          // Filesystems can give two distinct writes the same mtime. Under the lock compare content too.
+          if (current === lastKnownMtime && JSON.stringify(parsed.snapshot) === JSON.stringify(baseline)) {
+            return { status: "unchanged" };
+          }
           // Only a successfully parsed file counts as "seen" (QA-1.3-18): the mtime is recorded here, not before.
           const previous = baseline ?? emptySnapshot();
           baseline = parsed.snapshot;
@@ -786,7 +805,7 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
 
 export function createFlusher(
   store: Pick<OutcomeStore, "revision" | "snapshot"> & Partial<Pick<OutcomeStore, "mergeForeign">>,
-  persister: Pick<Persister, "saveSnapshot" | "appendRows"> & Partial<Pick<Persister, "readForeignWrites">>,
+  persister: Pick<Persister, "saveSnapshot" | "appendRows"> & Partial<Pick<Persister, "readForeignWrites" | "withSnapshotLock">>,
   deps: FlusherDeps,
   options: FlusherOptions = {},
 ): OutcomeFlusher {
@@ -873,7 +892,7 @@ export function createFlusher(
   async function absorbForeignWrites(): Promise<boolean> {
     if (persister.readForeignWrites === undefined || store.mergeForeign === undefined) return true;
     try {
-      const check = await persister.readForeignWrites();
+      const check = await persister.readForeignWrites(true);
       if (check.status === "merge") store.mergeForeign(check.disk, check.baseline);
       if (check.status === "skip") {
         noteFailure("snapshot", check.reason);
@@ -890,6 +909,7 @@ export function createFlusher(
     if (deps.ready !== undefined) await deps.ready;
     let ok = true;
     if (!snapshotBlocked && store.revision !== writtenRevision) {
+      const transaction = async (): Promise<void> => {
       // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
       const checked = await absorbForeignWrites();
       const revision = store.revision;
@@ -904,6 +924,19 @@ export function createFlusher(
       } else {
         ok = false;
         noteFailure("snapshot", result.error);
+      }
+      };
+      try {
+        const acquired = persister.withSnapshotLock === undefined
+          ? (await transaction(), true)
+          : await persister.withSnapshotLock(transaction);
+        if (!acquired) {
+          ok = false;
+          noteFailure("snapshot", "outcomes.json.lock is busy; snapshot remains pending");
+        }
+      } catch (error) {
+        ok = false;
+        noteFailure("snapshot", describeError(error));
       }
     }
     while (queue.length > 0) {

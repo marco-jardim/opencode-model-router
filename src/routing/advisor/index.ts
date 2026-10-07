@@ -18,8 +18,8 @@
  * is not asked again on every turn.
  */
 
-import { createHash, randomUUID } from "node:crypto";
-import { open } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { withLock as withFileLock } from "../file-lock";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { resolveRouting, type RouterConfig } from "../../router/config";
@@ -220,7 +220,6 @@ export const MIN_INTERVAL_MS = 3_600_000;
 /** An unchanged set of findings is mentioned again after this long at the earliest (QA-2.4-5). */
 export const REMINDER_MS = 7 * 24 * 3_600_000;
 /** A lock younger than this (by its file time, never by what it says) is held by a live process. */
-const LOCK_STALE_MS = 30_000;
 const BUSY_BACKOFF_MS = 30_000;
 const BACKOFF_AFTER_ERROR_MS = 10 * 60_000;
 
@@ -304,8 +303,6 @@ function keysOf(findings: readonly Finding[]): string[] {
 
 const sameKeys = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((key, i) => key === b[i]);
 
-const codeOf = (error: unknown): string | null => (isRecord(error) && typeof error.code === "string" ? error.code : null);
-
 /** What the notifier needs of a file system: `PersistFs` plus an exclusive create (the lock). */
 export interface AdvisorFs extends PersistFs {
   /** Create `path` with `data` only if it does not exist yet; `false` when it does. Any other failure rejects. */
@@ -313,24 +310,7 @@ export interface AdvisorFs extends PersistFs {
 }
 
 export function nodeAdvisorFs(): AdvisorFs {
-  return {
-    ...nodePersistFs(),
-    async createExclusive(path: string, data: string): Promise<boolean> {
-      let handle;
-      try {
-        handle = await open(path, "wx");
-      } catch (error) {
-        if (codeOf(error) === "EEXIST") return false;
-        throw error;
-      }
-      try {
-        await handle.writeFile(data, "utf8");
-      } finally {
-        await handle.close();
-      }
-      return true;
-    },
-  };
+  return nodePersistFs();
 }
 
 export interface AdvisorNotifierDeps {
@@ -420,64 +400,20 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
     }
   };
 
-  /**
-   * Run `run` while holding the exclusive lock file, so two processes never decide or deliver at once. `busy` = another process holds a
-   * live lock. A lock is stale only when its FILE TIME is older than {@link LOCK_STALE_MS}: what it says (or that it is still empty, in
-   * the instant between its creation and its first write) never decides that. A stale lock is taken over by renaming it to a name of its
-   * own, which only one process can do; the winner then creates a lock of its own. A lock that cannot be created at all (permissions,
-   * read-only disk) is logged and `run` goes ahead without it: the advisor is best effort, and a duplicate notice beats a lost one.
-   */
+  /** Advisor alone may fall back unlocked: a duplicate notice beats a lost one. */
   const withLock = async <T>(settings: AdvisorSettings, run: () => Promise<T>): Promise<{ status: "ran"; value: T } | { status: "busy" }> => {
     const { dir, lock: lockPath } = pathsOf(settings);
-    let acquired = false;
+    let started = false;
     try {
-      await fs.mkdirp(dir);
-      for (let attempt = 0; attempt < 3 && !acquired; attempt += 1) {
-        if (await fs.createExclusive(lockPath, String(now()))) {
-          acquired = true;
-          break;
-        }
-        const held = await fs.stat(lockPath);
-        if (held === null) continue; // released meanwhile: create it
-        if (now() - held.mtimeMs < LOCK_STALE_MS) return { status: "busy" };
-        const grave = `${lockPath}.stale-${randomUUID()}`;
-        try {
-          await fs.rename(lockPath, grave);
-        } catch (error) {
-          if (codeOf(error) === "ENOENT") continue; // another process took it over first
-          throw error;
-        }
-        // The name we moved may be a live lock a faster process created after our look: put it back when it is not stale after all.
-        const moved = await fs.stat(grave);
-        if (moved !== null && now() - moved.mtimeMs < LOCK_STALE_MS) {
-          try {
-            await fs.rename(grave, lockPath);
-          } catch (error) {
-            deps.logger.warn("[router] cost doctor: could not put back a live lock", { error: describeError(error) });
-          }
-          return { status: "busy" };
-        }
-        try {
-          await fs.unlink(grave);
-        } catch (error) {
-          deps.logger.warn("[router] cost doctor: could not remove a stale notice lock", { error: describeError(error) });
-        }
-      }
-      if (!acquired) return { status: "busy" };
+      return await withFileLock(fs, dir, lockPath, now, deps.logger, async () => {
+        started = true;
+        return run();
+      });
     } catch (error) {
+      if (started) throw error;
       deps.logger.warn("[router] cost doctor: could not lock the notice state; going on without the lock", { error: describeError(error) });
     }
-    try {
-      return { status: "ran", value: await run() };
-    } finally {
-      if (acquired) {
-        try {
-          await fs.unlink(lockPath);
-        } catch (error) {
-          deps.logger.warn("[router] cost doctor: could not remove the notice lock", { error: describeError(error) });
-        }
-      }
-    }
+    return { status: "ran", value: await run() };
   };
 
   /** Context mode: read the persisted state once per process; a notice a previous process left becomes pending, unverified. */
