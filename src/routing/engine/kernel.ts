@@ -31,10 +31,11 @@
  *
  * Pure: no I/O, no clock, no module state. The only reads are the injected store view's
  * `posterior`/`cost`/`classTokenProfile`. Memoisation lives in arrays local to one `decide` call.
- * Every runtime import is a pure module (`outcomes/beta`, `outcomes/cost`, `outcomes/types`).
+ * Every runtime import is a pure module (`outcomes/beta`, `outcomes/cost`, `outcomes/types`, `escalate/variants`).
  */
 
 import type { RoutingProfile } from "../../router/config";
+import { variantPosition } from "../../escalate/variants";
 import type { Need, Risk } from "../classify/types";
 import { PRIOR_STRENGTH, priorForRankOffset } from "../outcomes/beta";
 import { compareUnit, expectedAttemptUSD, isUnpriced, taxUSD } from "../outcomes/cost";
@@ -55,6 +56,7 @@ import type {
   DecisionInput,
   DecisionReasonCode,
   IneligibleReason,
+  Ladder,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -163,6 +165,64 @@ export function coversNeeds(grants: readonly Need[] | null, needs: readonly Need
   return needs.every((need) => grants !== null && grants.includes(need));
 }
 
+/** `provider/model` of a dispatch (a `#variant` suffix split off) and its normalized variant (`default` when none). */
+function canonicalRung(dispatch: { readonly model: string; readonly variant: string | null }): { readonly model: string; readonly variant: string } {
+  const parts = modelParts(dispatch.model, dispatch.variant);
+  return { model: parts.provider === "" ? parts.model : `${parts.provider}/${parts.model}`, variant: normalizeVariant(parts.variant) };
+}
+
+/**
+ * A34 (QA-G-B1): the CAPABILITY rank of a dispatch — what the model it runs on is worth on the escalate ladder, whatever agent
+ * runs it. The highest rank of a preset rung with its exact `model#variant`; when no rung has that variant, the highest rank of
+ * any preset rung on its model; never less than `candidateRank` (its rank as a candidate, when it is one). `null` when no preset
+ * rung is on its model and it has no candidate rank.
+ *
+ * Why: a role agent's candidate rank is capped at the class's owning tier (A25). That cap is right for a CANDIDATE (an agent on
+ * the heavy model serving a medium class is priced as a medium option), but the pick is the status quo that D9 "never down"
+ * protects: `@general` on the parent's `opus#xhigh` is heavy-capable, and moving it to the medium tier on high-risk work without
+ * detection is a move down. The table is `ladder.presetRungs`; a hand-built ladder without one uses its router rungs.
+ */
+export function capabilityRank(
+  ladder: Pick<Ladder, "presetRungs" | "candidates" | "reachable">,
+  dispatch: { readonly model: string; readonly variant: string | null },
+  candidateRank: number | null,
+): number | null {
+  const target = canonicalRung(dispatch);
+  const table = ladder.presetRungs
+    ?? [...ladder.candidates, ...(ladder.reachable ?? [])].filter((rung) => rung.agent.origin === "router");
+  let exact: number | null = null;
+  let sameModel: number | null = null;
+  for (const rung of table) {
+    if (!isFiniteNumber(rung.rank)) continue;
+    const own = canonicalRung(rung);
+    if (own.model !== target.model) continue;
+    if (sameModel === null || rung.rank > sameModel) sameModel = rung.rank;
+    if (own.variant === target.variant && (exact === null || rung.rank > exact)) exact = rung.rank;
+  }
+  const preset = exact ?? sameModel;
+  const floor = isFiniteNumber(candidateRank) ? candidateRank : null;
+  if (preset === null) return floor;
+  return floor === null ? preset : Math.max(preset, floor);
+}
+
+/**
+ * A34 (QA-G-B6): `candidate` runs the pick's own model on a variant that is NOT placed at or above the pick's on the effort scale
+ * every variant ladder follows (`escalate/variants`: ladders rise strictly in effort, `default` sits just below `high`) — a lower
+ * effort at an equal rank. A variant that cannot be placed (an unranked id) is not known to be at or above, so it counts as lower:
+ * under D9 "never down" the unknown side is the conservative one. The same model#variant is never lower.
+ */
+export function lowerEffortOnSameModel(
+  candidate: { readonly model: string; readonly variant: string | null },
+  pick: { readonly model: string; readonly variant: string | null },
+): boolean {
+  const c = canonicalRung(candidate);
+  const p = canonicalRung(pick);
+  if (c.model !== p.model || c.variant === p.variant) return false;
+  const cPos = variantPosition(c.variant);
+  const pPos = variantPosition(p.variant);
+  return cPos === null || pPos === null || cPos < pPos;
+}
+
 /** D5 `tokenSamples`: the key's own token samples, else the class-pooled profile's (1.3, C1). */
 function tokenSamples(stats: CostStats | null, profile: TokenMeans | null): number {
   if (stats !== null && stats.tokens.n >= 1) return stats.tokens.n;
@@ -180,8 +240,11 @@ function tokenSamples(stats: CostStats | null, profile: TokenMeans | null): numb
  * Switch iff ALL hold: not pinned; the pick is a priced candidate; `best` is another candidate;
  * `facts.confidence ≥ minClassConfidence`; `C(best) < (1 − margin) · C(chosen)` (strict).
  * Eligibility of a candidate as `best` (the pick itself is always eligible — it is the status quo):
- * its permissions cover `facts.needs` (A11), it is not below `floorRank`, and it is not a lower rank
- * than the pick when `risk == high && detection == none` (D9 "never down").
+ * its permissions cover `facts.needs` (A11), it is not below `floorRank`, and when `risk == high &&
+ * detection == none` (D9 "never down", A34) it is neither below the pick's CAPABILITY rank
+ * ({@link capabilityRank}, not the pick's capped candidate rank) nor the pick's own model on a lower-effort
+ * variant ({@link lowerEffortOnSameModel}). The A24/A27 "strictly higher rank" exemption from the evidence
+ * gate is measured against the same capability rank.
  *
  * Class trust (1.2 → 1.4 handoff): below `minClassConfidence` the store is not read at all — no
  * posterior or cost is taken under an untrusted class; priors are then centred on the pick's rank.
@@ -220,6 +283,7 @@ export function decide(input: DecisionInput): Decision {
       unit: "ratio",
       ineligible: {},
       target: null,
+      pickRank: null,
     });
   }
 
@@ -239,6 +303,8 @@ export function decide(input: DecisionInput): Decision {
     }
   }
   const chosenRank = chosenIndex >= 0 ? cands[chosenIndex]!.rank : null;
+  // A34 (QA-G-B1): what the pick is worth, not its capped candidate rank: never-down and the A24/A27 test compare against this.
+  const pickRank = chosenRank === null ? null : capabilityRank(ladder, input.chosen, chosenRank);
 
   // --- p_k: D7 prior by rank offset + evidence (store reads only for a trusted class) ------------
   const referenceRank = trusted
@@ -400,14 +466,16 @@ export function decide(input: DecisionInput): Decision {
     if (usable[k] !== 1 || !isFiniteNumber(C[k])) why = "invalid-cost";
     else if (!coversNeeds(cand.grants, facts.needs)) why = "needs";
     else if (floorRank !== null && cand.rank < floorRank) why = "floor";
-    else if (neverDown && chosenRank !== null && cand.rank < chosenRank) why = "never-down";
+    else if (neverDown && pickRank !== null && (cand.rank < pickRank || (cand.rank === pickRank && lowerEffortOnSameModel(cand, input.chosen)))) {
+      why = "never-down"; // A34: below the pick's capability rank, or the pick's model on a lower variant at its rank (QA-G-B1/B6)
+    }
     if (why !== null) {
       if (!Object.prototype.hasOwnProperty.call(ineligible, keys[k]!)) ineligible[keys[k]!] = why;
       continue;
     }
     // Strict: ties keep the pick (considered first), then the earlier rung.
     if (argmin < 0 || C[k]! < C[argmin]!) argmin = k;
-    if (!(chosenRank !== null && cand.rank > chosenRank) && !hasMinEvidence(evidence[k]!)) {
+    if (!(pickRank !== null && cand.rank > pickRank) && !hasMinEvidence(evidence[k]!)) {
       if (!Object.prototype.hasOwnProperty.call(ineligible, keys[k]!)) ineligible[keys[k]!] = "evidence";
       continue;
     }
@@ -458,7 +526,7 @@ export function decide(input: DecisionInput): Decision {
       : `kept: C(best)=${fmt(decidingCost)} is not < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
   } else if (gated) {
     reasonCode = "kept:evidence";
-    reason = `kept: the cheapest option ${argminChoice!.key} (${fmt(decidingCost)} ${unit}, rank ${cands[argminIndex!]!.rank}, the pick is rank ${cands[chosenIndex]!.rank}) needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[argminIndex!]!)}; the chosen dispatch is the cheapest eligible (${fmt(chosenCost)} ${unit})`;
+    reason = `kept: the cheapest option ${argminChoice!.key} (${fmt(decidingCost)} ${unit}, rank ${cands[argminIndex!]!.rank}, the pick is rank ${pickRank ?? cands[chosenIndex]!.rank}) needs ≥ ${MIN_EVIDENCE_TO_SWITCH_DOWN} recorded outcomes, it has ${fmt(evidence[argminIndex!]!)}; the chosen dispatch is the cheapest eligible (${fmt(chosenCost)} ${unit})`;
   } else {
     reasonCode = "switched";
     reason = `switched: C(best)=${fmt(bestCost)} < (1 − ${fmt(margin)})·C(chosen)=${fmt(threshold)} ${unit}`;
@@ -489,6 +557,7 @@ export function decide(input: DecisionInput): Decision {
     unit,
     ineligible,
     target: bestIndex === null ? null : cands[bestIndex]!,
+    pickRank,
   });
 }
 

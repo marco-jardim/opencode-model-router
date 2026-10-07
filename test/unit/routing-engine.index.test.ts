@@ -16,6 +16,7 @@ describe("routing engine index", () => {
         "annotateSteps",
         "buildLadder",
         "candidateKey",
+        "capabilityRank",
         "coversNeeds",
         "decide",
         "detectionOf",
@@ -26,11 +27,15 @@ describe("routing engine index", () => {
         "giveUpCost",
         "hasMinEvidence",
         "grantsFromTools",
+        "lowerEffortOnSameModel",
         "resolveChosen",
         "tierRankOf",
+        "weakerDetection",
       ].sort(),
     );
     expect(engine.decide).toBe(kernel.decide);
+    expect(engine.capabilityRank).toBe(kernel.capabilityRank);
+    expect(engine.lowerEffortOnSameModel).toBe(kernel.lowerEffortOnSameModel);
     expect(engine.GIVE_UP_COST).toBe(kernel.GIVE_UP_COST);
     expect(engine.buildLadder).toBe(ladders.buildLadder);
     expect(engine.resolveChosen).toBe(ladders.resolveChosen);
@@ -38,5 +43,6 @@ describe("routing engine index", () => {
     expect(engine.MIN_EVIDENCE_TO_MOVE).toBe(protocolLine.MIN_EVIDENCE_TO_MOVE);
     expect(engine.annotateSteps).toBe(plan.annotateSteps);
     expect(engine.formatRouteLine).toBe(plan.formatRouteLine);
+    expect(engine.weakerDetection).toBe(plan.weakerDetection);
   });
 });

@@ -22,7 +22,7 @@ import {
 import { classify } from "../classify";
 import { CLASS_STATIC_TIER, type TaskFacts } from "../classify/types";
 import { buildLadder, decide, floorRankOf, generateTaxonomy, resolveChosen } from "../engine";
-import { detectionOf } from "../engine/plan";
+import { detectionOf, weakerDetection } from "../engine/plan";
 import type { Decision, HostAgentInfo } from "../engine/types";
 import type { AgentView } from "./host-info";
 import { sessionRulesOf, type EngineRuntime, type Prepared, type WireLogger } from "./runtime";
@@ -160,7 +160,8 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
           facts: result.facts,
           chosen,
           ladder,
-          detection: result.detection ?? detectionOf(text),
+          // A34 (QA-G-B2): a route-line `d=` never raises detection above what the text's own `[acceptance]` block gives.
+          detection: weakerDetection(result.detection, detectionOf(text)),
           pin: false,
           routing: prepared.routing,
           store: prepared.store,

@@ -20,7 +20,7 @@ import type {
   TaskFacts,
 } from "../../src/routing/classify/types";
 import { MIN_EVIDENCE_TO_MOVE } from "../../src/routing/engine/protocol-line";
-import { annotateSteps, detectionOf, formatRouteLine } from "../../src/routing/engine/plan";
+import { annotateSteps, detectionOf, formatRouteLine, weakerDetection } from "../../src/routing/engine/plan";
 import type { AnnotateDeps, PlanStep } from "../../src/routing/engine/plan";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
@@ -86,6 +86,25 @@ const ACCEPT_TESTS = "[acceptance]\ncheck: testsPass\n[/acceptance]";
 // ---------------------------------------------------------------------------
 // detectionOf / formatRouteLine
 // ---------------------------------------------------------------------------
+
+describe("weakerDetection (A34, QA-G-B2): a route-line claim never raises detection above the prompt's", () => {
+  it("takes the weaker of the claim and the observed depth; no claim → the observed one", () => {
+    const order: Detection[] = ["none", "grader", "deterministic"];
+    for (const claimed of order) {
+      for (const observed of order) {
+        expect(weakerDetection(claimed, observed), `${claimed}/${observed}`).toBe(order[Math.min(order.indexOf(claimed), order.indexOf(observed))]);
+      }
+    }
+    expect(weakerDetection(null, "grader")).toBe("grader");
+    expect(weakerDetection(undefined, "deterministic")).toBe("deterministic");
+  });
+
+  it("the probe P2 prompts: a d=deterministic claim over no block is none, over a criteria-only block is grader", () => {
+    expect(weakerDetection("deterministic", detectionOf("[route class=implement risk=high d=deterministic]\nRotate the key."))).toBe("none");
+    expect(weakerDetection("deterministic", detectionOf("Deploy.\n[acceptance]\ncriteria: it works\n[/acceptance]"))).toBe("grader");
+    expect(weakerDetection("none", detectionOf(`Fix it\n${ACCEPT_TESTS}`))).toBe("none");
+  });
+});
 
 describe("detectionOf", () => {
   it("testsPass → deterministic; criteria only → grader; nothing → none", () => {

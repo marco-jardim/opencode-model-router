@@ -4,16 +4,22 @@ import {
   GIVE_UP_COST,
   MIN_EVIDENCE_TO_SWITCH_DOWN,
   candidateKey,
+  capabilityRank,
   coversNeeds,
   decide,
   giveUpCost,
   hasMinEvidence,
+  lowerEffortOnSameModel,
 } from "../../src/routing/engine/kernel";
+import { buildLadder, resolveChosen } from "../../src/routing/engine/ladders";
+import { resolveRouting } from "../../src/router/config";
+import type { RouterConfig, TierConfig } from "../../src/router/config";
 import type {
   Candidate,
   ChosenDispatch,
   DecisionInput,
   EngineStoreView,
+  HostAgentInfo,
   KernelRouting,
   Ladder,
 } from "../../src/routing/engine/types";
@@ -624,6 +630,118 @@ describe("D9 never down a rank when risk == high and d == none", () => {
     expect(graded.switched).toBe(true);
     const lowRisk = decide(input({ store: store(), detection: "none", chosen: chosenOf(MEDIUM), facts: facts({ risk: "medium" }) }));
     expect(lowRisk.ineligible[keyOf(FAST)]).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A34 (QA-G-B1/B6): never-down compares against the pick's CAPABILITY rank, and a lower variant of its model is down too
+// ---------------------------------------------------------------------------
+
+describe("A34: never-down uses the pick's capability rank (QA-G-B1) and excludes a lower variant of its model (QA-G-B6)", () => {
+  const SONNET = "anthropic/claude-sonnet-5-5";
+  const OPUS = "anthropic/claude-opus-5-5";
+  const tierOf = (model: string, variant: string, costRatio: number, extra: Partial<TierConfig> = {}): TierConfig => ({ model, variant, costRatio, ...extra });
+  const cfgOf = (tiers: Record<string, TierConfig>): RouterConfig => ({ activePreset: "p", presets: { p: tiers }, rules: [], defaultTier: "medium" });
+  const plain = cfgOf({ fast: tierOf(SONNET, "low", 1), medium: tierOf(SONNET, "medium", 5), heavy: tierOf(OPUS, "xhigh", 20) });
+  const routerAgents: HostAgentInfo[] = ["fast", "medium", "heavy"].map((id) => ({ id, mode: "subagent", hidden: false, permitted: true, grants: ALL_NEEDS }));
+  const general: HostAgentInfo = { id: "general", mode: "subagent", hidden: false, permitted: true, grants: ["shell", "web", "edit", "network"] };
+  const routing: KernelRouting = { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection: { deterministic: 0.95, grader: 0.7, none: 0.3 } };
+  const key = (agent: string, origin: "router" | "host", model: string, variant: string, cls = "implement"): OutcomeKey =>
+    candidateKey(cls, { agent: { origin, id: agent }, model, variant });
+  /** `[pass, fail]` per key, recorded in a real store. */
+  const seeded = (evidence: Record<string, readonly [number, number]>) => {
+    const store = createOutcomeStore({ now: () => 1_000 });
+    for (const [k, [pass, fail]] of Object.entries(evidence)) {
+      for (let i = 0; i < pass; i++) store.recordVerdict(k as OutcomeKey, "pass", { attemptID: `${k}:p${i}`, step: "dispatch" });
+      for (let i = 0; i < fail; i++) store.recordVerdict(k as OutcomeKey, "fail", { attemptID: `${k}:f${i}`, step: "dispatch" });
+    }
+    return store;
+  };
+  /** The probe P1 composition: the real ladder, the real pick resolution, the real kernel. */
+  const run = (cfg: RouterConfig, agents: readonly HostAgentInfo[], pick: string, f: TaskFacts, store: EngineStoreView, parentModel: string, detection: DecisionInput["detection"] = "none") => {
+    const r = resolveRouting({ ...cfg, routing: { engine: "enforce" } }, "v2");
+    const ladder = buildLadder({ cfg, routing: r, facts: f, agents, parentModel });
+    const chosen = resolveChosen({ cfg, agents, agent: pick, parentModel })!;
+    return decide({ facts: f, chosen, ladder, detection, pin: false, routing, store, floorRank: null });
+  };
+  const highImplement = facts({ class: "implement", risk: "high" });
+
+  it("P1 A1: @general on the parent's opus#xhigh (candidate rank capped at medium) is heavy-capable: medium is never-down → kept", () => {
+    const store = seeded({
+      [key("medium", "router", SONNET, "medium")]: [20, 0],
+      [key("general", "host", SONNET, "medium")]: [20, 0],
+      [key("general", "host", OPUS, "xhigh")]: [2, 3],
+    });
+    const d = run(plain, [...routerAgents, general], "general", highImplement, store, `${OPUS}#xhigh`);
+    expect(d.chosen.key).toBe(key("general", "host", OPUS, "xhigh"));
+    expect(d.pickRank).toBe(2); // the heavy rung of its model, not the capped candidate rank 1
+    expect(d.ineligible[key("medium", "router", SONNET, "medium")]).toBe("never-down");
+    expect(d.ineligible[key("general", "host", SONNET, "medium")]).toBe("never-down");
+    expect(d.switched).toBe(false);
+    expect(d.reasonCode.startsWith("kept:")).toBe(true);
+    // Control: with detection the same evidence does move it (never-down is what holds it, nothing else).
+    const detected = run(plain, [...routerAgents, general], "general", highImplement, store, `${OPUS}#xhigh`, "deterministic");
+    expect(detected.switched).toBe(true);
+  });
+
+  it("P1 A2: @general on the parent's opus without a variant takes the model-only capability (heavy) → kept", () => {
+    const store = seeded({
+      [key("medium", "router", SONNET, "medium")]: [20, 0],
+      [key("general", "host", SONNET, "medium")]: [20, 0],
+      [key("general", "host", OPUS, "default")]: [2, 3],
+    });
+    const d = run(plain, [...routerAgents, general], "general", highImplement, store, OPUS);
+    expect(d.chosen.key).toBe(key("general", "host", OPUS, "default"));
+    expect(d.pickRank).toBe(2);
+    expect(d.ineligible[key("medium", "router", SONNET, "medium")]).toBe("never-down");
+    expect(d.switched).toBe(false);
+    expect(d.reasonCode.startsWith("kept:")).toBe(true);
+  });
+
+  it("P1 B: @heavy on opus#xhigh, the heavy tier's opus#high rung with evidence is a lower variant at the same rank → never-down, kept", () => {
+    const cfg = cfgOf({
+      fast: tierOf(SONNET, "low", 1),
+      medium: tierOf(SONNET, "medium", 5),
+      heavy: tierOf(OPUS, "xhigh", 20, { candidates: [{ variant: "high", costRatio: 12 }, { variant: "xhigh", costRatio: 20 }] }),
+    });
+    const lower = key("heavy", "router", OPUS, "high", "design");
+    const d = run(cfg, routerAgents, "heavy", facts({ class: "design", risk: "high" }), seeded({ [lower]: [20, 0] }), `${OPUS}#xhigh`);
+    expect(d.ineligible[lower]).toBe("never-down");
+    expect(d.switched).toBe(false);
+    expect(d.best?.variant).toBe("xhigh");
+    // Without never-down (detection), the evidence-backed lower variant still wins: the exclusion is B6, not the margin.
+    const detected = run(cfg, routerAgents, "heavy", facts({ class: "design", risk: "high" }), seeded({ [lower]: [20, 0] }), `${OPUS}#xhigh`, "deterministic");
+    expect(detected.best?.key).toBe(lower);
+  });
+
+  it("A24/A27: a heavy rung is not 'strictly higher' than a heavy-capable pick, so it needs evidence to be best", () => {
+    const d = run(plain, [...routerAgents, general], "general", facts({ class: "implement", risk: "medium" }), seeded({}), `${OPUS}#xhigh`, "deterministic");
+    expect(d.pickRank).toBe(2);
+    expect(d.ineligible[key("heavy", "router", OPUS, "xhigh")]).toBe("evidence");
+  });
+
+  it("capabilityRank: exact model#variant first, else the model's highest rung, never below the candidate rank, null when unknown", () => {
+    const ladder = buildLadder({ cfg: plain, routing: { roles: {} }, facts: { class: "implement", needs: [] }, agents: routerAgents });
+    expect(capabilityRank(ladder, { model: SONNET, variant: "low" }, null)).toBe(0); // exact: fast, not medium's rank
+    expect(capabilityRank(ladder, { model: SONNET, variant: "medium" }, null)).toBe(1);
+    expect(capabilityRank(ladder, { model: SONNET, variant: "high" }, null)).toBe(1); // no exact rung: the model's highest
+    expect(capabilityRank(ladder, { model: `${OPUS}#xhigh`, variant: null }, null)).toBe(2); // a #variant suffix is split off
+    expect(capabilityRank(ladder, { model: OPUS, variant: null }, 1)).toBe(2);
+    expect(capabilityRank(ladder, { model: SONNET, variant: "low" }, 1)).toBe(1); // never below the candidate rank
+    expect(capabilityRank(ladder, { model: "anthropic/claude-haiku-4-5", variant: null }, null)).toBeNull();
+    expect(capabilityRank(ladder, { model: "anthropic/claude-haiku-4-5", variant: null }, 1)).toBe(1);
+    // A hand-built ladder without `presetRungs`: its router rungs stand in.
+    expect(capabilityRank(routerLadder(), { model: OPUS, variant: null }, null)).toBe(2);
+  });
+
+  it("lowerEffortOnSameModel: lower on the effort scale, same model only; an unplaceable variant counts as lower", () => {
+    expect(lowerEffortOnSameModel({ model: OPUS, variant: "high" }, { model: OPUS, variant: "xhigh" })).toBe(true);
+    expect(lowerEffortOnSameModel({ model: OPUS, variant: "xhigh" }, { model: OPUS, variant: "high" })).toBe(false);
+    expect(lowerEffortOnSameModel({ model: OPUS, variant: null }, { model: OPUS, variant: "high" })).toBe(true); // default sits below high
+    expect(lowerEffortOnSameModel({ model: OPUS, variant: "high" }, { model: OPUS, variant: null })).toBe(false);
+    expect(lowerEffortOnSameModel({ model: OPUS, variant: "xhigh" }, { model: OPUS, variant: "xhigh" })).toBe(false);
+    expect(lowerEffortOnSameModel({ model: SONNET, variant: "low" }, { model: OPUS, variant: "xhigh" })).toBe(false); // another model: rank decides
+    expect(lowerEffortOnSameModel({ model: OPUS, variant: "turbo" }, { model: OPUS, variant: "high" })).toBe(true);
   });
 });
 

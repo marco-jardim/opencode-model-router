@@ -16,7 +16,9 @@ import { candidateKey, decide } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { advance, buildEscalatePolicy, newLadderState, nextAction, recordAttempt } from "../../src/escalate/ladder";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
-import { FLOOR_LIFT_REASON, RESUME_PINNED_REASON, RESUME_REASON, RESUME_RUNNING_REASON } from "../../src/routing/outcomes/types";
+import {
+  FLOOR_LIFT_REASON, RESUME_NAMED_NEEDS_REASON, RESUME_NAMED_NEVER_DOWN_REASON, RESUME_PINNED_REASON, RESUME_REASON, RESUME_RUNNING_REASON,
+} from "../../src/routing/outcomes/types";
 import { DECISIONS_MAX_BYTES, DECISIONS_MAX_GENERATIONS, FLUSH_MIN_INTERVAL_MS, FLUSH_BATCH_ROWS, MAX_QUEUED_ROWS, MAX_CORRUPT_COPIES, RENAME_RETRY_DELAYS_MS, STALE_TMP_MS } from "../../src/routing/outcomes/types";
 import { LOCK_STALE_MS } from "../../src/routing/file-lock";
 import type { Need, TaskFacts } from "../../src/routing/classify/types";
@@ -560,8 +562,11 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
 
   it("the guide names every policy reason prefix of the decision log (QA-3.1-R2-1/2: kept:resume:pinned and the single prefix)", () => {
     const doc = read("docs/ROUTING_ENGINE.md");
-    for (const prefix of [FLOOR_LIFT_REASON, RESUME_REASON, RESUME_RUNNING_REASON, RESUME_PINNED_REASON]) expect(doc, prefix).toContain(`\`${prefix}\``);
+    const prefixes = [FLOOR_LIFT_REASON, RESUME_REASON, RESUME_RUNNING_REASON, RESUME_PINNED_REASON, RESUME_NAMED_NEEDS_REASON, RESUME_NAMED_NEVER_DOWN_REASON];
+    for (const prefix of prefixes) expect(doc, prefix).toContain(`\`${prefix}\``);
     expect(RESUME_PINNED_REASON.startsWith(RESUME_REASON) && RESUME_RUNNING_REASON.startsWith(RESUME_REASON)).toBe(true);
+    // A34 (QA-G-B3): the refused-rewrite prefixes are resume rows too
+    expect(RESUME_NAMED_NEEDS_REASON.startsWith(RESUME_REASON) && RESUME_NAMED_NEVER_DOWN_REASON.startsWith(RESUME_REASON)).toBe(true);
     // the kernel's reason codes lead a row once
     for (const code of ["switched", "kept:best-is-chosen", "kept:margin", "kept:evidence", "kept:pinned", "kept:class-confidence", "kept:no-candidates"]) expect(doc, code).toContain(`\`${code}\``);
   });

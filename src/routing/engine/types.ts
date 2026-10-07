@@ -99,6 +99,20 @@ export interface Ladder {
    * the candidate is priced through its `next` pointer instead (role chains, hand-built ladders).
    */
   readonly paths?: readonly (readonly number[] | null)[];
+  /**
+   * A34 (QA-G-B1): every rung of the active preset on the escalate ladder — modelled or not, its agent available or not — with
+   * its tier's rank: the table a dispatch's CAPABILITY rank is read from (`kernel.capabilityRank`). Absent on hand-built ladders:
+   * the router rungs of `candidates` and `reachable` stand in for it.
+   */
+  readonly presetRungs?: readonly PresetRung[];
+}
+
+/** A34: one rung of the active preset and the rank of its tier on the escalate ladder. */
+export interface PresetRung {
+  /** `provider/model`, never with a `#variant` suffix. */
+  readonly model: string;
+  readonly variant: string | null;
+  readonly rank: number;
 }
 
 export type ExclusionReason =
@@ -195,7 +209,10 @@ export type IneligibleReason =
   | "needs"
   /** Below `floorTier` (D9). */
   | "floor"
-  /** `risk == high` and `d == none`: never down a rank (D9). */
+  /**
+   * `risk == high` and `d == none`: never down (D9, A34): a rank below the pick's CAPABILITY rank, or the pick's own model on a
+   * lower-effort variant at the same rank.
+   */
   | "never-down"
   /** Non-finite or non-positive attempt cost. */
   | "invalid-cost"
@@ -244,4 +261,10 @@ export interface Decision {
   readonly ineligible: Readonly<Record<string, IneligibleReason>>;
   /** `best`'s candidate (its `agent`/`model`/`variant` are what an `enforce` swap writes); `null` with `best`. */
   readonly target: Candidate | null;
+  /**
+   * A34 (QA-G-B1): the pick's CAPABILITY rank — the highest rank of a preset rung on the pick's model (`kernel.capabilityRank`),
+   * never below its candidate rank. Never-down and the A24/A27 "strictly higher rank" test compare against it; candidate ranks
+   * stay capped at the class's owning tier (A25). `null` when the pick is not a candidate.
+   */
+  readonly pickRank: number | null;
 }

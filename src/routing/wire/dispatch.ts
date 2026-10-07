@@ -1,6 +1,6 @@
 /**
  * Dispatch-time routing on v2 (M7, Phase 2.2.1): `route()` composes M2 (classify) → ladders → M4 (decide) for one
- * `subagent` call, applies the engine mode and writes the decision row; `commit()` registers the dispatch with the 2.1
+ * `subagent` call and applies the engine mode; `commit()` writes the decision row (QA-G-A2) and registers the dispatch with the 2.1
  * dispatch-facts registry once the FINAL input is known, so ingestion sees what really ran.
  *
  * Design (the order the adapter calls it in, `src/compat/v2-hooks.ts` `execute.before` / `execute.after`):
@@ -18,7 +18,8 @@
  *     subagent's dispatch is left exactly as it is.
  *  4. Errors never reach the session: any failure is logged and the dispatch proceeds as the orchestrator wrote it.
  *  5. Registration (2.1 handoff, QA-2.1-R2-10; QA-2.2-2/3): once per execution of a child, from the FINAL input.
- *     `route()` only decides and logs. After the legacy hook has had its say, the adapter calls `commit(callID, input)`
+ *     `route()` only decides; its decision row is held until `commit()` (QA-G-A2: a call the hook chain rejects writes no row; a
+ *     call the HOST then fails keeps its row, a known limit — no retraction row). After the legacy hook has had its say, the adapter calls `commit(callID, input)`
  *     with the input the host will execute: a resume (`sessionID` given) is registered at once; a fresh child does not
  *     exist yet, so the dispatch waits and is claimed by the `session.created` event of the child (parent, agent and
  *     title decide which one). `execute.after` then names the child (`onCallResult`): a dispatch still waiting is
@@ -41,12 +42,13 @@
  */
 
 import {
-  buildLadder, candidateKey, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, resolveChosen, tierRankOf,
+  buildLadder, candidateKey, capabilityRank, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, lowerEffortOnSameModel, resolveChosen,
+  tierRankOf, weakerDetection,
 } from "../engine";
 import { routerTierIds } from "../engine/ladders";
-import type { ChosenDispatch, Decision, HostAgentInfo } from "../engine/types";
+import type { ChosenDispatch, Decision, HostAgentInfo, Ladder } from "../engine/types";
 import { classify } from "../classify";
-import type { ClassifyResult, TaskFacts } from "../classify/types";
+import type { ClassifyResult, Detection, TaskFacts } from "../classify/types";
 import type { RouterConfig } from "../../router/config";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
@@ -58,6 +60,8 @@ import {
   RESUME_REASON,
   RESUME_RUNNING_REASON,
   RESUME_PINNED_REASON,
+  RESUME_NAMED_NEEDS_REASON,
+  RESUME_NAMED_NEVER_DOWN_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -115,11 +119,11 @@ const UNTOUCHED: RouteOutcome = Object.freeze({ mode: "static" });
 const RUNNER_CHILD_TITLE = /^Router (?:.+ delegation|result verification)$/;
 
 export interface DispatchRouter {
-  /** Decide and log one `subagent` call. Registers nothing (see `commit`). Never throws. */
+  /** Decide one `subagent` call. Writes and registers nothing: `commit` writes its decision row and registers it. Never throws. */
   route(call: RouteCall): Promise<RouteOutcome>;
   /**
-   * The input the host is about to execute (`event.input` after the legacy hook ran): register the dispatch from it.
-   * A call `route()` did not act on is ignored. Never throws.
+   * The input the host is about to execute (`event.input` after the legacy hook ran): write the call's decision row, then register the
+   * dispatch from it. A call `route()` did not act on is ignored. Never throws.
    */
   commit(callID: string, input: unknown): void;
   /** A `session.created` event: claim the waiting dispatch of this child, if there is one. Never throws. */
@@ -155,8 +159,18 @@ interface Decided {
   readonly facts: DecisionRow["facts"];
   readonly acceptance: DetectionDepth;
   readonly description: string | null;
-  /** What the engine dispatches: the fallback for what the final input leaves out. */
-  readonly final: { readonly agent: string; readonly model: string; readonly variant: string | null };
+  /**
+   * QA-G-A2: the decision row, written by `commit()` — i.e. only for a dispatch whose hook chain let it through to the host. A call the
+   * legacy hook rejects (`onCallFinished`) never writes it. Known limit: a call the HOST then fails (`onCallResult` with no child for a
+   * fresh dispatch) keeps its row; no retraction row is written.
+   */
+  readonly row: DecisionRow;
+  /** Appends a row to the decision log (`Prepared.enqueue` of the call). */
+  readonly enqueue: (row: DecisionRow) => void;
+  /** A34 (QA-G-B8): the capability rank of what the host is handed (`row.capability.dispatched`); `null` = unknown. */
+  readonly capabilityOf: (ran: RanDispatch) => number | null;
+  /** What the engine dispatches: the fallback for what the final input leaves out. `null`: the pick resolved to no model (row only). */
+  readonly final: { readonly agent: string; readonly model: string; readonly variant: string | null } | null;
   /** The agent the orchestrator NAMED for this dispatch, before the router changed anything: recorded with the child (QA-2.4-R3-1). */
   readonly picked: string;
   readonly routerIds: readonly string[];
@@ -338,6 +352,43 @@ function unresolvedChoice(cls: string, agent: string, routerIds: readonly string
   return { key: makeKey(cls, { origin, id: agent }, "", "", null), agent, origin, model: "unknown/unknown", variant: "default" };
 }
 
+/** What the host runs for a committed call: agent, `provider/model` and variant. */
+interface RanDispatch {
+  readonly agent: string;
+  readonly model: string;
+  readonly variant: string | null;
+}
+
+/** Same `provider/model` (a `#variant` suffix split off) and the same normalized variant. */
+function sameModelVariant(a: { readonly model: string; readonly variant: string | null }, b: { readonly model: string; readonly variant: string | null }): boolean {
+  const left = splitModelRef(a.model);
+  const right = splitModelRef(b.model);
+  const modelOf = (ref: ReturnType<typeof splitModelRef>, raw: string): string => (ref === null ? raw : `${ref.provider}/${ref.model}`);
+  return modelOf(left, a.model) === modelOf(right, b.model)
+    && normalizeVariant(a.variant ?? left?.variant ?? null) === normalizeVariant(b.variant ?? right?.variant ?? null);
+}
+
+/**
+ * What the host will run for a committed call: the final input's agent and `model` win over what the engine decided (the legacy hook
+ * runs after the engine); a model the final input leaves out is the engine's (same agent) or the resolved one (another agent). `null`
+ * when it cannot be told (an unparseable `model`, an agent that resolves to no model).
+ */
+function ranOf(
+  d: Pick<Decided, "resolve">,
+  decidedFinal: NonNullable<Decided["final"]>,
+  final: Readonly<Record<string, unknown>>,
+): RanDispatch | null {
+  const agent = str(final.agent) ?? decidedFinal.agent;
+  const ref = str(final.model);
+  if (ref !== null) {
+    const parts = splitModelRef(ref);
+    return parts === null ? null : { agent, model: `${parts.provider}/${parts.model}`, variant: parts.variant };
+  }
+  if (agent === decidedFinal.agent) return { agent, model: decidedFinal.model, variant: decidedFinal.variant };
+  const resolved = d.resolve(agent);
+  return resolved === null ? null : { agent, model: resolved.model, variant: resolved.variant };
+}
+
 export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const now = deps.now ?? (() => Date.now());
   const instanceID = ++instanceSeq;
@@ -429,6 +480,31 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     return { agent: record.agent, model: record.model, variant: record.variant };
   };
 
+  /**
+   * A34 (QA-G-B3): may the A30 rewrite send this resume to the agent the child runs? Only when that agent is still startable by the
+   * parent and its EVALUATED permissions cover the resume's own `needs` (A11: the resume may ask for more than the first dispatch did),
+   * and, on high-risk work without detection (D9 never-down), when it is not below the named pick's capability rank — nor the pick's own
+   * model on a lower variant at that rank. Unknown agent info or an unknown capability is a refusal: the resume is then sent as named,
+   * which is the orchestrator's own pick and so never a move down. `null` = the rewrite is allowed.
+   */
+  const runningRefusal = (
+    running: { readonly agent: string; readonly model: string; readonly variant: string | null },
+    named: ChosenDispatch,
+    namedRank: number | null,
+    ladder: Ladder,
+    infos: readonly HostAgentInfo[] | null,
+    facts: TaskFacts,
+    detection: Detection,
+  ): "needs" | "never-down" | null => {
+    const info = infos?.find((candidate) => candidate.id === running.agent);
+    if (info === undefined || !info.permitted || info.mode === "primary" || info.hidden || !coversNeeds(info.grants, facts.needs)) return "needs";
+    if (facts.risk !== "high" || detection !== "none") return null;
+    const pickRank = capabilityRank(ladder, named, namedRank);
+    const runRank = capabilityRank(ladder, running, null);
+    if (pickRank === null || runRank === null || runRank < pickRank) return "never-down";
+    return runRank === pickRank && lowerEffortOnSameModel(running, named) ? "never-down" : null;
+  };
+
   const decideAndRecord = async (call: RouteCall, prepared: Prepared, session: SessionView, view: AgentView | null): Promise<RouteOutcome> => {
     const { args } = call;
     const agent = str(args.agent);
@@ -443,7 +519,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       deps.runtime.classifyDeps(prepared),
     );
     const facts = result.facts;
-    const detection = result.detection ?? detectionOf(prompt);
+    // A34 (QA-G-B2): the weaker of the route line's `d=` claim and the prompt's own `[acceptance]` block. Detection is the only
+    // field a route line could use to WEAKEN a safety rule (D9 never-down holds for `d == none`), so a claim never raises it.
+    const detection = weakerDetection(result.detection, detectionOf(prompt));
     const pin = result.pin;
     // `classify` removes only the first-line route line and returns every other byte unchanged (probe, QA-2.2-5).
     const stripped = result.stripped !== prompt ? result.stripped : undefined;
@@ -457,6 +535,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     let row: Pick<DecisionRow, "chosen" | "best" | "switched" | "pinned" | "unit" | "costs" | "confidence" | "reason">;
     let final: { agent: string; model: string; variant: string | null } | null = null;
     let outcome: RouteOutcome = { mode, ...(stripped === undefined ? {} : { prompt: stripped }), decisionID };
+    // A34 (QA-G-B8): the pick's capability rank for the row, and how to rank what the host is finally handed (at `commit`).
+    let pickCapability: number | null = null;
+    let capabilityOf: (ran: RanDispatch) => number | null = () => null;
 
     if (chosen === null) {
       row = {
@@ -479,20 +560,38 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         facts, chosen, ladder, detection, pin, routing: prepared.routing, store: prepared.store, floorRank: floorRankOf(prepared.cfg),
       });
       argmin = decision.argmin !== null && decision.argmin.key !== decision.best?.key ? decision.argmin : null;
+      const pickRank = decision.pickRank ?? capabilityRank(ladder, chosen, null);
+      pickCapability = pickRank;
+      capabilityOf = (ran) => {
+        // The pick itself ranks as the pick (its candidate rank included); anything else by its model, never below its candidate rank.
+        if (ran.agent === agent && sameModelVariant(ran, chosen)) return pickRank;
+        const candidate = ladder.candidates.find((c) => c.agent.id === ran.agent && sameModelVariant(c, ran));
+        return capabilityRank(ladder, ran, candidate?.rank ?? null);
+      };
       // A30 (QA-2.4-R2-3): a dispatch that resumes an existing child (`task_id`/`sessionID`) is never switched by the engine, in any mode:
       // the kernel's decision is still logged (best, costs, its own reason), but `switched` is false and the reason code is `kept:resume`.
       const resuming = resumeID !== null;
       // QA-2.4-R3-1 (A30 amended): the router never moves a child from where it runs. A resume that repeats the orchestrator's original
       // pick of a child the router moved is sent to the agent/model the child runs (`enforce`; the other modes only say so in the row).
-      const running = resumeID === null ? null : runningAfterRouter(resumeID, call.sessionID, agent);
+      const moved = resumeID === null ? null : runningAfterRouter(resumeID, call.sessionID, agent);
+      // A34 (QA-G-B3): the rewrite must neither send the resume to an agent that cannot do the resumed work (needs, permission) nor move
+      // it below the named pick on high-risk work without detection (D9 never-down). Refused: the resume is sent as named (and floor-lifted).
+      const refusal = moved === null || decision.pinned
+        ? null
+        : runningRefusal(moved, chosen, decision.pickRank, ladder, infos, facts, detection);
+      const running = refusal === null ? moved : null;
       row = {
         chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
-        reason: running !== null
+        reason: moved !== null
           ? decision.pinned
             // A pinned resume is sent as named (`kept:resume:pinned`): it was NOT rewritten, so the row must not claim it was.
-            ? `${RESUME_PINNED_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; pinned, so it is sent as named and NOT rewritten (the host moves the child to @${agent}); engine decision: ${reasonText(decision)}`
-            : `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${reasonText(decision)}`
+            ? `${RESUME_PINNED_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; pinned, so it is sent as named and NOT rewritten (the host moves the child to @${agent}); engine decision: ${reasonText(decision)}`
+            : refusal === "needs"
+              ? `${RESUME_NAMED_NEEDS_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; @${moved.agent} is not startable or its permissions do not cover needs [${facts.needs.join(",")}], so it is sent as named and NOT rewritten (the host moves the child to @${agent}) (A34); engine decision: ${reasonText(decision)}`
+              : refusal === "never-down"
+                ? `${RESUME_NAMED_NEVER_DOWN_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; @${moved.agent} is below the pick's capability on high-risk work without detection (D9 never down), so it is sent as named and NOT rewritten (the host moves the child to @${agent}) (A34); engine decision: ${reasonText(decision)}`
+                : `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; ${mode === "enforce" ? "sent to @" + moved.agent + " so the host does not switch it back (A30)" : "would be sent to @" + moved.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${reasonText(decision)}`
           : resuming
             ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${reasonText(decision)}`
             : reasonText(decision),
@@ -539,7 +638,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       }
     }
 
-    prepared.enqueue({
+    const decisionRow: DecisionRow = {
       v: LOG_ROW_VERSION,
       ts: new Date(safeNow(now)).toISOString(),
       sessionID: call.sessionID,
@@ -552,23 +651,31 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       step: "dispatch",
       resume: resumeID !== null,
       trace: traceOf(result, argmin),
-    });
+      // A34 (QA-G-B8): the detection decided with, and the route line's claim when the prompt did not back it.
+      detection: {
+        effective: detection,
+        ...(result.detection !== undefined && result.detection !== null && result.detection !== detection ? { claimed: result.detection } : {}),
+      },
+      capability: { pick: pickCapability, dispatched: null }, // `dispatched` is filled in by `commit()` from the final input
+    };
 
-    if (final !== null) {
-      decided.set(call.callID, {
-        parentSessionID: call.sessionID,
-        decisionID,
-        facts: factsOf(facts),
-        acceptance: depthOf(detection),
-        description: typeof args.description === "string" && args.description !== "" ? args.description : null,
-        final,
-        routerIds,
-        resolve: (target) => resolveChosen({ cfg: prepared.cfg, agents: infos, agent: target, parentModel: session.model }),
-        picked: agent,
-        at: now(),
-      });
-      trim(decided, MAX_PENDING);
-    }
+    // QA-G-A2: the row waits for `commit()`, so a call whose hook chain rejects it (`onCallFinished`) never writes one.
+    decided.set(call.callID, {
+      parentSessionID: call.sessionID,
+      decisionID,
+      facts: factsOf(facts),
+      acceptance: depthOf(detection),
+      description: typeof args.description === "string" && args.description !== "" ? args.description : null,
+      row: decisionRow,
+      enqueue: (logged) => prepared.enqueue(logged),
+      capabilityOf,
+      final,
+      routerIds,
+      resolve: (target) => resolveChosen({ cfg: prepared.cfg, agents: infos, agent: target, parentModel: session.model }),
+      picked: agent,
+      at: now(),
+    });
+    trim(decided, MAX_PENDING);
     return outcome;
   };
 
@@ -622,24 +729,17 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         decided.delete(callID);
         const final = isRecord(input) ? input : {};
         // The agent and model the host will run, after the legacy hook: they win over what the engine decided.
-        const agent = str(final.agent) ?? d.final.agent;
-        const ref = str(final.model);
-        let model: string;
-        let variant: string | null;
-        if (ref !== null) {
-          const parts = splitModelRef(ref);
-          if (parts === null) return;
-          model = `${parts.provider}/${parts.model}`;
-          variant = parts.variant;
-        } else if (agent === d.final.agent) {
-          model = d.final.model;
-          variant = d.final.variant;
-        } else {
-          const resolved = d.resolve(agent);
-          if (resolved === null) return; // nothing to record a step against
-          model = resolved.model;
-          variant = resolved.variant;
+        const ran = d.final === null ? null : ranOf(d, d.final, final);
+        // QA-G-A2: the hook chain let the call through, so the dispatch runs: its decision row is written now (never for a rejected call).
+        try {
+          // A34 (QA-G-B8): the capability of what really runs, after the legacy hook.
+          const dispatched = ran === null ? null : d.capabilityOf(ran);
+          d.enqueue({ ...d.row, capability: { pick: d.row.capability?.pick ?? null, dispatched } });
+        } catch (error) {
+          deps.logger.warn("[router] routing: the decision row could not be queued", { error: describeError(error) });
         }
+        if (ran === null) return; // nothing to record a step against
+        const { agent, model, variant } = ran;
         const dispatched: DispatchInput = {
           facts: d.facts,
           agent,

@@ -2,7 +2,7 @@
 // context hook; these tests drive the real `registerV2Hooks` over a fake v2 context, a real outcome store (A3 bundle) and
 // real config files. Temp directories only: HOME and the outcomes path are redirected, nothing touches the user's files.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
@@ -19,8 +19,10 @@ import {
 } from "../../src/router/sessions";
 import { resetDispatchRouting } from "../../src/routing/wire/dispatch";
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
+import { RESUME_NAMED_NEEDS_REASON, RESUME_NAMED_NEVER_DOWN_REASON, RESUME_REASON } from "../../src/routing/outcomes/types";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
+import { summarize } from "../../src/routing/outcomes/stats";
 
 const logger = { warn: vi.fn() };
 
@@ -682,6 +684,160 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     expect(last.reason).not.toMatch(/\b(?:kept|switched): (?:kept|switched): /);
   });
 });
+describe("A34 (QA-G-B3): the A30 running rewrite requires needs coverage and never-down", () => {
+  const CHECKED_MEDIUM = "[route class=implement risk=medium scope=single]\nImplement the parser change in src/a.ts.\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+  const HIGH = "[route class=implement risk=high scope=single]\nNow rotate the production API credentials and deploy the release.";
+  const FIND = "[route class=search risk=low scope=single]\nFind where the cache is built.";
+  const FIX = "[route class=implement risk=medium scope=single needs=shell,edit]\nNow fix it: edit src/cache.ts and run `npm test`.";
+  const resumeRows = async (world: World) => (await world.rows()).filter((row) => row.resume);
+
+  it("probe P3: a child moved down to @medium, resumed naming @heavy with high-risk work and no acceptance, is sent to @heavy (never-down)", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    const first = await hostStart(world, "child-dn", { agent: "heavy", prompt: CHECKED_MEDIUM });
+    expect(first.args).toMatchObject({ agent: "medium" }); // moved down legitimately: medium risk, deterministic checks
+    expect(lookupDispatch("child-dn")).toMatchObject({ agent: "medium", picked: "heavy" });
+    const resumed = await hostResume(world, "child-dn", { agent: "heavy", prompt: HIGH });
+    expect(resumed.args).toMatchObject({ agent: "heavy", sessionID: "child-dn" });
+    expect(resumed.args.model).toBeUndefined();
+    expect(resumed.child.agent).toBe("heavy"); // the host moves it back up to the pick
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, chosen: { agent: "heavy" }, facts: { risk: "high" } });
+    expect(row!.reason.startsWith(`${RESUME_NAMED_NEVER_DOWN_REASON}: `)).toBe(true);
+    expect(row!.reason.startsWith(RESUME_REASON)).toBe(true); // still a resume row for routing:stats
+    expect(row!.reason).toContain("NOT rewritten");
+    expect(lookupDispatch("child-dn")).toMatchObject({ agent: "heavy", decisionID: row!.decisionID });
+  });
+
+  it("control: the same resume with a deterministic [acceptance] block, or at medium risk, keeps the child where it runs", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    await hostStart(world, "child-ok", { agent: "heavy", prompt: CHECKED_MEDIUM });
+    const checked = await hostResume(world, "child-ok", { agent: "heavy", prompt: `${HIGH}\n[acceptance]\ncheck: testsPass\n[/acceptance]` });
+    expect(checked.args).toMatchObject({ agent: "medium", model: `${SONNET}#medium` });
+    expect(checked.switched).toBe(false);
+    const medium = await hostResume(world, "child-ok", { agent: "heavy", prompt: CHECKED_MEDIUM.replace("[acceptance]\ncheck: testsPass\n[/acceptance]", "") });
+    expect(medium.args).toMatchObject({ agent: "medium" });
+    const rows = await resumeRows(world);
+    expect(rows.map((row) => row.reason.split(":").slice(0, 3).join(":"))).toEqual(["kept:resume:running", "kept:resume:running"]);
+  });
+
+  it("probe P3b: a search child moved to read-only @explore, resumed with needs=shell,edit, is sent as named (needs)", async () => {
+    const world = await makeWorld({ engine: "enforce" }); // D12 default roles: search → explore
+    world.seed(KEYS.explore, 20, 0);
+    world.seed(KEYS.fast, 0, 10);
+    await world.start();
+    const first = await hostStart(world, "child-x", { agent: "fast", prompt: FIND });
+    expect(first.args).toMatchObject({ agent: "explore" });
+    const resumed = await hostResume(world, "child-x", { agent: "fast", prompt: FIX });
+    expect(resumed.args).toMatchObject({ agent: "fast", sessionID: "child-x" });
+    expect(resumed.args.agent).not.toBe("explore");
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, chosen: { agent: "fast" }, facts: { needs: ["shell", "edit"] } });
+    expect(row!.reason.startsWith(`${RESUME_NAMED_NEEDS_REASON}: `)).toBe(true);
+    expect(row!.reason).toContain("needs [shell,edit]");
+  });
+
+  it("a refused rewrite is still lifted to floorTier when the named pick is below it, and the lift row keeps the refusal", async () => {
+    const world = await makeWorld({ engine: "enforce" }, { enforcement: { verify: { testBaseline: false }, escalate: { floorTier: "medium" } } });
+    await world.start();
+    rememberDispatch("child-ro", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" },
+      agent: "explore", model: HAIKU, variant: null, tier: null, parentSessionID: "root", decisionID: "earlier", step: "dispatch", picked: "fast",
+    });
+    hostChildren.set("child-ro", { agent: "explore", model: HAIKU });
+    const resumed = await hostResume(world, "child-ro", { agent: "fast", prompt: FIX });
+    expect(resumed.args).toMatchObject({ agent: "medium", model: `${SONNET}#medium`, sessionID: "child-ro" });
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: true, best: { agent: "medium" } });
+    expect(row!.reason.startsWith("lift:floor: resume lifted from @fast to @medium")).toBe(true);
+    expect(row!.reason).toContain(`engine decision: ${RESUME_NAMED_NEEDS_REASON}: `);
+  });
+
+  it("shadow says what enforce would do with a refused rewrite: sent as named, never 'would be sent' to the running agent", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    rememberDispatch("child-sh", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" },
+      agent: "explore", model: HAIKU, variant: null, tier: null, parentSessionID: "root", decisionID: "earlier", step: "dispatch", picked: "fast",
+    });
+    const after = await routed(world, { agent: "fast", prompt: FIX, sessionID: "child-sh" });
+    expect(after.agent).toBe("fast");
+    const [row] = await resumeRows(world);
+    expect(row!.reason.startsWith(`${RESUME_NAMED_NEEDS_REASON}: `)).toBe(true);
+    expect(row!.reason).not.toContain("would be sent to @explore");
+  });
+});
+
+describe("A34 (QA-G-B8): the decision row records detection and capability ranks", () => {
+  /** The rows exactly as written to decisions.jsonl (the reader keeps only the fields it knows). */
+  const rawRows = async (world: World): Promise<Array<Record<string, any>>> => {
+    await world.bundle.flusher.flushNow();
+    const file = join(world.outcomes, "decisions.jsonl");
+    return readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, any>)
+      .filter((row) => row.kind === "decision");
+  };
+  const CLAIMED = "[route class=implement risk=high scope=single d=deterministic]\nRotate the production signing key and deploy.";
+  const CHECKED_MEDIUM = "[route class=implement risk=medium scope=single]\nImplement the parser change in src/a.ts.\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+
+  it("an unbacked d= claim is logged as claimed next to the effective none; a kept high-risk dispatch runs at the pick's rank", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    await routed(world, { agent: "heavy", prompt: CLAIMED });
+    await routed(world, { agent: "heavy", prompt: CHECKED_MEDIUM });
+    const [kept, switched] = await rawRows(world);
+    expect(kept).toMatchObject({ detection: { effective: "none", claimed: "deterministic" }, capability: { pick: 2, dispatched: 2 }, switched: false });
+    expect(switched).toMatchObject({ detection: { effective: "deterministic" }, capability: { pick: 2, dispatched: 1 }, switched: true });
+    expect(switched!.detection.claimed).toBeUndefined(); // no claim that differs
+  });
+
+  it("the ranks are those of what the host was handed (after the legacy hook), and summarize audits them: 0 below on high-risk d=none", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start({
+      "tool.execute.before": async (_input: unknown, output: { args: Record<string, unknown> }) => { output.args.subagent_type = "fast"; },
+    });
+    await routed(world, { agent: "heavy", prompt: "[route class=implement risk=high scope=single]\nRotate the key." });
+    const [row] = await rawRows(world);
+    expect(row).toMatchObject({ detection: { effective: "none" }, capability: { pick: 2, dispatched: 0 } }); // the legacy hook moved it to fast
+    expect(summarize(null, [row as unknown as DecisionRow], { since: null, until: null }).neverDown).toEqual({ below: 1, recorded: 1 });
+  });
+});
+
+describe("A34 (QA-G-B2): a route-line d= never raises detection above the prompt's own [acceptance] block", () => {
+  const CLAIMED = "[route class=implement risk=high scope=single d=deterministic]\nRotate the production signing key and deploy.";
+  const CHECKED = `${CLAIMED}\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+
+  it("risk=high d=deterministic without an [acceptance] block, enforce, evidence on a lower tier → kept on the pick (never-down holds)", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    const after = await routed(world, { agent: "heavy", prompt: CLAIMED });
+    expect(after.agent).toBe("heavy");
+    expect(after.model).toBeUndefined();
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: false, chosen: { agent: "heavy" }, facts: { risk: "high" } });
+    expect(row!.reason.startsWith("kept:")).toBe(true);
+  });
+
+  it("control: the same claim WITH a deterministic [acceptance] block may move it down on the same evidence", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    const after = await routed(world, { agent: "heavy", prompt: CHECKED });
+    expect(after.agent).toBe("medium");
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: true, best: { agent: "medium" } });
+  });
+});
+
 describe("advise: input untouched, protocol and hint through the context hook", () => {
   async function adviseWorld(withEvidence: boolean) {
     const world = await makeWorld({ engine: "advise", margin: 0.1, roles: { search: ["explore"], recon: ["explore"] } });
@@ -827,11 +983,15 @@ describe("classifier and failures never block a dispatch", () => {
 });
 
 describe("plan route lines and subagentTiers", () => {
-  it("a plan route line is authoritative: its d= sets the verification depth carried to ingestion", async () => {
+  it("a plan route line is authoritative for the facts; its d= is capped by the prompt's own [acceptance] block (A34, QA-G-B2)", async () => {
     const world = await makeWorld({ engine: "shadow" });
     await world.start();
-    await routed(world, { agent: "medium", prompt: "[route class=debug risk=medium scope=multi needs=shell,edit d=deterministic]\nFix the failing test.", sessionID: "child-plan" });
+    const line = "[route class=debug risk=medium scope=multi needs=shell,edit d=deterministic]\nFix the failing test.";
+    await routed(world, { agent: "medium", prompt: `${line}\n[acceptance]\ncheck: testsPass\n[/acceptance]`, sessionID: "child-plan" });
     expect(lookupDispatch("child-plan")).toMatchObject({ acceptance: "deterministic", facts: { class: "debug", risk: "medium", scope: "multi", needs: ["shell", "edit"], source: "plan" } });
+    // The same claim without a block the verifier could run: the dispatch is decided (and carried) as `none`.
+    await routed(world, { agent: "medium", prompt: line, sessionID: "child-plan-bare" });
+    expect(lookupDispatch("child-plan-bare")).toMatchObject({ acceptance: "none", facts: { class: "debug", source: "plan" } });
   });
 
   it("subagentTiers still fills a missing model when the engine does not switch, and never overrides the engine's own", async () => {
@@ -976,6 +1136,35 @@ describe("registration from the FINAL input (QA-2.2-2)", () => {
     world.emit({ type: "session.deleted", data: { sessionID: "barrier" } });
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(lookupDispatch("stray")).toBeUndefined();
+  });
+
+  it("QA-G-A2: a call the legacy hook rejects writes no decision row; the normal path writes exactly one", async () => {
+    for (const engine of ["shadow", "enforce"] as const) {
+      const rejected = await makeWorld({ engine });
+      await rejected.start(throwing);
+      await expect(dispatch(rejected, { agent: "medium", prompt: IMPLEMENT() }).run(), engine).rejects.toThrow("depth limit reached");
+      await expect(dispatch(rejected, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-rejected" }).run(), engine).rejects.toThrow("depth limit reached");
+      expect(await rejected.rows(), engine).toEqual([]);
+      for (const cleanup of cleanups.splice(0)) await cleanup();
+
+      const normal = await makeWorld({ engine });
+      await normal.start();
+      await routed(normal, { agent: "medium", prompt: IMPLEMENT() });
+      const rows = await normal.rows();
+      expect(rows, engine).toHaveLength(1);
+      expect(rows[0], engine).toMatchObject({ kind: "decision", mode: engine, chosen: { agent: "medium" } });
+      for (const cleanup of cleanups.splice(0)) await cleanup();
+    }
+  });
+
+  it("QA-G-A2: an unresolvable pick (nothing to register) still writes its kept:unresolved row at commit", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    world.session.current = { ...(world.session.current as Record<string, unknown>), model: null }; // no parent model to fall back on
+    await world.start();
+    await routed(world, { agent: "nobody-knows", prompt: IMPLEMENT() });
+    const rows = await world.rows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.reason.startsWith("kept:unresolved")).toBe(true);
   });
 
   it("a legacy hook that rewrites the agent: the waiting entry uses the final agent, and its model", async () => {
