@@ -1697,7 +1697,8 @@ describe("build-info", () => {
 
   describe("buildInfo (this checkout)", () => {
     const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8")) as { version: string };
-    const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" });
+    // Collection-time subprocess: bound it independently of individual test timeouts.
+    const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8", timeout: 60_000 });
     const gitHead = git.status === 0 ? git.stdout.trim() : undefined;
 
     it("has the package version", () => {

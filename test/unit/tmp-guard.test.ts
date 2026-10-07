@@ -20,7 +20,8 @@ const realTmp = (): string => {
 
 afterEach(() => vi.unstubAllEnvs());
 
-describe("temp directory guard", () => {
+// Includes native Node subprocesses and isolated-directory creation/cleanup.
+describe("temp directory guard", { timeout: 60_000 }, () => {
   it("R2-6: smoke cleanup failure warns but restores the environment", () => {
     const names = ["TEMP", "TMP", "TMPDIR", "OMR_SMOKE_REAL_TMPDIR"];
     const before = names.map((name) => process.env[name]);

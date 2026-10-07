@@ -1066,7 +1066,7 @@ describe("coexistence with *.scorecard.log (D15)", () => {
 // The real node fs
 // ---------------------------------------------------------------------------
 
-describe("nodePersistFs and a real directory", () => {
+describe("nodePersistFs and a real directory", { timeout: 60_000 }, () => {
   const made: string[] = [];
   afterEach(async () => {
     while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true });

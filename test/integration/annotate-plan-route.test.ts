@@ -532,7 +532,8 @@ describe("splitPlan: fences that end with their item, and HTML comments (QA-2.4-
 // Locating the plan, agents, rendering
 // ---------------------------------------------------------------------------
 
-describe("locatePlan, agentInfosForPlan, renderDirectives", () => {
+// Includes directory scans and the >1 MB on-disk plan rejection fixture.
+describe("locatePlan, agentInfosForPlan, renderDirectives", { timeout: 60_000 }, () => {
   let dir: string;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "annotate-locate-"));

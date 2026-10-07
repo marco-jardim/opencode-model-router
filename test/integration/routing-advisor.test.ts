@@ -571,7 +571,8 @@ function decisionRow(id: string, ts: string, over: Partial<DecisionRow> = {}): D
   };
 }
 
-describe("D18 /router stats and the checkpoint line", () => {
+// Includes plain-node CLI subprocesses and real persisted fixtures.
+describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () => {
   type Hooks = { "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>; dispose(): Promise<void> };
   let home: string;
   let store: string;
