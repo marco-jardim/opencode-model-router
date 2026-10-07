@@ -39,8 +39,15 @@ export function resolveSubagentOverrides(input: {
   tiers: Preset;
   /** The opencode config's `agent` record, when already populated. */
   existingAgents?: Record<string, unknown>;
+  /**
+   * Names defined by the router `agents` block (#81). Their `tier` wins, so a
+   * `subagentTiers` entry for one of them is skipped.
+   */
+  pluginAgents?: Record<string, unknown>;
+  /** Called for each skipped name whose agent does not exist (phantom) or is plugin-defined. */
+  onSkip?: (agentName: string, reason: "missing" | "plugin-agent") => void;
 }): Record<string, SubagentOverride> {
-  const { subagentTiers, tiers, existingAgents } = input;
+  const { subagentTiers, tiers, existingAgents, pluginAgents, onSkip } = input;
   if (!isPlainObject(subagentTiers)) return {};
 
   const out: Record<string, SubagentOverride> = {};
@@ -54,6 +61,17 @@ export function resolveSubagentOverrides(input: {
 
     const tier = tiers[tierName];
     if (!tier || typeof tier.model !== "string" || tier.model === "") continue;
+
+    if (isPlainObject(pluginAgents) && Object.hasOwn(pluginAgents, agentName)) {
+      onSkip?.(agentName, "plugin-agent");
+      continue;
+    }
+    // A name that no agent record carries would be created from nothing: a
+    // phantom agent with only a model. Only checked when the record is known.
+    if (isPlainObject(existingAgents) && !Object.hasOwn(existingAgents, agentName)) {
+      onSkip?.(agentName, "missing");
+      continue;
+    }
 
     const existing = existingAgents?.[agentName];
     if (isPlainObject(existing) && typeof existing.mode === "string") {

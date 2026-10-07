@@ -23,6 +23,7 @@ import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { gitTools } from "./router/git-tools";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
+import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
 import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
@@ -1753,7 +1754,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input?.tool === "grep" && typeof output.output === "string") {
         const tier = input.agent ?? sessionStore.getTier(input.sessionID);
         const definition = tier && getActiveTiers(cfg)[tier];
-        if (definition && isReadOnlyTier(tier, definition)) output.output = filterSensitiveGrep(output.output);
+        const pluginReadOnly = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier) && cfg.agents?.[tier]?.readOnly === true;
+        if ((definition && isReadOnlyTier(tier, definition)) || pluginReadOnly) output.output = filterSensitiveGrep(output.output);
       }
       if (bypassed) return;
       sessionStore.recordToolCall(input, output);
@@ -2208,10 +2210,47 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // preset's models. Opt-in: with no map, nothing here runs and the agent
       // record is left exactly as opencode built it. Runs after tier
       // registration so the tier-name collision guard sees the real tiers.
+      // Plugin agents (#81): subagents defined by the router `agents` block.
+      // Model/variant/steps always follow the ACTIVE preset's tier, so this
+      // re-run on /preset rebuilds them. An opencode.json `agent.<name>` entry
+      // wins for the fields it sets (its permission rules go after ours).
+      const context7 = Boolean(opencodeConfig.mcp?.context7) && opencodeConfig.mcp.context7.enabled !== false;
+      for (const [name, entry] of Object.entries(cfg.agents ?? {})) {
+        const tier = activeTiers[entry.tier];
+        if (!tier) continue;
+        const existing = opencodeConfig.agent[name];
+        // A definition this hook built on a previous run is not a user entry.
+        const previous = pluginAgentMarker(existing);
+        const hostEntry: Record<string, unknown> | undefined = previous
+          ? previous.hostEntry
+          : existing !== undefined && typeof existing === "object" && existing !== null && !Array.isArray(existing)
+            ? existing as Record<string, unknown>
+            : undefined;
+        let definition = buildPluginAgentDefinition(entry, tier, { context7, host: "v1" });
+        if (hostEntry !== undefined) {
+          definition = mergeHostAgentEntry(definition, hostEntry);
+          warnAgentOptionsEffortOnce(
+            `plugin-agent-host-entry:${name}`,
+            `agent ${name} is defined both in the router \`agents\` block and in opencode.json; opencode.json wins for the fields it sets`,
+            logger,
+          );
+        }
+        opencodeConfig.agent[name] = definition;
+      }
+
       const subagentOverrides = resolveSubagentOverrides({
         subagentTiers: cfg.subagentTiers,
         tiers: activeTiers,
         existingAgents: opencodeConfig.agent,
+        pluginAgents: cfg.agents,
+        onSkip: (agentName, reason) =>
+          warnAgentOptionsEffortOnce(
+            `subagent-tiers:${reason}:${agentName}`,
+            reason === "missing"
+              ? `subagentTiers: '${agentName}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`
+              : `subagentTiers: '${agentName}' is defined by the router \`agents\` block, whose tier wins; entry skipped`,
+            logger,
+          ),
       });
       for (const [agentName, override] of Object.entries(subagentOverrides)) {
         opencodeConfig.agent[agentName] = mergeSubagentOverride(
