@@ -275,11 +275,6 @@ function readBlock(rules: readonly PermissionRule[]): Record<string, PermissionE
 export interface PluginAgentPolicy {
   /** Ordered permission map in the host's vocabulary (v1: `bash`/`task`). */
   permission: PermissionMap;
-  /**
-   * Actions the agent's own config grants or asks for. The v2 publisher does not
-   * treat them as read-only canaries; every other canary must stay denied.
-   */
-  exempt: string[];
 }
 
 /**
@@ -306,11 +301,7 @@ export function pluginAgentPolicy(
     delete permission.read;
     permission.read = block;
   }
-  const exempt = [...new Set([
-    ...(entry.allowTools ?? []),
-    ...permissionRules(own).filter((rule) => rule.effect !== "deny").map((rule) => rule.action),
-  ])];
-  return { permission: opts.host === "v1" ? toV1Actions(permission) : permission, exempt };
+  return { permission: opts.host === "v1" ? toV1Actions(permission) : permission };
 }
 
 /** Rename the v2 actions to the v1 host's (`shell` → `bash`, `subagent` → `task`), keeping order. */
@@ -336,7 +327,6 @@ export const PLUGIN_AGENT = Symbol.for("opencode-model-router.plugin-agent");
 export interface PluginAgentMarker {
   tier: string;
   readOnly: boolean;
-  exempt: string[];
   /** v1 only: the opencode.json entry the definition was merged with, if any. */
   hostEntry?: Record<string, unknown>;
 }
@@ -369,7 +359,7 @@ export function buildPluginAgentDefinition(
     permission: policy.permission,
     tools: legacyReadOnlyTools(policy.permission),
   };
-  const marker: PluginAgentMarker = { tier: entry.tier, readOnly: entry.readOnly === true, exempt: policy.exempt };
+  const marker: PluginAgentMarker = { tier: entry.tier, readOnly: entry.readOnly === true };
   Object.defineProperty(definition, PLUGIN_AGENT, { value: marker, enumerable: false, configurable: true });
   return definition;
 }

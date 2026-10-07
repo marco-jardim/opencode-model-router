@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,9 @@ import type { Preset } from "../../src/router/config";
 import {
   GRADER_AGENT_NAME, pluginAgentPolicy, sanitizePluginAgents, validatePluginAgent,
 } from "../../src/router/plugin-agents";
-import { permissionRules } from "../../src/router/read-only";
+import {
+  evaluatePermission, isMonotone, permissionRules, publishReadOnlyPermissions, READ_ONLY_CANARIES, type PermissionRule,
+} from "../../src/router/read-only";
 
 const tier = (model: string) => ({ model, costRatio: 1, description: "t", whenToUse: [] });
 const tiers = { fast: tier("p/f"), medium: tier("p/m"), heavy: tier("p/h"), scout: tier("p/s") } as unknown as Preset;
@@ -82,11 +84,64 @@ describe("plugin agents: validation", () => {
   });
 });
 
+describe("plugin agents: v2 publication is fail-closed (QA-81-1)", () => {
+  const DEFAULTS: PermissionRule[] = [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "external_directory", resource: "*", effect: "ask" },
+    { action: "read", resource: "*.env", effect: "ask" },
+    { action: "read", resource: "*.env.*", effect: "ask" },
+    { action: "read", resource: "*.env.example", effect: "allow" },
+  ];
+  const hosts: Array<[string, PermissionRule[]]> = [
+    ["identical defaults", DEFAULTS],
+    ["appended allow", [...DEFAULTS, { action: "webfetch", resource: "*", effect: "allow" }]],
+    ["inserted", [DEFAULTS[0]!, { action: "question", resource: "*", effect: "allow" }, ...DEFAULTS.slice(1)]],
+    ["respelled", [{ action: "*", resource: "**", effect: "allow" }, ...DEFAULTS.slice(1)]],
+    ["dropped", DEFAULTS.filter((rule) => rule.action !== "external_directory")],
+    ["default changed to * * ask", [{ action: "*", resource: "*", effect: "ask" }, ...DEFAULTS.slice(1)]],
+    ["+shell * allow", [...DEFAULTS, { action: "shell", resource: "*", effect: "allow" }]],
+    ["+shell * ask", [...DEFAULTS, { action: "shell", resource: "*", effect: "ask" }]],
+  ];
+  const runner = permissionRules(pluginAgentPolicy(
+    { permission: { shell: { "*": "deny", "npm test*": "allow", "*>*": "deny" } } }, { context7: false, host: "v2" },
+  ).permission);
+  const reviewer = permissionRules(pluginAgentPolicy({ readOnly: true, allowTools: ["webfetch"] }, { context7: false, host: "v2" }).permission);
+
+  it.each(hosts)("runner on %s: shell stays fail-closed, npm test stays allowed", (_label, host) => {
+    const warn = vi.fn();
+    const rules = publishReadOnlyPermissions("runner", runner, host, warn, { plugin: true });
+    expect(evaluatePermission(rules, "shell", "rm -rf /")).toBe("deny");
+    expect(evaluatePermission(rules, "shell", "npm test > x")).toBe("deny");
+    expect(evaluatePermission(rules, "shell", "npm test")).toBe("allow");
+    for (const action of ["edit", "subagent", "webfetch", "question", "external_directory"]) {
+      expect(evaluatePermission(rules, action, "*")).toBe("deny");
+    }
+    expect(isMonotone(runner, rules, [...READ_ONLY_CANARIES, "shell", "read"], ["*", "rm -rf /", "a>b", "npm test; rm x", ".env"])).toBe(true);
+  });
+
+  it.each(hosts)("readOnly plugin agent on %s: never wider than its policy", (_label, host) => {
+    const rules = publishReadOnlyPermissions("reviewer", reviewer, host, vi.fn(), { plugin: true });
+    expect(isMonotone(reviewer, rules, [...READ_ONLY_CANARIES, "read", "grep", "webfetch"], ["*", ".env", "src/file.ts", "rm -rf /"])).toBe(true);
+    expect(evaluatePermission(rules, "shell", "*")).toBe("deny");
+    expect(evaluatePermission(rules, "webfetch", "https://x")).toBe("allow");
+    expect(evaluatePermission(rules, "read", ".env")).toBe("ask");
+  });
+
+  it("inherited denies are kept after the policy: a later deny stays a deny", () => {
+    const rules = publishReadOnlyPermissions("runner", runner, [...DEFAULTS, { action: "shell", resource: "npm test*", effect: "deny" }], vi.fn(), { plugin: true });
+    expect(evaluatePermission(rules, "shell", "npm test")).toBe("deny");
+  });
+
+  it("isMonotone flags an inherited allow that widens the policy", () => {
+    expect(isMonotone(runner, [...runner, { action: "shell", resource: "*", effect: "allow" }], ["shell"], ["rm -rf /"])).toBe(false);
+  });
+});
+
 describe("plugin agents: permission builders", () => {
   const opts = { context7: false, host: "v2" as const };
 
   it("readOnly + allowTools: policy first, grants after, user deny stays deny", () => {
-    const { permission, exempt } = pluginAgentPolicy(
+    const { permission } = pluginAgentPolicy(
       { readOnly: true, allowTools: ["webfetch"], permission: { grep: "deny" } }, opts,
     );
     const keys = Object.keys(permission);
@@ -98,7 +153,6 @@ describe("plugin agents: permission builders", () => {
     expect(permission.grep).toBe("deny");
     expect(keys.indexOf("webfetch")).toBeGreaterThan(0);
     expect(keys.indexOf("grep")).toBeGreaterThan(keys.indexOf("webfetch"));
-    expect(exempt).toEqual(["webfetch"]);
   });
 
   it("explicit permission: deny-by-default first, sensitive asks after each read grant", () => {

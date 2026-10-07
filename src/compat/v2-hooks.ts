@@ -272,7 +272,7 @@ export async function registerV2Hooks(
           if (definition.steps !== undefined) agent.steps = definition.steps;
           if (definition.permission) {
             agent.permissions = publishReadOnlyPermissions(
-              name, marker ? v2Actions(permissionRules(definition.permission)) : permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce, marker?.exempt ?? [],
+              name, marker ? v2Actions(permissionRules(definition.permission)) : permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce, { plugin: marker !== undefined },
             );
           }
         });
