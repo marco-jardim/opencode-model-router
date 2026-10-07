@@ -2519,7 +2519,11 @@ function mergeOverrideLayer(lower: unknown, layer: OverrideLayer, notices: Confi
   for (const key of ["maxStateChars", "samples", "timeoutMs"] as const) {
     const requested = projectClassifier[key];
     const inherited = isPlainObject(lowerClassifier) ? lowerClassifier[key] : undefined;
-    const ceiling = inherited ?? ROUTING_DEFAULTS.classifier[key];
+    const validInherited = typeof inherited === "number" && Number.isInteger(inherited)
+      && (key === "samples" ? inherited === 1 || inherited === 3
+        : key === "maxStateChars" ? inherited >= 200 && inherited <= 20_000
+          : inherited >= 100 && inherited <= 30_000);
+    const ceiling = validInherited ? inherited : ROUTING_DEFAULTS.classifier[key];
     if (typeof requested === "number" && Number.isFinite(requested) && typeof ceiling === "number" && requested > ceiling) {
       bounded[key] = ceiling;
       notices.push({ source: layer.path, message: `A18: clamping routing.classifier.${key} from ${layer.path} to ${ceiling}: project overrides may only tighten the lower-layer value (A35)` });

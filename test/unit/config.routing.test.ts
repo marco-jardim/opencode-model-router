@@ -1324,6 +1324,13 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(getConfigNotices(project)).toEqual([]);
     });
 
+    it.each(["500", 100, 20_001, 500.5])("R2-3: invalid inherited maxStateChars %s uses the default ceiling", (maxStateChars) => {
+      editOverride({ routing: { classifier: { maxStateChars } } });
+      writeProject({ routing: { classifier: { maxStateChars: 8000 } } });
+      expect(resolveRouting(reload(project), "v2").classifier.maxStateChars).toBe(2000);
+      expect(logged("A18: clamping").some((message) => message.includes("maxStateChars") && message.includes("2000"))).toBe(true);
+    });
+
     it("has nothing to strip, and nothing to say, when the project layer has no routing block", () => {
       writeProject({ tierCaps: { fast: 9 } });
       expect(loadConfig(project).tierCaps?.fast).toBe(9);
