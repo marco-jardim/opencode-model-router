@@ -43,12 +43,24 @@ afterEach(() => {
     const value = savedEnv[name];
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }
-  rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  rmSync(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  rmSync(outside, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const slash = (path: string) => path.replaceAll("\\", "/");
-const gitIn = (cwd: string, ...args: string[]) => execFileSync(gitExecutable(), args, { cwd, env: gitEnvironment(), encoding: "utf8" });
+function gitIn(cwd: string, ...args: string[]): string {
+  // Fixture writes must not leave detached maintenance racing the .git snapshots.
+  // Command-line overrides also protect commits in tests that alter repository config.
+  const run = (argv: string[]) => execFileSync(gitExecutable(), ["-c", "gc.auto=0", "-c", "maintenance.auto=false", ...argv],
+    { cwd, env: gitEnvironment(), encoding: "utf8" });
+  const output = run(args);
+  if (args[0] === "init") {
+    for (const [key, value] of [["gc.auto", "0"], ["maintenance.auto", "false"], ["gc.autoDetach", "false"]] as const) {
+      run(["config", key, value]);
+    }
+  }
+  return output;
+}
 const git = (...args: string[]) => gitIn(root, ...args);
 /** Plain git with no read-only hardening: the positive control for every vector. */
 function plain(cwd: string, ...args: string[]): string {
@@ -67,15 +79,21 @@ function repository(dir = root) {
   gitIn(dir, "add", "file.txt"); gitIn(dir, "commit", "-qm", "initial");
 }
 /** Content, size and mtime of every file under .git, plus the set of entries. */
-function gitDirDigest(repo: string): string {
+function gitDirDigest(repo: string, readContents: (path: string) => Buffer = readFileSync): string {
   const hash = createHash("sha256");
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const path = join(dir, entry.name);
-      hash.update(`${relative(repo, path)}\0`);
-      if (entry.isDirectory()) { walk(path); continue; }
-      const stats = statSync(path);
-      hash.update(`${stats.size}:${stats.mtimeMs}\0`).update(readFileSync(path));
+      if (entry.isDirectory()) { hash.update(`${relative(repo, path)}\0`); walk(path); continue; }
+      try {
+        const stats = statSync(path);
+        const contents = readContents(path);
+        // Hash only after both reads succeed, so a disappearing lock leaves no partial entry.
+        hash.update(`${relative(repo, path)}\0${stats.size}:${stats.mtimeMs}\0`).update(contents);
+      } catch (error) {
+        if (entry.name.endsWith(".lock") && error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+        throw error;
+      }
     }
   };
   walk(join(repo, ".git"));
@@ -125,6 +143,36 @@ function metadataReply(args: readonly string[]) {
 }
 
 describe("shell-free git inspection", () => {
+  it("disables maintenance in every initialized fixture and preserves plain Git output", async () => {
+    repository();
+    gitIn(outside, "init", "-q", "-b", "main");
+    for (const dir of [root, outside]) {
+      for (const [key, value] of [["gc.auto", "0"], ["maintenance.auto", "false"], ["gc.autoDetach", "false"]] as const) {
+        expect(plain(dir, "config", "--get", key).trim()).toBe(value);
+      }
+    }
+    writeFileSync(join(root, "file.txt"), "changed\n");
+    expect(await inspect("status")).toBe(plain(root, "--no-optional-locks", "status", "--porcelain=v1"));
+    expect(await inspect("diff")).toBe(plain(root, "diff"));
+  }, 30_000);
+  it("tolerates only vanished lock files in .git snapshots, never missing or changed real files", () => {
+    repository();
+    const baseline = gitDirDigest(root);
+    const lock = join(root, ".git", "maintenance.lock");
+    writeFileSync(lock, "temporary lock");
+    expect(gitDirDigest(root)).not.toBe(baseline); // Existing locks are still included.
+    const removeBeforeReading = (target: string) => (path: string) => {
+      if (path === target) rmSync(path);
+      return readFileSync(path);
+    };
+    expect(gitDirDigest(root, removeBeforeReading(lock))).toBe(baseline);
+    const real = join(root, ".git", "fixture-data");
+    writeFileSync(real, "real data");
+    const before = gitDirDigest(root);
+    writeFileSync(real, "different real data");
+    expect(gitDirDigest(root)).not.toBe(before);
+    expect(() => gitDirDigest(root, removeBeforeReading(real))).toThrow(/ENOENT/);
+  });
   it.each(["-o", "--output=x", "a b", "a;b", "a|b", "$(whoami)", "`whoami`", "x".repeat(201), ""])("rejects ref %s", ref => {
     expect(() => validateRef(ref)).toThrow();
   });
@@ -164,7 +212,8 @@ describe("shell-free git inspection", () => {
     const args = gitArgv(operation, { path: "file.txt" }, root);
     expect(args.slice(0, hardeningArgs().length)).toEqual(hardeningArgs());
     for (const flag of ["--no-optional-locks", "--no-pager", "core.pager=cat", "core.fsmonitor=false", "diff.external=", "protocol.allow=never",
-      "log.showSignature=false", "gpg.program=", "gpg.ssh.program=", "diff.autoRefreshIndex=false", "core.splitIndex=false", "index.threads=1"]) expect(args).toContain(flag);
+      "log.showSignature=false", "gpg.program=", "gpg.ssh.program=", "diff.autoRefreshIndex=false", "core.splitIndex=false", "index.threads=1",
+      "gc.auto=0", "maintenance.auto=false"]) expect(args).toContain(flag);
     expect(args.some(a => a.startsWith("core.hooksPath="))).toBe(true);
     if (["diff", "show", "log"].includes(operation)) {
       expect(args).toContain("--no-ext-diff"); expect(args).toContain("--no-textconv");
@@ -526,20 +575,33 @@ describe("shell-free git inspection", () => {
   });
   it("settles after a timeout although a re-parented grandchild keeps the pipes open (G7)", async () => {
     const pidFile = join(root, "grandchild.pid");
+    let grandchildPid: number | undefined;
     // parent -> middle (exits) -> grandchild (detached, inherits stdout/stderr). taskkill /T and
     // POSIX group kill cannot reach the orphan, so `close` never fires.
-    const middle = `const {spawn}=require('node:child_process');const g=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:['ignore','inherit','inherit']});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));g.unref();`;
+    const middle = `const {spawn}=require('node:child_process');const g=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{cwd:${JSON.stringify(tmpdir())},detached:true,stdio:['ignore','inherit','inherit']});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));g.unref();`;
     const parent = `const {spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(middle)}],{stdio:['ignore','inherit','inherit']});setInterval(()=>{},1000);`;
     const started = performance.now();
     try {
       await expect(runBoundedProcess(process.execPath, ["-e", parent], root, { timeoutMs: 2_000 })).rejects.toThrow("timed out");
       expect(performance.now() - started).toBeLessThan(6_000);
       expect(existsSync(pidFile)).toBe(true);
-      expect(alive(Number(readFileSync(pidFile, "utf8")))).toBe(true); // the pipe holder really survived
+      grandchildPid = Number(readFileSync(pidFile, "utf8"));
+      expect(alive(grandchildPid)).toBe(true); // the pipe holder really survived
     } finally {
-      if (existsSync(pidFile)) {
-        const pid = Number(readFileSync(pidFile, "utf8"));
-        if (alive(pid)) process.kill(pid, "SIGKILL");
+      if (grandchildPid === undefined && existsSync(pidFile)) grandchildPid = Number(readFileSync(pidFile, "utf8"));
+      if (grandchildPid !== undefined && alive(grandchildPid)) {
+        if (WIN) {
+          try {
+            execFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/PID", String(grandchildPid), "/T", "/F"],
+              { cwd: tmpdir(), stdio: "ignore", windowsHide: true, timeout: 10_000 });
+          } catch (error) {
+            if (alive(grandchildPid)) throw error; // Ignore only a process that has already exited.
+          }
+        } else {
+          try { process.kill(grandchildPid, "SIGKILL"); } catch (error) {
+            if (alive(grandchildPid)) throw error;
+          }
+        }
       }
     }
   }, 30_000);
