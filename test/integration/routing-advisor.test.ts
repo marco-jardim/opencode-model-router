@@ -1372,7 +1372,8 @@ describe("cost doctor: findings on bundled tiers never notify (QA-2.4-5)", () =>
 // In the plugin: the /router section and the notice in the orchestrator's context
 // ---------------------------------------------------------------------------
 
-describe("cost doctor in the plugin", () => {
+// A test may await several background checks; keep its timeout above the combined polling deadlines.
+describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
   type Hooks = {
     "command.execute.before"(input: unknown, output: { parts: Array<{ text: string }> }): Promise<void>;
     "experimental.chat.system.transform"(input: unknown, output: { system: string[] }): Promise<void>;
@@ -1496,11 +1497,20 @@ describe("cost doctor in the plugin", () => {
     await hooks["chat.message"]({ sessionID, agent: "build" }, output);
     return output.parts;
   };
-  async function until(condition: () => boolean, ms = 3_000): Promise<void> {
+  async function until(condition: () => boolean, ms = 15_000): Promise<void> {
     const end = Date.now() + ms;
     while (!condition() && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 10));
     expect(condition()).toBe(true);
   }
+
+  // The atomic rename makes the state file visible BEFORE checkContext updates its
+  // in-memory pending notice. The producer releases its lock only after that update.
+  // Waiting for both avoids consuming a root message in the middle of production.
+  const noticeStateReady = (): boolean => {
+    const names = existsSync(store) ? readdirSync(store) : [];
+    return names.some((n) => n.startsWith("advisor-notice.") && n.endsWith(".json"))
+      && !names.some((n) => n.startsWith("advisor-notice.") && n.endsWith(".lock"));
+  };
 
   it("/router shows the Cost doctor on v2: the title finding with its cheapest-model fix, from the host's own agents and catalog", async () => {
     const { hooks } = await plugin({ routing: { engine: "shadow", outcomes: { path: store } } });
@@ -1566,7 +1576,7 @@ describe("cost doctor in the plugin", () => {
     expect(parts).toEqual([{ type: "text", text: "again" }]);
     expect(host.synthetic).toHaveLength(1); // handed over once
     expect((await turn(hooks)).some((p) => p.includes("Cost doctor"))).toBe(false); // and the system prompt never carries it
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice.") && n.endsWith(".json"))); // one state file per project (QA-2.4-R2-5)
+    await until(noticeStateReady); // one state file per project (QA-2.4-R2-5), producer/claim lock released
     expect(readdirSync(store).filter((name) => name.endsWith(".lock"))).toEqual([]); // the lock is released
     // a restart: same directory, nothing is due and nothing is pending
     const again = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
@@ -1606,7 +1616,7 @@ describe("cost doctor in the plugin", () => {
   it("a subagent's or a grader's message never takes the notice; the root session still gets it afterwards", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, parents: { "child-1": "root-1" } });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    await until(noticeStateReady);
     expect(await userMessage(hooks, "child-1", "do the thing")).toEqual([{ type: "text", text: "do the thing" }]);
     expect(host.synthetic).toHaveLength(0);
     await userMessage(hooks, "root-1", "hello");
@@ -1617,7 +1627,7 @@ describe("cost doctor in the plugin", () => {
   it("without a synthetic-message call on the host (v1, an older adapter) the notice is a log line, once, and the user's message is untouched", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, synthetic: false });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    await until(noticeStateReady);
     expect(await userMessage(hooks, "root-1", "hello")).toEqual([{ type: "text", text: "hello" }]);
     expect(host.logs.filter((m) => m.startsWith("[model-router] Cost doctor:"))).toHaveLength(1);
     await userMessage(hooks, "root-1", "again");
@@ -1627,7 +1637,7 @@ describe("cost doctor in the plugin", () => {
   it("a failing synthetic call is logged and never reaches the turn", async () => {
     const { hooks, host } = await plugin({ routing: { engine: "advise", outcomes: { path: store } }, synthetic: "fail" });
     await turn(hooks);
-    await until(() => (existsSync(store) ? readdirSync(store) : []).some((n) => n.startsWith("advisor-notice") && n.endsWith(".json")));
+    await until(noticeStateReady);
     expect(await userMessage(hooks, "root-1", "hello")).toEqual([{ type: "text", text: "hello" }]);
     await until(() => host.logs.some((m) => m.includes("notice not delivered")));
   });

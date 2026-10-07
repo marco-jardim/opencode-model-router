@@ -734,16 +734,31 @@ describe("edit needs are imperative, not participles or nouns (QA-1.2-6)", () =>
   });
 });
 describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
-  /** Best of `runs` after a warm-up: immune to a GC pause or a busy CI core, still catches O(n²). */
-  const bestOf = (runs: number, fn: () => void): number => {
-    fn();
-    let best = Infinity;
-    for (let i = 0; i < runs; i++) {
+  /** Compare n with 4n, not a workstation-specific millisecond budget. Warm both sizes,
+   * interleave batches and use medians so isolated GC/scheduling pauses do not dominate.
+   * Linear growth should be near 4x; quadratic growth is 16x and must fail the 8x bound.
+   */
+  const expectSubquadratic = (text: string, fn: (input: string) => unknown): void => {
+    // classifyByRules reads at most 20,000 chars: both sizes must stay inside
+    // that cap, otherwise truncation would make even quadratic rules look flat.
+    const smaller = text.slice(0, Math.floor(Math.min(text.length, 20_000) / 4));
+    const larger = smaller.repeat(4);
+    const measure = (input: string): number => {
       const start = performance.now();
-      fn();
-      best = Math.min(best, performance.now() - start);
+      for (let i = 0; i < 3; i++) fn(input);
+      return (performance.now() - start) / 3;
+    };
+    for (let i = 0; i < 3; i++) { fn(smaller); fn(larger); }
+    const small: number[] = [];
+    const big: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      if (i % 2 === 0) { small.push(measure(smaller)); big.push(measure(larger)); }
+      else { big.push(measure(larger)); small.push(measure(smaller)); }
     }
-    return best;
+    const median = (samples: number[]): number => samples.sort((a, b) => a - b)[2]!;
+    const baseline = median(small);
+    const scaled = median(big);
+    expect(scaled, `4x input: median ${scaled.toFixed(3)} ms vs ${baseline.toFixed(3)} ms`).toBeLessThan(baseline * 8);
   };
 
   it.each([
@@ -759,14 +774,12 @@ describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
     ['"\\n" x 20000', "\n".repeat(20_000)],
     ['" " x 20000', " ".repeat(20_000)],
     ['"a," x 10000', "a,".repeat(10_000)],
-  ])("%s classifies in under 5 ms", (_label, text) => {
-    expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(5);
+  ])("%s classifies with subquadratic scaling", (_label, text) => {
+    expectSubquadratic(text, (input) => classifyByRules(input, cfg));
     expect(classifyByRules(text, cfg).confidence).toBeLessThanOrEqual(0.5);
   });
 
-  // Every `[^\n]{0,100}` command term re-scans up to 100 characters per command word, so a text that is
-  // nothing but command words ("rm " x 6000, ~18 kB) costs ~4-5 ms here: that is linear, but close to 5 ms,
-  // so this table asserts 10 ms (a loaded CI core cannot flake it) while a quadratic regression still fails by 100x.
+  // Command terms scan bounded windows per word: slower constants are fine, quadratic growth is not.
   it.each([
     ['"git push " x 2500', "git push ".repeat(2_500)],
     ['"git push -x " x 2000', "git push -x ".repeat(2_000)],
@@ -776,24 +789,23 @@ describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
     ['"del " x 5000', "del ".repeat(5_000)],
     ['"ri " x 6000', "ri ".repeat(6_000)],
     ['"git checkout " x 1500', "git checkout ".repeat(1_500)],
-  ])("%s classifies in under 10 ms", (_label, text) => {
-    expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(10);
+  ])("%s classifies with subquadratic scaling", (_label, text) => {
+    expectSubquadratic(text, (input) => classifyByRules(input, cfg));
   });
 
   it("shapeOf alone is also linear on long runs", () => {
     for (const text of ["a".repeat(20_000), "a.".repeat(10_000), "a/".repeat(10_000)]) {
-      expect(bestOf(5, () => shapeOf(text))).toBeLessThan(5);
+      expectSubquadratic(text, shapeOf);
       expect(shapeOf(text).chars).toBe(text.length);
     }
   });
 
-  // Runs just under the collapse threshold are the worst case that remains. 5 ms is the budget on a quiet
-  // machine; the bound below is looser (10 ms) only so a loaded CI core cannot flake it.
-  it("runs of 199 characters, the worst case under the collapse threshold, stay under 10 ms", () => {
+  // Runs just under the collapse threshold are the worst case that remains.
+  it("runs of 199 characters, the worst case under the collapse threshold, scale subquadratically", () => {
     const text = ("a".repeat(199) + " ").repeat(100);
-    expect(bestOf(5, () => classifyByRules(text, cfg))).toBeLessThan(10);
+    expectSubquadratic(text, (input) => classifyByRules(input, cfg));
     const dotted = ("a.".repeat(99) + "a ").repeat(100);
-    expect(bestOf(5, () => classifyByRules(dotted, cfg))).toBeLessThan(10);
+    expectSubquadratic(dotted, (input) => classifyByRules(input, cfg));
   });
 
   it("collapsing keeps the class of the words around a long blob", () => {

@@ -13,7 +13,7 @@ const node = `"${process.execPath}"`;
 const dirs: string[] = [];
 // Retries: on Windows a just-killed process can still hold its cwd (a scratch
 // dir) for a few hundred ms after `alive()` reports it dead (QA-1.2-30).
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); });
+afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
 
 /** A shell -> node -> grandchild node chain, like `cmd /c npm test` -> vitest -> workers. */
 function forkingFixture() {
