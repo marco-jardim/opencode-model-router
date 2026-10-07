@@ -5,7 +5,9 @@ Closes #73
 
 ## What changes
 
-**Head branch: `car/main`; base: `master`.** The orchestrator fast-forwards `car/main` to the reviewed `car/p34` tip before opening this PR. This PR adds the **DF5 evidence, CI portability fixes and 2.3.0 release metadata**, not the entire engine implementation: the dogfood syncs already pushed the engine to remote master, a deviation from the plan's local-only sync procedure.
+**Head branch: `car/main`; base: `master`.** PR #76 was opened on 2026-10-07; the orchestrator keeps `car/main` fast-forwarded to the reviewed `car/p34` tip. This PR adds the **DF5 evidence, CI portability fixes and 2.3.0 release metadata**, not the entire engine implementation: the dogfood syncs already pushed the engine to remote master, a deviation from the plan's local-only sync procedure.
+
+CI-safety margins loosened absolute performance budgets in tests (A36); the original budgets remain design targets, while relative run-length scaling, same-length pathological/prose ratios and deterministic timer-scheduling checks remain regression guards.
 
 For full feature review, use [the v2.2.0 → car/main comparison](https://github.com/marco-jardim/opencode-model-router/compare/v2.2.0...car/main). The release as a whole includes the opt-in OpenCode v2 cost-aware routing engine, learned outcome statistics, same-session variant escalation, native-agent candidates, a cost doctor, `/router stats` and route annotations. Decisions stay in code and use verified outcomes rather than classifier confidence as a success probability. Version: **2.3.0**.
 
