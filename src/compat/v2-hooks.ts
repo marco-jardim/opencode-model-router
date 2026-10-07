@@ -9,7 +9,8 @@ import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
 import { isAbsolute, resolve } from "node:path";
 import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
-import { DEFER_MISSING_SUBAGENT_NOTICE, resolveSubagentOverrides } from "../router/subagents";
+import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrides } from "../router/subagents";
+import { warnAgentOptionsEffortOnce } from "../router/agent-options";
 import { pluginAgentMarker } from "../router/plugin-agents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
@@ -164,7 +165,6 @@ export async function registerV2Hooks(
       mode: agent.mode,
       model: agent.model && `${agent.model.providerID}/${agent.model.id}`,
       variant: agent.model?.variant,
-      ...(agent.description ? { description: agent.description } : {}),
     };
     let config: LegacyConfig = { agent: {}, command: {} };
     let originals = new Map<string, string>();
@@ -182,6 +182,10 @@ export async function registerV2Hooks(
     const v2Actions = (rules: ReturnType<typeof permissionRules>) => rules.map((rule) => ({ ...rule, action: V2_ACTIONS[rule.action] ?? rule.action }));
     const protectedAgent = (name: string | undefined) => name !== undefined
       && (config.agent[name]?.permission?.["*"] === "deny" || pluginAgentMarker(config.agent[name]) !== undefined);
+    const agentLabel = (name: string | undefined): string => {
+      const marker = name === undefined ? undefined : pluginAgentMarker(config.agent[name]);
+      return marker !== undefined && !marker.readOnly ? "plugin agent" : "read-only agent";
+    };
     // Host agents appear after setup (the host's config-agent plugin activates after the router). Names
     // the router created itself never count as host agents, or a tier would look like an existing one.
     const routerCreated = new Set<string>();
@@ -203,7 +207,6 @@ export async function registerV2Hooks(
           mode: agent.mode,
           model: agent.model && `${agent.model.providerID}/${agent.model.id}`,
           variant: agent.model?.variant,
-          ...(agent.description ? { description: agent.description } : {}),
         };
         grew = true;
       }
@@ -220,6 +223,8 @@ export async function registerV2Hooks(
       const nextOriginals = new Map(Object.entries(next.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
       // The "no such agent" notice for `subagentTiers` waits for the first prompt-time check (see the prompt hook).
       Object.defineProperty(next, DEFER_MISSING_SUBAGENT_NOTICE, { value: !promptChecked, enumerable: false });
+      // Names in the setup seed are host built-in agents (not opencode.json entries the config hook can tell apart).
+      Object.defineProperty(next, HOST_SEED_AGENTS, { value: new Set(Object.keys(baseSeed)), enumerable: false });
       await hooks.config?.(next);
       for (const name of Object.keys(next.agent)) if (!Object.hasOwn(baseSeed, name)) routerCreated.add(name);
       const nextOptions = new Map<string, Record<string, unknown>>();
@@ -294,10 +299,10 @@ export async function registerV2Hooks(
         const effects = agent ? event.resources.map(resource => evaluatePermission(agent.permissions, event.action, resource)) : ["deny"];
         if (effects.includes("deny")) {
           event.effect = "deny";
-          event.message = `Permission denied by read-only agent ${name}: ${event.action}`;
+          event.message = `Permission denied by ${agentLabel(name)} ${name}: ${event.action}`;
         } else if (effects.includes("ask") && event.effect === "allow") {
           event.effect = "ask";
-          event.message = `Approval required by read-only agent ${name}: ${event.action}`;
+          event.message = `Approval required by ${agentLabel(name)} ${name}: ${event.action}`;
         }
       } catch (error) {
         if (protectedKnown) event.effect = "deny";
@@ -383,7 +388,7 @@ export async function registerV2Hooks(
       if (!promptChecked) {
         promptChecked = true;
         for (const name of pendingSubagentNames()) {
-          warnPermissionOnce(`subagentTiers: '${name}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`);
+          warnAgentOptionsEffortOnce(`subagent-tiers:missing:${name}`, `subagentTiers: '${name}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`, ingestLogger);
         }
       }
     }));

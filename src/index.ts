@@ -49,6 +49,7 @@ import {
 import {
   resolveSubagentOverrides,
   DEFER_MISSING_SUBAGENT_NOTICE,
+  HOST_SEED_AGENTS,
   mergeSubagentOverride,
 } from "./router/subagents";
 import { fingerprintToolCall } from "./guard/fingerprint";
@@ -2240,6 +2241,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const tier = activeTiers[entry.tier];
         if (!tier) continue;
         const existing = opencodeConfig.agent[name];
+        const seed = (opencodeConfig as Record<symbol, unknown>)[HOST_SEED_AGENTS];
+        const fromHostSeed = seed instanceof Set && seed.has(name);
+        if (fromHostSeed && existing?.mode !== undefined && existing.mode !== "subagent") {
+          warnAgentOptionsEffortOnce(`plugin-agent-host-mode:${name}`, `agent ${name} collides with a host built-in agent whose mode is '${String(existing.mode)}'; the router \`agents\` entry is skipped`, logger);
+          continue;
+        }
         // A definition this hook built on a previous run is not a user entry.
         const previous = pluginAgentMarker(existing);
         const hostEntry: Record<string, unknown> | undefined = previous
@@ -2252,7 +2259,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           definition = mergeHostAgentEntry(definition, hostEntry);
           warnAgentOptionsEffortOnce(
             `plugin-agent-host-entry:${name}`,
-            `agent ${name} is defined both in the router \`agents\` block and in opencode.json; opencode.json wins for the fields it sets`,
+            `agent ${name} is defined both in the router \`agents\` block and in ${fromHostSeed ? "a host built-in agent" : "opencode.json"}; ${fromHostSeed ? "the host definition" : "opencode.json"} wins for the fields it sets`,
             logger,
           );
         }

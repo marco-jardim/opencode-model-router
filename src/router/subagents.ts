@@ -16,6 +16,8 @@ export interface SubagentOverride {
  * `config` hook while host agents may still be missing: the "no such agent"
  * notice then waits for its first prompt-time check.
  */
+/** v2 only: non-enumerable `Set<string>` of agent names that came from the host setup seed (host built-ins). */
+export const HOST_SEED_AGENTS = Symbol.for("opencode-model-router.host-seed-agents");
 export const DEFER_MISSING_SUBAGENT_NOTICE = Symbol.for("opencode-model-router.defer-missing-subagent-notice");
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

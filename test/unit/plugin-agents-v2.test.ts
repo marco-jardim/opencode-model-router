@@ -247,6 +247,18 @@ describe("plugin agents on v2", () => {
     await f.start(await plugin(setup({ agents: { scout } })));
     const notices = warn.mock.calls.map((args) => String(args[0])).filter((text) => text.includes("agent scout is defined both"));
     expect(notices).toHaveLength(1);
-    expect(f.agents.scout.description).toBe("Mine");
+    expect(notices[0]).toContain("a host built-in agent");
+    // The seed no longer carries the host description (QA-81-7): the router `agents` entry supplies it.
+    expect(f.agents.scout.description).toBe("Scout");
+  });
+
+  it("skips a plugin agent whose name is a non-subagent host agent in the seed (QA-81-7)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    cleanups.push(() => { vi.restoreAllMocks(); });
+    const f = fixture(defaults);
+    f.agents.hostprimary = { id: "hostprimary", mode: "primary", permissions: defaults("hostprimary"), request: {} };
+    await f.start(await plugin(setup({ agents: { hostprimary: scout } })));
+    expect(f.agents.hostprimary.mode).toBe("primary");
+    expect(warn.mock.calls.map((args) => String(args[0])).some((text) => text.includes("collides with a host built-in agent"))).toBe(true);
   });
 });
