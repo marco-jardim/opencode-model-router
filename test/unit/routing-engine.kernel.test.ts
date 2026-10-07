@@ -666,6 +666,21 @@ describe("A34: never-down uses the pick's capability rank (QA-G-B1) and excludes
   };
   const highImplement = facts({ class: "implement", risk: "high" });
 
+  it("R2-5: off-preset general@haiku needs evidence even above the fast candidate rank", () => {
+    const haiku = "anthropic/claude-haiku-4-5";
+    const agents = [...routerAgents, { ...general, model: haiku }];
+    const target = key("general", "host", haiku, "default");
+    const cold = run(plain, agents, "fast", highImplement, seeded({}), haiku);
+    expect(cold.ineligible[target]).toBe("evidence");
+    const warm = run(plain, agents, "fast", highImplement, seeded({ [target]: [20, 0] }), haiku);
+    expect(warm.ineligible[target]).toBeUndefined();
+  });
+
+  it("R2-9: capability and same-model effort comparisons ignore provider/model case", () => {
+    expect(capabilityRank(routerLadder(), { model: OPUS.toUpperCase(), variant: "xhigh" }, null)).toBe(2);
+    expect(lowerEffortOnSameModel({ model: OPUS.toUpperCase(), variant: "high" }, { model: OPUS, variant: "xhigh" })).toBe(true);
+  });
+
   it("P1 A1: @general on the parent's opus#xhigh (candidate rank capped at medium) is heavy-capable: medium is never-down → kept", () => {
     const store = seeded({
       [key("medium", "router", SONNET, "medium")]: [20, 0],

@@ -168,7 +168,7 @@ export function coversNeeds(grants: readonly Need[] | null, needs: readonly Need
 /** `provider/model` of a dispatch (a `#variant` suffix split off) and its normalized variant (`default` when none). */
 function canonicalRung(dispatch: { readonly model: string; readonly variant: string | null }): { readonly model: string; readonly variant: string } {
   const parts = modelParts(dispatch.model, dispatch.variant);
-  return { model: parts.provider === "" ? parts.model : `${parts.provider}/${parts.model}`, variant: normalizeVariant(parts.variant) };
+  return { model: (parts.provider === "" ? parts.model : `${parts.provider}/${parts.model}`).toLowerCase(), variant: normalizeVariant(parts.variant) };
 }
 
 /**
@@ -187,22 +187,30 @@ export function capabilityRank(
   dispatch: { readonly model: string; readonly variant: string | null },
   candidateRank: number | null,
 ): number | null {
-  const target = canonicalRung(dispatch);
+  return capabilityRankLookup(ladder)(dispatch, candidateRank);
+}
+
+/** Index once per decision: evidence checks must stay linear on long ladders. */
+function capabilityRankLookup(ladder: Pick<Ladder, "presetRungs" | "candidates" | "reachable">) {
   const table = ladder.presetRungs
     ?? [...ladder.candidates, ...(ladder.reachable ?? [])].filter((rung) => rung.agent.origin === "router");
-  let exact: number | null = null;
-  let sameModel: number | null = null;
+  const models = new Map<string, number>();
+  const exact = new Map<string, Map<string, number>>();
   for (const rung of table) {
     if (!isFiniteNumber(rung.rank)) continue;
     const own = canonicalRung(rung);
-    if (own.model !== target.model) continue;
-    if (sameModel === null || rung.rank > sameModel) sameModel = rung.rank;
-    if (own.variant === target.variant && (exact === null || rung.rank > exact)) exact = rung.rank;
+    models.set(own.model, Math.max(models.get(own.model) ?? -Infinity, rung.rank));
+    let variants = exact.get(own.model);
+    if (variants === undefined) { variants = new Map(); exact.set(own.model, variants); }
+    variants.set(own.variant, Math.max(variants.get(own.variant) ?? -Infinity, rung.rank));
   }
-  const preset = exact ?? sameModel;
-  const floor = isFiniteNumber(candidateRank) ? candidateRank : null;
-  if (preset === null) return floor;
-  return floor === null ? preset : Math.max(preset, floor);
+  return (dispatch: { readonly model: string; readonly variant: string | null }, candidateRank: number | null): number | null => {
+    const target = canonicalRung(dispatch);
+    const preset = exact.get(target.model)?.get(target.variant) ?? models.get(target.model) ?? null;
+    const floor = isFiniteNumber(candidateRank) ? candidateRank : null;
+    if (preset === null) return floor;
+    return floor === null ? preset : Math.max(preset, floor);
+  };
 }
 
 /**
@@ -304,7 +312,8 @@ export function decide(input: DecisionInput): Decision {
   }
   const chosenRank = chosenIndex >= 0 ? cands[chosenIndex]!.rank : null;
   // A34 (QA-G-B1): what the pick is worth, not its capped candidate rank: never-down and the A24/A27 test compare against this.
-  const pickRank = chosenRank === null ? null : capabilityRank(ladder, input.chosen, chosenRank);
+  const rankOf = capabilityRankLookup(ladder);
+  const pickRank = chosenRank === null ? null : rankOf(input.chosen, chosenRank);
 
   // --- p_k: D7 prior by rank offset + evidence (store reads only for a trusted class) ------------
   const referenceRank = trusted
@@ -475,7 +484,8 @@ export function decide(input: DecisionInput): Decision {
     }
     // Strict: ties keep the pick (considered first), then the earlier rung.
     if (argmin < 0 || C[k]! < C[argmin]!) argmin = k;
-    if (!(pickRank !== null && cand.rank > pickRank) && !hasMinEvidence(evidence[k]!)) {
+    const presetRank = rankOf(cand, null);
+    if (!(pickRank !== null && cand.rank > pickRank && presetRank !== null && presetRank > pickRank) && !hasMinEvidence(evidence[k]!)) {
       if (!Object.prototype.hasOwnProperty.call(ineligible, keys[k]!)) ineligible[keys[k]!] = "evidence";
       continue;
     }
