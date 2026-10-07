@@ -10,10 +10,12 @@ export {
   GIVE_UP_COST,
   MIN_EVIDENCE_TO_SWITCH_DOWN,
   candidateKey,
+  capabilityRank,
   coversNeeds,
   decide,
   giveUpCost,
   hasMinEvidence,
+  lowerEffortOnSameModel,
 } from "./kernel";
 export {
   buildLadder,

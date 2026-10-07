@@ -19,6 +19,7 @@ function decision(over: Partial<Decision> = {}): Decision {
   return {
     chosen: choice("medium", "medium"), best: choice("heavy", "xhigh"), argmin: null, switched: true, pinned: false, confidence: 0.5,
     reasonCode: "switched", reason: "switched: C(best)=5 < (1 − 0.2)·C(chosen)=9 ratio", costs: {}, unit: "ratio", ineligible: {}, target: target("heavy", "xhigh"),
+    pickRank: 1,
     ...over,
   };
 }

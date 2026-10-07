@@ -389,7 +389,8 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     if (ref !== null) {
       const model = `${ref.provider}/${ref.model}`;
       const matched = presetRungs.find((rung) => sameRung(rung, { model, variant: ref.variant }));
-      // A25: price and rank come from the matching preset rung; the owning tier's rank only caps it.
+      // A25: price and rank come from the matching preset rung; the owning tier's rank only caps it. The cap is for the CANDIDATE
+      // only: when this agent is the pick, never-down compares against its capability rank (`kernel.capabilityRank`, A34).
       const lowered = matched !== undefined && matched.rank < owningRank;
       own = {
         agent,
@@ -506,6 +507,8 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     excluded,
     ...(reachable.length > 0 ? { reachable } : {}),
     paths,
+    // A34 (QA-G-B1): the capability table. A role rung's rank stays capped at the owning tier; the pick's capability is read here.
+    presetRungs: presetRungs.map((rung) => ({ model: rung.model, variant: rung.variant, rank: rung.rank })),
   };
 }
 // ---------------------------------------------------------------------------

@@ -642,24 +642,28 @@ describe("QA-1.4-15: only a strictly higher rank is ungated (A24 amended) — th
       medium: tier(SONNET, "high", 5, { candidates: [{ variant: "low", costRatio: 5 }, { variant: "high", costRatio: 5 }] }),
       heavy: tier(OPUS, "xhigh", 20),
     });
-    // risk high + no detection: never-down keeps `fast` out, so the argmin is the sideways rung.
-    const f = { class: "implement", risk: "high", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+    // A medium floor keeps `fast` out, so the argmin is the sideways rung (risk medium: never-down does not apply).
+    const f = { class: "implement", risk: "medium", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
     const ladder = buildLadder({ cfg, routing: { roles: {} }, facts: f, agents: routerAgents() });
     const [low, high] = ladder.candidates.filter((c) => c.tier === "medium");
     expect([low!.variant, high!.variant, low!.costRatio, high!.costRatio, low!.rank, high!.rank]).toEqual(["low", "high", 5, 5, 1, 1]);
     const store = createOutcomeStore({ now: () => 1_000 });
     const pickKey = keyOf("implement", "medium", "router", SONNET, "high");
     for (let i = 0; i < 4; i++) store.recordVerdict(pickKey, "fail", { attemptID: `h${i}`, step: "dispatch" });
-    const decision = decide({
-      facts: f, ladder, store, detection: "none", pin: false,
-      routing: { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection },
-      chosen: resolveChosen({ cfg, agents: routerAgents(), agent: "medium", model: `${SONNET}#high` })!,
-    });
+    const chosen = resolveChosen({ cfg, agents: routerAgents(), agent: "medium", model: `${SONNET}#high` })!;
+    const routing = { profile: "balanced", margin: 0.2, minClassConfidence: 0.7, detection } as const;
+    const decision = decide({ facts: f, ladder, store, detection: "none", pin: false, routing, chosen, floorRank: 1 });
     expect(decision.chosen.variant).toBe("high");
     expect(decision.argmin?.agent).toBe("medium");
     expect(decision.argmin?.variant).toBe("low");
     expect(decision.best?.variant).toBe("high");
     expect(decision.reasonCode).toBe("kept:evidence");
+    // QA-G-B6 (A34): on high-risk work without detection the lower variant of the pick's own model is never-down, not merely gated.
+    const high3 = { ...f, risk: "high" } as const;
+    const neverDown = decide({ facts: high3, ladder, store, detection: "none", pin: false, routing, chosen, floorRank: 1 });
+    expect(neverDown.ineligible[keyOf("implement", "medium", "router", SONNET, "low")]).toBe("never-down");
+    expect(neverDown.argmin?.variant).toBe("high");
+    expect(neverDown.switched).toBe(false);
   });
 
   it("E4: search, safe/high/deterministic, margin 0.1, priors only: fast → explore@haiku is sideways → kept:evidence", () => {
