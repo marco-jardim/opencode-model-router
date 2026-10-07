@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GIT_OPERATIONS, gitArgv, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit, runBoundedProcess, stripUrlUserinfo, validatePath, validateRef } from "../../src/router/git-tools";
@@ -30,6 +30,14 @@ describe("shell-free git inspection", () => {
     for (const limit of [0, -1, 51, 1.5, NaN]) expect(() => gitArgv("log", { limit }, root)).toThrow();
     expect(() => gitTools().router_git_diff.args.mode?.parse("--output=x")).toThrow();
     expect(() => gitArgv("blame", {}, root)).toThrow("requires path");
+  });
+  it("rejects escaping directory symlinks/junctions and absolute paths inside the repo too", () => {
+    const outside = mkdtempSync(join(tmpdir(), "router-git-outside-"));
+    try {
+      symlinkSync(outside, join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+      expect(() => validatePath(root, "escape/new.txt")).toThrow("escapes");
+      expect(() => validatePath(root, join(root, "file.txt"))).toThrow("relative path");
+    } finally { rmSync(outside, { recursive: true, force: true }); }
   });
   it.each(GIT_OPERATIONS)("hardens %s argv and environment", operation => {
     const args = gitArgv(operation, { path: "file.txt" }, root);
@@ -84,5 +92,20 @@ describe("shell-free git inspection", () => {
     const result = runBoundedProcess(process.execPath, ["-e", "setInterval(()=>{},1000)"], root, { signal: controller.signal });
     controller.abort(); await expect(result).rejects.toThrow("aborted");
     await expect(runBoundedProcess(process.execPath, [], root, { signal: controller.signal })).rejects.toThrow("aborted");
+  });
+  it("kills a spawned descendant, not just its parent, on abort", async () => {
+    const pidFile = join(root, "child.pid");
+    const controller = new AbortController();
+    const script = `const {spawn}=require('node:child_process'); const fs=require('node:fs'); const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid)); setInterval(()=>{},1000);`;
+    const result = runBoundedProcess(process.execPath, ["-e", script], root, { signal: controller.signal });
+    // Attach the rejection handler immediately; startup may fail before the file appears.
+    const settled = result.catch(error => String(error));
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise(done => setTimeout(done, 20));
+    controller.abort();
+    expect(await settled).toContain("aborted");
+    expect(existsSync(pidFile)).toBe(true);
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
   });
 });

@@ -74,6 +74,62 @@ const sameModel = (m: ModelRef | undefined, want: { providerID: string; id: stri
 const inputOf = (h: HookRecord | undefined) => obj(h?.input);
 
 d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
+  it("77 fast read-only: host refuses shell edit execute subagent and permits inspection", async () => {
+    const host = await RoutingHost.start("fast-readonly", { routing: null });
+    const evidence: Obj[] = [];
+    try {
+      execFileSync("git", ["init", "-q", host.project], { shell: false, windowsHide: true });
+      const target = path.join(host.project, "readonly-probe.txt");
+      await writeFile(target, "READ_ONLY_ORIGINAL\n");
+      const probes: Array<{ tool: string; input: Obj; allowed: boolean }> = [
+        { tool: "shell", input: { command: "echo WRITE_ATTEMPT > readonly-probe.txt", workdir: host.project }, allowed: false },
+        { tool: "edit", input: { path: target, oldString: "READ_ONLY_ORIGINAL", newString: "WRITE_ATTEMPT" }, allowed: false },
+        { tool: "execute", input: { code: "return 'WRITE_ATTEMPT'" }, allowed: false },
+        { tool: "subagent", input: { agent: "medium", description: "forbidden child", prompt: "CHILD_DONE" }, allowed: false },
+        { tool: "read", input: { path: target }, allowed: true },
+        { tool: "grep", input: { pattern: "READ_ONLY_ORIGINAL", path: host.project }, allowed: true },
+        { tool: "glob", input: { pattern: "*.txt", path: host.project }, allowed: true },
+        { tool: "router_git_status", input: {}, allowed: true },
+        { tool: "router_git_diff", input: { ref: "--output=readonly-probe.txt" }, allowed: false },
+      ];
+      for (const probe of probes) {
+        // No allow-all session rule: v2 inherits parent session rules AFTER the
+        // agent's rules, and an explicit allow-all intentionally overrides policy.
+        const root = await host.newRoot(`readonly ${probe.tool}`, undefined, host.project, []);
+        const result = await host.dispatch(root, { agent: "fast", description: `readonly ${probe.tool}`, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool: probe.tool, input: probe.input })}`, background: false });
+        const requests = host.requestsOf(result.childID).filter(r => r.kind === "primary");
+        const names = requests[0]?.toolNames ?? [];
+        const hooks = (await host.hooks()).filter(h => h.sessionID === result.childID && h.tool === probe.tool && h.hook === "after");
+        const messages = await host.client.session.context({ sessionID: result.childID });
+        const states = messages.flatMap(message => arr(obj(message).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
+        const context = JSON.stringify(states);
+        const agent = (await host.client.agent.list()).data.find(a => a.id === "fast");
+        evidence.push({ tool: probe.tool, allowed: probe.allowed, advertised: names, permissions: agent?.permissions,
+          statuses: hooks.map(h => h.status), hostRefusal: states.some(state => state.status === "error") });
+        await writeFile(path.join(ROOT, "docs", "qa", "fast-readonly-smoke.json"), JSON.stringify(evidence, null, 2) + "\n");
+        if (probe.allowed) {
+          expect(names).toContain(probe.tool);
+          expect(hooks.some(h => h.status === "completed"), JSON.stringify(hooks)).toBe(true);
+        } else if (probe.tool === "router_git_diff") {
+          // Thrown plugin tool errors are recorded in host session state; the
+          // host need not invoke execute.after for a failed executor.
+          expect(states.some(state => state.status === "error"), context).toBe(true);
+          expect(context).toContain("Invalid git ref");
+        } else {
+          expect(names).not.toContain(probe.tool);
+          expect(hooks.some(h => h.status === "completed")).toBe(false);
+          expect(states.some(state => state.status === "error" && String(obj(state.error).message).includes(`No tool named "${probe.tool}"`)), context).toBe(true);
+        }
+        expect(await readFile(target, "utf8")).toBe("READ_ONLY_ORIGINAL\n");
+        expect(await host.children(result.childID)).toHaveLength(0);
+      }
+      expect(host.provider.errors).toEqual([]);
+    } finally {
+      const teardown = await host.stop();
+      expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
+    }
+  }, 300_000);
+
   it("1 shadow: a dispatch writes a decision row and a step record, and the host runs the orchestrator's pick untouched", async () => {
     const host = await RoutingHost.start("shadow", { routing: { engine: "shadow" }, seed: SEARCH_SEED });
     try {
