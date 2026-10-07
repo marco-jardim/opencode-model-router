@@ -950,6 +950,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               gateRes: Awaited<ReturnType<typeof accept>>;
               /** The producer errored or timed out: its context is not trusted for a resume (D11). */
               producerFailed: boolean;
+              confirmProducer?: () => void;
             } | {
               sessionID: string;
               text: string;
@@ -1270,7 +1271,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // still covered by the `finally` below. Without a session-aware policy: as before.
               if (!sessionAware) await disposeChildSession(producerSid);
 
-              return { sessionID: producerSid, text: producerText, gateRes, producerFailed: producerError !== null };
+              return { sessionID: producerSid, text: producerText, gateRes, producerFailed: producerError !== null, confirmProducer };
             };
 
             while (true) {
@@ -1325,7 +1326,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 sessionAware ? { sessionID: producerSid, lastStepTokens } : undefined,
               );
               // The verdict of this attempt, on the attempt's own registration (variant steps feed the store separately).
-              if (recording && !gateRes.verdict.skipped) ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict));
+              if (recording && !gateRes.verdict.skipped) {
+                // R2-2: a failed/timed-out producer may never deliver host confirmation. The ladder's
+                // verdict still needs its decision row; the same callback is idempotent after host progress/result.
+                attempt.confirmProducer?.();
+                ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict));
+              }
 
               const action = nextAction(
                 state,

@@ -386,6 +386,15 @@ describe("native v2 child runner", () => {
 });
 
 describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
+  it.each(["failed", "aborted", "timeout"])("R2-2: a named %s result confirms the resumed attempt without progress", async (status) => {
+    const { runtime, toolContext, execute } = fixture();
+    const onConfirmed = vi.fn(async () => {});
+    execute.mockResolvedValueOnce({ output: { sessionID: "child", status, output: "" } });
+    await expect(runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "go", resumeSessionID: "child", onCreated: async () => {}, onConfirmed,
+    }))).rejects.toThrow("completed child result");
+    expect(onConfirmed).toHaveBeenCalledExactlyOnceWith("child");
+  });
   it("sends sessionID with the new agent and model#variant, registers the child before the host runs it, and keeps its cwd", async () => {
     const { runtime, toolContext, execute, context } = fixture();
     const order: string[] = [];

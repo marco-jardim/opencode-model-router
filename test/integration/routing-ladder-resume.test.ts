@@ -56,6 +56,8 @@ interface Scenario {
   readonly during?: (attempt: number, sid: string) => void;
   /** Never settle the producer of attempt `n` (it only ends when its signal aborts). */
   readonly hangAttempt?: number;
+  /** Fail a resumed producer without a host confirmation, exercising verdict fallback. */
+  readonly failUnconfirmedResume?: boolean;
   /**
    * When the host's `session.execution.*` event for a producer reaches the plugin: right after its last step event
    * (default), 300 ms after the producer returned (the runner has to wait for it), or never.
@@ -179,6 +181,7 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
         }
         await request.onCreated(sid);
         if (resume !== undefined && s.strayResume === true) throw new ResumeRejectedError(resume, "the host started another child instead");
+        if (resume !== undefined && s.failUnconfirmedResume === true) throw new Error("unconfirmed producer timeout");
         await request.onConfirmed?.(sid);
         const options = await params(sid, request.agent, request.model);
         runs.push({ kind: "producer", sid, agent: request.agent, model: request.model, resumeSessionID: resume, prompt: request.prompt, options });
@@ -618,6 +621,22 @@ describe("delegate ladder: resume on v2 (Phase 2.3, D10/D11)", { timeout: 20_000
   });
 
   describe("telemetry (engine shadow)", () => {
+    it("R2-2: a verdict confirms a failed resume with no host progress/result, exactly once", async () => {
+      const outcomes = mkdtempSync(join(tmpdir(), "ladder-unconfirmed-outcomes-"));
+      dirs.push(outcomes);
+      const t = await setup({ tiers: OWNER, routing: { engine: "shadow", minClassConfidence: 0, outcomes: { path: outcomes } }, verdicts: [false], failUnconfirmedResume: true });
+      await t.run();
+      const bundle = acquireOutcomes({ dir: outcomes, tuning: {}, logger: { warn: () => undefined } });
+      try {
+        await bundle.flusher.flushNow();
+        const rows = (await bundle.persister.readRows()).rows;
+        const decisions = rows.filter((r): r is DecisionRow => r.kind === "decision");
+        expect(decisions.map((r) => [r.step, r.resume])).toEqual([["dispatch", false], ["variant", true]]);
+        expect(new Set(decisions.map((r) => r.decisionID)).size).toBe(2);
+        expect(rows.filter((r): r is VerdictRow => r.kind === "verdict").map((r) => [r.verdict, r.decisionID]))
+          .toEqual([["fail", decisions[0]!.decisionID], ["fail", decisions[1]!.decisionID]]);
+      } finally { await bundle.release(); }
+    });
     it("a stray resume writes only the fresh fallback row for that attempt", async () => {
       const outcomes = mkdtempSync(join(tmpdir(), "ladder-stray-outcomes-"));
       dirs.push(outcomes);

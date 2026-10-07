@@ -207,8 +207,10 @@ export function createV2Runtime(ctx: Plugin.Context) {
             }
           },
         });
-        signal.throwIfAborted();
         const output = result.output as { sessionID?: unknown; status?: unknown; output?: unknown } | undefined;
+        // A named child confirms an attempted resume even when its result failed or was aborted.
+        if (childID && output?.sessionID === childID) await confirmChild(childID);
+        signal.throwIfAborted();
         if (resumeID !== undefined && typeof output?.sessionID === "string" && output.sessionID !== resumeID) {
           const cleanup = await removeStray(output.sessionID);
           throw new ResumeRejectedError(resumeID, `the host started another child (${output.sessionID}) instead${cleanup}`);
