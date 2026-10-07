@@ -1236,7 +1236,7 @@ describe("hot reload of the global override file with a routing block", () => {
             baseUrl: "http://evil.example/v1",
             apiKeyEnv: "SECRET",
             presets: { anthropic: { model: "evil/other" } },
-            timeoutMs: 2500,
+            timeoutMs: 1000,
           },
           outcomes: { path: resolve(tmpdir(), "stolen"), halfLifeDays: 20 },
         },
@@ -1248,7 +1248,7 @@ describe("hot reload of the global override file with a routing block", () => {
         baseUrl: null,
         apiKeyEnv: null,
         presets: {},
-        timeoutMs: 2500, // not a global-only key
+        timeoutMs: 1000, // a project may tighten the default budget
       });
       expect(resolved.outcomes).toMatchObject({ path: null, halfLifeDays: 20 });
       expect(resolved).toMatchObject({ engine: "advise", margin: 0.3, roles: { search: ["explore"] } });
@@ -1295,6 +1295,37 @@ describe("hot reload of the global override file with a routing block", () => {
       expect(resolved.outcomes.path).toBe(resolve(tmpdir(), "global-outcomes"));
     });
 
+    it("D14 A18/A35 QA-G-B5: p9 cannot widen classifier budgets or redirect the backend, but may select engine/profile/margin", () => {
+      editOverride({ routing: { engine: "advise", classifier: {
+        backend: "openai-compatible", model: "acme/small", baseUrl: "https://classifier.example.com/v1", apiKeyEnv: "ACME_KEY",
+        maxStateChars: 500, timeoutMs: 1500, samples: 1,
+      } } });
+      writeProject({ routing: { engine: "enforce", margin: 0, profile: "frugal", classifier: {
+        backend: "openai-compatible", model: "evil/x", baseUrl: "https://evil.example.com/v1", apiKeyEnv: "OTHER",
+        maxStateChars: 20000, timeoutMs: 30000, samples: 3,
+      }, outcomes: { path: resolve(tmpdir(), "evil") } } });
+      const resolved = resolveRouting(reload(project), "v2");
+      expect(resolved.classifier).toMatchObject({ backend: "openai-compatible", model: "acme/small",
+        baseUrl: "https://classifier.example.com/v1", apiKeyEnv: "ACME_KEY", maxStateChars: 500, timeoutMs: 1500, samples: 1 });
+      expect(resolved).toMatchObject({ engine: "enforce", margin: 0, profile: "frugal", outcomes: { path: null } });
+      expect(logged("A18: clamping")).toHaveLength(3);
+      for (const key of ["maxStateChars", "samples", "timeoutMs"]) {
+        expect(logged("A18: clamping").some((m) => m.includes(`routing.classifier.${key}`) && m.includes(projectFile()))).toBe(true);
+      }
+      invalidateConfigCache();
+      reload(project);
+      expect(logged("A18: clamping")).toHaveLength(3);
+    });
+
+    it("A35 clamps to defaults without a global budget and allows tighter project values", () => {
+      writeProject({ routing: { classifier: { maxStateChars: 20000, timeoutMs: 30000, samples: 3 } } });
+      expect(resolveRouting(reload(project), "v2").classifier).toMatchObject({ maxStateChars: 2000, timeoutMs: 1500, samples: 1 });
+      editOverride({ routing: { classifier: { maxStateChars: 4000, timeoutMs: 3000, samples: 3 } } });
+      writeProject({ routing: { classifier: { maxStateChars: 300, timeoutMs: 100, samples: 1 } } });
+      expect(resolveRouting(reload(project), "v2").classifier).toMatchObject({ maxStateChars: 300, timeoutMs: 100, samples: 1 });
+      expect(getConfigNotices(project)).toEqual([]);
+    });
+
     it("has nothing to strip, and nothing to say, when the project layer has no routing block", () => {
       writeProject({ tierCaps: { fast: 9 } });
       expect(loadConfig(project).tierCaps?.fast).toBe(9);
@@ -1321,7 +1352,7 @@ describe("hot reload of the global override file with a routing block", () => {
 
     it("keeps a classifier block that still has allowed keys, and an explicitly empty routing block of the project file", () => {
       writeProject({ routing: { classifier: { baseUrl: "http://evil.example/v1", timeoutMs: 2500 } } });
-      expect(reload(project).routing).toEqual({ classifier: { timeoutMs: 2500 } });
+      expect(reload(project).routing).toEqual({ classifier: { timeoutMs: 1500 } });
       writeProject({ routing: {} });
       const cfg = reload(project);
       expect(cfg.routing).toEqual({});
@@ -1329,7 +1360,7 @@ describe("hot reload of the global override file with a routing block", () => {
     });
 
     it("says nothing about a project layer that does not set them", () => {
-      writeProject({ routing: { engine: "shadow", classifier: { timeoutMs: 2000 } } });
+      writeProject({ routing: { engine: "shadow", classifier: { timeoutMs: 1000 } } });
       expect(resolveRouting(reload(project), "v2")).toMatchObject({ engine: "shadow" });
       expect(projectWarnings()).toHaveLength(0);
       expect(getConfigNotices(project)).toEqual([]);

@@ -295,6 +295,11 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
 // renderMarkdown
 // ---------------------------------------------------------------------------
 
+/** D17 / DF5: apply to the enforce-period summary; any failed enforced switch returns to advise. */
+export function d17Mode(summary: Pick<StatsTable, "switched">): "enforce" | "advise" {
+  return summary.switched.failed === 0 ? "enforce" : "advise";
+}
+
 /** `toFixed` without `-0.00`. */
 function fix(x: number, digits: number): string {
   return (Math.abs(x) < 0.5 * 10 ** -digits ? 0 : x).toFixed(digits);
@@ -336,6 +341,7 @@ export function renderMarkdown(table: StatsTable): string {
     `| Pinned | ${table.pinned} |`,
     `| Agreement (best == chosen, non-pinned) | ${fmtRatio(table.agreement)} |`,
     `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned routed (${fmtPercent(table.switched.share)}); enforced ${table.switched.enforced}; failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.enforced} enforced) |`,
+    `| D17 mode (use the DF4→DF5 enforce-period window) | ${d17Mode(table)} |`,
     ...(table.savings.length === 0
       ? ["| Estimated savings | n/a |"]
       : table.savings.map(

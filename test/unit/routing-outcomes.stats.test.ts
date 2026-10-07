@@ -6,6 +6,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   USAGE,
+  d17Mode,
   parseStatsArgs,
   renderMarkdown,
   runStatsCli,
@@ -151,7 +152,35 @@ function shuffled<T>(items: readonly T[], seed: number): T[] {
 // summarize
 // ---------------------------------------------------------------------------
 
-describe("summarize", () => {
+describe("D17 final dogfood mode", () => {
+  it.each(["pass", "fail", "unverifiable"] as const)("D17: a switched enforced dispatch with %s chooses mode from the failed-switch count", (outcome) => {
+    const rows = [decision("switched", SINCE, { mode: "enforce", switched: true, best: choice(C) }), verdict("switched", SINCE, C, outcome)];
+    const table = summarize(null, rows, WINDOW);
+    expect(table.switched.failed).toBe(outcome === "fail" ? 1 : 0);
+    expect(d17Mode(table)).toBe(outcome === "fail" ? "advise" : "enforce");
+    expect(renderMarkdown(table)).toContain(`| D17 mode (use the DF4→DF5 enforce-period window) | ${outcome === "fail" ? "advise" : "enforce"} |`);
+  });
+
+  it("D17: only actual switched dispatches in the enforce period count, not would-switches, pins, resumes or policy lifts", () => {
+    const excluded: Partial<DecisionRow>[] = [
+      { mode: "advise" }, { mode: "shadow" }, { switched: false }, { pinned: true }, { resume: true },
+      { reason: `${FLOOR_LIFT_REASON}medium` }, { ts: "2026-10-05T23:59:59.000Z" }, { ts: UNTIL },
+    ];
+    const rows = excluded.flatMap((partial, i) => [
+      decision(`excluded-${i}`, SINCE, { mode: "enforce", switched: true, best: choice(C), ...partial }),
+      verdict(`excluded-${i}`, SINCE, C, "fail"),
+    ]);
+    expect(d17Mode(summarize(null, rows, WINDOW))).toBe("enforce");
+    expect(d17Mode(summarize(null, [], WINDOW))).toBe("enforce");
+    rows.push(decision("actual", SINCE, { mode: "enforce", switched: true, best: choice(C) }),
+      verdict("actual", "2026-10-07T01:00:00.000Z", C, "fail"));
+    const table = summarize(null, rows, WINDOW);
+    expect(table.switched.failed).toBe(1); // the dispatch is in-period even if its verdict lands later
+    expect(d17Mode(table)).toBe("advise");
+  });
+});
+
+describe("D18 summarize", () => {
   it("QA-G-C7: a duplicated batch has exactly the original statistics", () => {
     const batch = scenario();
     expect(summarize(null, [...batch, ...batch], WINDOW)).toEqual(summarize(null, batch, WINDOW));
@@ -584,6 +613,7 @@ describe("renderMarkdown", () => {
     "| Pinned | 1 |",
     "| Agreement (best == chosen, non-pinned) | 2/5 (40.0%) |",
     "| Switched | 2 of 6 non-pinned routed (33.3%); enforced 2; failed 1 (verified 1 of 2 enforced) |",
+    "| D17 mode (use the DF4→DF5 enforce-period window) | advise |",
     "| Estimated savings (ratio) | 1.50 over 3 rows |",
     "| Estimated savings (usd) | $0.0123 over 2 rows |",
     "| Variant steps | 3 taken; pass 1/2 (50.0%) |",
@@ -654,6 +684,7 @@ describe("renderMarkdown", () => {
         "| Pinned | 0 |",
         "| Agreement (best == chosen, non-pinned) | n/a |",
         "| Switched | 0 of 0 non-pinned routed (n/a); enforced 0; failed 0 (verified 0 of 0 enforced) |",
+        "| D17 mode (use the DF4→DF5 enforce-period window) | enforce |",
         "| Estimated savings | n/a |",
         "| Variant steps | 0 taken; pass n/a |",
         "| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 0 of 0 routed dispatches |",
@@ -847,7 +878,7 @@ function fakeIo(source: Partial<StatsSource> = {}) {
   return { io, out, errs, load, readRows, open };
 }
 
-describe("runStatsCli", () => {
+describe("D18 runStatsCli", () => {
   it("--help prints USAGE on stdout and exits 0 without opening anything", async () => {
     const { io, out, errs, open } = fakeIo();
     expect(await runStatsCli(["--help"], io)).toBe(0);
@@ -989,7 +1020,7 @@ describe("runStatsCli", () => {
 // The script, against a real directory
 // ---------------------------------------------------------------------------
 
-describe("scripts/routing-stats.ts (plain node)", () => {
+describe("D18 scripts/routing-stats.ts (plain node)", () => {
   const made: string[] = [];
   afterEach(async () => {
     while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true });
@@ -1029,7 +1060,7 @@ describe("scripts/routing-stats.ts (plain node)", () => {
     return { status: result.status, stdout: result.stdout, stderr: result.stderr.toString("utf8"), error: result.error };
   }
 
-  it("prints exactly the module's output for the same directory and window (byte for byte)", async () => {
+  it("D18: prints exactly the module's output for the same directory and window (byte for byte)", async () => {
     const parent = await parentDir();
     const dir = join(parent, "outcomes");
     await writeFixture(dir);

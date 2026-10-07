@@ -2122,6 +2122,7 @@ interface SourceFailure {
 export interface OverrideLayer {
   path: string;
   data: Record<string, unknown>;
+  project?: boolean;
 }
 
 /**
@@ -2189,7 +2190,7 @@ function collectOverrideLayers(
         });
       }
     }
-    layers.push({ path: p, data });
+    layers.push({ path: p, data, project });
   }
   return layers;
 }
@@ -2503,6 +2504,31 @@ function replaceRolesWholesale(merged: unknown, layers: readonly OverrideLayer[]
   return merged;
 }
 
+/** Merge an override while keeping project classifier budgets within the lower layers' bounds. */
+function mergeOverrideLayer(lower: unknown, layer: OverrideLayer, notices: ConfigNotice[]): unknown {
+  const merged = deepMerge(lower, layer.data);
+  if (!layer.project || !isPlainObject(merged) || !isPlainObject(merged.routing)) return merged;
+  const classifier = merged.routing.classifier;
+  const projectRouting = layer.data.routing;
+  const projectClassifier = isPlainObject(projectRouting) ? projectRouting.classifier : undefined;
+  if (!isPlainObject(classifier) || !isPlainObject(projectClassifier)) return merged;
+  const lowerRouting = isPlainObject(lower) ? lower.routing : undefined;
+  const lowerClassifier = isPlainObject(lowerRouting) ? lowerRouting.classifier : undefined;
+  const bounded = { ...classifier };
+  // A18 / A35: a repository may tighten the user's exposure/latency budgets, never widen them.
+  for (const key of ["maxStateChars", "samples", "timeoutMs"] as const) {
+    const requested = projectClassifier[key];
+    const inherited = isPlainObject(lowerClassifier) ? lowerClassifier[key] : undefined;
+    const ceiling = inherited ?? ROUTING_DEFAULTS.classifier[key];
+    if (typeof requested === "number" && Number.isFinite(requested) && typeof ceiling === "number" && requested > ceiling) {
+      bounded[key] = ceiling;
+      notices.push({ source: layer.path, message: `A18: clamping routing.classifier.${key} from ${layer.path} to ${ceiling}: project overrides may only tighten the lower-layer value (A35)` });
+    }
+  }
+  // deepMerge can share an override-only block: do not mutate a source layer used by fallback merges.
+  return { ...merged, routing: { ...merged.routing, classifier: bounded } };
+}
+
 /**
  * Build a fresh config from tiers.json + override layers + persisted state.
  * Throws only when tiers.json itself is unreadable/invalid. Override and state
@@ -2524,7 +2550,7 @@ function buildConfig(
   if (layers.length > 0) {
     const merge = (ls: OverrideLayer[]): unknown =>
       replaceRolesWholesale(
-        ls.reduce<unknown>((acc, l) => deepMerge(acc, l.data), base),
+        ls.reduce<unknown>((acc, l) => mergeOverrideLayer(acc, l, notices), base),
         ls,
       );
 
