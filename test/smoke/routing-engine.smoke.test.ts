@@ -111,10 +111,9 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
           expect(names).toContain(probe.tool);
           expect(hooks.some(h => h.status === "completed"), JSON.stringify(hooks)).toBe(true);
         } else if (probe.tool === "router_git_diff") {
-          // Thrown plugin tool errors are recorded in host session state; the
-          // host need not invoke execute.after for a failed executor.
-          expect(states.some(state => state.status === "error"), context).toBe(true);
-          expect(context).toContain("Invalid git ref");
+          // QA-77-G12: the tool reports its refusal as output instead of throwing
+          // into the session, so the host state holds the redacted error text.
+          expect(context).toContain("[router_git] error: Invalid git ref");
         } else {
           expect(names).not.toContain(probe.tool);
           expect(hooks.some(h => h.status === "completed")).toBe(false);
