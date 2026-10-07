@@ -19,6 +19,7 @@ import {
 } from "../../src/router/sessions";
 import { resetDispatchRouting } from "../../src/routing/wire/dispatch";
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
+import { RESUME_NAMED_NEEDS_REASON, RESUME_NAMED_NEVER_DOWN_REASON, RESUME_REASON } from "../../src/routing/outcomes/types";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 
@@ -682,6 +683,95 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     expect(last.reason).not.toMatch(/\b(?:kept|switched): (?:kept|switched): /);
   });
 });
+describe("A34 (QA-G-B3): the A30 running rewrite requires needs coverage and never-down", () => {
+  const CHECKED_MEDIUM = "[route class=implement risk=medium scope=single]\nImplement the parser change in src/a.ts.\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+  const HIGH = "[route class=implement risk=high scope=single]\nNow rotate the production API credentials and deploy the release.";
+  const FIND = "[route class=search risk=low scope=single]\nFind where the cache is built.";
+  const FIX = "[route class=implement risk=medium scope=single needs=shell,edit]\nNow fix it: edit src/cache.ts and run `npm test`.";
+  const resumeRows = async (world: World) => (await world.rows()).filter((row) => row.resume);
+
+  it("probe P3: a child moved down to @medium, resumed naming @heavy with high-risk work and no acceptance, is sent to @heavy (never-down)", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    const first = await hostStart(world, "child-dn", { agent: "heavy", prompt: CHECKED_MEDIUM });
+    expect(first.args).toMatchObject({ agent: "medium" }); // moved down legitimately: medium risk, deterministic checks
+    expect(lookupDispatch("child-dn")).toMatchObject({ agent: "medium", picked: "heavy" });
+    const resumed = await hostResume(world, "child-dn", { agent: "heavy", prompt: HIGH });
+    expect(resumed.args).toMatchObject({ agent: "heavy", sessionID: "child-dn" });
+    expect(resumed.args.model).toBeUndefined();
+    expect(resumed.child.agent).toBe("heavy"); // the host moves it back up to the pick
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, chosen: { agent: "heavy" }, facts: { risk: "high" } });
+    expect(row!.reason.startsWith(`${RESUME_NAMED_NEVER_DOWN_REASON}: `)).toBe(true);
+    expect(row!.reason.startsWith(RESUME_REASON)).toBe(true); // still a resume row for routing:stats
+    expect(row!.reason).toContain("NOT rewritten");
+    expect(lookupDispatch("child-dn")).toMatchObject({ agent: "heavy", decisionID: row!.decisionID });
+  });
+
+  it("control: the same resume with a deterministic [acceptance] block, or at medium risk, keeps the child where it runs", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    await hostStart(world, "child-ok", { agent: "heavy", prompt: CHECKED_MEDIUM });
+    const checked = await hostResume(world, "child-ok", { agent: "heavy", prompt: `${HIGH}\n[acceptance]\ncheck: testsPass\n[/acceptance]` });
+    expect(checked.args).toMatchObject({ agent: "medium", model: `${SONNET}#medium` });
+    expect(checked.switched).toBe(false);
+    const medium = await hostResume(world, "child-ok", { agent: "heavy", prompt: CHECKED_MEDIUM.replace("[acceptance]\ncheck: testsPass\n[/acceptance]", "") });
+    expect(medium.args).toMatchObject({ agent: "medium" });
+    const rows = await resumeRows(world);
+    expect(rows.map((row) => row.reason.split(":").slice(0, 3).join(":"))).toEqual(["kept:resume:running", "kept:resume:running"]);
+  });
+
+  it("probe P3b: a search child moved to read-only @explore, resumed with needs=shell,edit, is sent as named (needs)", async () => {
+    const world = await makeWorld({ engine: "enforce" }); // D12 default roles: search → explore
+    world.seed(KEYS.explore, 20, 0);
+    world.seed(KEYS.fast, 0, 10);
+    await world.start();
+    const first = await hostStart(world, "child-x", { agent: "fast", prompt: FIND });
+    expect(first.args).toMatchObject({ agent: "explore" });
+    const resumed = await hostResume(world, "child-x", { agent: "fast", prompt: FIX });
+    expect(resumed.args).toMatchObject({ agent: "fast", sessionID: "child-x" });
+    expect(resumed.args.agent).not.toBe("explore");
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: false, chosen: { agent: "fast" }, facts: { needs: ["shell", "edit"] } });
+    expect(row!.reason.startsWith(`${RESUME_NAMED_NEEDS_REASON}: `)).toBe(true);
+    expect(row!.reason).toContain("needs [shell,edit]");
+  });
+
+  it("a refused rewrite is still lifted to floorTier when the named pick is below it, and the lift row keeps the refusal", async () => {
+    const world = await makeWorld({ engine: "enforce" }, { enforcement: { verify: { testBaseline: false }, escalate: { floorTier: "medium" } } });
+    await world.start();
+    rememberDispatch("child-ro", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" },
+      agent: "explore", model: HAIKU, variant: null, tier: null, parentSessionID: "root", decisionID: "earlier", step: "dispatch", picked: "fast",
+    });
+    hostChildren.set("child-ro", { agent: "explore", model: HAIKU });
+    const resumed = await hostResume(world, "child-ro", { agent: "fast", prompt: FIX });
+    expect(resumed.args).toMatchObject({ agent: "medium", model: `${SONNET}#medium`, sessionID: "child-ro" });
+    const [row] = await resumeRows(world);
+    expect(row).toMatchObject({ resume: true, switched: true, best: { agent: "medium" } });
+    expect(row!.reason.startsWith("lift:floor: resume lifted from @fast to @medium")).toBe(true);
+    expect(row!.reason).toContain(`engine decision: ${RESUME_NAMED_NEEDS_REASON}: `);
+  });
+
+  it("shadow says what enforce would do with a refused rewrite: sent as named, never 'would be sent' to the running agent", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    await world.start();
+    rememberDispatch("child-sh", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [] as string[], confidence: 0.9, source: "rules" },
+      agent: "explore", model: HAIKU, variant: null, tier: null, parentSessionID: "root", decisionID: "earlier", step: "dispatch", picked: "fast",
+    });
+    const after = await routed(world, { agent: "fast", prompt: FIX, sessionID: "child-sh" });
+    expect(after.agent).toBe("fast");
+    const [row] = await resumeRows(world);
+    expect(row!.reason.startsWith(`${RESUME_NAMED_NEEDS_REASON}: `)).toBe(true);
+    expect(row!.reason).not.toContain("would be sent to @explore");
+  });
+});
+
 describe("A34 (QA-G-B2): a route-line d= never raises detection above the prompt's own [acceptance] block", () => {
   const CLAIMED = "[route class=implement risk=high scope=single d=deterministic]\nRotate the production signing key and deploy.";
   const CHECKED = `${CLAIMED}\n[acceptance]\ncheck: testsPass\n[/acceptance]`;

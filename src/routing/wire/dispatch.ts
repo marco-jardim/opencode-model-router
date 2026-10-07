@@ -41,12 +41,13 @@
  */
 
 import {
-  buildLadder, candidateKey, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, resolveChosen, tierRankOf, weakerDetection,
+  buildLadder, candidateKey, capabilityRank, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, lowerEffortOnSameModel, resolveChosen,
+  tierRankOf, weakerDetection,
 } from "../engine";
 import { routerTierIds } from "../engine/ladders";
-import type { ChosenDispatch, Decision, HostAgentInfo } from "../engine/types";
+import type { ChosenDispatch, Decision, HostAgentInfo, Ladder } from "../engine/types";
 import { classify } from "../classify";
-import type { ClassifyResult, TaskFacts } from "../classify/types";
+import type { ClassifyResult, Detection, TaskFacts } from "../classify/types";
 import type { RouterConfig } from "../../router/config";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
@@ -58,6 +59,8 @@ import {
   RESUME_REASON,
   RESUME_RUNNING_REASON,
   RESUME_PINNED_REASON,
+  RESUME_NAMED_NEEDS_REASON,
+  RESUME_NAMED_NEVER_DOWN_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -429,6 +432,31 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     return { agent: record.agent, model: record.model, variant: record.variant };
   };
 
+  /**
+   * A34 (QA-G-B3): may the A30 rewrite send this resume to the agent the child runs? Only when that agent is still startable by the
+   * parent and its EVALUATED permissions cover the resume's own `needs` (A11: the resume may ask for more than the first dispatch did),
+   * and, on high-risk work without detection (D9 never-down), when it is not below the named pick's capability rank — nor the pick's own
+   * model on a lower variant at that rank. Unknown agent info or an unknown capability is a refusal: the resume is then sent as named,
+   * which is the orchestrator's own pick and so never a move down. `null` = the rewrite is allowed.
+   */
+  const runningRefusal = (
+    running: { readonly agent: string; readonly model: string; readonly variant: string | null },
+    named: ChosenDispatch,
+    namedRank: number | null,
+    ladder: Ladder,
+    infos: readonly HostAgentInfo[] | null,
+    facts: TaskFacts,
+    detection: Detection,
+  ): "needs" | "never-down" | null => {
+    const info = infos?.find((candidate) => candidate.id === running.agent);
+    if (info === undefined || !info.permitted || info.mode === "primary" || info.hidden || !coversNeeds(info.grants, facts.needs)) return "needs";
+    if (facts.risk !== "high" || detection !== "none") return null;
+    const pickRank = capabilityRank(ladder, named, namedRank);
+    const runRank = capabilityRank(ladder, running, null);
+    if (pickRank === null || runRank === null || runRank < pickRank) return "never-down";
+    return runRank === pickRank && lowerEffortOnSameModel(running, named) ? "never-down" : null;
+  };
+
   const decideAndRecord = async (call: RouteCall, prepared: Prepared, session: SessionView, view: AgentView | null): Promise<RouteOutcome> => {
     const { args } = call;
     const agent = str(args.agent);
@@ -486,15 +514,25 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       const resuming = resumeID !== null;
       // QA-2.4-R3-1 (A30 amended): the router never moves a child from where it runs. A resume that repeats the orchestrator's original
       // pick of a child the router moved is sent to the agent/model the child runs (`enforce`; the other modes only say so in the row).
-      const running = resumeID === null ? null : runningAfterRouter(resumeID, call.sessionID, agent);
+      const moved = resumeID === null ? null : runningAfterRouter(resumeID, call.sessionID, agent);
+      // A34 (QA-G-B3): the rewrite must neither send the resume to an agent that cannot do the resumed work (needs, permission) nor move
+      // it below the named pick on high-risk work without detection (D9 never-down). Refused: the resume is sent as named (and floor-lifted).
+      const refusal = moved === null || decision.pinned
+        ? null
+        : runningRefusal(moved, chosen, decision.pickRank, ladder, infos, facts, detection);
+      const running = refusal === null ? moved : null;
       row = {
         chosen: decision.chosen, best: decision.best, switched: resuming ? false : decision.switched, pinned: decision.pinned,
         unit: decision.unit, costs: { ...decision.costs }, confidence: decision.confidence,
-        reason: running !== null
+        reason: moved !== null
           ? decision.pinned
             // A pinned resume is sent as named (`kept:resume:pinned`): it was NOT rewritten, so the row must not claim it was.
-            ? `${RESUME_PINNED_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; pinned, so it is sent as named and NOT rewritten (the host moves the child to @${agent}); engine decision: ${reasonText(decision)}`
-            : `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${running.agent}; ${mode === "enforce" ? "sent to @" + running.agent + " so the host does not switch it back (A30)" : "would be sent to @" + running.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${reasonText(decision)}`
+            ? `${RESUME_PINNED_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; pinned, so it is sent as named and NOT rewritten (the host moves the child to @${agent}); engine decision: ${reasonText(decision)}`
+            : refusal === "needs"
+              ? `${RESUME_NAMED_NEEDS_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; @${moved.agent} is not startable or its permissions do not cover needs [${facts.needs.join(",")}], so it is sent as named and NOT rewritten (the host moves the child to @${agent}) (A34); engine decision: ${reasonText(decision)}`
+              : refusal === "never-down"
+                ? `${RESUME_NAMED_NEVER_DOWN_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; @${moved.agent} is below the pick's capability on high-risk work without detection (D9 never down), so it is sent as named and NOT rewritten (the host moves the child to @${agent}) (A34); engine decision: ${reasonText(decision)}`
+                : `${RESUME_RUNNING_REASON}: the resume names @${agent}, the orchestrator's own pick for a child the router moved to @${moved.agent}; ${mode === "enforce" ? "sent to @" + moved.agent + " so the host does not switch it back (A30)" : "would be sent to @" + moved.agent + " (not applied in " + mode + ") so the host does not switch it back (A30)"}; engine decision: ${reasonText(decision)}`
           : resuming
             ? `${RESUME_REASON}: a dispatch that resumes an existing child is never switched by the engine (A30); engine decision: ${reasonText(decision)}`
             : reasonText(decision),

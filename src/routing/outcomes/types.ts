@@ -491,6 +491,20 @@ export const RESUME_RUNNING_REASON = "kept:resume:running";
  */
 export const RESUME_PINNED_REASON = "kept:resume:pinned";
 
+/**
+ * Reason prefix of a resume that repeats the original pick of a child the router moved, where the A30 rewrite to the running agent was
+ * REFUSED (plan amendment A34, QA-G-B3): the resume is sent as named (and lifted to `floorTier` in `enforce` when it would fall below it).
+ * The suffix says why: {@link RESUME_NAMED_NEEDS_REASON} or {@link RESUME_NAMED_NEVER_DOWN_REASON}. Still a `kept:resume` row
+ * (`startsWith(RESUME_REASON)`), `switched` false, outside every routing metric.
+ */
+export const RESUME_NAMED_REASON = "kept:resume:named";
+
+/** A34: the running agent's evaluated permissions do not cover the resume's `needs`, or it is no longer startable by the parent. */
+export const RESUME_NAMED_NEEDS_REASON = "kept:resume:named:needs";
+
+/** A34: the running agent is below the named pick's capability rank on high-risk work without detection (D9 never down). */
+export const RESUME_NAMED_NEVER_DOWN_REASON = "kept:resume:named:never-down";
+
 interface LogRowBase {
   readonly v: typeof LOG_ROW_VERSION;
   /** ISO-8601 UTC (`new Date(now()).toISOString()`). */
