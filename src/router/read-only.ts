@@ -65,6 +65,7 @@ function publishPluginPermissions(name: string, policy: readonly PermissionRule[
   const candidate = [...policy, ...denies];
   const actions = [...READ_ONLY_CANARIES, ...policy.filter(rule => rule.effect !== "deny").map(rule => rule.action)];
   const resources = [...PROBE_RESOURCES, ...policy.map(rule => rule.resource), ...inherited.map(rule => rule.resource)];
+  // Guard against future edits: with the current deny-only projection of `inherited` this check cannot fail.
   if (!isMonotone(policy, candidate, actions, resources)) {
     warn(`plugin agent permission check failed for ${name}; inherited rules restricted to denies`);
     return [...policy, ...denies];

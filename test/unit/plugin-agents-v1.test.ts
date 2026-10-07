@@ -202,5 +202,24 @@ describe("plugin agents on v1 (config hook)", () => {
     }
     expect(await grepAs("medium", "s3")).toContain("SECRET=abc");
   });
-});
+
+  it("records the plugin-agent session even while bypassed, and forgets it on session.deleted (QA-81-R2-2, R2-3)", async () => {
+    writeGlobal({ agents: agentsBlock });
+    const { hooks } = await run({});
+    const text = "Found 1 matches\n/repo/.env:\n  Line 1: SECRET=abc";
+    const grep = async (sessionID: string): Promise<string> => {
+      const output = { title: "grep", metadata: {}, output: text };
+      await hooks["tool.execute.after"]({ tool: "grep", sessionID, callID: `g-${sessionID}`, args: {} }, output);
+      return output.output;
+    };
+    const chat = (sessionID: string) => hooks["chat.message"]({ sessionID, agent: "scout" }, {
+      message: { id: `u-${sessionID}`, sessionID, role: "user", time: { created: Date.now() }, agent: "scout", model: { providerID: "test", modelID: "test" } },
+      parts: [],
+    });
+    await hooks["command.execute.before"]({ command: "bypass", arguments: "on", sessionID: "root" }, { parts: [] });
+    await chat("b1");
+    expect(await grep("b1")).not.toContain("SECRET=abc");
+    await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "b1" } } } });
+    expect(await grep("b1")).toContain("SECRET=abc");
+  });});
 

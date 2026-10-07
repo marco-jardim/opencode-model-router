@@ -288,7 +288,8 @@ function warnSessionLookupFailedOnce(): void {
 }
 
 /**
- * Agents the v1 host defines itself (opencode v1.18.34 agent.ts). They are absent from the opencodeConfig.agent`n * record the config hook receives, so subagentTiers needs them listed to avoid a false \missing\ skip (QA-81-4).
+ * Agents the v1 host defines itself (opencode v1.18.34 agent.ts). They are absent from the `opencodeConfig.agent`
+ * record the config hook receives, so `subagentTiers` needs them listed to avoid a false `missing` skip (QA-81-4).
  */
 const V1_HOST_BUILTIN_AGENTS: Record<string, { mode: string }> = {
   general: { mode: "subagent" },
@@ -315,6 +316,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const sessionStore = createSessionStore();
   /** v1 sessionID -> plugin agent name, from chat.message (tool.execute.after has no `agent` on v1). */
   const pluginAgentSessions = new Map<string, string>();
+  /** Records a plugin-agent session, bounded like the session-root memo (oldest entry evicted first). */
+  const rememberPluginAgentSession = (sessionID: string, agent: string): void => {
+    pluginAgentSessions.delete(sessionID);
+    pluginAgentSessions.set(sessionID, agent);
+    while (pluginAgentSessions.size > SESSION_ROOT_MEMO_MAX) {
+      const oldest = pluginAgentSessions.keys().next().value;
+      if (oldest === undefined) break;
+      pluginAgentSessions.delete(oldest);
+    }
+  };
   /** Plugin agents the v1 config hook built on its previous run -> the host entry it merged (QA-81-8). */
   let builtPluginAgents = new Map<string, Record<string, unknown> | undefined>();
   let systemDebugLogged = false;
@@ -1502,6 +1513,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
 
     "chat.message": async (input: any, output: any) => {
+      // Recorded even while bypassed: the grep redaction in `tool.execute.after` runs regardless of bypass (QA-81-R2-2).
+      if (typeof input?.sessionID === "string" && typeof input?.agent === "string" && Object.hasOwn(cfg.agents ?? {}, input.agent)) {
+        rememberPluginAgentSession(input.sessionID, input.agent);
+      }
       if (bypassed) return;
       // 2.4.3 (QA-2.4-R2-1): the cost doctor's notice is NEVER part of the user's message (the prompt text stays byte for byte what the user
       // typed). It is a synthetic transcript entry, through the same host call the adapter uses for the config-reload and narration notices
@@ -1531,10 +1546,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
       const tierNames = Object.keys(getActiveTiers(cfg));
       const sid = input?.sessionID;
-      // v1 `tool.execute.after` carries no agent: remember which sessions run a plugin agent (QA-81-2).
-      if (typeof sid === "string" && typeof input?.agent === "string" && Object.hasOwn(cfg.agents ?? {}, input.agent)) {
-        pluginAgentSessions.set(sid, input.agent);
-      }
+      // v1 `tool.execute.after` carries no agent: plugin-agent sessions are recorded at the top of this hook (QA-81-2).
       try {
         const registration = sessionStore.registerFromChatMessage(
           input,
@@ -2068,6 +2080,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           if (typeof id === "string") {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
+            pluginAgentSessions.delete(id);
             sessionStore.unregister(id);
             effortOverrides.clear(id);
             depthTracker.forget(id);
@@ -2286,7 +2299,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const subagentOverrides = resolveSubagentOverrides({
         subagentTiers: cfg.subagentTiers,
         tiers: activeTiers,
-        existingAgents: { ...V1_HOST_BUILTIN_AGENTS, ...opencodeConfig.agent },
+        // The built-in list is the v1 host's; on v2 the setup seed already carries the real host agents.
+        existingAgents: ctx.routerHost === "v2" ? opencodeConfig.agent : { ...V1_HOST_BUILTIN_AGENTS, ...opencodeConfig.agent },
         pluginAgents: cfg.agents,
         onSkip: (agentName, reason) =>
           reason === "missing" && opencodeConfig[DEFER_MISSING_SUBAGENT_NOTICE] === true
