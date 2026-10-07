@@ -18,11 +18,13 @@ import {
   resolveVariantSteps,
   routerStatusLines,
   warnConfigIssues,
+  resolveActiveTiers,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { gitTools } from "./router/git-tools";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
+import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
 import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
@@ -47,6 +49,8 @@ import {
 } from "./commands/output";
 import {
   resolveSubagentOverrides,
+  DEFER_MISSING_SUBAGENT_NOTICE,
+  HOST_SEED_AGENTS,
   mergeSubagentOverride,
 } from "./router/subagents";
 import { fingerprintToolCall } from "./guard/fingerprint";
@@ -283,6 +287,20 @@ function warnSessionLookupFailedOnce(): void {
   );
 }
 
+/**
+ * Agents the v1 host defines itself (opencode v1.18.34 agent.ts). They are absent from the `opencodeConfig.agent`
+ * record the config hook receives, so `subagentTiers` needs them listed to avoid a false `missing` skip (QA-81-4).
+ */
+const V1_HOST_BUILTIN_AGENTS: Record<string, { mode: string }> = {
+  general: { mode: "subagent" },
+  explore: { mode: "subagent" },
+  build: { mode: "primary" },
+  plan: { mode: "primary" },
+  title: { mode: "primary" },
+  summary: { mode: "primary" },
+  compaction: { mode: "primary" },
+};
+
 const SESSION_ROOT_MEMO_MAX = 500;
 const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
 
@@ -296,6 +314,20 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
   // Per-plugin-instance session store: owns subagentSessionIDs and subagentCapState.
   const sessionStore = createSessionStore();
+  /** v1 sessionID -> plugin agent name, from chat.message (tool.execute.after has no `agent` on v1). */
+  const pluginAgentSessions = new Map<string, string>();
+  /** Records a plugin-agent session, bounded like the session-root memo (oldest entry evicted first). */
+  const rememberPluginAgentSession = (sessionID: string, agent: string): void => {
+    pluginAgentSessions.delete(sessionID);
+    pluginAgentSessions.set(sessionID, agent);
+    while (pluginAgentSessions.size > SESSION_ROOT_MEMO_MAX) {
+      const oldest = pluginAgentSessions.keys().next().value;
+      if (oldest === undefined) break;
+      pluginAgentSessions.delete(oldest);
+    }
+  };
+  /** Plugin agents the v1 config hook built on its previous run -> the host entry it merged (QA-81-8). */
+  let builtPluginAgents = new Map<string, Record<string, unknown> | undefined>();
   let systemDebugLogged = false;
   let dispatchDebugLogged = false;
 
@@ -1481,6 +1513,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
 
     "chat.message": async (input: any, output: any) => {
+      // Recorded even while bypassed: the grep redaction in `tool.execute.after` runs regardless of bypass (QA-81-R2-2).
+      if (typeof input?.sessionID === "string" && typeof input?.agent === "string" && Object.hasOwn(cfg.agents ?? {}, input.agent)) {
+        rememberPluginAgentSession(input.sessionID, input.agent);
+      }
       if (bypassed) return;
       // 2.4.3 (QA-2.4-R2-1): the cost doctor's notice is NEVER part of the user's message (the prompt text stays byte for byte what the user
       // typed). It is a synthetic transcript entry, through the same host call the adapter uses for the config-reload and narration notices
@@ -1510,6 +1546,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
       const tierNames = Object.keys(getActiveTiers(cfg));
       const sid = input?.sessionID;
+      // v1 `tool.execute.after` carries no agent: plugin-agent sessions are recorded at the top of this hook (QA-81-2).
       try {
         const registration = sessionStore.registerFromChatMessage(
           input,
@@ -1751,9 +1788,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // -----------------------------------------------------------------------
     "tool.execute.after": async (input: any, output: any) => {
       if (input?.tool === "grep" && typeof output.output === "string") {
-        const tier = input.agent ?? sessionStore.getTier(input.sessionID);
+        const tier = input.agent ?? pluginAgentSessions.get(input.sessionID) ?? sessionStore.getTier(input.sessionID);
         const definition = tier && getActiveTiers(cfg)[tier];
-        if (definition && isReadOnlyTier(tier, definition)) output.output = filterSensitiveGrep(output.output);
+        // Every plugin agent is redacted (a denied grep produces no output anyway), readOnly or explicit-permission.
+        const isPlugin = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier);
+        if ((definition && isReadOnlyTier(tier, definition)) || isPlugin) output.output = filterSensitiveGrep(output.output);
       }
       if (bypassed) return;
       sessionStore.recordToolCall(input, output);
@@ -2041,6 +2080,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           if (typeof id === "string") {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
+            pluginAgentSessions.delete(id);
             sessionStore.unregister(id);
             effortOverrides.clear(id);
             depthTracker.forget(id);
@@ -2208,10 +2248,71 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // preset's models. Opt-in: with no map, nothing here runs and the agent
       // record is left exactly as opencode built it. Runs after tier
       // registration so the tier-name collision guard sees the real tiers.
+      // Plugin agents (#81): subagents defined by the router `agents` block.
+      // Model/variant/steps always follow the ACTIVE preset's tier, so this
+      // re-run on /preset rebuilds them. An opencode.json `agent.<name>` entry
+      // wins for the fields it sets (its permission rules go after ours).
+      const context7 = Boolean(opencodeConfig.mcp?.context7) && opencodeConfig.mcp.context7.enabled !== false;
+      const builtNow = new Map<string, Record<string, unknown> | undefined>();
+      const pluginTiers = resolveActiveTiers(cfg);
+      for (const [name, entry] of Object.entries(cfg.agents ?? {})) {
+        const tier = pluginTiers[entry.tier];
+        if (!tier) continue;
+        const existing = opencodeConfig.agent[name];
+        const seed = (opencodeConfig as Record<symbol, unknown>)[HOST_SEED_AGENTS];
+        const fromHostSeed = seed instanceof Set && seed.has(name);
+        if (fromHostSeed && existing?.mode !== undefined && existing.mode !== "subagent") {
+          warnAgentOptionsEffortOnce(`plugin-agent-host-mode:${name}`, `agent ${name} collides with a host built-in agent whose mode is '${String(existing.mode)}'; the router \`agents\` entry is skipped`, logger);
+          continue;
+        }
+        // A definition this hook built on a previous run is not a user entry.
+        const previous = pluginAgentMarker(existing);
+        const hostEntry: Record<string, unknown> | undefined = previous
+          ? previous.hostEntry
+          : existing !== undefined && typeof existing === "object" && existing !== null && !Array.isArray(existing)
+            ? existing as Record<string, unknown>
+            : undefined;
+        let definition = buildPluginAgentDefinition(entry, tier, { context7, host: "v1" });
+        if (hostEntry !== undefined) {
+          definition = mergeHostAgentEntry(definition, hostEntry);
+          warnAgentOptionsEffortOnce(
+            `plugin-agent-host-entry:${name}`,
+            `agent ${name} is defined both in the router \`agents\` block and in ${fromHostSeed ? "a host built-in agent" : "opencode.json"}; ${fromHostSeed ? "the host definition" : "opencode.json"} wins for the fields it sets`,
+            logger,
+          );
+        }
+        opencodeConfig.agent[name] = definition;
+        builtNow.set(name, hostEntry);
+      }
+      // QA-81-8 invariant: after this loop every plugin agent in `opencodeConfig.agent` was built THIS run, or is the host entry
+      // the router replaced (restored), or is absent. Anything built on a previous run and not rebuilt now (removed or invalid) must not linger.
+      // Detection is the symbol marker OR the closure set, so a cloned config (marker lost) is covered too.
+      for (const name of Object.keys(opencodeConfig.agent)) {
+        if (builtNow.has(name)) continue;
+        const marker = pluginAgentMarker(opencodeConfig.agent[name]);
+        if (marker === undefined && !builtPluginAgents.has(name)) continue;
+        const restore = marker ? marker.hostEntry : builtPluginAgents.get(name);
+        if (restore !== undefined) opencodeConfig.agent[name] = restore;
+        else delete opencodeConfig.agent[name];
+      }
+      builtPluginAgents = builtNow;
+
       const subagentOverrides = resolveSubagentOverrides({
         subagentTiers: cfg.subagentTiers,
         tiers: activeTiers,
-        existingAgents: opencodeConfig.agent,
+        // The built-in list is the v1 host's; on v2 the setup seed already carries the real host agents.
+        existingAgents: ctx.routerHost === "v2" ? opencodeConfig.agent : { ...V1_HOST_BUILTIN_AGENTS, ...opencodeConfig.agent },
+        pluginAgents: cfg.agents,
+        onSkip: (agentName, reason) =>
+          reason === "missing" && opencodeConfig[DEFER_MISSING_SUBAGENT_NOTICE] === true
+            ? undefined
+            : warnAgentOptionsEffortOnce(
+            `subagent-tiers:${reason}:${agentName}`,
+            reason === "missing"
+              ? `subagentTiers: '${agentName}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`
+              : `subagentTiers: '${agentName}' is defined by the router \`agents\` block, whose tier wins; entry skipped`,
+            logger,
+          ),
       });
       for (const [agentName, override] of Object.entries(subagentOverrides)) {
         opencodeConfig.agent[agentName] = mergeSubagentOverride(

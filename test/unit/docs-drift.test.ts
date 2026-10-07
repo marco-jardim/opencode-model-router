@@ -77,6 +77,13 @@ describe("docs drift", () => {
     expect(undocumented).toEqual([]);
   });
 
+  it("documents the plugin `agents` block keys in CONFIG_REFERENCE.md", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md");
+    for (const key of ["agents", "tier", "description", "prompt", "steps", "readOnly", "allowTools", "permission"]) {
+      expect(doc, key).toContain(`\`${key}\``);
+    }
+    expect(doc.replace(/\s+/g, " ")).toContain("opencode.json wins for the fields it sets");
+  });
   it("documents depth and effort bump key paths in CONFIG_REFERENCE.md", () => {
     const doc = read("docs/CONFIG_REFERENCE.md");
     expect(undocumentedKeys(doc, nestedEnforcementKeys)).toEqual([]);

@@ -35,11 +35,52 @@ export function evaluatePermission(rules: readonly PermissionRule[], action: str
   return "ask";
 }
 
+const EFFECT_RANK: Readonly<Record<PermissionEffect, number>> = { deny: 0, ask: 1, allow: 2 };
+/** Resources every monotonicity probe tries, besides the policy's and the inherited rules' own patterns. */
+const PROBE_RESOURCES: readonly string[] = ["*", "rm -rf /", "a>b", "npm test; rm x", "npm test > x", ".env", "src/file.ts", "echo probe"];
+
+/**
+ * True when `rules` never grant more than `policy` alone, for any probe action
+ * and resource, under last-match evaluation (deny < ask < allow).
+ */
+export function isMonotone(policy: readonly PermissionRule[], rules: readonly PermissionRule[], actions: Iterable<string>, resources: Iterable<string>): boolean {
+  const probes = [...new Set(resources)];
+  for (const action of new Set(actions)) {
+    for (const resource of probes) {
+      if (EFFECT_RANK[evaluatePermission(rules, action, resource)] > EFFECT_RANK[evaluatePermission(policy, action, resource)]) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * A plugin agent's policy (#81) is complete: it starts from `* deny` (or the
+ * read-only map) and lists everything the agent may do. Only inherited denies
+ * are copied after it, so a later deny stays a deny and no inherited allow/ask
+ * (a global `shell * allow`, a drifted host default) can widen it. The agent's
+ * own opencode.json rules are added by the host after the transform.
+ */
+function publishPluginPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void): PermissionRule[] {
+  const denies = inherited.filter(rule => rule.effect === "deny");
+  const candidate = [...policy, ...denies];
+  const actions = [...READ_ONLY_CANARIES, ...policy.filter(rule => rule.effect !== "deny").map(rule => rule.action)];
+  const resources = [...PROBE_RESOURCES, ...policy.map(rule => rule.resource), ...inherited.map(rule => rule.resource)];
+  // Guard against future edits: with the current deny-only projection of `inherited` this check cannot fail.
+  if (!isMonotone(policy, candidate, actions, resources)) {
+    warn(`plugin agent permission check failed for ${name}; inherited rules restricted to denies`);
+    return [...policy, ...denies];
+  }
+  return candidate;
+}
+
 /** No provenance API distinguishes a newly appended host default from a user
  * grant. While readOnly is true, neither can widen the policy's action surface.
  * Resource overrides on permitted actions and inherited denies survive.
- * Inherited asks cannot create auto-approvable capabilities outside that set. */
-export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void): PermissionRule[] {
+ * Inherited asks cannot create auto-approvable capabilities outside that set.
+ * `plugin`: the agent is a plugin agent (#81); see {@link publishPluginPermissions}. */
+export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void, opts: { plugin?: boolean } = {}): PermissionRule[] {
+  if (opts.plugin === true) return publishPluginPermissions(name, policy, inherited, warn);
+  const canaries = READ_ONLY_CANARIES;
   const recognised = KNOWN_HOST_DEFAULTS.every((rule, i) => inherited[i]?.action === rule.action
     && inherited[i]?.resource === rule.resource && inherited[i]?.effect === rule.effect);
   const tail = inherited.slice(recognised ? KNOWN_HOST_DEFAULTS.length : 0);
@@ -54,11 +95,11 @@ export function publishReadOnlyPermissions(name: string, policy: readonly Permis
   // Check the final projected list, including policy rules, with last-match semantics.
   const candidate = [...policy, ...safe];
   const resources = new Set(["*", "src/file.ts", "echo probe", ...tail.map(rule => rule.resource)]);
-  const breached = READ_ONLY_CANARIES.some(action => [...resources].some(resource => evaluatePermission(candidate, action, resource) !== "deny"));
+  const breached = canaries.some(action => [...resources].some(resource => evaluatePermission(candidate, action, resource) !== "deny"));
   if (breached) {
     warn(`read-only permission canary failed for ${name}; inherited grants restricted`);
     return [{ action: "*", resource: "*", effect: "deny" }, ...candidate.filter(rule => rule.effect === "deny"
-      || (rule.action !== "*" && !READ_ONLY_CANARIES.some(action => permissionMatches(action, rule.action))))];
+      || (rule.action !== "*" && !canaries.some(action => permissionMatches(action, rule.action))))];
   }
   return candidate;
 }

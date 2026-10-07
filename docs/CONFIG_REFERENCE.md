@@ -79,8 +79,87 @@ falls back to its in-code default), so you only ever see them in an overrides fi
 | `subagentTiers` | `Record<string, string>` | `{}` — no pre-existing agent is touched | Opt-in map of your own subagent names to tier names, repointing them at the active preset's model for that tier. Unknown tier names are skipped at resolve time rather than rejected. |
 | `antiNarration` | `boolean` | `false` | Adds the anti-narration clause to Claude tier prompts and enables the non-blocking narration detector. |
 | `experimental` | `{ verifiedDelegateTool?: boolean }` | `{}` — every experimental feature off | Opt-in features. `verifiedDelegateTool` exposes the independently-verified `delegate` tool, also settable via `MODEL_ROUTER_VERIFIED_DELEGATE=1`. |
+| `agents` | `Record<string, PluginAgent>` | `{}` — no router-defined subagent | Subagents defined by the router instead of `opencode.json` (#81). See [`agents`](#agents--router-defined-subagents-81). Only `tiers.json` and the global override may set it. |
 | `routing` | object | `{}` — engine `static`, today's behaviour | The cost-aware routing engine (#74): engine mode, profile, margin, classifier, roles, outcome store, session reuse, advisor. Per-tier `candidates` and `escalate.variantSteps` belong to the same feature. See [`routing`](#routing--cost-aware-routing-engine-74). |
 
+---
+
+## `agents` — router-defined subagents (#81)
+
+`agents` registers extra subagents from the router config, on OpenCode 1 and 2, without editing
+`opencode.json`. Each runs on the model and variant of a **tier of the active preset**, so it follows
+`/preset`. Its mode is always `subagent` and its permissions are always published by the router.
+
+```jsonc
+{
+  "agents": {
+    "reviewer": { "tier": "heavy", "description": "Reviews diffs", "readOnly": true, "allowTools": ["router_git_*"] },
+    "runner": {
+      "tier": "fast", "description": "Runs the tests",
+      "permission": { "read": "allow", "grep": "allow", "shell": { "allow": ["npm test*"], "deny": ["*;*", "*&*", "*|*", "*>*", "*\n*", "*`*", "*$(*"] }, "edit": "deny" }
+    }
+  }
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `tier` | `string` (required) | A tier of the **active** preset. Model, variant and (by default) `steps` come from it. |
+| `description` | `string` (required) | Non-empty. |
+| `prompt` | `string` | System prompt, used verbatim (never rewritten for the host vocabulary). |
+| `steps` | positive integer | Turn budget; defaults to the tier's `steps`. |
+| `readOnly` | `boolean` | Reuses the [#77 read-only policy](READ_ONLY_TIERS.md): deny `*`, then read/glob/grep/`router_git_*`, sensitive-path asks. |
+| `allowTools` | `string[]` | Extra actions allowed on top of the policy (MCP tools, `webfetch`, …); wildcards allowed, but only after a literal first character (`web*`, `context7_*`; a leading `*` or `?` such as `*_*` is rejected). `allowTools` can never grant edit (`edit`/`write`/`patch`, including `multiedit` and `apply_patch`), delegation (`subagent`/`task`/`delegate`), Code Mode `execute`, shell (`shell`/`bash`) or `read`: those belong in `permission`. Entries are permission rules only; they are never copied into the legacy `tools` booleans (a host maps `write`/`edit`/`patch` tools to the `edit` permission). |
+| `permission` | object | v1-style rules, canonical v2 names (`shell`, `subagent`; `bash`/`task` accepted as aliases). Each action maps to an effect or an ordered `{ pattern: effect }` object (`{ effect: [patterns] }` is accepted too). In the `{ effect: [patterns] }` form the groups are applied in the order written and **later groups win**: `{ "allow": ["npm test*"], "deny": ["*"] }` denies everything, so put the broad deny first or the narrow allow last. `npm test*` also matches `npm test; rm -rf x`, which is why the runner example adds later denies for `;`, `&` (covers `&&`), `|` (covers `||`), `>`, a newline (`"*\n*"`: the host matcher is dotAll, so `*` crosses newlines and a JSON `\n` is a literal newline in the pattern), a backtick and `$(`. The example is illustrative, not a sandbox: shell patterns are permission rules, and other expansions or redirections the list misses still reach the shell.
+
+On a host where the global config also denies an action, the two hosts differ. On v2 the inherited global denies are copied **after** the agent's own rules, so a global `bash: deny` also denies the runner's `npm test`. On v1 the agent's own rule wins. With `readOnly: true` it may only add `deny`/`ask` rules, and never `ask` for shell, edit or delegation. |
+
+An entry needs `readOnly: true` or a `permission`: a router agent never inherits the host's allow-all
+defaults. Without `readOnly`, the policy is `* deny`, then `allowTools`, then your `permission`; the
+sensitive-path asks are re-applied after every `read` grant. A narrow wildcard `read` grant (anything other than `*`) denies the sensitive globs **globally**, overriding earlier asks and an explicit `*.env: allow`. A later deny stays a deny: plugin agents copy only the *inherited denies* of the host defaults (never its allows), and a monotonicity check on the final rule list verifies that no later rule re-opens an earlier deny; the old `exempt` escape hatch is gone.
+
+### Validation
+
+Per entry, never throwing: an invalid entry is **removed** and reported as a `router: config notice:`
+line (key path and file); the other entries, the rest of the layer and `routing` stay in force. Rejected:
+unknown keys (`model`, `variant` and `mode` get a specific message: the model follows the tier and the
+mode is always `subagent`); names that are invalid (letters, digits, `.`, `_`, `-`, at most 64 characters),
+reserved (`fast`, `medium`, `heavy`, every tier of the active preset, `model-router-grader`, `build`,
+`plan`, `title`, `summary`, `compaction`); an unknown `tier`; a missing policy; an `allowTools` entry
+matching a policy action or starting with a wildcard. A name that collides with a host built-in agent that is not a subagent (v2 setup seed, for example a primary agent) is skipped with the notice `collides with a host built-in agent`. A `tier` the active preset lacks skips the entry for that preset only; a
+`/preset` rebuild re-checks it.
+
+### Layer rules (A18)
+
+Only `tiers.json` and the **global** override may define `agents`. A project override
+(`.opencode/opencode-model-router.overrides.jsonc`) is stripped of its `agents` block with a notice
+(`ignoring agents from <path>: only tiers.json or the global override may define agents (A18)`); the rest
+of that layer still applies. A cloned repository must not be able to register agents with permissions.
+
+### Precedence with `opencode.json`
+
+If `opencode.json` also defines `agent.<name>`, it **wins for the fields it sets**; its permission rules are
+placed after the router's (last match wins) and its `tools` are merged over ours. A one-time notice says:
+`agent <name> is defined both in the router `agents` block and in opencode.json; opencode.json wins for the
+fields it sets` (on v2 a name present in the host setup seed reads "a host built-in agent" instead of "opencode.json"). The v2 seed no longer carries the host `description`, so the router entry supplies it.
+
+When the v1 config hook runs again in the same process (a preset refresh, for example), plugin agents it built earlier but that are no longer defined or valid are removed, restoring the `opencode.json` entry if there was one. Detection uses the non-enumerable marker plus a closure record of the names built last run, so it also works when the host hands back a cloned config; a restart simply rebuilds from scratch. One limit: if a name was built with no `opencode.json` entry and the user adds one before the next run, a cloned config cannot tell it from the router's own and it is removed. Validation, registration and `/router` all use one preset resolver (`resolveActiveTiers`: case-insensitive like `/preset`, falling back to the first preset).
+
+### Grep redaction
+
+Grep output is redacted of sensitive-file matches for **every** plugin agent, including explicit-permission ones such as `runner` whenever their rules do not deny `grep`, on v1 (the session is recorded at `chat.message`, since `tool.execute.after` carries no agent) and on v2.
+
+### `agents.<name>.tier` vs `subagentTiers`
+
+`agents.<name>.tier` wins: a `subagentTiers[<name>]` entry for a plugin agent is skipped with a notice.
+
+### `subagentTiers` no longer creates agents
+
+A `subagentTiers` name that is neither an existing agent nor a plugin agent is skipped (once-per-process
+notice), never created. Previously it produced an unrestricted agent with only a model (mode `all` on v1, `primary` on v2). On
+OpenCode 2 the host registers `opencode.json` agents after the router starts, so the router re-checks at the
+first prompt and refreshes once when a pending name appears; the "no such agent" notice is only given after
+that first check. Existing agents still get the tier model: on v1 the host built-ins (`general`, `explore`, `build`, `plan`, `title`, `summary`, `compaction`) are known to the router even though they are absent from the config record, so `subagentTiers: { "explore": "fast" }` works; `opencode.json` custom agents do too.
 ---
 
 ## `falseRefusalDetection`
