@@ -623,9 +623,10 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     expect(lock.version).toBe("2.3.0");
     expect(lock.packages[""].version).toBe("2.3.0");
     expect(read("CHANGELOG.md")).toContain("## [2.3.0] - 2026-10-07");
-    const pr = read("docs/qa/cost-aware-routing/pr-body.md");
-    expect(pr).toContain("Closes #74");
-    expect(pr).toContain("Closes #73");
+    expect(read("CHANGELOG.md")).toMatch(/^## \[Unreleased\]\r?$/m);
+    const pr = read("docs/qa/cost-aware-routing/pr-body.md").replace(/\r\n/g, "\n");
+    expect(pr).toMatch(/^Closes #74$/m);
+    expect(pr).toMatch(/^Closes #73$/m);
     expect(pr).toContain("@javizuurc");
     expect(pr).toContain("TypeSafe");
     const plan = read("docs/plans/cost-aware-routing-engine-plan.md");

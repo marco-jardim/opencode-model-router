@@ -1,11 +1,13 @@
-# Cost-aware routing engine — 2.3.0
+# Cost-aware routing — DF5 evidence and 2.3.0 release preparation
 
 Closes #74
 Closes #73
 
 ## What changes
 
-This single PR adds an opt-in, OpenCode v2 cost-aware routing engine, learned outcome statistics, same-session variant escalation, native-agent candidates, a cost doctor, `/router stats` and route annotations. Decisions stay in code and use verified outcomes rather than classifier confidence as a success probability. Version: **2.3.0**.
+**Head branch: `car/main`; base: `master`.** The orchestrator fast-forwards `car/main` to the reviewed `car/p34` tip before opening this PR. This PR adds the **DF5 evidence, CI portability fixes and 2.3.0 release metadata**, not the entire engine implementation: the dogfood syncs already pushed the engine to remote master, a deviation from the plan's local-only sync procedure.
+
+For full feature review, use [the v2.2.0 → car/main comparison](https://github.com/marco-jardim/opencode-model-router/compare/v2.2.0...car/main). The release as a whole includes the opt-in OpenCode v2 cost-aware routing engine, learned outcome statistics, same-session variant escalation, native-agent candidates, a cost doctor, `/router stats` and route annotations. Decisions stay in code and use verified outcomes rather than classifier confidence as a success probability. Version: **2.3.0**.
 
 Thanks to **@javizuurc in #73** for suggesting a routing step that sees the agents and the work before choosing a destination. **TypeSafe's documentation** inspired the bounded typed-classification integration; TypeSafe is an optional backend, not a required service. The implementation is written from scratch.
 
@@ -20,10 +22,10 @@ An explicit `routing` block also enables automatic variant steps on v2 unless ov
 
 **OpenCode v1:** the block is validated but the engine is forced to `static`, with one notice when a non-static engine is requested. Explicit `routing.roles` adds only a prose destination suffix; no engine, variant ladder or telemetry is enabled. No routing block preserves the existing v1 behaviour.
 
-- [ADR 0005: decisions, safeguards, trade-offs and evidence](docs/adr/0005-cost-aware-routing-engine.md)
-- [Routing engine guide](docs/ROUTING_ENGINE.md)
-- [Dogfood evidence and bounded reproduction commands](docs/qa/cost-aware-routing/dogfood.md#summary)
-- [Release preparation and approval-gated checklist](docs/qa/cost-aware-routing/phase-3.4.md)
+- [ADR 0005: decisions, safeguards, trade-offs and evidence](https://github.com/marco-jardim/opencode-model-router/blob/car/main/docs/adr/0005-cost-aware-routing-engine.md)
+- [Routing engine guide](https://github.com/marco-jardim/opencode-model-router/blob/car/main/docs/ROUTING_ENGINE.md)
+- [Dogfood evidence and bounded reproduction commands](https://github.com/marco-jardim/opencode-model-router/blob/car/main/docs/qa/cost-aware-routing/dogfood.md#summary)
+- [Release preparation and approval-gated checklist](https://github.com/marco-jardim/opencode-model-router/blob/car/main/docs/qa/cost-aware-routing/phase-3.4.md)
 
 ## Dogfood summary
 
@@ -41,6 +43,6 @@ One owner, one machine, and an implementation-/QA-heavy plan workload, with unpr
 
 ## Validation and rollout
 
-Scoped validation covers docs drift (D16/D17), packaging/import closure and routing-outcomes statistics; release preparation also checks a real clean tarball install and static startup without new plugin log lines. Exact commands and results are in the phase report. Existing Phase 3.2 scripted-host evidence remains distinct from this preparation run; it is not presented as a newly repeated full suite.
+Scoped validation covers docs drift (D16/D17), packaging/import closure and routing-outcomes statistics; release preparation also checks a real clean tarball install and **server-factory initialization/disposal** without new plugin log lines. This is not real-host startup evidence. Exact commands and results are in the phase report. Existing Phase 3.2 scripted-host evidence remains distinct from this preparation run; it is not presented as a newly repeated full suite. The full CI matrix is a required PR/pre-tag gate, not a claim of this local verification.
 
 Release actions remain approval-gated: merge, release tag push (which triggers npm publication), npm publish and optional manual GitHub release. No live override is changed by release preparation.

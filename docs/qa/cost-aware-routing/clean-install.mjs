@@ -64,7 +64,7 @@ try {
   });
   assert.equal(typeof hooks["command.execute.before"], "function");
   if (hooks.dispose) await hooks.dispose();
-  assert.deepEqual(logs, [], "No plugin startup/disposal log with the shipped no-routing config");
+  assert.deepEqual(logs, [], "No plugin server-factory initialization/disposal log with the shipped no-routing config");
 } finally {
   Object.assign(console, original);
 }
