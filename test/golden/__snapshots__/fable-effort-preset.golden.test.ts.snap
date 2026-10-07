@@ -21,6 +21,7 @@ exports[`fable-effort preset golden > matches the fable-effort preset snapshot 1
     "description": "Fable 5 at low effort for exploration, search, and simple reads (token-spend ratios are estimates; same model across tiers preserves prompt cache)",
     "effort": "low",
     "model": "anthropic/claude-fable-5-1",
+    "readOnly": true,
     "steps": 30,
     "whenToUse": [
       "Codebase exploration and search",

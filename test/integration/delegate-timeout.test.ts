@@ -178,7 +178,7 @@ describe("delegate time-boxes (fake timers)", () => {
     delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
     try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // ignore
     }
@@ -653,7 +653,7 @@ describe("delegate time-boxes: resumed v2 children (Phase 2.3, fake timers)", ()
     resetIngestState();
     invalidateConfigCache();
     try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // ignore
     }

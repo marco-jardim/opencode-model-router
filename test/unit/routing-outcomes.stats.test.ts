@@ -1038,7 +1038,7 @@ describe("plain-node TypeScript support boundary", () => {
 describe.skipIf(!supportsPlainNodeTypeScript())("D18 scripts/routing-stats.ts (plain node; requires default TS stripping)", () => {
   const made: string[] = [];
   afterEach(async () => {
-    while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   const realDeps = (): PersistDeps => ({ fs: nodePersistFs(), now: Date.now, sleep: async () => undefined, logger: { warn() {} }, pid: process.pid });

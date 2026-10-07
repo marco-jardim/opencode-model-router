@@ -178,7 +178,7 @@ describe("loadConfig — user overrides file", () => {
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
     try {
-      rmSync(tmpHome, { recursive: true, force: true });
+      rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // best-effort cleanup
     }
@@ -691,7 +691,7 @@ describe("loadConfig — global + project override hierarchy", () => {
     else process.env.USERPROFILE = savedUserProfile;
     for (const d of [tmpHome, tmpProject]) {
       try {
-        rmSync(d, { recursive: true, force: true });
+        rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       } catch {
         // best-effort cleanup
       }
@@ -884,7 +884,7 @@ describe("findProjectOverride — upward search", () => {
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
     try {
-      rmSync(tmpRoot, { recursive: true, force: true });
+      rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // best-effort cleanup
     }
@@ -983,7 +983,7 @@ describe("loadConfig — host-provided project directory", () => {
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
     try {
-      rmSync(tmpRoot, { recursive: true, force: true });
+      rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // best-effort cleanup
     }
@@ -1246,7 +1246,7 @@ describe("findProjectOverride — walk boundaries", () => {
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
     try {
-      rmSync(tmpRoot, { recursive: true, force: true });
+      rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // best-effort cleanup
     }

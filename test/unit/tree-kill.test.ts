@@ -21,7 +21,7 @@ afterEach(() => {
 // (EBUSY on rmdir). Retry, then leave the temp dir behind with a warning rather than fail the test.
 function removeScratch(d: string): void {
   try {
-    rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") throw err;

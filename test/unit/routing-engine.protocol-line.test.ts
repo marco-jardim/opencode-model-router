@@ -33,20 +33,20 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** 0.P.3 (phase-0P.md) `R:` line hash, identical for every shipped preset. */
-const R_HASH = "5aca1a71c1450dd61deb2a65c411c9ee03e26b835e3704fe4d81df45bee42452";
+/** Issue #77: rename moved from fast to medium; all other protocol bytes retained. */
+const R_HASH = "6ace4a35c29f8972a86e67e705830aaff964c78997b654c4b13a139b5b0563fe";
 
 const D2: Readonly<Record<string, { raw: string; rawChars: number; v2: string; v2Chars: number }>> = {
   anthropic: {
-    raw: "ee7e33eed9ee3068bc8eb9f2a7492abaed6c428bbf10372bba51f2e92d152af2",
+    raw: "96c9fa385ca8104f72730ab9aff1d6b6d83a98c1be6c8dd857a6ed129fb38b60",
     rawChars: 3249,
-    v2: "aa24cbbf7e558c4f9bd8130fe378a1cdee12e9e9bafef684f57fa4ba9bc59817",
+    v2: "85d07a3a46c79abc1b15caa65bfff0757912d5e33a6b8ec0deff6b81fae592b1",
     v2Chars: 3249,
   },
   "hybrid-2": {
-    raw: "392ff439845c7c96d3f6728111f50c69e4f46315e79db0c4a252507a402a6d33",
+    raw: "f79fde6484ae5a8f4ca64dc0b1a89910bd55e12f649f39e54e4817d770877211",
     rawChars: 3288,
-    v2: "10c2437a28b312f6745512fa6ca69867808b1d2efe897e0e6bb3b0235381370b",
+    v2: "f9fd9f713f80942d01c3d23ca236164d03e72bd1d8730ab55f1d5081a19c19e0",
     v2Chars: 3288,
   },
 };
@@ -70,7 +70,7 @@ afterEach(() => {
   else process.env.HOME = savedHome;
   if (savedUserProfile === undefined) delete process.env.USERPROFILE;
   else process.env.USERPROFILE = savedUserProfile;
-  rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   invalidateConfigCache();
 });
 

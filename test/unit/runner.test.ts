@@ -1007,7 +1007,7 @@ async function withGitTree(files: Record<string, string>, fn: (search: TestSearc
       ),
     });
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }
 
@@ -2360,7 +2360,7 @@ describe("QA-1.3-1: canonical paths through the realpath seam", () => {
 
   describe("real filesystem: a junction (win32) or symlink to the repo", () => {
     const base = mkdtempSync(path.join(tmpdir(), "omr-qa131-"));
-    afterAll(() => rmSync(base, { recursive: true, force: true }));
+    afterAll(() => rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
     const repo = path.join(base, "repo");
     for (const [rel, body] of Object.entries({
       ".git": "gitdir: elsewhere",
@@ -3009,7 +3009,7 @@ describe("QA-1.3-19: the zero-test guard covers every runner; lexical mode stays
 
   describe("real filesystem: vitest through a junction (win32) or symlink", () => {
     const base = mkdtempSync(path.join(tmpdir(), "omr-qa1319-"));
-    afterAll(() => rmSync(base, { recursive: true, force: true }));
+    afterAll(() => rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
     const repo = path.join(base, "repo");
     for (const [rel, body] of Object.entries({
       ".git": "gitdir: elsewhere",

@@ -437,8 +437,8 @@ export interface KeywordRule {
 
 /**
  * The rules table. Shipped taskPatterns (tiers.json):
- *   fast:   search, grep, read, git-info, ls, lookup-docs/types, count, exists-check, rename
- *   medium: impl-feature, refactor, write-tests, bugfix(≤2), edit-logic, code-review,
+ *   fast:   search, grep, read, git-info, ls, lookup-docs/types, count, exists-check
+ *   medium: rename, impl-feature, refactor, write-tests, bugfix(≤2), edit-logic, code-review,
  *           build-fix, create-file, db-migrate, api-endpoint, config-update
  *   heavy:  arch-design, debug(≥3fail), sec-audit, perf-opt, migrate-strategy,
  *           multi-system-integration, tradeoff-analysis, rca
@@ -536,7 +536,7 @@ export const KEYWORD_RULES: readonly KeywordRule[] = [
   },
   {
     pattern: "rename",
-    tier: "fast",
+    tier: "medium",
     class: "mechanical",
     terms: [
       /\brenam(?:e|es|ed|ing)\b/i,

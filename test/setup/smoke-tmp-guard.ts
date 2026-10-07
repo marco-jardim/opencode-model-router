@@ -18,7 +18,7 @@ export function setup(): void {
 
 export function teardown(): void {
   try {
-    if (isolated !== undefined) fs.rmSync(isolated, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    if (isolated !== undefined) fs.rmSync(isolated, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   } catch (error) {
     console.warn(`smoke-tmp-guard: cannot remove ${isolated}: ${String(error)}`);
   } finally {

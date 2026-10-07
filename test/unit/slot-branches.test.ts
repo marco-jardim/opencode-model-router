@@ -64,7 +64,7 @@ afterEach(async () => {
     // Retry a busy entry (EBUSY/EPERM on Windows); one stuck directory must not strand the rest.
     for (const d of dirs.splice(0)) {
       try {
-        rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       } catch {
         // Best effort: left to the OS temp cleanup.
       }
@@ -524,11 +524,11 @@ describe("slot branches: exit-time release", () => {
     releaseAllSlotsSync();
     expect(exitReleaseFailures).toBe(before + 1);
     expect(readdirSync(isDir).filter((n) => n.includes(".reap-"))).toEqual([]);
-    rmSync(lockOf(isDir), { recursive: true });
+    rmSync(lockOf(isDir), { recursive: true, maxRetries: 10, retryDelay: 200 });
 
     const noDir = fresh();
     held(await acquireSlot(opts(), deps(noDir)));
-    rmSync(noDir, { recursive: true, force: true });
+    rmSync(noDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     releaseAllSlotsSync();
     expect(exitReleaseFailures).toBe(before + 2);
   });
@@ -739,7 +739,7 @@ describe("slot branches: waiting, watching and the dir", () => {
     const b = fresh();
     const h = held(await acquireSlot(opts(), deps(b)));
     await h.release();
-    rmSync(b, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     H.fail = (op, path) => (op === "mkdir" && path === b ? { err: "boom" } : undefined);
     expect(await acquireSlot(opts(), deps(b))).toEqual(BUSY);
     expect(count("could not re-create the slot dir")).toBe(1);

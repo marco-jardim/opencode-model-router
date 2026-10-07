@@ -163,7 +163,7 @@ afterEach(async () => {
         await writeFile(path.join(process.env.SMOKE_DEPTH_EFFORT_ARTIFACTS, `${f.host.version}-${path.basename(f.root)}.json`), JSON.stringify({ revision: f.revision, sourceHashes: f.sourceHashes, host: f.host.version, configs: f.configs, captures: f.provider.captures, replies: f.provider.replies, barrierEvents: f.provider.barrierEvents, hooks: await f.hooks(), runs: f.runs, processes: f.processes.map(p => ({ pid: p.child.pid, exitCode: p.child.exitCode, signal: p.child.signalCode, stdout: p.stdout, stderr: p.stderr })) }, null, 2));
       }
     } finally {
-      await rm(f.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+      await rm(f.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   }
 }, 30_000);

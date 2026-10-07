@@ -47,7 +47,7 @@ describe("router-reload — failed reload keeps the last valid config", () => {
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
     try {
-      rmSync(testHomeDir, { recursive: true, force: true });
+      rmSync(testHomeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // best-effort cleanup
     }

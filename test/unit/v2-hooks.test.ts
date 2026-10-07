@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
+import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
@@ -20,6 +21,8 @@ import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { appendRouterFooter } from "../../src/verify/pending";
+import { evaluatePermission, READ_ONLY_CANARIES, readOnlyPermissions } from "../../src/router/read-only";
+import type { PermissionEvaluation } from "@opencode/plugin/promise/permission";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -32,6 +35,7 @@ function fixture() {
   const registrations: Array<{ dispose: ReturnType<typeof vi.fn> }> = [];
   const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
   const toolHooks: Record<string, (event: any) => Promise<void>> = {};
+  const permissionHooks: Record<string, (event: PermissionEvaluation) => Promise<void>> = {};
   const agents: Record<string, any> = {
     explore: { id: "explore", mode: "subagent", model: { providerID: "old", id: "old" }, permissions: [{ action: "write", effect: "deny" }], request: { settings: {}, headers: {}, body: {} } },
     build: { id: "build", mode: "primary", request: { settings: {}, headers: {}, body: {} } },
@@ -57,10 +61,12 @@ function fixture() {
     },
     session: {
       get: vi.fn(async () => ({ id: "child", parentID: "root", agent: "fast" })),
+      update: vi.fn(async (_input: unknown) => {}),
       context: vi.fn(async () => [] as any[]),
       prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
       hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),
     },
+    permission: { hook: vi.fn(async (name: string, cb: (event: PermissionEvaluation) => Promise<void>) => { permissionHooks[name] = cb; return register(); }) },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       signal.addEventListener("abort", () => wake(), { once: true });
       while (!signal.aborted) {
@@ -70,7 +76,7 @@ function fixture() {
     } },
   };
   return {
-    ctx, agents, commands, tools, transforms, editors, sessionHooks, toolHooks, registrations,
+    ctx, agents, commands, tools, transforms, editors, sessionHooks, toolHooks, permissionHooks, registrations,
     emit(event: any) { eventQueue.push(event); wake(); },
     async start(hooks: Record<string, any> = {}, runtime?: any) {
       const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, runtime);
@@ -83,6 +89,158 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  it.each([false, true])("filters v2 grep model content and raw structured matches (parts=%s)", async parts => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    const secret = "Found 2 matches\n/repo/.env:\n  Line 1: SECRET\n";
+    const ordinary = "/repo/id_utils.ts:\n  Line 1: PUBLIC";
+    const event = { ...call, tool: "grep", input: { pattern: "." }, status: "completed", result: {
+      content: parts ? [{ type: "text", text: secret }, { type: "text", text: ordinary }] : secret + ordinary,
+      output: [{ entry: { path: ".env" }, line: 1, text: "SECRET" }, { entry: { path: "id_utils.ts" }, line: 1, text: "PUBLIC" }],
+    } };
+    await f.toolHooks["execute.after"](event);
+    expect(JSON.stringify(event.result)).not.toContain("SECRET");
+    expect(JSON.stringify(event.result)).toContain("PUBLIC");
+    expect(event.result.output).toHaveLength(1);
+    expect(JSON.stringify(event.result.content)).toContain("1 matches in sensitive files withheld; use read (asks for approval)");
+  });
+  it.each([true, false])("Context7 lookup permissions and direct exposure require configured MCP: %s", async configured => {
+    const f = fixture();
+    Object.assign(f.ctx, { mcp: { list: async () => ({ data: configured ? [{ name: "context7", status: { status: "connected" } }] : [] }) } });
+    f.tools["context7_query-docs"] = { options: { namespace: "context7", codemode: true } };
+    Object.assign(f.editors.tool, { update: (id: string, update: (definition: { options?: { namespace?: string; codemode?: boolean } }) => void) => {
+      if (f.tools[id]) update(f.tools[id]);
+    } });
+    await f.start({ config: async (cfg: { mcp?: unknown; agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { permission: readOnlyPermissions(Boolean(cfg.mcp)) };
+    } });
+    expect(f.agents.fast.permissions.some((rule: { action: string }) => rule.action === "context7_query-docs")).toBe(configured);
+    expect(f.tools["context7_query-docs"].options.codemode).toBe(!configured);
+  });
+
+  it("prepends read-only policy before explicit host rules, without changing other tiers", async () => {
+    const f = fixture();
+    f.agents.fast = { id: "fast", mode: "subagent", permissions: [...Agent.Info.default(Agent.ID.make("fast")).permissions,
+      { action: "external_directory", resource: "*", effect: "deny" }], request: {} };
+    const before = structuredClone(f.agents.explore);
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { mode: "subagent", permission: { "*": "deny", read: "allow", router_git_status: "allow" } };
+      cfg.agent.medium = { mode: "subagent" };
+    } });
+    expect(f.agents.fast.permissions).toEqual([
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "read", resource: "*", effect: "allow" },
+      { action: "router_git_status", resource: "*", effect: "allow" },
+      { action: "external_directory", resource: "*", effect: "deny" },
+    ]);
+    expect(f.agents.medium.permissions).toBeUndefined();
+    expect(f.agents.explore).toEqual(before);
+  });
+
+  it("leaves user permissions intact when the tier policy is opted out", async () => {
+    const f = fixture();
+    const permissions = [{ action: "shell", resource: "*", effect: "deny" }];
+    f.agents.fast = { id: "fast", permissions: structuredClone(permissions) };
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { mode: "subagent" }; } });
+    expect(f.agents.fast.permissions).toEqual(permissions);
+  });
+  it("fails closed on an allow-all appended after the host's default prefix", async () => {
+    const f = fixture();
+    f.agents.fast = { id: "fast", permissions: [...Agent.Info.default(Agent.ID.make("fast")).permissions,
+      { action: "*", resource: "*", effect: "allow" }] };
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: { "*": "deny", read: "allow" } }; } });
+    for (const action of READ_ONLY_CANARIES) expect(evaluatePermission(f.agents.fast.permissions, action, "*")).toBe("deny");
+    expect(f.agents.fast.permissions).not.toContainEqual({ action: "*", resource: "*", effect: "allow" });
+  });
+  it("warns once per agent/diagnostic across registry rebuilds", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const f = fixture();
+    const drifted = [{ action: "*", resource: "*", effect: "allow" }];
+    f.agents.fast = { id: "fast", permissions: structuredClone(drifted) };
+    try {
+      await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+      f.agents.fast.permissions = structuredClone(drifted);
+      f.transforms.agent(f.editors.agent);
+      expect(warn.mock.calls.filter(args => String(args[0]).includes("host default permissions not recognised for fast"))).toHaveLength(1);
+      expect(warn.mock.calls.filter(args => String(args[0]).includes("inherited grant dropped for fast"))).toHaveLength(1);
+    } finally { warn.mockRestore(); }
+  });
+  it("enforces own resource denies against session allows, retaining safe agent overrides", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { permission: { "*": "deny", read: { "*": "allow", "*/blocked.txt": "deny" } } };
+    } });
+    const event = (action: string, resources: string[], effect: "allow" | "deny" = "allow"): PermissionEvaluation => ({
+      sessionID: "child" as PermissionEvaluation["sessionID"], agent: "fast" as PermissionEvaluation["agent"], action, resources, effect,
+    });
+    for (const action of READ_ONLY_CANARIES) {
+      const e = event(action, ["anything"]); await f.permissionHooks.evaluate(e); expect(e.effect).toBe("deny");
+    }
+    const blocked = event("read", ["src/allowed.txt", "src/blocked.txt"]);
+    await f.permissionHooks.evaluate(blocked); expect(blocked.effect).toBe("deny");
+    const allowed = event("read", ["src/allowed.txt"]);
+    await f.permissionHooks.evaluate(allowed); expect(allowed.effect).toBe("allow");
+    const narrowed = event("read", ["src/allowed.txt"], "deny");
+    await f.permissionHooks.evaluate(narrowed); expect(narrowed.effect).toBe("deny");
+    const medium = { ...event("shell", ["echo hi"]), agent: "medium" as PermissionEvaluation["agent"] };
+    await f.permissionHooks.evaluate(medium); expect(medium.effect).toBe("allow");
+  });
+  it("retains parent grants when fast resumes as medium, hiding denied tools only for fast", async () => {
+    const f = fixture();
+    const permissions = [{ action: "shell", resource: "*", effect: "allow" }, { action: "read", resource: "private/*", effect: "deny" }, { action: "glob", resource: "*", effect: "ask" }];
+    f.ctx.session.get.mockResolvedValue({ id: "child", parentID: "root", agent: "fast", ...{ permissions } });
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    await f.sessionHooks.prompt({ sessionID: "child", prompt: { text: "inspect" } });
+    expect(f.ctx.session.update).not.toHaveBeenCalled();
+    const e = { ...call, model: {}, options: {}, system: [], messages: [], tools: { shell: {}, execute: {}, write: {}, read: {} } };
+    await f.sessionHooks.context(e);
+    expect(Object.keys(e.tools)).toEqual(["read"]);
+    expect(await f.ctx.session.get()).toMatchObject({ permissions });
+    f.ctx.session.get.mockResolvedValue({ id: "child", parentID: "root", agent: "medium", ...{ permissions } });
+    const resumed = { ...e, agent: "medium", tools: { shell: {}, read: {} } };
+    await f.sessionHooks.context(resumed);
+    expect(Object.keys(resumed.tools)).toEqual(["shell", "read"]);
+    expect(await f.ctx.session.get()).toMatchObject({ permissions });
+    expect(f.ctx.session.update).not.toHaveBeenCalled();
+    const grant: PermissionEvaluation = { sessionID: "child" as PermissionEvaluation["sessionID"],
+      agent: "medium" as PermissionEvaluation["agent"], action: "shell", resources: ["echo hi"], effect: "allow" };
+    await f.permissionHooks.evaluate(grant);
+    expect(grant.effect).toBe("allow");
+  });
+  it("does not upgrade an agent ask under a parent allow or weaken a deny", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    for (const effect of ["allow", "ask", "deny"] as const) {
+      const event: PermissionEvaluation = { sessionID: "child" as PermissionEvaluation["sessionID"],
+        agent: "fast" as PermissionEvaluation["agent"], action: "read", resources: ["normal.ts", "prod.env"], effect };
+      await f.permissionHooks.evaluate(event);
+      expect(event.effect).toBe(effect === "deny" ? "deny" : "ask");
+    }
+  });
+  it("handles permission lookup failures without rejecting or blocking unprotected agents", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    f.ctx.session.get.mockRejectedValue(new Error("session unavailable"));
+    const make = (agent?: string): PermissionEvaluation => ({ sessionID: "child" as PermissionEvaluation["sessionID"],
+      agent: agent as PermissionEvaluation["agent"], action: "read", resources: ["normal.ts"], effect: "allow" });
+    const explicit = make("fast");
+    await expect(f.permissionHooks.evaluate(explicit)).resolves.toBeUndefined();
+    expect(explicit.effect).toBe("allow");
+    expect(f.ctx.session.get).not.toHaveBeenCalled();
+    const unknown = make();
+    await expect(f.permissionHooks.evaluate(unknown)).resolves.toBeUndefined();
+    expect(unknown.effect).toBe("allow");
+    f.ctx.agent.list.mockRejectedValue(new Error("registry unavailable"));
+    const protectedEvent = make("fast");
+    await expect(f.permissionHooks.evaluate(protectedEvent)).resolves.toBeUndefined();
+    expect(protectedEvent.effect).toBe("deny");
+    const medium = make("medium");
+    await expect(f.permissionHooks.evaluate(medium)).resolves.toBeUndefined();
+    expect(medium.effect).toBe("allow");
+    const context = { ...call, model: {}, options: {}, system: [], messages: [], tools: { shell: {}, read: {} } };
+    await expect(f.sessionHooks.context(context)).resolves.toBeUndefined();
+    expect(Object.keys(context.tools)).toEqual([]);
+  });
   it("applies the real ladder retry's effort through context without nesting options or changing grader temperature", async () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-effort-"));
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
@@ -121,7 +279,7 @@ describe("OpenCode 2 hook adapter", () => {
       routerChildRunner: { run, dispose: async () => undefined },
     } as unknown as RouterPluginInput);
     await f.start(hooks);
-    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
     const result = await f.tools.delegate.execute({ tier: "fast", task: "VERIFY:required\nDo the work", acceptance: "[acceptance]\ncriteria: correct\n[/acceptance]" }, {
       ...call, sessionID: "root", signal: new AbortController().signal, progress: vi.fn(async () => undefined),
     });
@@ -155,7 +313,7 @@ describe("OpenCode 2 hook adapter", () => {
     } as unknown as RouterPluginInput);
     const lifecycle = vi.fn(async (input: Parameters<NonNullable<Hooks["event"]>>[0]) => { await hooks.event?.(input); });
     await f.start({ ...hooks, event: lifecycle });
-    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
     f.emit({ type: "session.created", data: { sessionID: "root" } });
     f.emit({ type: "session.created", data: { sessionID: "child", parentID: "root" } });
     await vi.waitFor(() => expect(lifecycle).toHaveBeenCalledTimes(2));
@@ -362,7 +520,7 @@ describe("OpenCode 2 hook adapter", () => {
       client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
     } as unknown as RouterPluginInput);
     await f.start(hooks);
-    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
     await f.commands["router-reload"].execute({ sessionID: "root", prompt: { text: "" }, delivery: "steer" });
     expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
     expect(f.ctx.session.synthetic).toHaveBeenCalledWith(expect.objectContaining({
@@ -874,7 +1032,7 @@ describe("OpenCode 2 hook adapter", () => {
       await f.sessionHooks.context(event);
       expect(event.messages[0].content).toEqual([attachment]);
       expect(event.messages[1]).toBe(explicit);
-    } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+    } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
   });
 
   it("uses post-configuration subagent tiers at dispatch without overriding explicit models or primary agents", async () => {
@@ -933,7 +1091,7 @@ describe("OpenCode 2 hook adapter", () => {
       expect(unmapped.input.model).toBeUndefined();
     } finally {
       process.chdir(savedCwd);
-      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
   });
 });
@@ -1030,7 +1188,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     }
     await cleanup(); // flushes through the D15 flusher on dispose
     expect(existsSync(join(outcomes, "outcomes.json"))).toBe(true);
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("QA-2.3-2: a child's context is readable only after its execution end event, in every engine mode (static here)", async () => {
@@ -1046,7 +1204,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]); // memory only: nothing was written
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("QA-2.3-R2-1: the adapter passes the event id, so a copy of an end event delivered after a re-registration is ignored", async () => {
@@ -1068,7 +1226,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });  it("ignores step events of sessions that are not registered children", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const f = fixture();
@@ -1080,7 +1238,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it.each([
@@ -1103,7 +1261,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const defaultDir = join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME);
     expect(existsSync(defaultDir) ? readdirSync(defaultDir).filter((name) => /^(outcomes|decisions)/.test(name)) : []).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("records nothing under a class below routing.minClassConfidence", async () => {
@@ -1115,7 +1273,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier");
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("counts a step once when the same event id reaches two plugin instances (A3)", async () => {
@@ -1140,7 +1298,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     }
     await first.cleanup();
     await second.cleanup();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("session.deleted drops the child's registration and still reaches the legacy event hook", async () => {
@@ -1154,7 +1312,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await vi.waitFor(() => expect(legacyEvent).toHaveBeenCalledWith({ event: { type: "session.deleted", properties: { info: { id: "child-1" } } } }, undefined));
     const { lookupDispatch } = await import("../../src/router/sessions");
     expect(lookupDispatch("child-1")).toBeUndefined();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   describe("src/v2.ts setup (the real wiring)", () => {
@@ -1177,7 +1335,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
         await peek.release();
       }
       await cleanup();
-      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     });
 
     it("QA-2.1-5: disposing does not wait for a model catalog that never answers", async () => {
@@ -1192,7 +1350,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
       const started = performance.now();
       await cleanup();
       expect(performance.now() - started).toBeLessThan(1000); // the catalog wait itself is bounded by 2 s
-      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     });
   });
 

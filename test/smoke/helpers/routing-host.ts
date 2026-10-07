@@ -200,8 +200,12 @@ export class RoutingProvider {
       const grader = system.includes(GRADER_MARK);
       const subagentCall = toolResult || grader ? undefined : /SPIKE_CALL=(\{[^\n]*\})/.exec(lastText)?.[1];
       const delegateCall = toolResult || grader ? undefined : /SPIKE_DELEGATE=(\{[^\n]*\})/.exec(lastText)?.[1];
-      const toolName = subagentCall ? "subagent" : delegateCall ? "delegate" : undefined;
-      const toolInput = subagentCall ?? delegateCall;
+      // Issue #77: intentionally emit even an unadvertised tool to prove that
+      // the HOST rejects it, rather than a cooperative model merely abstaining.
+      const readOnlyProbe = toolResult || grader || subagentCall || delegateCall ? undefined : /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1];
+      const probe = readOnlyProbe ? obj(JSON.parse(readOnlyProbe)) : undefined;
+      const toolName = subagentCall ? "subagent" : delegateCall ? "delegate" : str(probe?.tool);
+      const toolInput = subagentCall ?? delegateCall ?? (probe ? JSON.stringify(probe.input) : undefined);
       const { messages: _m, system: _s, tools, input: _i, instructions: _in, ...fields } = body;
       const toolNames = arr(tools).map(t => String(obj(t).name ?? obj(obj(t).function).name ?? ""));
       const inputTokens = Math.max(10, Math.ceil(raw.length / 4));
@@ -211,7 +215,7 @@ export class RoutingProvider {
         toolNames, payload: fields, inputTokens, lastText, toolResult, reply: grader ? "grader" : toolName ? "tool" : "text",
       };
       this.requests.push(request);
-      if (toolName && !toolNames.includes(toolName)) throw new Error(`Fixture requested ${toolName} but the request carries no such tool (${toolNames.join(",")})`);
+      if (toolName && !probe && !toolNames.includes(toolName)) throw new Error(`Fixture requested ${toolName} but the request carries no such tool (${toolNames.join(",")})`);
       let text = toolResult ? "ROOT_DONE" : lastText.includes("CHILD_DONE") ? "CHILD_DONE" : "CHILD_OK";
       if (grader) {
         this.graders += 1;
@@ -510,7 +514,7 @@ export class RoutingHost {
     const providerStopped = await this.provider.stop().then(() => true, () => false);
     const hostPortClosed = this.port === 0 ? true : await waitFor("host port to close", async () => (await portOpen(this.port)) ? undefined : true, 10_000, 200).catch(() => false);
     liveHosts.delete(this);
-    const rootRemoved = await rm(this.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }).then(() => !existsSync(this.root), () => false);
+    const rootRemoved = await rm(this.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).then(() => !existsSync(this.root), () => false);
     return { pid, method, taskkill, exitCode: child?.exitCode, hostPort: this.port, hostPortClosed, providerStopped, rootRemoved };
   }
 

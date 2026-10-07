@@ -15,6 +15,41 @@ keys of `tiers.json`, in the order the bundled file writes them. The router type
 `RouterConfig` in `src/router/config.ts`; `validateConfig` in the same file rejects a file that
 gets any of them wrong.
 
+### Per-tier `readOnly`
+
+`presets.<preset>.<tier>.readOnly` is an optional **boolean**, validated by the
+`TierConfig` schema/`validateConfig` in `src/router/config.ts`. Missing means
+`true` for the name `fast`, `false` for every other tier. All eight bundled
+presets explicitly set `fast.readOnly: true`. This policy is independent of
+`enforcement.mode`, the environment enforcement gate, and prompt style.
+
+The field is deep/layer-mergeable; a project or global router override can opt out
+without restating the model or any other tier field:
+
+```jsonc
+{ "presets": { "anthropic": { "fast": { "readOnly": false } } } }
+```
+
+Replace `anthropic` with each preset you intend to opt out of. Setting a custom
+tier's `readOnly: true` opts it in. Opt-out removes the plugin policy, not any
+separate host/user permission restrictions. Prompts still describe exploration;
+opt-out does not rewrite them. Non-read-only tier definitions are unchanged.
+
+The policy allows external-directory lookups by default. To tighten that, set
+host `agent.fast.permission.external_directory: "deny"` (v1-compatible config),
+or append native v2 `agents.fast.permissions` rules with
+`{ "action": "external_directory", "resource": "*", "effect": "deny" }`.
+Agent-specific resource rules on permitted actions retain precedence as described
+in [Read-only tiers](READ_ONLY_TIERS.md). V2 inherited session allows cannot
+override agent-own denies or asks; the session grants remain intact for later
+medium/heavy resumes. Inherited agent asks are projected onto permitted actions;
+broad inherited agent allow-all is dropped. Global-rule
+precedence for newly created router agents is unverified: use agent-specific rules.
+This changes the default capabilities even when an existing config has neither
+`readOnly` nor an enforcement block.
+
+### Top-level key table
+
 | Key | Type | Bundled value | Notes |
 |---|---|---|---|
 | `activePreset` | `string` | `"anthropic"` | Names the entry of `presets` the router routes with. `validateConfig` rejects a name that is not a defined preset; matching is case-insensitive and trimmed. `/router preset <name>` rewrites it at runtime and persists the choice to the router's state file. Read by `getActiveTiers` in `src/router/protocol.ts`, which falls back to the first defined preset, and by the fallback-chain builder. |

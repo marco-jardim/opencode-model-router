@@ -18,6 +18,8 @@ import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
 import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
 import { createSystemAugmenter } from "../routing/wire/hint";
+import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
+import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -31,7 +33,7 @@ export function v2Instructions(text: string): string {
 }
 
 type LegacyAgent = Record<string, any>;
-type LegacyConfig = { agent: Record<string, LegacyAgent>; command: Record<string, any> };
+type LegacyConfig = { agent: Record<string, LegacyAgent>; command: Record<string, any>; mcp?: Parameters<NonNullable<Hooks["config"]>>[0]["mcp"] };
 type LegacyHook = (input: any, output: any) => Promise<void>;
 
 function modelRef(value: string, variant?: string): any {
@@ -165,11 +167,21 @@ export async function registerV2Hooks(
     let config: LegacyConfig = { agent: {}, command: {} };
     let originals = new Map<string, string>();
     let agentOptions = new Map<string, Record<string, unknown>>();
+    const warnedPermissions = new Set<string>();
+    const warnPermissionOnce = (message: string) => {
+      if (warnedPermissions.has(message)) return;
+      warnedPermissions.add(message);
+      ingestLogger.warn(message);
+    };
+    const protectedAgent = (name: string | undefined) => name !== undefined && config.agent[name]?.permission?.["*"] === "deny";
     let lastConfig: unknown;
     // Returns the router config the registry state was built from; the caller
     // advances `lastConfig` only once the host registries have reloaded from it.
     const buildConfig = async (): Promise<unknown> => {
       const next: LegacyConfig = { agent: JSON.parse(JSON.stringify(baseSeed)), command: {} };
+      const context7 = ctx.mcp && (await ctx.mcp.list()).data.some(server => server.name === "context7" && server.status.status !== "disabled");
+      // Presence-only bridge input, never registered as an MCP definition.
+      if (context7) next.mcp = { context7: { type: "local", command: [], enabled: true } };
       const nextOriginals = new Map(Object.entries(next.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
       await hooks.config?.(next);
       const nextOptions = new Map<string, Record<string, unknown>>();
@@ -218,7 +230,36 @@ export async function registerV2Hooks(
           if (definition.prompt !== undefined) agent.system = v2Instructions(definition.prompt);
           if (definition.color !== undefined) agent.color = definition.color;
           if (definition.steps !== undefined) agent.steps = definition.steps;
+          if (definition.permission) {
+            agent.permissions = publishReadOnlyPermissions(name, permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce);
+          }
         });
+      }
+    }));
+
+    // Enforce the protected agent's own deny/ask without destroying inherited
+    // grants: the same session can later resume as medium/heavy (P-R2-3).
+    registrations.push(await ctx.permission.hook("evaluate", async event => {
+      let name: string | undefined = event.agent;
+      let protectedKnown = protectedAgent(name);
+      try {
+        // An explicit event agent is authoritative, even when session lookup
+        // would fail or still refers to the previous agent during a switch.
+        name ??= (await ctx.session.get({ sessionID: event.sessionID })).agent;
+        protectedKnown = protectedAgent(name);
+        if (!protectedKnown) return;
+        const agent = (await ctx.agent.list()).data.find(agent => agent.id === name);
+        const effects = agent ? event.resources.map(resource => evaluatePermission(agent.permissions, event.action, resource)) : ["deny"];
+        if (effects.includes("deny")) {
+          event.effect = "deny";
+          event.message = `Permission denied by read-only agent ${name}: ${event.action}`;
+        } else if (effects.includes("ask") && event.effect === "allow") {
+          event.effect = "ask";
+          event.message = `Approval required by read-only agent ${name}: ${event.action}`;
+        }
+      } catch (error) {
+        if (protectedKnown) event.effect = "deny";
+        warnPermissionOnce(`read-only permission evaluation failed for ${name ?? "unknown agent"}: ${String(error)}`);
       }
     }));
 
@@ -252,6 +293,12 @@ export async function registerV2Hooks(
     }));
 
     registrations.push(await ctx.tool.transform((editor) => {
+      // execute is denied for read-only tiers. Keep the explicitly allowed docs
+      // lookups directly callable rather than stranding them in Code Mode.
+      if (config.mcp?.context7) for (const name of CONTEXT7_DOC_TOOLS) editor.update(name, definition => {
+        const { pinned: _pinned, ...options } = definition.options ?? {};
+        definition.options = { ...options, codemode: false };
+      });
       for (const [name, definition] of Object.entries(hooks.tool ?? {})) editor.add({
         name,
         description: v2Instructions(definition.description),
@@ -259,9 +306,12 @@ export async function registerV2Hooks(
         // Router tools must remain directly callable, matching v1 tool exposure.
         options: { codemode: false },
         execute: async (args, context) => within(context, async () => {
+          const directory = name.startsWith("router_git_")
+            ? (await ctx.session.get({ sessionID: context.sessionID })).location?.directory ?? ctx.location.directory
+            : ctx.location.directory;
           const result = await definition.execute(args, {
             sessionID: context.sessionID, messageID: context.messageID, agent: context.agent,
-            directory: ctx.location.directory, worktree: ctx.location.project.directory,
+            directory, worktree: name.startsWith("router_git_") ? "" : ctx.location.project.directory, // Session.Info.location has no project; discover from its directory, never the plugin's project.
             abort: context.signal,
             metadata: (metadata) => { void context.progress(metadata); },
             ask: async () => { throw new Error("[model-router] This tool cannot request v1 permissions on OpenCode 2"); },
@@ -288,6 +338,23 @@ export async function registerV2Hooks(
       if (loadConfig(ctx.location.directory) !== lastConfig) await refresh();
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
+      if (protectedAgent(event.agent)) {
+        try {
+          // Catalogs use merged session rules; remove widened tools from this
+          // request snapshot only. Resource-specific asks remain callable.
+          const agent = (await ctx.agent.list()).data.find(agent => agent.id === event.agent);
+          for (const name of Object.keys(event.tools ?? {})) {
+            const action = name === "write" || name === "patch" ? "edit" : name;
+            if (!agent || (evaluatePermission(agent.permissions, action, "*") === "deny"
+              && !agent.permissions.some(rule => rule.effect !== "deny" && rule.action === action && rule.resource !== "*"))) delete event.tools[name];
+          }
+        } catch (error) {
+          // Known protected agent: no usable catalog is safer than widened
+          // tools. Never turn a hook rejection into a host operation failure.
+          for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
+          warnPermissionOnce(`read-only tool catalog failed for ${event.agent}: ${String(error)}`);
+        }
+      }
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };
       // V2 consumes per-turn options, not Agent.Info.request.settings.
       for (const [key, value] of Object.entries(agentOptions.get(event.agent) ?? {})) {
@@ -419,6 +486,21 @@ export async function registerV2Hooks(
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
       if (event.status !== "completed") return;
+      if (event.tool === "grep" && protectedAgent(event.agent)) {
+        const content = event.result.content;
+        event.result = {
+          ...event.result,
+          content: filterSensitiveGrep(contentText(content)),
+          // Native grep also exposes raw matches to SDK callers. Do not leave
+          // their text behind after scrubbing the model-facing representation.
+          ...(Array.isArray(event.result.output) ? { output: event.result.output.filter(match => {
+            if (!match || typeof match !== "object" || !("entry" in match)) return false;
+            const entry = match.entry;
+            return entry !== null && typeof entry === "object" && "path" in entry
+              && typeof entry.path === "string" && !isSensitivePath(entry.path);
+          }) } : {}),
+        };
+      }
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That
       // acknowledgement is not a final result and must never enter acceptance.

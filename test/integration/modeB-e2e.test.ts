@@ -102,7 +102,7 @@ describe("Mode B end-to-end (plan-annotation)", () => {
     delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // ignore
     }

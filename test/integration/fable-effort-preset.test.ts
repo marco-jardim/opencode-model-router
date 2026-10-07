@@ -68,7 +68,7 @@ test("applies fable-effort preset options through config hook", async () => {
 
     const { invalidateConfigCache } = await import("../../src/router/config");
     invalidateConfigCache();
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -116,7 +116,7 @@ test("registers each anthropic tier's effort as `effort`", async () => {
 
     const { invalidateConfigCache } = await import("../../src/router/config");
     invalidateConfigCache();
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 

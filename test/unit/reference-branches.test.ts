@@ -193,7 +193,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await unlinkLinks(base);
-  await fsp.rm(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await fsp.rm(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // --- captureReference ------------------------------------------------------------
@@ -579,8 +579,8 @@ describe("materialize branches (fake git)", { timeout: 20_000 }, () => {
     await fsp.symlink(join(root, "packages", "w"), join(nm, "pkg-ws"), linkType);
     await fsp.mkdir(join(base, "gone2"));
     await fsp.symlink(join(base, "gone2"), join(nm, "pkg-dangling"), linkType);
-    await fsp.rm(join(base, "gone2"), { recursive: true });
-    await fsp.rm(join(base, "gone"), { recursive: true });
+    await fsp.rm(join(base, "gone2"), { recursive: true, maxRetries: 10, retryDelay: 200 });
+    await fsp.rm(join(base, "gone"), { recursive: true, maxRetries: 10, retryDelay: 200 });
     const g = fakeGit((cmd) =>
       cmd.startsWith("ls-files --others --ignored")
         ? { stdout: "a/node_modules/\0b/node_modules/\0c/node_modules/\0node_modules/\0" }

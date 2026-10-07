@@ -425,9 +425,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-  if (state.refRoot !== "") rmSync(state.refRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-  for (const ref of Object.values(state.otherRefs)) rmSync(ref.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  rmSync(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  if (state.refRoot !== "") rmSync(state.refRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  for (const ref of Object.values(state.otherRefs)) rmSync(ref.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 describe("verifyHandles (2.4.3a)", () => {
@@ -1315,7 +1315,7 @@ describe("the router_verify tool (2.4.3b)", () => {
     delete process.env.MODEL_ROUTER_ENFORCE;
     delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   function writeOverrides(verify: Record<string, unknown>): void {
@@ -1367,7 +1367,7 @@ describe("the router_verify tool (2.4.3b)", () => {
     expect((await makePlugin()).hooks.tool.delegate).toBeUndefined();
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
     const both = (await makePlugin()).hooks.tool;
-    expect(Object.keys(both).sort()).toEqual(["delegate", "router_verify"]);
+    expect(Object.keys(both).sort()).toEqual(["delegate", "router_git_blame", "router_git_diff", "router_git_log", "router_git_ls_files", "router_git_show", "router_git_status", "router_verify"]);
     writeOverrides({ require: "never" });
     expect((await makePlugin()).hooks.tool.router_verify).toBeUndefined();
   });

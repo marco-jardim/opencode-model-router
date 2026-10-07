@@ -1,0 +1,413 @@
+# Issue #77 — fast read-only QA
+
+## 1. Pre-flight
+
+- Base: **b7094c4**, v2.3.0; branch `feat/fast-readonly`, worktree
+  `D:\git\omr-fast-ro`. `gh issue view 77` read before implementation.
+- Linear: **not used**. GitHub issue #77 is the work item.
+- Target host: **OpenCode 2.0.24**; adapter dependency/types: `@opencode/plugin`
+  2.0.22; Windows/pwsh. The v1 SDK's `AgentConfig` supports permission fields and
+  `tools: Record<string, boolean>`; the plugin supplies both.
+- `opencode --version` returned `opencode v2.0.24`. Host source checks used
+  `git show v2.0.22:...` (the host source checkout's current HEAD is newer).
+- All edits are in the feature worktree. No live config/store edits, master
+  merge, release, or AI commit attribution.
+- Permission-review follow-up: branch `fast-ro/perm`, worktree
+  `D:\git\omr-fast-perm`, based on `1c977ad`. This round does not modify
+  `src/router/git-tools.ts` or its tests; P3/P8/G8 remain separate work.
+
+## 2. Implementation and policy decisions
+
+- Six named tools keep schemas narrow and audit/permission actions explicit.
+  Git processes have fixed argv, no shell, strict paths/refs, bounded output,
+  timeout/tree cancellation and URL redaction. **Correction:** the first round
+  did *not* make executable configuration inert. It disabled fsmonitor, hooks,
+  pager, `diff.external` and textconv only; repository filter drivers,
+  `gpg.program` via `log.showSignature`, index writes, PATH hijack and link
+  escapes stayed reachable until the second hardening round (section 7).
+  Repository discovery and inspection share one monotonic 15-second deadline;
+  discovery cannot grant a second 15-second window to the inspection command.
+- Optional tier `readOnly`, defaulting to true for fast and false otherwise;
+  all eight presets explicitly opt fast in. Override `readOnly: false` is
+  layer-mergeable. Other tier definitions/prompts are not changed.
+- V1 merges user permission resources after baseline and publishes legacy tool
+  booleans. Arbitrary v1 permission actions/resources remain **unverified**;
+  hosts honouring only `tools` cannot enforce sensitive `read` asks.
+- QA-77-P1/P4 supersede the original v2 prefix-only implementation: reviewed
+  hard-coded defaults, conservative inherited-rule filtering and last-match
+  canaries fail closed on host drift, including appended grants. Warnings are
+  deduplicated. Inherited allow-all is no longer preserved; opt out with
+  `readOnly: false`. Agent resource overrides on permitted actions survive.
+- QA-77-P2 preserves agent-own denies in the permission-evaluate hook, removes
+  child-session allows before prompting/context construction, and filters stale
+  denied tools from the catalog. Parent-session grants cannot reopen denies.
+  `--auto`/`--yolo` auto-answer prompts, not denied permissions.
+- QA-77-P7: global-rule precedence on newly created router agents is unverified;
+  the supported restriction guidance is agent-specific configuration.
+- Only the explicitly named Context7 documentation actions are allowed, only
+  when configured; v2 exposes them directly rather than through denied Code Mode.
+  Action naming was checked against `packages/core/src/tool/mcp.ts` at the
+  host's `v2.0.22` tag (`name(server, tool)` and the executor's permission assertion).
+- External-directory access is allowed but user-configurable. This is not an
+  OS sandbox or a content-confidentiality policy; Git/grep can reveal secrets.
+
+## 3. Tests and verification
+
+### Permission-review follow-up (QA-77-P1/P2/P4/P5/P6/P7/P9/P10)
+
+- `npm run typecheck`: passed.
+- Explicit read-only, evidence-redaction, v2-hooks, v1-roles-line,
+  routing-engine.protocol-line and `test/golden` run: **228 passed / 12 files**.
+  Command: `npx vitest run test/unit/read-only.test.ts test/unit/readonly-evidence.test.ts test/unit/v2-hooks.test.ts test/integration/v1-roles-line.test.ts test/unit/routing-engine.protocol-line.test.ts test/golden --maxWorkers=2 --testTimeout=30000`.
+- `npx vitest related src/compat/v2-hooks.ts src/router/read-only.ts --run --maxWorkers=2 --testTimeout=30000`:
+  **1123 passed, 55 skipped / 41 passed files, 3 skipped** (46.63 s).
+  Both runs use the default pool. No snapshot updates in this round.
+- Hard-coded host fixtures cover identical, appended allow, inserted-middle,
+  respelled and dropped defaults; no SDK-generated drift fixtures. Tests also
+  cover wildcard semantics, canary fallback, warning deduplication, inherited
+  session grants, multi-resource denies, safe overrides and stale tool catalogs.
+
+### Original implementation verification (historical)
+
+- Initial Git implementation: typecheck passed; 32 focused Git tests passed;
+  related tests passed **996 tests / 39 files**, with 55 tests / 3 files skipped.
+- Policy-focused pass: **100 tests / 2 files** (`read-only`, `v2-hooks`), including
+  v1 opt-out/user merge and v2 default-prefix/user precedence. Prompt tests also
+  passed after their deliberate fast-only count update.
+- Added rejection cases: `-o`, `--output=x`, traversal, absolute paths, spaces
+  and shell punctuation in refs, long inputs, invalid limits/modes; hardened
+  argv for all six tools; malicious fsmonitor/diff/textconv/hook marker scripts;
+  stale-index hash/mtime; root discovery; redaction/truncation; timeout/abort.
+- Additional tests cover escaping symlink/junction paths and aborting a process
+  with a live descendant.
+- Focused final pass: **191 tests / 5 files** (Git, permissions, v2 adapter,
+  D2 protocol hashes, v1 roles); typecheck passed. Four affected golden files
+  passed **36 tests**, with **23 snapshots deliberately updated**. The protocol
+  and assembled-prompt snapshots were compared against their old versions with
+  only the documented rename substitution applied: exact equality.
+- Final related run: **9046 passed, 56 skipped; 96 files passed, 3 skipped**,
+  142.01 s. Command:
+
+  ```text
+  npx vitest related src/index.ts src/router/config.ts src/router/read-only.ts src/router/prompts.ts src/compat/v2-hooks.ts src/routing/classify/types.ts src/router/git-tools.ts --run --maxWorkers=2 --testTimeout=30000
+  ```
+
+  Default pool (no `--pool=threads`). An initial invocation hit its 120 s shell
+  deadline; the completed runs used no enclosing shell deadline. One initial
+  adapter test exceeded Vitest's 5 s default on cold startup; focused and final
+  runs used 30 s. Expected protocol/prompt snapshot failures were updated only
+  after inspecting their exact text deltas. No unresolved failures remain.
+- Final deadline hardening: `npm run typecheck` passed, followed by
+  `npx vitest related src/router/git-tools.ts --run --maxWorkers=2 --testTimeout=30000`:
+  **1147 passed, 55 skipped; 42 files passed, 3 skipped**, 50.20 s. Includes the
+  regression proving discovery cannot reset the 15-second deadline.
+- `git diff --check` passed. A comparison against `git show b7094c4:tiers.json`
+  verified all eight presets differ only by `fast.readOnly: true`, every
+  medium/heavy definition and prompt is identical, and fast's prompt is append-only.
+
+## 4. Real-host smoke and evidence
+
+- Permission-review follow-up smoke passed: **1 passed, 12 unrelated scenarios
+  skipped**, 13.87 s, **12 fresh-child probes**. Command:
+  `RUN_OC_SMOKE_ROUTING=1 OMR_UPDATE_READONLY_EVIDENCE=1 npx vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts -t '77 fast read-only' --maxWorkers=2`
+  (environment variables were set with PowerShell syntax).
+- Added parent `shell` allow and parent `*` allow probes: shell remains absent
+  and host-refused. Added an **advertised** read with an agent-specific resource
+  deny and inherited parent read allow: host reports `Permission denied`,
+  exercising permission assertion / BlockedError rather than missing-tool
+  refusal. All probes assert no published `*:*:allow` and no child-session allow.
+- P10: normal smoke runs write only to the isolated harness directory. Updating
+  tracked evidence requires `OMR_UPDATE_READONLY_EVIDENCE=1`. The committed JSON
+  was regenerated with this flag and scrubbed: absolute path resources, embedded
+  Windows user directories and short names are replaced by placeholders. A unit
+  test covers long/short Windows paths, embedded user paths and POSIX paths.
+
+The following records the original nine-probe run; its session-inheritance
+limitation is superseded by the follow-up above.
+
+- Gated scenario: `77 fast read-only: host refuses shell edit execute subagent
+  and permits inspection` in `test/smoke/routing-engine.smoke.test.ts`.
+- Uses the existing isolated real-host harness: private HOME/XDG/temp/store,
+  keyless scripted provider, fresh fast child for every probe, no parent
+  session allow-all. It intentionally emits unavailable tools, so refusal is
+  the host's, not model cooperation.
+- Negative probes: shell redirection, edit, execute, subagent, and Git ref
+  `--output=readonly-probe.txt`; positives: read, grep, glob, git status.
+  Every probe checks the original file and absence of nested children.
+- `docs/qa/fast-readonly-smoke.json` stores names-only advertised-tool traces,
+  permission rules, hook statuses, and refusal booleans (no file contents,
+  provider credentials, or complete model requests).
+- `npm run smoke:routing -- -t ...` was rejected by this npm CLI with
+  `EUNKNOWNCONFIG: Unknown cli flag --t`; the equivalent direct Vitest command
+  with `RUN_OC_SMOKE_ROUTING=1` was used instead.
+- First host attempt exposed inherited default allow-all; corrected by exact
+  prefix replacement and covered in a regression test. The next attempt passed
+  all access probes but the Git rejection assertion incorrectly required an
+  execute.after error hook. Host context already held `status: error` and
+  `Invalid git ref`; the assertion now uses that authoritative host state.
+- Since QA-77-G12 the Git tools return `[router_git] error: <redacted>` instead
+  of throwing, so the Git probe now asserts that text in host state. The gated
+  smoke was not re-run in that round (it would rewrite the evidence JSON).
+- A subsequent assertion was tightened to the host's exact `No tool named
+  "<name>"` refusal instead of a loose regex. Final smoke **passed** on 2.0.24:
+  **1 passed, 12 unrelated scenarios skipped**, nine fresh-child probes. Re-run
+  after final deadline hardening also passed (12.38 s); verdicts and tool inventories
+  were identical, with only isolated temporary-directory paths changing in host rules.
+
+## 5. Exact prompt/snapshot delta
+
+Only two changes to shipped prompt text:
+
+1. Append two newlines and this exact line to fast's prescriptive and built-in
+   goal-oriented prompt (all presets use these defaults):
+
+   > Direct tools (read, glob, grep, router_git_*) and the Code Mode catalog are separate; an empty Code Mode search does not mean a direct tool is missing. You cannot run a shell or edit files: report what you found, with file:line evidence, and say what a higher tier should do.
+
+   Fast lengths: prescriptive **2155 → 2432**, goal-oriented **1212 → 1489**.
+   Medium/heavy lengths and bytes remain unchanged.
+
+2. Taxonomy substring, identically in raw and v2-adapted protocols:
+
+   ```diff
+   -exists-check/rename @medium→impl-feature
+   +exists-check @medium→rename/impl-feature
+   ```
+
+   `git-info` stays the taxonomy token (the protocol does not name shell Git
+   commands); the fast prompt names `router_git_*` and the docs map git-info to
+   these tools. No other protocol text changed.
+
+Updated D2 SHA-256 goldens (character counts unchanged):
+
+| Snapshot | Before | After |
+|---|---|---|
+| R: | `5aca1a71c1450dd61deb2a65c411c9ee03e26b835e3704fe4d81df45bee42452` | `6ace4a35c29f8972a86e67e705830aaff964c78997b654c4b13a139b5b0563fe` |
+| anthropic raw, 3249 | `ee7e33eed9ee3068bc8eb9f2a7492abaed6c428bbf10372bba51f2e92d152af2` | `96c9fa385ca8104f72730ab9aff1d6b6d83a98c1be6c8dd857a6ed129fb38b60` |
+| anthropic v2, 3249 | `aa24cbbf7e558c4f9bd8130fe378a1cdee12e9e9bafef684f57fa4ba9bc59817` | `85d07a3a46c79abc1b15caa65bfff0757912d5e33a6b8ec0deff6b81fae592b1` |
+| hybrid-2 raw, 3288 | `392ff439845c7c96d3f6728111f50c69e4f46315e79db0c4a252507a402a6d33` | `f79fde6484ae5a8f4ca64dc0b1a89910bd55e12f649f39e54e4817d770877211` |
+| hybrid-2 v2, 3288 | `10c2437a28b312f6745512fa6ca69867808b1d2efe897e0e6bb3b0235381370b` | `f9fd9f713f80942d01c3d23ca236164d03e72bd1d8730ab55f1d5081a19c19e0` |
+
+The v1 roles inline snapshot uses the same exact substring change. Its historic
+6357-character system-prompt hash remains pinned after inverting **only** that
+substring, proving every other byte remains identical.
+
+## 6. Limitations and handoff
+
+- V2 agent resource overrides on permitted actions survive; inherited session
+  allows cannot override own denies. Broad inherited allow-all is dropped.
+- The shared filename policy now drives read asks, grep match-block filtering
+  and Git exclusions/refusals (P3/G8). It is not content-based secret detection.
+- No OS sandbox, network Git operations, arbitrary flags, or writable Git tools.
+- V1 permission registration/merge is unit-tested; no claim of a real-v1
+  negative-probe smoke unless explicitly recorded later. Arbitrary actions on
+  v1 are unverified; tool-boolean-only hosts cannot enforce sensitive-read asks.
+- Verification is scoped/related, default Vitest pool, maximum two workers;
+  the full suite was not requested or run. No release or master merge.
+- Implementation and tests were committed/pushed incrementally:
+  `057e472` (Git tools), `7236d5d` (policy/config/protocol), `0c8952d`
+  (real-host smoke, names-only evidence, additional Git safety tests), `9d3cda1`
+  (one shared Git deadline and its regression test).
+  `npm run typecheck` passed before each commit; documentation is the final subtask.
+
+## 7. Second hardening round (QA-77 G1–G14)
+
+A senior review reproduced each finding on Git 2.51.0.windows.1 with throwaway
+fixtures. Every program-starting fixture only creates an empty marker file.
+
+| Id | Finding | Fix |
+|---|---|---|
+| G1 | repository `filter.<d>.clean/process/smudge` (also via `include.path`/`includeIf`) still ran | After discovery, `git config -z --name-only --get-regexp '^(filter\|diff)\..+\.(clean\|smudge\|process\|textconv\|command)$'` (same hardened env) lists configured drivers; each gets `-c <key>=` plus `-c filter.<d>.required=false`. A driver name containing `=` cannot be blanked with `-c`, so the call is refused. On Git ≥ 2.40, `--attr-source=<empty tree>` (SHA-1 or SHA-256 id from `rev-parse --show-object-format`) also ignores in-tree `.gitattributes`. |
+| G2 | `log.showSignature=true` ran `gpg.program` | `-c log.showSignature=false`, `--no-show-signature` on log/show, `gpg.program=`, `gpg.ssh.program=`, `gpg.x509.program=` |
+| G3 | diff's index auto-refresh wrote `.git` (and could empty a split/manyFiles index) | `-c diff.autoRefreshIndex=false -c core.splitIndex=false -c index.threads=1`; each was verified not to write. Without the refresh, `--name-only` would list stat-only changes, so name-only output is derived from `--numstat -z`, which compares content. |
+| G4 | git resolved from any absolute PATH entry, including `<repo>\node_modules\.bin` | Candidates resolved once at plugin load (`%ProgramFiles%\Git\cmd\git.exe`, else the Git for Windows registry `InstallPath`, then absolute PATH). Before any spawn, a candidate whose real path is inside the session directory, the session worktree or the nearest `.git` ancestor is refused. This is re-asserted against the discovered root. |
+| G5 | a tracked directory replaced by a junction/symlink exposed outside files | Before status and worktree diffs: `ls-files -z` prefixes are deduplicated and `lstat`ed shallow-first in batches of 64. Descendants of a link are skipped, and the scan is capped at 50 000 directories. Linked prefixes become `:(exclude,literal)` pathspecs (user paths use `:(literal)`) and are named in a trailing note. Paths through a link are rejected. |
+| G6 | `blame.ignoreRevsFile` leaked its first line | `--no-ignore-revs-file` |
+| G7 | timeouts not enforced when MSYS helpers inherit the pipes | settle on `exit` (drain 200 ms after a kill), destroy the streams, `child.kill()` fallback after 500 ms, forced settle 1 s after a kill request |
+| G9 | `GIT_CONFIG_NOSYSTEM` dropped Git for Windows' `core.autocrlf=true` | `core.autocrlf/eol/safecrlf/longpaths` and `safe.directory` are read from system/global config (`git config --system/--global -z --get-regexp`), value-validated and passed with `-c`, unless the repository sets the key. No inherited key can name a program. |
+| G10 | redaction gaps | Scheme URLs lose the whole userinfo (including `/` or `@` in the password). The scp pattern is anchored at token start. `token`, `password` and similar query values are masked; `image@sha256:` is untouched. On truncation, only the tail of the last token is dropped, from its last possible credential start, so minified single-line files keep their content. |
+| G11 | discovery walked up to any ancestor repository | `GIT_CEILING_DIRECTORIES` = parent of the session worktree (or of the session directory), and the toplevel must lie inside it (`core.worktree` redirects are refused) |
+| G12 | errors thrown into the session | `execute` returns `[router_git] error: <redacted>`; cwd checked before spawn; POSIX kill catch narrowed to `ESRCH`; taskkill start failures logged; no empty catch |
+| G13 | Windows path aliasing | device names (with or without extension), trailing dot/space, NBSP and bidi controls rejected on win32 |
+| G14 | test gaps | marker matrix below; `.git` hashed (content, size, mtime and entries) around every tool call |
+
+Marker matrix (`test/unit/git-tools.test.ts`): fsmonitor, hooks, pager, external
+diff, textconv, diff driver command, filter clean/process/smudge, filter and
+textconv via `.git/info/attributes` (exercises the driver blanking alone),
+`gpg.program` via `log.showSignature`, `includeIf` onbranch and gitdir, and
+`include.path`. For each vector, nine tool calls run first and must leave no
+marker and an unchanged `.git`. Plain git then has to produce the marker; the
+pager can only run on a terminal, so its control is the resolved
+`git var GIT_PAGER`. Further tests cover a split-index/manyFiles repository,
+a fake git in `node_modules/.bin`, a junction or symlink, `ignoreRevsFile`, a
+re-parented grandchild holding the pipes (settles in < 6 s with a 2 s
+timeout), a sleeping filter (never started), autocrlf inheritance and
+precedence, redaction cases, and truncation.
+
+Verification (`fast-ro/git`, Windows): `npm run typecheck` passed;
+`npx vitest run test/unit/git-tools.test.ts` **110 passed**;
+`npx vitest related src/router/git-tools.ts --run --maxWorkers=2`
+**1222 passed, 55 skipped; 42 files passed, 3 skipped** (default pool). The
+reviewer's harnesses (`h1.mjs`, `h2.mjs`) were re-run against this
+implementation: no marker from any tool call, `.git` unchanged, no
+junction/ignore-revs leak, and the slow-filter blame completed in 162 ms.
+
+Known limits:
+
+- G8 was deferred by that branch and is now implemented in the shared-list
+  round below; the TODO has been removed.
+- `--attr-source=<empty tree>` also ignores in-tree `text`/`eol`/`diff`
+  attributes. A repository that relies on `.gitattributes` line endings, with
+  `core.autocrlf` unset, can show stat-dirty CRLF files as modified.
+- Discovery from a subdirectory needs the host worktree context, which v1
+  `context.worktree` and the v2 project directory provide.
+- On Windows the file's tests cover 86% of `git-tools.ts` branches; the POSIX
+  kill/candidate paths rely on Linux CI. The aggregated `src/router/**`
+  coverage gate and the gated real-host smoke were not re-run in this round.
+
+## 8. Round 1 fixes
+
+The table records the original review findings across the merged permission and
+Git branches. **Shared-list commit** below means `d5e377e`, with subject
+`fix(router): one sensitive-file list for read, grep and git tools (QA-77-P3/P8/G8)`.
+These are historical findings/results; Round 2 supersedes the session-mutation,
+ask-projection and sensitive-pattern details below.
+
+| Finding | Resolution | Commit |
+|---|---|---|
+| P1 | Fail-closed drift handling, action filtering, canaries and warnings | `4834f18` |
+| P2 | Agent-own denies survive inherited session grants; child grants narrowed | `4834f18` |
+| P3 | One expanded sensitive-path list; grep after-hook filters native v1/v2 outputs | Shared-list commit |
+| P4 | Hard-coded identical/appended/inserted/respelled/dropped host fixtures | `4834f18` |
+| P5 | Advertised-but-denied read, parent grants, no published allow-all smoke | `4834f18` |
+| P6 | V1 arbitrary actions unverified; boolean-only hosts lack sensitive-read asks | `4834f18` |
+| P7 | Global-rule precedence unverified; guidance limited to agent-specific rules | `4834f18` |
+| P8 | Saved project-wide “always allow” can satisfy read asks; documented caveat | Shared-list commit |
+| P9 | Changelog marked Breaking (behaviour), including session inheritance | `4834f18` |
+| P10 | Evidence updates opt-in; paths/usernames scrubbed | `4834f18` |
+| G1 | Repository filter/diff drivers neutralized, in-tree attributes disabled | `8acc664` |
+| G2 | Signature helpers disabled | `8acc664` |
+| G3 | No diff auto-refresh or split-index writes; numstat-derived names | `8acc664` |
+| G4 | Trusted executable selection outside session/repository | `8acc664` |
+| G5 | Linked tracked directories excluded; explicit linked paths refused | `8acc664` |
+| G6 | Blame ignore-revs file disabled | `8acc664` |
+| G7 | Bounded settlement even with inherited pipes/re-parented helpers | `8acc664` |
+| G8 | Shared sensitive exclusions, explicit-path/ref refusals, commit peeling, diff backstop | Shared-list commit |
+| G9 | Safe line-ending/system config allowlist | `8acc664` |
+| G10 | Expanded URL redaction and safe truncated-token handling | `8acc664` |
+| G11 | Discovery restricted to session/worktree boundary | `8acc664` |
+| G12 | Redacted tool errors; process failures handled | `8acc664` |
+| G13 | Windows device/alias/spoofing path rejection | `8acc664` |
+| G14 | Marker controls, whole-.git digests and expanded regression matrix | `8acc664`, `13d3ca6` (QA documentation) |
+
+Shared-list implementation details:
+
+- `src/router/sensitive-paths.ts` exports the patterns, host permission globs,
+  matcher, Git exclusion pathspecs and output filters. Matching is at every
+  depth, with Windows case folding. `.env.example` remains visible; the private
+  key patterns no longer accidentally match `src/id_utils.ts`.
+- V1's after-hook rewrites `output.output`, resolving the tier from registered
+  session state. V2 rewrites both `result.content` and the raw match array in
+  `result.output`, including text-part arrays. Native host source
+  `v2.0.22:packages/core/src/tool/plugin/grep.ts` confirms permission resources
+  are regexes and the output is grouped by filename. No real-v1 probe was run.
+- Show/diff/log append shared exclude globs; log emits patches. Explicit
+  sensitive paths and colon refs are refused. Show peels to a commit before
+  execution, so direct blob/tree ids cannot bypass pathspecs. Diff sections are
+  also checked for old/new sensitive paths, including rename and C-quoted names.
+- Blame takes one literal filename, not pathspec exclusions, so the equivalent
+  guard is a pre-execution sensitive-path refusal. Status/ls-files can list names.
+- The fixture commits every sensitive pattern, exercises working changes,
+  checks show/diff/log/blame refusals and ordinary/example-file visibility, and
+  verifies no secret marker escapes. The existing minified-output regression
+  now uses `show HEAD` with `path` instead of the deliberately forbidden blob
+  syntax. `.git` digests remain checked around Git fixture calls.
+- P8 source check: host `v2.0.22:packages/core/src/permission.ts`,
+  `evaluateInput`, appends saved project approvals after its configured-deny
+  check. The router leaves that state untouched. This is a filename policy, not
+  a content scanner: ordinary files/metadata can still contain secrets.
+- Real-host smoke passed with evidence writing **off**: **1 passed / 12 skipped**,
+  18.70 s, **13 fresh-child probes**. The additional explicit `.env` grep probe
+  verifies the secret is absent from persisted tool state and the withheld
+  notice is present. `docs/qa/fast-readonly-smoke.json` remained unchanged.
+- `npm run typecheck`: passed. Explicit Git/read-only/v2-hooks/shared-path tests:
+  **253 passed / 4 files**, 57.03 s. Command:
+  `npx vitest run test/unit/git-tools.test.ts test/unit/read-only.test.ts test/unit/v2-hooks.test.ts test/unit/sensitive-paths.test.ts --maxWorkers=2 --testTimeout=30000`.
+- Related run: **1263 passed, 55 skipped / 43 passed files, 3 skipped**, 160.88 s.
+  Command: `npx vitest related src/router/sensitive-paths.ts src/router/git-tools.ts src/router/read-only.ts src/compat/v2-hooks.ts --run --maxWorkers=2 --testTimeout=30000`.
+  Both use the default pool. After pinning log's submodule patch format to short,
+  the focused argv/sensitive-fixture/minified/error regression rerun passed
+  **9 tests**, 17.53 s. No snapshots changed.
+- Initial explicit run: 251 passed, two old expectations failed (`HEAD:minified.js`
+  now raises `Invalid git ref`; the exact error-string assertion still expected
+  the old wording). Tests were deliberately updated for the new colon-ref
+  restriction; the completed explicit/related reruns above have no failures.
+
+## 9. Round 2 fixes
+
+Branch `fast-ro/perm2`, based on `d5e377e`, worktree `D:\git\omr-fast-perm`.
+The permission/sensitive-path changes below are in the commit with subject
+`fix(router): permission and sensitive-file round-2 fixes (QA-77-P-R2-1..8)`.
+No edits to `git-tools.ts`, its tests, or the Git session/worktree-context line
+in `v2-hooks.ts`. Git-producer findings are tracked here without claiming their
+implementation or verification on this branch.
+
+| Finding | Resolution / ownership | Status |
+|---|---|---|
+| P-R2-1 | `*.env`/`*.env.*`, including `prod.env`, `secret.env`, `prod.env.local`; generalized exception pathspecs; read/grep/Git-helper regressions | Fixed here |
+| P-R2-2 | Always project inherited asks onto permitted actions; drop non-explicit allows before projection so drifted host allow-all cannot erase read asks; final canary check | Fixed here |
+| P-R2-3 | Session grants never mutated; own deny/ask restored by evaluate hook, denied catalog tools removed per request; same-child medium resume retains grants | Fixed here |
+| P-R2-4 | Event agent checked first; permission/catalog lookup errors caught and logged, deny only when protected status is known | Fixed here |
+| P-R2-5 | Additional credential patterns; exact SSH key basenames plus dotted extensions, exact `.pub` public keys intentionally readable | Fixed here |
+| P-R2-6 | Preserve grep's `(Results are truncated…` line after sensitive blocks | Fixed here |
+| P-R2-7 | Separate unknown-host-default and inherited-grant-dropped warnings, deduplicated | Fixed here |
+| P-R2-8 | Refresh redacted evidence with all 13 probes, including sensitive grep | Fixed here |
+| G-R2-1 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-2 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-3 | Split diff backstop at commit headers so following log messages survive; public SSH key exception (shared-file nit) | Fixed here |
+| G-R2-4 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-5 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-6 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-7 | Document shared-index mtime refresh, content unchanged, matching plain `git --no-optional-locks status`; Git verification owned by producer | Documentation fixed here; fast-ro/git2, pending merge |
+
+Policy decisions and regression coverage:
+
+- SSH keys are exact `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` names or
+  dotted extensions. Exact `.pub` files are public material and deliberately
+  remain readable; `id_rsa_helpers/x.ts` no longer falls under the read ask.
+  Environment examples remain readable. Expanded patterns are listed in
+  `READ_ONLY_TIERS.md` and generated from one shared module.
+- Tests exercise every pattern's matcher/read glob, real Git exclusion
+  pathspecs against an isolated index, env-suffix grep/diff filtering, commit
+  header preservation, and grep truncation notices. These helper tests do not
+  modify the Git producer's implementation or tests.
+- Unit tests cover inherited `github_* ask` and drifted `apply_patch ask`,
+  parent allows over agent asks, fast-to-medium resume with unchanged grants,
+  failed session/registry lookups and request-local catalog filtering.
+- Saved approvals are not deleted. The v2 hook now restores an agent-own ask
+  even if host evaluation returned allow from saved/session grants; CLI
+  auto-answer can still approve that ask. No claim of mandatory interactive
+  approval or real-v1 host verification.
+- Real-host smoke: **1 passed, 12 unrelated scenarios skipped**, 22.66 s.
+  `RUN_OC_SMOKE_ROUTING=1 OMR_UPDATE_READONLY_EVIDENCE=1` with the gated
+  `77 fast read-only` scenario and `--maxWorkers=2` (PowerShell env syntax).
+  All **13 probes** preserve inherited session grants; parent shell/allow-all
+  grants do not advertise shell to fast. The sensitive grep probe's secret is
+  absent and its withholding notice present. Refreshed JSON has 13 records and
+  passed the local-path/username/secret-marker scrub check.
+- Initial smoke required an assertion update: the host correctly refused a
+  request-local removed tool with `Tool is not available for this request: shell`
+  rather than `No tool named "shell"`. Both exact host refusal forms are now
+  accepted, while absent advertisement and no completed execution remain
+  mandatory. The completed rerun above passed.
+- `npm run typecheck`: passed. Explicit read-only, v2-hooks, sensitive-paths,
+  readonly-evidence and routing-dispatch run: **276 passed / 5 files**, 10.69 s.
+  Command: `npx vitest run test/unit/read-only.test.ts test/unit/v2-hooks.test.ts test/unit/sensitive-paths.test.ts test/unit/readonly-evidence.test.ts test/integration/routing-dispatch.test.ts --maxWorkers=2 --testTimeout=30000`.
+- Related run: **1295 passed, 55 skipped / 43 passed files, 3 skipped**, 84.06 s.
+  Command: `npx vitest related src/router/sensitive-paths.ts src/router/read-only.ts src/compat/v2-hooks.ts --run --maxWorkers=2 --testTimeout=30000`.
+  Both use the default pool. No snapshots updated and no full-suite run.
+- During development, typecheck caught a branded Agent.ID/string fallback
+  mismatch; declaring the local lookup name as `string | undefined` fixed it
+  without assertions/suppressions. A drifted-host regression then reported
+  `expected 'allow' to be 'ask'` for `.env`: projecting a default wildcard allow
+  erased sensitive asks. Retaining P1's rejection of non-explicit allows before
+  projecting non-deny rules fixed it. The final runs above pass all checks.

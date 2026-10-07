@@ -195,7 +195,7 @@ if (process.argv[2] === "child") {
     }
   } finally {
     for (const k of kids) if (k.exitCode === null && k.signalCode === null) k.kill();
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
   console.log(JSON.stringify(results));
 }

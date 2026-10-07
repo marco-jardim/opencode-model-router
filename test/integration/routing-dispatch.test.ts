@@ -145,6 +145,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
     command: { reload: vi.fn(async () => {}), transform: vi.fn(async () => register()) },
     model: { list: vi.fn(async () => ({ data: catalog() })) },
     generate: { text: generate },
+    permission: { hook: vi.fn(async () => register()) },
     tool: {
       list: vi.fn(async () => [{ id: "subagent", execute: hostSubagent }]),
       transform: vi.fn(async () => register()),
@@ -153,6 +154,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
     session: {
       get: vi.fn(async () => { if (session.current instanceof Error) throw session.current; return session.current; }),
       context: vi.fn(async () => [] as unknown[]),
+      update: vi.fn(async () => {}),
       prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
       interrupt: vi.fn(async () => ({ interrupted: true })), remove: vi.fn(async () => {}), move: vi.fn(async () => {}),
       hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),
@@ -234,7 +236,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
   for (const world of worlds.splice(0)) {
     await world.bundle.release();
-    rmSync(world.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(world.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
   hostChildren.clear();
   vi.unstubAllEnvs();
@@ -624,7 +626,7 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
       expect(row!.reason, engine).toContain(`would be sent to @medium (not applied in ${engine})`);
       await world.bundle.release();
       worlds.splice(worlds.indexOf(world), 1);
-      rmSync(world.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      rmSync(world.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       hostChildren.clear();
     }
   });
@@ -1703,7 +1705,7 @@ describe("round 2 (QA-2.2-R2-1, R2-2, R2-7)", () => {
         expect(await world.rows()).toEqual([]);
         expect(lookupDispatch("anything")).toBeUndefined();
         await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
-        for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+        for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
       }
     });
 
@@ -1715,7 +1717,7 @@ describe("round 2 (QA-2.2-R2-1, R2-2, R2-7)", () => {
         expect(input).toMatchObject({ agent: "medium", prompt: "Implement the change in src/a.ts." });
         expect(await world.rows()).toHaveLength(1);
         await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
-        for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+        for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
       }
     });
 
@@ -1835,7 +1837,7 @@ describe("instance selection: the receiving live instance acts; call claims de-d
       expect(listB).not.toHaveBeenCalled();
       expect(await world.rows()).toHaveLength(2);
       await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
-      for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+      for (const w of worlds.splice(0)) { await w.bundle.release(); rmSync(w.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
     }
   });
 

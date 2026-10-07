@@ -21,6 +21,9 @@ import {
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
+import { gitTools } from "./router/git-tools";
+import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
+import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
 import { buildDispatchHeader } from "./router/dispatch-header";
@@ -811,6 +814,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
+      ...gitTools(),
       ...(enableDelegateTool ? { delegate: tool({
         description: DELEGATE_TOOL_DESCRIPTION,
         args: {
@@ -1746,6 +1750,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // treats them as ground truth rather than advisory system noise.
     // -----------------------------------------------------------------------
     "tool.execute.after": async (input: any, output: any) => {
+      if (input?.tool === "grep" && typeof output.output === "string") {
+        const tier = input.agent ?? sessionStore.getTier(input.sessionID);
+        const definition = tier && getActiveTiers(cfg)[tier];
+        if (definition && isReadOnlyTier(tier, definition)) output.output = filterSensitiveGrep(output.output);
+      }
       if (bypassed) return;
       sessionStore.recordToolCall(input, output);
 
@@ -2162,6 +2171,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           prompt: finalPrompt,
           color: tier.color,
         };
+        if (isReadOnlyTier(name, tier)) {
+          const permission = mergePermissions(readOnlyPermissions(Boolean(opencodeConfig.mcp?.context7)
+            && opencodeConfig.mcp.context7.enabled !== false), opencodeConfig.agent[name]?.permission);
+          agentDef.permission = permission;
+          agentDef.tools = { ...legacyReadOnlyTools(permission), ...opencodeConfig.agent[name]?.tools };
+        } else if (name === "fast" || tier.readOnly === false) {
+          // Opt-out removes OUR policy, not restrictions the user supplied.
+          for (const key of ["permission", "tools"]) {
+            if (opencodeConfig.agent[name]?.[key] !== undefined) agentDef[key] = opencodeConfig.agent[name][key];
+          }
+        }
 
         // Apply variant (thinking/reasoning mode)
         if (tier.variant) {

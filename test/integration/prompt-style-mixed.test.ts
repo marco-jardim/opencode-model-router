@@ -60,7 +60,7 @@ async function withPluginHome(
     else process.env.MODEL_ROUTER_VERIFIED_DELEGATE = prevVerifiedDelegate;
 
     invalidateConfigCache();
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }
 

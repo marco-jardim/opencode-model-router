@@ -324,7 +324,7 @@ describe("dispatch reference capture in the changed-file store", () => {
       try {
         await body(real, alias);
       } finally {
-        rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+        rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
       }
     };
     /** The 8.3 short spelling of `p`, or undefined when the volume has no short names. */

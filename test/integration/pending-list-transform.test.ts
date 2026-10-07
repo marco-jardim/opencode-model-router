@@ -118,7 +118,7 @@ describe("the pending list in the orchestrator's system prompt (2.4.4)", () => {
     }
     delete process.env.MODEL_ROUTER_ENFORCE;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("is absent when the orchestrator has no unverified delegation (the prompt does not grow)", async () => {

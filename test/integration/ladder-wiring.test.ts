@@ -101,7 +101,7 @@ describe("Layer-3 escalation ladder wiring", () => {
     delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
     invalidateConfigCache();
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       // ignore
     }
@@ -214,7 +214,7 @@ describe("effortBump false preserves the v2.0.0 golden ladder scenarios", () => 
   afterEach(async () => {
     for (const hooks of instances.splice(0)) await hooks.dispose();
     vi.unstubAllEnvs(); invalidateConfigCache();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   for (const host of ["v1", "v2"] as const) {

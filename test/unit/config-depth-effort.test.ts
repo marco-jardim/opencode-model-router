@@ -35,7 +35,7 @@ function validRaw(extra: Record<string, unknown> = {}): Record<string, unknown> 
 
 const tempRoots: string[] = [];
 afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 function withOverrideFile(run: (path: string) => void): void {

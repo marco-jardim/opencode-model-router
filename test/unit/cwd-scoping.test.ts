@@ -54,7 +54,7 @@ describe("native task — acceptance cwd wiring", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     invalidateConfigCache();
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it.each([undefined, "", "   ", "override"])("uses acceptance cwd unless args.cwd is non-empty (%j)", async (argCwd) => {

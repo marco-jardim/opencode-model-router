@@ -9,7 +9,7 @@ Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -33,7 +33,7 @@ Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Rules: 1.default→@fast unless edits/complex-reasoning needed 2.@medium ONLY: multi-file-edit/refactor/test-suite/build-fix 3.@heavy ONLY: user-requested OR ≥2 @medium failures 4.trivial(grep/read/glob)→direct,spends orchestrator read-only allowance 5.batch related searches→single @fast 6.uncertain @fast vs @medium→@fast,escalate on fail 7.dispatch caps (tighter): always include CAP:5 when dispatching @fast, CAP:2 for @medium, CAP:2 for @heavy 8.orchestrator read-only allowance: dispatch is default; ≤1 direct read-only call per turn; 2nd need → dispatch @fast
 
@@ -55,7 +55,7 @@ Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Rules: 1.default→@medium for implementation and multi-file changes 2.@heavy for architecture/debug/security/tradeoff-analysis by default 3.allow long heavy runs before fallback; avoid premature downshift 4.trivial one-off lookup(grep/read/glob) that settles the question→direct; further reads→@fast 5.if task is composite: explore@fast then execute@heavy 6.dispatch caps: CAP:none (with a \`reason:\` line) for @heavy only; @fast=CAP:8 and @medium=CAP:5 baselines apply 7.subagents still run redundancy check; CAP:none only lifts the numeric cap
 
@@ -77,7 +77,7 @@ Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -101,7 +101,7 @@ Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Rules: 1.default→@medium incl exploration when deep-context matters 2.@heavy: arch/debug/security/multi-file-coord 3.@fast ONLY: trivial single-tool ops (1 grep/1 read) 4.prefer thoroughness over speed 5.dispatch caps: always include CAP:none with a \`reason:\` line in dispatch prompts — subagents may explore as needed for deep context 6.subagents still run redundancy check; CAP:none only lifts the numeric cap, not the stop-on-redundancy rule
 
@@ -123,7 +123,7 @@ Preset: fable-effort. Tiers: @fast=claude-fable-5-1(1x) @medium=claude-fable-5-1
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -147,7 +147,7 @@ Preset: github-copilot. Tiers: @fast=claude-haiku-4.5(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -171,7 +171,7 @@ Preset: google. Tiers: @fast=gemini-3.5-flash-lite(1x) @medium=gemini-3.7-flash(
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -195,7 +195,7 @@ Preset: hybrid. Tiers: @fast=gpt-6-luna-fast/medium(1x) @medium=gpt-6-astra-fast
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -219,7 +219,7 @@ Preset: hybrid-2. Tiers: @fast=gpt-6-luna-fast/medium(1x) @medium=claude-sonnet-
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -243,7 +243,7 @@ Preset: openai. Tiers: @fast=gpt-6-luna-fast(1x) @medium=gpt-6.1-sol-fast/xhigh(
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 
@@ -267,7 +267,7 @@ Preset: zai. Tiers: @fast=glm-4.7(1x) @medium=glm-5.3/high(3x) @heavy=glm-5.3/ma
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
+R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check @medium→rename/impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 

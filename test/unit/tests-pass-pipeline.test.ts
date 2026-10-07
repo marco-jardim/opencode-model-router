@@ -1493,7 +1493,7 @@ describe("scope.rechecker under 8.3 short paths (E2E-2)", { timeout: 60_000 }, (
   afterEach(async () => {
     reruns.length = 0;
     if (junction !== "" && (await fsp.lstat(junction).catch(() => undefined))?.isSymbolicLink()) await fsp.unlink(junction);
-    if (longRoot !== "") await fsp.rm(longRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    if (longRoot !== "") await fsp.rm(longRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     longRoot = "";
     junction = "";
   });
