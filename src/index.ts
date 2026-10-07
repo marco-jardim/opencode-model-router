@@ -285,6 +285,19 @@ function warnSessionLookupFailedOnce(): void {
   );
 }
 
+/**
+ * Agents the v1 host defines itself (opencode v1.18.34 agent.ts). They are absent from the opencodeConfig.agent`n * record the config hook receives, so subagentTiers needs them listed to avoid a false \missing\ skip (QA-81-4).
+ */
+const V1_HOST_BUILTIN_AGENTS: Record<string, { mode: string }> = {
+  general: { mode: "subagent" },
+  explore: { mode: "subagent" },
+  build: { mode: "primary" },
+  plan: { mode: "primary" },
+  title: { mode: "primary" },
+  summary: { mode: "primary" },
+  compaction: { mode: "primary" },
+};
+
 const SESSION_ROOT_MEMO_MAX = 500;
 const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
 
@@ -2249,7 +2262,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const subagentOverrides = resolveSubagentOverrides({
         subagentTiers: cfg.subagentTiers,
         tiers: activeTiers,
-        existingAgents: opencodeConfig.agent,
+        existingAgents: { ...V1_HOST_BUILTIN_AGENTS, ...opencodeConfig.agent },
         pluginAgents: cfg.agents,
         onSkip: (agentName, reason) =>
           reason === "missing" && opencodeConfig[DEFER_MISSING_SUBAGENT_NOTICE] === true

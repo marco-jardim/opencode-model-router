@@ -139,6 +139,16 @@ describe("plugin agents on v1 (config hook)", () => {
     expect(opencodeConfig.agent.ghost).toBeUndefined();
   });
 
+  it("subagentTiers maps a host built-in agent (explore) absent from opencodeConfig.agent (QA-81-4)", async () => {
+    writeGlobal({ subagentTiers: { explore: "fast", ghost: "fast" } });
+    const cfg = loadConfig();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { opencodeConfig } = await run({});
+    expect(opencodeConfig.agent.explore.model).toBe(cfg.presets[cfg.activePreset].fast.model);
+    expect(opencodeConfig.agent.ghost).toBeUndefined();
+    expect(warn.mock.calls.flat().join("\n")).not.toContain("'explore' is not defined");
+    warn.mockRestore();
+  });
   it("a preset switch updates the model and variant on the next hook run", async () => {
     const presetTiers = (prefix: string, variant?: string) => Object.fromEntries(["fast", "medium", "heavy"].map((name) => [name, {
       model: `${prefix}/${name}`, costRatio: 1, description: name, whenToUse: ["anything"],
