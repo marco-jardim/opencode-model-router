@@ -651,7 +651,7 @@ function stable(value: unknown): string {
  * `loadConfig` hands out a new object on every reload, so a `tiers.json` the plugin update replaced is read again (QA-2.4-R2-11) while
  * a config in use is not re-read on every check. `null` = unreadable (a tier is then not "bundled").
  */
-let bundledMemo = new WeakMap<RouterConfig, { readonly config: RouterConfig | null }>();
+const bundledMemo = new WeakMap<RouterConfig, { readonly config: RouterConfig | null }>();
 
 function bundledConfig(cfg: RouterConfig, onError: (check: string, error: unknown) => void): RouterConfig | null {
   let memo = bundledMemo.get(cfg);
@@ -671,11 +671,6 @@ function isUnmodifiedBundledTier(cfg: RouterConfig, tierName: string, onError: (
   const live = cfg.presets[cfg.activePreset]?.[tierName];
   const shipped = bundledConfig(cfg, onError)?.presets[cfg.activePreset]?.[tierName];
   return live !== undefined && shipped !== undefined && stable(live) === stable(shipped);
-}
-
-/** Test seam: forget every memoized shipped config. */
-export function resetBundledConfigMemo(): void {
-  bundledMemo = new WeakMap();
 }
 
 /**

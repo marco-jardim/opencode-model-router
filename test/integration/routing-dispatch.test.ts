@@ -878,8 +878,8 @@ describe("advise: input untouched, protocol and hint through the context hook", 
     expect(texts[0]).toContain("Routing line (optional)");
     expect(texts[0]).not.toMatch(/\bmodel\b/);
     expect(texts[0]!.replace(/\n\nRouting line \(optional\)[\s\S]*$/, "")).toBe(shipped.replace(buildTaskTaxonomy(cfg), () => `${buildTaskTaxonomy(cfg)} | by class: search→@explore recon→@explore`));
-    expect(texts[1]).toMatch(/^Route hint: for recon work like this turn, prefer @explore \(Fast read-only codebase exploration\) over @fast\.\nWhy: /);
-    expect(texts[1]!.split("\n")).toHaveLength(2);
+    expect(texts[1]).toBe("Route hint: for recon work like this turn, prefer @explore (Fast read-only codebase exploration).");
+    expect(texts[1]!.split("\n")).toHaveLength(1);
   });
 
   it("without evidence the R: line is the shipped one and there is no hint, only the route paragraph", async () => {
@@ -900,6 +900,10 @@ describe("advise: input untouched, protocol and hint through the context hook", 
     const again = turn("Find all the usages of parseConfig in the repository");
     await world.sessionHooks.context(again);
     expect(again.system.map((part: { text: string }) => part.text)).toEqual(first.system.map((part: { text: string }) => part.text));
+    world.seed(KEYS.reconExplore, 40, 0);
+    const next = turn("Find all the usages of anotherFunction in the repository");
+    await world.sessionHooks.context(next);
+    expect(next.system[1].text).toBe(first.system[1].text); // new outcomes and a new turn, same destination
     const child: any = { ...turn("Find usages"), system: [] };
     // the legacy hook pushes nothing for a child: no protocol text, so nothing to adapt
     const pushedNothing = await makeWorld({ engine: "advise" });
@@ -909,15 +913,18 @@ describe("advise: input untouched, protocol and hint through the context hook", 
   });
 
   it("enforce appends the paragraph that lets the engine switch; shadow never does", async () => {
-    const world = await makeWorld({ engine: "enforce" });
+    const world = await makeWorld({ engine: "enforce", margin: 0.1, roles: { recon: ["explore"] } });
+    world.seed(KEYS.reconFast, 0, 20);
+    world.seed(KEYS.reconExplore, 20, 0);
     const cfg = loadConfig(world.home);
     const protocol = assembleSystemPrompt(cfg, undefined, false);
     await world.start({ "experimental.chat.system.transform": async (_input: unknown, output: { system: string[] }) => { output.system.push(protocol); } });
-    const event = turn("Do the thing");
+    const event = turn("Find all the usages of parseConfig in the repository");
     await world.sessionHooks.context(event);
     const text = event.system[0].text as string;
     expect(text).toContain("may start a dispatch on another agent");
     expect(text).not.toContain("does not change your dispatches");
+    expect(event.system).toHaveLength(1); // enforce routes already: no advisory hint, even with evidence
   });
 });
 
@@ -1685,12 +1692,13 @@ describe("round 2 (QA-2.2-R2-1, R2-2, R2-7)", () => {
       return event.input as Record<string, any>;
     };
 
-    it("a session of the static location is not routed by the live instance of another location (either delivery order)", async () => {
+    it("a static location receiving its own hook stays untouched (measured host delivery)", async () => {
       for (const order of ["A-first", "B-first"] as const) {
         const { world, dirB } = await twoLocations();
         inDirectory(world, dirB);
-        const input = await deliver(world, order);
-        expect(input).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // not stripped, not rewritten
+        const event = dispatch(world, { agent: "medium", prompt: IMPLEMENT() }).event;
+        await world.allToolHooks["execute.before"]![1]!(event); // only the static location receives this hook
+        expect(event.input).toMatchObject({ agent: "medium", prompt: IMPLEMENT() }); // not stripped, not rewritten
         expect(await world.rows()).toEqual([]);
         expect(lookupDispatch("anything")).toBeUndefined();
         await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
@@ -1744,7 +1752,7 @@ describe("round 2 (QA-2.2-R2-1, R2-2, R2-7)", () => {
     });
   });
 });
-describe("instance selection: the session's directory picks the instance, with a fallback (QA-2.2-R2-2)", () => {
+describe("instance selection: the receiving live instance acts; call claims de-duplicate (QA-G-A6)", () => {
   const sessionIn = (world: World, directory: string): void => {
     world.session.current = { id: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, permissions: [{ action: "subagent", resource: "*", effect: "allow" }], location: { directory } };
   };
@@ -1786,11 +1794,11 @@ describe("instance selection: the session's directory picks the instance, with a
     expect(await deliver(world)).toMatchObject({ prompt: stripped });
     expect(await deliver(world)).toMatchObject({ prompt: stripped });
     expect(await world.rows()).toHaveLength(2);
-    const lines = debug.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("no plugin instance owns the session directory"));
+    const lines = debug.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("the receiving instance acts"));
     expect(lines).toHaveLength(1); // once per directory, not per dispatch
   });
 
-  it("two live instances, one matching the session's directory exactly: only that one acts (either delivery order)", async () => {
+  it("two live instances: the first receiving instance acts, even if another owns the directory", async () => {
     for (const order of ["in-order", "reversed"] as const) {
       const world = await makeWorld({ engine: "shadow", roles: {} });
       await world.start();
@@ -1800,13 +1808,14 @@ describe("instance selection: the session's directory picks the instance, with a
       listA.mockClear();
       sessionIn(world, dirB);
       expect(await deliver(world, order)).toMatchObject({ prompt: stripped });
-      expect(listB).toHaveBeenCalledTimes(1);
-      expect(listA).not.toHaveBeenCalled();
+      expect(order === "in-order" ? listA : listB).toHaveBeenCalledTimes(1);
+      expect(order === "in-order" ? listB : listA).not.toHaveBeenCalled();
       expect(await world.rows()).toHaveLength(1);
+      listA.mockClear();
       listB.mockClear();
       sessionIn(world, world.home);
       expect(await deliver(world, order)).toMatchObject({ prompt: stripped });
-      expect(listA).toHaveBeenCalledTimes(1);
+      expect(listA).not.toHaveBeenCalled(); // the first receiver's agent list is cached
       expect(listB).not.toHaveBeenCalled();
       expect(await world.rows()).toHaveLength(2);
       await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
@@ -1831,10 +1840,25 @@ describe("instance selection: the session's directory picks the instance, with a
     }
     expect(listSub).toHaveBeenCalledTimes(1); // its agent list is cached for the second dispatch
     expect(listRoot).not.toHaveBeenCalled();
-    // a session elsewhere under the root: the root instance owns it, and it is static
+    // A measured host sends a root location's hook only to that (static) instance.
     sessionIn(world, join(world.home, "other"));
-    expect(await deliver(world)).toMatchObject({ prompt: IMPLEMENT() });
+    const event = dispatch(world, { agent: "medium", prompt: IMPLEMENT() }).event;
+    await world.allToolHooks["execute.before"]![0]!(event);
+    expect(event.input).toMatchObject({ prompt: IMPLEMENT() });
     expect(await world.rows()).toHaveLength(2);
+  });
+
+  it("does not drop the only delivered hook when another live instance owns the session directory", async () => {
+    const world = await makeWorld({ engine: "shadow", roles: {} });
+    await world.start();
+    const dirB = join(world.home, "owner");
+    const listB = await instanceAt(world, dirB);
+    sessionIn(world, dirB);
+    const event = dispatch(world, { agent: "medium", prompt: IMPLEMENT() }).event;
+    await world.allToolHooks["execute.before"]![0]!(event);
+    expect(event.input).toMatchObject({ prompt: stripped });
+    expect(await world.rows()).toHaveLength(1);
+    expect(listB).not.toHaveBeenCalled();
   });
 
   it("a disposed instance no longer owns anything: the remaining one takes its sessions through the fallback", async () => {

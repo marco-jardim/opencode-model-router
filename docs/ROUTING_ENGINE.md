@@ -35,7 +35,7 @@ The routing engine decides, for every dispatch, which **agent**, **model and var
 | **Candidate** | One thing a dispatch could be sent to: a router tier (`@fast`, `@medium`, `@heavy`) at one of its rungs, or a native/user agent listed under [`routing.roles`](#roles-and-native-agents). |
 | **Rung** | One `(model, variant, costRatio)` of a tier's ladder. Without `candidates` a tier has one rung, its own. See [Tier `candidates`](./CONFIG_REFERENCE.md#tier-candidates). |
 | **Key** | `(class × agent × model#variant)`: the unit the scoreboard keeps. |
-| **Outcome** | A verification verdict (`pass`, `fail`, `unverifiable`) or a false refusal (a child that handed back with zero tool calls) for a key. |
+| **Outcome** | A verification verdict (`pass`, `fail`, `unverifiable`) or a suspected false refusal for a key. False-refusal detection requires zero observed tool calls **and** a recognized hand-back prefix (`ESCALATE:`, `NEED MORE:`, `NEED CONTEXT:`, `SCOPE GROWTH:`, `BLOCKED:`) **and** capability/access/refusal wording; zero calls alone are not a refusal. |
 | **Posterior** | A Beta distribution over "this key passes verification for this class", built from a prior (below) and the key's outcomes. Only verified outcomes feed it (D4). `unverifiable` verdicts change nothing; a false refusal counts as a failure. |
 | **Decision** | The engine's answer for one dispatch: `chosen` (what the orchestrator picked), `best` (the cheapest eligible candidate by expected cost), whether it would switch, why. |
 | **Pin** | `[route … pin]`: the tier is mandated by a plan or by policy; the engine never switches a pinned dispatch. |
@@ -50,8 +50,8 @@ The routing engine decides, for every dispatch, which **agent**, **model and var
 |---|---|---|---|---|
 | `static` (default) | nothing | nothing | the shipped protocol and `R:` line, byte for byte | never |
 | `shadow` | every dispatch | a decision row per dispatch, verdicts and refusals into the store | unchanged (a `[route …]` line is parsed and stripped) | never |
-| `advise` | every dispatch | as `shadow` | the generated `R:` line, a paragraph about the route line, and a one-or-two-line `Route hint` when the engine would move a dispatch | never: the orchestrator decides |
-| `enforce` | every dispatch | as `shadow` | as `advise` | yes, under [the rules below](#when-enforce-switches-a-dispatch) |
+| `advise` | every dispatch | as `shadow` | the generated `R:` line, a paragraph about the route line, and a stable one-line `Route hint` when the engine would move a dispatch | never: the orchestrator decides |
+| `enforce` | every dispatch | as `shadow` | the generated `R:` line and route-line paragraph, **no hint** (the engine already routes) | yes, under [the rules below](#when-enforce-switches-a-dispatch) |
 
 Facts worth knowing:
 
@@ -118,7 +118,7 @@ The orchestrator (or `/annotate-plan`) may describe the work in one line:
 
 ### The generated `R:` line and the hint
 
-In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 effective outcomes for that class** (see [When `enforce` switches](#when-enforce-switches-a-dispatch) for what "effective" means), so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. The per-turn hint classifies the latest user message with the rules classifier only (a hint never costs a model call), is at most two lines (`Route hint: for <class> work like this turn, prefer @<agent> (<description>) over @<chosen>.` and `Why: …`) and appears only when the kernel would switch, so it never contradicts the `R:` line. It is a separate system part, so the protocol prefix stays cacheable, but the hint part changes with each user turn.
+In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 effective outcomes for that class** (see [When `enforce` switches](#when-enforce-switches-a-dispatch) for what "effective" means), so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. **Only `advise` emits the hint**; `enforce` already routes and emits none. The hint classifies the latest user message with the rules classifier only (a hint never costs a model call), and appears only when the kernel would switch. Its one line names only the class and destination: `Route hint: for <class> work like this turn, prefer @<agent> (<description>).` It contains no live numbers, previous pick or decision reason. It is the last system part: changing it can invalidate the cached history after the system prefix, so merely separating it from the protocol does **not** preserve that history's cache. With the same class and destination, new outcomes and turns leave its text byte-identical.
 
 ### `/annotate-plan`
 
@@ -370,6 +370,7 @@ A resume is also refused, and a fresh child started, for these reasons:
 | `invalid-variant` | The target variant is not in the live catalog (checked before the call). The attempt runs on a fresh child, charged at the tier's ratio, with the effort override when the variant names an effort level. |
 | `bare-model-after-variant` | An escalation would send a bare `provider/model` to a child whose stored variant was set by an earlier step. **Measured on 2.0.22 (Phase 3.2):** the host does **not** keep the old variant: it stores `#default`, and on a same-model resume the top level keeps the old effort while the model's default effort travels in-band (sonnet after `#low`: in-band `high`; opus: none; OpenAI luna after `#high`: in-band `medium`). The guard stays as a safety choice: that was seen at the host-to-provider boundary only, and provider acceptance of in-band effort is unverified. |
 | `effort-path` | An escalation across a tier that configures `effort`/`thinking`/`reasoning`. **Measured on 2.0.22 (Phase 3.2):** after an agent switch on a resumed child, on a **same-model** switch the previous agent's effort stays at the top level and the target's goes in-band, and the target's takes effect **only if the provider honours in-band effort**; on a model change the top level carries the target's effort. The guard stays: provider acceptance of in-band effort is unverified, so the least trusted path still starts fresh. |
+| child gone / not a child of this session / host started another child | The runner rejects the resume and starts a **fresh child for the same attempt**, without charging an extra failed attempt. The registry is installed early, but the resume decision row is enqueued only when matching progress or the completed result confirms the child's identity; a stray resume leaves no phantom `resume: true` row. |
 | a refused resume | The host rejected the resume (for example a permission re-check on an agent switch); the attempt fails and the ladder continues. |
 
 A resume needs a `routing` block (A15), a model catalog, and the child's execution end (waited for at most 1 s). The routine resume/fresh decisions are logged only with `MODEL_ROUTER_TRAJECTORY_DEBUG=1`; the unusual ones (a refusal, an invalid variant) always are. The catalog is cached; a hung catalog call is not repeated.
@@ -472,6 +473,10 @@ OpenCode v1 is unchanged in every mode (D1). With no `routing` block nothing dif
 - `/annotate-plan` adds nothing for the engine on v1 (and none under `static`): `[route …]` lines are emitted only where the engine will strip and honour them.
 
 ## Known limits and experimental parts
+
+- **The advise hint can still affect the prompt cache.** For a given class and unchanged agent description, the hint changes only when the recommended destination changes (including gaining or losing a recommendation), not when live outcome numbers change. A different class also changes its class label. It is absent in `enforce`. The cache-read share remains unmeasured; DF5 must compare the orchestrator's cache-read share with the hint on against the `shadow` baseline (QA-2.2-10 / QA-G-A1).
+- **Credential-skip diagnostics are coarse.** `backendSkipped: "credentials"` records that the backend was skipped, but does not identify which credential-detection signal fired.
+- **`delegate` producers have no false-refusal detection.** `onFalseRefusal` is wired only on the native-subagent result path, not the runner's `delegate` producers; zero-call capability hand-backs there do not feed refusal outcomes.
 
 - **Hard exits can lose buffered data.** Up to ≈30 s of queued decision/verdict/refusal rows plus an unsaved snapshot can be lost on a hard exit. Graceful `dispose()` flushes; persistence errors or a busy snapshot lock can still prevent that final best-effort save.
 

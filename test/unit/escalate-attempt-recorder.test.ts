@@ -95,6 +95,35 @@ afterEach(() => {
 });
 
 describe("createAttemptRecorder", () => {
+  it("registers a pending resume before execution, but enqueues its row only once identity is confirmed", async () => {
+    const h = harness();
+    const recorder = createAttemptRecorder({ host: "v2", config: () => config({ engine: "shadow" }, h.outcomes), logger: h.logger, acquire: h.acquire });
+    try {
+      const confirm = recorder.record(attempt(), true);
+      const decisionID = lookupDispatch("c1")?.decisionID;
+      expect(decisionID).toBeTruthy();
+      expect(await h.rows()).toEqual([]);
+      confirm();
+      confirm();
+      expect(await h.rows()).toMatchObject([{ decisionID, resume: true }]);
+    } finally {
+      await recorder.dispose();
+    }
+  });
+
+  it("a rejected resume followed by a fresh child has no phantom resume row", async () => {
+    const h = harness();
+    const recorder = createAttemptRecorder({ host: "v2", config: () => config({ engine: "shadow" }, h.outcomes), logger: h.logger, acquire: h.acquire });
+    try {
+      recorder.record(attempt(), true); // early registration is never confirmed by the host
+      recorder.record(attempt({ childSessionID: "fresh", resumed: false }));
+      expect(await h.rows()).toMatchObject([{ childSessionID: "fresh", resume: false }]);
+      expect(await h.rows()).toHaveLength(1);
+    } finally {
+      await recorder.dispose();
+    }
+  });
+
   it("registers the attempt under its step label and writes one decision row when the engine is live", async () => {
     const h = harness();
     const recorder = createAttemptRecorder({ host: "v2", config: () => config({ engine: "shadow" }, h.outcomes), logger: h.logger, acquire: h.acquire, now: () => T0 });

@@ -59,7 +59,7 @@ export async function runStatsCommand(args: string, deps: StatsCommandDeps): Pro
   let stderr = "";
   let bundle: OutcomesBundle | null = null;
   try {
-    const routing = resolveRouting(deps.cfg, deps.host);
+    const routing = resolveRouting(deps.cfg, deps.host, deps.logger);
     const defaultDir = resolveOutcomesDir(routing.outcomes.path, env);
     // Only a live engine holds (or may hold) rows in memory; static never touches the store (§1.2).
     const live = deps.host === "v2" ? ingestSettings(deps.cfg, "v2") : null;

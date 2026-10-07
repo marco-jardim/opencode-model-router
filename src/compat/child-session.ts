@@ -29,6 +29,8 @@ export interface ChildSessionRequest {
   resumeSessionID?: string;
   /** Runs before the child can start its first model request. */
   onCreated(sessionID: string): Promise<void>;
+  /** Runs once when progress or the completed result confirms which child the host actually ran. */
+  onConfirmed?(sessionID: string): Promise<void>;
 }
 
 /**

@@ -60,8 +60,8 @@ export interface AttemptRecord {
 export interface AttemptRecorder {
   /** True when attempts are worth registering for the engine alone (any mode but `static`, on v2). */
   engineLive(config?: RouterConfig): boolean;
-  /** Register the attempt and, when the engine is live, enqueue its decision row. Never throws. */
-  record(attempt: AttemptRecord): void;
+  /** Register now; optionally defer the row until the returned idempotent confirmation is called. Never throws. */
+  record(attempt: AttemptRecord, deferRow?: boolean): () => void;
   /** Opportunistic maintenance: releases the outcomes bundle when the engine went back to `static`. */
   sweep(): void;
   /** Releases this recorder's reference to the outcomes bundle. Never rejects. */
@@ -141,7 +141,7 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
       }
     },
 
-    record(attempt) {
+    record(attempt, deferRow = false) {
       try {
         const { plan } = attempt;
         const settings = settingsNow(attempt.config);
@@ -160,9 +160,9 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
           // Registered with ingestion off (engine static): no instance may score it (QA-2.3-6).
           outcomes: settings !== null,
         }, safeNow(now));
-        if (settings === null || decisionID === null || plan.model === undefined) return;
+        if (settings === null || decisionID === null || plan.model === undefined) return () => undefined;
         const bundle = bundleFor(settings);
-        if (bundle === null) return;
+        if (bundle === null) return () => undefined;
         const variant = normalizeVariant(plan.model.variant);
         const origin = classifyAgentOrigin(plan.agent, settings.routerAgentIds);
         const key = makeKey(attempt.facts.class, { origin, id: plan.agent }, plan.model.providerID, plan.model.modelID, variant);
@@ -187,9 +187,21 @@ export function createAttemptRecorder(deps: AttemptRecorderDeps): AttemptRecorde
           step: plan.step,
           resume: attempt.resumed,
         };
-        bundle.flusher.enqueue(row);
+        let confirmed = false;
+        const confirm = (): void => {
+          if (confirmed) return;
+          confirmed = true;
+          try {
+            bundle.flusher.enqueue(row);
+          } catch (error) {
+            deps.logger.warn("[router] ladder attempts: enqueueing an attempt failed", { error: describe(error), child: attempt.childSessionID });
+          }
+        };
+        if (!deferRow) confirm();
+        return confirm;
       } catch (error) {
         deps.logger.warn("[router] ladder attempts: registering an attempt failed", { error: describe(error), child: attempt.childSessionID });
+        return () => undefined;
       }
     },
 

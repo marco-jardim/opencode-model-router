@@ -1183,7 +1183,6 @@ export const ROUTE_LINE_MAX_CHARS = 500;
 export const ROUTE_LINE_RE = /^[ \t]*\[route(?:[ \t]+([^\]\r\n]*?))?[ \t]*\][ \t]*$/i;
 
 /** Field keys understood in a route line; anything else is ignored. */
-export const ROUTE_LINE_KEYS = ["class", "risk", "scope", "needs", "d", "pin"] as const;
 
 // ---------------------------------------------------------------------------
 // Backend option sets and fixed prompt text (English, D14)

@@ -135,6 +135,12 @@ export function createV2Runtime(ctx: Plugin.Context) {
       }
       // A resumed child is known up front: the host does not create one, and a progress event for another id is an error.
       let childID: string | undefined = resumeID;
+      let confirmed = false;
+      const confirmChild = async (sessionID: string): Promise<void> => {
+        if (confirmed) return;
+        confirmed = true;
+        await request.onConfirmed?.(sessionID);
+      };
       /** Set when the host answered a resume with another child; thrown from `run` whatever the host made of the progress error. */
       let strayResume: ResumeRejectedError | undefined;
       if (resumeID !== undefined) {
@@ -192,6 +198,7 @@ export function createV2Runtime(ctx: Plugin.Context) {
               if (request.cwd) await ctx.session.move({ sessionID, directory: request.cwd }, { signal });
               signal.throwIfAborted();
             }
+            if (typeof sessionID === "string" && sessionID === childID) await confirmChild(sessionID);
             // V2 rejects progress outside a running call. Deferred/queued graders
             // retain settled parent contexts; also tolerate settlement during progress.
             if (scope.active) {
@@ -202,9 +209,14 @@ export function createV2Runtime(ctx: Plugin.Context) {
         });
         signal.throwIfAborted();
         const output = result.output as { sessionID?: unknown; status?: unknown; output?: unknown } | undefined;
+        if (resumeID !== undefined && typeof output?.sessionID === "string" && output.sessionID !== resumeID) {
+          const cleanup = await removeStray(output.sessionID);
+          throw new ResumeRejectedError(resumeID, `the host started another child (${output.sessionID}) instead${cleanup}`);
+        }
         if (!childID || output?.sessionID !== childID || output.status !== "completed" || typeof output.output !== "string") {
           throw new Error("[model-router] native subagent did not return a completed child result; verification cannot use a pending result");
         }
+        await confirmChild(childID);
         return { sessionID: childID, text: output.output };
       } catch (error) {
         controller.abort();
