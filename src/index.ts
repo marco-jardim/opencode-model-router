@@ -18,6 +18,7 @@ import {
   resolveVariantSteps,
   routerStatusLines,
   warnConfigIssues,
+  resolveActiveTiers,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
@@ -314,6 +315,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const sessionStore = createSessionStore();
   /** v1 sessionID -> plugin agent name, from chat.message (tool.execute.after has no `agent` on v1). */
   const pluginAgentSessions = new Map<string, string>();
+  /** Plugin agents the v1 config hook built on its previous run -> the host entry it merged (QA-81-8). */
+  let builtPluginAgents = new Map<string, Record<string, unknown> | undefined>();
   let systemDebugLogged = false;
   let dispatchDebugLogged = false;
 
@@ -2237,8 +2240,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // re-run on /preset rebuilds them. An opencode.json `agent.<name>` entry
       // wins for the fields it sets (its permission rules go after ours).
       const context7 = Boolean(opencodeConfig.mcp?.context7) && opencodeConfig.mcp.context7.enabled !== false;
+      const builtNow = new Map<string, Record<string, unknown> | undefined>();
+      const pluginTiers = resolveActiveTiers(cfg);
       for (const [name, entry] of Object.entries(cfg.agents ?? {})) {
-        const tier = activeTiers[entry.tier];
+        const tier = pluginTiers[entry.tier];
         if (!tier) continue;
         const existing = opencodeConfig.agent[name];
         const seed = (opencodeConfig as Record<symbol, unknown>)[HOST_SEED_AGENTS];
@@ -2264,7 +2269,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           );
         }
         opencodeConfig.agent[name] = definition;
+        builtNow.set(name, hostEntry);
       }
+      // A plugin agent built on a previous run but not rebuilt now (removed or invalid) must not linger.
+      // Detection is the symbol marker OR the closure set, so a cloned config (marker lost) is covered too.
+      for (const name of Object.keys(opencodeConfig.agent)) {
+        if (builtNow.has(name)) continue;
+        const marker = pluginAgentMarker(opencodeConfig.agent[name]);
+        if (marker === undefined && !builtPluginAgents.has(name)) continue;
+        const restore = marker ? marker.hostEntry : builtPluginAgents.get(name);
+        if (restore !== undefined) opencodeConfig.agent[name] = restore;
+        else delete opencodeConfig.agent[name];
+      }
+      builtPluginAgents = builtNow;
 
       const subagentOverrides = resolveSubagentOverrides({
         subagentTiers: cfg.subagentTiers,

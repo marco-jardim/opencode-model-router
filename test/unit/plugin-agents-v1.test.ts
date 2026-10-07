@@ -149,6 +149,18 @@ describe("plugin agents on v1 (config hook)", () => {
     expect(warn.mock.calls.flat().join("\n")).not.toContain("'explore' is not defined");
     warn.mockRestore();
   });
+  it.each([["same config object", (c: any) => c], ["cloned config (symbol marker lost)", (c: any) => JSON.parse(JSON.stringify(c))]])(
+    "re-run drops a plugin agent removed from the router config (%s) (QA-81-8)", async (_label, rebuild) => {
+      writeGlobal({ agents: agentsBlock });
+      const first = await run({});
+      expect(first.opencodeConfig.agent.scout).toBeDefined();
+      writeGlobal({ agents: {} });
+      invalidateConfigCache();
+      const second = rebuild(first.opencodeConfig);
+      await first.hooks.config(second);
+      expect(second.agent.scout).toBeUndefined();
+    },
+  );
   it("a preset switch updates the model and variant on the next hook run", async () => {
     const presetTiers = (prefix: string, variant?: string) => Object.fromEntries(["fast", "medium", "heavy"].map((name) => [name, {
       model: `${prefix}/${name}`, costRatio: 1, description: name, whenToUse: ["anything"],

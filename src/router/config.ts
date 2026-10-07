@@ -2683,9 +2683,18 @@ function buildConfig(
  * every `tier`. A bad entry is removed with a notice naming its key path and
  * file; the other entries, the layer and `routing` are kept (#80).
  */
+/**
+ * The one preset resolver for plugin agents: validation, registration and the status lines all use it,
+ * so they cannot disagree (QA-81-9). Case-insensitive like /preset; falls back to the first preset.
+ */
+export function resolveActiveTiers(cfg: RouterConfig): Preset {
+  const name = resolvePresetName(cfg, cfg.activePreset);
+  return (name !== undefined ? cfg.presets[name] : undefined) ?? Object.values(cfg.presets)[0] ?? {};
+}
+
 function applyPluginAgents(cfg: RouterConfig, layers: readonly OverrideLayer[], notices: ConfigNotice[]): void {
   if (!Object.hasOwn(cfg, "agents")) return;
-  const tiers = cfg.presets[cfg.activePreset] ?? Object.values(cfg.presets)[0] ?? {};
+  const tiers = resolveActiveTiers(cfg);
   const { agents, issues } = sanitizePluginAgents(cfg.agents, { activePreset: cfg.activePreset, tiers });
   // Project layers never carry `agents` (stripped while collecting), so the
   // source is the global override when it names the entry, else tiers.json.
@@ -3174,8 +3183,7 @@ export function pluginAgentLines(cfg: RouterConfig): string[] {
   if (agents === undefined) return [];
   const names = Object.keys(agents);
   if (names.length === 0) return [];
-  const presetName = resolvePresetName(cfg, cfg.activePreset);
-  const preset = presetName !== undefined && Object.hasOwn(cfg.presets, presetName) ? cfg.presets[presetName] : undefined;
+  const preset = resolveActiveTiers(cfg);
   return [
     "router: Plugin agents:",
     ...names.map((name) => {

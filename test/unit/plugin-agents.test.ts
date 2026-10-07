@@ -277,3 +277,18 @@ describe("plugin agents: layer rules", () => {
   });
 });
 
+describe("plugin agents: one preset resolver (QA-81-9)", () => {
+  const mk = (activePreset: string) => ({
+    activePreset,
+    presets: { alpha: { scout: { model: "p/alpha", costRatio: 1, description: "a", whenToUse: [] } }, beta: { scout: { model: "p/beta", costRatio: 1, description: "b", whenToUse: [] } } },
+    agents: { r: { tier: "scout", description: "d", readOnly: true } },
+  }) as unknown as import("../../src/router/config").RouterConfig;
+
+  it("a case-different activePreset resolves like /preset", () => {
+    expect(pluginAgentLines(mk("BETA")).join("\n")).toContain("p/beta");
+  });
+
+  it("a missing activePreset falls back to the first preset, as registration does", () => {
+    expect(pluginAgentLines(mk("nope")).join("\n")).toContain("p/alpha");
+  });
+});
