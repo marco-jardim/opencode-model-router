@@ -16,8 +16,12 @@
 ## 2. Implementation and policy decisions
 
 - Six named tools keep schemas narrow and audit/permission actions explicit.
-  Git processes have fixed argv, no shell, strict paths/refs, inert executable
-  configuration, bounded output, timeout/tree cancellation, URL redaction.
+  Git processes have fixed argv, no shell, strict paths/refs, bounded output,
+  timeout/tree cancellation and URL redaction. **Correction:** the first round
+  did *not* make executable configuration inert. It disabled fsmonitor, hooks,
+  pager, `diff.external` and textconv only; repository filter drivers,
+  `gpg.program` via `log.showSignature`, index writes, PATH hijack and link
+  escapes stayed reachable until the second hardening round (section 7).
   Repository discovery and inspection share one monotonic 15-second deadline;
   discovery cannot grant a second 15-second window to the inspection command.
 - Optional tier `readOnly`, defaulting to true for fast and false otherwise;
@@ -95,6 +99,9 @@
   all access probes but the Git rejection assertion incorrectly required an
   execute.after error hook. Host context already held `status: error` and
   `Invalid git ref`; the assertion now uses that authoritative host state.
+- Since QA-77-G12 the Git tools return `[router_git] error: <redacted>` instead
+  of throwing, so the Git probe now asserts that text in host state. The gated
+  smoke was not re-run in that round (it would rewrite the evidence JSON).
 - A subsequent assertion was tightened to the host's exact `No tool named
   "<name>"` refusal instead of a loose regex. Final smoke **passed** on 2.0.24:
   **1 passed, 12 unrelated scenarios skipped**, nine fresh-child probes. Re-run
@@ -152,3 +159,58 @@ substring, proving every other byte remains identical.
   (real-host smoke, names-only evidence, additional Git safety tests), `9d3cda1`
   (one shared Git deadline and its regression test).
   `npm run typecheck` passed before each commit; documentation is the final subtask.
+
+## 7. Second hardening round (QA-77 G1–G14)
+
+A senior review reproduced each finding on Git 2.51.0.windows.1 with throwaway
+fixtures. Every program-starting fixture only creates an empty marker file.
+
+| Id | Finding | Fix |
+|---|---|---|
+| G1 | repository `filter.<d>.clean/process/smudge` (also via `include.path`/`includeIf`) still ran | After discovery, `git config -z --name-only --get-regexp '^(filter\|diff)\..+\.(clean\|smudge\|process\|textconv\|command)$'` (same hardened env) lists configured drivers; each gets `-c <key>=` plus `-c filter.<d>.required=false`. A driver name containing `=` cannot be blanked with `-c`, so the call is refused. On Git ≥ 2.40, `--attr-source=<empty tree>` (SHA-1 or SHA-256 id from `rev-parse --show-object-format`) also ignores in-tree `.gitattributes`. |
+| G2 | `log.showSignature=true` ran `gpg.program` | `-c log.showSignature=false`, `--no-show-signature` on log/show, `gpg.program=`, `gpg.ssh.program=`, `gpg.x509.program=` |
+| G3 | diff's index auto-refresh wrote `.git` (and could empty a split/manyFiles index) | `-c diff.autoRefreshIndex=false -c core.splitIndex=false -c index.threads=1`; each was verified not to write. Without the refresh, `--name-only` would list stat-only changes, so name-only output is derived from `--numstat -z`, which compares content. |
+| G4 | git resolved from any absolute PATH entry, including `<repo>\node_modules\.bin` | Candidates resolved once at plugin load (`%ProgramFiles%\Git\cmd\git.exe`, else the Git for Windows registry `InstallPath`, then absolute PATH). Before any spawn, a candidate whose real path is inside the session directory, the session worktree or the nearest `.git` ancestor is refused. This is re-asserted against the discovered root. |
+| G5 | a tracked directory replaced by a junction/symlink exposed outside files | Before status and worktree diffs: `ls-files -z` prefixes are deduplicated and `lstat`ed shallow-first in batches of 64. Descendants of a link are skipped, and the scan is capped at 50 000 directories. Linked prefixes become `:(exclude,literal)` pathspecs (user paths use `:(literal)`) and are named in a trailing note. Paths through a link are rejected. |
+| G6 | `blame.ignoreRevsFile` leaked its first line | `--no-ignore-revs-file` |
+| G7 | timeouts not enforced when MSYS helpers inherit the pipes | settle on `exit` (drain 200 ms after a kill), destroy the streams, `child.kill()` fallback after 500 ms, forced settle 1 s after a kill request |
+| G9 | `GIT_CONFIG_NOSYSTEM` dropped Git for Windows' `core.autocrlf=true` | `core.autocrlf/eol/safecrlf/longpaths` and `safe.directory` are read from system/global config (`git config --system/--global -z --get-regexp`), value-validated and passed with `-c`, unless the repository sets the key. No inherited key can name a program. |
+| G10 | redaction gaps | Scheme URLs lose the whole userinfo (including `/` or `@` in the password). The scp pattern is anchored at token start. `token`, `password` and similar query values are masked; `image@sha256:` is untouched. On truncation, only the tail of the last token is dropped, from its last possible credential start, so minified single-line files keep their content. |
+| G11 | discovery walked up to any ancestor repository | `GIT_CEILING_DIRECTORIES` = parent of the session worktree (or of the session directory), and the toplevel must lie inside it (`core.worktree` redirects are refused) |
+| G12 | errors thrown into the session | `execute` returns `[router_git] error: <redacted>`; cwd checked before spawn; POSIX kill catch narrowed to `ESRCH`; taskkill start failures logged; no empty catch |
+| G13 | Windows path aliasing | device names (with or without extension), trailing dot/space, NBSP and bidi controls rejected on win32 |
+| G14 | test gaps | marker matrix below; `.git` hashed (content, size, mtime and entries) around every tool call |
+
+Marker matrix (`test/unit/git-tools.test.ts`): fsmonitor, hooks, pager, external
+diff, textconv, diff driver command, filter clean/process/smudge, filter and
+textconv via `.git/info/attributes` (exercises the driver blanking alone),
+`gpg.program` via `log.showSignature`, `includeIf` onbranch and gitdir, and
+`include.path`. For each vector, nine tool calls run first and must leave no
+marker and an unchanged `.git`. Plain git then has to produce the marker; the
+pager can only run on a terminal, so its control is the resolved
+`git var GIT_PAGER`. Further tests cover a split-index/manyFiles repository,
+a fake git in `node_modules/.bin`, a junction or symlink, `ignoreRevsFile`, a
+re-parented grandchild holding the pipes (settles in < 6 s with a 2 s
+timeout), a sleeping filter (never started), autocrlf inheritance and
+precedence, redaction cases, and truncation.
+
+Verification (`fast-ro/git`, Windows): `npm run typecheck` passed;
+`npx vitest run test/unit/git-tools.test.ts` **110 passed**;
+`npx vitest related src/router/git-tools.ts --run --maxWorkers=2`
+**1222 passed, 55 skipped; 42 files passed, 3 skipped** (default pool). The
+reviewer's harnesses (`h1.mjs`, `h2.mjs`) were re-run against this
+implementation: no marker from any tool call, `.git` unchanged, no
+junction/ignore-revs leak, and the slow-filter blame completed in 162 ms.
+
+Known limits:
+
+- G8 (sensitive-path exclusion for show/diff/blame) is deferred to the round
+  that adds the shared sensitive-file list (`TODO(#77 G8)` in `gitArgv`).
+- `--attr-source=<empty tree>` also ignores in-tree `text`/`eol`/`diff`
+  attributes. A repository that relies on `.gitattributes` line endings, with
+  `core.autocrlf` unset, can show stat-dirty CRLF files as modified.
+- Discovery from a subdirectory needs the host worktree context, which v1
+  `context.worktree` and the v2 project directory provide.
+- On Windows the file's tests cover 86% of `git-tools.ts` branches; the POSIX
+  kill/candidate paths rely on Linux CI. The aggregated `src/router/**`
+  coverage gate and the gated real-host smoke were not re-run in this round.
