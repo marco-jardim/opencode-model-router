@@ -1,15 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
+import * as childProcess from "node:child_process";
+import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative } from "node:path";
 import {
-  dropPartialCredential, emptyTreeId, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
+  dropPartialCredential, errorMessage, quoteGitPath, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
   linkedTrackedDirectories, numstatNames, parseInheritedConfig, runBoundedProcess, selectGitExecutable, stripUrlUserinfo, validatePath, validateRef,
   type GitInput, type GitInspectOptions, type GitOperation,
 } from "../../src/router/git-tools";
 import { sensitiveGitPathspecs, SENSITIVE_PATH_PATTERNS } from "../../src/router/sensitive-paths";
+
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 const WIN = process.platform === "win32";
 const INHERITED_ENV = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM"] as const;
@@ -18,6 +25,7 @@ let outside: string;
 let savedEnv: Partial<Record<typeof INHERITED_ENV[number], string>>;
 
 beforeEach(() => {
+  vi.mocked(childProcess.spawn).mockReset();
   root = mkdtempSync(join(tmpdir(), "router-git-"));
   outside = mkdtempSync(join(tmpdir(), "router-git-outside-"));
   savedEnv = {};
@@ -29,6 +37,8 @@ beforeEach(() => {
   delete process.env.GIT_CONFIG_SYSTEM;
 });
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   for (const name of INHERITED_ENV) {
     const value = savedEnv[name];
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
@@ -92,6 +102,27 @@ function alive(pid: number): boolean {
   }
 }
 const OLD = new Date(Date.now() - 86_400_000);
+
+/** Deterministic transport faults without executing a replacement Git binary. */
+function fakeGit(reply: (args: readonly string[]) => { code?: number; stdout?: string | Buffer; stderr?: string }) {
+  return vi.mocked(childProcess.spawn).mockImplementation((_executable, args) => {
+    const child = Object.assign(new childProcess.ChildProcess(), { pid: undefined, stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true) });
+    const result = reply(Array.isArray(args) ? args : []);
+    queueMicrotask(() => {
+      if (result.stdout) child.stdout.emit("data", Buffer.from(result.stdout));
+      if (result.stderr) child.stderr.emit("data", Buffer.from(result.stderr));
+      child.emit("exit", result.code ?? 0);
+      child.emit("close", result.code ?? 0);
+    });
+    return child;
+  });
+}
+
+function metadataReply(args: readonly string[]) {
+  if (args.includes("--show-toplevel")) return { stdout: `${root}\n` };
+  if (args.includes("config")) return { code: 1 };
+  return { stdout: "" };
+}
 
 describe("shell-free git inspection", () => {
   it.each(["-o", "--output=x", "a b", "a;b", "a|b", "$(whoami)", "`whoami`", "x".repeat(201), ""])("rejects ref %s", ref => {
@@ -182,15 +213,41 @@ describe("shell-free git inspection", () => {
       git("add", "UPPER.PEM"); git("commit", "-qm", "uppercase");
       expect(await inspect("show")).not.toContain("SECRET_G8");
     }
-  });
-  it("computes the empty tree for SHA-1 and SHA-256 repositories", () => {
-    for (const format of ["sha1", "sha256"]) {
-      const dir = join(root, format); mkdirSync(dir);
-      gitIn(dir, "init", "-q", `--object-format=${format}`);
-      expect(execFileSync(gitExecutable(), ["mktree"], { cwd: dir, env: gitEnvironment(), input: "", encoding: "utf8" }).trim()).toBe(emptyTreeId(format));
+  }, 30_000);
+  it("preserves in-tree text/eol/binary attributes without running drivers (R2-1)", async () => {
+    repository(); git("config", "core.autocrlf", "false");
+    writeFileSync(join(root, ".gitattributes"), "* text=auto\n*.bat text eol=crlf\n*.bin binary\npackage-lock.json -diff\n");
+    for (const name of ["a.bat", "b.txt", "x.bin", "package-lock.json"]) writeFileSync(join(root, name), "one\ntwo\n");
+    git("add", "-A"); git("commit", "-qm", "attributes");
+    rmSync(join(root, "a.bat")); git("checkout", "--", "a.bat");
+    expect(readFileSync(join(root, "a.bat"), "utf8")).toContain("\r\n");
+    for (const name of ["a.bat", "b.txt"]) {
+      utimesSync(join(root, name), OLD, OLD);
+      expect(await inspect("blame", { path: name })).toBe(plain(root, "blame", "--", name));
     }
-    expect(() => emptyTreeId("md5")).toThrow();
-  });
+    expect(await inspect("status")).toBe(plain(root, "--no-optional-locks", "status", "--porcelain=v1"));
+    for (const name of ["x.bin", "package-lock.json"]) writeFileSync(join(root, name), "changed\n");
+    expect((await inspect("diff")).split("[router_git stderr]\n")[0]).toBe(plain(root, "diff"));
+    expect(await inspect("diff")).toContain("Binary files");
+  }, 30_000);
+  it("retains sensitive-only history and annotated tag messages, rejecting non-commit targets and show ranges (R2-2/4)", async () => {
+    repository();
+    writeFileSync(join(root, "app.ts"), "a\n"); git("add", "app.ts"); git("commit", "-qm", "A");
+    writeFileSync(join(root, ".env"), "SECRET_ONLY\n"); git("add", ".env"); git("commit", "-qm", "B");
+    writeFileSync(join(root, "app.ts"), "c\n"); git("commit", "-qam", "C");
+    const log = await inspect("log", { limit: 3 });
+    expect([...log.matchAll(/^    (.+)$/gm)].map(match => match[1])).toEqual(["C", "B", "A"]);
+    expect(log).toContain("changes to sensitive files withheld");
+    expect(log).not.toContain("SECRET_ONLY");
+    expect(await inspect("show", { ref: "HEAD~1" })).toContain("changes to sensitive files withheld");
+    git("tag", "-a", "v1", "-m", "release notes");
+    expect(await inspect("show", { ref: "v1" })).toContain("release notes");
+    git("tag", "-a", "blob-tag", git("rev-parse", "HEAD:app.ts").trim(), "-m", "not a commit");
+    for (const ref of ["blob-tag", "HEAD^{tree}", "missing"]) await expect(inspect("show", { ref })).rejects.toThrow("use read");
+    await expect(inspect("show", { ref: "HEAD~2..HEAD" })).rejects.toThrow("not ranges");
+    git("commit", "--allow-empty", "-qm", "empty");
+    expect(await inspect("show")).not.toContain("withheld");
+  }, 30_000);
 
   describe("marker matrix: repository-configured programs never run (G1, G2, G14)", () => {
     /** Two commits, a signed tip, .gitattributes naming every driver, stale worktree changes. */
@@ -234,7 +291,7 @@ describe("shell-free git inspection", () => {
       { name: "filter clean", setup: m => git("config", "filter.evil.clean", `${markerCommand(m)}; cat`), control: ran(["diff"]) },
       { name: "filter process", setup: m => { git("config", "filter.proc.process", markerCommand(m)); git("config", "filter.proc.required", "false"); }, control: ran(["diff"]) },
       { name: "filter smudge", setup: m => git("config", "filter.evil.smudge", `${markerCommand(m)}; cat`), control: ran(["cat-file", "--filters", "HEAD:file.txt"]) },
-      // .git/info/attributes is not replaced by --attr-source: only the driver blanking stops these.
+      // Both worktree and .git/info/attributes stay active; driver blanking stops these.
       { name: "filter clean via .git/info/attributes", setup: m => {
         mkdirSync(join(root, ".git", "info"), { recursive: true });
         writeFileSync(join(root, ".git", "info", "attributes"), "*.txt filter=infof diff=infod\n");
@@ -300,9 +357,9 @@ describe("shell-free git inspection", () => {
   }, 30_000);
   it("does not discover a repository above the session worktree (G11)", async () => {
     repository(); mkdirSync(join(root, "proj"));
-    await expect(inspect("ls_files", {}, { dir: join(root, "proj") })).rejects.toThrow(/not a git repository/i);
-    // A worktree that does not contain the session directory is ignored.
-    await expect(inspect("ls_files", {}, { dir: join(root, "proj"), options: { worktree: outside } })).rejects.toThrow(/not a git repository/i);
+    await expect(inspect("ls_files", {}, { dir: join(root, "proj"), options: { worktree: join(root, "proj") } })).rejects.toThrow(/not a git repository/i);
+    // No boundary (or an unrelated project) falls back to the nearest checkout.
+    expect(await inspect("ls_files", {}, { dir: join(root, "proj"), options: { worktree: outside } })).toContain("file.txt");
     expect(await inspect("ls_files", {}, { dir: join(root, "proj"), options: { worktree: root } })).toContain("file.txt");
   }, 30_000);
   it("refuses a core.worktree that points outside the session worktree (G11)", async () => {
@@ -361,7 +418,7 @@ describe("shell-free git inspection", () => {
     symlinkSync(outside, join(root, "link"), WIN ? "junction" : "dir");
     const paths = ["top.txt", "real/a.txt", "real/nested/b.txt", "real/nested/c.txt", "missing/x/y.txt", ...Array.from({ length: 500 }, (_, i) => `link/sub${i}/f.txt`)];
     expect(await linkedTrackedDirectories(root, paths)).toEqual(["link"]);
-    await expect(linkedTrackedDirectories(root, Array.from({ length: 50_001 }, (_, i) => `d${i}/f.txt`))).rejects.toThrow("too many tracked directories");
+    await expect(linkedTrackedDirectories(root, Array.from({ length: 100_001 }, (_, i) => `d${i}/f.txt`))).rejects.toThrow(/Tracked-directory cap.*mode: cached.*range/);
   });
   it("never reads blame.ignoreRevsFile (G6)", async () => {
     repository();
@@ -552,10 +609,10 @@ describe("shell-free git inspection", () => {
     git("config", "filter.a=b.clean", "cat");
     await expect(inspect("status")).rejects.toThrow("cannot be neutralized");
   }, 30_000);
-  it("treats a filesystem-root worktree as no boundary beyond the session directory (G11)", async () => {
+  it("resolves a filesystem-root worktree to the nearest checkout (R2-5)", async () => {
     repository(); mkdirSync(join(root, "sub"));
     const fsRoot = realpathSync.native(root).slice(0, WIN ? 3 : 1);
-    await expect(inspect("ls_files", {}, { dir: join(root, "sub"), options: { worktree: fsRoot } })).rejects.toThrow(/not a git repository/i);
+    expect(await inspect("ls_files", {}, { dir: join(root, "sub"), options: { worktree: fsRoot } })).toBe("file.txt\n");
     expect(await inspect("ls_files", {}, { options: { worktree: fsRoot } })).toBe("file.txt\n");
   }, 30_000);
   it("execute reports redacted errors instead of throwing into the session (G12)", async () => {
@@ -567,9 +624,130 @@ describe("shell-free git inspection", () => {
     const run = (name: string, args: unknown, directory = root) => (tools[name]!.execute as Execute)(args, { ...context, directory });
     expect(await run("router_git_log", { ref: "--output=x" })).toBe("[router_git] error: Invalid git ref: use at most 200 ref characters, never an option or rev:path; use read for sensitive files (asks for approval)");
     const zod = String(await run("router_git_diff", { mode: "https://alice:hunter2@example.com/x" }));
-    expect(zod).toMatch(/^\[router_git\] error: /); expect(zod).not.toContain("hunter2");
+    expect(zod).toMatch(/^\[router_git\] error: /); expect(zod).not.toContain("hunter2"); expect(zod).not.toMatch(/[\r\n]/);
     expect(String(await run("router_git_log", { ref: "doesnotexist" }))).toMatch(/^\[router_git\] error: Git inspection failed \(128\)/);
     expect(await run("router_git_status", {}, join(root, "missing"))).toBe("[router_git] error: Session directory does not exist");
     expect(await run("router_git_ls_files", {})).toBe("file.txt\n");
   }, 30_000);
+  it("resolves linked worktrees from session subdirectories with missing, main-checkout or drive-root context (R2-5)", async () => {
+    repository();
+    const linked = join(outside, "linked");
+    git("worktree", "add", "--detach", linked);
+    mkdirSync(join(linked, "sub"));
+    const before = gitDirDigest(root);
+    for (const worktree of [undefined, root, linked, realpathSync.native(root).slice(0, WIN ? 3 : 1)]) {
+      expect(await inspectGit("ls_files", {}, join(linked, "sub"), undefined, { worktree })).toBe("file.txt\n");
+    }
+    expect(gitDirDigest(root)).toBe(before);
+  }, 30_000);
+  it("matches Git C-style pathname quoting, including non-ASCII and newlines (R2-9)", async () => {
+    repository();
+    const names = ["é.txt", "space name.txt", ...(WIN ? [] : ['line\nbreak.txt', 'quote".txt'])];
+    for (const name of names) writeFileSync(join(root, name), "original\n");
+    git("add", "-A"); git("commit", "-qm", "names");
+    for (const name of names) writeFileSync(join(root, name), "modified\n");
+    for (const value of ["true", "false"]) {
+      git("config", "core.quotePath", value);
+      expect(await inspect("diff", { mode: "name-only" })).toBe(plain(root, "diff", "--name-only"));
+    }
+    expect(quoteGitPath("line\nbreak.txt")).toBe('"line\\nbreak.txt"');
+    expect(quoteGitPath('é\n"\\\x01\x7f', false)).toBe('"é\\n\\"\\\\\\001\\177"');
+    expect(quoteGitPath("é.txt")).toBe('"\\303\\251.txt"');
+    expect(errorMessage("bad\n thing")).toBe("bad thing");
+  }, 30_000);
+  it("labels stderr independently of stdout (R2-10)", async () => {
+    expect(await runBoundedProcess(process.execPath, ["-e", "process.stdout.write('content');process.stderr.write('warning: CRLF\\n')"], root))
+      .toBe("content\n[router_git stderr]\nwarning: CRLF\n");
+  });
+  it("settles even when tree termination and direct kill both fail (R2-8)", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new childProcess.ChildProcess(), { pid: 987654, stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => { throw new Error("kill denied"); }) });
+    const spawn = vi.mocked(childProcess.spawn).mockReturnValueOnce(child);
+    // Windows taskkill spawn rejects; POSIX process-group kill rejects.
+    spawn.mockImplementation(() => { throw new Error("tree kill denied"); });
+    vi.spyOn(process, "kill").mockImplementation(() => { throw new Error("tree kill denied"); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const result = runBoundedProcess(process.execPath, [], root, { timeoutMs: 10 });
+    const rejected = expect(result).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(2_000);
+    await rejected;
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not kill the git process tree"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not terminate git directly"));
+    expect(child.kill).toHaveBeenCalled();
+  });
+  it.skipIf(!WIN)("falls back when taskkill emits an error (R2-8)", async () => {
+    vi.useFakeTimers();
+    const child = Object.assign(new childProcess.ChildProcess(), { pid: 987654, stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true) });
+    const killer = new childProcess.ChildProcess();
+    vi.mocked(childProcess.spawn).mockReturnValueOnce(child).mockReturnValueOnce(killer);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const result = runBoundedProcess(process.execPath, [], root, { timeoutMs: 10 });
+    const rejected = expect(result).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(10);
+    killer.emit("error", new Error("taskkill unavailable"));
+    child.emit("exit", 1);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await rejected;
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("taskkill failed to start"));
+    expect(child.kill).toHaveBeenCalled();
+  });
+  it("reports the index listing size cap with actionable alternatives (R2-6)", async () => {
+    repository();
+    fakeGit(args => args.includes("ls-files") ? { stdout: Buffer.alloc(32 * 1024 * 1024 + 1, 120) } : metadataReply(args));
+    await expect(inspectGit("status", {}, root)).rejects.toThrow(/Tracked-index listing size cap.*mode: cached.*range/);
+  });
+  it.each([
+    ["configuration", "ls_files", (args: readonly string[]) => args.includes("--name-only"), "Cannot read repository configuration"],
+    ["tracked listing", "status", (args: readonly string[]) => args.includes("ls-files"), "Cannot list tracked files"],
+    ["path quoting", "diff", (args: readonly string[]) => args.includes("--type=bool"), "Cannot read path quoting configuration"],
+    ["diff names", "diff", (args: readonly string[]) => args.includes("diff"), "Git inspection failed"],
+  ] as const)("reports %s query failures with redacted stderr (R2-8)", async (_label, operation, matches, error) => {
+    repository();
+    fakeGit(args => matches(args) ? { code: 3, stderr: "failure https://user:password@host/repo\n" } : metadataReply(args));
+    await expect(inspectGit(operation, { mode: "name-only" }, root)).rejects.toThrow(`${error} (3): failure https://host/repo`);
+  });
+  it("rejects oversized metadata and invalid discovery output (R2-8)", async () => {
+    repository();
+    const mock = fakeGit(args => args.includes("--name-only") ? { stdout: "a".repeat(1024 * 1024 + 1) } : metadataReply(args));
+    await expect(inspectGit("ls_files", {}, root)).rejects.toThrow("metadata exceeds its size bound");
+    mock.mockRestore();
+    fakeGit(args => args.includes("--show-toplevel") ? { stdout: "not-an-absolute-path\n" } : metadataReply(args));
+    await expect(inspectGit("ls_files", {}, root)).rejects.toThrow("Cannot resolve repository toplevel");
+  });
+  it("covers invalid programmatic inputs and incomplete numstat records (R2-8)", () => {
+    expect(() => gitArgv("unknown" as GitOperation, {}, root)).toThrow("Invalid git operation");
+    expect(() => gitArgv("diff", { mode: "invalid" } as unknown as GitInput, root)).toThrow("Invalid git diff mode");
+    expect(numstatNames("garbage\0\t\t\0old\0")).toEqual([]);
+    expect(quoteGitPath("plain.txt", false)).toBe("plain.txt");
+    expect(errorMessage(new Error("line one\n  line two"))).toBe("line one line two");
+  });
+  it("bounds name-only output without returning a partial filename (R2-8)", async () => {
+    repository();
+    fakeGit(args => args.includes("diff") ? { stdout: `1\t0\tcomplete.txt\0${"1\t0\tlong-name.txt\0".repeat(5_000)}` } : metadataReply(args));
+    const output = await inspectGit("diff", { mode: "name-only" }, root);
+    expect(output).toContain("complete.txt\n");
+    expect(output).toContain("[truncated: output exceeds 65536 bytes]");
+    expect(output).not.toContain("1\t0\t");
+  });
+  it("reports failed hidden-change metadata and failed object typing (R2-8)", async () => {
+    repository();
+    const oid = "1".repeat(40);
+    const mock = fakeGit(args => args.includes("log") ? { stdout: `commit ${oid}\nAuthor: T\n\n    only secrets\n` }
+      : args.includes("diff-tree") ? { code: 1, stderr: "object disappeared\n" } : metadataReply(args));
+    await expect(inspectGit("log", {}, root)).rejects.toThrow("Cannot inspect withheld changes (1)");
+    mock.mockRestore();
+    fakeGit(args => args.includes("--verify") ? { stdout: oid } : args.includes("cat-file") ? { code: 1 } : metadataReply(args));
+    await expect(inspectGit("show", {}, root)).rejects.toThrow("not a blob/tree");
+  });
+  it("caps linked-directory exclusions and abbreviates a long skip summary (R2-6/8)", async () => {
+    repository();
+    const paths = Array.from({ length: 201 }, (_, index) => `link${index}/file.txt`);
+    for (const path of paths) symlinkSync(outside, join(root, dirname(path)), WIN ? "junction" : "dir");
+    let selected = paths.slice(0, 21);
+    fakeGit(args => args.includes("ls-files") ? { stdout: selected.join("\0") + "\0" }
+      : args.includes("diff") ? { stdout: "content without newline" } : metadataReply(args));
+    expect(await inspectGit("diff", {}, root)).toMatch(/content without newline\n\[router_git\] skipped .*\.\.\.$/);
+    selected = paths;
+    await expect(inspectGit("status", {}, root)).rejects.toThrow(/too many tracked directories were replaced by links.*mode: cached/);
+  });
 });
