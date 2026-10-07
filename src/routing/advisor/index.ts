@@ -219,7 +219,7 @@ const STATE_VERSION = 3;
 export const MIN_INTERVAL_MS = 3_600_000;
 /** An unchanged set of findings is mentioned again after this long at the earliest (QA-2.4-5). */
 export const REMINDER_MS = 7 * 24 * 3_600_000;
-/** A lock younger than this (by its file time, never by what it says) is held by a live process. */
+/** Wait before checking again when another process holds the notice lock. */
 const BUSY_BACKOFF_MS = 30_000;
 const BACKOFF_AFTER_ERROR_MS = 10 * 60_000;
 

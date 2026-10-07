@@ -405,7 +405,7 @@ Everything is written under one directory, `routing.outcomes.path` (global overr
 
 ### `/router stats` and `npm run routing:stats`
 
-The statistics report includes **D17 mode (use the DF4→DF5 enforce-period window)**: `enforce` with zero failed enforced switches, otherwise `advise`. At DF5, run `routing:stats` with the enforce period's `--since` / `--until` boundaries; this line is a recommendation from that window, not an automatic config change or proof that unverified dispatches passed. Failures of shadow/advise would-switches, pinned dispatches, resumes and policy floor lifts do not decide D17.
+The statistics report includes **D17 mode (use the DF4→DF5 enforce-period window)**: `n/a (0 enforced switches)` when no dispatch was switched under enforce; otherwise `enforce` with zero failed enforced switches, or `advise` with any failed enforced switch. At DF5, run `routing:stats` with the enforce period's `--since` / `--until` boundaries; this line is a recommendation from that window, not an automatic config change or proof that unverified dispatches passed. Failures of shadow/advise would-switches, pinned dispatches, resumes and policy floor lifts do not decide D17.
 
 **The script does not read the router config.** When `routing.outcomes.path` is set, pass `--dir <routing.outcomes.path>` explicitly (for example `node scripts/routing-stats.ts --dir "D:\\routing-outcomes"`); otherwise it reads the default temp trajectory directory, not your configured store.
 

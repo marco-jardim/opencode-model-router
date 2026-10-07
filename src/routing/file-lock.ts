@@ -31,7 +31,11 @@ export async function withLock<T>(
     }
     const moved = await fs.stat(grave);
     if (moved !== null && now() - moved.mtimeMs < staleMs) {
-      await fs.rename(grave, lockPath);
+      try {
+        await fs.rename(grave, lockPath);
+      } catch (error) {
+        logger.warn("[router] could not put back a live file lock", { error: String(error) });
+      }
       return { status: "busy" };
     }
     try { await fs.unlink(grave); } catch (error) {

@@ -170,8 +170,8 @@ describe("D17 final dogfood mode", () => {
       decision(`excluded-${i}`, SINCE, { mode: "enforce", switched: true, best: choice(C), ...partial }),
       verdict(`excluded-${i}`, SINCE, C, "fail"),
     ]);
-    expect(d17Mode(summarize(null, rows, WINDOW))).toBe("enforce");
-    expect(d17Mode(summarize(null, [], WINDOW))).toBe("enforce");
+    expect(d17Mode(summarize(null, rows, WINDOW))).toBe("n/a (0 enforced switches)");
+    expect(d17Mode(summarize(null, [], WINDOW))).toBe("n/a (0 enforced switches)");
     rows.push(decision("actual", SINCE, { mode: "enforce", switched: true, best: choice(C) }),
       verdict("actual", "2026-10-07T01:00:00.000Z", C, "fail"));
     const table = summarize(null, rows, WINDOW);
@@ -687,7 +687,7 @@ describe("renderMarkdown", () => {
         "| Pinned | 0 |",
         "| Agreement (best == chosen, non-pinned) | n/a |",
         "| Switched | 0 of 0 non-pinned routed (n/a); enforced 0; failed 0 (verified 0 of 0 enforced) |",
-        "| D17 mode (use the DF4→DF5 enforce-period window) | enforce |",
+        "| D17 mode (use the DF4→DF5 enforce-period window) | n/a (0 enforced switches) |",
         "| Estimated savings | n/a |",
         "| Variant steps | 0 taken; pass n/a |",
         "| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 0 of 0 routed dispatches |",

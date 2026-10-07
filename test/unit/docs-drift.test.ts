@@ -630,6 +630,7 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     const guide = read("docs/ROUTING_ENGINE.md");
     expect(guide).toContain("D17 mode (use the DF4→DF5 enforce-period window)");
     expect(guide).toContain("zero failed enforced switches");
+    expect(guide).toContain("n/a (0 enforced switches)");
   });
 
   it("the cost-doctor table of the guide lists every finding with the severity the code gives it", () => {

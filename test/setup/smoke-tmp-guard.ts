@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import fs from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,14 +11,16 @@ export function setup(): void {
   const real = tmpdir();
   original = Object.fromEntries(NAMES.map((name) => [name, process.env[name]]));
   isolated = join(real, `omr-smoke-tmp-${process.pid}-${Date.now()}`);
-  mkdirSync(isolated);
+  fs.mkdirSync(isolated);
   process.env.OMR_SMOKE_REAL_TMPDIR = real;
   for (const name of ["TEMP", "TMP", "TMPDIR"]) process.env[name] = isolated;
 }
 
 export function teardown(): void {
   try {
-    if (isolated !== undefined) rmSync(isolated, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    if (isolated !== undefined) fs.rmSync(isolated, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    console.warn(`smoke-tmp-guard: cannot remove ${isolated}: ${String(error)}`);
   } finally {
     if (original !== undefined) for (const name of NAMES) {
       if (original[name] === undefined) delete process.env[name];
@@ -37,7 +39,7 @@ export function keyedSmokeEnv(): NodeJS.ProcessEnv {
   if (!process.env.OMR_SMOKE_REAL_TMPDIR) throw new Error("keyed smoke requires vitest.smoke.config.ts temp guard");
   const realHome = homedir();
   const home = join(tmpdir(), `keyed-home-${process.pid}`);
-  mkdirSync(home, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
   return {
     ...process.env,
     HOME: home,

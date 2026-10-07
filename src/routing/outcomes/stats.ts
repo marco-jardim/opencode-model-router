@@ -309,7 +309,8 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
 // ---------------------------------------------------------------------------
 
 /** D17 / DF5: apply to the enforce-period summary; any failed enforced switch returns to advise. */
-export function d17Mode(summary: Pick<StatsTable, "switched">): "enforce" | "advise" {
+export function d17Mode(summary: Pick<StatsTable, "switched">): "enforce" | "advise" | "n/a (0 enforced switches)" {
+  if (summary.switched.enforced === 0) return "n/a (0 enforced switches)";
   return summary.switched.failed === 0 ? "enforce" : "advise";
 }
 

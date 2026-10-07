@@ -10,6 +10,7 @@ import { assertTmpIsGuarded, guardedTmpdir, REAL_TMPDIR_ENV, RUN_ID_ENV, sameDir
 import { removeRunGuardDirs } from "../setup/global-guard";
 import { keyedSmokeEnv, setup as setupSmoke, teardown as teardownSmoke } from "../setup/smoke-tmp-guard";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
 
 const realTmp = (): string => {
   const value = process.env[REAL_TMPDIR_ENV];
@@ -20,6 +21,23 @@ const realTmp = (): string => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("temp directory guard", () => {
+  it("R2-6: smoke cleanup failure warns but restores the environment", () => {
+    const names = ["TEMP", "TMP", "TMPDIR", "OMR_SMOKE_REAL_TMPDIR"];
+    const before = names.map((name) => process.env[name]);
+    setupSmoke();
+    const dir = process.env.TEMP!;
+    const remove = vi.spyOn(fs, "rmSync").mockImplementation(() => { throw new Error("EPERM"); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect(() => teardownSmoke()).not.toThrow();
+      expect(names.map((name) => process.env[name])).toEqual(before);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("EPERM"));
+    } finally {
+      remove.mockRestore();
+      warn.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it("N10: native child homedir inherits the private home, not just the os mock", () => {
     expect(process.env.HOME).toBe(homedir());
     expect(process.env.USERPROFILE).toBe(homedir());

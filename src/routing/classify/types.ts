@@ -1182,8 +1182,6 @@ export const ROUTE_LINE_MAX_CHARS = 500;
 /** Tested against ONE line (no terminator). Group 1 = the field list. */
 export const ROUTE_LINE_RE = /^[ \t]*\[route(?:[ \t]+([^\]\r\n]*?))?[ \t]*\][ \t]*$/i;
 
-/** Field keys understood in a route line; anything else is ignored. */
-
 // ---------------------------------------------------------------------------
 // Backend option sets and fixed prompt text (English, D14)
 // ---------------------------------------------------------------------------
