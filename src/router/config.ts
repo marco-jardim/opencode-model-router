@@ -1026,26 +1026,11 @@ const MAX_TIMER_MS = 2_147_483_647;
  */
 export const MAX_DELEGATION_DEPTH_LIMIT = 32;
 
-/** Total, typed and bounded rendering of an invalid config value. */
+/** Describe shape only: invalid strings/containers can contain pasted credentials. */
 function describeValue(value: unknown): string {
-  let description: string;
-  try {
-    if (typeof value === "string") description = JSON.stringify(value);
-    else if (typeof value === "number") description = Object.is(value, -0) ? "-0" : String(value);
-    else if (typeof value === "bigint") description = `${value}n`;
-    else if (value === null) description = "null";
-    else if (typeof value === "object") {
-      const tag = Array.isArray(value) ? "array" : "object";
-      description = `${tag} ${JSON.stringify(value) ?? "<unserializable>"}`;
-    } else if (typeof value === "function") description = "<function>";
-    else description = String(value);
-  } catch {
-    description = `<${typeof value}>`;
-  }
-  if (description.length <= 80) return description;
-  // Keep the 80-code-unit bound without splitting a surrogate pair.
-  const end = /[\uD800-\uDBFF]/.test(description[78]!) && /[\uDC00-\uDFFF]/.test(description[79]!) ? 78 : 79;
-  return `${description.slice(0, end)}…`;
+  if (value === null) return "null";
+  const kind = Array.isArray(value) ? "array" : typeof value;
+  return `${kind}; value not shown`;
 }
 
 /** Copy without invoking accessors again; include defined get-only Proxy values. */
@@ -1607,7 +1592,7 @@ function validateClassifier(routing: Record<string, unknown>): ClassifierConfig 
   if (baseUrl !== undefined && baseUrl !== null) {
     if (typeof baseUrl !== "string" || !isHttpUrl(baseUrl)) {
       throw new Error(
-        `tiers.json: ${path}.baseUrl must be null or an http(s) URL (got ${describeValue(baseUrl)})`,
+        `tiers.json: ${path}.baseUrl must be null or an http(s) URL (value not shown)`,
       );
     }
   }
@@ -1617,7 +1602,7 @@ function validateClassifier(routing: Record<string, unknown>): ClassifierConfig 
   if (apiKeyEnv !== undefined && apiKeyEnv !== null) {
     if (typeof apiKeyEnv !== "string" || !ENV_NAME_PATTERN.test(apiKeyEnv)) {
       throw new Error(
-        `tiers.json: ${path}.apiKeyEnv must be null or an environment variable name (got ${describeValue(apiKeyEnv)})`,
+        `tiers.json: ${path}.apiKeyEnv must be null or an environment variable name (value not shown)`,
       );
     }
   }
