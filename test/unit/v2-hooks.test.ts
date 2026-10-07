@@ -161,7 +161,8 @@ describe("OpenCode 2 hook adapter", () => {
       await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
       f.agents.fast.permissions = structuredClone(drifted);
       f.transforms.agent(f.editors.agent);
-      expect(warn.mock.calls.filter(args => String(args[0]).includes("host default permissions not recognised for fast; inherited allow rules dropped"))).toHaveLength(1);
+      expect(warn.mock.calls.filter(args => String(args[0]).includes("host default permissions not recognised for fast"))).toHaveLength(1);
+      expect(warn.mock.calls.filter(args => String(args[0]).includes("inherited grant dropped for fast"))).toHaveLength(1);
     } finally { warn.mockRestore(); }
   });
   it("enforces own resource denies against session allows, retaining safe agent overrides", async () => {
@@ -184,16 +185,61 @@ describe("OpenCode 2 hook adapter", () => {
     const medium = { ...event("shell", ["echo hi"]), agent: "medium" as PermissionEvaluation["agent"] };
     await f.permissionHooks.evaluate(medium); expect(medium.effect).toBe("allow");
   });
-  it("narrows inherited session grants before prompting and hides stale catalog grants", async () => {
+  it("retains parent grants when fast resumes as medium, hiding denied tools only for fast", async () => {
     const f = fixture();
     const permissions = [{ action: "shell", resource: "*", effect: "allow" }, { action: "read", resource: "private/*", effect: "deny" }, { action: "glob", resource: "*", effect: "ask" }];
     f.ctx.session.get.mockResolvedValue({ id: "child", parentID: "root", agent: "fast", ...{ permissions } });
     await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
     await f.sessionHooks.prompt({ sessionID: "child", prompt: { text: "inspect" } });
-    expect(f.ctx.session.update).toHaveBeenCalledWith({ sessionID: "child", permissions: permissions.slice(1) });
+    expect(f.ctx.session.update).not.toHaveBeenCalled();
     const e = { ...call, model: {}, options: {}, system: [], messages: [], tools: { shell: {}, execute: {}, write: {}, read: {} } };
     await f.sessionHooks.context(e);
     expect(Object.keys(e.tools)).toEqual(["read"]);
+    expect(await f.ctx.session.get()).toMatchObject({ permissions });
+    f.ctx.session.get.mockResolvedValue({ id: "child", parentID: "root", agent: "medium", ...{ permissions } });
+    const resumed = { ...e, agent: "medium", tools: { shell: {}, read: {} } };
+    await f.sessionHooks.context(resumed);
+    expect(Object.keys(resumed.tools)).toEqual(["shell", "read"]);
+    expect(await f.ctx.session.get()).toMatchObject({ permissions });
+    expect(f.ctx.session.update).not.toHaveBeenCalled();
+    const grant: PermissionEvaluation = { sessionID: "child" as PermissionEvaluation["sessionID"],
+      agent: "medium" as PermissionEvaluation["agent"], action: "shell", resources: ["echo hi"], effect: "allow" };
+    await f.permissionHooks.evaluate(grant);
+    expect(grant.effect).toBe("allow");
+  });
+  it("does not upgrade an agent ask under a parent allow or weaken a deny", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    for (const effect of ["allow", "ask", "deny"] as const) {
+      const event: PermissionEvaluation = { sessionID: "child" as PermissionEvaluation["sessionID"],
+        agent: "fast" as PermissionEvaluation["agent"], action: "read", resources: ["normal.ts", "prod.env"], effect };
+      await f.permissionHooks.evaluate(event);
+      expect(event.effect).toBe(effect === "deny" ? "deny" : "ask");
+    }
+  });
+  it("handles permission lookup failures without rejecting or blocking unprotected agents", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    f.ctx.session.get.mockRejectedValue(new Error("session unavailable"));
+    const make = (agent?: string): PermissionEvaluation => ({ sessionID: "child" as PermissionEvaluation["sessionID"],
+      agent: agent as PermissionEvaluation["agent"], action: "read", resources: ["normal.ts"], effect: "allow" });
+    const explicit = make("fast");
+    await expect(f.permissionHooks.evaluate(explicit)).resolves.toBeUndefined();
+    expect(explicit.effect).toBe("allow");
+    expect(f.ctx.session.get).not.toHaveBeenCalled();
+    const unknown = make();
+    await expect(f.permissionHooks.evaluate(unknown)).resolves.toBeUndefined();
+    expect(unknown.effect).toBe("allow");
+    f.ctx.agent.list.mockRejectedValue(new Error("registry unavailable"));
+    const protectedEvent = make("fast");
+    await expect(f.permissionHooks.evaluate(protectedEvent)).resolves.toBeUndefined();
+    expect(protectedEvent.effect).toBe("deny");
+    const medium = make("medium");
+    await expect(f.permissionHooks.evaluate(medium)).resolves.toBeUndefined();
+    expect(medium.effect).toBe("allow");
+    const context = { ...call, model: {}, options: {}, system: [], messages: [], tools: { shell: {}, read: {} } };
+    await expect(f.sessionHooks.context(context)).resolves.toBeUndefined();
+    expect(Object.keys(context.tools)).toEqual([]);
   });
   it("applies the real ladder retry's effort through context without nesting options or changing grader temperature", async () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-effort-"));

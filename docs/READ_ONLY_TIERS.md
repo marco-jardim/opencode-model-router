@@ -9,15 +9,23 @@ not a prompt-only request, and is independent of advisory/enforced/off mode.
 
 The ordered baseline is deny `*`, then allow `read`, `glob`, `grep`, the six
 `router_git_*` tools below, and `external_directory`. The shared sensitive-path
-policy (`src/router/sensitive-paths.ts`) asks for read approval for `.env`,
-`.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.kdbx`, `id_rsa*`,
-`id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `.npmrc`, `.netrc`, `.pgpass`,
-`.git-credentials`, `credentials.json`, `.aws/credentials`, `.docker/config.json`.
+policy (`src/router/sensitive-paths.ts`) asks for read approval for `*.env`,
+`*.env.*` (including bare `.env`, `prod.env` and `prod.env.local`), `*.pem`,
+`*.key`, `*.p12`, `*.pfx`, `*.kdbx`, `.npmrc`, `.netrc`, `.pgpass`,
+`.git-credentials`, `credentials.json`, `.aws/credentials`, `.docker/config.json`,
+`.envrc`, `*.ppk`, `*.jks`, `*.keystore`, `.kube/config`, `*.tfvars`, `*.tfstate`,
+`.pypirc`, `.vault-token`, `.cargo/credentials*`, `.config/gh/hosts.yml`, and
+`application_default_credentials.json`. SSH keys use the exact basenames
+`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, optionally followed by `.*`.
 It applies at every path depth, case-insensitively on Windows. `*.env.example`
-is allowed; ordinary `id_*` names such as `src/id_utils.ts` are not sensitive.
+and the exact public-key names `id_rsa.pub`, `id_ed25519.pub`, `id_ecdsa.pub`,
+`id_dsa.pub` are deliberately readable: public keys are not private credentials.
+Ordinary names such as `src/id_utils.ts` and `id_rsa_helpers/x.ts` are not keys.
 Shell (`bash` on v1, `shell` on v2), edits/write/patch, Code Mode `execute`,
 subagent/task/delegate, webfetch/websearch, browser, and unspecified MCP tools
-remain denied. Adding a future tool does not implicitly allow it.
+remain denied, including inherited `ask` grants for those actions. Asks are
+confined to permitted actions, so auto-answering asks cannot enable a new tool.
+Adding a future tool does not implicitly allow it.
 
 Only when an enabled MCP named **`context7`** is configured, the effective MCP
 actions `context7_resolve-library-id`, `context7_query-docs`, and the older
@@ -44,8 +52,10 @@ V2's config-agent transform runs before external plugins. The host initializes
 agents with `Agent.Info.default`'s permissive rules, then appends configured rules.
 The router recognises a reviewed, hard-coded leading default sequence, not the
 bundled SDK's assertion about the running host. Unknown sequences fail closed:
-only inherited deny/ask rules and allows on permitted actions survive. An
-appended allow outside that surface is also dropped. A last-match canary check
+inherited denies survive, while asks are projected onto permitted actions and
+allows require explicitly permitted actions. No inherited ask or allow can add
+a new action. Broad allows are dropped rather than projected onto `read`, where
+they could erase sensitive-path asks. A last-match canary check of the final list
 tests shell/edit/execute/delegation/network/browser and a random action, warning
 once per agent/diagnostic and restricting inherited grants on a breach.
 Resource overrides on permitted actions in native `agents.<tier>.permissions`
@@ -56,11 +66,13 @@ reload. Global-rule precedence for newly created router agents is **unverified**
 use agent-specific rules for restrictions such as `external_directory: deny`.
 
 V2 normally evaluates inherited session rules after agent rules. The router's
-permission-evaluate hook preserves the agent's **own deny** for every requested
-resource, so parent/session grants cannot override it. Read-only child session
-allows are removed before prompting/context construction, and stale denied
-tools are removed from the catalog. Agent-level resource overrides remain
-effective; session rules can narrow, not widen, the agent's denied surface.
+permission-evaluate hook preserves the agent's **own deny or ask** for every
+requested resource. Session grants remain stored and unchanged so a resumed
+medium/heavy child retains its parent's grants; only fast's per-request tool
+catalog is filtered. Agent-level resource overrides remain effective; session
+rules can narrow, not widen, the protected agent's deny/ask surface. Lookup
+failures deny only for a known protected agent; unknown/unprotected agents are
+left unchanged and failures are logged instead of rejecting the permission hook.
 CLI `--auto`/`--yolo` only auto-answer prompts; they do not override denies.
 This is host enforcement, not an immutable security boundary or OS sandbox.
 For external directories, use `external_directory: "deny"` or scoped `ask`
@@ -68,12 +80,13 @@ rules in host agent configuration. Read-only does not mean confined to the
 project by default.
 
 **Saved “always allow” caveat (P8):** the v2 host checks configured denies first,
-then appends saved project-wide approvals before evaluating asks. An earlier
-“always” approval can therefore make a sensitive `read` ask resolve to allow
-without another prompt. The router does not delete saved approvals or turn asks
-into denies. Review/revoke those host approvals when approval on each read is
-required. This ordering was checked in host `v2.0.22`'s `permission.ts`
-(`evaluateInput`); own denies are still protected by the P2 hook.
+then appends saved project-wide approvals before evaluating asks. Without the
+router evaluate hook, an earlier “always” approval can satisfy a sensitive read
+ask. Round 2 restores the protected agent's own ask when the resulting effect is
+allow (whether from session or saved grants). It does not delete saved approvals.
+CLI auto-answer modes can still approve the resulting ask with “once”; this is
+not a promise of interactive confirmation. Host ordering was checked in
+`v2.0.22`'s `permission.ts` (`evaluateInput`). V1 enforcement remains unverified.
 
 ### Grep output filtering
 
@@ -128,7 +141,7 @@ no free-form argv or `--output`/`-o` option.
 
 Sensitive explicit paths are refused with a pointer to `read`. Show/diff/log
 always append shared `:(exclude,glob)` pathspecs (`icase` on Windows), preserving
-the `.env.example` exception. Log includes patches. A second output filter
+the `*.env.example` and public SSH key exceptions. Log includes patches. A second output filter
 withholds diff sections whose old or new path is sensitive, including rename
 and C-quoted forms. Blame accepts exactly one literal filename, **not exclusion
 pathspecs**: it instead rejects sensitive paths before execution. Status and
@@ -166,6 +179,12 @@ helper, hooks, fsmonitor, external diff, or textconv execution. Status uses no
 optional index refresh/locks; the stale-index regression checks both its mtime
 and SHA-256. Tests exercise a malicious repository configuration with marker
 scripts that must never execute.
+
+**Split-index limitation (G-R2-7):** in repositories already using a split index,
+inspection can bump the mtime of `.git/sharedindex.<hash>` without changing its
+content, exactly as plain `git --no-optional-locks status` does. This is Git's
+own shared-index retention behaviour and cannot be disabled. Read-only here
+does not promise unchanged filesystem timestamps in split-index repositories.
 
 This is **not an OS sandbox**, a confidentiality filter, or protection against
 a compromised Git executable/OS, Git vulnerabilities, concurrent filesystem

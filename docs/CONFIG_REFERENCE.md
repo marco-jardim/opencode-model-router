@@ -41,7 +41,9 @@ or append native v2 `agents.fast.permissions` rules with
 `{ "action": "external_directory", "resource": "*", "effect": "deny" }`.
 Agent-specific resource rules on permitted actions retain precedence as described
 in [Read-only tiers](READ_ONLY_TIERS.md). V2 inherited session allows cannot
-override agent-own denies; broad inherited allow-all is dropped. Global-rule
+override agent-own denies or asks; the session grants remain intact for later
+medium/heavy resumes. Inherited agent asks are projected onto permitted actions;
+broad inherited agent allow-all is dropped. Global-rule
 precedence for newly created router agents is unverified: use agent-specific rules.
 This changes the default capabilities even when an existing config has neither
 `readOnly` nor an enforcement block.

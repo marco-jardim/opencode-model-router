@@ -37,28 +37,30 @@ export function evaluatePermission(rules: readonly PermissionRule[], action: str
 
 /** No provenance API distinguishes a newly appended host default from a user
  * grant. While readOnly is true, neither can widen the policy's action surface.
- * Resource overrides on permitted actions, and inherited deny/ask, survive. */
+ * Resource overrides on permitted actions and inherited denies survive.
+ * Inherited asks cannot create auto-approvable capabilities outside that set. */
 export function publishReadOnlyPermissions(name: string, policy: readonly PermissionRule[], inherited: readonly PermissionRule[], warn: (message: string) => void): PermissionRule[] {
   const recognised = KNOWN_HOST_DEFAULTS.every((rule, i) => inherited[i]?.action === rule.action
     && inherited[i]?.resource === rule.resource && inherited[i]?.effect === rule.effect);
   const tail = inherited.slice(recognised ? KNOWN_HOST_DEFAULTS.length : 0);
   const allowed = new Set(policy.filter(rule => rule.effect === "allow" && rule.action !== "*").map(rule => rule.action));
-  const safe = tail.filter(rule => rule.effect !== "allow" || allowed.has(rule.action));
-  if (!recognised || safe.length !== tail.length) warn(`host default permissions not recognised for ${name}; inherited allow rules dropped`);
-  // Probe before discarding suspicious tail grants too, so appended defaults
-  // cannot silently defeat a correctly recognised five-rule prefix.
-  const candidate = [...policy, ...(recognised ? tail : safe)];
+  // Keep P1's rejection of non-explicit allows: projecting a drifted host's
+  // '* allow' onto read would overwrite the policy's sensitive-path asks.
+  const projectable = tail.filter(rule => rule.effect !== "allow" || allowed.has(rule.action));
+  const safe = projectable.flatMap(rule => rule.effect === "deny" ? [rule]
+    : [...allowed].filter(action => permissionMatches(action, rule.action)).map(action => ({ ...rule, action })));
+  if (!recognised) warn(`host default permissions not recognised for ${name}`);
+  if (tail.some(rule => rule.effect !== "deny" && !allowed.has(rule.action))) warn(`inherited grant dropped for ${name}`);
+  // Check the final projected list, including policy rules, with last-match semantics.
+  const candidate = [...policy, ...safe];
   const resources = new Set(["*", "src/file.ts", "echo probe", ...tail.map(rule => rule.resource)]);
   const breached = READ_ONLY_CANARIES.some(action => [...resources].some(resource => evaluatePermission(candidate, action, resource) !== "deny"));
   if (breached) {
     warn(`read-only permission canary failed for ${name}; inherited grants restricted`);
-    // A wildcard ask must not turn every future action into a confirmable
-    // capability. Project it onto known permitted actions; keep all denies.
-    const restricted = safe.flatMap(rule => rule.effect === "deny" ? [rule]
-      : [...allowed].filter(action => permissionMatches(action, rule.action)).map(action => ({ ...rule, action })));
-    return [...policy, ...restricted];
+    return [{ action: "*", resource: "*", effect: "deny" }, ...candidate.filter(rule => rule.effect === "deny"
+      || (rule.action !== "*" && !READ_ONLY_CANARIES.some(action => permissionMatches(action, rule.action))))];
   }
-  return [...policy, ...safe];
+  return candidate;
 }
 // MCP effective names are <sanitized-server>_<sanitized-tool>; hyphens survive
 // sanitization on both hosts. Never allow context7_* (future tools may write).

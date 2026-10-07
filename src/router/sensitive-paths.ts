@@ -1,12 +1,17 @@
 /** One filename policy for read approval, grep filtering and Git exclusions.
  * Patterns are relative suffixes, matched at any depth (not a content scanner). */
+const SSH_KEY_NAMES = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"] as const;
 export const SENSITIVE_PATH_PATTERNS = [
-  ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
-  "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*",
+  "*.env", "*.env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
+  ...SSH_KEY_NAMES.flatMap(name => [name, `${name}.*`]),
   ".npmrc", ".netrc", ".pgpass", ".git-credentials", "credentials.json",
   ".aws/credentials", ".docker/config.json",
+  ".envrc", "*.ppk", "*.jks", "*.keystore", ".kube/config", "*.tfvars", "*.tfstate",
+  ".pypirc", ".vault-token", ".cargo/credentials*", ".config/gh/hosts.yml", "application_default_credentials.json",
 ] as const;
-export const SENSITIVE_PATH_EXCEPTIONS = ["*.env.example"] as const;
+// Public SSH keys are intentionally readable; backups/extensions other than
+// exactly .pub remain sensitive. Helpers like id_rsa_helpers are not key names.
+export const SENSITIVE_PATH_EXCEPTIONS = ["*.env.example", ...SSH_KEY_NAMES.map(name => `${name}.pub`)] as const;
 const escape = (text: string) => text.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", "[^/]*");
 
 export function isSensitivePath(path: string, platform: NodeJS.Platform = process.platform): boolean {
@@ -21,15 +26,20 @@ const hostGlobs = (pattern: string) => [...new Set([pattern, pattern.replaceAll(
 export const SENSITIVE_PERMISSION_GLOBS = SENSITIVE_PATH_PATTERNS.flatMap(hostGlobs);
 export const SENSITIVE_PERMISSION_EXCEPTIONS = SENSITIVE_PATH_EXCEPTIONS.flatMap(hostGlobs);
 
-/** Git glob pathspecs cannot re-include a file after an exclude. Expand .env.*
- * minus .env.example into disjoint globs instead of excluding the example too. */
+/** Expand prefix* minus prefix+suffix: Git cannot re-include an excluded file. */
+function exceptSuffix(prefix: string, suffix: string): string[] {
+  return [prefix, ...[...suffix].flatMap((char, i) => {
+    const start = `${prefix}${suffix.slice(0, i)}`;
+    return [`${start}[!${char}]*`, ...(i > 0 ? [start] : [])];
+  }), `${prefix}${suffix}?*`];
+}
+
+/** Preserve env examples and public SSH keys without re-including private files. */
 export function sensitiveGitPathspecs(platform: NodeJS.Platform = process.platform): string[] {
-  const suffix = "example";
-  const env = [".env.", ...[...suffix].flatMap((char, i) => {
-    const prefix = `.env.${suffix.slice(0, i)}`;
-    return [`${prefix}[!${char}]*`, ...(i > 0 ? [prefix] : [])];
-  }), ".env.example?*"];
-  return SENSITIVE_PATH_PATTERNS.flatMap(pattern => pattern === ".env.*" ? env : [pattern])
+  return SENSITIVE_PATH_PATTERNS.flatMap(pattern => {
+    const exception = SENSITIVE_PATH_EXCEPTIONS.find(value => pattern.endsWith("*") && value.startsWith(pattern.slice(0, -1)));
+    return exception ? exceptSuffix(pattern.slice(0, -1), exception.slice(pattern.length - 1)) : [pattern];
+  })
     .map(pattern => `:(exclude,glob${platform === "win32" ? ",icase" : ""})**/${pattern}`);
 }
 
@@ -40,6 +50,7 @@ export function filterSensitiveGrep(text: string): string {
   let withheld = 0;
   const kept: string[] = [];
   for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith("(Results are truncated")) { kept.push(line); continue; }
     const header = /^(\S.*):$/.exec(line);
     if (header) blocked = isSensitivePath(header[1]!);
     if (blocked) {
@@ -74,7 +85,7 @@ function gitPath(value: string): string {
 /** Backstop for rename/quoted-path diffs, including sections cut by the output
  * bound. Fixed a/b prefixes are imposed by the Git argv builder. */
 export function filterSensitiveDiff(text: string): string {
-  return text.split(/(?=^diff --(?:git|cc|combined) )/m).map(section => {
+  return text.split(/(?=^diff --(?:git|cc|combined) |^commit [0-9a-f]{40,64}(?:\s|$))/m).map(section => {
     if (!/^diff --(?:git|cc|combined) /.test(section)) return section;
     const header = section.split("\n", 1)[0]!;
     const paths: string[] = [];
