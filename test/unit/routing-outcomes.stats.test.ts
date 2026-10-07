@@ -1209,12 +1209,14 @@ describe("QA-2.1-3: a refusal overrides an earlier pass of the same attempt", ()
     expect(cell(later, A, { since: Date.parse("2026-10-07T00:00:00.000Z"), until: null })).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
   });
 
-  it("QA-G-C7: first verdict per decision/attempt wins, including unverifiable", () => {
+  it.each(["pass", "fail"] as const)("QA-2.1-R2-9: later %s replaces unverifiable without counting duplicate signals", (outcome) => {
     const attempt = (row: VerdictRow): VerdictRow => ({ ...row, attemptID: "c-U:0" });
-    const rows = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, "pass"))];
-    expect(cell(rows, A)).toMatchObject({ pass: 0, fail: 0, unverifiable: 1 });
+    const rows = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, outcome))];
+    const expected = { pass: outcome === "pass" ? 1 : 0, fail: outcome === "fail" ? 1 : 0, unverifiable: 0 };
+    expect(cell(rows, A)).toMatchObject(expected);
+    expect(cell([...rows, ...rows], A)).toMatchObject(expected);
     const reversed = [rows[0]!, rows[2]!, rows[1]!];
-    expect(cell(reversed, A)).toMatchObject({ pass: 1, unverifiable: 0 });
+    expect(cell(reversed, A)).toMatchObject(expected);
     const still = [decision("U", at(0)), attempt(verdict("U", at(1), A, "unverifiable")), attempt(verdict("U", at(2), A, "unverifiable"))];
     expect(cell(still, A)).toMatchObject({ pass: 0, fail: 0, unverifiable: 1 });
   });

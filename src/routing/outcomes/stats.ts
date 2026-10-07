@@ -83,12 +83,13 @@ interface KeyAcc {
  */
 export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[], window: StatsWindow): StatsTable {
   // An append may reach disk before reporting failure; retrying that batch must not inflate rates.
-  // First row wins, before windowing and before the cross-window outcome joins.
+  // Decisions keep their first row. Signals dedupe per outcome, before windowing and joins:
+  // a later decisive verdict must still replace an earlier unverifiable verdict (R2-9).
   const seen = new Set<string>();
   rows = rows.filter((row) => {
     const id = JSON.stringify(row.kind === "decision"
       ? [row.kind, row.decisionID]
-      : [row.kind, row.decisionID, row.attemptID]);
+      : [row.kind, row.decisionID, row.attemptID, row.kind === "verdict" ? row.verdict : row.overrides ?? null]);
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
