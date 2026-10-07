@@ -10,20 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
-  Code Mode, delegation and unspecified MCP tools are denied by default, even
+  Code Mode, delegation and unspecified MCP tools are denied, including inherited
+  ask grants outside the permitted actions, even
   for existing configs without the new optional tier `readOnly` boolean.
   Opt out by setting `presets.<preset>.fast.readOnly: false` in a router override
-  file. V2 inherited session grants no longer override the agent's own denies;
-  drifted host defaults fail closed. Agent-specific resource overrides on
+  file. V2 inherited session grants no longer override the agent's own denies or
+  asks, but remain intact for children resumed as medium/heavy. Drifted host
+  defaults fail closed. Agent-specific resource overrides on
   permitted actions remain supported; other tiers are unchanged. Legacy v1
   hosts that honour only tool booleans cannot enforce sensitive-read approval.
   `rename` moves from the fast taxonomy to medium. Fast prompts distinguish
   direct tools from the separate Code Mode catalog.
   One shared sensitive-file policy now drives read asks, read-only grep output
   filtering, and Git patch exclusions/refusals. Git show accepts commits only
-  (no blob ids or `rev:path`); log includes filtered patches. Saved project-wide
-  “always allow” approvals can still satisfy sensitive-read asks without another
-  prompt: the host applies them after checking configured denies (QA-77-P8).
+  (no blob ids or `rev:path`); log includes filtered patches. The list includes
+  `*.env`/`*.env.*` and additional credential stores; exact SSH public-key `.pub`
+  names and `*.env.example` are intentionally readable. Saved project-wide
+  “always allow” approvals are applied after host deny checks (QA-77-P8), but the
+  v2 router hook now restores the protected agent's ask. Auto-answer modes may
+  still approve that ask; denies remain denied.
 
 ### Added
 

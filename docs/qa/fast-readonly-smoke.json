@@ -31,17 +31,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -51,17 +76,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -93,6 +278,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -170,6 +710,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [],
     "hostRefusal": true,
     "permissionDenied": false
@@ -206,17 +748,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -226,17 +793,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -268,6 +995,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -345,6 +1427,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [],
     "hostRefusal": true,
     "permissionDenied": false
@@ -381,17 +1465,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -401,17 +1510,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -443,6 +1712,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -520,6 +2144,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [],
     "hostRefusal": true,
     "permissionDenied": false
@@ -556,17 +2182,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -576,17 +2227,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -618,6 +2429,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -695,6 +2861,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [],
     "hostRefusal": true,
     "permissionDenied": false
@@ -731,17 +2899,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -751,17 +2944,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -793,6 +3146,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -870,6 +3578,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [
       "completed"
     ],
@@ -908,17 +3618,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -928,17 +3663,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -970,6 +3865,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -1047,6 +4297,727 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
+    "statuses": [
+      "completed"
+    ],
+    "hostRefusal": false,
+    "permissionDenied": false
+  },
+  {
+    "tool": "grep",
+    "allowed": true,
+    "advertised": [
+      "glob",
+      "grep",
+      "read",
+      "router_git_blame",
+      "router_git_diff",
+      "router_git_log",
+      "router_git_ls_files",
+      "router_git_show",
+      "router_git_status"
+    ],
+    "permissions": [
+      {
+        "action": "*",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "read",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.key",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.key",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.key",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.npmrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.netrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "glob",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "grep",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_status",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_log",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_diff",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_show",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_blame",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "router_git_ls_files",
+        "resource": "*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<absolute-path>",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*readonly-blocked.txt",
+        "effect": "deny"
+      },
+      {
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      }
+    ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": true,
     "statuses": [
       "completed"
     ],
@@ -1085,17 +5056,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -1105,17 +5101,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -1147,6 +5303,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -1224,6 +5735,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [
       "completed"
     ],
@@ -1262,17 +5775,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -1282,17 +5820,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -1324,6 +6022,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -1401,6 +6454,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [
       "completed"
     ],
@@ -1439,17 +6494,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -1459,17 +6539,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -1501,6 +6741,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -1578,8 +7173,12 @@
         "effect": "deny"
       }
     ],
-    "statuses": [],
-    "hostRefusal": true,
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
+    "statuses": [
+      "completed"
+    ],
+    "hostRefusal": false,
     "permissionDenied": false
   },
   {
@@ -1615,17 +7214,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -1635,17 +7259,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -1677,6 +7461,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -1754,6 +7893,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [],
     "hostRefusal": true,
     "permissionDenied": false
@@ -1791,17 +7932,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -1811,17 +7977,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -1853,6 +8179,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -1930,6 +8611,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [],
     "hostRefusal": true,
     "permissionDenied": false
@@ -1967,17 +8650,42 @@
       },
       {
         "action": "read",
+        "resource": "*/*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
         "resource": "*.env.*",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*.env.example",
-        "effect": "allow"
+        "resource": "*/*.env.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.*",
+        "effect": "ask"
       },
       {
         "action": "read",
         "resource": "*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pem",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pem",
         "effect": "ask"
       },
       {
@@ -1987,17 +8695,177 @@
       },
       {
         "action": "read",
-        "resource": "id_*",
+        "resource": "*/*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*/id_*",
+        "resource": "*\\*.key",
         "effect": "ask"
       },
       {
         "action": "read",
-        "resource": "*\\id_*",
+        "resource": "*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.p12",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.pfx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.kdbx",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.*",
         "effect": "ask"
       },
       {
@@ -2029,6 +8897,361 @@
         "action": "read",
         "resource": "*\\.netrc",
         "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pgpass",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.git-credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.aws/credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.aws\\credentials",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.docker/config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.docker\\config.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.envrc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.ppk",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.jks",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.keystore",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.kube/config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.kube\\config",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfvars",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.tfstate",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.pypirc",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.vault-token",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.cargo/credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.cargo\\credentials*",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": ".config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/.config/gh/hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\.config\\gh\\hosts.yml",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*/application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*\\application_default_credentials.json",
+        "effect": "ask"
+      },
+      {
+        "action": "read",
+        "resource": "*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\*.env.example",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_rsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ed25519.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_ecdsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*/id_dsa.pub",
+        "effect": "allow"
+      },
+      {
+        "action": "read",
+        "resource": "*\\id_dsa.pub",
+        "effect": "allow"
       },
       {
         "action": "glob",
@@ -2106,6 +9329,8 @@
         "effect": "deny"
       }
     ],
+    "inheritedGrantsRetained": true,
+    "sensitiveWithheld": false,
     "statuses": [
       "error"
     ],

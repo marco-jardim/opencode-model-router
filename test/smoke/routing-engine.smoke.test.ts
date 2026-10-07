@@ -115,8 +115,11 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const agent = (await host.client.agent.list()).data.find(a => a.id === "fast");
         expect(arr(agent?.permissions).some(rule => obj(rule).action === "*" && obj(rule).resource === "*" && obj(rule).effect === "allow")).toBe(false);
         const child = await host.client.session.get({ sessionID: result.childID });
-        expect(child.permissions?.some(rule => rule.effect === "allow") ?? false).toBe(false);
+        const parent = await host.client.session.get({ sessionID: root });
+        expect(child.permissions ?? []).toEqual(parent.permissions ?? []);
         evidence.push({ tool: probe.tool, allowed: probe.allowed, parentAllow: probe.parentAllow, advertised: names, permissions: agent?.permissions,
+          inheritedGrantsRetained: true, sensitiveWithheld: probe.sensitive === true && !context.includes("SECRET_GREP_RO")
+            && context.includes("1 matches in sensitive files withheld; use read (asks for approval)"),
           statuses: hooks.map(h => h.status), hostRefusal: states.some(state => state.status === "error"),
           permissionDenied: states.some(state => /Permission denied/i.test(String(obj(state.error).message))) });
         // Normal runs leave tracked evidence untouched. Opt in deliberately to
@@ -144,7 +147,10 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         } else {
           expect(names).not.toContain(probe.tool);
           expect(hooks.some(h => h.status === "completed")).toBe(false);
-          expect(states.some(state => state.status === "error" && String(obj(state.error).message).includes(`No tool named "${probe.tool}"`)), context).toBe(true);
+          // Host-filtered tools are unknown; tools removed from a merged
+          // request snapshot are registered but unavailable for that request.
+          const refusals = [`No tool named "${probe.tool}"`, `Tool is not available for this request: ${probe.tool}`];
+          expect(states.some(state => state.status === "error" && refusals.some(refusal => String(obj(state.error).message).includes(refusal))), context).toBe(true);
         }
         expect(await readFile(target, "utf8")).toBe("READ_ONLY_ORIGINAL\n");
         expect(await host.children(result.childID)).toHaveLength(0);

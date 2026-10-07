@@ -237,24 +237,31 @@ export async function registerV2Hooks(
       }
     }));
 
-    // QA-77-P2: the host merges session/saved allows AFTER agent rules. Preserve
-    // the agent's own deny at the permission assertion, not just in the catalog.
+    // Enforce the protected agent's own deny/ask without destroying inherited
+    // grants: the same session can later resume as medium/heavy (P-R2-3).
     registrations.push(await ctx.permission.hook("evaluate", async event => {
-      const name = event.agent ?? (await ctx.session.get({ sessionID: event.sessionID })).agent;
-      if (!protectedAgent(name)) return;
-      const agent = (await ctx.agent.list()).data.find(agent => agent.id === name);
-      if (!agent || event.resources.some(resource => evaluatePermission(agent.permissions, event.action, resource) === "deny")) {
-        event.effect = "deny";
-        event.message = `Permission denied by read-only agent ${name}: ${event.action}`;
+      let name: string | undefined = event.agent;
+      let protectedKnown = protectedAgent(name);
+      try {
+        // An explicit event agent is authoritative, even when session lookup
+        // would fail or still refers to the previous agent during a switch.
+        name ??= (await ctx.session.get({ sessionID: event.sessionID })).agent;
+        protectedKnown = protectedAgent(name);
+        if (!protectedKnown) return;
+        const agent = (await ctx.agent.list()).data.find(agent => agent.id === name);
+        const effects = agent ? event.resources.map(resource => evaluatePermission(agent.permissions, event.action, resource)) : ["deny"];
+        if (effects.includes("deny")) {
+          event.effect = "deny";
+          event.message = `Permission denied by read-only agent ${name}: ${event.action}`;
+        } else if (effects.includes("ask") && event.effect === "allow") {
+          event.effect = "ask";
+          event.message = `Approval required by read-only agent ${name}: ${event.action}`;
+        }
+      } catch (error) {
+        if (protectedKnown) event.effect = "deny";
+        warnPermissionOnce(`read-only permission evaluation failed for ${name ?? "unknown agent"}: ${String(error)}`);
       }
     }));
-
-    const narrowSession = async (sessionID: Parameters<typeof ctx.session.get>[0]["sessionID"]) => {
-      const session = await ctx.session.get({ sessionID });
-      if (protectedAgent(session.agent) && session.permissions?.some(rule => rule.effect === "allow")) {
-        await ctx.session.update({ sessionID, permissions: session.permissions.filter(rule => rule.effect !== "allow") });
-      }
-    };
 
     registrations.push(await ctx.command.transform((editor) => {
       for (const [name, definition] of Object.entries(config.command)) editor.add({
@@ -329,19 +336,23 @@ export async function registerV2Hooks(
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
       if (loadConfig(ctx.location.directory) !== lastConfig) await refresh();
-      await narrowSession(event.sessionID);
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
       if (protectedAgent(event.agent)) {
-        await narrowSession(event.sessionID);
-        // A context snapshot can predate narrowing (or a later session update).
-        // Hide wholly denied actions here as well. Resource-specific denies
-        // remain advertised and are enforced by the permission evaluate hook.
-        const agent = (await ctx.agent.list()).data.find(agent => agent.id === event.agent);
-        for (const name of Object.keys(event.tools ?? {})) {
-          const action = name === "write" || name === "patch" ? "edit" : name;
-          if (!agent || (evaluatePermission(agent.permissions, action, "*") === "deny"
-            && !agent.permissions.some(rule => rule.effect !== "deny" && rule.action === action && rule.resource !== "*"))) delete event.tools[name];
+        try {
+          // Catalogs use merged session rules; remove widened tools from this
+          // request snapshot only. Resource-specific asks remain callable.
+          const agent = (await ctx.agent.list()).data.find(agent => agent.id === event.agent);
+          for (const name of Object.keys(event.tools ?? {})) {
+            const action = name === "write" || name === "patch" ? "edit" : name;
+            if (!agent || (evaluatePermission(agent.permissions, action, "*") === "deny"
+              && !agent.permissions.some(rule => rule.effect !== "deny" && rule.action === action && rule.resource !== "*"))) delete event.tools[name];
+          }
+        } catch (error) {
+          // Known protected agent: no usable catalog is safer than widened
+          // tools. Never turn a hook rejection into a host operation failure.
+          for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
+          warnPermissionOnce(`read-only tool catalog failed for ${event.agent}: ${String(error)}`);
         }
       }
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };

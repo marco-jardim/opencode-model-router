@@ -267,10 +267,10 @@ Known limits:
 ## 8. Round 1 fixes
 
 The table records the original review findings across the merged permission and
-Git branches. **Shared-list commit** below means the commit with subject
-`fix(router): one sensitive-file list for read, grep and git tools (QA-77-P3/P8/G8)`
-(this commit; use `git log --all --fixed-strings --grep='QA-77-P3/P8/G8'` to resolve
-its hash without a self-referential hash in this document).
+Git branches. **Shared-list commit** below means `d5e377e`, with subject
+`fix(router): one sensitive-file list for read, grep and git tools (QA-77-P3/P8/G8)`.
+These are historical findings/results; Round 2 supersedes the session-mutation,
+ask-projection and sensitive-pattern details below.
 
 | Finding | Resolution | Commit |
 |---|---|---|
@@ -341,3 +341,73 @@ Shared-list implementation details:
   now raises `Invalid git ref`; the exact error-string assertion still expected
   the old wording). Tests were deliberately updated for the new colon-ref
   restriction; the completed explicit/related reruns above have no failures.
+
+## 9. Round 2 fixes
+
+Branch `fast-ro/perm2`, based on `d5e377e`, worktree `D:\git\omr-fast-perm`.
+The permission/sensitive-path changes below are in the commit with subject
+`fix(router): permission and sensitive-file round-2 fixes (QA-77-P-R2-1..8)`.
+No edits to `git-tools.ts`, its tests, or the Git session/worktree-context line
+in `v2-hooks.ts`. Git-producer findings are tracked here without claiming their
+implementation or verification on this branch.
+
+| Finding | Resolution / ownership | Status |
+|---|---|---|
+| P-R2-1 | `*.env`/`*.env.*`, including `prod.env`, `secret.env`, `prod.env.local`; generalized exception pathspecs; read/grep/Git-helper regressions | Fixed here |
+| P-R2-2 | Always project inherited asks onto permitted actions; drop non-explicit allows before projection so drifted host allow-all cannot erase read asks; final canary check | Fixed here |
+| P-R2-3 | Session grants never mutated; own deny/ask restored by evaluate hook, denied catalog tools removed per request; same-child medium resume retains grants | Fixed here |
+| P-R2-4 | Event agent checked first; permission/catalog lookup errors caught and logged, deny only when protected status is known | Fixed here |
+| P-R2-5 | Additional credential patterns; exact SSH key basenames plus dotted extensions, exact `.pub` public keys intentionally readable | Fixed here |
+| P-R2-6 | Preserve grep's `(Results are truncated…` line after sensitive blocks | Fixed here |
+| P-R2-7 | Separate unknown-host-default and inherited-grant-dropped warnings, deduplicated | Fixed here |
+| P-R2-8 | Refresh redacted evidence with all 13 probes, including sensitive grep | Fixed here |
+| G-R2-1 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-2 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-3 | Split diff backstop at commit headers so following log messages survive; public SSH key exception (shared-file nit) | Fixed here |
+| G-R2-4 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-5 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-6 | Git producer ownership | fast-ro/git2, pending merge |
+| G-R2-7 | Document shared-index mtime refresh, content unchanged, matching plain `git --no-optional-locks status`; Git verification owned by producer | Documentation fixed here; fast-ro/git2, pending merge |
+
+Policy decisions and regression coverage:
+
+- SSH keys are exact `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` names or
+  dotted extensions. Exact `.pub` files are public material and deliberately
+  remain readable; `id_rsa_helpers/x.ts` no longer falls under the read ask.
+  Environment examples remain readable. Expanded patterns are listed in
+  `READ_ONLY_TIERS.md` and generated from one shared module.
+- Tests exercise every pattern's matcher/read glob, real Git exclusion
+  pathspecs against an isolated index, env-suffix grep/diff filtering, commit
+  header preservation, and grep truncation notices. These helper tests do not
+  modify the Git producer's implementation or tests.
+- Unit tests cover inherited `github_* ask` and drifted `apply_patch ask`,
+  parent allows over agent asks, fast-to-medium resume with unchanged grants,
+  failed session/registry lookups and request-local catalog filtering.
+- Saved approvals are not deleted. The v2 hook now restores an agent-own ask
+  even if host evaluation returned allow from saved/session grants; CLI
+  auto-answer can still approve that ask. No claim of mandatory interactive
+  approval or real-v1 host verification.
+- Real-host smoke: **1 passed, 12 unrelated scenarios skipped**, 22.66 s.
+  `RUN_OC_SMOKE_ROUTING=1 OMR_UPDATE_READONLY_EVIDENCE=1` with the gated
+  `77 fast read-only` scenario and `--maxWorkers=2` (PowerShell env syntax).
+  All **13 probes** preserve inherited session grants; parent shell/allow-all
+  grants do not advertise shell to fast. The sensitive grep probe's secret is
+  absent and its withholding notice present. Refreshed JSON has 13 records and
+  passed the local-path/username/secret-marker scrub check.
+- Initial smoke required an assertion update: the host correctly refused a
+  request-local removed tool with `Tool is not available for this request: shell`
+  rather than `No tool named "shell"`. Both exact host refusal forms are now
+  accepted, while absent advertisement and no completed execution remain
+  mandatory. The completed rerun above passed.
+- `npm run typecheck`: passed. Explicit read-only, v2-hooks, sensitive-paths,
+  readonly-evidence and routing-dispatch run: **276 passed / 5 files**, 10.69 s.
+  Command: `npx vitest run test/unit/read-only.test.ts test/unit/v2-hooks.test.ts test/unit/sensitive-paths.test.ts test/unit/readonly-evidence.test.ts test/integration/routing-dispatch.test.ts --maxWorkers=2 --testTimeout=30000`.
+- Related run: **1295 passed, 55 skipped / 43 passed files, 3 skipped**, 84.06 s.
+  Command: `npx vitest related src/router/sensitive-paths.ts src/router/read-only.ts src/compat/v2-hooks.ts --run --maxWorkers=2 --testTimeout=30000`.
+  Both use the default pool. No snapshots updated and no full-suite run.
+- During development, typecheck caught a branded Agent.ID/string fallback
+  mismatch; declaring the local lookup name as `string | undefined` fixed it
+  without assertions/suppressions. A drifted-host regression then reported
+  `expected 'allow' to be 'ask'` for `.env`: projecting a default wildcard allow
+  erased sensitive asks. Retaining P1's rejection of non-explicit allows before
+  projecting non-deny rules fixed it. The final runs above pass all checks.

@@ -52,7 +52,10 @@ describe("read-only tier policy", () => {
     expect(evaluatePermission(rules, "read", ".env")).toBe("ask");
     expect(rules).not.toContainEqual({ action: "*", resource: "*", effect: "allow" });
     if (name === "identical") expect(warn).not.toHaveBeenCalled();
-    else expect(warn).toHaveBeenCalledWith("host default permissions not recognised for fast; inherited allow rules dropped");
+    else if (name === "appended-allow") {
+      expect(warn).toHaveBeenCalledWith("inherited grant dropped for fast");
+      expect(warn).not.toHaveBeenCalledWith("host default permissions not recognised for fast");
+    } else expect(warn).toHaveBeenCalledWith("host default permissions not recognised for fast");
   });
   it("canaries reject scoped and ask grants; permitted resource overrides remain", () => {
     const warn = vi.fn();
@@ -61,7 +64,7 @@ describe("read-only tier policy", () => {
       { action: "read", resource: "blocked/*", effect: "deny" }, { action: "read", resource: "*.env", effect: "deny" },
       { action: "read", resource: "safe.env", effect: "allow" }, { action: "external_directory", resource: "*", effect: "deny" },
     ], warn);
-    expect(warn).toHaveBeenCalledWith("read-only permission canary failed for fast; inherited grants restricted");
+    expect(warn).toHaveBeenCalledWith("inherited grant dropped for fast");
     expect(evaluatePermission(rules, "shell", "echo hello")).toBe("deny");
     expect(evaluatePermission(rules, "browser", "page")).toBe("deny");
     expect(evaluatePermission(rules, "read", "blocked/a.ts")).toBe("deny");
@@ -74,6 +77,23 @@ describe("read-only tier policy", () => {
     expect(permissionMatches("git", "git *")).toBe(true);
     expect(permissionMatches("READ", "read")).toBe(process.platform === "win32");
     expect(evaluatePermission([], "unknown", "*")).toBe("ask");
+  });
+  it.each([false, true])("drops inherited asks outside the allowed surface (drifted=%s)", drifted => {
+    const inherited: PermissionRule[] = [...(drifted ? host.slice(1) : host),
+      { action: "github_*", resource: "*", effect: "ask" },
+      { action: "apply_patch", resource: "*", effect: "ask" }];
+    const rules = publishReadOnlyPermissions("fast", permissionRules(readOnlyPermissions()), inherited, vi.fn());
+    for (const action of ["github_create_issue", "github_push", "apply_patch"])
+      expect(evaluatePermission(rules, action, "repo")).toBe("deny");
+    expect(evaluatePermission(rules, "read", "prod.env.local")).toBe("ask");
+  });
+  it("checks canaries after projection and fails closed on a widened policy too", () => {
+    const warn = vi.fn();
+    const rules = publishReadOnlyPermissions("fast", [...permissionRules(readOnlyPermissions()),
+      { action: "shell", resource: "*", effect: "allow" }], host, warn);
+    expect(warn).toHaveBeenCalledWith("read-only permission canary failed for fast; inherited grants restricted");
+    for (const action of READ_ONLY_CANARIES) expect(evaluatePermission(rules, action, "*")).toBe("deny");
+    expect(evaluatePermission(rules, "read", "ordinary.ts")).toBe("allow");
   });
   it("projects inherited wildcard ask onto the permitted surface, keeping unknown actions denied", () => {
     const rules = publishReadOnlyPermissions("fast", permissionRules(readOnlyPermissions()), [...host, { action: "*", resource: "*", effect: "ask" }], vi.fn());
