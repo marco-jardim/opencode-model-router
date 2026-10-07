@@ -270,9 +270,9 @@ describe("docs drift: cost-aware routing engine", () => {
     expect(read("README.md")).toContain("docs/adr/0005-cost-aware-routing-engine.md");
     expect(read("docs/plans/README.md")).toContain("../adr/0005-cost-aware-routing-engine.md");
     expect(read("docs/plans/README.md")).toContain("../ROUTING_ENGINE.md");
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1] ?? "";
-    expect(unreleased).toContain("#73");
-    expect(unreleased).toContain("#74");
+    const release = /## \[2\.3\.0\] - 2026-10-07([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1] ?? "";
+    expect(release).toContain("#73");
+    expect(release).toContain("#74");
   });
 
   it("resolves every relative markdown link of the routing docs, anchors included", () => {
@@ -617,7 +617,17 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
   });
 
   it("D16: the release contract is version 2.3.0 in one PR closing both #74 and #73", () => {
-    // Phase 3.4 executes the release; do not prematurely bump the current package during QA.
+    // Phase 3.4 prepares the release without merging, tagging or publishing it.
+    expect(JSON.parse(read("package.json")).version).toBe("2.3.0");
+    const lock = JSON.parse(read("package-lock.json"));
+    expect(lock.version).toBe("2.3.0");
+    expect(lock.packages[""].version).toBe("2.3.0");
+    expect(read("CHANGELOG.md")).toContain("## [2.3.0] - 2026-10-07");
+    const pr = read("docs/qa/cost-aware-routing/pr-body.md");
+    expect(pr).toContain("Closes #74");
+    expect(pr).toContain("Closes #73");
+    expect(pr).toContain("@javizuurc");
+    expect(pr).toContain("TypeSafe");
     const plan = read("docs/plans/cost-aware-routing-engine-plan.md");
     expect(plan).toContain("**D16 — Release `2.3.0`**, one PR, closes #74 and #73.");
     const adr = read("docs/adr/0005-cost-aware-routing-engine.md");
