@@ -26,6 +26,7 @@ type Seed = (id: string) => unknown[];
 
 function fixture(seed: Seed = () => []) {
   const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
+  const toolHooks: Record<string, (event: any) => Promise<void>> = {};
   const permissionHooks: Record<string, (event: PermissionEvaluation) => Promise<void>> = {};
   const agents: Record<string, any> = {
     explore: { id: "explore", mode: "subagent", model: { providerID: "old", id: "old" }, permissions: [], request: { settings: {}, headers: {}, body: {} } },
@@ -47,7 +48,7 @@ function fixture(seed: Seed = () => []) {
       transform: vi.fn(async (cb: any) => { transforms.agent = cb; cb(editor); return none(); }),
     },
     command: { reload: vi.fn(async () => {}), transform: vi.fn(async () => none()) },
-    tool: { transform: vi.fn(async () => none()), hook: vi.fn(async () => none()) },
+    tool: { transform: vi.fn(async () => none()), hook: vi.fn(async (name: string, cb: any) => { toolHooks[name] = cb; return none(); }) },
     session: {
       get: vi.fn(async () => ({ id: "child", parentID: "root", agent: "scout" })),
       update: vi.fn(async () => {}),
@@ -62,7 +63,7 @@ function fixture(seed: Seed = () => []) {
     } },
   };
   return {
-    ctx, agents, transforms, editor, sessionHooks, permissionHooks,
+    ctx, agents, transforms, editor, sessionHooks, permissionHooks, toolHooks,
     async start(hooks: Record<string, any>) {
       cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks));
     },
@@ -147,6 +148,25 @@ describe("plugin agents on v2", () => {
         warn.mockRestore();
       }
     });
+
+  it("redacts grep output for readOnly and explicit-permission plugin agents, not for other agents (QA-81-3)", async () => {
+    const f = fixture(defaults);
+    await f.start(await plugin(setup({ agents: { scout, worker } })));
+    const grepAs = async (agent: string) => {
+      const event = { id: `call-${agent}`, sessionID: "child", agent, tool: "grep", input: { pattern: "." }, status: "completed", result: {
+        content: "Found 2 matches\n/repo/.env:\n  Line 1: SECRET\n/repo/src/a.ts:\n  Line 1: PUBLIC",
+        output: [{ entry: { path: ".env" }, line: 1, text: "SECRET" }, { entry: { path: "src/a.ts" }, line: 1, text: "PUBLIC" }],
+      } };
+      await f.toolHooks["execute.after"](event);
+      return JSON.stringify(event.result);
+    };
+    for (const agent of ["scout", "worker"]) {
+      const result = await grepAs(agent);
+      expect(result).not.toContain("SECRET");
+      expect(result).toContain("PUBLIC");
+    }
+    expect(await grepAs("medium")).toContain("SECRET");
+  });
 
   it("a session grant cannot re-open a plugin agent's deny or capability", async () => {
     const f = fixture(drifted);

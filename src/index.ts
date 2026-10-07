@@ -298,6 +298,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
   // Per-plugin-instance session store: owns subagentSessionIDs and subagentCapState.
   const sessionStore = createSessionStore();
+  /** v1 sessionID -> plugin agent name, from chat.message (tool.execute.after has no `agent` on v1). */
+  const pluginAgentSessions = new Map<string, string>();
   let systemDebugLogged = false;
   let dispatchDebugLogged = false;
 
@@ -1512,6 +1514,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
       const tierNames = Object.keys(getActiveTiers(cfg));
       const sid = input?.sessionID;
+      // v1 `tool.execute.after` carries no agent: remember which sessions run a plugin agent (QA-81-2).
+      if (typeof sid === "string" && typeof input?.agent === "string" && Object.hasOwn(cfg.agents ?? {}, input.agent)) {
+        pluginAgentSessions.set(sid, input.agent);
+      }
       try {
         const registration = sessionStore.registerFromChatMessage(
           input,
@@ -1753,10 +1759,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // -----------------------------------------------------------------------
     "tool.execute.after": async (input: any, output: any) => {
       if (input?.tool === "grep" && typeof output.output === "string") {
-        const tier = input.agent ?? sessionStore.getTier(input.sessionID);
+        const tier = input.agent ?? pluginAgentSessions.get(input.sessionID) ?? sessionStore.getTier(input.sessionID);
         const definition = tier && getActiveTiers(cfg)[tier];
-        const pluginReadOnly = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier) && cfg.agents?.[tier]?.readOnly === true;
-        if ((definition && isReadOnlyTier(tier, definition)) || pluginReadOnly) output.output = filterSensitiveGrep(output.output);
+        // Every plugin agent is redacted (a denied grep produces no output anyway), readOnly or explicit-permission.
+        const isPlugin = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier);
+        if ((definition && isReadOnlyTier(tier, definition)) || isPlugin) output.output = filterSensitiveGrep(output.output);
       }
       if (bypassed) return;
       sessionStore.recordToolCall(input, output);

@@ -154,7 +154,7 @@ describe("plugin agents on v1 (config hook)", () => {
     expect(opencodeConfig.agent.scout.model).toBe("beta/medium");
     expect(opencodeConfig.agent.scout.variant).toBe("deep");
   });
-  it("the grep post-filter covers a readOnly plugin agent but not an explicit-permission one", async () => {
+  it("the grep post-filter covers every plugin agent with the real v1 hook shapes (QA-81-2, QA-81-3)", async () => {
     writeGlobal({
       agents: {
         ...agentsBlock,
@@ -162,13 +162,23 @@ describe("plugin agents on v1 (config hook)", () => {
       },
     });
     const { hooks } = await run({});
-    const text = ".env:\n  Line 1: SECRET=abc\nsrc/a.ts:\n  Line 3: const x = 1";
-    const filtered = { output: text };
-    await hooks["tool.execute.after"]({ tool: "grep", agent: "scout", sessionID: "s1" }, filtered);
-    expect(filtered.output).not.toContain("SECRET=abc");
-    const untouched = { output: text };
-    await hooks["tool.execute.after"]({ tool: "grep", agent: "worker", sessionID: "s2" }, untouched);
-    expect(untouched.output).toContain("SECRET=abc");
+    const text = "Found 2 matches\n/repo/.env:\n  Line 1: SECRET=abc\n/repo/src/a.ts:\n  Line 3: PUBLIC";
+    // v1: `chat.message` names the agent; `tool.execute.after` carries no agent field.
+    const grepAs = async (agent: string, sessionID: string): Promise<string> => {
+      await hooks["chat.message"]({ sessionID, agent }, {
+        message: { id: `user-${sessionID}`, sessionID, role: "user", time: { created: Date.now() }, agent, model: { providerID: "test", modelID: "test" } },
+        parts: [],
+      });
+      const output = { title: "grep", metadata: {}, output: text };
+      await hooks["tool.execute.after"]({ tool: "grep", sessionID, callID: `grep-${sessionID}`, args: {} }, output);
+      return output.output;
+    };
+    for (const [agent, sessionID] of [["scout", "s1"], ["worker", "s2"]] as const) {
+      const out = await grepAs(agent, sessionID);
+      expect(out).not.toContain("SECRET=abc");
+      expect(out).toContain("PUBLIC");
+    }
+    expect(await grepAs("medium", "s3")).toContain("SECRET=abc");
   });
 });
 
