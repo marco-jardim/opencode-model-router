@@ -16,7 +16,7 @@ Final checkpoint and cross-period table: [DF5](#df5), [Summary](#summary). The r
 
 `d17Mode` intentionally reports no switching evidence. Nevertheless, D17's literal **zero switched+fail** condition holds, so the resulting mode is **enforce**. This is a safety-rule result, not evidence that switching saves money or succeeds. **No live override was edited here; the orchestrator applies/retains the resulting mode.** The CLI joins switched decisions to verdicts across the snapshot (including later verdicts), while dispatch windows are half-open. With zero switches, this distinction does not change this result.
 
-**Sync 5 / code boundary.** `master` → `93db126` at **2026-10-07T03:40:45Z**. Per the orchestrator handoff, the file watcher reloaded the plugin within approximately 20 seconds; the first decision row with the 3.3 audit fields is **03:41:05Z**. The owner restart was **04:11:34Z**, host **2.0.24**. Rows before 03:41:05Z ran pre-3.3 code; a restart-only boundary would incorrectly label the earlier audit-bearing rows. Restart timing and its limitations are in [run-log.md](run-log.md#df5-liveness-and-timing-correction).
+**Sync 5 / code boundary (QA-3.4-13 correction).** `master` → `93db126` has a sync-completion record at **2026-10-07T03:40:45Z**, not an exact file-change timestamp. In `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`, router `msg="loading plugin"` entries are already present at **03:40:41.517Z / 03:40:41.546Z**, existing run **`ed92edfe`**. **The new code was live without a restart by 03:41:05.545Z**, the first decision row with the 3.3 audit fields; neither watcher causality nor a 20-second reload duration is established. The bounded split stays at **03:41:05Z**, immediately before that first row. Earlier rows ran pre-3.3 code. The same log directly records the owner restart at **04:11:34.806Z**, `message="cli starting"`, host **2.0.24**, run **`b5f6e377`**. A restart-only boundary would incorrectly label earlier audit-bearing rows. Details are in [run-log.md](run-log.md#df5-liveness-and-timing-correction).
 
 | Enforce slice (UTC, half-open) | Dispatches | Resumes | Pinned | Agreement | Switched / enforced / failed | Savings | False refusals | Variant steps / pass |
 |---|---:|---:|---:|---|---|---|---:|---|
@@ -30,11 +30,94 @@ Final checkpoint and cross-period table: [DF5](#df5), [Summary](#summary). The r
 | High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | 0 of 2 recorded |
 ```
 
-Pre-3.3: `n/a (no row records detection and capability)`, not a retroactive safety pass. **`pinned && switched` = 0 over ALL 247 decision rows** in the copied log (not just DF5). Whole-window kept-for-evidence: 2 of 45 fresh dispatches. Verdicts on all keys: 2 pass, 1 fail, 2 unverifiable; that fail is **not** a switched-dispatch failure. Dollar measurements remain n/a (unpriced).
+Pre-3.3: `n/a (no row records detection and capability)`, not a retroactive safety pass. **`switched` is false on all 247 decision rows**, hence **`pinned && switched` = 0 over ALL 247 decision rows** in the copied log (not just DF5). This pin invariant is vacuous evidence when nothing switched. Whole-window kept-for-evidence: 2 of 45 fresh dispatches. Verdicts on all keys: 2 pass, 1 fail, 2 unverifiable; that fail is **not** a switched-dispatch failure. Dollar measurements remain n/a (unpriced).
+
+### Whole-window DF5 routing:stats output
+
+Verbatim retained `<copy>/df5.md`, produced by `node scripts/routing-stats.ts --dir <copy> --since 2026-10-07T00:51:45Z --until 2026-10-07T04:13:39.877Z`:
+
+```text
+## Routing stats
+
+Window: 2026-10-07T00:51:45.000Z → 2026-10-07T04:13:39.877Z
+
+| Metric | Value |
+|---|---|
+| Dispatches | 56 |
+| Routed dispatches | 56 |
+| Delegate first attempts | 0 |
+| Floor lifts | 0 |
+| Pinned | 11 |
+| Agreement (best == chosen, non-pinned) | 24/24 (100.0%) |
+| Switched | 0 of 24 non-pinned routed (0.0%); enforced 0; failed 0 (verified 0 of 0 enforced) |
+| D17 mode (use the DF4→DF5 enforce-period window) | n/a (0 enforced switches) |
+| Estimated savings (ratio) | 0.00 over 24 rows |
+| Variant steps | 0 taken; pass n/a |
+| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | 11 of 56 routed dispatches |
+| Kept for lack of evidence (A27, fresh dispatches) | 2 of 45 fresh routed dispatches |
+| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | 0 of 2 recorded |
+
+### By class
+
+| Class | Dispatches |
+|---|---|
+| debug | 3 |
+| design | 12 |
+| implement | 11 |
+| mechanical | 2 |
+| other | 1 |
+| recon | 2 |
+| review | 12 |
+| search | 2 |
+
+### By key
+
+| Key | Dispatches | Attempts | Pass | Fail | Unverifiable | Pass rate | False refusals | Refusal rate | USD/attempt (lifetime) |
+|---|---|---|---|---|---|---|---|---|---|
+| debug\|host:general\|anthropic/claude-opus-5-5#default | 3 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |
+| debug\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 0 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| debug\|router:medium\|openai/gpt-6-astra-fast#high | 0 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| design\|host:general\|anthropic/claude-opus-5-5#default | 11 | 11 | 0 | 0 | 0 | n/a | 0 | 0/11 (0.0%) | n/a |
+| design\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| design\|router:medium\|openai/gpt-6-astra-fast#high | 0 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| implement\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 3 | 3 | 0 | 1 | 0 | 0/1 (0.0%) | 0 | 0/3 (0.0%) | n/a |
+| implement\|router:medium\|openai/gpt-6-astra-fast#high | 8 | 8 | 0 | 0 | 1 | n/a | 0 | 0/8 (0.0%) | n/a |
+| mechanical\|router:medium\|openai/gpt-6-astra-fast#high | 2 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| other\|router:medium\|openai/gpt-6-astra-fast#high | 1 | 1 | 0 | 0 | 0 | n/a | 0 | 0/1 (0.0%) | n/a |
+| recon\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 0 | 1 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/1 (0.0%) | n/a |
+| recon\|router:medium\|openai/gpt-6-astra-fast#high | 2 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+| review\|host:general\|anthropic/claude-opus-5-5#default | 5 | 7 | 0 | 0 | 1 | n/a | 0 | 0/7 (0.0%) | n/a |
+| review\|router:heavy\|anthropic/claude-opus-5-5#xhigh | 6 | 8 | 1 | 0 | 0 | 1/1 (100.0%) | 0 | 0/8 (0.0%) | n/a |
+| review\|router:medium\|openai/gpt-6-astra-fast#high | 1 | 3 | 0 | 0 | 0 | n/a | 0 | 0/3 (0.0%) | n/a |
+| search\|router:fast\|openai/gpt-6-luna-fast#medium | 2 | 2 | 0 | 0 | 0 | n/a | 0 | 0/2 (0.0%) | n/a |
+
+### Gated by evidence (trace.argmin)
+
+| Cheapest key held back | Rows |
+|---|---|
+| design\|router:medium\|openai/gpt-6-astra-fast#high | 11 |
+| implement\|router:fast\|openai/gpt-6-luna-fast#medium | 3 |
+| review\|router:fast\|openai/gpt-6-luna-fast#medium | 2 |
+| debug\|router:fast\|openai/gpt-6-luna-fast#medium | 1 |
+| implement\|router:medium\|openai/gpt-6-astra-fast#high | 1 |
+| other\|router:fast\|openai/gpt-6-luna-fast#medium | 1 |
+
+### Resume vs fresh
+
+| Step | Resume | Fresh |
+|---|---|---|
+| variant | 0 | 0 |
+| retry | 0 | 0 |
+| escalate | 0 | 0 |
+
+_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._
+```
 
 ### Cache-read share — QA-G-A1 / QA-2.2-10
 
-**Read-only discovery:** `opencode session --help` confirms `list` and `export`; current v2 CLI docs also describe `opencode stats --json`. Those data commands connect to the service, so none was run. Instead, `opencode.db` and its WAL from `C:\Users\Marquinho\.local\share\opencode` were copied to `<copy>\session-copy` (approximately 7.6 GB database); only the copy was opened with Node's SQLite API. `PRAGMA quick_check` on the copy returned `ok`. No service/API request, live database write, or credential file read was made.
+**Read-only discovery:** `opencode session --help` confirms `list` and `export`; current v2 CLI docs also describe `opencode stats --json`. Those data commands connect to the service, so none was run. The initial DB/WAL file copy is **superseded by QA-3.4-8's consistent SQLite online backup**, taken with Node 24 `node:sqlite.backup` from a **read-only** connection to `C:\Users\Marquinho\.local\share\opencode\opencode.db`. A read transaction was established before backup to hold a consistent snapshot. No service/API request, live database write, or credential-file read was made.
+
+Snapshot: **`<copy>/session-backup-r1.db`**, backup started **2026-10-07T04:41:36.289Z**, finished **04:43:30.559Z**, **1,865,172 pages**. SHA-256: **`c42c21c6bc5f86aa53e221e78432d566ca4cac8e96ab4b0a3f58d1b6cfdb517f`**. `PRAGMA quick_check` on this backup returned **`ok`**. All queries below were re-run on this backup with the original fixed cutoff; the original three-window token sums and percentages were unchanged. The backup contains private session data and remains outside the repository.
 
 The plan's root session is `ses_ef09ca71effe2FoiBgxxJuCg6W` (`session_v2.parent_id IS NULL`, directory `D:/git/opencode-model-router`). It was the only root session in that directory updated during the measured period. Children, graders, other projects, synthetic messages and compactions are excluded. Select `session_message.type = 'assistant'` with **`data.time.completed` in the half-open window**; use per-message usage, not lifetime session totals. The host records non-cache input separately, so **total input = `tokens.input + tokens.cache.read + tokens.cache.write`**; the numerator is `tokens.cache.read`. Output and reasoning tokens are not part of the denominator.
 
@@ -43,10 +126,25 @@ The plan's root session is `ses_ef09ca71effe2FoiBgxxJuCg6W` (`session_v2.parent_
 | shadow | 25 | 25 | 50 | 3,813,758 | 351,895 | 4,165,703 | 91.55% |
 | advise | 55 | 52 | 116 | 12,176,648 | 1,072,271 | 13,249,035 | 91.91% |
 | enforce | 34 | 33 | 80 | 11,134,968 | 687,870 | 11,822,918 | 94.18% |
+| enforce, pre-3.3 (00:51:45 → 03:41:05Z) | 28 | 27 | 66 | 8,796,627 | 682,976 | 9,479,669 | 92.79% |
+| enforce, post-3.3 (03:41:05 → 04:13:39.877Z) | 6 | 6 | 14 | 2,338,341 | 4,894 | 2,343,249 | 99.79% |
 
-**Qualification:** the observed-token subset is measurable, but full-window advise/enforce shares are **unverifiable**: three advise records and one enforce record lack `tokens` (two advise errors and two records without a finish value across those windows). They are excluded, **not assumed zero**. A live DB/WAL file copy is not an atomic database backup; the copy passed structural validation, but this is observational evidence, not a transactionally certified capture. The advise window used the **old per-turn hint**, not the stable A1 fix. Post-3.3 enforce emits **no hint at all**; the whole enforce window includes the pre-fix period, as split above. Session growth, compactions, changing work and host versions confound comparisons. These percentages do not establish a causal hint/cache improvement and do not validate the stable advise hint.
+**Qualification:** the observed-token subset is measurable, but full-window advise/enforce shares are **unverifiable** because records still lack `tokens` in the consistent backup. Recount: **three advise records** (00:16:31.056Z, no finish; 00:16:31.705Z and 00:24:47.382Z, `finish: error`) and **one pre-3.3 enforce record** (02:17:41.570Z, no finish). They are excluded, **not assumed zero**. The snapshot-consistency limitation of the original file copy is resolved, but missing provider usage is not. The advise window used the **old per-turn hint**, not the stable A1 fix. Post-3.3 enforce emits **no hint at all**; the whole enforce window includes the pre-fix period. The post-fix sample has only six completed records. Session growth, compactions, changing work and host versions confound comparisons. These percentages do not establish a causal hint/cache improvement and do not validate the stable advise hint.
 
-Reproduce the cache table on the **copy only** with Node 24 (save this as a temporary `.mjs`, then `node <script> <copy>/session-copy/opencode.db`):
+Snapshot method (Node 24; save as temporary `.mjs`, choose a **new destination** because `backup` overwrites it; live source is opened read-only):
+
+```js
+import { DatabaseSync, backup } from 'node:sqlite';
+const source = new DatabaseSync(process.argv[2], { readOnly: true });
+try {
+  source.exec('BEGIN');
+  source.prepare('SELECT count(*) FROM sqlite_schema').get();
+  await backup(source, process.argv[3], { rate: 4096 });
+  source.exec('ROLLBACK');
+} finally { source.close(); }
+```
+
+Reproduce the cache table on the **backup only** with Node 24 (save this as a temporary `.mjs`, then `node <script> <copy>/session-backup-r1.db`):
 
 ```js
 import { DatabaseSync } from 'node:sqlite';
@@ -55,6 +153,8 @@ const windows = [
   ['shadow', '2026-10-06T15:28:34Z', '2026-10-06T20:32:23Z'],
   ['advise', '2026-10-06T20:32:23Z', '2026-10-07T00:51:45Z'],
   ['enforce', '2026-10-07T00:51:45Z', '2026-10-07T04:13:39.877Z'],
+  ['enforce-pre', '2026-10-07T00:51:45Z', '2026-10-07T03:41:05Z'],
+  ['enforce-post', '2026-10-07T03:41:05Z', '2026-10-07T04:13:39.877Z'],
 ];
 for (const [mode, since, until] of windows) {
   const rows = db.prepare(`SELECT data FROM session_message
@@ -106,6 +206,7 @@ $rows = @(Get-ChildItem "$copy/decisions.jsonl*" | ForEach-Object {
 } | Where-Object kind -eq decision)
 $rows.Count # 247
 @($rows | Where-Object { $_.pinned -and $_.switched }).Count # 0
+@($rows | Where-Object switched).Count # 0: switched is false on every row
 ```
 
 All routing numbers in the summary are reproduced by these bounded commands; restart numbers are independently timestamped ledger facts, and cache shares use the separate bounded SQLite query above. The snapshot cutoff excludes later work on this phase.

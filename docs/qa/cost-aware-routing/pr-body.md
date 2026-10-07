@@ -37,7 +37,7 @@ An explicit `routing` block also enables automatic variant steps on v2 unless ov
 | DF4 / advise | 112 | 67/67 (100%) | 0 | 0.00 ratio / 67 rows | n/a, unpriced | 0 | 0 / n/a | 2 starts (1 failed) / 35m38s total |
 | DF5 / enforce | 56 | 24/24 (100%) | 0 | 0.00 ratio / 24 rows | n/a, unpriced | 0 | 0 / n/a | 2 / 30m49s sync→owner restart + unmeasured unplanned restart |
 
-Cutoff: **2026-10-07T04:13:39.877Z**. D17 counts zero failed switched dispatches, so its literal rule retains **enforce**; the stats display correctly says `n/a (0 enforced switches)`. Post-3.3 never-down audit: **0 of 2 recorded**. `pinned && switched`: **0 of 247 decision rows**. This demonstrates neither dollar savings nor successful switching.
+Cutoff: **2026-10-07T04:13:39.877Z**. D17 counts zero failed switched dispatches, so its literal rule retains **enforce**; the stats display correctly says `n/a (0 enforced switches)`. Post-3.3 never-down audit: **0 of 2 recorded**. **`switched` is false on all 247 decision rows**; therefore `pinned && switched` is also zero, a vacuous invariant in this sample. This demonstrates neither dollar savings nor successful switching.
 
 One owner, one machine, and an implementation-/QA-heavy plan workload, with unpriced models: **not a benchmark**. The host-wide store includes concurrent projects, not just this plan. DF1/DF2 zeros reflect absent instrumentation. Agreement excludes pinned/resumed/ineligible rows. Restart durations include human idle time, not just downtime. The plan-session cache measurements are documented separately: advise used the old hint, and missing token records prevent a trustworthy full-window advise/enforce comparison.
 
