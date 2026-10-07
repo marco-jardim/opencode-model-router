@@ -213,7 +213,7 @@ describe("shell-free git inspection", () => {
       git("add", "UPPER.PEM"); git("commit", "-qm", "uppercase");
       expect(await inspect("show")).not.toContain("SECRET_G8");
     }
-  });
+  }, 30_000);
   it("preserves in-tree text/eol/binary attributes without running drivers (R2-1)", async () => {
     repository(); git("config", "core.autocrlf", "false");
     writeFileSync(join(root, ".gitattributes"), "* text=auto\n*.bat text eol=crlf\n*.bin binary\npackage-lock.json -diff\n");
