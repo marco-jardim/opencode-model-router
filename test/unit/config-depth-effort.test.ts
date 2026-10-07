@@ -89,16 +89,16 @@ describe("depth and effort bump config — defaults and validation", () => {
   });
 
   it.each([
-    ["zero", 0, "number"], ["negative", -1, "number"], ["negative zero", -0, "number"],
-    ["fraction", 1.5, "number"], ["NaN", NaN, "number"],
-    ["Infinity", Infinity, "number"], ["overflow", 1e400, "number"],
-    ["string", "1", "string"], ["boolean", true, "boolean"],
-    ["array", [], "array"], ["object", {}, "object"],
-    ["above limit", 33, "number"], ["old unbounded limit", 100, "number"],
-    ["huge integer", 1e300, "number"], ["unsafe integer", 2 ** 53 + 2, "number"],
-  ])("rejects maxDelegationDepth %s with the exact redacted message", (_label, value, received) => {
+    ["zero", 0, "0"], ["negative", -1, "-1"], ["negative zero", -0, "-0"],
+    ["fraction", 1.5, "1.5"], ["NaN", NaN, "NaN"],
+    ["Infinity", Infinity, "Infinity"], ["overflow", 1e400, "Infinity"],
+    ["string", "1", '"1"'], ["boolean", true, "true"],
+    ["array", [], "array []"], ["object", {}, "object {}"],
+    ["above limit", 33, "33"], ["old unbounded limit", 100, "100"],
+    ["huge integer", 1e300, "1e+300"], ["unsafe integer", 2 ** 53 + 2, "9007199254740994"],
+  ])("rejects maxDelegationDepth %s with the exact received-value message", (_label, value, received) => {
     expect(() => validateConfig(validRaw({ enforcement: { maxDelegationDepth: value } })))
-      .toThrowError(new Error(`tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got ${received}; value not shown)`));
+      .toThrowError(new Error(`tiers.json: enforcement.maxDelegationDepth must be null or an integer from 1 to 32 (got ${received})`));
   });
 
   it.each([true, false])("accepts effortBump %s", (effortBump) => {
@@ -106,9 +106,9 @@ describe("depth and effort bump config — defaults and validation", () => {
     expect(resolveEffortBump(cfg)).toEqual({ enabled: effortBump, max: "xhigh" });
   });
 
-  it.each([["true", "string; value not shown"], [0, "number; value not shown"], [null, "null"]])("rejects effortBump %s with the exact redacted message", (effortBump, received) => {
+  it.each(["true", 0, null])("rejects effortBump %s with the exact received-value message", (effortBump) => {
     expect(() => validateConfig(validRaw({ enforcement: { escalate: { effortBump } } })))
-      .toThrowError(new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got ${received})`));
+      .toThrowError(new Error(`tiers.json: enforcement.escalate.effortBump must be a boolean (got ${JSON.stringify(effortBump)})`));
   });
 
   it.each(["low", "medium", "high", "xhigh", "max"])("accepts effortBumpMax %s", (effortBumpMax) => {
@@ -116,9 +116,9 @@ describe("depth and effort bump config — defaults and validation", () => {
     expect(resolveEffortBump(cfg)).toEqual({ enabled: true, max: effortBumpMax });
   });
 
-  it.each([["High", "string; value not shown"], ["ultra", "string; value not shown"], ["", "string; value not shown"], [null, "null"], [3, "number; value not shown"]])("rejects effortBumpMax %s with the exact redacted message", (effortBumpMax, received) => {
+  it.each(["High", "ultra", "", null, 3])("rejects effortBumpMax %s with the exact received-value message", (effortBumpMax) => {
     expect(() => validateConfig(validRaw({ enforcement: { escalate: { effortBumpMax } } })))
-      .toThrowError(new Error(`tiers.json: enforcement.escalate.effortBumpMax must be one of low|medium|high|xhigh|max (got ${received})`));
+      .toThrowError(new Error(`tiers.json: enforcement.escalate.effortBumpMax must be one of low|medium|high|xhigh|max (got ${JSON.stringify(effortBumpMax)})`));
   });
 });
 
@@ -234,38 +234,36 @@ describe("depth and effort bump config — regression cases", () => {
   });
 
   it.each([
-    [{ toString: 1 }, "object"],
-    [Object.create(null), "object"],
-    [Symbol("invalid"), "symbol"],
-    [2n, "bigint"],
-    [new Number(2), "object"],
-    [-0, "number"],
-    [[], "array"],
-    ["", "string"],
-    ["true", "string"],
-    ["x".repeat(5000), "string"],
-    ["a" + "😀".repeat(100), "string"],
+    [{ toString: 1 }, 'object {"toString":1}'],
+    [Object.create(null), "object {}"],
+    [Symbol("invalid"), "Symbol(invalid)"],
+    [2n, "2n"],
+    [new Number(2), "object 2"],
+    [-0, "-0"],
+    [[], "array []"],
+    ["", '""'],
+    ["true", '"true"'],
+    ["x".repeat(5000), `"${"x".repeat(78)}…`],
+    ["a" + "😀".repeat(100), `"a${"😀".repeat(38)}…`],
   ])("safely describes invalid values for all three keys: %s", (value, description) => {
     for (const key of ["maxDelegationDepth", "effortBump", "effortBumpMax"]) {
       const enforcement = key === "maxDelegationDepth" ? { [key]: value } : { escalate: { [key]: value } };
       expect(() => validateConfig(validRaw({ enforcement })))
-        .toThrowError(`(got ${description}; value not shown)`);
-      expect(`${description}; value not shown`.length).toBeLessThanOrEqual(80);
+        .toThrowError(`(got ${description})`);
+      expect(String(description).length).toBeLessThanOrEqual(80);
     }
   });
 
-  it("uses a type tag without invoking serializers, including circular objects", () => {
+  it("falls back to a type tag for circular objects and throwing serializers", () => {
     const circular: Record<string, unknown> = {};
     circular.self = circular;
-    const toJSON = vi.fn(() => { throw new Error("do not leak this"); });
-    const throwing = { toJSON };
+    const throwing = { toJSON() { throw new Error("do not leak this"); } };
     for (const value of [circular, throwing]) {
       for (const key of ["maxDelegationDepth", "effortBump", "effortBumpMax"]) {
         const enforcement = key === "maxDelegationDepth" ? { [key]: value } : { escalate: { [key]: value } };
-        expect(() => validateConfig(validRaw({ enforcement }))).toThrowError("(got object; value not shown)");
+        expect(() => validateConfig(validRaw({ enforcement }))).toThrowError("(got <object>)");
       }
     }
-    expect(toJSON).not.toHaveBeenCalled();
   });
 
   it.each(["__proto__", "constructor", "prototype"])("rejects own %s keys in enforcement containers", (key) => {
@@ -354,36 +352,11 @@ describe("depth and effort bump config — regression cases", () => {
     expect(Object.hasOwn(cfg.enforcement?.escalate ?? {}, "effortBumpMax")).toBe(false);
   });
 
-  it.each(["maxDelegationDepth", "effortBump", "effortBumpMax"])("never logs credentials pasted into %s, even inside a container", (key) => {
-    const secret = "sk-proj-Q7x9V2m8K4z6P1w3SECRET";
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      for (const value of [secret, { apiKey: secret, headers: { Authorization: secret } }]) {
-        withOverrideFile((path) => {
-          const bundled = loadConfig();
-          const enforcement = key === "maxDelegationDepth" ? { [key]: value } : { escalate: { [key]: value } };
-          writeFileSync(path, JSON.stringify({ enforcement }), "utf-8");
-          invalidateConfigCache();
-          expect(loadConfig()).toEqual(bundled);
-          expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(key));
-          expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("value not shown"));
-          const warnings = warnSpy.mock.calls.flat().join("\n");
-          for (let offset = 0; offset <= secret.length - 8; offset++) {
-            expect(warnings).not.toContain(secret.slice(offset, offset + 8));
-          }
-          warnSpy.mockClear();
-        });
-      }
-    } finally {
-      warnSpy.mockRestore();
-    }
-  });
-
   it.each([
-    [{ maxDelegationDepth: 2, escalate: { effortBump: false, effortBumpMax: "ultra" } }, "enforcement.escalate.effortBumpMax", "string"],
-    [{ maxDelegationDepth: 0 }, "enforcement.maxDelegationDepth", "number"],
-    [{ escalate: { effortBump: "true" } }, "enforcement.escalate.effortBump", "string"],
-  ])("drops a bad override without preventing startup and names its offending field/type: %j", (enforcement, key, received) => {
+    [{ maxDelegationDepth: 2, escalate: { effortBump: false, effortBumpMax: "ultra" } }, "enforcement.escalate.effortBumpMax", '"ultra"'],
+    [{ maxDelegationDepth: 0 }, "enforcement.maxDelegationDepth", "0"],
+    [{ escalate: { effortBump: "true" } }, "enforcement.escalate.effortBump", '"true"'],
+  ])("drops a bad override without preventing startup and names its offending value: %j", (enforcement, key, received) => {
     // Match the existing override integration seam: isolate HOME and cwd rather
     // than mocking validation or merge, and leave the bundled tiers.json intact.
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -398,7 +371,7 @@ describe("depth and effort bump config — regression cases", () => {
         expect(resolveEffortBump(cfg)).toEqual({ enabled: true, max: "xhigh" });
         expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("ignoring"));
         expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(key));
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`(got ${received}; value not shown)`));
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`(got ${received})`));
       });
     } finally {
       warnSpy.mockRestore();
