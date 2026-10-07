@@ -2,7 +2,8 @@
 // is a fresh mkdtemp under the OS temp dir, injected through the settings; the real trajectory directory and
 // ~/.config/opencode are never touched.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -53,6 +54,7 @@ const MEDIUM_KEY = makeKey("implement", { origin: "router", id: "medium" }, "ant
 
 const dirs: string[] = [];
 const disposers: Array<() => Promise<void>> = [];
+const releases: Promise<void>[] = [];
 
 interface Harness {
   readonly dir: string;
@@ -80,8 +82,21 @@ function harness(settingsOverride: Partial<IngestSettings> = {}): Harness {
   };
   const acquire = (options: AcquireOutcomesOptions): OutcomesBundle => {
     const bundle = acquireOutcomes({ ...options, deps: { ...nodePersistDeps(logger), now: () => clock.t }, scheduler });
-    bundles.push(bundle);
-    return bundle;
+    // Directory switches release the old holder in the background. Remember the
+    // original promise: calling the production holder's release twice returns early.
+    let released: Promise<void> | undefined;
+    const tracked: OutcomesBundle = {
+      ...bundle,
+      release() {
+        if (released === undefined) {
+          released = bundle.release();
+          releases.push(released);
+        }
+        return released;
+      },
+    };
+    bundles.push(tracked);
+    return tracked;
   };
   const h: Harness = {
     dir, clock, warnings, timers, bundles,
@@ -160,7 +175,8 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const dispose of disposers.splice(0)) await dispose();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  await Promise.all(releases.splice(0));
+  for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   resetDispatchRegistry();
   resetIngestState();
 });
@@ -1070,7 +1086,7 @@ describe("flush scheduling (D15)", () => {
     expect(h.bundles).toHaveLength(1);
   });
 
-  it("follows a changed outcomes directory", () => {
+  it("follows a changed outcomes directory", async () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
@@ -1081,6 +1097,12 @@ describe("flush scheduling (D15)", () => {
     dispatch("c2");
     ingest.onVerdict("c2", "pass");
     expect(h.bundles.map((b) => b.dir)).toEqual([h.dir, second]);
+    await ingest.dispose();
+    await Promise.all(h.bundles.map((bundle) => bundle.release()));
+    // Both the retired and current directory are fully flushed before teardown.
+    for (const bundle of h.bundles) {
+      expect((await bundle.persister.readRows()).rows.filter((row) => row.kind === "verdict")).toHaveLength(1);
+    }
   });
 });
 

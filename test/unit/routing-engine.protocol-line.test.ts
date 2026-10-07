@@ -70,7 +70,7 @@ afterEach(() => {
   else process.env.HOME = savedHome;
   if (savedUserProfile === undefined) delete process.env.USERPROFILE;
   else process.env.USERPROFILE = savedUserProfile;
-  rmSync(tmpHome, { recursive: true, force: true });
+  rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   invalidateConfigCache();
 });
 

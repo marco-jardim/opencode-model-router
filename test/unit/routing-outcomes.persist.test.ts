@@ -1069,7 +1069,7 @@ describe("coexistence with *.scorecard.log (D15)", () => {
 describe("nodePersistFs and a real directory", { timeout: 60_000 }, () => {
   const made: string[] = [];
   afterEach(async () => {
-    while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true });
+    while (made.length > 0) await rm(made.pop() as string, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   async function tempDir(): Promise<string> {

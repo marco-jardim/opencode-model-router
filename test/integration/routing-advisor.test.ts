@@ -596,7 +596,7 @@ describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () =>
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   async function plugin(routing: Record<string, unknown> | null, host: "v2" | "v1" = "v2"): Promise<Hooks> {
@@ -1402,7 +1402,7 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
     invalidateConfigCache();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   interface Host {

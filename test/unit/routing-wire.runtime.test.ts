@@ -36,7 +36,7 @@ describe("createEngineRuntime.dispose (QA-2.4-17)", () => {
     dir = mkdtempSync(join(tmpdir(), "runtime-dispose-"));
     store = join(dir, "store");
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const logger = () => ({ warn: vi.fn() });
   const decisionIDs = (): string[] =>

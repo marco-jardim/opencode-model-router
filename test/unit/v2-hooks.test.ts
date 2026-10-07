@@ -121,7 +121,7 @@ describe("OpenCode 2 hook adapter", () => {
       routerChildRunner: { run, dispose: async () => undefined },
     } as unknown as RouterPluginInput);
     await f.start(hooks);
-    cleanups.push(async () => { rmSync(home, { recursive: true, force: true }); });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
     const result = await f.tools.delegate.execute({ tier: "fast", task: "VERIFY:required\nDo the work", acceptance: "[acceptance]\ncriteria: correct\n[/acceptance]" }, {
       ...call, sessionID: "root", signal: new AbortController().signal, progress: vi.fn(async () => undefined),
     });
@@ -155,7 +155,7 @@ describe("OpenCode 2 hook adapter", () => {
     } as unknown as RouterPluginInput);
     const lifecycle = vi.fn(async (input: Parameters<NonNullable<Hooks["event"]>>[0]) => { await hooks.event?.(input); });
     await f.start({ ...hooks, event: lifecycle });
-    cleanups.push(async () => { rmSync(home, { recursive: true, force: true }); });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
     f.emit({ type: "session.created", data: { sessionID: "root" } });
     f.emit({ type: "session.created", data: { sessionID: "child", parentID: "root" } });
     await vi.waitFor(() => expect(lifecycle).toHaveBeenCalledTimes(2));
@@ -362,7 +362,7 @@ describe("OpenCode 2 hook adapter", () => {
       client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
     } as unknown as RouterPluginInput);
     await f.start(hooks);
-    cleanups.push(async () => { rmSync(home, { recursive: true, force: true }); });
+    cleanups.push(async () => { rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
     await f.commands["router-reload"].execute({ sessionID: "root", prompt: { text: "" }, delivery: "steer" });
     expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
     expect(f.ctx.session.synthetic).toHaveBeenCalledWith(expect.objectContaining({
@@ -874,7 +874,7 @@ describe("OpenCode 2 hook adapter", () => {
       await f.sessionHooks.context(event);
       expect(event.messages[0].content).toEqual([attachment]);
       expect(event.messages[1]).toBe(explicit);
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
   });
 
   it("uses post-configuration subagent tiers at dispatch without overriding explicit models or primary agents", async () => {
@@ -933,7 +933,7 @@ describe("OpenCode 2 hook adapter", () => {
       expect(unmapped.input.model).toBeUndefined();
     } finally {
       process.chdir(savedCwd);
-      rmSync(home, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });
@@ -1030,7 +1030,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     }
     await cleanup(); // flushes through the D15 flusher on dispose
     expect(existsSync(join(outcomes, "outcomes.json"))).toBe(true);
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it("QA-2.3-2: a child's context is readable only after its execution end event, in every engine mode (static here)", async () => {
@@ -1046,7 +1046,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]); // memory only: nothing was written
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it("QA-2.3-R2-1: the adapter passes the event id, so a copy of an end event delivered after a re-registration is ignored", async () => {
@@ -1068,7 +1068,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });  it("ignores step events of sessions that are not registered children", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
     const f = fixture();
@@ -1080,7 +1080,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it.each([
@@ -1103,7 +1103,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const defaultDir = join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME);
     expect(existsSync(defaultDir) ? readdirSync(defaultDir).filter((name) => /^(outcomes|decisions)/.test(name)) : []).toEqual([]);
     expect(model.list).not.toHaveBeenCalled();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it("records nothing under a class below routing.minClassConfidence", async () => {
@@ -1115,7 +1115,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier");
     await cleanup();
     expect(readdirSync(outcomes)).toEqual([]);
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it("counts a step once when the same event id reaches two plugin instances (A3)", async () => {
@@ -1140,7 +1140,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     }
     await first.cleanup();
     await second.cleanup();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it("session.deleted drops the child's registration and still reaches the legacy event hook", async () => {
@@ -1154,7 +1154,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await vi.waitFor(() => expect(legacyEvent).toHaveBeenCalledWith({ event: { type: "session.deleted", properties: { info: { id: "child-1" } } } }, undefined));
     const { lookupDispatch } = await import("../../src/router/sessions");
     expect(lookupDispatch("child-1")).toBeUndefined();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   describe("src/v2.ts setup (the real wiring)", () => {
@@ -1177,7 +1177,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
         await peek.release();
       }
       await cleanup();
-      rmSync(home, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     });
 
     it("QA-2.1-5: disposing does not wait for a model catalog that never answers", async () => {
@@ -1192,7 +1192,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
       const started = performance.now();
       await cleanup();
       expect(performance.now() - started).toBeLessThan(1000); // the catalog wait itself is bounded by 2 s
-      rmSync(home, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     });
   });
 

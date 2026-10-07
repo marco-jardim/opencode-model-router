@@ -205,8 +205,8 @@ for (const name of readdirSync(guard.realTmp)) {
 }
 
 afterAll(() => {
-  rmSync(guard.isolatedHome, { recursive: true, force: true });
-  rmSync(guard.isolatedTmp, { recursive: true, force: true });
+  rmSync(guard.isolatedHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  rmSync(guard.isolatedTmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   for (const [name, value] of Object.entries(guard.original)) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
