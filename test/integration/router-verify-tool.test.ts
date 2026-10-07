@@ -1367,7 +1367,7 @@ describe("the router_verify tool (2.4.3b)", () => {
     expect((await makePlugin()).hooks.tool.delegate).toBeUndefined();
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
     const both = (await makePlugin()).hooks.tool;
-    expect(Object.keys(both).sort()).toEqual(["delegate", "router_verify"]);
+    expect(Object.keys(both).sort()).toEqual(["delegate", "router_git_blame", "router_git_diff", "router_git_log", "router_git_ls_files", "router_git_show", "router_git_status", "router_verify"]);
     writeOverrides({ require: "never" });
     expect((await makePlugin()).hooks.tool.router_verify).toBeUndefined();
   });

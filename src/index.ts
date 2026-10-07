@@ -21,6 +21,7 @@ import {
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
+import { gitTools } from "./router/git-tools";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
 import { buildDispatchHeader } from "./router/dispatch-header";
@@ -811,6 +812,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
+      ...gitTools(),
       ...(enableDelegateTool ? { delegate: tool({
         description: DELEGATE_TOOL_DESCRIPTION,
         args: {
