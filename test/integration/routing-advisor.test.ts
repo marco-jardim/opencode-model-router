@@ -825,6 +825,61 @@ describe("cost doctor: the throttled notice (context delivery)", () => {
     return n.instance.take();
   }
 
+  it.each(["check", "claim"] as const)("dispose waits for an in-flight %s write and its lock release", async (phase) => {
+    const fs = memoryFs();
+    const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
+    const n = notifier(fs, clock);
+    if (phase === "claim") {
+      n.instance.poll();
+      await n.instance.settled();
+    }
+    let releaseWrite!: () => void;
+    let releaseUnlock!: () => void;
+    let enteredWrite!: () => void;
+    let enteredUnlock!: () => void;
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const unlockGate = new Promise<void>((resolve) => { releaseUnlock = resolve; });
+    const writing = new Promise<void>((resolve) => { enteredWrite = resolve; });
+    const unlocking = new Promise<void>((resolve) => { enteredUnlock = resolve; });
+    const write = fs.writeDurable.bind(fs);
+    const unlink = fs.unlink.bind(fs);
+    fs.writeDurable = async (path, data) => { enteredWrite(); await writeGate; await write(path, data); };
+    fs.unlink = async (path) => {
+      if (path === LOCK_PATH) { enteredUnlock(); await unlockGate; }
+      await unlink(path);
+    };
+    const operation = phase === "claim" ? n.instance.take() : (n.instance.poll(), n.instance.settled());
+    await writing;
+    let done = false;
+    const disposed = n.instance.dispose();
+    const completed = disposed.then(() => { done = true; });
+    try {
+      expect(n.instance.dispose()).toBe(disposed);
+      await Promise.resolve();
+      expect(done).toBe(false);
+      expect(fs.files.has(LOCK_PATH)).toBe(true);
+      releaseWrite();
+      await unlocking;
+      expect(done).toBe(false);
+      expect(fs.files.has(LOCK_PATH)).toBe(true);
+    } finally {
+      releaseWrite();
+      releaseUnlock();
+      await Promise.all([operation, completed]);
+    }
+    expect(done).toBe(true);
+    expect(fs.files.has(LOCK_PATH)).toBe(false);
+    const calls = n.gather.mock.calls.length;
+    const persisted = [...fs.files.entries()];
+    clock.now += 8 * 24 * HOUR;
+    n.instance.poll();
+    expect(n.instance.maybePending()).toBe(false);
+    expect(await n.instance.take()).toBeNull();
+    await n.instance.settled();
+    expect(n.gather).toHaveBeenCalledTimes(calls);
+    expect([...fs.files.entries()]).toEqual(persisted);
+  });
+
   it("fires once: the check runs in the background, the notice is handed over once, and the state records what the user was told", async () => {
     const fs = memoryFs();
     const clock = { now: Date.parse("2026-10-06T12:00:00Z") };
@@ -1498,10 +1553,13 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     await hooks["chat.message"]({ sessionID, agent: "build" }, output);
     return output.parts;
   };
-  async function until(condition: () => boolean, ms = 15_000): Promise<void> {
+  async function until(condition: () => boolean | Promise<boolean>, ms = 15_000): Promise<void> {
     const end = Date.now() + ms;
-    while (!condition() && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(condition()).toBe(true);
+    while (Date.now() < end) {
+      if (await condition()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(await condition()).toBe(true);
   }
 
   // The atomic rename makes the state file visible BEFORE checkContext updates its
@@ -1561,11 +1619,10 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     const first = await turn(hooks);
     expect(first.some((p) => p.includes("Cost doctor"))).toBe(false); // the first turn only starts the check
     let seen = 0;
-    await until(() => {
-      void userMessage(hooks, "root-1", "hello").then((parts) => {
-        seen += 1;
-        expect(parts).toEqual([{ type: "text", text: "hello" }]); // the user's message is untouched, with or without a pending notice
-      });
+    await until(async () => {
+      const parts = await userMessage(hooks, "root-1", "hello");
+      seen += 1;
+      expect(parts).toEqual([{ type: "text", text: "hello" }]); // unchanged, with or without a pending notice
       return host.synthetic.length > 0;
     });
     expect(host.synthetic).toHaveLength(1);
@@ -1590,6 +1647,32 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     expect(again.host.agentCalls()).toBe(0); // throttled before any host call
   });
 
+  it("plugin dispose drains a background advisor check before its store can be removed", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const { hooks } = await plugin({
+      routing: { engine: "advise", outcomes: { path: store } },
+      agents: async () => { started(); await gate; return rawAgents(); },
+    });
+    await turn(hooks);
+    await entered;
+    let done = false;
+    const disposal = hooks.dispose().then(() => { done = true; });
+    try {
+      // Drain microtasks so an incorrectly immediate disposal would have resolved.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(done).toBe(false);
+    } finally {
+      release();
+      await disposal;
+    }
+    expect(done).toBe(true);
+    expect(noticeStateReady()).toBe(true);
+    expect(readdirSync(store).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"))).toEqual([]);
+  });
+
   it("QA-2.4-8 / R2-5: a notice a previous process left pending is delivered by the next one only after its own check has confirmed it is still current", async () => {
     const first = await plugin({ routing: { engine: "advise", outcomes: { path: store } } });
     await turn(first.hooks);
@@ -1606,8 +1689,8 @@ describe("cost doctor in the plugin", { timeout: 60_000 }, () => {
     expect(await userMessage(second.hooks, "root-9", "first message")).toEqual([{ type: "text", text: "first message" }]);
     expect(second.host.synthetic).toHaveLength(0); // not yet: it is only a notice from the file until this process has looked at the host itself
     await turn(second.hooks); // the confirming check runs in the background
-    await until(() => {
-      void userMessage(second.hooks, "root-9", "next message");
+    await until(async () => {
+      await userMessage(second.hooks, "root-9", "next message");
       return second.host.synthetic.length > 0;
     });
     expect(second.host.synthetic[0]).toMatchObject({ sessionID: "root-9", description: "Model router cost doctor" });
