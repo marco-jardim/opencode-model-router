@@ -391,6 +391,14 @@ describe("splitPlan", () => {
 // ---------------------------------------------------------------------------
 
 describe("splitPlan: fences that end with their item, and HTML comments (QA-2.4-12)", () => {
+  it("QA-G-C13: skips an unbalanced backtick anchor instead of inserting inside multiline code", async () => {
+    const text = "1. Fix `the parser\n   implementation`\n2. Find `files`\n";
+    const result = await annotatePlanText(text, makeDeps().deps);
+    expect(result.skipped.map((step) => step.line)).toEqual([1]);
+    expect(result.text.startsWith("1. Fix `the parser\n   implementation`\n")).toBe(true);
+    expect(result.additions.map((step) => step.line)).toEqual([3]);
+    expect(renderDirectives(result, { path: "plan.md", engine: "shadow", classification: { backend: "rules", statuses: {}, latencyMs: null, error: null } })).toContain("unbalanced backtick run");
+  });
   /** `closerWithInfo`: the closing line carries an info string, so it is not a closer; the next top-level item still ends the block. */
   const CLOSER_WITH_INFO = ["1. run the build", "   ```sh", "   npm run build", "   ```sh", "2. run the tests", "3. ship it"].join("\n");
   const DEDENT = ["- first", "  ```", "  code", "not indented", "- second"].join("\n");

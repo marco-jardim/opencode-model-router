@@ -354,6 +354,20 @@ export function withTagAtStart(line: string, tier: string): string {
   return rest === "" ? `${prefix}[tier:${tier}]` : `${prefix}[tier:${tier}] ${rest}`;
 }
 
+/** A matching run must close inline code on the anchor itself, never below the inserted route. */
+function hasUnbalancedBackticks(line: string): boolean {
+  let open = 0;
+  for (const match of line.matchAll(/`+/g)) {
+    const run = match[0].length;
+    if (open === 0) {
+      const slashes = /\\*$/.exec(line.slice(0, match.index))?.[0].length ?? 0;
+      if (slashes % 2 === 1) continue;
+      open = run;
+    } else if (run === open) open = 0;
+  }
+  return open !== 0;
+}
+
 function additionsOf(placed: readonly PlacedStep[], steps: readonly AnnotatedStep[]): { additions: PlanAddition[]; skipped: SkippedStep[]; pinned: number } {
   const out: PlanAddition[] = [];
   const skipped: SkippedStep[] = [];
@@ -364,7 +378,7 @@ function additionsOf(placed: readonly PlacedStep[], steps: readonly AnnotatedSte
     const original = where.text.split(LINE_SPLIT_RE).filter((_, i) => i % 2 === 0);
     const annotated = step.text.split(LINE_SPLIT_RE).filter((_, i) => i % 2 === 0);
     const anchor = original[0] ?? "";
-    if (opensCodeBlock(anchor)) {
+    if (opensCodeBlock(anchor) || hasUnbalancedBackticks(anchor)) {
       skipped.push({ line: where.line, anchor, tier: step.tier, routeLine: step.routeLine });
       return;
     }
@@ -469,13 +483,15 @@ export function renderDirectives(
   const statuses = Object.entries(info.classification.statuses).map(([status, count]) => `${status} ${count}`).join(", ");
   const lines = [
     `## Router route lines (model-router, engine=${info.engine})`,
-    `Computed by the router for ${info.path}: ${steps.length} step${steps.length === 1 ? "" : "s"} found, ${additions.length} need${additions.length === 1 ? "s" : ""} an addition${skipped.length === 0 ? "" : ` (${skipped.length} more start${skipped.length === 1 ? "s" : ""} with a code block and ${skipped.length === 1 ? "is" : "are"} skipped)`}, ${result.pinnedCount} pinned by this annotation (a \`[tier:heavy]\` or QA step is never moved by the engine).`,
+    `Computed by the router for ${info.path}: ${steps.length} step${steps.length === 1 ? "" : "s"} found, ${additions.length} need${additions.length === 1 ? "s" : ""} an addition${skipped.length === 0 ? "" : ` (${skipped.length} more start${skipped.length === 1 ? "s" : ""} with a code block${skipped.some((s) => !opensCodeBlock(s.anchor)) ? " or unbalanced backtick run" : ""} and ${skipped.length === 1 ? "is" : "are"} skipped)`}, ${result.pinnedCount} pinned by this annotation (a \`[tier:heavy]\` or QA step is never moved by the engine).`,
     `Classification: backend=${info.classification.backend}; sources: ${[...sources].map(([source, count]) => `${source} ${count}`).join(", ") || "none"}${statuses === "" ? "" : `; backend outcomes: ${statuses}`}${info.classification.latencyMs === null ? "" : `; backend latency ${info.classification.latencyMs} ms`}${info.classification.error === null ? "" : `; first error: ${info.classification.error}`}.`,
   ];
   // A step whose first line is a list item that opens a code block (`1. ```bash`) takes neither a tag (it would break the fence opener)
   // nor a route line below (it would be inside the code): skipped, and said so (QA-2.4-R2-2).
   const skippedLines = skipped.slice(0, MAX_LISTED_STEPS).map(
-    (step) => `- line ${step.line} ${q(step.anchor)}: step at line ${step.line} starts with a code block: add nothing to it here; to annotate it by hand, put ${q(`[tier:${step.tier}]`)} and ${q(step.routeLine)} on their own lines directly above the list item, or after the closing fence.`,
+    (step) => opensCodeBlock(step.anchor)
+      ? `- line ${step.line} ${q(step.anchor)}: step at line ${step.line} starts with a code block: add nothing to it here; to annotate it by hand, put ${q(`[tier:${step.tier}]`)} and ${q(step.routeLine)} on their own lines directly above the list item, or after the closing fence.`
+      : `- line ${step.line} ${q(step.anchor)}: step at line ${step.line} has an unbalanced backtick run: add nothing here; close the inline code on that line before annotating it by hand with ${q(`[tier:${step.tier}]`)} and ${q(step.routeLine)}.`,
   );
   if (additions.length === 0) {
     lines.push(skipped.length === 0 ? "Every step already carries its tier and route line: add nothing." : "No step can take an addition automatically. Make no change to the file for these steps:");
@@ -493,7 +509,7 @@ export function renderDirectives(
     lines.push(`- line ${addition.line} ${q(addition.anchor)}: ${pieces.join("; ")} [facts source: ${addition.source}]`);
   }
   if (additions.length > MAX_LISTED_STEPS) lines.push(`- … ${additions.length - MAX_LISTED_STEPS} more steps: run /annotate-plan again after applying these.`);
-  if (skippedLines.length > 0) lines.push("Make no change to these steps (each starts with a code block; a tag or a route line cannot be added to its first line):", ...skippedLines);
+  if (skippedLines.length > 0) lines.push("Make no change to these steps (a code block or unbalanced backtick run makes the first line unsafe to annotate):", ...skippedLines);
   return lines.join("\n");
 }
 
