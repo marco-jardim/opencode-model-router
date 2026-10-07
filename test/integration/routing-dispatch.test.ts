@@ -1101,6 +1101,35 @@ describe("registration from the FINAL input (QA-2.2-2)", () => {
     expect(lookupDispatch("stray")).toBeUndefined();
   });
 
+  it("QA-G-A2: a call the legacy hook rejects writes no decision row; the normal path writes exactly one", async () => {
+    for (const engine of ["shadow", "enforce"] as const) {
+      const rejected = await makeWorld({ engine });
+      await rejected.start(throwing);
+      await expect(dispatch(rejected, { agent: "medium", prompt: IMPLEMENT() }).run(), engine).rejects.toThrow("depth limit reached");
+      await expect(dispatch(rejected, { agent: "medium", prompt: IMPLEMENT(), sessionID: "child-rejected" }).run(), engine).rejects.toThrow("depth limit reached");
+      expect(await rejected.rows(), engine).toEqual([]);
+      for (const cleanup of cleanups.splice(0)) await cleanup();
+
+      const normal = await makeWorld({ engine });
+      await normal.start();
+      await routed(normal, { agent: "medium", prompt: IMPLEMENT() });
+      const rows = await normal.rows();
+      expect(rows, engine).toHaveLength(1);
+      expect(rows[0], engine).toMatchObject({ kind: "decision", mode: engine, chosen: { agent: "medium" } });
+      for (const cleanup of cleanups.splice(0)) await cleanup();
+    }
+  });
+
+  it("QA-G-A2: an unresolvable pick (nothing to register) still writes its kept:unresolved row at commit", async () => {
+    const world = await makeWorld({ engine: "shadow" });
+    world.session.current = { ...(world.session.current as Record<string, unknown>), model: null }; // no parent model to fall back on
+    await world.start();
+    await routed(world, { agent: "nobody-knows", prompt: IMPLEMENT() });
+    const rows = await world.rows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.reason.startsWith("kept:unresolved")).toBe(true);
+  });
+
   it("a legacy hook that rewrites the agent: the waiting entry uses the final agent, and its model", async () => {
     const world = await makeWorld({ engine: "shadow" });
     await world.start({

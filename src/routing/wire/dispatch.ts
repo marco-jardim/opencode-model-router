@@ -1,6 +1,6 @@
 /**
  * Dispatch-time routing on v2 (M7, Phase 2.2.1): `route()` composes M2 (classify) → ladders → M4 (decide) for one
- * `subagent` call, applies the engine mode and writes the decision row; `commit()` registers the dispatch with the 2.1
+ * `subagent` call and applies the engine mode; `commit()` writes the decision row (QA-G-A2) and registers the dispatch with the 2.1
  * dispatch-facts registry once the FINAL input is known, so ingestion sees what really ran.
  *
  * Design (the order the adapter calls it in, `src/compat/v2-hooks.ts` `execute.before` / `execute.after`):
@@ -18,7 +18,8 @@
  *     subagent's dispatch is left exactly as it is.
  *  4. Errors never reach the session: any failure is logged and the dispatch proceeds as the orchestrator wrote it.
  *  5. Registration (2.1 handoff, QA-2.1-R2-10; QA-2.2-2/3): once per execution of a child, from the FINAL input.
- *     `route()` only decides and logs. After the legacy hook has had its say, the adapter calls `commit(callID, input)`
+ *     `route()` only decides; its decision row is held until `commit()` (QA-G-A2: a call the hook chain rejects writes no row; a
+ *     call the HOST then fails keeps its row, a known limit — no retraction row). After the legacy hook has had its say, the adapter calls `commit(callID, input)`
  *     with the input the host will execute: a resume (`sessionID` given) is registered at once; a fresh child does not
  *     exist yet, so the dispatch waits and is claimed by the `session.created` event of the child (parent, agent and
  *     title decide which one). `execute.after` then names the child (`onCallResult`): a dispatch still waiting is
@@ -118,11 +119,11 @@ const UNTOUCHED: RouteOutcome = Object.freeze({ mode: "static" });
 const RUNNER_CHILD_TITLE = /^Router (?:.+ delegation|result verification)$/;
 
 export interface DispatchRouter {
-  /** Decide and log one `subagent` call. Registers nothing (see `commit`). Never throws. */
+  /** Decide one `subagent` call. Writes and registers nothing: `commit` writes its decision row and registers it. Never throws. */
   route(call: RouteCall): Promise<RouteOutcome>;
   /**
-   * The input the host is about to execute (`event.input` after the legacy hook ran): register the dispatch from it.
-   * A call `route()` did not act on is ignored. Never throws.
+   * The input the host is about to execute (`event.input` after the legacy hook ran): write the call's decision row, then register the
+   * dispatch from it. A call `route()` did not act on is ignored. Never throws.
    */
   commit(callID: string, input: unknown): void;
   /** A `session.created` event: claim the waiting dispatch of this child, if there is one. Never throws. */
@@ -158,8 +159,16 @@ interface Decided {
   readonly facts: DecisionRow["facts"];
   readonly acceptance: DetectionDepth;
   readonly description: string | null;
-  /** What the engine dispatches: the fallback for what the final input leaves out. */
-  readonly final: { readonly agent: string; readonly model: string; readonly variant: string | null };
+  /**
+   * QA-G-A2: the decision row, written by `commit()` — i.e. only for a dispatch whose hook chain let it through to the host. A call the
+   * legacy hook rejects (`onCallFinished`) never writes it. Known limit: a call the HOST then fails (`onCallResult` with no child for a
+   * fresh dispatch) keeps its row; no retraction row is written.
+   */
+  readonly row: DecisionRow;
+  /** Appends a row to the decision log (`Prepared.enqueue` of the call). */
+  readonly enqueue: (row: DecisionRow) => void;
+  /** What the engine dispatches: the fallback for what the final input leaves out. `null`: the pick resolved to no model (row only). */
+  readonly final: { readonly agent: string; readonly model: string; readonly variant: string | null } | null;
   /** The agent the orchestrator NAMED for this dispatch, before the router changed anything: recorded with the child (QA-2.4-R3-1). */
   readonly picked: string;
   readonly routerIds: readonly string[];
@@ -339,6 +348,27 @@ function reasonText(decision: Pick<Decision, "reasonCode" | "reason">): string {
 function unresolvedChoice(cls: string, agent: string, routerIds: readonly string[]): RouteChoice {
   const origin = classifyAgentOrigin(agent, routerIds);
   return { key: makeKey(cls, { origin, id: agent }, "", "", null), agent, origin, model: "unknown/unknown", variant: "default" };
+}
+
+/**
+ * What the host will run for a committed call: the final input's agent and `model` win over what the engine decided (the legacy hook
+ * runs after the engine); a model the final input leaves out is the engine's (same agent) or the resolved one (another agent). `null`
+ * when it cannot be told (an unparseable `model`, an agent that resolves to no model).
+ */
+function ranOf(
+  d: Pick<Decided, "resolve">,
+  decidedFinal: NonNullable<Decided["final"]>,
+  final: Readonly<Record<string, unknown>>,
+): { readonly agent: string; readonly model: string; readonly variant: string | null } | null {
+  const agent = str(final.agent) ?? decidedFinal.agent;
+  const ref = str(final.model);
+  if (ref !== null) {
+    const parts = splitModelRef(ref);
+    return parts === null ? null : { agent, model: `${parts.provider}/${parts.model}`, variant: parts.variant };
+  }
+  if (agent === decidedFinal.agent) return { agent, model: decidedFinal.model, variant: decidedFinal.variant };
+  const resolved = d.resolve(agent);
+  return resolved === null ? null : { agent, model: resolved.model, variant: resolved.variant };
 }
 
 export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
@@ -579,7 +609,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       }
     }
 
-    prepared.enqueue({
+    const decisionRow: DecisionRow = {
       v: LOG_ROW_VERSION,
       ts: new Date(safeNow(now)).toISOString(),
       sessionID: call.sessionID,
@@ -592,23 +622,24 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       step: "dispatch",
       resume: resumeID !== null,
       trace: traceOf(result, argmin),
-    });
+    };
 
-    if (final !== null) {
-      decided.set(call.callID, {
-        parentSessionID: call.sessionID,
-        decisionID,
-        facts: factsOf(facts),
-        acceptance: depthOf(detection),
-        description: typeof args.description === "string" && args.description !== "" ? args.description : null,
-        final,
-        routerIds,
-        resolve: (target) => resolveChosen({ cfg: prepared.cfg, agents: infos, agent: target, parentModel: session.model }),
-        picked: agent,
-        at: now(),
-      });
-      trim(decided, MAX_PENDING);
-    }
+    // QA-G-A2: the row waits for `commit()`, so a call whose hook chain rejects it (`onCallFinished`) never writes one.
+    decided.set(call.callID, {
+      parentSessionID: call.sessionID,
+      decisionID,
+      facts: factsOf(facts),
+      acceptance: depthOf(detection),
+      description: typeof args.description === "string" && args.description !== "" ? args.description : null,
+      row: decisionRow,
+      enqueue: (logged) => prepared.enqueue(logged),
+      final,
+      routerIds,
+      resolve: (target) => resolveChosen({ cfg: prepared.cfg, agents: infos, agent: target, parentModel: session.model }),
+      picked: agent,
+      at: now(),
+    });
+    trim(decided, MAX_PENDING);
     return outcome;
   };
 
@@ -662,24 +693,15 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         decided.delete(callID);
         const final = isRecord(input) ? input : {};
         // The agent and model the host will run, after the legacy hook: they win over what the engine decided.
-        const agent = str(final.agent) ?? d.final.agent;
-        const ref = str(final.model);
-        let model: string;
-        let variant: string | null;
-        if (ref !== null) {
-          const parts = splitModelRef(ref);
-          if (parts === null) return;
-          model = `${parts.provider}/${parts.model}`;
-          variant = parts.variant;
-        } else if (agent === d.final.agent) {
-          model = d.final.model;
-          variant = d.final.variant;
-        } else {
-          const resolved = d.resolve(agent);
-          if (resolved === null) return; // nothing to record a step against
-          model = resolved.model;
-          variant = resolved.variant;
+        const ran = d.final === null ? null : ranOf(d, d.final, final);
+        // QA-G-A2: the hook chain let the call through, so the dispatch runs: its decision row is written now (never for a rejected call).
+        try {
+          d.enqueue(d.row);
+        } catch (error) {
+          deps.logger.warn("[router] routing: the decision row could not be queued", { error: describeError(error) });
         }
+        if (ran === null) return; // nothing to record a step against
+        const { agent, model, variant } = ran;
         const dispatched: DispatchInput = {
           facts: d.facts,
           agent,
