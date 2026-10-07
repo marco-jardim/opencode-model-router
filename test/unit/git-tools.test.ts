@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
@@ -92,6 +92,15 @@ describe("shell-free git inspection", () => {
     const result = runBoundedProcess(process.execPath, ["-e", "setInterval(()=>{},1000)"], root, { signal: controller.signal });
     controller.abort(); await expect(result).rejects.toThrow("aborted");
     await expect(runBoundedProcess(process.execPath, [], root, { signal: controller.signal })).rejects.toThrow("aborted");
+  });
+  it("does not grant a second 15-second budget after repository discovery", async () => {
+    repository();
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      const result = inspectGit("status", {}, root);
+      clock.mockReturnValue(15_001);
+      await expect(result).rejects.toThrow("timed out");
+    } finally { clock.mockRestore(); }
   });
   it("kills a spawned descendant, not just its parent, on abort", async () => {
     const pidFile = join(root, "child.pid");

@@ -143,10 +143,17 @@ export async function runBoundedProcess(executable: string, args: string[], cwd:
 }
 
 export async function inspectGit(operation: GitOperation, input: GitInput, directory: string, signal?: AbortSignal): Promise<string> {
+  // Discovery and inspection share one tool-call deadline, not two 15 s waits.
+  const deadline = performance.now() + 15_000;
+  const timeoutMs = () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("Git inspection timed out");
+    return remaining;
+  };
   const executable = gitExecutable();
-  const root = (await runBoundedProcess(executable, [...hardeningArgs(), "rev-parse", "--show-toplevel"], directory, { signal })).trim();
+  const root = (await runBoundedProcess(executable, [...hardeningArgs(), "rev-parse", "--show-toplevel"], directory, { signal, timeoutMs: timeoutMs() })).trim();
   if (!root || !isAbsolute(root) || !existsSync(root)) throw new Error("Cannot resolve repository toplevel");
-  return runBoundedProcess(executable, gitArgv(operation, input, root), root, { signal });
+  return runBoundedProcess(executable, gitArgv(operation, input, root), root, { signal, timeoutMs: timeoutMs() });
 }
 
 export function gitTools() {
