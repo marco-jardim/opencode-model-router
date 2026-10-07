@@ -30,6 +30,7 @@ describe("routing engine index", () => {
         "lowerEffortOnSameModel",
         "resolveChosen",
         "tierRankOf",
+        "weakerDetection",
       ].sort(),
     );
     expect(engine.decide).toBe(kernel.decide);
@@ -42,5 +43,6 @@ describe("routing engine index", () => {
     expect(engine.MIN_EVIDENCE_TO_MOVE).toBe(protocolLine.MIN_EVIDENCE_TO_MOVE);
     expect(engine.annotateSteps).toBe(plan.annotateSteps);
     expect(engine.formatRouteLine).toBe(plan.formatRouteLine);
+    expect(engine.weakerDetection).toBe(plan.weakerDetection);
   });
 });

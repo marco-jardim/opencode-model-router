@@ -682,6 +682,35 @@ describe("A30 amended: a resume keeps the child where it runs (QA-2.4-R3-1)", ()
     expect(last.reason).not.toMatch(/\b(?:kept|switched): (?:kept|switched): /);
   });
 });
+describe("A34 (QA-G-B2): a route-line d= never raises detection above the prompt's own [acceptance] block", () => {
+  const CLAIMED = "[route class=implement risk=high scope=single d=deterministic]\nRotate the production signing key and deploy.";
+  const CHECKED = `${CLAIMED}\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+
+  it("risk=high d=deterministic without an [acceptance] block, enforce, evidence on a lower tier → kept on the pick (never-down holds)", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    const after = await routed(world, { agent: "heavy", prompt: CLAIMED });
+    expect(after.agent).toBe("heavy");
+    expect(after.model).toBeUndefined();
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: false, chosen: { agent: "heavy" }, facts: { risk: "high" } });
+    expect(row!.reason.startsWith("kept:")).toBe(true);
+  });
+
+  it("control: the same claim WITH a deterministic [acceptance] block may move it down on the same evidence", async () => {
+    const world = await makeWorld({ engine: "enforce", roles: {} });
+    world.seed(KEYS.medium, 20, 0);
+    world.seed(KEYS.heavy, 3, 2);
+    await world.start();
+    const after = await routed(world, { agent: "heavy", prompt: CHECKED });
+    expect(after.agent).toBe("medium");
+    const [row] = await world.rows();
+    expect(row).toMatchObject({ switched: true, best: { agent: "medium" } });
+  });
+});
+
 describe("advise: input untouched, protocol and hint through the context hook", () => {
   async function adviseWorld(withEvidence: boolean) {
     const world = await makeWorld({ engine: "advise", margin: 0.1, roles: { search: ["explore"], recon: ["explore"] } });
@@ -827,11 +856,15 @@ describe("classifier and failures never block a dispatch", () => {
 });
 
 describe("plan route lines and subagentTiers", () => {
-  it("a plan route line is authoritative: its d= sets the verification depth carried to ingestion", async () => {
+  it("a plan route line is authoritative for the facts; its d= is capped by the prompt's own [acceptance] block (A34, QA-G-B2)", async () => {
     const world = await makeWorld({ engine: "shadow" });
     await world.start();
-    await routed(world, { agent: "medium", prompt: "[route class=debug risk=medium scope=multi needs=shell,edit d=deterministic]\nFix the failing test.", sessionID: "child-plan" });
+    const line = "[route class=debug risk=medium scope=multi needs=shell,edit d=deterministic]\nFix the failing test.";
+    await routed(world, { agent: "medium", prompt: `${line}\n[acceptance]\ncheck: testsPass\n[/acceptance]`, sessionID: "child-plan" });
     expect(lookupDispatch("child-plan")).toMatchObject({ acceptance: "deterministic", facts: { class: "debug", risk: "medium", scope: "multi", needs: ["shell", "edit"], source: "plan" } });
+    // The same claim without a block the verifier could run: the dispatch is decided (and carried) as `none`.
+    await routed(world, { agent: "medium", prompt: line, sessionID: "child-plan-bare" });
+    expect(lookupDispatch("child-plan-bare")).toMatchObject({ acceptance: "none", facts: { class: "debug", source: "plan" } });
   });
 
   it("subagentTiers still fills a missing model when the engine does not switch, and never overrides the engine's own", async () => {

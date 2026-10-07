@@ -41,7 +41,7 @@
  */
 
 import {
-  buildLadder, candidateKey, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, resolveChosen, tierRankOf,
+  buildLadder, candidateKey, coversNeeds, decide, detectionOf, escalateLadder, floorRankOf, resolveChosen, tierRankOf, weakerDetection,
 } from "../engine";
 import { routerTierIds } from "../engine/ladders";
 import type { ChosenDispatch, Decision, HostAgentInfo } from "../engine/types";
@@ -443,7 +443,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       deps.runtime.classifyDeps(prepared),
     );
     const facts = result.facts;
-    const detection = result.detection ?? detectionOf(prompt);
+    // A34 (QA-G-B2): the weaker of the route line's `d=` claim and the prompt's own `[acceptance]` block. Detection is the only
+    // field a route line could use to WEAKEN a safety rule (D9 never-down holds for `d == none`), so a claim never raises it.
+    const detection = weakerDetection(result.detection, detectionOf(prompt));
     const pin = result.pin;
     // `classify` removes only the first-line route line and returns every other byte unchanged (probe, QA-2.2-5).
     const stripped = result.stripped !== prompt ? result.stripped : undefined;

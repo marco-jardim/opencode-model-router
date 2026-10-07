@@ -139,6 +139,20 @@ export function detectionOf(stepText: string): Detection {
   return "none";
 }
 
+/** Strength order of the detection vocabulary: `none` < `grader` < `deterministic`. */
+const DETECTION_STRENGTH: Readonly<Record<Detection, number>> = Object.freeze({ none: 0, grader: 1, deterministic: 2 });
+
+/**
+ * A34 (QA-G-B2): the detection a dispatch is decided with — the WEAKER of the route line's `d=` claim and what the prompt's own
+ * `[acceptance]` block makes the verifier run (`detectionOf`). A route line is written by the orchestrator (an LLM); detection is
+ * the one field of it that can weaken a safety rule (D9 never-down holds only for `d == none`), so a claim never raises it above
+ * what the verifier will really check. No claim (`null`/`undefined`): the prompt alone decides.
+ */
+export function weakerDetection(claimed: Detection | null | undefined, observed: Detection): Detection {
+  if (claimed === null || claimed === undefined || !isMember(DETECTIONS, claimed)) return observed;
+  return DETECTION_STRENGTH[claimed] < DETECTION_STRENGTH[observed] ? claimed : observed;
+}
+
 /**
  * `[route class=<c> risk=<r> scope=<s>[ needs=<a,b>] d=<d>[ pin]]` — fixed field order, `needs` omitted
  * when empty, values from the 1.2 vocabularies only (anything else would be ignored by the parser).
