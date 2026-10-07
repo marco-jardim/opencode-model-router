@@ -114,10 +114,24 @@ function script(path: string, body: string): string {
   writeFileSync(path, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return slash(path);
 }
+function isZombieProcStat(stat: string): boolean {
+  // /proc's comm field is parenthesized and may itself contain spaces or parentheses.
+  return /^\s+Z(?:\s|$)/.test(stat.slice(stat.lastIndexOf(")") + 1));
+}
 function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+  try { process.kill(pid, 0); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
   }
+  if (process.platform === "linux") {
+    try {
+      // kill(pid, 0) succeeds for zombies; CI container init may reap them much later.
+      return !isZombieProcStat(readFileSync(`/proc/${pid}/stat`, "utf8"));
+    } catch (error) {
+      // It may have been reaped between kill(0) and readFile. Other errors do not prove death.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    }
+  }
+  return true;
 }
 const OLD = new Date(Date.now() - 86_400_000);
 
@@ -143,6 +157,12 @@ function metadataReply(args: readonly string[]) {
 }
 
 describe("shell-free git inspection", () => {
+  it("recognizes Linux zombies without confusing the process name with the state", () => {
+    expect(isZombieProcStat("123 (node) Z 1 123 123 0")).toBe(true);
+    expect(isZombieProcStat("123 (worker (nested) name)) Z 1 123 123 0")).toBe(true);
+    expect(isZombieProcStat("123 (worker Z) S 1 123 123 0")).toBe(false);
+    expect(isZombieProcStat("123 (node) R 1 123 123 0")).toBe(false);
+  });
   it("disables maintenance in every initialized fixture and preserves plain Git output", async () => {
     repository();
     gitIn(outside, "init", "-q", "-b", "main");
@@ -640,8 +660,10 @@ describe("shell-free git inspection", () => {
     expect(await settled).toContain("aborted");
     expect(existsSync(pidFile)).toBe(true);
     const pid = Number(readFileSync(pidFile, "utf8"));
+    const stoppedBy = Date.now() + 3_000;
+    while (alive(pid) && Date.now() < stoppedBy) await new Promise(done => setTimeout(done, 20));
     expect(alive(pid)).toBe(false);
-  });
+  }, 30_000);
   it("checks the working directory before spawning (G12)", async () => {
     await expect(runBoundedProcess(process.execPath, ["-e", ""], join(root, "missing"))).rejects.toThrow("does not exist");
     await expect(inspectGit("status", {}, join(root, "missing"))).rejects.toThrow("does not exist");

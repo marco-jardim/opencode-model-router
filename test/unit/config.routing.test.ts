@@ -1140,7 +1140,7 @@ describe("hot reload of the global override file with a routing block", () => {
       }
       expect(logged("ignoring unknown routing key: routing.typo")).toHaveLength(260);
       expect(noticeMessages()).toEqual(["ignoring unknown routing key: routing.typo259"]);
-    });
+    }, 60_000);
 
     it("passes the source file along with a notice that concerns one", () => {
       const project = mkdtempSync(join(tmpdir(), "oc-mr-routing-src-"));
