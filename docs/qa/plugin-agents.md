@@ -80,3 +80,19 @@ agents (unit test: "publishes the v2 vocabulary").
 | QA-81-11 | shared dedupe key for the "missing subagentTiers" notice | b92e798 |
 | QA-81-12 | v2 deny/ask wording by agent kind | 7804dad |
 | QA-81-13 | docs: narrow wildcard read grant denies sensitive globs globally | this commit |
+
+## 8. Round 2 fixes
+
+Verdict: **PASS after R2-1**.
+
+| QA | Fix | Commit |
+|---|---|---|
+| QA-81-R2-1 (major) | `HARD_ACTIONS` derives from `POLICY_ACTIONS`: a readOnly agent can never ask for delegation, Code Mode, `multiedit` or `apply_patch` | f8f7cc8 |
+| QA-81-R2-2 | plugin-agent session recorded before the bypass return | 674c52c |
+| QA-81-R2-3 | session map bounded and cleared on `session.deleted` | 674c52c |
+| QA-81-R2-4 | comment: the monotonicity check guards future edits | 674c52c |
+| QA-81-R2-5 | mangled docstring fixed | 674c52c |
+| QA-81-R2-6 | `V1_HOST_BUILTIN_AGENTS` applied on v1 only | 674c52c |
+| QA-81-R2-7 | runner example: more deny patterns (newline, `&`, `\|`, backtick, `$(`), labelled illustrative | this commit |
+| QA-81-R2-8 | v1/v2 difference for inherited global denies documented | this commit |
+| QA-81-R2-9 | reload claim corrected; QA-81-8 invariant commented in code | this commit |

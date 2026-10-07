@@ -2284,7 +2284,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         opencodeConfig.agent[name] = definition;
         builtNow.set(name, hostEntry);
       }
-      // A plugin agent built on a previous run but not rebuilt now (removed or invalid) must not linger.
+      // QA-81-8 invariant: after this loop every plugin agent in `opencodeConfig.agent` was built THIS run, or is the host entry
+      // the router replaced (restored), or is absent. Anything built on a previous run and not rebuilt now (removed or invalid) must not linger.
       // Detection is the symbol marker OR the closure set, so a cloned config (marker lost) is covered too.
       for (const name of Object.keys(opencodeConfig.agent)) {
         if (builtNow.has(name)) continue;

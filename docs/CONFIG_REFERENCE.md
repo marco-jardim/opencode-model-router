@@ -96,7 +96,7 @@ falls back to its in-code default), so you only ever see them in an overrides fi
     "reviewer": { "tier": "heavy", "description": "Reviews diffs", "readOnly": true, "allowTools": ["router_git_*"] },
     "runner": {
       "tier": "fast", "description": "Runs the tests",
-      "permission": { "read": "allow", "grep": "allow", "shell": { "allow": ["npm test*"], "deny": ["*;*", "*&&*", "*||*", "*>*"] }, "edit": "deny" }
+      "permission": { "read": "allow", "grep": "allow", "shell": { "allow": ["npm test*"], "deny": ["*;*", "*&*", "*|*", "*>*", "*\n*", "*`*", "*$(*"] }, "edit": "deny" }
     }
   }
 }
@@ -110,7 +110,9 @@ falls back to its in-code default), so you only ever see them in an overrides fi
 | `steps` | positive integer | Turn budget; defaults to the tier's `steps`. |
 | `readOnly` | `boolean` | Reuses the [#77 read-only policy](READ_ONLY_TIERS.md): deny `*`, then read/glob/grep/`router_git_*`, sensitive-path asks. |
 | `allowTools` | `string[]` | Extra actions allowed on top of the policy (MCP tools, `webfetch`, …); wildcards allowed, but only after a literal first character (`web*`, `context7_*`; a leading `*` or `?` such as `*_*` is rejected). `allowTools` can never grant edit (`edit`/`write`/`patch`, including `multiedit` and `apply_patch`), delegation (`subagent`/`task`/`delegate`), Code Mode `execute`, shell (`shell`/`bash`) or `read`: those belong in `permission`. Entries are permission rules only; they are never copied into the legacy `tools` booleans (a host maps `write`/`edit`/`patch` tools to the `edit` permission). |
-| `permission` | object | v1-style rules, canonical v2 names (`shell`, `subagent`; `bash`/`task` accepted as aliases). Each action maps to an effect or an ordered `{ pattern: effect }` object (`{ effect: [patterns] }` is accepted too). In the `{ effect: [patterns] }` form the groups are applied in the order written and **later groups win**: `{ "allow": ["npm test*"], "deny": ["*"] }` denies everything, so put the broad deny first or the narrow allow last. `npm test*` also matches `npm test; rm -rf x`, which is why the runner example adds later denies for `*;*`, `*&&*`, `*||*` and `*>*`. With `readOnly: true` it may only add `deny`/`ask` rules, and never `ask` for shell, edit or delegation. |
+| `permission` | object | v1-style rules, canonical v2 names (`shell`, `subagent`; `bash`/`task` accepted as aliases). Each action maps to an effect or an ordered `{ pattern: effect }` object (`{ effect: [patterns] }` is accepted too). In the `{ effect: [patterns] }` form the groups are applied in the order written and **later groups win**: `{ "allow": ["npm test*"], "deny": ["*"] }` denies everything, so put the broad deny first or the narrow allow last. `npm test*` also matches `npm test; rm -rf x`, which is why the runner example adds later denies for `;`, `&` (covers `&&`), `|` (covers `||`), `>`, a newline (`"*\n*"`: the host matcher is dotAll, so `*` crosses newlines and a JSON `\n` is a literal newline in the pattern), a backtick and `$(`. The example is illustrative, not a sandbox: shell patterns are permission rules, and other expansions or redirections the list misses still reach the shell.
+
+On a host where the global config also denies an action, the two hosts differ. On v2 the inherited global denies are copied **after** the agent's own rules, so a global `bash: deny` also denies the runner's `npm test`. On v1 the agent's own rule wins. With `readOnly: true` it may only add `deny`/`ask` rules, and never `ask` for shell, edit or delegation. |
 
 An entry needs `readOnly: true` or a `permission`: a router agent never inherits the host's allow-all
 defaults. Without `readOnly`, the policy is `* deny`, then `allowTools`, then your `permission`; the
@@ -141,7 +143,7 @@ placed after the router's (last match wins) and its `tools` are merged over ours
 `agent <name> is defined both in the router `agents` block and in opencode.json; opencode.json wins for the
 fields it sets` (on v2 a name present in the host setup seed reads "a host built-in agent" instead of "opencode.json"). The v2 seed no longer carries the host `description`, so the router entry supplies it.
 
-Reloading (v1 config hook re-run, `/preset`) removes plugin agents that were built earlier but are no longer defined or valid, restoring the `opencode.json` entry if there was one. Validation, registration and `/router` all use one preset resolver (`resolveActiveTiers`: case-insensitive like `/preset`, falling back to the first preset).
+When the v1 config hook runs again in the same process (a preset refresh, for example), plugin agents it built earlier but that are no longer defined or valid are removed, restoring the `opencode.json` entry if there was one. Detection uses the non-enumerable marker plus a closure record of the names built last run, so it also works when the host hands back a cloned config; a restart simply rebuilds from scratch. One limit: if a name was built with no `opencode.json` entry and the user adds one before the next run, a cloned config cannot tell it from the router's own and it is removed. Validation, registration and `/router` all use one preset resolver (`resolveActiveTiers`: case-insensitive like `/preset`, falling back to the first preset).
 
 ### Grep redaction
 
