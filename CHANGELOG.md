@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`agents` block: subagents defined by the router (#81).** `tiers.json` and the global override can define
+  subagents that run on a tier of the active preset (following `/preset`), with `readOnly`/`allowTools` or an
+  explicit `permission`, on v1 and v2 with fail-closed permissions. Project overrides cannot define `agents`
+  (A18). `/router` lists them under "Plugin agents".
+
+### Fixed
+
+- `subagentTiers` no longer creates phantom primary, allow-all agents for names that no agent defines; such
+  names are skipped with a notice. On v2 the router re-checks at the first prompt, so `opencode.json` agents
+  registered after startup still get the tier model.
 ### Changed
 
 - **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,

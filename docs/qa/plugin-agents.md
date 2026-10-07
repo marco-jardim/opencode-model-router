@@ -23,16 +23,38 @@
 - tiers.json and the global override may define `agents`. A project override may not (A18): a cloned
   repository must not be able to register agents with permissions. The block is stripped from the project
   layer with a notice; the rest of that layer still applies.
-- (in progress)
+- opencode.json precedence: it wins for the fields it sets; its permission rules go after the router's and its
+  `tools` are merged over ours; one-time notice. `agents.<name>.tier` wins over `subagentTiers[<name>]`.
+- Phantom names: a `subagentTiers` name that no agent defines is skipped, never created (v1 at config time; v2
+  re-checks at the first prompt and refreshes once when the host registers it later).
 
 ## 4. Tests
 
-(in progress)
+- `test/unit/plugin-agents.test.ts`: validation (unknown keys, reserved names, unknown tier, missing policy,
+  `bash`→`shell` alias, `allowTools` rejecting shell/edit/subagent/read), layer rules (project `agents`
+  stripped with a notice and the rest of the layer kept; a bad entry dropped while `routing` stays), permission
+  builders (deny-by-default first, sensitive asks after each read grant, user deny stays deny).
+- `test/unit/plugin-agents-v1.test.ts`: v1 registration shape, precedence and the one-time notice, `tier` vs
+  `subagentTiers`, phantom skip, preset switch, grep filter for a readOnly plugin agent.
+- `test/unit/plugin-agents-v2.test.ts`: v2 registration, permissions under identical and drifted host defaults,
+  explicit-permission fail-closed, session grant vs deny, late host agents after the prompt refresh, notices,
+  and `GRADER_AGENT_NAME === V2_GRADER_AGENT`.
+- Without an `agents` block nothing changes: `test/golden` and the related suites stay green.
 
 ## 5. Real-host smoke
 
-(in progress)
+Gated scenario in `test/smoke/` (isolated v2 host; global override defines `reviewer` (heavy, readOnly,
+`router_git_*`) and `runner` (fast, explicit permission). Asserts the host's agent list (mode, tier model,
+permission rules, no `*:*:allow`) and that child sessions are refused shell/edit (and non-allowed shell
+commands for `runner`). Result: see the commit that adds it and the notes appended below.
 
-## 6. Residual risks
+## 6. Residual risks and known limits
 
-(in progress)
+- `allowTools` and shell patterns are permission rules, not a sandbox (see `docs/READ_ONLY_TIERS.md`).
+- A host agent with the same name as a plugin agent that the host registers **after** the router's setup cannot
+  be told apart from the router's own agent; the same-name notice is based on the setup-time agent list.
+- Host-seed fields win: for a same-name host agent, `mode`, `model`, `variant` and `description` read from the
+  host at setup override the router's values (opencode.json wins for the fields it sets).
+- A `readOnly` agent whose `permission` only adds deny/ask rules cannot grant anything; grants go in `allowTools`.
+- Wildcard read grants other than `*` get the sensitive globs denied at that position (stricter than needed).
+- v2 `ctx.agent.list()` is called per prompt only while a `subagentTiers` name is still pending.

@@ -606,6 +606,19 @@ The `rules` array is injected verbatim (in compact form) into the system prompt.
 
 Rules in `modes[x].overrideRules` replace this array entirely for that mode.
 
+### Router-defined subagents (`agents`)
+
+Define extra subagents in `tiers.json` or the global override instead of `opencode.json` (#81). Each runs on a
+tier of the active preset (so it follows `/preset`), is always a subagent, and gets router-published
+permissions: `readOnly: true` reuses the read-only policy, or give an explicit `permission`.
+
+```jsonc
+{ "agents": { "reviewer": { "tier": "heavy", "description": "Reviews diffs", "readOnly": true, "allowTools": ["router_git_*"] } } }
+```
+
+Project overrides cannot define `agents`. `opencode.json` wins for the fields it sets when it defines the same
+name. `subagentTiers` no longer creates agents that do not exist. See
+[CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md#agents--router-defined-subagents-81).
 ### Read-only call caps
 
 Subagents carry a cap on their own read-only tool calls (grep/read/glob/ls) per dispatch. Enforcement is **two-layered**: prompt-level stop rules + runtime banners injected into tool results. Baselines (configurable via `tierCaps` — see below):

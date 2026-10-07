@@ -172,6 +172,19 @@ share one 15-second tool-call deadline; abort, timeout, and output overflow kill
 userinfo is stripped, including scp-like remotes; an incomplete trailing token
 is discarded before redacting truncated output.
 
+## Plugin agents (#81)
+
+An agent defined in the router's `agents` block with `readOnly: true` gets the same host-enforced policy as
+`fast`: deny `*`, then read/glob/grep/`router_git_*` and the sensitive-path asks, published as a protected
+agent (evaluate hook, tool-catalog filter and grep filter on v2; the grep post-filter on v1). `allowTools`
+adds actions on top (for example `webfetch` or an MCP tool); those actions are exempt from the fail-closed
+canary check for that agent only. A `readOnly` agent's own `permission` may only add `deny`/`ask` rules.
+An agent with an explicit `permission` and no `readOnly` starts from `* deny` and is protected the same way,
+so inherited session grants cannot re-open what it denies.
+
+`allowTools` entries and shell patterns (`shell: { "npm test*": "allow" }`) are **not a sandbox**: an allowed
+`npm test*` runs whatever `npm test` runs, and an allowed MCP tool does what the MCP server does. They are
+permission rules, not isolation. See `docs/CONFIG_REFERENCE.md` for the schema.
 ## Guarantees and limits — not an OS sandbox
 
 No tool exposes a write command, shell expansion, arbitrary option, credential
