@@ -62,7 +62,7 @@ export const POLICY_ACTIONS: readonly string[] = [
 ];
 
 /** The capabilities a read-only agent's own `permission` may never ask for (only deny). */
-const HARD_ACTIONS: readonly string[] = ["shell", "bash", "edit", "write", "patch", "subagent", "task"];
+const HARD_ACTIONS: readonly string[] = POLICY_ACTIONS.filter((action) => action !== "read");
 
 const ENTRY_KEYS = new Set(["tier", "description", "prompt", "steps", "readOnly", "allowTools", "permission"]);
 const EFFECTS = new Set<string>(["allow", "deny", "ask"]);

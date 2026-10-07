@@ -82,6 +82,12 @@ describe("plugin agents: validation", () => {
     expect(Object.keys(t)).not.toContain("context7_*");
     for (const k of ["write", "edit", "patch", "multiedit"]) expect(t[k]).not.toBe(true);
   });
+  it.each([{ delegate: "ask" }, { "de*": "ask" }, { execute: "ask" }, { "ex*": "ask" }, { multiedit: "ask" }, { apply_patch: "ask" }])(
+    "readOnly permission may not ask for %j (QA-81-R2-1)", (permission) => {
+      expect(validatePluginAgent("r", { ...ok, permission }, ctx).ok).toBe(false);
+    },
+  );
+
   it("allowTools accepts MCP and webfetch names", () => {
     expect(validatePluginAgent("r", { ...ok, allowTools: ["webfetch", "context7_*"] }, ctx).ok).toBe(true);
   });
