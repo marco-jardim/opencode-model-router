@@ -196,6 +196,19 @@ describe("plugin agents on v2", () => {
     expect(notices()).toHaveLength(1);
   });
 
+  it("publishes the v2 vocabulary: a shell pattern allow applies to `shell`, not the v1 `bash`", async () => {
+    const f = fixture(drifted);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    cleanups.push(() => { vi.restoreAllMocks(); });
+    const runner = { tier: "fast", description: "R", permission: { shell: { "*": "deny", "npm test*": "allow" }, edit: "deny", task: "deny" } };
+    await f.start(await plugin(setup({ agents: { runner } })));
+    const rules = f.agents.runner.permissions;
+    expect(evaluatePermission(rules, "shell", "npm test -- x")).toBe("allow");
+    expect(evaluatePermission(rules, "shell", "echo hi")).toBe("deny");
+    expect(evaluatePermission(rules, "edit", "a.ts")).toBe("deny");
+    expect(evaluatePermission(rules, "subagent", "*")).toBe("deny");
+    expect(rules.some((rule: { action: string }) => rule.action === "bash" || rule.action === "task")).toBe(false);
+  });
   it("the tier of a plugin agent wins over subagentTiers on v2", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     cleanups.push(() => { vi.restoreAllMocks(); });

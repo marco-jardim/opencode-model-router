@@ -46,7 +46,12 @@
 Gated scenario in `test/smoke/` (isolated v2 host; global override defines `reviewer` (heavy, readOnly,
 `router_git_*`) and `runner` (fast, explicit permission). Asserts the host's agent list (mode, tier model,
 permission rules, no `*:*:allow`) and that child sessions are refused shell/edit (and non-allowed shell
-commands for `runner`). Result: see the commit that adds it and the notes appended below.
+commands for `runner`). Run once with evidence writing OFF (`OMR_UPDATE_READONLY_EVIDENCE` unset; the scenario writes no files):
+`RUN_OC_SMOKE_ROUTING=1 npx vitest run --config vitest.smoke.config.ts test/smoke/plugin-agents.smoke.test.ts` → 1 passed.
+The smoke found a real bug the unit harness could not: the config hook builds plugin agents in the v1 vocabulary
+(`bash`, `task`), so on v2 a `shell: { "npm test*": "allow" }` rule was published as action `bash` and never
+applied to the host's `shell` action. The v2 transform now maps `bash`→`shell`, `task`→`subagent` for plugin
+agents (unit test: "publishes the v2 vocabulary").
 
 ## 6. Residual risks and known limits
 

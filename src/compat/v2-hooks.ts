@@ -177,6 +177,9 @@ export async function registerV2Hooks(
     };
     // Plugin agents (#81) are protected like read-only tiers: readOnly ones and explicit-permission ones
     // (which start from `* deny`) both keep their own deny/ask rules against inherited session grants.
+    // The config hook builds plugin agents in the v1 vocabulary (`bash`, `task`); the v2 host evaluates `shell`/`subagent`.
+    const V2_ACTIONS: Readonly<Record<string, string>> = { bash: "shell", task: "subagent" };
+    const v2Actions = (rules: ReturnType<typeof permissionRules>) => rules.map((rule) => ({ ...rule, action: V2_ACTIONS[rule.action] ?? rule.action }));
     const protectedAgent = (name: string | undefined) => name !== undefined
       && (config.agent[name]?.permission?.["*"] === "deny" || pluginAgentMarker(config.agent[name]) !== undefined);
     // Host agents appear after setup (the host's config-agent plugin activates after the router). Names
@@ -269,7 +272,7 @@ export async function registerV2Hooks(
           if (definition.steps !== undefined) agent.steps = definition.steps;
           if (definition.permission) {
             agent.permissions = publishReadOnlyPermissions(
-              name, permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce, marker?.exempt ?? [],
+              name, marker ? v2Actions(permissionRules(definition.permission)) : permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce, marker?.exempt ?? [],
             );
           }
         });
