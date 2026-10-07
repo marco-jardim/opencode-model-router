@@ -1,14 +1,106 @@
 # Phase 3.3 — global QA of cost-aware routing (#74)
 
-Three parallel reviewers covered areas **A**, **B** and **C**. This report records the findings and their fixes by area; it is not a final global PASS while other areas await integration. Part C was implemented on `car/p33`; parallel producers' branches are not merged here.
+Three parallel reviewers covered areas **A**, **B** and **C**. Part C was implemented on `car/p33`; the other producers are now integrated: `car/p33b` (never-down, commit-time rows) via `4b60d78`, `car/p33c` (privacy/config/pricing) via `e7ef8c0`, and `car/p33d` (adapter/docs) via `c7addec`. Post-integration handoffs are closed below. This is not final release acceptance: criteria #12 and #13 remain pending DF5 / Phase 3.4, with explicitly accepted limits preserved.
 
 ## Part A
 
-**Fixes pending merge.** The orchestrator will append the reviewer findings, commits and verification after integration.
+### Reviewer summary
+
+Area A reviewed v1/static compatibility, adapter and hook ordering, the native runner, and integration documentation over `v2.2.0..d3f6ffc`. The reviewer found no blocking/critical issue; D1/D2 held in the reviewed snapshots/goldens. A1 was major: the QA-2.2-10 prompt-cache measurement handoff had been dropped. Other findings were phantom decision rows, v1 warning delivery, ungated statistics, resume identity accounting, location ownership suppressing hooks, stale defensive-token commentary, unused exports and missing documented limits. The source review record is `g-probe-a/report-part-A.md` in the reviewer's temp evidence directory; the committed fixes below are the durable references.
+
+| Finding | Resolution | Commit(s) |
+|---|---|---|
+| QA-G-A1, major | Advise-only stable class/destination hint; no live numbers, previous pick or reason, and no hint in enforce. Document that a separate system part does not preserve cached history; restore the cache-read-share measurement to DF5. | `e36c853` |
+| QA-G-A2, minor | Hold the decision row until `commit()` after the hook chain accepts the call. Rejected calls write nothing; successful/unresolved calls write exactly once. | `14af9df`, documentation `350e893` |
+| QA-G-A3, minor | Thread the plugin logger through v1 role/stat routing resolution, including hot reload, instead of falling through to `console.warn`. | `e36c853` |
+| QA-G-A4, nit | Without a routing block, `/router stats` retains legacy help behavior on v1/v2. | `e36c853` |
+| QA-G-A5, minor | A resumed attempt's row waits for matching host progress/result identity confirmation. Reject a stray result even without progress, clean up and use the fresh-attempt fallback; document that path. | `e36c853` |
+| QA-G-A6, minor | The receiving live instance acts even if another location appears to own the session; process-wide call claims, not directory preference, prevent duplicate work. | `e36c853` |
+| QA-G-A7, nit | Correct runner-token comments: measured hosts 2.0.22/2.0.24 do not deliver those internal tool-before hooks; the token remains defensive for hosts that do. Do not claim broader defense than tested. | `e36c853` |
+| QA-G-A8, nit | Remove unused route-line-key and advisor memo-reset exports. | `e36c853` |
+| QA-G-A9, nit | Document coarse credential-skip diagnostics and the lack of false-refusal detection for `delegate` producers (native-subagent result path only). | `e36c853` |
 
 ## Part B
 
-**Fixes pending merge.** The orchestrator will append the reviewer findings, commits and verification after integration.
+### Reviewer summary
+
+Area B reviewed the policy invariants (especially high-risk/no-detection never-down), claimed versus actual verification, resume rewrites, classifier privacy and project overrides, catalog pricing, observability, named D-rule coverage and acceptance evidence. The unsafe paths were not just a missing table row: an external/native agent's capped candidate rank could understate the pick's actual model capability, a route `d=` claim could exaggerate verification, and a resume rewrite could evade needs/never-down checks. Privacy probes also exposed trailing-acceptance credential signals and project budget widening. These paths now have targeted regressions, and the two post-merge omissions in parser/plan annotation are fixed.
+
+| Finding | Resolution | Commit(s) |
+|---|---|---|
+| QA-G-B1 | Compare against the pick's capability rank from the preset's model ladder, not only its capped candidate/role rank. | `35058ea`, A34 docs `350e893` |
+| QA-G-B2 | Use the weaker of route-line detection claims and the prompt's actual acceptance checks for dispatch/hints. Apply the same rule to plan annotation in the post-integration handoff, with unbacked-claim and real-check controls. | `654557d`, `350e893`, follow-up `d01d1a6` |
+| QA-G-B3 | A30 running-agent rewrites require a still-usable agent, needs coverage, and D9 never-down; otherwise send the resume as named. | `abaddd7`, `350e893` |
+| QA-G-B4 | Credential gate and classifier state use the same raw description/acceptance/body sources, including a trailing acceptance block. | `7372fec` |
+| QA-G-B5 | Project overrides may tighten, never widen, inherited classifier max-state/samples/timeout budgets. Preserve source layers and surface clamping notices. | `8c772a7` |
+| QA-G-B6 | Never-down also rejects the pick's own model at a lower or unproved variant at the same capability rank. | `35058ea`, `350e893` |
+| QA-G-B7 | A catalog variant step that reaches another preset tier's same-model rung costs at least that rung's ratio, rather than inheriting only the cheaper starting tier's ratio. Explicit candidate/base pricing remains distinct. | `7d8d544` |
+| QA-G-B8 | Record effective/claimed detection and pick/dispatched capability ranks; show the high-risk d=none audit. Post-integration parser preserves validated fields, tolerates old rows and discards malformed metadata without losing the decision. A real flusher → disk → summarize/render test proves a numerical audit, not n/a. | `ed75aaa`, `350e893`, follow-up `cbbc3ab` |
+| QA-G-B9 | Fill named D-rule gaps and expose the tested D17 mode calculation in statistics for the enforce-period checkpoint. | `8c772a7` |
+| QA-G-B10 | Record sync/restart timings and qualifications; correct the Phase 3.3 ledger to ONE unplanned host restart (02:17:33Z). The second interruption aborted subagent runs without restarting the host. | `e36c853`, corrected by `7349b2c` |
+| QA-G-B11 | Remove acceptance `cwd:` lines from classifier state before backend transmission. | `7372fec` |
+
+### Per-D named-title coverage
+
+Re-ran the reviewer's existing `C:\Users\Marquinho\AppData\Local\Temp\opencode\g-probe-b\p10-dcov.mjs` from this worktree after integration. It scans literal `it`/`test`/`describe` titles under `test/`; these are **title hits**, not independent executed tests or proof of complete semantic coverage. Parameterized titles count once; unrelated D-label reuse can also match (for example a depth-guard D5). The regression suites and evidence remain the substantive proof.
+
+| Decision | Reviewer baseline | Post-integration title hits |
+|---|---:|---:|
+| D1 | 5 | 6 |
+| D2 | 5 | 5 |
+| D3 | 1 | 1 |
+| D4 | 4 | 4 |
+| D5 | 5 | 5 |
+| D6 | 4 | 4 |
+| D7 | 4 | 4 |
+| D8 | 6 | 6 |
+| D9 | 5 | 6 |
+| D10 | 4 | 4 |
+| D11 | 7 | 7 |
+| D12 | 6 | 6 |
+| D13 | 3 | 3 |
+| D14 | 3 | 3 |
+| D15 | 4 | 4 |
+| D16 | 1 | 1 |
+| D17 | 4 | 4 |
+| D18 | 7 | 7 |
+
+### Global acceptance criteria 1–13
+
+Numbering follows plan §4.1. “Addressed” here means the finding is resolved in code/tests/docs; it does not imply a new live-host smoke was run after these fixes. The historical real-host evidence is in [Phase 3.2](phase-3.2.md).
+
+| # | Criterion | Status after fixes / evidence and qualification |
+|---|---|---|
+| 1 | No routing block preserves 2.2.0 on v1/v2 | Addressed: A4 restores legacy `/router stats`; static/no-block snapshots and goldens retained. The reviewer reported D1/D2 hold; post-integration goldens passed. No new host smoke in this follow-up. |
+| 2 | Shadow records without changing dispatch | Addressed: A2 writes at commit rather than for rejected calls; dispatch regressions cover modes. Outcome rates still cover trusted classes only, as documented. |
+| 3 | Advise R: line/hint, no LLM model selection | Addressed: generated routing prose remains; A1 stabilizes the advise-only hint. Cache-read-share measurement is explicitly deferred to DF5, not asserted as proven. |
+| 4 | Enforce only under D9, real-host path proven | B1/B2/B3 addressed capability rank, detection claims and resume rewrites; B6 closes same-model variant downshifts. B8 audit survives disk round trips. Targeted regressions are green; real-host execution evidence remains Phase 3.2, not a new smoke of every fix. |
+| 5 | Variant retry before escalation; D11 resume/fresh | Addressed: existing ladder/Phase 3.2 evidence plus A5 identity-confirmed rows and documented rejected-resume fallback. Provider acceptance of in-band effort remains the existing experimental limit. |
+| 6 | USD/ratio units separate; unpriced zero unknown | Addressed: existing D5/D6 coverage and B7 corrected catalog-rung pricing. |
+| 7 | D14 classifier bounds/privacy; dispatch not hung | B4/B5 addressed shared credential/state sources and project-only-tightening budgets; B11 removes cwd. Classifier/config regressions and existing timeout/fallback behavior retained. |
+| 8 | Cost doctor reports unset title/summary model | Addressed per documented host correction: title-model findings are supported; no summary-model consumer exists on the inspected v2 host, so no fictitious summary finding is promised. |
+| 9 | Annotation additive relative to existing behavior | Addressed with C13 unsafe-anchor skipping/reporting, B2 effective-detection correction and accepted N11 pre-existing tier-tag slug behavior. New route lines are separate from headings. |
+| 10 | Every D-decision named in a test title | B9 addressed; all D1–D18 have nonzero title hits in the re-run above, with the scan's limits explicitly stated. |
+| 11 | v2 native candidates, v1 opt-in only; roles:{} disables | Addressed by existing D1/D12 tests; A3 preserves plugin-logger coercion on v1 reload. |
+| 12 | DF0–DF5 reproducible; pinned && switched = 0 | **Pending DF5 / 3.4.** DF3/DF4 bounded copy-based outputs are recorded; DF5 and the final pinned-dispatch query must still be captured. |
+| 13 | Restart ledger/durations; no merged work redone | **Pending DF5 / 3.4.** B10 timings corrected and one Phase 3.3 unplanned restart recorded. The second interruption was not a restart. Complete the final checkpoint; wall-clock sync→probe intervals are not measured service downtime. |
+
+### DF5 handoffs
+
+- **QA-G-A1 / QA-2.2-10 carry-over:** measure the orchestrator's cache-read share with the advise hint on against the shadow baseline. Record the inputs/denominator and workload caveat; hint stability and its absence in enforce are not a substitute for that measurement.
+- Record the **D17 result** from the new `D17 mode (use the DF4→DF5 enforce-period window)` line (`d17Mode`): any failed enforced switch returns the mode to advise. Include enforced/verified/failed counts so zero failed switches is not mistaken for broad verified evidence.
+- Use bounded `--since` / exclusive `--until` windows, explicitly recording the DF5 cutoff. Read a COPY of the live store with `--dir <copy>`; retain the source window and command with the output. Complete the pinned-dispatch query and restart/liveness ledger required by criteria #12/#13.
+
+### Post-integration verification
+
+On the integrated tree plus parser/plan follow-ups: `npm run typecheck` passed. Explicit scoped run (default pool, `--maxWorkers=2`) passed **15 files / 818 tests**, including all requested golden files:
+
+```text
+npx vitest run test/unit/routing-outcomes.persist.test.ts test/unit/routing-outcomes.stats.test.ts test/unit/routing-engine.plan.test.ts test/integration/annotate-plan-route.test.ts test/unit/docs-drift.test.ts test/integration/routing-dispatch.test.ts test/unit/routing-classify.index.test.ts test/unit/config.routing.test.ts test/golden --maxWorkers=2
+npx vitest related src/routing/outcomes/persist.ts src/routing/engine/plan.ts --run --maxWorkers=2
+```
+
+The related run passed **51 files / 1561 tests**, with **3 files / 55 tests skipped**. The first plan run exposed one obsolete assertion that an unsupported `d=deterministic` claim wins; it was updated to assert effective `none` while preserving the original route text. The rerun passed 103 plan/annotation tests. No full suite, thread pool, keyed smoke, live-store write, host configuration change or service restart was performed for this follow-up.
 
 ## Part C
 
