@@ -2,7 +2,7 @@
 // live outcome store and decision log of a running OpenCode session. The guard lives in test/setup/home-guard.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import os, { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { DEFAULT_OUTCOMES_DIRNAME } from "../../src/routing/outcomes/types";
 import { resolveOutcomesDir } from "../../src/routing/outcomes/persist";
@@ -109,7 +109,10 @@ describe("temp directory guard", { timeout: 60_000 }, () => {
   it("assertTmpIsGuarded accepts the private dir and the real dir under another spelling is still rejected", () => {
     expect(() => assertTmpIsGuarded(tmpdir)).not.toThrow();
     expect(() => assertTmpIsGuarded(() => `${realTmp()}${process.platform === "win32" ? "\\" : "/"}`)).toThrow(/real temp directory/);
-    expect(() => assertTmpIsGuarded(() => join(realTmp(), "nested", ".."))).toThrow(/real temp directory/);
+    expect(() => assertTmpIsGuarded(() => `${realTmp()}${sep}nested${sep}..`)).toThrow(/real temp directory/);
+    if (process.platform === "win32") {
+      expect(() => assertTmpIsGuarded(() => realTmp().toUpperCase())).toThrow(/real temp directory/);
+    }
     // Case folding is a Windows spelling alias, not a POSIX filesystem rule.
     expect(sameDir(join(realTmp(), "CaseProbe"), join(realTmp(), "caseprobe"))).toBe(process.platform === "win32");
   });

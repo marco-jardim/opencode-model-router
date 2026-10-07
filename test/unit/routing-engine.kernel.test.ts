@@ -1113,7 +1113,7 @@ describe("purity", () => {
     }
   });
 
-  it("decides 12 candidates in under 2 ms", () => {
+  it("decides 12 candidates targeting <2 ms (median; CI ceiling <50 ms)", () => {
     const cands: Candidate[] = [];
     const tiers = ["fast", "medium", "heavy"] as const;
     const variants = ["low", "medium", "high", "xhigh"] as const;

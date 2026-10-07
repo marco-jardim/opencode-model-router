@@ -734,31 +734,33 @@ describe("edit needs are imperative, not participles or nouns (QA-1.2-6)", () =>
   });
 });
 describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
-  /** Compare n with 4n, not a workstation-specific millisecond budget. Warm both sizes,
-   * interleave batches and use medians so isolated GC/scheduling pauses do not dominate.
-   * Linear growth should be near 4x; quadratic growth is 16x and must fail the 8x bound.
+  /** Minimum of 20 interleaved batches: scheduling/GC noise adds time. Compare against
+   * real work in this process, not only n vs 4n with a fixed pathological run length.
+   * Keep both inputs inside the classifier's 20 kB cap, and an independent 200 ms ceiling.
    */
-  const expectSubquadratic = (text: string, fn: (input: string) => unknown): void => {
-    // classifyByRules reads at most 20,000 chars: both sizes must stay inside
-    // that cap, otherwise truncation would make even quadratic rules look flat.
-    const smaller = text.slice(0, Math.floor(Math.min(text.length, 20_000) / 4));
-    const larger = smaller.repeat(4);
+  const minimumPair = (left: string, right: string, fn: (input: string) => unknown): readonly [number, number] => {
     const measure = (input: string): number => {
       const start = performance.now();
       for (let i = 0; i < 3; i++) fn(input);
       return (performance.now() - start) / 3;
     };
-    for (let i = 0; i < 3; i++) { fn(smaller); fn(larger); }
-    const small: number[] = [];
-    const big: number[] = [];
-    for (let i = 0; i < 5; i++) {
-      if (i % 2 === 0) { small.push(measure(smaller)); big.push(measure(larger)); }
-      else { big.push(measure(larger)); small.push(measure(smaller)); }
+    for (let i = 0; i < 3; i++) { fn(left); fn(right); }
+    let a = Infinity;
+    let b = Infinity;
+    for (let i = 0; i < 20; i++) {
+      if (i % 2 === 0) { a = Math.min(a, measure(left)); b = Math.min(b, measure(right)); }
+      else { b = Math.min(b, measure(right)); a = Math.min(a, measure(left)); }
     }
-    const median = (samples: number[]): number => samples.sort((a, b) => a - b)[2]!;
-    const baseline = median(small);
-    const scaled = median(big);
-    expect(scaled, `4x input: median ${scaled.toFixed(3)} ms vs ${baseline.toFixed(3)} ms`).toBeLessThan(baseline * 8);
+    return [a, b];
+  };
+
+  const expectSubquadratic = (text: string, fn: (input: string) => unknown): void => {
+    const pathological = text.slice(0, 20_000);
+    const prose = "Please implement the parser in src/a.ts and add support for the new option. ";
+    const harmless = prose.repeat(Math.ceil(pathological.length / prose.length)).slice(0, pathological.length);
+    const [baseline, cost] = minimumPair(harmless, pathological, fn);
+    expect(cost, `pathological ${cost.toFixed(3)} ms / prose ${baseline.toFixed(3)} ms`).toBeLessThanOrEqual(baseline * 4);
+    expect(cost, "absolute CI ceiling per <=20 kB input").toBeLessThanOrEqual(200);
   };
 
   it.each([
@@ -806,6 +808,18 @@ describe("long runs cannot make the rules quadratic (QA-1.2-7)", () => {
     expectSubquadratic(text, (input) => classifyByRules(input, cfg));
     const dotted = ("a.".repeat(99) + "a ").repeat(100);
     expectSubquadratic(dotted, (input) => classifyByRules(input, cfg));
+  });
+
+  it("50 vs 199 character runs at equal 20 kB cost at most 2x (minimum batches)", () => {
+    for (const token of ["a", "a."]) {
+      const runs = (length: number): string => {
+        const run = token.repeat(length).slice(0, length) + " ";
+        return run.repeat(Math.ceil(20_000 / run.length)).slice(0, 20_000);
+      };
+      const [short, long] = minimumPair(runs(50), runs(199), (input) => classifyByRules(input, cfg));
+      expect(long, `199-char ${long.toFixed(3)} ms / 50-char ${short.toFixed(3)} ms`).toBeLessThanOrEqual(short * 2);
+      expect(long).toBeLessThanOrEqual(200);
+    }
   });
 
   it("collapsing keeps the class of the words around a long blob", () => {
