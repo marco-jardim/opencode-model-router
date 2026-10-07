@@ -3,6 +3,7 @@ import { existsSync, lstatSync, realpathSync, statSync, type Stats } from "node:
 import { lstat } from "node:fs/promises";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
+import { filterSensitiveDiff, isSensitivePath, sensitiveGitPathspecs } from "./sensitive-paths";
 
 export const GIT_OPERATIONS = ["status", "log", "diff", "show", "blame", "ls_files"] as const;
 export type GitOperation = typeof GIT_OPERATIONS[number];
@@ -69,8 +70,8 @@ function isDirectory(path: string): boolean {
 function realpath(path: string): string { return realpathSync.native(path); }
 
 export function validateRef(ref: string): string {
-  if (!ref || ref.length > 200 || ref.startsWith("-") || !/^[A-Za-z0-9._/@{}~^:-]+$/.test(ref)) {
-    throw new Error("Invalid git ref: use at most 200 ref characters, never an option");
+  if (!ref || ref.length > 200 || ref.startsWith("-") || !/^[A-Za-z0-9._/@{}~^-]+$/.test(ref)) {
+    throw new Error("Invalid git ref: use at most 200 ref characters, never an option or rev:path; use read for sensitive files (asks for approval)");
   }
   return ref;
 }
@@ -141,6 +142,7 @@ export function hardeningArgs(): string[] {
 
 function validateInput(operation: GitOperation, input: GitInput): { ref?: string } {
   if (!GIT_OPERATIONS.includes(operation)) throw new Error("Invalid git operation");
+  if (input.path && isSensitivePath(input.path)) throw new Error("Sensitive git path refused; use read (asks for approval)");
   const ref = input.ref === undefined ? undefined : validateRef(input.ref);
   if (input.limit !== undefined && (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 50)) throw new Error("Git log limit must be 1..50");
   if (input.mode !== undefined && !["patch", "stat", "name-only", "cached"].includes(input.mode)) throw new Error("Invalid git diff mode");
@@ -160,10 +162,10 @@ export function gitArgv(operation: GitOperation, input: GitInput, root: string,
   const args = [...hardeningArgs(), ...(extra.config ?? [])];
   switch (operation) {
     case "status": args.push("status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=all"); break;
-    case "log": args.push("log", "--no-show-signature", "--no-ext-diff", "--no-textconv", `--max-count=${input.limit ?? 20}`, "--format=medium", ...(ref ? [ref] : [])); break;
-    case "diff": args.push("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--submodule=short",
+    case "log": args.push("log", "--patch", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--no-show-signature", "--no-ext-diff", "--no-textconv", `--max-count=${input.limit ?? 20}`, "--format=medium", ...(ref ? [ref] : [])); break;
+    case "diff": args.push("diff", "--src-prefix=a/", "--dst-prefix=b/", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--submodule=short",
       ...(input.mode && input.mode !== "patch" ? [`--${input.mode}`] : []), ...(ref ? [ref] : [])); break;
-    case "show": args.push("show", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--format=medium", "--submodule=short", ref ?? "HEAD"); break;
+    case "show": args.push("show", "--src-prefix=a/", "--dst-prefix=b/", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--format=medium", "--submodule=short", ref ?? "HEAD"); break;
     case "blame":
       // G6: never read blame.ignoreRevsFile (it may name a file outside the repository).
       // Blame takes one literal path, not a pathspec.
@@ -171,8 +173,11 @@ export function gitArgv(operation: GitOperation, input: GitInput, root: string,
       return [...args, "--", path ?? ""];
     case "ls_files": args.push("ls-files", "--cached"); break;
   }
-  // TODO(#77 G8): exclude the shared sensitive-file list from show/diff (and refuse it for blame) here.
-  return [...args, "--", ...(path ? [`:(literal)${path}`] : []), ...(extra.exclude ?? []).map(dir => `:(exclude,literal)${dir}`)];
+  // Blame accepts one literal filename, not exclusion pathspecs: explicit
+  // sensitive paths were refused above. Status/ls-files may list names only.
+  return [...args, "--", ...(path ? [`:(literal)${path}`] : []),
+    ...(["show", "diff", "log"].includes(operation) ? sensitiveGitPathspecs() : []),
+    ...(extra.exclude ?? []).map(dir => `:(exclude,literal)${dir}`)];
 }
 
 function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -652,10 +657,20 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
     linked = await linkedTrackedDirectories(root, index.output.toString("utf8").split("\0").filter(Boolean), budget);
     if (linked.length > MAX_LINKED_EXCLUDES) throw new Error("Refusing inspection: too many tracked directories were replaced by links");
   }
-  const argv = gitArgv(operation, input, root, { config, exclude: linked });
-  const output = operation === "diff" && input.mode === "name-only"
+  let inspected = input;
+  if (operation === "show") {
+    const commit = await query(executable, [...base, "rev-parse", "--verify", "--end-of-options", `${input.ref ?? "HEAD"}^{commit}`], root, env, budget);
+    const oid = commit.output.toString("utf8").trim();
+    if (commit.code !== 0 || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)) {
+      throw new Error("Git show requires a commit (not a blob/tree); use read for sensitive files (asks for approval)");
+    }
+    inspected = { ...input, ref: oid };
+  }
+  const argv = gitArgv(operation, inspected, root, { config, exclude: linked });
+  const raw = operation === "diff" && input.mode === "name-only"
     ? await diffNames(executable, argv, root, env, budget)
     : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
+  const output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
   if (linked.length === 0) return output;
   return `${output}${output.endsWith("\n") || output === "" ? "" : "\n"}[router_git] skipped tracked directories replaced by symlinks/junctions: ${linked.slice(0, 20).join(", ")}${linked.length > 20 ? ", ..." : ""}`;
 }

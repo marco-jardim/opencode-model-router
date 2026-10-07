@@ -19,6 +19,7 @@ import { createEngineRuntime } from "../routing/wire/runtime";
 import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
 import { createSystemAugmenter } from "../routing/wire/hint";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
+import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -474,6 +475,21 @@ export async function registerV2Hooks(
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
       if (event.status !== "completed") return;
+      if (event.tool === "grep" && protectedAgent(event.agent)) {
+        const content = event.result.content;
+        event.result = {
+          ...event.result,
+          content: filterSensitiveGrep(contentText(content)),
+          // Native grep also exposes raw matches to SDK callers. Do not leave
+          // their text behind after scrubbing the model-facing representation.
+          ...(Array.isArray(event.result.output) ? { output: event.result.output.filter(match => {
+            if (!match || typeof match !== "object" || !("entry" in match)) return false;
+            const entry = match.entry;
+            return entry !== null && typeof entry === "object" && "path" in entry
+              && typeof entry.path === "string" && !isSensitivePath(entry.path);
+          }) } : {}),
+        };
+      }
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That
       // acknowledgement is not a final result and must never enter acceptance.

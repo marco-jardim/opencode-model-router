@@ -89,6 +89,21 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  it.each([false, true])("filters v2 grep model content and raw structured matches (parts=%s)", async parts => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
+    const secret = "Found 2 matches\n/repo/.env:\n  Line 1: SECRET\n";
+    const ordinary = "/repo/id_utils.ts:\n  Line 1: PUBLIC";
+    const event = { ...call, tool: "grep", input: { pattern: "." }, status: "completed", result: {
+      content: parts ? [{ type: "text", text: secret }, { type: "text", text: ordinary }] : secret + ordinary,
+      output: [{ entry: { path: ".env" }, line: 1, text: "SECRET" }, { entry: { path: "id_utils.ts" }, line: 1, text: "PUBLIC" }],
+    } };
+    await f.toolHooks["execute.after"](event);
+    expect(JSON.stringify(event.result)).not.toContain("SECRET");
+    expect(JSON.stringify(event.result)).toContain("PUBLIC");
+    expect(event.result.output).toHaveLength(1);
+    expect(JSON.stringify(event.result.content)).toContain("1 matches in sensitive files withheld; use read (asks for approval)");
+  });
   it.each([true, false])("Context7 lookup permissions and direct exposure require configured MCP: %s", async configured => {
     const f = fixture();
     Object.assign(f.ctx, { mcp: { list: async () => ({ data: configured ? [{ name: "context7", status: { status: "connected" } }] : [] }) } });

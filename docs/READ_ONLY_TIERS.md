@@ -8,9 +8,13 @@ their previous definitions unless opted in. This is host permission enforcement,
 not a prompt-only request, and is independent of advisory/enforced/off mode.
 
 The ordered baseline is deny `*`, then allow `read`, `glob`, `grep`, the six
-`router_git_*` tools below, and `external_directory`. Reads of `*.env`,
-`*.env.*`, `*.pem`, `*.key`, `id_*`, `.npmrc`, `.netrc` ask for approval;
-`*.env.example` is allowed. Basename patterns are also applied in subdirectories.
+`router_git_*` tools below, and `external_directory`. The shared sensitive-path
+policy (`src/router/sensitive-paths.ts`) asks for read approval for `.env`,
+`.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.kdbx`, `id_rsa*`,
+`id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `.npmrc`, `.netrc`, `.pgpass`,
+`.git-credentials`, `credentials.json`, `.aws/credentials`, `.docker/config.json`.
+It applies at every path depth, case-insensitively on Windows. `*.env.example`
+is allowed; ordinary `id_*` names such as `src/id_utils.ts` are not sensitive.
 Shell (`bash` on v1, `shell` on v2), edits/write/patch, Code Mode `execute`,
 subagent/task/delegate, webfetch/websearch, browser, and unspecified MCP tools
 remain denied. Adding a future tool does not implicitly allow it.
@@ -63,6 +67,26 @@ For external directories, use `external_directory: "deny"` or scoped `ask`
 rules in host agent configuration. Read-only does not mean confined to the
 project by default.
 
+**Saved “always allow” caveat (P8):** the v2 host checks configured denies first,
+then appends saved project-wide approvals before evaluating asks. An earlier
+“always” approval can therefore make a sensitive `read` ask resolve to allow
+without another prompt. The router does not delete saved approvals or turn asks
+into denies. Review/revoke those host approvals when approval on each read is
+required. This ordering was checked in host `v2.0.22`'s `permission.ts`
+(`evaluateInput`); own denies are still protected by the P2 hook.
+
+### Grep output filtering
+
+Grep permission resources are the search regex, **not file paths**. For read-only
+tiers, the after-hook withholds sensitive file match blocks and appends
+`N matches in sensitive files withheld; use read (asks for approval)`.
+V1 rewrites `tool.execute.after`'s `output.output`; v2 rewrites both model-facing
+`result.content` and its structured match array. Both shapes are unit-tested;
+real-host v1 execution is unverified. This covers the native grouped
+`path:` / `Line N:` format, not arbitrary third-party grep output formats.
+The tool still reads the files internally; this is output filtering, not I/O
+isolation. Hooks must be supported and active for the filter to run.
+
 To remove the router policy, deep-merge the following in
 `opencode-model-router.overrides.jsonc` (global or `.opencode/` project override):
 
@@ -99,8 +123,19 @@ directory**, not an arbitrary caller-supplied working directory. Paths are
 literal, repository-relative (maximum 4096 characters), with absolute paths,
 parent segments, option prefixes, control characters, and escaping existing
 symlinks/junctions rejected. Git pathspec magic is disabled. Refs allow only
-`^[A-Za-z0-9._/@{}~^:-]+$`, maximum 200 characters, never a leading `-`. There is
+`^[A-Za-z0-9._/@{}~^-]+$`, maximum 200 characters, never a leading `-`. There is
 no free-form argv or `--output`/`-o` option.
+
+Sensitive explicit paths are refused with a pointer to `read`. Show/diff/log
+always append shared `:(exclude,glob)` pathspecs (`icase` on Windows), preserving
+the `.env.example` exception. Log includes patches. A second output filter
+withholds diff sections whose old or new path is sensitive, including rename
+and C-quoted forms. Blame accepts exactly one literal filename, **not exclusion
+pathspecs**: it instead rejects sensitive paths before execution. Status and
+ls-files may list sensitive names, but not their contents.
+Show first peels its ref with `rev-parse --verify --end-of-options <ref>^{commit}`;
+blob/tree ids and `rev:path`/`:N:path` refs are refused. Use `ref: "HEAD"` with
+`path: "ordinary-file"` rather than `HEAD:ordinary-file`.
 
 Every subprocess uses `spawn` with `shell: false`, fixed argv, an absolute Git
 executable resolved from absolute PATH entries (`git.exe`, never cmd/bat, on
@@ -116,7 +151,8 @@ Diff/show/log disable external diffs and textconv; blame disables textconv too.
 Submodule diff helpers are disabled. Inherited `GIT_*` variables are stripped
 before setting `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=NUL` (or `/dev/null`), `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`,
-`PAGER=cat`, `GIT_LITERAL_PATHSPECS=1`, and `GIT_NO_LAZY_FETCH=1`.
+`PAGER=cat` and `GIT_NO_LAZY_FETCH=1`. User paths use explicit `:(literal)`
+pathspecs rather than `GIT_LITERAL_PATHSPECS`, permitting router-owned exclusions.
 Output is bounded to 64 KiB with a truncation notice. Discovery and inspection
 share one 15-second tool-call deadline; abort, timeout, and output overflow kill the process tree
 (taskkill `/T /F` on Windows, a detached process group elsewhere). Remote URL
@@ -133,10 +169,10 @@ scripts that must never execute.
 
 This is **not an OS sandbox**, a confidentiality filter, or protection against
 a compromised Git executable/OS, Git vulnerabilities, concurrent filesystem
-replacement, or an administrator explicitly loosening permissions. Git output
-and grep can expose file contents (including committed secrets); `read`'s
-sensitive-path approval rules do not filter Git or grep output. URL redaction
-is not a general secret scrubber. Large output is deliberately incomplete;
+replacement, or an administrator explicitly loosening permissions. The shared
+filename filter is not secret detection: secrets in ordinary files, copied or
+renamed to ordinary paths, commit messages or other metadata can still appear.
+URL redaction is not a general secret scrubber. Large output is deliberately incomplete;
 narrow the path/ref or ask a higher tier for more work. No remote access,
 fetching missing objects, arbitrary git configuration, commits, or mutations
 are supported.

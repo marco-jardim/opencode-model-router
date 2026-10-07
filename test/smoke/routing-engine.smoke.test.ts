@@ -86,13 +86,15 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       const blocked = path.join(host.project, "readonly-blocked.txt");
       await writeFile(target, "READ_ONLY_ORIGINAL\n");
       await writeFile(blocked, "BLOCKED_CONTENT\n");
-      const probes: Array<{ tool: string; input: Obj; allowed: boolean; parentAllow?: string; blocked?: boolean }> = [
+      await writeFile(path.join(host.project, ".env"), "SECRET_GREP_RO\n");
+      const probes: Array<{ tool: string; input: Obj; allowed: boolean; parentAllow?: string; blocked?: boolean; sensitive?: boolean }> = [
         { tool: "shell", input: { command: "echo WRITE_ATTEMPT > readonly-probe.txt", workdir: host.project }, allowed: false },
         { tool: "edit", input: { path: target, oldString: "READ_ONLY_ORIGINAL", newString: "WRITE_ATTEMPT" }, allowed: false },
         { tool: "execute", input: { code: "return 'WRITE_ATTEMPT'" }, allowed: false },
         { tool: "subagent", input: { agent: "medium", description: "forbidden child", prompt: "CHILD_DONE" }, allowed: false },
         { tool: "read", input: { path: target }, allowed: true },
         { tool: "grep", input: { pattern: "READ_ONLY_ORIGINAL", path: host.project }, allowed: true },
+        { tool: "grep", input: { pattern: ".", path: path.join(host.project, ".env") }, allowed: true, sensitive: true },
         { tool: "glob", input: { pattern: "*.txt", path: host.project }, allowed: true },
         { tool: "router_git_status", input: {}, allowed: true },
         { tool: "router_git_diff", input: { ref: "--output=readonly-probe.txt" }, allowed: false },
@@ -125,6 +127,10 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         if (probe.allowed) {
           expect(names).toContain(probe.tool);
           expect(hooks.some(h => h.status === "completed"), JSON.stringify(hooks)).toBe(true);
+          if (probe.sensitive) {
+            expect(context).not.toContain("SECRET_GREP_RO");
+            expect(context).toContain("1 matches in sensitive files withheld; use read (asks for approval)");
+          }
         } else if (probe.blocked) {
           // Advertised read, but denied resource: this reaches the host's
           // Permission.assert / BlockedError path, not the missing-tool path.

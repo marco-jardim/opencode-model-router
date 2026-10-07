@@ -3,12 +3,13 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, join, relative } from "node:path";
+import { basename, delimiter, dirname, join, relative } from "node:path";
 import {
   dropPartialCredential, emptyTreeId, GIT_OPERATIONS, gitArgv, gitCandidates, gitEnvironment, gitExecutable, gitTools, hardeningArgs, inspectGit,
   linkedTrackedDirectories, numstatNames, parseInheritedConfig, runBoundedProcess, selectGitExecutable, stripUrlUserinfo, validatePath, validateRef,
   type GitInput, type GitInspectOptions, type GitOperation,
 } from "../../src/router/git-tools";
+import { sensitiveGitPathspecs, SENSITIVE_PATH_PATTERNS } from "../../src/router/sensitive-paths";
 
 const WIN = process.platform === "win32";
 const INHERITED_ENV = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM"] as const;
@@ -142,11 +143,45 @@ describe("shell-free git inspection", () => {
       expect(args).toContain("--no-ignore-revs-file");
       expect(args.slice(-2)).toEqual(["--", "file.txt"]);
     } else {
-      expect(args.slice(-2)).toEqual(["--", ":(literal)file.txt"]);
+      expect(args.slice(args.indexOf("--"))).toEqual(["--", ":(literal)file.txt",
+        ...(["show", "diff", "log"].includes(operation) ? sensitiveGitPathspecs() : [])]);
     }
     expect(gitArgv(operation, { path: "file.txt" }, root, { config: ["-c", "x.y=z"], exclude: ["linked"] }).join(" "))
-      .toMatch(operation === "blame" ? /x\.y=z.* -- file\.txt$/ : /x\.y=z.* -- :\(literal\)file\.txt :\(exclude,literal\)linked$/);
+      .toMatch(operation === "blame" ? /x\.y=z.* -- file\.txt$/ : /x\.y=z.* -- :\(literal\)file\.txt .*:\(exclude,literal\)linked$/);
     expect(gitEnvironment()).toMatchObject({ GIT_OPTIONAL_LOCKS: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_ATTR_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", PAGER: "cat" });
+  });
+  it("withholds committed sensitive content from patch tools and refuses explicit paths/blob refs (G8)", async () => {
+    repository();
+    mkdirSync(join(root, "nested")); mkdirSync(join(root, ".aws"));
+    const secrets = [".env", "id_rsa", "nested/cert.pem", ".aws/credentials", ".env.e", ".env.exampl", ".env.example2",
+      ...SENSITIVE_PATH_PATTERNS.map(pattern => `nested/${pattern.replaceAll("*", "fixture")}`)];
+    for (const path of secrets) {
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      writeFileSync(join(root, path), "SECRET_G8_ORIGINAL\n");
+    }
+    writeFileSync(join(root, ".env.example"), "PUBLIC_EXAMPLE\n");
+    writeFileSync(join(root, "file.txt"), "PUBLIC_ORDINARY\n");
+    git("add", "."); git("commit", "-qm", "fixture");
+    const blob = git("rev-parse", "HEAD:.env").trim();
+    expect(git("show", "HEAD:.env")).toContain("SECRET_G8_ORIGINAL");
+    for (const path of secrets) writeFileSync(join(root, path), "SECRET_G8_MODIFIED\n");
+    writeFileSync(join(root, "file.txt"), "PUBLIC_CHANGED\n");
+    for (const operation of ["show", "diff", "log"] as const) {
+      const output = await inspect(operation);
+      expect(output, operation).not.toContain("SECRET_G8");
+      expect(output, operation).toContain("PUBLIC_");
+      if (operation !== "diff") expect(output).toContain("PUBLIC_EXAMPLE");
+    }
+    expect(await inspect("blame", { path: "file.txt" })).toContain("PUBLIC_CHANGED");
+    for (const operation of ["show", "diff", "log", "blame"] as const) {
+      for (const path of [...secrets, ".aws/./credentials"]) await expect(inspect(operation, { path })).rejects.toThrow("use read");
+    }
+    for (const ref of ["HEAD:.env", ":0:.env", blob]) await expect(inspect("show", { ref })).rejects.toThrow("use read");
+    if (WIN) {
+      writeFileSync(join(root, "UPPER.PEM"), "SECRET_G8_UPPER\n");
+      git("add", "UPPER.PEM"); git("commit", "-qm", "uppercase");
+      expect(await inspect("show")).not.toContain("SECRET_G8");
+    }
   });
   it("computes the empty tree for SHA-1 and SHA-256 repositories", () => {
     for (const format of ["sha1", "sha256"]) {
@@ -405,7 +440,7 @@ describe("shell-free git inspection", () => {
     repository();
     writeFileSync(join(root, "minified.js"), "a".repeat(200_000));
     git("add", "-A"); git("commit", "-qm", "minified");
-    const output = await inspect("show", { ref: "HEAD:minified.js" });
+    const output = await inspect("show", { ref: "HEAD", path: "minified.js" });
     expect(output).toContain("a".repeat(60_000));
     expect(output).toContain("[truncated");
   }, 30_000);
@@ -530,7 +565,7 @@ describe("shell-free git inspection", () => {
     const context = { sessionID: "s", messageID: "m", agent: "fast", directory: root, worktree: root, abort: new AbortController().signal,
       metadata: () => undefined, ask: async () => undefined };
     const run = (name: string, args: unknown, directory = root) => (tools[name]!.execute as Execute)(args, { ...context, directory });
-    expect(await run("router_git_log", { ref: "--output=x" })).toBe("[router_git] error: Invalid git ref: use at most 200 ref characters, never an option");
+    expect(await run("router_git_log", { ref: "--output=x" })).toBe("[router_git] error: Invalid git ref: use at most 200 ref characters, never an option or rev:path; use read for sensitive files (asks for approval)");
     const zod = String(await run("router_git_diff", { mode: "https://alice:hunter2@example.com/x" }));
     expect(zod).toMatch(/^\[router_git\] error: /); expect(zod).not.toContain("hunter2");
     expect(String(await run("router_git_log", { ref: "doesnotexist" }))).toMatch(/^\[router_git\] error: Git inspection failed \(128\)/);

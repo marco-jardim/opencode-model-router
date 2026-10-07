@@ -195,7 +195,8 @@ substring, proving every other byte remains identical.
 
 - V2 agent resource overrides on permitted actions survive; inherited session
   allows cannot override own denies. Broad inherited allow-all is dropped.
-- Sensitive-file `ask` rules belong to `read`, not Git or grep content filtering.
+- The shared filename policy now drives read asks, grep match-block filtering
+  and Git exclusions/refusals (P3/G8). It is not content-based secret detection.
 - No OS sandbox, network Git operations, arbitrary flags, or writable Git tools.
 - V1 permission registration/merge is unit-tested; no claim of a real-v1
   negative-probe smoke unless explicitly recorded later. Arbitrary actions on
@@ -252,8 +253,8 @@ junction/ignore-revs leak, and the slow-filter blame completed in 162 ms.
 
 Known limits:
 
-- G8 (sensitive-path exclusion for show/diff/blame) is deferred to the round
-  that adds the shared sensitive-file list (`TODO(#77 G8)` in `gitArgv`).
+- G8 was deferred by that branch and is now implemented in the shared-list
+  round below; the TODO has been removed.
 - `--attr-source=<empty tree>` also ignores in-tree `text`/`eol`/`diff`
   attributes. A repository that relies on `.gitattributes` line endings, with
   `core.autocrlf` unset, can show stat-dirty CRLF files as modified.
@@ -262,3 +263,81 @@ Known limits:
 - On Windows the file's tests cover 86% of `git-tools.ts` branches; the POSIX
   kill/candidate paths rely on Linux CI. The aggregated `src/router/**`
   coverage gate and the gated real-host smoke were not re-run in this round.
+
+## 8. Round 1 fixes
+
+The table records the original review findings across the merged permission and
+Git branches. **Shared-list commit** below means the commit with subject
+`fix(router): one sensitive-file list for read, grep and git tools (QA-77-P3/P8/G8)`
+(this commit; use `git log --all --fixed-strings --grep='QA-77-P3/P8/G8'` to resolve
+its hash without a self-referential hash in this document).
+
+| Finding | Resolution | Commit |
+|---|---|---|
+| P1 | Fail-closed drift handling, action filtering, canaries and warnings | `4834f18` |
+| P2 | Agent-own denies survive inherited session grants; child grants narrowed | `4834f18` |
+| P3 | One expanded sensitive-path list; grep after-hook filters native v1/v2 outputs | Shared-list commit |
+| P4 | Hard-coded identical/appended/inserted/respelled/dropped host fixtures | `4834f18` |
+| P5 | Advertised-but-denied read, parent grants, no published allow-all smoke | `4834f18` |
+| P6 | V1 arbitrary actions unverified; boolean-only hosts lack sensitive-read asks | `4834f18` |
+| P7 | Global-rule precedence unverified; guidance limited to agent-specific rules | `4834f18` |
+| P8 | Saved project-wide “always allow” can satisfy read asks; documented caveat | Shared-list commit |
+| P9 | Changelog marked Breaking (behaviour), including session inheritance | `4834f18` |
+| P10 | Evidence updates opt-in; paths/usernames scrubbed | `4834f18` |
+| G1 | Repository filter/diff drivers neutralized, in-tree attributes disabled | `8acc664` |
+| G2 | Signature helpers disabled | `8acc664` |
+| G3 | No diff auto-refresh or split-index writes; numstat-derived names | `8acc664` |
+| G4 | Trusted executable selection outside session/repository | `8acc664` |
+| G5 | Linked tracked directories excluded; explicit linked paths refused | `8acc664` |
+| G6 | Blame ignore-revs file disabled | `8acc664` |
+| G7 | Bounded settlement even with inherited pipes/re-parented helpers | `8acc664` |
+| G8 | Shared sensitive exclusions, explicit-path/ref refusals, commit peeling, diff backstop | Shared-list commit |
+| G9 | Safe line-ending/system config allowlist | `8acc664` |
+| G10 | Expanded URL redaction and safe truncated-token handling | `8acc664` |
+| G11 | Discovery restricted to session/worktree boundary | `8acc664` |
+| G12 | Redacted tool errors; process failures handled | `8acc664` |
+| G13 | Windows device/alias/spoofing path rejection | `8acc664` |
+| G14 | Marker controls, whole-.git digests and expanded regression matrix | `8acc664`, `13d3ca6` (QA documentation) |
+
+Shared-list implementation details:
+
+- `src/router/sensitive-paths.ts` exports the patterns, host permission globs,
+  matcher, Git exclusion pathspecs and output filters. Matching is at every
+  depth, with Windows case folding. `.env.example` remains visible; the private
+  key patterns no longer accidentally match `src/id_utils.ts`.
+- V1's after-hook rewrites `output.output`, resolving the tier from registered
+  session state. V2 rewrites both `result.content` and the raw match array in
+  `result.output`, including text-part arrays. Native host source
+  `v2.0.22:packages/core/src/tool/plugin/grep.ts` confirms permission resources
+  are regexes and the output is grouped by filename. No real-v1 probe was run.
+- Show/diff/log append shared exclude globs; log emits patches. Explicit
+  sensitive paths and colon refs are refused. Show peels to a commit before
+  execution, so direct blob/tree ids cannot bypass pathspecs. Diff sections are
+  also checked for old/new sensitive paths, including rename and C-quoted names.
+- Blame takes one literal filename, not pathspec exclusions, so the equivalent
+  guard is a pre-execution sensitive-path refusal. Status/ls-files can list names.
+- The fixture commits every sensitive pattern, exercises working changes,
+  checks show/diff/log/blame refusals and ordinary/example-file visibility, and
+  verifies no secret marker escapes. The existing minified-output regression
+  now uses `show HEAD` with `path` instead of the deliberately forbidden blob
+  syntax. `.git` digests remain checked around Git fixture calls.
+- P8 source check: host `v2.0.22:packages/core/src/permission.ts`,
+  `evaluateInput`, appends saved project approvals after its configured-deny
+  check. The router leaves that state untouched. This is a filename policy, not
+  a content scanner: ordinary files/metadata can still contain secrets.
+- Real-host smoke passed with evidence writing **off**: **1 passed / 12 skipped**,
+  18.70 s, **13 fresh-child probes**. The additional explicit `.env` grep probe
+  verifies the secret is absent from persisted tool state and the withheld
+  notice is present. `docs/qa/fast-readonly-smoke.json` remained unchanged.
+- `npm run typecheck`: passed. Explicit Git/read-only/v2-hooks/shared-path tests:
+  **253 passed / 4 files**, 57.03 s. Command:
+  `npx vitest run test/unit/git-tools.test.ts test/unit/read-only.test.ts test/unit/v2-hooks.test.ts test/unit/sensitive-paths.test.ts --maxWorkers=2 --testTimeout=30000`.
+- Related run: **1263 passed, 55 skipped / 43 passed files, 3 skipped**, 160.88 s.
+  Command: `npx vitest related src/router/sensitive-paths.ts src/router/git-tools.ts src/router/read-only.ts src/compat/v2-hooks.ts --run --maxWorkers=2 --testTimeout=30000`.
+  Both use the default pool. After pinning log's submodule patch format to short,
+  the focused argv/sensitive-fixture/minified/error regression rerun passed
+  **9 tests**, 17.53 s. No snapshots changed.
+- Initial explicit run: 251 passed, two old expectations failed (`HEAD:minified.js`
+  now raises `Invalid git ref`; the exact error-string assertion still expected
+  the old wording). Tests were deliberately updated for the new colon-ref
+  restriction; the completed explicit/related reruns above have no failures.

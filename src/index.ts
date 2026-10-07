@@ -23,6 +23,7 @@ import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
 import { gitTools } from "./router/git-tools";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
+import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
 import { buildDispatchHeader } from "./router/dispatch-header";
@@ -1749,6 +1750,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // treats them as ground truth rather than advisory system noise.
     // -----------------------------------------------------------------------
     "tool.execute.after": async (input: any, output: any) => {
+      if (input?.tool === "grep" && typeof output.output === "string") {
+        const tier = input.agent ?? sessionStore.getTier(input.sessionID);
+        const definition = tier && getActiveTiers(cfg)[tier];
+        if (definition && isReadOnlyTier(tier, definition)) output.output = filterSensitiveGrep(output.output);
+      }
       if (bypassed) return;
       sessionStore.recordToolCall(input, output);
 

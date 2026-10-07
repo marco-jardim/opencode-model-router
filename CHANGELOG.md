@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hosts that honour only tool booleans cannot enforce sensitive-read approval.
   `rename` moves from the fast taxonomy to medium. Fast prompts distinguish
   direct tools from the separate Code Mode catalog.
+  One shared sensitive-file policy now drives read asks, read-only grep output
+  filtering, and Git patch exclusions/refusals. Git show accepts commits only
+  (no blob ids or `rev:path`); log includes filtered patches. Saved project-wide
+  “always allow” approvals can still satisfy sensitive-read asks without another
+  prompt: the host applies them after checking configured denies (QA-77-P8).
 
 ### Added
 

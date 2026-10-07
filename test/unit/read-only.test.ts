@@ -16,6 +16,19 @@ function effect(rules: PermissionRule[], action: string, resource = "*") {
 }
 
 describe("read-only tier policy", () => {
+  it.each(["fast", "medium"])("filters native v1 grep output only for read-only tiers: %s", async agent => {
+    const home = mkdtempSync(join(tmpdir(), "router-sensitive-")); roots.push(home);
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home); invalidateConfigCache();
+    const hooks = await ModelRouterPlugin({ directory: home, worktree: home, client: {} } as unknown as RouterPluginInput);
+    await hooks["chat.message"]?.({ sessionID: "test", agent }, {
+      message: { id: "user", sessionID: "test", role: "user", time: { created: Date.now() }, agent, model: { providerID: "test", modelID: "test" } }, parts: [],
+    });
+    const output = { title: "grep", metadata: {}, output: "Found 2 matches\n/repo/.env:\n  Line 1: SECRET\n/repo/file.ts:\n  Line 1: PUBLIC" };
+    await hooks["tool.execute.after"]?.({ tool: "grep", sessionID: "test", callID: "grep", args: {} }, output);
+    expect(output.output.includes("SECRET")).toBe(agent === "medium");
+    expect(output.output).toContain("PUBLIC");
+    await hooks.dispose?.();
+  });
   // Deliberately hard-coded: importing Agent.Info.default here repeats P1's bug.
   const host: PermissionRule[] = [
     { action: "*", resource: "*", effect: "allow" },

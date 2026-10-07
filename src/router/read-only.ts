@@ -1,6 +1,7 @@
 import type { TierConfig } from "./config";
 import { GIT_TOOL_NAMES } from "./git-tools";
 import { randomUUID } from "node:crypto";
+import { SENSITIVE_PERMISSION_GLOBS, SENSITIVE_PERMISSION_EXCEPTIONS } from "./sensitive-paths";
 
 export type PermissionEffect = "allow" | "deny" | "ask";
 export type PermissionMap = Record<string, PermissionEffect | Record<string, PermissionEffect>>;
@@ -70,9 +71,8 @@ export function isReadOnlyTier(name: string, tier: Pick<TierConfig, "readOnly">)
 export function readOnlyPermissions(context7 = false): PermissionMap {
   return {
     "*": "deny",
-    read: { "*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow", "*.pem": "ask", "*.key": "ask",
-      "id_*": "ask", "*/id_*": "ask", "*\\id_*": "ask", ".npmrc": "ask", "*/.npmrc": "ask", "*\\.npmrc": "ask",
-      ".netrc": "ask", "*/.netrc": "ask", "*\\.netrc": "ask" },
+    read: { "*": "allow", ...Object.fromEntries(SENSITIVE_PERMISSION_GLOBS.map(pattern => [pattern, "ask" as const])),
+      ...Object.fromEntries(SENSITIVE_PERMISSION_EXCEPTIONS.map(pattern => [pattern, "allow" as const])) },
     glob: "allow", grep: "allow", external_directory: "allow",
     ...Object.fromEntries([...GIT_TOOL_NAMES, ...(context7 ? CONTEXT7_DOC_TOOLS : [])].map(name => [name, "allow" as const])),
   };
