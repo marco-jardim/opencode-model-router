@@ -24,13 +24,14 @@ const DRAIN_AFTER_EXIT_MS = 1_000;
 /** How long a settled call waits for taskkill to finish removing the tree. */
 const KILL_WAIT_MS = 300;
 const MAX_INDEX_BYTES = 32 * 1024 * 1024;
-const MAX_LINK_CHECKS = 50_000;
+// Linear grouping below makes 100k directories cheap; the shared deadline still bounds I/O.
+const MAX_LINK_CHECKS = 100_000;
 const MAX_LINKED_EXCLUDES = 200;
 const LSTAT_BATCH = 64;
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const DRIVER_KEYS = /^(filter|diff)\.(.+)\.(clean|smudge|process|textconv|command)$/;
-const REPOSITORY_QUERY = "^((filter|diff)\\..+\\.(clean|smudge|process|textconv|command)|core\\.(autocrlf|eol|safecrlf|longpaths))$";
-const INHERITED_QUERY = "^(core\\.(autocrlf|eol|safecrlf|longpaths)|safe\\.directory)$";
+const REPOSITORY_QUERY = "^((filter|diff)\\..+\\.(clean|smudge|process|textconv|command)|core\\.(autocrlf|eol|safecrlf|longpaths|quotepath))$";
+const INHERITED_QUERY = "^(core\\.(autocrlf|eol|safecrlf|longpaths|quotepath)|safe\\.directory)$";
 const BOOLEAN = /^(true|false|yes|no|on|off|1|0)$/i;
 /** Non-executing settings Git for Windows commonly keeps in system/global config (G9). Nothing here can name a program. */
 const INHERITED_VALUES = new Map<string, RegExp>([
@@ -38,6 +39,7 @@ const INHERITED_VALUES = new Map<string, RegExp>([
   ["core.eol", /^(lf|crlf|native)$/i],
   ["core.safecrlf", /^(true|false|warn|yes|no|on|off|1|0)$/i],
   ["core.longpaths", BOOLEAN],
+  ["core.quotepath", BOOLEAN],
   ["safe.directory", /^[^\x00-\x1f\x7f]{0,4096}$/],
 ]);
 const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)$/i;
@@ -49,7 +51,7 @@ function errorCode(error: unknown): string | undefined {
 }
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+\s*/g, " ");
 }
 
 /** lstat that reports a missing path (or a file used as a directory) as undefined. */
@@ -152,7 +154,7 @@ function validateInput(operation: GitOperation, input: GitInput): { ref?: string
 
 /**
  * Fixed argv for one inspection. `config` holds additional top-level options
- * (neutralized drivers, inherited settings, attribute source) placed right after
+ * (neutralized drivers, inherited settings) placed right after
  * the hardening; `exclude` lists repository paths hidden with exclude pathspecs.
  */
 export function gitArgv(operation: GitOperation, input: GitInput, root: string,
@@ -162,10 +164,10 @@ export function gitArgv(operation: GitOperation, input: GitInput, root: string,
   const args = [...hardeningArgs(), ...(extra.config ?? [])];
   switch (operation) {
     case "status": args.push("status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=all"); break;
-    case "log": args.push("log", "--patch", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--no-show-signature", "--no-ext-diff", "--no-textconv", `--max-count=${input.limit ?? 20}`, "--format=medium", ...(ref ? [ref] : [])); break;
+    case "log": args.push("log", "--sparse", "--full-history", "--patch", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--no-show-signature", "--no-ext-diff", "--no-textconv", `--max-count=${input.limit ?? 20}`, "--format=medium", ...(ref ? [ref] : [])); break;
     case "diff": args.push("diff", "--src-prefix=a/", "--dst-prefix=b/", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--submodule=short",
       ...(input.mode && input.mode !== "patch" ? [`--${input.mode}`] : []), ...(ref ? [ref] : [])); break;
-    case "show": args.push("show", "--src-prefix=a/", "--dst-prefix=b/", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--format=medium", "--submodule=short", ref ?? "HEAD"); break;
+    case "show": args.push("show", "--sparse", "--src-prefix=a/", "--dst-prefix=b/", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--format=medium", "--submodule=short", ref ?? "HEAD"); break;
     case "blame":
       // G6: never read blame.ignoreRevsFile (it may name a file outside the repository).
       // Blame takes one literal path, not a pathspec.
@@ -253,13 +255,6 @@ export function gitExecutable(): string {
   return selectGitExecutable(defaultCandidates(), []);
 }
 
-/** Empty tree id of the repository's object format, the `--attr-source` that disables in-tree attributes. */
-export function emptyTreeId(format: string): string {
-  if (format === "sha1") return "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-  if (format === "sha256") return "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
-  throw new Error("Unsupported repository object format");
-}
-
 /**
  * Remove URL credentials (G10): the whole `user:pass@` of scheme URLs (even with
  * a `/` or `@` in the password), scp-style `user[:pass]@host:path` anchored at the
@@ -319,14 +314,20 @@ async function killTree(child: ChildProcess): Promise<void> {
       { shell: false, windowsHide: true, stdio: "ignore" });
     killer.once("error", error => {
       console.warn(`[model-router] router_git: taskkill failed to start (${error.message}); terminating git directly`);
-      child.kill();
+      killDirect(child);
       done();
     });
     killer.once("close", () => done());
   });
 }
 
-interface BoundedOptions { signal?: AbortSignal; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv; separateStderr?: boolean }
+function killDirect(child: ChildProcess): void {
+  try { child.kill("SIGKILL"); } catch (error) {
+    console.warn(`[model-router] router_git: could not terminate git directly (${errorMessage(error)})`);
+  }
+}
+
+interface BoundedOptions { signal?: AbortSignal; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv }
 interface BoundedResult { code: number | null; output: Buffer; stderr: Buffer; truncated: boolean }
 
 /**
@@ -376,9 +377,9 @@ function spawnBounded(executable: string, args: readonly string[], cwd: string, 
       if (killing || settled) return;
       killing = killTree(child).catch((error: unknown) => {
         console.warn(`[model-router] router_git: could not kill the git process tree (${errorMessage(error)})`);
-        child.kill("SIGKILL");
+        killDirect(child);
       });
-      later(KILL_FALLBACK_MS, () => { if (!exited) child.kill("SIGKILL"); });
+      later(KILL_FALLBACK_MS, () => { if (!exited) killDirect(child); });
       later(SETTLE_GRACE_MS, () => finish(null));
     };
     const abort = () => { failure ??= "Git inspection aborted"; stop(); };
@@ -397,7 +398,7 @@ function spawnBounded(executable: string, args: readonly string[], cwd: string, 
       errorBytes += kept.length;
     };
     child.stdout.on("data", collect);
-    child.stderr.on("data", options.separateStderr ? collectError : collect);
+    child.stderr.on("data", collectError);
     child.once("error", error => settle(() => reject(error)));
     child.once("exit", code => {
       exited = true;
@@ -417,35 +418,41 @@ export async function runBoundedProcess(executable: string, args: string[], cwd:
   // A byte boundary must not expose part of a credential: trim BEFORE redacting.
   if (result.truncated) text = dropPartialCredential(text);
   text = stripUrlUserinfo(text);
-  if (result.truncated) return `${text}\n[truncated: output exceeds ${max} bytes]`;
-  if (result.code !== 0) throw new Error(`Git inspection failed (${result.code}): ${text}`);
-  return text;
+  if (result.truncated) return withWarnings(`${text}\n[truncated: output exceeds ${max} bytes]`, result);
+  if (result.code !== 0) throw queryFailure("Git inspection failed", result);
+  return withWarnings(text, result);
+}
+
+function withWarnings(text: string, result: BoundedResult): string {
+  const warnings = stripUrlUserinfo(dropPartialCredential(result.stderr.toString("utf8"))).trim();
+  return warnings ? `${text}${text.endsWith("\n") || text === "" ? "" : "\n"}[router_git stderr]\n${warnings}\n` : text;
 }
 
 interface Budget { signal?: AbortSignal; timeoutMs: () => number }
 
 async function query(executable: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, budget: Budget, maxBytes = 1024 * 1024): Promise<BoundedResult> {
-  const result = await spawnBounded(executable, args, cwd, { env, signal: budget.signal, timeoutMs: budget.timeoutMs(), maxBytes, separateStderr: true });
+  const result = await spawnBounded(executable, args, cwd, { env, signal: budget.signal, timeoutMs: budget.timeoutMs(), maxBytes });
   if (result.truncated) throw new Error("Git inspection metadata exceeds its size bound");
   return result;
 }
 
 function queryFailure(label: string, result: BoundedResult): Error {
-  return new Error(`${label} (${result.code}): ${stripUrlUserinfo(result.stderr.toString("utf8").trim())}`);
+  return new Error(`${label} (${result.code}): ${stripUrlUserinfo(dropPartialCredential(result.stderr.toString("utf8"))).trim()}`);
 }
 
-const attrSourceSupport = new Map<string, boolean>();
-/** `--attr-source` exists from Git 2.40. Cached per executable once known. */
-async function supportsAttrSource(executable: string, budget: Budget): Promise<boolean> {
-  const known = attrSourceSupport.get(executable);
-  if (known !== undefined) return known;
-  const cwd = dirname(executable);
-  const result = await query(executable, ["version"], cwd, gitEnvironment({ GIT_CEILING_DIRECTORIES: dirname(cwd) }), budget);
-  const version = /git version (\d+)\.(\d+)/.exec(result.output.toString("utf8"));
-  if (result.code !== 0 || !version) throw queryFailure("Cannot determine the git version", result);
-  const supported = Number(version[1]) > 2 || (Number(version[1]) === 2 && Number(version[2]) >= 40);
-  attrSourceSupport.set(executable, supported);
-  return supported;
+/** Keep sensitive-only commits visible, without mistaking genuinely empty commits for withheld patches. */
+async function annotateWithheld(output: string, executable: string, base: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget): Promise<string> {
+  const sections = output.split(/(?=^commit [a-f0-9]{40,64}(?:\s|$))/m);
+  for (let index = 0; index < sections.length; index++) {
+    const section = sections[index]!;
+    const oid = /^commit ([a-f0-9]{40,64})(?:\s|$)/.exec(section)?.[1];
+    if (!oid || /^diff --/m.test(section) || section.includes("[truncated:")) continue;
+    const names = await query(executable, [...base, "diff-tree", "--root", "-m", "--no-commit-id", "--name-only", "-r", "-z", oid, "--"], root, env, budget);
+    if (names.code !== 0) throw queryFailure("Cannot inspect withheld changes", names);
+    const paths = names.output.toString("utf8").split("\0").filter(Boolean);
+    if (paths.length && paths.every(path => isSensitivePath(path))) sections[index] = `${section.trimEnd()}\n\n[router_git] changes to sensitive files withheld\n\n`;
+  }
+  return sections.join("");
 }
 
 /** Parse `git config -z --get-regexp` output into allowlisted `key=value` pairs (G9). */
@@ -538,11 +545,13 @@ export async function linkedTrackedDirectories(root: string, trackedPaths: Itera
       dirs.add(dir);
     }
   }
-  if (dirs.size > MAX_LINK_CHECKS) throw new Error(`Repository has too many tracked directories to verify for links (${dirs.size} > ${MAX_LINK_CHECKS})`);
+  if (dirs.size > MAX_LINK_CHECKS) throw new Error(`Tracked-directory cap exceeded: too many tracked directories (${dirs.size} > ${MAX_LINK_CHECKS}); use diff mode: cached or a commit range`);
   const levels = new Map<number, string[]>();
   for (const dir of dirs) {
     const depth = dir.split("/").length;
-    levels.set(depth, [...(levels.get(depth) ?? []), dir]);
+    const level = levels.get(depth) ?? [];
+    level.push(dir);
+    levels.set(depth, level);
   }
   const blocked = new Set<string>();
   const linked: string[] = [];
@@ -588,18 +597,30 @@ export function numstatNames(raw: string, complete = true): string[] {
   return names;
 }
 
+/** C-style pathname display matching core.quotePath; control characters are always escaped. */
+export function quoteGitPath(name: string, quoteHigh = true): string {
+  // Git's C-style quoting works on UTF-8 bytes, not Unicode code points.
+  const escapes: Record<number, string> = { 7: "\\a", 8: "\\b", 9: "\\t", 10: "\\n", 11: "\\v", 12: "\\f", 13: "\\r", 34: '\\"', 92: "\\\\" };
+  if (!/[\x00-\x1f\x7f"\\]/.test(name) && (!quoteHigh || !/[^\x00-\x7f]/.test(name))) return name;
+  const quoted = [...Buffer.from(name)].map(byte => escapes[byte] ?? (byte < 32 || byte === 127 || (quoteHigh && byte >= 128)
+    ? `\\${byte.toString(8).padStart(3, "0")}` : Buffer.from([byte])));
+  return `"${Buffer.concat(quoted.map(part => typeof part === "string" ? Buffer.from(part) : part)).toString("utf8")}"`;
+}
+
 /**
  * `diff --name-only` without the index auto-refresh (G3) also lists files whose
  * stat data is stale but whose content is unchanged. --numstat compares content,
  * so name-only output is derived from it instead.
  */
 async function diffNames(executable: string, argv: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget): Promise<string> {
+  const quoting = await query(executable, [...argv.slice(0, argv.indexOf("diff")), "config", "--type=bool", "--get", "core.quotePath"], root, env, budget);
+  if (quoting.code !== 0 && quoting.code !== 1) throw queryFailure("Cannot read path quoting configuration", quoting);
   const args = argv.flatMap(arg => arg === "--name-only" ? ["--numstat", "-z"] : [arg]);
-  const result = await spawnBounded(executable, args, root, { env, signal: budget.signal, timeoutMs: budget.timeoutMs(), separateStderr: true });
+  const result = await spawnBounded(executable, args, root, { env, signal: budget.signal, timeoutMs: budget.timeoutMs() });
   if (!result.truncated && result.code !== 0) throw queryFailure("Git inspection failed", result);
   const names = numstatNames(result.output.toString("utf8"), !result.truncated);
-  const text = stripUrlUserinfo(names.map(name => `${name}\n`).join(""));
-  return result.truncated ? `${text}[truncated: output exceeds ${MAX_BYTES} bytes]` : text;
+  const text = stripUrlUserinfo(names.map(name => `${quoteGitPath(name, quoting.output.toString("utf8").trim() !== "false")}\n`).join(""));
+  return withWarnings(result.truncated ? `${text}[truncated: output exceeds ${MAX_BYTES} bytes]` : text, result);
 }
 
 function nearestRepository(directory: string): string | undefined {
@@ -609,13 +630,13 @@ function nearestRepository(directory: string): string | undefined {
   }
 }
 
-/** The project worktree when it contains the session directory, else the session directory itself. */
+/** Honour an explicit containing worktree; otherwise discover the nearest checkout, including linked worktrees. */
 function sessionBoundary(session: string, worktree: string | undefined): string {
   if (worktree && isAbsolute(worktree) && isDirectory(worktree)) {
     const real = realpath(worktree);
     if (dirname(real) !== real && inside(real, session)) return real;
   }
-  return session;
+  return nearestRepository(session) ?? session;
 }
 
 export async function inspectGit(operation: GitOperation, input: GitInput, directory: string, signal?: AbortSignal, options: GitInspectOptions = {}): Promise<string> {
@@ -633,15 +654,14 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   // G4: never run a git that lives in the session's tree, checked before anything is spawned.
   const nearest = nearestRepository(session);
   const executable = selectGitExecutable(options.executables ?? defaultCandidates(), [session, boundary, ...(nearest ? [nearest] : [])]);
-  const attrSource = await supportsAttrSource(executable, budget);
   const inherited = await inheritedConfig(executable, budget);
   const trusted = inherited.filter(pair => pair.startsWith("safe.directory=")).flatMap(pair => ["-c", pair]);
   const base = [...hardeningArgs(), ...trusted];
   // G11: discovery cannot climb above the session's worktree.
   const env = gitEnvironment(dirname(boundary) === boundary ? {} : { GIT_CEILING_DIRECTORIES: dirname(boundary) });
-  const shown = await runBoundedProcess(executable, [...base, "rev-parse", "--show-toplevel", ...(attrSource ? ["--show-object-format"] : [])],
+  const shown = await runBoundedProcess(executable, [...base, "rev-parse", "--show-toplevel"],
     session, { signal, timeoutMs: budget.timeoutMs(), env });
-  const [top = "", format = ""] = shown.trim().split(/\r?\n/);
+  const top = shown.trim();
   if (!top || !isAbsolute(top) || !existsSync(top)) throw new Error("Cannot resolve repository toplevel");
   const root = realpath(top);
   if (!inside(boundary, root)) throw new Error("Repository toplevel is outside the session worktree");
@@ -649,20 +669,30 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   const repository = await repositoryConfig(executable, root, env, base, budget);
   const config = [...trusted,
     ...inherited.filter(pair => !pair.startsWith("safe.directory=") && !repository.overridden.has(pair.slice(0, pair.indexOf("=")))).flatMap(pair => ["-c", pair]),
-    ...repository.neutralize, ...(attrSource ? [`--attr-source=${emptyTreeId(format)}`] : [])];
+    ...repository.neutralize];
   let linked: string[] = [];
   if (readsWorktree(operation, input)) {
-    const index = await query(executable, [...base, "ls-files", "-z", "--cached"], root, env, budget, MAX_INDEX_BYTES);
+    const index = await spawnBounded(executable, [...base, "ls-files", "-z", "--cached"], root,
+      { env, signal, timeoutMs: budget.timeoutMs(), maxBytes: MAX_INDEX_BYTES });
+    if (index.truncated) throw new Error(`Tracked-index listing size cap exceeded (${MAX_INDEX_BYTES} bytes); use diff mode: cached or a commit range`);
     if (index.code !== 0) throw queryFailure("Cannot list tracked files", index);
     linked = await linkedTrackedDirectories(root, index.output.toString("utf8").split("\0").filter(Boolean), budget);
-    if (linked.length > MAX_LINKED_EXCLUDES) throw new Error("Refusing inspection: too many tracked directories were replaced by links");
+    if (linked.length > MAX_LINKED_EXCLUDES) throw new Error("Refusing inspection: too many tracked directories were replaced by links; use diff mode: cached or a commit range");
   }
   let inspected = input;
   if (operation === "show") {
-    const commit = await query(executable, [...base, "rev-parse", "--verify", "--end-of-options", `${input.ref ?? "HEAD"}^{commit}`], root, env, budget);
-    const oid = commit.output.toString("utf8").trim();
-    if (commit.code !== 0 || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)) {
-      throw new Error("Git show requires a commit (not a blob/tree); use read for sensitive files (asks for approval)");
+    // Deliberately single-object only: log/diff accept ranges, show preserves tag messages.
+    if (input.ref?.includes("..")) throw new Error("Git show accepts one commit or annotated tag, not ranges; use log or diff for a range");
+    const object = await query(executable, [...base, "rev-parse", "--verify", "--end-of-options", input.ref ?? "HEAD"], root, env, budget);
+    const oid = object.output.toString("utf8").trim();
+    const refused = () => new Error("Git show requires a commit or annotated tag pointing to a commit (not a blob/tree); use read for sensitive files (asks for approval)");
+    if (object.code !== 0 || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)) throw refused();
+    const type = await query(executable, [...base, "cat-file", "-t", oid], root, env, budget);
+    const kind = type.output.toString("utf8").trim();
+    if (type.code !== 0 || !["commit", "tag"].includes(kind)) throw refused();
+    if (kind === "tag") {
+      const commit = await query(executable, [...base, "rev-parse", "--verify", `${oid}^{commit}`], root, env, budget);
+      if (commit.code !== 0) throw refused();
     }
     inspected = { ...input, ref: oid };
   }
@@ -670,7 +700,8 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   const raw = operation === "diff" && input.mode === "name-only"
     ? await diffNames(executable, argv, root, env, budget)
     : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
-  const output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
+  let output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
+  if (operation === "show" || operation === "log") output = await annotateWithheld(output, executable, base, root, env, budget);
   if (linked.length === 0) return output;
   return `${output}${output.endsWith("\n") || output === "" ? "" : "\n"}[router_git] skipped tracked directories replaced by symlinks/junctions: ${linked.slice(0, 20).join(", ")}${linked.length > 20 ? ", ..." : ""}`;
 }
@@ -688,7 +719,7 @@ export function gitTools() {
     args: {
       path: tool.schema.string().optional().describe("Literal repository-relative path; required for blame"),
       ...(operation === "log" || operation === "diff" || operation === "show" || operation === "blame"
-        ? { ref: tool.schema.string().optional().describe("Ref or diff range, at most 200 characters; never an option") } : {}),
+        ? { ref: tool.schema.string().optional().describe(operation === "show" ? "One commit or annotated tag pointing to a commit; ranges require log or diff" : "Ref or diff range, at most 200 characters; never an option") } : {}),
       ...(operation === "log" ? { limit: tool.schema.number().int().min(1).max(50).optional() } : {}),
       ...(operation === "diff" ? { mode: tool.schema.enum(["patch", "stat", "name-only", "cached"]).optional() } : {}),
     },

@@ -304,7 +304,7 @@ export async function registerV2Hooks(
             : ctx.location.directory;
           const result = await definition.execute(args, {
             sessionID: context.sessionID, messageID: context.messageID, agent: context.agent,
-            directory, worktree: ctx.location.project.directory,
+            directory, worktree: name.startsWith("router_git_") ? "" : ctx.location.project.directory, // Session.Info.location has no project; discover from its directory, never the plugin's project.
             abort: context.signal,
             metadata: (metadata) => { void context.progress(metadata); },
             ask: async () => { throw new Error("[model-router] This tool cannot request v1 permissions on OpenCode 2"); },
