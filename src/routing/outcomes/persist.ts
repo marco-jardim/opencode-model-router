@@ -373,6 +373,16 @@ export function parseLogLine(line: string): LogRow | null {
   );
 
   const trace = readTrace(json.trace);
+  const isDetection = (value: unknown): value is "none" | "grader" | "deterministic" =>
+    value === "none" || value === "grader" || value === "deterministic";
+  const detection = isRec(json.detection) && isDetection(json.detection.effective)
+    ? { effective: json.detection.effective, ...(isDetection(json.detection.claimed) ? { claimed: json.detection.claimed } : {}) }
+    : undefined;
+  const capability = isRec(json.capability)
+    && (json.capability.pick === null || isFiniteNum(json.capability.pick))
+    && (json.capability.dispatched === null || isFiniteNum(json.capability.dispatched))
+    ? { pick: json.capability.pick, dispatched: json.capability.dispatched }
+    : undefined;
   const row: DecisionRow = {
     v: LOG_ROW_VERSION,
     kind,
@@ -393,6 +403,8 @@ export function parseLogLine(line: string): LogRow | null {
     step,
     resume,
     ...(trace === undefined ? {} : { trace }),
+    ...(detection === undefined ? {} : { detection }),
+    ...(capability === undefined ? {} : { capability }),
   };
   return row;
 }

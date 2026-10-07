@@ -15,6 +15,7 @@ import {
 import { acquireOutcomes } from "../../src/routing/outcomes/index";
 import { emptyTokenSample } from "../../src/routing/outcomes/cost";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
+import { summarize, renderMarkdown } from "../../src/routing/outcomes/stats";
 import {
   DECISIONS_FILE,
   DECISIONS_ROTATED_RE,
@@ -919,6 +920,25 @@ describe("persister: decisions.jsonl", () => {
 });
 
 describe("parseLogLine", () => {
+  it.each(["none", "grader", "deterministic"] as const)("retains audit detection %s and nullable finite capabilities", (effective) => {
+    const row = decisionRow(1, { detection: { effective, claimed: "deterministic" }, capability: { pick: 2, dispatched: null } });
+    expect(parseLogLine(JSON.stringify(row))).toEqual(row);
+    expect(parseLogLine(JSON.stringify(decisionRow(2)))).toEqual(decisionRow(2));
+  });
+
+  it("drops malformed audit metadata without discarding the decision", () => {
+    const row = decisionRow(1);
+    for (const bad of [null, "none", {}, { effective: "unknown" }]) {
+      expect(parseLogLine(JSON.stringify({ ...row, detection: bad }))).toEqual(row);
+    }
+    expect(parseLogLine(JSON.stringify({ ...row, detection: { effective: "none", claimed: "unknown" } })))
+      .toEqual({ ...row, detection: { effective: "none" } });
+    for (const bad of [null, [], {}, { pick: "2", dispatched: 1 }, { pick: 2, dispatched: false }]) {
+      expect(parseLogLine(JSON.stringify({ ...row, capability: bad }))).toEqual(row);
+    }
+    // JSON can encode a number that overflows the reader to Infinity.
+    expect(parseLogLine(JSON.stringify({ ...row, capability: { pick: "overflow", dispatched: 1 } }).replace('"overflow"', '1e400'))).toEqual(row);
+  });
   const roundTrip = (row: LogRow) => parseLogLine(JSON.stringify(row));
 
   it("accepts every row kind and returns an equal clean copy", () => {
@@ -1055,6 +1075,30 @@ describe("nodePersistFs and a real directory", () => {
     made.push(dir);
     return dir;
   }
+
+  it("B8 handoff: real flusher disk round-trip keeps the numerical never-down audit", async () => {
+    const dir = await tempDir();
+    const logger = makeLogger();
+    const deps: PersistDeps = { fs: nodePersistFs(), now: Date.now, sleep: async () => undefined, logger, pid: process.pid };
+    const persister = createPersister(dir, deps);
+    const flusher = createFlusher(createOutcomeStore(), persister, { now: Date.now, scheduler: nodeScheduler(), logger });
+    const base = decisionRow(1);
+    const row = decisionRow(1, {
+      facts: { ...base.facts, risk: "high" },
+      detection: { effective: "none", claimed: "deterministic" },
+      capability: { pick: 2, dispatched: 2 },
+    });
+    flusher.enqueue(row);
+    flusher.enqueue(decisionRow(2)); // pre-A34 rows remain readable and are not audited
+    await flusher.dispose();
+    const disk = await createPersister(dir, deps).readRows();
+    expect(disk.rows).toEqual([row, decisionRow(2)]);
+    const table = summarize(null, disk.rows, { since: null, until: null });
+    expect(table.neverDown).toEqual({ below: 0, recorded: 1 });
+    const audit = renderMarkdown(table).split("\n").find((line) => line.includes("D9 never-down"));
+    expect(audit).toContain("0 of 1 recorded");
+    expect(audit).not.toContain("n/a");
+  });
 
   it("implements the PersistFs contract (ENOENT mappings, durable write, rename over an existing file)", async () => {
     const dir = await tempDir();
