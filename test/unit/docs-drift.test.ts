@@ -19,12 +19,21 @@ import {
   sanitizeRun,
   workRootProblem,
 } from "../../src/router/roles-config";
-import { CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS } from "../../src/router/roles";
+import { ACTION_CLASS, CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS } from "../../src/router/roles";
+import type { AuthorityAction, RoleSpec } from "../../src/router/roles";
+import { ROLE_DENIED_ACTIONS, ROLE_STEPS_MARGIN, roleAgentSteps } from "../../src/router/role-agents";
+import { GUARD_CUMULATIVE_MULTIPLIER, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "../../src/router/guard-profile";
+import { DEFAULT_RUN_TIMEOUT_MS, RUN_ARG_RE, RUN_MAX_ARGS, RUN_OUTPUT_BYTES } from "../../src/router/run-tools";
+import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
+import { authorityFloor, GRANT_NOTES } from "../../src/routing/roles/policy";
+import { REDISPATCH_WINDOW_MS, SIGNAL_MASS_CAPS, SIGNAL_WEIGHTS } from "../../src/routing/outcomes/signals";
+import { CRITERIA_BUDGET_CHARS } from "../../src/verify/dod";
+import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
 import { buildLadder, resolveChosen } from "../../src/routing/engine/ladders";
-import { candidateKey, decide } from "../../src/routing/engine/kernel";
+import { candidateKey, decide, MAX_EXPLORATION_RATE } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { advance, buildEscalatePolicy, newLadderState, nextAction, recordAttempt } from "../../src/escalate/ladder";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
@@ -33,7 +42,7 @@ import {
 } from "../../src/routing/outcomes/types";
 import { DECISIONS_MAX_BYTES, DECISIONS_MAX_GENERATIONS, FLUSH_MIN_INTERVAL_MS, FLUSH_BATCH_ROWS, MAX_QUEUED_ROWS, MAX_CORRUPT_COPIES, RENAME_RETRY_DELAYS_MS, STALE_TMP_MS } from "../../src/routing/outcomes/types";
 import { LOCK_STALE_MS } from "../../src/routing/file-lock";
-import type { Need, TaskFacts } from "../../src/routing/classify/types";
+import type { Detection, Need, Risk, Scope, TaskFacts } from "../../src/routing/classify/types";
 import {
   assembleSystemPrompt,
   buildDelegationProtocol,
@@ -772,5 +781,258 @@ describe("docs drift: roles delegation keys (#84)", () => {
     // exploration is off outside roles mode
     expect(resolveRolesRouting(validateConfig({ ...JSON.parse(read("tiers.json")), routing: { exploration: { rate: 0.1 } } }), "v2").exploration.rate).toBe(0);
     expect(text).toContain("`routing.exploration.rate` is then `0`");
+  });
+
+  it("states the script rule router_run applies: exact names, no wildcard entries", () => {
+    const text = doc.replace(/\s+/g, " ");
+    expect(text).toContain("matched exactly (no wildcards: a `*` entry is dropped with a notice)");
+    expect(sanitizeRun({ scripts: ["test:*"] }).issues).toHaveLength(1);
+    expect(sanitizeRun({ scripts: ["test:unit"] }).issues).toEqual([]);
+    expect(text).not.toContain("any `test:*` script is always allowed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Roles mode guide (#84 P3.2): docs/ROLES.md, ADR 0006, the CHANGELOG entry.
+// The roles table is SHIPPED_ROLE_SPECS and the floor table is authorityFloor.
+// ---------------------------------------------------------------------------
+
+const ROLES_DOCS = [
+  "docs/ROLES.md",
+  "docs/adr/0006-role-tier-assurance-delegation.md",
+  "docs/READ_ONLY_TIERS.md",
+] as const;
+
+/** Cells of a markdown table line (unescaped pipes only). */
+function cellsOf(line: string): string[] {
+  return line.split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim());
+}
+
+/** The table right after `<!-- marker -->`: its header cells and its body rows (separator dropped). */
+function tableAfter(doc: string, marker: string): { header: string[]; rows: string[][] } | undefined {
+  const lines = doc.split(/\r?\n/);
+  let i = lines.findIndex((line) => line.trim() === `<!-- ${marker} -->`);
+  if (i < 0) return undefined;
+  i += 1;
+  while (i < lines.length && lines[i]!.trim() === "") i += 1;
+  const table: string[][] = [];
+  for (; i < lines.length && lines[i]!.trim().startsWith("|"); i += 1) table.push(cellsOf(lines[i]!.trim()));
+  if (table.length < 2) return undefined;
+  return { header: table[0]!, rows: table.slice(2) };
+}
+
+const tick = (text: string): string => `\`${text}\``;
+
+/** The roles-table row the guide must print for a shipped spec. */
+function expectedRoleRow(spec: RoleSpec): string[] {
+  return [
+    tick(spec.agent),
+    tick(spec.kind),
+    spec.description,
+    tick(spec.authority.mode),
+    spec.authority.allow.map(tick).join(", "),
+    `${tick(spec.tierRange.floor)}–${tick(spec.tierRange.ceiling)}`,
+    tick(spec.assurance),
+    tick(spec.guard),
+    Object.entries(spec.budget).map(([tier, n]) => `${tick(tier)} ${n}`).join(" · "),
+    String(roleAgentSteps(spec)),
+  ];
+}
+
+/** Every difference between the guide's roles table and `specs`, cell by cell. */
+function roleTableProblems(doc: string, specs: readonly RoleSpec[]): string[] {
+  const table = tableAfter(doc, "roles-table");
+  if (table === undefined) return ["no roles table"];
+  const problems: string[] = [];
+  const byAgent = new Map(table.rows.map((row) => [row[0] ?? "", row] as const));
+  for (const spec of specs) {
+    const row = byAgent.get(tick(spec.agent));
+    if (row === undefined) {
+      problems.push(`${spec.agent}: no row`);
+      continue;
+    }
+    const want = expectedRoleRow(spec);
+    if (row.length !== want.length) problems.push(`${spec.agent}: ${row.length} cells, code ${want.length}`);
+    want.forEach((cell, index) => {
+      if (row[index] !== cell) problems.push(`${spec.agent} column ${index + 1}: doc ${row[index] ?? "(none)"}, code ${cell}`);
+    });
+  }
+  for (const agent of byAgent.keys()) if (!specs.some((spec) => tick(spec.agent) === agent)) problems.push(`${agent}: not a shipped role`);
+  return problems;
+}
+
+/** Floor-table rows: the grants each row stands for (every one must give the documented tier). */
+const FLOOR_ROWS: Readonly<Record<string, ReadonlyArray<readonly AuthorityAction[]>>> = {
+  "no write (local, egress or exec only)": [
+    [], ["read", "glob", "grep", "router_git"], ["webfetch", "websearch", "context7"], ["router_run"], ["read", "glob", "grep", "router_git", "router_run"],
+  ],
+  "write without exec": [["edit"], ["read", "glob", "grep", "router_git", "edit"]],
+  "write + exec": [["edit", "router_run"], ["read", "glob", "grep", "router_git", "edit", "router_run"]],
+};
+const FLOOR_COLUMNS: readonly Detection[] = ["deterministic", "grader", "none"];
+const RISKS: readonly Risk[] = ["low", "medium", "high"];
+const SCOPES: readonly Scope[] = ["single", "multi", "repo"];
+
+/** The tier a floor-table cell names for `risk` and `scope`; undefined for a cell of no known shape. */
+function floorCell(cell: string, risk: Risk, scope: Scope): string | undefined {
+  const plain = /^`(\w+)`$/.exec(cell);
+  if (plain !== null) return plain[1];
+  const both = /^`(\w+)` if risk `(\w+)` and scope `(\w+)`, else `(\w+)`$/.exec(cell);
+  if (both !== null) return risk === both[2] && scope === both[3] ? both[1] : both[4];
+  const riskOnly = /^`(\w+)`; `(\w+)` if risk `(\w+)`$/.exec(cell);
+  if (riskOnly !== null) return risk === riskOnly[3] ? riskOnly[2] : riskOnly[1];
+  return undefined;
+}
+
+/** Every (row, detection, risk, scope, grant) where the guide's floor table and `floor` disagree. */
+function floorTableProblems(doc: string, floor: typeof authorityFloor): string[] {
+  const table = tableAfter(doc, "authority-floor-table");
+  if (table === undefined) return ["no floor table"];
+  const problems: string[] = [];
+  if (JSON.stringify(table.header.slice(1)) !== JSON.stringify(FLOOR_COLUMNS.map(tick))) problems.push(`columns ${table.header.join(" | ")}`);
+  const labels = table.rows.map((row) => row[0] ?? "");
+  if (JSON.stringify(labels) !== JSON.stringify(Object.keys(FLOOR_ROWS))) problems.push(`rows ${labels.join(" / ")}`);
+  for (const row of table.rows) {
+    const grants = FLOOR_ROWS[row[0] ?? ""];
+    if (grants === undefined) continue;
+    FLOOR_COLUMNS.forEach((detection, column) => {
+      const cell = row[column + 1] ?? "";
+      for (const risk of RISKS) {
+        for (const scope of SCOPES) {
+          const documented = floorCell(cell, risk, scope);
+          if (documented === undefined) {
+            problems.push(`${row[0]} / ${detection}: unreadable cell ${cell}`);
+            return;
+          }
+          for (const actions of grants) {
+            const code = floor({ actions: new Set(actions), notes: [], workRoot: null }, detection, risk, scope);
+            if (code !== documented) problems.push(`${row[0]} / ${detection} / ${risk} / ${scope} / ${actions.join("+") || "no action"}: doc ${documented}, code ${code}`);
+          }
+        }
+      }
+    });
+  }
+  return problems;
+}
+
+describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () => {
+  const guide = read("docs/ROLES.md");
+  const flat = guide.replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
+
+  it("the roles table of ROLES.md is SHIPPED_ROLE_SPECS, cell by cell", () => {
+    expect(SHIPPED_ROLE_SPECS.length).toBe(7);
+    expect(roleTableProblems(guide, SHIPPED_ROLE_SPECS)).toEqual([]);
+  });
+
+  it("detects a changed cell, a missing row and an extra row of the roles table", () => {
+    const changed = guide.replace("| `fast` 30 · `medium` 40 | 95 |", "| `fast` 31 · `medium` 40 | 95 |");
+    expect(changed).not.toBe(guide);
+    expect(roleTableProblems(changed, SHIPPED_ROLE_SPECS)).toEqual(["explorer column 9: doc `fast` 31 · `medium` 40, code `fast` 30 · `medium` 40"]);
+    const missing = guide.split(/\r?\n/).filter((line) => !line.startsWith("| `general` |")).join("\n");
+    expect(roleTableProblems(missing, SHIPPED_ROLE_SPECS)).toEqual(["general: no row"]);
+    const narrowed = SHIPPED_ROLE_SPECS.filter((spec) => spec.agent !== "architect");
+    expect(roleTableProblems(guide, narrowed)).toEqual(["`architect`: not a shipped role"]);
+    const widened = SHIPPED_ROLE_SPECS.map((spec) => (spec.agent === "reviewer" ? { ...spec, authority: { ...spec.authority, allow: [...spec.authority.allow, "edit" as const] } } : spec));
+    expect(roleTableProblems(guide, widened)).toEqual([
+      "reviewer column 5: doc `read`, `glob`, `grep`, `router_git`, `router_run`, code `read`, `glob`, `grep`, `router_git`, `router_run`, `edit`",
+    ]);
+    expect(roleTableProblems("# no table\n", SHIPPED_ROLE_SPECS)).toEqual(["no roles table"]);
+  });
+
+  it("the floor table of ROLES.md is authorityFloor for every grant, detection, risk and scope", () => {
+    expect(floorTableProblems(guide, authorityFloor)).toEqual([]);
+  });
+
+  it("detects a floor cell that differs from the code, a code change and an unreadable cell", () => {
+    const changed = guide.replace("| write + exec | `medium` |", "| write + exec | `fast` |");
+    expect(changed).not.toBe(guide);
+    const problems = floorTableProblems(changed, authorityFloor);
+    expect(problems.length).toBeGreaterThan(0);
+    expect(problems.every((p) => p.startsWith("write + exec / deterministic /"))).toBe(true);
+    // a code change the doc does not follow: high risk no longer lifts write without detection to heavy
+    const mutant: typeof authorityFloor = (grant, detection, risk, scope) =>
+      grant.actions.has("edit") && !grant.actions.has("router_run") && detection === "none" ? "medium" : authorityFloor(grant, detection, risk, scope);
+    const drift = floorTableProblems(guide, mutant);
+    expect(drift.length).toBeGreaterThan(0);
+    expect(drift.every((p) => p.startsWith("write without exec / none / high /"))).toBe(true);
+    const unreadable = guide.replace("| `medium` | `heavy` | `heavy` |", "| `medium` | heavy-ish | `heavy` |");
+    expect(floorTableProblems(unreadable, authorityFloor)).toEqual(["write + exec / grader: unreadable cell heavy-ish"]);
+    expect(floorTableProblems("no table", authorityFloor)).toEqual(["no floor table"]);
+  });
+
+  it("the action-class table names every role action under its class", () => {
+    const rows = guide.split(/\r?\n/).filter((line) => /^\| (local|exec|write|egress) \|/.test(line)).map(cellsOf);
+    expect(rows.map((row) => row[0])).toEqual(["local", "exec", "write", "egress"]);
+    const hostName = (action: string): string => (action === "router_git" ? "router_git_*" : action === "context7" ? "context7_*" : action);
+    for (const [action, cls] of Object.entries(ACTION_CLASS)) {
+      expect(rows.find((row) => row[0] === cls)?.[1], action).toContain(tick(hostName(action)));
+    }
+  });
+
+  it("quotes the budget, steps, signal, exploration and router_run numbers of the code", () => {
+    expect(flat).toContain(`${ROUTE_BUDGET_RAISE_MAX} × top role budget + \`REFUSAL_CAP\` + ${ROLE_STEPS_MARGIN}`);
+    expect(flat).toContain(`\`REFUSAL_CAP\` = ${REFUSAL_CAP}`);
+    expect(flat).toContain(`+ \`REFUSAL_CAP\` (${REFUSAL_CAP}) + ${ROLE_STEPS_MARGIN}`);
+    expect(flat).toContain(`never above ${ROUTE_BUDGET_RAISE_MAX} ×`);
+    expect(flat).toContain(`total × ${GUARD_CUMULATIVE_MULTIPLIER}`);
+    expect(flat).toContain(`unchanged: ${TIER_GUARD_BUDGET} calls, cumulative × ${GUARD_CUMULATIVE_MULTIPLIER}`);
+    expect(flat).toContain(`(${[...new Set(SHIPPED_ROLE_SPECS.map(roleAgentSteps))].join(" or ")} for the shipped roles)`);
+    expect(flat).toContain(`| \`verdict\` | ${SIGNAL_WEIGHTS.deterministic} (pass or fail) |`);
+    expect(flat).toContain(`| \`run\` | ${SIGNAL_WEIGHTS.run} (success only) |`);
+    expect(SIGNAL_MASS_CAPS.run.negative).toBe(0);
+    expect(flat).toContain(`| \`grader\` | ${SIGNAL_WEIGHTS.grader} (pass or fail) |`);
+    expect(flat).toContain(`| \`incomplete\` | ${SIGNAL_WEIGHTS.incomplete} (failure) |`);
+    expect(flat).toContain(`| \`redispatch\` | ${SIGNAL_WEIGHTS.redispatch} (failure, on the earlier attempt) |`);
+    expect(flat).toContain(`| \`budget\`, \`authority\` | ${SIGNAL_WEIGHTS.recorded} (recorded, no tier penalty) |`);
+    expect(flat).toContain(`within ${REDISPATCH_WINDOW_MS / 60_000} minutes`);
+    expect(MAX_EXPLORATION_RATE).toBe(EXPLORATION_MAX_RATE);
+    expect(flat).toContain(`at most \`${MAX_EXPLORATION_RATE}\``);
+    expect(flat).toContain(`starting with \`${ROUTER_BUDGET_NOTE_PREFIX}\``);
+    expect(flat).toContain(`\`${RUN_ARG_RE.source}\` (at most ${RUN_MAX_ARGS} arguments)`);
+    expect(flat).toContain(`(default ${DEFAULT_RUN_TIMEOUT_MS} ms)`);
+    expect(flat).toContain(`output bounded to ${RUN_OUTPUT_BYTES / 1024} KiB`);
+  });
+
+  it("quotes the notices, grant notes and denied actions the code emits", () => {
+    expect(flat).toContain(ROLES_V1_NOTICE);
+    expect(flat).toContain(ROLES_RESTART_NOTICE);
+    for (const note of [GRANT_NOTES.shell, GRANT_NOTES.web, GRANT_NOTES.noWorkRoot]) expect(flat).toContain(note);
+    const denied = `${ROLE_DENIED_ACTIONS.slice(0, -1).map(tick).join(", ")} and ${tick(ROLE_DENIED_ACTIONS[ROLE_DENIED_ACTIONS.length - 1]!)} denied explicitly`;
+    expect(flat).toContain(denied);
+    for (const key of ["routing.delegation", "roleAgents", "routing.exploration.rate", "routing.exploration.requireDetection", "routing.run.scripts",
+      "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots"]) expect(guide, key).toContain(`\`${key}`);
+  });
+
+  it("ADR 0006 has D1–D13 in order, the evidence E1–E13 and only the literature L1–L14", () => {
+    const adr = read("docs/adr/0006-role-tier-assurance-delegation.md");
+    expect([...adr.matchAll(/^### D(\d+) — /gm)].map((m) => Number(m[1]))).toEqual(Array.from({ length: 13 }, (_, i) => i + 1));
+    expect([...adr.matchAll(/^\| E(\d+) \|/gm)].map((m) => Number(m[1]))).toEqual(Array.from({ length: 13 }, (_, i) => i + 1));
+    expect([...adr.matchAll(/^- \[L(\d+)\] /gm)].map((m) => Number(m[1]))).toEqual(Array.from({ length: 14 }, (_, i) => i + 1));
+    const cited = new Set([...adr.matchAll(/\bL(\d+)\b/g)].map((m) => Number(m[1])));
+    expect([...cited].filter((n) => n < 1 || n > 14)).toEqual([]);
+    expect([...adr.matchAll(/^\| RH(\d+) \|/gm)].map((m) => Number(m[1]))).toEqual(Array.from({ length: 10 }, (_, i) => i + 1));
+  });
+
+  it("the changelog lists roles mode and the §2.9 behaviour changes under [Unreleased]", () => {
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("Roles mode: role × tier × assurance delegation (#84)");
+    expect(unreleased).toContain("(docs/ROLES.md)");
+    expect(unreleased).toContain("Behaviour change (#84)");
+    for (const item of ["Reader guard profile.", "Uncharged denials.", "Whole criteria.", "Header strip.", "Progress notes are incomplete.", "`root=` in the header.",
+      "The budget claim is read from the return prefix", "downgrading past this version is unsupported"]) expect(unreleased, item).toContain(item);
+    expect(unreleased).toContain(`Explicit \`[acceptance]\` lists over ${CRITERIA_BUDGET_CHARS} code points are no longer graded in full`);
+  });
+
+  it("links the guide and ADR 0006 from the README, the plans index, the config reference and the routing guide", () => {
+    expect(read("README.md")).toContain("(docs/ROLES.md)");
+    expect(read("README.md")).toContain("(docs/adr/0006-role-tier-assurance-delegation.md)");
+    expect(read("docs/plans/README.md")).toContain("(../adr/0006-role-tier-assurance-delegation.md)");
+    expect(read("docs/plans/README.md")).toContain("(../ROLES.md)");
+    expect(read("docs/CONFIG_REFERENCE.md")).toContain("(./ROLES.md)");
+    expect(read("docs/ROUTING_ENGINE.md")).toContain("(./ROLES.md)");
+  });
+
+  it("resolves every relative markdown link of the roles docs, anchors included", () => {
+    expect(brokenLinks(ROLES_DOCS, readRepo)).toEqual([]);
   });
 });
