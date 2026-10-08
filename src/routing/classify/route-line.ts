@@ -42,11 +42,23 @@ const QUOTED_PLACEHOLDER_RE = /^@q(\d+)$/;
 /** `tier=` literals the parser can know; the engine validates against the active tier list. */
 const TIER_NAMES = ["fast", "medium", "heavy"] as const;
 export const ROUTE_BUDGET_MAX = 10000;
-const ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/)/;
+/** A drive-absolute Windows path (`D:\…`, `D:/…`) or a POSIX path with exactly one leading `/`. */
+const WORK_ROOT_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/;
+/** A `..` path segment, with either separator. */
+const PARENT_SEGMENT_RE = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
+/**
+ * A first line that starts like a route line (`[route` + a separator, `]` or the end) but is not one (QA-P12-1-6).
+ * `[router …]` and friends are other tags, not malformed route lines.
+ */
+const ROUTE_START_RE = /^[ \t]*\[route(?![A-Za-z0-9_-])/i;
 
-/** An absolute Windows (drive or UNC) or POSIX path; relative paths and NUL are rejected. */
-function isAbsolutePath(value: string): boolean {
-  return ABSOLUTE_PATH_RE.test(value) && !value.includes("\0");
+/**
+ * A role work root (QA-P12-1-6): a local, drive-absolute Windows path or a POSIX path. Rejected: relative and
+ * drive-relative paths, every `\\` or `//` prefix (UNC `\\host\share`, `\\?\`, `\\.\` device paths — a work root is a
+ * local worktree), any `..` segment, and NUL.
+ */
+function isWorkRootPath(value: string): boolean {
+  return WORK_ROOT_RE.test(value) && !PARENT_SEGMENT_RE.test(value) && !value.includes("\0");
 }
 
 function isMember<T extends string>(values: readonly T[], value: string): value is T {
@@ -152,7 +164,7 @@ function parseFields(body: string): RouteLine {
       case "root": {
         const q = value === null ? null : QUOTED_PLACEHOLDER_RE.exec(value);
         const candidate = q ? quotedRoots[Number(q[1])] : rawValue === null ? undefined : stripTail(rawValue);
-        if (candidate !== undefined && isAbsolutePath(candidate)) root = candidate;
+        if (candidate !== undefined && isWorkRootPath(candidate)) root = candidate;
         else ignored.push(key);
         break;
       }
@@ -286,6 +298,12 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
     lastNonEmpty = i;
   });
 
+  // QA-P12-1-6: a first non-empty line that starts like a route line but does not parse is flagged, never silently
+  // dropped. It stays text (not stripped, not applied), so tier-mode facts are unchanged.
+  const head = firstNonEmpty >= 0 ? lines[firstNonEmpty]! : "";
+  const malformed = firstNonEmpty >= 0 && !fenced[firstNonEmpty] && !INDENTED_CODE_RE.test(head)
+    && ROUTE_START_RE.test(head) && !isRecognisable(head, false);
+
   const kept: string[] = [];
   const parsed: RouteLine[] = [];
   let edgeOnly = true;
@@ -303,15 +321,17 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
     parsed.push(parseFields(ROUTE_LINE_RE.exec(line)?.[1] ?? ""));
   }
   if (parsed.length === 0) {
-    return { line: null, count: 0, stripped: kept.join(""), conflict: false, edgeOnly: true };
+    return { line: null, count: 0, stripped: kept.join(""), conflict: false, edgeOnly: true, ...(malformed ? { malformed } : {}) };
   }
   const conflict = new Set(parsed.map(canonical)).size > 1;
+  const line = conflict ? resolveConflict(parsed) : parsed[0]!;
   return {
-    line: conflict ? resolveConflict(parsed) : parsed[0]!,
+    line: malformed ? { ...line, ignored: [...line.ignored, "malformed"] } : line,
     count: parsed.length,
     stripped: kept.join(""),
     conflict,
     edgeOnly,
+    ...(malformed ? { malformed } : {}),
   };
 }
 const RISK_ORDER: readonly Risk[] = RISKS;

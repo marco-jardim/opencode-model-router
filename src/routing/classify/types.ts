@@ -286,7 +286,16 @@ export interface RouteLine {
   readonly tier?: string;
   /** `budget=<int>`, 1..10000. */
   readonly budget?: number;
-  /** `root=<absolute path>` (Windows drive/UNC or POSIX); quote it to carry spaces. */
+  /**
+   * `root=<absolute path>`: the work root of a role dispatch (plan §2.2), as written (not normalised).
+   * - Accepted: a drive-absolute Windows path (`D:\…`, `D:/…`) or a POSIX path (`/…`). Rejected at parse
+   *   (QA-P12-1-6): relative and drive-relative paths, any `\\`/`//` prefix (UNC `\\host\share`, `\\?\`, `\\.\`),
+   *   any `..` segment, NUL. Quote it to carry spaces (`root="D:\My Work\Repo"`).
+   * - Limitation: a `]` cannot appear in the value (it closes the route line; even quoted).
+   * - Read it ONLY from `ClassifyResult.trace.routeLine` (QA-P12-1-9): never re-parse the prompt.
+   * - Handoff (P2.1): normalise the text (separators, case on Windows, trailing separator) and compare it with
+   *   `git worktree list --porcelain` BEFORE any filesystem call on it; no match → no work root.
+   */
   readonly root?: string;
   /** Bare `pin` flag (or `pin=true|yes|1`). */
   readonly pin: boolean;
@@ -309,6 +318,13 @@ export interface RouteLineParse {
   readonly conflict: boolean;
   /** Every recognised route line is the first or the last non-empty line of the text (trusted positions). */
   readonly edgeOnly: boolean;
+  /**
+   * QA-P12-1-6: the first non-empty line starts like a route line (`[route` then a blank, `]` or the end; not
+   * fenced, quoted or indented) but is not one (unbalanced, too long, ...). That line stays text and is neither
+   * applied nor stripped (tier mode unchanged); when another route line was parsed its `ignored` also gets
+   * `"malformed"`. Absent otherwise.
+   */
+  readonly malformed?: true;
 }
 
 /** Structural facts from the classifyTrivial shape gates (rules.ts `shapeOf`). */
