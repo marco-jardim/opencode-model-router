@@ -12,6 +12,7 @@ import { getActiveTiers } from "../router/protocol";
 import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrides } from "../router/subagents";
 import { warnAgentOptionsEffortOnce } from "../router/agent-options";
 import { pluginAgentMarker } from "../router/plugin-agents";
+import { registerRoleAgents, roleAgentAlias, roleAgentOf } from "../router/role-agents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
@@ -175,6 +176,12 @@ export async function registerV2Hooks(
       warnedPermissions.add(message);
       ingestLogger.warn(message);
     };
+    const warnedRoles = new Set<string>();
+    const warnRoleOnce = (key: string, message: string) => {
+      if (warnedRoles.has(key)) return;
+      warnedRoles.add(key);
+      ingestLogger.warn(message);
+    };
     // Plugin agents (#81) are protected like read-only tiers: readOnly ones and explicit-permission ones
     // (which start from `* deny`) both keep their own deny/ask rules against inherited session grants.
     // The config hook builds plugin agents in the v1 vocabulary (`bash`, `task`); the v2 host evaluates `shell`/`subagent`.
@@ -226,6 +233,12 @@ export async function registerV2Hooks(
       // Names in the setup seed are host built-in agents (not opencode.json entries the config hook can tell apart).
       Object.defineProperty(next, HOST_SEED_AGENTS, { value: new Set(Object.keys(baseSeed)), enumerable: false });
       await hooks.config?.(next);
+      const routerConfig = loadConfig(ctx.location.directory);
+      // #84 P2.1: the role agents (roles mode only; tiers mode returns at once). Built like plugin agents, so the transform
+      // below publishes their max policy and protectedAgent() holds for each; fail closed (no role agent) on any error.
+      await registerRoleAgents(next.agent, routerConfig, {
+        context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce,
+      });
       for (const name of Object.keys(next.agent)) if (!Object.hasOwn(baseSeed, name)) routerCreated.add(name);
       const nextOptions = new Map<string, Record<string, unknown>>();
       for (const [name, definition] of Object.entries(next.agent)) {
@@ -240,7 +253,7 @@ export async function registerV2Hooks(
       config = next;
       originals = nextOriginals;
       agentOptions = nextOptions;
-      return loadConfig(ctx.location.directory);
+      return routerConfig;
     };
     lastConfig = await buildConfig();
     let refreshChain: Promise<void> = Promise.resolve();
@@ -481,6 +494,10 @@ export async function registerV2Hooks(
       if (event.tool === "subagent" && args && typeof args.agent === "string") {
         // The model `subagentTiers` would fill in when the call names none (unchanged behaviour: only then, only for a mapped agent).
         const cfg = loadConfig(ctx.location.directory);
+        // #84 P-7: roles mode dispatches the host-native `explore` as the `explorer` role agent. Legacy shape: nativeArgs
+        // derives `agent` from `subagent_type`; `args.agent` is set too, so everything below keys on the role name.
+        const alias = roleAgentAlias(args.agent, cfg, (name) => roleAgentOf(config.agent[name]) === name);
+        if (alias !== undefined) { args.agent = alias; args.subagent_type = alias; }
         let tierModel: string | undefined;
         if (args.model === undefined) {
           if (cfg.subagentTiers?.[args.agent]) {
