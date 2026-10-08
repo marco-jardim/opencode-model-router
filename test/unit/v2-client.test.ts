@@ -324,7 +324,7 @@ describe("native v2 child runner", () => {
     });
     await expect(runtime.withToolContext(toolContext, () => wiring.dispatchGrader({
       tier: "medium", system: "Judge the changes", prompt: "inspect", cwd: "/artifact",
-    }, "parent", inFlight))).resolves.toEqual({ sessionID: "child", text: "verified result" });
+    }, "parent", inFlight))).resolves.toEqual({ sessionID: "child", text: "verified result", model: "p/model" });
     expect(wiring.graderSessions.size).toBe(0);
     expect(inFlight.size).toBe(0);
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" }, undefined);

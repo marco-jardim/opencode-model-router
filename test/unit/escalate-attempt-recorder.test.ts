@@ -306,7 +306,7 @@ describe("QA-2.3-6: attempts registered while ingestion is off are not scored by
           id: `step-${child}`, type: "session.step.ended",
           data: { sessionID: child, assistantMessageID: `m-${child}`, finish: "stop", cost: 0, tokens: { input: 700, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } },
         });
-        ingest.onVerdict(child, "pass");
+        ingest.onVerdict(child, "pass", undefined);
         ingest.onFalseRefusal(child);
         ingest.onExecutionEnded(child);
       }

@@ -73,6 +73,12 @@ export interface Delegation {
    * written). With `workRoot`, the gate refuses it (unverifiable) without resolving it.
    */
   refusedCwd?: string;
+  /**
+   * Fix-1 review nit: where the requested cwd (`cwd` / `refusedCwd`) came from — the call's own `cwd` argument or the
+   * `[acceptance]` block's `cwd:` (work-root.ts `requestedVerificationCwdSource`). Only names the source in a refusal; absent:
+   * the refusal names neither.
+   */
+  cwdSource?: "argument" | "acceptance";
 }
 
 export interface GateDeps {
@@ -225,7 +231,13 @@ export async function accept(
   const workRoot = delegation.workRoot;
   const refuseCwd = (cwd: string): GateResult => {
     // Refused like any path outside the role's work root (§2.2): no check runs and no grader is dispatched there.
-    const reason = `the [acceptance] block's cwd ${cwd} is outside this role dispatch's work root ${workRoot}; the router verifies a role dispatch only inside its work root. Remove "cwd:" (the checks then run in the work root) or name a directory inside it.`;
+    // The text names where the cwd came from (fix-1 review nit): the call's `cwd` argument, or the [acceptance] block's `cwd:`.
+    const [subject, remedy] = delegation.cwdSource === "argument"
+      ? [`the call's cwd argument ${cwd}`, `Drop the "cwd" argument (the checks then run in the work root) or name a directory inside it.`]
+      : delegation.cwdSource === "acceptance"
+        ? [`the [acceptance] block's cwd ${cwd}`, `Remove "cwd:" (the checks then run in the work root) or name a directory inside it.`]
+        : [`the requested cwd ${cwd}`, `Name no cwd (the checks then run in the work root) or one inside it.`];
+    const reason = `${subject} is outside this role dispatch's work root ${workRoot}; the router verifies a role dispatch only inside its work root. ${remedy}`;
     return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
   };
   // QA-P33F1-1-2: the caller decided containment with P2.3's rule (routing/roles/work-root.ts verificationScope); a refused cwd

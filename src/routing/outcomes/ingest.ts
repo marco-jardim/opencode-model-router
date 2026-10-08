@@ -24,7 +24,7 @@
 
 import { homedir, tmpdir } from "node:os";
 import type { RouterConfig, RouterHost } from "../../router/config";
-import { resolveRouting } from "../../router/config";
+import { resolveCandidates, resolveRouting } from "../../router/config";
 import { getActiveTiers } from "../../router/protocol";
 import {
   forgetDispatch,
@@ -41,8 +41,9 @@ import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
 import { pricingState, tokenSampleFromEvent } from "./cost";
 import { resolveOutcomesDir } from "./persist";
-import type { SignalObservation } from "./signals";
-import { SIGNAL_MASS_CAPS, isSignalObservation, signalRow, verdictSignal } from "./signals";
+import { roleTierOrder } from "../engine/ladders";
+import type { SignalObservation, TierRung } from "./signals";
+import { SIGNAL_MASS_CAPS, graderSignal, isSignalObservation, signalRow, tierOfModel, verdictSignal } from "./signals";
 import type {
   AgentOrigin,
   AttemptSignal,
@@ -58,6 +59,7 @@ import type {
   StepEndedTokens,
   StepSample,
   Verdict,
+  VerdictGrader,
   VerdictRow,
 } from "./types";
 import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, normalizeVariant, safeNow, splitModelRef } from "./types";
@@ -81,6 +83,21 @@ export interface IngestSettings {
    * mode and on v1, so keys stay `router`/`host` there. Filled by P2.1 from `resolveRoles`.
    */
   readonly roleAgentIds?: ReadonlySet<string>;
+  /**
+   * #84 P3.3 fix 2: the tier order of role dispatches (`roleTierOrder`, cheapest first) and its rungs, which rank a grader
+   * against the producer (plan §2.6: grader tier ≥ producer tier). Absent or empty: no grader is ever independent.
+   */
+  readonly tierOrder?: readonly string[];
+  readonly tierRungs?: readonly TierRung[];
+}
+
+/** The role tier order of `cfg` and its rungs (empty without a config). */
+function tierLadderOf(cfg: RouterConfig | undefined): { readonly tierOrder: readonly string[]; readonly tierRungs: readonly TierRung[] } {
+  if (cfg === undefined) return { tierOrder: [], tierRungs: [] };
+  const tierOrder = Object.freeze([...roleTierOrder(cfg)]);
+  const tierRungs = Object.freeze(tierOrder.flatMap((tier) =>
+    resolveCandidates(tier, cfg).map((rung): TierRung => Object.freeze({ tier, model: rung.model, variant: rung.variant ?? null }))));
+  return { tierOrder, tierRungs };
 }
 
 const settingsCache = new WeakMap<RouterConfig, IngestSettings | null>();
@@ -106,6 +123,7 @@ export function ingestSettings(cfg: RouterConfig | undefined, host: RouterHost):
         maxEffectiveSamples: routing.outcomes.maxEffectiveSamples,
       }),
       routerAgentIds: new Set(cfg === undefined ? [] : Object.keys(getActiveTiers(cfg))),
+      ...tierLadderOf(cfg),
     });
   }
   if (cfg !== undefined) settingsCache.set(cfg, settings);
@@ -417,13 +435,20 @@ export interface Ingest {
    * (QA-2.3-R2-1). Without an id every delivery is applied.
    */
   onExecutionEnded(childSessionID: string, eventId?: unknown): void;
-  /** A verifier verdict for the child's current attempt. Never throws. */
-  onVerdict(childSessionID: string, outcome: Verdict): void;
+  /**
+   * A verifier verdict for the child's current attempt. Never throws. `grader` (#84 P3.3 fix 2, `verdictGraderOf`; always passed,
+   * `undefined` = deterministic checks): the LLM grader that judged the verdict. Tier and host dispatches: the store and the
+   * verdict row take it either way, at full weight (unchanged, I1). A ROLE dispatch's grader verdict (plan §2.6, I6,
+   * QA-P33F2-1-1) moves the store at 0.5 with a verdict row and a `grader` signal row only when the grader is independent (tier
+   * ≥ the producer's and another model); otherwise nothing at all — no store change, no verdict row, no signal row.
+   */
+  onVerdict(childSessionID: string, outcome: Verdict, grader: VerdictGrader | undefined): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
   onFalseRefusal(childSessionID: string): void;
   /**
    * P1.4: append a signal row (signals.ts) for the child's current attempt. Rows only: the Beta store, its decay and the
-   * verdict/refusal rows are untouched. `verdict` is refused (`onVerdict` writes it when the store takes the verdict);
+   * verdict/refusal rows are untouched. `verdict` and `grader` are refused (`onVerdict` writes them when the store takes the
+   * verdict; QA-P33F2-1 N2);
    * `redispatch` needs `expectDecisionID`. Gated like a verdict (registered, keyable, trusted class), except that the
    * zero-mass kinds (`budget`, `authority`) are written under class `unknown` when the class is not trusted. The dispatch
    * must have a decision id (the row annotates its decision row). One row per attempt and kind (C7: a repeat, even with
@@ -654,6 +679,25 @@ export function createIngest(deps: IngestDeps): Ingest {
     return true;
   };
 
+  /**
+   * #84 P3.3 fix 2 (plan §2.6, I6): the signal of a grader's verdict on the target's attempt. The grader's tier is the LOWER of
+   * the tier of the model it ran on (`tierOfModel`: a variant that is not a preset rung, as the host's `#default`, matches by
+   * model) and the tier the checker asked for (on the order, with a known model) — either one alone when the other is unknown
+   * (QA-P33F2-1 N3: a grader never ranks above either); the producer's is the registered tier, else its model's. `graderSignal`
+   * decides: independent (tier ≥ producer's, another model) → 0.5; unknown or not → none.
+   */
+  const graderSignalOf = (target: Target, outcome: Verdict, grader: VerdictGrader): SignalObservation | null => {
+    const tiers = target.settings.tierOrder ?? [];
+    const rungs = target.settings.tierRungs ?? [];
+    const requested = grader.model !== null && grader.tier !== null && tiers.includes(grader.tier) ? grader.tier : null;
+    const byModel = tierOfModel(grader.model, rungs);
+    const graderTier = byModel !== null && requested !== null
+      ? (tiers.indexOf(byModel) <= tiers.indexOf(requested) ? byModel : requested)
+      : (byModel ?? requested);
+    const producerTier = target.record.tier ?? tierOfModel(`${target.model}#${target.variant}`, rungs);
+    return graderSignal({ outcome, graderTier, graderModel: grader.model, producerTier, producerModel: target.model }, tiers);
+  };
+
   return {
     async onStepEnded(event: IngestEvent): Promise<void> {
       try {
@@ -742,7 +786,7 @@ export function createIngest(deps: IngestDeps): Ingest {
       }
     },
 
-    onVerdict(childSessionID: string, outcome: Verdict): void {
+    onVerdict(childSessionID: string, outcome: Verdict, grader: VerdictGrader | undefined): void {
       try {
         const target = targetOf(childSessionID);
         if (target === null) return;
@@ -750,13 +794,25 @@ export function createIngest(deps: IngestDeps): Ingest {
         const bundle = bundleFor(settings);
         if (bundle === null) return;
         const attempt = record.attemptId;
+        // QA-P33F2-1-1 (plan §2.6, I6): a role dispatch's GRADER verdict counts only from an independent grader, and then at
+        // the grader's 0.5 — in the store that role routing reads (kernel) as in the rows. A grader that is not independent, or
+        // not known to be, moves nothing: no store observation, no verdict row, no signal row, and the attempt stays unscored
+        // (a later false refusal is then its first terminal signal, as in the store). Tier and host dispatches: unchanged (I1).
+        const graded = outcome !== "unverifiable" && target.origin === "role" && grader !== undefined
+          ? graderSignalOf(target, outcome, grader)
+          : undefined;
+        if (graded === null) {
+          touchDispatch(childSessionID, safeNow(now));
+          return;
+        }
         // Rows follow the store (QA-2.1-3): a verdict that moves nothing (the attempt was scored already, by a
         // verdict or a refusal) writes no row, or `routing:stats` would count outcomes the store never saw.
         // `unverifiable` moves nothing by design; it is a row only while the attempt is still unscored.
         if (outcome === "unverifiable") {
           if (scored.has(attempt) || !boundedAdd(signalled, `unverifiable|${attempt}`, SIGNAL_CAP)) return;
         } else {
-          if (!bundle.store.recordVerdict(key, outcome, signalOf(record))) return;
+          const weight = graded === undefined ? undefined : graded.weight; // the grader's 0.5 (signals.ts SIGNAL_WEIGHTS.grader)
+          if (!bundle.store.recordVerdict(key, outcome, signalOf(record), weight)) return;
           boundedSet(scored, attempt, outcome, SIGNAL_CAP);
         }
         const row: VerdictRow = {
@@ -771,8 +827,9 @@ export function createIngest(deps: IngestDeps): Ingest {
         };
         bundle.flusher.enqueue(row);
         // P1.4 (QA-P14-1-6): a role dispatch's verdict signal row follows the store: written only for a verdict it took.
+        // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a `grader` signal (0.5, independent graders only), never `verdict`.
         if (outcome !== "unverifiable" && target.origin === "role") {
-          const signal = verdictSignal(outcome);
+          const signal = graded ?? verdictSignal(outcome);
           if (signal !== null) appendSignal(target, childSessionID, signal, bundle);
         }
         touchDispatch(childSessionID, safeNow(now));
@@ -816,8 +873,8 @@ export function createIngest(deps: IngestDeps): Ingest {
     onSignal(childSessionID: string, observation: SignalObservation, options: SignalOptions = {}): boolean {
       try {
         if (!isSignalObservation(observation)) return false;
-        // QA-P14-1-6: verdict rows follow the store; only onVerdict writes them.
-        if (observation.kind === "verdict") return false;
+        // QA-P14-1-6: verdict rows follow the store; only onVerdict writes them. QA-P33F2-1 N2: grader rows too.
+        if (observation.kind === "verdict" || observation.kind === "grader") return false;
         // QA-P14-1-5: a re-dispatch failure belongs to one earlier attempt and must name it.
         if (observation.kind === "redispatch" && options.expectDecisionID === undefined) return false;
         const caps = SIGNAL_MASS_CAPS[observation.kind];

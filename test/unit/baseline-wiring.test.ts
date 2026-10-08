@@ -914,7 +914,7 @@ describe("gate seams", () => {
     const create = vi.fn(async () => ({ data: {} }));
     const cfg = harness().cfg;
     const deps = createVerificationWiring({ client: { session: { create } }, directory: cwd, getConfig: () => cfg }).buildGateDeps("parent");
-    expect(await deps.checker.dispatchGrader({ tier: "medium", system: "s", prompt: "p" })).toEqual({ sessionID: "", text: "" });
+    expect(await deps.checker.dispatchGrader({ tier: "medium", system: "s", prompt: "p" })).toEqual({ sessionID: "", text: "", model: null });
     expect(create).toHaveBeenCalledWith({ body: { parentID: "parent" } });
   });
 });
