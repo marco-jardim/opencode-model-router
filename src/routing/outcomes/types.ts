@@ -63,7 +63,10 @@ export type LoggedRoutingMode = "shadow" | "advise" | "enforce";
  * (native `explore`/`general`, or user-defined in opencode.json) is `host`. The origin is part of the
  * key, so a router tier and a native agent with the same id never share evidence.
  */
-export type AgentOrigin = "router" | "host";
+export type AgentOrigin = "router" | "host" | "role";
+
+/** Kind of signal an outcome observation carries (role/tier assurance, plan §2.4). */
+export type SignalKind = "verdict" | "run" | "grader" | "incomplete" | "budget" | "authority" | "redispatch";
 
 export interface AgentRef {
   readonly origin: AgentOrigin;
@@ -79,7 +82,8 @@ export const UNKNOWN_PART = "unknown";
 
 /**
  * Canonical outcome key, e.g. `implement|router:medium|anthropic/claude-sonnet-5-5#medium` or
- * `search|host:explore|anthropic/claude-haiku-4-5#default`. Build it only with {@link makeKey}.
+ * `search|host:explore|anthropic/claude-haiku-4-5#default`. A role-origin key is
+ * `class|role:<agent>|provider/model#variant`. Build it only with {@link makeKey}.
  */
 export type OutcomeKey = `${string}|${string}:${string}|${string}/${string}#${string}`;
 
@@ -166,7 +170,7 @@ export function parseKey(key: string): OutcomeKeyParts | null {
   const colon = agentSeg.indexOf(":");
   if (colon < 0) return null;
   const origin = agentSeg.slice(0, colon);
-  if (origin !== "router" && origin !== "host") return null;
+  if (origin !== "router" && origin !== "host" && origin !== "role") return null;
 
   const hash = modelSeg.lastIndexOf("#");
   if (hash < 0) return null;
@@ -566,6 +570,22 @@ export interface DecisionRow extends LogRowBase {
   readonly detection?: DecisionDetection;
   /** A34 (QA-G-B8): capability ranks of the pick and of what the host was handed. Absent on older rows and on ladder attempts. */
   readonly capability?: DecisionCapability;
+  /** Role/tier assurance (plan §2.4), all optional; absent on older rows. Agent name of the role the dispatch ran as. */
+  readonly role?: string;
+  /** Sorted authority action names granted to the dispatch. */
+  readonly grant?: readonly string[];
+  /** Bounds that limited the dispatch. */
+  readonly boundsReasons?: readonly string[];
+  /** Budget consumed by the attempt. */
+  readonly budgetUsed?: number;
+  /** Signal kind this row carries. */
+  readonly signal?: SignalKind;
+  /** The pick was an exploration draw. */
+  readonly explore?: boolean;
+  /** Probability with which the pick was drawn. */
+  readonly propensity?: number;
+  /** How the grant was bound to the child's permissions. */
+  readonly binding?: "exact" | "intersection" | "unknown";
 }
 
 /** The `[acceptance]` depth vocabulary of 1.2 (`Detection`), restated here so this module keeps no runtime import. */
