@@ -173,7 +173,7 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
   withheld (note "no valid work root: write and run withheld").
 - **Registration.** The role agents' max policy allows `external_directory` for the worktree roots git lists when the
   agents are registered, plus the `routing.workRoots` globs (global layer only, default `[]`), never `*`. A worktree
-  created after registration is covered only by a matching `routing.workRoots` glob (or the next restart). Roles
+  created after the plugin started is covered only by a matching `routing.workRoots` glob (or a restart). Roles
   without local actions (`researcher`) get no `external_directory` rule.
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
@@ -254,6 +254,11 @@ Errors fail closed: a context-hook error leaves the role child an empty tool cat
 Reader roles are never denied for "non-producing" reads; producer roles keep the read/draft guard. `CAP:N` (or
 `CAP:none` with a `reason:` line) changes only the read-only call counter, and a role dispatch has a read-only call cap
 only when it carries `CAP:N` or `CAP:none`; without one, only the total budget above bounds it.
+
+**Budgets stop a child only in `enforced` mode.** The router's guard enforces role budgets (and the read-only cap) only
+when the effective `enforcement.mode` is `enforced`. In `advisory` mode (the shipped default) it only warns: the child
+is never stopped by the router, the `[router budget]` note for a guard stop never appears, and only the host's own
+`steps` limit (above) ends a run that goes on. In `off` mode the guard does nothing.
 
 **Exhaustion is not failure.** When the budget runs out the child is told to return `NEED MORE: budget` with a
 progress summary, and the parent's result gets a note starting with `[router budget]` (also when the host's step limit
