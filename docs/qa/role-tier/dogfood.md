@@ -126,4 +126,27 @@ The 25-call tier budget is unchanged in tiers mode (E7 is addressed by role budg
 | Backup (kill switch) | `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc.bak-2026-10-08_16-10-50` (SHA-256 `700E2587…88F8`) |
 | New override SHA-256 | `E73373581618F1193A4E3AF9264FD59E603C1D66B2ECF100C4F3C246A1C50750` (copy at `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`) |
 | Config diff | `routing` += `delegation: "roles"`, `workRoots: ["D:/git/omr-rta-*"]`; removed `subagentTiers.explore`; removed custom `agents` runner, reviewer, researcher (replaced by shipped roles) |
-| Restart 2 of 2 (R8) | requested — roles mode is decided at plugin start |
+| Restart 2 of 2 (R8) | owner restarted at 2026-10-08T19:11Z (service PID 60388 started 19:11:41Z) |
+### DF-2 step 3 — roles mode live (2026-10-08T19:12Z) — PASS
+
+- `/router` (owner paste): `build=2.3.0+ae67429`, a "Roles:" block listing the 7 roles with ranges and authority, advisor info `native-explore-aliased` and `role-usage-share` (0 of 1005 historical dispatches were role dispatches).
+- `/api/agent`: explorer, researcher, runner, implementer, reviewer, architect registered (+ host `General` replaced by the role: steps 255); floor-tier fallback models (explorer/researcher/runner/implementer/General haiku#low, architect sonnet#medium, reviewer opus#xhigh); steps 95 (fast–medium roles) / 255 (others); 0 genuine plugin load failures since 19:00Z.
+- The orchestrator system prompt carries `## Role Delegation Protocol (MANDATORY)`.
+
+### DF-2 step 4 — self-test probes (role dispatches from this session; decision rows from a read-only copy of the live log)
+
+| Probe | Role → routed model (row) | Result |
+|---|---|---|
+| explorer lookup in `D:\git\omr-rta-p23` | explorer → haiku#low (fast; grant glob/grep/read/router_git; binding exact) | PASS: answer correct, no guard footers |
+| runner scoped test via `router_run` (`test-files`, cwd = worktree) | runner → haiku#low (grant + router_run) | PASS: exit 0, `Test Files 1 passed`, `Tests 2 passed` |
+| implementer throwaway file, `d=deterministic` + `fileExists` | implementer → sonnet#medium (floor:authority; classifier risk medium; detection deterministic) | file created (verified, then deleted); **gate UNVERIFIED** — checks ran in the session directory, not the work root (finding DF2-F1) |
+| implementer `[route class=implement risk=high tier=heavy pin]` | implementer → opus#xhigh (pinned:heavy) | PASS |
+| general without edit vocabulary → expect edit denied → ladder | general → sonnet#medium, grant included `edit` in all 3 attempts (classifier needs `edit` every time) | ladder not exercised live (finding DF2-F2); ladder covered by P2.3 integration tests; P3.1 real-host smoke must prove it end to end |
+| reviewer 40 sequential reads | reviewer → opus#xhigh (heavy..heavy) | PASS: 40/40, 0 denied, 0 guard/budget footers (E7 solved by role budgets) |
+| researcher web lookup | researcher → haiku#low (grant context7/webfetch/websearch) | PASS: web egress works; tool list WebFetch/websearch only, no local tools |
+| negative: read `C:\Windows\win.ini` and the base checkout from the worktree root | explorer | PASS: both denied by the router ("outside this dispatch's work root"); a parallel-call re-probe showed each refusal names its own path (the first probe's child misreported the second message) |
+
+Self-test findings (to fix in Wave 3, P3.3 fix branches; plan §0.10):
+- **DF2-F1 (major):** a role dispatch's `[acceptance]` checks run in the session directory instead of the dispatch's work root, so deterministic checks on a worktree root are unverifiable while the router still treats detection as deterministic for the floor. Workaround until fixed: every acceptance block carries `cwd: <work root>`.
+- **DF2-F2 (minor):** the rules classifier attributes `edit` to `class=other` prompts that contain no edit vocabulary (3/3 general probes), which makes the authority ladder rarely reachable live; investigate the matched term.
+- Observation: classifier noise also gave the explorer `shell` and the researcher `risk=high`; harmless for fixed roles.
