@@ -61,6 +61,18 @@ export interface Delegation {
    * router's own directory", which is the pre-existing behaviour exactly.
    */
   cwd?: string;
+  /**
+   * #84 P3.3 DF2-F1: the validated work root of a ROLE dispatch (plan §2.2; `routedWorkRoot`). Present: verification runs in
+   * it — the default base when `cwd` is absent, the base a relative `cwd` resolves against — and a `cwd` outside it is refused
+   * (unverifiable, nothing runs). Absent (tier dispatches): unchanged (I1). Set from `verificationScope` (index.ts): the child's
+   * bound work root, else its canonical session directory (QA-P33F1-1-1, 1-3), with `cwd` the checked canonical directory.
+   */
+  workRoot?: string;
+  /**
+   * QA-P33F1-1-2: the `cwd:` the caller found outside `workRoot` by P2.3's containment rule (`verificationScope.refused`, as
+   * written). With `workRoot`, the gate refuses it (unverifiable) without resolving it.
+   */
+  refusedCwd?: string;
 }
 
 export interface GateDeps {
@@ -209,19 +221,39 @@ export async function accept(
   });
   if (stopped) return gateResult(stopped, dodSource, deps.strictUnverifiable);
 
+  // DF2-F1: a role dispatch is verified in its work root (its default base, and the base of a relative cwd), never the router's.
+  const workRoot = delegation.workRoot;
+  const refuseCwd = (cwd: string): GateResult => {
+    // Refused like any path outside the role's work root (§2.2): no check runs and no grader is dispatched there.
+    const reason = `the [acceptance] block's cwd ${cwd} is outside this role dispatch's work root ${workRoot}; the router verifies a role dispatch only inside its work root. Remove "cwd:" (the checks then run in the work root) or name a directory inside it.`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
+  // QA-P33F1-1-2: the caller decided containment with P2.3's rule (routing/roles/work-root.ts verificationScope); a refused cwd
+  // is never resolved here (a UNC/device path reaches no filesystem call).
+  if (workRoot !== undefined && delegation.refusedCwd !== undefined) return refuseCwd(delegation.refusedCwd);
   const effectiveBaseDir = resolveBaseDir(
     delegation.cwd,
-    deps.deterministic.cwd,
+    workRoot ?? deps.deterministic.cwd,
   );
+  // Backstop for a caller that did not check its cwd: lexical only (no filesystem call); a checked canonical cwd always passes.
+  if (workRoot !== undefined && !isWithinDir(effectiveBaseDir, workRoot)) return refuseCwd(effectiveBaseDir);
+  const canonical = deps.canonicalPath ?? ((path: string) => path);
 
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
-    const canonical = deps.canonicalPath ?? ((path: string) => path);
     const canonicalBase = canonical(effectiveBaseDir);
     if (artefact.changedFiles.length > 0 && artefact.changedFiles.every(
       ({ path }) => isAbsolute(path) && !isWithinDir(canonical(path), canonicalBase),
     )) {
-      const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`;
+      // QA-P33F1-1 nit 1: a cwd: narrower than the work root, with work elsewhere in the root → widen (or drop) the cwd:.
+      const narrowed = workRoot !== undefined && !isWithinDir(canonical(workRoot), canonicalBase)
+        && artefact.changedFiles.some(({ path }) => isWithinDir(canonical(path), canonical(workRoot)));
+      const hint = workRoot === undefined
+        ? `Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`
+        : narrowed
+          ? `The [acceptance] block's "cwd:" narrows verification to ${effectiveBaseDir} inside the work root ${workRoot}: widen "cwd:" to where the work landed, or remove it (the checks then run in the work root).`
+          : `A role dispatch is verified only inside its work root ${workRoot}: the work belongs there.`;
+      const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. ${hint}`;
       return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
     }
     verdict = await runDeterministic(dod, {
@@ -238,10 +270,10 @@ export async function accept(
         producerSessionID: artefact.producerSessionID,
         ...(artefact.returnContract !== undefined ? { returnContract: artefact.returnContract } : {}),
         ...(artefact.budget !== undefined ? { budget: artefact.budget } : {}),
-        // Only when the delegation actually declared one. Passing the router's
+        // Only when the delegation actually declared one (or is a role dispatch: its work root, DF2-F1). Passing the router's
         // own directory here would scope every existing grader and add a
         // working-directory line to every existing prompt for no reason.
-        ...(delegation.cwd ? { workingDir: effectiveBaseDir } : {}),
+        ...(delegation.cwd || workRoot !== undefined ? { workingDir: effectiveBaseDir } : {}),
       },
       deps.checker,
     );
