@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -30,6 +30,10 @@ import {
   resolveRoles,
   roleSpecProblems,
   separationProblem,
+  withContract,
+  EDIT_DENIED_RULE,
+  RETURN_CONTRACT,
+  WORK_ROOT_RULE,
   type RoleSpec,
 } from "../../src/router/roles";
 
@@ -243,6 +247,29 @@ describe("layers (loadConfig)", () => {
     return project;
   }
 
+  it("hot reload: switching delegation in the global override switches the role table", () => {
+    const project = setup({ routing: { delegation: "tiers" } }, undefined);
+    expect(resolveRoles(loadConfig(project), "v2").size).toBe(0);
+    writeFileSync(overridePath(), JSON.stringify({ routing: { delegation: "roles" } }));
+    invalidateConfigCache();
+    expect(resolveRoles(loadConfig(project), "v2").size).toBe(SHIPPED_ROLE_SPECS.length);
+    expect(resolveRoles(loadConfig(project), "v1").size).toBe(0);
+    writeFileSync(overridePath(), JSON.stringify({ routing: { delegation: "tiers" } }));
+    invalidateConfigCache();
+    expect(resolveRoles(loadConfig(project), "v2").size).toBe(0);
+  });
+
+  it("the bundled config is unchanged: no roles keys, no roles, no notices (I1)", () => {
+    const project = setup(undefined, undefined);
+    const cfg = loadConfig(project);
+    expect(cfg.roleAgents).toBeUndefined();
+    expect(cfg.routing).toBeUndefined();
+    expect(Object.keys(cfg).filter((k) => /role/i.test(k))).toEqual([]);
+    expect(resolveRoles(cfg, "v2").size).toBe(0);
+    expect(getConfigNotices(project).map((n) => n.message).filter((m) => /roles|roleAgents|delegation/.test(m))).toEqual([]);
+    expect(Object.keys(JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")))).not.toContain("roleAgents");
+  });
+
   it("strips project roleAgents/exploration/run/workRoots with a notice but keeps delegation and the rest", () => {
     const project = setup(undefined, {
       defaultTier: "fast",
@@ -309,7 +336,7 @@ describe("shipped role specs (T1.1.3)", () => {
       general: ["general", "dynamic", `edit,${local},router_run`, "fast-heavy", "none", "producer", '{"fast":40,"medium":80,"heavy":120}'],
     });
     for (const name of ["implementer", "general"]) {
-      expect(SHIPPED_ROLE_SPECS.find((s) => s.agent === name)!.prompt).toContain("if `edit` is denied return `ESCALATE: authority`".replace("if", "If"));
+      expect(SHIPPED_ROLE_SPECS.find((s) => s.agent === name)!.prompt).toContain("If `edit` is denied return `ESCALATE: authority`; never deliver a diff as text.");
     }
   });
 });
@@ -414,6 +441,83 @@ describe("resolveRoles (T1.1.3)", () => {
     expect(t.issues.find((i) => i.path === "agents.researcher")?.message).toMatch(/dropped in roles mode/);
     const tiers = resolveRoleTable(validateConfig(raw({ agents })), "v2");
     expect([tiers.droppedAgents, tiers.replacedRoles, tiers.roles.size]).toEqual([[], [], 0]);
+  });
+
+  it("keeps the contract lines when a custom prompt replaces the shipped one", () => {
+    const t = resolveRoleTable(rolesMode({ roleAgents: { implementer: { prompt: "Be terse." }, explorer: { prompt: "Look around." } } }), "v2");
+    const impl = t.roles.get("implementer")!.prompt;
+    expect(impl.startsWith("Be terse.\n")).toBe(true);
+    for (const line of [WORK_ROOT_RULE, RETURN_CONTRACT, EDIT_DENIED_RULE]) expect(impl).toContain(line);
+    const explorer = t.roles.get("explorer")!.prompt;
+    expect(explorer).toContain(WORK_ROOT_RULE);
+    expect(explorer).toContain(RETURN_CONTRACT);
+    expect(explorer).not.toContain(EDIT_DENIED_RULE);
+    // idempotent: text that already carries the lines is not extended
+    const full = `x\n${WORK_ROOT_RULE}\n${RETURN_CONTRACT}`;
+    expect(withContract(full, SHIPPED_ROLE_SPECS[0]!)).toBe(full);
+    // untouched prompts stay the shipped ones
+    expect(resolveRoles(rolesMode(), "v2").get("explorer")!.prompt).toBe(SHIPPED_ROLE_SPECS[0]!.prompt);
+  });
+
+  it("orders tiers by costRatio when every tier has one, listing order on ties", () => {
+    const costed = (ratios: Record<string, number>) => rolesMode({
+      presets: { anthropic: Object.fromEntries(Object.entries(ratios).map(([t, c]) => [t, { ...tier(t), costRatio: c }])) },
+    });
+    const shuffled = resolveRoleTable(costed({ heavy: 20, fast: 1, medium: 5 }), "v2");
+    expect(shuffled.roles.get("explorer")!.tierRange).toEqual({ floor: "fast", ceiling: "medium" });
+    expect(shuffled.issues).toEqual([]);
+    const ties = resolveRoleTable(costed({ fast: 1, medium: 1, heavy: 1 }), "v2");
+    expect(ties.roles.get("explorer")!.tierRange).toEqual({ floor: "fast", ceiling: "medium" });
+    // custom tier names the role ranges do not know: nothing lies inside, roles are disabled with notices
+    const odd = resolveRoleTable(rolesMode({}, ["low", "high"]), "v2");
+    expect(odd.roles.size).toBe(0);
+    expect(odd.issues.filter((i) => i.path.endsWith(".tierRange"))).toHaveLength(SHIPPED_ROLE_SPECS.length);
+  });
+
+  it("disables a role whose shipped range is inverted on a preset ordered by cost", () => {
+    const inverted = rolesMode({
+      presets: { anthropic: { fast: { ...tier("fast"), costRatio: 20 }, medium: { ...tier("medium"), costRatio: 5 }, heavy: { ...tier("heavy"), costRatio: 1 } } },
+    });
+    const t = resolveRoleTable(inverted, "v2");
+    expect(t.roles.has("explorer")).toBe(false);
+    expect(t.roles.has("reviewer")).toBe(true);
+    expect(t.issues.find((i) => i.path === "roleAgents.explorer.tierRange")?.message).toMatch(/role disabled/);
+  });
+
+  it.each<[string, (s: RoleSpec) => Partial<RoleSpec>, RegExp]>([
+    ["kind", () => ({ kind: "oracle" as RoleSpec["kind"] }), /not a role kind/],
+    ["description", () => ({ description: " " }), /description is empty/],
+    ["prompt", () => ({ prompt: "" }), /prompt is empty/],
+    ["mode", (s) => ({ authority: { ...s.authority, mode: "open" as "fixed" }, }), /not fixed\|dynamic/],
+    ["unknown action", (s) => ({ authority: { ...s.authority, allow: [...s.authority.allow, "sudo" as "read"] } }), /unknown actions: sudo/],
+    ["allow and deny", (s) => ({ authority: { ...s.authority, deny: [...s.authority.deny, "read"] } }), /both allowed and denied: read/],
+    ["tierRange", () => ({ tierRange: { floor: "", ceiling: "heavy" } }), /needs a floor and a ceiling/],
+    ["assurance", () => ({ assurance: "maybe" as RoleSpec["assurance"] }), /assurance maybe/],
+    ["guard", () => ({ guard: "admin" as RoleSpec["guard"] }), /guard admin/],
+    ["no budget", () => ({ budget: {} }), /has no budget/],
+    ["budget value", () => ({ budget: { fast: 0, medium: 40 } }), /budget\.fast must be > 0/],
+    ["enabled", () => ({ enabled: "yes" as unknown as boolean }), /enabled must be a boolean/],
+  ])("rejects an invalid %s", (_name, mutate, expected) => {
+    const base = SHIPPED_ROLE_SPECS[0]!;
+    expect(roleSpecProblems({ ...base, ...mutate(base) }).join("; ")).toMatch(expected);
+  });
+
+  it("holds shipped specs to the stricter contract", () => {
+    const base = SHIPPED_ROLE_SPECS.find((s) => s.agent === "implementer")!;
+    const problems = (patch: Partial<RoleSpec>) => roleSpecProblems({ ...base, ...patch }, { shipped: true }).join("; ");
+    expect(problems({ authority: { ...base.authority, deny: base.authority.deny.filter((a) => a !== "webfetch") } })).toMatch(/neither allows nor denies webfetch/);
+    expect(problems({ prompt: WORK_ROOT_RULE })).toMatch(/prompt lacks `DONE:`/);
+    expect(problems({ prompt: base.prompt.replace(WORK_ROOT_RULE, "") })).toMatch(/lacks the work-root rule/);
+    expect(problems({ prompt: base.prompt.replace(EDIT_DENIED_RULE, "") })).toMatch(/lacks the edit-denied rule/);
+    expect(problems({ tierRange: { floor: "heavy", ceiling: "fast" } })).toMatch(/not inside fast\.\.medium\.\.heavy/);
+    expect(problems({ tierRange: { floor: "tiny", ceiling: "heavy" } })).toMatch(/not inside/);
+    expect(problems({ budget: { fast: 40 } })).toMatch(/budget tiers fast differ from the range fast,medium,heavy/);
+    expect(problems({})).toBe("");
+  });
+
+  it("treats a #81 agent whose policy cannot be evaluated as a violation", () => {
+    const hostile = { tier: "fast", description: "x", get permission(): never { throw new Error("boom"); } };
+    expect(pluginAgentSeparationProblem(hostile)).toMatch(/cannot be evaluated/);
   });
 
   it("skips an invalid shipped spec (fail closed)", () => {

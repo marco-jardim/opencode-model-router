@@ -84,7 +84,6 @@ export const ACTION_CLASS: Readonly<Record<AuthorityAction, ActionClass>> = Obje
 /** Host action names of the local class; `external_directory` counts as local (§2.2, R4). */
 const HOST_LOCAL: ReadonlySet<string> = new Set(["read", "glob", "grep", "list", "lsp", "skill", "external_directory", "router_git", ...GIT_TOOL_NAMES]);
 const HOST_WRITE: ReadonlySet<string> = new Set(["edit", "write", "patch", "multiedit", "apply_patch"]);
-const HOST_EXEC: ReadonlySet<string> = new Set(["router_run"]);
 /** Host actions that reach neither repository data nor the network. */
 const HOST_NEUTRAL: ReadonlySet<string> = new Set(["todowrite", "todoread", "question"]);
 
@@ -97,7 +96,6 @@ export function classifyAction(name: string): ActionClass | "neutral" {
   const n = name.toLowerCase();
   if (Object.hasOwn(ACTION_CLASS, n)) return ACTION_CLASS[n as AuthorityAction];
   if (HOST_LOCAL.has(n)) return "local";
-  if (HOST_EXEC.has(n)) return "exec";
   if (HOST_WRITE.has(n)) return "write";
   if (HOST_NEUTRAL.has(n)) return "neutral";
   return "egress";
@@ -119,7 +117,7 @@ export function separationProblem(actions: Iterable<string>): string | undefined
 /** Stands for every tool name the router cannot list (MCP servers added later): egress. */
 const UNLISTED_TOOL_PROBE = "mcp_unlisted_tool";
 const PROBE_ACTIONS: readonly string[] = [...new Set([
-  ...AUTHORITY_ACTIONS, ...HOST_LOCAL, ...HOST_WRITE, ...HOST_EXEC, ...HOST_NEUTRAL,
+  ...AUTHORITY_ACTIONS, ...HOST_LOCAL, ...HOST_WRITE, ...HOST_NEUTRAL,
   "shell", "bash", "browser", "subagent", "task", "delegate", "codesearch", ...CONTEXT7_DOC_TOOLS, "brave_web_search",
   UNLISTED_TOOL_PROBE,
 ])];
@@ -216,9 +214,12 @@ function role(
 
 /**
  * The shipped role agents (v2, `routing.delegation: "roles"`). They live in code, not in
- * tiers.json: authority must never come from a file that is deep-merged with user layers, and
- * a new top-level tiers.json key would change tiers mode (I1). Users narrow them through
- * `roleAgents` (global layer only). Implementer and general default to `none`: the effective
+ * tiers.json, for four reasons: (1) authority must never come from a file that is deep-merged
+ * with user layers (a user `roleAgents.x.authority` would widen it); (2) a `roleAgents` key in
+ * tiers.json would make `resolveRolesRouting` treat every config as "roles keys set" and print
+ * the v1 notice; (3) `buildConfig` reports every non-customisable field of `roleAgents` as an
+ * unknown-field notice; (4) a new top-level tiers.json key changes tiers mode (I1) and the
+ * docs-drift guard. Users narrow them through `roleAgents` (global layer only). Implementer and general default to `none`: the effective
  * assurance is the weaker of the route-line claim and the prompt's `[acceptance]` block, so the
  * role never claims more than the dispatch proves (§2.1).
  */
@@ -324,6 +325,17 @@ const EMPTY_TABLE: RoleTable = Object.freeze({
   replacedRoles: Object.freeze([]),
 });
 
+/**
+ * A custom `roleAgents.<name>.prompt` replaces the shipped text, but never the contract lines:
+ * the work-root rule, the return contract and (for roles that can edit) the edit-denied rule are
+ * appended when the custom text does not already contain them, so customisation cannot drop them.
+ */
+export function withContract(prompt: string, shipped: RoleSpec): string {
+  const lines = [WORK_ROOT_RULE, RETURN_CONTRACT, ...(shipped.authority.allow.includes("edit") ? [EDIT_DENIED_RULE] : [])];
+  const missing = lines.filter((line) => !prompt.includes(line));
+  return missing.length === 0 ? prompt : [prompt, ...missing].join("\n");
+}
+
 /** Tier names of a preset from cheapest to dearest: by `costRatio` when every tier has one, else as listed. */
 function tierOrder(preset: Preset): string[] {
   const names = Object.keys(preset);
@@ -407,6 +419,7 @@ export function resolveRoleTable(
     const narrowed = narrowRoleSpec({ ...spec, tierRange: placed }, Object.hasOwn(custom, spec.agent) ? custom[spec.agent] : undefined, order);
     issues.push(...narrowed.issues);
     if (!narrowed.spec.enabled) continue;
+    if (narrowed.spec.prompt !== spec.prompt) narrowed.spec = { ...narrowed.spec, prompt: withContract(narrowed.spec.prompt, spec) };
     // Narrowing cannot create a violation; validate anyway (I4).
     const problems = roleSpecProblems(narrowed.spec);
     if (problems.length > 0) {
