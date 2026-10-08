@@ -1,0 +1,77 @@
+# Dogfood record — Role × Tier × Assurance delegation (#84)
+
+Executor-owned (plan §0.10, §4). Written and committed only in `D:\git\omr-rta-main` on `rta/main`. Holds aggregated
+counts and decision-row fields only — never prompt text, tool arguments or file contents from the live store.
+
+## Baseline (P0.1 pre-flight step 5) — 2026-10-08T02:37Z
+
+### Live host and base checkout
+
+| Item | Value |
+|---|---|
+| Host | `opencode --version` → `opencode v2.0.24` |
+| Base checkout | `D:\git\opencode-model-router` on `master` @ `eeab36bce8bcc72f481a6e4fd919b47daebfa051`, `status --porcelain` empty |
+| Owner state (read-only) | `activePreset: anthropic`, `activeMode: normal`, `enforcementMode: advisory` |
+| Override SHA-256 | `700E25876937EB740748AB4B10EAF1CDDD4C7E29C7FDD8B84F23C609B0BE88F8` (`C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`); copy kept at `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc` |
+
+### §0.7 liveness commands on `master` code
+
+1. **`/router` marker.** Format read from `src\router\build-info.ts` (`formatRouterLine`):
+   `router: engine=<mode> build=<version>+<sha7>`. For the live code: version `2.3.0` (`package.json` line 3), sha7
+   `eeab36b`, engine `enforce` (owner override) → expected line `router: engine=enforce build=2.3.0+eeab36b`. No human
+   round trip at P0.1 (plan §5 P0.1 step 5).
+2. **Host log** `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`: plugin-load lines present, e.g.
+   `timestamp=2026-10-08T02:35:32.975Z level=INFO … msg="loading plugin" id="D:\\git\\opencode-model-router"
+   entrypoint=file:///D:/git/opencode-model-router/server.ts role=server`. Genuine `failed to load plugin` lines: 0.
+   Caveat (R5): the host logs every shell command it spawns (`message="spawning process" … args=…`), so a plain
+   `Select-String 'failed to load plugin'` also matches the executor's own probe command. The probe must exclude
+   `message="spawning process"` lines.
+3. **Agent list** `opencode api get '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` works on
+   2.0.24. Agents (name | mode | model):
+
+   | Agent | Mode | Model |
+   |---|---|---|
+   | Build, Compaction, Plan | primary | — |
+   | Title, Summary | primary | `anthropic/claude-haiku-5-5` |
+   | General | subagent | — |
+   | Explore | subagent | `anthropic/claude-haiku-5-5#low` |
+   | model-router-grader | subagent | — |
+   | fast | subagent | `anthropic/claude-haiku-5-5#low` |
+   | medium | subagent | `anthropic/claude-sonnet-5-5#medium` |
+   | heavy | subagent | `anthropic/claude-opus-5-5#xhigh` |
+   | runner, researcher | subagent | `anthropic/claude-haiku-5-5#low` |
+   | reviewer | subagent | `anthropic/claude-opus-5-5#xhigh` |
+
+### DF-1 self-test probes on `master` code (the reference DF-1 compares against)
+
+All three ran from the executor's session with work root `D:\git\omr-rta-main` (read-only work).
+
+**Probe 1 — read-only `fast`, 10 consecutive reads.** The router's default dispatch cap for `fast` is `CAP:8`, so the
+first dispatch stopped after 8 reads with `[⚠ CAP REACHED (8/8) …]`; the same session was resumed with `CAP:12` for
+reads 9–10 (R5: the DF-1 probe must carry `CAP:12`).
+- Reads 1–8: no guard footer; `[cap: N/8]` counters and `[⚠ CAP WARNING …]` on reads 6–7.
+- Reads 9–10 (resumed session): `[⚠ GUARD:read_budget] [budget 0/25 | deliverable=n/a | reads_since_produce=8] NEXT:
+  take a producing action (write/edit) or emit your final answer` and `… [budget 1/25 | … | reads_since_produce=9] …`.
+- Totals: 10 reads, 0 denied, 2 with a `GUARD:read_budget` footer. Note: `reads_since_produce` survived the resume
+  while the `budget` counter restarted at 0.
+
+**Probe 2 — `[route class=review risk=high pin]` heavy, `CAP:none` + `reason:`, 20 reads.**
+- 20 reads, 0 denied, 9 with `[⚠ GUARD:read_budget] [budget N/25 | deliverable=n/a | reads_since_produce=N] NEXT:
+  take a producing action (write/edit) or emit your final answer`; first footer on read 4
+  (`budget 3/25 | reads_since_produce=3`), last on read 20 (`budget 18/25 | reads_since_produce=18`).
+- `[cap: N/∞]` on every read (`CAP:none` honoured for the read-only counter). The guard `budget` counter ran 1–2 below
+  the `cap` counter; reads were issued in parallel batches of five, so footer presence per read was intermittent.
+
+**Probe 3 — delegation with a long acceptance block (verdict criteria whole).**
+- 3a: `fast` lookup, `VERIFY:required`, `check: fileExists` + two long `criteria:` lines → `[router ✓ verified:
+  deterministic]` (the deterministic check settled it; no grader text).
+- 3b: same shape with `criteria:` lines only (≈ 400 characters each) → `[router ✓ verified: checker]`.
+- No `NOT ACCEPTED` and no truncated criterion observed on `master` code for these two dispatches; E8 did not
+  reproduce here. DF-1 repeats 3b and additionally checks the live decision log's verdict text (read-only copy).
+
+### Test baseline
+
+- Capped full suite on `rta/main` @ `a8b1905` (`npx vitest run --maxWorkers=2`, 353.6 s): `Test Files 1 failed | 152
+  passed | 3 skipped (156)`, `Tests 1 failed | 12016 passed | 66 skipped (12083)`. The failure is the known flake
+  `test\unit\exec.test.ts` › `lowPriority > runs grandchildren of runArgv below normal priority` (`spawnSync
+  powershell.exe ETIMEDOUT`); re-run alone: `42 passed | 2 skipped (44)`.

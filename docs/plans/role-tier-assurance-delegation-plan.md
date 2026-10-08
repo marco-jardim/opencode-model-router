@@ -139,7 +139,7 @@ Handoffs, Verdict).
   (§0.1). The **liveness probe** after the restart: in the pasted `build=<version>+<sha7>`
   (`D:\git\opencode-model-router\src\router\build-info.ts`) `<sha7>` equals the first 7 hex digits of the synced
   commit; a plugin-load line for opencode-model-router newer than the restart and no `failed to load plugin` in
-  `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`; `opencode api get
+  `C:\Users\Marquinho\.local\share\opencode\log\opencode.log` (excluding `spawning process` lines, R5); `opencode api get
   '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` (works on the live 2.0.24, used 2026-10-07)
   lists the router agents. A marker with the previous sha means the host was not restarted: ask again, no rollback.
   A marker with any other sha means the sync went wrong: compare `git -C D:\git\opencode-model-router log -1` with
@@ -767,7 +767,7 @@ Steps:
 3. [executor] Self-test probes (the executor's own dispatches), recorded in
    `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` against the P0.1
    baseline. Under `advisory` the old guard warns instead of denying, so each probe asserts no `DENIED` **and** no
-   `[⚠ GUARD:read_budget]` footer: a read-only `fast` dispatch with 10 consecutive reads; a
+   `[⚠ GUARD:read_budget]` footer: a read-only `fast` dispatch with `CAP:12` and 10 consecutive reads (R5); a
    `[route class=review risk=high pin]` heavy dispatch with `CAP:none` + `reason:` making 20 reads (below the
    unchanged 25-call tier budget); a delegation with a long acceptance block whose verdict criteria are whole (no
    mid-sentence cut). Evidence: the delegates' tool results and a read-only copy of the live decision log.
@@ -1095,6 +1095,13 @@ prompt (§0.2.3).
   kept copy (A14 class stays an incident); dogfood probes are `[executor]`; §0.9.5 lists the executor's exceptions;
   the 25-call tier budget remains until DF-2; executor-owned files always cited at `D:\git\omr-rta-main`; reviewers
   receive CI and host-log facts from the executor.
+- R5 (P0.1 baseline, 2026-10-08): the §0.7 commands work on 2.0.24 with two refinements. (1) The host log records
+  every shell command it spawns (`message="spawning process" … args=…`), so the "no `failed to load plugin`" check
+  excludes `spawning process` lines (otherwise the probe matches its own command); the plugin-load line is
+  `msg="loading plugin" id="D:\\git\\opencode-model-router"`. (2) The router caps a `fast` dispatch at `CAP:8`
+  read-only calls, so the DF-1 probe "read-only `fast` dispatch with 10 consecutive reads" carries `CAP:12`; the P0.1
+  baseline needed a same-session resume for reads 9–10 (dogfood.md, Baseline). Smoke files run only with
+  `--config vitest.smoke.config.ts` (the default config excludes `test\smoke\**`).
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |
