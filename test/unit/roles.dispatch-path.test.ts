@@ -381,10 +381,12 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
     expect(nextRoleTier(["fast", "medium", "heavy"], "medium", "fast")).toBe("medium");
     expect(nextRoleTier(["fast", "medium", "heavy"], "medium", "medium")).toBeNull();
     expect(nextRoleTier(["fast", "medium", "heavy"], "heavy", null)).toBeNull();
+    // QA-P21-2-2: the router raises the tier itself; the orchestrator resumes with the findings and sets neither model nor tier=.
     const up = roleEscalationHint({ agent: "explorer", childSessionID: "ses_1", currentTier: "fast", nextTier: "medium" });
-    expect(up).toContain('the same task_id ("ses_1") on tier medium');
-    expect(up).toContain("[route tier=medium]");
-    expect(up).toContain("never set `model`");
+    expect(up).toContain('resume the same sessionID ("ses_1") with @explorer and the findings');
+    expect(up).toContain("the router raises it to medium");
+    expect(up).toContain("set neither `model` nor `tier=`");
+    expect(up).not.toContain("[route tier=");
     const top = roleEscalationHint({ agent: "explorer", childSessionID: "ses_1", currentTier: "medium", nextTier: null });
     expect(top).toContain("highest tier, medium");
     const cfg = config({ delegation: "roles" });
@@ -392,7 +394,7 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
       facts: { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
       agent: "explorer", model: "anthropic/x", variant: null, tier: "fast", parentSessionID: "root", step: "dispatch",
     });
-    expect(roleEscalationHintFor(cfg, "ses_2")).toContain("on tier medium");
+    expect(roleEscalationHintFor(cfg, "ses_2")).toContain("raises it to medium");
     expect(roleEscalationHintFor(config({ delegation: "tiers" }), "ses_2")).toBeNull();
   });
 });

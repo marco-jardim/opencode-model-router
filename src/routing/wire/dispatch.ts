@@ -264,7 +264,12 @@ export interface DispatchRouterDeps {
    * QA-P21-1-8: the role path is live (the plugin STARTED in roles mode, so its role agents and tools exist). `false` → every role
    * agent takes the tier path, as in tiers mode. Default: live.
    */
-  readonly rolesEnabled?: () => boolean;
+  readonly rolesEnabled?: (agent: string) => boolean;
+  /**
+   * QA-P21-2 nit 3: `router_verify` is registered (index.ts `routerVerifyEnabled`); `false` → nothing is deferred, so a deferred
+   * directive does not weaken the detection. Absent: treated as registered.
+   */
+  readonly routerVerifyEnabled?: () => boolean;
 }
 
 /** What `route()` decided, until `commit()` has the final input. */
@@ -563,9 +568,11 @@ export function roleRouterGate(input: {
  * verify/wiring.ts `isDeferred`): its `VERIFY:` directives resolve to `deferred` (the configured `defaultVerify` when the text has
  * none; the text is `dispatchDirectiveText(prompt, description)`) AND its DoD carries a `testsPass` check. A deferred dispatch
  * returns without the gate (`router_verify` runs it later), so the router's gate cannot back a `deterministic` detection.
- * Fails toward "deferred" on any error (a weaker detection, never a stronger one).
+ * Fails toward "deferred" on any error (a weaker detection, never a stronger one). QA-P21-2 nit 3: nothing is deferred when
+ * `router_verify` is not registered (`verifyEnabled: false`, index.ts `routerVerifyEnabled`): the gate then runs at the return.
  */
-export function roleGateDeferred(cfg: RouterConfig, prompt: string, description: string): boolean {
+export function roleGateDeferred(cfg: RouterConfig, prompt: string, description: string, opts: { readonly verifyEnabled?: boolean } = {}): boolean {
+  if (opts.verifyEnabled === false) return false;
   try {
     const text = prompt.trim() !== "" ? prompt : description; // verify/wiring.ts dispatchDirectiveText
     const budget = resolveVerifyBudget(cfg);
@@ -589,8 +596,9 @@ export function nextRoleTier(order: readonly string[], ceiling: string, current:
 }
 
 /**
- * P-8 (handoff 39): the role-aware escalation hint — resume the SAME child on a higher tier (the router sets the model; the
- * orchestrator asks for the tier with a `tier=` route-line pin, honoured inside the role's window). Pure.
+ * P-8 (handoff 39), QA-P21-2-2: the role-aware escalation hint after a verification FAIL — resume the SAME child with the findings;
+ * the router itself raises it to the next tier of the role's range ({@link roleEscalationAfterFail} records the raise, the next
+ * resume applies it). The orchestrator sets neither `model` nor a `tier=` pin, and never names a tier agent. Pure.
  */
 export function roleEscalationHint(input: {
   readonly agent: string;
@@ -598,29 +606,64 @@ export function roleEscalationHint(input: {
   readonly currentTier: string | null;
   readonly nextTier: string | null;
 }): string {
-  // P2.2 handoff: resume the SAME session with the findings; never a tier agent, never a model.
-  const task = input.childSessionID === null ? "the same task_id" : `the same task_id ("${input.childSessionID}")`;
+  const task = input.childSessionID === null ? "the same sessionID" : `the same sessionID ("${input.childSessionID}")`;
   if (input.nextTier === null) {
     const top = input.currentTier === null ? "" : ` (it already runs on its highest tier, ${input.currentTier})`;
-    return `NEXT: resume ${task} with @${input.agent} and the findings above${top}; do not start a new task, do not set \`model\`, and do not treat the prior result as complete.`;
+    return `NEXT: resume ${task} with @${input.agent} and the findings${top}; set neither \`model\` nor \`tier=\`; do not start a new task and do not treat the prior result as complete.`;
   }
-  const from = input.currentTier === null ? "" : ` (escalated from ${input.currentTier})`;
-  return `NEXT: resume ${task} on tier ${input.nextTier}${from} with the findings above: dispatch @${input.agent} again with that task_id and the first line \`[route tier=${input.nextTier}]\`; the router sets the model (never set \`model\` yourself); do not start a new task.`;
+  const from = input.currentTier === null ? "" : ` from ${input.currentTier}`;
+  return `NEXT: resume ${task} with @${input.agent} and the findings; the router raises it to ${input.nextTier}${from}; set neither \`model\` nor \`tier=\`; do not start a new task.`;
 }
 
-/**
- * {@link roleEscalationHint} for a child the router registered: its role and running tier from the dispatch registry, the next
- * tier from the role's range on `roleTierOrder(cfg)`. `null` when the child is not a role dispatch of roles mode.
- */
-export function roleEscalationHintFor(cfg: RouterConfig, childSessionID: string): string | null {
+/** The child's role, running tier and next tier of its role range, from the dispatch registry; null when it is not a role child. */
+function escalationOf(cfg: RouterConfig, childSessionID: string): { agent: string; current: string | null; next: string | null } | null {
   const record = lookupDispatch(childSessionID);
   if (record === undefined) return null;
   const spec = resolveRoles(cfg, "v2").get(record.agent);
   if (spec === undefined) return null;
   const current = record.tier ?? null;
-  return roleEscalationHint({
-    agent: record.agent, childSessionID, currentTier: current, nextTier: nextRoleTier(roleTierOrder(cfg), spec.tierRange.ceiling, current),
-  });
+  return { agent: record.agent, current, next: nextRoleTier(roleTierOrder(cfg), spec.tierRange.ceiling, current) };
+}
+
+/**
+ * {@link roleEscalationHint} for a child the router registered: its role and running tier from the dispatch registry, the next
+ * tier from the role's range on `roleTierOrder(cfg)`. `null` when the child is not a role dispatch of roles mode. Records nothing.
+ */
+export function roleEscalationHintFor(cfg: RouterConfig, childSessionID: string): string | null {
+  const e = escalationOf(cfg, childSessionID);
+  return e === null ? null : roleEscalationHint({ agent: e.agent, childSessionID, currentTier: e.current, nextTier: e.next });
+}
+
+/** QA-P21-2-2: pending raises, child → the parent that may consume it and the tier (bounded, oldest out; 30 min TTL). */
+export const MAX_RESUME_RAISES = 1000;
+export const RESUME_RAISE_TTL_MS = 30 * 60 * 1000;
+const resumeRaises = new Map<string, { readonly parentSessionID: string; readonly tier: string; readonly at: number }>();
+
+/**
+ * QA-P21-2-2 ("the router raises the tier"): the hint emitted after a verification FAIL of a role child, AND the raise it promises:
+ * the next tier of the role's range is recorded for the child, consumed once by `parentSessionID`'s next resume of that child,
+ * which applies it as a raise-only floor. Nothing is recorded at the ceiling. `null` when the child is not a role child.
+ */
+export function roleEscalationAfterFail(cfg: RouterConfig, childSessionID: string, parentSessionID: string): string | null {
+  const e = escalationOf(cfg, childSessionID);
+  if (e === null) return null;
+  if (e.next !== null && parentSessionID !== "") {
+    resumeRaises.delete(childSessionID);
+    resumeRaises.set(childSessionID, { parentSessionID, tier: e.next, at: Date.now() });
+    while (resumeRaises.size > MAX_RESUME_RAISES) resumeRaises.delete(resumeRaises.keys().next().value as string);
+  }
+  return roleEscalationHint({ agent: e.agent, childSessionID, currentTier: e.current, nextTier: e.next });
+}
+
+/** The raise recorded for this parent's resume of the child (not consumed), or null. */
+export function pendingResumeRaise(childSessionID: string, parentSessionID: string): string | null {
+  const raise = resumeRaises.get(childSessionID);
+  if (raise === undefined) return null;
+  if (Date.now() - raise.at >= RESUME_RAISE_TTL_MS) {
+    resumeRaises.delete(childSessionID);
+    return null;
+  }
+  return raise.parentSessionID === parentSessionID ? raise.tier : null;
 }
 
 /** `prompt` with `line` as its LAST line (every byte of `prompt` kept). */
@@ -670,6 +713,28 @@ function placeCallerModel(
     ? { candidate: ceiling, code: "clamp:caller-model:ceiling" }
     : { candidate: floor, code: "lift:caller-model:floor" };
   return resumed && placed.candidate.rank < decided.rank ? { candidate: decided, code: "kept:caller-model:resume" } : placed;
+}
+
+/** QA-P21-2-2: the note of a resume raised after a verification FAIL (`raise:verification-fail:<tier>`). */
+export const RESUME_RAISE_NOTE = "raise:verification-fail:";
+
+/** The higher of two tiers on `order` (unknown or null ones ignored); null when neither is on it. */
+function higherTier(order: readonly string[], a: string | null, b: string | null): string | null {
+  const ia = a === null ? -1 : order.indexOf(a);
+  const ib = b === null ? -1 : order.indexOf(b);
+  if (ia < 0 && ib < 0) return a ?? b; // let tierBounds report an unknown floorTier as before
+  return ia >= ib ? a : b;
+}
+
+/**
+ * QA-P21-2-1: the grant of a resume of an EXACTLY bound child: what the child holds (its bound grant) plus the actions widened for
+ * this resume. Only adds; `router_run` stays withheld without a work root (I9). The work root is the bound one, else the resume's.
+ */
+function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityAction[], workRoot: string | null): DispatchGrant {
+  const root = boundGrant.workRoot ?? workRoot;
+  const actions = new Set<AuthorityAction>([...boundGrant.actions, ...widened]);
+  if (root === null) actions.delete("router_run");
+  return { actions, notes: [...boundGrant.notes], workRoot: root };
 }
 
 /** QA-P21-1-1: the note of a delegate's role dispatch (unparsed, floor rung of the unknown-binding window). */
@@ -725,6 +790,7 @@ export function resetDispatchRouting(): void {
   subagentAnnotations.clear();
   routedRoles.clear();
   strippedRoots.clear();
+  resumeRaises.clear();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1182,7 +1248,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const prepareRole = async (agent: string, cfg: RouterConfig | undefined): Promise<RolePrepared | null> => {
     const prepareRoles = deps.runtime.prepareRoles;
     if (prepareRoles === undefined) return null;
-    if (deps.rolesEnabled !== undefined && !deps.rolesEnabled()) return null; // QA-P21-1-8: not started in roles mode
+    // QA-P21-1-8 / QA-P21-2-4: not started in roles mode, or this role agent was not registered: the tier path, as today.
+    if (deps.rolesEnabled !== undefined && !deps.rolesEnabled(agent)) return null;
 
     try {
       return await prepareRoles.call(deps.runtime, agent, cfg);
@@ -1210,22 +1277,29 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 2. work root: `root=` from the trace only, text-compared with `git worktree list --porcelain` before any filesystem call.
     const root = await resolveRoleWorkRoot({ root: routeLine?.root ?? null, sessionDirectory }, workRootDeps);
 
-    // 3. grant (widened actions of a resume recompute the floor, handoff 36).
-    const grant = grantFor(rp.spec, result.facts, call.widened ?? [], root.workRoot, routeLine);
+    // 3. grant (widened actions of a resume recompute the floor, handoff 36). QA-P21-2-1: a resume of an EXACTLY bound child keeps
+    // what that child holds (its bound grant) plus the widened actions — the resume prompt alone ("continue") would lose them.
+    const bound = resumeID === null ? undefined : currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) });
+    const grant: DispatchGrant = bound?.kind === "exact" ? resumedGrant(bound.grant, call.widened ?? [], root.workRoot)
+      : grantFor(rp.spec, result.facts, call.widened ?? [], root.workRoot, routeLine);
 
     // 4. effective detection (S10/P-9, A34; handoff 5): never `result.detection` as is.
     const acceptance = detectionOf(prompt);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed: deps.isBypassed?.(call.sessionID) === true, acceptance, ...(deps.env === undefined ? {} : { env: deps.env }),
-      deferred: roleGateDeferred(rp.cfg, prompt, description), // QA-P21-1-2
+      // QA-P21-1-2, QA-P21-2 nit 3
+      deferred: roleGateDeferred(rp.cfg, prompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false }),
     });
     const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance });
 
-    // 5. bounds on the one role tier order (handoff 9); a resume passes the child's running tier.
+    // 5. bounds on the one role tier order (handoff 9); a resume passes the child's running tier. QA-P21-2-2: the raise recorded
+    // after a verification FAIL of this child (for this parent) is a raise-only floor, like `floorTier`; consumed on success.
     const running = resumeID === null ? null : await runningRungOf(resumeID);
     const tiers = roleTierOrder(rp.cfg, rp.session);
+    const raised = resumeID === null ? null : pendingResumeRaise(resumeID, call.sessionID);
+    const floorTier = higherTier(tiers, rp.cfg.enforcement?.escalate?.floorTier ?? null, raised);
     const bounds = tierBounds(rp.spec, grant, result, detection, {
-      floorTier: rp.cfg.enforcement?.escalate?.floorTier ?? null,
+      floorTier,
       runningTier: running?.tier ?? null,
       pinTier: routeLine?.tier ?? null,
       tiers,
@@ -1246,6 +1320,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 7. an explicit caller `model` is kept only inside the bounds, and never over a route-line pin (QA-P21-1-5: the pinned rung,
     // raised to the running rung on a resume, wins); then the host catalog decides whether the variant exists.
     const notes: string[] = [...(root.note === null ? [] : [root.note]), ...grant.notes];
+    if (raised !== null) notes.push(`${RESUME_RAISE_NOTE}${raised}`);
     const callerRef = str(args.model);
     const placed = callerRef === null
       ? null
@@ -1349,6 +1424,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       class: cls,
     };
     rememberRoutedRole(routed);
+    if (raised !== null && resumeID !== null) resumeRaises.delete(resumeID); // QA-P21-2-2: consumed once, by a routed resume
 
     decided.set(call.callID, {
       parentSessionID: call.sessionID,
