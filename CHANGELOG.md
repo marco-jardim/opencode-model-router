@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Roles mode: role × tier × assurance delegation (#84), OpenCode v2, opt-in.** With `routing.delegation: "roles"`
+  the orchestrator dispatches seven role agents — `explorer`, `researcher`, `runner`, `implementer`, `reviewer`,
+  `architect`, `general` — and the router picks the tier and the per-call model of every dispatch. Decided at plugin
+  start: restart OpenCode after switching. See [Roles mode](docs/ROLES.md) and
+  [ADR 0006](docs/adr/0006-role-tier-assurance-delegation.md).
+  - Role contracts in code (`SHIPPED_ROLE_SPECS`): maximum authority, tier range, a descriptive default assurance,
+    guard profile, call budget per tier; `roleAgents.<name>` (global only) can only narrow them. A role whose tier
+    range the active preset's `costRatio` orders against the tier names is disabled with a notice.
+  - Least privilege with capability separation: no grant mixes local, exec or write actions with egress; Code Mode
+    `execute`, shell and delegation are denied to every role; `researcher` is web and docs only.
+  - Tier floor from authority × effective detection (`authorityFloor`): edits reach `fast` only behind the router's
+    own deterministic checks on a low-risk single-file change; edit + run never below `medium`. After a verification
+    FAIL of a role child the router raises its tier on the next resume itself; the orchestrator never sets `tier=`
+    or `model`.
+  - Dynamic authority for `implementer` and `general`, with nonce-exact binding and a resume-based ladder
+    (`router_request_authority` → `ESCALATE: authority` → resume the same session; widening only for exact bindings).
+  - Work roots: `root=` on the route line (a git worktree of the repository) and `routing.workRoots` globs; the router
+    narrows each session to its own root. A role dispatch's acceptance checks run in its work root; a `cwd:` outside
+    it is refused.
+  - `router_run`: `package.json` scripts listed by exact name and `routing.run.commands` with fixed argv, argument
+    patterns, pinned npm script shell and config files, refused `.npmrc` keys and a credential-stripped environment;
+    single-dash arguments carrying `/`, `\` or `..` are refused.
+  - Role budgets (`budget=` up to 2×), `NEED MORE: budget` with a `[router budget]` resume note, never a tier penalty.
+    Role agents' host `steps` = 2 × the top role budget + `REFUSAL_CAP` (10) + 5. A role dispatch has a read-only
+    call cap only when it carries `CAP:N` or `CAP:none`.
+  - Outcome signals from external verification only (deterministic/run 1, independent grader 0.5, incomplete 0.5,
+    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only). An LLM grader's verdict of
+    a role dispatch moves the outcome store by 0.5 with a `grader` signal row only when the grader is independent
+    (tier ≥ the producer's, another model); any other grader records nothing (no store change, no verdict row), so
+    `routing:stats` shows fewer verdict rows for role dispatches. Role × tier statistics and the advisor findings
+    `role-separation`,
+    `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`,
+    `native-explore-aliased`, `roles-none-enabled`, `role-usage-share`.
+  - Exploration of cheaper rungs (`routing.exploration.rate`, off by default, at most 0.2, `enforce` and deterministic
+    detection only).
+  - New keys: `routing.delegation`, `roleAgents`, `routing.exploration`, `routing.run`, `routing.workRoots`. On
+    OpenCode v1 they are validated and inert, with one notice.
 - **`agents` block: subagents defined by the router (#81).** `tiers.json` and the global override can define
   subagents that run on a tier of the active preset (following `/preset`), with `readOnly`/`allowTools` or an
   explicit `permission`, on v1 and v2 with fail-closed permissions. Project overrides cannot define `agents`
@@ -22,6 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered after startup still get the tier model.
 ### Changed
 
+- **Behaviour change (#84): guard and verification fixes for every host and mode** (v1, v2 tiers mode and roles mode;
+  each ships with a before/after golden):
+  - **Reader guard profile.** The read-only `fast` tier, dispatches routed `class=review|recon|search` (OpenCode v2
+    with a routing engine other than `static`; never on v1), dispatches with `CAP:none` + `reason:` and reader roles are no longer denied or warned for "consecutive non-producing" reads;
+    readers are told to emit their final answer instead of to take a producing action.
+  - **Uncharged denials.** A refused call is no longer charged to the call budget nor recorded as executed by the
+    repeat check; a round is stopped for refusals only when it has min(budget, 10) of them and its executed plus refused
+    calls reach the budget.
+  - **Whole criteria.** Verification never cuts a criterion: the inferred criterion is the first task line whole (or
+    its leading whole sentences within 4000 code points), and grader criteria are kept whole within 4000 code points.
+    **Explicit `[acceptance]` lists over 4000 code points are no longer graded in full:** the overflow is named
+    ("n criteria omitted") and not graded, and a pass on the rest is unverifiable.
+  - **Header strip.** The router's dispatch header (through its first `---` separator) and router directives
+    (`CAP:`, `VERIFY:`, `VERIFY_WAIT:`, `reason:`, `[route …]`, `[router]`) are no longer gradable criteria.
+  - **Progress notes are incomplete.** A contract follower's progress note, and a `NEED MORE: budget` return backed
+    by the guard's state, is an `incomplete` verdict (`[router ⚠ INCOMPLETE]`): never accepted, no next tier, no
+    evidence, resume the same session. The budget claim is read from the return prefix; a progress summary written
+    before a line-start `NEED MORE: budget` still counts.
+  - **`root=` in the header.** The dispatch header's `Working directory:` names the route line's `root=` when present
+    (byte-identical otherwise).
+  - **Downgrades.** Outcome signals are written as annotation rows of the decision log, which earlier versions drop
+    only through their decision-id dedupe: downgrading past this version is unsupported.
 - `anthropic` preset: `fast` tier now uses Claude Haiku 5.5 (low) instead of Sonnet 5.5 (low).
 - **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
   Code Mode, delegation and unspecified MCP tools are denied, including inherited
