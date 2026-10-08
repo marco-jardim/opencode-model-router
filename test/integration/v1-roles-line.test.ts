@@ -149,6 +149,11 @@ describe("v1: the text-only roles line (A28, D1)", () => {
    * harness against a `git archive` of 1fc94a3, never against the current code (QA-2.4-14), so a change to the v1 protocol shows up here.
    */
   const SYSTEM_PROMPT_1FC94A3 = { sha256: "56854f788c0d1d22fad12c9425fdd33e4947b1683be0a9a877787ba5bd911409", length: 6357 } as const;
+  /**
+   * The same prompt after the bundled `anthropic` preset's `fast` tier moved from `claude-sonnet-5-5` to `claude-haiku-5-5` (low): the
+   * single `@fast=` model name differs (one character shorter), nothing else. Derived from the 1fc94a3 constant above by that one inversion.
+   */
+  const SYSTEM_PROMPT_FAST_HAIKU = { sha256: "fefb07f47947ba1e37c48aca8e2d9197239017391c3bcf9d8715270b68145cab", length: 6356 } as const;
 
   it.each([
     ["no routing block", null],
@@ -158,7 +163,7 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     ["roles: {}", { roles: {} }],
     ["advisor disabled", { advisor: { enabled: false } }],
     ["classifier rules", { classifier: { backend: "rules" } }],
-  ] as const)("without an explicit routing.roles (%s) the whole output.system is what 1fc94a3 produced: one part with the pinned SHA-256", async (_name, routing) => {
+  ] as const)("without an explicit routing.roles (%s) the whole output.system is 1fc94a3's output plus only the anthropic fast tier on Haiku 5.5: one part with the pinned SHA-256", async (_name, routing) => {
     invalidateConfigCache();
     const { hooks, agentsCall } = await plugin(routing as Record<string, unknown> | null);
     const system = await turn(hooks);
@@ -166,7 +171,9 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     // #77 deliberately moves rename to medium. Invert exactly that text delta
     // before checking the historical hash: NO other prompt byte may change.
     expect(system[0]).toContain("exists-check @medium→rename/impl-feature");
-    expect(system.map((part) => ({ sha256: sha(part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature")), length: part.length }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
+    expect(system.map((part) => ({ sha256: sha(part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature")), length: part.length }))).toEqual([SYSTEM_PROMPT_FAST_HAIKU]);
+    // the bundled anthropic fast tier moved from Sonnet 5.5 to Haiku 5.5: invert exactly that one model name and the output is 1fc94a3's again
+    expect(system.map((part) => ({ sha256: sha(part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature").replace("@fast=claude-haiku-5-5/low", "@fast=claude-sonnet-5-5/low")), length: part.length + 1 }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
     expect(system[0]).toBe(baseline()); // and the current assembleSystemPrompt agrees with that commit's output
     expect(agentsCall).not.toHaveBeenCalled(); // the agent list is not even fetched
   });

@@ -87,7 +87,14 @@ function model(ref: string, over: Partial<AdvisorCatalogModel> = {}): AdvisorCat
   };
 }
 
-const CATALOG: AdvisorCatalogModel[] = [model(SONNET), model(OPUS, { cost: [{ input: 15, output: 75, cache: { read: 1.5, write: 18 } }] })];
+// The bundled `anthropic` preset's fast tier. No `family` and the helper's default (Sonnet) price, so the title-model
+// findings — the host's own pick (`hostSmallModel`) and "a cheaper title-eligible model" — are unaffected by its presence.
+const HAIKU = "anthropic/claude-haiku-5-5";
+const CATALOG: AdvisorCatalogModel[] = [
+  model(SONNET),
+  model(OPUS, { cost: [{ input: 15, output: 75, cache: { read: 1.5, write: 18 } }] }),
+  model(HAIKU, { variants: ["none", "low", "medium", "high", "xhigh", "max"].map((id) => ({ id })) }),
+];
 
 const noHost: HostConfigView = { agents: [] };
 const hostWith = (...agents: Array<Record<string, unknown>>): HostConfigView => hostConfigFromAgents(agents);

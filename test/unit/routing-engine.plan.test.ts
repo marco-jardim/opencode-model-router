@@ -384,7 +384,7 @@ describe("annotateSteps — detection and pin", () => {
 describe("annotateSteps — evidence moves the engine tier", () => {
   const HEAVY_KEY = "design|router:heavy|anthropic/claude-opus-5-5#xhigh" as OutcomeKey;
   const MEDIUM_KEY = "design|router:medium|anthropic/claude-sonnet-5-5#medium" as OutcomeKey;
-  const FAST_KEY = "design|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey;
+  const FAST_KEY = "design|router:fast|anthropic/claude-haiku-5-5#low" as OutcomeKey;
   const designStep = step("a", `Design the new cache architecture\n${ACCEPT_TESTS}`);
   const designFacts = () => facts("design", { risk: "high" });
 
@@ -447,7 +447,7 @@ describe("annotateSteps — evidence moves the engine tier", () => {
   });
 
   it("an up switch is not gated by the kernel, but the plan still wants evidence on the winner", async () => {
-    const FAST_SEARCH = "search|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey;
+    const FAST_SEARCH = "search|router:fast|anthropic/claude-haiku-5-5#low" as OutcomeKey;
     const MEDIUM_SEARCH = "search|router:medium|anthropic/claude-sonnet-5-5#medium" as OutcomeKey;
     const searchStep = step("s", `Search the repo\n${ACCEPT_TESTS}`);
     const searchFacts = () => facts("search", { risk: "high" }); // a costly give-up makes the dearer, reliable rung worth it
@@ -559,7 +559,7 @@ describe("QA-1.4-7 / QA-1.4-8: heavy and QA steps are pinned, QA steps run on he
   it("a QA step never moves on evidence", async () => {
     const store = createOutcomeStore();
     for (let i = 0; i < 20; i++) store.recordVerdict("search|router:heavy|anthropic/claude-opus-5-5#xhigh" as OutcomeKey, "fail", { attemptID: `h${i}`, step: "dispatch" });
-    for (let i = 0; i < 20; i++) store.recordVerdict("search|router:fast|anthropic/claude-sonnet-5-5#low" as OutcomeKey, "pass", { attemptID: `f${i}`, step: "dispatch" });
+    for (let i = 0; i < 20; i++) store.recordVerdict("search|router:fast|anthropic/claude-haiku-5-5#low" as OutcomeKey, "pass", { attemptID: `f${i}`, step: "dispatch" });
     const out = await annotateSteps([step("a", `QA the release\n${ACCEPT_TESTS}`)], stubDeps(() => facts("search", { risk: "low" }), { store }));
     expect(out[0]!.tier).toBe("heavy");
   });

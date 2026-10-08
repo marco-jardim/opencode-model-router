@@ -153,7 +153,7 @@ For the router tiers `next(k)` is **not** a fixed chain of tiers: the kernel pri
 Every assumption is stated, and the figures are the output of the real kernel (`buildLadder` and `decide`), pinned by `test/unit/docs-drift.test.ts`:
 
 - **Policy:** the default escalate policy: ladder `fast → medium → heavy`, `maxAttemptsPerTier: 1` (**one retry** in the same tier before escalating), `maxTotalAttempts: 4`, cost ceiling 4× the first attempt; no model catalog, so no variant steps.
-- **Candidates:** `roles: {}`, so only the three router tiers: `fast` = `claude-sonnet-5-5#low` (`costRatio` 1), `medium` = `claude-sonnet-5-5#medium` (5), `heavy` = `claude-opus-5-5#xhigh` (20). Tiers are priced by `costRatio` (no USD), no measured tax.
+- **Candidates:** `roles: {}`, so only the three router tiers: `fast` = `claude-haiku-5-5#low` (`costRatio` 1), `medium` = `claude-sonnet-5-5#medium` (5), `heavy` = `claude-opus-5-5#xhigh` (20). Tiers are priced by `costRatio` (no USD), no measured tax.
 - **The task:** class `implement` (static tier `medium`), risk `medium`, `balanced` profile (`U = 15`), a grader-checked dispatch (`d = 0.7`), class confidence 1. The orchestrator picked `@medium`.
 
 The attempts the runner makes when every attempt fails and the failure is caught. The cost ceiling ends the `fast` and `medium` cascades; `heavy`'s ends at the top of the ladder after its retry:
