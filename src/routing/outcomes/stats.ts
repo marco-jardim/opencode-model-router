@@ -655,6 +655,34 @@ export function renderMarkdown(table: StatsTable): string {
   return blocks.join("\n\n") + "\n";
 }
 
+/** True when the role table has anything to show: tier-only logs render exactly as before (no role section). */
+export function hasRoleRows(table: RoleStatsTable): boolean {
+  return table.byRoleTier.length > 0 || table.unattributed.signals > 0 || table.unattributed.unknownBindings > 0;
+}
+
+/** P2.2: the role × tier section appended to the report when the log has role rows. Same determinism rules as {@link renderMarkdown}. */
+export function renderRoleMarkdown(table: RoleStatsTable): string {
+  const rows =
+    table.byRoleTier.length === 0
+      ? "_none_"
+      : [
+          "| Role | Tier | Dispatches | Pass | Fail | +mass | -mass | Budget exhaustions | Authority requests | Unknown bindings | Explored | Tokens/dispatch (in/out) | USD/attempt (lifetime) |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+          ...table.byRoleTier.map((r) => {
+            const pass = r.signals.reduce((sum, s) => sum + s.pass, 0);
+            const fail = r.signals.reduce((sum, s) => sum + s.fail, 0);
+            const tokens = r.tokensPerDispatch === null ? "n/a" : `${fix(r.tokensPerDispatch.input, 0)}/${fix(r.tokensPerDispatch.output, 0)} (n=${r.tokensPerDispatch.n})`;
+            const usd = r.measuredUSD === null ? "n/a" : `${fmtUSD(r.measuredUSD.mean)} (n=${r.measuredUSD.n})`;
+            return `| ${cell(r.role)} | ${cell(r.tier)} | ${r.dispatches} | ${pass} | ${fail} | ${fix(r.positiveMass, 2)} | ${fix(r.negativeMass, 2)} | ${r.budgetExhaustions} | ${r.authorityRequests} | ${r.unknownBindings} | ${r.explored} | ${tokens} | ${usd} |`;
+          }),
+        ].join("\n");
+  const blocks = ["### By role × tier", rows];
+  if (table.unattributed.signals > 0 || table.unattributed.unknownBindings > 0) {
+    blocks.push(`_Not attributed to a role: ${table.unattributed.signals} signal row(s), ${table.unattributed.unknownBindings} unknown binding(s)._`);
+  }
+  return blocks.join("\n\n") + "\n";
+}
+
 // ---------------------------------------------------------------------------
 // Arguments and CLI
 // ---------------------------------------------------------------------------
@@ -820,7 +848,15 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Prom
     }
 
     const table = summarize(store, read.rows, { since: args.since, until: args.until });
-    io.stdout(args.json ? JSON.stringify(table, null, 2) + "\n" : renderMarkdown(table));
+    const roles = summarizeRoles(store, read.rows, { since: args.since, until: args.until });
+    const withRoles = hasRoleRows(roles);
+    io.stdout(
+      args.json
+        ? JSON.stringify(withRoles ? { ...table, roles } : table, null, 2) + "\n"
+        : withRoles
+          ? `${renderMarkdown(table)}\n${renderRoleMarkdown(roles)}`
+          : renderMarkdown(table),
+    );
     return STATS_EXIT.ok;
   } catch (error) {
     try {

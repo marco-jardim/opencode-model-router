@@ -52,7 +52,7 @@ export const FINDING_IDS = [
   "tier-agent-unavailable",
   "classifier-model-missing",
   "role-separation",
-  "roles-on-v1",
+  "roles-on-legacy-host",
   "role-budget-low",
   "role-range-clamped",
   "role-binding-unknown",
@@ -84,7 +84,7 @@ export const FINDING_TARGET: Readonly<Record<FindingId, FindingTarget>> = {
   "tier-agent-unavailable": "router",
   "classifier-model-missing": "router",
   "role-separation": "router",
-  "roles-on-v1": "router",
+  "roles-on-legacy-host": "router",
   "role-budget-low": "router",
   "role-range-clamped": "router",
   "role-binding-unknown": "router",
@@ -661,11 +661,11 @@ function activeRoleTable({ cfg, extras }: CheckInput): ReturnType<typeof resolve
 const roleSeparation: Check = (input) => {
   const table = activeRoleTable(input);
   if (table === null) return [];
-  return table.droppedAgents.map((agent) => {
+  return table.droppedAgents.map((agent): RawFinding => {
     const issue = table.issues.find((i) => i.path === `agents.${agent}`);
     return {
-      id: "role-separation" as const,
-      severity: "warning" as const,
+      id: "role-separation",
+      severity: "warning",
       subject: agent,
       message: `${issue?.message ?? `agents.${agent} breaks the separation rule`}. No role may combine write, exec and egress (I4): remove the agent from \`agents\` or narrow its permissions, otherwise the shipped ${agent} role runs instead of yours.`,
       snippet: null,
@@ -677,7 +677,7 @@ const roleSeparation: Check = (input) => {
 const rolesOnV1: Check = ({ cfg, extras }) => {
   if (extras.host !== "v1" || !rolesMode(cfg)) return [];
   return [{
-    id: "roles-on-v1",
+    id: "roles-on-legacy-host",
     severity: "info",
     subject: "",
     message: "routing.delegation is `roles`, which does nothing on OpenCode v1: the orchestrator keeps the tier protocol and no role agent is registered. It takes effect on OpenCode v2.",
@@ -691,9 +691,9 @@ const roleRangeClamped: Check = (input) => {
   if (table === null) return [];
   return table.issues
     .filter((i) => /^roleAgents\.[^.]+\.(tierRange|budget)(\.|$)/.test(i.path))
-    .map((i) => ({
-      id: "role-range-clamped" as const,
-      severity: "info" as const,
+    .map((i): RawFinding => ({
+      id: "role-range-clamped",
+      severity: "info",
       subject: i.path.split(".")[1] ?? "",
       message: i.message,
       snippet: null,
@@ -783,7 +783,7 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["tier-agents", tierAgents],
   ["classifier-model", classifierModel],
   ["role-separation", roleSeparation],
-  ["roles-on-v1", rolesOnV1],
+  ["roles-on-legacy-host", rolesOnV1],
   ["role-range", roleRangeClamped],
   ["native-explore", nativeExploreAliased],
   ["role-budget", roleBudgetLow],
