@@ -85,4 +85,21 @@ reads 9–10 (R5: the DF-1 probe must carry `CAP:12`).
 | Sync | `git -C D:\git\opencode-model-router switch --no-track -C rta/live origin/rta/main` → `741a8359c4532bdefa7a6d2e6f1bd6be175b169f` |
 | `npm ci` | not needed (`package-lock.json` identical `eeab36b`..`741a835`) |
 | Roles | inert (`routing.delegation` absent → `tiers`) |
-| Restart | requested; liveness probe pending |
+| Restart | owner restarted OpenCode v2 at 2026-10-08T12:34Z (service `opencode serve --service` PID 78648 started 12:34:27Z) |
+
+### DF-1 liveness probe (2026-10-08T12:40Z) — PASS
+
+- `/router` line pasted by the owner: `router: engine=enforce build=2.3.0+741a835` → matches the synced commit.
+- Host log: plugin-load lines for `D:\git\opencode-model-router` after the restart; 0 genuine `failed to load plugin` lines since 12:00Z (spawn lines excluded, R5).
+- `/api/agent` (location `D:\git\opencode-model-router`): fast/medium/heavy, runner, reviewer, researcher, model-router-grader present with the same models as the P0.1 baseline.
+- `/router` also printed the pre-existing cost-doctor `variant-effort` warnings for the bundled anthropic tiers (not introduced by this work; owner's choice).
+
+### DF-1 self-test probes (vs P0.1 baseline) — PASS
+
+| Probe | P0.1 (master) | DF-1 (`741a835`) |
+|---|---|---|
+| 1. read-only `fast`, `CAP:12`, 10 reads | 2 reads with `[⚠ GUARD:read_budget]` (after a resume) | 10 reads, 0 denied, 0 `GUARD` footers (only `[cap: N/12]` and one `CAP WARNING`) |
+| 2. heavy `[route class=review risk=high pin]`, `CAP:none` + `reason:`, 20 sequential reads | 9 of 20 with `[⚠ GUARD:read_budget] … take a producing action`, first at read 4 | 20 reads, 0 denied, 0 `GUARD` footers (`[cap: N/∞]` only) |
+| 3. long `[acceptance]` criteria, `VERIFY:required` | `[router ✓ verified: checker]` | `[router ✓ verified: checker]`; no `NOT ACCEPTED`, no truncated criterion |
+
+The 25-call tier budget is unchanged in tiers mode (E7 is addressed by role budgets at DF-2).
