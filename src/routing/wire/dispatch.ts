@@ -58,7 +58,7 @@ import { parseVerifyDirectives } from "../../verify/directives";
 import { buildDelegationDoD } from "../../verify/dispatch";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
-  LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
+  BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
 } from "../roles/binding";
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
@@ -1320,6 +1320,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 7. an explicit caller `model` is kept only inside the bounds, and never over a route-line pin (QA-P21-1-5: the pinned rung,
     // raised to the running rung on a resume, wins); then the host catalog decides whether the variant exists.
     const notes: string[] = [...(root.note === null ? [] : [root.note]), ...grant.notes];
+    // #84 P2.3 (T2.3.3): the row of a resume records the authority it widens (the actions new to this child's grant).
+    const widenedNow = (call.widened ?? []).filter((action) => grant.actions.has(action) && bound?.grant.actions.has(action) !== true);
+    if (widenedNow.length > 0) notes.push(BINDING_NOTES.widened(widenedNow));
     if (raised !== null) notes.push(`${RESUME_RAISE_NOTE}${raised}`);
     const callerRef = str(args.model);
     const placed = callerRef === null

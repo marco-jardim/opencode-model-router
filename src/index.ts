@@ -557,6 +557,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return { role: true, root: currentBinding(sessionID, { maxOf: roleMaxOf })?.grant.workRoot ?? null };
   };
   /**
+   * #84 P2.3 (P-12, S11, I3): no `evaluate` fires for a plugin tool, so each tool's own resolver also refuses a role session whose
+   * dispatch grant lacks the tool's action (`router_run`: exec; `router_git_*`: local): the answer is then "no bound work root"
+   * and the tool refuses (I9). The context hook's catalog filter is the primary control; this one holds when a call gets through.
+   */
+  const resolveWorkRootFor = (action: "router_run" | "router_git") => (sessionID: string): WorkRootAnswer => {
+    const answer = resolveWorkRoot(sessionID);
+    if (!answer.role) return answer;
+    const grant = currentBinding(sessionID, { maxOf: roleMaxOf })?.grant;
+    return grant !== undefined && grant.actions.has(action) ? answer : { role: true, root: null };
+  };
+  /**
    * Handoff 27: the guard profile of a role child — the role's budget for the tier it runs on (the dispatch registry's tier, else
    * the role's floor, which is its registered fallback model, P-1), raised by the dispatch's `budget=` (the bound dispatch budget).
    */
@@ -1190,12 +1201,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
-      ...gitTools(rolesAtStart ? { resolveWorkRoot } : {}),
+      ...gitTools(rolesAtStart ? { resolveWorkRoot: resolveWorkRootFor("router_git") } : {}),
       // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
       ...(rolesAtStart ? {
         router_run: routerRunTool({
           config: () => resolveRolesRouting(cfg, "v2").run,
-          resolveWorkRoot,
+          resolveWorkRoot: resolveWorkRootFor("router_run"),
           recordRun: (run) => pushBounded(roleRuns, run.sessionID, run),
         }),
       } : {}),

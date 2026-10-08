@@ -2,11 +2,13 @@ import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
+import type { SessionContext } from "@opencode/plugin/promise/session";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
-import { isAbsolute, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrides } from "../router/subagents";
@@ -20,21 +22,23 @@ import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/
 import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
 import {
-  annotateSubagentResult, childSessionOf, createDispatchRouter, forgetRoutedRole, roleMaxActions, routedRoleOf, takeSubagentAnnotations,
+  annotateSubagentResult, childSessionOf, createDispatchRouter, forgetRoutedRole, gitWorktreeList, normalizeRootText, parseWorktreeList,
+  roleMaxActions, routedRoleOf, takeSubagentAnnotations,
 } from "../routing/wire/dispatch";
 import type { RouterConfig } from "../router/config";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
-import { bind, currentBinding, evict as evictBinding, evictCall, type SessionLookup } from "../routing/roles/binding";
+import { bind, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup } from "../routing/roles/binding";
+import type { DispatchGrant } from "../routing/roles/policy";
 import {
-  AUTHORITY_TEXT, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText, requestedAuthority,
-  type AuthorityDeps,
+  AUTHORITY_TEXT, AUTHORITY_TOOL_NAME, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText,
+  requestedAuthority, type AuthorityDeps,
 } from "../routing/roles/authority";
 import { budgetExhausted, type BudgetSnapshot } from "../guard/enforce";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
 import { parseReturnPrefix } from "../routing/outcomes/signals";
 import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
-import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
+import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -308,6 +312,175 @@ export function roleAuthorityNotice(agent: string, childSessionID: string, actio
     + "(the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.";
 }
 
+// ---------------------------------------------------------------------------
+// #84 P2.3 (T2.3.1, T2.3.2): per-session authority of role agents (plan §2.2, §2.5, §2.8 I3/I5/I9; spikes S3, S8, S11;
+// amendments P-3, P-12, P-13, P-17). The agent's MAX policy (registration, P2.1) bounds every child of a role; these helpers
+// narrow ONE session to its dispatch grant. They only ever remove: an action the max policy refuses is refused before them.
+// ---------------------------------------------------------------------------
+
+/**
+ * The role action a host permission action or tool name stands for (§2.2): `read`, `glob`, `grep`, `edit`, `webfetch`,
+ * `websearch` and `router_run` as named; `write`, `patch`, `multiedit`, `apply_patch` are `edit`; every `router_git_*` is
+ * `router_git`; every `context7_*` is `context7`; `external_directory` is its own class (a path check, local class). Anything else
+ * (`execute`, `shell`, `subagent`, todo tools, MCP tools, …) stands for no role action: never granted to a role session.
+ */
+export function roleActionOf(name: string): AuthorityAction | "external_directory" | undefined {
+  switch (name) {
+    case "read": case "glob": case "grep": case "edit": case "webfetch": case "websearch": case "router_run":
+      return name;
+    case "write": case "patch": case "multiedit": case "apply_patch":
+      return "edit";
+    case "external_directory":
+      return "external_directory";
+    default:
+      if (name.startsWith("router_git_")) return "router_git";
+      if (name.startsWith("context7_")) return "context7";
+      return undefined;
+  }
+}
+
+/** A win32 8.3 short-name segment (`PROGRA~1`, `MARQUI~1.TXT`): refused, never expanded (S11, P-11: fail closed). */
+const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
+
+/**
+ * The canonical long form of a path a role session names (T2.3.1): resolved against `base` when relative (`..` and `.`
+ * resolved), then the longest existing ancestor through `realpath` (`realpathSync.native`: links, junctions and case as on disk)
+ * with the rest appended. Undefined — the caller refuses — for an empty path, a NUL, a wildcard, and on win32 an 8.3 spelling, a
+ * UNC/device path (`\\server\…`, `\\?\…`: no filesystem call may reach a remote host) or a drive-relative path (`C:x`); and when an
+ * ancestor fails to resolve for any reason other than "does not exist".
+ */
+export function canonicalAuthorityPath(
+  path: string,
+  base: string,
+  opts: { platform?: NodeJS.Platform; realpath?: (path: string) => string } = {},
+): string | undefined {
+  const platform = opts.platform ?? process.platform;
+  const realpath = opts.realpath ?? ((p: string) => realpathSync.native(p));
+  const text = path.trim();
+  if (text === "" || text.includes("\0") || /[*?]/.test(text)) return undefined;
+  const api = platform === "win32" ? win32 : posix;
+  if (platform === "win32") {
+    if (SHORT_NAME_SEGMENT.test(text) || /^[\\/]{2}/.test(text) || /^[A-Za-z]:(?![\\/])/.test(text)) return undefined;
+    if (!api.isAbsolute(text) && (SHORT_NAME_SEGMENT.test(base) || /^[\\/]{2}/.test(base))) return undefined;
+  }
+  let head = api.resolve(base, text);
+  const tail: string[] = [];
+  for (let depth = 0; depth < 1024; depth++) {
+    try {
+      const real = realpath(head);
+      return tail.length === 0 ? real : api.join(real, ...[...tail].reverse());
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+      const parent = api.dirname(head);
+      if (parent === head) return undefined;
+      tail.push(api.basename(head));
+      head = parent;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `target` (canonical) is the work root or inside it, with the matcher of the max policy's `external_directory` rules
+ * (`read-only.ts` `permissionMatches`: separators unified, win32 case folding) on the registration's `<root><sep>*` shape (P-11,
+ * P-13). A root carrying a wildcard never contains anything.
+ */
+export function insideWorkRoot(target: string, root: string): boolean {
+  if (root === "" || /[*?]/.test(root)) return false;
+  return permissionMatches(target, root) || permissionMatches(target, join(root, "*"));
+}
+
+/** The decision for one role-session action: allowed, or refused with the reason the child sees. */
+export type RoleAuthorityDecision = { readonly allow: true } | { readonly allow: false; readonly reason: string };
+
+const ALLOW: RoleAuthorityDecision = Object.freeze({ allow: true });
+const refuse = (reason: string): RoleAuthorityDecision => ({ allow: false, reason });
+
+export interface RoleAuthorityInput {
+  /** The host permission action (`event.action`) or the tool name (`execute.before`). */
+  readonly action: string;
+  /** The paths the action touches (read/edit files, glob/grep search roots, `external_directory` `<dir>/*` resources). */
+  readonly paths: readonly string[];
+  /** The child's binding ∩ its role max (binding.ts view). */
+  readonly binding: Pick<Binding, "kind" | "grant">;
+  /** The role is dynamic: `router_request_authority` is part of its catalog (ladder, §2.5). */
+  readonly dynamic: boolean;
+  /** Base of relative paths: the child session's directory (what the host resolves them against). */
+  readonly sessionDirectory: string;
+  /** Canonical long form of the plugin's own directory: the work root of a grant without one (`workRoot: null`, I9). */
+  readonly fallbackRoot: string | undefined;
+  readonly canonical?: (path: string, base: string) => string | undefined;
+}
+
+/**
+ * T2.3.1 / T2.3.2: may this role session use `action` on `paths`? (plan §2.2, §2.5; I3, I5, I9; P-13)
+ * - `execute` (Code Mode) never (R6/P-6: its inner calls are never evaluated); `router_request_authority` for dynamic roles only.
+ * - an action outside every role class → refused; a role action outside the dispatch grant → refused (an unknown binding's grant
+ *   is the role max ∩ local, binding.ts);
+ * - `external_directory` (P-13): only an EXACT binding with a work root and a local action, every resource inside that root;
+ *   an unknown binding or a grant without a root → refused (I9);
+ * - path actions (`read`, `edit`, `glob`, `grep`): every path, canonical (`..` resolved, case folded on win32, long form; 8.3
+ *   spellings refused), inside the bound work root — the plugin's directory when the grant has none.
+ */
+export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityDecision {
+  const { action, binding } = input;
+  const grant: DispatchGrant = binding.grant;
+  if (action === "execute") return refuse("`execute` (Code Mode) is never available to a role agent");
+  if (action === AUTHORITY_TOOL_NAME) {
+    return input.dynamic ? ALLOW : refuse(`${AUTHORITY_TOOL_NAME} is only for dynamic roles`);
+  }
+  const canonical = input.canonical ?? ((path: string, base: string) => canonicalAuthorityPath(path, base));
+  const cls = roleActionOf(action);
+  if (cls === undefined) return refuse(`${action} is outside every role's authority`);
+  if (cls === "external_directory") {
+    if (binding.kind !== "exact") return refuse("external_directory: this session is not bound to its dispatch (binding unknown, I9)");
+    const root = grant.workRoot;
+    if (root === null) return refuse("external_directory: this dispatch has no work root (root=)");
+    if (![...grant.actions].some((a) => a === "read" || a === "glob" || a === "grep" || a === "router_git")) {
+      return refuse("external_directory: this dispatch grants no local action");
+    }
+    if (input.paths.length === 0) return refuse("external_directory: no path to check");
+    for (const resource of input.paths) {
+      const dir = resource.replace(/[\\/]\*$/, "");
+      const target = dir === "" ? undefined : canonical(dir, input.sessionDirectory);
+      if (target === undefined || !insideWorkRoot(target, root)) {
+        return refuse(`external_directory: ${resource} is outside this dispatch's work root ${root}`);
+      }
+    }
+    return ALLOW;
+  }
+  if (!grant.actions.has(cls)) return refuse(`${action} is not in this dispatch's grant (${[...grant.actions].join(", ") || "none"})`);
+  if (cls === "read" || cls === "edit" || cls === "glob" || cls === "grep") {
+    const root = grant.workRoot ?? input.fallbackRoot;
+    if (root === undefined) return refuse(`${action}: no work root could be resolved`);
+    for (const path of input.paths) {
+      const target = canonical(path, input.sessionDirectory);
+      if (target === undefined || !insideWorkRoot(target, root)) {
+        return refuse(`${action}: ${path} is outside this dispatch's work root ${root} (use an absolute path inside it)`);
+      }
+    }
+  }
+  return ALLOW;
+}
+
+/**
+ * T2.3.2: a tool a role session keeps in its catalog — `execute` never (S8), `router_request_authority` for dynamic roles only
+ * (also under an unknown binding: the ladder is how it asks), any other tool only when its role action is in the grant.
+ */
+export function roleToolKept(name: string, grant: Pick<DispatchGrant, "actions">, dynamic: boolean): boolean {
+  if (name === "execute") return false;
+  if (name === AUTHORITY_TOOL_NAME) return dynamic;
+  const cls = roleActionOf(name);
+  return cls !== undefined && cls !== "external_directory" && grant.actions.has(cls);
+}
+
+/** P-3: the parent's annotation when a role child's tool catalog could not be built (the child ran with no tools). */
+export function roleCatalogFailureNotice(agent: string, childSessionID: string): string {
+  return `[router] @${agent} ran without tools: the router could not build its tool catalog for this dispatch (fail closed, `
+    + `session "${childSessionID}"). Its result is not grounded in tool output. NEXT: dispatch the task again as a fresh task.`;
+}
+
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
 export async function registerV2Hooks(
   ctx: Context,
@@ -332,6 +505,11 @@ export async function registerV2Hooks(
     onRoleLive?: (isLive: (agent: string) => boolean) => void;
     /** QA-P21-2 nit 3: `router_verify` is registered (index.ts `routerVerifyEnabled`); nothing is deferred otherwise. */
     routerVerifyEnabled?: () => boolean;
+    /**
+     * #84 P2.3 (§2.2): `git worktree list --porcelain` in a directory (stdout), for the fresh re-check of a sibling work root when
+     * a role session's `external_directory` is evaluated. Default: `gitWorktreeList` (dispatch.ts).
+     */
+    listWorktrees?: (cwd: string) => Promise<string>;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -442,6 +620,128 @@ export async function registerV2Hooks(
     roles: () => roles,
     bindingOf: (child) => currentBinding(child, { maxOf: maxOfRoles(roles) }),
   });
+  // -------------------------------------------------------------------------
+  // #84 P2.3 (T2.3.1, T2.3.2): the per-session authority of a role session, shared by the evaluate, context and execute.before
+  // hooks. Every view is the child's binding ∩ the role max of the agent the HOOK names ∩ the role max of the agent the child
+  // was bound as (a session resumed under another role never gets the union).
+  // -------------------------------------------------------------------------
+  /** Canonical long form of the plugin's directory: the work root of a grant without one (I9); undefined when it does not resolve. */
+  let pluginRoot: string | null | undefined;
+  const fallbackRoot = (): string | undefined => {
+    if (pluginRoot === undefined) {
+      try {
+        pluginRoot = realpathSync.native(ctx.location.directory);
+      } catch {
+        pluginRoot = null;
+      }
+    }
+    return pluginRoot ?? undefined;
+  };
+  /** The live role spec and the binding view of a role session; undefined when the role table has no live spec for `agent`. */
+  const roleAuthorityOf = async (sessionID: string, agent: string): Promise<{ spec: RoleSpec; binding: Binding } | undefined> => {
+    const roles = rolesOf(loadConfig(ctx.location.directory));
+    const spec = roles.get(agent);
+    if (spec === undefined) return undefined;
+    const own = roleMaxActions(spec) ?? [];
+    const maxOf = (bound: string): AuthorityAction[] | undefined => {
+      const boundMax = roleMaxActions(roles.get(bound));
+      return boundMax === undefined ? undefined : boundMax.filter((action) => own.includes(action));
+    };
+    // P-2: lazy, at the first context build or permission evaluation (one decision per child, shared with execute.before).
+    const binding = await bind(sessionID, bindingLookup, { maxOf });
+    dispatchRouter.noteBinding(sessionID, binding); // the observed kind (QA-P21-1-11), once per child
+    return { spec, binding };
+  };
+  /** The directory the host resolves a session's relative paths against (its location), else the plugin's. */
+  const sessionDirectoryOf = async (sessionID: string): Promise<string> => {
+    const session = await ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]) as unknown as { location?: { directory?: unknown } };
+    const directory = session?.location?.directory;
+    return typeof directory === "string" && directory !== "" ? directory : ctx.location.directory;
+  };
+  /**
+   * §2.2: a sibling work root is re-checked against a fresh `git worktree list --porcelain` when `external_directory` is
+   * evaluated (a removed worktree, or a plain directory created in its place, no longer counts). Cached 5 s per root; any failure →
+   * not listed (fail closed).
+   */
+  const listWorktreesOf = options.listWorktrees ?? gitWorktreeList;
+  const worktreeChecks = new Map<string, { at: number; listed: boolean }>();
+  const stillAWorktree = async (root: string): Promise<boolean> => {
+    const own = fallbackRoot();
+    if (own !== undefined && normalizeRootText(own) === normalizeRootText(root)) return true;
+    const cached = worktreeChecks.get(root);
+    if (cached !== undefined && Date.now() - cached.at < 5_000) return cached.listed;
+    let listed = false;
+    try {
+      const want = normalizeRootText(root);
+      for (const entry of parseWorktreeList(await listWorktreesOf(ctx.location.directory))) {
+        let real: string | undefined;
+        try {
+          real = realpathSync.native(entry);
+        } catch {
+          real = undefined;
+        }
+        if (normalizeRootText(entry) === want || (real !== undefined && normalizeRootText(real) === want)) {
+          listed = true;
+          break;
+        }
+      }
+    } catch {
+      listed = false;
+    }
+    worktreeChecks.delete(root);
+    worktreeChecks.set(root, { at: Date.now(), listed });
+    while (worktreeChecks.size > 64) worktreeChecks.delete(worktreeChecks.keys().next().value!);
+    return listed;
+  };
+  /**
+   * T2.3.1: the reason a role session's permission request is refused, or undefined when its dispatch grants it. Paths: the
+   * resources of `read`/`edit` and of `external_directory`; `glob`/`grep` resources are search PATTERNS, not paths — their search
+   * root is checked by `external_directory` (outside the session directory) and by the `execute.before` check (inside it).
+   */
+  const roleEvaluateRefusal = async (event: { sessionID: unknown; action: string; resources: readonly string[] }, agent: string): Promise<string | undefined> => {
+    const sessionID = String(event.sessionID);
+    const authority = await roleAuthorityOf(sessionID, agent);
+    if (authority === undefined) return "the role table is unavailable (fail closed)";
+    const cls = roleActionOf(event.action);
+    const paths = cls === "read" || cls === "edit" || cls === "external_directory" ? event.resources : [];
+    const decision = roleAuthorityDecision({
+      action: event.action, paths, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
+      sessionDirectory: paths.length > 0 ? await sessionDirectoryOf(sessionID) : ctx.location.directory, fallbackRoot: fallbackRoot(),
+    });
+    if (!decision.allow) return decision.reason;
+    const root = authority.binding.grant.workRoot;
+    if (cls === "external_directory" && root !== null && !(await stillAWorktree(root))) {
+      return `external_directory: the work root ${root} is no longer a worktree listed by \`git worktree list --porcelain\``;
+    }
+    return undefined;
+  };
+  /**
+   * T2.3.1 (P-12, S11): the `execute.before` side of a role session's own tool call — the tool's role action must be in the grant
+   * and its paths inside the work root (the file of `read`/`write`/`edit`, the search root of `glob`/`grep`, which defaults to the
+   * session directory). The only router check that fires for plugin tools (`router_run`, `router_git_*`: no `evaluate`, S11) and
+   * for Code Mode `execute` (S8); tools outside every role class are left to the agent's max policy and the router's evaluate hook.
+   */
+  const roleToolRefusal = async (event: { sessionID: unknown; tool: string }, args: any, agent: string): Promise<string | undefined> => {
+    const cls = roleActionOf(event.tool);
+    if (cls === undefined && event.tool !== "execute" && event.tool !== AUTHORITY_TOOL_NAME) return undefined;
+    const sessionID = String(event.sessionID);
+    const authority = await roleAuthorityOf(sessionID, agent);
+    if (authority === undefined) return "the role table is unavailable (fail closed)";
+    const record = args !== null && typeof args === "object" ? args as Record<string, unknown> : {};
+    const text = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+    const sessionDirectory = await sessionDirectoryOf(sessionID);
+    const paths = cls === "read" || cls === "edit"
+      ? [text(record.filePath) ?? text(record.path)].filter((p): p is string => p !== undefined)
+      : cls === "glob" || cls === "grep" ? [text(record.path) ?? sessionDirectory] : [];
+    if ((cls === "read" || cls === "edit") && paths.length === 0) return `${event.tool}: no path to check`;
+    const decision = roleAuthorityDecision({
+      action: event.tool, paths, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
+      sessionDirectory, fallbackRoot: fallbackRoot(),
+    });
+    return decision.allow ? undefined : decision.reason;
+  };
+  /** P-3: role children whose catalog failure is already annotated for the parent's current call (cleared when it ends). */
+  const catalogFailures = new Set<string>();
   const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger });
   let eventTask: Promise<void> | undefined;
   let disposed = false;
@@ -556,9 +856,25 @@ export async function registerV2Hooks(
       const rolesRequested = routerConfig.routing?.delegation === "roles";
       rolesStarted ??= rolesRequested;
       if (rolesStarted) {
-        await registerRoleAgents(next.agent, routerConfig, {
+        const registration = await registerRoleAgents(next.agent, routerConfig, {
           context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce,
         });
+        // #84 P2.3 (T2.3.3, §2.5): the ladder tool is a plugin tool, advertised to a deny-by-default agent only with an explicit
+        // allow (S11 (a)); the router's catalog filter then keeps it for dynamic roles only. Fixed roles never get it.
+        if (!registration.failed && registration.registered.length > 0) {
+          let roleTable: ReadonlyMap<string, RoleSpec> = new Map();
+          try {
+            roleTable = resolveRoles(routerConfig, "v2");
+          } catch {
+            roleTable = new Map(); // no allow written: the role keeps no ladder (fail closed)
+          }
+          for (const name of registration.registered) {
+            const definition = next.agent[name];
+            if (roleTable.get(name)?.authority.mode !== "dynamic" || definition === undefined || roleAgentOf(definition) !== name) continue;
+            const permission = definition.permission;
+            if (permission !== null && typeof permission === "object") definition.permission = { ...permission, [AUTHORITY_TOOL_NAME]: "allow" };
+          }
+        }
       } else if (rolesRequested) {
         warnRoleOnce("roles:restart", ROLES_RESTART_NOTICE);
       }
@@ -622,14 +938,18 @@ export async function registerV2Hooks(
 
     // Enforce the protected agent's own deny/ask without destroying inherited
     // grants: the same session can later resume as medium/heavy (P-R2-3).
+    /** #84 P2.3: a registered role agent (its registration succeeded); every role agent is also a protected agent (P-19). */
+    const roleAgentName = (name: unknown): string | undefined => (typeof name === "string" && registeredRole(name) ? name : undefined);
     registrations.push(await ctx.permission.hook("evaluate", async event => {
       let name: string | undefined = event.agent;
       let protectedKnown = protectedAgent(name);
+      let role = roleAgentName(name);
       try {
         // An explicit event agent is authoritative, even when session lookup
         // would fail or still refers to the previous agent during a switch.
         name ??= (await ctx.session.get({ sessionID: event.sessionID })).agent;
         protectedKnown = protectedAgent(name);
+        role = roleAgentName(name);
         if (!protectedKnown) return;
         const agent = (await ctx.agent.list()).data.find(agent => agent.id === name);
         const effects = agent ? event.resources.map(resource => evaluatePermission(agent.permissions, event.action, resource)) : ["deny"];
@@ -640,8 +960,22 @@ export async function registerV2Hooks(
           event.effect = "ask";
           event.message = `Approval required by ${agentLabel(name)} ${name}: ${event.action}`;
         }
+        // #84 P2.3 (T2.3.1, P-13, I3/I9): a role session is narrowed to ITS dispatch grant and work root. Only ever a deny: an
+        // action the max policy refused stays refused, a sensitive-read ask stays an ask when the grant covers it.
+        if (role !== undefined && event.effect !== "deny") {
+          const refusal = await roleEvaluateRefusal(event, role);
+          if (refusal !== undefined) {
+            event.effect = "deny";
+            event.message = `Permission denied by role agent ${role} for this dispatch: ${refusal}`;
+          }
+        }
       } catch (error) {
         if (protectedKnown) event.effect = "deny";
+        // P-3: a role agent's evaluation error is an explicit deny; other agents keep today's behaviour.
+        if (role !== undefined) {
+          event.effect = "deny";
+          event.message = `Permission denied by role agent ${role}: the router could not check this dispatch's authority (fail closed)`;
+        }
         warnPermissionOnce(`read-only permission evaluation failed for ${name ?? "unknown agent"}: ${String(error)}`);
       }
     }));
@@ -729,6 +1063,24 @@ export async function registerV2Hooks(
       }
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
+      // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
+      // strictest outcome) and is annotated for the parent's `subagent` result; every other agent keeps today's behaviour.
+      const role = roleAgentName(event.agent);
+      try {
+        await buildContext(event, role);
+      } catch (error) {
+        if (role === undefined) throw error;
+        for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
+        warnPermissionOnce(`role tool catalog failed for ${role}: ${String(error)}`);
+        const child = String(event.sessionID);
+        if (!catalogFailures.has(child)) {
+          catalogFailures.add(child);
+          while (catalogFailures.size > 1000) catalogFailures.delete(catalogFailures.values().next().value!);
+          annotateSubagentResult("authority", child, roleCatalogFailureNotice(role, child));
+        }
+      }
+    }));
+    const buildContext = async (event: SessionContext, role: string | undefined): Promise<void> => {
       if (protectedAgent(event.agent)) {
         try {
           // Catalogs use merged session rules; remove widened tools from this
@@ -745,6 +1097,15 @@ export async function registerV2Hooks(
           for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
           warnPermissionOnce(`read-only tool catalog failed for ${event.agent}: ${String(error)}`);
         }
+      }
+      // #84 P2.3 (T2.3.2, I3): a role session keeps only the tools of ITS dispatch grant (this request snapshot only; sibling
+      // sessions of the same agent are untouched), `execute` never (S8), `router_request_authority` for dynamic roles only — also
+      // under an unknown binding, whose grant is the role max ∩ local (I9). The binding is made here at the latest (P-2).
+      if (role !== undefined) {
+        const authority = await roleAuthorityOf(String(event.sessionID), role);
+        if (authority === undefined) throw new Error(`role ${role}: no live role spec (fail closed)`);
+        const dynamic = authority.spec.authority.mode === "dynamic";
+        for (const name of Object.keys(event.tools ?? {})) if (!roleToolKept(name, authority.binding.grant, dynamic)) delete event.tools[name];
       }
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };
       // V2 consumes per-turn options, not Agent.Info.request.settings.
@@ -810,7 +1171,7 @@ export async function registerV2Hooks(
           }
         }
       }
-    }));
+    };
 
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       const args = await scopedArgs(event);
@@ -820,6 +1181,18 @@ export async function registerV2Hooks(
       if (callerRoles.size > 0 && typeof event.agent === "string" && callerRoles.has(event.agent)) {
         const binding = await bind(String(event.sessionID), bindingLookup, { maxOf: maxOfRoles(callerRoles) });
         dispatchRouter.noteBinding(String(event.sessionID), binding); // QA-P21-1-11: the observed kind, once per child
+      }
+      // #84 P2.3 (T2.3.1, I3, P-12): a role session's own tool call stays inside its dispatch grant and work root. This is the
+      // router check that fires for plugin tools and Code Mode `execute` (no `evaluate` does, S8/S11); errors refuse (fail closed).
+      const callerRole = roleAgentName(event.agent);
+      if (callerRole !== undefined && event.tool !== "subagent") {
+        let refusal: string | undefined;
+        try {
+          refusal = await roleToolRefusal(event, args, callerRole);
+        } catch {
+          refusal = "the router could not check this dispatch's authority (fail closed)";
+        }
+        if (refusal !== undefined) throw new Error(`[router] Refused for role agent ${callerRole} in this dispatch: ${refusal}`);
       }
       // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
       let roleForeground = false;
@@ -964,6 +1337,7 @@ export async function registerV2Hooks(
             if (child !== null) {
               if (!running && !(escalated && markAnnotated(child, end.id, end.sessionID))) discardAuthority(child, end.id);
               rememberLastCall(child, end.id);
+              if (!running) catalogFailures.delete(child); // P-3: the next attempt's catalog failure is annotated again
             }
             evictCall(end.sessionID, end.id);
           } catch (error) {
