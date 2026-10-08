@@ -49,8 +49,21 @@ const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GR
 /** `NEED MORE: budget` at the start of a line (QA-P15-1-2); the fallback when the first line carries no prefix. */
 const NEED_MORE_BUDGET_LINE_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
 
+/** A `SCOPE GROWTH:` / `NEED CONTEXT:` first line: a contract prefix unknown to parseReturnPrefix that still decides. */
+const OTHER_CONTRACT_FIRST_LINE_RE = /^(?:NEED[\s_-]*CONTEXT|SCOPE[\s_-]*GROWTH)\b[*_`\s]*:/i;
+
+/** The first non-empty line, past a leading `task_id:` / `<task_result>` envelope, with leading decoration stripped. */
+function firstLine(text: string): string {
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/^\s*<task_result>/i, "");
+    if (line.trim() === "" || /^\s*task_id\s*:/i.test(line)) continue;
+    return line.replace(/^[^\p{L}\p{N}]+/u, "").replace(/^\d+[.)]\s+/, "");
+  }
+  return "";
+}
+
 /**
- * Two contract definitions coexist on purpose. CONTRACT_MARKER_RE (above) is a ANY-line test that also knows
+ * Two contract definitions coexist on purpose. CONTRACT_MARKER_RE (above) is an any-line test that also knows
  * NEED CONTEXT / SCOPE GROWTH; the stop branch keeps it so a guard-stopped producer that wrote any marker
  * anywhere is not forced to "incomplete" over a result it did state. parseReturnPrefix (signals.ts) is the
  * FIRST-line contract (DONE / NEED MORE / ESCALATE) used for the claim decision below.
@@ -63,7 +76,7 @@ const NEED_MORE_BUDGET_LINE_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*bud
 function claimsNeedMoreBudget(text: string): boolean {
   const contract = parseReturnPrefix(text);
   if (contract === null) return false;
-  if (contract.prefix === "none") return NEED_MORE_BUDGET_LINE_RE.test(text);
+  if (contract.prefix === "none") return !OTHER_CONTRACT_FIRST_LINE_RE.test(firstLine(text)) && NEED_MORE_BUDGET_LINE_RE.test(text);
   return contract.prefix === "need-more" && contract.claim === "budget";
 }
 

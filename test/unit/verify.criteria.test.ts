@@ -617,6 +617,15 @@ describe("DF-1 fix: the budget claim is read only from the return prefix", () =>
     expect(grader).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "SCOPE GROWTH: needs a design call.\n- `NEED MORE: budget` at the cap",
+    "**NEED CONTEXT:** which file?\nNEED MORE: budget",
+    "task_id: ses_1\n<task_result>\nSCOPE GROWTH: bigger than scoped\nNEED MORE: budget\n</task_result>",
+  ])("QA-FX2-2-1: %j — a SCOPE GROWTH/NEED CONTEXT first line decides, no budget claim", (text) => {
+    const input = { finalReturnText: text, producerSessionID: "p", producerTier: "medium" };
+    expect(incompleteVerdict(input, { progressNotes: false, budgetSnapshot: room })).toBeNull();
+  });
+
   it("a prefix claim is still incomplete", () => {
     const input = { finalReturnText: "NEED MORE: budget\nDONE: later", producerSessionID: "p", producerTier: "medium" };
     expect(incompleteVerdict(input, { progressNotes: false, budgetSnapshot: room })?.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
