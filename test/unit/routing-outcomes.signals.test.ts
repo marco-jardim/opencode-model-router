@@ -17,6 +17,7 @@ import {
 } from "../../src/routing/outcomes";
 import {
   REDISPATCH_WINDOW_MS,
+  SAME_TASK_LINE_SHARE,
   SIGNAL_MASS_CAPS,
   SIGNAL_WEIGHTS,
   detectRedispatch,
@@ -25,15 +26,17 @@ import {
   parseReturnPrefix,
   returnSignal,
   runSignal,
+  sameModel,
+  sharedLines,
   signalMass,
   signalRow,
   signedWeight,
-  taskSections,
+  taskSection,
   taskSimilarity,
   tierRank,
   verdictSignal,
-  withoutSharedLines,
   type DispatchText,
+  type ReturnSignalInput,
   type RunRecord,
   type SignalObservation,
 } from "../../src/routing/outcomes/signals";
@@ -52,6 +55,7 @@ import {
   type LogRow,
   type OutcomeKey,
   type SignalKind,
+  type VerdictRow,
 } from "../../src/routing/outcomes/types";
 
 const TIERS = ["fast", "medium", "heavy"] as const;
@@ -71,18 +75,28 @@ describe("parseReturnPrefix", () => {
     expect(parseReturnPrefix("NEED MORE: budget\r\nprogress: 3 of 5 files")).toEqual({ prefix: "need-more", claim: "budget" });
   });
 
-  it("tolerates markdown decoration, case and NEED MORE spellings", () => {
-    expect(parseReturnPrefix("**DONE:** shipped")?.prefix).toBe("done");
-    expect(parseReturnPrefix("> done: shipped")?.prefix).toBe("done");
+  it("tolerates markdown, list markers, emoji, numbering, case and NEED MORE spellings (QA-P14-1-2)", () => {
+    for (const text of ["**DONE:** shipped", "> done: shipped", "- DONE: shipped", "* DONE: shipped", "✅ DONE: shipped", "1. DONE: shipped", "### DONE: shipped", "DONE.", "DONE", "DONE!", "Done — shipped", "`DONE`: shipped"]) {
+      expect(parseReturnPrefix(text)?.prefix, text).toBe("done");
+    }
     expect(parseReturnPrefix("## ESCALATE: authority")).toEqual({ prefix: "escalate", claim: "authority" });
     expect(parseReturnPrefix("`NEED_MORE`: Budget exhausted")).toEqual({ prefix: "need-more", claim: "budget" });
-    expect(parseReturnPrefix("NEED-MORE: more context")).toEqual({ prefix: "need-more", claim: null });
+    expect(parseReturnPrefix("2) NEED-MORE: more context")).toEqual({ prefix: "need-more", claim: null });
     expect(parseReturnPrefix("ESCALATE: budget")).toEqual({ prefix: "escalate", claim: "budget" });
   });
 
-  it("DONE never carries a claim; a prefix without a colon is a progress note; no text is null", () => {
+  it("unwraps the task tool output: <task_result> and leading task_id lines (QA-P14-1-2)", () => {
+    const wrapped = "task_id: ses_abc123 (for resuming to continue this task if needed)\n\n<task_result>\nDONE: shipped\n</task_result>";
+    expect(parseReturnPrefix(wrapped)?.prefix).toBe("done");
+    expect(parseReturnPrefix("<task_result>\n\nNEED MORE: the schema")?.prefix).toBe("need-more");
+    expect(parseReturnPrefix("task_id: ses_1\nDONE: shipped")?.prefix).toBe("done");
+    expect(parseReturnPrefix("task_id: ses_1\n")).toBeNull();
+  });
+
+  it("DONE never carries a claim; prose is `none`; no text is null", () => {
     expect(parseReturnPrefix("DONE: budget left over")).toEqual({ prefix: "done", claim: null });
-    expect(parseReturnPrefix("DONE.")).toEqual({ prefix: "none", claim: null });
+    expect(parseReturnPrefix("Done with the first file, moving on")).toEqual({ prefix: "none", claim: null });
+    expect(parseReturnPrefix("DONEZO: x")).toEqual({ prefix: "none", claim: null });
     expect(parseReturnPrefix("ESCALATE: authorityish")).toEqual({ prefix: "escalate", claim: null });
     expect(parseReturnPrefix("")).toBeNull();
     expect(parseReturnPrefix("  \n\t\n")).toBeNull();
@@ -92,47 +106,56 @@ describe("parseReturnPrefix", () => {
 });
 
 describe("returnSignal (I6, I7)", () => {
+  const ret = (text: string | undefined, over: Partial<ReturnSignalInput> = {}): ReturnSignalInput => ({
+    text,
+    budgetExhausted: false,
+    authorityRequested: false,
+    ...over,
+  });
+  const incomplete = obs("incomplete", "fail", 0.5);
+
   it("DONE alone → no signal and no positive mass (I6)", () => {
-    expect(returnSignal({ text: "DONE: implemented and tested" })).toBeNull();
-    expect(returnSignal({ text: "DONE: x", budgetExhausted: false, authorityRequested: false })).toBeNull();
+    expect(returnSignal(ret("DONE: implemented and tested"))).toBeNull();
+    expect(returnSignal(ret("DONE: x", { budgetExhausted: "unobserved", authorityRequested: "unobserved" }))).toBeNull();
   });
 
-  it("no text → no signal", () => {
-    expect(returnSignal({ text: undefined })).toBeNull();
-    expect(returnSignal({ text: "\n" })).toBeNull();
+  it("a return without a contract prefix (progress note, prose, §2.9 E8) or no text → no signal (QA-P14-1-2)", () => {
+    expect(returnSignal(ret("I have read the files and will now edit them."))).toBeNull();
+    expect(returnSignal(ret("Done with the first file, moving on"))).toBeNull();
+    expect(returnSignal(ret(undefined))).toBeNull();
+    expect(returnSignal(ret("\n"))).toBeNull();
   });
 
-  it("NEED MORE / ESCALATE / a progress note without budget or authority → incomplete, failure 0.5", () => {
-    const incomplete = obs("incomplete", "fail", 0.5);
-    expect(returnSignal({ text: "NEED MORE: the schema file" })).toEqual(incomplete);
-    expect(returnSignal({ text: "ESCALATE: needs a design decision" })).toEqual(incomplete);
-    expect(returnSignal({ text: "I have read the files and will now edit them." })).toEqual(incomplete);
+  it("explicit NEED MORE / ESCALATE with both guards observed false → incomplete, failure 0.5", () => {
+    expect(returnSignal(ret("NEED MORE: the schema file"))).toEqual(incomplete);
+    expect(returnSignal(ret("ESCALATE: needs a design decision"))).toEqual(incomplete);
+    expect(returnSignal(ret("task_id: ses_1\n<task_result>\n- NEED MORE: x\n</task_result>"))).toEqual(incomplete);
   });
 
-  it("NEED MORE after budget exhaustion → budget, no mass (I7), whatever the text says", () => {
-    const budget = obs("budget", "none", 0);
-    expect(returnSignal({ text: "NEED MORE: budget\nprogress summary", budgetExhausted: true })).toEqual(budget);
-    expect(returnSignal({ text: "NEED MORE: still reading", budgetExhausted: true })).toEqual(budget);
-    expect(returnSignal({ text: "DONE: partial", budgetExhausted: true })).toEqual(budget);
-    // Not observed: the contract claim is taken.
-    expect(returnSignal({ text: "NEED MORE: budget" })).toEqual(budget);
+  it("the child's own budget/authority claim is no exemption when the guard says otherwise (QA-P14-1-10)", () => {
+    expect(returnSignal(ret("NEED MORE: budget"))).toEqual(incomplete);
+    expect(returnSignal(ret("ESCALATE: authority"))).toEqual(incomplete);
   });
 
-  it("a budget claim the guard refutes is incomplete", () => {
-    expect(returnSignal({ text: "NEED MORE: budget", budgetExhausted: false })).toEqual(obs("incomplete", "fail", 0.5));
-  });
-
-  it("authority request → authority, never a failure (I7)", () => {
-    const authority = obs("authority", "none", 0);
-    expect(returnSignal({ text: "ESCALATE: authority (edit denied)", authorityRequested: true })).toEqual(authority);
-    expect(returnSignal({ text: "ESCALATE: authority" })).toEqual(authority);
-    expect(returnSignal({ text: "anything", authorityRequested: true, budgetExhausted: true })).toEqual(authority);
-    expect(returnSignal({ text: "ESCALATE: authority", authorityRequested: false })).toEqual(obs("incomplete", "fail", 0.5));
-    for (const text of ["ESCALATE: authority", "NEED MORE: authority"]) {
-      const s = returnSignal({ text });
-      expect(s?.outcome).not.toBe("fail");
-      expect(signalMass(s!.kind, signedWeight(s!))).toEqual({ positive: 0, negative: 0 });
+  it("without guard state an unfinished return is no signal: never a penalty that could be budget or authority (QA-P14-1-10)", () => {
+    for (const text of ["NEED MORE: budget", "NEED MORE: the schema", "ESCALATE: authority", "ESCALATE: other"]) {
+      expect(returnSignal(ret(text, { budgetExhausted: "unobserved" }))).toBeNull();
+      expect(returnSignal(ret(text, { authorityRequested: "unobserved" }))).toBeNull();
     }
+  });
+
+  it("NEED MORE after an observed budget exhaustion → budget, no mass (I7), whatever the text says", () => {
+    const budget = obs("budget", "none", 0);
+    expect(returnSignal(ret("NEED MORE: budget\nprogress summary", { budgetExhausted: true }))).toEqual(budget);
+    expect(returnSignal(ret("NEED MORE: still reading", { budgetExhausted: true }))).toEqual(budget);
+    expect(returnSignal(ret("DONE: partial", { budgetExhausted: true }))).toEqual(budget);
+  });
+
+  it("an observed authority request → authority, never a failure (I7)", () => {
+    const authority = obs("authority", "none", 0);
+    expect(returnSignal(ret("ESCALATE: authority (edit denied)", { authorityRequested: true }))).toEqual(authority);
+    expect(returnSignal(ret("anything", { authorityRequested: true, budgetExhausted: true }))).toEqual(authority);
+    expect(signalMass(authority.kind, signedWeight(authority))).toEqual({ positive: 0, negative: 0 });
   });
 });
 
@@ -157,11 +180,26 @@ describe("graderSignal", () => {
     expect(graderSignal({ ...base, graderTier: "medium", outcome: "pass" }, TIERS)).toEqual(obs("grader", "pass", 0.5));
   });
 
-  it("a grader on the producer's model is ignored (variant and case do not make it another model)", () => {
-    const same = { ...base, graderModel: "anthropic/claude-sonnet-5-5" };
-    expect(graderSignal({ ...same, outcome: "pass" }, TIERS)).toBeNull();
-    expect(graderSignal({ ...same, graderModel: "anthropic/claude-sonnet-5-5#high", outcome: "fail" }, TIERS)).toBeNull();
-    expect(graderSignal({ ...same, graderModel: "Anthropic/Claude-Sonnet-5-5", outcome: "pass" }, TIERS)).toBeNull();
+  it("a grader on the producer's model is ignored, also through another provider or id spelling (QA-P14-1-4)", () => {
+    for (const graderModel of [
+      "anthropic/claude-sonnet-5-5",
+      "anthropic/claude-sonnet-5-5#high",
+      "Anthropic/Claude-Sonnet-5-5",
+      "openrouter/anthropic/claude-sonnet-5-5",
+      "anthropic/claude-sonnet-5.5",
+      "amazon-bedrock/anthropic.claude-sonnet-5-5-v1:0",
+      "anthropic/claude-sonnet-5-5-20260101",
+    ]) {
+      expect(graderSignal({ ...base, graderModel, outcome: "pass" }, TIERS), graderModel).toBeNull();
+    }
+  });
+
+  it("an ambiguous pair (one id inside the other) is no signal", () => {
+    expect(graderSignal({ ...base, graderModel: "openai/gpt-5-mini", producerModel: "openai/gpt-5", outcome: "pass" }, TIERS)).toBeNull();
+    expect(sameModel("openai/gpt-5", "openai/gpt-5-mini")).toBe(true);
+    expect(sameModel("openai/gpt-5", "anthropic/claude-opus-5")).toBe(false);
+    expect(sameModel(null, "openai/gpt-5")).toBe(true);
+    expect(sameModel("openai/", "openai/gpt-5")).toBe(true);
   });
 
   it("a lower-tier, unknown-tier or unknown-model grader is ignored; unverifiable is no signal", () => {
@@ -183,7 +221,13 @@ describe("graderSignal", () => {
 
 describe("runSignal", () => {
   const run = (script: string, exitCode: number | null, at: number, sessionID = "c1"): RunRecord => ({ sessionID, script, exitCode, at });
-  const input = (runs: RunRecord[], edits: number[] = [T0], acceptance: string[] = ["test"]) => ({ childSessionID: "c1", runs, edits, acceptance });
+  const input = (runs: RunRecord[], edits: number[] = [T0], acceptance: string[] = ["test"], editsObserved = true) => ({
+    childSessionID: "c1",
+    runs,
+    editsObserved,
+    edits,
+    acceptance,
+  });
 
   it("router_run exit 0 of the acceptance command started after the last edit → success 1", () => {
     expect(runSignal(input([run("test", 0, T0 + 1)]))).toEqual(obs("run", "pass", 1));
@@ -192,7 +236,6 @@ describe("runSignal", () => {
   it("router_run exit 0 before (or at) the last edit is ignored: `at` is the run START", () => {
     expect(runSignal(input([run("test", 0, T0 - 1)], [T0 - 10, T0]))).toBeNull();
     expect(runSignal(input([run("test", 0, T0)], [T0]))).toBeNull();
-    // A run that started before an edit made during it does not cover that edit.
     expect(runSignal(input([run("test", 0, T0 + 5)], [T0, T0 + 6]))).toBeNull();
   });
 
@@ -213,9 +256,11 @@ describe("runSignal", () => {
     expect(runSignal(input([run("test", 0, T0 + 1)], [T0], []))).toBeNull();
   });
 
-  it("no edits (a runner) → any acceptance run counts; non-finite timestamps are ignored", () => {
+  it("observed no edits (a runner) → any acceptance run counts; untracked edits or an unknown edit time → no signal (QA-P14-1-3)", () => {
     expect(runSignal(input([run("test", 0, T0)], []))).toEqual(obs("run", "pass", 1));
-    expect(runSignal(input([run("test", 0, T0)], [Number.NaN]))).toEqual(obs("run", "pass", 1));
+    expect(runSignal(input([run("test", 0, T0)], [], ["test"], false))).toBeNull();
+    expect(runSignal(input([run("test", 0, T0 + 10)], [Number.NaN]))).toBeNull();
+    expect(runSignal(input([run("test", 0, T0 + 10)], [T0, Number.POSITIVE_INFINITY]))).toBeNull();
     expect(runSignal(input([run("test", 0, Number.NaN)], []))).toBeNull();
   });
 });
@@ -250,37 +295,37 @@ const PROMPT_B = sevenSection(
 );
 
 function d(id: string, prompt: string, tier: string | null, at: number, over: Partial<DispatchText> = {}): DispatchText {
-  return { decisionID: id, parentSessionID: "p1", childSessionID: `c-${id}`, prompt, tier, at, ...over };
+  return { decisionID: id, parentSessionID: "p1", childSessionID: `c-${id}`, class: "implement", prompt, tier, at, ...over };
 }
 
-describe("taskSections / withoutSharedLines / taskSimilarity", () => {
-  it("extracts TASK + EXPECTED OUTCOME and drops the other sections", () => {
-    const text = taskSections(PROMPT_A) ?? "";
+describe("taskSection / sharedLines / taskSimilarity", () => {
+  it("extracts the TASK section only", () => {
+    const text = taskSection(PROMPT_A) ?? "";
     expect(text).toContain("off-by-one");
-    expect(text).toContain("regression test");
-    expect(text).not.toContain("ENVIRONMENT");
+    expect(text).not.toContain("regression test");
     expect(text).not.toContain("no new dependencies");
     expect(text).not.toContain("[router]");
   });
 
-  it("accepts bold, heading and parenthesised headers; null without either section", () => {
-    const md = ["**1. TASK:** do X", "multi-line task body", "## 2) EXPECTED OUTCOME (strict): Y", "3. REQUIRED TOOLS: read", "tool line"].join("\n");
-    expect(taskSections(md)).toBe([" do X", "multi-line task body", " Y"].join("\n"));
-    expect(taskSections("just a free-form request\nwith two lines")).toBeNull();
+  it("accepts bold, heading and parenthesised headers; null without a TASK header", () => {
+    const md = ["**1. TASK:** do X", "multi-line   task body", "## 2) EXPECTED OUTCOME (strict): Y", "3. REQUIRED TOOLS: read"].join("\n");
+    expect(taskSection(md)).toBe(["do X", "multi-line task body"].join("\n"));
+    expect(taskSection("2. EXPECTED OUTCOME: only this")).toBeNull();
+    expect(taskSection("just a free-form request\nwith two lines")).toBeNull();
   });
 
-  it("removes lines shared with at least two siblings", () => {
-    const sib = (unique: string) => ["shared header", "shared footer", unique].join("\n");
-    const out = withoutSharedLines(sib("mine"), [sib("one"), sib("two"), "shared header only"]);
-    expect(out).toBe("mine");
-    // Shared with one sibling only: kept.
-    expect(withoutSharedLines("a line\nb line", ["a line"])).toBe("a line\nb line");
+  it("sharedLines: normalized lines present in at least two siblings", () => {
+    expect(sharedLines(["a  line\nb", "a line\nc", "b\nd"])).toEqual(new Set(["a line", "b"]));
+    expect(sharedLines(["only once"])).toEqual(new Set());
   });
 
-  it("taskSimilarity is a word-set Dice; short texts never match", () => {
+  it("taskSimilarity: word-set Dice capped by identifier Dice; dotted identifiers and digits are words (QA-P14-1-1)", () => {
     expect(taskSimilarity("alpha beta gamma", "alpha beta gamma")).toBe(1);
     expect(taskSimilarity("alpha beta", "alpha beta")).toBe(0);
     expect(taskSimilarity("alpha beta gamma delta", "epsilon zeta eta theta")).toBe(0);
+    expect(taskSimilarity("Implement plan step P1.4 of the role tier plan", "Implement plan step P1.5 of the role tier plan")).toBe(0);
+    expect(taskSimilarity("Run step 1 of the plan", "Run step 2 of the plan")).toBe(0);
+    expect(taskSimilarity("touch signals.ts and stats.ts files", "touch signals stats ts files")).toBe(0);
   });
 });
 
@@ -297,12 +342,40 @@ describe("detectRedispatch", () => {
     expect(detectRedispatch(d("D2", PROMPT_B, "heavy", T0 + MIN), [d("D1", PROMPT_A, "fast", T0)], TIERS)).toBeNull();
   });
 
+  it("the same EXPECTED OUTCOME template with different short tasks → no signal: TASK alone decides (QA-P14-1-1)", () => {
+    const expected = "All edits committed on the branch with a conventional message, the related tests green, typecheck green, no unrelated file touched, a short summary with file:line evidence for every change.";
+    const prev = d("D1", sevenSection("Rename parseConfig to loadConfig in src/config.ts.", expected), "fast", T0);
+    const cur = d("D2", sevenSection("Bump vitest to 3.2 in package.json.", expected), "medium", T0 + MIN);
+    expect(detectRedispatch(cur, [prev], TIERS)).toBeNull();
+  });
+
+  it("plan steps P1.4 and P1.5 are different tasks (QA-P14-1-1)", () => {
+    const task = (step: string) => sevenSection(`Implement plan step ${step} of the role tier plan in the worktree.`, "Committed and pushed.");
+    expect(detectRedispatch(d("D2", task("P1.5"), "heavy", T0 + MIN), [d("D1", task("P1.4"), "fast", T0)], TIERS)).toBeNull();
+  });
+
+  it("a template inside TASK is removed when ≥ 2 siblings share it (QA-P14-1-1)", () => {
+    const tpl = (specific: string) =>
+      [
+        "1. TASK: Follow the plan step below exactly and report evidence with file references for every change you make.",
+        "Commit each change separately with a conventional commit message and the issue reference in the body.",
+        specific,
+        "2. EXPECTED OUTCOME: done",
+      ].join("\n");
+    const s1 = d("S1", tpl("Add a contributing section about release tags."), "fast", T0 - 3 * MIN);
+    const s2 = d("S2", tpl("Raise the default timeout of the fetch helper."), "fast", T0 - 2 * MIN);
+    const prev = d("P", tpl("Remove the deprecated legacy flag from the command parser."), "fast", T0);
+    const cur = d("N", tpl("Rename parseConfig to loadConfig across the config module."), "medium", T0 + MIN);
+    expect(detectRedispatch(cur, [s1, s2, prev], TIERS)).toBeNull();
+    expect(detectRedispatch(d("N", tpl("Remove the deprecated legacy flag from the command parser, carefully."), "medium", T0 + MIN), [s1, s2, prev], TIERS)?.previous).toBe(prev);
+  });
+
   it("re-dispatch to a lower or the same tier → no signal", () => {
     expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "fast", T0 + MIN), [d("D1", PROMPT_A, "medium", T0)], TIERS)).toBeNull();
     expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "medium", T0 + MIN), [d("D1", PROMPT_A, "medium", T0)], TIERS)).toBeNull();
   });
 
-  it("outside 30 min, simultaneous or later, another parent, the same child, a resume, an unknown tier → no signal", () => {
+  it("window, parent, child, resume, tier, class and role gates", () => {
     const prev = d("D1", PROMPT_A, "fast", T0);
     const cur = (over: Partial<DispatchText> = {}) => d("D2", PROMPT_A_AGAIN, "heavy", T0 + 5 * MIN, over);
     expect(detectRedispatch(cur({ at: T0 + REDISPATCH_WINDOW_MS + 1 }), [prev], TIERS)).toBeNull();
@@ -314,8 +387,23 @@ describe("detectRedispatch", () => {
     expect(detectRedispatch(cur({ resume: true }), [prev], TIERS)).toBeNull();
     expect(detectRedispatch(cur({ tier: null }), [prev], TIERS)).toBeNull();
     expect(detectRedispatch(cur(), [{ ...prev, tier: "ultra" }], TIERS)).toBeNull();
-    expect(detectRedispatch(cur(), [{ ...prev, childSessionID: null }], TIERS)).not.toBeNull();
+    expect(detectRedispatch(cur({ class: "review" }), [prev], TIERS)).toBeNull();
+    expect(detectRedispatch(cur({ class: null }), [{ ...prev, class: null }], TIERS)).toBeNull();
+    expect(detectRedispatch(cur({ role: "implementer" }), [prev], TIERS)).toBeNull();
+    expect(detectRedispatch(cur({ role: "implementer" }), [{ ...prev, role: "implementer" }], TIERS)).not.toBeNull();
     expect(detectRedispatch(cur(), [prev, { ...prev }], TIERS, { windowMs: MIN })).toBeNull();
+  });
+
+  it("an attempt without a child session cannot be addressed: never a candidate (QA-P14-1-5)", () => {
+    expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "medium", T0 + MIN), [d("D1", PROMPT_A, "fast", T0, { childSessionID: null })], TIERS)).toBeNull();
+  });
+
+  it("the window runs from the previous attempt's end when known; an attempt still running is not re-dispatched (QA-P14-1-7)", () => {
+    const prev = d("D1", PROMPT_A, "fast", T0, { endedAt: T0 + 40 * MIN });
+    expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "medium", T0 + 50 * MIN), [prev], TIERS)?.previous).toBe(prev);
+    expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "medium", T0 + 20 * MIN), [prev], TIERS)).toBeNull();
+    expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "medium", T0 + 71 * MIN), [prev], TIERS)).toBeNull();
+    expect(detectRedispatch(d("D2", PROMPT_A_AGAIN, "medium", T0 + 50 * MIN), [{ ...prev, endedAt: Number.NaN }], TIERS)).toBeNull();
   });
 
   it("an attempt that stopped on budget or authority is never penalised (I7)", () => {
@@ -330,22 +418,32 @@ describe("detectRedispatch", () => {
     const b = d("B", PROMPT_A, "fast", T0 + MIN);
     const other = d("X", PROMPT_B, "fast", T0 + 2 * MIN);
     expect(detectRedispatch(d("C", PROMPT_A_AGAIN, "medium", T0 + 3 * MIN), [a, other, b], TIERS)?.previous).toBe(b);
-    // The latest same-task attempt already ran at the same tier: nothing, even though an older one ran lower.
     const m = d("M", PROMPT_A, "medium", T0 + 2 * MIN);
     expect(detectRedispatch(d("C", PROMPT_A_AGAIN, "medium", T0 + 3 * MIN), [a, m], TIERS)).toBeNull();
   });
 
+  const wrap = (body: string) => ["You are a helper subagent.", "Follow the repository conventions strictly.", body, "Report file:line evidence."].join("\n");
+  const TASK = "Add retry with exponential backoff to src/net/fetch.ts and cover it with tests.";
+  const sibling1 = d("S1", wrap("Rename the logger helper in src/log/index.ts to createLogger everywhere."), "fast", T0 - 3 * MIN);
+  const sibling2 = d("S2", wrap("Translate the README introduction to Portuguese keeping the badges."), "fast", T0 - 2 * MIN);
+
   it("without sections: compares what is left after removing lines shared with ≥ 2 siblings", () => {
-    const wrap = (body: string) => ["You are a helper subagent.", "Follow the repository conventions strictly.", body, "Report file:line evidence."].join("\n");
-    const sibling1 = d("S1", wrap("Rename the logger helper in src/log/index.ts to createLogger everywhere."), "fast", T0 - 3 * MIN);
-    const sibling2 = d("S2", wrap("Translate the README introduction to Portuguese keeping the badges."), "fast", T0 - 2 * MIN);
-    const prev = d("P", wrap("Add retry with exponential backoff to src/net/fetch.ts and cover it with tests."), "fast", T0);
-    const same = d("N", wrap("Add retry with exponential backoff to src/net/fetch.ts and cover it with tests please."), "medium", T0 + MIN);
+    const prev = d("P", wrap(TASK), "fast", T0);
+    const same = d("N", wrap(`${TASK} Please.`), "medium", T0 + MIN);
     const different = d("N", wrap("Delete the unused feature flags from src/flags/registry.ts and their docs."), "medium", T0 + MIN);
     expect(detectRedispatch(same, [sibling1, sibling2, prev], TIERS)?.previous).toBe(prev);
     expect(detectRedispatch(different, [sibling1, sibling2, prev], TIERS)).toBeNull();
-    // One prompt with sections, the other without: both fall back.
     expect(detectRedispatch(d("N", PROMPT_A_AGAIN, "medium", T0 + MIN), [d("P", "Fix lexer", "fast", T0)], TIERS)).toBeNull();
+  });
+
+  it("third and fourth dispatches of a task still match: earlier attempts are not siblings (QA-P14-1-7)", () => {
+    expect(SAME_TASK_LINE_SHARE).toBe(0.8);
+    const a1 = d("A1", wrap(TASK), "fast", T0);
+    const a2 = d("A2", wrap(`${TASK}\nPrevious attempt left the tests red.`), "fast", T0 + MIN);
+    const a3 = d("A3", wrap(`${TASK}\nTwo attempts failed, read the tests first.`), "medium", T0 + 2 * MIN);
+    const a4 = d("A4", wrap(`${TASK}\nThird try: the flaky case is the timeout test.`), "heavy", T0 + 3 * MIN);
+    expect(detectRedispatch(a3, [sibling1, sibling2, a1, a2], TIERS)?.previous).toBe(a2);
+    expect(detectRedispatch(a4, [sibling1, sibling2, a1, a2, a3], TIERS)?.previous).toBe(a3);
   });
 });
 
@@ -434,24 +532,32 @@ function sig(of: DecisionRow, observation: SignalObservation, ts: string, over: 
   };
 }
 
-describe("signalRow and parseLogLine", () => {
-  it("a signal row is an annotation that round-trips through the log", () => {
+describe("signalRow, isAnnotationRow and parseLogLine", () => {
+  it("a signal row is an annotation that round-trips through the log (with its attempt id)", () => {
     const r = signalRow(
-      { ts: "2026-10-06T12:00:00.000Z", sessionID: "p1", decisionID: "D1", mode: "shadow", childSessionID: "c1", facts: row("D1", "x").facts, chosen: choiceOf(R_MED, "implementer"), step: "dispatch", role: "implementer", tier: "medium" },
+      { ts: "2026-10-06T12:00:00.000Z", sessionID: "p1", decisionID: "D1", mode: "shadow", childSessionID: "c1", facts: row("D1", "x").facts, chosen: choiceOf(R_MED, "implementer"), step: "dispatch", attemptID: "c1:0", role: "implementer", tier: "medium" },
       obs("grader", "fail", 0.5),
     );
     expect(r.reason).toBe(`${SIGNAL_REASON}grader:fail`);
     expect(r.reason.startsWith(ANNOTATION_REASON)).toBe(true);
-    expect(r).toMatchObject({ signal: "grader", signalWeight: -0.5, role: "implementer", tier: "medium", best: null, resume: false, confidence: 0.9 });
+    expect(r).toMatchObject({ signal: "grader", signalWeight: -0.5, attemptID: "c1:0", role: "implementer", tier: "medium", best: null, resume: false, confidence: 0.9 });
     expect(isAnnotationRow(r)).toBe(true);
     expect(parseLogLine(JSON.stringify(r))).toEqual(r);
     const bare = signalRow({ ts: r.ts, sessionID: "p1", decisionID: "D1", mode: "shadow", childSessionID: null, facts: r.facts, chosen: r.chosen, step: "variant" }, obs("budget", "none", 0));
     expect(bare).not.toHaveProperty("role");
     expect(bare).not.toHaveProperty("tier");
+    expect(bare).not.toHaveProperty("attemptID");
     expect(bare.signalWeight).toBe(0);
   });
 
-  it("round-trips the eight contract fields of DecisionRow (plus tier, signalWeight and a role-origin key)", () => {
+  it("isAnnotationRow keys on the `note:` reason prefix only (QA-P14-1-12)", () => {
+    expect(isAnnotationRow(row("D1", "2026-10-06T12:00:00.000Z", { signal: "run" }))).toBe(false);
+    expect(isAnnotationRow(row("D1", "2026-10-06T12:00:00.000Z", { reason: `${ANNOTATION_REASON}binding:unknown` }))).toBe(true);
+    const verdict: VerdictRow = { v: 1, kind: "verdict", ts: "2026-10-06T12:00:00.000Z", sessionID: "p1", decisionID: "D1", childSessionID: "c1", attemptID: "c1:0", key: R_FAST, verdict: "pass", step: "dispatch" };
+    expect(isAnnotationRow(verdict)).toBe(false);
+  });
+
+  it("round-trips the eight contract fields of DecisionRow (plus tier, signalWeight, attemptID and a role-origin key)", () => {
     const full = row("D9", "2026-10-06T12:00:00.000Z", {
       chosen: choiceOf(R_MED, "implementer", "role"),
       role: "implementer",
@@ -464,6 +570,7 @@ describe("signalRow and parseLogLine", () => {
       binding: "intersection",
       tier: "medium",
       signalWeight: 1,
+      attemptID: "c-D9:2",
     });
     const parsed = parseLogLine(JSON.stringify(full));
     expect(parsed).toEqual(full);
@@ -478,13 +585,16 @@ describe("signalRow and parseLogLine", () => {
     }
   });
 
-  it("malformed extension fields are dropped, never the row; old rows parse without them", () => {
-    const bad = { ...row("D9", "2026-10-06T12:00:00.000Z"), role: 7, grant: ["read", 1], boundsReasons: "x", budgetUsed: "37", signal: "bogus", explore: "yes", propensity: Number.NaN, binding: "maybe", tier: 3, signalWeight: "1" };
+  it("malformed or empty extension fields are dropped, never the row; old rows parse without them (QA-P14-1-13)", () => {
+    const bad = { ...row("D9", "2026-10-06T12:00:00.000Z"), role: 7, grant: ["read", 1], boundsReasons: "x", budgetUsed: "37", signal: "bogus", explore: "yes", propensity: Number.NaN, binding: "maybe", tier: 3, signalWeight: "1", attemptID: 4 };
     const parsed = parseLogLine(JSON.stringify(bad)) as DecisionRow;
     expect(parsed).not.toBeNull();
-    for (const field of ["role", "grant", "boundsReasons", "budgetUsed", "signal", "explore", "propensity", "binding", "tier", "signalWeight"]) {
+    for (const field of ["role", "grant", "boundsReasons", "budgetUsed", "signal", "explore", "propensity", "binding", "tier", "signalWeight", "attemptID"]) {
       expect(parsed).not.toHaveProperty(field);
     }
+    const empty = parseLogLine(JSON.stringify({ ...row("D9", "2026-10-06T12:00:00.000Z"), tier: "", attemptID: "" })) as DecisionRow;
+    expect(empty).not.toHaveProperty("tier");
+    expect(empty).not.toHaveProperty("attemptID");
     const { role: _role, tier: _tier, ...old } = row("D0", "2026-10-06T12:00:00.000Z", { chosen: choiceOf(TIER_KEY, "medium", "router") });
     const oldParsed = parseLogLine(JSON.stringify(old)) as DecisionRow;
     expect(oldParsed).toEqual(old);
@@ -573,18 +683,24 @@ describe("summarizeRoles", () => {
       sig(D2, obs("run", "pass", 1), "2026-10-06T10:40:00.000Z"),
       sig(D2, obs("grader", "pass", 0.5), "2026-10-06T10:41:00.000Z"),
       sig(D2, obs("verdict", "fail", 1), "2026-10-06T10:42:00.000Z"),
+      // QA-P14-1-8: the dispatch row decides role AND tier; the signal's own role/tier are ignored.
+      sig(D2, obs("redispatch", "fail", 0.5), "2026-10-06T10:43:00.000Z", { role: "reviewer", tier: "heavy" }),
       sig(D3, obs("budget", "none", 0), "2026-10-06T11:10:00.000Z"),
       sig(D3, obs("authority", "none", 0), "2026-10-06T11:11:00.000Z"),
       sig(D4, obs("budget", "none", 0), "2026-10-06T11:40:00.000Z"),
-      // A forged row: self-report trying to create positive mass, and a penalty for an authority request.
+      // Forged rows: self-report trying to create positive mass, and a penalty for an authority request (another attempt).
       sig(D3, obs("incomplete", "pass", 1), "2026-10-06T11:12:00.000Z"),
-      sig(D3, obs("authority", "fail", 1), "2026-10-06T11:13:00.000Z"),
-      // A tier-mode dispatch's signal and a signal without any dispatch row and without a role: unattributed.
+      sig(D3, obs("authority", "fail", 1), "2026-10-06T11:13:00.000Z", { attemptID: "c-R3:1" }),
+      // Same attempt and kind again: the first row wins (QA-P14-1-14).
+      sig(D3, obs("authority", "fail", 1), "2026-10-06T11:14:00.000Z"),
+      // A tier-mode dispatch's signals are unattributed, even when the signal row claims a role; so is a row without
+      // any dispatch row and without a role.
       sig(TIERED, obs("verdict", "pass", 1), "2026-10-06T10:30:00.000Z"),
+      sig(TIERED, obs("run", "pass", 1), "2026-10-06T10:30:30.000Z", { role: "implementer", tier: "fast" }),
       sig({ ...D1, decisionID: "ghost", role: undefined }, obs("run", "pass", 1), "2026-10-06T10:31:00.000Z"),
-      // A signal of a dispatch decided before the window joins it all the same; its own role/tier fill a missing join.
+      // No dispatch row to join: the signal's own role/tier place it.
       sig({ ...D1, decisionID: "ghost-role" }, obs("verdict", "pass", 1), "2026-10-06T10:32:00.000Z", { role: "reviewer", tier: "heavy" }),
-      // Unknown bindings: one on the dispatch row (D3), one annotation row attributed by its own role, one unattributed.
+      // Unknown bindings: one on the dispatch row (D3), one annotation row attributed by its dispatch, one unattributed.
       { ...D4, reason: `${ANNOTATION_REASON}binding:unknown`, binding: "unknown", ts: "2026-10-06T11:41:00.000Z" },
       { ...D4, decisionID: "nobody", role: undefined, reason: `${ANNOTATION_REASON}binding:unknown`, binding: "unknown", ts: "2026-10-06T11:42:00.000Z" },
     ];
@@ -622,20 +738,32 @@ describe("summarizeRoles", () => {
     expect(kind(medium, "run")).toMatchObject({ pass: 1, positive: 1 });
     expect(kind(medium, "grader")).toMatchObject({ pass: 1, positive: 0.5 });
     expect(kind(medium, "verdict")).toMatchObject({ fail: 1, negative: 1 });
+    expect(kind(medium, "redispatch")).toMatchObject({ fail: 1, negative: 0.5 });
     expect(medium.positiveMass).toBe(1.5);
-    expect(medium.negativeMass).toBe(1);
+    expect(medium.negativeMass).toBe(1.5);
     expect(medium.costUnits).toEqual([{ unit: "usd", total: 0.12, rows: 1 }]);
 
     const explorer = bucket(t, "explorer", "unknown");
     expect(explorer).toMatchObject({ dispatches: 1, budgetExhaustions: 1, unknownBindings: 1, costUnits: [] });
 
-    expect(bucket(t, "reviewer", "heavy")).toMatchObject({ dispatches: 0, positiveMass: 1 });
-    expect(t.unattributed).toEqual({ signals: 2, unknownBindings: 1 });
+    expect(bucket(t, "reviewer", "heavy")).toMatchObject({ dispatches: 0, positiveMass: 1, negativeMass: 0 });
+    expect(t.unattributed).toEqual({ signals: 3, unknownBindings: 1 });
   });
 
   it("duplicated rows count once (C7)", () => {
     const rows = log();
     expect(summarizeRoles(null, [...rows, ...rows], WINDOW)).toEqual(summarizeRoles(null, rows, WINDOW));
+  });
+
+  it("one signal per attempt and kind, first wins; another attempt id of the same decision is its own (QA-P14-1-14)", () => {
+    const at = (m: number) => `2026-10-06T10:${String(m).padStart(2, "0")}:00.000Z`;
+    const rows: LogRow[] = [
+      D1,
+      sig(D1, obs("grader", "pass", 0.5), at(30), { attemptID: "c-R1:0" }),
+      sig(D1, obs("grader", "fail", 0.5), at(31), { attemptID: "c-R1:0" }),
+      sig(D1, obs("grader", "fail", 0.5), at(32), { attemptID: "c-R1:1" }),
+    ];
+    expect(kind(bucket(summarizeRoles(null, rows, WINDOW), "implementer", "fast"), "grader")).toEqual({ kind: "grader", pass: 1, fail: 1, none: 0, positive: 0.5, negative: 0.5 });
   });
 
   it("windows signals by their own ts and joins dispatches outside the window", () => {
@@ -752,24 +880,27 @@ function register(child: string, over: Partial<DispatchInput> = {}): void {
   }, T0);
 }
 
+const reasonOf = (r: LogRow): string => (r.kind === "verdict" ? `verdict:${r.verdict}` : r.kind === "decision" ? r.reason : r.kind);
+
 describe("ingest.onSignal", () => {
-  it("appends one role signal row per attempt, kind and outcome (C7); the store, its Beta and decay are untouched", async () => {
+  it("one row per attempt and kind; verdict refused; the store, its Beta and decay untouched (QA-P14-1-6, 1-14)", async () => {
     const h = ingestHarness();
     register("c1");
-    expect(h.ingest.onSignal?.("c1", obs("redispatch", "fail", 0.5))).toBe(true);
+    expect(h.ingest.onSignal?.("c1", obs("run", "pass", 1))).toBe(true);
     const store = h.bundles[0]!.store;
     const before = { revision: store.revision, snapshot: JSON.stringify(store.snapshot()), posterior: store.posterior(R_FAST) };
-    expect(h.ingest.onSignal?.("c1", obs("redispatch", "fail", 0.5))).toBe(false);
-    expect(h.ingest.onSignal?.("c1", obs("run", "pass", 1))).toBe(true);
-    expect(h.ingest.onSignal?.("c1", obs("verdict", "fail", 1))).toBe(true);
-    expect(h.ingest.onSignal?.("c1", obs("verdict", "pass", 1))).toBe(true);
+    expect(h.ingest.onSignal?.("c1", obs("run", "pass", 1))).toBe(false);
+    expect(h.ingest.onSignal?.("c1", obs("grader", "pass", 0.5))).toBe(true);
+    expect(h.ingest.onSignal?.("c1", obs("grader", "fail", 0.5))).toBe(false);
+    expect(h.ingest.onSignal?.("c1", obs("verdict", "fail", 1))).toBe(false);
+    expect(h.ingest.onSignal?.("c1", obs("verdict", "pass", 1))).toBe(false);
     expect(store.revision).toBe(before.revision);
     expect(JSON.stringify(store.snapshot())).toBe(before.snapshot);
     expect(store.posterior(R_FAST)).toEqual(before.posterior);
     expect(store.keys()).toEqual([]);
 
     const rows = (await h.rows()) as DecisionRow[];
-    expect(rows.map((r) => r.reason)).toEqual(["note:signal:redispatch:fail", "note:signal:run:pass", "note:signal:verdict:fail", "note:signal:verdict:pass"]);
+    expect(rows.map(reasonOf)).toEqual(["note:signal:run:pass", "note:signal:grader:pass"]);
     expect(rows[0]).toMatchObject({
       kind: "decision",
       decisionID: "dec-1",
@@ -778,12 +909,70 @@ describe("ingest.onSignal", () => {
       mode: "enforce",
       role: "implementer",
       tier: "fast",
-      signal: "redispatch",
-      signalWeight: -0.5,
+      signal: "run",
+      signalWeight: 1,
       step: "dispatch",
+      attemptID: expect.any(String),
       chosen: { key: R_FAST, agent: "implementer", origin: "role", model: "anthropic/claude-haiku-4-5", variant: "default" },
     });
     expect(rows.every((r) => isAnnotationRow(r))).toBe(true);
+  });
+
+  it("a re-dispatch failure needs the previous attempt's decision id, and only that attempt takes it (QA-P14-1-5)", async () => {
+    const h = ingestHarness();
+    register("c1");
+    expect(h.ingest.onSignal?.("c1", obs("redispatch", "fail", 0.5))).toBe(false);
+    expect(h.ingest.onSignal?.("c1", obs("redispatch", "fail", 0.5), { expectDecisionID: "dec-other" })).toBe(false);
+    // The child was registered again for a new dispatch: the old decision id no longer matches.
+    register("c1", { decisionID: "dec-2" });
+    expect(h.ingest.onSignal?.("c1", obs("redispatch", "fail", 0.5), { expectDecisionID: "dec-1" })).toBe(false);
+    expect(h.ingest.onSignal?.("c1", obs("redispatch", "fail", 0.5), { expectDecisionID: "dec-2" })).toBe(true);
+    // Evicted: nothing, and the caller is told.
+    expect(h.ingest.onSignal?.("gone", obs("redispatch", "fail", 0.5), { expectDecisionID: "dec-2" })).toBe(false);
+    const rows = (await h.rows()) as DecisionRow[];
+    expect(rows.map((r) => [r.decisionID, r.reason])).toEqual([["dec-2", "note:signal:redispatch:fail"]]);
+  });
+
+  it("onVerdict writes the verdict signal row of a role dispatch only when the store takes the verdict (QA-P14-1-6)", async () => {
+    const h = ingestHarness();
+    register("c1");
+    h.ingest.onVerdict("c1", "unverifiable");
+    h.ingest.onVerdict("c1", "fail");
+    h.ingest.onVerdict("c1", "pass"); // the store already scored the attempt: no row of either kind
+    const rows = await h.rows();
+    expect(rows.map(reasonOf)).toEqual(["verdict:unverifiable", "verdict:fail", "note:signal:verdict:fail"]);
+    expect((rows[2] as DecisionRow).signalWeight).toBe(-1);
+    const roles = summarizeRoles(null, rows, { since: null, until: null });
+    expect(roles.unattributed.signals).toBe(0); // dec-1 has no dispatch row here, the signal row's own role places it
+    expect(roles.byRoleTier[0]).toMatchObject({ role: "implementer", tier: "fast", negativeMass: 1 });
+  });
+
+  it("onVerdict of a tier-mode dispatch writes no signal row", async () => {
+    const h = ingestHarness({ roleAgentIds: undefined });
+    register("c2", { agent: "medium", model: "anthropic/claude-sonnet-5-5#high", tier: "medium" });
+    h.ingest.onVerdict("c2", "pass");
+    expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass"]);
+  });
+
+  it("zero-mass kinds are written under class `unknown` when the class is not trusted; others are not (QA-P14-1-9)", async () => {
+    const h = ingestHarness();
+    register("low", { facts: { ...FACTS, confidence: 0.2 } });
+    register("unk", { facts: { ...FACTS, class: "unknown" }, decisionID: "dec-u" });
+    expect(h.ingest.onSignal?.("low", obs("incomplete", "fail", 0.5))).toBe(false);
+    expect(h.ingest.onSignal?.("low", obs("budget", "none", 0))).toBe(true);
+    expect(h.ingest.onSignal?.("unk", obs("authority", "none", 0))).toBe(true);
+    const rows = (await h.rows()) as DecisionRow[];
+    expect(rows.map((r) => r.chosen.key)).toEqual([
+      makeKey("unknown", { origin: "role", id: "implementer" }, "anthropic", "claude-haiku-4-5"),
+      makeKey("unknown", { origin: "role", id: "implementer" }, "anthropic", "claude-haiku-4-5"),
+    ]);
+    expect(h.bundles[0]!.store.keys()).toEqual([]);
+  });
+
+  it("a registration without a decision id writes no signal row (QA-P14-1-11)", () => {
+    const h = ingestHarness();
+    register("c1", { decisionID: null });
+    expect(h.ingest.onSignal?.("c1", obs("budget", "none", 0))).toBe(false);
   });
 
   it("a new attempt of the same child is a new identity", async () => {
@@ -792,29 +981,28 @@ describe("ingest.onSignal", () => {
     expect(h.ingest.onSignal?.("c1", obs("incomplete", "fail", 0.5))).toBe(true);
     register("c1");
     expect(h.ingest.onSignal?.("c1", obs("incomplete", "fail", 0.5))).toBe(true);
-    expect(await h.rows()).toHaveLength(2);
+    const rows = (await h.rows()) as DecisionRow[];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.attemptID).not.toBe(rows[1]?.attemptID);
   });
 
-  it("tier-mode agents keep router/host keys and carry no role; a registration without a decision gets its own id", async () => {
+  it("tier-mode agents keep router keys and carry no role", async () => {
     const h = ingestHarness({ roleAgentIds: undefined });
-    register("c1", { agent: "medium", model: "anthropic/claude-sonnet-5-5#high", tier: null, decisionID: null });
+    register("c1", { agent: "medium", model: "anthropic/claude-sonnet-5-5#high", tier: null });
     expect(h.ingest.onSignal?.("c1", obs("budget", "none", 0))).toBe(true);
     const [r] = (await h.rows()) as DecisionRow[];
     expect(r?.chosen.origin).toBe("router");
     expect(r?.chosen.variant).toBe("high");
-    expect(r?.decisionID.startsWith("attempt:")).toBe(true);
     expect(r).not.toHaveProperty("role");
     expect(r).not.toHaveProperty("tier");
     expect(r?.signalWeight).toBe(0);
   });
 
-  it("records nothing for an unregistered, untrusted or unkeyable child, an invalid observation, or with ingestion off", async () => {
+  it("records nothing for an unregistered or unkeyable child, an invalid observation, or with ingestion off", () => {
     const h = ingestHarness();
     expect(h.ingest.onSignal?.("nobody", obs("run", "pass", 1))).toBe(false);
-    register("low", { facts: { ...FACTS, confidence: 0.2 } });
-    expect(h.ingest.onSignal?.("low", obs("run", "pass", 1))).toBe(false);
     register("nomodel", { model: null });
-    expect(h.ingest.onSignal?.("nomodel", obs("run", "pass", 1))).toBe(false);
+    expect(h.ingest.onSignal?.("nomodel", obs("budget", "none", 0))).toBe(false);
     register("c1");
     expect(h.ingest.onSignal?.("c1", { kind: "run", outcome: "pass", weight: -1 })).toBe(false);
     expect(h.ingest.onSignal?.("c1", { kind: "nope", outcome: "pass", weight: 1 } as unknown as SignalObservation)).toBe(false);
