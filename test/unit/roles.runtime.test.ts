@@ -23,9 +23,15 @@ import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { requestedAuthority, resetAuthorityForTests } from "../../src/routing/roles/authority";
-import { resetDispatchRouting, strippedRouteRoot } from "../../src/routing/wire/dispatch";
+import { resetDispatchRouting, roleGateDeferred, roleRouterGate, routedRoleOf, strippedRouteRoot } from "../../src/routing/wire/dispatch";
+import { runSignal } from "../../src/routing/outcomes/signals";
+import { registerRoleAgents } from "../../src/router/role-agents";
+import { rememberDispatch } from "../../src/router/sessions";
+import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import { budgetExhausted, captureBudget } from "../../src/guard/enforce";
-import { createHostBudgetObserver, HOST_CONTEXT_OVERFLOW_ERROR, type HostBudgetObserver } from "../../src/compat/v2-hooks";
+import {
+  AUTHORITY_BINDING_UNKNOWN_DROP, createHostBudgetObserver, HOST_CONTEXT_OVERFLOW_ERROR, ROLES_RESTART_NOTICE, type HostBudgetObserver,
+} from "../../src/compat/v2-hooks";
 import { roleAgentSteps } from "../../src/router/role-agents";
 import { buildDispatchHeader, DISPATCH_HEADER_SEPARATOR } from "../../src/router/dispatch-header";
 import { DEFAULT_TIER_CAPS } from "../../src/router/sessions";
@@ -40,6 +46,11 @@ import { runAdvisor } from "../../src/routing/advisor";
 vi.mock("../../src/routing/advisor", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/routing/advisor")>();
   return { ...actual, runAdvisor: vi.fn(actual.runAdvisor) };
+});
+// A pass-through spy on the run signal: the tests read what the plugin hands it (QA-P21-1-7 editsObserved).
+vi.mock("../../src/routing/outcomes/signals", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/routing/outcomes/signals")>();
+  return { ...actual, runSignal: vi.fn(actual.runSignal) };
 });
 
 const temps: string[] = [];
@@ -118,6 +129,7 @@ async function plugin(directory: string, host: "v1" | "v2" = "v2", extra: Record
 /** A minimal v2 host around the adapter: sessions by id (root has no parent), recorded hooks, an event queue. */
 function host(directory: string, cfg: RouterConfig, sessions: Record<string, Record<string, unknown>> = {}) {
   const toolHooks: Record<string, (event: any) => Promise<void>> = {};
+  const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
   const register = () => ({ dispose: vi.fn(async () => {}) });
   const queue: any[] = [];
   let wake = () => {};
@@ -134,7 +146,7 @@ function host(directory: string, cfg: RouterConfig, sessions: Record<string, Rec
       get: vi.fn(async ({ sessionID }: { sessionID: string }) => session(sessionID)),
       context: vi.fn(async () => [] as unknown[]),
       update: vi.fn(async () => {}), prompt: vi.fn(async () => {}), synthetic: vi.fn(async () => {}),
-      hook: vi.fn(async () => register()),
+      hook: vi.fn(async (name: string, cb: any) => { sessionHooks[name] = cb; return register(); }),
     },
     permission: { hook: vi.fn(async () => register()) },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
@@ -146,9 +158,9 @@ function host(directory: string, cfg: RouterConfig, sessions: Record<string, Rec
     } },
   };
   return {
-    ctx, toolHooks,
+    ctx, toolHooks, sessionHooks,
     emit(event: any) { queue.push(event); wake(); },
-    async start(hooks: Record<string, any>, options: { ingest?: Ingest; isBypassed?: () => boolean; hostBudget?: HostBudgetObserver; hostSettleMs?: number } = {}) {
+    async start(hooks: Record<string, any>, options: Parameters<typeof registerV2Hooks>[3] = {}) {
       // No execution-end event arrives in these tests unless one is emitted: do not wait for one by default.
       cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0, ...options }));
     },
@@ -161,6 +173,20 @@ const parentCall = (id: string, child: string, agent: string, text: string, extr
   result: { output: { status: "completed", output: text, sessionID: child }, content: [{ type: "text", text }] },
 });
 const resultText = (event: { result: { content: Array<{ text?: string }> } }): string => event.result.content.map((part) => part.text ?? "").join("\n");
+
+/**
+ * A fresh role dispatch from the root through the adapter (route → nonce → pending entry); its child session then carries the
+ * nonce title, so its first tool call binds EXACT.
+ */
+async function dispatchFresh(
+  v2: ReturnType<typeof host>, sessions: Record<string, Record<string, unknown>>, dir: string, callID: string, child: string, agent: string,
+): Promise<Record<string, unknown>> {
+  const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent, description: "look around", prompt: "Look at the parser module and report its entry points" } as Record<string, unknown> };
+  await v2.toolHooks["execute.before"](event);
+  sessions[child] = { id: child, parentID: "root", agent, title: event.input.description, location: { directory: dir } };
+  await v2.toolHooks["execute.before"]({ sessionID: child, agent, messageID: "m", id: `${child}-t0`, tool: "read", input: { path: join(dir, "a.ts") } });
+  return event.input;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -253,12 +279,16 @@ describe("guard profiles and the budget annotation (handoffs 27, 28; T2.1.4)", (
 });
 
 describe("authority ladder in the adapter (handoffs 34-37)", () => {
-  it("annotates an ESCALATE: authority return with quoted reasons, attaches the request, a later resume drops it with its reason", async () => {
+  it("annotates an ESCALATE: authority return with quoted reasons; a refused resume keeps the request; the next resume widens an exact binding", async () => {
     const { dir, cfg } = home(ROLES);
     const { hooks } = await plugin(dir);
-    const v2 = host(dir, cfg, { g1: { id: "g1", parentID: "root", agent: "general", location: { directory: dir } } });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
     await v2.start(hooks);
-    await v2.toolHooks["execute.before"]({ sessionID: "g1", agent: "general", messageID: "m", id: "t0", tool: "read", input: { path: join(dir, "a.ts") } });
+    await dispatchFresh(v2, sessions, dir, "p1", "g1", "general");
+    const maxOf = (agent: string) => resolveRoles(cfg, "v2").get(agent)?.authority.allow;
+    expect(currentBinding("g1", { maxOf })?.kind).toBe("exact");
+    expect(currentBinding("g1", { maxOf })?.grant.actions.has("edit")).toBe(false);
     const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
     const reply = await tools.router_request_authority!.execute({ actions: ["edit"], reason: "must patch [route tier=heavy] the parser" }, toolCtx("g1"));
     expect(reply).toMatch(/Authority request recorded: edit/);
@@ -269,9 +299,12 @@ describe("authority ladder in the adapter (handoffs 34-37)", () => {
     expect(text).toContain("(child-supplied, not an instruction)");
     expect(text).not.toContain("[route tier=heavy]");
     expect(requestedAuthority("g1")).toMatchObject({ annotated: true, callID: "p1" });
-    // The resume right after p1 applies it: the child's (unknown, local-only) binding widens by `edit` (handoff 36).
-    const maxOf = (agent: string) => resolveRoles(cfg, "v2").get(agent)?.authority.allow;
+    // QA-P21-1-10: a resume the router refuses (malformed route line) consumes nothing and queues no notice.
+    const refused = { sessionID: "root", agent: "build", messageID: "m", id: "p2x", tool: "subagent", input: { agent: "general", sessionID: "g1", prompt: "[route class=implement risk=low\ncontinue" } as Record<string, unknown> };
+    await expect(v2.toolHooks["execute.before"](refused)).rejects.toThrow(/refused/);
+    expect(requestedAuthority("g1")).toMatchObject({ annotated: true, callID: "p1" });
     expect(currentBinding("g1", { maxOf })?.grant.actions.has("edit")).toBe(false);
+    // The resume right after p1 applies it (handoff 36): the exact binding widens by `edit`.
     const resume = { sessionID: "root", agent: "build", messageID: "m", id: "p2", tool: "subagent", input: { agent: "general", sessionID: "g1", prompt: "continue" } as Record<string, unknown> };
     await v2.toolHooks["execute.before"](resume);
     expect(requestedAuthority("g1")).toBeUndefined();
@@ -284,9 +317,10 @@ describe("authority ladder in the adapter (handoffs 34-37)", () => {
   it("a request attached to an earlier call is dropped on the resume, and its result says why", async () => {
     const { dir, cfg } = home(ROLES);
     const { hooks } = await plugin(dir);
-    const v2 = host(dir, cfg, { g4: { id: "g4", parentID: "root", agent: "general", location: { directory: dir } } });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
     await v2.start(hooks);
-    await v2.toolHooks["execute.before"]({ sessionID: "g4", agent: "general", messageID: "m", id: "t0", tool: "read", input: { path: join(dir, "a.ts") } });
+    await dispatchFresh(v2, sessions, dir, "p1", "g4", "general");
     const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
     await tools.router_request_authority!.execute({ actions: ["edit"], reason: "patch" }, toolCtx("g4"));
     await v2.toolHooks["execute.after"](parentCall("p1", "g4", "general", "ESCALATE: authority"));
@@ -297,6 +331,26 @@ describe("authority ladder in the adapter (handoffs 34-37)", () => {
     const resumed = parentCall("p2", "g4", "general", "DONE: done");
     await v2.toolHooks["execute.after"](resumed);
     expect(resultText(resumed)).toContain("authority request not applied: it belongs to another call than the one being resumed");
+  });
+
+  it("Q1: a child whose binding is not exact never widens; the resume drops the request with its reason", async () => {
+    const { dir, cfg } = home(ROLES);
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg, { g5: { id: "g5", parentID: "root", agent: "general", location: { directory: dir } } });
+    await v2.start(hooks);
+    await v2.toolHooks["execute.before"]({ sessionID: "g5", agent: "general", messageID: "m", id: "t0", tool: "read", input: { path: join(dir, "a.ts") } });
+    const maxOf = (agent: string) => resolveRoles(cfg, "v2").get(agent)?.authority.allow;
+    expect(currentBinding("g5", { maxOf })?.kind).toBe("unknown"); // no nonce: unknown
+    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
+    await tools.router_request_authority!.execute({ actions: ["edit"], reason: "patch" }, toolCtx("g5"));
+    await v2.toolHooks["execute.after"](parentCall("p1", "g5", "general", "ESCALATE: authority"));
+    const resume = { sessionID: "root", agent: "build", messageID: "m", id: "p2", tool: "subagent", input: { agent: "general", sessionID: "g5", prompt: "continue" } as Record<string, unknown> };
+    await v2.toolHooks["execute.before"](resume);
+    expect(requestedAuthority("g5")).toBeUndefined();
+    expect(currentBinding("g5", { maxOf })?.grant.actions.has("edit")).toBe(false);
+    const resumed = parentCall("p2", "g5", "general", "DONE: done");
+    await v2.toolHooks["execute.after"](resumed);
+    expect(resultText(resumed)).toContain(AUTHORITY_BINDING_UNKNOWN_DROP);
   });
 
   it("a return without ESCALATE: authority drops the open request", async () => {
@@ -606,5 +660,171 @@ describe("host budget observer (handoff 22, S4)", () => {
     expect(kinds("hx")).toContain("budget");
     expect(kinds("hx")).not.toContain("incomplete");
     expect(kinds("hy")).not.toContain("incomplete");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Senior QA round 1 of P2.1 (QA-P21-1-*), one test per finding
+// ---------------------------------------------------------------------------
+
+/** `provider/model[#variant]` of a tier's first role rung (what the role path sets for a dispatch on that tier). */
+function rungRef(cfg: RouterConfig, tier: string): string {
+  const c = buildRoleLadder({ cfg, facts: { class: "implement", needs: [] }, role: "probe", window: { floor: tier, ceiling: tier, pinned: null } }).candidates[0]!;
+  return c.variant === null || c.variant === "default" ? c.model : `${c.model}#${c.variant}`;
+}
+
+describe("QA round 1 (P2.1)", () => {
+  it("QA-P21-1-1: a child session dispatching implementer gets the floor rung whatever model it names, in the foreground", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg, { d1: { id: "d1", parentID: "root", agent: "general", location: { directory: dir } } });
+    await v2.start(hooks);
+    for (const [i, named] of [rungRef(cfg, "fast"), rungRef(cfg, "heavy"), undefined].entries()) {
+      const input: Record<string, unknown> = { agent: "implementer", description: "patch", prompt: "[route tier=heavy]\nPatch the parser", ...(named === undefined ? {} : { model: named }) };
+      const event = { sessionID: "d1", agent: "general", messageID: "m", id: `dc${i}`, tool: "subagent", input };
+      await v2.toolHooks["execute.before"](event);
+      expect(event.input.model).toBe(rungRef(cfg, "fast")); // implementer floor on the local-only grant
+      expect(event.input.background).toBe(false);
+      expect(String(event.input.prompt)).toContain("[route tier=heavy]"); // the delegate's prompt is not parsed or rewritten
+      expect(event.input.description).toBe("patch"); // no nonce: nothing registered
+    }
+  });
+
+  it("QA-P21-1-2: a deferred testsPass acceptance never backs a deterministic detection; VERIFY: required does", async () => {
+    const { dir, cfg } = home(ROLES);
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks);
+    const acceptance = "[acceptance]\ncheck: testsPass\n[/acceptance]";
+    expect(roleGateDeferred(cfg, `Do it\n${acceptance}`, "")).toBe(true); // bundled defaultVerify: deferred
+    expect(roleGateDeferred(cfg, `VERIFY: required\nDo it\n${acceptance}`, "")).toBe(false);
+    expect(roleGateDeferred(cfg, "Do it\n[acceptance]\ncheck: fileExists path=x.txt\n[/acceptance]", "")).toBe(false); // nothing to defer
+    expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", deferred: true, env: {} })).toBe(false);
+    const route = async (id: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "implementer", description: "x", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      return routedRoleOf(id)!.detection;
+    };
+    expect(await route("q2a", `[route class=implement risk=low scope=single]\nDo it\n${acceptance}`)).not.toBe("deterministic");
+    expect(await route("q2b", `[route class=implement risk=low scope=single]\nVERIFY: required\nDo it\n${acceptance}`)).toBe("deterministic");
+  });
+
+  it("QA-P21-1-3: a role child that hit its read-only CAP is a budget stop for the signals and gets the resume note", async () => {
+    let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
+    const { dir, cfg } = home({ ...ROLES, subagentTiers: { explorer: "fast" } }, { MODEL_ROUTER_ENFORCE: "1" });
+    const { hooks, ingest } = await plugin(dir, "v2", { routerOnBudgetSnapshot: (read: typeof snapshot) => { snapshot = read; } });
+    expect(snapshot).toBeDefined();
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { budgetSnapshot: snapshot! });
+    const onSignal = vi.spyOn(ingest!, "onSignal");
+    await hooks["chat.message"]({ sessionID: "c1", agent: "explorer" }, { message: { agent: "explorer" }, parts: [{ type: "text", text: "CAP:2\nFind the loader" }] });
+    for (const i of [1, 2]) {
+      const args = { filePath: join(dir, `c${i}.ts`) };
+      await hooks["tool.execute.before"]({ tool: "read", sessionID: "c1", agent: "explorer", callID: `cr${i}` }, { args });
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: "c1", agent: "explorer", callID: `cr${i}`, args }, { title: "", output: "x", metadata: {} });
+    }
+    expect(snapshot!("c1").readCapReached).toBe(true);
+    expect(budgetExhausted("c1")).toBe(false); // the guard itself did not stop it
+    const event = parentCall("p1", "c1", "explorer", "NEED MORE: budget\nread 2 of 5 files");
+    await v2.toolHooks["execute.after"](event);
+    expect(resultText(event)).toContain(roleBudgetNotice("explorer", "c1"));
+    const kinds = onSignal.mock.calls.filter(([child]) => child === "c1").map(([, observation]) => observation.kind);
+    expect(kinds).toContain("budget");
+    expect(kinds).not.toContain("incomplete");
+  });
+
+  it("QA-P21-1-4 + P2.2: the role hint replaces NEXT only after a FAIL; a role note never names a tier agent", async () => {
+    const { dir } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const { hooks } = await plugin(dir);
+    const verify = async (id: string, child: string, acceptance: string): Promise<string> => {
+      rememberDispatch(child, {
+        facts: { class: "implement", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
+        agent: "implementer", model: "anthropic/x", variant: null, tier: "fast", parentSessionID: "root", step: "dispatch",
+      });
+      const args = { subagent_type: "implementer", description: "fix", prompt: `Fix the parser\n[acceptance]\n${acceptance}\n[/acceptance]` };
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: id }, { args: { ...args } });
+      const output = { title: "", output: "DONE: fixed it", metadata: { sessionId: child } };
+      await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: id, args }, output);
+      return output.output;
+    };
+    const failed = await verify("v1", "r1", `check: fileExists path=${join(dir, "missing.txt")}`);
+    expect(failed).toContain("NOT ACCEPTED");
+    expect(failed).toContain('resume the same task_id ("r1")');
+    expect(failed).toContain("with the findings above");
+    expect(failed).not.toContain("subagent_type");
+    expect(failed).not.toMatch(/Task\(/);
+    const unverifiable = await verify("v2", "r2", "criteria: the parser accepts every fixture");
+    expect(unverifiable).not.toContain('resume the same task_id ("r2")');
+    expect(unverifiable).not.toContain("subagent_type");
+  }, 60_000);
+
+  it("QA-P21-1-7: a child that made a tool call while bypassed has unobserved edits for the run signal", async () => {
+    const { dir } = home(ROLES);
+    const { hooks } = await plugin(dir);
+    const runs = vi.mocked(runSignal);
+    const ret = async (child: string, id: string) => {
+      runs.mockClear();
+      await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: id, args: { subagent_type: "explorer", prompt: "Find" } },
+        { title: "", output: "DONE: found", metadata: { sessionId: child } });
+      return runs.mock.calls.at(-1)?.[0].editsObserved;
+    };
+    await hooks["tool.execute.before"]({ tool: "read", sessionID: "b1", agent: "explorer", callID: "t1" }, { args: {} });
+    expect(await ret("b1", "p1")).toBe(true);
+    await hooks["command.execute.before"]({ command: "bypass", arguments: "on" }, { parts: [] });
+    await hooks["tool.execute.before"]({ tool: "edit", sessionID: "b1", agent: "explorer", callID: "t2" }, { args: {} });
+    await hooks["command.execute.before"]({ command: "bypass", arguments: "off" }, { parts: [] });
+    expect(await ret("b1", "p2")).toBe(false);
+  });
+
+  it("QA-P21-1-8: a switch to roles mode at runtime registers nothing and asks for a restart; tools stay as started", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { dir, cfg } = home({}, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks);
+    writeFileSync(overridePath(), JSON.stringify(ROLES));
+    invalidateConfigCache();
+    await v2.sessionHooks.prompt({ sessionID: "root", prompt: { text: "hello" } });
+    expect(JSON.stringify(warn.mock.calls)).toContain("restart OpenCode");
+    expect(ROLES_RESTART_NOTICE).toContain("restart OpenCode");
+    expect(Object.keys(hooks.tool ?? {})).not.toContain("router_run");
+    const event = { sessionID: "root", agent: "build", messageID: "m", id: "r8", tool: "subagent", input: { agent: "explorer", description: "find", prompt: "find x" } as Record<string, unknown> };
+    await v2.toolHooks["execute.before"](event);
+    expect(event.input.description).toBe("find"); // no role routing: no nonce
+    expect(routedRoleOf("r8")).toBeUndefined();
+  });
+
+  it("QA-P21-1-9: tiers mode returns before any resolution — a throwing resolver changes nothing", async () => {
+    const agents: Record<string, Record<string, unknown>> = { explorer: { mode: "subagent", model: "host/x" } };
+    const before = JSON.stringify(agents);
+    const warnFn = vi.fn();
+    const cfg = { routing: { delegation: "tiers" } } as unknown as RouterConfig;
+    Object.defineProperty(cfg, "roleAgents", { get() { throw new Error("must not be read in tiers mode"); } });
+    const result = await registerRoleAgents(agents, cfg, {
+      context7: false, directory: "/nowhere", seed: {}, warn: warnFn,
+      resolveTable: () => { throw new Error("must not be called in tiers mode"); },
+      listWorktrees: async () => { throw new Error("must not be called in tiers mode"); },
+    });
+    expect(result.failed).toBe(false);
+    expect(result.registered).toEqual([]);
+    expect(JSON.stringify(agents)).toBe(before);
+    expect(warnFn).not.toHaveBeenCalled();
+  });
+
+  it("QA-P21-1-12: the observer reads data.message and counts a retried step (same assistant message) once", () => {
+    const o = createHostBudgetObserver();
+    o.onEvent("session.tool.failed", { sessionID: "m1", message: "Tools are disabled after the maximum agent steps" });
+    expect(o.observe("m1", 100)).toBe(true);
+    o.onEvent("session.step.failed", { sessionID: "m2", assistantMessageID: "a1", message: "context_length_exceeded" });
+    expect(o.observe("m2", 100)).toBe(true);
+    for (const message of ["a1", "a1", "a2"]) o.onEvent("session.step.ended", { sessionID: "m3", assistantMessageID: message });
+    o.onEvent("session.execution.succeeded", { sessionID: "m3" });
+    expect(o.observe("m3", 3)).toBe(false); // 2 distinct steps
+    expect(o.observe("m3", 2)).toBe(true);
+  });
+
+  it("P2.2: the budget note starts with the protocol's prefix", () => {
+    expect(roleBudgetNotice("explorer", "x").startsWith(`${ROUTER_BUDGET_NOTE_PREFIX} `)).toBe(true);
+    expect(roleBudgetNotice("explorer", "x", "host").startsWith(`${ROUTER_BUDGET_NOTE_PREFIX} `)).toBe(true);
   });
 });
