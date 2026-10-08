@@ -239,9 +239,11 @@ describe("role dispatch path", () => {
     const row = rows[0]!;
     expect(row).toMatchObject({
       kind: "decision", mode: "enforce", decisionID: role.decisionID, role: "implementer", tier: "medium",
-      explore: false, propensity: 1, binding: "exact", resume: false, childSessionID: null,
+      explore: false, propensity: 1, resume: false, childSessionID: null,
       detection: { effective: "none" },
     });
+    // QA-P21-1-11: a fresh dispatch row claims no binding; the child's observed kind is written when it binds (noteBinding).
+    expect(row.binding).toBeUndefined();
     expect(row.grant).toEqual([...role.grant.actions].sort());
     expect(Array.isArray(row.boundsReasons)).toBe(true);
     expect(row.boundsReasons).toContain("floor:authority");
@@ -338,10 +340,14 @@ describe("role dispatch path", () => {
     expect((await never.router.route(call(never, { agent: "implementer", prompt }))).role!.detection).toBe("grader");
   });
 
-  it("a delegate's dispatch is left as written (only the orchestrator's own prompt is routed)", async () => {
+  it("a delegate's dispatch is not parsed, but runs on the floor rung of the local-only window (QA-P21-1-1)", async () => {
     const world = makeWorld({ delegation: "roles", engine: "enforce" });
     world.session.parentID = "grand-parent";
-    expect(await world.router.route(call(world, { agent: "explorer", prompt: "find x" }))).toEqual({ mode: "static" });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: "[route tier=medium]\nfind x", model: tierRef(world.cfg, "medium") }));
+    expect(outcome.prompt).toBeUndefined(); // the route line is not parsed or stripped
+    expect(outcome.description).toBeUndefined(); // no nonce, no pending entry
+    expect(outcome.role!.tier).toBe("fast");
+    expect(outcome.model).toBe(tierRef(world.cfg, "fast"));
   });
 });
 

@@ -50,12 +50,16 @@ import { decideRole } from "../engine/kernel";
 import type { Candidate, ChosenDispatch, Decision, HostAgentInfo, Ladder, RoleLadder } from "../engine/types";
 import { classify } from "../classify";
 import type { ClassifyResult, Detection, TaskFacts } from "../classify/types";
-import type { RouterConfig } from "../../router/config";
+import { resolveVerifyBudget, type RouterConfig } from "../../router/config";
 import { resolveEnforcementMode } from "../../router/enforcement";
 import { roleGuardProfile } from "../../router/guard-profile";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../../router/roles";
+import { parseVerifyDirectives } from "../../verify/directives";
+import { buildDelegationDoD } from "../../verify/dispatch";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
-import { currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending } from "../roles/binding";
+import {
+  LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
+} from "../roles/binding";
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import {
@@ -70,6 +74,7 @@ import {
   RESUME_PINNED_REASON,
   RESUME_NAMED_NEEDS_REASON,
   RESUME_NAMED_NEVER_DOWN_REASON,
+  ANNOTATION_REASON,
   LOG_ROW_VERSION,
   classifyAgentOrigin,
   makeKey,
@@ -218,6 +223,12 @@ export interface DispatchRouter {
   onCallResult(callID: string, childSessionID: string | null): void;
   /** The call ended without a result, or its hook chain failed: forget it. */
   onCallFinished(callID: string): void;
+  /**
+   * QA-P21-1-11 (handoff 20): a role child bound to its dispatch (`bind`). The first time per child, an annotation row records the
+   * OBSERVED binding kind (reason `note:binding:<kind>`, `note:binding:unknown` for an unknown one) against its dispatch's decision
+   * row; nothing when the engine writes no rows or the dispatch is unknown. Never throws.
+   */
+  noteBinding(childSessionID: string, binding: Pick<Binding, "kind" | "decisionID">): void;
   /** Dispatches still waiting to be claimed (diagnostics, tests). */
   pendingCount(): number;
   /** Children registered by a wrong heuristic claim and not yet taken over by their own dispatch (diagnostics, tests). */
@@ -249,6 +260,11 @@ export interface DispatchRouterDeps {
   readonly isBypassed?: (sessionID: string) => boolean;
   /** #84 P2.1: environment of the enforcement-mode env gate (default `process.env`). */
   readonly env?: Readonly<Record<string, string | undefined>>;
+  /**
+   * QA-P21-1-8: the role path is live (the plugin STARTED in roles mode, so its role agents and tools exist). `false` → every role
+   * agent takes the tier path, as in tiers mode. Default: live.
+   */
+  readonly rolesEnabled?: () => boolean;
 }
 
 /** What `route()` decided, until `commit()` has the final input. */
@@ -306,6 +322,8 @@ interface Entry {
   claimedChild?: string;
   /** #84 P2.1: a binding entry was registered for this call (`registerPending`); a rejected call evicts it. */
   rolePending?: true;
+  /** QA-P21-1-11: a role dispatch's decision row and its log, for the binding annotation row (absent: no rows). */
+  roleRow?: { readonly row: DecisionRow; readonly enqueue: (row: DecisionRow) => void };
 }
 
 /**
@@ -523,8 +541,13 @@ export function roleRouterGate(input: {
   /** `detectionOf(prompt)`: the depth of the prompt's own `[acceptance]` block. */
   readonly acceptance: Detection;
   readonly env?: Readonly<Record<string, string | undefined>>;
+  /**
+   * QA-P21-1-2: the dispatch's verification is DEFERRED (`roleGateDeferred`): the gate does not run at the return, so the
+   * detection is never `deterministic` on its account. Absent = not deferred.
+   */
+  readonly deferred?: boolean;
 }): boolean {
-  if (input.bypassed || input.acceptance !== "deterministic") return false;
+  if (input.bypassed || input.deferred === true || input.acceptance !== "deterministic") return false;
   let mode = "off";
   try {
     mode = resolveEnforcementMode({ config: input.cfg, env: { ...(input.env ?? process.env) } }).mode;
@@ -533,6 +556,27 @@ export function roleRouterGate(input: {
   }
   if (mode === "off") return false;
   return (input.cfg.enforcement?.verify?.require ?? "whenDoDPresent") !== "never";
+}
+
+/**
+ * QA-P21-1-2: the dispatch's verification would be deferred, exactly as the native path decides it (index.ts `isDeferred` →
+ * verify/wiring.ts `isDeferred`): its `VERIFY:` directives resolve to `deferred` (the configured `defaultVerify` when the text has
+ * none; the text is `dispatchDirectiveText(prompt, description)`) AND its DoD carries a `testsPass` check. A deferred dispatch
+ * returns without the gate (`router_verify` runs it later), so the router's gate cannot back a `deterministic` detection.
+ * Fails toward "deferred" on any error (a weaker detection, never a stronger one).
+ */
+export function roleGateDeferred(cfg: RouterConfig, prompt: string, description: string): boolean {
+  try {
+    const text = prompt.trim() !== "" ? prompt : description; // verify/wiring.ts dispatchDirectiveText
+    const budget = resolveVerifyBudget(cfg);
+    const directives = parseVerifyDirectives(text, {
+      defaultVerify: budget.defaultVerify, captureWaitMs: budget.captureWaitMs, baselineTimeoutMs: budget.baselineTimeoutMs,
+    });
+    if (directives.mode !== "deferred") return false;
+    return buildDelegationDoD({ prompt, description }).checks.some((check) => check.kind === "testsPass");
+  } catch {
+    return true;
+  }
 }
 
 /** The tier above `current` on `order`, up to the role's `ceiling`; null at (or above) the ceiling or when either is not on the order. */
@@ -554,13 +598,14 @@ export function roleEscalationHint(input: {
   readonly currentTier: string | null;
   readonly nextTier: string | null;
 }): string {
+  // P2.2 handoff: resume the SAME session with the findings; never a tier agent, never a model.
   const task = input.childSessionID === null ? "the same task_id" : `the same task_id ("${input.childSessionID}")`;
   if (input.nextTier === null) {
     const top = input.currentTier === null ? "" : ` (it already runs on its highest tier, ${input.currentTier})`;
-    return `NEXT: address the above and resume ${task} with @${input.agent}${top}; do not start a new task and do not treat the prior result as complete.`;
+    return `NEXT: resume ${task} with @${input.agent} and the findings above${top}; do not start a new task, do not set \`model\`, and do not treat the prior result as complete.`;
   }
   const from = input.currentTier === null ? "" : ` (escalated from ${input.currentTier})`;
-  return `NEXT: resume ${task} on tier ${input.nextTier}${from}: dispatch @${input.agent} again with that task_id and the first line \`[route tier=${input.nextTier}]\`; the router sets the model (never set \`model\` yourself); do not start a new task.`;
+  return `NEXT: resume ${task} on tier ${input.nextTier}${from} with the findings above: dispatch @${input.agent} again with that task_id and the first line \`[route tier=${input.nextTier}]\`; the router sets the model (never set \`model\` yourself); do not start a new task.`;
 }
 
 /**
@@ -625,6 +670,53 @@ function placeCallerModel(
     ? { candidate: ceiling, code: "clamp:caller-model:ceiling" }
     : { candidate: floor, code: "lift:caller-model:floor" };
   return resumed && placed.candidate.rank < decided.rank ? { candidate: decided, code: "kept:caller-model:resume" } : placed;
+}
+
+/** QA-P21-1-1: the note of a delegate's role dispatch (unparsed, floor rung of the unknown-binding window). */
+export const DELEGATE_DISPATCH_NOTE =
+  "delegate dispatch: the prompt is not routed (a delegate never pins or steers); the floor rung of the role's local-only window is dispatched";
+/** QA-P21-1-5: the reason code of a route-line pin that wins over an explicit caller `model`. */
+export const PIN_OVER_CALLER_REASON = "pin:over-caller-model";
+/** QA-P21-1-6: no window rung present in the host catalog at or above the floor (the role dispatch is refused). */
+export const VARIANT_NO_CANDIDATE_REASON = "variant:no-catalog-candidate";
+
+/**
+ * QA-P21-1-6: what is dispatched for the picked rung given the host catalog. Its variant exists (or the catalog does not know the
+ * model) → the rung as is. Otherwise the bare model, at its OWN capability rank (`capabilityRank(ladder, { model, variant: null })`),
+ * when that rank reaches the window floor; else the next window rung present in the catalog at or above the floor; `null` when
+ * there is none (the caller refuses).
+ */
+function placeInCatalog(
+  ladder: RoleLadder,
+  picked: Candidate,
+  catalog: RolePrepared["catalog"],
+): { readonly candidate: Candidate; readonly variant: string | null; readonly dropped: string | null } | null {
+  const variantOf = (c: Pick<Candidate, "variant">): string | null => (normalizeVariant(c.variant) === "default" ? null : normalizeVariant(c.variant));
+  const present = (c: Candidate): boolean => {
+    const v = variantOf(c);
+    if (v === null) return true;
+    const ids = catalogVariantIds(catalog, c.model);
+    return ids === null || ids.includes(v);
+  };
+  if (present(picked)) return { candidate: picked, variant: variantOf(picked), dropped: null };
+  const wanted = variantOf(picked);
+  const floorRank = ladder.floorRank;
+  const bareRank = capabilityRank(ladder, { model: picked.model, variant: null }, null);
+  if (bareRank !== null && (floorRank === null || bareRank >= floorRank)) {
+    return {
+      candidate: { ...picked, variant: null, rank: bareRank },
+      variant: null,
+      dropped: `variant ${wanted} of ${picked.model} is not in the host catalog: dispatched on the tier model without a variant (capability rank ${bareRank})`,
+    };
+  }
+  const at = ladder.candidates.indexOf(picked);
+  const next = ladder.candidates.slice(at < 0 ? 0 : at + 1).find((c) => present(c) && (floorRank === null || c.rank >= floorRank));
+  if (next === undefined) return null;
+  return {
+    candidate: next,
+    variant: variantOf(next),
+    dropped: `variant ${wanted} of ${picked.model} is not in the host catalog and the bare model ranks below the window floor: dispatched on ${refOf(next.model, variantOf(next))}`,
+  };
 }
 
 /** Test-only: forget which calls were handled. */
@@ -779,6 +871,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
    * result of the dispatch that really started them takes them over.
    */
   const misclaimed = new Map<string, string>();
+  /** QA-P21-1-11: role children whose observed binding has been recorded (once per child; bounded). */
+  const notedBindings = new Set<string>();
   let sequence = 0;
 
   const trim = <T>(map: Map<string, T>, limit: number): void => {
@@ -1088,6 +1182,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const prepareRole = async (agent: string, cfg: RouterConfig | undefined): Promise<RolePrepared | null> => {
     const prepareRoles = deps.runtime.prepareRoles;
     if (prepareRoles === undefined) return null;
+    if (deps.rolesEnabled !== undefined && !deps.rolesEnabled()) return null; // QA-P21-1-8: not started in roles mode
+
     try {
       return await prepareRoles.call(deps.runtime, agent, cfg);
     } catch (error) {
@@ -1121,6 +1217,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const acceptance = detectionOf(prompt);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed: deps.isBypassed?.(call.sessionID) === true, acceptance, ...(deps.env === undefined ? {} : { env: deps.env }),
+      deferred: roleGateDeferred(rp.cfg, prompt, description), // QA-P21-1-2
     });
     const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance });
 
@@ -1146,16 +1243,22 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     });
     if (rd.dispatch === null) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.noCandidate(bounds.floor, bounds.ceiling, rd.reasons));
 
-    // 7. an explicit caller `model` is kept only inside the bounds; then the host catalog decides whether the variant exists.
+    // 7. an explicit caller `model` is kept only inside the bounds, and never over a route-line pin (QA-P21-1-5: the pinned rung,
+    // raised to the running rung on a resume, wins); then the host catalog decides whether the variant exists.
     const notes: string[] = [...(root.note === null ? [] : [root.note]), ...grant.notes];
     const callerRef = str(args.model);
-    const placed = callerRef === null ? null : placeCallerModel(ladder, callerRef, rd.dispatch, resumed);
-    const dispatch: Candidate = placed === null ? rd.dispatch : placed.candidate;
-    const wanted = normalizeVariant(dispatch.variant);
-    const ids = wanted === "default" ? null : catalogVariantIds(rp.catalog, dispatch.model);
-    const dropped = ids !== null && !ids.includes(wanted);
-    if (dropped) notes.push(`variant ${wanted} of ${dispatch.model} is not in the host catalog: dispatched on the tier model without a variant`);
-    const finalVariant = wanted === "default" || dropped ? null : wanted;
+    const placed = callerRef === null
+      ? null
+      : bounds.pinned !== null
+        ? { candidate: rd.dispatch, code: PIN_OVER_CALLER_REASON }
+        : placeCallerModel(ladder, callerRef, rd.dispatch, resumed);
+    const picked: Candidate = placed === null ? rd.dispatch : placed.candidate;
+    const variantPlace = placeInCatalog(ladder, picked, rp.catalog);
+    if (variantPlace === null) {
+      throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.noCandidate(bounds.floor, bounds.ceiling, [...rd.reasons, VARIANT_NO_CANDIDATE_REASON]));
+    }
+    const { candidate: dispatch, variant: finalVariant, dropped } = variantPlace;
+    if (dropped !== null) notes.push(dropped);
     const model = refOf(dispatch.model, finalVariant);
     const tier = dispatch.tier;
 
@@ -1174,7 +1277,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     let row: DecisionRow | null = null;
     const mode = rp.engine;
     if (mode !== "static" && rp.enqueue !== null) {
-      const applied = mode === "enforce" && rd.switched && placed === null && !dropped;
+      // QA-P21-1-6: switched/chosen follow the kernel's decision; a variant the catalog lacks only changes what is dispatched.
+      const applied = mode === "enforce" && rd.switched && placed === null;
       const wouldSwitch = mode !== "enforce" && !resumed && decision.switched && placed === null;
       const argmin = decision.argmin !== null && decision.argmin.key !== decision.best?.key ? decision.argmin : null;
       const head = resumed
@@ -1185,9 +1289,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
             ? `${placed.code}: the call named model ${callerRef}; engine decision: ${reasonText(decision)}`
             : reasonText(decision);
       const extra = [...rd.reasons, ...notes];
-      const binding = resumed
-        ? currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) })?.kind
-        : "exact" as const; // registered with a router nonce (P-2/R7); the child's observed binding is P2.3's row
+      // QA-P21-1-11: a fresh dispatch has no binding yet (its child binds later; `noteBinding` writes the observed kind then).
+      // A resume records the child's current binding.
+      const binding = resumed ? currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) })?.kind : undefined;
       row = {
         v: LOG_ROW_VERSION,
         ts: new Date(safeNow(now)).toISOString(),
@@ -1277,6 +1381,61 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     };
   };
 
+  /**
+   * QA-P21-1-1: a role dispatch made by a session that has a parent (a delegate). Its prompt is never parsed (no route line, pin
+   * or steering) and nothing is registered for it (no nonce, no pending entry, no row: its child binds `unknown`), but it never
+   * runs on a model of its own choosing (I2): any caller `model` is replaced by the FLOOR rung of the window computed on the
+   * unknown-binding grant (role max ∩ local, I9) — on a resume never below the child's running tier — and, as a routed role
+   * dispatch, it is forced to the foreground (P-5).
+   */
+  const decideDelegateRoleDispatch = (call: RouteCall, rp: RolePrepared): RouteOutcome => {
+    const agent = rp.spec.agent;
+    const max = new Set<AuthorityAction>(roleMaxActions(rp.spec) ?? []);
+    const grant: DispatchGrant = { actions: new Set(LOCAL_ACTIONS.filter((a) => max.has(a))), notes: [DELEGATE_DISPATCH_NOTE], workRoot: null };
+    const facts: TaskFacts = { class: "other", risk: "low", scope: "single", needs: [], confidence: 0, source: "rules" };
+    const detection = effectiveDetection({ routerGate: false, claim: null, acceptance: null });
+    const tiers = roleTierOrder(rp.cfg, rp.session);
+    const resumeID = str(call.args.sessionID);
+    const runningTier = resumeID === null ? null : lookupDispatch(resumeID)?.tier ?? null;
+    const bounds = tierBounds(rp.spec, grant, { facts, trace: { rules: facts, routeLine: null } }, detection, {
+      floorTier: rp.cfg.enforcement?.escalate?.floorTier ?? null, runningTier, pinTier: null, tiers,
+    });
+    const ladder = buildRoleLadder({
+      cfg: rp.cfg, facts, role: agent, window: { floor: bounds.floor, ceiling: bounds.ceiling, pinned: null },
+      pricing: (model) => rp.catalog.pricing(model), logger: deps.logger, session: rp.session,
+    });
+    const first = ladder.tiers.find((t) => t.tier === bounds.floor)?.first ?? ladder.tiers.find((t) => t.first !== null)?.first ?? null;
+    const rung = first === null ? undefined : ladder.candidates[first];
+    const placed = rung === undefined ? null : placeInCatalog(ladder, rung, rp.catalog);
+    if (placed === null) {
+      throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.noCandidate(bounds.floor, bounds.ceiling, rung === undefined ? ["window:no-candidates"] : [VARIANT_NO_CANDIDATE_REASON]));
+    }
+    const tier = placed.candidate.tier;
+    const model = refOf(placed.candidate.model, placed.variant);
+    const routed: RoleRouted = {
+      callID: call.callID,
+      parentSessionID: call.sessionID,
+      agent,
+      tier,
+      model,
+      window: { floor: bounds.floor, ceiling: bounds.ceiling, pinned: null },
+      grant,
+      workRoot: null,
+      requestedRoot: null,
+      notes: [DELEGATE_DISPATCH_NOTE, ...(placed.dropped === null ? [] : [placed.dropped])],
+      detection,
+      budget: roleGuardProfile(rp.spec, tier, null).budget,
+      routeBudget: null,
+      nonce: null,
+      decisionID: null,
+      resumeID,
+      nextTier: nextRoleTier(tiers, rp.spec.tierRange.ceiling, tier),
+      class: null,
+    };
+    rememberRoutedRole(routed);
+    return { mode: rp.engine, model, role: routed };
+  };
+
   /** A role dispatch, from `route()`: claimed like a tier call (A3); only the orchestrator's own dispatch is routed. */
   const routeRoleCall = async (call: RouteCall, callKey: string, rp: RolePrepared): Promise<RouteOutcome> => {
     const agent = rp.spec.agent;
@@ -1288,10 +1447,10 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.session(describeError(error)));
     }
     if (!claimCall(callKey)) return UNTOUCHED;
-    // A delegate's dispatch is never parsed (it must not pin or steer): left as written, its child binds `unknown` (max ∩ local, I9)
-    // and runs on the role's registered floor model (P-1).
-    if (session.parentID !== null) return UNTOUCHED;
     try {
+      // QA-P21-1-1: a delegate's dispatch is never parsed (it must not pin or steer), but it runs on the router's floor rung of
+      // the unknown-binding window, in the foreground — never on a model the delegate names (I2).
+      if (session.parentID !== null) return decideDelegateRoleDispatch(call, rp);
       return await decideRoleDispatch(call, rp, session);
     } catch (error) {
       if (error instanceof RoleDispatchRefusal) throw error;
@@ -1354,10 +1513,14 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         // The agent and model the host will run, after the legacy hook: they win over what the engine decided.
         const ran = d.final === null ? null : ranOf(d, d.final, final);
         // QA-G-A2: the hook chain let the call through, so the dispatch runs: its decision row is written now (never for a rejected call).
+        let written: DecisionRow | null = null;
         try {
           // A34 (QA-G-B8): the capability of what really runs, after the legacy hook.
           const dispatched = ran === null ? null : d.capabilityOf(ran);
-          if (d.row !== null) d.enqueue({ ...d.row, capability: { pick: d.row.capability?.pick ?? null, dispatched } });
+          if (d.row !== null) {
+            written = { ...d.row, capability: { pick: d.row.capability?.pick ?? null, dispatched } };
+            d.enqueue(written);
+          }
         } catch (error) {
           deps.logger.warn("[router] routing: the decision row could not be queued", { error: describeError(error) });
         }
@@ -1406,6 +1569,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           ...(resumeID === null ? {} : { resumeID }),
           ...(previous === undefined ? {} : { previous }),
           ...(rolePending ? { rolePending: true as const } : {}),
+          ...(d.role !== undefined && written !== null ? { roleRow: { row: written, enqueue: d.enqueue } } : {}),
         };
         if (resumeID !== null) register(resumeID, dispatched);
         entries.delete(callID);
@@ -1482,6 +1646,44 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         } catch (error) {
           deps.logger.warn("[router] routing: a rejected role dispatch could not be evicted from the binding registry", { error: describeError(error) });
         }
+      }
+    },
+
+    noteBinding(childSessionID, binding): void {
+      try {
+        if (notedBindings.has(childSessionID)) return;
+        const decisionID = binding.decisionID ?? lookupDispatch(childSessionID)?.decisionID ?? null;
+        const entry = [...entries.values()].find((e) => e.roleRow !== undefined
+          && ((decisionID !== null && e.input.decisionID === decisionID) || e.claimedChild === childSessionID || e.resumeID === childSessionID));
+        if (entry?.roleRow === undefined) return;
+        notedBindings.add(childSessionID);
+        while (notedBindings.size > MAX_HANDLED_CALLS) notedBindings.delete(notedBindings.values().next().value as string);
+        const { row, enqueue } = entry.roleRow;
+        enqueue({
+          v: LOG_ROW_VERSION,
+          kind: "decision",
+          ts: new Date(safeNow(now)).toISOString(),
+          sessionID: row.sessionID,
+          decisionID: row.decisionID,
+          mode: row.mode,
+          childSessionID,
+          facts: row.facts,
+          chosen: row.chosen,
+          best: null,
+          switched: false,
+          pinned: false,
+          unit: row.unit,
+          costs: {},
+          confidence: row.confidence,
+          reason: `${ANNOTATION_REASON}binding:${binding.kind}`,
+          step: row.step,
+          resume: row.resume,
+          ...(row.role === undefined ? {} : { role: row.role }),
+          ...(row.tier === undefined ? {} : { tier: row.tier }),
+          binding: binding.kind,
+        });
+      } catch (error) {
+        deps.logger.warn("[router] routing: the binding of a role child could not be recorded", { error: describeError(error) });
       }
     },
 
