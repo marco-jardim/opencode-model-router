@@ -485,7 +485,22 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
         remember(scored, signal.attemptID, { key, kind: "refusal", at: t, variant: previous.variant }, maxScored);
         return true;
       }
-      // Already a failure (fail verdict or an earlier refusal): lifetime counter only.
+      const weight = previous.weight ?? 1;
+      if (previous.kind === "fail" && previous.key === key && weight < 1) {
+        // QA-P33F2-2 N-a: a weighted failure (an independent grader's 0.5) is topped up to a full failure, as a refusal after
+        // a weighted pass ends at one: beta gains 1 − weight × decay, so the attempt weighs one failure now. The fail is already
+        // counted; only the lifetime refusal counter moves. Recorded as the refusal, so a repeat tops up nothing.
+        const decayed = decayTo(entry.beta, t, tuning);
+        const topUp = Math.max(0, 1 - weight * decayFactor(t - previous.at, tuning.halfLifeDays));
+        entry.beta = capEvidence(
+          { alpha: decayed.alpha, beta: decayed.beta + topUp, updatedAt: decayed.updatedAt },
+          tuning.maxEffectiveSamples,
+        );
+        entry.counts = { ...c, falseRefusals: c.falseRefusals + 1 };
+        remember(scored, signal.attemptID, { key, kind: "refusal", at: t, variant: previous.variant }, maxScored);
+        return true;
+      }
+      // Already a full failure (fail verdict or an earlier refusal): lifetime counter only.
       entry.counts = { ...c, falseRefusals: c.falseRefusals + 1 };
       remember(scored, signal.attemptID, previous, maxScored);
       return false;
