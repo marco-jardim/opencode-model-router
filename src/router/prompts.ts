@@ -28,7 +28,7 @@ import type { RoleKind } from "./roles";
 export const ROLE_MENU_INTENT: Readonly<Record<RoleKind, string>> = Object.freeze({
   explore: "lookups: files, symbols, facts, git history.",
   research: "web and library docs; no local files.",
-  run: "runs allowlisted scripts (tests, typecheck, lint, build).",
+  run: "runs allowlisted scripts and commands (tests, typecheck, lint, build).",
   implement: "scoped code changes.",
   review: "senior QA review: defects, risks, regressions.",
   design: "design: options, tradeoffs, a recommendation.",

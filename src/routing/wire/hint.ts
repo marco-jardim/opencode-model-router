@@ -26,6 +26,9 @@ import {
   buildRouteLineProtocol,
   swapTaxonomyLine,
 } from "../../router/protocol";
+/** The roles heading only counts at the start of a line (QA-P22-2-4): a part that merely quotes it mid-line is not the roles protocol. */
+const ROLES_HEADING_LINE = /^## Role Delegation Protocol \(MANDATORY\)$/m;
+
 import { classify } from "../classify";
 import { CLASS_STATIC_TIER, type TaskFacts } from "../classify/types";
 import { buildLadder, decide, floorRankOf, generateTaxonomy, resolveChosen } from "../engine";
@@ -185,7 +188,7 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
         // Roles mode: no hint part, and the protocol text stays exactly as the legacy hook built it. Keyed on the roles
         // protocol the orchestrator actually carries (QA-P22-1-5): `delegation: "roles"` with no enabled role keeps the
         // tiers protocol, which is then augmented like tiers mode.
-        if (system.some((text) => added.has(text) && text.includes(ROLES_PROTOCOL_HEADING))) return;
+        if (system.some((text) => added.has(text) && ROLES_HEADING_LINE.test(text))) return;
         const protocolAt: number[] = [];
         system.forEach((text, index) => {
           if (added.has(text) && text.includes(DELEGATION_PROTOCOL_HEADING)) protocolAt.push(index);
