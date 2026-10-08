@@ -184,6 +184,32 @@ so inherited session grants cannot re-open what it denies. Grep output is redact
 `allowTools` entries and shell patterns (`shell: { "npm test*": "allow" }`) are **not a sandbox**: an allowed
 `npm test*` runs whatever `npm test` runs, and an allowed MCP tool does what the MCP server does. They are
 permission rules, not isolation. See `docs/CONFIG_REFERENCE.md` for the schema.
+
+## Reader guard profile (#84)
+
+A read-only policy decides what a child **may** do; the guard profile decides how its calls are **counted**. Since #84,
+on OpenCode v1 and v2 and in every delegation mode, the router's guard treats a dispatch as a **reader** — reading is
+its work, so the "3 consecutive non-producing actions" read/draft denial and its `[⚠ GUARD:read_budget]` footer do
+not apply — when:
+
+- it runs on a read-only tier (`fast` by default, see above);
+- its routed task class is `review`, `recon` or `search` (the class comes from the routing engine's dispatch record,
+  so this needs `routing.engine` other than `static`);
+- it carries `CAP:none` with a `reason:` line (for that dispatch round only);
+- it is a reader role in roles mode: `explorer`, `researcher`, `runner`, `reviewer`, `architect`.
+
+Every other dispatch is a producer and keeps the read/draft guard. The reader profile does not lift the read-only
+call cap (`CAP:N`) or the total call budget: tier dispatches keep 25 calls (cumulative × 3), role dispatches have
+their role's budget ([`ROLES.md`](./ROLES.md#budgets)). For readers and producers alike, a refused call is no longer
+charged to the budget nor recorded as executed by the repeat check; a dispatch round is stopped for refusals only
+once it has at least min(budget, 10) of them **and** its executed plus refused calls reach the budget.
+
+**Reader roles and read-only tiers.** The reader roles of [roles mode](./ROLES.md) get both halves: a deny-by-default
+max policy with the same sensitive-read asks as this page, and the reader profile. They differ from the read-only
+tiers in authority: `runner` and `reviewer` also hold `router_run` (a fixed-argv run tool, never a shell), and
+`researcher` holds only web and documentation egress, without local reads. No role gets Code Mode `execute`, shell,
+edits outside `implementer`/`general`, or delegation.
+
 ## Guarantees and limits — not an OS sandbox
 
 No tool exposes a write command, shell expansion, arbitrary option, credential

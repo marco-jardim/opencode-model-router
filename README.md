@@ -1102,6 +1102,8 @@ Full field notes are in [docs/CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md).
 - `docs/ENFORCEMENT_PRESETS.md` — ready-to-paste enforcement presets
 - `docs/ROUTING_ENGINE.md` — the cost-aware routing engine: modes, formula, classifier backends, session-aware ladder, cost doctor, privacy
 - `docs/adr/0005-cost-aware-routing-engine.md` — the decisions behind the routing engine
+- `docs/ROLES.md` — roles mode: role agents, authority and separation, tier floor, budgets, `router_run`, migration
+- `docs/adr/0006-role-tier-assurance-delegation.md` — the decisions behind roles mode
 
 > These files are not included in the npm tarball. This section is the self-contained summary; the docs are available in the repository for contributors and advanced users.
 
@@ -1131,6 +1133,27 @@ What else ships with it:
 - **Classifier backends** for uncertain task classes: `rules` (default, local), `openai-compatible` (Ollama, any OpenAI-style server), `typesafe`, and `host` (**experimental**). Backends receive at most a bounded, scrubbed excerpt of the task, are only configurable from the global override, and never block a dispatch.
 
 OpenCode v1 is unchanged: the `routing` block is validated and `engine` is forced to `static`; the only effect is an opt-in prose line when you set `routing.roles`. Every key and default is in [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md#routing--cost-aware-routing-engine-74); the full guide is [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md) and the decision record is [`docs/adr/0005-cost-aware-routing-engine.md`](docs/adr/0005-cost-aware-routing-engine.md).
+
+## Roles mode (opt-in, OpenCode v2)
+
+With `routing.delegation: "roles"` the orchestrator stops picking tiers: it dispatches **role agents** by intent, and the router picks the tier and model of every dispatch (issue #84).
+
+| Role | For | Tiers |
+|---|---|---|
+| `explorer` | read-only codebase lookups | fast–medium |
+| `researcher` | web and library docs, no local files | fast–medium |
+| `runner` | tests, typecheck, lint, build through `router_run` | fast–medium |
+| `implementer` | scoped edits, checks when needed | fast–heavy |
+| `reviewer` | read-only senior review | heavy |
+| `architect` | read-only design analysis | medium–heavy |
+| `general` | anything else; authority follows the task's needs | fast–heavy |
+
+- **Least privilege.** Each role has a fixed maximum authority, and no role holds the web together with reads, runs or edits. Commands run through `router_run` (allowlisted scripts and commands, fixed argv, no shell); raw shell stays with the tier agents.
+- **Authority sets the floor.** Reading may use the cheapest tier; an edit goes below `medium` only when the router itself runs the acceptance checks on a low-risk, single-file change, and edit + run never goes below `medium` (`heavy` without those checks).
+- **Budgets per role.** A role that runs out of calls returns `NEED MORE: budget` and is resumed in the same session; that is never counted as a failure.
+- **Evidence from verification only.** Deterministic checks and router-observed runs count; a bare `DONE` does not.
+
+Put `{ "routing": { "delegation": "roles" } }` in the global override file and **restart OpenCode** (roles mode is decided at plugin start); restore the previous file and restart to go back. OpenCode v1 keeps the tier model. Guide: [`docs/ROLES.md`](docs/ROLES.md); decision record: [`docs/adr/0006-role-tier-assurance-delegation.md`](docs/adr/0006-role-tier-assurance-delegation.md).
 
 ## Commands
 
