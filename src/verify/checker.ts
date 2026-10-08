@@ -46,14 +46,25 @@ export function isIncompleteVerdict(verdict: object): boolean {
 /** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
 const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*[ \t]*:/m;
 
+/** `NEED MORE: budget` at the start of a line (QA-P15-1-2); the fallback when the first line carries no prefix. */
+const NEED_MORE_BUDGET_LINE_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
+
 /**
- * `NEED MORE: budget` claimed by the RETURN PREFIX only (the first non-empty line after unwrapping the
- * task envelope and markdown/list decoration; DF-1 fix): a later line quoting it, or a DONE:/ESCALATE:
- * return, is never a budget claim.
+ * Two contract definitions coexist on purpose. CONTRACT_MARKER_RE (above) is a ANY-line test that also knows
+ * NEED CONTEXT / SCOPE GROWTH; the stop branch keeps it so a guard-stopped producer that wrote any marker
+ * anywhere is not forced to "incomplete" over a result it did state. parseReturnPrefix (signals.ts) is the
+ * FIRST-line contract (DONE / NEED MORE / ESCALATE) used for the claim decision below.
+ *
+ * `NEED MORE: budget` is claimed by the return prefix (the first non-empty line after unwrapping the task
+ * envelope and markdown/list decoration; DF-1 fix). A DONE:/ESCALATE: first line decides: a later line
+ * quoting the claim is never one. When the first line carries no prefix (a progress summary before the
+ * claim, as the guard's own message asks for), a line-start `NEED MORE: budget` still counts (I7).
  */
 function claimsNeedMoreBudget(text: string): boolean {
   const contract = parseReturnPrefix(text);
-  return contract !== null && contract.prefix === "need-more" && contract.claim === "budget";
+  if (contract === null) return false;
+  if (contract.prefix === "none") return NEED_MORE_BUDGET_LINE_RE.test(text);
+  return contract.prefix === "need-more" && contract.claim === "budget";
 }
 
 /** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
@@ -121,7 +132,7 @@ function claimHonoured(snapshot: BudgetSnapshot): boolean {
  * budget snapshot captured when the task returned (`budget`, QA-P15-2-5; absent
  * → read now through `budgetSnapshot`, default the live guard):
  * - budget: the guard STOPPED the producer in that round (enforced) and it
- *   returned no contract marker, or a `NEED MORE: budget` line the snapshot
+ *   returned no contract marker, or a `NEED MORE: budget` claim (return prefix, or, with no prefix, a line) the snapshot
  *   backs (claimHonoured) — for every agent;
  * - progress note (only when `progressNotes`): for an agent that follows the
  *   return contract — `returnContract`, else a router tier of the ladder.
