@@ -454,13 +454,30 @@ export function normalizeRootText(path: string, platform: NodeJS.Platform = proc
   return win ? out.toLowerCase() : out;
 }
 
-/** The worktree paths of `git worktree list --porcelain` output (the `worktree <path>` lines), as git prints them. */
+/**
+ * The worktree paths of `git worktree list --porcelain` output (the `worktree <path>` line of each entry), as git prints them, in
+ * git's order (the main worktree first). QA-P23-A4: an entry git marks `prunable` (its directory is gone or no longer points
+ * back) is dropped — it is not a work root any more, even if a plain directory now sits at its path.
+ */
 export function parseWorktreeList(porcelain: string): string[] {
   const out: string[] = [];
+  let current: string | undefined;
+  let prunable = false;
+  const flush = (): void => {
+    if (current !== undefined && !prunable) out.push(current);
+    current = undefined;
+    prunable = false;
+  };
   for (const raw of porcelain.split("\n")) {
     const line = raw.replace(/\r$/, "");
-    if (line.startsWith("worktree ") && line.length > "worktree ".length) out.push(line.slice("worktree ".length));
+    if (line.startsWith("worktree ")) {
+      flush();
+      if (line.length > "worktree ".length) current = line.slice("worktree ".length);
+    } else if (line === "prunable" || line.startsWith("prunable ")) {
+      prunable = true;
+    }
   }
+  flush();
   return out;
 }
 

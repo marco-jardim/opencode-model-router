@@ -7,7 +7,7 @@ import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION } from "./child-session";
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
@@ -343,42 +343,112 @@ export function roleActionOf(name: string): AuthorityAction | "external_director
 const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
 
 /**
- * The canonical long form of a path a role session names (T2.3.1): resolved against `base` when relative (`..` and `.`
- * resolved), then the longest existing ancestor through `realpath` (`realpathSync.native`: links, junctions and case as on disk)
- * with the rest appended. Undefined — the caller refuses — for an empty path, a NUL, a wildcard, and on win32 an 8.3 spelling, a
- * UNC/device path (`\\server\…`, `\\?\…`: no filesystem call may reach a remote host) or a drive-relative path (`C:x`); and when an
- * ancestor fails to resolve for any reason other than "does not exist".
+ * The canonical long form of a path a role session names (T2.3.1). The RAW path (a relative one joined to `base` as text) goes to
+ * `realpath` (`realpathSync.native`: links, junctions, case and 8.3 as on disk) WITHOUT lexical normalisation first, so a link is
+ * resolved before any `..` after it (QA-P23-A1: POSIX `<root>/link/../x` is where the filesystem says, not `<root>/x`). A path that
+ * does not exist is peeled to its longest existing ancestor, one component at a time, and only on a real "does not exist": an
+ * entry `lstat` sees but `realpath` cannot resolve is a dangling (or looping) link and refuses; a `..` left in the missing tail
+ * refuses. Undefined — the caller refuses — also for an empty path, a NUL, a wildcard, and on win32 an 8.3 spelling, a UNC/device
+ * path (`\\server\…`, `\\?\…`: no filesystem call may reach a remote host), a drive-relative path (`C:x`) or a rooted path without
+ * a drive (`\x`); and when anything fails to resolve for another reason than "does not exist".
  */
 export function canonicalAuthorityPath(
   path: string,
   base: string,
-  opts: { platform?: NodeJS.Platform; realpath?: (path: string) => string } = {},
+  opts: { platform?: NodeJS.Platform; realpath?: (path: string) => string; lstat?: (path: string) => unknown } = {},
 ): string | undefined {
   const platform = opts.platform ?? process.platform;
   const realpath = opts.realpath ?? ((p: string) => realpathSync.native(p));
+  const lstat = opts.lstat ?? ((p: string) => lstatSync(p));
   const text = path.trim();
   if (text === "" || text.includes("\0") || /[*?]/.test(text)) return undefined;
   const api = platform === "win32" ? win32 : posix;
+  const unc = (value: string): boolean => /^[\\/]{2}/.test(value);
   if (platform === "win32") {
-    if (SHORT_NAME_SEGMENT.test(text) || /^[\\/]{2}/.test(text) || /^[A-Za-z]:(?![\\/])/.test(text)) return undefined;
-    if (!api.isAbsolute(text) && (SHORT_NAME_SEGMENT.test(base) || /^[\\/]{2}/.test(base))) return undefined;
+    if (SHORT_NAME_SEGMENT.test(text) || unc(text) || /^[A-Za-z]:(?![\\/])/.test(text) || /^[\\/](?![\\/])/.test(text)) return undefined;
+    if (!api.isAbsolute(text) && (SHORT_NAME_SEGMENT.test(base) || unc(base))) return undefined;
   }
-  let head = api.resolve(base, text);
+  if (!api.isAbsolute(text) && !api.isAbsolute(base)) return undefined;
+  const sep = platform === "win32" ? "\\" : "/";
+  let head = api.isAbsolute(text) ? text : `${base.replace(/[\\/]+$/, "")}${sep}${text}`;
   const tail: string[] = [];
-  for (let depth = 0; depth < 1024; depth++) {
+  const missing = (error: unknown): boolean => {
+    const code = (error as { code?: unknown } | null)?.code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  };
+  for (let depth = 0; depth < 4096; depth++) {
     try {
       const real = realpath(head);
-      return tail.length === 0 ? real : api.join(real, ...[...tail].reverse());
+      if (tail.includes("..")) return undefined;
+      return tail.length === 0 ? real : api.join(real, ...tail);
     } catch (error) {
-      const code = (error as { code?: unknown } | null)?.code;
-      if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
-      const parent = api.dirname(head);
-      if (parent === head) return undefined;
-      tail.push(api.basename(head));
-      head = parent;
+      if (!missing(error)) return undefined;
     }
+    try {
+      lstat(head);
+      return undefined; // the entry exists, yet does not resolve: a dangling or looping link
+    } catch (error) {
+      if (!missing(error)) return undefined;
+    }
+    const parent = api.dirname(head);
+    if (parent === head) return undefined;
+    const name = api.basename(head);
+    if (name !== "" && name !== ".") tail.unshift(name);
+    head = parent;
   }
   return undefined;
+}
+
+/**
+ * QA-P23-A3: every path an `apply_patch` (`patch`) call touches, from the headers of the host's patch format (OpenCode v2
+ * `Patch.parse`: `*** Add File:`, `*** Update File:`, `*** Delete File:` and the `*** Move to:` that follows an update; a header
+ * with leading blanks counts too). Undefined — the caller refuses — when a header names no path or no header is found (a unified
+ * diff, which the v2 host's tool does not take, therefore refuses).
+ */
+export function patchPaths(patchText: string): string[] | undefined {
+  const paths: string[] = [];
+  for (const raw of patchText.split(/\r?\n/)) {
+    const line = raw.trimStart();
+    const header = ["*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:"].find((prefix) => line.startsWith(prefix));
+    if (header === undefined) continue;
+    const path = line.slice(header.length).trim();
+    if (path === "") return undefined;
+    paths.push(path);
+  }
+  return paths.length > 0 ? paths : undefined;
+}
+
+/**
+ * QA-P23-A9: a `glob` pattern or `grep` `include` glob that could reach outside the search root by itself — absolute,
+ * drive-qualified (`C:…`), UNC/device (`\\…`, `//…`) or with a `..` segment. Residual (documented): links inside the work root
+ * are followed or not by the host's own search (ripgrep), which the router does not see.
+ */
+export function unsafeSearchPattern(pattern: string): boolean {
+  const text = pattern.trim();
+  return /^[\\/]/.test(text) || /^[A-Za-z]:/.test(text) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(text);
+}
+
+/**
+ * QA-P23-A2/A3: every path a role session's own `read`/`write`/`edit`/`apply_patch` call names — each string among `filePath`,
+ * `path`, `file_path`, each `edits[]` entry's, and every path of a patch text. Undefined when the call names none, or a patch
+ * cannot be read (the caller refuses).
+ */
+export function toolCallPaths(tool: string, args: unknown): string[] | undefined {
+  const record = args !== null && typeof args === "object" ? args as Record<string, unknown> : {};
+  const strings = (value: unknown): string[] => (typeof value === "string" && value.trim() !== "" ? [value] : []);
+  const fields = (entry: Record<string, unknown>): string[] => [...strings(entry.filePath), ...strings(entry.path), ...strings(entry.file_path)];
+  const paths = [...fields(record)];
+  if (Array.isArray(record.edits)) {
+    for (const edit of record.edits) if (edit !== null && typeof edit === "object") paths.push(...fields(edit as Record<string, unknown>));
+  }
+  if (tool === "patch" || tool === "apply_patch") {
+    const text = [record.patchText, record.patch_text, record.patch, record.input].find((value) => typeof value === "string");
+    if (typeof text !== "string") return paths.length > 0 ? paths : undefined;
+    const fromPatch = patchPaths(text);
+    if (fromPatch === undefined) return undefined;
+    paths.push(...fromPatch);
+  }
+  return paths.length > 0 ? paths : undefined;
 }
 
 /**
@@ -411,6 +481,8 @@ export interface RoleAuthorityInput {
   /** Canonical long form of the plugin's own directory: the work root of a grant without one (`workRoot: null`, I9). */
   readonly fallbackRoot: string | undefined;
   readonly canonical?: (path: string, base: string) => string | undefined;
+  /** `glob` patterns / `grep` include globs of the call (QA-P23-A9): refused when {@link unsafeSearchPattern}. */
+  readonly patterns?: readonly string[];
 }
 
 /**
@@ -420,8 +492,9 @@ export interface RoleAuthorityInput {
  *   is the role max ∩ local, binding.ts);
  * - `external_directory` (P-13): only an EXACT binding with a work root and a local action, every resource inside that root;
  *   an unknown binding or a grant without a root → refused (I9);
- * - path actions (`read`, `edit`, `glob`, `grep`): every path, canonical (`..` resolved, case folded on win32, long form; 8.3
- *   spellings refused), inside the bound work root — the plugin's directory when the grant has none.
+ * - path actions (`read`, `edit`, `glob`, `grep`): every path, canonical ({@link canonicalAuthorityPath}; case folded on win32),
+ *   inside the bound work root — the plugin's directory when the grant has none; `read`/`edit` with no path refuse (QA-P23-A5);
+ *   a `glob`/`grep` pattern that reaches outside its search root by itself refuses (QA-P23-A9).
  */
 export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityDecision {
   const { action, binding } = input;
@@ -454,6 +527,10 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
   if (cls === "read" || cls === "edit" || cls === "glob" || cls === "grep") {
     const root = grant.workRoot ?? input.fallbackRoot;
     if (root === undefined) return refuse(`${action}: no work root could be resolved`);
+    if ((cls === "read" || cls === "edit") && input.paths.length === 0) return refuse(`${action}: no path to check`);
+    for (const pattern of input.patterns ?? []) {
+      if (unsafeSearchPattern(pattern)) return refuse(`${action}: the pattern ${pattern} reaches outside its search root (use a relative pattern and \`path\`)`);
+    }
     for (const path of input.paths) {
       const target = canonical(path, input.sessionDirectory);
       if (target === undefined || !insideWorkRoot(target, root)) {
@@ -625,20 +702,27 @@ export async function registerV2Hooks(
   // hooks. Every view is the child's binding ∩ the role max of the agent the HOOK names ∩ the role max of the agent the child
   // was bound as (a session resumed under another role never gets the union).
   // -------------------------------------------------------------------------
-  /** Canonical long form of the plugin's directory: the work root of a grant without one (I9); undefined when it does not resolve. */
-  let pluginRoot: string | null | undefined;
+  /**
+   * Canonical long form of the plugin's directory: the work root of a grant without one (I9); undefined when it does not resolve.
+   * QA-P23-A11: only a resolved directory is cached; a failure is retried on the next call.
+   */
+  let pluginRoot: string | undefined;
   const fallbackRoot = (): string | undefined => {
     if (pluginRoot === undefined) {
       try {
         pluginRoot = realpathSync.native(ctx.location.directory);
       } catch {
-        pluginRoot = null;
+        return undefined;
       }
     }
-    return pluginRoot ?? undefined;
+    return pluginRoot;
   };
-  /** The live role spec and the binding view of a role session; undefined when the role table has no live spec for `agent`. */
-  const roleAuthorityOf = async (sessionID: string, agent: string): Promise<{ spec: RoleSpec; binding: Binding } | undefined> => {
+  /**
+   * The live role spec and the binding view of a role session; undefined when the role table has no live spec for `agent`.
+   * `stored`: the decision is in the registry (QA-P23-B1/B2) — false when the session lookup failed or reported no parent/agent
+   * (binding.ts does not cache those) or the session was deleted meanwhile.
+   */
+  const roleAuthorityOf = async (sessionID: string, agent: string): Promise<{ spec: RoleSpec; binding: Binding; stored: boolean } | undefined> => {
     const roles = rolesOf(loadConfig(ctx.location.directory));
     const spec = roles.get(agent);
     if (spec === undefined) return undefined;
@@ -649,8 +733,18 @@ export async function registerV2Hooks(
     };
     // P-2: lazy, at the first context build or permission evaluation (one decision per child, shared with execute.before).
     const binding = await bind(sessionID, bindingLookup, { maxOf });
-    dispatchRouter.noteBinding(sessionID, binding); // the observed kind (QA-P21-1-11), once per child
-    return { spec, binding };
+    const stored = currentBinding(sessionID, { maxOf }) !== undefined;
+    if (stored) dispatchRouter.noteBinding(sessionID, binding); // the observed kind (QA-P21-1-11), once per child; QA-P23-B2
+    return { spec, binding, stored };
+  };
+  /**
+   * QA-P23-A8: the role of a session the router knows as a role child — its dispatch record names a registered role agent, or the
+   * binding registry holds a decision for it — whatever agent name a hook event carries (or lacks). Undefined otherwise.
+   */
+  const knownRoleSession = (sessionID: string): string | undefined => {
+    const recorded = lookupDispatch(sessionID)?.agent;
+    if (typeof recorded === "string" && registeredRole(recorded)) return recorded;
+    return currentBinding(sessionID, { maxOf: () => [] }) !== undefined ? "(bound role session)" : undefined;
   };
   /** The directory the host resolves a session's relative paths against (its location), else the plugin's. */
   const sessionDirectoryOf = async (sessionID: string): Promise<string> => {
@@ -660,52 +754,76 @@ export async function registerV2Hooks(
   };
   /**
    * §2.2: a sibling work root is re-checked against a fresh `git worktree list --porcelain` when `external_directory` is
-   * evaluated (a removed worktree, or a plain directory created in its place, no longer counts). Cached 5 s per root; any failure →
-   * not listed (fail closed).
+   * evaluated (a removed worktree, or a plain directory created in its place, no longer counts). QA-P23-A4: `prunable` entries
+   * never count (`parseWorktreeList`), and the listed root must still look like that worktree on disk — `<root>/.git` a directory
+   * for the main worktree (the first entry), a file for a linked one. Cached 5 s per root; concurrent checks of one root share one
+   * `git` run (QA-P23-A12); any failure → not listed (fail closed).
    */
   const listWorktreesOf = options.listWorktrees ?? gitWorktreeList;
-  const worktreeChecks = new Map<string, { at: number; listed: boolean }>();
-  const stillAWorktree = async (root: string): Promise<boolean> => {
-    const own = fallbackRoot();
-    if (own !== undefined && normalizeRootText(own) === normalizeRootText(root)) return true;
-    const cached = worktreeChecks.get(root);
-    if (cached !== undefined && Date.now() - cached.at < 5_000) return cached.listed;
-    let listed = false;
+  const worktreeChecks = new Map<string, { at: number; listed: Promise<boolean> }>();
+  const checkWorktree = async (root: string): Promise<boolean> => {
     try {
       const want = normalizeRootText(root);
-      for (const entry of parseWorktreeList(await listWorktreesOf(ctx.location.directory))) {
+      const entries = parseWorktreeList(await listWorktreesOf(ctx.location.directory));
+      for (const [index, entry] of entries.entries()) {
         let real: string | undefined;
         try {
           real = realpathSync.native(entry);
         } catch {
           real = undefined;
         }
-        if (normalizeRootText(entry) === want || (real !== undefined && normalizeRootText(real) === want)) {
-          listed = true;
-          break;
+        if (normalizeRootText(entry) !== want && (real === undefined || normalizeRootText(real) !== want)) continue;
+        try {
+          const git = statSync(join(real ?? entry, ".git"));
+          return index === 0 ? git.isDirectory() : git.isFile();
+        } catch {
+          return false;
         }
       }
+      return false;
     } catch {
-      listed = false;
+      return false;
     }
+  };
+  const stillAWorktree = (root: string): Promise<boolean> => {
+    const own = fallbackRoot();
+    if (own !== undefined && normalizeRootText(own) === normalizeRootText(root)) return Promise.resolve(true);
+    const cached = worktreeChecks.get(root);
+    if (cached !== undefined && Date.now() - cached.at < 5_000) return cached.listed;
+    const listed = checkWorktree(root);
     worktreeChecks.delete(root);
     worktreeChecks.set(root, { at: Date.now(), listed });
     while (worktreeChecks.size > 64) worktreeChecks.delete(worktreeChecks.keys().next().value!);
     return listed;
   };
+  /** QA-P23-A9: the `glob` pattern / `grep` include glob of a call, from the tool's input or the evaluated event. */
+  const searchPatterns = (cls: ReturnType<typeof roleActionOf>, pattern: unknown, include: unknown): string[] => {
+    const text = (value: unknown): string[] => (typeof value === "string" && value !== "" ? [value] : []);
+    return cls === "glob" ? text(pattern) : cls === "grep" ? text(include) : [];
+  };
   /**
-   * T2.3.1: the reason a role session's permission request is refused, or undefined when its dispatch grants it. Paths: the
-   * resources of `read`/`edit` and of `external_directory`; `glob`/`grep` resources are search PATTERNS, not paths — their search
-   * root is checked by `external_directory` (outside the session directory) and by the `execute.before` check (inside it).
+   * T2.3.1: the reason a role session's permission request is refused, or undefined when its dispatch grants it. Paths
+   * (OpenCode v2 host, `packages/core/src/tool`): the resources of `read`/`edit` (`write`, `apply_patch` assert `edit`) are
+   * Location-relative or canonical absolute; `external_directory` resources are `<canonical dir>/*`. `glob`/`grep` resources are
+   * their PATTERN, not a path, and the host asserts NO `external_directory` for them (QA-P23-N1): their search root comes from the
+   * event's `metadata.path` (default `.`, the session's Location) and is checked here, and again from the call's own input in
+   * `execute.before`.
    */
-  const roleEvaluateRefusal = async (event: { sessionID: unknown; action: string; resources: readonly string[] }, agent: string): Promise<string | undefined> => {
+  const roleEvaluateRefusal = async (
+    event: { sessionID: unknown; action: string; resources: readonly string[]; metadata?: Record<string, unknown> | undefined },
+    agent: string,
+  ): Promise<string | undefined> => {
     const sessionID = String(event.sessionID);
     const authority = await roleAuthorityOf(sessionID, agent);
     if (authority === undefined) return "the role table is unavailable (fail closed)";
     const cls = roleActionOf(event.action);
-    const paths = cls === "read" || cls === "edit" || cls === "external_directory" ? event.resources : [];
+    const metadata = event.metadata !== null && typeof event.metadata === "object" ? event.metadata : undefined;
+    const search = cls === "glob" || cls === "grep";
+    const paths = cls === "read" || cls === "edit" || cls === "external_directory" ? event.resources
+      : search && metadata !== undefined ? [typeof metadata.path === "string" && metadata.path !== "" ? metadata.path : "."] : [];
+    const patterns = searchPatterns(cls, event.resources[0], metadata?.include);
     const decision = roleAuthorityDecision({
-      action: event.action, paths, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
+      action: event.action, paths, patterns, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
       sessionDirectory: paths.length > 0 ? await sessionDirectoryOf(sessionID) : ctx.location.directory, fallbackRoot: fallbackRoot(),
     });
     if (!decision.allow) return decision.reason;
@@ -716,27 +834,32 @@ export async function registerV2Hooks(
     return undefined;
   };
   /**
-   * T2.3.1 (P-12, S11): the `execute.before` side of a role session's own tool call — the tool's role action must be in the grant
-   * and its paths inside the work root (the file of `read`/`write`/`edit`, the search root of `glob`/`grep`, which defaults to the
-   * session directory). The only router check that fires for plugin tools (`router_run`, `router_git_*`: no `evaluate`, S11) and
-   * for Code Mode `execute` (S8); tools outside every role class are left to the agent's max policy and the router's evaluate hook.
+   * T2.3.1 (P-12, S11): the `execute.before` side of EVERY tool call a role session makes — the tool's role action must be in the
+   * grant and its paths inside the work root. Paths: every path a `read`/`write`/`edit`/`apply_patch` call names
+   * ({@link toolCallPaths}: `filePath`, `path`, `file_path`, `edits[]`, patch headers; none → refused), the search root of
+   * `glob`/`grep` (default: the session directory) and their pattern (QA-P23-A9). The only router check that fires for plugin tools
+   * (`router_run`, `router_git_*`: no `evaluate`, S11) and for Code Mode `execute` (S8). A tool outside every role class —
+   * `subagent` included — is refused here too (QA-P23-A7), whatever the agent's max policy or the parent's grants say.
    */
   const roleToolRefusal = async (event: { sessionID: unknown; tool: string }, args: any, agent: string): Promise<string | undefined> => {
     const cls = roleActionOf(event.tool);
-    if (cls === undefined && event.tool !== "execute" && event.tool !== AUTHORITY_TOOL_NAME) return undefined;
+    if (cls === undefined && event.tool !== "execute" && event.tool !== AUTHORITY_TOOL_NAME) return `${event.tool} is outside every role's authority`;
     const sessionID = String(event.sessionID);
     const authority = await roleAuthorityOf(sessionID, agent);
     if (authority === undefined) return "the role table is unavailable (fail closed)";
     const record = args !== null && typeof args === "object" ? args as Record<string, unknown> : {};
-    const text = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
     const sessionDirectory = await sessionDirectoryOf(sessionID);
-    const paths = cls === "read" || cls === "edit"
-      ? [text(record.filePath) ?? text(record.path)].filter((p): p is string => p !== undefined)
-      : cls === "glob" || cls === "grep" ? [text(record.path) ?? sessionDirectory] : [];
-    if ((cls === "read" || cls === "edit") && paths.length === 0) return `${event.tool}: no path to check`;
+    let paths: string[] = [];
+    if (cls === "read" || cls === "edit") {
+      const named = toolCallPaths(event.tool, record);
+      if (named === undefined) return `${event.tool}: no path to check (or a patch whose paths cannot be read)`;
+      paths = named;
+    } else if (cls === "glob" || cls === "grep") {
+      paths = [typeof record.path === "string" && record.path !== "" ? record.path : sessionDirectory];
+    }
     const decision = roleAuthorityDecision({
-      action: event.tool, paths, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
-      sessionDirectory, fallbackRoot: fallbackRoot(),
+      action: event.tool, paths, patterns: searchPatterns(cls, record.pattern, record.include), binding: authority.binding,
+      dynamic: authority.spec.authority.mode === "dynamic", sessionDirectory, fallbackRoot: fallbackRoot(),
     });
     return decision.allow ? undefined : decision.reason;
   };
@@ -950,7 +1073,7 @@ export async function registerV2Hooks(
         name ??= (await ctx.session.get({ sessionID: event.sessionID })).agent;
         protectedKnown = protectedAgent(name);
         role = roleAgentName(name);
-        if (!protectedKnown) return;
+        if (!protectedKnown && role === undefined) return; // QA-P23-A10: every role agent is protected; never skip one
         const agent = (await ctx.agent.list()).data.find(agent => agent.id === name);
         const effects = agent ? event.resources.map(resource => evaluatePermission(agent.permissions, event.action, resource)) : ["deny"];
         if (effects.includes("deny")) {
@@ -970,6 +1093,9 @@ export async function registerV2Hooks(
           }
         }
       } catch (error) {
+        // QA-P23-A8: no agent on the event and the session lookup failed — a session the router knows as a role child (its
+        // dispatch record or its binding) is still a role session, and is denied.
+        if (role === undefined && event.agent === undefined) role = knownRoleSession(String(event.sessionID));
         if (protectedKnown) event.effect = "deny";
         // P-3: a role agent's evaluation error is an explicit deny; other agents keep today's behaviour.
         if (role !== undefined) {
@@ -1062,25 +1188,8 @@ export async function registerV2Hooks(
         }
       }
     }));
-    registrations.push(await ctx.session.hook("context", async (event) => {
-      // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
-      // strictest outcome) and is annotated for the parent's `subagent` result; every other agent keeps today's behaviour.
-      const role = roleAgentName(event.agent);
-      try {
-        await buildContext(event, role);
-      } catch (error) {
-        if (role === undefined) throw error;
-        for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
-        warnPermissionOnce(`role tool catalog failed for ${role}: ${String(error)}`);
-        const child = String(event.sessionID);
-        if (!catalogFailures.has(child)) {
-          catalogFailures.add(child);
-          while (catalogFailures.size > 1000) catalogFailures.delete(catalogFailures.values().next().value!);
-          annotateSubagentResult("authority", child, roleCatalogFailureNotice(role, child));
-        }
-      }
-    }));
-    const buildContext = async (event: SessionContext, role: string | undefined): Promise<void> => {
+    /** The context hook's body (QA-P23-B5: declared before the hook that calls it). */
+    async function buildContext(event: SessionContext, role: string | undefined): Promise<void> {
       if (protectedAgent(event.agent)) {
         try {
           // Catalogs use merged session rules; remove widened tools from this
@@ -1092,6 +1201,8 @@ export async function registerV2Hooks(
               && !agent.permissions.some(rule => rule.effect !== "deny" && rule.action === action && rule.resource !== "*"))) delete event.tools[name];
           }
         } catch (error) {
+          // QA-P23-B1: a role session's failure goes to the hook's own catch (empty catalog AND the parent's annotation).
+          if (role !== undefined) throw error;
           // Known protected agent: no usable catalog is safer than widened
           // tools. Never turn a hook rejection into a host operation failure.
           for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
@@ -1104,6 +1215,9 @@ export async function registerV2Hooks(
       if (role !== undefined) {
         const authority = await roleAuthorityOf(String(event.sessionID), role);
         if (authority === undefined) throw new Error(`role ${role}: no live role spec (fail closed)`);
+        // QA-P23-B1: a decision the registry could not keep (the session lookup failed or named no parent/agent) is not a
+        // binding: the catalog is emptied and the parent told, instead of a silently reduced child.
+        if (!authority.stored) throw new Error(`role ${role}: the session could not be bound to its dispatch (lookup failed)`);
         const dynamic = authority.spec.authority.mode === "dynamic";
         for (const name of Object.keys(event.tools ?? {})) if (!roleToolKept(name, authority.binding.grant, dynamic)) delete event.tools[name];
       }
@@ -1171,7 +1285,25 @@ export async function registerV2Hooks(
           }
         }
       }
-    };
+    }
+    registrations.push(await ctx.session.hook("context", async (event) => {
+      // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
+      // strictest outcome) and is annotated for the parent's `subagent` result; every other agent keeps today's behaviour.
+      const role = roleAgentName(event.agent);
+      try {
+        await buildContext(event, role);
+      } catch (error) {
+        if (role === undefined) throw error;
+        for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
+        warnPermissionOnce(`role tool catalog failed for ${role}: ${String(error)}`);
+        const child = String(event.sessionID);
+        if (!catalogFailures.has(child)) {
+          catalogFailures.add(child);
+          while (catalogFailures.size > 1000) catalogFailures.delete(catalogFailures.values().next().value!);
+          annotateSubagentResult("authority", child, roleCatalogFailureNotice(role, child));
+        }
+      }
+    }));
 
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       const args = await scopedArgs(event);
@@ -1179,13 +1311,21 @@ export async function registerV2Hooks(
       // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
       const callerRoles = rolesOf(loadConfig(ctx.location.directory));
       if (callerRoles.size > 0 && typeof event.agent === "string" && callerRoles.has(event.agent)) {
-        const binding = await bind(String(event.sessionID), bindingLookup, { maxOf: maxOfRoles(callerRoles) });
-        dispatchRouter.noteBinding(String(event.sessionID), binding); // QA-P21-1-11: the observed kind, once per child
+        const maxOf = maxOfRoles(callerRoles);
+        const binding = await bind(String(event.sessionID), bindingLookup, { maxOf });
+        // QA-P21-1-11: the observed kind, once per child; QA-P23-B2: only a decision the registry kept.
+        if (currentBinding(String(event.sessionID), { maxOf }) !== undefined) dispatchRouter.noteBinding(String(event.sessionID), binding);
       }
-      // #84 P2.3 (T2.3.1, I3, P-12): a role session's own tool call stays inside its dispatch grant and work root. This is the
-      // router check that fires for plugin tools and Code Mode `execute` (no `evaluate` does, S8/S11); errors refuse (fail closed).
+      // #84 P2.3 (T2.3.1, I3, P-12): EVERY tool call of a role session (`subagent` included, QA-P23-A7) stays inside its dispatch
+      // grant and work root. This is the router check that fires for plugin tools and Code Mode `execute` (no `evaluate` does,
+      // S8/S11); errors refuse (fail closed). QA-P23-A8: an event without an agent from a session the router knows as a role child
+      // is refused outright.
+      if (typeof event.agent !== "string" || event.agent === "") {
+        const known = knownRoleSession(String(event.sessionID));
+        if (known !== undefined) throw new Error(`[router] Refused for role session ${String(event.sessionID)}: the calling agent is unknown (fail closed)`);
+      }
       const callerRole = roleAgentName(event.agent);
-      if (callerRole !== undefined && event.tool !== "subagent") {
+      if (callerRole !== undefined) {
         let refusal: string | undefined;
         try {
           refusal = await roleToolRefusal(event, args, callerRole);
