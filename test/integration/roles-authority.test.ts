@@ -19,8 +19,8 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import {
-  canonicalAuthorityPath, insideWorkRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision, roleCatalogFailureNotice,
-  roleToolKept, toolCallPaths, unsafeSearchPattern,
+  canonicalAuthorityPath, insideWorkRoot, listedWorktreeRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision,
+  roleCatalogFailureNotice, roleToolKept, toolCallPaths, truncationMarkerPaths, unsafeSearchPattern,
 } from "../../src/compat/v2-hooks";
 import { evaluatePermission } from "../../src/router/read-only";
 import { SHIPPED_ROLE_SPECS } from "../../src/router/roles";
@@ -132,12 +132,14 @@ type Sessions = Record<string, Record<string, unknown>>;
  * A minimal v2 host around the adapter: sessions by id (root has no parent), the agent map the adapter's transform PUBLISHES (so
  * the evaluate hook reads the real max policies), recorded tool/session/permission hooks, a per-session first message.
  */
-function host(directory: string, cfg: RouterConfig, sessions: Sessions) {
+function host(directory: string, cfg: RouterConfig, sessions: Sessions, inherited: ReadonlyArray<Record<string, string>> = []) {
   const toolHooks: Record<string, (event: any) => Promise<void>> = {};
   const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
   const permissionHooks: Record<string, (event: any) => Promise<void>> = {};
   const agents: Record<string, any> = {};
   const register = () => ({ dispose: vi.fn(async () => {}) });
+  const queue: any[] = [];
+  let wake = () => {};
   const session = (id: string) => sessions[id] ?? (id === "root"
     ? { id, agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, location: { directory } }
     : { id, parentID: "root", agent: "explorer", location: { directory } });
@@ -148,7 +150,7 @@ function host(directory: string, cfg: RouterConfig, sessions: Sessions) {
       list: vi.fn(async () => ({ data: Object.values(agents) })),
       transform: vi.fn(async (cb: any) => {
         cb({ update: (id: string, apply: (agent: any) => void) => {
-          agents[id] ??= { id, mode: "subagent", permissions: [], request: { settings: {}, headers: {}, body: {} } };
+          agents[id] ??= { id, mode: "subagent", permissions: inherited.map((rule) => ({ ...rule })), request: { settings: {}, headers: {}, body: {} } };
           apply(agents[id]);
         } });
         return register();
@@ -168,13 +170,23 @@ function host(directory: string, cfg: RouterConfig, sessions: Sessions) {
     },
     permission: { hook: vi.fn(async (name: string, cb: any) => { permissionHooks[name] = cb; return register(); }) },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
-      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      signal.addEventListener("abort", () => wake(), { once: true });
+      while (!signal.aborted) {
+        if (queue.length) yield queue.shift();
+        else await new Promise<void>((resolve) => { wake = resolve; });
+      }
     } },
   };
   return {
     ctx, agents, toolHooks, sessionHooks, permissionHooks,
-    async start(hooks: Record<string, any>, options: Parameters<typeof registerV2Hooks>[3] = {}) {
-      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0, ...options }));
+    /** A host event on the adapter's event stream. */
+    emit(event: { type: string; data: Record<string, unknown> }) { queue.push(event); wake(); },
+    async start(
+      hooks: Record<string, any>,
+      options: Parameters<typeof registerV2Hooks>[3] = {},
+      runtime?: Parameters<typeof registerV2Hooks>[2],
+    ) {
+      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, runtime, { hostSettleMs: 0, ...options }));
     },
   };
 }
@@ -545,6 +557,13 @@ describe("binding (I5, I9)", () => {
     const a = await dispatch(v2, sessions, "pa", "ca", "general", prompt, dir, "fix typo");
     const b = await dispatch(v2, sessions, "pb", "cb", "general", prompt, dir, "fix typo");
     expect(a.description).not.toBe(b.description); // each its own nonce
+    // nit b (round 2): concurrent first hooks of both children — two of them for `ca` share bind's one in-flight lookup.
+    const [firstCa, firstCb, editCa] = await Promise.all([
+      catalog(v2, "ca", "general"), catalog(v2, "cb", "general"), evaluate(v2, "ca", "general", "edit", [join(dir, "a.ts")]),
+    ]);
+    expect(firstCa).toContain("edit");
+    expect(firstCb).toContain("edit");
+    expect(editCa.effect).toBe("allow");
     expect(await catalog(v2, "ca", "general")).toContain("edit");
     expect(await catalog(v2, "cb", "general")).toContain("edit");
     expect(kindOf(cfg, "ca")).toBe("exact");
@@ -595,7 +614,7 @@ describe("inherited grants and other sessions (I3, #77 P2 lesson)", () => {
     expect(implementer).toEqual(expect.arrayContaining(["edit", "write", "read"]));
     for (const kept of [explorer, implementer]) for (const never of ["execute", "shell", "subagent", "webfetch", "todowrite", "mcp_tool"]) expect(kept).not.toContain(never);
     await expect(toolCall(v2, "x1", "explorer", "execute", { code: "tools.opencode.session_rename({ title: 'x' })" })).rejects.toThrow(/never available to a role agent/);
-    // The same tool map object filtered for one session leaves another session's map alone; non-role agents are not filtered.
+    // Filtering one session's tool map leaves every other session's map alone; non-role agents are not filtered at all.
     expect(await catalog(v2, "root", "build")).toEqual([...FULL_CATALOG].sort());
     expect(await catalog(v2, "x1", "explorer")).toEqual(explorer);
     expect((await evaluate(v2, "root", "build", "shell", ["npm test"])).effect).toBe("allow");
@@ -772,14 +791,130 @@ describe("QA round 1 (P2.3)", () => {
   }
 
   it("B4: the ladder's explicit allow is published for dynamic roles only — never fixed roles, tiers or the grader", async () => {
-    const { v2 } = await started();
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const v2 = host(dir, cfg, {});
+    // A runtime, so the adapter publishes its grader agent too.
+    await v2.start(hooks, {}, { withToolContext: (_context, operation) => operation(), applyChildSystem: () => {} } as Parameters<typeof registerV2Hooks>[2]);
     for (const spec of SHIPPED_ROLE_SPECS) {
       const effect = evaluatePermission(v2.agents[spec.agent].permissions, "router_request_authority", "*");
       expect([spec.agent, effect]).toEqual([spec.agent, spec.authority.mode === "dynamic" ? "allow" : "deny"]);
     }
     for (const name of ["fast", "medium", "heavy", V2_GRADER_AGENT]) {
-      expect([name, evaluatePermission(v2.agents[name]?.permissions ?? [], "router_request_authority", "*")]).not.toEqual([name, "allow"]);
+      expect(v2.agents[name], name).toBeDefined(); // nit c (round 2)
+      expect([name, evaluatePermission(v2.agents[name].permissions ?? [], "router_request_authority", "*")]).not.toEqual([name, "allow"]);
     }
+  });
+
+  it("2-A1: a role child reads and greps exactly its own truncated outputs — never edits them, never another session's", async () => {
+    const { dir, cfg } = home(ROLES);
+    const data = temp("omr-p23-data-");
+    const outputs = join(data, "tool-output");
+    mkdirSync(outputs);
+    const mine = join(outputs, "tool_01J9ZXAMPLE");
+    const unrecorded = join(outputs, "tool_01J9OTHER");
+    const fromEvent = join(outputs, "tool_01J9EVENT");
+    for (const file of [mine, unrecorded, fromEvent]) writeFileSync(file, "full output\n");
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    // The host's own default rules for a new agent include its tool-output directory (plugin/agent.ts TRUNCATION_GLOB).
+    const glob = join(outputs, "*");
+    const v2 = host(dir, cfg, sessions, [{ action: "external_directory", resource: glob, effect: "allow" }]);
+    await v2.start(hooks);
+    // The rule is kept for reading roles only (before the inherited denies); never for a role without `read`.
+    expect(evaluatePermission(v2.agents.explorer.permissions, "external_directory", glob)).toBe("allow");
+    expect(evaluatePermission(v2.agents.researcher.permissions, "external_directory", glob)).toBe("deny");
+    await dispatch(v2, sessions, "e1", "x1", "explorer", "[route class=search risk=low scope=single]\nfind the parser", dir);
+    await dispatch(v2, sessions, "e2", "x2", "explorer", "[route class=search risk=low scope=single]\nfind the lexer", dir);
+    expect(await catalog(v2, "x1", "explorer")).toContain("read");
+    expect(await catalog(v2, "x2", "explorer")).toContain("read");
+    const slash = (p: string) => p.replaceAll("\\", "/");
+    const ext = (child: string) => evaluate(v2, child, "explorer", "external_directory", [`${slash(outputs)}/*`]);
+    expect((await ext("x1")).effect).toBe("deny");
+    expect((await evaluate(v2, "x1", "explorer", "read", [mine])).effect).toBe("deny");
+    // The child's own tool result carries the host's marker; a marker a file's content made up (wrong shape) is ignored.
+    const toolResult = (child: string, id: string, text: string) => v2.toolHooks["execute.after"]!({
+      sessionID: child, agent: "explorer", messageID: "m", id, tool: "grep", input: { pattern: "x", path: dir }, status: "completed",
+      result: { content: [{ type: "text", text }] },
+    });
+    await toolResult("x1", "t1", `a:1:x\n\n... output truncated; full content saved to ${mine} ...\n... output truncated; full content saved to ${join(dir, "secret.txt")} ...`);
+    expect((await ext("x1")).effect).toBe("allow");
+    expect((await evaluate(v2, "x1", "explorer", "read", [mine])).effect).toBe("allow");
+    await toolCall(v2, "x1", "explorer", "read", { path: mine });
+    await toolCall(v2, "x1", "explorer", "grep", { pattern: "full", path: mine });
+    const grepEvent = { sessionID: "x1", agent: "explorer", action: "grep", resources: ["full"], effect: "allow", metadata: { root: ".", path: mine } };
+    await v2.permissionHooks.evaluate!(grepEvent);
+    expect(grepEvent.effect).toBe("allow");
+    expect((await evaluate(v2, "x1", "explorer", "read", [unrecorded])).effect).toBe("deny"); // exactly its own files
+    expect((await evaluate(v2, "x1", "explorer", "read", [join(dir, "secret.txt")])).effect).toBe("allow"); // inside the root anyway
+    await expect(toolCall(v2, "x1", "explorer", "glob", { pattern: "*", path: outputs })).rejects.toThrow(/outside/); // never glob
+    // Another session never gets them; it gets its own from the host's `outputPaths` on its tool event.
+    expect((await ext("x2")).effect).toBe("deny");
+    expect((await evaluate(v2, "x2", "explorer", "read", [mine])).effect).toBe("deny");
+    v2.emit({ type: "session.tool.success", data: { sessionID: "x2", callID: "c9", outputPaths: [fromEvent] } });
+    await vi.waitFor(async () => expect((await evaluate(v2, "x2", "explorer", "read", [fromEvent])).effect).toBe("allow"));
+    expect((await evaluate(v2, "x2", "explorer", "read", [mine])).effect).toBe("deny");
+    // Never edit: a writing role with the same record is refused.
+    await dispatch(v2, sessions, "i1", "w1", "implementer", "[route class=implement risk=low scope=single needs=edit]\nfix the parser", dir);
+    expect(await catalog(v2, "w1", "implementer")).toContain("edit");
+    await toolResult("w1", "t2", `... output truncated; full content saved to ${mine} ...`);
+    expect((await evaluate(v2, "w1", "implementer", "read", [mine])).effect).toBe("allow");
+    expect((await evaluate(v2, "w1", "implementer", "edit", [mine])).effect).toBe("deny");
+    await expect(toolCall(v2, "w1", "implementer", "write", { path: mine, content: "x" })).rejects.toThrow(/outside/);
+    await expect(toolCall(v2, "w1", "implementer", "apply_patch", { patchText: `*** Begin Patch\n*** Delete File: ${mine}\n*** End Patch` })).rejects.toThrow(/outside/);
+    // Cleared with the session.
+    v2.emit({ type: "session.deleted", data: { sessionID: "x1" } });
+    await vi.waitFor(async () => expect((await evaluate(v2, "x1", "explorer", "read", [mine])).effect).toBe("deny"));
+  });
+
+  it("2-A1: marker paths — the host's exact text and the tool-output store's shape only", () => {
+    const file = join(tmpdir(), "data", "tool-output", "tool_01J9ABC");
+    expect(truncationMarkerPaths(`x\n... output truncated; full content saved to ${file} ...\n`)).toEqual([file]);
+    expect(truncationMarkerPaths(`... output truncated; full content saved to ${join(tmpdir(), "secret.txt")} ...`)).toEqual([]);
+    expect(truncationMarkerPaths(`... output truncated; full content saved to tool-output/tool_1 ...`)).toEqual([]); // relative
+    expect(truncationMarkerPaths(`output truncated; saved to ${file}`)).toEqual([]); // not the host's text
+  });
+
+  it("2-A2: an evaluation whose event and session both name no agent is denied for a known role session", async () => {
+    const { dir, v2, sessions } = await started();
+    await dispatch(v2, sessions, "e1", "x1", "explorer", "[route class=search risk=low scope=single]\nfind the parser", dir);
+    expect(await catalog(v2, "x1", "explorer")).toContain("read"); // bound
+    v2.ctx.session.get.mockResolvedValueOnce({ id: "x1", parentID: "root", location: { directory: dir } } as never);
+    const event: Record<string, unknown> = { sessionID: "x1", action: "read", resources: [join(dir, "a.ts")], effect: "allow" };
+    await v2.permissionHooks.evaluate!(event);
+    expect(event).toMatchObject({ effect: "deny", message: expect.stringMatching(/names no agent/) });
+    v2.ctx.session.get.mockResolvedValueOnce({ id: "nobody", location: { directory: dir } } as never);
+    const stranger: Record<string, unknown> = { sessionID: "nobody", action: "read", resources: [join(dir, "a.ts")], effect: "allow" };
+    await v2.permissionHooks.evaluate!(stranger);
+    expect(stranger.effect).toBe("allow");
+  });
+
+  it("2-A3: the main worktree may have a `.git` file (a submodule's main checkout); a linked one must", () => {
+    const porcelain = "worktree /r/main\nHEAD 1\n\nworktree /r/wt-1\nHEAD 2\n\nworktree /r/wt-2\nHEAD 3\nprunable gone\n";
+    const realpath = (p: string) => p;
+    const of = (kinds: Record<string, "file" | "directory" | undefined>) => ({ realpath, gitEntry: (p: string) => kinds[p.replaceAll("\\", "/")] });
+    expect(listedWorktreeRoot(porcelain, "/r/main", of({ "/r/main/.git": "file" }))).toBe(true);
+    expect(listedWorktreeRoot(porcelain, "/r/main", of({ "/r/main/.git": "directory" }))).toBe(true);
+    expect(listedWorktreeRoot(porcelain, "/r/main", of({}))).toBe(false);
+    expect(listedWorktreeRoot(porcelain, "/r/wt-1", of({ "/r/wt-1/.git": "file" }))).toBe(true);
+    expect(listedWorktreeRoot(porcelain, "/r/wt-1", of({ "/r/wt-1/.git": "directory" }))).toBe(false);
+    expect(listedWorktreeRoot(porcelain, "/r/wt-2", of({ "/r/wt-2/.git": "file" }))).toBe(false); // prunable
+    expect(listedWorktreeRoot(porcelain, "/r/other", of({ "/r/other/.git": "file" }))).toBe(false);
+  });
+
+  it("2-B1: a session with an agent but no parent is an unknown binding (max ∩ local, no notice); one without an agent fails closed", async () => {
+    const { dir, v2, sessions } = await started();
+    sessions.np = { id: "np", agent: "explorer", title: "orphan", location: { directory: dir } };
+    expect(await catalog(v2, "np", "explorer")).toEqual(["glob", "grep", "read", "router_git_diff", "router_git_status"]);
+    const orphan = parentCall("e8", "np", "explorer", "DONE: found it");
+    await v2.toolHooks["execute.after"]!(orphan);
+    expect(resultText(orphan)).not.toContain("had no tools");
+    sessions.na = { id: "na", parentID: "root", title: "agentless", location: { directory: dir } };
+    expect(await catalog(v2, "na", "explorer")).toEqual([]);
+    const agentless = parentCall("e9", "na", "explorer", "DONE: found it");
+    await v2.toolHooks["execute.after"]!(agentless);
+    expect(resultText(agentless)).toContain(roleCatalogFailureNotice("explorer", "na"));
+    expect(roleCatalogFailureNotice("explorer", "na")).toMatch(/had no tools for at least one step; check that its result is grounded in tool output, otherwise dispatch again/);
   });
 
   it("B1 + N3: a role session's protected-catalog or binding-lookup failure empties its catalog AND annotates the parent, again on the next attempt", async () => {
