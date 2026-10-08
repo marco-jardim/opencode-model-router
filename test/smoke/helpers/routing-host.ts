@@ -176,6 +176,9 @@ export class RoutingProvider {
   graderDelayMs = 0;
   /** See `loopSource` in `handle`: repeat the READ_ONLY_PROBE tool call on every request after the first tool result. */
   loopProbe = false;
+  /** When set, requests whose last user text contains `marker` are held until `n` of them are in flight (`arrivals`, `releasedByArrival`, `timedOut` record what happened). */
+  barrier?: { marker: string; n: number; timeoutMs: number; arrivals: number[]; waiting: Array<() => void>; releasedByArrival: boolean; timedOut: boolean };
+  holdUntilOverlap(marker: string, n: number, timeoutMs = 20_000): void { this.barrier = { marker, n, timeoutMs, arrivals: [], waiting: [], releasedByArrival: false, timedOut: false }; }
   private sequence = 0;
   private server = createServer((req, res) => { void this.handle(req, res); });
   async start(): Promise<string> { return `http://127.0.0.1:${await listenOnFetchSafePort(this.server)}/v1`; }
@@ -204,18 +207,21 @@ export class RoutingProvider {
       const grader = system.includes(GRADER_MARK);
       const subagentCall = toolResult || grader ? undefined : /SPIKE_CALL=(\{[^\n]*\})/.exec(lastText)?.[1];
       const delegateCall = toolResult || grader ? undefined : /SPIKE_DELEGATE=(\{[^\n]*\})/.exec(lastText)?.[1];
+      // `SPIKE_CALLS=[{…},{…}]`: ONE reply carrying several `subagent` tool calls (Anthropic Messages only), so one parent turn spawns siblings.
+      const multiSource = toolResult || grader ? undefined : /SPIKE_CALLS=(\[[^\n]*\])/.exec(lastText)?.[1];
+      const multi = multiSource ? (JSON.parse(multiSource) as Obj[]) : undefined;
       // `loopProbe` (off by default): once any tool result is in the history (even if the last message is no longer one, e.g. the host's max-steps note), keep emitting the READ_ONLY_PROBE call found in the earlier user text, so a
       // child never finishes by itself and only the host's step limit can stop it.
       const hadToolResult = toolResult || messages.some(m => m.type === "function_call_output" || this.blocks(m.content).some(b => b.type === "tool_result"));
       const loopSource = this.loopProbe && hadToolResult && !grader
-        ? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(messages.flatMap(m => this.blocks(m.content)).filter(b => b.type === "text" || b.type === "input_text").map(b => String(b.text ?? "")).filter(text => !/SPIKE_(CALL|DELEGATE)=/.test(text)).join("\n"))?.[1]
+        ? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(messages.flatMap(m => this.blocks(m.content)).filter(b => b.type === "text" || b.type === "input_text").map(b => String(b.text ?? "")).filter(text => !/SPIKE_(CALLS?|DELEGATE)=/.test(text)).join("\n"))?.[1]
         : undefined;
       // Issue #77: intentionally emit even an unadvertised tool to prove that
       // the HOST rejects it, rather than a cooperative model merely abstaining.
-      const readOnlyProbe = (toolResult && !loopSource) || grader || subagentCall || delegateCall ? undefined : (loopSource ?? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1]);
+      const readOnlyProbe = (toolResult && !loopSource) || grader || subagentCall || delegateCall || multi ? undefined : (loopSource ?? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1]);
       const probe = readOnlyProbe ? obj(JSON.parse(readOnlyProbe)) : undefined;
-      const toolName = subagentCall ? "subagent" : delegateCall ? "delegate" : str(probe?.tool);
-      const toolInput = subagentCall ?? delegateCall ?? (probe ? JSON.stringify(probe.input) : undefined);
+      const toolName = subagentCall || multi ? "subagent" : delegateCall ? "delegate" : str(probe?.tool);
+      const toolInput = subagentCall ?? (multi ? JSON.stringify(multi[0]) : undefined) ?? delegateCall ?? (probe ? JSON.stringify(probe.input) : undefined);
       const { messages: _m, system: _s, tools, input: _i, instructions: _in, ...fields } = body;
       const toolNames = arr(tools).map(t => String(obj(t).name ?? obj(obj(t).function).name ?? ""));
       const inputTokens = Math.max(10, Math.ceil(raw.length / 4));
@@ -225,6 +231,7 @@ export class RoutingProvider {
         toolNames, toolDefs: arr(tools).map(obj), payload: fields, inputTokens, lastText, toolResult, reply: grader ? "grader" : toolName ? "tool" : "text",
       };
       this.requests.push(request);
+      if (this.barrier && !toolResult && !grader && !multi && !subagentCall && lastText.includes(this.barrier.marker)) await this.holdAtBarrier(request.seq);
       if (toolName && !probe && !toolNames.includes(toolName)) throw new Error(`Fixture requested ${toolName} but the request carries no such tool (${toolNames.join(",")})`);
       let text = toolResult ? "ROOT_DONE" : lastText.includes("CHILD_DONE") ? "CHILD_DONE" : "CHILD_OK";
       if (grader) {
@@ -235,12 +242,30 @@ export class RoutingProvider {
       const input = toolInput ? JSON.parse(toolInput) as Obj : undefined;
       if (grader && this.graderDelayMs > 0) await delay(this.graderDelayMs);
       if (responses) this.sendResponses(res, request, inputTokens, text, toolName, input);
-      else this.sendAnthropic(res, request, inputTokens, text, toolName, input);
+      else this.sendAnthropic(res, request, inputTokens, text, toolName, input, multi?.slice(1));
     } catch (error) {
       this.errors.push(String(error));
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "scripted provider error" } }));
     }
+  }
+  /** Holds a request until `barrier.n` requests carrying `barrier.marker` are in flight (or the timeout passes): proves that sessions overlap. */
+  private async holdAtBarrier(seq: number): Promise<void> {
+    const barrier = this.barrier!;
+    const release = barrier.waiting;
+    await new Promise<void>(resolve => {
+      release.push(resolve);
+      barrier.arrivals.push(seq);
+      if (release.length >= barrier.n) {
+        barrier.releasedByArrival = true;
+        for (const fn of release.splice(0)) fn();
+        return;
+      }
+      setTimeout(() => {
+        const at = release.indexOf(resolve);
+        if (at >= 0) { release.splice(at, 1); barrier.timedOut = true; resolve(); }
+      }, barrier.timeoutMs);
+    });
   }
   private systemText(system: unknown): string {
     if (typeof system === "string") return system;
@@ -251,21 +276,30 @@ export class RoutingProvider {
     if (typeof content === "string") return [{ type: "text", text: content }];
     return arr(content).map(obj);
   }
-  private sendAnthropic(res: ServerResponse, request: WireRequest, inputTokens: number, text: string, tool?: string, input?: Obj) {
+  private sendAnthropic(res: ServerResponse, request: WireRequest, inputTokens: number, text: string, tool?: string, input?: Obj, more: Obj[] = []) {
     const n = request.seq;
+    const calls = tool ? [input, ...more].map((callInput, i) => ({ id: i === 0 ? `toolu_smoke_${n}` : `toolu_smoke_${n}_${i}`, input: callInput })) : [];
     const message = { id: `msg_smoke_${n}`, type: "message", role: "assistant", model: request.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } };
     if (!request.stream) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ...message, content: tool ? [{ type: "tool_use", id: `toolu_smoke_${n}`, name: tool, input }] : [{ type: "text", text }], stop_reason: tool ? "tool_use" : "end_turn", usage: { input_tokens: inputTokens, output_tokens: 5 } }));
+      res.end(JSON.stringify({ ...message, content: tool ? calls.map(call => ({ type: "tool_use", id: call.id, name: tool, input: call.input })) : [{ type: "text", text }], stop_reason: tool ? "tool_use" : "end_turn", usage: { input_tokens: inputTokens, output_tokens: 5 } }));
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     const event = (type: string, data: Obj) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
     event("message_start", { message });
     event("ping", {});
-    event("content_block_start", { index: 0, content_block: tool ? { type: "tool_use", id: `toolu_smoke_${n}`, name: tool, input: {} } : { type: "text", text: "" } });
-    event("content_block_delta", { index: 0, delta: tool ? { type: "input_json_delta", partial_json: JSON.stringify(input) } : { type: "text_delta", text } });
-    event("content_block_stop", { index: 0 });
+    if (tool) {
+      calls.forEach((call, index) => {
+        event("content_block_start", { index, content_block: { type: "tool_use", id: call.id, name: tool, input: {} } });
+        event("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(call.input) } });
+        event("content_block_stop", { index });
+      });
+    } else {
+      event("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+      event("content_block_delta", { index: 0, delta: { type: "text_delta", text } });
+      event("content_block_stop", { index: 0 });
+    }
     event("message_delta", { delta: { stop_reason: tool ? "tool_use" : "end_turn", stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: 5 } });
     event("message_stop", {});
     res.end();
@@ -307,9 +341,12 @@ export class RoutingProvider {
 }
 
 // -------------------------------------------------------------- probe plugin ----
-/** Native v2 plugin loaded NEXT TO the router. It only observes: tool hooks (every tool, with the plugin-instance id), the
- * session event stream (with event ids), the provider requests (it tags them with session/agent/kind/model headers) and the host's
- * own `ctx.agent.list()` / `ctx.model.list()` records (dumped once, on the first context hook). It never rewrites anything. */
+/** Native v2 plugin loaded NEXT TO the router. By default it only observes: tool hooks (every tool, with the plugin-instance id), the
+ * session event stream (with event ids), the provider requests (it tags them with session/agent/kind/model headers; the headers are
+ * the one thing it always adds) and the host's own `ctx.agent.list()` / `ctx.model.list()` records (dumped once, on the first context
+ * hook). Only when a spike configures it (HostOptions.probe → SMOKE_PROBE_CONFIG) does it also act: deny / ask→deny permission
+ * evaluations, strip tools from a session's catalog, throw from a hook, append text to a tool result, rewrite a subagent call's agent,
+ * add a per-dispatch nonce to a subagent call, register the `wt_probe` tool. */
 export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync,readFileSync,existsSync} from 'node:fs';
 const tick=()=>(globalThis.__smokeSeq=(globalThis.__smokeSeq||0)+1);
 const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify({...x,__t:Date.now(),__n:tick()})+'\\n');
@@ -333,12 +370,16 @@ export default {id:'routing-smoke-probe',async setup(ctx){
  const snap=async(id)=>{try{const s=await ctx.session.get({sessionID:id});return {parentID:s.parentID,agent:s.agent,title:s.title,model:clone(s.model)};}catch(error){return {error:String(error)};}};
  if(cfg.lifecycle){
   const firstContext=new Set();
-  const firstEvaluate=new Set();
   await ctx.session.hook('context',async e=>{
    if(firstContext.has(e.sessionID))return; firstContext.add(e.sessionID);
    const entered=Date.now(),enteredN=tick();
-   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'context',sessionID:e.sessionID,agent:e.agent,model:clone(e.model),options:clone(e.options),entered,enteredN,got:await snap(e.sessionID),__instance:instance,__iid:iid});
+   const messages=(e.messages||[]).map(m=>{try{return JSON.stringify(m).slice(0,2000);}catch{return String(m);}});
+   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'context',sessionID:e.sessionID,agent:e.agent,model:clone(e.model),options:clone(e.options),messages,entered,enteredN,got:await snap(e.sessionID),__instance:instance,__iid:iid});
   });
+ }
+ // The evaluate hook is registered when ANY of lifecycle / deny / denyAsk is configured (the denials never depend on lifecycle logging).
+ if(cfg.lifecycle||cfg.deny||cfg.denyAsk){
+  const firstEvaluate=new Set();
   await ctx.permission.hook('evaluate',async e=>{
    const entered=Date.now(),enteredN=tick();
    const first=!firstEvaluate.has(e.sessionID); firstEvaluate.add(e.sessionID);
@@ -379,6 +420,16 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    const out=r.output&&typeof r.output==='object'&&typeof r.output.output==='string'?{output:{...r.output,output:r.output.output+'\\n\\n'+cfg.afterAppend.text}}:{};
    e.result={...r,content:[...content,{type:'text',text:cfg.afterAppend.text}],...out};
    log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.after',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'append',__instance:instance,__iid:iid});
+  });
+ }
+ // Opt-in nonce: tags every subagent call with its own call id in BOTH the description (= the child's title) and the prompt, so a
+ // child can be bound to the exact dispatch from what the host shows at the child's first context hook.
+ if(cfg.nonce){
+  await ctx.tool.hook('execute.before',e=>{
+   if(e.tool!=='subagent'||!e.input||typeof e.input!=='object')return;
+   const tag=' [nonce '+e.id+']';
+   e.input={...e.input,description:String(e.input.description||'')+tag,prompt:String(e.input.prompt||'')+'\\nOMR_NONCE='+e.id};
+   log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'nonce',__instance:instance,__iid:iid});
   });
  }
  if(cfg.rewriteAgent){
@@ -452,7 +503,7 @@ export interface HostOptions {
   readonly hostConfig?: Obj | ((root: string) => Obj);
   /** Seeds written to the outcomes store BEFORE the host starts (through the repo's own store + persister, on the temp dir). */
   readonly seed?: readonly Seed[];
-  /** Probe-plugin configuration (written to a JSON file the probe reads): `lifecycle` logs first context/evaluate per session; `deny` = { agent?, actions[] } denies those permission actions. */
+  /** Probe-plugin configuration (written to a JSON file the probe reads): `lifecycle` logs the first context build (with the first-context messages) and every permission evaluation per session; `deny` = { agent?, actions[] } denies those permission actions and `denyAsk` turns an `ask` into a deny — both work with or without `lifecycle` (the evaluate hook is registered for any of the three). */
   readonly probe?: {
     readonly lifecycle?: boolean; readonly denyAsk?: boolean; readonly cwdTool?: boolean; readonly deny?: { readonly agent?: string; readonly actions: readonly string[] };
     /** Per-SESSION decisions (the probe resolves the session title with session.get(event.sessionID)). */
@@ -466,6 +517,8 @@ export interface HostOptions {
     readonly afterAppend?: { readonly tool: string; readonly text: string };
     /** Rewrites `input.agent` of a `subagent` call from `from` to `to` in tool.hook("execute.before"). */
     readonly rewriteAgent?: { readonly from: string; readonly to: string };
+    /** Appends ` [nonce <callID>]` to the description (child title) and `OMR_NONCE=<callID>` to the prompt of every subagent call (tool.hook("execute.before")). */
+    readonly nonce?: boolean;
   };
 }
 export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonly fail: number }
@@ -707,6 +760,22 @@ export class RoutingHost {
     const output = obj(obj(after.result).output);
     const failed = /sessionID: (ses_[A-Za-z0-9]+)/.exec(String(obj(after.error).string ?? ""))?.[1];
     return { before, after, callID: after.callID, childID: str(output.sessionID) ?? failed };
+  }
+  /** One parent turn that emits SEVERAL `subagent` calls in a single reply (`SPIKE_CALLS=[…]`); waits for every matching execute.after. Results follow the order of the parent's execute.before records. */
+  async callMany(rootID: string, inputs: Obj[], timeoutMs = 120_000): Promise<Dispatched[]> {
+    const seen = new Set((await this.hooks()).filter(h => h.hook === "after" && h.sessionID === rootID && h.tool === "subagent").map(h => h.callID));
+    await this.client.session.prompt({ sessionID: rootID, text: `SPIKE_CALLS=${JSON.stringify(inputs)}` });
+    const afters = await waitFor(`${inputs.length} subagent execute.after of ${rootID}`, async () => {
+      const found = (await this.hooks()).filter(h => h.hook === "after" && h.sessionID === rootID && h.tool === "subagent" && !seen.has(h.callID));
+      return found.length >= inputs.length ? found : undefined;
+    }, timeoutMs);
+    const hooks = await this.hooks();
+    const befores = hooks.filter(h => h.hook === "before" && h.sessionID === rootID && h.tool === "subagent" && afters.some(a => a.callID === h.callID));
+    await this.settle(rootID);
+    return befores.map(before => {
+      const after = afters.find(a => a.callID === before.callID)!;
+      return { before, after, callID: before.callID, childID: str(obj(obj(after.result).output).sessionID) };
+    });
   }
   /** `call("subagent", …)` that must identify exactly one child (from the result, or from a parent with exactly one child). */
   async dispatch(rootID: string, input: Obj): Promise<Dispatched & { childID: string }> {

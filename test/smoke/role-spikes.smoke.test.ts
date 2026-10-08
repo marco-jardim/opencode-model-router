@@ -1,4 +1,4 @@
-/** Issue #84, plan P0.1: role spikes on a REAL OpenCode v2 host (2.0.24 live, 2.0.22 source), group A: S1, S2, S4, S7.
+/** Issue #84, plan P0.1: role spikes S1-S12 on a REAL OpenCode v2 host (2.0.24 live, 2.0.22 source).
  *
  *   RUN_OC_SMOKE_ROLE_SPIKES=1 [OPENCODE_V2_BIN=<abs path to opencode 2>] \
  *     npx vitest run --config vitest.smoke.config.ts test/smoke/role-spikes.smoke.test.ts
@@ -8,12 +8,13 @@
  *   Anthropic + OpenAI Responses provider, the router loaded from THIS checkout next to the probe plugin) and tears it down.
  * - The assertions PIN WHAT THE HOST DID (provider wire requests, host session API, probe hooks/events), never the scripted
  *   provider's own echo. If a host upgrade changes the behaviour, the matching spike fails loudly.
- * - Raw observations of each spike are written (redacted) to <tmpdir>/omr-role-spikes/<spike>.json so they can be cited; nothing
- *   is written to the repository.
- * - Groups B (S3, S6, S8, S9) and C (S10, S11, S12) extend this file: reuse `startSpikeHost`, `wire`, `save` below.
+ * - Raw observations of each spike are written (redacted) to <OMR_SMOKE_REAL_TMPDIR>/omr-role-spikes/<spike>.json so they can be
+ *   cited; nothing is written to the repository.
+ * - Shared helpers (`startSpikeHost`, `wire`, `save`, `childReport`, `lifecycle`) sit at the top; each spike is one `it`.
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";import { execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -36,9 +37,10 @@ const SOL = "openai/gpt-6-sol";
 
 /** Starts an isolated host with `agents` registered in the host's own opencode.json (they carry exactly the fields given) and the lifecycle probe on. */
 async function startSpikeHost(name: string, agents: Record<string, Obj>, extra: Partial<HostOptions> = {}): Promise<RoutingHost> {
+  const { probe, ...rest } = extra;
   return RoutingHost.start(name, {
-    routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true },
-    hostConfig: { agents }, ...extra,
+    routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, hostConfig: { agents }, ...rest,
+    probe: { lifecycle: true, ...probe }, // lifecycle logging is always on; a spike adds its own options on top
   });
 }
 /** Writes the raw (redacted) observations of one spike. */
@@ -109,7 +111,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
     try {
       const onDisk = obj(obj((await host.hostConfigOnDisk()).agents)[NO_MODEL]);
       const hostAgent = (await host.client.agent.list()).data.find(a => a.id === NO_MODEL);
-      const root = await host.newRoot("s1 root");
+      // The root runs on a model that is NEITHER the host default (anthropic/claude-opus-4-7) nor any per-call model below, so
+      // what a child without a per-call model gets can be attributed (parent model vs host default).
+      const rootModel = { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "medium" };
+      const root = await host.newRoot("s1 root", rootModel);
       const rows: Obj[] = [];
       const step = async (label: string, model: string | undefined) => {
         const mark = host.provider.requests.length;
@@ -130,7 +135,9 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       // The generated opencode.json really has no model for the agent, and the host's own agent record has none either.
       expect("model" in onDisk).toBe(false);
       expect("variant" in onDisk).toBe(false);
+      expect(hostAgent, "the model-less agent is registered").toBeDefined();
       expect(hostAgent?.model).toBeUndefined();
+      expect(parent.model).toEqual(rootModel);
       // Observed (host 2.0.24): the model-less agent is accepted by the host and the per-call model wins outright.
       for (const row of [anthropic, anthropicOpus, responses, bare]) {
         expect(row.toolStatus).toBe("completed");
@@ -142,15 +149,15 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       expect(anthropicOpus).toMatchObject({ storedModel: `${OPUS}#xhigh`, wire: [{ wireModel: "claude-opus-5-5", catalogModel: `${OPUS}#xhigh`, effort: "xhigh", topLevelEffort: "xhigh", inBandEfforts: [] }] });
       // OpenAI Responses: model and top-level reasoning.effort follow the per-call model#variant.
       expect(responses).toMatchObject({ storedModel: `${LUNA}#high`, wire: [{ protocol: "responses", wireModel: "gpt-6-luna", catalogModel: `${LUNA}#high`, effort: "high", topLevelEffort: "high", inBandEfforts: [] }] });
-      // Without a per-call model the model-less agent INHERITS the parent's model with variant "default" and no effort is sent.
-      expect(bare).toMatchObject({ storedModel: "anthropic/claude-opus-4-7#default", wire: [{ wireModel: "claude-opus-4-7", catalogModel: "anthropic/claude-opus-4-7#default", inBandEfforts: [] }] });
-      expect(bare.wire[0]?.effort).toBeUndefined();
+      // Without a per-call model the model-less agent INHERITS the PARENT SESSION's model AND variant (sonnet-5-5#medium, not the host
+      // default opus-4-7) and the parent's effort is what the provider is told.
+      expect(bare).toMatchObject({ storedModel: `${SONNET}#medium`, wire: [{ wireModel: "claude-sonnet-5-5", catalogModel: `${SONNET}#medium`, effort: "medium", topLevelEffort: "medium", inBandEfforts: [] }] });
       expect(host.errorLines()).toEqual([]);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
   }, 300_000);
 
-  it("S2 child session as seen from the first context build and first permission evaluation (parentID / agent / title), ordering vs session.created, same-title parallel children", async () => {
+  it("S2 serialised samples: child session as seen from the first context build and first permission evaluation (parentID / agent / title / model), session.created order", async () => {
     const host = await startSpikeHost("s2", { [NO_MODEL]: agentWithoutModel() });
     try {
       const rootA = await host.newRoot("s2 root A");
@@ -159,9 +166,9 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       await writeFile(probeFile, "S2\n");
       const TITLE = "S2 same title";
       const input = (prompt: string): Obj => ({ agent: NO_MODEL, description: TITLE, prompt, model: `${SONNET}#low`, background: false });
-      // (1) two roots dispatch the same agent with the same title at the same time.
+      // (1) two roots dispatch the same agent with the same title, started together (NOT proven to overlap: see the next test).
       const parallel = await Promise.all([host.dispatch(rootA, input("S2 parallel A")), host.dispatch(rootB, input("S2 parallel B"))]);
-      // (2) the same root dispatches twice in a row, in the background (the children overlap).
+      // (2) the same root dispatches twice in successive turns in the background (separate turns, each settled before the next).
       const bg1 = await host.call(rootA, "subagent", { ...input("S2 background 1"), background: true });
       const bg2 = await host.call(rootA, "subagent", { ...input("S2 background 2"), background: true });
       const kids = (await host.children(rootA)).map(k => k.id);
@@ -185,6 +192,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
           createdEvent: life.created ? { type: life.created.type, created: life.created.created, data: life.created.data, seenAtN: life.created.__n, seenAtT: life.created.__t } : undefined,
           contextEnteredN: life.context?.enteredN, contextEnteredT: life.context?.entered, firstEvaluateEnteredN: life.firstEvaluate?.enteredN,
           createdBeforeContext: life.created && life.context ? (life.created.__n as number) < (life.context.enteredN as number) : undefined,
+          sameProbeInstance: life.created !== undefined && life.context !== undefined && life.created.__iid === life.context.__iid,
           createdEventTimeVsContext: life.created && life.context ? { created: life.created.created, contextEntered: life.context.entered } : undefined,
           now: sessionView(obj(await host.client.session.get({ sessionID: s.childID }))),
         });
@@ -200,11 +208,12 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
         expect(row.contextAgent).toBe(NO_MODEL);
         // pinned: the model of the child is already the per-call one at the first context build.
         expect(obj(row.atContext).model).toEqual({ providerID: "anthropic", id: "claude-sonnet-5-5", variant: "low" });
-        // pinned ordering: session.created is emitted (and reaches the probe subscriber) BEFORE the child's first context hook,
-        // and its payload already carries parentID / agent / title / model.
-        expect(row.createdBeforeContext, `${String(row.label)} session.created before context`).toBe(true);
+        // observed in these serialised samples (NOT a host guarantee: the probe receives events through a detached loop): the probe sees
+        // session.created before the child's first context hook. Both records come from the same probe instance (same process, so the
+        // shared sequence counter is comparable), and the event payload already carries parentID / agent / title / model.
+        expect(row.sameProbeInstance, `${String(row.label)} created and context seen by one probe instance`).toBe(true);
+        expect(row.createdBeforeContext, `${String(row.label)} session.created seen before context`).toBe(true);
         expect(obj(obj(row.createdEvent).data)).toMatchObject({ parentID: row.expectedParent, agent: NO_MODEL, title: TITLE, model: { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "low" } });
-        expect(Number(obj(row.createdEvent).created)).toBeLessThanOrEqual(Number(row.contextEnteredT));
         // pinned: no permission evaluation happens for a child that calls no tool.
         if (row.label !== "reader") expect(row.evaluateActions).toEqual([]);
       }
@@ -213,14 +222,83 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       const reading = rows.find(r => r.label === "reader")!;
       expect((reading.evaluateActions as string[]).length).toBeGreaterThan(0);
       expect(obj(reading.atFirstEvaluate)).toMatchObject({ parentID: rootB, agent: NO_MODEL, title: TITLE });
-      // both parallel children (different parents, same agent, same title) are told apart ONLY by parentID.
+      // these two (different roots, same agent, same title, dispatched together) are told apart only by parentID.
       expect(new Set(rows.slice(0, 2).map(r => obj(r.atContext).title)).size).toBe(1);
       expect(rows[0]!.childID).not.toBe(rows[1]!.childID);
     } finally { await finish(host); }
   }, 300_000);
 
+  it("S2 siblings spawned by ONE parent turn with their first requests held in flight: overlap, creation/context order, nonce binding", async () => {
+    const run = async (name: string, nonce: boolean) => {
+      const host = await startSpikeHost(name, { [NO_MODEL]: agentWithoutModel() }, { probe: { nonce } });
+      try {
+        host.provider.holdUntilOverlap("S2_HOLD", 2);
+        const root = await host.newRoot(`${name} root`);
+        const TITLE = "S2 twin";
+        const input = { agent: NO_MODEL, description: TITLE, prompt: "S2_HOLD twin", model: `${SONNET}#low`, background: false };
+        const calls = await host.callMany(root, [input, input]);
+        const events = await host.events();
+        const rows = await Promise.all(calls.map(async (call, index) => {
+          const life = await lifecycle(host, call.childID!);
+          return {
+            index, callID: call.callID, childID: call.childID, beforeN: call.before.__t,
+            created: life.created ? { n: life.created.__n, iid: life.created.__iid, data: life.created.data } : undefined,
+            context: life.context ? { n: life.context.enteredN, iid: life.context.__iid, got: life.context.got, agent: life.context.agent, messages: life.context.messages } : undefined,
+          };
+        }));
+        const order = rows.flatMap(r => [{ what: "created", child: r.index, n: Number(r.created?.n) }, { what: "context", child: r.index, n: Number(r.context?.n) }]).sort((a, b) => a.n - b.n).map(x => `${x.what}:${x.child}`);
+        const barrier = host.provider.barrier!;
+        return {
+          rows, order, barrier: { arrivals: barrier.arrivals.length, releasedByArrival: barrier.releasedByArrival, timedOut: barrier.timedOut },
+          parentBeforeOrder: calls.map(c => c.callID), firstContextOrder: [...rows].sort((a, b) => Number(a.context?.n) - Number(b.context?.n)).map(r => r.callID),
+          instances: new Set(events.filter(e => e.type === "probe.instance.started").map(e => e.__iid)).size,
+          rootChildren: (await host.children(root)).map(c => c.id), nonceDecisions: events.filter(e => e.type === "probe.decision" && e.decision === "nonce").map(e => e.callID),
+          hostErrors: host.errorLines(),
+        };
+      } finally { await finish(host); }
+    };
+    const plain = await run("s2-twins", false);
+    const tagged = await run("s2-nonce", true);
+    await save("S2-overlap", { plain, tagged });
+
+    const text = (messages: unknown): string => arr(messages).map(m => arr(obj(JSON.parse(String(m))).content).map(c => str(obj(c).text) ?? "").join("")).join("\n");
+    for (const [label, r] of [["plain", plain], ["tagged", tagged]] as const) {
+      // Overlap: the first model requests of BOTH siblings were in flight at the same time (the scripted provider held each one until both
+      // had arrived; released by arrival, not by timeout), so the host runs the children of one parent turn concurrently.
+      expect(r.barrier, label).toEqual({ arrivals: 2, releasedByArrival: true, timedOut: false });
+      expect(r.instances, `${label}: one probe instance (one process, comparable sequence numbers)`).toBe(1);
+      expect(r.hostErrors).toEqual([]);
+      expect(r.rootChildren.sort()).toEqual(r.rows.map(x => x.childID).sort());
+      for (const row of r.rows) expect(row.created?.iid === row.context?.iid && row.created?.iid !== undefined, label).toBe(true);
+      // Observed interleaving (pinned): the second child is created only AFTER the first child's first context hook, although the first
+      // child's model request is still in flight until the second has also arrived. Creation order = context order = the order of the
+      // parent's execute.before records.
+      expect(r.order, label).toEqual(["created:0", "context:0", "created:1", "context:1"]);
+      expect(r.firstContextOrder, label).toEqual(r.parentBeforeOrder);
+      for (const row of r.rows) expect(obj(row.context?.got), label).toMatchObject({ parentID: r.rootChildren.length === 2 ? obj(r.rows[0]!.context?.got).parentID : undefined, agent: NO_MODEL, model: { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "low" } });
+    }
+    // Without a nonce the siblings are indistinguishable at the first context hook: same parentID, agent, title, model and the same
+    // first-message text; only the child session id differs.
+    const [p0, p1] = plain.rows;
+    expect(plain.nonceDecisions).toEqual([]);
+    expect(p0!.context!.got).toEqual(p1!.context!.got);
+    expect(obj(p0!.context!.got).title).toBe("S2 twin");
+    expect(text(p0!.context!.messages)).toBe(text(p1!.context!.messages));
+    expect(p0!.childID).not.toBe(p1!.childID);
+    // With a per-dispatch nonce (the probe's execute.before adds the call id to description and prompt) each child shows ITS dispatch's call
+    // id in the title (session.get) and in the first context message, and that id maps to the child the parent's own tool result names.
+    expect(tagged.nonceDecisions).toEqual(tagged.parentBeforeOrder);
+    for (const row of tagged.rows) {
+      expect(obj(row.context!.got).title).toBe(`S2 twin [nonce ${row.callID}]`);
+      expect(text(row.context!.messages)).toContain(`OMR_NONCE=${row.callID}`);
+      expect(row.created!.data).toMatchObject({ title: `S2 twin [nonce ${row.callID}]` });
+    }
+    const boundByNonce = Object.fromEntries(tagged.rows.map(row => [/OMR_NONCE=(\S+)/.exec(text(row.context!.messages))![1], row.childID]));
+    expect(boundByNonce).toEqual(Object.fromEntries(tagged.rows.map(row => [row.callID, row.childID])));
+  }, 600_000);
+
   it("S4 how the parent sees a child that hits its step limit (agent steps) and a child whose tool call a plugin guard denies", async () => {
-    const host = await startSpikeHost("s4", { "role-steps": agentWithoutModel({ steps: 2 }), "role-guard": agentWithoutModel(), [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, deny: { agent: "role-guard", actions: ["read"] } } });
+    const host = await startSpikeHost("s4", { "role-steps": agentWithoutModel({ steps: 2 }), "role-steps3": agentWithoutModel({ steps: 3 }), "role-guard": agentWithoutModel(), [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, deny: { agent: "role-guard", actions: ["read"] } } });
     try {
       const file = path.join(host.project, "s4-read.txt");
       await writeFile(file, "S4\n");
@@ -233,61 +311,77 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
         const requests = host.provider.requests.slice(mark).filter(r => r.session === call.childID && r.kind === "primary");
         const context = await host.client.session.context({ sessionID: call.childID });
         const childEvents = (await host.eventsOf(call.childID)).filter(e => typeof e.type === "string" && e.type.startsWith("session.")).map(e => ({ type: e.type, data: e.data }));
-        const parentHooks = (await host.hooks()).filter(h => h.sessionID === call.childID && h.hook === "after").map(h => ({ tool: h.tool, status: h.status, result: h.result, error: h.error }));
+        const childToolHooks = (await host.hooks()).filter(h => h.sessionID === call.childID && h.hook === "after").map(h => ({ tool: h.tool, status: h.status, result: h.result, error: h.error }));
+        // What the PARENT model was actually given: the tool_result of its own NEXT provider request (not the probe's execute.after record).
+        const parentRequest = host.requestsOf(root).find(r => r.kind === "primary" && r.toolResult);
+        const parentSaw = (parentRequest?.messages ?? []).flatMap(m => arr(m.content).map(obj)).filter(b => b.type === "tool_result")
+          .flatMap(b => (typeof b.content === "string" ? [b.content] : arr(b.content).map(c => str(obj(c).text) ?? ""))).join("\n");
         return {
           label, parentToolStatus: call.after.status, parentToolResult: call.after.result, parentToolError: call.after.error,
           child: { outcome: child.outcome, agent: child.agent, tokens: child.tokens },
           childRequests: requests.map(r => ({ ...wire(r), toolNames: r.toolNames, toolResult: r.toolResult, reply: r.reply, systemHasMaxSteps: r.system.includes("MAXIMUM STEPS REACHED") || JSON.stringify(r.messages).includes("MAXIMUM STEPS REACHED"), toolChoice: r.payload.tool_choice })),
-          childToolHooks: parentHooks, childEvents, childContext: context,
+          childToolHooks, parentSaw, childEvents, childContext: context,
           lifecycleEvaluate: (await lifecycle(host, call.childID)).evaluates.map(e => ({ action: e.action, denied: e.denied })),
         };
       };
       const steps = await report("step limit, cooperative model", "role-steps", probe);
+      host.provider.loopProbe = true;
+      const steps3 = await report("steps 3, model keeps calling tools", "role-steps3", probe);
+      host.provider.loopProbe = false;
       host.provider.loopProbe = true; // a model that keeps calling tools after the host told it that tools are disabled
       const stepsLoop = await report("step limit, model keeps calling tools", "role-steps", probe);
       host.provider.loopProbe = false;
       const guard = await report("guard denial", "role-guard", probe);
       const control = await report("control: no limit no denial", NO_MODEL, probe);
-      await save("S4", { steps, stepsLoop, guard, control, hostErrors: host.errorLines(), providerErrors: host.provider.errors });
+      await save("S4", { steps, steps3, stepsLoop, guard, control, hostErrors: host.errorLines(), providerErrors: host.provider.errors });
       const toolStates = (r: typeof steps) => r.childContext.flatMap(m => arr(obj(m).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
       const finishes = (r: typeof steps) => r.childContext.filter(m => obj(m).type === "assistant").map(m => ({ finish: obj(m).finish, rawFinish: obj(m).rawFinish }));
-      const parentText = (r: typeof steps) => str(obj(obj(r.parentToolResult).output).output);
+      // The parent's view = its next provider request's tool_result text (the session id attribute is removed before looking for words).
+      const seen = (r: typeof steps) => r.parentSaw.replace(/sessionID="[^"]*"/g, "");
+      const NOISE = /MAXIMUM|maximum|\bsteps?\b|PLUGIN_GUARD_DENIED|denied|Permission/;
       const MAX = "Tools are disabled after the maximum agent steps";
-      // (a) step limit, cooperative model: the host appends its MAX-STEPS note and forces tool_choice none on the LAST step; the model
-      // answers with text; the PARENT sees an ordinary completed child with that text. Nothing marks the budget exhaustion for the parent.
+      // (a) step limit, scripted model that answers with text on the last step: the host appends its MAX-STEPS note and sends
+      // tool_choice none on the LAST step; the PARENT's next request carries an ordinary completed child with that text and nothing
+      // that marks the budget exhaustion.
       expect(steps.childRequests.map(r => ({ reply: r.reply, maxSteps: r.systemHasMaxSteps, toolChoice: r.toolChoice }))).toEqual([
         { reply: "tool", maxSteps: false, toolChoice: undefined }, { reply: "text", maxSteps: true, toolChoice: { type: "none" } },
       ]);
-      expect(steps.parentToolStatus).toBe("completed");
-      expect(obj(obj(steps.parentToolResult).output).status).toBe("completed");
-      expect(parentText(steps)).toBe("CHILD_OK");
-      expect(JSON.stringify(steps.parentToolResult)).not.toMatch(/step|maximum|MAXIMUM/i);
+      expect(steps.parentSaw).toContain('state="completed"');
+      expect(steps.parentSaw).toContain("CHILD_OK");
+      expect(seen(steps)).not.toMatch(NOISE);
       expect(steps.child.outcome).toBe("succeeded");
       expect(finishes(steps)).toEqual([{ finish: "tool-calls", rawFinish: "tool_use" }, { finish: "stop", rawFinish: "end_turn" }]);
       expect(steps.childEvents.at(-1)?.type).toBe("session.execution.succeeded");
-      // (b) step limit, model that keeps calling a tool: the call on the last step FAILS in the child ("Tools are disabled after the
-      // maximum agent steps"), the child still ends `succeeded` with finish tool-calls and NO text, and the parent sees a completed child
-      // whose text is the host's placeholder.
+      // (b) step limit, scripted model that keeps calling a tool although tool_choice is none (a real provider would normally honour it, so
+      // this path needs a provider that ignores it): the HOST answers the call on the last step with an error to the child model ("Tools are
+      // disabled after the maximum agent steps"), the session ends `succeeded` with finish tool-calls and no text, and the parent's next
+      // request carries the host's placeholder text.
       expect(stepsLoop.childRequests.map(r => ({ reply: r.reply, maxSteps: r.systemHasMaxSteps, toolChoice: r.toolChoice }))).toEqual([
         { reply: "tool", maxSteps: false, toolChoice: undefined }, { reply: "tool", maxSteps: true, toolChoice: { type: "none" } },
       ]);
       expect(toolStates(stepsLoop).map(s => ({ status: s.status, message: obj(s.error).message }))).toEqual([{ status: "completed", message: undefined }, { status: "error", message: MAX }]);
       expect(stepsLoop.childEvents.map(e => e.type)).toContain("session.tool.failed");
-      expect(stepsLoop.parentToolStatus).toBe("completed");
-      expect(obj(obj(stepsLoop.parentToolResult).output).status).toBe("completed");
-      expect(parentText(stepsLoop)).toBe("Subagent completed without a text response.");
+      expect(stepsLoop.parentSaw).toContain('state="completed"');
+      expect(stepsLoop.parentSaw).toContain("Subagent completed without a text response.");
+      expect(seen(stepsLoop)).not.toMatch(NOISE);
       expect(stepsLoop.child.outcome).toBe("succeeded");
       expect(finishes(stepsLoop)).toEqual([{ finish: "tool-calls", rawFinish: "tool_use" }, { finish: "tool-calls", rawFinish: "tool_use" }]);
-      // (c) plugin-guard denial (permission.hook("evaluate") sets effect deny): the child's tool call fails with permission.rejected
-      // carrying the plugin's message; the hook sees an error; the child recovers and ends `succeeded`; the PARENT sees a plain completed
-      // child with the child's final text and no trace of the denial.
+      // (c) steps 3: the same scripted loop gets TWO tool-capable steps and the third (last) one is tool-less: steps N = N-1 tool steps
+      // + 1 final step (observed for N = 2 and N = 3).
+      expect(steps3.childRequests.map(r => ({ reply: r.reply, maxSteps: r.systemHasMaxSteps, toolChoice: r.toolChoice }))).toEqual([
+        { reply: "tool", maxSteps: false, toolChoice: undefined }, { reply: "tool", maxSteps: false, toolChoice: undefined }, { reply: "tool", maxSteps: true, toolChoice: { type: "none" } },
+      ]);
+      expect(toolStates(steps3).map(s => ({ status: s.status, message: obj(s.error).message }))).toEqual([{ status: "completed", message: undefined }, { status: "completed", message: undefined }, { status: "error", message: MAX }]);
+      // (d) plugin-guard denial (permission.hook("evaluate") sets effect deny): the child's tool call fails with permission.rejected
+      // carrying the plugin's message and the tool hook sees Permission.BlockedError (child-side signals); the scripted child then ends with its
+      // fixed reply; the PARENT's next request carries a plain completed child and no trace of the denial.
       expect(guard.lifecycleEvaluate).toEqual([{ action: "read", denied: true }]);
       expect(toolStates(guard).map(s => ({ status: s.status, type: obj(s.error).type, message: obj(s.error).message }))).toEqual([{ status: "error", type: "permission.rejected", message: "PLUGIN_GUARD_DENIED: read" }]);
       expect(guard.childToolHooks.map(h => h.status)).toEqual(["error"]);
       expect(JSON.stringify(guard.childToolHooks[0]?.error)).toContain("Permission.BlockedError");
-      expect(guard.parentToolStatus).toBe("completed");
-      expect(parentText(guard)).toBe("ROOT_DONE");
-      expect(JSON.stringify(guard.parentToolResult)).not.toMatch(/PLUGIN_GUARD_DENIED|denied|Permission/i);
+      expect(guard.parentSaw).toContain('state="completed"');
+      expect(guard.parentSaw).toContain("ROOT_DONE"); // the scripted provider's fixed reply after a tool result
+      expect(seen(guard)).not.toMatch(NOISE);
       expect(guard.child.outcome).toBe("succeeded");
       expect(finishes(guard)).toEqual([{ finish: "tool-calls", rawFinish: "tool_use" }, { finish: "stop", rawFinish: "end_turn" }]);
       // control: the same call without limit or denial completes the read.
@@ -305,13 +399,14 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       const step = async (label: string, model: string, sessionID?: string) => {
         const mark = host.provider.requests.length;
         const call = await host.call(root, "subagent", { agent: NO_MODEL, description: `S7 ${label}`, prompt: `S7 ${label}`, model, background: false, ...(sessionID ? { sessionID } : {}) });
-        const childID = call.childID ?? sessionID;
+        const childID = call.childID; // taken from the call's own result: a resume must name the same child, not echo the input
         const stored = childID ? await host.client.session.get({ sessionID: childID }) : undefined;
         const requests = host.provider.requests.slice(mark).filter(r => r.session === childID && r.kind === "primary");
         const row = {
-          label, asked: model, resumed: sessionID !== undefined, childID, sameChildAsResumed: sessionID === undefined ? undefined : childID === sessionID,
+          label, asked: model, resumed: sessionID !== undefined, childID, sameChildAsResumed: sessionID === undefined ? undefined : call.childID === sessionID,
           toolStatus: call.after.status, toolError: call.after.error, storedModel: stored?.model ? ref(stored.model) : undefined, storedAgent: stored?.agent, storedParent: stored?.parentID,
           totalInputTokens: stored?.tokens?.input, wire: requests.map(wire),
+          history: JSON.stringify(requests[0]?.messages ?? []),
         };
         table.push(row);
         return row;
@@ -328,8 +423,9 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       const x0 = await step("cross start sonnet#low", `${SONNET}#low`);
       const x1 = await step("cross resume luna#high", `${LUNA}#high`, x0.childID);
       const children = (await host.children(root)).map(c => c.id);
-      await save("S7", { table, rootChildren: children, hostErrors: host.errorLines(), providerErrors: host.provider.errors });
+      await save("S7", { table: table.map(({ history, ...row }) => ({ ...row, historyChars: String(history).length })), rootChildren: children, hostErrors: host.errorLines(), providerErrors: host.provider.errors });
 
+      for (const row of [a0, a1, a2, o0, o1, o2, x0, x1]) expect(row.childID, `${String(row.label)}: the result names a child`).toMatch(/^ses_/);
       for (const row of [a1, a2, o1, o2, x1]) {
         expect(row.toolStatus, String(row.label)).toBe("completed");
         expect(row.sameChildAsResumed, String(row.label)).toBe(true);
@@ -353,6 +449,21 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
         expect(row.wire[0]?.inBandEfforts, String(row.label)).toEqual([]);
         expect(row.wire[0]?.topLevelEffort, String(row.label)).toBe(row.wire[0]?.effort);
       }
+      // The resumed request carries the child's earlier turns: every earlier prompt and the earlier replies are in the messages the provider
+      // received (so the context is kept across a model/variant/provider change), and a fresh start carries none of them.
+      const hist = (row: { history: unknown }) => String(row.history);
+      expect(hist(a0)).not.toContain("S7 anthropic resume");
+      expect(hist(a1)).toContain("S7 anthropic start sonnet#low");
+      expect(hist(a1)).toContain("CHILD_OK");
+      expect(hist(a2)).toContain("S7 anthropic start sonnet#low");
+      expect(hist(a2)).toContain("S7 anthropic resume 1 opus#xhigh");
+      expect(hist(a2).split("CHILD_OK").length - 1).toBeGreaterThanOrEqual(2);
+      expect(hist(o1)).toContain("S7 responses start luna#low");
+      expect(hist(o2)).toContain("S7 responses start luna#low");
+      expect(hist(o2)).toContain("S7 responses resume 1 sol#high");
+      expect(hist(o2).split("CHILD_OK").length - 1).toBeGreaterThanOrEqual(2);
+      expect(hist(x1)).toContain("S7 cross start sonnet#low");
+      expect(hist(x1)).toContain("CHILD_OK");
       // one child per start, no child created by a resume.
       expect(children.sort()).toEqual([a0.childID, o0.childID, x0.childID].sort());
       expect(host.errorLines()).toEqual([]);
