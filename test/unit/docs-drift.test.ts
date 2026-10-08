@@ -785,7 +785,9 @@ describe("docs drift: roles delegation keys (#84)", () => {
 
   it("states the script rule router_run applies: exact names, no wildcard entries", () => {
     const text = doc.replace(/\s+/g, " ");
-    expect(text).toContain("matched exactly (no wildcards: a `*` entry is dropped with a notice)");
+    // plan amendment R9: exact names only; the sanitiser drops a wildcard entry
+    expect(text).toContain("matched exactly (no wildcards");
+    expect(text).toContain("a `*` entry is dropped with a notice");
     expect(sanitizeRun({ scripts: ["test:*"] }).issues).toHaveLength(1);
     expect(sanitizeRun({ scripts: ["test:unit"] }).issues).toEqual([]);
     expect(text).not.toContain("any `test:*` script is always allowed");
@@ -1079,6 +1081,40 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(unreleased).toContain("the `run` signal matches npm-script-form checks only");
     expect(unreleased).toContain("A role dispatch's acceptance checks run in its work root; a `cwd:` outside it is refused.");
     expect(unreleased).not.toContain("budgetUsed");
+  });
+
+  it("QA-P32-2: a missing d= is none, graders weigh half only when independent, run matching by entry name, R9(5), code map", () => {
+    // roles mode: an [acceptance] block without a d= claim (and without the router's gate) is `none`
+    expect(effectiveDetection({ routerGate: false, claim: null, acceptance: "grader" })).toBe("none");
+    expect(effectiveDetection({ routerGate: false, claim: "grader", acceptance: "grader" })).toBe("grader");
+    expect(effectiveDetection({ routerGate: false, claim: "deterministic", acceptance: "deterministic" })).toBe("grader");
+    expect(flat).toContain("**Unlike a tier dispatch, a role dispatch without a `d=` claim is `none` even when its prompt has an `[acceptance]` block**");
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain("a role dispatch without `d=` is `none` even when its prompt has an `[acceptance]` block");
+    const flatAdr = read("docs/adr/0006-role-tier-assurance-delegation.md").replace(/\s+/g, " ");
+    expect(flatAdr).toContain("a role dispatch without a `d=` claim is `none` even when its prompt has an `[acceptance]` block");
+    // graders: 0.5 when independent, nothing otherwise, never a weight-1 verdict signal
+    expect(SIGNAL_WEIGHTS.grader).toBe(0.5);
+    expect(flat).toContain("**Graders weigh half, and only when independent.**");
+    expect(flat).toContain("there is never a weight-1 `verdict` signal");
+    expect(flat).toContain("records nothing at all: no store change, no verdict row, no signal row");
+    expect(flatAdr).toContain("An LLM grader's verdict of a role dispatch is never a weight-1 `verdict`");
+    const engine = read("docs/ROUTING_ENGINE.md").replace(/\s+/g, " ");
+    expect(engine).toContain("an independent grader (tier ≥ the producer's, another model) adds 0.5");
+    expect(engine).toContain("needs about twice as many verdicts");
+    expect(engine).toContain("**Role dispatches have fewer verdict rows still:**");
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("moves the outcome store by 0.5 with a `grader` signal row only when the grader is independent");
+    // run matching is by router_run entry name
+    expect(flat).toContain("a command named `test` counts for `npm test`; one named `test-files` never does");
+    expect(flat).toContain("or an independent grader's verdict (weight 0.5)");
+    // R9(5): no outputPaths on 2.0.24
+    expect(flat).toContain("**Truncated tool outputs are unreadable on OpenCode 2.0.24.** Its tool-success events carry no `outputPaths`");
+    // where things live: the work-root module and the gate exist and are named
+    for (const path of ["src/routing/roles/work-root.ts", "src/verify/gate.ts"]) {
+      expect(readRepo(path), path).toBeDefined();
+      expect(guide).toContain(`\`${path}\``);
+    }
+    expect(guide).not.toContain("the role has no budget for that tier:");
   });
 
   it("README and READ_ONLY_TIERS describe router_run's shell precisely; the class reader case is v2-only; ADR wording follows the plan", () => {
