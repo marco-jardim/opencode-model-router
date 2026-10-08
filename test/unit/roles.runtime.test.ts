@@ -179,7 +179,7 @@ function host(directory: string, cfg: RouterConfig, sessions: Record<string, Rec
     emit(event: any) { queue.push(event); wake(); },
     async start(hooks: Record<string, any>, options: Parameters<typeof registerV2Hooks>[3] = {}) {
       // No execution-end event arrives in these tests unless one is emitted: do not wait for one by default.
-      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0, ...options }));
+      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0, listRegistrationWorktrees: async () => [], ...options })); // no real `git worktree list` at registration (seconds on Windows CI)
     },
   };
 }
