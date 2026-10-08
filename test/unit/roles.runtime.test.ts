@@ -28,7 +28,7 @@ import {
 import {
   resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
 } from "../../src/routing/wire/dispatch";
-import { canonicalAuthorityPath, verificationScope } from "../../src/routing/roles/work-root";
+import { canonicalAuthorityPath, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope } from "../../src/routing/roles/work-root";
 import { runSignal } from "../../src/routing/outcomes/signals";
 import { registerRoleAgents } from "../../src/router/role-agents";
 import { rememberDispatch } from "../../src/router/sessions";
@@ -607,6 +607,49 @@ describe("router_verify judges the budget captured at return (handoff 24)", () =
   }, 60_000);
 });
 
+// #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate of a deferred role dispatch gets its work root.
+describe("router_verify judges a deferred role dispatch in its work root (DF2-F1)", () => {
+  const DOD: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "fileExists", path: "out.txt" }] };
+
+  async function deferAndVerify(workRoot: (dir: string) => string | undefined) {
+    const dir = temp("omr-p33-defer-");
+    writeFileSync(join(dir, "out.txt"), "x");
+    const { cfg } = home();
+    const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
+    const wiring = createVerificationWiring({ client: client as never, directory: dir, getConfig: () => cfg, logger: { warn: () => {} } });
+    cleanups.push(async () => { wiring.pending.dispose(); await wiring.disposeVerification(); });
+    const store = createChangedFileStore();
+    await wiring.startDispatch(store, "task:orch:w1", dir, DOD, "", false);
+    const root = workRoot(dir);
+    const finish = await wiring.finishDeferred(store, {
+      dispatchID: "task:orch:w1", orchestratorSessionID: "orch", producerSessionID: "child-w1", producerTier: "implementer",
+      description: "work", cwd: dir, dod: DOD, dispatchedAt: Date.now(), ...(root === undefined ? {} : { workRoot: root }),
+    });
+    if (!finish.deferred) throw new Error(`not deferred: ${finish.reason} ${finish.detail}`);
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [finish.handle] });
+    const item = report.items[0] as { result?: { verdict: { outcome?: string; reasons: string[] } } } | undefined;
+    return item?.result?.verdict;
+  }
+
+  it("the gate re-checks the stored cwd against the work root: a cwd outside it is refused, nothing runs", async () => {
+    const elsewhere = temp("omr-p33-root-");
+    const refused = await deferAndVerify(() => elsewhere);
+    expect(refused?.outcome).toBe("unverifiable");
+    expect(refused?.reasons.join("\n")).toMatch(/outside this role dispatch's work root/);
+    expect(refused?.reasons.join("\n")).toContain(elsewhere);
+    expect(refused?.reasons.join("\n")).not.toContain("deterministic checks");
+  }, 60_000);
+
+  it("inside its work root it verifies as before; a tier dispatch (no work root) is unchanged (I1)", async () => {
+    // The checks run (router_verify's own drift rule then decides the outcome, the same with or without a work root).
+    const inside = await deferAndVerify((dir) => dir);
+    const tier = await deferAndVerify(() => undefined);
+    expect(inside?.reasons).toEqual(["all 1 deterministic checks passed"]);
+    expect(tier?.reasons).toEqual(inside?.reasons);
+    expect(inside?.outcome).toBe(tier?.outcome);
+  }, 60_000);
+});
+
 // ---------------------------------------------------------------------------
 // Handoff 22: the host's own stops (step limit, context overflow)
 // ---------------------------------------------------------------------------
@@ -767,6 +810,17 @@ describe("QA round 1 (P2.1)", () => {
     expect(await route("df1f", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`, { cwd: root })).toBe("deterministic");
     // QA-P33F1-1-2: a UNC/device cwd is never inside (refused before any filesystem call).
     expect(roleGateOutsideWorkRoot(root, block("//server/share/x"), "")).toBe(true);
+  });
+
+  it("fix-1 review nit: requestedVerificationCwdSource names the input requestedVerificationCwd takes", () => {
+    expect(requestedVerificationCwdSource("/x", "/y")).toBe("argument");
+    expect(requestedVerificationCwd("/x", "/y")).toBe("/x");
+    for (const blank of [undefined, null, "", "  ", 3]) {
+      expect(requestedVerificationCwdSource(blank, "/y")).toBe("acceptance");
+      expect(requestedVerificationCwd(blank, "/y")).toBe("/y");
+      expect(requestedVerificationCwdSource(blank, undefined)).toBeUndefined();
+      expect(requestedVerificationCwd(blank, undefined)).toBeUndefined();
+    }
   });
 
   it("DF2-F1 / QA-P33F1-1-2: verificationScope — tiers unchanged (I1); a role root is the default; P2.3's containment rule", () => {

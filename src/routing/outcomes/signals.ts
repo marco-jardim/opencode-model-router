@@ -23,7 +23,7 @@ import type {
   SignalKind,
   Verdict,
 } from "./types";
-import { LOG_ROW_VERSION, SIGNAL_REASON } from "./types";
+import { LOG_ROW_VERSION, SIGNAL_REASON, normalizeVariant, splitModelRef } from "./types";
 
 // ---------------------------------------------------------------------------
 // Observations and weights
@@ -241,6 +241,36 @@ export function graderSignal(input: GraderVerdictInput, tiers: readonly string[]
   if (graderRank === null || producerRank === null || graderRank < producerRank) return null;
   if (sameModel(input.graderModel, input.producerModel)) return null;
   return observe("grader", input.outcome, SIGNAL_WEIGHTS.grader);
+}
+
+/** One rung of the active preset on the tier order: the tier it belongs to and its `provider/model` and variant (null = default). */
+export interface TierRung {
+  readonly tier: string;
+  readonly model: string;
+  readonly variant: string | null;
+}
+
+/**
+ * #84 P3.3 fix 2: the tier of a model reference (`provider/model` or `provider/model#variant`) among `rungs` (cheapest tier
+ * first): the first rung with the same model and variant (absent ≡ `default`), else — the variant is not a rung of the preset,
+ * as when the host reports the model's default variant (`anthropic/claude-opus-5-5#default`) of a tier that lists another one —
+ * the first rung of the same model. The cheapest match wins, so an ambiguous model never ranks higher than it may. Models are
+ * compared case-insensitively. Null for an unknown or malformed reference.
+ */
+export function tierOfModel(model: string | null | undefined, rungs: readonly TierRung[]): string | null {
+  const parse = (text: unknown): { readonly id: string; readonly variant: string | null } | null => {
+    const ref = typeof text === "string" ? splitModelRef(text.trim()) : null;
+    return ref === null ? null : { id: `${ref.provider}/${ref.model}`.toLowerCase(), variant: ref.variant };
+  };
+  const wanted = parse(model);
+  if (wanted === null) return null;
+  const variant = normalizeVariant(wanted.variant);
+  const same: Array<{ readonly tier: string; readonly variant: string }> = [];
+  for (const rung of rungs) {
+    const own = parse(rung.model);
+    if (own !== null && own.id === wanted.id) same.push({ tier: rung.tier, variant: normalizeVariant(rung.variant ?? own.variant) });
+  }
+  return (same.find((rung) => rung.variant === variant) ?? same[0])?.tier ?? null;
 }
 
 /** One router-observed `router_run` (P1.3). `at` is the run's START (epoch ms). `exitCode` null = killed or timed out. */

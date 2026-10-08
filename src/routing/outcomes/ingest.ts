@@ -24,7 +24,7 @@
 
 import { homedir, tmpdir } from "node:os";
 import type { RouterConfig, RouterHost } from "../../router/config";
-import { resolveRouting } from "../../router/config";
+import { resolveCandidates, resolveRouting } from "../../router/config";
 import { getActiveTiers } from "../../router/protocol";
 import {
   forgetDispatch,
@@ -41,8 +41,9 @@ import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
 import { pricingState, tokenSampleFromEvent } from "./cost";
 import { resolveOutcomesDir } from "./persist";
-import type { SignalObservation } from "./signals";
-import { SIGNAL_MASS_CAPS, isSignalObservation, signalRow, verdictSignal } from "./signals";
+import { roleTierOrder } from "../engine/ladders";
+import type { SignalObservation, TierRung } from "./signals";
+import { SIGNAL_MASS_CAPS, graderSignal, isSignalObservation, signalRow, tierOfModel, verdictSignal } from "./signals";
 import type {
   AgentOrigin,
   AttemptSignal,
@@ -58,6 +59,7 @@ import type {
   StepEndedTokens,
   StepSample,
   Verdict,
+  VerdictGrader,
   VerdictRow,
 } from "./types";
 import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, normalizeVariant, safeNow, splitModelRef } from "./types";
@@ -81,6 +83,21 @@ export interface IngestSettings {
    * mode and on v1, so keys stay `router`/`host` there. Filled by P2.1 from `resolveRoles`.
    */
   readonly roleAgentIds?: ReadonlySet<string>;
+  /**
+   * #84 P3.3 fix 2: the tier order of role dispatches (`roleTierOrder`, cheapest first) and its rungs, which rank a grader
+   * against the producer (plan §2.6: grader tier ≥ producer tier). Absent or empty: no grader is ever independent.
+   */
+  readonly tierOrder?: readonly string[];
+  readonly tierRungs?: readonly TierRung[];
+}
+
+/** The role tier order of `cfg` and its rungs (empty without a config). */
+function tierLadderOf(cfg: RouterConfig | undefined): { readonly tierOrder: readonly string[]; readonly tierRungs: readonly TierRung[] } {
+  if (cfg === undefined) return { tierOrder: [], tierRungs: [] };
+  const tierOrder = Object.freeze([...roleTierOrder(cfg)]);
+  const tierRungs = Object.freeze(tierOrder.flatMap((tier) =>
+    resolveCandidates(tier, cfg).map((rung): TierRung => Object.freeze({ tier, model: rung.model, variant: rung.variant ?? null }))));
+  return { tierOrder, tierRungs };
 }
 
 const settingsCache = new WeakMap<RouterConfig, IngestSettings | null>();
@@ -106,6 +123,7 @@ export function ingestSettings(cfg: RouterConfig | undefined, host: RouterHost):
         maxEffectiveSamples: routing.outcomes.maxEffectiveSamples,
       }),
       routerAgentIds: new Set(cfg === undefined ? [] : Object.keys(getActiveTiers(cfg))),
+      ...tierLadderOf(cfg),
     });
   }
   if (cfg !== undefined) settingsCache.set(cfg, settings);
@@ -417,8 +435,13 @@ export interface Ingest {
    * (QA-2.3-R2-1). Without an id every delivery is applied.
    */
   onExecutionEnded(childSessionID: string, eventId?: unknown): void;
-  /** A verifier verdict for the child's current attempt. Never throws. */
-  onVerdict(childSessionID: string, outcome: Verdict): void;
+  /**
+   * A verifier verdict for the child's current attempt. Never throws. `grader` (#84 P3.3 fix 2, `verdictGraderOf`): the verdict
+   * was judged by an LLM grader, not by deterministic checks. The store and the verdict row take it either way (unchanged, I1);
+   * a role dispatch's signal row is then a `grader` row (plan §2.6: weight 0.5, only when the grader is independent — tier ≥ the
+   * producer's and another model; otherwise none), never a `verdict` row of weight 1.
+   */
+  onVerdict(childSessionID: string, outcome: Verdict, grader?: VerdictGrader | null): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
   onFalseRefusal(childSessionID: string): void;
   /**
@@ -654,6 +677,21 @@ export function createIngest(deps: IngestDeps): Ingest {
     return true;
   };
 
+  /**
+   * #84 P3.3 fix 2 (plan §2.6, I6): the signal of a grader's verdict on the target's attempt. The grader's tier is the tier of
+   * the model it ran on (`tierOfModel`: a variant that is not a preset rung, as the host's `#default`, matches by model), else the
+   * tier the checker asked for when that tier is on the order and the model is known; the producer's is the registered tier,
+   * else its model's. `graderSignal` decides: independent (tier ≥ producer's, another model) → 0.5; unknown or not → none.
+   */
+  const graderSignalOf = (target: Target, outcome: Verdict, grader: VerdictGrader): SignalObservation | null => {
+    const tiers = target.settings.tierOrder ?? [];
+    const rungs = target.settings.tierRungs ?? [];
+    const requested = grader.model !== null && grader.tier !== null && tiers.includes(grader.tier) ? grader.tier : null;
+    const graderTier = tierOfModel(grader.model, rungs) ?? requested;
+    const producerTier = target.record.tier ?? tierOfModel(`${target.model}#${target.variant}`, rungs);
+    return graderSignal({ outcome, graderTier, graderModel: grader.model, producerTier, producerModel: target.model }, tiers);
+  };
+
   return {
     async onStepEnded(event: IngestEvent): Promise<void> {
       try {
@@ -742,7 +780,7 @@ export function createIngest(deps: IngestDeps): Ingest {
       }
     },
 
-    onVerdict(childSessionID: string, outcome: Verdict): void {
+    onVerdict(childSessionID: string, outcome: Verdict, grader?: VerdictGrader | null): void {
       try {
         const target = targetOf(childSessionID);
         if (target === null) return;
@@ -771,8 +809,9 @@ export function createIngest(deps: IngestDeps): Ingest {
         };
         bundle.flusher.enqueue(row);
         // P1.4 (QA-P14-1-6): a role dispatch's verdict signal row follows the store: written only for a verdict it took.
+        // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a `grader` signal (0.5, independent graders only), never `verdict`.
         if (outcome !== "unverifiable" && target.origin === "role") {
-          const signal = verdictSignal(outcome);
+          const signal = grader === undefined || grader === null ? verdictSignal(outcome) : graderSignalOf(target, outcome, grader);
           if (signal !== null) appendSignal(target, childSessionID, signal, bundle);
         }
         touchDispatch(childSessionID, safeNow(now));

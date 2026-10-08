@@ -83,7 +83,16 @@ export function insideWorkRoot(target: string, root: string): boolean {
  * names one, else the `[acceptance]` block's `cwd:`. The dispatch-time detection and the after-hook's gate read it the same way.
  */
 export function requestedVerificationCwd(argsCwd: unknown, blockCwd: string | undefined): string | undefined {
-  return typeof argsCwd === "string" && argsCwd.trim() !== "" ? argsCwd : blockCwd;
+  return requestedVerificationCwdSource(argsCwd, blockCwd) === "argument" ? (argsCwd as string) : blockCwd;
+}
+
+/**
+ * Fix-1 review nit: which input {@link requestedVerificationCwd} takes — `argument` (the call's `cwd`), `acceptance` (the block's
+ * `cwd:`), or undefined when neither names one. The gate names it in a refusal (`Delegation.cwdSource`).
+ */
+export function requestedVerificationCwdSource(argsCwd: unknown, blockCwd: string | undefined): "argument" | "acceptance" | undefined {
+  if (typeof argsCwd === "string" && argsCwd.trim() !== "") return "argument";
+  return blockCwd !== undefined ? "acceptance" : undefined;
 }
 
 /** Where one dispatch is verified ({@link verificationScope}). */

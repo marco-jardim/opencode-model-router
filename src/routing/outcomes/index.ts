@@ -93,6 +93,7 @@ export {
   signedWeight,
   taskSection,
   taskSimilarity,
+  tierOfModel,
   tierRank,
   verdictSignal,
 } from "./signals";
@@ -110,6 +111,7 @@ export type {
   SignalObservation,
   SignalOutcome,
   SignalRowInput,
+  TierRung,
 } from "./signals";
 
 export interface AcquireOutcomesOptions {

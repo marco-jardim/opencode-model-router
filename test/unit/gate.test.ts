@@ -269,12 +269,31 @@ describe("accept() — a role dispatch is verified in its work root (DF2-F1)", (
     const { exec, fileExists, d, dod } = setup();
     const canonicalPath = vi.fn((path: string) => path);
     const unc = "\\\\server\\share\\x";
-    const r = await accept({ dod, workRoot: root, refusedCwd: unc }, wrote(), { ...d, canonicalPath });
+    const r = await accept({ dod, workRoot: root, refusedCwd: unc, cwdSource: "acceptance" }, wrote(), { ...d, canonicalPath });
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.verdict.reasons).toEqual([expect.stringContaining(`the [acceptance] block's cwd ${unc} is outside this role dispatch's work root ${root}`)]);
     expect(canonicalPath).not.toHaveBeenCalled();
     expect(exec).not.toHaveBeenCalled();
     expect(fileExists).not.toHaveBeenCalled();
+  });
+
+  it("fix-1 review nit: the refusal names where the cwd came from — the call's argument, the block, or neither", async () => {
+    const { exec, d, dod } = setup();
+    const refused = async (over: { refusedCwd?: string; cwd?: string; cwdSource?: "argument" | "acceptance" }) =>
+      (await accept({ dod, workRoot: root, ...over }, wrote(), d)).verdict.reasons[0] ?? "";
+    const argument = await refused({ refusedCwd: session, cwdSource: "argument" });
+    expect(argument).toContain(`the call's cwd argument ${session} is outside this role dispatch's work root ${root}`);
+    expect(argument).toContain(`Drop the "cwd" argument`);
+    expect(argument).not.toContain("[acceptance]");
+    const block = await refused({ refusedCwd: session, cwdSource: "acceptance" });
+    expect(block).toContain(`the [acceptance] block's cwd ${session} is outside`);
+    expect(block).toContain(`Remove "cwd:"`);
+    const unknown = await refused({ refusedCwd: session });
+    expect(unknown).toContain(`the requested cwd ${session} is outside`);
+    expect(unknown).not.toContain("[acceptance]");
+    // The lexical backstop (a cwd the caller did not check) names its source the same way.
+    expect(await refused({ cwd: session, cwdSource: "argument" })).toContain(`the call's cwd argument ${session} is outside`);
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it("QA-P33F1-1 nit 1: a cwd: inside the root but narrower than where the work landed suggests widening it", async () => {

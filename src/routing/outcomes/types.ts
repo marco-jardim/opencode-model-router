@@ -40,6 +40,22 @@ export function verdictOf(verdict: Pick<VerificationVerdict, "pass" | "outcome">
   return verdict.outcome ?? (verdict.pass ? "pass" : "fail");
 }
 
+/** #84 P3.3 fix 2: the LLM grader of a gate verdict — the tier the checker asked for and its model (null: unknown). */
+export interface VerdictGrader {
+  readonly tier: string | null;
+  readonly model: string | null;
+}
+
+/**
+ * Who judged a gate verdict, for `Ingest.onVerdict` (plan §2.6, I6): a `checker` verdict was judged by an LLM grader — its
+ * `grader` (verify/types.ts), else an unknown one (no tier, no model: never independent) — and any other verdict by deterministic
+ * checks (`undefined`).
+ */
+export function verdictGraderOf(verdict: Pick<VerificationVerdict, "method" | "grader">): VerdictGrader | undefined {
+  if (verdict.method !== "checker") return undefined;
+  return { tier: verdict.grader?.tier ?? null, model: verdict.grader?.model ?? null };
+}
+
 /**
  * Kind of attempt a row or signal belongs to. `dispatch` = an orchestrator dispatch routed in
  * `execute.before` (2.2); the others are `delegate` ladder attempts (1.5 / 2.3): `variant` = same model,
