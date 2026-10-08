@@ -314,6 +314,8 @@ export async function registerRoleAgents(
   cfg: RouterConfig,
   opts: RoleRegistrationOptions,
 ): Promise<RoleRegistration> {
+  // QA-P21-1-9: tiers mode returns before anything is resolved, so no resolution error can touch the agent map (I1).
+  if (cfg.routing?.delegation !== "roles") return NONE;
   let routing: ReturnType<typeof resolveRolesRouting>;
   try {
     routing = resolveRolesRouting(cfg, "v2");
