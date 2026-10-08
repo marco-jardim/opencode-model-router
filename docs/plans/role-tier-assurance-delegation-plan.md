@@ -293,7 +293,7 @@ Action classes: **local** = `read`, `glob`, `grep`, `router_git_*`; **exec** = `
 | Agent | Kind | Authority (max) | Tier range | Default assurance | Guard | Budget (calls fast/medium/heavy) |
 |---|---|---|---|---|---|---|
 | `explorer` | explore | local | fast–medium | none | reader | 30 / 40 / — |
-| `researcher` | research | egress: `webfetch`, `websearch`, `context7_*` (+ `execute` only if S8 passes, restricted to `codeModeAllow`) — **no local** | fast–medium | none | reader | 30 / 40 / — |
+| `researcher` | research | egress: `webfetch`, `websearch`, `context7_*` (direct tools) — **no local, no `execute`, no `brave_*`** (S8, R6) | fast–medium | none | reader | 30 / 40 / — |
 | `runner` | run | local + exec | fast–medium | deterministic (router-observed run) | reader | 25 / 40 / — |
 | `implementer` | implement | local + write; exec only when the task needs it | fast–heavy (floor §2.3) | from the prompt | producer | 40 / 80 / 120 |
 | `reviewer` | review | local + exec | heavy–heavy | none | reader | — / — / 120 |
@@ -327,7 +327,8 @@ Rules:
   behaviour); the roles protocol stops advertising them.
 - User customisation (global override layer only, A18) in `roleAgents.<name>`: `enabled`, `description`, `prompt`,
   `tierRange` (narrowing only, never below the authority floor), `budget`, `deny` (narrowing authority),
-  `codeModeAllow` (researcher, after S8). Authority is never widened by configuration.
+  Authority is never widened by configuration. (`codeModeAllow` dropped by R6: Code Mode inner calls are never
+  permission-checked and its catalog cannot be filtered, S8; `execute` is absent from every role's max policy.)
 - #81 `agents` with a shipped role name: on v1 and in tiers mode they are validated exactly as today; in roles mode a
   same-named agent replaces the shipped role only if it passes the separation rule, otherwise it is dropped with a
   notice and the shipped role stays.
@@ -358,7 +359,7 @@ export type AuthorityAction = "read" | "glob" | "grep" | "router_git" | "router_
 export interface RoleSpec { agent: string; kind: RoleKind; description: string; prompt: string;
   authority: { mode: "fixed" | "dynamic"; allow: readonly AuthorityAction[]; deny: readonly AuthorityAction[] };
   tierRange: { floor: string; ceiling: string }; assurance: Detection; guard: "reader" | "producer";
-  budget: Readonly<Record<string, number>>; enabled: boolean; codeModeAllow: readonly string[] }
+  budget: Readonly<Record<string, number>>; enabled: boolean } // codeModeAllow removed (R6, S8)
 export interface RolesRoutingConfig { delegation: "tiers" | "roles"; workRoots: readonly string[] }
 export interface ExplorationConfig { rate: number; requireDetection: "deterministic" }
 export interface RunConfig { scripts: readonly string[]; commands: Readonly<Record<string, { argv: readonly string[]; args?: readonly string[] }>>; timeoutMs: number }
@@ -431,13 +432,13 @@ the only v1 changes are the mode-independent fixes of §2.9, each with a before/
 |---|---|---|
 | I1 | Without `routing.delegation: "roles"`, v2 is byte-identical to the base except §2.9 | P1.1, P2.1, P2.2 (D1/D2 suites, goldens) |
 | I2 | Every role dispatch on v2 gets a router-set model within `[floor, ceiling]`, never below the authority floor | P1.2 (property test), P2.1, P3.1 |
-| I3 | A role child can never use an action outside its dispatch grant (host refusal on the real host) | P2.3, P3.1 |
+| I3 | A role child can never use an action outside its dispatch grant: unlisted tools are absent from its catalog (host without session grants; router context-hook stripping under a granting parent), native actions outside the policy are refused (host or router `evaluate`), `router_run`/`router_git_*` refuse a foreign `cwd` themselves (R6/P-17; proven under a parent without grants and under an allow-all parent) | P2.3, P3.1 |
 | I4 | No shipped or accepted grant violates the separation rule | P1.1 (validator), P1.2, P3.1 |
 | I5 | Binding ambiguity never widens authority | P1.6 (property test), P2.3, P3.1 |
 | I6 | Positive evidence never comes from self-report | P1.4 |
 | I7 | Budget exhaustion never counts as a tier failure | P1.4, P1.5 |
 | I8 | v1 is byte-identical to the base except §2.9 | P1.1, P3.1 (hash + `smoke:v1`) |
-| I9 | Role-agent enforcement fails closed when a hook errors or a binding is unknown | P2.3, P3.1 |
+| I9 | Role-agent enforcement fails closed: a context-hook error → empty catalog (annotated); an unknown/absent binding → max policy ∩ local actions, `router_run` refuses, `external_directory` denied; an `evaluate` error → deny with a message (R6/P-2, P-3, P-17) | P2.3, P3.1 |
 
 ### 2.9 Mode-independent fixes (apply to v1, tiers mode and roles mode)
 - E6: reader guard profile for the read-only `fast` tier (#78), for dispatches routed `class=review|recon|search`,
@@ -462,9 +463,9 @@ effective deterministic detection; removing the tier agents; raw shell inside ro
 | 0 | P0.1 | `D:\git\opencode-model-router\test\smoke\role-spikes.smoke.test.ts` (new), `D:\git\opencode-model-router\test\smoke\helpers\routing-host.ts`, `D:\git\opencode-model-router\docs\qa\role-tier\spikes.md` (new) |
 | 1 | P1.1 | `D:\git\opencode-model-router\src\router\roles.ts` (new), `D:\git\opencode-model-router\src\router\config.ts`, `D:\git\opencode-model-router\src\router\plugin-agents.ts`, `D:\git\opencode-model-router\tiers.json`, `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md` (new keys only), `D:\git\opencode-model-router\test\unit\docs-drift.test.ts`, `D:\git\opencode-model-router\test\unit\roles.config.test.ts` (new) |
 | 1 | P1.2 | `D:\git\opencode-model-router\src\routing\roles\policy.ts` (new), `D:\git\opencode-model-router\src\routing\classify\route-line.ts`, `D:\git\opencode-model-router\src\routing\classify\types.ts` (additive), `D:\git\opencode-model-router\src\routing\engine\kernel.ts`, `D:\git\opencode-model-router\src\routing\engine\ladders.ts`, `D:\git\opencode-model-router\src\routing\engine\types.ts` (additive), `D:\git\opencode-model-router\src\routing\engine\simulate.ts`, `D:\git\opencode-model-router\src\routing\engine\index.ts`, `D:\git\opencode-model-router\test\unit\roles.policy.test.ts` (new), `D:\git\opencode-model-router\test\unit\roles.kernel.test.ts` (new), `D:\git\opencode-model-router\test\unit\route-line.roles.test.ts` (new) |
-| 1 | P1.3 | `D:\git\opencode-model-router\src\router\run-tools.ts` (new), `D:\git\opencode-model-router\test\unit\run-tools.test.ts` (new) |
+| 1 | P1.3 | `D:\git\opencode-model-router\src\router\run-tools.ts` (new), `D:\git\opencode-model-router\src\router\git-tools.ts` (work-root resolver injection only, R6/P-18), `D:\git\opencode-model-router\test\unit\run-tools.test.ts` (new) |
 | 1 | P1.4 | `D:\git\opencode-model-router\src\routing\outcomes\types.ts`, `D:\git\opencode-model-router\src\routing\outcomes\signals.ts` (new), `D:\git\opencode-model-router\src\routing\outcomes\ingest.ts`, `D:\git\opencode-model-router\src\routing\outcomes\stats.ts`, `D:\git\opencode-model-router\src\routing\outcomes\persist.ts`, `D:\git\opencode-model-router\src\routing\outcomes\index.ts`, `D:\git\opencode-model-router\test\unit\routing-outcomes.signals.test.ts` (new) |
-| 1 | P1.5 | `D:\git\opencode-model-router\src\router\guard-profile.ts` (new), `D:\git\opencode-model-router\src\guard\guards.ts`, `D:\git\opencode-model-router\src\guard\enforce.ts`, `D:\git\opencode-model-router\src\router\dispatch-header.ts`, `D:\git\opencode-model-router\src\verify\dod.ts`, `D:\git\opencode-model-router\src\verify\checker.ts` (S5 confirms or amends), `D:\git\opencode-model-router\test\unit\guards.roles.test.ts` (new), `D:\git\opencode-model-router\test\unit\verify.criteria.test.ts` (new) |
+| 1 | P1.5 | `D:\git\opencode-model-router\src\router\guard-profile.ts` (new), `D:\git\opencode-model-router\src\guard\guards.ts`, `D:\git\opencode-model-router\src\guard\enforce.ts`, `D:\git\opencode-model-router\src\router\dispatch-header.ts`, `D:\git\opencode-model-router\src\verify\dod.ts`, `D:\git\opencode-model-router\src\verify\checker.ts` (S5 confirms or amends), `D:\git\opencode-model-router\src\verify\dispatch.ts` (header strip in `buildDelegationDoD`, R6/P-15), `D:\git\opencode-model-router\test\unit\guards.roles.test.ts` (new), `D:\git\opencode-model-router\test\unit\verify.criteria.test.ts` (new) |
 | 1 | P1.6 | `D:\git\opencode-model-router\src\routing\roles\binding.ts` (new), `D:\git\opencode-model-router\src\routing\roles\authority.ts` (new), `D:\git\opencode-model-router\test\unit\roles.binding.test.ts` (new), `D:\git\opencode-model-router\test\unit\roles.authority.test.ts` (new) |
 | 2 | P2.1 | `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`, `D:\git\opencode-model-router\src\routing\wire\runtime.ts`, `D:\git\opencode-model-router\src\compat\v2-hooks.ts`, `D:\git\opencode-model-router\src\index.ts`, `D:\git\opencode-model-router\src\v2.ts`, `D:\git\opencode-model-router\src\router\read-only.ts`, `D:\git\opencode-model-router\src\router\plugin-agents.ts`, `D:\git\opencode-model-router\test\integration\roles-dispatch.test.ts` (new) |
 | 2 | P2.2 | `D:\git\opencode-model-router\src\router\protocol.ts`, `D:\git\opencode-model-router\src\router\prompts.ts`, `D:\git\opencode-model-router\src\routing\engine\protocol-line.ts`, `D:\git\opencode-model-router\src\routing\wire\hint.ts`, `D:\git\opencode-model-router\src\routing\advisor\findings.ts`, `D:\git\opencode-model-router\src\routing\advisor\index.ts`, `D:\git\opencode-model-router\src\routing\commands\stats.ts`, `D:\git\opencode-model-router\src\commands\output.ts`, `D:\git\opencode-model-router\scripts\routing-stats.ts`, `D:\git\opencode-model-router\test\integration\roles-protocol.test.ts` (new), `D:\git\opencode-model-router\test\golden\roles-protocol.golden.test.ts` (new) |
@@ -885,9 +886,9 @@ Steps:
    (replaced by shipped roles); exploration stays 0.
 3. [executor] At the next orchestrator prompt verify through
    `opencode api get '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` that the role agents exist
-   with their max policies, and that the executor's system prompt now carries the roles protocol. If S12 showed that
-   agent registrations need a restart, step 2 ends with a second restart stop (handover §7 "DF-2b") and this step
-   runs after it.
+   with their max policies, and that the executor's system prompt now carries the roles protocol. S12 (R6/P-14):
+   router-defined agent changes apply on the next prompt without a restart, so DF-2b is not needed for this migration
+   (it stays only for agents defined in the host's `opencode.json`, which DF-2 does not touch).
 4. [executor] Self-test probes (the executor's own dispatches) on a phase-worktree work root, each recorded with its
    decision row: `explorer`
    lookup (fast model, local grant); `runner` running a scoped test through `router_run` with `cwd` = the worktree;
@@ -1102,6 +1103,25 @@ prompt (§0.2.3).
   read-only calls, so the DF-1 probe "read-only `fast` dispatch with 10 consecutive reads" carries `CAP:12`; the P0.1
   baseline needed a same-session resume for reads 9–10 (dogfood.md, Baseline). Smoke files run only with
   `--config vitest.smoke.config.ts` (the default config excludes `test\smoke\**`).
+- R6 (P0.1 spikes S1–S12, `docs\qa\role-tier\spikes.md`, proposals P-1…P-19 after three heavy QA rounds, phase report
+  `docs\qa\role-tier\phase-p01.md`). Every proposal is adopted as written in the spikes report's "Proposed amendments"
+  table, which is normative for the owning phases; in short: P-1 role agents keep the floor tier's model as fallback
+  (a model-less child inherits the parent's model); P-2 bind at the first context hook, router-inserted per-dispatch
+  nonce (roles mode only), intersection fallback, unbound → max ∩ local; P-3 context-hook error → empty catalog,
+  evaluate error → deny with message, P2.3 keeps the router's catalog stripping; P-4 host `steps` = top budget +
+  margin; P-5 budget/denial annotations come from plugin state in `execute.after`, role dispatches forced to
+  foreground with a separate flag; P-6 `execute` absent from every role's max policy, `codeModeAllow` removed,
+  researcher = `webfetch`/`websearch`/`context7_*` only (`brave_*` is a follow-up; E13 closed); P-7 `explore → explorer`
+  through `subagent_type`, roles mode only; P-8 role-aware escalation hint (resume on a higher tier); P-9 full
+  verification gating condition (agent-agnostic); P-10 `router_run` cwd from the binding, never `context.directory`
+  or `session.location`; P-11 (owners P1.1 + P2.1) `workRoots` as `external_directory` globs, canonical long form
+  only, documented over-match; P-12 plugin tools listed explicitly in role allows and self-checked; P-13 per-session
+  `external_directory` narrowing is mandatory (P2.3); P-14 no DF-2b for router-defined agents; P-15 P1.5 strips the
+  whole router header (through the first `\n\n---\n\n`) in `src\verify\dispatch.ts` (ownership added), `src\index.ts`
+  untouched in Wave 1; P-16 S5 data-flow wording; P-17 I3/I9 reworded (§2.8); P-18 `router_git_*` take the bound work
+  root (P1.3 owns the resolver injection in `src\router\git-tools.ts`, P2.1 wires it); P-19 role agents are always
+  router-registered. Round-3 minors of P0.1 are handoffs listed in `phase-p01.md` (P1.1, P2.1, P2.3); the pre-existing
+  `6 v1 untouched` smoke failure (stale pin `71815eb`) is a P3.1 handoff.
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |

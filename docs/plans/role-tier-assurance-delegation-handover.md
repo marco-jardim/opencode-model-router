@@ -85,8 +85,8 @@ matter most:
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | P0.1 pre-flight complete (2026-10-08): `rta/main`, draft PR #85, `D:\git\omr-rta-p01` ready, capped suite and dogfood baseline recorded, R5 written |
-| **Next task id** | **P0.1 T0.1.2** (S5 lookup, @fast) in parallel with **T0.1.1** (spike smoke, @medium/@heavy) in `D:\git\omr-rta-p01` |
+| Checkpoint reached | **P0.1 merged** into `rta/main` (2026-10-08, QA PASS after 3 rounds; spikes S1–S12 answered; R5, R6 written) |
+| **Next task id** | **Wave 1 start**: standard pre-flight for P1.1, P1.3, P1.4, P1.5 (P1.2 needs the P1.1 + P1.4 contract commits; P1.6 needs P1.1 + P1.2) — contract-first commits merged into `rta/main` at once (§0.3.3). Read `docs\qa\role-tier\spikes.md` amendments table and `phase-p01.md` handoffs before dispatching |
 | Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
 | Active worktrees for this plan | `D:\git\omr-rta-main` → `rta/main` (integration, executor only); `D:\git\omr-rta-p01` → `rta/p01` (P0.1); `D:\git\omr-plan-rta` → `docs/role-tier-plan` (frozen) |
 | Plan branch | `docs/role-tier-plan` (pushed, frozen): `47f1e88` plan, `f23c9a7` handover + R1/R2, `8dcf455` R3, `a8b1905` R4 |
@@ -98,9 +98,10 @@ matter most:
 | Owner override (`C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`) | `routing {engine: enforce, profile: balanced, margin: 0.2}`; `subagentTiers {explore: fast}`; `agents`: `runner` (fast, explicit shell allowlist), `reviewer` (heavy, readOnly + `router_git_*`/`context7_*`), `researcher` (fast, readOnly + `webfetch`/`websearch`/`brave_*`/`context7_*`) |
 | Live agent models | `fast`, `explore`, `runner`, `researcher`: `anthropic/claude-haiku-5-5#low`; `medium`: `anthropic/claude-sonnet-5-5#medium`; `heavy`, `reviewer`: `anthropic/claude-opus-5-5#xhigh`; `title`/`summary`: `anthropic/claude-haiku-5-5` (pinned in `C:\Users\Marquinho\.config\opencode\opencode.json`) |
 | Dogfood | DF-1 pending; DF-2 pending |
-| Restart stops | none requested yet; three planned (DF-1, DF-2, P3.4), plus DF-2b only if spike S12 shows agent registration needs one |
+| Restart stops | none requested yet; three planned (DF-1, DF-2, P3.4); DF-2b not needed (S12, R6/P-14) |
 | Override SHA-256 baseline | `700E25876937EB740748AB4B10EAF1CDDD4C7E29C7FDD8B84F23C609B0BE88F8` (dogfood.md Baseline; copy at `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`) |
-| Plan amendments | R0–R5; next free id: R6 |
+| Plan amendments | R0–R6; next free id: R7 |
+| Reference sessions (P0.1) | producer `ses_ee69d18aaffeG5XhB066ODnp2f` (spikes); reviewers `ses_ee672f085ffeHGQTnuwSgAruHy` (area 1), `ses_ee672bf60ffehoOgt7YSyo3wvd` (area 2) |
 
 ---
 
@@ -111,7 +112,7 @@ matter most:
 | `D:\git\opencode-model-router` | `master` @ `eeab36b` | **Base directory** of the repository. The live host loads the plugin from here. Written only by DF-1/DF-2 (local branch `rta/live`) and P3.4 |
 | `D:\git\omr-plan-rta` | `docs/role-tier-plan` | Where the plan and this handover were written; frozen once `rta/main` exists; removed in T3.4.5 |
 | `D:\git\omr-rta-main` | `rta/main` (created in P0.1, `npm ci` done) | Integration worktree; executor only; merges, plan amendments, handover, dogfood record |
-| `D:\git\omr-rta-p01` | `rta/p01` (open, `npm ci` done) | P0.1 spikes |
+| `D:\git\omr-rta-p01` | `rta/p01` (merged, idle; removed in T3.4.5) | P0.1 spikes; also the place to re-run `test\smoke\role-spikes.smoke.test.ts` (`$env:RUN_OC_SMOKE_ROLE_SPIKES='1'`, `--config vitest.smoke.config.ts`, ≈ 4.5 min) |
 | `D:\git\omr-rta-<id>` | `rta/<id>` | One per phase: `p01`, `p11`…`p16`, `p21`…`p23`, `p31`…`p34` |
 | `D:\git\opencode` | (host source, tags `v1.18.34`, `v2.0.22`) | Read-only reference for hook, permission and agent semantics; the live host is 2.0.24 |
 | `D:\git\opencode-model-router-agent-options-gate` (`fix/agent-options-provider-gate`), `D:\git\opencode-model-router-release` (`release/1.13.0`), `D:\git\opencode-model-router-v2` (`fix/gate-task-cwd`), `C:\Users\Marquinho\AppData\Local\Temp\omr-regress`, `C:\Users\Marquinho\AppData\Local\Temp\opencode\omr-old` | — | Older worktrees unrelated to this plan. **Do not touch or remove** |
@@ -268,7 +269,7 @@ one, the host was not restarted: ask again, do not roll back.
 
 | Phase | Worktree | Status | QA rounds / verdict | Merge sha | Report |
 |---|---|---|---|---|---|
-| P0.1 | `D:\git\omr-rta-p01` | pre-flight done; tasks in progress | — | — | `docs\qa\role-tier\phase-p01.md` |
+| P0.1 | `D:\git\omr-rta-p01` | merged | 3 rounds (36 → 17 → 1 major, all fixed); PASS | `085a792` | `docs\qa\role-tier\phase-p01.md` |
 | P1.1 | `D:\git\omr-rta-p11` | pending | — | — | `docs\qa\role-tier\phase-p11.md` |
 | P1.2 | `D:\git\omr-rta-p12` | pending | — | — | `docs\qa\role-tier\phase-p12.md` |
 | P1.3 | `D:\git\omr-rta-p13` | pending | — | — | `docs\qa\role-tier\phase-p13.md` |
