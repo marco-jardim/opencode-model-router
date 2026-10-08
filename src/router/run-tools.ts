@@ -201,12 +201,11 @@ export function authorizeCwd(bound: unknown, cwd: unknown, platform: NodeJS.Plat
 }
 
 /**
- * `scripts` entries match exactly, or as a prefix when they end in `*` (`test:*` admits
- * `test:unit`, not `test:` itself); a bare `*` matches nothing.
+ * Plan amendment R9: `routing.run.scripts` names scripts exactly (the config sanitiser admits no wildcard), so an entry
+ * matches only the identical name.
  */
 export function scriptAllowed(scripts: readonly string[], name: string): boolean {
-  return scripts.some(entry => typeof entry === "string" && (entry === name
-    || (entry.length > 1 && entry.endsWith("*") && name.length >= entry.length && name.startsWith(entry.slice(0, -1)))));
+  return scripts.some(entry => typeof entry === "string" && entry === name);
 }
 
 /** The option-like lead of an argument (`-x`, `@responsefile`, `+opt`), or undefined. */

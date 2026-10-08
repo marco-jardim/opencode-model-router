@@ -1021,7 +1021,7 @@ The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`
 | `roleAgents.<name>.deny` | `string[]` | `[]` | actions to remove: `read \| glob \| grep \| router_git \| router_run \| edit \| webfetch \| websearch \| context7 \| execute`; can only narrow | as `roleAgents` |
 | `routing.exploration.rate` | `number` | `0` | `[0, 0.2]` | global only; `0` unless `delegation` is `roles` on v2 |
 | `routing.exploration.requireDetection` | `string` | `"deterministic"` | fixed; any other value is ignored with a notice | global only |
-| `routing.run.scripts` | `string[]` | `["test", "typecheck", "lint", "build"]` | `package.json` script names `router_run` may run, matched exactly (no wildcards: a `*` entry is dropped with a notice); to run another script such as `test:unit`, list it by name or add a `commands` entry | global only |
+| `routing.run.scripts` | `string[]` | `["test", "typecheck", "lint", "build"]` | `package.json` script names `router_run` may run, matched exactly (no wildcards, R9: a `*` entry is dropped with a notice); to run another script such as `test:unit`, list it by name or add a `commands` entry | global only |
 | `routing.run.commands` | `Record<string, { argv, args? }>` | `{ "test-files": … }` (below) | `argv`: non-empty array of non-empty strings; `args`: patterns for the caller's arguments | global only |
 | `routing.run.timeoutMs` | `integer` | `600000` | `[1000, 3600000]` | global only |
 | `routing.workRoots` | `string[]` | `[]` | absolute globs, see below | global only |

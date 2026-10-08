@@ -84,7 +84,7 @@ import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
-import { isAnnotationRow, verdictOf, type LogRow } from "./routing/outcomes/types";
+import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./routing/outcomes/types";
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
@@ -148,6 +148,7 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
+import { requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
 import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
@@ -1085,6 +1086,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     pendingRoleCaps.delete(callID);
     registerRoleCap(child, pending.agent, pending.cap);
   };
+  /**
+   * #84 P3.3 DF2-F1: where the `task` call `callID` is verified. A routed role dispatch (`routedRoleOf`, kept until the adapter's
+   * `execute.after` is done) in its `verifyRoot` — the grant's work root (a resume keeps the child's bound root, QA-P33F1-1-1), else
+   * its canonical session directory (QA-P33F1-1-3); the requested cwd (`requestedVerificationCwd`: the call's `cwd`, else the
+   * block's `cwd:`, the order the dispatch-time detection uses, nit 3) still wins inside it, by P2.3's rule (QA-P33F1-1-2); one
+   * outside it is refused by the gate. Every other dispatch: the explicit cwd, as before (I1).
+   */
+  const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }): VerificationScope =>
+    verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), typeof callID === "string" ? routedRoleOf(callID)?.verifyRoot : undefined);
   /** The prompt as the orchestrator wrote it: without the router's nonce line (handoff 18; role dispatches carry no header). */
   const withoutNonceLine = (prompt: string): string => prompt.replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
   /**
@@ -1735,7 +1745,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 // R2-2: a failed/timed-out producer may never deliver host confirmation. The ladder's
                 // verdict still needs its decision row; the same callback is idempotent after host progress/result.
                 attempt.confirmProducer?.();
-                ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict));
+                // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+                ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict), verdictGraderOf(gateRes.verdict));
               }
 
               const action = nextAction(
@@ -2049,12 +2060,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           const prompt = typeof output?.args?.prompt === "string" ? output.args.prompt : undefined;
           const description = typeof output?.args?.description === "string" ? output.args.description : undefined;
           const dod = buildDelegationDoD({ prompt, description });
-          const effectiveCwd = typeof output?.args?.cwd === "string" && output.args.cwd.trim() ? output.args.cwd : dod.cwd;
           // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
           // dispatch header or any repair touches it, and are kept for the after hook. The capture
           // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
+          // DF2-F1: a role dispatch's capture is taken in its verification root (never in a refused cwd).
           await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
-            effectiveCwd,
+            verificationScopeOf(input.callID, output?.args, dod).cwd,
             dod,
             dispatchDirectiveText(prompt, description),
             true);
@@ -2301,7 +2312,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               prompt: input?.args?.prompt,
               description: input?.args?.description,
             });
-            const effectiveCwd = typeof input?.args?.cwd === "string" && input.args.cwd.trim() ? input.args.cwd : dod.cwd;
+            // DF2-F1: a role dispatch is verified in its verification root (capture, change set, checks, deferral); a requested
+            // cwd outside that root is refused by the gate below, never deferred to run there later.
+            const scope = verificationScopeOf(input.callID, input?.args, dod);
+            const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
+            const effectiveCwd = scope.cwd;
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
@@ -2313,7 +2328,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               : false;
             // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
             // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
-            if (isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+            if (!scope.outside && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
@@ -2323,6 +2338,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 producerTier,
                 description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
                 cwd: effectiveCwd,
+                // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
+                ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
                 dod,
                 dispatchedAt: start.dispatchedAt,
                 // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
@@ -2397,7 +2414,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     trivial,
                     mode: "modeA",
                     // Native task has no cwd argument; the acceptance block can supply it.
-                    ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+                    ...(scope.requested ? { cwd: scope.requested } : {}),
+                    ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
+                    ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
+                    // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
+                    ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
                   },
                   artefact,
                   gateDeps,
@@ -2443,7 +2464,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
             res = applyDispatchCaveats(res, verification);
             // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
-            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict));
+            // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);

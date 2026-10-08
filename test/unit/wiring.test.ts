@@ -95,8 +95,15 @@ describe("dispatchGrader", () => {
     const client = fakeClient();
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
     const out = await w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" });
-    expect(out).toEqual({ sessionID: "SID1", text: "graded" });
+    // #84 P3.3 fix 2: the answer names the model the grader was dispatched on (the tier's model).
+    expect(out).toEqual({ sessionID: "SID1", text: "graded", model: "p/fast-m" });
     expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("#84 P3.3 fix 2: a tier without a model leaves the grader on the host's default: its model is unknown (null)", async () => {
+    const client = fakeClient();
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+    expect(await w.dispatchGrader({ tier: "medium", system: "s", prompt: "p" })).toEqual({ sessionID: "SID1", text: "graded", model: null });
   });
 
   // The dispose lives in a finally; a failing prompt must not leak the session.
@@ -303,7 +310,7 @@ describe("dispatchGrader", () => {
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
-      .resolves.toEqual({ sessionID: "SID1", text: '{"pass":true,"reasons":[]}' });
+      .resolves.toEqual({ sessionID: "SID1", text: '{"pass":true,"reasons":[]}', model: "p/fast-m" });
     expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
@@ -351,6 +358,7 @@ describe("dispatchGrader", () => {
     expect(await w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" })).toEqual({
       sessionID: "",
       text: "",
+      model: null,
     });
   });
 });

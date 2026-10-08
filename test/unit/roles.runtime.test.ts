@@ -4,7 +4,7 @@
  * the authority ladder's resume, session eviction, P-5 foreground, signals with the real guard state. Tiers mode and v1 unchanged.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
@@ -14,18 +14,23 @@ import {
   firstMessageText, registerV2Hooks, roleAuthorityNotice, roleBudgetNotice,
 } from "../../src/compat/v2-hooks";
 import type { RouterPluginInput } from "../../src/compat/child-session";
-import { invalidateConfigCache, loadConfig, overridePath, resetRolesWarnings, type RouterConfig } from "../../src/router/config";
+import { invalidateConfigCache, loadConfig, overridePath, resetRolesWarnings, resolveCandidates, type RouterConfig } from "../../src/router/config";
+import { getActiveTiers } from "../../src/router/protocol";
+import { acquireOutcomes } from "../../src/routing/outcomes";
 import { assembleRolesSystemPrompt, assembleSystemPrompt } from "../../src/router/protocol";
 import { resolveEnforcementMode } from "../../src/router/enforcement";
 import { resolveRoles } from "../../src/router/roles";
 import { resetDispatchRegistry } from "../../src/router/sessions";
-import { buildRoleLadder } from "../../src/routing/engine/ladders";
+import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
-import { resetDispatchRouting, roleGateDeferred, roleRouterGate, routedRoleOf, strippedRouteRoot } from "../../src/routing/wire/dispatch";
+import {
+  resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
+} from "../../src/routing/wire/dispatch";
+import { canonicalAuthorityPath, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope } from "../../src/routing/roles/work-root";
 import { runSignal } from "../../src/routing/outcomes/signals";
 import { registerRoleAgents } from "../../src/router/role-agents";
 import { rememberDispatch } from "../../src/router/sessions";
@@ -604,6 +609,49 @@ describe("router_verify judges the budget captured at return (handoff 24)", () =
   }, 60_000);
 });
 
+// #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate of a deferred role dispatch gets its work root.
+describe("router_verify judges a deferred role dispatch in its work root (DF2-F1)", () => {
+  const DOD: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "fileExists", path: "out.txt" }] };
+
+  async function deferAndVerify(workRoot: (dir: string) => string | undefined) {
+    const dir = temp("omr-p33-defer-");
+    writeFileSync(join(dir, "out.txt"), "x");
+    const { cfg } = home();
+    const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
+    const wiring = createVerificationWiring({ client: client as never, directory: dir, getConfig: () => cfg, logger: { warn: () => {} } });
+    cleanups.push(async () => { wiring.pending.dispose(); await wiring.disposeVerification(); });
+    const store = createChangedFileStore();
+    await wiring.startDispatch(store, "task:orch:w1", dir, DOD, "", false);
+    const root = workRoot(dir);
+    const finish = await wiring.finishDeferred(store, {
+      dispatchID: "task:orch:w1", orchestratorSessionID: "orch", producerSessionID: "child-w1", producerTier: "implementer",
+      description: "work", cwd: dir, dod: DOD, dispatchedAt: Date.now(), ...(root === undefined ? {} : { workRoot: root }),
+    });
+    if (!finish.deferred) throw new Error(`not deferred: ${finish.reason} ${finish.detail}`);
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [finish.handle] });
+    const item = report.items[0] as { result?: { verdict: { outcome?: string; reasons: string[] } } } | undefined;
+    return item?.result?.verdict;
+  }
+
+  it("the gate re-checks the stored cwd against the work root: a cwd outside it is refused, nothing runs", async () => {
+    const elsewhere = temp("omr-p33-root-");
+    const refused = await deferAndVerify(() => elsewhere);
+    expect(refused?.outcome).toBe("unverifiable");
+    expect(refused?.reasons.join("\n")).toMatch(/outside this role dispatch's work root/);
+    expect(refused?.reasons.join("\n")).toContain(elsewhere);
+    expect(refused?.reasons.join("\n")).not.toContain("deterministic checks");
+  }, 60_000);
+
+  it("inside its work root it verifies as before; a tier dispatch (no work root) is unchanged (I1)", async () => {
+    // The checks run (router_verify's own drift rule then decides the outcome, the same with or without a work root).
+    const inside = await deferAndVerify((dir) => dir);
+    const tier = await deferAndVerify(() => undefined);
+    expect(inside?.reasons).toEqual(["all 1 deterministic checks passed"]);
+    expect(tier?.reasons).toEqual(inside?.reasons);
+    expect(inside?.outcome).toBe(tier?.outcome);
+  }, 60_000);
+});
+
 // ---------------------------------------------------------------------------
 // Handoff 22: the host's own stops (step limit, context overflow)
 // ---------------------------------------------------------------------------
@@ -727,6 +775,102 @@ describe("QA round 1 (P2.1)", () => {
     expect(await route("q2b", `[route class=implement risk=low scope=single]\nVERIFY: required\nDo it\n${acceptance}`)).toBe("deterministic");
   });
 
+  it("DF2-F1 (#84 P3.3): the detection is deterministic only when the gate can run the checks in the dispatch's work root", async () => {
+    const { dir, cfg } = home(ROLES);
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks);
+    const root = realpathSync.native(dir);
+    const block = (cwd?: string) => `Do it\n[acceptance]\n${cwd === undefined ? "" : `cwd: ${cwd}\n`}check: fileExists path=x.txt\n[/acceptance]`;
+    expect(roleGateOutsideWorkRoot(root, block(), "")).toBe(false); // no cwd: → the work root
+    expect(roleGateOutsideWorkRoot(root, block("sub"), "")).toBe(false); // relative → inside the work root
+    expect(roleGateOutsideWorkRoot(root, block(join(root, "sub")), "")).toBe(false);
+    expect(roleGateOutsideWorkRoot(root, block(join(root, "..")), "")).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, block(`${root}-v2`), "")).toBe(true); // a sibling prefix is outside
+    expect(roleGateOutsideWorkRoot(null, block(), "")).toBe(true); // no validated work root
+    expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", outsideWorkRoot: true, env: {} })).toBe(false);
+    expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", outsideWorkRoot: false, env: {} })).toBe(true);
+    const route = async (id: string, prompt: string, extra: Record<string, unknown> = {}) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "implementer", description: "x", prompt, ...extra } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      return routedRoleOf(id)!.detection;
+    };
+    expect(await route("df1a", `[route class=implement risk=low scope=single]\n${block()}`)).toBe("deterministic");
+    expect(routedRoleOf("df1a")!.verifyRoot).toBe(root);
+    expect(await route("df1b", `[route class=implement risk=low scope=single]\n${block("sub")}`)).toBe("deterministic");
+    expect(await route("df1c", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`)).not.toBe("deterministic");
+    // root= naming no worktree of this repository: no work root, so the gate cannot back a deterministic detection; it is
+    // verified in the canonical session directory (QA-P33F1-1-3).
+    expect(await route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`)).not.toBe("deterministic");
+    expect(routedRoleOf("df1d")!.workRoot).toBeNull();
+    expect(routedRoleOf("df1d")!.verifyRoot).toBe(root);
+    // QA-P33F1-1 nit 3: the call's own cwd argument wins over the block's cwd:, exactly as in the after-hook.
+    expect(roleGateOutsideWorkRoot(root, block(), "", join(root, ".."))).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, block(join(root, "..")), "", root)).toBe(false);
+    expect(roleGateOutsideWorkRoot(root, block(), "", "  ")).toBe(false); // a blank argument names no cwd
+    expect(await route("df1e", `[route class=implement risk=low scope=single]\n${block()}`, { cwd: join(root, "..") })).not.toBe("deterministic");
+    expect(await route("df1f", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`, { cwd: root })).toBe("deterministic");
+    // QA-P33F1-1-2: a UNC/device cwd is never inside (refused before any filesystem call).
+    expect(roleGateOutsideWorkRoot(root, block("//server/share/x"), "")).toBe(true);
+  });
+
+  it("fix-1 review nit: requestedVerificationCwdSource names the input requestedVerificationCwd takes", () => {
+    expect(requestedVerificationCwdSource("/x", "/y")).toBe("argument");
+    expect(requestedVerificationCwd("/x", "/y")).toBe("/x");
+    for (const blank of [undefined, null, "", "  ", 3]) {
+      expect(requestedVerificationCwdSource(blank, "/y")).toBe("acceptance");
+      expect(requestedVerificationCwd(blank, "/y")).toBe("/y");
+      expect(requestedVerificationCwdSource(blank, undefined)).toBeUndefined();
+      expect(requestedVerificationCwd(blank, undefined)).toBeUndefined();
+    }
+  });
+
+  it("DF2-F1 / QA-P33F1-1-2: verificationScope — tiers unchanged (I1); a role root is the default; P2.3's containment rule", () => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-root-")));
+    const away = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-away-")));
+    try {
+      expect(verificationScope(undefined, undefined)).toEqual({ cwd: undefined, requested: undefined, outside: false });
+      expect(verificationScope("/elsewhere", undefined)).toEqual({ cwd: "/elsewhere", requested: "/elsewhere", outside: false });
+      expect(verificationScope("rel", null)).toEqual({ cwd: "rel", requested: "rel", outside: false });
+      expect(verificationScope(undefined, root)).toEqual({ cwd: root, requested: root, workRoot: root, outside: false });
+      expect(verificationScope("pkg", root)).toEqual({ cwd: join(root, "pkg"), requested: join(root, "pkg"), workRoot: root, outside: false });
+      expect(verificationScope(away, root)).toEqual({ cwd: root, requested: undefined, workRoot: root, outside: true, refused: away });
+      expect(verificationScope(`${root}-v2`, root).outside).toBe(true); // a sibling prefix
+      // The checked CANONICAL directory is what the checks run in (a link inside the root is resolved) …
+      const kind = process.platform === "win32" ? "junction" : "dir";
+      mkdirSync(join(root, "real-pkg"));
+      symlinkSync(join(root, "real-pkg"), join(root, "pkg-link"), kind);
+      expect(verificationScope("pkg-link", root)).toMatchObject({ cwd: join(root, "real-pkg"), requested: join(root, "real-pkg"), outside: false });
+      // … and a link inside the root that leads out of it is outside.
+      symlinkSync(away, join(root, "out-link"), kind);
+      expect(verificationScope("out-link", root)).toMatchObject({ outside: true, cwd: root, refused: "out-link" });
+      // UNC/device paths and 8.3 spellings: refused before any filesystem call (P2.3's rule, also at dispatch time).
+      const realpath = vi.fn((p: string) => p);
+      const lstat = vi.fn(() => undefined);
+      const canonical = (p: string, b: string) => canonicalAuthorityPath(p, b, { platform: "win32", realpath, lstat });
+      for (const cwd of ["\\\\server\\share\\x", "\\\\?\\C:\\x", "//server/share", "C:\\Users\\PROGRA~1\\x"]) {
+        expect(verificationScope(cwd, "C:\\repo\\wt", canonical)).toMatchObject({ outside: true, refused: cwd, cwd: "C:\\repo\\wt" });
+      }
+      expect(realpath).not.toHaveBeenCalled();
+      expect(lstat).not.toHaveBeenCalled();
+    } finally {
+      for (const dir of [root, away]) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("QA-P33F1-1-2 (POSIX): a cwd `<root>/link/..` is where the filesystem says (outside), not `<root>`", () => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-root-")));
+    const away = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-away-")));
+    try {
+      mkdirSync(join(away, "deep"));
+      symlinkSync(join(away, "deep"), join(root, "link"), "dir");
+      expect(verificationScope("link/..", root)).toMatchObject({ outside: true, cwd: root });
+      expect(roleGateOutsideWorkRoot(root, `Do it\n[acceptance]\ncwd: ${join(root, "link")}/..\ncheck: fileExists path=x\n[/acceptance]`, "")).toBe(true);
+    } finally {
+      for (const dir of [root, away]) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
   it("QA-P21-1-3: a role child that hit its read-only CAP is a budget stop for the signals and gets the resume note", async () => {
     let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
     const { dir, cfg } = home({ ...ROLES, subagentTiers: { explorer: "fast" } }, { MODEL_ROUTER_ENFORCE: "1" });
@@ -775,6 +919,61 @@ describe("QA round 1 (P2.1)", () => {
     const unverifiable = await verify("v2", "r2", "criteria: the parser accepts every fixture");
     expect(unverifiable).not.toContain('resume the same sessionID ("r2")');
     expect(unverifiable).not.toContain("subagent_type");
+  }, 60_000);
+
+  // #84 P3.3 fix 2 (QA-P33F2-1-3): the real after-hook, gate and ingest: a role child judged by the grader gets a `grader`
+  // signal row (0.5), never a `verdict` row of 1; a deterministic DoD keeps its `verdict` row.
+  it("QA-P33F2-1-3: a role child with a checker DoD yields note:signal:grader:* and no note:signal:verdict:*", async () => {
+    const outcomes = temp("omr-p33-grader-outcomes-");
+    const { dir, cfg } = home({ routing: { delegation: "roles", engine: "shadow", outcomes: { path: outcomes } } }, { MODEL_ROUTER_ENFORCE: "1" });
+    const [lowest] = roleTierOrder(cfg);
+    const producer = resolveCandidates(lowest!, cfg)[0]!;
+    const graderModel = getActiveTiers(cfg).heavy?.model; // a role producer's grader is the ladder's top tier
+    expect(graderModel).toBeDefined();
+    expect(graderModel).not.toBe(producer.model);
+    const graded: string[] = [];
+    const runner = {
+      run: vi.fn(async (request: { model?: { providerID: string; modelID: string } }) => {
+        graded.push(request.model === undefined ? "" : `${request.model.providerID}/${request.model.modelID}`);
+        return { sessionID: `grader-${graded.length}`, text: '{"pass":true,"reasons":["the parser accepts every fixture"]}' };
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    const { hooks, ingest } = await plugin(dir, "v2", { routerChildRunner: runner });
+    const onVerdict = vi.spyOn(ingest!, "onVerdict");
+    writeFileSync(join(dir, "present.txt"), "x");
+    const verify = async (id: string, child: string, acceptance: string): Promise<string> => {
+      rememberDispatch(child, {
+        facts: { class: "implement", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
+        agent: "implementer", model: producer.model, variant: producer.variant ?? null, tier: lowest!, parentSessionID: "root",
+        step: "dispatch", decisionID: `dec-${child}`,
+      });
+      const args = { subagent_type: "implementer", description: "fix", prompt: `Fix the parser\n[acceptance]\n${acceptance}\n[/acceptance]` };
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: id }, { args: { ...args } });
+      const output = { title: "", output: "DONE: fixed the parser; every fixture parses", metadata: { sessionId: child } };
+      await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: id, args }, output);
+      return output.output;
+    };
+    expect(await verify("g1", "gc1", "criteria: the parser accepts every fixture")).not.toContain("NOT ACCEPTED");
+    expect(graded).toEqual([graderModel]);
+    expect(onVerdict).toHaveBeenCalledWith("gc1", "pass", { tier: "heavy", model: graderModel });
+    await verify("d1", "dc1", `check: fileExists path=${join(dir, "present.txt")}`);
+    expect(onVerdict).toHaveBeenCalledWith("dc1", "pass", undefined);
+
+    await hooks.dispose?.(); // flushes the ingest's rows
+    const bundle = acquireOutcomes({ dir: outcomes, tuning: {}, logger: { warn: () => {} } });
+    try {
+      const rows = (await bundle.persister.readRows()).rows;
+      const notes = (child: string) => rows
+        .filter((r) => r.kind === "decision" && r.childSessionID === child && r.reason.startsWith("note:signal:"))
+        .map((r) => (r as { reason: string }).reason);
+      expect(notes("gc1")).toEqual(["note:signal:grader:pass"]);
+      expect(rows.find((r) => r.kind === "decision" && r.childSessionID === "gc1" && r.signal === "grader")).toMatchObject({ signalWeight: 0.5 });
+      expect(notes("dc1")).toEqual(["note:signal:verdict:pass"]);
+      expect(rows.filter((r) => r.kind === "verdict").map((r) => r.childSessionID).sort()).toEqual(["dc1", "gc1"]);
+    } finally {
+      await bundle.release();
+    }
   }, 60_000);
 
   it("QA-P21-1-7: a child that made a tool call while bypassed has unobserved edits for the run signal", async () => {

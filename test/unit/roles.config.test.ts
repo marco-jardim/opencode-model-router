@@ -16,7 +16,6 @@ import {
 } from "../../src/router/config";
 import { inspect } from "node:util";
 import {
-  isRunScriptAllowed,
   narrowRoleSpec,
   sanitizeDelegation,
   sanitizeExploration,
@@ -115,11 +114,13 @@ describe("routing.run", () => {
     expect(r.value?.timeoutMs).toBeUndefined();
     expect(r.issues.length).toBeGreaterThanOrEqual(5);
   });
-  it("accepts a valid timeout and allows test:* scripts", () => {
+  it("accepts a valid timeout", () => {
     expect(sanitizeRun({ timeoutMs: 1000 }).value?.timeoutMs).toBe(1000);
-    expect(isRunScriptAllowed("test:e2e", ["lint"])).toBe(true);
-    expect(isRunScriptAllowed("deploy", ["lint"])).toBe(false);
-    expect(isRunScriptAllowed("lint", ["lint"])).toBe(true);
+  });
+  it("R9: scripts are exact names — a wildcard entry is dropped with an issue", () => {
+    const r = sanitizeRun({ scripts: ["test", "test:*", "*", "test:unit"] });
+    expect(r.value?.scripts).toEqual(["test", "test:unit"]);
+    expect(r.issues.map((i) => i.path)).toEqual(["routing.run.scripts[1]", "routing.run.scripts[2]"]);
   });
 });
 

@@ -200,6 +200,11 @@ export interface GraderRequest {
 export interface GraderResult {
   sessionID: string;
   text: string;
+  /**
+   * #84 P3.3 fix 2: the model the grader session was dispatched on (`provider/model`), when the dispatcher chose one; absent or
+   * null = the host's default (unknown to the router). Carried on the verdict (`Verdict.grader`) for the outcome signals.
+   */
+  model?: string | null;
 }
 
 /** MUST create a FRESH session each call */
@@ -436,6 +441,9 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     };
   }
 
+  // #84 P3.3 fix 2 (plan §2.6, I6): who judged — the outcome signals weigh it as a grader verdict, never a deterministic one.
+  const grader = { tier: graderTier, model: typeof res.model === "string" && res.model.trim() !== "" ? res.model : null };
+
   // 5. Independence check (fail-closed)
   if (res.sessionID === input.producerSessionID || !res.sessionID) {
     return {
@@ -444,6 +452,8 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
       reasons: [
         "grader session is not independent of the producer (producer=grader); refusing to accept",
       ],
+      // The producer judged itself: its model is the producer's, so the outcome signals give this verdict no mass.
+      grader: { tier: graderTier, model: null },
     };
   }
 
@@ -457,6 +467,7 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
         "could not parse grader verdict; defaulting to FAIL",
         scrubText(res.text.slice(0, 300)),
       ],
+      grader,
     };
   }
 
@@ -470,5 +481,6 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     reasons: parsed.reasons.map(scrubText),
     evidence: scrubText("grader=" + graderTier),
     ...(partial ? { caveats: [omittedNote(omitted)] } : {}),
+    grader,
   };
 }
