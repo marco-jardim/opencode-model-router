@@ -208,11 +208,14 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       const input = (prompt: string): Obj => ({ agent: NO_MODEL, description: TITLE, prompt, model: `${SONNET}#low`, background: false });
       // (1) two roots dispatch the same agent with the same title, started together (NOT proven to overlap: see the next test).
       const parallel = await Promise.all([host.dispatch(rootA, input("S2 parallel A")), host.dispatch(rootB, input("S2 parallel B"))]);
-      // (2) the same root dispatches twice in successive turns in the background (separate turns, each settled before the next).
+      // (2) the same root dispatches twice in successive turns, flagged background:true (separate turns, each settled before the next). With the
+      //     default enforcement (not off) the router rewrites every subagent call to background:false before the host sees it (asserted
+      //     below from the probe's before record), so these are foreground children in practice.
       const bg1 = await host.call(rootA, "subagent", { ...input("S2 background 1"), background: true });
       const bg2 = await host.call(rootA, "subagent", { ...input("S2 background 2"), background: true });
       const kids = (await host.children(rootA)).map(k => k.id);
       const bgIDs = [bg1.childID, bg2.childID].filter((id): id is string => id !== undefined);
+      expect([obj(bg1.before.input).background, obj(bg2.before.input).background]).toEqual([false, false]);
       // a permission evaluation needs a tool call in the child: one child that reads a file.
       const reader = await host.dispatch(rootB, { agent: NO_MODEL, description: TITLE, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool: "read", input: { path: probeFile } })}`, model: `${SONNET}#low`, background: false });
       await host.settle(rootA);
@@ -682,7 +685,12 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
         await host.prompt(root2, "S6B follow-up");
         const later = host.requestsOf(root2).filter(r => r.kind === "primary").map(r => ({ toolResult: r.toolResult, hasChildText: JSON.stringify(r.messages).includes("CHILD_OK"), hasNote: JSON.stringify(r.messages).includes(NOTE), hasVerdict: JSON.stringify(r.messages).includes("verified: deterministic") || JSON.stringify(r.messages).includes("NOT ACCEPTED") }));
         const afters = (await host.hooks()).filter(h => h.hook === "after" && h.sessionID === root2 && h.tool === "subagent");
+        // how the child's final text reached the parent after a running ack: the first non-assistant parent message that carries it
+        const carrying = host.requestsOf(root2).filter(r => r.kind === "primary").flatMap(r => r.messages).filter(m => m.role !== "assistant" && JSON.stringify(m).includes("CHILD_OK"));
+        const delivery = carrying.at(0);
+        const deliverySnippet = delivery ? JSON.stringify(delivery).slice(0, 400) : undefined;
         return {
+          delivery: { found: delivery !== undefined, isToolResult: delivery ? JSON.stringify(delivery).includes("tool_result") : undefined, hasNote: delivery ? JSON.stringify(delivery).includes(NOTE) : undefined, snippet: deliverySnippet },
           fgParts: fgSeen.parts, bgParts: bgSeen.parts, bgInputBackground: obj(bg.before.input).background, bgBlockedMs: bg.after.__t - bg.before.__t,
           bgAckStatus: obj(obj(bg.after.result).output).status, bgAfterRecords: afters.length, later, hostErrors: host.errorLines(),
         };
@@ -710,8 +718,19 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     expect(off.bgInputBackground).toBe(true);
     expect(off.hostErrors).toEqual([]);
     expect(enforced.hostErrors).toEqual([]);
-    // PLACEHOLDER: the observed behaviour of the host for a real background call is pinned below after the first run.
-    expect(off.bgAckStatus).toBeDefined();
+    // ... and the host answers at once with a RUNNING acknowledgement (no wait for the held child), whose text the probe's execute.after
+    // extended with its note; there is exactly ONE execute.after record for the call.
+    expect(off.bgAckStatus).toBe("running");
+    expect(off.bgBlockedMs).toBeLessThan(3_000);
+    expect(off.bgParts[0]).toMatch(/^The subagent is working in the background \(sessionID: ses_[A-Za-z0-9]+/);
+    expect(off.bgParts.at(-1)).toBe(NOTE);
+    expect(off.bgAfterRecords).toBe(1);
+    // The child's FINAL text reaches the parent later in a message that is not a tool_result and does not pass through execute.after: it
+    // carries no appended note (the note is only in the acknowledgement). So without verification the after-hook channel exists only for the ack.
+    expect(off.delivery.found).toBe(true);
+    expect(off.delivery.isToolResult).toBe(false);
+    expect(off.delivery.hasNote).toBe(false);
+    expect(off.delivery.snippet).toContain('state=\\"completed\\" description=\\"S6B bg\\"'); // a host-made completion notification to the parent
   }, 600_000);
 
   it("S8 Code Mode execute: inner tools.* calls bypass the permission evaluate hook and the per-session context filter", async () => {
