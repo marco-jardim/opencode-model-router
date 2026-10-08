@@ -54,14 +54,131 @@ const CLOSE_TAG_RE = /^\s*\[\/(acceptance|dod)\]\s*$/i;
 // summarizeDispatch
 // ---------------------------------------------------------------------------
 
-export function summarizeDispatch(text: string): string {
+/**
+ * Router-protocol lines (§2.9 E8, QA-P15-1-8): a `[router]` / `[route …]` line and
+ * the whole-line directives `CAP:<n|none>`, `VERIFY:<word>`, `VERIFY_WAIT:<value>`;
+ * `reason:` only when a CAP line is present. They steer the router, they are
+ * never the task's outcome. "Verify: …" / "Reason: …" task lines stay criteria.
+ */
+const ROUTER_LINE_RE = /^(?:\[router\]|\[route(?:\s[^\]]*)?\]$)/i;
+const CAP_LINE_RE = /^CAP\s*:\s*(?:\d+|none)\s*$/i;
+const VERIFY_LINE_RE = /^VERIFY:\s*\w+\s*$/;
+const VERIFY_WAIT_LINE_RE = /^VERIFY_WAIT:\s*\S+\s*$/;
+const REASON_LINE_RE = /^reason\s*:/i;
+
+const WRAPPERS = new Set(["*", "_", "`"]);
+const TRAILING_PUNCTUATION = new Set([".", ",", ";", "!"]);
+
+/**
+ * QA-P15-2-10: a directive wrapped in markdown (`**VERIFY:required**`,
+ * `` `CAP:8` ``) or ending in punctuation (`VERIFY:required.`) is still a
+ * directive. Linear scans, no backtracking.
+ */
+function unwrapDirective(line: string): string {
+  let start = 0;
+  let end = line.length;
+  while (start < end && WRAPPERS.has(line[start]!)) start++;
+  while (end > start && (WRAPPERS.has(line[end - 1]!) || TRAILING_PUNCTUATION.has(line[end - 1]!))) end--;
+  return line.slice(start, end).trim();
+}
+
+function isCapLine(line: string): boolean {
+  return CAP_LINE_RE.test(unwrapDirective(line));
+}
+
+function isDirectiveLine(line: string, hasCap: boolean): boolean {
+  const bare = unwrapDirective(line);
+  return (
+    ROUTER_LINE_RE.test(bare) ||
+    CAP_LINE_RE.test(bare) ||
+    VERIFY_LINE_RE.test(bare) ||
+    VERIFY_WAIT_LINE_RE.test(bare) ||
+    (hasCap && REASON_LINE_RE.test(bare))
+  );
+}
+
+const SENTENCE_ENDS = new Set([".", "!", "?", "\u2026"]);
+
+/**
+ * QA-P15-1-7: a line over the budget keeps its leading WHOLE sentences that fit
+ * (cut only between sentences: a sentence end followed by a space); "" when even
+ * the first sentence does not fit.
+ */
+function leadingSentences(line: string, budget: number): string {
+  if (codePointLength(line) <= budget) return line;
+  let kept = 0;
+  let points = 0;
+  let segment = 0;
+  for (let i = 0; i < line.length; i++) {
+    if (!SENTENCE_ENDS.has(line[i]!) || line[i + 1] !== " ") continue;
+    points += codePointLength(line.slice(segment, i + 1));
+    if (points > budget) break;
+    kept = i + 1;
+    segment = i + 1;
+  }
+  return line.slice(0, kept);
+}
+
+/**
+ * The dispatch's first non-empty line that is not a router directive,
+ * whitespace-collapsed and never cut mid-sentence (§2.9 E8): whole when it fits
+ * the verification budget, else its leading whole sentences that fit.
+ */
+export function summarizeDispatch(text: string, budget: number = CRITERIA_BUDGET_CHARS): string {
+  const line = firstTaskLine(text);
+  return line ? leadingSentences(line, budget) : "";
+}
+
+/** The dispatch's first non-empty line that is not a router directive, whitespace-collapsed; "" if none. */
+function firstTaskLine(text: string): string {
   if (!text) return "";
-  const lines = text.split("\n");
+  const lines = text.split("\n").map((line) => line.trim().replace(/\s+/g, " "));
+  const hasCap = lines.some(isCapLine);
   for (const line of lines) {
-    const trimmed = line.trim().replace(/\s+/g, " ");
-    if (trimmed) return trimmed.slice(0, 120);
+    if (line && !isDirectiveLine(line, hasCap)) return line;
   }
   return "";
+}
+
+// ---------------------------------------------------------------------------
+// fitCriteria — the verification text budget (§2.9 E8)
+// ---------------------------------------------------------------------------
+
+/** Budget for the criteria text sent to a grader, in code points. */
+export const CRITERIA_BUDGET_CHARS = 4000;
+
+/** Length in code points (a surrogate pair counts once), so the budget is multi-byte safe. */
+export function codePointLength(text: string): number {
+  return Array.from(text).length;
+}
+
+/**
+ * Whole criteria only: each criterion, in order, is kept when it fits in what is
+ * left of the budget, otherwise omitted (never cut). One criterion longer than
+ * the whole budget is omitted. `omitted` criteria are not graded.
+ */
+export function fitCriteria(
+  criteria: readonly string[],
+  budget: number = CRITERIA_BUDGET_CHARS,
+): { criteria: string[]; omitted: number } {
+  const kept: string[] = [];
+  let used = 0;
+  let omitted = 0;
+  for (const criterion of criteria) {
+    const length = codePointLength(criterion);
+    if (used + length <= budget) {
+      kept.push(criterion);
+      used += length;
+    } else {
+      omitted += 1;
+    }
+  }
+  return { criteria: kept, omitted };
+}
+
+/** "1 criterion omitted" / "n criteria omitted". */
+export function omittedCriteriaText(omitted: number): string {
+  return `${omitted} ${omitted === 1 ? "criterion" : "criteria"} omitted`;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,12 +369,12 @@ export function inferDoD(dispatchText: string, tier: string, hints: InferHints):
   const criteria: string[] = [];
 
   if (checks.length === 0) {
-    const summary = summarizeDispatch(dispatchText);
-    criteria.push(
-      summary.length > 0
-        ? summary
-        : "the delegated task is completed as described in the dispatch",
-    );
+    const line = firstTaskLine(dispatchText);
+    const summary = line ? leadingSentences(line, CRITERIA_BUDGET_CHARS) : "";
+    // QA-P15-2-11: a first sentence over the budget is kept whole, never replaced
+    // by the generic text; the grader budget (fitCriteria) omits it, so no
+    // criterion is graded and the verdict is unverifiable.
+    criteria.push(summary || line || "the delegated task is completed as described in the dispatch");
   }
 
   const rawPath = hints.declaredPath != null ? hints.declaredPath.trim() : "";

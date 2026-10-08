@@ -45,12 +45,15 @@ describe("concurrency isolation", () => {
 
     // Register two subagent sessions with NON-trivial dispatch text so the
     // guard is fully enforced (no trivial-bypass for either session).
+    // §2.9 E6 golden — before: agent "fast"; after: "medium", because the
+    // read-only fast tier now gets the reader profile (no read/draft denial),
+    // and these tests exercise the producer read budget per session.
     await hooks["chat.message"](
-      { sessionID: "CC_A", agent: "fast" },
+      { sessionID: "CC_A", agent: "medium" },
       { parts: [{ type: "text", text: "analyze the module deeply" }] },
     );
     await hooks["chat.message"](
-      { sessionID: "CC_B", agent: "fast" },
+      { sessionID: "CC_B", agent: "medium" },
       { parts: [{ type: "text", text: "inspect the other module deeply" }] },
     );
   });
@@ -135,5 +138,39 @@ describe("concurrency isolation", () => {
     await expect(
       callBefore("CC_B", "read", { file_path: "/f/b4" }),
     ).rejects.toThrow();
+  });
+
+  // QA-P15-1-12 (§2.9 E6): through the hooks, the read-only fast tier is a reader.
+  it("a fast-tier session's 4th consecutive read is allowed (reader profile)", async () => {
+    await hooks["chat.message"](
+      { sessionID: "CC_F", agent: "fast" },
+      { parts: [{ type: "text", text: "analyze the module deeply" }] },
+    );
+    for (const f of ["/f/f1", "/f/f2", "/f/f3"]) {
+      await callBefore("CC_F", "read", { file_path: f });
+      await callAfter("CC_F", "read", { file_path: f });
+    }
+    await expect(callBefore("CC_F", "read", { file_path: "/f/f4" })).resolves.toBeUndefined();
+  });
+
+  // QA-P15-1-3: the cap reaches the guard from the session store before the first
+  // call, and a resume with a numeric cap makes the session a producer again.
+  it("CAP:none + reason: is a reader from the first call and only for its dispatch round", async () => {
+    await hooks["chat.message"](
+      { sessionID: "CC_U", agent: "heavy" },
+      { parts: [{ type: "text", text: "CAP:none\nreason: whole-module review\nanalyze the module deeply" }] },
+    );
+    for (let i = 0; i < 3; i++) {
+      await callBefore("CC_U", "router_git_log", { n: i });
+      await callAfter("CC_U", "router_git_log", { n: i });
+    }
+    await expect(callBefore("CC_U", "read", { file_path: "/f/u1" })).resolves.toBeUndefined();
+    await callAfter("CC_U", "read", { file_path: "/f/u1" });
+
+    await hooks["chat.message"](
+      { sessionID: "CC_U", agent: "heavy" },
+      { parts: [{ type: "text", text: "CAP:8\nanalyze the module deeply" }] },
+    );
+    await expect(callBefore("CC_U", "read", { file_path: "/f/u2" })).rejects.toThrow(/read\/draft budget exhausted/);
   });
 });

@@ -22,8 +22,9 @@ import type { DeterministicDeps } from "./types";
 import type { DoD } from "./dod";
 import { isCheckable } from "./dod";
 import { runDeterministic } from "./deterministic";
-import { runChecker } from "./checker";
+import { incompleteVerdict, isIncompleteVerdict, runChecker } from "./checker";
 import type { ArtefactView, CheckerDeps } from "./checker";
+import type { BudgetSnapshot } from "../guard/enforce";
 import { isAbsolute } from "node:path";
 import { isWithinDir, resolveBaseDir } from "./paths";
 
@@ -35,6 +36,15 @@ export interface Artefact {
   declaredOutputs: string[];
   producerSessionID: string;
   producerTier: string;
+  /** The producer follows the return contract (role agents, P2.1); absent = a router tier. */
+  returnContract?: boolean;
+  /**
+   * QA-P15-2-5: the producer's guard budget state captured when its task
+   * returned (enforce.ts captureBudget, with sessions.ts readCapReached). Absent:
+   * read live when the gate runs (the synchronous task path runs it right after
+   * the return).
+   */
+  budget?: BudgetSnapshot;
 }
 
 /** The delegation being judged: its DoD plus dispatch-time classification. */
@@ -82,7 +92,9 @@ export function gateResult(verdict: Verdict, dodSource: DoD["source"], strictUnv
   const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
   const caveats = verdict.caveats ?? (outcome === "unverifiable" ? verdict.reasons : []);
   return {
-    accepted: outcome !== "fail" && !(strictUnverifiable && caveats.length > 0),
+    // QA-P15-1-1: an incomplete return (progress note, budget stop) is never accepted;
+    // as an unverifiable outcome it still gets no next-tier hint and moves no evidence.
+    accepted: outcome !== "fail" && !isIncompleteVerdict(verdict) && !(strictUnverifiable && caveats.length > 0),
     verdict: { ...verdict, outcome, ...(caveats.length ? { caveats } : {}) },
     dodSource,
   };
@@ -187,6 +199,16 @@ export async function accept(
   // THAT directory, not the router's. Both verifiers get the same effective
   // base dir so a deterministic check and a grader can never disagree about
   // where the work was supposed to land.
+  // QA-P15-1-2 / 2-6 / I7: a budget stop, or a contract follower's progress note,
+  // is incomplete under either verifier — never a failure, never a next-tier hint.
+  // Judged on the snapshot captured when the task returned (artefact.budget, 2-5).
+  const stopped = incompleteVerdict(artefact, {
+    progressNotes: true,
+    ladder: deps.checker.ladder,
+    budgetSnapshot: deps.checker.budgetSnapshot,
+  });
+  if (stopped) return gateResult(stopped, dodSource, deps.strictUnverifiable);
+
   const effectiveBaseDir = resolveBaseDir(
     delegation.cwd,
     deps.deterministic.cwd,
@@ -214,6 +236,8 @@ export async function accept(
         artefact: view(artefact),
         producerTier: artefact.producerTier,
         producerSessionID: artefact.producerSessionID,
+        ...(artefact.returnContract !== undefined ? { returnContract: artefact.returnContract } : {}),
+        ...(artefact.budget !== undefined ? { budget: artefact.budget } : {}),
         // Only when the delegation actually declared one. Passing the router's
         // own directory here would scope every existing grader and add a
         // working-directory line to every existing prompt for no reason.

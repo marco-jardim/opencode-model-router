@@ -28,7 +28,7 @@ import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } fr
 import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
-import { buildDispatchHeader } from "./router/dispatch-header";
+import { buildDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, routeLineRoot } from "./router/dispatch-header";
 import { detectFalseRefusal, parseTaskResult as parseRefusalTaskResult } from "./router/false-refusal";
 import {
   buildTiersOutput,
@@ -1721,7 +1721,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               typeof tier === "string" &&
               Object.prototype.hasOwnProperty.call(getActiveTiers(cfg), tier) &&
               typeof args.prompt === "string" &&
-              !args.prompt.startsWith("[router] You are @")
+              !args.prompt.startsWith(DISPATCH_HEADER_PREFIX)
             ) {
               // Resolve from the original dispatch, using the registration rules.
               const parsed = parseCapDirective(args.prompt);
@@ -1729,8 +1729,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 parsed === "none" && !/\breason:/i.test(args.prompt) ? null : parsed;
               const baseline = cfg.tierCaps?.[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5;
               const cap = override ?? baseline;
-              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory }) +
-                "\n\n---\n\n" + args.prompt;
+              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root: routeLineRoot(args.prompt) }) +
+                DISPATCH_HEADER_SEPARATOR + args.prompt;
               args.prompt = prompt;
               if (process.env.MODEL_ROUTER_DISPATCH_DEBUG === "1" && !dispatchDebugLogged) {
                 dispatchDebugLogged = true;
@@ -1759,6 +1759,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           cfg,
           tier: sessionStore.getTier(sid),
           trivial: sessionStore.isTrivial(sid),
+          cap: sessionStore.getCap(sid),
           sessionID: sid,
           tool: input.tool,
           toolArgs: output?.args,

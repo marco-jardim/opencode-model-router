@@ -376,6 +376,25 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
       return subagentCapState.get(sessionID)?.tierName ?? null;
     },
 
+    /**
+     * The current dispatch round's honoured cap: "none" only for CAP:none with a
+     * reason: line, else a number; null for an untracked session. A resume
+     * re-registers and replaces it (QA-P15-1-3: the guard's reader signal).
+     */
+    getCap(sessionID: string): Cap | null {
+      return subagentCapState.get(sessionID)?.cap ?? null;
+    },
+
+    /**
+     * The current round's read-only counter reached its cap (calls >= a numeric
+     * cap). Captured when a task returns, it validates a `NEED MORE: budget`
+     * claim (QA-P15-2-2); false for CAP:none and untracked sessions.
+     */
+    readCapReached(sessionID: string): boolean {
+      const state = subagentCapState.get(sessionID);
+      return state !== undefined && state.cap !== "none" && state.calls >= state.cap;
+    },
+
     /** Returns true when the session was classified as trivial at dispatch time. */
     isTrivial(sessionID: string): boolean {
       return subagentCapState.get(sessionID)?.trivial === true;

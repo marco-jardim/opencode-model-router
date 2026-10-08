@@ -7,6 +7,140 @@
 
 import type { Verdict } from "./types";
 import { scrubText } from "../guard/scrub";
+import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
+import { captureBudget } from "../guard/enforce";
+import type { BudgetSnapshot } from "../guard/enforce";
+
+// ---------------------------------------------------------------------------
+// Incomplete returns (§2.9 E8, I7)
+// ---------------------------------------------------------------------------
+
+/** Verdict reason: the return is a progress note. Matched exactly, never by prefix (QA-P15-1-6). */
+export const INCOMPLETE_REASON =
+  "incomplete: the delegate returned a progress note (no DONE:, NEED MORE: or ESCALATE:), not a result; resume the same delegation to let it finish";
+
+/** Verdict reason: the producer stopped at its tool-call budget (I7: never a tier failure). */
+export const BUDGET_INCOMPLETE_REASON =
+  "incomplete: the delegate stopped at its tool-call budget (NEED MORE: budget), not with a result; resume the same delegation to let it finish";
+
+const INCOMPLETE_REASONS: ReadonlySet<string> = new Set([INCOMPLETE_REASON, BUDGET_INCOMPLETE_REASON]);
+
+/** One of the router's own incomplete reasons (a grader reason "incomplete: …" is not). */
+export function isIncompleteReason(reason: string): boolean {
+  return INCOMPLETE_REASONS.has(reason);
+}
+
+/**
+ * QA-P15-2-4: a verdict carries `incomplete: true` structurally (set only by
+ * incompleteVerdict), so caveats appended later (wiring.ts applyDispatchCaveats)
+ * never turn it back into an ordinary unverifiable result.
+ */
+export type IncompleteFlag = { incomplete?: boolean };
+
+/** An incomplete verdict (the structured flag). Never accepted (gate.ts gateResult). */
+export function isIncompleteVerdict(verdict: object): boolean {
+  return (verdict as IncompleteFlag).incomplete === true;
+}
+
+/** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
+const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*[ \t]*:/m;
+
+/** `NEED MORE: budget` at the start of a line (QA-P15-1-2). */
+const NEED_MORE_BUDGET_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
+
+/** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
+const ANNOUNCE_RE = /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue)\b/i;
+
+/**
+ * Deferral to separate work, or a conditional offer ("If you'd like, I'll
+ * continue…", "I'll continue once you confirm…", QA-P15-2-7): a finished
+ * result, not a progress note.
+ */
+const DEFERRAL_RE = /\b(?:follow[- ]?up|later|separately|another (?:PR|change|task)|next (?:PR|release)|if|once|when|unless|would|want)\b/i;
+
+const SENTENCE_END = new Set([".", "!", "?", "\u2026"]);
+
+/** The last sentence of a text: after the last sentence end or line break that is followed by more text. */
+function finalSentence(text: string): string {
+  let end = text.length;
+  while (end > 0 && (SENTENCE_END.has(text[end - 1]!) || /\s/.test(text[end - 1]!))) end--;
+  let start = end;
+  while (start > 0) {
+    const ch = text[start - 1]!;
+    if (ch === "\n" || (/\s/.test(ch) && start >= 2 && SENTENCE_END.has(text[start - 2]!))) break;
+    start--;
+  }
+  return text.slice(start, end);
+}
+
+/**
+ * A progress-note return (QA-P15-1-1): no return-contract marker on any line,
+ * and its FINAL sentence is a first-person announcement of finishing or
+ * continuing ("I'll finish the tests next", "let me continue with …") that is
+ * not a deferral to separate work. Applied only to agents that follow the
+ * return contract (runChecker), never in place of grading for others.
+ */
+export function isProgressNote(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0 || CONTRACT_MARKER_RE.test(trimmed)) return false;
+  // QA-P15-2-7: a final question ("Shall I continue?") asks; it does not announce.
+  if (trimmed.endsWith("?")) return false;
+  const last = finalSentence(trimmed);
+  return ANNOUNCE_RE.test(last) && !DEFERRAL_RE.test(last);
+}
+
+const DEFAULT_LADDER = ["fast", "medium", "heavy"];
+
+function incomplete(reason: string): Verdict {
+  const verdict: Verdict & IncompleteFlag = {
+    pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason], incomplete: true,
+  };
+  return verdict;
+}
+
+/**
+ * The guard state a `NEED MORE: budget` claim is checked against (QA-P15-2-2):
+ * honoured when the guard did not track the session (enforcement off: nothing
+ * can be checked), or the budget/refusals were used up, or the read-only cap
+ * was reached. Any other claim is graded normally (P1.4 §2.6 scores it).
+ */
+function claimHonoured(snapshot: BudgetSnapshot): boolean {
+  return !snapshot.tracked || snapshot.usedUp || snapshot.readCapReached === true;
+}
+
+/**
+ * The incomplete verdict of a return, or null (§2.9 E8, I7), judged on the
+ * budget snapshot captured when the task returned (`budget`, QA-P15-2-5; absent
+ * → read now through `budgetSnapshot`, default the live guard):
+ * - budget: the guard STOPPED the producer in that round (enforced) and it
+ *   returned no contract marker, or a `NEED MORE: budget` line the snapshot
+ *   backs (claimHonoured) — for every agent;
+ * - progress note (only when `progressNotes`): for an agent that follows the
+ *   return contract — `returnContract`, else a router tier of the ladder.
+ * Incomplete is never accepted, never escalates and never moves evidence.
+ */
+export function incompleteVerdict(
+  input: {
+    finalReturnText: string;
+    producerSessionID: string;
+    producerTier: string;
+    returnContract?: boolean;
+    budget?: BudgetSnapshot;
+  },
+  opts: { progressNotes: boolean; ladder?: readonly string[]; budgetSnapshot?: (sessionID: string) => BudgetSnapshot },
+): Verdict | null {
+  const text = input.finalReturnText;
+  const snapshot = input.budget ?? (opts.budgetSnapshot ?? captureBudget)(input.producerSessionID);
+  if (
+    (snapshot.stopped && !CONTRACT_MARKER_RE.test(text)) ||
+    (NEED_MORE_BUDGET_RE.test(text) && claimHonoured(snapshot))
+  ) {
+    return incomplete(BUDGET_INCOMPLETE_REASON);
+  }
+  const contract = input.returnContract ?? (opts.ladder ?? DEFAULT_LADDER).includes(input.producerTier);
+  if (opts.progressNotes && contract && isProgressNote(text)) return incomplete(INCOMPLETE_REASON);
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -45,6 +179,8 @@ export interface CheckerDeps {
   dispatchGrader: GraderDispatch;
   ladder?: string[];             // default ["fast","medium","heavy"]
   minGraderTier?: string | null; // optional floor
+  /** The guard's budget state of a producer session when no snapshot was captured. Default: the live guard (captureBudget). */
+  budgetSnapshot?: (sessionID: string) => BudgetSnapshot;
 }
 
 export interface CheckerInput {
@@ -54,6 +190,10 @@ export interface CheckerInput {
   producerSessionID: string;
   /** Effective producer working directory; scopes the grader + informs its prompt. */
   workingDir?: string;
+  /** The producer follows the DONE:/NEED MORE:/ESCALATE: return contract (role agents); absent = a router tier of the ladder. */
+  returnContract?: boolean;
+  /** The producer's budget state captured when its task returned (QA-P15-2-5). */
+  budget?: BudgetSnapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +251,11 @@ function sanitizeOneLine(value: string): string {
     : cleaned;
 }
 
+/** The note for criteria over the verification budget (prompt line and verdict caveat). */
+function omittedNote(omitted: number): string {
+  return `(${omittedCriteriaText(omitted)}: over the ${CRITERIA_BUDGET_CHARS}-character verification budget; not graded)`;
+}
+
 export function buildGradingPrompt(input: CheckerInput): { system: string; prompt: string } {
   const lines: string[] = [];
 
@@ -122,9 +267,12 @@ export function buildGradingPrompt(input: CheckerInput): { system: string; promp
   }
 
   lines.push("## Acceptance criteria (ALL must be satisfied)");
-  for (let i = 0; i < input.criteria.length; i++) {
-    lines.push(`${i + 1}. ${input.criteria[i]}`);
+  // §2.9 E8: whole criteria only; those over the budget are named as omitted, not graded.
+  const { criteria, omitted } = fitCriteria(input.criteria);
+  for (let i = 0; i < criteria.length; i++) {
+    lines.push(`${i + 1}. ${criteria[i]}`);
   }
+  if (omitted > 0) lines.push(omittedNote(omitted));
 
   lines.push("");
   lines.push("## Artefact to evaluate");
@@ -214,6 +362,21 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     return { pass: false, method: "none", skipped: true, reasons: ["no criteria to grade"] };
   }
 
+  // 1b. §2.9 E8 / I7: a budget stop, or a contract follower's progress note, is
+  // incomplete — never accepted, never escalated, never outcome evidence.
+  const stopped = incompleteVerdict(
+    { ...input, finalReturnText: input.artefact.finalReturnText },
+    { progressNotes: true, ladder: deps.ladder, budgetSnapshot: deps.budgetSnapshot },
+  );
+  if (stopped) return stopped;
+
+  // 1c. §2.9 E8: every criterion is over the verification budget — nothing gradable.
+  const { criteria: gradable, omitted } = fitCriteria(input.criteria);
+  if (gradable.length === 0) {
+    const reason = `no criterion fits the verification budget ${omittedNote(omitted)}`;
+    return { pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason] };
+  }
+
   // 2. Determine grader tier
   const graderTier = atLeastProducerTier(input.producerTier, {
     ladder: deps.ladder,
@@ -265,12 +428,15 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     };
   }
 
-  // 7. Return verdict
+  // 7. Return verdict. Criteria omitted from grading (§2.9 E8) make a pass
+  // unverifiable with a caveat: what was not graded is not verified.
+  const partial = omitted > 0;
   return {
-    pass: parsed.pass === true,
-    outcome: parsed.pass ? "pass" : "fail",
+    pass: parsed.pass === true && !partial,
+    outcome: parsed.pass ? (partial ? "unverifiable" : "pass") : "fail",
     method: "checker",
     reasons: parsed.reasons.map(scrubText),
     evidence: scrubText("grader=" + graderTier),
+    ...(partial ? { caveats: [omittedNote(omitted)] } : {}),
   };
 }

@@ -10,6 +10,8 @@ import type { RouterConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
+import { isIncompleteReason } from "./checker";
+import { stripDispatchHeader } from "../router/dispatch-header";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
@@ -553,10 +555,13 @@ export function buildDelegationDoD(
   args: { prompt?: string; description?: string; acceptance?: string },
   hints: InferHints = {},
 ): DoD {
-  const blockSource = args.acceptance ?? args.prompt ?? args.description ?? "";
+  // R6/P-15 (§2.9 E8): the router's dispatch header is a directive, never a
+  // criterion — parse and infer from the orchestrator's prompt behind it.
+  const prompt = typeof args.prompt === "string" ? stripDispatchHeader(args.prompt) : args.prompt;
+  const blockSource = args.acceptance ?? prompt ?? args.description ?? "";
   const explicit = parseDoDFromDispatch(blockSource);
   if (explicit) return explicit;
-  const dispatch = args.prompt ?? args.description ?? "";
+  const dispatch = prompt ?? args.description ?? "";
   return inferDoD(dispatch, "", hints);
 }
 
@@ -597,12 +602,24 @@ export function shouldVerifyTask(
  */
 export function buildForcingNote(
   reasons: string[],
-  escalation?: { producerTier?: string; nextTier?: string | null },
+  escalation?: { producerTier?: string; nextTier?: string | null; incomplete?: boolean },
 ): string {
   const body =
     reasons.length > 0
       ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
       : "- (no reasons provided)";
+  // §2.9 E8 / I7: a progress note or a budget stop is incomplete, not a failed result.
+  // QA-P15-2-4: the verdict's structured flag (`incomplete`); a caller that cannot
+  // pass it is recognised by the router's own incomplete reason among the reasons,
+  // matched exactly (QA-P15-1-6: a grader's "incomplete: …" stays a failure), so a
+  // caveat appended after it does not change the rendering.
+  if (escalation?.incomplete === true || reasons.some(isIncompleteReason)) {
+    return (
+      `[router \u26a0 INCOMPLETE] The delegate stopped before a final result:\n` +
+      `${body}\n` +
+      `NEXT: resume the same delegation so it can finish; do not treat the prior result as complete.`
+    );
+  }
   const next =
     escalation?.nextTier
       ? `NEXT: address the above, then re-run via \`Task(subagent_type="${escalation.nextTier}")\`` +
