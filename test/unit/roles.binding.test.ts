@@ -1,5 +1,7 @@
+import { isAbsolute, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AuthorityAction } from "../../src/router/roles";
+import type { AuthorityAction, RoleSpec } from "../../src/router/roles";
+import * as authority from "../../src/routing/roles/authority";
 import * as binding from "../../src/routing/roles/binding";
 import {
   BINDING_NOTES,
@@ -10,12 +12,16 @@ import {
   bind,
   bindingRegistrySize,
   currentBinding,
+  dropBindingCacheForTests,
   evict,
+  evictCall,
+  newDispatchNonce,
   noncePromptLine,
   nonceTitleSuffix,
   registerPending,
   resetBindingRegistryForTests,
   widen,
+  type BindOptions,
   type Binding,
   type PendingDispatch,
   type SessionLookup,
@@ -23,14 +29,24 @@ import {
 import type { DispatchGrant } from "../../src/routing/roles/policy";
 
 const PARENT = "ses_parent";
-const ROOT = "D:\\git\\omr-rta-p16";
-const OTHER_ROOT = "D:\\git\\omr-rta-p15";
+const ROOT = resolve("/git/omr-rta-p16");
+const OTHER_ROOT = resolve("/git/omr-rta-p15");
 const LOCAL: AuthorityAction[] = ["read", "glob", "grep", "router_git"];
+const EGRESS: AuthorityAction[] = ["webfetch", "websearch", "context7"];
+const ALL: AuthorityAction[] = [...LOCAL, "router_run", "edit", ...EGRESS, "execute"];
+const MAX: Readonly<Record<string, readonly AuthorityAction[]>> = {
+  implementer: [...LOCAL, "router_run", "edit"],
+  general: [...LOCAL, "router_run", "edit"],
+  researcher: EGRESS,
+  explorer: LOCAL,
+};
+const OPTS: BindOptions = { maxOf: (agent) => MAX[agent] };
 
 let clock = 1_000_000_000;
 
 beforeEach(() => {
   resetBindingRegistryForTests();
+  authority.resetAuthorityForTests();
   clock = 1_000_000_000;
   vi.spyOn(Date, "now").mockImplementation(() => clock);
 });
@@ -49,7 +65,7 @@ function pending(callID: string, over: Partial<PendingDispatch> = {}): PendingDi
     callID,
     agent: "implementer",
     description: "task",
-    nonce: callID,
+    nonce: `nonce_${callID}`,
     grant: grant([...LOCAL, "edit"]),
     budget: 80,
     decisionID: `dec_${callID}`,
@@ -60,30 +76,33 @@ function pending(callID: string, over: Partial<PendingDispatch> = {}): PendingDi
 
 type Session = Awaited<ReturnType<SessionLookup>>;
 
-function lookup(over: Partial<NonNullable<Session>> = {}) {
-  return vi.fn<SessionLookup>(async () => ({
-    parentID: PARENT,
-    agent: "implementer",
-    title: "task",
-    firstText: "You are a subagent spawned by another session.",
-    ...over,
-  }));
+function session(over: Partial<NonNullable<Session>> = {}): NonNullable<Session> {
+  return { parentID: PARENT, agent: "implementer", title: "task", firstText: "You are a subagent spawned by another session.", ...over };
 }
 
-function actions(b: { grant: DispatchGrant } | DispatchGrant): AuthorityAction[] {
+/** A child carrying the router's markers of `nonce` in its title and first message. */
+function marked(nonce: string, over: Partial<NonNullable<Session>> = {}): NonNullable<Session> {
+  return session({ title: `task${nonceTitleSuffix(nonce)}`, firstText: `You are a subagent.\n${noncePromptLine(nonce)}`, ...over });
+}
+
+function lookup(value: Session = session()) {
+  return vi.fn<SessionLookup>(async () => value);
+}
+
+function acts(b: { grant: DispatchGrant } | DispatchGrant): AuthorityAction[] {
   return [...("grant" in b ? b.grant.actions : b.actions)];
 }
 
 function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => { resolve = r; });
-  return { promise, resolve };
+  let resolveFn!: (value: T) => void;
+  const promise = new Promise<T>((r) => { resolveFn = r; });
+  return { promise, resolve: resolveFn };
 }
 
-describe("bind: exact, intersection, unknown", () => {
-  it("binds the only pending dispatch exactly, with its grant, budget and decision", async () => {
+describe("bind: marker nonces (P-2, QA-P16-1-2)", () => {
+  it("binds exactly by the router's markers, ∩ the role max, and claims the dispatch", async () => {
     registerPending(pending("call_A", { grant: grant([...LOCAL, "edit", "router_run"], ROOT, ["note A"]) }));
-    const b = await bind("ses_child", lookup());
+    const b = await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
     expect(b).toEqual({
       childSessionID: "ses_child",
       kind: "exact",
@@ -92,108 +111,137 @@ describe("bind: exact, intersection, unknown", () => {
       decisionID: "dec_call_A",
       budget: 80,
     } satisfies Binding);
+    const second = await bind("ses_impostor", lookup(marked("nonce_call_A")), OPTS);
+    expect(second.kind).toBe("unknown");
+    expect(second.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.claimed]);
   });
 
-  it("two identical parallel dispatches → intersection: actions ∩, notes merged, shared root kept, smallest budget", async () => {
-    registerPending(pending("call_A", { grant: grant([...LOCAL, "edit", "router_run"], ROOT, ["a", "shared"]), budget: 80 }));
-    registerPending(pending("call_B", { grant: grant(["read", "grep", "edit", "router_run"], ROOT, ["b", "shared"]), budget: 40 }));
-    const first = await bind("ses_child1", lookup());
-    const second = await bind("ses_child2", lookup());
-    for (const b of [first, second]) {
-      expect(b.kind).toBe("intersection");
-      expect(actions(b)).toEqual(["read", "grep", "router_run", "edit"]);
-      expect(b.grant.workRoot).toBe(ROOT);
-      expect(b.grant.notes).toEqual([BINDING_NOTES.intersection(2), "a", "shared", "b"]);
-      expect(b.candidates).toEqual(["call_A", "call_B"]);
-      expect(b.budget).toBe(40);
-      expect(b.decisionID).toBeNull();
+  it("uses the title's marker when the first message has none, and the first message's alone", async () => {
+    registerPending(pending("call_A"));
+    registerPending(pending("call_B"));
+    expect((await bind("ses_a", lookup(session({ title: `task${nonceTitleSuffix("nonce_call_A")}`, firstText: undefined })), OPTS)).candidates)
+      .toEqual(["call_A"]);
+    expect((await bind("ses_b", lookup(session({ firstText: noncePromptLine("nonce_call_B") })), OPTS)).candidates)
+      .toEqual(["call_B"]);
+  });
+
+  it("a bare nonce token is not a marker: no marker → unknown when the dispatches are nonce-bound", async () => {
+    registerPending(pending("call_A"));
+    const b = await bind("ses_child", lookup(session({ title: "resume nonce_call_A", firstText: "see nonce_call_A" })), OPTS);
+    expect(b.kind).toBe("unknown");
+    expect(b.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.noNonce]);
+  });
+
+  it("QA-P16-1-1: a marker-free child is never bound by counting to a nonce-bound dispatch", async () => {
+    registerPending(pending("call_A", { grant: grant(LOCAL) }));
+    evictCall(PARENT, "call_A"); // the child's own dispatch completed
+    registerPending(pending("call_B", { grant: grant([...LOCAL, "edit", "router_run"]) }));
+    const b = await bind("ses_plain", lookup(), OPTS);
+    expect(b.kind).toBe("unknown");
+    expect(acts(b)).toEqual(LOCAL);
+    expect(b.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.noNonce]);
+  });
+
+  it("title and first message disagreeing → unknown; several markers → unknown", async () => {
+    registerPending(pending("call_A"));
+    registerPending(pending("call_B"));
+    const disagree = await bind("ses_1", lookup(marked("nonce_call_A", { title: `t${nonceTitleSuffix("nonce_call_B")}` })), OPTS);
+    expect(disagree.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.markers]);
+    const sibling = await bind("ses_2", lookup(marked("nonce_call_A", {
+      firstText: `quoting ${noncePromptLine("nonce_call_B")}\n${noncePromptLine("nonce_call_A")}`, title: "task",
+    })), OPTS);
+    expect(sibling.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.markers]);
+    const forged = await bind("ses_3", lookup(marked("nonce_call_A", { title: `t [nonce forged] [nonce nonce_call_A]` })), OPTS);
+    expect(forged.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.markers]);
+    expect((await bind("ses_4", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("exact");
+  });
+
+  it("a retired, unregistered, foreign-parent or foreign-agent marker → unknown", async () => {
+    registerPending(pending("call_A"));
+    evictCall(PARENT, "call_A");
+    registerPending(pending("call_B"));
+    registerPending(pending("call_X", { parentSessionID: "ses_other" }));
+    registerPending(pending("call_G", { agent: "general" }));
+    for (const nonce of ["nonce_call_A", "nonce_never", "nonce_call_X", "nonce_call_G"]) {
+      const b = await bind(`ses_${nonce}`, lookup(marked(nonce)), OPTS);
+      expect(b.kind, nonce).toBe("unknown");
+      expect(b.grant.notes, nonce).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.foreignNonce]);
     }
   });
 
-  it("keeps a decision id every candidate shares; a non-finite budget is ignored, none left → null", async () => {
-    registerPending(pending("call_A", { decisionID: "dec", budget: Number.NaN }));
-    registerPending(pending("call_B", { decisionID: "dec", budget: 30 }));
-    const b = await bind("ses_child", lookup());
-    expect(b.decisionID).toBe("dec");
-    expect(b.budget).toBe(30);
-    resetBindingRegistryForTests();
-    registerPending(pending("call_C", { budget: Number.POSITIVE_INFINITY }));
-    registerPending(pending("call_D", { budget: Number.NaN }));
-    expect((await bind("ses_other", lookup())).budget).toBeNull();
-    resetBindingRegistryForTests();
-    registerPending(pending("call_E", { budget: Number.NaN }));
-    expect((await bind("ses_third", lookup())).budget).toBeNull();
-  });
-
-  it("candidates with different work roots → workRoot null, and router_run goes with it (I9)", async () => {
-    registerPending(pending("call_A", { grant: grant([...LOCAL, "edit", "router_run"], ROOT) }));
-    registerPending(pending("call_B", { grant: grant([...LOCAL, "edit", "router_run"], OTHER_ROOT) }));
-    const b = await bind("ses_child", lookup());
-    expect(b.kind).toBe("intersection");
-    expect(b.grant.workRoot).toBeNull();
-    expect(actions(b)).toEqual([...LOCAL, "edit"]);
-    expect(b.grant.notes).toContain(BINDING_NOTES.noWorkRoot);
-  });
-
-  it("the nonce in the title or the first message binds exactly (P-2)", async () => {
-    registerPending(pending("call_A", { grant: grant([...LOCAL]) }));
-    registerPending(pending("call_B", { grant: grant([...LOCAL, "edit"]) }));
-    const byTitle = await bind("ses_b", lookup({ title: `task${nonceTitleSuffix("call_B")}` }));
-    expect(byTitle.kind).toBe("exact");
-    expect(byTitle.candidates).toEqual(["call_B"]);
-    expect(actions(byTitle)).toEqual([...LOCAL, "edit"]);
-    const byPrompt = await bind("ses_a", lookup({ firstText: `You are a subagent.\n${noncePromptLine("call_A")}` }));
-    expect(byPrompt.kind).toBe("exact");
-    expect(byPrompt.candidates).toEqual(["call_A"]);
-    expect(nonceTitleSuffix("x")).toBe(" [nonce x]");
-    expect(noncePromptLine("x")).toBe("OMR_NONCE=x");
-  });
-
-  it("matches a nonce as a whole token only", async () => {
-    registerPending(pending("c1", { grant: grant(["read"]) }));
-    registerPending(pending("c12", { grant: grant(["read", "edit"]) }));
-    const b = await bind("ses_child", lookup({ title: "resume c12." }));
-    expect(b.kind).toBe("exact");
-    expect(b.candidates).toEqual(["c12"]);
-    const neither = await bind("ses_child2", lookup({ title: "c1x and xc12" }));
-    expect(neither.kind).toBe("intersection");
-    expect(actions(neither)).toEqual(["read"]);
-  });
-
-  it("an empty nonce never matches", async () => {
-    registerPending(pending("call_A", { nonce: "" }));
-    registerPending(pending("call_B", { nonce: "  " }));
-    const b = await bind("ses_child", lookup({ title: "task   " }));
-    expect(b.kind).toBe("intersection");
-    evict("call_A");
-    evict("call_B");
-    expect(bindingRegistrySize()).toMatchObject({ pending: 0, retired: 0 }); // nothing to remember
-  });
-
-  it("two candidates' nonces both named → intersection over all candidates", async () => {
-    registerPending(pending("call_A", { grant: grant([...LOCAL, "edit"]) }));
-    registerPending(pending("call_B", { grant: grant(["read"]) }));
-    registerPending(pending("call_C", { grant: grant(["read", "glob"]) }));
-    const b = await bind("ses_child", lookup({ title: "call_A", firstText: "call_B" }));
-    expect(b.kind).toBe("intersection");
-    expect(b.candidates).toEqual(["call_A", "call_B", "call_C"]);
-    expect(actions(b)).toEqual(["read"]);
-  });
-
-  it("agent or parent mismatch → unknown; a session without a parent → unknown", async () => {
+  it("the claimer re-deciding after a cache loss binds exactly again; the claim survives", async () => {
     registerPending(pending("call_A"));
-    expect((await bind("ses_1", lookup({ agent: "general" }))).kind).toBe("unknown");
-    expect((await bind("ses_2", lookup({ parentID: "ses_other" }))).kind).toBe("unknown");
-    const root = await bind("ses_3", lookup({ parentID: undefined }));
-    expect(root.kind).toBe("unknown");
-    expect(root.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.noCandidate]);
-    expect((await bind("ses_4", lookup({ agent: "" }))).kind).toBe("unknown");
-    expect(currentBinding("ses_3")?.kind).toBe("unknown");
+    const get = lookup(marked("nonce_call_A"));
+    expect((await bind("ses_child", get, OPTS)).kind).toBe("exact");
+    dropBindingCacheForTests("ses_child");
+    expect((await bind("ses_child", get, OPTS)).kind).toBe("exact");
+    expect(get).toHaveBeenCalledTimes(2);
+    expect((await bind("ses_other", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("unknown");
   });
 
-  it("unknown → local only, no work root, no candidates, a note naming router_request_authority", async () => {
-    const b = await bind("ses_child", lookup());
-    expect(b).toEqual({
+  it("a marker with a live unclaimed nonce-less sibling → intersection with it", async () => {
+    registerPending(pending("call_A", { grant: grant([...LOCAL, "edit"]) }));
+    registerPending(pending("call_N", { nonce: "", grant: grant(["read", "edit"]) }));
+    const b = await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
+    expect(b.kind).toBe("intersection");
+    expect(b.candidates).toEqual(["call_A", "call_N"]);
+    expect(acts(b)).toEqual(["read", "edit"]);
+  });
+});
+
+describe("bind: nonce-less counting (QA-P16-1-1)", () => {
+  it("one unclaimed nonce-less dispatch → exact and claimed; the next marker-free child gets nothing", async () => {
+    registerPending(pending("call_N", { nonce: "" }));
+    const get = lookup();
+    expect((await bind("ses_1", get, OPTS)).kind).toBe("exact");
+    const next = await bind("ses_2", lookup(), OPTS);
+    expect(next.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.claimed]);
+    dropBindingCacheForTests("ses_1");
+    expect((await bind("ses_1", get, OPTS)).candidates).toEqual(["call_N"]);
+  });
+
+  it("a claimed nonce-less entry stays in the pool: the real child gets an intersection, never another entry", async () => {
+    registerPending(pending("call_D", { nonce: "", grant: grant(["read"]) }));
+    await bind("ses_late", lookup(), OPTS); // a late child claims call_D
+    registerPending(pending("call_G", { nonce: "", grant: grant([...LOCAL, "edit"]) }));
+    const real = await bind("ses_real", lookup(), OPTS);
+    expect(real.kind).toBe("intersection");
+    expect(real.candidates).toEqual(["call_D", "call_G"]);
+    expect(acts(real)).toEqual(["read"]);
+    expect((await bind("ses_late", lookup(), OPTS)).candidates).toEqual(["call_D"]);
+  });
+
+  it("two nonce-less dispatches → intersection: actions ∩, notes merged, shared root and decision kept, smallest budget", async () => {
+    registerPending(pending("call_A", { nonce: "", grant: grant([...LOCAL, "edit", "router_run"], ROOT, ["a", "shared"]), budget: 80, decisionID: "dec" }));
+    registerPending(pending("call_B", { nonce: "", grant: grant(["read", "grep", "edit", "router_run"], ROOT, ["b", "shared"]), budget: 40, decisionID: "dec" }));
+    const b = await bind("ses_child", lookup(), OPTS);
+    expect(b.kind).toBe("intersection");
+    expect(acts(b)).toEqual(["read", "grep", "router_run", "edit"]);
+    expect(b.grant.workRoot).toBe(ROOT);
+    expect(b.grant.notes).toEqual([BINDING_NOTES.intersection(2), "a", "shared", "b"]);
+    expect(b.candidates).toEqual(["call_A", "call_B"]);
+    expect(b.budget).toBe(40);
+    expect(b.decisionID).toBe("dec");
+  });
+
+  it("different work roots → workRoot null and router_run goes with it; different decisions → null", async () => {
+    registerPending(pending("call_A", { nonce: "", grant: grant([...LOCAL, "router_run"], ROOT) }));
+    registerPending(pending("call_B", { nonce: "", grant: grant([...LOCAL, "router_run"], OTHER_ROOT) }));
+    const b = await bind("ses_child", lookup(), OPTS);
+    expect(b.grant.workRoot).toBeNull();
+    expect(acts(b)).toEqual(LOCAL);
+    expect(b.grant.notes).toContain(BINDING_NOTES.noWorkRoot);
+    expect(b.decisionID).toBeNull();
+  });
+
+  it("mixed nonce-bound and nonce-less dispatches: a marker-free child → unknown", async () => {
+    registerPending(pending("call_A"));
+    registerPending(pending("call_N", { nonce: "" }));
+    expect((await bind("ses_child", lookup(), OPTS)).grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.noNonce]);
+  });
+
+  it("no dispatch at all → unknown = max ∩ local, no root, no budget", async () => {
+    expect(await bind("ses_child", lookup(), OPTS)).toEqual({
       childSessionID: "ses_child",
       kind: "unknown",
       grant: { actions: new Set(LOCAL), notes: [BINDING_NOTES.unknown, BINDING_NOTES.noCandidate], workRoot: null },
@@ -203,253 +251,288 @@ describe("bind: exact, intersection, unknown", () => {
     });
     expect(BINDING_NOTES.unknown).toContain("router_request_authority");
   });
+});
 
-  it("unknown takes fallback ∩ local: iterable, per-agent function, throw or undefined → nothing", async () => {
-    const one = await bind("ses_1", lookup(), { localFallback: ["read", "edit", "webfetch"] });
-    expect(actions(one)).toEqual(["read"]);
-    const seen: Array<string | undefined> = [];
-    const two = await bind("ses_2", lookup({ agent: "researcher" }), {
-      localFallback: (agent) => {
-        seen.push(agent);
-        return agent === "researcher" ? ["webfetch", "websearch"] : LOCAL;
-      },
-    });
-    expect(seen).toEqual(["researcher"]);
-    expect(actions(two)).toEqual([]);
-    const three = await bind("ses_3", lookup(), { localFallback: () => { throw new Error("boom"); } });
-    expect(actions(three)).toEqual([]);
-    const four = await bind("ses_4", lookup(), { localFallback: () => undefined });
-    expect(actions(four)).toEqual([]);
-    expect(LOCAL_ACTIONS).toEqual(LOCAL);
+describe("bind: the role max bounds every grant (QA-P16-1-3)", () => {
+  it("exact and intersection grants are ∩ the max; on a mixed grant the role's own side survives", async () => {
+    registerPending(pending("call_I", { grant: grant([...LOCAL, "edit", "webfetch", "execute"]) }));
+    const impl = await bind("ses_i", lookup(marked("nonce_call_I")), OPTS);
+    expect(acts(impl)).toEqual([...LOCAL, "edit"]);
+    expect(impl.grant.notes).toEqual([BINDING_NOTES.beyondMax(["webfetch", "execute"])]);
+    registerPending(pending("call_R", { agent: "researcher", grant: grant(["read", "grep", "webfetch"], null) }));
+    const res = await bind("ses_r", lookup(marked("nonce_call_R", { agent: "researcher" })), OPTS);
+    expect(acts(res)).toEqual(["webfetch"]);
   });
 
-  it("a failed lookup → unknown, not cached: the next hook retries", async () => {
+  it("unknown = max ∩ local: nothing for a researcher", async () => {
+    expect(acts(await bind("ses_r", lookup(session({ agent: "researcher" })), OPTS))).toEqual([]);
+    expect(acts(await bind("ses_e", lookup(session({ agent: "explorer" })), OPTS))).toEqual(LOCAL);
+  });
+
+  it("a max that is undefined, throws, is missing or holds execute fails closed", async () => {
+    registerPending(pending("call_A", { grant: grant([...LOCAL, "edit"]) }));
+    expect(acts(await bind("ses_1", lookup(marked("nonce_call_A")), { maxOf: () => undefined }))).toEqual([]);
+    expect(acts(await bind("ses_1", lookup(), { maxOf: () => { throw new Error("boom"); } }))).toEqual([]);
+    expect(acts(await bind("ses_1", lookup(), undefined as unknown as BindOptions))).toEqual([]);
+    expect(acts(await bind("ses_1", lookup(), { maxOf: () => null as unknown as undefined }))).toEqual([]);
+    expect(acts(await bind("ses_1", lookup(), { maxOf: () => [...LOCAL, "edit"] }))).toEqual([...LOCAL, "edit"]);
+    registerPending(pending("call_X", { grant: grant(["read", "execute"]) }));
+    expect(acts(await bind("ses_x", lookup(marked("nonce_call_X")), { maxOf: () => ALL }))).toEqual(["read"]);
+  });
+
+  it("each caller sees the shared decision ∩ its own max; a permissive first caller widens nobody", async () => {
+    registerPending(pending("call_A", { agent: "explorer", grant: grant([...LOCAL, "edit"]) }));
+    const gate = deferred<Session>();
+    const permissive = bind("ses_child", () => gate.promise, { maxOf: () => ALL });
+    const strict = bind("ses_child", lookup(), OPTS);
+    gate.resolve(marked("nonce_call_A", { agent: "explorer" }));
+    expect(acts(await permissive)).toEqual([...LOCAL, "edit"]);
+    expect(acts(await strict)).toEqual(LOCAL);
+    expect(acts((await bind("ses_child", lookup(), OPTS)))).toEqual(LOCAL);
+    expect(acts(currentBinding("ses_child", OPTS)!)).toEqual(LOCAL);
+    expect(acts(currentBinding("ses_child", { maxOf: () => ["read"] })!)).toEqual(["read"]);
+    expect(currentBinding("ses_nobody", OPTS)).toBeUndefined();
+  });
+});
+
+describe("bind: lookups (QA-P16-1-10)", () => {
+  it("a failed lookup or one without parent or agent → unknown, never cached: the next hook retries", async () => {
     registerPending(pending("call_A"));
-    const throwing = vi.fn<SessionLookup>(async () => { throw new Error("host down"); });
-    const failed = await bind("ses_child", throwing);
-    expect(failed.kind).toBe("unknown");
-    expect(failed.grant.notes).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.lookupFailed]);
-    expect(currentBinding("ses_child")).toBeUndefined();
-    const missing = await bind("ses_child", vi.fn<SessionLookup>(async () => undefined), { localFallback: (agent) => (agent === undefined ? ["read"] : LOCAL) });
-    expect(actions(missing)).toEqual(["read"]);
-    const syncThrow = (() => { throw new Error("sync"); }) as unknown as SessionLookup;
-    expect((await bind("ses_child", syncThrow)).kind).toBe("unknown");
-    const ok = await bind("ses_child", lookup());
-    expect(ok.kind).toBe("exact");
+    const failures: SessionLookup[] = [
+      async () => { throw new Error("host down"); },
+      (() => { throw new Error("sync"); }) as unknown as SessionLookup,
+      async () => undefined,
+      async () => session({ parentID: undefined }),
+      async () => session({ agent: "" }),
+    ];
+    for (const failing of failures) {
+      const b = await bind("ses_child", failing, OPTS);
+      expect(b.kind).toBe("unknown");
+      expect(currentBinding("ses_child", OPTS)).toBeUndefined();
+    }
+    expect((await bind("ses_x", async () => undefined, OPTS)).grant).toEqual({
+      actions: new Set(), notes: [BINDING_NOTES.unknown, BINDING_NOTES.lookupFailed], workRoot: null,
+    });
+    expect((await bind("ses_y", async () => session({ parentID: undefined }), OPTS)).grant.notes)
+      .toEqual([BINDING_NOTES.unknown, BINDING_NOTES.noParent]);
+    expect((await bind("ses_child", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("exact");
+  });
+});
+
+describe("registration", () => {
+  it("newDispatchNonce is a fresh UUID", () => {
+    const a = newDispatchNonce();
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(newDispatchNonce()).not.toBe(a);
+    expect(nonceTitleSuffix("x")).toBe(" [nonce x]");
+    expect(noncePromptLine("x")).toBe("OMR_NONCE=x");
   });
 
-  it("normalises a malformed grant: never router_run without a root, never egress with local", async () => {
-    registerPending(pending("call_A", { grant: grant(["read", "webfetch", "router_run", "bogus" as AuthorityAction], null) }));
-    const b = await bind("ses_child", lookup());
-    expect(actions(b)).toEqual(["read"]);
-    expect(b.grant.notes).toEqual([BINDING_NOTES.separation, BINDING_NOTES.noWorkRoot]);
+  it("refuses invalid entries, including a budget that is not finite and > 0 (QA-P16-1-14)", () => {
+    for (const bad of [
+      pending("", {}), pending("call", { parentSessionID: "" }), pending("call", { agent: "" }),
+      { ...pending("call"), grant: { actions: ["read"] as unknown as Set<AuthorityAction>, notes: [], workRoot: null } },
+      null as unknown as PendingDispatch, { ...pending("call"), nonce: 5 as unknown as string },
+      { ...pending("call"), grant: null as unknown as DispatchGrant },
+      pending("call", { budget: Number.NaN }), pending("call", { budget: Number.POSITIVE_INFINITY }), pending("call", { budget: 0 }),
+      pending("call", { budget: "80" as unknown as number }),
+    ]) registerPending(bad);
+    expect(bindingRegistrySize().pending).toBe(0);
+  });
+
+  it("a work root that is not an absolute path becomes null and takes router_run with it (QA-P16-1-8)", async () => {
+    for (const [i, root] of (["", undefined, "relative/root", `${ROOT}\0x`, 42] as unknown[]).entries()) {
+      registerPending(pending(`call_${i}`, { grant: { actions: new Set<AuthorityAction>([...LOCAL, "router_run"]), notes: [], workRoot: root as string } }));
+      const b = await bind(`ses_${i}`, lookup(marked(`nonce_call_${i}`)), OPTS);
+      expect(b.grant.workRoot, String(root)).toBeNull();
+      expect(acts(b), String(root)).toEqual(LOCAL);
+    }
+  });
+
+  it("copies the grant: a later mutation of the caller's set cannot widen it", async () => {
+    const set = new Set<AuthorityAction>(["read"]);
+    registerPending(pending("call_A", { grant: { actions: set, notes: [], workRoot: ROOT } }));
+    set.add("edit");
+    const b = await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
+    expect(acts(b)).toEqual(["read"]);
+    (b.grant.actions as Set<AuthorityAction>).add("edit");
+    (b.candidates as string[]).push("call_evil");
+    expect(acts(currentBinding("ses_child", OPTS)!)).toEqual(["read"]);
+    expect(currentBinding("ses_child", OPTS)!.candidates).toEqual(["call_A"]);
+  });
+
+  it("never un-retires a nonce and refuses a nonce another live dispatch holds (QA-P16-1-5)", async () => {
+    registerPending(pending("call_A"));
+    evictCall(PARENT, "call_A");
+    registerPending(pending("call_A2", { nonce: "nonce_call_A" }));
+    expect(bindingRegistrySize().pending).toBe(0);
+    expect((await bind("ses_old", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("unknown");
+    registerPending(pending("call_B"));
+    registerPending(pending("call_C", { nonce: "nonce_call_B" }));
+    expect(bindingRegistrySize().pending).toBe(1);
+  });
+
+  it("re-registering a key: the same nonce keeps the claim, a new nonce retires the old one and resets it", async () => {
+    registerPending(pending("call_A"));
+    await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
+    registerPending(pending("call_A", { grant: grant(LOCAL) }));
+    expect((await bind("ses_other", lookup(marked("nonce_call_A")), OPTS)).grant.notes).toContain(BINDING_NOTES.claimed);
+    registerPending(pending("call_A", { nonce: "nonce_fresh" }));
+    expect((await bind("ses_old", lookup(marked("nonce_call_A")), OPTS)).grant.notes).toContain(BINDING_NOTES.foreignNonce);
+    expect((await bind("ses_new", lookup(marked("nonce_fresh")), OPTS)).kind).toBe("exact");
+  });
+
+  it("evicts a call by (parent, callID) only: a reused call id under another parent stays (QA-P16-1-5)", async () => {
+    registerPending(pending("call_1"));
+    registerPending(pending("call_1", { parentSessionID: "ses_p2", nonce: "nonce_p2" }));
+    evictCall(PARENT, "call_1");
+    evictCall(PARENT, "call_missing");
+    expect(bindingRegistrySize().pending).toBe(1);
+    expect((await bind("ses_c", lookup(marked("nonce_p2", { parentID: "ses_p2" })), OPTS)).kind).toBe("exact");
   });
 });
 
 describe("lifetimes and eviction", () => {
-  it("binding after the parent call completed → unknown, even with a newer sibling pending", async () => {
-    registerPending(pending("call_A", { grant: grant([...LOCAL, "edit"]) }));
-    evict("call_A"); // execute.after of the parent's subagent call
-    const none = await bind("ses_none", lookup());
-    expect(none.kind).toBe("unknown");
-    expect(actions(none)).toEqual(LOCAL);
-    registerPending(pending("call_B", { grant: grant([...LOCAL, "edit", "router_run"]) }));
-    for (const [id, over] of [
-      ["ses_title", { title: `task${nonceTitleSuffix("call_A")}` }],
-      ["ses_prompt", { firstText: noncePromptLine("call_A") }],
-      ["ses_bare", { firstText: "continue call_A please" }],
-      ["ses_unregistered", { title: `task${nonceTitleSuffix("call_never")}` }],
-    ] as const) {
-      const b = await bind(id, lookup(over));
-      expect(b.kind, id).toBe("unknown");
-      expect(b.grant.notes, id).toEqual([BINDING_NOTES.unknown, BINDING_NOTES.foreignNonce]);
-      expect(b.grant.workRoot, id).toBeNull();
-    }
-    // A nonce-less child cannot be told apart: the count rule applies.
-    expect((await bind("ses_plain", lookup())).candidates).toEqual(["call_B"]);
-  });
-
-  it("a nonce of another parent's pending dispatch → unknown", async () => {
-    registerPending(pending("call_A"));
-    registerPending(pending("call_X", { parentSessionID: "ses_other_parent" }));
-    expect((await bind("ses_1", lookup({ firstText: "OMR_NONCE=call_X" }))).kind).toBe("unknown");
-    expect((await bind("ses_2", lookup({ firstText: "see call_X" }))).kind).toBe("unknown");
-  });
-
-  it("parent deleted: its pending entries and its children's bindings go; others stay", async () => {
+  it("evict(parent): its entries and its children's bindings go, the parent is tombstoned (QA-P16-1-7)", async () => {
     registerPending(pending("call_A"));
     registerPending(pending("call_O", { parentSessionID: "ses_other" }));
-    const before = await bind("ses_child", lookup({ title: "task [nonce call_A]" }));
-    expect(before.kind).toBe("exact");
-    const other = await bind("ses_other_child", lookup({ parentID: "ses_other" }));
-    expect(other.kind).toBe("exact");
-    evict(PARENT); // session.deleted of the parent
-    expect(currentBinding("ses_child")).toBeUndefined();
-    expect(currentBinding("ses_other_child")?.kind).toBe("exact");
+    await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
+    await bind("ses_other_child", lookup(marked("nonce_call_O", { parentID: "ses_other" })), OPTS);
+    evict(PARENT);
+    expect(currentBinding("ses_child", OPTS)).toBeUndefined();
+    expect(currentBinding("ses_other_child", OPTS)?.kind).toBe("exact");
+    expect(bindingRegistrySize()).toMatchObject({ pending: 1, deleted: 1 });
+    registerPending(pending("call_late"));
     expect(bindingRegistrySize().pending).toBe(1);
-    expect((await bind("ses_child", lookup({ title: "task [nonce call_A]" }))).kind).toBe("unknown");
-    expect((await bind("ses_new", lookup())).kind).toBe("unknown");
+  });
+
+  it("an in-flight lookup never stores a binding to a deleted parent or child", async () => {
+    registerPending(pending("call_A"));
+    registerPending(pending("call_B"));
+    const gate = deferred<Session>();
+    const late = bind("ses_child", () => gate.promise, OPTS);
+    evict(PARENT);
+    gate.resolve(marked("nonce_call_A"));
+    expect((await late).kind).toBe("unknown");
+    expect(currentBinding("ses_child", OPTS)).toBeUndefined();
+    registerPending(pending("call_C", { parentSessionID: "ses_p2" }));
+    const gate2 = deferred<Session>();
+    const deleted = bind("ses_gone", () => gate2.promise, OPTS);
+    evict("ses_gone");
+    gate2.resolve(marked("nonce_call_C", { parentID: "ses_p2" }));
+    expect((await deleted).kind).toBe("exact");
+    expect(currentBinding("ses_gone", OPTS)).toBeUndefined();
+    await bind("ses_gone", lookup(marked("nonce_call_C", { parentID: "ses_p2" })), OPTS);
+    expect(currentBinding("ses_gone", OPTS)).toBeUndefined();
   });
 
   it("the same child resumed twice gets the cached binding with its widened grant, one lookup", async () => {
     registerPending(pending("call_A", { grant: grant(LOCAL) }));
-    const get = lookup();
-    const first = await bind("ses_child", get);
-    expect(first.kind).toBe("exact");
-    evict("call_A"); // the first run completed
-    expect(actions(widen("ses_child", ["edit"]))).toEqual([...LOCAL, "edit"]);
-    registerPending(pending("call_B", { grant: grant(["read"]) })); // an unrelated later dispatch
+    const get = lookup(marked("nonce_call_A"));
+    await bind("ses_child", get, OPTS);
+    evictCall(PARENT, "call_A");
+    expect(acts(widen("ses_child", ["edit"], MAX.implementer!))).toEqual([...LOCAL, "edit"]);
     for (let resume = 0; resume < 2; resume++) {
-      const again = await bind("ses_child", get);
+      const again = await bind("ses_child", get, OPTS);
       expect(again.kind).toBe("exact");
-      expect(again.candidates).toEqual(["call_A"]);
-      expect(actions(again)).toEqual([...LOCAL, "edit"]);
+      expect(acts(again)).toEqual([...LOCAL, "edit"]);
       expect(again.grant.notes).toEqual([BINDING_NOTES.widened(["edit"])]);
     }
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it("evict(child) on session.deleted drops the binding; the next bind decides again", async () => {
+  it("expires pending entries after 30 min; retired nonces and tombstones are forgotten after 30 min more", async () => {
     registerPending(pending("call_A"));
-    await bind("ses_child", lookup());
-    evict("ses_child");
-    expect(currentBinding("ses_child")).toBeUndefined();
-    const get = lookup();
-    await bind("ses_child", get);
-    expect(get).toHaveBeenCalledTimes(1);
-  });
-
-  it("an evict while the lookup runs returns the decision without caching it", async () => {
-    registerPending(pending("call_A"));
-    const gate = deferred<Session>();
-    const pendingBind = bind("ses_child", () => gate.promise);
-    evict("ses_child");
-    gate.resolve({ parentID: PARENT, agent: "implementer", title: "task" });
-    expect((await pendingBind).kind).toBe("exact");
-    expect(currentBinding("ses_child")).toBeUndefined();
-  });
-
-  it("expires pending entries after 30 min (checked on access) and remembers their nonces for 30 min more", async () => {
-    registerPending(pending("call_A"));
+    evict("ses_deleted");
     clock += PENDING_TTL_MS - 1;
-    expect((await bind("ses_1", lookup())).kind).toBe("exact");
+    expect((await bind("ses_1", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("exact");
     clock += 1;
-    expect((await bind("ses_2", lookup())).kind).toBe("unknown");
-    expect(bindingRegistrySize()).toMatchObject({ pending: 0, retired: 1 });
-    registerPending(pending("call_B"));
-    expect((await bind("ses_3", lookup({ firstText: "call_A" }))).kind).toBe("unknown");
+    expect((await bind("ses_2", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("unknown");
+    expect(bindingRegistrySize()).toEqual({ pending: 0, bound: 2, retired: 1, deleted: 0 }); // a foreign-nonce unknown is final
     clock += PENDING_TTL_MS;
-    registerPending(pending("call_C"));
-    expect(bindingRegistrySize()).toMatchObject({ pending: 1, retired: 1 }); // call_A forgotten, call_B retired
+    registerPending(pending("call_B"));
+    expect(bindingRegistrySize()).toMatchObject({ pending: 1, retired: 0 });
   });
 
   it("a future registeredAt cannot extend the TTL; a non-finite one means now; an expired one is refused", async () => {
     registerPending(pending("call_F", { registeredAt: clock + 10 * PENDING_TTL_MS }));
-    registerPending(pending("call_N", { registeredAt: Number.NaN, agent: "general" }));
+    registerPending(pending("call_N", { registeredAt: Number.NaN }));
     clock += PENDING_TTL_MS;
-    expect(bindingRegistrySize().pending).toBe(2);
-    expect((await bind("ses_1", lookup())).kind).toBe("unknown");
-    expect((await bind("ses_2", lookup({ agent: "general" }))).kind).toBe("unknown");
+    expect((await bind("ses_1", lookup(marked("nonce_call_F")), OPTS)).kind).toBe("unknown");
+    expect((await bind("ses_2", lookup(marked("nonce_call_N")), OPTS)).kind).toBe("unknown");
     registerPending(pending("call_old", { registeredAt: clock - PENDING_TTL_MS }));
     expect(bindingRegistrySize().pending).toBe(0);
-    registerPending(pending("call_new"));
-    expect((await bind("ses_3", lookup({ firstText: "call_old" }))).kind).toBe("unknown");
+    registerPending(pending("call_again", { nonce: "nonce_call_old" }));
+    expect(bindingRegistrySize().pending).toBe(0);
   });
 
-  it("bounds the pending registry: the oldest entry goes first and its nonce is remembered", async () => {
-    for (let i = 0; i <= PENDING_MAX; i++) registerPending(pending(`call_${i}`, { parentSessionID: `ses_p${i}` }));
+  it("bounds the pending registry: the oldest entry goes first and its nonce retires", async () => {
+    for (let i = 0; i <= PENDING_MAX; i++) registerPending(pending(`call_${i}`));
     expect(bindingRegistrySize().pending).toBe(PENDING_MAX);
-    expect((await bind("ses_0", lookup({ parentID: "ses_p0" }))).kind).toBe("unknown");
-    expect((await bind("ses_1", lookup({ parentID: "ses_p1" }))).kind).toBe("exact");
-    // Re-registering a dispatch moves it to the newest position and un-retires its nonce.
-    registerPending(pending("call_0", { parentSessionID: "ses_p0" }));
-    expect(bindingRegistrySize().pending).toBe(PENDING_MAX);
-    expect((await bind("ses_0b", lookup({ parentID: "ses_p0", firstText: "OMR_NONCE=call_0" }))).kind).toBe("exact");
+    expect((await bind("ses_0", lookup(marked("nonce_call_0")), OPTS)).grant.notes).toContain(BINDING_NOTES.foreignNonce);
+    expect((await bind("ses_1", lookup(marked("nonce_call_1")), OPTS)).kind).toBe("exact");
   });
 
-  it("bounds the retired nonces", () => {
+  it("bounds the retired nonces and the tombstones", () => {
     for (let i = 0; i < 1100; i++) {
       registerPending(pending(`call_${i}`));
-      evict(`call_${i}`);
+      evictCall(PARENT, `call_${i}`);
     }
-    expect(bindingRegistrySize()).toMatchObject({ pending: 0, retired: 1024 });
+    for (let i = 0; i < 4200; i++) evict(`ses_${i}`);
+    expect(bindingRegistrySize()).toMatchObject({ pending: 0, retired: 1024, deleted: 4096 });
   });
 
   it("bounds the bound children, least recently used first", async () => {
-    registerPending(pending("call_A"));
-    const get = lookup();
-    for (let i = 0; i < BOUND_MAX; i++) await bind(`ses_${i}`, get);
-    await bind("ses_0", get); // touch: now the most recent
-    await bind("ses_extra", get);
+    registerPending(pending("call_N", { nonce: "", agent: "explorer" }));
+    const get = lookup(session({ agent: "explorer" }));
+    for (let i = 0; i < BOUND_MAX; i++) await bind(`ses_${i}`, get, OPTS);
+    await bind("ses_0", get, OPTS);
+    await bind("ses_extra", get, OPTS);
     expect(bindingRegistrySize().bound).toBe(BOUND_MAX);
-    expect(currentBinding("ses_0")).toBeDefined();
-    expect(currentBinding("ses_1")).toBeUndefined();
-  });
-
-  it("ignores invalid entries and copies the grant (a later mutation cannot widen)", async () => {
-    registerPending(pending("", {}));
-    registerPending(pending("call_X", { parentSessionID: "" }));
-    registerPending(pending("call_Y", { agent: "" }));
-    registerPending({ ...pending("call_Z"), grant: { actions: ["read"] as unknown as Set<AuthorityAction>, notes: [], workRoot: null } });
-    registerPending(null as unknown as PendingDispatch);
-    registerPending({ ...pending("call_W"), nonce: 5 as unknown as string });
-    registerPending({ ...pending("call_V"), grant: null as unknown as DispatchGrant });
-    expect(bindingRegistrySize().pending).toBe(0);
-    const set = new Set<AuthorityAction>(["read"]);
-    registerPending(pending("call_A", { grant: { actions: set, notes: [], workRoot: ROOT } }));
-    set.add("edit");
-    expect(actions(await bind("ses_child", lookup()))).toEqual(["read"]);
-  });
-
-  it("returns copies: mutating a returned binding changes nothing", async () => {
-    registerPending(pending("call_A", { grant: grant(["read"]) }));
-    const b = await bind("ses_child", lookup());
-    (b.grant.actions as Set<AuthorityAction>).add("edit");
-    (b.candidates as string[]).push("call_evil");
-    const peek = currentBinding("ses_child")!;
-    expect(actions(peek)).toEqual(["read"]);
-    expect(peek.candidates).toEqual(["call_A"]);
-    (peek.grant.actions as Set<AuthorityAction>).add("edit");
-    expect(actions((await bind("ses_child", lookup())))).toEqual(["read"]);
+    expect(currentBinding("ses_0", OPTS)).toBeDefined();
+    expect(currentBinding("ses_1", OPTS)).toBeUndefined();
   });
 });
 
 describe("widen", () => {
   it("an unbound child gets an empty grant and nothing is stored", () => {
-    expect(widen("ses_nobody", ["edit"])).toEqual({ actions: new Set(), notes: [BINDING_NOTES.notBound], workRoot: null });
-    expect(currentBinding("ses_nobody")).toBeUndefined();
+    expect(widen("ses_nobody", ["edit"], ALL)).toEqual({ actions: new Set(), notes: [BINDING_NOTES.notBound], workRoot: null });
+    expect(currentBinding("ses_nobody", OPTS)).toBeUndefined();
+  });
+
+  it("without a max nothing is added and nothing stored", async () => {
+    registerPending(pending("call_A", { grant: grant(["read"]) }));
+    await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
+    expect(acts(widen("ses_child", ["edit"], undefined as unknown as AuthorityAction[]))).toEqual(["read"]);
+    expect(acts(widen("ses_child", ["edit"], null as unknown as AuthorityAction[]))).toEqual(["read"]);
+    expect(acts(currentBinding("ses_child", OPTS)!)).toEqual(["read"]);
   });
 
   it("adds only inside the max, never execute, router_run only with a root, never across the separation rule", async () => {
     registerPending(pending("call_A", { grant: grant(["read"], ROOT) }));
-    await bind("ses_child", lookup());
-    const max: AuthorityAction[] = [...LOCAL, "edit", "router_run", "execute"];
-    const g = widen("ses_child", ["edit", "router_run", "execute", "webfetch", "grep"], max);
-    expect(actions(g)).toEqual(["read", "grep", "router_run", "edit"]);
-    expect(g.notes).toEqual([BINDING_NOTES.widened(["grep", "router_run", "edit"])]);
-    const unbounded = widen("ses_child", ["webfetch", "edit"]);
-    expect(actions(unbounded)).toEqual(["read", "grep", "router_run", "edit"]);
-    expect(unbounded.notes).toContain(BINDING_NOTES.separation);
-    expect(actions(currentBinding("ses_child")!)).toEqual(["read", "grep", "router_run", "edit"]);
+    await bind("ses_child", lookup(marked("nonce_call_A")), OPTS);
+    const g = widen("ses_child", ["edit", "router_run", "execute", "webfetch", "grep"], [...ALL]);
+    expect(acts(g)).toEqual(["read", "grep", "router_run", "edit"]);
+    expect(g.notes).toEqual([BINDING_NOTES.separation, BINDING_NOTES.widened(["grep", "router_run", "edit"])]);
+    const narrowed = widen("ses_child", ["glob"], ["read", "glob"]);
+    expect(acts(narrowed)).toEqual(["read", "glob"]);
+    expect(narrowed.notes).toContain(BINDING_NOTES.beyondMax(["grep", "router_run", "edit"]));
   });
 
   it("never adds router_run to a binding without a work root (unknown)", async () => {
-    const unknownChild = await bind("ses_child", lookup());
-    expect(unknownChild.kind).toBe("unknown");
-    const g = widen("ses_child", ["router_run", "edit"]);
-    expect(actions(g)).toEqual([...LOCAL, "edit"]);
+    expect((await bind("ses_child", lookup(), OPTS)).kind).toBe("unknown");
+    const g = widen("ses_child", ["router_run", "edit"], MAX.implementer!);
+    expect(acts(g)).toEqual([...LOCAL, "edit"]);
     expect(g.workRoot).toBeNull();
     expect(g.notes).toContain(BINDING_NOTES.noWorkRoot);
-    expect(currentBinding("ses_child")!.kind).toBe("unknown");
   });
 
   it("keeps an egress grant egress-only", async () => {
     registerPending(pending("call_R", { agent: "researcher", grant: grant(["webfetch"], null) }));
-    await bind("ses_r", lookup({ agent: "researcher" }));
-    const g = widen("ses_r", ["read", "websearch"]);
-    expect(actions(g)).toEqual(["webfetch", "websearch"]);
+    await bind("ses_r", lookup(marked("nonce_call_R", { agent: "researcher" })), OPTS);
+    const g = widen("ses_r", ["read", "websearch"], [...EGRESS, "read"]);
+    expect(acts(g)).toEqual(["webfetch", "websearch"]);
     expect(g.notes).toEqual([BINDING_NOTES.separation, BINDING_NOTES.widened(["websearch"])]);
-    expect(actions(widen("ses_r", ["webfetch"]))).toEqual(["webfetch", "websearch"]);
   });
 });
 
@@ -461,31 +544,31 @@ describe("process-wide registry", () => {
     binding.registerPending(pending("call_A", { grant: grant([...LOCAL, "edit"]) }));
     const gate = deferred<Session>();
     const slow = vi.fn<SessionLookup>(() => gate.promise);
-    const fast = lookup({ agent: "general" });
-    const fromA = binding.bind("ses_child", slow);
-    const fromB = other.bind("ses_child", fast);
-    gate.resolve({ parentID: PARENT, agent: "implementer", title: "task" });
+    const fast = lookup(session({ agent: "general" }));
+    const fromA = binding.bind("ses_child", slow, OPTS);
+    const fromB = other.bind("ses_child", fast, OPTS);
+    gate.resolve(marked("nonce_call_A"));
     const [a, b] = await Promise.all([fromA, fromB]);
     expect(a).toEqual(b);
     expect(a.kind).toBe("exact");
     expect(slow).toHaveBeenCalledTimes(1);
     expect(fast).not.toHaveBeenCalled();
-    expect(other.currentBinding("ses_child")).toEqual(a);
     other.evict("ses_child");
-    expect(binding.currentBinding("ses_child")).toBeUndefined();
+    expect(binding.currentBinding("ses_child", OPTS)).toBeUndefined();
   });
 
-  it("replaces a foreign value under the registry key", async () => {
-    Reflect.set(globalThis, Symbol.for("opencode-model-router.role-binding"), { version: 1, pending: {} });
+  it("replaces a foreign or older-version value under the registry key", async () => {
+    const key = Symbol.for("opencode-model-router.role-binding");
+    Reflect.set(globalThis, key, { version: 1, pending: new Map(), bound: new Map(), inflight: new Map(), retired: new Map() });
     registerPending(pending("call_A"));
-    expect((await bind("ses_child", lookup())).kind).toBe("exact");
-    Reflect.set(globalThis, Symbol.for("opencode-model-router.role-binding"), null);
-    expect(bindingRegistrySize()).toEqual({ pending: 0, bound: 0, retired: 0 });
+    expect((await bind("ses_child", lookup(marked("nonce_call_A")), OPTS)).kind).toBe("exact");
+    Reflect.set(globalThis, key, null);
+    expect(bindingRegistrySize()).toEqual({ pending: 0, bound: 0, retired: 0, deleted: 0 });
   });
 });
 
 // ---------------------------------------------------------------------------
-// Property test (I5): random interleavings, seeded, no dependency
+// Property (I5, QA-P16-1-6): random interleavings, seeded, no dependency, no restated decision rules.
 // ---------------------------------------------------------------------------
 
 function mulberry32(seed: number): () => number {
@@ -499,202 +582,318 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-const AGENT_MAX: Readonly<Record<string, readonly AuthorityAction[]>> = {
-  implementer: [...LOCAL, "router_run", "edit"],
-  general: [...LOCAL, "router_run", "edit"],
-  researcher: ["webfetch", "websearch", "context7"],
-};
-const AGENTS = Object.keys(AGENT_MAX);
-const ORDER: readonly AuthorityAction[] = [...LOCAL, "router_run", "edit", "webfetch", "websearch", "context7", "execute"];
+const AGENTS = ["implementer", "general", "researcher"] as const;
+const SPECS: ReadonlyMap<string, RoleSpec> = new Map(AGENTS.map((agent) => [agent, {
+  agent, kind: agent === "researcher" ? "research" : agent === "general" ? "general" : "implement",
+  description: agent, prompt: agent,
+  authority: { mode: agent === "researcher" ? "fixed" : "dynamic", allow: [...MAX[agent]!], deny: [] },
+  tierRange: { floor: "fast", ceiling: "heavy" }, assurance: "none", guard: "producer", budget: {}, enabled: true,
+} satisfies RoleSpec]));
+const EGRESS_SET = new Set<AuthorityAction>([...EGRESS, "execute"]);
 
 interface SimDispatch {
-  callID: string;
   parent: string;
+  callID: string;
   agent: string;
+  nonce: string;
   grant: DispatchGrant;
-  budget: number;
-  decisionID: string;
   registeredAt: number;
   live: boolean;
+  spawned: boolean;
 }
 
 interface SimChild {
   id: string;
   dispatch: SimDispatch;
-  mode: "title" | "first" | "none";
+  session: NonNullable<Session>;
+  /** The router's own marker survived in the title or the first message. */
+  carriesOwn: boolean;
+  /** Another dispatch's or a forged marker was planted in the text. */
+  injected: boolean;
   gate?: ReturnType<typeof deferred<Session>>;
-  results: Array<Binding | undefined>;
-  lookups: number;
-  cached?: Binding;
-  ownLiveAtDecision?: boolean;
+  waiting: Array<{ max: readonly AuthorityAction[]; result?: Binding }>;
+  /** Actions any widening of this child may have added (requested ∩ max). */
+  widened: Set<AuthorityAction>;
+  decided: boolean;
+  /** Registrations at the child's last decision (a cached binding is judged against them). */
+  snapshot: Map<string, SimDispatch>;
 }
 
-function sortActions(set: Iterable<AuthorityAction>): AuthorityAction[] {
-  const have = new Set(set);
-  return ORDER.filter((a) => have.has(a));
+interface Stats {
+  checked: number; exact: number; intersection: number; unknown: number;
+  cleanLive: number; cleanExact: number; widened: number; residual: number;
 }
 
-function expectedBinding(child: SimChild, dispatches: readonly SimDispatch[], now: number): Omit<Binding, "grant"> & { actions: AuthorityAction[]; workRoot: string | null } {
-  const live = dispatches.filter((d) => d.live && now - d.registeredAt < PENDING_TTL_MS);
-  const candidates = live.filter((d) => d.parent === child.dispatch.parent && d.agent === child.dispatch.agent);
-  const base = { childSessionID: child.id };
-  const unknownResult = () => ({
-    ...base, kind: "unknown" as const, candidates: [], decisionID: null, budget: null, workRoot: null,
-    actions: LOCAL.filter((a) => AGENT_MAX[child.dispatch.agent]!.includes(a)),
-  });
-  const fromSet = (set: SimDispatch[], kind: "exact" | "intersection") => {
-    let acts = sortActions(set[0]!.grant.actions);
-    for (const d of set.slice(1)) acts = acts.filter((a) => d.grant.actions.has(a));
-    const root = set.every((d) => d.grant.workRoot === set[0]!.grant.workRoot) ? set[0]!.grant.workRoot : null;
-    if (root === null) acts = acts.filter((a) => a !== "router_run");
-    return {
-      ...base, kind, candidates: set.map((d) => d.callID), workRoot: root, actions: acts,
-      decisionID: set.every((d) => d.decisionID === set[0]!.decisionID) ? set[0]!.decisionID : null,
-      budget: Math.min(...set.map((d) => d.budget)),
-    };
-  };
-  if (child.mode !== "none") {
-    const own = candidates.find((d) => d.callID === child.dispatch.callID);
-    return own ? fromSet([own], "exact") : unknownResult();
-  }
-  if (candidates.length === 1) return fromSet(candidates, "exact");
-  if (candidates.length >= 2) return fromSet(candidates, "intersection");
-  return unknownResult();
+function absoluteRoot(root: unknown): string | null {
+  return typeof root === "string" && root !== "" && !root.includes("\0") && isAbsolute(root) ? root : null;
 }
 
 async function drain(): Promise<void> {
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((done) => setImmediate(done));
 }
 
-async function runInterleaving(seed: number, steps: number): Promise<number> {
+async function runInterleaving(seed: number, steps: number, stats: Stats, nonceless: boolean): Promise<void> {
+  const noncelessRun = nonceless;
   const rand = mulberry32(seed);
   const pick = <T>(list: readonly T[]): T => list[Math.floor(rand() * list.length)]!;
+  const subset = <T>(list: readonly T[], p: number): T[] => list.filter(() => rand() < p);
+  const generation: Record<string, number> = { p1: 0, p2: 0 };
+  const parentOf = (slot: string) => `ses_${slot}_${generation[slot]}`;
   const dispatches: SimDispatch[] = [];
   const children: SimChild[] = [];
-  const byCall = new Map<string, SimDispatch>();
-  let checked = 0;
-  const fallback = (agent: string | undefined) => (agent === undefined ? [] : AGENT_MAX[agent]);
+  const registered = new Map<string, SimDispatch>(); // (parent, callID) → current dispatch
 
-  const check = (child: SimChild, got: Binding) => {
-    // Independent properties first.
-    const cands = got.candidates.map((id) => byCall.get(id)!);
-    for (const c of cands) {
-      expect(c.parent).toBe(child.dispatch.parent);
-      expect(c.agent).toBe(child.dispatch.agent);
-      for (const a of got.grant.actions) expect(c.grant.actions.has(a), `${a} ⊄ ${c.callID}`).toBe(true); // ⊆ every candidate: never a union
+  const ownLive = (d: SimDispatch) => d.live && clock - d.registeredAt < PENDING_TTL_MS && registered.get(`${d.parent}|${d.callID}`) === d;
+
+  const check = (child: SimChild, got: Binding, callerMax: readonly AuthorityAction[], ownLiveAtDecision: boolean, snapshot: Map<string, SimDispatch>) => {
+    const max = new Set(callerMax);
+    for (const a of got.grant.actions) {
+      expect(max.has(a), `${child.id}: ${a} beyond the caller's max`).toBe(true);
+      expect(a).not.toBe("execute");
     }
-    const roots = new Set(cands.map((c) => c.grant.workRoot));
+    const actions = [...got.grant.actions];
+    expect(actions.some((a) => EGRESS_SET.has(a)) && actions.some((a) => !EGRESS_SET.has(a)), "separation").toBe(false);
+    if (got.grant.actions.has("router_run")) expect(absoluteRoot(got.grant.workRoot)).not.toBeNull();
+    // Never a union: ⊆ every candidate's registered grant; work root shared or null.
+    const cands = got.candidates.map((id) => snapshot.get(`${child.dispatch.parent}|${id}`)!);
+    for (const c of cands) {
+      expect(c, `${child.id}: candidate ${String(c)} not registered`).toBeDefined();
+      for (const a of got.grant.actions) if (!child.widened.has(a)) expect(c.grant.actions.has(a), `${a} ⊄ ${c.callID}`).toBe(true);
+    }
+    const roots = new Set(cands.map((c) => absoluteRoot(c.grant.workRoot)));
     if (roots.size > 1) expect(got.grant.workRoot).toBeNull();
-    if (roots.size === 1) expect([...roots][0] === got.grant.workRoot || got.grant.workRoot === null).toBe(true);
+    if (roots.size === 1) expect([[...roots][0], null]).toContain(got.grant.workRoot);
+    // I5: a child gets nothing beyond its own dispatch (unknown: beyond max ∩ local), plus what was widened.
+    // Guaranteed whenever the router's own marker reached the child (P2.1 always writes both); for a
+    // marker-less child without planted markers when no nonce-less dispatch exists; and for a marker-less
+    // child whose own dispatch is still pending — unless a sibling's marker was planted in a nonce-bound child
+    // that lost its own. The rest (a planted marker in a marker-less child, or the nonce-less counting
+    // fallback after the child's own dispatch ended) is indistinguishable by design: the documented residual.
+    const base = got.kind === "unknown" ? new Set(LOCAL.filter((a) => max.has(a))) : child.dispatch.grant.actions;
+    const guaranteed = child.carriesOwn
+      || (!child.injected && !noncelessRun)
+      || (ownLiveAtDecision && !(child.dispatch.nonce !== "" && child.injected));
+    if (guaranteed) {
+      for (const a of got.grant.actions) {
+        expect(base.has(a) || child.widened.has(a), `I5: ${child.id} (${got.kind}) got ${a} beyond its own dispatch`).toBe(true);
+      }
+    } else {
+      stats.residual++;
+    }
     if (got.kind === "unknown") {
       expect(got.candidates).toEqual([]);
       expect(got.grant.workRoot).toBeNull();
-      for (const a of got.grant.actions) expect(LOCAL.includes(a) && AGENT_MAX[child.dispatch.agent]!.includes(a)).toBe(true);
-    } else {
-      expect(got.candidates.length).toBeGreaterThan(0);
+      for (const a of got.grant.actions) expect(LOCAL.includes(a) || child.widened.has(a)).toBe(true);
     }
-    if (got.grant.actions.has("router_run")) expect(got.grant.workRoot).not.toBeNull();
-    // I5: a child carrying its nonce, or whose own dispatch was still pending, never gets more than its own grant.
-    if (child.mode !== "none" || child.ownLiveAtDecision) {
-      const own = child.dispatch.grant.actions;
-      for (const a of got.grant.actions) {
-        expect(got.kind === "unknown" || own.has(a), `${child.id} got ${a} beyond its own dispatch`).toBe(true);
+    stats.checked++;
+    stats[got.kind]++;
+  };
+
+  const register = () => {
+    const slot = pick(["p1", "p2"]);
+    const agent = pick(AGENTS);
+    const max = MAX[agent]!;
+    const extra = rand() < 0.15 ? [pick(ALL)] : [];
+    const d: SimDispatch = {
+      parent: parentOf(slot),
+      callID: `call_${Math.floor(rand() * 6)}`, // call ids are reused across parents and after completion
+      agent,
+      nonce: nonceless && rand() < 0.25 ? "" : newDispatchNonce(),
+      grant: grant([...subset(max, 0.6), ...extra], pick([ROOT, OTHER_ROOT, null, "", "relative/root"]) as string | null),
+      registeredAt: clock,
+      live: true,
+      spawned: false,
+    };
+    const key = `${d.parent}|${d.callID}`;
+    const previous = registered.get(key);
+    if (previous) previous.live = false;
+    registered.set(key, d);
+    dispatches.push(d);
+    registerPending({
+      parentSessionID: d.parent, callID: d.callID, agent: d.agent, description: "task", nonce: d.nonce,
+      grant: d.grant, budget: 10 + Math.floor(rand() * 100), decisionID: null, registeredAt: d.registeredAt,
+    });
+  };
+
+  const spawn = () => {
+    const free = dispatches.filter((d) => !d.spawned);
+    if (free.length === 0) return;
+    const d = pick(free);
+    d.spawned = true;
+    const others = dispatches.filter((o) => o !== d && o.nonce !== "");
+    let title = "task";
+    let first: string | undefined = "You are a subagent.";
+    let inTitle = false;
+    let inFirst = false;
+    if (d.nonce !== "") {
+      const where = pick(["title", "first", "both"] as const);
+      inTitle = where !== "first";
+      inFirst = where !== "title";
+      if (inTitle) title += nonceTitleSuffix(d.nonce);
+      if (inFirst) first += `\n${noncePromptLine(d.nonce)}`;
+    }
+    let injected = false;
+    const inject = (marker: string) => {
+      injected = true;
+      if (rand() < 0.5) title += ` ${marker}`;
+      else first = `${marker}\n${first}`;
+    };
+    if (others.length > 0 && rand() < 0.2) inject(rand() < 0.5 ? nonceTitleSuffix(pick(others).nonce).trim() : noncePromptLine(pick(others).nonce));
+    if (rand() < 0.1) inject(noncePromptLine(`forged-${Math.floor(rand() * 1e6)}`));
+    if (rand() < 0.1) {
+      first = undefined; // the lookup did not return the first message
+      inFirst = false;
+    }
+    const child: SimChild = {
+      id: `ses_c${seed}_${children.length}`, dispatch: d, carriesOwn: inTitle || inFirst, injected,
+      session: { parentID: d.parent, agent: d.agent, title, firstText: first },
+      waiting: [], widened: new Set(), decided: false, snapshot: new Map(),
+    };
+    children.push(child);
+    startBind(child);
+  };
+
+  const startBind = (child: SimChild) => {
+    child.gate = deferred<Session>();
+    const gate = child.gate;
+    const callers = rand() < 0.3 ? 2 : 1;
+    for (let i = 0; i < callers; i++) {
+      const role = MAX[child.dispatch.agent]!;
+      const max = i === 0 && rand() < 0.15 ? ALL : i === 1 ? subset(role, 0.7) : role;
+      const entry: SimChild["waiting"][number] = { max };
+      child.waiting.push(entry);
+      void bind(child.id, () => gate.promise, { maxOf: () => max }).then((b) => { entry.result = b; });
+    }
+  };
+
+  const release = async () => {
+    const waiting = children.filter((c) => c.gate !== undefined);
+    if (waiting.length === 0) return;
+    const child = pick(waiting);
+    const live = ownLive(child.dispatch);
+    const snapshot = new Map(registered);
+    const gate = child.gate!;
+    child.gate = undefined;
+    gate.resolve(rand() < 0.05 ? undefined : child.session);
+    await drain();
+    const [first, ...rest] = child.waiting;
+    for (const w of child.waiting) {
+      expect(w.result, `${child.id} unresolved`).toBeDefined();
+      check(child, w.result!, w.max, live, snapshot);
+    }
+    for (const w of rest) {
+      expect(w.result!.kind).toBe(first!.result!.kind);
+      expect(w.result!.candidates).toEqual(first!.result!.candidates);
+    }
+    const clean = child.carriesOwn && !child.injected;
+    if (clean && live && !child.decided && !nonceless && first!.result!.grant.notes[1] !== BINDING_NOTES.lookupFailed) {
+      stats.cleanLive++;
+      if (first!.result!.kind === "exact") {
+        expect(first!.result!.candidates).toEqual([child.dispatch.callID]);
+        stats.cleanExact++;
       }
     }
-    checked++;
+    child.snapshot = snapshot;
+    child.waiting = [];
+    child.decided = true;
+  };
+
+  const rebind = async () => {
+    const decided = children.filter((c) => c.decided && c.gate === undefined);
+    if (decided.length === 0) return;
+    const child = pick(decided);
+    const live = ownLive(child.dispatch);
+    let looked = false;
+    const got = await bind(child.id, async () => { looked = true; return child.session; }, { maxOf: () => MAX[child.dispatch.agent] });
+    if (looked) child.snapshot = new Map(registered); // a re-decision is judged against today's registrations
+    check(child, got, MAX[child.dispatch.agent]!, live, child.snapshot);
+  };
+
+  const widenSome = () => {
+    const decided = children.filter((c) => c.decided);
+    if (decided.length === 0) return;
+    const child = pick(decided);
+    const max = MAX[child.dispatch.agent]!;
+    const asked = subset(ALL, 0.3);
+    const g = widen(child.id, asked, max);
+    for (const a of asked) if (max.includes(a)) child.widened.add(a);
+    for (const a of g.actions) expect(max.includes(a)).toBe(true);
+    stats.widened++;
+  };
+
+  const ladder = () => {
+    const decided = children.filter((c) => c.decided && c.dispatch.agent !== "researcher");
+    if (decided.length === 0) return;
+    const child = pick(decided);
+    const deps: authority.AuthorityDeps = {
+      roleOf: () => SPECS.get(child.dispatch.agent),
+      dispatchOf: () => ({ parentSessionID: child.dispatch.parent, callID: child.dispatch.callID }),
+      roles: () => SPECS,
+    };
+    const result = authority.requestAuthority(child.id, { actions: subset(ALL, 0.3), reason: "need" }, deps);
+    for (const a of result.recorded) child.widened.add(a);
+    if (rand() < 0.8) authority.markAnnotated(child.id, child.dispatch.callID);
+    const consumed = authority.consumeAuthority(child.id, deps, { afterCall: rand() < 0.9 ? child.dispatch.callID : "call_other" });
+    if (consumed) for (const a of consumed.grant.actions) expect(MAX[child.dispatch.agent]!.includes(a)).toBe(true);
   };
 
   for (let step = 0; step < steps; step++) {
     const roll = rand();
-    if (roll < 0.25 || dispatches.length === 0) {
-      const agent = pick(AGENTS);
-      const max = AGENT_MAX[agent]!;
-      const d: SimDispatch = {
-        callID: `call_${seed}_${dispatches.length}`,
-        parent: pick(["ses_p1", "ses_p2"]),
-        agent,
-        grant: { actions: new Set(max.filter(() => rand() < 0.6)), notes: [`n${dispatches.length % 3}`], workRoot: pick([ROOT, OTHER_ROOT, null]) },
-        budget: 10 + Math.floor(rand() * 110),
-        decisionID: pick(["dec_shared", `dec_${dispatches.length}`]),
-        registeredAt: clock,
-        live: true,
-      };
-      dispatches.push(d);
-      byCall.set(d.callID, d);
-      registerPending({
-        parentSessionID: d.parent, callID: d.callID, agent: d.agent, description: "task", nonce: d.callID,
-        grant: d.grant, budget: d.budget, decisionID: d.decisionID, registeredAt: d.registeredAt,
-      });
-    } else if (roll < 0.5) {
-      const dispatch = pick(dispatches);
-      const mode = pick(["title", "first", "none"] as const);
-      const child: SimChild = { id: `ses_c${seed}_${children.length}`, dispatch, mode, results: [], lookups: 0, gate: deferred<Session>() };
-      children.push(child);
-      const lookupFn: SessionLookup = () => { child.lookups++; return child.gate!.promise; };
-      const calls = rand() < 0.3 ? 2 : 1; // a second plugin hook asking at the same time
-      for (let i = 0; i < calls; i++) {
-        const index = child.results.push(undefined) - 1;
-        void bind(child.id, lookupFn, { localFallback: fallback }).then((b) => { child.results[index] = b; });
-      }
-    } else if (roll < 0.7) {
-      const waiting = children.filter((c) => c.gate !== undefined);
-      if (waiting.length === 0) continue;
-      const child = pick(waiting);
-      const want = expectedBinding(child, dispatches, clock);
-      child.ownLiveAtDecision = child.dispatch.live && clock - child.dispatch.registeredAt < PENDING_TTL_MS;
-      const gate = child.gate!;
-      child.gate = undefined;
-      gate.resolve({
-        parentID: child.dispatch.parent,
-        agent: child.dispatch.agent,
-        title: child.mode === "title" ? `task${nonceTitleSuffix(child.dispatch.callID)}` : "task",
-        firstText: child.mode === "first" ? `You are a subagent.\n${noncePromptLine(child.dispatch.callID)}` : "You are a subagent.",
-      });
-      await drain();
-      expect(child.lookups).toBe(1);
-      const [first, ...rest] = child.results;
-      expect(first).toBeDefined();
-      for (const other of rest) expect(other).toEqual(first);
-      const { actions: wantActions, workRoot, ...wantRest } = want;
-      expect({ ...first!, grant: undefined }).toEqual({ ...wantRest, grant: undefined });
-      expect(sortActions(first!.grant.actions)).toEqual(wantActions);
-      expect(first!.grant.workRoot).toBe(workRoot);
-      check(child, first!);
-      child.cached = first;
-    } else if (roll < 0.85) {
+    if (roll < 0.22 || dispatches.length === 0) register();
+    else if (roll < 0.42) spawn();
+    else if (roll < 0.62) await release();
+    else if (roll < 0.72) {
       const live = dispatches.filter((d) => d.live);
-      if (live.length === 0) continue;
-      const d = pick(live);
-      d.live = false;
-      evict(d.callID);
-    } else if (roll < 0.88) {
-      const parent = pick(["ses_p1", "ses_p2"]);
+      if (live.length > 0) {
+        const d = pick(live);
+        d.live = false;
+        evictCall(d.parent, d.callID);
+      }
+    } else if (roll < 0.74) {
+      const slot = pick(["p1", "p2"]);
+      const parent = parentOf(slot);
       for (const d of dispatches) if (d.parent === parent) d.live = false;
-      for (const c of children) if (c.dispatch.parent === parent) c.cached = undefined;
       evict(parent);
-    } else if (roll < 0.95) {
-      clock += rand() < 0.1 ? PENDING_TTL_MS : 1_000 + Math.floor(rand() * 120_000);
-    } else {
-      const decided = children.filter((c) => c.cached !== undefined && c.gate === undefined);
-      if (decided.length === 0) continue;
-      const child = pick(decided);
-      const again = await bind(child.id, () => { throw new Error("a cached binding needs no lookup"); });
-      expect(again).toEqual(child.cached);
-    }
+      generation[slot]!++;
+    } else if (roll < 0.76) {
+      const decided = children.filter((c) => c.decided);
+      if (decided.length > 0) evict(pick(decided).id);
+    } else if (roll < 0.8) {
+      const decided = children.filter((c) => c.decided);
+      if (decided.length > 0) dropBindingCacheForTests(pick(decided).id);
+    } else if (roll < 0.86) await rebind();
+    else if (roll < 0.9) widenSome();
+    else if (roll < 0.94) ladder();
+    else clock += rand() < 0.1 ? PENDING_TTL_MS : 1_000 + Math.floor(rand() * 120_000);
   }
-  // Release whatever is still waiting, so no promise outlives the run.
   for (const child of children) child.gate?.resolve(undefined);
   await drain();
-  return checked;
 }
 
 describe("property: binding ambiguity never widens authority (I5)", () => {
-  it("holds over random interleavings of dispatches, children, completions, deletions and time", async () => {
-    let checked = 0;
-    for (let seed = 1; seed <= 300; seed++) {
+  it("holds over random interleavings: markers, forgeries, disagreement, cache loss, call-id reuse, widening", async () => {
+    const stats: Stats = { checked: 0, exact: 0, intersection: 0, unknown: 0, cleanLive: 0, cleanExact: 0, widened: 0, residual: 0 };
+    for (let seed = 1; seed <= 400; seed++) {
       resetBindingRegistryForTests();
-      checked += await runInterleaving(seed, 80);
+      authority.resetAuthorityForTests();
+      await runInterleaving(seed, 90, stats, seed % 2 === 0);
     }
-    expect(checked).toBeGreaterThan(1000);
-  }, 60_000);
+    expect(stats.checked).toBeGreaterThan(2000);
+    expect(stats.exact).toBeGreaterThan(200);
+    expect(stats.intersection).toBeGreaterThan(20);
+    expect(stats.unknown).toBeGreaterThan(200);
+    expect(stats.widened).toBeGreaterThan(100);
+    // Non-vacuity: a clean child of a pending dispatch binds exactly (only a planted-marker theft can stop it).
+    expect(stats.cleanLive).toBeGreaterThan(100);
+    expect(stats.cleanExact / stats.cleanLive).toBeGreaterThan(0.9);
+    // The unguaranteed cases stay a small share; they exist because the generator also plants markers in
+    // marker-less children and runs the nonce-less counting fallback after a child's own dispatch ended.
+    // Half the seeds run the nonce-less fallback, which dominates this share.
+    expect(stats.residual).toBeGreaterThan(0);
+    expect(stats.residual).toBeLessThan(stats.checked / 5);
+  }, 120_000);
+});
+
+it("LOCAL_ACTIONS is the local class", () => {
+  expect(LOCAL_ACTIONS).toEqual(LOCAL);
 });
