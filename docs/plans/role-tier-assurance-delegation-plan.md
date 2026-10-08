@@ -1145,6 +1145,22 @@ prompt (§0.2.3).
   `globalconfig`, `userconfig` or `prefix` is refused. P1.1 — role specs live in code (`SHIPPED_ROLE_SPECS`), not in
   `tiers.json`; role-table notices carry the prefix `roles mode (OpenCode v2 only): `; roles whose range a preset's
   cost order inverts are disabled. Every P2.1 handoff is listed in the phase reports.
+- R8 (Wave 2, 2026-10-08; reports `docs\qa\role-tier\phase-p2{1..3}.md`). (1) Roles mode is decided at plugin
+  START: role agents, `router_run`, `router_request_authority` and the work-root resolver are registered only when the
+  plugin started with `routing.delegation: "roles"`; a runtime switch logs a restart notice and registers nothing.
+  Therefore **DF-2 has a second restart stop after the override migration** (DF-2 step 2 → restart → step 3), and
+  the kill switch (pre-DF-2 backup) also needs a restart to unregister the role tools; P3.4 likewise. (2) Steps for
+  role agents = 2 × top role budget + `REFUSAL_CAP` + 5. (3) The router raises the tier itself after a verification
+  FAIL of a role child (raise-only floor on that child's next resume); the orchestrator never sets `tier=` or `model`.
+  (4) Authority widens on resume only for an exact (nonce) binding; unknown bindings drop the request with a notice.
+  (5) Role children may not call `subagent` or any tool outside the role action classes. (6) Reading roles keep the
+  host's inherited `external_directory` allow for its tool-output folder; the router narrows it per session to files
+  named by the host's structured `outputPaths` (never free text). (7) Residual risks: host `grep` (ripgrep) may follow
+  links inside the work root; a role's read-only cap exists only when the dispatch carries `CAP:N`/`CAP:none`.
+  (8) §4 deviations accepted: P2.2 edited `src\routing\outcomes\stats.ts`, `src\routing\outcomes\index.ts` and
+  `docs\ROUTING_ENGINE.md`; P2.3 edited P2.1's own tests where I9/A7 required it; the advisor finding is named
+  `roles-on-legacy-host` (docs-drift ids cannot contain digits). (9) DF-1 self-test finding fixed on `rta/fx2`
+  (budget claim read from the return prefix; summary-before-claim still counts).
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |
