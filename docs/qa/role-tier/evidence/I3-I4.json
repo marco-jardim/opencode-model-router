@@ -1,0 +1,1990 @@
+{
+  "test": "I3-I4",
+  "recordedAt": "2026-10-08T22:31:20.075Z",
+  "observed": {
+    "perParent": [
+      {
+        "parent": "none",
+        "explorer": {
+          "label": "I3 explorer (none)",
+          "callID": "toolu_smoke_1",
+          "childID": "ses_ee25c7544ffewBsTK7M73NbBDk",
+          "parentText": "<subagent sessionID=\"ses_ee25c7544ffewBsTK7M73NbBDk\" state=\"completed\">\nDONE: attempted the scripted calls\n</subagent>\nDONE: attempted the scripted calls",
+          "firstUser": "{\"id\":\"msg_11da38b57002ftq649H7O7Qnws\",\"time\":{\"created\":1791498619764},\"text\":\"You are a subagent spawned by another session.\\nTASK: look around the work root\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\\\\\\e0.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"execute\\\",\\\"input\\\":{\\\"code\\\":\\\"return await tools.opencode.session_rename({ title: 'I3 renamed by execute none' })\\\"}},{\\\"tool\\\":\\\"subagent\\\",\\\"input\\\":{\\\"agent\\\":\\\"explorer\\\",\\\"description\\\":\\\"I3 nested none\\\",\\\"prompt\\\":\\\"nested\\\"}},{\\\"tool\\\":\\\"shell\\\",\\\"input\\\":{\\\"command\\\":\\\"node -e \\\\\\\"require('fs').writeFileSync('shell-none.txt','x')\\\\\\\"\\\",\\\"description\\\":\\\"smoke shell attempt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\other\\\\\\\\x.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\\\\\\m.txt\\\"}},{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"probe-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\\\\\\m.txt\\\"}}],\\\"final\\\":\\\"DONE: attempted the scripted calls\\\"}\\nOMR_NONCE=5ddadae0-d3fe-4bd9-a475-78539ac89d11\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\e0.txt",
+                "oldString": "main",
+                "newString": "edited"
+              },
+              "tool": "edit",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: edit is not in this dispatch's grant (read, glob, grep, router_git)"
+            },
+            {
+              "text": "",
+              "input": {
+                "code": "return await tools.opencode.session_rename({ title: 'I3 renamed by execute none' })"
+              },
+              "tool": "execute",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: `execute` (Code Mode) is never available to a role agent"
+            },
+            {
+              "text": "",
+              "input": {
+                "agent": "explorer",
+                "description": "I3 nested none",
+                "prompt": "nested"
+              },
+              "tool": "subagent",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: subagent is outside every role's authority"
+            },
+            {
+              "text": "",
+              "input": {
+                "command": "node -e \"require('fs').writeFileSync('shell-none.txt','x')\"",
+                "description": "smoke shell attempt"
+              },
+              "tool": "shell",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: shell is outside every role's authority"
+            },
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\other\\x.txt"
+              },
+              "tool": "read",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\other\\x.txt is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1 (use an absolute path inside it)"
+            },
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\m.txt"
+              },
+              "tool": "read",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\m.txt is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1 (use an absolute path inside it)"
+            },
+            {
+              "text": "",
+              "input": {
+                "script": "probe-marker",
+                "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1"
+              },
+              "tool": "router_run",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: router_run is not in this dispatch's grant (read, glob, grep, router_git)"
+            },
+            {
+              "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\m.txt, lines 1-1\n1: main",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\m.txt"
+              },
+              "tool": "read",
+              "status": "completed"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 2,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 3,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 4,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 5,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 6,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 7,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 8,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 9,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 10,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "text",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            }
+          ],
+          "evaluates": [
+            {
+              "action": "external_directory",
+              "resources": [
+                "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-i3-QVEloI/wt-1/*"
+              ],
+              "effectIn": "allow",
+              "effectOut": "allow"
+            },
+            {
+              "action": "read",
+              "resources": [
+                "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-i3-QVEloI/wt-1/m.txt"
+              ],
+              "effectIn": "allow",
+              "effectOut": "allow"
+            }
+          ],
+          "parentStatus": "completed",
+          "agent": "explorer",
+          "title": "I3 explorer none [nonce 5ddadae0-d3fe-4bd9-a475-78539ac89d11]",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk",
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ]
+        },
+        "runner": {
+          "label": "I3 runner (none)",
+          "callID": "toolu_smoke_12",
+          "childID": "ses_ee25c63b4ffeBC7fpjdZ6qsvtS",
+          "parentText": "<subagent sessionID=\"ses_ee25c63b4ffeBC7fpjdZ6qsvtS\" state=\"completed\">\nDONE: ran\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: ran\n\n[router ✓ verified: checker]",
+          "firstUser": "{\"id\":\"msg_11da39ced0013o5aII6U1apMFz\",\"time\":{\"created\":1791498624255},\"text\":\"You are a subagent spawned by another session.\\nTASK: run the smoke marker\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\"}},{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\"}}],\\\"final\\\":\\\"DONE: ran\\\"}\\nOMR_NONCE=81fa07fd-e51f-4829-91dd-6b32d062dbe1\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "[router_run] error: refused: cwd is not this dispatch's work root (<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1)",
+              "input": {
+                "script": "smoke-marker",
+                "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project"
+              },
+              "tool": "router_run",
+              "status": "completed"
+            },
+            {
+              "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.6 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",
+              "input": {
+                "script": "smoke-marker",
+                "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1"
+              },
+              "tool": "router_run",
+              "status": "completed"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 13,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_run"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 14,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_run"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 15,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_run"
+              ],
+              "reply": "text",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            }
+          ],
+          "evaluates": [],
+          "parentStatus": "completed",
+          "agent": "runner",
+          "title": "I3 runner none [nonce 81fa07fd-e51f-4829-91dd-6b32d062dbe1]",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk"
+        },
+        "researcher": {
+          "label": "I4 researcher (none)",
+          "callID": "toolu_smoke_18",
+          "childID": "ses_ee25c4598ffeXeaEFseX07dRAA",
+          "parentText": "<subagent sessionID=\"ses_ee25c4598ffeXeaEFseX07dRAA\" state=\"completed\">\nDONE: attempted\n</subagent>\nDONE: attempted",
+          "firstUser": "{\"id\":\"msg_11da3bb1100156yg2ZlHfwBWAW\",\"time\":{\"created\":1791498631972},\"text\":\"You are a subagent spawned by another session.\\nTASK: look up the split semantics\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\\\\\\m.txt\\\"}},{\\\"tool\\\":\\\"glob\\\",\\\"input\\\":{\\\"pattern\\\":\\\"*.txt\\\",\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\"}},{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\\\\\\e1.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}}],\\\"final\\\":\\\"DONE: attempted\\\"}\\nOMR_NONCE=fe77d13c-1e56-4b0d-9391-8cb6cb75f611\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\m.txt"
+              },
+              "tool": "read",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent researcher in this dispatch: read is not in this dispatch's grant (webfetch, websearch, context7)"
+            },
+            {
+              "text": "",
+              "input": {
+                "pattern": "*.txt",
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project"
+              },
+              "tool": "glob",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent researcher in this dispatch: glob is not in this dispatch's grant (webfetch, websearch, context7)"
+            },
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\e1.txt",
+                "oldString": "main",
+                "newString": "edited"
+              },
+              "tool": "edit",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent researcher in this dispatch: edit is not in this dispatch's grant (webfetch, websearch, context7)"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 19,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 20,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 21,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 22,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "text",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            }
+          ],
+          "evaluates": [],
+          "parentStatus": "completed",
+          "agent": "researcher",
+          "title": "I3 researcher none [nonce fe77d13c-1e56-4b0d-9391-8cb6cb75f611]",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk"
+        },
+        "implementer": {
+          "label": "I4 implementer (none)",
+          "callID": "toolu_smoke_24",
+          "childID": "ses_ee25c39dfffe8vrvEiG98AvuN0",
+          "parentText": "<subagent sessionID=\"ses_ee25c39dfffe8vrvEiG98AvuN0\" state=\"completed\">\nDONE: attempted\n</subagent>\nDONE: attempted",
+          "firstUser": "{\"id\":\"msg_11da3c6d5001SIVQuxsf0261Y7\",\"time\":{\"created\":1791498634993},\"text\":\"You are a subagent spawned by another session.\\nTASK: tidy parser.ts\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"webfetch\\\",\\\"input\\\":{\\\"url\\\":\\\"https://example.com/\\\",\\\"format\\\":\\\"text\\\"}},{\\\"tool\\\":\\\"websearch\\\",\\\"input\\\":{\\\"query\\\":\\\"opencode roles\\\"}},{\\\"tool\\\":\\\"execute\\\",\\\"input\\\":{\\\"code\\\":\\\"return 1\\\"}}],\\\"final\\\":\\\"DONE: attempted\\\"}\\nOMR_NONCE=232d7c62-8fd3-4d21-819a-ad69c888c5ca\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "",
+              "input": {
+                "url": "https://example.com/",
+                "format": "text"
+              },
+              "tool": "webfetch",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent implementer in this dispatch: webfetch is not in this dispatch's grant (read, glob, grep, router_git, edit)"
+            },
+            {
+              "text": "",
+              "input": {
+                "query": "opencode roles"
+              },
+              "tool": "websearch",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent implementer in this dispatch: websearch is not in this dispatch's grant (read, glob, grep, router_git, edit)"
+            },
+            {
+              "text": "",
+              "input": {
+                "code": "return 1"
+              },
+              "tool": "execute",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent implementer in this dispatch: `execute` (Code Mode) is never available to a role agent"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 25,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 26,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 27,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 28,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "text",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            }
+          ],
+          "evaluates": [],
+          "parentStatus": "completed",
+          "agent": "implementer",
+          "title": "I3 implementer none [nonce 232d7c62-8fd3-4d21-819a-ad69c888c5ca]",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk"
+        },
+        "grandchildren": [],
+        "titleAfter": "I3 explorer none [nonce 5ddadae0-d3fe-4bd9-a475-78539ac89d11]",
+        "secretReachedProvider": false,
+        "disk": {
+          "e0": "main\n",
+          "e1Main": "main\n",
+          "shellRan": false,
+          "probeMarker": false,
+          "wt1Marker": true,
+          "mainMarker": false
+        }
+      },
+      {
+        "parent": "allow-all",
+        "explorer": {
+          "label": "I3 explorer (allow-all)",
+          "callID": "toolu_smoke_30",
+          "childID": "ses_ee25c2d72ffe3hTIIZRzI3seHr",
+          "parentText": "<subagent sessionID=\"ses_ee25c2d72ffe3hTIIZRzI3seHr\" state=\"completed\">\nDONE: attempted the scripted calls\n</subagent>\nDONE: attempted the scripted calls",
+          "firstUser": "{\"id\":\"msg_11da3d336001aPFucDLZZoTcrn\",\"time\":{\"created\":1791498638159},\"text\":\"You are a subagent spawned by another session.\\nTASK: look around the work root\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\\\\\\e0.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"execute\\\",\\\"input\\\":{\\\"code\\\":\\\"return await tools.opencode.session_rename({ title: 'I3 renamed by execute allow-all' })\\\"}},{\\\"tool\\\":\\\"subagent\\\",\\\"input\\\":{\\\"agent\\\":\\\"explorer\\\",\\\"description\\\":\\\"I3 nested allow-all\\\",\\\"prompt\\\":\\\"nested\\\"}},{\\\"tool\\\":\\\"shell\\\",\\\"input\\\":{\\\"command\\\":\\\"node -e \\\\\\\"require('fs').writeFileSync('shell-allow-all.txt','x')\\\\\\\"\\\",\\\"description\\\":\\\"smoke shell attempt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\other\\\\\\\\x.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\\\\\\m.txt\\\"}},{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"probe-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\\\\\\m.txt\\\"}}],\\\"final\\\":\\\"DONE: attempted the scripted calls\\\"}\\nOMR_NONCE=d7f86d3d-4c4d-4694-941b-29db07edad46\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\e0.txt",
+                "oldString": "main",
+                "newString": "edited"
+              },
+              "tool": "edit",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: edit is not in this dispatch's grant (read, glob, grep, router_git)"
+            },
+            {
+              "text": "",
+              "input": {
+                "code": "return await tools.opencode.session_rename({ title: 'I3 renamed by execute allow-all' })"
+              },
+              "tool": "execute",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: `execute` (Code Mode) is never available to a role agent"
+            },
+            {
+              "text": "",
+              "input": {
+                "agent": "explorer",
+                "description": "I3 nested allow-all",
+                "prompt": "nested"
+              },
+              "tool": "subagent",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: subagent is outside every role's authority"
+            },
+            {
+              "text": "",
+              "input": {
+                "command": "node -e \"require('fs').writeFileSync('shell-allow-all.txt','x')\"",
+                "description": "smoke shell attempt"
+              },
+              "tool": "shell",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: shell is outside every role's authority"
+            },
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\other\\x.txt"
+              },
+              "tool": "read",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\other\\x.txt is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1 (use an absolute path inside it)"
+            },
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\m.txt"
+              },
+              "tool": "read",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\m.txt is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1 (use an absolute path inside it)"
+            },
+            {
+              "text": "",
+              "input": {
+                "script": "probe-marker",
+                "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1"
+              },
+              "tool": "router_run",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent explorer in this dispatch: router_run is not in this dispatch's grant (read, glob, grep, router_git)"
+            },
+            {
+              "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\m.txt, lines 1-1\n1: main",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\m.txt"
+              },
+              "tool": "read",
+              "status": "completed"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 31,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 32,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 33,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 34,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 35,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 36,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 37,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 38,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 39,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status"
+              ],
+              "reply": "text",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            }
+          ],
+          "evaluates": [
+            {
+              "action": "external_directory",
+              "resources": [
+                "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-i3-QVEloI/wt-1/*"
+              ],
+              "effectIn": "allow",
+              "effectOut": "allow"
+            },
+            {
+              "action": "read",
+              "resources": [
+                "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-i3-QVEloI/wt-1/m.txt"
+              ],
+              "effectIn": "allow",
+              "effectOut": "allow"
+            }
+          ],
+          "parentStatus": "completed",
+          "agent": "explorer",
+          "title": "I3 explorer allow-all [nonce d7f86d3d-4c4d-4694-941b-29db07edad46]",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf",
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ]
+        },
+        "runner": {
+          "label": "I3 runner (allow-all)",
+          "callID": "toolu_smoke_41",
+          "childID": "ses_ee25c1aebffeQm5Psw3NPlNB6w",
+          "parentText": "<subagent sessionID=\"ses_ee25c1aebffeQm5Psw3NPlNB6w\" state=\"completed\">\nDONE: ran\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: ran\n\n[router ✓ verified: checker]",
+          "firstUser": "{\"id\":\"msg_11da3e5bf0013j1BUYgm4k5XC5\",\"time\":{\"created\":1791498642901},\"text\":\"You are a subagent spawned by another session.\\nTASK: run the smoke marker\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\"}},{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\wt-1\\\"}}],\\\"final\\\":\\\"DONE: ran\\\"}\\nOMR_NONCE=eeb676f0-b08f-464a-814b-c3e3ba750c48\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "[router_run] error: refused: cwd is not this dispatch's work root (<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1)",
+              "input": {
+                "script": "smoke-marker",
+                "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project"
+              },
+              "tool": "router_run",
+              "status": "completed"
+            },
+            {
+              "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.4 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",
+              "input": {
+                "script": "smoke-marker",
+                "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1"
+              },
+              "tool": "router_run",
+              "status": "completed"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 42,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_run"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 43,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_run"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 44,
+              "toolNames": [
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_run"
+              ],
+              "reply": "text",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            }
+          ],
+          "evaluates": [],
+          "parentStatus": "completed",
+          "agent": "runner",
+          "title": "I3 runner allow-all [nonce eeb676f0-b08f-464a-814b-c3e3ba750c48]",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf"
+        },
+        "researcher": {
+          "label": "I4 researcher (allow-all)",
+          "callID": "toolu_smoke_47",
+          "childID": "ses_ee25c0b17ffer7evGl2326fAvB",
+          "parentText": "<subagent sessionID=\"ses_ee25c0b17ffer7evGl2326fAvB\" state=\"completed\">\nDONE: attempted\n</subagent>\nDONE: attempted",
+          "firstUser": "{\"id\":\"msg_11da3f5b80019xb8iYVRbUfzpZ\",\"time\":{\"created\":1791498647021},\"text\":\"You are a subagent spawned by another session.\\nTASK: look up the split semantics\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\\\\\\m.txt\\\"}},{\\\"tool\\\":\\\"glob\\\",\\\"input\\\":{\\\"pattern\\\":\\\"*.txt\\\",\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\"}},{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-i3-QVEloI\\\\\\\\project\\\\\\\\e1.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}}],\\\"final\\\":\\\"DONE: attempted\\\"}\\nOMR_NONCE=cdad98f0-d095-480e-98db-5b64a624fde0\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\m.txt"
+              },
+              "tool": "read",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent researcher in this dispatch: read is not in this dispatch's grant (webfetch, websearch, context7)"
+            },
+            {
+              "text": "",
+              "input": {
+                "pattern": "*.txt",
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project"
+              },
+              "tool": "glob",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent researcher in this dispatch: glob is not in this dispatch's grant (webfetch, websearch, context7)"
+            },
+            {
+              "text": "",
+              "input": {
+                "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\e1.txt",
+                "oldString": "main",
+                "newString": "edited"
+              },
+              "tool": "edit",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent researcher in this dispatch: edit is not in this dispatch's grant (webfetch, websearch, context7)"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 48,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 49,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 50,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "tool",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            },
+            {
+              "seq": 51,
+              "toolNames": [
+                "webfetch",
+                "websearch"
+              ],
+              "reply": "text",
+              "effort": "low",
+              "catalogModel": "anthropic/claude-sonnet-5-5#low",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "fast"
+            }
+          ],
+          "evaluates": [],
+          "parentStatus": "completed",
+          "agent": "researcher",
+          "title": "I3 researcher allow-all [nonce cdad98f0-d095-480e-98db-5b64a624fde0]",
+          "model": "anthropic/claude-sonnet-5-5#low",
+          "parentID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf"
+        },
+        "implementer": {
+          "label": "I4 implementer (allow-all)",
+          "callID": "toolu_smoke_53",
+          "childID": "ses_ee25bfc73ffe5IAOLEAEFvC5bw",
+          "parentText": "<subagent sessionID=\"ses_ee25bfc73ffe5IAOLEAEFvC5bw\" state=\"completed\">\nDONE: attempted\n</subagent>\nDONE: attempted",
+          "firstUser": "{\"id\":\"msg_11da404880011PCVh9GdoYpuyv\",\"time\":{\"created\":1791498650789},\"text\":\"You are a subagent spawned by another session.\\nTASK: tidy parser.ts\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"webfetch\\\",\\\"input\\\":{\\\"url\\\":\\\"https://example.com/\\\",\\\"format\\\":\\\"text\\\"}},{\\\"tool\\\":\\\"websearch\\\",\\\"input\\\":{\\\"query\\\":\\\"opencode roles\\\"}},{\\\"tool\\\":\\\"execute\\\",\\\"input\\\":{\\\"code\\\":\\\"return 1\\\"}}],\\\"final\\\":\\\"DONE: attempted\\\"}\\nOMR_NONCE=508607fd-dcc7-43ff-b57c-b047af1bfd03\",\"type\":\"user\"}",
+          "states": [
+            {
+              "text": "",
+              "input": {
+                "url": "https://example.com/",
+                "format": "text"
+              },
+              "tool": "webfetch",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent implementer in this dispatch: webfetch is not in this dispatch's grant (read, glob, grep, router_git, edit)"
+            },
+            {
+              "text": "",
+              "input": {
+                "query": "opencode roles"
+              },
+              "tool": "websearch",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent implementer in this dispatch: websearch is not in this dispatch's grant (read, glob, grep, router_git, edit)"
+            },
+            {
+              "text": "",
+              "input": {
+                "code": "return 1"
+              },
+              "tool": "execute",
+              "status": "error",
+              "errorType": "unknown",
+              "errorMessage": "[router] Refused for role agent implementer in this dispatch: `execute` (Code Mode) is never available to a role agent"
+            }
+          ],
+          "requests": [
+            {
+              "seq": 54,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 55,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 56,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "tool",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            },
+            {
+              "seq": 57,
+              "toolNames": [
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "router_git_blame",
+                "router_git_diff",
+                "router_git_log",
+                "router_git_ls_files",
+                "router_git_show",
+                "router_git_status",
+                "router_request_authority",
+                "write"
+              ],
+              "reply": "text",
+              "effort": "medium",
+              "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+              "wireModel": "claude-sonnet-5-5",
+              "tier": "medium"
+            }
+          ],
+          "evaluates": [],
+          "parentStatus": "completed",
+          "agent": "implementer",
+          "title": "I3 implementer allow-all [nonce 508607fd-dcc7-43ff-b57c-b047af1bfd03]",
+          "model": "anthropic/claude-sonnet-5-5#medium",
+          "parentID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf"
+        },
+        "grandchildren": [],
+        "titleAfter": "I3 explorer allow-all [nonce d7f86d3d-4c4d-4694-941b-29db07edad46]",
+        "secretReachedProvider": false,
+        "disk": {
+          "e0": "main\n",
+          "e1Main": "main\n",
+          "shellRan": false,
+          "probeMarker": false,
+          "wt1Marker": true,
+          "mainMarker": false
+        }
+      }
+    ],
+    "control": {
+      "agent": "smoke-control",
+      "states": [
+        {
+          "text": "(no output)\n\n[⚠ GUARD:anti_self_script] [budget 0/25 | deliverable=n/a | reads_since_produce=0] NEXT: take a producing action (write/edit) or emit your final answer",
+          "input": {
+            "command": "node -e \"require('fs').writeFileSync('shell-control.txt','x')\"",
+            "description": "smoke shell control"
+          },
+          "tool": "shell",
+          "status": "completed"
+        },
+        {
+          "text": "{\n  \"sessionID\": \"ses_ee25bec01ffed1vrfmTzDdFyEi\",\n  \"title\": \"I3 control renamed by execute\"\n}",
+          "input": {
+            "code": "return await tools.opencode.session_rename({ title: 'I3 control renamed by execute' })"
+          },
+          "tool": "execute",
+          "status": "completed"
+        }
+      ],
+      "title": "I3 control renamed by execute",
+      "shellControlRan": true
+    },
+    "records": [
+      {
+        "agent": "general",
+        "allowed": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "router_git_blame",
+          "router_git_diff",
+          "router_git_log",
+          "router_git_ls_files",
+          "router_git_show",
+          "router_git_status",
+          "router_run"
+        ],
+        "classes": [
+          [
+            "glob",
+            "local"
+          ],
+          [
+            "grep",
+            "local"
+          ],
+          [
+            "router_git_status",
+            "local"
+          ],
+          [
+            "router_git_log",
+            "local"
+          ],
+          [
+            "router_git_diff",
+            "local"
+          ],
+          [
+            "router_git_show",
+            "local"
+          ],
+          [
+            "router_git_blame",
+            "local"
+          ],
+          [
+            "router_git_ls_files",
+            "local"
+          ],
+          [
+            "edit",
+            "write"
+          ],
+          [
+            "router_run",
+            "exec"
+          ],
+          [
+            "read",
+            "local"
+          ]
+        ]
+      },
+      {
+        "agent": "explorer",
+        "allowed": [
+          "glob",
+          "grep",
+          "read",
+          "router_git_blame",
+          "router_git_diff",
+          "router_git_log",
+          "router_git_ls_files",
+          "router_git_show",
+          "router_git_status"
+        ],
+        "classes": [
+          [
+            "glob",
+            "local"
+          ],
+          [
+            "grep",
+            "local"
+          ],
+          [
+            "router_git_status",
+            "local"
+          ],
+          [
+            "router_git_log",
+            "local"
+          ],
+          [
+            "router_git_diff",
+            "local"
+          ],
+          [
+            "router_git_show",
+            "local"
+          ],
+          [
+            "router_git_blame",
+            "local"
+          ],
+          [
+            "router_git_ls_files",
+            "local"
+          ],
+          [
+            "read",
+            "local"
+          ]
+        ]
+      },
+      {
+        "agent": "researcher",
+        "allowed": [
+          "webfetch",
+          "websearch"
+        ],
+        "classes": [
+          [
+            "webfetch",
+            "egress"
+          ],
+          [
+            "websearch",
+            "egress"
+          ]
+        ]
+      },
+      {
+        "agent": "runner",
+        "allowed": [
+          "glob",
+          "grep",
+          "read",
+          "router_git_blame",
+          "router_git_diff",
+          "router_git_log",
+          "router_git_ls_files",
+          "router_git_show",
+          "router_git_status",
+          "router_run"
+        ],
+        "classes": [
+          [
+            "glob",
+            "local"
+          ],
+          [
+            "grep",
+            "local"
+          ],
+          [
+            "router_git_status",
+            "local"
+          ],
+          [
+            "router_git_log",
+            "local"
+          ],
+          [
+            "router_git_diff",
+            "local"
+          ],
+          [
+            "router_git_show",
+            "local"
+          ],
+          [
+            "router_git_blame",
+            "local"
+          ],
+          [
+            "router_git_ls_files",
+            "local"
+          ],
+          [
+            "router_run",
+            "exec"
+          ],
+          [
+            "read",
+            "local"
+          ]
+        ]
+      },
+      {
+        "agent": "implementer",
+        "allowed": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "router_git_blame",
+          "router_git_diff",
+          "router_git_log",
+          "router_git_ls_files",
+          "router_git_show",
+          "router_git_status",
+          "router_run"
+        ],
+        "classes": [
+          [
+            "glob",
+            "local"
+          ],
+          [
+            "grep",
+            "local"
+          ],
+          [
+            "router_git_status",
+            "local"
+          ],
+          [
+            "router_git_log",
+            "local"
+          ],
+          [
+            "router_git_diff",
+            "local"
+          ],
+          [
+            "router_git_show",
+            "local"
+          ],
+          [
+            "router_git_blame",
+            "local"
+          ],
+          [
+            "router_git_ls_files",
+            "local"
+          ],
+          [
+            "edit",
+            "write"
+          ],
+          [
+            "router_run",
+            "exec"
+          ],
+          [
+            "read",
+            "local"
+          ]
+        ]
+      },
+      {
+        "agent": "reviewer",
+        "allowed": [
+          "glob",
+          "grep",
+          "read",
+          "router_git_blame",
+          "router_git_diff",
+          "router_git_log",
+          "router_git_ls_files",
+          "router_git_show",
+          "router_git_status",
+          "router_run"
+        ],
+        "classes": [
+          [
+            "glob",
+            "local"
+          ],
+          [
+            "grep",
+            "local"
+          ],
+          [
+            "router_git_status",
+            "local"
+          ],
+          [
+            "router_git_log",
+            "local"
+          ],
+          [
+            "router_git_diff",
+            "local"
+          ],
+          [
+            "router_git_show",
+            "local"
+          ],
+          [
+            "router_git_blame",
+            "local"
+          ],
+          [
+            "router_git_ls_files",
+            "local"
+          ],
+          [
+            "router_run",
+            "exec"
+          ],
+          [
+            "read",
+            "local"
+          ]
+        ]
+      },
+      {
+        "agent": "architect",
+        "allowed": [
+          "glob",
+          "grep",
+          "read",
+          "router_git_blame",
+          "router_git_diff",
+          "router_git_log",
+          "router_git_ls_files",
+          "router_git_show",
+          "router_git_status"
+        ],
+        "classes": [
+          [
+            "glob",
+            "local"
+          ],
+          [
+            "grep",
+            "local"
+          ],
+          [
+            "router_git_status",
+            "local"
+          ],
+          [
+            "router_git_log",
+            "local"
+          ],
+          [
+            "router_git_diff",
+            "local"
+          ],
+          [
+            "router_git_show",
+            "local"
+          ],
+          [
+            "router_git_blame",
+            "local"
+          ],
+          [
+            "router_git_ls_files",
+            "local"
+          ],
+          [
+            "read",
+            "local"
+          ]
+        ]
+      }
+    ],
+    "explorerExternal": [
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\project\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-1\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-2\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\wt-late-*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i3-QVEloI\\data\\opencode\\tool-output\\*",
+        "effect": "allow"
+      }
+    ],
+    "grants": [
+      {
+        "child": "ses_ee25c7544ffewBsTK7M73NbBDk",
+        "row": {
+          "decisionID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk:1791498619156:d606409b83237af6:1",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.58 ratio); role @explorer on fast in fast..medium",
+          "role": "explorer",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "child": "ses_ee25c63b4ffeBC7fpjdZ6qsvtS",
+        "row": {
+          "decisionID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk:1791498623691:d606409b83237af6:2",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.58 ratio); role @runner on fast in fast..medium [edit is outside this role — use `implementer`]",
+          "role": "runner",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git",
+            "router_run"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "child": "ses_ee25c4598ffeXeaEFseX07dRAA",
+        "row": {
+          "decisionID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk:1791498631368:d606409b83237af6:3",
+          "reason": "kept:margin: C(best)=0.0805 is not < (1 − 0.2)·C(chosen)=0.0734 usd; role @researcher on fast in fast..medium",
+          "role": "researcher",
+          "tier": "fast",
+          "grant": [
+            "context7",
+            "webfetch",
+            "websearch"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "low",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "child": "ses_ee25c39dfffe8vrvEiG98AvuN0",
+        "row": {
+          "decisionID": "ses_ee25c83a5ffeSAjQf3oHHFzYyk:1791498634376:d606409b83237af6:4",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0192 usd); role @implementer on medium in medium..heavy [default:clamp:floor]",
+          "role": "implementer",
+          "tier": "medium",
+          "grant": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [
+            "floor:authority"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "child": "ses_ee25c2d72ffe3hTIIZRzI3seHr",
+        "row": {
+          "decisionID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf:1791498637561:d606409b83237af6:5",
+          "reason": "switched: C(best)=0.1148 < (1 − 0.2)·C(chosen)=0.1337 usd; role @explorer on medium in fast..medium",
+          "role": "explorer",
+          "tier": "medium",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": true
+        }
+      },
+      {
+        "child": "ses_ee25c1aebffeQm5Psw3NPlNB6w",
+        "row": {
+          "decisionID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf:1791498642286:d606409b83237af6:6",
+          "reason": "kept:margin: C(best)=0.0415 is not < (1 − 0.2)·C(chosen)=0.0351 usd; role @runner on fast in fast..medium [edit is outside this role — use `implementer`]",
+          "role": "runner",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git",
+            "router_run"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "child": "ses_ee25c0b17ffer7evGl2326fAvB",
+        "row": {
+          "decisionID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf:1791498646329:d606409b83237af6:7",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0211 usd); role @researcher on fast in fast..medium",
+          "role": "researcher",
+          "tier": "fast",
+          "grant": [
+            "context7",
+            "webfetch",
+            "websearch"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "low",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "child": "ses_ee25bfc73ffe5IAOLEAEFvC5bw",
+        "row": {
+          "decisionID": "ses_ee25c30d3ffepl7Pg7EY1M8uCf:1791498649911:d606409b83237af6:8",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0296 usd); role @implementer on medium in medium..heavy [default:clamp:floor]",
+          "role": "implementer",
+          "tier": "medium",
+          "grant": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [
+            "floor:authority"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      }
+    ],
+    "unknownBindings": [],
+    "routerWarnings": [],
+    "hostErrors": [],
+    "providerErrors": []
+  }
+}

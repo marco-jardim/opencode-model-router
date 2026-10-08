@@ -29,6 +29,17 @@ import {
 const RUN = process.env.RUN_OC_SMOKE_ROUTING === "1";
 /** The tip of car/main this phase branched from. */
 const BASE_COMMIT = "71815eb";
+/**
+ * Base of scenario 6 ("v1 untouched"), repinned by #84 P3.1. The Phase 3.2 base 71815eb is stale: later releases changed the v1 suite and
+ * package.json on purpose (#67, #77, #83 among them), so "nothing under test/smoke changed since 71815eb" no longer holds and never will
+ * again. What must hold is that the v1 entry points do not change across #84 (plan §2.7, I8): the v1 suite files `smoke:keyless` runs,
+ * the smoke vitest config and its temp guard (`test/setup/smoke-tmp-guard.ts`), the v1 preflight and the `smoke:keyless` / `smoke:v1`
+ * scripts. Base: `bd1ecd1`, a commit on the #84 rta line (its parent is `66dcdff`), not on master. For every guarded path it is equivalent
+ * to master before #84 (`eeab36b`, the #83 merge) except one literal: #83 had left subagent-tiers.smoke.test.ts pinning FAST_MODEL to the
+ * old Sonnet fast tier, and bd1ecd1 aligned it with #83's Haiku fast tier (no v1 behaviour change). Every later #84 change must leave
+ * these paths byte-identical; new #84 smoke files (roles, role spikes), the v2 harness and this file are outside the guarded set.
+ */
+const V1_BASE_COMMIT = "bd1ecd1";
 /** `RESUME_END_WAIT_MS` of `src/index.ts`: the longest the delegate runner waits for a child's execution end after the child returned. */
 const RUNNER_END_WAIT_MS = 1_000;
 const d = RUN ? describe : describe.skip;
@@ -528,21 +539,26 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
       expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
     }
   }, 300_000);
-  it("6 v1 untouched: the files of the existing v1 smoke suite and the smoke:keyless script are byte-identical to the base commit", async () => {
-    await runScenario("6-v1-untouched", "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly two lines, `smoke:routing` and `smoke:v1`, the alias of `smoke:keyless` behind a preflight that fails clearly when `opencode` on PATH is not 1.x (QA-3.2-11, QA-3.2-R2-2). The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).", async s => {
+  it("6 v1 untouched: the v1 smoke suite, its config, its preflight and the smoke:keyless / smoke:v1 scripts are byte-identical to the v1 base (V1_BASE_COMMIT)", async () => {
+    await runScenario("6-v1-untouched", `The v1 entry points are unchanged since ${V1_BASE_COMMIT} (a commit on the #84 rta line, parent 66dcdff; for every guarded path it equals master before #84, eeab36b, except the FAST_MODEL literal of subagent-tiers.smoke.test.ts aligned with #83's Haiku fast tier — see V1_BASE_COMMIT): the v1 suite smoke:keyless runs (registration, subagent-tiers, deferred-catalog, depth-effort, the scripted-provider helper and its test, fetch-safe-port), vitest.smoke.config.ts, its temp guard test/setup/smoke-tmp-guard.ts, scripts/smoke-v1-preflight.mjs, and the package.json scripts smoke:keyless and smoke:v1 (the alias of smoke:keyless behind a preflight that fails clearly when \`opencode\` on PATH is not 1.x, QA-3.2-11, QA-3.2-R2-2). Repinned by #84 P3.1 from the stale Phase 3.2 base ${BASE_COMMIT}. Every other test/smoke change since the v1 base is recorded, not asserted.`, async s => {
       const git = (...args: string[]) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
-      const changed = git("diff", "--name-status", BASE_COMMIT, "--", "test/smoke", "vitest.smoke.config.ts").split(/\r?\n/).filter(Boolean);
-      const modified = changed.filter(line => !line.startsWith("A\t"));
-      const packageDiff = git("diff", "-U0", BASE_COMMIT, "--", "package.json").split(/\r?\n/).filter(line => /^[+-](?![+-])/.test(line));
       const v1Files = ["registration.smoke.test.ts", "subagent-tiers.smoke.test.ts", "deferred-catalog.smoke.test.ts", "depth-effort.smoke.test.ts", "helpers/scripted-provider.ts", "helpers/scripted-provider.test.ts", "helpers/fetch-safe-port.ts"];
-      s.observed.baseCommit = BASE_COMMIT;
-      s.observed.changedSinceBase = changed;
-      s.observed.modifiedOrDeleted = modified;
-      s.observed.packageJsonChangedLines = packageDiff;
-      s.observed.v1SuiteFiles = v1Files.map(file => ({ file, changed: git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) !== "" }));
-      s.observed.externalRun = "npm run smoke:keyless with OpenCode 1.18.34 first on PATH: 5 files passed, 27 tests passed, 11 skipped (the v2 describes); log in 6-smoke-keyless.log.txt";
-      const ok = modified.length === 0 && packageDiff.length === 2 && packageDiff.every(line => line.startsWith("+")) && packageDiff.some(line => line.includes("smoke:routing")) && packageDiff.some(line => line.includes("\"smoke:v1\": \"node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless\"")) && v1Files.every(file => git("diff", "--name-only", BASE_COMMIT, "--", `test/smoke/${file}`) === "");
-      s.verdict(ok, `${changed.length} path(s) changed under test/smoke since ${BASE_COMMIT} (all added: ${modified.length === 0}); package.json changed lines: ${packageDiff.join(" | ")}`);
+      const v1Paths = [...v1Files.map(file => `test/smoke/${file}`), "vitest.smoke.config.ts", "test/setup/smoke-tmp-guard.ts", "scripts/smoke-v1-preflight.mjs"];
+      const changedV1 = v1Paths.filter(file => git("diff", "--name-only", V1_BASE_COMMIT, "--", file) !== "");
+      const scriptsOf = (json: string): Record<string, unknown> => (JSON.parse(json) as { scripts?: Record<string, unknown> }).scripts ?? {};
+      const baseScripts = scriptsOf(git("show", `${V1_BASE_COMMIT}:package.json`));
+      const nowScripts = scriptsOf(await readFile(path.join(ROOT, "package.json"), "utf8"));
+      const v1Scripts = ["smoke:keyless", "smoke:v1"].map(name => ({ name, base: baseScripts[name], now: nowScripts[name] }));
+      s.observed.v1BaseCommit = V1_BASE_COMMIT;
+      s.observed.phase32BaseCommit = BASE_COMMIT;
+      s.observed.v1Paths = v1Paths.map(file => ({ file, changed: changedV1.includes(file) }));
+      s.observed.v1Scripts = v1Scripts;
+      s.observed.otherSmokeChangesSinceV1Base = git("diff", "--name-status", V1_BASE_COMMIT, "--", "test/smoke").split(/\r?\n/).filter(Boolean);
+      s.observed.externalRun = "npm run smoke:v1 (= preflight + smoke:keyless) with OpenCode 1.18.35 first on PATH: exit 0 (#84 P3.1, docs/qa/role-tier/phase-p31.md); earlier: smoke:keyless with OpenCode 1.18.34, 5 files passed (phase-3.2.md)";
+      const scriptsKept = v1Scripts.every(x => typeof x.base === "string" && x.base === x.now)
+        && nowScripts["smoke:v1"] === "node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless";
+      const ok = changedV1.length === 0 && scriptsKept;
+      s.verdict(ok, `v1 paths changed since ${V1_BASE_COMMIT}: ${changedV1.length === 0 ? "none" : changedV1.join(", ")}; smoke:keyless/smoke:v1 unchanged: ${scriptsKept}`);
     });
   }, 60_000);
   it("7 openai responses: effort delivery of a same-model variant change on the OpenAI Responses route (A7 / QA-0P-26)", async () => {

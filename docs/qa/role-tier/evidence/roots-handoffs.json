@@ -1,0 +1,861 @@
+{
+  "test": "roots-handoffs",
+  "recordedAt": "2026-10-08T22:33:42.428Z",
+  "observed": {
+    "explorerExternal": [
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-2\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-late-*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\*",
+        "effect": "allow"
+      }
+    ],
+    "formats": {
+      "worktree": [
+        {
+          "action": "external_directory",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/*"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/m.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "session": [
+        {
+          "action": "read",
+          "resources": [
+            "m.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "edit": [
+        {
+          "action": "external_directory",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/*"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "edit",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/e1.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "states": [
+        [
+          {
+            "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\m.txt, lines 1-1\n1: main",
+            "input": {
+              "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\m.txt"
+            },
+            "tool": "read",
+            "status": "completed"
+          }
+        ],
+        [
+          {
+            "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project\\m.txt, lines 1-1\n1: main",
+            "input": {
+              "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project\\m.txt"
+            },
+            "tool": "read",
+            "status": "completed"
+          }
+        ],
+        [
+          {
+            "text": "Edited <home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/e1.txt (1 replacement)",
+            "input": {
+              "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e1.txt",
+              "oldString": "main",
+              "newString": "edited"
+            },
+            "tool": "edit",
+            "status": "completed"
+          }
+        ]
+      ]
+    },
+    "search": [
+      {
+        "text": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\wt1-only-untracked.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\m.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\i9-retarget.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e7.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e6.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e5.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e4.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e3.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e2.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e1.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\e0.txt\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\big.txt",
+        "input": {
+          "pattern": "*.txt",
+          "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1"
+        },
+        "tool": "glob",
+        "status": "completed"
+      },
+      {
+        "text": "",
+        "input": {
+          "pattern": "*.txt",
+          "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\other"
+        },
+        "tool": "glob",
+        "status": "error",
+        "errorType": "unknown",
+        "errorMessage": "[router] Refused for role agent explorer in this dispatch: glob: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\other is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1 (use an absolute path inside it)"
+      },
+      {
+        "text": "",
+        "input": {
+          "pattern": "*.txt"
+        },
+        "tool": "glob",
+        "status": "error",
+        "errorType": "unknown",
+        "errorMessage": "[router] Refused for role agent explorer in this dispatch: glob: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1 (use an absolute path inside it)"
+      },
+      {
+        "text": "",
+        "input": {
+          "pattern": "main",
+          "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1",
+          "include": "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/other/*.txt"
+        },
+        "tool": "grep",
+        "status": "error",
+        "errorType": "unknown",
+        "errorMessage": "[router] Refused for role agent explorer in this dispatch: grep: the pattern <home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/other/*.txt reaches outside its search root (use a relative pattern and `path`)"
+      },
+      {
+        "text": "",
+        "input": {
+          "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project\\m.txt"
+        },
+        "tool": "read",
+        "status": "error",
+        "errorType": "unknown",
+        "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project\\m.txt is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1 (use an absolute path inside it)"
+      },
+      {
+        "text": " M e1.txt\n?? wt1-only-untracked.txt\n",
+        "input": {},
+        "tool": "router_git_status",
+        "status": "completed"
+      }
+    ],
+    "searchEvaluates": [
+      {
+        "action": "external_directory",
+        "resources": [
+          "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/*"
+        ],
+        "effectIn": "allow",
+        "effectOut": "allow"
+      },
+      {
+        "action": "glob",
+        "resources": [
+          "*.txt"
+        ],
+        "effectIn": "allow",
+        "effectOut": "allow"
+      }
+    ],
+    "withPaths": [],
+    "outputView": {
+      "successTypes": [
+        "session.tool.success"
+      ],
+      "anyWithPaths": [],
+      "ownPaths": [],
+      "savedPaths": [
+        "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta"
+      ],
+      "toolResultLengths": [
+        192517,
+        192517,
+        13175
+      ],
+      "truncationNotices": [
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)"
+      ],
+      "states": [
+        {
+          "tool": "grep",
+          "status": "completed",
+          "length": 192517,
+          "tail": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)"
+        },
+        {
+          "tool": "router_git_diff",
+          "status": "completed",
+          "length": 13175,
+          "tail": "7\n-l1968\n-l1969\n-l1970\n-l1971\n-l1972\n-l1973\n-l1974\n-l1975\n-l1976\n-l1977\n-l1978\n-l1979\n-l1980\n-l1981\n-l1982\n-l1983\n-l1984\n-l1985\n-l1986\n-l1987\n-l1988\n-l1989\n-l1990\n-l1991\n-l1992\n-l1993\n-l1994\n[showing lines 1-2000 of 9673; full output saved to <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta]"
+        }
+      ]
+    },
+    "savedPath": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta",
+    "big": [
+      {
+        "text": "Found 100 matches\n<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\needles.txt:\n  Line 1: needle 0 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "input": {
+          "pattern": "needle",
+          "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1"
+        },
+        "tool": "grep",
+        "status": "completed"
+      },
+      {
+        "text": "diff --git a/big.txt b/big.txt\nindex b495a56..a3a1bde 100644\n--- a/big.txt\n+++ b/big.txt\n@@ -1,6000 +1,6000 @@\n-l0\n-l1\n-l2\n-l3\n-l4\n-l5\n-l6\n-l7\n-l8\n-l9\n-l10\n-l11\n-l12\n-l13\n-l14\n-l15\n-l16\n-l17\n-l18\n-l19\n-l20\n-l21\n-l22\n-l23\n-l24\n-l25\n-l26\n-l27\n-l28\n-l29\n-l30\n-l31\n-l32\n-l33\n-l34\n-l35\n-l36\n-l37\n-l38\n-l39\n-l40\n-l41\n-l42\n-l43\n-l44\n-l45\n-l46\n-l47\n-l48\n-l49\n-l50\n-l51\n-l52\n-l53\n-l54\n-l55\n-l56\n-l57\n-l58\n-l59\n-l60\n-l61\n-l62\n-l63\n-l64\n-l65\n-l66\n-l67\n-l68\n-l69\n-l70\n-l71\n-l72\n-l73\n-l74\n-l75\n-l76\n-l77\n-l78\n-l79\n-l80\n-l81\n-l82\n-l83\n-l84\n-l85\n-l86\n-l87\n-l88\n-l89\n-l90\n-l91\n-l92\n-l93\n-l94\n-l95\n-l96\n-l97\n-l98\n-l99\n-l100\n-l101\n-l102\n-l103\n-l104\n-l105\n-l106\n-l107\n-l108\n-l109\n-l110\n-l111\n-l112\n-l113\n-l114\n-l115\n-l116\n-l117\n-l118\n-l119\n-l120\n-l121\n-l122\n-l123\n-l124\n-l125\n-l126\n-l127\n-l128\n-l129\n-l130\n-l131\n-l132\n-",
+        "input": {},
+        "tool": "router_git_diff",
+        "status": "completed"
+      }
+    ],
+    "ownRead": {
+      "label": "own output read",
+      "callID": "toolu_smoke_28",
+      "childID": "ses_ee25a0708ffem86mwL6IPXItwt",
+      "parentText": "<subagent sessionID=\"ses_ee25a0708ffem86mwL6IPXItwt\" state=\"completed\">\nDONE: read my saved output\n</subagent>\nDONE: read my saved output",
+      "firstUser": "{\"id\":\"msg_11da5f999001nj13Jyb6m3dG5C\",\"time\":{\"created\":1791498779055},\"text\":\"You are a subagent spawned by another session.\\nTASK: find every needle and show the changes\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"grep\\\",\\\"input\\\":{\\\"pattern\\\":\\\"needle\\\",\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-roots-vfSFhd\\\\\\\\wt-1\\\"}},{\\\"tool\\\":\\\"router_git_diff\\\",\\\"input\\\":{}}],\\\"final\\\":\\\"DONE: needles.txt:1 big.txt:1\\\"}\\nOMR_NONCE=4659674b-e061-49f8-ad63-df778868334a\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta"
+          },
+          "tool": "read",
+          "status": "error",
+          "errorType": "unknown",
+          "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1 (use an absolute path inside it)"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 29,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        },
+        {
+          "seq": 30,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "external_directory",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/*"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "grep",
+          "resources": [
+            "needle"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "roots big output [nonce 4659674b-e061-49f8-ad63-df778868334a]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z"
+    },
+    "foreignRead": {
+      "label": "another child's output",
+      "callID": "toolu_smoke_32",
+      "childID": "ses_ee259ee90ffeTC5kOq4qXdRkuR",
+      "parentText": "<subagent sessionID=\"ses_ee259ee90ffeTC5kOq4qXdRkuR\" state=\"completed\">\nDONE: tried\n</subagent>\nDONE: tried",
+      "firstUser": "{\"id\":\"msg_11da61207001Q6EZ13Hrow4Rx8\",\"time\":{\"created\":1791498785308},\"text\":\"You are a subagent spawned by another session.\\nTASK: read a saved output\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-roots-vfSFhd\\\\\\\\data\\\\\\\\opencode\\\\\\\\tool-output\\\\\\\\tool_11da601b70018hZJRCmU9muHta\\\"}}],\\\"final\\\":\\\"DONE: tried\\\"}\\nOMR_NONCE=0f599359-5221-4476-9848-ef180b685ad6\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta"
+          },
+          "tool": "read",
+          "status": "error",
+          "errorType": "unknown",
+          "errorMessage": "[router] Refused for role agent explorer in this dispatch: read: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\data\\opencode\\tool-output\\tool_11da601b70018hZJRCmU9muHta is outside this dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1 (use an absolute path inside it)"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 33,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        },
+        {
+          "seq": 34,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "roots foreign output [nonce 0f599359-5221-4476-9848-ef180b685ad6]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z"
+    },
+    "lateRead": {
+      "label": "later worktree (glob)",
+      "callID": "toolu_smoke_36",
+      "childID": "ses_ee259e57affeS55lwvvj14TMVs",
+      "parentText": "<subagent sessionID=\"ses_ee259e57affeS55lwvvj14TMVs\" state=\"completed\">\nDONE: m.txt:1\n</subagent>\nDONE: m.txt:1",
+      "firstUser": "{\"id\":\"msg_11da61b13002NiqSyy6D6d84hu\",\"time\":{\"created\":1791498787621},\"text\":\"You are a subagent spawned by another session.\\nTASK: read m.txt\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-roots-vfSFhd\\\\\\\\wt-late-1\\\\\\\\m.txt\\\"}}],\\\"final\\\":\\\"DONE: m.txt:1\\\"}\\nOMR_NONCE=8ac84bc6-700a-4295-9211-54fbff0647b9\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-late-1\\m.txt, lines 1-1\n1: main",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-late-1\\m.txt"
+          },
+          "tool": "read",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 37,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        },
+        {
+          "seq": 38,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "external_directory",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-late-1/*"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-late-1/m.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "roots late read [nonce 8ac84bc6-700a-4295-9211-54fbff0647b9]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z"
+    },
+    "uncoveredRead": {
+      "label": "later worktree (no pattern)",
+      "callID": "toolu_smoke_40",
+      "childID": "ses_ee259dcf2ffea4XoyZ9DfY9n6p",
+      "parentText": "<subagent sessionID=\"ses_ee259dcf2ffea4XoyZ9DfY9n6p\" state=\"completed\">\nDONE: m.txt:1\n</subagent>\nDONE: m.txt:1",
+      "firstUser": "{\"id\":\"msg_11da623bf001etzV4Ctp4c9l7S\",\"time\":{\"created\":1791498789844},\"text\":\"You are a subagent spawned by another session.\\nTASK: read m.txt\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-roots-vfSFhd\\\\\\\\wt-uncovered-1\\\\\\\\m.txt\\\"}}],\\\"final\\\":\\\"DONE: m.txt:1\\\"}\\nOMR_NONCE=239f0d37-2ff6-45ac-8659-b05855137202\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-uncovered-1\\m.txt"
+          },
+          "tool": "read",
+          "status": "error",
+          "errorType": "permission.rejected",
+          "errorMessage": "Permission denied: external_directory"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 41,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        },
+        {
+          "seq": 42,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "roots uncovered read [nonce 239f0d37-2ff6-45ac-8659-b05855137202]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z"
+    },
+    "lateRun": {
+      "label": "router_run in the later worktree",
+      "callID": "toolu_smoke_44",
+      "childID": "ses_ee259d484ffeAWwIYqN7qUY166",
+      "parentText": "<subagent sessionID=\"ses_ee259d484ffeAWwIYqN7qUY166\" state=\"completed\">\nDONE: exit code 0\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: exit code 0\n\n[router ✓ verified: checker]",
+      "firstUser": "{\"id\":\"msg_11da62c1d001owmwGvkO0g92mV\",\"time\":{\"created\":1791498791987},\"text\":\"You are a subagent spawned by another session.\\nTASK: run the smoke marker\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-roots-vfSFhd\\\\\\\\wt-late-1\\\"}},{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-roots-vfSFhd\\\\\\\\wt-1\\\"}}],\\\"final\\\":\\\"DONE: exit code 0\\\"}\\nOMR_NONCE=1543c1b3-80ca-4ceb-b51f-76cd2a0123d5\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.5 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",
+          "input": {
+            "script": "smoke-marker",
+            "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-late-1"
+          },
+          "tool": "router_run",
+          "status": "completed"
+        },
+        {
+          "text": "[router_run] error: refused: cwd is not this dispatch's work root (<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-late-1)",
+          "input": {
+            "script": "smoke-marker",
+            "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1"
+          },
+          "tool": "router_run",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 45,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_run"
+          ],
+          "reply": "tool",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        },
+        {
+          "seq": 46,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_run"
+          ],
+          "reply": "tool",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        },
+        {
+          "seq": 47,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_run"
+          ],
+          "reply": "text",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "runner",
+      "title": "roots late run [nonce 1543c1b3-80ca-4ceb-b51f-76cd2a0123d5]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z"
+    },
+    "disk": {
+      "wt1E1": "edited\n",
+      "lateMarker": true,
+      "wt1Marker": false,
+      "mainMarker": false
+    },
+    "df2NoCwd": {
+      "parentText": "<subagent sessionID=\"ses_ee259b775ffe5a8BSrUWZdpJf3\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: deterministic]\nCHILD_OK\n\n[router ✓ verified: deterministic]",
+      "verified": true,
+      "notAccepted": false,
+      "cwdRefused": false,
+      "detection": "deterministic",
+      "row": {
+        "decisionID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z:1791498798881:c04529e762b48a44:11",
+        "reason": "kept:margin: C(best)=0.0506 is not < (1 − 0.2)·C(chosen)=0.0478 usd; role @explorer on fast in fast..medium",
+        "role": "explorer",
+        "tier": "fast",
+        "grant": [
+          "glob",
+          "grep",
+          "read",
+          "router_git"
+        ],
+        "boundsReasons": [],
+        "detection": {
+          "effective": "deterministic"
+        },
+        "facts": {
+          "class": "search",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": null,
+        "explore": false,
+        "propensity": 1,
+        "pinned": false,
+        "switched": false
+      }
+    },
+    "df2WithCwd": {
+      "parentText": "<subagent sessionID=\"ses_ee259b066ffeVJ1iPRkt7WAkLt\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: deterministic]\nCHILD_OK\n\n[router ✓ verified: deterministic]",
+      "verified": true,
+      "notAccepted": false,
+      "cwdRefused": false,
+      "detection": "deterministic",
+      "row": {
+        "decisionID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z:1791498800693:c04529e762b48a44:12",
+        "reason": "kept:margin: C(best)=0.0448 is not < (1 − 0.2)·C(chosen)=0.0402 usd; role @explorer on fast in fast..medium",
+        "role": "explorer",
+        "tier": "fast",
+        "grant": [
+          "glob",
+          "grep",
+          "read",
+          "router_git"
+        ],
+        "boundsReasons": [],
+        "detection": {
+          "effective": "deterministic"
+        },
+        "facts": {
+          "class": "search",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": null,
+        "explore": false,
+        "propensity": 1,
+        "pinned": false,
+        "switched": false
+      }
+    },
+    "df2Live": {
+      "parentText": "<subagent sessionID=\"ses_ee259a884ffe0qifW5x1baysaM\" state=\"completed\">\nDONE: df2-live-created.txt:1 created\n</subagent>\n\n\n[router ✓ verified: deterministic]\nDONE: df2-live-created.txt:1 created\n\n[router ✓ verified: deterministic]",
+      "verified": true,
+      "notAccepted": false,
+      "cwdRefused": false,
+      "detection": "deterministic",
+      "row": {
+        "decisionID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z:1791498802694:c04529e762b48a44:13",
+        "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0125 usd); role @implementer on medium in medium..heavy [default:clamp:floor]",
+        "role": "implementer",
+        "tier": "medium",
+        "grant": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "router_git"
+        ],
+        "boundsReasons": [
+          "floor:authority"
+        ],
+        "detection": {
+          "effective": "deterministic"
+        },
+        "facts": {
+          "class": "mechanical",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [
+            "edit"
+          ],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": null,
+        "explore": false,
+        "propensity": 1,
+        "pinned": false,
+        "switched": false
+      },
+      "states": [
+        {
+          "text": "Created file successfully: <home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-roots-vfSFhd/wt-1/df2-live-created.txt",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1\\df2-live-created.txt",
+            "content": "created by the role child\n"
+          },
+          "tool": "write",
+          "status": "completed"
+        }
+      ],
+      "createdOnDisk": true
+    },
+    "df2Outside": {
+      "parentText": "<subagent sessionID=\"ses_ee2599fb8ffeyNeQvXF0kshec5\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ UNVERIFIED: none]\nVerification caveats — NOT verified (acceptance is not a passing check):\n- the [acceptance] block's cwd <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project is outside this role dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1; the router verifies a role dispatch only inside its work root. Remove \"cwd:\" (the checks then run in the work root) or name a directory inside it.\nCHILD_OK\n\n[router ⚠ UNVERIFIED: none]\nVerification caveats — NOT verified (acceptance is not a passing check):\n- the [acceptance] block's cwd <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\project is outside this role dispatch's work root <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-roots-vfSFhd\\wt-1; the router verifies a role dispatch only inside its work root. Remove \"cwd:\" (the checks then run in the work root) or name a directory inside it.",
+      "verified": false,
+      "notAccepted": false,
+      "cwdRefused": true,
+      "detection": "none",
+      "row": {
+        "decisionID": "ses_ee25a5565ffeJ75UUgM4AMBk5Z:1791498804948:c04529e762b48a44:14",
+        "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0528 usd); role @explorer on fast in fast..medium",
+        "role": "explorer",
+        "tier": "fast",
+        "grant": [
+          "glob",
+          "grep",
+          "read",
+          "router_git"
+        ],
+        "boundsReasons": [],
+        "detection": {
+          "effective": "none"
+        },
+        "facts": {
+          "class": "search",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": null,
+        "explore": false,
+        "propensity": 1,
+        "pinned": false,
+        "switched": false
+      }
+    },
+    "bindings": [
+      {
+        "label": "read in the worktree",
+        "binding": "exact"
+      },
+      {
+        "label": "read in the session directory",
+        "binding": "exact"
+      },
+      {
+        "label": "edit in the worktree",
+        "binding": "exact"
+      },
+      {
+        "label": "search roots",
+        "binding": "exact"
+      },
+      {
+        "label": "big output",
+        "binding": "exact"
+      },
+      {
+        "label": "later worktree (glob)",
+        "binding": "exact"
+      },
+      {
+        "label": "later worktree (no pattern)",
+        "binding": "exact"
+      },
+      {
+        "label": "router_run in the later worktree",
+        "binding": "exact"
+      },
+      {
+        "label": "DF2-F1 without cwd",
+        "binding": "exact"
+      },
+      {
+        "label": "DF2-F1 with cwd",
+        "binding": "exact"
+      },
+      {
+        "label": "DF2-F1 live shape (child writes, no cwd)",
+        "binding": "exact"
+      },
+      {
+        "label": "DF2-F1 cwd outside the work root",
+        "binding": "exact"
+      },
+      {
+        "label": "another child's output",
+        "binding": "exact"
+      }
+    ],
+    "unknownBindings": [],
+    "routerWarnings": [],
+    "hostErrors": [],
+    "providerErrors": []
+  }
+}

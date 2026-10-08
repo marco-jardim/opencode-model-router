@@ -98,6 +98,22 @@ export function redactText(text: string): string {
   return out;
 }
 export function redact(value: unknown): unknown { return JSON.parse(redactText(JSON.stringify(value))) as unknown; }
+/** A `CHILD_SCRIPT64=<base64>` run in any recorded text (see {@link scriptLine}). */
+const SCRIPT64_RE = /CHILD_SCRIPT64=([A-Za-z0-9+/=]+)/g;
+/**
+ * Issue #84 P3.1 (QA-P31-1-1): base64 hides the scripted steps — their absolute paths included — from the redaction and from a grep
+ * of the evidence. Every `CHILD_SCRIPT64=<base64>` in every string of `value` becomes `CHILD_SCRIPT64(decoded)=<text>`: the decoded
+ * script, passed through {@link redactText} BEFORE it is inserted, then JSON-escaped (it often sits inside a JSON-encoded message, which
+ * stays parseable). Run it before clipping, so no clipped base64 fragment survives.
+ */
+export function decodeScriptsForEvidence(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(SCRIPT64_RE, (_whole, encoded: string) => `CHILD_SCRIPT64(decoded)=${JSON.stringify(redactText(Buffer.from(encoded, "base64").toString("utf8"))).slice(1, -1)}`);
+  }
+  if (Array.isArray(value)) return value.map(decodeScriptsForEvidence);
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, decodeScriptsForEvidence(v)]));
+  return value;
+}
 export function clip(value: unknown, max = 600): unknown {
   if (typeof value === "string") return value.length > max ? `${value.slice(0, max / 2)}...[clipped, ${value.length} chars]` : value;
   if (Array.isArray(value)) return value.map(v => clip(v, max));
@@ -156,6 +172,12 @@ export interface WireRequest {
   reply: "tool" | "text" | "grader";
 }
 const GRADER_MARK = "independent, skeptical verification grader";
+/** One scripted step of a child (`CHILD_SCRIPT64`, see RoutingProvider.childScript). */
+export interface ScriptStep { readonly tool: string; readonly input: Obj }
+/** The prompt line that makes a scripted child call `steps` one per request (unadvertised tools included) and then answer `final`. */
+export function scriptLine(steps: readonly ScriptStep[], final: string): string {
+  return `CHILD_SCRIPT64=${Buffer.from(JSON.stringify({ steps, final }), "utf8").toString("base64")}`;
+}
 /** Effort changes the host sends IN-BAND: {"role":"system","content":[],"output_config":{"effort":...}} messages. */
 export const inBandEfforts = (r: WireRequest): unknown[] => r.messages.map(m => obj(m.output_config).effort).filter(e => e !== undefined);
 /** The effort the provider is actually told to use (Anthropic Messages): the last in-band effort, else the top-level output_config.effort. */
@@ -211,16 +233,18 @@ export class RoutingProvider {
       const multiSource = toolResult || grader ? undefined : /SPIKE_CALLS=(\[[^\n]*\])/.exec(lastText)?.[1];
       const multi = multiSource ? (JSON.parse(multiSource) as Obj[]) : undefined;
       if (multi && responses) throw new Error("SPIKE_CALLS is supported on the Anthropic Messages protocol only");
+      // `CHILD_SCRIPT64=…` (issue #84 P3.1, see `childScript`): a multi-step scripted child; it takes precedence over READ_ONLY_PROBE.
+      const scripted = grader || subagentCall || delegateCall || multi ? undefined : this.childScript(messages);
       // `loopProbe` (off by default): once any tool result is in the history (even if the last message is no longer one, e.g. the host's max-steps note), keep emitting the READ_ONLY_PROBE call found in the earlier user text, so a
       // child never finishes by itself and only the host's step limit can stop it.
       const hadToolResult = toolResult || messages.some(m => m.type === "function_call_output" || this.blocks(m.content).some(b => b.type === "tool_result"));
-      const loopSource = this.loopProbe && hadToolResult && !grader
+      const loopSource = this.loopProbe && hadToolResult && !grader && !scripted
         ? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(messages.flatMap(m => this.blocks(m.content)).filter(b => b.type === "text" || b.type === "input_text").map(b => String(b.text ?? "")).filter(text => !/SPIKE_(CALLS?|DELEGATE)=/.test(text)).join("\n"))?.[1]
         : undefined;
       // Issue #77: intentionally emit even an unadvertised tool to prove that
       // the HOST rejects it, rather than a cooperative model merely abstaining.
-      const readOnlyProbe = (toolResult && !loopSource) || grader || subagentCall || delegateCall || multi ? undefined : (loopSource ?? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1]);
-      const probe = readOnlyProbe ? obj(JSON.parse(readOnlyProbe)) : undefined;
+      const readOnlyProbe = scripted || (toolResult && !loopSource) || grader || subagentCall || delegateCall || multi ? undefined : (loopSource ?? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1]);
+      const probe = scripted ? scripted.step : readOnlyProbe ? obj(JSON.parse(readOnlyProbe)) : undefined;
       const toolName = subagentCall || multi ? "subagent" : delegateCall ? "delegate" : str(probe?.tool);
       const toolInput = subagentCall ?? (multi ? JSON.stringify(multi[0]) : undefined) ?? delegateCall ?? (probe ? JSON.stringify(probe.input) : undefined);
       const { messages: _m, system: _s, tools, input: _i, instructions: _in, ...fields } = body;
@@ -234,7 +258,7 @@ export class RoutingProvider {
       this.requests.push(request);
       if (this.barrier && !toolResult && !grader && !multi && !subagentCall && lastText.includes(this.barrier.marker)) await this.holdAtBarrier(request.seq);
       if (toolName && !probe && !toolNames.includes(toolName)) throw new Error(`Fixture requested ${toolName} but the request carries no such tool (${toolNames.join(",")})`);
-      let text = toolResult ? "ROOT_DONE" : lastText.includes("CHILD_DONE") ? "CHILD_DONE" : "CHILD_OK";
+      let text = scripted && !scripted.step ? scripted.final : toolResult ? "ROOT_DONE" : lastText.includes("CHILD_DONE") ? "CHILD_DONE" : "CHILD_OK";
       if (grader) {
         this.graders += 1;
         const pass = this.graderVerdicts.length > 0 ? this.graderVerdicts.shift()! : true;
@@ -269,6 +293,31 @@ export class RoutingProvider {
         if (at >= 0) { release.splice(at, 1); barrier.timedOut = true; resolve(); }
       }, barrier.timeoutMs);
     });
+  }
+  /**
+   * Issue #84 P3.1: `CHILD_SCRIPT64=<base64 of {"steps":[{"tool","input"},…],"final":"…"}>` in a user text that carries no SPIKE_*
+   * marker (a parent's SPIKE_CALL text that merely quotes a script is never one). The k-th request after the LAST such message
+   * (k = tool results since it) emits `steps[k]` — even a tool the request does not advertise, so the HOST/router must refuse it —
+   * and every later request answers `final`. A resume prompt carrying its own script starts over. Base64 keeps the script's tool
+   * names, paths and words out of the router's classifier.
+   */
+  private childScript(messages: Obj[]): { step?: Obj; final: string; index: number; of: number } | undefined {
+    let at = -1;
+    let encoded: string | undefined;
+    messages.forEach((m, i) => {
+      for (const b of this.blocks(m.content)) {
+        if (b.type !== "text" && b.type !== "input_text") continue;
+        const text = String(b.text ?? "");
+        if (/SPIKE_(CALLS?|DELEGATE)=/.test(text)) continue;
+        const found = /CHILD_SCRIPT64=([A-Za-z0-9+/=]+)/.exec(text)?.[1];
+        if (found) { at = i; encoded = found; }
+      }
+    });
+    if (encoded === undefined) return undefined;
+    const parsed = obj(JSON.parse(Buffer.from(encoded, "base64").toString("utf8")));
+    const steps = arr(parsed.steps).map(obj);
+    const done = messages.slice(at + 1).reduce((n, m) => n + (m.type === "function_call_output" ? 1 : 0) + this.blocks(m.content).filter(b => b.type === "tool_result").length, 0);
+    return { ...(done < steps.length ? { step: steps[done]! } : {}), final: str(parsed.final) ?? "CHILD_OK", index: done, of: steps.length };
   }
   private systemText(system: unknown): string {
     if (typeof system === "string") return system;
@@ -387,10 +436,11 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    const entered=Date.now(),enteredN=tick();
    const first=!firstEvaluate.has(e.sessionID); firstEvaluate.add(e.sessionID);
    const effectIn=e.effect;
+   const messageIn=e.message;
    if(cfg.denyAsk&&e.effect==='ask'){e.effect='deny';e.message='PROBE_ASK_AS_DENY: '+e.action;}
    const deny=cfg.deny&&(cfg.deny.agent===undefined||cfg.deny.agent===e.agent)&&(cfg.deny.actions||[]).includes(e.action);
    if(deny){e.effect='deny';e.message='PLUGIN_GUARD_DENIED: '+e.action;}
-   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),effectIn,effectOut:e.effect,first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
+   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),effectIn,messageIn,effectOut:e.effect,first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
   });
  }
  // Opt-in decisions keyed by the session TITLE (looked up with session.get(event.sessionID), so the decision is per session, not per agent).
@@ -454,6 +504,42 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    return {content:JSON.stringify(report)};
   }});});
  }
+ // Opt-in (issue #84 P3.1, I5): AFTER the router added its dispatch nonce, a subagent call whose description contains
+ // cfg.mixNonce.descriptionContains gets the LAST prompt line (the router's OMR_NONCE=<n> line) of the previous other subagent
+ // call instead of its own, so its child carries two different dispatches' markers (title: its own, first message: the other's).
+ if(cfg.mixNonce){
+  let lastNonceLine;
+  await ctx.tool.hook('execute.before',async e=>{
+   if(e.tool!=='subagent'||!e.input||typeof e.input.prompt!=='string')return;
+   const NL=String.fromCharCode(10);
+   const lines=e.input.prompt.split(NL);
+   const last=lines[lines.length-1];
+   if(typeof last!=='string'||!last.startsWith('OMR_NONCE='))return;
+   if(!String(e.input.description||'').includes(cfg.mixNonce.descriptionContains)){lastNonceLine=last;return;}
+   for(let i=0;i<100&&lastNonceLine===undefined;i++)await new Promise(r=>setTimeout(r,50));
+   if(lastNonceLine===undefined){log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'mix-nonce-missing',__instance:instance,__iid:iid});return;}
+   lines[lines.length-1]=lastNonceLine;
+   e.input={...e.input,prompt:lines.join(NL)};
+   log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'mix-nonce',replaced:last,with:lastNonceLine,__instance:instance,__iid:iid});
+  });
+ }
+ // Opt-in (issue #84 P3.1, QA-P31-1-2): AFTER the router's execute.before approved a call, a path or filePath equal to one of
+ // cfg.retarget[].from (case-insensitive) is replaced by its "to", so the HOST's own permission request (external_directory) for
+ // the new path reaches the permission evaluate hooks, the router's included.
+ if(Array.isArray(cfg.retarget)&&cfg.retarget.length>0){
+  await ctx.tool.hook('execute.before',e=>{
+   if(!e.input||typeof e.input!=='object')return;
+   for(const key of ['path','filePath']){
+    const value=e.input[key];
+    if(typeof value!=='string')continue;
+    const rule=cfg.retarget.find(r=>typeof r.from==='string'&&r.from.toLowerCase()===value.toLowerCase());
+    if(!rule)continue;
+    e.input={...e.input,[key]:rule.to};
+    log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'retarget',from:value,to:rule.to,__instance:instance,__iid:iid});
+    return;
+   }
+  });
+ }
  let dumped=false;
  await ctx.session.hook('context',e=>{
   if(dumped)return; dumped=true;
@@ -468,6 +554,60 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    if(typeof event.type==='string'&&event.type.startsWith('session.')&&!/(delta|streamed)/.test(event.type)) log('SMOKE_EVENTS',{...event,__instance:instance,__iid:iid});
   }}catch(error){log('SMOKE_EVENTS',{type:'probe.subscription.failed',error:String(error),__instance:instance,__iid:iid});}
  })();
+}};`;
+
+/** Issue #84 P3.1 (I9): a native v2 plugin loaded BEFORE the router (HostOptions.preProbe). For a session whose title contains
+ * `breakSystemTitleContains`, its context hook replaces `event.system` with a copy whose iterator throws ONCE, and only when the
+ * calling stack contains `routerStackNeedle` (the router checkout's directory name): the router's own context hook then fails for
+ * that step (an injected, real-host hook error) while the host's later iterations of the same array work. `breakEvaluateTitleContains`
+ * does the same to the router's permission evaluate hook through `event.resources` (a Proxy). Records `preprobe.*`. */
+export const PRE_PROBE_PLUGIN = `import {appendFileSync,readFileSync} from 'node:fs';
+const NL=String.fromCharCode(10);
+const log=(x)=>appendFileSync(process.env.SMOKE_EVENTS,JSON.stringify({...x,__t:Date.now()})+NL);
+export default {id:'routing-smoke-preprobe',async setup(ctx){
+ let cfg={};try{cfg=JSON.parse(readFileSync(process.env.SMOKE_PREPROBE_CONFIG,'utf8'));}catch{}
+ log({type:'preprobe.instance.started',config:cfg});
+ const tripped=new Set();
+ const armed=new Set();
+ await ctx.session.hook('context',async e=>{
+  if(!cfg.breakSystemTitleContains||tripped.has(e.sessionID))return;
+  let title;try{title=(await ctx.session.get({sessionID:e.sessionID})).title;}catch{}
+  if(typeof title!=='string'||!title.includes(cfg.breakSystemTitleContains))return;
+  const needle=String(cfg.routerStackNeedle||'').toLowerCase();
+  const sid=e.sessionID;
+  try{
+   const parts=Array.from(e.system||[]);
+   Object.defineProperty(parts,Symbol.iterator,{configurable:true,writable:true,value:function(){
+    const stack=String(new Error().stack||'').toLowerCase();
+    if(!tripped.has(sid)&&needle!==''&&stack.includes(needle)){tripped.add(sid);log({type:'preprobe.decision',sessionID:sid,title,decision:'threw-in-router-iteration'});throw new Error('PREPROBE_SYSTEM_ITERATION_TRAP');}
+    return Array.prototype.values.call(this);
+   }});
+   e.system=parts;
+   if(!armed.has(sid)){armed.add(sid);log({type:'preprobe.decision',sessionID:sid,title,decision:'armed'});}
+  }catch(error){log({type:'preprobe.decision',sessionID:sid,title,decision:'arm-failed',error:String(error)});}
+ });
+ // QA-P31-1-2 (c): the same for the router's permission evaluate hook. For a session whose title contains
+ // breakEvaluateTitleContains, event.resources becomes a Proxy whose FIRST property read from a stack that contains the router's
+ // directory name throws once: the router's evaluate hook fails for that evaluation; every other reader (the host) is unaffected.
+ const trippedEvaluate=new Set();
+ if(cfg.breakEvaluateTitleContains){
+  await ctx.permission.hook('evaluate',async e=>{
+   if(trippedEvaluate.has(e.sessionID))return;
+   let title;try{title=(await ctx.session.get({sessionID:e.sessionID})).title;}catch{}
+   if(typeof title!=='string'||!title.includes(cfg.breakEvaluateTitleContains))return;
+   const needle=String(cfg.routerStackNeedle||'').toLowerCase();
+   const sid=e.sessionID;
+   const action=e.action;
+   try{
+    const original=Array.isArray(e.resources)?e.resources:[];
+    e.resources=new Proxy(original,{get(target,prop,receiver){
+     if(!trippedEvaluate.has(sid)&&needle!==''&&String(new Error().stack||'').toLowerCase().includes(needle)){trippedEvaluate.add(sid);log({type:'preprobe.decision',sessionID:sid,title,hook:'evaluate',action,decision:'threw-in-router-evaluate'});throw new Error('PREPROBE_EVALUATE_TRAP');}
+     return Reflect.get(target,prop,receiver);
+    }});
+    log({type:'preprobe.decision',sessionID:sid,title,hook:'evaluate',action,decision:'armed-evaluate'});
+   }catch(error){log({type:'preprobe.decision',sessionID:sid,title,hook:'evaluate',action,decision:'arm-evaluate-failed',error:String(error)});}
+  });
+ }
 }};`;
 
 // ------------------------------------------------------------------ the host ----
@@ -494,8 +634,21 @@ export function agentWithoutModel(fields: Obj = {}): Obj {
 export interface HostOptions {
   /** Router override file content, merged over the smoke preset. `routing.outcomes.path` is always forced to this host's temp directory. */
   readonly overrides?: Obj | ((root: string) => Obj);
-  /** The `routing` block; `null` writes no routing block at all. Default: engine shadow. */
-  readonly routing?: Obj | null;
+  /** The `routing` block; `null` writes no routing block at all. Default: engine shadow. A function receives the host's temp root (e.g. for `workRoots` globs). */
+  readonly routing?: Obj | null | ((root: string) => Obj);
+  /** Use the long (realpath, non-8.3) spelling of the temp root, so the project, worktrees and every path under it are canonical (role work roots refuse 8.3 spellings). */
+  readonly longPaths?: boolean;
+  /** Runs once the (empty) project directory exists and BEFORE the host process starts: e.g. a git repository whose worktrees the router lists at role-agent registration (plugin start). */
+  readonly prepare?: (dirs: { readonly root: string; readonly project: string }) => Promise<void>;
+  /** Issue #84 P3.1: load {@link PRE_PROBE_PLUGIN} BEFORE the router with this configuration (written to a JSON file it reads). */
+  readonly preProbe?: {
+    /** The router's context hook fails once for a session whose title contains this (I9 catalog failure). */
+    readonly breakSystemTitleContains?: string;
+    /** The router's permission evaluate hook fails once for a session whose title contains this (I9 evaluate error). */
+    readonly breakEvaluateTitleContains?: string;
+    /** A string only the router's own stack frames contain (the checkout's directory name). */
+    readonly routerStackNeedle: string;
+  };
   /** Extra `providers` entries of opencode.json (merged with the scripted anthropic provider). */
   readonly providers?: Obj;
   /** Replaces the default `plugins` entries after ROOT (the probe is always last). */
@@ -522,6 +675,10 @@ export interface HostOptions {
     readonly rewriteAgent?: { readonly from: string; readonly to: string };
     /** Appends ` [nonce <callID>]` to the description (child title) and `OMR_NONCE=<callID>` to the prompt of every subagent call (tool.hook("execute.before")). */
     readonly nonce?: boolean;
+    /** Issue #84 P3.1 (I5): a subagent call whose description contains `descriptionContains` gets the router's last prompt line (`OMR_NONCE=…`) of the previous other subagent call instead of its own (runs after the router's execute.before). */
+    readonly mixNonce?: { readonly descriptionContains: string };
+    /** Issue #84 P3.1 (QA-P31-1-2): after the router's execute.before, a call's `path`/`filePath` equal to `from` becomes `to` (the host then asks its own permissions for `to`). `$ROOT` in either is the host's temp root. */
+    readonly retarget?: readonly { readonly from: string; readonly to: string }[];
   };
 }
 export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonly fail: number }
@@ -555,7 +712,8 @@ export class RoutingHost {
   }
 
   static async start(name: string, options: HostOptions = {}): Promise<RoutingHost> {
-    const root = await mkdtemp(path.join(tmpdir(), `omr-p32-${name}-`));
+    const made = await mkdtemp(path.join(tmpdir(), `omr-p32-${name}-`));
+    const root = options.longPaths ? realpathSync.native(made) : made;
     const host = new RoutingHost(root, options);
     liveHosts.add(host);
     try { return await host.boot(); } catch (error) { await host.stop().catch(() => undefined); throw error; }
@@ -571,7 +729,8 @@ export class RoutingHost {
     };
     const enforcement = { ...obj(overridesNow.enforcement), ...obj(extra.enforcement) };
     merged.enforcement = { ...enforcement, verify: { testBaseline: false, ...obj(enforcement.verify) } };
-    const routing = o.routing === undefined ? { engine: "shadow" } : o.routing;
+    const routingNow = typeof o.routing === "function" ? o.routing(this.root) : o.routing;
+    const routing = routingNow === undefined ? { engine: "shadow" } : routingNow;
     if (routing !== null) merged.routing = { ...routing, ...obj(extra.routing), outcomes: { ...obj(obj(routing).outcomes), path: this.outcomes } };
     return merged;
   }
@@ -594,6 +753,7 @@ export class RoutingHost {
     }
     this.project = path.join(this.root, "project");
     await mkdir(this.project, { recursive: true });
+    if (this.options.prepare) await this.options.prepare({ root: this.root, project: this.project });
     await mkdir(this.outcomes, { recursive: true });
     const probe = path.join(this.root, "probe-plugin");
     await mkdir(probe, { recursive: true });
@@ -601,7 +761,17 @@ export class RoutingHost {
     await writeFile(path.join(probe, "server.mjs"), PROBE_PLUGIN);
     for (const file of [this.logs.hooks, this.logs.events]) await writeFile(file, "");
     const probeConfig = path.join(this.root, "probe-config.json");
-    if (this.options.probe) await writeFile(probeConfig, JSON.stringify(this.options.probe));
+    // `$ROOT` in any probe string (e.g. a `retarget` path) is this host's temp root, which only exists from here on.
+    if (this.options.probe) await writeFile(probeConfig, JSON.stringify(this.options.probe).replaceAll("$ROOT", JSON.stringify(this.root).slice(1, -1)));
+    // Issue #84 P3.1: the optional pre-probe, loaded BEFORE the router (plugin order = hook order).
+    const preProbe = this.options.preProbe ? path.join(this.root, "pre-probe-plugin") : undefined;
+    const preProbeConfig = path.join(this.root, "pre-probe-config.json");
+    if (preProbe) {
+      await mkdir(preProbe, { recursive: true });
+      await writeFile(path.join(preProbe, "package.json"), JSON.stringify({ name: "routing-smoke-preprobe", type: "module", exports: { ".": "./server.mjs", "./server": "./server.mjs" } }));
+      await writeFile(path.join(preProbe, "server.mjs"), PRE_PROBE_PLUGIN);
+      await writeFile(preProbeConfig, JSON.stringify(this.options.preProbe));
+    }
     if (this.options.seed && this.options.seed.length > 0) await seedOutcomes(this.outcomes, this.options.seed);
     await this.writeOverrides();
     const baseURL = await this.provider.start();
@@ -611,7 +781,7 @@ export class RoutingHost {
     await writeFile(path.join(configDir, "opencode.json"), JSON.stringify({
       $schema: "https://opencode.ai/config.json",
       model: ref(root),
-      plugins: [...(this.options.withoutRouter ? [] : [ROOT]), probe],
+      plugins: [...(preProbe ? [preProbe] : []), ...(this.options.withoutRouter ? [] : [ROOT]), probe],
       providers: { anthropic: { settings: { baseURL, apiKey: "keyless-smoke-fake" } }, ...this.resolveProviders(baseURL) },
       ...obj(typeof this.options.hostConfig === "function" ? this.options.hostConfig(this.root) : this.options.hostConfig),
     }));
@@ -621,6 +791,7 @@ export class RoutingHost {
       OPENCODE_CONFIG_PROJECT_DISABLE: "true", OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_FILEWATCHER_DISABLE: "true",
       SMOKE_HOOKS: this.logs.hooks, SMOKE_EVENTS: this.logs.events, SMOKE_DUMP: this.logs.dump,
       ...(this.options.probe ? { SMOKE_PROBE_CONFIG: probeConfig, SMOKE_PLUGIN_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href } : {}),
+      ...(preProbe ? { SMOKE_PREPROBE_CONFIG: preProbeConfig } : {}),
     });
     this.envKeys = Object.keys(env).sort();
     // No credential-shaped variable may reach the host; OPENCODE_PASSWORD is the harness's own random one.
@@ -637,7 +808,7 @@ export class RoutingHost {
     this.authorization = basic("opencode", password);
     this.client = await loadClient(this.baseUrl, this.authorization);
     await this.client.agent.list(); // a catalog read starts the native plugin graph
-    const wanted = this.options.withoutRouter ? ["routing-smoke-probe"] : ["opencode-model-router", "routing-smoke-probe"];
+    const wanted = [...(preProbe ? ["routing-smoke-preprobe"] : []), ...(this.options.withoutRouter ? ["routing-smoke-probe"] : ["opencode-model-router", "routing-smoke-probe"])];
     for (const id of wanted) {
       const state = await waitFor(`${id} plugin state`, async () => {
         const found = (await this.client.plugin.list()).data.find(p => p.id === id)?.state;

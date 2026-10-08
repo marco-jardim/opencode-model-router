@@ -1,0 +1,930 @@
+{
+  "test": "I2",
+  "recordedAt": "2026-10-08T22:30:12.237Z",
+  "observed": {
+    "cases": [
+      {
+        "agent": "explorer",
+        "fields": "class=search risk=low scope=single",
+        "minFloor": "fast",
+        "task": "find where parse is exported",
+        "child": "explorer",
+        "requests": [
+          {
+            "seq": 2,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status"
+            ],
+            "reply": "text",
+            "effort": "low",
+            "catalogModel": "anthropic/claude-sonnet-5-5#low",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "fast"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498581483:5b21b01d9cf54094:1",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (2.06 ratio); role @explorer on fast in fast..medium",
+          "role": "explorer",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "low",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "explorer",
+        "fields": "class=design risk=low scope=single",
+        "minFloor": "fast",
+        "task": "outline how the modules relate",
+        "child": "explorer",
+        "requests": [
+          {
+            "seq": 5,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status"
+            ],
+            "reply": "text",
+            "effort": "medium",
+            "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "medium"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498584154:5b21b01d9cf54094:2",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (11.244 ratio); role @explorer on medium in fast..medium [default:clamp:ceiling]",
+          "role": "explorer",
+          "tier": "medium",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "design",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "researcher",
+        "fields": "class=search risk=low scope=single",
+        "minFloor": "fast",
+        "task": "look up the split semantics online",
+        "child": "researcher",
+        "requests": [
+          {
+            "seq": 8,
+            "toolNames": [
+              "webfetch",
+              "websearch"
+            ],
+            "reply": "text",
+            "effort": "low",
+            "catalogModel": "anthropic/claude-sonnet-5-5#low",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "fast"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498586359:5b21b01d9cf54094:3",
+          "reason": "kept:margin: C(best)=0.0058 is not < (1 − 0.2)·C(chosen)=0.0053 usd; role @researcher on fast in fast..medium",
+          "role": "researcher",
+          "tier": "fast",
+          "grant": [
+            "context7",
+            "webfetch",
+            "websearch"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "low",
+            "scope": "single",
+            "needs": [
+              "web"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "runner",
+        "fields": "class=mechanical risk=low scope=single root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "minFloor": "fast",
+        "task": "run the smoke marker script",
+        "child": "runner",
+        "requests": [
+          {
+            "seq": 11,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status",
+              "router_run"
+            ],
+            "reply": "text",
+            "effort": "low",
+            "catalogModel": "anthropic/claude-sonnet-5-5#low",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "fast"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498588281:5b21b01d9cf54094:4",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.58 ratio); role @runner on fast in fast..medium [edit is outside this role — use `implementer`]",
+          "role": "runner",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git",
+            "router_run"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "implementer",
+        "fields": "class=mechanical risk=low scope=single needs=edit root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "minFloor": "medium",
+        "task": "rename one local variable in parser.ts",
+        "child": "implementer",
+        "requests": [
+          {
+            "seq": 14,
+            "toolNames": [
+              "edit",
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status",
+              "router_request_authority",
+              "write"
+            ],
+            "reply": "text",
+            "effort": "medium",
+            "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "medium"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498590287:5b21b01d9cf54094:5",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0048 usd); role @implementer on medium in medium..heavy [default:clamp:floor]",
+          "role": "implementer",
+          "tier": "medium",
+          "grant": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [
+            "floor:authority"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "low",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "implementer",
+        "fields": "class=implement risk=high scope=single needs=edit root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "minFloor": "heavy",
+        "task": "rework the tokenizer of parser.ts",
+        "child": "implementer",
+        "requests": [
+          {
+            "seq": 17,
+            "toolNames": [
+              "edit",
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status",
+              "router_request_authority",
+              "write"
+            ],
+            "reply": "text",
+            "effort": "xhigh",
+            "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+            "wireModel": "claude-opus-5-5",
+            "tier": "heavy"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498592153:5b21b01d9cf54094:6",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (25.37 ratio); role @implementer on heavy in heavy..heavy [default:clamp:floor]",
+          "role": "implementer",
+          "tier": "heavy",
+          "grant": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [
+            "floor:authority"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "implement",
+            "risk": "high",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "reviewer",
+        "fields": "class=review risk=low scope=single",
+        "minFloor": "heavy",
+        "task": "review parser.ts for defects",
+        "child": "reviewer",
+        "requests": [
+          {
+            "seq": 20,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status",
+              "router_run"
+            ],
+            "reply": "text",
+            "effort": "xhigh",
+            "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+            "wireModel": "claude-opus-5-5",
+            "tier": "heavy"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498594053:5b21b01d9cf54094:7",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (22.5763 ratio); role @reviewer on heavy in heavy..heavy [default:clamp:floor]",
+          "role": "reviewer",
+          "tier": "heavy",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git",
+            "router_run"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "review",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "architect",
+        "fields": "class=search risk=low scope=single",
+        "minFloor": "medium",
+        "task": "find the module boundaries",
+        "child": "architect",
+        "requests": [
+          {
+            "seq": 23,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status"
+            ],
+            "reply": "text",
+            "effort": "medium",
+            "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "medium"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498595816:5b21b01d9cf54094:8",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0052 usd); role @architect on medium in medium..heavy [default:clamp:floor]",
+          "role": "architect",
+          "tier": "medium",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "high",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "architect",
+        "fields": "class=design risk=low scope=single",
+        "minFloor": "medium",
+        "task": "propose a structure for the parser",
+        "child": "architect",
+        "requests": [
+          {
+            "seq": 26,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status"
+            ],
+            "reply": "text",
+            "effort": "xhigh",
+            "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+            "wireModel": "claude-opus-5-5",
+            "tier": "heavy"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498597652:5b21b01d9cf54094:9",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0122 usd); role @architect on heavy in medium..heavy",
+          "role": "architect",
+          "tier": "heavy",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "design",
+            "risk": "high",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "general",
+        "fields": "class=search risk=low scope=single",
+        "minFloor": "fast",
+        "task": "find the callers of parse",
+        "child": "general",
+        "requests": [
+          {
+            "seq": 29,
+            "toolNames": [
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status",
+              "router_request_authority"
+            ],
+            "reply": "text",
+            "effort": "low",
+            "catalogModel": "anthropic/claude-sonnet-5-5#low",
+            "wireModel": "claude-sonnet-5-5",
+            "tier": "fast"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498599632:5b21b01d9cf54094:10",
+          "reason": "kept:margin: C(best)=0.0048 is not < (1 − 0.2)·C(chosen)=0.0044 usd; role @general on fast in fast..heavy",
+          "role": "general",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "low",
+            "scope": "single",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      },
+      {
+        "agent": "general",
+        "fields": "class=implement risk=low scope=single needs=edit,shell root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "minFloor": "heavy",
+        "task": "change parse and run the checks",
+        "child": "general",
+        "requests": [
+          {
+            "seq": 32,
+            "toolNames": [
+              "edit",
+              "glob",
+              "grep",
+              "read",
+              "router_git_blame",
+              "router_git_diff",
+              "router_git_log",
+              "router_git_ls_files",
+              "router_git_show",
+              "router_git_status",
+              "router_request_authority",
+              "router_run",
+              "write"
+            ],
+            "reply": "text",
+            "effort": "xhigh",
+            "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+            "wireModel": "claude-opus-5-5",
+            "tier": "heavy"
+          }
+        ],
+        "row": {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498601525:5b21b01d9cf54094:11",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.011 usd); role @general on heavy in heavy..heavy [default:clamp:floor; raw shell is outside roles mode — dispatch a tier agent explicitly]",
+          "role": "general",
+          "tier": "heavy",
+          "grant": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git",
+            "router_run"
+          ],
+          "boundsReasons": [
+            "floor:authority"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "implement",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "shell",
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        },
+        "binding": "exact"
+      }
+    ],
+    "pinned": {
+      "requests": [
+        {
+          "seq": 35,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "write"
+          ],
+          "reply": "text",
+          "effort": "xhigh",
+          "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+          "wireModel": "claude-opus-5-5",
+          "tier": "heavy"
+        }
+      ],
+      "row": {
+        "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498603478:5b21b01d9cf54094:12",
+        "reason": "kept:pinned: pinned dispatch (best implement|role:implementer|anthropic/claude-opus-5-5#xhigh at 0.0108 usd); role @implementer on heavy in medium..heavy [pinned:heavy]",
+        "role": "implementer",
+        "tier": "heavy",
+        "grant": [
+          "edit",
+          "glob",
+          "grep",
+          "read",
+          "router_git"
+        ],
+        "boundsReasons": [
+          "floor:authority"
+        ],
+        "detection": {
+          "effective": "none"
+        },
+        "facts": {
+          "class": "implement",
+          "risk": "low",
+          "scope": "single",
+          "needs": [
+            "edit"
+          ],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": null,
+        "explore": false,
+        "propensity": 1,
+        "pinned": true,
+        "switched": false
+      }
+    },
+    "keptRung": {
+      "childID": "ses_ee25cb244ffebMJNvVvUBdgWcD",
+      "requests": [
+        {
+          "seq": 38,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "write"
+          ],
+          "reply": "text",
+          "effort": "xhigh",
+          "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+          "wireModel": "claude-opus-5-5",
+          "tier": "heavy"
+        }
+      ],
+      "rows": [
+        {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498605640:5b21b01d9cf54094:13",
+          "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:pinned: pinned dispatch (best mechanical|role:implementer|anthropic/claude-opus-5-5#xhigh at 0.0098 usd); role @implementer on heavy in heavy..heavy [default:clamp:floor; pinned:heavy]",
+          "role": "implementer",
+          "tier": "heavy",
+          "grant": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "binding": "exact",
+          "boundsReasons": [
+            "floor:authority",
+            "floor:running",
+            "lift:floor"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "mechanical",
+            "risk": "medium",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": true,
+          "childSessionID": "ses_ee25cb244ffebMJNvVvUBdgWcD",
+          "explore": false,
+          "propensity": 1,
+          "pinned": true,
+          "switched": false
+        }
+      ]
+    },
+    "failed": {
+      "requests": [
+        {
+          "seq": 41,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "effort": "low",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "fast"
+        }
+      ],
+      "parentText": "<subagent sessionID=\"ses_ee25ca3a8ffeVx9HxN99VGv23s\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\project\\i2-never-created.txt\nNEXT: resume the same sessionID (\"ses_ee25ca3a8ffeVx9HxN99VGv23s\") with @explorer and the findings; the router raises it to medium from fast; set neither `model` nor `tier=`; do not start a new task.\nCHILD_OK\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\project\\i2-never-created.txt\nNEXT: resume the same sessionID (\"ses_ee25ca3a8ffeVx9HxN99VGv23s\") with @explorer and the findings; the router raises it to medium from fast; set neither `model` nor `tier=`; do not start a new task.",
+      "row": {
+        "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498607347:5b21b01d9cf54094:14",
+        "reason": "kept:pinned: pinned dispatch (best search|role:explorer|anthropic/claude-sonnet-5-5#medium at 0.004 usd); role @explorer on fast in fast..medium [pinned:fast]",
+        "role": "explorer",
+        "tier": "fast",
+        "grant": [
+          "glob",
+          "grep",
+          "read",
+          "router_git"
+        ],
+        "boundsReasons": [],
+        "detection": {
+          "effective": "deterministic"
+        },
+        "facts": {
+          "class": "search",
+          "risk": "low",
+          "scope": "multi",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": null,
+        "explore": false,
+        "propensity": 1,
+        "pinned": true,
+        "switched": false
+      }
+    },
+    "raised": {
+      "childID": "ses_ee25ca3a8ffeVx9HxN99VGv23s",
+      "requests": [
+        {
+          "seq": 44,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "effort": "medium",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "wireModel": "claude-sonnet-5-5",
+          "tier": "medium"
+        }
+      ],
+      "rows": [
+        {
+          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498609208:5b21b01d9cf54094:15",
+          "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0046 usd); role @explorer on medium in medium..medium [default:clamp:floor; resume:off-ladder; raise:verification-fail:medium]",
+          "role": "explorer",
+          "tier": "medium",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "binding": "exact",
+          "boundsReasons": [
+            "floor:floorTier"
+          ],
+          "detection": {
+            "effective": "none"
+          },
+          "facts": {
+            "class": "search",
+            "risk": "medium",
+            "scope": "multi",
+            "needs": [],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": true,
+          "childSessionID": "ses_ee25ca3a8ffeVx9HxN99VGv23s",
+          "explore": false,
+          "propensity": 1,
+          "pinned": false,
+          "switched": false
+        }
+      ]
+    },
+    "unknownBindings": [],
+    "routerWarnings": [],
+    "hostErrors": [],
+    "providerErrors": []
+  }
+}
