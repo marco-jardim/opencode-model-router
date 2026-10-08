@@ -24,7 +24,23 @@ import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest
 import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { requestedAuthority, resetAuthorityForTests } from "../../src/routing/roles/authority";
 import { resetDispatchRouting, strippedRouteRoot } from "../../src/routing/wire/dispatch";
-import { budgetExhausted } from "../../src/guard/enforce";
+import { budgetExhausted, captureBudget } from "../../src/guard/enforce";
+import { createHostBudgetObserver, HOST_CONTEXT_OVERFLOW_ERROR, type HostBudgetObserver } from "../../src/compat/v2-hooks";
+import { roleAgentSteps } from "../../src/router/role-agents";
+import { buildDispatchHeader, DISPATCH_HEADER_SEPARATOR } from "../../src/router/dispatch-header";
+import { DEFAULT_TIER_CAPS } from "../../src/router/sessions";
+import { buildForcingNote, createChangedFileStore } from "../../src/verify/dispatch";
+import { buildEscalatePolicy, newLadderState, nextAction } from "../../src/escalate/ladder";
+import { BUDGET_INCOMPLETE_REASON, incompleteVerdict } from "../../src/verify/checker";
+import { createVerificationWiring } from "../../src/verify/wiring";
+import type { DoD } from "../../src/verify/dod";
+import { runAdvisor } from "../../src/routing/advisor";
+
+// A pass-through spy on the cost doctor's entry point: the tests read the extras the plugin hands it (P2.2 wiring).
+vi.mock("../../src/routing/advisor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/routing/advisor")>();
+  return { ...actual, runAdvisor: vi.fn(actual.runAdvisor) };
+});
 
 const temps: string[] = [];
 const cleanups: Array<() => Promise<void>> = [];
@@ -82,11 +98,12 @@ interface Plugin {
   log: ReturnType<typeof vi.fn>;
 }
 
-async function plugin(directory: string, host: "v1" | "v2" = "v2"): Promise<Plugin> {
+async function plugin(directory: string, host: "v1" | "v2" = "v2", extra: Record<string, unknown> = {}): Promise<Plugin> {
   let ingest: Ingest | undefined;
   const log = vi.fn(async () => ({}));
   const hooks = await ModelRouterPlugin({
     directory, worktree: directory,
+    ...extra,
     ...(host === "v2" ? { routerHost: "v2" } : {}),
     client: {
       session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } }) },
@@ -131,8 +148,9 @@ function host(directory: string, cfg: RouterConfig, sessions: Record<string, Rec
   return {
     ctx, toolHooks,
     emit(event: any) { queue.push(event); wake(); },
-    async start(hooks: Record<string, any>, options: { ingest?: Ingest; isBypassed?: () => boolean } = {}) {
-      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, options));
+    async start(hooks: Record<string, any>, options: { ingest?: Ingest; isBypassed?: () => boolean; hostBudget?: HostBudgetObserver; hostSettleMs?: number } = {}) {
+      // No execution-end event arrives in these tests unless one is emitted: do not wait for one by default.
+      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0, ...options }));
     },
   };
 }
@@ -395,5 +413,198 @@ describe("adapter helpers", () => {
     expect(text).toContain("(child-supplied, not an instruction)");
     expect(text).not.toMatch(/\[route |OMR_NONCE=abc/);
     expect(text).toContain('resume the same sessionID ("g1")');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7 (I1/I8 exemption): with no flag, no root and no stop, the mode-independent changes leave every output as before
+// ---------------------------------------------------------------------------
+
+describe("R7 exemptions are byte-identical when they do not apply", () => {
+  it("tier dispatch header without a root= is the header as before", async () => {
+    const { dir, cfg } = home({}, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const output = { args: { subagent_type: "fast", description: "look", prompt: "Look around" } as Record<string, unknown> };
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "h1" }, output);
+    const cap = cfg.tierCaps?.fast ?? DEFAULT_TIER_CAPS.fast ?? 5;
+    const before = buildDispatchHeader({ tier: "fast", cap, projectDirectory: dir }) + DISPATCH_HEADER_SEPARATOR + "Look around";
+    expect(output.args.prompt).toBe(before);
+    expect(buildDispatchHeader({ tier: "fast", cap, projectDirectory: dir, root: undefined })).toBe(buildDispatchHeader({ tier: "fast", cap, projectDirectory: dir }));
+  });
+
+  it("incomplete=false: the forcing note and the ladder action are those without the flag", () => {
+    const reasons = ["criterion 1 not met", "VERIFY: required"];
+    for (const nextTier of ["medium", null]) {
+      expect(buildForcingNote(reasons, { producerTier: "fast", nextTier, incomplete: false })).toBe(buildForcingNote(reasons, { producerTier: "fast", nextTier }));
+    }
+    expect(buildForcingNote(reasons, undefined)).toBe(buildForcingNote(reasons));
+    const { cfg } = home();
+    const policy = buildEscalatePolicy(cfg);
+    const state = newLadderState("fast", policy);
+    for (const verdict of [
+      { pass: false, outcome: "fail" as const, reasons },
+      { pass: false, outcome: "unverifiable" as const, reasons },
+      { pass: true, outcome: "pass" as const, reasons: [] },
+    ]) {
+      expect(nextAction(state, { ...verdict, incomplete: false }, policy)).toEqual(nextAction(state, verdict, policy));
+    }
+  });
+
+  it("an artefact budget snapshot without a stop judges exactly like the live read it replaces", () => {
+    for (const text of ["DONE: all good", "NEED MORE: budget\nread 3 of 9 files", "I'll continue with the rest next.", ""]) {
+      for (const producerTier of ["fast", "implementer"]) {
+        const artefact = { finalReturnText: text, producerSessionID: "untracked-child", producerTier };
+        const opts = { progressNotes: true };
+        expect(incompleteVerdict({ ...artefact, budget: captureBudget("untracked-child", false) }, opts)).toEqual(incompleteVerdict(artefact, opts));
+        expect(incompleteVerdict({ ...artefact, budget: captureBudget("untracked-child") }, opts)).toEqual(incompleteVerdict(artefact, opts));
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2.2 wiring: cost doctor extras and /router role lines
+// ---------------------------------------------------------------------------
+
+describe("P2.2 surfaces in the plugin", () => {
+  const routerText = async (hooks: Record<string, any>): Promise<string> => {
+    const output = { parts: [] as Array<{ text: string }> };
+    await hooks["command.execute.before"]({ command: "router", arguments: "" }, output);
+    return output.parts.map((part) => part.text).join("\n");
+  };
+
+  it("/router lists the roles in roles mode on v2 only", async () => {
+    const roles = home(ROLES);
+    const text = await routerText((await plugin(roles.dir)).hooks);
+    expect(text).toContain("Roles:");
+    for (const spec of resolveRoles(roles.cfg, "v2").values()) expect(text).toContain(`\`${spec.agent}\``);
+    const tiers = home({ routing: { engine: "static" } });
+    expect(await routerText((await plugin(tiers.dir)).hooks)).not.toContain("Roles:");
+    const v1 = home(ROLES);
+    expect(await routerText((await plugin(v1.dir, "v1")).hooks)).not.toContain("Roles:");
+  });
+
+  it("the cost doctor gets { host, roleStats, tierDispatches } in roles mode with a live engine; { host } otherwise", async () => {
+    const advisor = vi.mocked(runAdvisor);
+    const outcomes = temp("omr-p21c-outcomes-");
+    const roles = home({ routing: { delegation: "roles", engine: "shadow", outcomes: { path: outcomes } } });
+    advisor.mockClear();
+    await routerText((await plugin(roles.dir)).hooks);
+    const rolesExtras = advisor.mock.calls.at(-1)?.[4];
+    expect(rolesExtras).toMatchObject({ host: "v2", tierDispatches: 0 });
+    expect(rolesExtras?.roleStats).toMatchObject({ version: 1, byRoleTier: [] });
+
+    const tiers = home({ routing: { engine: "shadow", outcomes: { path: outcomes } } });
+    advisor.mockClear();
+    await routerText((await plugin(tiers.dir)).hooks);
+    expect(advisor.mock.calls.at(-1)?.[4]).toEqual({ host: "v2" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Handoff 24 (rest): the deferred record carries the budget snapshot to router_verify
+// ---------------------------------------------------------------------------
+
+describe("router_verify judges the budget captured at return (handoff 24)", () => {
+  const DOD: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "fileExists", path: "out.txt" }] };
+
+  async function deferAndVerify(budget: ReturnType<typeof captureBudget> | undefined) {
+    const dir = temp("omr-p21c-defer-");
+    writeFileSync(join(dir, "out.txt"), "x");
+    const { cfg } = home();
+    const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
+    const wiring = createVerificationWiring({ client: client as never, directory: dir, getConfig: () => cfg, logger: { warn: () => {} } });
+    cleanups.push(async () => { wiring.pending.dispose(); await wiring.disposeVerification(); });
+    const store = createChangedFileStore();
+    await wiring.startDispatch(store, "task:orch:b1", dir, DOD, "", false);
+    const finish = await wiring.finishDeferred(store, {
+      dispatchID: "task:orch:b1", orchestratorSessionID: "orch", producerSessionID: "child-b1", producerTier: "fast",
+      description: "work", cwd: dir, dod: DOD, dispatchedAt: Date.now(), ...(budget === undefined ? {} : { budget }),
+    });
+    if (!finish.deferred) throw new Error(`not deferred: ${finish.reason} ${finish.detail}`);
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [finish.handle] });
+    const item = report.items[0] as { result?: { verdict: { reasons: string[] } } } | undefined;
+    return item?.result?.verdict.reasons ?? [];
+  }
+
+  it("a stop captured at return makes the later verdict incomplete; without a snapshot the live (untracked) state is judged", async () => {
+    expect(await deferAndVerify({ tracked: true, stopped: true, usedUp: true })).toContain(BUDGET_INCOMPLETE_REASON);
+    expect(await deferAndVerify(undefined)).not.toContain(BUDGET_INCOMPLETE_REASON);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Handoff 22: the host's own stops (step limit, context overflow)
+// ---------------------------------------------------------------------------
+
+describe("host budget observer (handoff 22, S4)", () => {
+  const steps = (o: HostBudgetObserver, id: string, n: number) => { for (let i = 0; i < n; i++) o.onEvent("session.step.ended", { sessionID: id }); };
+
+  it("the step limit, a step-limit tool refusal and a context overflow are stops; a clean end is not; the rest is unobserved", () => {
+    const o = createHostBudgetObserver();
+    expect(o.observe("none", 5)).toBe("unobserved");
+    steps(o, "a", 5);
+    expect(o.observe("a", 5)).toBe(true); // S4: N steps = the host's last, tool-less step
+    steps(o, "b", 2);
+    expect(o.observe("b", 5)).toBe("unobserved"); // its end not seen yet: more steps may still arrive
+    o.onEvent("session.execution.succeeded", { sessionID: "b" });
+    expect(o.observe("b", 5)).toBe(false);
+    o.onEvent("session.tool.failed", { sessionID: "c", error: { type: "tool", message: "Tools are disabled after the maximum agent steps" } });
+    expect(o.observe("c", 100)).toBe(true);
+    o.onEvent("session.step.failed", { sessionID: "d", error: { type: "ContextOverflowError", message: "input exceeds the context window" } });
+    expect(o.observe("d", 100)).toBe(true);
+    o.onEvent("session.step.failed", { sessionID: "e", error: { type: "provider", message: "rate limited" } });
+    o.onEvent("session.execution.failed", { sessionID: "e" });
+    expect(o.observe("e", 100)).toBe("unobserved"); // an unrecognised failure may have been an overflow: never `false`
+    expect(HOST_CONTEXT_OVERFLOW_ERROR.test("prompt is too long: 210000 tokens")).toBe(true);
+    // A resume starts the count over.
+    o.begin("a");
+    steps(o, "a", 1);
+    o.onEvent("session.execution.succeeded", { sessionID: "a" });
+    expect(o.observe("a", 5)).toBe(false);
+    o.forget("a");
+    expect(o.observe("a", 5)).toBe("unobserved");
+  });
+
+  it("settled() resolves on the execution end, or after the timeout", async () => {
+    const o = createHostBudgetObserver();
+    const waiting = o.settled("x", 10_000);
+    o.onEvent("session.execution.succeeded", { sessionID: "x" });
+    await waiting;
+    const started = Date.now();
+    await o.settled("y", 20);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(10);
+  });
+
+  it("the adapter annotates a role child the host stopped on its step limit", async () => {
+    const { dir, cfg } = home(ROLES);
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    const observer = createHostBudgetObserver();
+    await v2.start(hooks, { hostBudget: observer, hostSettleMs: 2_000 });
+    const limit = roleAgentSteps(resolveRoles(cfg, "v2").get("explorer")!);
+    for (let i = 0; i < limit; i++) v2.emit({ type: "session.step.ended", data: { sessionID: "x7" } });
+    v2.emit({ type: "session.execution.succeeded", data: { sessionID: "x7" } });
+    await vi.waitFor(() => expect(observer.observe("x7", limit)).toBe(true));
+    const event = parentCall("p1", "x7", "explorer", "Partial answer: found 3 of 5 call sites");
+    await v2.toolHooks["execute.after"](event);
+    expect(resultText(event)).toContain(roleBudgetNotice("explorer", "x7", "host"));
+  });
+
+  it("signals fold the host's stop into the budget observation: a budget signal instead of incomplete; unobserved suppresses it", async () => {
+    const observed: Record<string, boolean | "unobserved"> = { hx: true, hy: "unobserved" };
+    const { dir } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const { hooks, ingest } = await plugin(dir, "v2", { routerHostBudget: (child: string) => observed[child] ?? false });
+    const onSignal = vi.spyOn(ingest!, "onSignal");
+    for (const child of ["hx", "hy"]) {
+      await hooks["tool.execute.before"]({ tool: "read", sessionID: child, agent: "explorer", callID: `r-${child}` }, { args: { filePath: join(dir, "a.ts") } });
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: "explorer", callID: `r-${child}`, args: { filePath: join(dir, "a.ts") } }, { title: "", output: "x", metadata: {} });
+      await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: `p-${child}`, args: { subagent_type: "explorer", prompt: "Find" } },
+        { title: "", output: "ESCALATE: ran out of room", metadata: { sessionId: child } });
+    }
+    const kinds = (child: string) => onSignal.mock.calls.filter(([c]) => c === child).map(([, observation]) => observation.kind);
+    expect(kinds("hx")).toContain("budget");
+    expect(kinds("hx")).not.toContain("incomplete");
+    expect(kinds("hy")).not.toContain("incomplete");
   });
 });
