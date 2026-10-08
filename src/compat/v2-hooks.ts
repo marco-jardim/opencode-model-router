@@ -27,7 +27,9 @@ import {
 } from "../routing/wire/dispatch";
 import type { RouterConfig } from "../router/config";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
-import { bind, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup } from "../routing/roles/binding";
+import {
+  BINDING_NOTES, bind, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup,
+} from "../routing/roles/binding";
 import type { DispatchGrant } from "../routing/roles/policy";
 import {
   AUTHORITY_TEXT, AUTHORITY_TOOL_NAME, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText,
@@ -483,6 +485,81 @@ export interface RoleAuthorityInput {
   readonly canonical?: (path: string, base: string) => string | undefined;
   /** `glob` patterns / `grep` include globs of the call (QA-P23-A9): refused when {@link unsafeSearchPattern}. */
   readonly patterns?: readonly string[];
+  /**
+   * QA-P23-2-A1: canonical paths of THIS session's own truncated tool outputs (the host's tool-output store): `read` and `grep`
+   * of exactly these files — and, for an exact binding, `external_directory` of their directory — are allowed outside the work
+   * root. Never `edit`, `glob` or anything else.
+   */
+  readonly ownOutputs?: ReadonlySet<string>;
+}
+
+/** The host's truncation marker (OpenCode v2 `tool-output-store.ts`: `... output truncated; full content saved to <path> ...`). */
+const TRUNCATION_MARKER = /\.\.\. output truncated; full content saved to (.+?) \.\.\./g;
+/** The shape of a tool-output store file: `<data>/tool-output/tool_<id>` (`MANAGED_DIRECTORY`, `tool_${Identifier.ascending()}`). */
+const TOOL_OUTPUT_FILE = /[\\/]tool-output[\\/]tool_[A-Za-z0-9_-]+$/;
+/** The host's tool-output `external_directory` rule (`path.join(Global.Path.data, "tool-output", "*")`). */
+const TOOL_OUTPUT_GLOB = /[\\/]tool-output[\\/]\*$/;
+
+/**
+ * QA-P23-2-A1: the files named by the host's truncation markers in a tool result's text, when they have the tool-output store's
+ * shape (absolute, `…/tool-output/tool_<id>`, no wildcard). Anything else in a marker — a path a file's content made up — is
+ * ignored.
+ */
+export function truncationMarkerPaths(text: string): string[] {
+  const out: string[] = [];
+  for (const match of text.matchAll(TRUNCATION_MARKER)) {
+    const path = match[1]!.trim();
+    if ((posix.isAbsolute(path) || win32.isAbsolute(path)) && TOOL_OUTPUT_FILE.test(path) && !/[*?\0]/.test(path) && !out.includes(path)) out.push(path);
+  }
+  return out;
+}
+
+/** `target` (canonical) is exactly one of the session's own truncated outputs (win32 case folding, the max policy's matcher). */
+function ownOutput(target: string, outputs: ReadonlySet<string> | undefined): boolean {
+  if (outputs === undefined) return false;
+  for (const file of outputs) if (permissionMatches(target, file)) return true;
+  return false;
+}
+
+/** `dir` (canonical) is the directory of one of the session's own truncated outputs. */
+function ownOutputDirectory(dir: string, outputs: ReadonlySet<string> | undefined): boolean {
+  if (outputs === undefined) return false;
+  for (const file of outputs) if (permissionMatches(dir, file.replace(/[\\/][^\\/]+$/, ""))) return true;
+  return false;
+}
+
+/**
+ * §2.2 / QA-P23-A4 / QA-P23-2-A3: `root` is still a worktree of `git worktree list --porcelain` (prunable entries dropped by
+ * `parseWorktreeList`) whose `.git` still has a worktree's shape — a linked worktree's is a file; the main worktree's (the first
+ * entry) a directory, or a file for a submodule's main checkout.
+ */
+export function listedWorktreeRoot(
+  porcelain: string,
+  root: string,
+  opts: { realpath?: (path: string) => string; gitEntry?: (path: string) => "file" | "directory" | undefined } = {},
+): boolean {
+  const realpath = opts.realpath ?? ((p: string) => realpathSync.native(p));
+  const gitEntry = opts.gitEntry ?? ((p: string) => {
+    try {
+      const stat = statSync(p);
+      return stat.isFile() ? "file" : stat.isDirectory() ? "directory" : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  const want = normalizeRootText(root);
+  for (const [index, entry] of parseWorktreeList(porcelain).entries()) {
+    let real: string | undefined;
+    try {
+      real = realpath(entry);
+    } catch {
+      real = undefined;
+    }
+    if (normalizeRootText(entry) !== want && (real === undefined || normalizeRootText(real) !== want)) continue;
+    const kind = gitEntry(join(real ?? entry, ".git"));
+    return index === 0 ? kind === "directory" || kind === "file" : kind === "file";
+  }
+  return false;
 }
 
 /**
@@ -509,17 +586,20 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
   if (cls === "external_directory") {
     if (binding.kind !== "exact") return refuse("external_directory: this session is not bound to its dispatch (binding unknown, I9)");
     const root = grant.workRoot;
-    if (root === null) return refuse("external_directory: this dispatch has no work root (root=)");
     if (![...grant.actions].some((a) => a === "read" || a === "glob" || a === "grep" || a === "router_git")) {
       return refuse("external_directory: this dispatch grants no local action");
     }
     if (input.paths.length === 0) return refuse("external_directory: no path to check");
+    // QA-P23-2-A1: the directory of the session's own truncated output, for `read`/`grep` of exactly those files.
+    const outputs = grant.actions.has("read") || grant.actions.has("grep") ? input.ownOutputs : undefined;
     for (const resource of input.paths) {
       const dir = resource.replace(/[\\/]\*$/, "");
       const target = dir === "" ? undefined : canonical(dir, input.sessionDirectory);
-      if (target === undefined || !insideWorkRoot(target, root)) {
-        return refuse(`external_directory: ${resource} is outside this dispatch's work root ${root}`);
-      }
+      if (target !== undefined && root !== null && insideWorkRoot(target, root)) continue;
+      if (target !== undefined && ownOutputDirectory(target, outputs)) continue;
+      return refuse(root === null
+        ? "external_directory: this dispatch has no work root (root=)"
+        : `external_directory: ${resource} is outside this dispatch's work root ${root}`);
     }
     return ALLOW;
   }
@@ -533,9 +613,9 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
     }
     for (const path of input.paths) {
       const target = canonical(path, input.sessionDirectory);
-      if (target === undefined || !insideWorkRoot(target, root)) {
-        return refuse(`${action}: ${path} is outside this dispatch's work root ${root} (use an absolute path inside it)`);
-      }
+      if (target !== undefined && insideWorkRoot(target, root)) continue;
+      if (target !== undefined && (cls === "read" || cls === "grep") && ownOutput(target, input.ownOutputs)) continue; // QA-P23-2-A1
+      return refuse(`${action}: ${path} is outside this dispatch's work root ${root} (use an absolute path inside it)`);
     }
   }
   return ALLOW;
@@ -552,10 +632,10 @@ export function roleToolKept(name: string, grant: Pick<DispatchGrant, "actions">
   return cls !== undefined && cls !== "external_directory" && grant.actions.has(cls);
 }
 
-/** P-3: the parent's annotation when a role child's tool catalog could not be built (the child ran with no tools). */
+/** P-3: the parent's annotation when a role child's tool catalog could not be built for at least one of its steps. */
 export function roleCatalogFailureNotice(agent: string, childSessionID: string): string {
-  return `[router] @${agent} ran without tools: the router could not build its tool catalog for this dispatch (fail closed, `
-    + `session "${childSessionID}"). Its result is not grounded in tool output. NEXT: dispatch the task again as a fresh task.`;
+  return `[router] @${agent} had no tools for at least one step; check that its result is grounded in tool output, otherwise dispatch `
+    + `again (the router could not build its tool catalog for this dispatch: fail closed, session "${childSessionID}").`;
 }
 
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
@@ -669,6 +749,10 @@ export async function registerV2Hooks(
       firstText = undefined; // the title marker still binds
     }
     const text = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+    // QA-P23-2-B1: whether the session named an agent, for the context hook's "no binding" decision.
+    lookupNamedAgent.delete(id);
+    lookupNamedAgent.set(id, text(session.agent) !== undefined);
+    while (lookupNamedAgent.size > 1000) lookupNamedAgent.delete(lookupNamedAgent.keys().next().value!);
     return {
       ...(text(session.parentID) === undefined ? {} : { parentID: text(session.parentID) }),
       ...(text(session.agent) === undefined ? {} : { agent: text(session.agent) }),
@@ -676,6 +760,8 @@ export async function registerV2Hooks(
       ...(firstText === undefined ? {} : { firstText }),
     };
   };
+  /** QA-P23-2-B1: the last binding lookup of a session named an agent (bounded). */
+  const lookupNamedAgent = new Map<string, boolean>();
   /** Handoff 22: the host's own stops of role children (step limit, context overflow), from the event stream. */
   const hostBudget = options.hostBudget ?? createHostBudgetObserver();
   options.onHostBudget?.((childSessionID, stepLimit) => hostBudget.observe(childSessionID, stepLimit));
@@ -763,26 +849,34 @@ export async function registerV2Hooks(
   const worktreeChecks = new Map<string, { at: number; listed: Promise<boolean> }>();
   const checkWorktree = async (root: string): Promise<boolean> => {
     try {
-      const want = normalizeRootText(root);
-      const entries = parseWorktreeList(await listWorktreesOf(ctx.location.directory));
-      for (const [index, entry] of entries.entries()) {
-        let real: string | undefined;
-        try {
-          real = realpathSync.native(entry);
-        } catch {
-          real = undefined;
-        }
-        if (normalizeRootText(entry) !== want && (real === undefined || normalizeRootText(real) !== want)) continue;
-        try {
-          const git = statSync(join(real ?? entry, ".git"));
-          return index === 0 ? git.isDirectory() : git.isFile();
-        } catch {
-          return false;
-        }
-      }
-      return false;
+      return listedWorktreeRoot(await listWorktreesOf(ctx.location.directory), root);
     } catch {
       return false;
+    }
+  };
+  /**
+   * QA-P23-2-A1: per session, the canonical paths of its OWN truncated tool outputs — named by the host's truncation marker in
+   * that session's own tool results (`execute.after`) or by the host's `outputPaths` on that session's events; a marker path must
+   * sit in the host's tool-output directory when the role agents' inherited rules named it (`hostOutputDirs`). Bounded (1000
+   * sessions, 64 files each, oldest first out); cleared on `session.deleted`.
+   */
+  const ownOutputs = new Map<string, Set<string>>();
+  const hostOutputDirs = new Set<string>();
+  const rememberOutputs = (sessionID: unknown, paths: readonly string[], fromHost: boolean): void => {
+    if (typeof sessionID !== "string" || sessionID === "" || paths.length === 0) return;
+    for (const path of paths) {
+      if (!TOOL_OUTPUT_FILE.test(path) || /[*?\0]/.test(path)) continue;
+      const canonical = canonicalAuthorityPath(path, path.replace(/[\\/][^\\/]+$/, ""));
+      if (canonical === undefined || !TOOL_OUTPUT_FILE.test(canonical)) continue;
+      const dir = canonical.replace(/[\\/][^\\/]+$/, "");
+      if (!fromHost && hostOutputDirs.size > 0 && ![...hostOutputDirs].some((known) => permissionMatches(dir, known))) continue;
+      const files = ownOutputs.get(sessionID) ?? new Set<string>();
+      ownOutputs.delete(sessionID);
+      files.delete(canonical);
+      files.add(canonical);
+      while (files.size > 64) files.delete(files.values().next().value!);
+      ownOutputs.set(sessionID, files);
+      while (ownOutputs.size > 1000) ownOutputs.delete(ownOutputs.keys().next().value!);
     }
   };
   const stillAWorktree = (root: string): Promise<boolean> => {
@@ -825,6 +919,7 @@ export async function registerV2Hooks(
     const decision = roleAuthorityDecision({
       action: event.action, paths, patterns, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
       sessionDirectory: paths.length > 0 ? await sessionDirectoryOf(sessionID) : ctx.location.directory, fallbackRoot: fallbackRoot(),
+      ownOutputs: ownOutputs.get(sessionID),
     });
     if (!decision.allow) return decision.reason;
     const root = authority.binding.grant.workRoot;
@@ -859,7 +954,7 @@ export async function registerV2Hooks(
     }
     const decision = roleAuthorityDecision({
       action: event.tool, paths, patterns: searchPatterns(cls, record.pattern, record.include), binding: authority.binding,
-      dynamic: authority.spec.authority.mode === "dynamic", sessionDirectory, fallbackRoot: fallbackRoot(),
+      dynamic: authority.spec.authority.mode === "dynamic", sessionDirectory, fallbackRoot: fallbackRoot(), ownOutputs: ownOutputs.get(sessionID),
     });
     return decision.allow ? undefined : decision.reason;
   };
@@ -1051,8 +1146,22 @@ export async function registerV2Hooks(
           if (definition.color !== undefined) agent.color = definition.color;
           if (definition.steps !== undefined) agent.steps = definition.steps;
           if (definition.permission) {
+            const inherited = (agent.permissions ?? []) as ReturnType<typeof permissionRules>;
+            let rules = marker ? v2Actions(permissionRules(definition.permission)) : permissionRules(definition.permission);
+            // #84 QA-P23-2-A1: a reading role agent keeps the host's own tool-output directory rule (`<data>/tool-output/*`, host
+            // plugin/agent.ts TRUNCATION_GLOB) so a child can read its truncated output; the router's evaluate hook narrows it to
+            // the session's own files. Placed before the inherited denies, which still win.
+            if (roleAgentOf(definition) === name && evaluatePermission(rules, "read", "x.ts") !== "deny") {
+              const outputs = inherited.filter((rule) => rule.action === "external_directory" && rule.effect === "allow"
+                && TOOL_OUTPUT_GLOB.test(rule.resource));
+              rules = [...rules, ...outputs.map((rule) => ({ action: rule.action, resource: rule.resource, effect: rule.effect }))];
+              for (const rule of outputs) {
+                const dir = rule.resource.replace(/[\\/]\*$/, "");
+                hostOutputDirs.add(canonicalAuthorityPath(dir, dir) ?? dir);
+              }
+            }
             agent.permissions = publishReadOnlyPermissions(
-              name, marker ? v2Actions(permissionRules(definition.permission)) : permissionRules(definition.permission), agent.permissions ?? [], warnPermissionOnce, { plugin: marker !== undefined },
+              name, rules, inherited, warnPermissionOnce, { plugin: marker !== undefined },
             );
           }
         });
@@ -1071,6 +1180,15 @@ export async function registerV2Hooks(
         // An explicit event agent is authoritative, even when session lookup
         // would fail or still refers to the previous agent during a switch.
         name ??= (await ctx.session.get({ sessionID: event.sessionID })).agent;
+        if (name === undefined) {
+          // QA-P23-2-A2: neither the event nor the session names an agent — a session the router knows as a role child is denied.
+          const known = knownRoleSession(String(event.sessionID));
+          if (known !== undefined) {
+            event.effect = "deny";
+            event.message = `Permission denied by role agent ${known}: the session names no agent (fail closed)`;
+            return;
+          }
+        }
         protectedKnown = protectedAgent(name);
         role = roleAgentName(name);
         if (!protectedKnown && role === undefined) return; // QA-P23-A10: every role agent is protected; never skip one
@@ -1217,7 +1335,12 @@ export async function registerV2Hooks(
         if (authority === undefined) throw new Error(`role ${role}: no live role spec (fail closed)`);
         // QA-P23-B1: a decision the registry could not keep (the session lookup failed or named no parent/agent) is not a
         // binding: the catalog is emptied and the parent told, instead of a silently reduced child.
-        if (!authority.stored) throw new Error(`role ${role}: the session could not be bound to its dispatch (lookup failed)`);
+        // QA-P23-2-B1: only a failed lookup or a session that names no agent; one with an agent but no parent is an unknown
+        // binding (I9 (a): the role max ∩ local), not a failure.
+        if (!authority.stored && (authority.binding.grant.notes.includes(BINDING_NOTES.lookupFailed)
+          || lookupNamedAgent.get(String(event.sessionID)) !== true)) {
+          throw new Error(`role ${role}: the session could not be bound to its dispatch (lookup failed or no agent)`);
+        }
         const dynamic = authority.spec.authority.mode === "dynamic";
         for (const name of Object.keys(event.tools ?? {})) if (!roleToolKept(name, authority.binding.grant, dynamic)) delete event.tools[name];
       }
@@ -1490,6 +1613,15 @@ export async function registerV2Hooks(
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
       dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
+      // QA-P23-2-A1: the files the host's truncation markers name in this session's OWN tool result (never throws).
+      try {
+        const raw = (event as { result?: unknown }).result as Record<string, unknown> | undefined;
+        const structured = raw?.output as Record<string, unknown> | string | undefined;
+        const texts = [contentText(raw?.content), typeof structured === "string" ? structured : typeof structured?.output === "string" ? structured.output : ""];
+        rememberOutputs(event.sessionID, truncationMarkerPaths(texts.join("\n")), false);
+      } catch {
+        // a malformed result names no output file
+      }
       const role = event.tool === "subagent" ? await roleAfterCall({
         id: event.id, sessionID: String(event.sessionID), status: event.status,
         result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
@@ -1598,6 +1730,10 @@ export async function registerV2Hooks(
         try {
           const data = event.data as Record<string, any>;
           hostBudget.onEvent(event.type, data); // handoff 22 (S4): step counts, step-limit tool refusals, overflow failures
+          // QA-P23-2-A1: the host names a tool result's saved full output on that session's tool event (`outputPaths`).
+          if (data && Array.isArray(data.outputPaths)) {
+            rememberOutputs(data.sessionID, data.outputPaths.filter((path: unknown): path is string => typeof path === "string"), true);
+          }
           if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
             await ingesting(event.type, () => ingest.onStepEnded(event));
@@ -1612,6 +1748,8 @@ export async function registerV2Hooks(
             if (typeof data.sessionID === "string") {
               evictBinding(data.sessionID);
               evictAuthority(data.sessionID);
+              ownOutputs.delete(data.sessionID); // QA-P23-2-A1
+              lookupNamedAgent.delete(data.sessionID);
               lastCallOfChild.delete(data.sessionID);
               hostBudget.forget(data.sessionID);
             }
