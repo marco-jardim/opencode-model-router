@@ -22,6 +22,8 @@ import {
   type RoleRegistrationOptions,
 } from "../../src/router/role-agents";
 import { HOST_NATIVE_ROLE_NAMES, resolveRoleTable, SHIPPED_ROLE_SPECS, type RoleSpec } from "../../src/router/roles";
+import { newDispatchNonce, nonceTitleSuffix, registerPending, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { roleMaxActions } from "../../src/routing/wire/dispatch";
 
 const temps: string[] = [];
 const cleanups: Array<() => Promise<void>> = [];
@@ -438,6 +440,14 @@ describe("v2 adapter in roles mode", () => {
     home({ routing: { delegation: "roles" } });
     const f = fixture(main);
     const generalBefore = JSON.parse(JSON.stringify(f.agents.general));
+    // #84 P2.3 (approved amendment of this P2.1 test): each role's child below is bound EXACTLY to a dispatch whose grant is the
+    // role max with the sibling worktree as work root, so the max policy is what decides. An unbound child is narrowed to
+    // max ∩ local with external_directory denied (I9) — asserted in test/integration/roles-authority.test.ts.
+    resetBindingRegistryForTests();
+    const boundSessions = new Map<string, Record<string, unknown>>();
+    f.ctx.session.get.mockImplementation((async ({ sessionID }: { sessionID: string }) =>
+      boundSessions.get(sessionID) ?? { id: "child", parentID: "root", agent: "explorer" }) as never);
+    const root = realpathSync.native(wt);
     await f.start();
     const names = SHIPPED_ROLE_SPECS.map((spec) => spec.agent);
     for (const name of names) {
@@ -447,18 +457,31 @@ describe("v2 adapter in roles mode", () => {
       expect(evaluatePermission(published, "execute", "*")).toBe("deny");
       expect(evaluatePermission(published, "subagent", "*")).toBe("deny");
       expect(evaluatePermission(published, "shell", "*")).toBe("deny");
+      const spec = SHIPPED_ROLE_SPECS.find((s) => s.agent === name)!;
+      const child = `child-${name}`;
+      const nonce = newDispatchNonce();
+      registerPending({
+        parentSessionID: "root", callID: `call-${name}`, agent: name, description: "look", nonce,
+        grant: { actions: new Set(roleMaxActions(spec)), notes: [], workRoot: root }, budget: 40, decisionID: null, registeredAt: Date.now(),
+      });
+      boundSessions.set(child, { id: child, parentID: "root", agent: name, title: `look${nonceTitleSuffix(nonce)}` });
+      const as = (event: PermissionEvaluation): PermissionEvaluation => ({ ...event, sessionID: child } as PermissionEvaluation);
       // protectedAgent(): the router's evaluate hook enforces the policy under an allow-all parent.
-      const edit = evaluation(name, "edit", ["src/a.ts"]);
+      const edit = as(evaluation(name, "edit", [join(root, "src", "a.ts")]));
       await f.permissionHooks.evaluate(edit);
-      const canEdit = SHIPPED_ROLE_SPECS.find((s) => s.agent === name)!.authority.allow.includes("edit");
+      const canEdit = spec.authority.allow.includes("edit");
       expect([name, edit.effect]).toEqual([name, canEdit ? "allow" : "deny"]);
-      const outside = evaluation(name, "external_directory", ["C:/Windows/*"]);
+      // QA-P23-A6: these refusals are the MAX policy's (its message), not the per-dispatch narrowing's.
+      const label = canEdit ? "plugin agent" : "read-only agent";
+      if (!canEdit) expect([name, edit.message]).toEqual([name, `Permission denied by ${label} ${name}: edit`]);
+      const outside = as(evaluation(name, "external_directory", ["C:/Windows/*"]));
       await f.permissionHooks.evaluate(outside);
       expect([name, outside.effect]).toEqual([name, "deny"]);
-      const sibling = evaluation(name, "external_directory", [join(wt, "*").replaceAll("\\", "/")]);
+      expect([name, outside.message]).toEqual([name, `Permission denied by ${label} ${name}: external_directory`]);
+      const sibling = as(evaluation(name, "external_directory", [join(wt, "*").replaceAll("\\", "/")]));
       await f.permissionHooks.evaluate(sibling);
       expect([name, sibling.effect]).toEqual([name, name === "researcher" ? "deny" : "allow"]);
-      const execute = evaluation(name, "execute", ["*"]);
+      const execute = as(evaluation(name, "execute", ["*"]));
       await f.permissionHooks.evaluate(execute);
       expect(execute.effect).toBe("deny");
     }

@@ -694,11 +694,12 @@ describe("QA round 1 (P2.1)", () => {
   it("QA-P21-1-1: a child session dispatching implementer gets the floor rung whatever model it names, in the foreground", async () => {
     const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
     const { hooks } = await plugin(dir);
-    const v2 = host(dir, cfg, { d1: { id: "d1", parentID: "root", agent: "general", location: { directory: dir } } });
+    // #84 P2.3 (QA-P23-A7, approved amendment): the delegate is a TIER child — a role child may never call `subagent` (§2.2).
+    const v2 = host(dir, cfg, { d1: { id: "d1", parentID: "root", agent: "medium", location: { directory: dir } } });
     await v2.start(hooks);
     for (const [i, named] of [rungRef(cfg, "fast"), rungRef(cfg, "heavy"), undefined].entries()) {
       const input: Record<string, unknown> = { agent: "implementer", description: "patch", prompt: "[route tier=heavy]\nPatch the parser", ...(named === undefined ? {} : { model: named }) };
-      const event = { sessionID: "d1", agent: "general", messageID: "m", id: `dc${i}`, tool: "subagent", input };
+      const event = { sessionID: "d1", agent: "medium", messageID: "m", id: `dc${i}`, tool: "subagent", input };
       await v2.toolHooks["execute.before"](event);
       expect(event.input.model).toBe(rungRef(cfg, "fast")); // implementer floor on the local-only grant
       expect(event.input.background).toBe(false);

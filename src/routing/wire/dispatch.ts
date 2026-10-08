@@ -58,7 +58,7 @@ import { parseVerifyDirectives } from "../../verify/directives";
 import { buildDelegationDoD } from "../../verify/dispatch";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
-  LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
+  BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
 } from "../roles/binding";
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
@@ -454,13 +454,30 @@ export function normalizeRootText(path: string, platform: NodeJS.Platform = proc
   return win ? out.toLowerCase() : out;
 }
 
-/** The worktree paths of `git worktree list --porcelain` output (the `worktree <path>` lines), as git prints them. */
+/**
+ * The worktree paths of `git worktree list --porcelain` output (the `worktree <path>` line of each entry), as git prints them, in
+ * git's order (the main worktree first). QA-P23-A4: an entry git marks `prunable` (its directory is gone or no longer points
+ * back) is dropped — it is not a work root any more, even if a plain directory now sits at its path.
+ */
 export function parseWorktreeList(porcelain: string): string[] {
   const out: string[] = [];
+  let current: string | undefined;
+  let prunable = false;
+  const flush = (): void => {
+    if (current !== undefined && !prunable) out.push(current);
+    current = undefined;
+    prunable = false;
+  };
   for (const raw of porcelain.split("\n")) {
     const line = raw.replace(/\r$/, "");
-    if (line.startsWith("worktree ") && line.length > "worktree ".length) out.push(line.slice("worktree ".length));
+    if (line.startsWith("worktree ")) {
+      flush();
+      if (line.length > "worktree ".length) current = line.slice("worktree ".length);
+    } else if (line === "prunable" || line.startsWith("prunable ")) {
+      prunable = true;
+    }
   }
+  flush();
   return out;
 }
 
@@ -1320,6 +1337,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 7. an explicit caller `model` is kept only inside the bounds, and never over a route-line pin (QA-P21-1-5: the pinned rung,
     // raised to the running rung on a resume, wins); then the host catalog decides whether the variant exists.
     const notes: string[] = [...(root.note === null ? [] : [root.note]), ...grant.notes];
+    // #84 P2.3 (T2.3.3): the row of a resume records the authority it widens (the actions new to this child's grant).
+    const widenedNow = (call.widened ?? []).filter((action) => grant.actions.has(action) && bound?.grant.actions.has(action) !== true);
+    if (widenedNow.length > 0) notes.push(BINDING_NOTES.widened(widenedNow));
     if (raised !== null) notes.push(`${RESUME_RAISE_NOTE}${raised}`);
     const callerRef = str(args.model);
     const placed = callerRef === null
