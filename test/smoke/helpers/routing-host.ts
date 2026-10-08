@@ -490,7 +490,7 @@ export function agentWithoutModel(fields: Obj = {}): Obj {
 
 export interface HostOptions {
   /** Router override file content, merged over the smoke preset. `routing.outcomes.path` is always forced to this host's temp directory. */
-  readonly overrides?: Obj;
+  readonly overrides?: Obj | ((root: string) => Obj);
   /** The `routing` block; `null` writes no routing block at all. Default: engine shadow. */
   readonly routing?: Obj | null;
   /** Extra `providers` entries of opencode.json (merged with the scripted anthropic provider). */
@@ -561,11 +561,12 @@ export class RoutingHost {
   /** Router override file: the smoke preset + the caller's overrides; `routing.outcomes.path` is forced to the temp store. */
   overrideFile(extra: Obj = {}): Obj {
     const o = this.options;
+    const overridesNow = obj(typeof o.overrides === "function" ? o.overrides(this.root) : o.overrides);
     const merged: Obj = {
       activePreset: "smoke", defaultTier: "fast", presets: { smoke: SMOKE_PRESET },
-      ...obj(o.overrides), ...extra,
+      ...overridesNow, ...extra,
     };
-    const enforcement = { ...obj(obj(o.overrides).enforcement), ...obj(extra.enforcement) };
+    const enforcement = { ...obj(overridesNow.enforcement), ...obj(extra.enforcement) };
     merged.enforcement = { ...enforcement, verify: { testBaseline: false, ...obj(enforcement.verify) } };
     const routing = o.routing === undefined ? { engine: "shadow" } : o.routing;
     if (routing !== null) merged.routing = { ...routing, ...obj(extra.routing), outcomes: { ...obj(obj(routing).outcomes), path: this.outcomes } };

@@ -14,6 +14,7 @@
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -83,6 +84,17 @@ const sessionView = (s: Obj | undefined) => (s ? { parentID: s.parentID, agent: 
 // ---- group B helpers ----
 const toolStatesOf = (context: Obj[]): Obj[] => context.flatMap(m => arr(obj(m).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
 const stateView = (s: Obj) => ({ status: s.status, errorType: obj(s.error).type, errorMessage: obj(s.error).message, text: arr(s.content).map(c => str(obj(c).text)).join("\n") });
+/** What the PARENT model was given for one of its tool calls: the tool_result block (matched by tool_use_id) of its own later provider request. */
+function parentView(host: RoutingHost, root: string, callID: string): { found: boolean; isError: unknown; parts: string[]; text: string } {
+  for (const r of [...host.requestsOf(root)].reverse()) {
+    if (r.kind !== "primary" || !r.toolResult) continue;
+    const blocks = r.messages.flatMap(m => arr(m.content).map(obj)).filter(b => b.type === "tool_result" && b.tool_use_id === callID);
+    if (blocks.length === 0) continue;
+    const parts = blocks.flatMap(b => (typeof b.content === "string" ? [b.content] : arr(b.content).map(c => str(obj(c).text) ?? "")));
+    return { found: true, isError: blocks.at(-1)!.is_error, parts, text: parts.join("\n") };
+  }
+  return { found: false, isError: undefined, parts: [], text: "" };
+}
 /** Dispatches one child (foreground) and reports what the host recorded about it and what the parent was told. */
 async function childReport(host: RoutingHost, root: string, input: Obj) {
   const started = Date.now();
@@ -93,7 +105,8 @@ async function childReport(host: RoutingHost, root: string, input: Obj) {
   const decisions = (await host.events()).filter(e => e.type === "probe.decision" && e.sessionID === call.childID);
   return {
     childID: call.childID, startedAt: started, endedAt: Date.now(),
-    parentToolStatus: call.after.status, parentToolError: call.after.error, parentOutput: str(obj(obj(call.after.result).output).output),
+    callID: call.callID, parentToolStatus: call.after.status, parentToolError: call.after.error, parentOutput: str(obj(obj(call.after.result).output).output),
+    parentSeen: parentView(host, root, call.callID),
     child: { agent: child.agent, title: child.title, outcome: child.outcome, parentID: child.parentID },
     toolStates: toolStatesOf(context).map(stateView), events, decisions,
     requests: primary(host, call.childID).map(r => ({ ...wire(r), toolNames: r.toolNames, system: r.system })),
@@ -105,7 +118,7 @@ const readProbe = (file: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "r
 const executeProbe = (code: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "execute", input: { code } })}`;
 const decisionsOf = (r: ChildReport, point: string) => r.decisions.filter(d => d.point === point).map(d => ({ decision: d.decision, action: d.action, removed: d.removed }));
 // ------------------------------------------------------------------------------------------------ the spikes ----
-d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
+d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   it("S1 agent registered without a model: the per-call model and variant reach the provider (Anthropic and OpenAI Responses)", async () => {
     const host = await startSpikeHost("s1", { [NO_MODEL]: agentWithoutModel() });
     try {
@@ -481,12 +494,20 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       await writeFile(file, "S3\n");
       const [rootA, rootB, rootC, rootD] = await Promise.all([1, 2, 3, 4].map(i => host.newRoot(`s3 root ${i}`)));
       const input = (title: string, prompt: string): Obj => ({ agent: NO_MODEL, description: title, prompt });
-      // permission evaluate: two concurrent children of the SAME agent, `read` denied for the child titled "S3 A" only.
-      const [a, b] = await Promise.all([childReport(host, rootA!, input("S3 A", readProbe(file))), childReport(host, rootB!, input("S3 B", readProbe(file)))]);
-      // context hook: two concurrent children of the same agent, `shell` and `write` removed from the catalog of "S3 C" only.
-      const [c, d] = await Promise.all([childReport(host, rootC!, input("S3 C", readProbe(file))), childReport(host, rootD!, input("S3 D", readProbe(file)))]);
-      await save("S3", { a, b, c, d, overlap: { ab: a.startedAt < b.endedAt && b.startedAt < a.endedAt, cd: c.startedAt < d.endedAt && d.startedAt < c.endedAt }, hostErrors: host.errorLines() });
+      // permission evaluate: two children of the SAME agent whose first model requests are held until both are in flight (so they overlap
+      // in the host), `read` denied for the child titled "S3 A" only.
+      host.provider.holdUntilOverlap("S3_HOLD_AB", 2);
+      const [a, b] = await Promise.all([childReport(host, rootA!, input("S3 A", `S3_HOLD_AB ${readProbe(file)}`)), childReport(host, rootB!, input("S3 B", `S3_HOLD_AB ${readProbe(file)}`))]);
+      const barrierAB = { arrivals: host.provider.barrier!.arrivals.length, releasedByArrival: host.provider.barrier!.releasedByArrival, timedOut: host.provider.barrier!.timedOut };
+      // context hook: two overlapping children of the same agent, `shell` and `write` removed from the catalog of "S3 C" only.
+      host.provider.holdUntilOverlap("S3_HOLD_CD", 2);
+      const [c, d] = await Promise.all([childReport(host, rootC!, input("S3 C", `S3_HOLD_CD ${readProbe(file)}`)), childReport(host, rootD!, input("S3 D", `S3_HOLD_CD ${readProbe(file)}`))]);
+      const barrierCD = { arrivals: host.provider.barrier!.arrivals.length, releasedByArrival: host.provider.barrier!.releasedByArrival, timedOut: host.provider.barrier!.timedOut };
+      await save("S3", { a, b, c, d, barrierAB, barrierCD, hostErrors: host.errorLines() });
 
+      // The pairs really overlapped: each child's first request was held until the other had also arrived (released by arrival, not timeout).
+      expect(barrierAB).toEqual({ arrivals: 2, releasedByArrival: true, timedOut: false });
+      expect(barrierCD).toEqual({ arrivals: 2, releasedByArrival: true, timedOut: false });
       expect(a.child.agent).toBe(NO_MODEL);
       expect(b.child.agent).toBe(NO_MODEL);
       // A: refused, with the plugin's message; B: the read ran. Decided from event.sessionID (title resolved through session.get).
@@ -521,15 +542,26 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
   }, 300_000);
 
   it("S3 edge: a plugin hook that throws (evaluate / context) - the host's reaction", async () => {
-    const file = "s3-throw.txt";
     const observe = async (hook: "evaluate" | "context") => {
       const host = await startSpikeHost(`s3t-${hook}`, { [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, bySession: { throwTitle: "S3 T", throwHook: hook } } });
       try {
-        await writeFile(path.join(host.project, file), "S3\n");
-        const root = await host.newRoot("s3 throw root");
-        const report = await childReport(host, root, { agent: NO_MODEL, description: "S3 T", prompt: readProbe(path.join(host.project, file)) });
-        const stillWorks = await childReport(host, root, { agent: NO_MODEL, description: "S3 ok", prompt: readProbe(path.join(host.project, file)) });
-        return { hook, report, stillWorks, hostErrors: host.errorLines(), providerErrors: host.provider.errors };
+        const readFileP = path.join(host.project, "s3-throw.txt");
+        const editFile = path.join(host.project, "s3-edit.txt");
+        const writeFileP = path.join(host.project, "s3-written.txt");
+        await writeFile(readFileP, "S3\n");
+        await writeFile(editFile, "ORIGINAL\n");
+        const bytes = async (file: string) => (await readFile(file)).toString("hex");
+        const before = await bytes(editFile);
+        const call = (title: string, tool: string, input: Obj) => host.newRoot(`s3 throw root ${title}`).then(root => childReport(host, root, { agent: NO_MODEL, description: title, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool, input })}` }));
+        const report = await call("S3 T", "read", { path: readFileP });
+        const editThrown = await call("S3 T", "edit", { path: editFile, oldString: "ORIGINAL", newString: "CHANGED" });
+        const writeThrown = await call("S3 T", "write", { path: writeFileP, content: "WRITTEN\n" });
+        const afterThrown = { edit: await bytes(editFile), writeExists: existsSync(writeFileP) };
+        // the next children of the same agent (other title) are evaluated and run normally, and may now mutate.
+        const stillWorks = await call("S3 ok", "read", { path: readFileP });
+        const editOk = await call("S3 ok", "edit", { path: editFile, oldString: "ORIGINAL", newString: "CHANGED" });
+        const afterOk = await readFile(editFile, "utf8");
+        return { hook, report, editThrown, writeThrown, before, afterThrown, stillWorks, editOk, afterOk, hostErrors: host.errorLines(), providerErrors: host.provider.errors };
       } finally { await finish(host); }
     };
     const evaluate = await observe("evaluate");
@@ -537,30 +569,45 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
     await save("S3-throw", { evaluate, context });
     expect(evaluate.report.decisions.some(d => d.decision === "throw")).toBe(true);
     expect(context.report.decisions.some(d => d.decision === "throw")).toBe(true);
-    // evaluate throws: the host does not fail open. The single tool call is refused with the thrown message (error type "unknown", surfaced
-    // in the CHILD's tool state only); the child recovers and ends `succeeded`; the parent sees a plain completed child; the hook stays
-    // registered and the next child of the same agent is evaluated normally.
-    expect(evaluate.report.toolStates).toEqual([expect.objectContaining({ status: "error", errorType: "unknown", errorMessage: "PROBE_HOOK_THROWN evaluate" })]);
-    expect(evaluate.report.events).toContain("session.tool.failed");
-    expect(evaluate.report.child.outcome).toBe("succeeded");
-    expect(evaluate.report.parentToolStatus).toBe("completed");
+    // evaluate throws: every mutating call of the throwing session errors with the thrown message (error type "unknown", child side only)
+    // and the mutation did NOT happen: the edited file is byte-identical and the written file does not exist. So for read, edit and write
+    // the call is refused, not allowed (the host does not fail open on a throwing evaluate hook).
+    for (const r of [evaluate.report, evaluate.editThrown, evaluate.writeThrown]) {
+      expect(r.toolStates).toEqual([expect.objectContaining({ status: "error", errorType: "unknown", errorMessage: "PROBE_HOOK_THROWN evaluate" })]);
+      expect(r.events).toContain("session.tool.failed");
+      expect(r.child.outcome).toBe("succeeded");
+      expect(r.parentToolStatus).toBe("completed");
+    }
+    expect(evaluate.afterThrown).toEqual({ edit: evaluate.before, writeExists: false });
+    // the hook stays registered and does not poison later sessions: the next children are evaluated (the probe logs an evaluate record
+    // with the action) and run; the edit of the non-throwing session goes through.
     expect(evaluate.stillWorks.toolStates.map(s => s.status)).toEqual(["completed"]);
+    expect(evaluate.stillWorks.evaluates).toEqual([{ action: "read", denied: false }]);
+    expect(evaluate.stillWorks.decisions.filter(d => d.point === "evaluate").map(d => d.decision)).toEqual(["pass"]);
+    expect(evaluate.editOk.toolStates.map(s => s.status)).toEqual(["completed"]);
+    expect(evaluate.editOk.evaluates).toEqual([{ action: "edit", denied: false }]);
+    expect(evaluate.afterOk).toBe("CHANGED\n");
     expect(evaluate.hostErrors).toEqual([]);
     // context throws: the child's very first model request is never made (0 provider requests); the child execution FAILS
-    // (session.execution.failed, outcome failed, no step started) and the error is surfaced in the PARENT's subagent tool call
-    // ("Subagent failed (sessionID: ...): <message>", status error) and as one host ERROR log line "Failed to drain Session".
+    // (session.execution.failed, outcome failed, no step started) and the error reaches the PARENT: its next provider request carries the
+    // tool_result of that call as an error ("Subagent failed (sessionID: ...): <message>"), one host ERROR log line "Failed to drain Session".
     expect(context.report.requests).toHaveLength(0);
     expect(context.report.events.at(-1)).toBe("session.execution.failed");
     expect(context.report.events).not.toContain("session.step.started");
     expect(context.report.child.outcome).toBe("failed");
     expect(context.report.parentToolStatus).toBe("error");
     expect(String(obj(context.report.parentToolError).string)).toMatch(/^Tool\.Error: Subagent failed \(sessionID: ses_[A-Za-z0-9]+\): PROBE_HOOK_THROWN context$/);
-    expect(context.hostErrors).toHaveLength(1);
-    expect(context.hostErrors[0]).toContain("Failed to drain Session");
-    expect(context.hostErrors[0]).toContain("PROBE_HOOK_THROWN context");
+    expect(context.report.parentSeen.found).toBe(true);
+    expect(context.report.parentSeen.isError).toBe(true);
+    expect(context.report.parentSeen.text).toMatch(/Subagent failed \(sessionID: ses_[A-Za-z0-9]+\): PROBE_HOOK_THROWN context/);
+    // three children of the throwing title (read, edit, write) = three failed sessions = three host ERROR lines; none ran its tool.
+    expect(context.hostErrors).toHaveLength(3);
+    for (const line of context.hostErrors) { expect(line).toContain("Failed to drain Session"); expect(line).toContain("PROBE_HOOK_THROWN context"); }
+    for (const r of [context.editThrown, context.writeThrown]) { expect(r.child.outcome).toBe("failed"); expect(r.requests).toHaveLength(0); }
+    expect(context.afterThrown).toEqual({ edit: context.before, writeExists: false });
     // the failed child does not poison the agent: the next child of the same agent runs.
     expect(context.stillWorks.toolStates.map(s => s.status)).toEqual(["completed"]);
-  }, 300_000);
+  }, 600_000);
 
   it("S6 tool.hook execute.after on the parent's subagent call appends text the PARENT model sees on its next request", async () => {
     const NOTE = "S6_APPENDED_NOTE_FOR_THE_PARENT";
@@ -579,13 +626,56 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       expect(next, "the parent's next provider request after the subagent call").toBeDefined();
       // the parent's tool_result block (what the parent MODEL receives) carries both the child's text and the appended note.
       expect(toolResultBlocks).toHaveLength(1);
-      const received = JSON.stringify(toolResultBlocks[0]);
-      expect(received).toContain("CHILD_OK");
-      expect(received).toContain(NOTE);
-      expect(received.indexOf(NOTE)).toBeGreaterThan(received.indexOf("CHILD_OK"));
+      const seen = parentView(host, root, call.callID);
+      // exactly two text parts: the host's envelope with the child's text, then the appended note.
+      expect(seen.parts).toHaveLength(2);
+      expect(seen.parts[0]).toMatch(/^<subagent sessionID="ses_[A-Za-z0-9]+" state="completed">\nCHILD_OK\n<\/subagent>$/);
+      expect(seen.parts[1]).toBe(NOTE);
       // the note exists only in the parent's view: the child's own requests never carry it.
       expect(childRequests.some(r => JSON.stringify(r.messages).includes(NOTE))).toBe(false);
       expect((await host.events()).filter(e => e.type === "probe.decision" && e.point === "execute.after")).toHaveLength(1);
+    } finally { await finish(host); }
+  }, 300_000);
+
+  it("S6 order against the router's own after-hook, and a background-flagged dispatch", async () => {
+    const NOTE = "S6B_APPENDED_NOTE";
+    const host = await startSpikeHost("s6b", { [NO_MODEL]: agentWithoutModel() }, { probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode: "enforced" } } });
+    try {
+      const present = path.join(host.project, "s6b-present.txt");
+      await writeFile(present, "x\n");
+      const accept = `\n[acceptance]\ncheck: fileExists path=${present}\n[/acceptance]`;
+      const OK = "[router \u2713 verified: deterministic]";
+      const root = await host.newRoot("s6b root");
+      const fg = await host.dispatch(root, { agent: NO_MODEL, description: "S6B fg", prompt: `S6B fg${accept}`, model: `${SONNET}#low`, background: false });
+      const fgSeen = parentView(host, root, fg.callID);
+      // A dispatch flagged background:true whose child's first request is held for 4 s.
+      host.provider.holdUntilOverlap("S6B_HOLD", 99, 4_000);
+      const root2 = await host.newRoot("s6b root bg");
+      const bg = await host.call(root2, "subagent", { agent: NO_MODEL, description: "S6B bg", prompt: `S6B_HOLD S6B bg${accept}`, model: `${SONNET}#low`, background: true });
+      const bgSeen = parentView(host, root2, bg.callID);
+      const bgBlockedMs = bg.after.__t - bg.before.__t;
+      const afters = (await host.hooks()).filter(h => h.hook === "after" && h.sessionID === root2 && h.tool === "subagent");
+      await save("S6-order-background", { fgParts: fgSeen.parts, bgParts: bgSeen.parts, bgBlockedMs, bgAfterRecords: afters.length, bgAckStatus: obj(obj(bg.after.result).output).status });
+
+      // Order: within the parent's tool_result the router's own execute.after text (the verification line, appended by the router plugin
+      // loaded FIRST) comes before the probe's note (the probe plugin is loaded second): plugin load order, observed on the host's output.
+      expect(fgSeen.parts).toHaveLength(3);
+      expect(fgSeen.parts[0]).toMatch(/^<subagent sessionID="ses_[A-Za-z0-9]+" state="completed">\nCHILD_OK\n<\/subagent>$/);
+      expect(fgSeen.parts[1]).toBe(`\n\n${OK}`);
+      expect(fgSeen.parts[2]).toBe(NOTE);
+      // Background: on 2.0.24, with this scripted headless parent, `background: true` did NOT produce an immediate "running"
+      // acknowledgement. The tool call stayed open for as long as the held child ran (>= 3.5 s of the 4 s hold), then returned
+      // `state="completed"` with the child's text; the router's verification line and the probe's note were both appended, from a single
+      // execute.after record. So the "result delivered after a running ack never passes execute.after" gap could not be demonstrated on
+      // this host (the router's own branch for a running ack, v2-hooks.ts:562-577, was not reached).
+      expect(bgBlockedMs).toBeGreaterThanOrEqual(3_500);
+      expect(obj(obj(bg.after.result).output).status).toBe("completed");
+      expect(bgSeen.text).toContain('state="completed"');
+      expect(bgSeen.text).not.toContain('state="running"');
+      expect(bgSeen.parts.at(-1)).toBe(NOTE);
+      expect(bgSeen.text).toContain(OK);
+      expect(afters).toHaveLength(1);
+      expect(host.errorLines()).toEqual([]);
     } finally { await finish(host); }
   }, 300_000);
 
@@ -683,6 +773,31 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       expect(rewritten.parentToolStatus).toBe("completed");
       expect(before[0]).toMatchObject({ agent: "explore" });
       expect(control.child.agent).toBe(NO_MODEL);
+      // ---- permissions of the rewritten agent, exercised: the child ATTEMPTS an edit.
+      // Root session WITHOUT inherited grants (permissions []): the rewritten child (explorer, `edit` denied) has no `edit` tool at all in
+      // its provider request, the call fails with "No tool named edit", and the file is unchanged; the control agent edits normally.
+      const strict = await host.newRoot("s9 strict root", undefined, host.project, []);
+      const fileA = path.join(host.project, "s9-a.txt");
+      const fileB = path.join(host.project, "s9-b.txt");
+      const fileC = path.join(host.project, "s9-c.txt");
+      for (const f of [fileA, fileB, fileC]) await writeFile(f, "main\n");
+      const editProbe = (f: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "edit", input: { path: f, oldString: "main", newString: "edited" } })}`;
+      const rewrittenEdit = await childReport(host, strict, { agent: "explore", description: "S9 rewritten edit", prompt: editProbe(fileA) });
+      const controlEdit = await childReport(host, strict, { agent: NO_MODEL, description: "S9 control edit", prompt: editProbe(fileB) });
+      expect(rewrittenEdit.child.agent).toBe("explorer");
+      expect(rewrittenEdit.requests[0]?.toolNames).not.toContain("edit");
+      expect(rewrittenEdit.toolStates).toEqual([expect.objectContaining({ status: "error", errorType: "tool.execution", errorMessage: 'No tool named "edit" is currently available. Please use a tool from the available tool list.' })]);
+      expect(await readFile(fileA, "utf8")).toBe("main\n");
+      expect(controlEdit.requests[0]?.toolNames).toContain("edit");
+      expect(controlEdit.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(await readFile(fileB, "utf8")).toBe("edited\n");
+      // Root session WITH an inherited allow-all (`newRoot`'s default): the same rewritten agent's `edit: deny` is NOT enforced - the edit tool
+      // is advertised and the edit is applied. The agent's own max policy only binds a child whose session grants nothing broader.
+      const open = await childReport(host, root, { agent: "explore", description: "S9 rewritten edit open", prompt: editProbe(fileC) });
+      expect(open.child.agent).toBe("explorer");
+      expect(open.requests[0]?.toolNames).toContain("edit");
+      expect(open.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(await readFile(fileC, "utf8")).toBe("edited\n");
     } finally { await finish(host); }
   }, 300_000);
 
@@ -697,13 +812,13 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
         const present = path.join(host.project, "s10-present.txt");
         const absent = path.join(host.project, "s10-absent.txt");
         await writeFile(present, "x\n");
-        const rows: Record<string, { output: string; content: string; status: unknown }> = {};
+        const rows: Record<string, { output: string; content: string; status: unknown; parentSaw: string }> = {};
         for (const agent of subjects) {
           for (const [label, file] of [["present", present], ["absent", absent]] as const) {
             const root = await host.newRoot(`${name} ${agent} ${label}`);
             const call = await host.dispatch(root, { agent, description: `S10 ${agent} ${label}`, prompt: `S10 do the work\n[acceptance]\ncheck: fileExists path=${file}\n[/acceptance]`, model: `${SONNET}#low`, background: false });
             const res = obj(call.after.result);
-            rows[`${agent}/${label}`] = { status: call.after.status, output: String(obj(res.output).output), content: arr(res.content).map(c => str(obj(c).text)).join("") };
+            rows[`${agent}/${label}`] = { status: call.after.status, output: String(obj(res.output).output), content: arr(res.content).map(c => str(obj(c).text)).join(""), parentSaw: parentView(host, root, call.callID).text };
           }
         }
         return { rows, graders: host.provider.graders, hostErrors: host.errorLines() };
@@ -726,6 +841,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       // fail: NOT ACCEPTED with the checker's reason, appended to the text the parent receives.
       expect(rejected(absent), agent).toBe(true);
       expect(absent.content, agent).toContain("NOT ACCEPTED");
+      // and what the PARENT model was given (its next provider request's tool_result) carries the same verdict lines.
+      expect(present.parentSaw, agent).toContain(OK);
+      expect(absent.parentSaw, agent).toContain("[router \u26a0 NOT ACCEPTED]");
+      expect(absent.parentSaw, agent).toContain("s10-absent.txt");
     }
     expect(enforced.graders).toBe(0);
     // The ONLY difference is the escalation hint: ladder names (fast/medium) get "re-run via subagent(agent=\"next\") (escalated from X)",
