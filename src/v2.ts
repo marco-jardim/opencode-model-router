@@ -16,6 +16,9 @@ export default {
     let ingest: Ingest | undefined;
     // #84 P2.1: the plugin's `/bypass` state, read by the role dispatch path (the router's own gate will not run while bypassed, S10/P-9).
     let isBypassed: (() => boolean) | undefined;
+    // #84 P2.1 (handoff 22): the host's own stops of role children (step limit, context overflow), observed by the adapter from the
+    // event stream and folded into the plugin's budget signals. The adapter hands its observer back once registered.
+    let observeHostBudget: ((childSessionID: string, stepLimit: number | null) => boolean | "unobserved") | undefined;
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
@@ -35,8 +38,12 @@ export default {
       },
       routerOnIngest: (created: Ingest) => { ingest = created; },
       routerOnBypassState: (read: () => boolean) => { isBypassed = read; },
+      routerHostBudget: (childSessionID: string, stepLimit: number | null) => observeHostBudget?.(childSessionID, stepLimit),
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
-    return registerV2Hooks(ctx, hooks, runtime, { ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}) });
+    return registerV2Hooks(ctx, hooks, runtime, {
+      ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}),
+      onHostBudget: (observe) => { observeHostBudget = observe; },
+    });
   },
 } satisfies Plugin.Plugin & { server: typeof ModelRouterPlugin };

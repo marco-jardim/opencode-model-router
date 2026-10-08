@@ -12,7 +12,7 @@ import { getActiveTiers } from "../router/protocol";
 import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrides } from "../router/subagents";
 import { warnAgentOptionsEffortOnce } from "../router/agent-options";
 import { pluginAgentMarker } from "../router/plugin-agents";
-import { registerRoleAgents, roleAgentAlias, roleAgentOf } from "../router/role-agents";
+import { registerRoleAgents, roleAgentAlias, roleAgentOf, roleAgentSteps } from "../router/role-agents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
@@ -129,11 +129,137 @@ export function firstMessageText(messages: unknown): string | undefined {
   return user !== undefined ? messageText(user) : messages.map(messageText).find((text) => text !== undefined);
 }
 
-/** T2.1.4 (P-5, S6): resume guidance appended to the parent's result when the guard stopped a role child on its call budget. */
-export function roleBudgetNotice(agent: string, childSessionID: string): string {
-  return `[router] @${agent} stopped on its tool-call budget before finishing: this is not a failed result. `
+/**
+ * T2.1.4 (P-5, S6): resume guidance appended to the parent's result when a role child was stopped before finishing — by the
+ * router's guard on its call budget (`guard`), or by the host itself: its step limit or a context overflow (`host`, handoff 22).
+ */
+export function roleBudgetNotice(agent: string, childSessionID: string, cause: "guard" | "host" = "guard"): string {
+  const what = cause === "guard" ? "its tool-call budget" : "the host's step or context limit";
+  return `[router] @${agent} stopped on ${what} before finishing: this is not a failed result. `
     + `NEXT: resume the same sessionID ("${childSessionID}") with @${agent} and the prompt "continue and finish"; `
     + "do not start a new task and do not set `model` (the router keeps the child's tier).";
+}
+
+// ---------------------------------------------------------------------------
+// #84 P2.1 (handoff 22): the host's own budget stops of a child, from the event stream (spike S4)
+// ---------------------------------------------------------------------------
+
+/** A budget stop as handed to the signals: observed true/false, or not observable for this attempt. */
+export type HostBudgetObservation = boolean | "unobserved";
+
+/**
+ * S4 (measured on 2.0.24): a tool call made on the last allowed step is answered by the host with this error
+ * (`session.tool.failed`). Only a model that ignores the step's `tool_choice: none` makes such a call.
+ */
+export const HOST_STEP_LIMIT_TOOL_ERROR = /maximum agent steps/i;
+/**
+ * NOT measured (S4 covers step limits and guard denials only): how a context-overflow failure is recognised in a
+ * `session.step.failed` / `session.execution.failed` error (`type` and `message`). A failure that matches nothing here makes the
+ * attempt's host observation `unobserved`, never `false`.
+ */
+export const HOST_CONTEXT_OVERFLOW_ERROR = /context.?(?:overflow|length|window|limit)|prompt is too long|too many tokens|maximum context/i;
+
+export interface HostBudgetObserver {
+  /** A role child's attempt starts again (a resume): its counters start over. */
+  begin(childSessionID: string): void;
+  /** Every host event (only step/tool/execution events of a session are read). Never throws. */
+  onEvent(type: string, data: unknown): void;
+  /**
+   * The host stopped the child's current attempt: `true` when it ran `stepLimit` steps (S4: the last of N allowed steps carries the
+   * host's max-steps note and `tool_choice: none`), a tool call was refused for the step limit, or a step failed with a context
+   * overflow; `false` when its execution ended without any of these and without an unrecognised failure; else `unobserved`.
+   */
+  observe(childSessionID: string, stepLimit: number | null): HostBudgetObservation;
+  /** Resolves when the child's execution end was seen, or after `timeoutMs` (the event may trail the tool result). */
+  settled(childSessionID: string, timeoutMs: number): Promise<void>;
+  forget(sessionID: string): void;
+}
+
+/** Bounded per-instance state (oldest child first out). */
+export function createHostBudgetObserver(max = 1000): HostBudgetObserver {
+  interface ChildState { steps: number; toolLimit: boolean; failure: "overflow" | "other" | null; ended: boolean; waiters: Set<() => void> }
+  const children = new Map<string, ChildState>();
+  const wake = (state: ChildState): void => {
+    for (const waiter of [...state.waiters]) waiter();
+    state.waiters.clear();
+  };
+  const stateOf = (id: string): ChildState => {
+    let state = children.get(id);
+    if (state === undefined) {
+      state = { steps: 0, toolLimit: false, failure: null, ended: false, waiters: new Set() };
+      children.set(id, state);
+      while (children.size > max) {
+        const oldest = children.keys().next().value as string;
+        const dropped = children.get(oldest);
+        children.delete(oldest);
+        if (dropped !== undefined) wake(dropped);
+      }
+    }
+    return state;
+  };
+  const errorText = (error: unknown): string => {
+    if (typeof error === "string") return error;
+    if (!error || typeof error !== "object") return "";
+    const e = error as Record<string, unknown>;
+    return [e.type, e.name, e.message].filter((part) => typeof part === "string").join(" ");
+  };
+  const classify = (state: ChildState, error: unknown): void => {
+    if (state.failure === "overflow") return;
+    state.failure = HOST_CONTEXT_OVERFLOW_ERROR.test(errorText(error)) ? "overflow" : "other";
+  };
+  return {
+    begin(id) {
+      const old = children.get(id);
+      children.delete(id);
+      if (old !== undefined) wake(old);
+      stateOf(id);
+    },
+    onEvent(type, data) {
+      if (!data || typeof data !== "object") return;
+      const event = data as Record<string, unknown>;
+      const id = event.sessionID;
+      if (typeof id !== "string" || id === "") return;
+      if (type === "session.step.ended") {
+        stateOf(id).steps += 1;
+      } else if (type === "session.step.failed") {
+        const state = stateOf(id);
+        state.steps += 1;
+        classify(state, event.error);
+      } else if (type === "session.tool.failed") {
+        if (HOST_STEP_LIMIT_TOOL_ERROR.test(errorText(event.error))) stateOf(id).toolLimit = true;
+      } else if (EXECUTION_END_TYPES.has(type)) {
+        const state = stateOf(id);
+        if (type === "session.execution.failed" && event.error !== undefined) classify(state, event.error);
+        state.ended = true;
+        wake(state);
+      }
+    },
+    observe(id, stepLimit) {
+      const state = children.get(id);
+      if (state === undefined) return "unobserved";
+      if (state.toolLimit || state.failure === "overflow" || (stepLimit !== null && stepLimit > 0 && state.steps >= stepLimit)) return true;
+      return !state.ended || state.failure === "other" ? "unobserved" : false;
+    },
+    settled(id, timeoutMs) {
+      const state = stateOf(id);
+      if (state.ended || !(timeoutMs > 0)) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const done = (): void => {
+          clearTimeout(timer);
+          state.waiters.delete(done);
+          resolve();
+        };
+        const timer = setTimeout(done, timeoutMs);
+        timer.unref?.();
+        state.waiters.add(done);
+      });
+    },
+    forget(id) {
+      const state = children.get(id);
+      children.delete(id);
+      if (state !== undefined) wake(state);
+    },
+  };
 }
 
 /**
@@ -155,8 +281,14 @@ export async function registerV2Hooks(
   /**
    * `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing.
    * `isBypassed`: the plugin's `/bypass` state (#84 P2.1: the role path's router-gate condition, S10/P-9).
+   * `hostBudget`: the host-side budget observer (handoff 22); a private one when absent. `onHostBudget` receives its `observe`,
+   * so the plugin's signals read the same observations (src/v2.ts).
+   * `hostSettleMs`: how long a role dispatch's result waits for the child's execution-end event (default 500 ms).
    */
-  options: { ingest?: Ingest; isBypassed?: () => boolean } = {},
+  options: {
+    ingest?: Ingest; isBypassed?: () => boolean; hostBudget?: HostBudgetObserver; hostSettleMs?: number;
+    onHostBudget?: (observe: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation) => void;
+  } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
   // casts confined to this adapter, rather than weakening the v2 event types.
@@ -224,6 +356,15 @@ export async function registerV2Hooks(
       ...(text(session.title) === undefined ? {} : { title: text(session.title) }),
       ...(firstText === undefined ? {} : { firstText }),
     };
+  };
+  /** Handoff 22: the host's own stops of role children (step limit, context overflow), from the event stream. */
+  const hostBudget = options.hostBudget ?? createHostBudgetObserver();
+  options.onHostBudget?.((childSessionID, stepLimit) => hostBudget.observe(childSessionID, stepLimit));
+  const hostSettleMs = options.hostSettleMs ?? 500;
+  /** The host `steps` limit the router registers for a role agent (P-4); null for any other agent. */
+  const hostStepLimitOf = (roles: ReadonlyMap<string, RoleSpec>, agent: string): number | null => {
+    const spec = roles.get(agent);
+    return spec === undefined ? null : roleAgentSteps(spec);
   };
   /** Handoff 36: the parent's last `subagent` call of each role child (the call a resume follows, `consumeAuthority` `afterCall`). */
   const lastCallOfChild = new Map<string, string>();
@@ -636,6 +777,7 @@ export async function registerV2Hooks(
         const resumeID = typeof args.sessionID === "string" && args.sessionID !== "" ? args.sessionID : undefined;
         let widened: AuthorityAction[] | undefined;
         if (resumeID !== undefined && roles.has(args.agent)) {
+          hostBudget.begin(resumeID); // handoff 22: the host's step count starts over with the resumed attempt
           const consumed = consumeAuthority(resumeID, authorityDeps(roles, args.agent), { afterCall: lastCallOfChild.get(resumeID) ?? "" });
           if (consumed.status === "widened") widened = [...consumed.widened];
           else if (consumed.status === "dropped") annotateSubagentResult("authority", resumeID, `[router] ${consumed.reason}.`);
@@ -690,15 +832,16 @@ export async function registerV2Hooks(
      * (`markAnnotated`), else dropped (`discardAuthority`); then the call's pending binding entry is evicted (`evictCall`).
      * `undefined` for every call that is not a role dispatch (tiers mode: always).
      */
-    const roleAfterCall = (end: {
+    const roleAfterCall = async (end: {
       readonly id: string; readonly sessionID: string; readonly status: string; readonly result: unknown; readonly input: unknown;
-    }): { readonly notice: string | undefined; readonly finish: () => void } | undefined => {
+    }): Promise<{ readonly notice: string | undefined; readonly finish: () => void } | undefined> => {
       const record = (value: unknown): Record<string, unknown> | undefined =>
         value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
       const routedRole = routedRoleOf(end.id);
       const calledAgent = record(end.input)?.agent;
       const agent = routedRole?.agent ?? (typeof calledAgent === "string" ? calledAgent : undefined);
-      if (agent === undefined || (routedRole === undefined && !rolesOf(loadConfig(ctx.location.directory)).has(agent))) return undefined;
+      const roles = rolesOf(loadConfig(ctx.location.directory));
+      if (agent === undefined || (routedRole === undefined && !roles.has(agent))) return undefined;
       const child = end.status === "completed" ? childSessionOf(end.result) : null;
       const structured = record(end.result)?.output;
       const running = record(structured)?.status === "running";
@@ -712,7 +855,10 @@ export async function registerV2Hooks(
         if (escalated && request !== undefined && request.actions.length > 0 && (!request.annotated || request.callID === end.id)) {
           annotateSubagentResult("authority", child, roleAuthorityNotice(agent, child, request.actions, request.reasons));
         }
+        // Handoff 22: the host's own stop (step limit, context overflow) counts like the guard's; its events may trail the result.
+        await hostBudget.settled(child, hostSettleMs);
         if (budgetExhausted(child)) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child));
+        else if (hostBudget.observe(child, hostStepLimitOf(roles, agent)) === true) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child, "host"));
         for (const annotation of takeSubagentAnnotations(child)) notices.push(annotation.text);
       }
       return {
@@ -734,7 +880,7 @@ export async function registerV2Hooks(
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
       dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
-      const role = event.tool === "subagent" ? roleAfterCall({
+      const role = event.tool === "subagent" ? await roleAfterCall({
         id: event.id, sessionID: String(event.sessionID), status: event.status,
         result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
       }) : undefined;
@@ -832,6 +978,7 @@ export async function registerV2Hooks(
         if (abort.signal.aborted) break;
         try {
           const data = event.data as Record<string, any>;
+          hostBudget.onEvent(event.type, data); // handoff 22 (S4): step counts, step-limit tool refusals, overflow failures
           if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
             await ingesting(event.type, () => ingest.onStepEnded(event));
@@ -847,6 +994,7 @@ export async function registerV2Hooks(
               evictBinding(data.sessionID);
               evictAuthority(data.sessionID);
               lastCallOfChild.delete(data.sessionID);
+              hostBudget.forget(data.sessionID);
             }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {
