@@ -1,8 +1,8 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync, statSync, type Stats } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import { filterSensitiveDiff, isSensitivePath, sensitiveGitPathspecs } from "./sensitive-paths";
 
@@ -283,49 +283,90 @@ export function isFullPath(path: string, platform: NodeJS.Platform = process.pla
 }
 
 /**
+ * A regular file's text, read through one descriptor (QA-P13-1-8, QA-P13-2-4): opened
+ * without blocking on POSIX (a FIFO cannot hang the call), fstat-checked as a regular
+ * file, and read up to `max` bytes (a larger file or a device is refused, never read
+ * whole). Undefined when missing. Errors name the file, never quote its contents.
+ */
+export function readBoundedRegularFile(path: string, max: number, label: string): string | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (process.platform === "win32" ? 0 : (fsConstants.O_NONBLOCK ?? 0)));
+  } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return undefined;
+    throw new Error(`${label} is not readable (${errorCode(error) ?? "error"})`);
+  }
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`${label} is not a regular file`);
+    const buffer = Buffer.alloc(max + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const read = readSync(fd, buffer, length, buffer.length - length, null);
+      if (read === 0) break;
+      length += read;
+    }
+    if (length > max) throw new Error(`${label} is larger than ${max >= 1024 * 1024 ? `${max / (1024 * 1024)} MiB` : `${max} bytes`}`);
+    return buffer.subarray(0, length).toString("utf8").replace(/^\uFEFF/, "");
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(label)) throw error;
+    throw new Error(`${label} is not readable (${errorCode(error) ?? "error"})`);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Bound of the `.git` pointer and `commondir` files (QA-P13-2-4). */
+const GIT_POINTER_BYTES = 4 * 1024;
+
+/**
  * The main worktree of the checkout at `checkout` (QA-P13-1-6): the checkout itself
  * when `.git` is a directory; for a linked worktree (`.git` file → gitdir →
- * `commondir`) the directory holding the common `.git`. Undefined when unreadable.
+ * `commondir`) the directory holding the common `.git`, or the common directory
+ * itself for a bare repository (QA-P13-2-3b). Both pointer files are read bounded
+ * (4 KiB, regular files only). Undefined when unreadable.
  */
 export function mainWorktree(checkout: string): string | undefined {
   try {
     const dotGit = join(checkout, ".git");
-    const stats = lstatSync(dotGit);
-    if (stats.isDirectory()) return checkout;
-    if (!stats.isFile() || stats.size > 64 * 1024) return undefined;
-    const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"))?.[1];
+    if (lstatSync(dotGit).isDirectory()) return checkout;
+    const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readBoundedRegularFile(dotGit, GIT_POINTER_BYTES, ".git") ?? "")?.[1];
     if (!pointer) return undefined;
     const gitdir = resolve(checkout, pointer);
-    const commondirFile = join(gitdir, "commondir");
-    if (!existsSync(commondirFile)) return undefined;
-    const common = resolve(gitdir, readFileSync(commondirFile, "utf8").trim());
-    return common.replace(/[\\/]+$/, "").toLowerCase().endsWith(".git") ? dirname(common) : undefined;
+    const commondir = readBoundedRegularFile(join(gitdir, "commondir"), GIT_POINTER_BYTES, "commondir");
+    if (commondir === undefined || commondir.trim() === "") return undefined;
+    const common = resolve(gitdir, commondir.trim());
+    return basename(common).toLowerCase() === ".git" ? dirname(common) : common;
   } catch { return undefined; }
 }
 
+function foldCase(path: string): string { return process.platform === "win32" ? path.toLowerCase() : path; }
+
+/** A derived guard (never the work root itself) must not be a filesystem root or the home directory. */
 function guardable(dir: string): boolean {
   if (dirname(dir) === dir) return false; // a filesystem root would refuse every executable
-  try { return realpath(dir).toLowerCase() !== realpath(homedir()).toLowerCase(); } catch { return true; }
+  try { return foldCase(realpath(dir)) !== foldCase(realpath(homedir())); } catch { return true; }
 }
 
 /**
  * Directories no executable may come from for a run or inspection in `root` (#77 G4,
- * QA-P13-1-6): the root, its checkout and that checkout's main worktree (a sibling
- * worktree's main checkout is the same repository), and the plugin's working
- * directory with its checkout and main worktree. Filesystem roots and the home
- * directory are never guards.
+ * QA-P13-1-6, QA-P13-2-3): always the work root itself; derived from it, its checkout
+ * and that checkout's main worktree (a sibling worktree's main checkout, or the bare
+ * repository, is the same repository); and the checkout of the plugin's working
+ * directory with its main worktree (never the working directory itself, which may be
+ * System32 or the home directory). Derived guards that are a filesystem root or the
+ * home directory are skipped. Deduplicated case-insensitively on win32 only.
  */
 export function workRootGuards(root: string): string[] {
   const out: string[] = [];
-  const add = (dir: string | undefined) => {
-    if (dir === undefined || !guardable(dir)) return;
-    if (!out.some(known => known.toLowerCase() === dir.toLowerCase())) out.push(dir);
+  const add = (dir: string | undefined, derived: boolean) => {
+    if (dir === undefined || (derived && !guardable(dir))) return;
+    if (!out.some(known => foldCase(known) === foldCase(dir))) out.push(dir);
   };
+  add(root, false);
   for (const start of [root, process.cwd()]) {
-    add(start);
     const checkout = nearestRepository(start);
-    add(checkout);
-    if (checkout !== undefined) add(mainWorktree(checkout));
+    add(checkout, true);
+    if (checkout !== undefined) add(mainWorktree(checkout), true);
   }
   return out;
 }
@@ -860,7 +901,11 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
  * Any other answer, or a throwing resolver, is reported as a tool error; nothing is spawned.
  */
 export type WorkRootAnswer = { role: false } | { role: true; root: string | null };
-/** P1.3 injects, P2.1 wires it to the dispatch binding. */
+/**
+ * P1.3 injects, P2.1 wires it to the dispatch binding. Shared by router_git_* and
+ * router_run (QA-P13-2-8); router_run refuses `{ role: false }` (it exists for role
+ * sessions only) as well as `{ role: true, root: null }`.
+ */
 export type GitWorkRootResolver = (sessionID: string) => WorkRootAnswer;
 export interface GitToolsOptions { resolveWorkRoot?: GitWorkRootResolver }
 
