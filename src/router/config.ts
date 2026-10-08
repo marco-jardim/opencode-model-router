@@ -3150,6 +3150,19 @@ export interface ResolvedRolesRouting {
   readonly inert: boolean;
 }
 
+/**
+ * Default `routing.run.commands` (#84, P1.3 handoff): package.json scripts take no caller
+ * arguments, so a scoped test run needs a command entry. `npm run test -- <files>` goes through
+ * router_run's hardened npm path (npm-cli.js of the node install, pinned script shell); callers
+ * may pass only `test/...` paths and `--maxWorkers=N`. A user `routing.run.commands` replaces it.
+ */
+export const DEFAULT_RUN_COMMANDS: RunConfig["commands"] = Object.freeze({
+  "test-files": Object.freeze({
+    argv: Object.freeze(["npm", "run", "test", "--"]),
+    args: Object.freeze(["test/*", "--maxWorkers=*"]),
+  }),
+});
+
 let warnedRolesInertOnV1 = false;
 
 /** Test-only: re-arm the once-per-process "roles delegation requires v2" notice. */
@@ -3185,7 +3198,7 @@ export function resolveRolesRouting(
     }),
     run: Object.freeze({
       scripts: Object.freeze([...(r.run?.scripts ?? DEFAULT_RUN_SCRIPTS)]),
-      commands: Object.freeze({ ...(r.run?.commands ?? {}) }),
+      commands: Object.freeze({ ...(r.run?.commands ?? DEFAULT_RUN_COMMANDS) }),
       timeoutMs: r.run?.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
     }),
     workRoots: Object.freeze([...(r.workRoots ?? [])]),

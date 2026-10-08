@@ -22,7 +22,16 @@ import {
   sanitizeWorkRoots,
   workRootProblem,
 } from "../../src/router/roles-config";
-import type { RoleSpec } from "../../src/router/roles";
+import {
+  SHIPPED_ROLE_SPECS,
+  classifyAction,
+  pluginAgentSeparationProblem,
+  resolveRoleTable,
+  resolveRoles,
+  roleSpecProblems,
+  separationProblem,
+  type RoleSpec,
+} from "../../src/router/roles";
 
 function validRaw(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -271,5 +280,155 @@ describe("layers (loadConfig)", () => {
     expect(text).toContain("routing.workRoots[0]");
     expect(text).toContain("roleAgents.reviewer.budget.reads");
     expect(text).not.toContain("unknown routing key");
+  });
+});
+
+describe("shipped role specs (T1.1.3)", () => {
+  it("are valid: return contract, work-root rule, separation, execute denied, frozen", () => {
+    expect(SHIPPED_ROLE_SPECS.map((s) => s.agent)).toEqual(["explorer", "researcher", "runner", "implementer", "reviewer", "architect", "general"]);
+    for (const s of SHIPPED_ROLE_SPECS) {
+      expect(roleSpecProblems(s, { shipped: true })).toEqual([]);
+      expect(s.authority.allow).not.toContain("execute");
+      expect(s.authority.deny).toContain("execute");
+      expect(s.prompt).toContain("`cwd` = the work root");
+      expect(Object.isFrozen(s) && Object.isFrozen(s.authority.allow) && Object.isFrozen(s.budget)).toBe(true);
+    }
+  });
+
+  it("match the plan §2.2 table (R6)", () => {
+    const row = (s: RoleSpec) => [s.kind, s.authority.mode, [...s.authority.allow].sort().join(","),
+      `${s.tierRange.floor}-${s.tierRange.ceiling}`, s.assurance, s.guard, JSON.stringify(s.budget)];
+    const local = "glob,grep,read,router_git";
+    expect(Object.fromEntries(SHIPPED_ROLE_SPECS.map((s) => [s.agent, row(s)]))).toEqual({
+      explorer: ["explore", "fixed", local, "fast-medium", "none", "reader", '{"fast":30,"medium":40}'],
+      researcher: ["research", "fixed", "context7,webfetch,websearch", "fast-medium", "none", "reader", '{"fast":30,"medium":40}'],
+      runner: ["run", "fixed", `${local},router_run`, "fast-medium", "deterministic", "reader", '{"fast":25,"medium":40}'],
+      implementer: ["implement", "dynamic", `edit,${local},router_run`, "fast-heavy", "none", "producer", '{"fast":40,"medium":80,"heavy":120}'],
+      reviewer: ["review", "fixed", `${local},router_run`, "heavy-heavy", "none", "reader", '{"heavy":120}'],
+      architect: ["design", "fixed", local, "medium-heavy", "none", "reader", '{"medium":80,"heavy":120}'],
+      general: ["general", "dynamic", `edit,${local},router_run`, "fast-heavy", "none", "producer", '{"fast":40,"medium":80,"heavy":120}'],
+    });
+    for (const name of ["implementer", "general"]) {
+      expect(SHIPPED_ROLE_SPECS.find((s) => s.agent === name)!.prompt).toContain("if `edit` is denied return `ESCALATE: authority`".replace("if", "If"));
+    }
+  });
+});
+
+describe("separation validator (I4)", () => {
+  it("classifies actions; unknown and MCP names are egress", () => {
+    expect(["read", "external_directory", "router_git_status", "router_run", "edit", "todowrite"].map(classifyAction))
+      .toEqual(["local", "local", "local", "exec", "write", "neutral"]);
+    expect(["bash", "shell", "execute", "context7_query-docs", "brave_web_search", "subagent", "github_create_issue"].map(classifyAction))
+      .toEqual(Array(7).fill("egress"));
+  });
+
+  it("refuses local, exec or write together with egress", () => {
+    expect(separationProblem(["read", "webfetch"])).toMatch(/separation rule I4/);
+    expect(separationProblem(["router_run", "context7"])).toBeDefined();
+    expect(separationProblem(["edit", "execute"])).toBeDefined();
+    expect(separationProblem(["external_directory", "websearch"])).toBeDefined();
+    expect(separationProblem(["read", "glob", "edit", "router_run", "todowrite"])).toBeUndefined();
+    expect(separationProblem(["webfetch", "websearch", "context7"])).toBeUndefined();
+  });
+
+  it("rejects specs that mix classes or allow execute", () => {
+    const explorer = SHIPPED_ROLE_SPECS[0]!;
+    const mixed: RoleSpec = { ...explorer, authority: { ...explorer.authority, allow: [...explorer.authority.allow, "webfetch"], deny: explorer.authority.deny.filter((a) => a !== "webfetch") } };
+    expect(roleSpecProblems(mixed).join("; ")).toMatch(/separation rule I4/);
+    const code: RoleSpec = { ...explorer, authority: { mode: "fixed", allow: ["execute"], deny: [] } };
+    expect(roleSpecProblems(code).join("; ")).toMatch(/allows execute.*does not deny execute/);
+  });
+
+  it("evaluates #81 agent policies, wildcards included", () => {
+    expect(pluginAgentSeparationProblem({ tier: "fast", description: "x", permission: { read: "allow", webfetch: "allow" } })).toBeDefined();
+    expect(pluginAgentSeparationProblem({ tier: "fast", description: "x", permission: { read: "allow", glob: "allow" } })).toBeUndefined();
+    expect(pluginAgentSeparationProblem({ tier: "fast", description: "x", permission: { "*": "allow" } })).toBeDefined();
+    expect(pluginAgentSeparationProblem({ tier: "fast", description: "x", permission: { "*": "deny", webfetch: "allow", websearch: "ask" } })).toBeUndefined();
+    expect(pluginAgentSeparationProblem({ readOnly: true }, true)).toMatch(/context7/);
+    expect(pluginAgentSeparationProblem({ readOnly: true }, false)).toBeUndefined();
+    expect(pluginAgentSeparationProblem("nope")).toBeDefined();
+  });
+});
+
+describe("resolveRoles (T1.1.3)", () => {
+  const tier = (m: string) => ({ model: `anthropic/${m}`, description: m, whenToUse: ["x"] });
+  const raw = (extra: Record<string, unknown> = {}, tiers: string[] = ["fast", "medium", "heavy"]) =>
+    validRaw({ presets: { anthropic: Object.fromEntries(tiers.map((t) => [t, tier(t)])) }, ...extra });
+  const rolesMode = (extra: Record<string, unknown> = {}, tiers?: string[]) =>
+    validateConfig(raw({ routing: { delegation: "roles" }, ...extra }, tiers));
+
+  it("is empty in tiers mode and on v1", () => {
+    expect(resolveRoles(validateConfig(raw()), "v2").size).toBe(0);
+    expect(resolveRoles(validateConfig(raw({ routing: { delegation: "tiers" } })), "v2").size).toBe(0);
+    expect(resolveRoles(rolesMode(), "v1").size).toBe(0);
+  });
+
+  it("returns every shipped role in roles mode on v2, read-only", () => {
+    const t = resolveRoleTable(rolesMode(), "v2");
+    expect([...t.roles.keys()]).toEqual(SHIPPED_ROLE_SPECS.map((s) => s.agent));
+    expect(t.issues).toEqual([]);
+    expect(() => (t.roles as Map<string, RoleSpec>).set("x", t.roles.get("explorer")!)).toThrow(TypeError);
+    expect(Object.isFrozen(t.roles.get("reviewer"))).toBe(true);
+  });
+
+  it("narrows with roleAgents, never widens, and leaves disabled roles out", () => {
+    const t = resolveRoleTable(rolesMode({
+      roleAgents: {
+        implementer: { deny: ["router_run"], tierRange: { floor: "medium" }, budget: { heavy: 500 } },
+        reviewer: { tierRange: { floor: "fast" } },
+        architect: { enabled: false },
+        ghost: { enabled: false },
+      },
+    }), "v2");
+    const impl = t.roles.get("implementer")!;
+    expect(impl.authority.allow).not.toContain("router_run");
+    expect(impl.authority.deny).toContain("router_run");
+    expect(impl.tierRange).toEqual({ floor: "medium", ceiling: "heavy" });
+    expect(impl.budget.heavy).toBe(240);
+    expect(t.roles.get("reviewer")!.tierRange).toEqual({ floor: "heavy", ceiling: "heavy" });
+    expect(t.roles.has("architect")).toBe(false);
+    const paths = t.issues.map((i) => i.path);
+    expect(paths).toEqual(expect.arrayContaining(["roleAgents.ghost", "roleAgents.reviewer.tierRange.floor", "roleAgents.implementer.budget.heavy"]));
+  });
+
+  it("places tier ranges on the active preset's tiers, with a notice", () => {
+    const t = resolveRoleTable(rolesMode({}, ["fast", "heavy"]), "v2");
+    expect(t.roles.get("explorer")!.tierRange).toEqual({ floor: "fast", ceiling: "fast" });
+    expect(t.roles.get("architect")!.tierRange).toEqual({ floor: "heavy", ceiling: "heavy" });
+    expect(t.issues.map((i) => i.path)).toContain("roleAgents.architect.tierRange");
+    const small = resolveRoleTable(rolesMode({}, ["fast", "medium"]), "v2");
+    expect(small.roles.has("reviewer")).toBe(false);
+    expect(small.issues.find((i) => i.path === "roleAgents.reviewer.tierRange")?.message).toMatch(/role disabled/);
+  });
+
+  it("drops a #81 agent with a role name that breaks separation in roles mode only", () => {
+    const agents = {
+      researcher: { tier: "fast", description: "r", permission: { read: "allow", webfetch: "allow" } },
+      explorer: { tier: "fast", description: "e", permission: { read: "allow", glob: "allow" } },
+    };
+    const t = resolveRoleTable(rolesMode({ agents }), "v2");
+    expect(t.droppedAgents).toEqual(["researcher"]);
+    expect(t.roles.get("researcher")!.authority.allow).toEqual(["webfetch", "websearch", "context7"]);
+    expect(t.replacedRoles).toEqual(["explorer"]);
+    expect(t.roles.has("explorer")).toBe(false);
+    expect(t.issues.find((i) => i.path === "agents.researcher")?.message).toMatch(/dropped in roles mode/);
+    const tiers = resolveRoleTable(validateConfig(raw({ agents })), "v2");
+    expect([tiers.droppedAgents, tiers.replacedRoles, tiers.roles.size]).toEqual([[], [], 0]);
+  });
+
+  it("skips an invalid shipped spec (fail closed)", () => {
+    const bad: RoleSpec = { ...SHIPPED_ROLE_SPECS[0]!, authority: { mode: "fixed", allow: ["read", "webfetch"], deny: [] } };
+    const t = resolveRoleTable(rolesMode(), "v2", { shipped: [bad] });
+    expect(t.roles.size).toBe(0);
+    expect(t.issues[0]?.message).toMatch(/shipped role explorer is invalid/);
+  });
+});
+
+describe("routing.run default commands (P1.3 handoff)", () => {
+  it("ships a scoped test entry; a user commands block replaces it", () => {
+    const r = resolveRolesRouting(validateConfig(validRaw()), "v2");
+    expect(r.run.commands["test-files"]).toEqual({ argv: ["npm", "run", "test", "--"], args: ["test/*", "--maxWorkers=*"] });
+    const own = resolveRolesRouting(validateConfig(validRaw({ routing: { run: { commands: { x: { argv: ["node", "x.js"] } } } } })), "v2");
+    expect(Object.keys(own.run.commands)).toEqual(["x"]);
   });
 });
