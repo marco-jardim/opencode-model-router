@@ -11,7 +11,14 @@ import {
   type Scope,
   type TaskFacts,
 } from "../../src/routing/classify/types";
-import { GRANT_NOTES, authorityFloor, grantFor, type DispatchGrant } from "../../src/routing/roles/policy";
+import {
+  GRANT_NOTES,
+  authorityFloor,
+  grantFor,
+  tierBounds,
+  type DispatchGrant,
+  type TierBoundsOptions,
+} from "../../src/routing/roles/policy";
 
 // ---------------------------------------------------------------------------
 // Fixtures: the §2.2 classes and the shipped role table, written independently of policy.ts
@@ -353,6 +360,261 @@ describe("grantFor — properties", () => {
           expect(violatesSeparation(g.actions)).toBe(false);
         }
       }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tierBounds
+// ---------------------------------------------------------------------------
+
+const TIERS = ["fast", "medium", "heavy"] as const;
+
+function opts(o: Partial<TierBoundsOptions> = {}): TierBoundsOptions {
+  return { floorTier: null, runningTier: null, pinTier: null, tiers: TIERS, ...o };
+}
+
+describe("tierBounds — window", () => {
+  it("a read-only grant keeps the role range", () => {
+    expect(tierBounds(ROLES.implementer, grantOf(...LOCAL), facts(), "none", opts())).toEqual({
+      floor: "fast",
+      ceiling: "heavy",
+      pinned: null,
+      reasons: [],
+    });
+    expect(tierBounds(ROLES.architect, grantOf(...LOCAL), facts(), "none", opts())).toMatchObject({ floor: "medium", ceiling: "heavy" });
+  });
+
+  it("the authority floor raises the floor", () => {
+    const b = tierBounds(ROLES.implementer, grantOf("edit"), facts([], "high"), "none", opts());
+    expect(b).toMatchObject({ floor: "heavy", ceiling: "heavy", reasons: ["floor:authority"] });
+  });
+
+  it("empty tier list → built-in order; duplicates and invalid entries are dropped", () => {
+    const g = grantOf("edit");
+    expect(tierBounds(ROLES.implementer, g, facts(), "grader", opts({ tiers: [] }))).toMatchObject({ floor: "medium", ceiling: "heavy" });
+    const messy = ["fast", "fast", "", 7 as unknown as string, "medium", "heavy"];
+    expect(tierBounds(ROLES.implementer, g, facts(), "grader", opts({ tiers: messy }))).toMatchObject({ floor: "medium", ceiling: "heavy" });
+  });
+});
+
+describe("tierBounds — risk and scope are raise-only", () => {
+  const g = grantOf("edit");
+
+  it("a route line lowering risk is ignored", () => {
+    const b = tierBounds(ROLES.implementer, g, facts([], "high"), "none", opts({ routeLine: { risk: "low" } }));
+    expect(b.floor).toBe("heavy");
+  });
+
+  it("a route line raising risk is applied", () => {
+    const b = tierBounds(ROLES.implementer, g, facts([], "low"), "none", opts({ routeLine: { risk: "high" } }));
+    expect(b.floor).toBe("heavy");
+  });
+
+  it("a route line raising scope is applied", () => {
+    expect(tierBounds(ROLES.implementer, g, facts(), "deterministic", opts()).floor).toBe("fast");
+    const b = tierBounds(ROLES.implementer, g, facts(), "deterministic", opts({ routeLine: { scope: "multi" } }));
+    expect(b.floor).toBe("medium");
+  });
+
+  it("a scope the route line lowered inside classify() is restored from the classifier facts", () => {
+    // classify() merged `[route scope=single]` over a rules scope of `repo`: facts.scope is single.
+    const merged = facts([], "low", "single");
+    const b = tierBounds(ROLES.implementer, g, merged, "deterministic", opts({
+      classifier: { risk: "low", scope: "repo" },
+      routeLine: { scope: "single" },
+    }));
+    expect(b.floor).toBe("medium");
+    expect(tierBounds(ROLES.implementer, g, merged, "deterministic", opts({ classifier: null, routeLine: null })).floor).toBe("fast");
+  });
+});
+
+describe("tierBounds — pins", () => {
+  it("a pin inside the window is honoured", () => {
+    expect(tierBounds(ROLES.implementer, grantOf(...LOCAL), facts(), "none", opts({ pinTier: "medium" }))).toMatchObject({
+      pinned: "medium",
+      reasons: [],
+    });
+  });
+
+  it("a pin above the ceiling is clamped", () => {
+    const b = tierBounds(ROLES.explorer, grantOf(...LOCAL), facts(), "none", opts({ pinTier: "heavy" }));
+    expect(b).toMatchObject({ floor: "fast", ceiling: "medium", pinned: "medium", reasons: ["clamp:ceiling"] });
+  });
+
+  it("a pin below the authority floor is lifted (lift:authority)", () => {
+    const b = tierBounds(ROLES.implementer, grantOf("edit"), facts([], "medium"), "none", opts({ pinTier: "fast" }));
+    expect(b).toMatchObject({ floor: "medium", pinned: "medium", reasons: ["floor:authority", "lift:authority"] });
+  });
+
+  it("a pin below the role floor is lifted (lift:floor)", () => {
+    const b = tierBounds(ROLES.architect, grantOf(...LOCAL), facts(), "none", opts({ pinTier: "fast" }));
+    expect(b).toMatchObject({ floor: "medium", pinned: "medium", reasons: ["lift:floor"] });
+  });
+
+  it("on a tie the authority floor names the lift", () => {
+    const narrowed = role("implementer", "implement", "dynamic", [...LOCAL, "edit"], "medium", "heavy");
+    const b = tierBounds(narrowed, grantOf("edit"), facts(), "grader", opts({ pinTier: "fast" }));
+    expect(b).toMatchObject({ floor: "medium", pinned: "medium", reasons: ["lift:authority"] });
+  });
+
+  it("a pin to an unknown tier is ignored", () => {
+    const b = tierBounds(ROLES.implementer, grantOf(...LOCAL), facts(), "none", opts({ pinTier: "giant" }));
+    expect(b).toMatchObject({ pinned: null, reasons: ["ignore:pin:giant"] });
+  });
+});
+
+describe("tierBounds — floors above the role range", () => {
+  it("resume at heavy with a fast default never moves below the running rung", () => {
+    const b = tierBounds(ROLES.implementer, grantOf(...LOCAL, "edit"), facts(), "deterministic", opts({ runningTier: "heavy", pinTier: "fast" }));
+    expect(b).toMatchObject({ floor: "heavy", ceiling: "heavy", pinned: "heavy", reasons: ["floor:running", "lift:floor"] });
+  });
+
+  it("floorTier above the role ceiling: the floor wins, the range is widened upward only", () => {
+    const b = tierBounds(ROLES.explorer, grantOf(...LOCAL), facts(), "none", opts({ floorTier: "heavy" }));
+    expect(b).toMatchObject({ floor: "heavy", ceiling: "heavy", pinned: null, reasons: ["floor:floorTier", "lift:floor"] });
+  });
+
+  it("an authority floor above a narrowed ceiling raises the ceiling (lift:authority)", () => {
+    const narrowed = role("implementer", "implement", "dynamic", [...LOCAL, "edit", "router_run"], "fast", "medium");
+    const b = tierBounds(narrowed, grantOf("edit", "router_run"), facts(), "grader", opts());
+    expect(b).toMatchObject({ floor: "heavy", ceiling: "heavy", reasons: ["floor:authority", "lift:authority"] });
+  });
+
+  it("an inverted role range keeps the floor and lifts the ceiling", () => {
+    const inverted = role("x", "design", "fixed", LOCAL, "heavy", "fast");
+    expect(tierBounds(inverted, grantOf(...LOCAL), facts(), "none", opts())).toMatchObject({
+      floor: "heavy",
+      ceiling: "heavy",
+      reasons: ["lift:floor"],
+    });
+  });
+});
+
+describe("tierBounds — tier names off the order", () => {
+  it("unknown names are ignored with a reason", () => {
+    const r = role("x", "general", "dynamic", LOCAL, "giant", "huge");
+    const b = tierBounds(r, grantOf(...LOCAL), facts(), "none", opts({ floorTier: "giant", runningTier: "tiny" }));
+    expect(b).toEqual({
+      floor: "fast",
+      ceiling: "heavy",
+      pinned: null,
+      reasons: ["ignore:role:giant", "ignore:floorTier:giant", "ignore:running:tiny", "ignore:ceiling:huge"],
+    });
+  });
+
+  it("a built-in floor missing from the order rounds up (fail-closed)", () => {
+    const b = tierBounds(ROLES.implementer, grantOf("edit"), facts(), "grader", opts({ tiers: ["fast", "heavy"] }));
+    expect(b).toMatchObject({ floor: "heavy", ceiling: "heavy" });
+    expect(b.reasons).toEqual(["round:authority:medium->heavy", "floor:authority"]);
+  });
+
+  it("a built-in ceiling missing from the order rounds down", () => {
+    const b = tierBounds(ROLES.explorer, grantOf(...LOCAL), facts(), "none", opts({ tiers: ["fast", "heavy"], pinTier: "heavy" }));
+    expect(b).toMatchObject({ floor: "fast", ceiling: "fast", pinned: "fast" });
+    expect(b.reasons).toEqual(["round:ceiling:medium->fast", "clamp:ceiling"]);
+  });
+
+  it("with no built-in tier at or below the ceiling, the cheapest tier is the ceiling", () => {
+    const fastOnly = role("x", "explore", "fixed", LOCAL, "fast", "fast");
+    const b = tierBounds(fastOnly, grantOf(...LOCAL), facts(), "none", opts({ tiers: ["medium", "heavy"] }));
+    expect(b).toMatchObject({ floor: "medium", ceiling: "medium" });
+    expect(b.reasons).toEqual(["round:role:fast->medium", "round:authority:fast->medium", "round:ceiling:fast->medium"]);
+  });
+
+  it("a custom order: `fast` is vacuous, a higher built-in floor takes the top tier", () => {
+    const custom = { tiers: ["small", "large"] };
+    const low = tierBounds(ROLES.implementer, grantOf(...LOCAL), facts(), "none", opts(custom));
+    expect(low).toMatchObject({ floor: "small", ceiling: "small" });
+    const high = tierBounds(ROLES.implementer, grantOf("edit"), facts([], "high"), "none", opts(custom));
+    expect(high).toMatchObject({ floor: "large", ceiling: "large" });
+    expect(high.reasons).toContain("round:authority:heavy->large");
+    expect(high.reasons).toContain("lift:authority");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Property tests — bounds (I2: never below the authority floor; raise-only route line)
+// ---------------------------------------------------------------------------
+
+describe("tierBounds — properties", () => {
+  const ORDERS: ReadonlyArray<readonly string[]> = [
+    TIERS,
+    [],
+    ["fast", "heavy"],
+    ["medium", "heavy"],
+    ["fast", "medium"],
+    ["small", "large"],
+  ];
+  const NAMES: ReadonlyArray<string | null> = [null, ...TIERS, "giant", "small"];
+  const rank = (t: string): number => (TIERS as readonly string[]).indexOf(t);
+  const maxOf = <T extends string>(order: readonly T[], xs: ReadonlyArray<T | undefined | null>): T =>
+    order[Math.max(...xs.map((x) => (x == null ? -1 : order.indexOf(x))))]!;
+
+  /** `floor` is at least `want` on `order` (rounded up / fail-closed for built-in names off the order). */
+  function atLeast(order: readonly string[], floor: string, want: string): boolean {
+    const at = order.indexOf(want);
+    if (at >= 0) return order.indexOf(floor) >= at;
+    if (rank(want) <= 0) return true;
+    return rank(floor) >= rank(want) || order.indexOf(floor) === order.length - 1;
+  }
+
+  it("every generated input: window ordered, floor ≥ every floor source, pin inside, route line raise-only", () => {
+    const r = rng(0x7135);
+    for (let i = 0; i < 6000; i++) {
+      const tiers = pick(r, ORDERS);
+      const order = tiers.length > 0 ? tiers : TIERS;
+      const spec = role("p", "general", "dynamic", ALL, pick(r, NAMES) ?? "fast", pick(r, NAMES) ?? "heavy");
+      const g = grantOf(...subset(r, ALL));
+      const d = pick(r, DETECTIONS);
+      const f = facts([], pick(r, RISKS), pick(r, SCOPES));
+      const classifier = r() < 0.5 ? { risk: pick(r, RISKS), scope: pick(r, SCOPES) } : null;
+      const routeLine = r() < 0.5 ? { risk: r() < 0.5 ? pick(r, RISKS) : undefined, scope: r() < 0.5 ? pick(r, SCOPES) : undefined } : null;
+      const o = opts({ tiers, floorTier: pick(r, NAMES), runningTier: pick(r, NAMES), pinTier: pick(r, NAMES), classifier, routeLine });
+      const b = tierBounds(spec, g, f, d, o);
+
+      expect(order).toContain(b.floor);
+      expect(order).toContain(b.ceiling);
+      expect(order.indexOf(b.floor)).toBeLessThanOrEqual(order.indexOf(b.ceiling));
+      expect(new Set(b.reasons).size).toBe(b.reasons.length);
+
+      const risk = maxOf(RISKS, [f.risk, classifier?.risk, routeLine?.risk]);
+      const scope = maxOf(SCOPES, [f.scope, classifier?.scope, routeLine?.scope]);
+      expect(atLeast(order, b.floor, authorityFloor(g, d, risk, scope))).toBe(true);
+      expect(atLeast(order, b.floor, authorityFloor(g, d, f.risk, f.scope))).toBe(true);
+      for (const src of [spec.tierRange.floor, o.floorTier, o.runningTier]) {
+        if (src !== null && rank(src) >= 0) expect(atLeast(order, b.floor, src)).toBe(true);
+        if (src !== null && order.includes(src)) expect(order.indexOf(b.floor)).toBeGreaterThanOrEqual(order.indexOf(src));
+      }
+
+      if (o.pinTier === null || !order.includes(o.pinTier)) expect(b.pinned).toBeNull();
+      else {
+        const p = order.indexOf(b.pinned!);
+        expect(p).toBeGreaterThanOrEqual(order.indexOf(b.floor));
+        expect(p).toBeLessThanOrEqual(order.indexOf(b.ceiling));
+      }
+
+      const bare = tierBounds(spec, g, f, d, { ...o, classifier: null, routeLine: null });
+      expect(order.indexOf(b.floor)).toBeGreaterThanOrEqual(order.indexOf(bare.floor));
+    }
+  });
+
+  it("no generated (role, facts) yields a floor below authorityFloor or a grant outside the role max", () => {
+    const r = rng(0x84);
+    const KINDS: readonly RoleKind[] = ["explore", "research", "run", "implement", "review", "design", "general"];
+    for (let i = 0; i < 4000; i++) {
+      const allow = subset(r, ALL);
+      const deny = subset(r, ALL, 0.2);
+      const spec = role("p", pick(r, KINDS), r() < 0.5 ? "fixed" : "dynamic", allow, pick(r, TIERS), pick(r, TIERS), deny);
+      const f = facts(subset(r, NEEDS), pick(r, RISKS), pick(r, SCOPES));
+      const g = grantFor(spec, f, subset(r, ALL, 0.3), r() < 0.5 ? ROOT : null);
+      const d = pick(r, DETECTIONS);
+      const b = tierBounds(spec, g, f, d, opts({ floorTier: pick(r, NAMES), runningTier: pick(r, NAMES), pinTier: pick(r, NAMES) }));
+      const max = new Set(allow.filter((a) => !deny.includes(a)));
+      for (const a of g.actions) expect(max.has(a)).toBe(true);
+      expect(violatesSeparation(g.actions)).toBe(false);
+      expect(rank(b.floor)).toBeGreaterThanOrEqual(rank(authorityFloor(g, d, f.risk, f.scope)));
+      if (b.pinned !== null) expect(rank(b.pinned)).toBeGreaterThanOrEqual(rank(b.floor));
     }
   });
 });

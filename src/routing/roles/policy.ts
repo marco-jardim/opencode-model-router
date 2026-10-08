@@ -4,8 +4,8 @@
  * - `grantFor` (T1.2.1): the actions one dispatch may use, inside the role's max policy, with the
  *   separation rule (I4) and the work-root rule applied last so nothing can re-add what they remove.
  * - `authorityFloor` (T1.2.1): the §2.3 table.
- * - `tierBounds` returns the most restrictive valid result today (the role's own range tightened by the
- *   authority floor); T1.2.2 completes it.
+ * - `tierBounds` (T1.2.2): the role range ∩ the authority floor ∩ `floorTier` ∩ the running rung, risk and
+ *   scope raise-only, route-line pin lifted/clamped into the window.
  */
 
 import type { AuthorityAction, RoleKind, RoleSpec } from "../../router/roles";
@@ -158,46 +158,166 @@ export function authorityFloor(grant: DispatchGrant, detection: Detection, risk:
   return floor;
 }
 
+// ---------------------------------------------------------------------------
+// Tier window (§2.3, T1.2.2)
+// ---------------------------------------------------------------------------
+
+export interface TierBoundsOptions {
+  /** `enforcement.escalate.floorTier`, or null. */
+  floorTier: string | null;
+  /** The child's running tier on a resume (never move below it), or null. */
+  runningTier: string | null;
+  /** Route-line `tier=`, or null. */
+  pinTier: string | null;
+  /** Active tier order, cheapest first (the escalate ladder); empty → `fast`, `medium`, `heavy`. */
+  tiers: readonly string[];
+  /**
+   * The classifier's facts before the route line (`ClassifyResult.trace.rules`). `classify()` lets a route
+   * line override `scope` (tier-mode L3); passing these restores raise-only semantics for the floor.
+   */
+  classifier?: Pick<TaskFacts, "risk" | "scope"> | null;
+  /** The route line (`ClassifyResult.trace.routeLine`): raises risk/scope, never lowers them. */
+  routeLine?: Pick<RouteLine, "risk" | "scope"> | null;
+}
+
+export interface TierBounds {
+  floor: string;
+  ceiling: string;
+  pinned: string | null;
+  reasons: readonly string[];
+}
+
+type FloorSource = "role" | "authority" | "floorTier" | "running";
+
+const RISK_ORDER: readonly string[] = ["low", "medium", "high"];
+const SCOPE_ORDER: readonly string[] = ["single", "multi", "repo"];
+
+/** Highest of `values` in `order`; values not in `order` are ignored; `base` when none is higher. */
+function highest<T extends string>(order: readonly string[], base: T, values: ReadonlyArray<T | null | undefined>): T {
+  let out = base;
+  for (const v of values) if (v != null && order.indexOf(v) > order.indexOf(out)) out = v;
+  return out;
+}
+
 /**
- * Tier window of a dispatch. Most restrictive valid result today: floor = the
- * highest of the role floor, the authority floor and `floorTier`; ceiling = the
- * role ceiling (raised to the floor if below); `pinned` = `pinTier` when it lies
- * inside the window. T1.2.2 completes the running-tier and tier-list rules.
+ * Position of a floor-type tier on `order`. A built-in name missing from the order rounds UP to the
+ * cheapest present built-in tier at least as capable; with none, `fast` is vacuous (the cheapest tier) and
+ * anything else fails closed to the most capable tier. Any other unknown name → null (ignored).
+ */
+function placeFloor(tier: string, order: readonly string[]): { index: number; exact: boolean } | null {
+  const at = order.indexOf(tier);
+  if (at >= 0) return { index: at, exact: true };
+  const rank = tierIndex(tier);
+  if (rank < 0) return null;
+  const up = order.findIndex((t) => tierIndex(t) >= rank);
+  if (up >= 0) return { index: up, exact: false };
+  return { index: rank === 0 ? 0 : order.length - 1, exact: false };
+}
+
+/**
+ * Position of the role ceiling. A built-in name missing from the order rounds DOWN to the most capable
+ * present built-in tier not above it (none → the cheapest tier; the floor then wins). Any other unknown
+ * name → null (ignored: no ceiling below the top).
+ */
+function placeCeiling(tier: string, order: readonly string[]): { index: number; exact: boolean } | null {
+  const at = order.indexOf(tier);
+  if (at >= 0) return { index: at, exact: true };
+  const rank = tierIndex(tier);
+  if (rank < 0) return null;
+  let down = -1;
+  order.forEach((t, i) => {
+    const r = tierIndex(t);
+    if (r >= 0 && r <= rank) down = i;
+  });
+  return { index: Math.max(down, 0), exact: false };
+}
+
+/**
+ * Tier window of a dispatch (§2.3).
+ *
+ * - risk/scope = max(`facts`, `opts.classifier`, `opts.routeLine`): a route line can raise them, never
+ *   lower them.
+ * - floor = max(role floor, `authorityFloor(grant, detection, risk, scope)`, `floorTier`, `runningTier`).
+ * - ceiling = the role ceiling; when the floor is above it the floor wins and the ceiling is raised to the
+ *   floor (the range is widened upward only).
+ * - pin (`tier=`): inside [floor, ceiling] → pinned; below → lifted to the floor; above → clamped to the
+ *   ceiling; not on the tier order → ignored (`pinned` null).
+ * - Tier order = `opts.tiers` (empty → built-in). Floor names missing from it round up, the ceiling rounds
+ *   down (see {@link placeFloor}); other unknown names are ignored.
+ *
+ * Reasons (deduplicated, in order of application):
+ * `floor:<source>` a source raised the floor (source = authority | floorTier | running);
+ * `round:<source>:<from>-><to>` a built-in name missing from the order was rounded (source adds role | ceiling);
+ * `ignore:<source>:<name>` an unknown name was ignored (source adds pin);
+ * `lift:authority` the authority floor (on a tie it is named first) lifted the pin or the ceiling;
+ * `lift:floor` any other floor source (role, floorTier, running) lifted the pin or the ceiling;
+ * `clamp:ceiling` a pin above the ceiling was clamped to it.
  */
 export function tierBounds(
   role: RoleSpec,
   grant: DispatchGrant,
   facts: TaskFacts,
   detection: Detection,
-  opts: {
-    floorTier: string | null;
-    runningTier: string | null;
-    pinTier: string | null;
-    tiers: readonly string[];
-  },
-): { floor: string; ceiling: string; pinned: string | null; reasons: readonly string[] } {
-  const order = opts.tiers.length > 0 ? opts.tiers : BUILTIN_TIERS;
-  const idx = (t: string): number => order.indexOf(t);
-  const higher = (a: string, b: string): string => (idx(b) > idx(a) ? b : a);
+  opts: TierBoundsOptions,
+): TierBounds {
+  const listed = opts.tiers.filter((t, i) => typeof t === "string" && t !== "" && opts.tiers.indexOf(t) === i);
+  const order: readonly string[] = listed.length > 0 ? listed : BUILTIN_TIERS;
   const reasons: string[] = [];
-  let floor = role.tierRange.floor;
-  const candidates: Array<[string | null, string]> = [
-    [authorityFloor(grant, detection, facts.risk, facts.scope), "authority"],
-    [opts.floorTier, "floorTier"],
+
+  const risk = highest<Risk>(RISK_ORDER, facts.risk, [opts.classifier?.risk, opts.routeLine?.risk]);
+  const scope = highest<Scope>(SCOPE_ORDER, facts.scope, [opts.classifier?.scope, opts.routeLine?.scope]);
+  const sources: Array<[FloorSource, string | null]> = [
+    ["role", role.tierRange.floor],
+    ["authority", authorityFloor(grant, detection, risk, scope)],
+    ["floorTier", opts.floorTier],
+    ["running", opts.runningTier],
   ];
-  for (const [tier, why] of candidates) {
-    if (tier !== null && idx(tier) > idx(floor)) {
-      floor = higher(floor, tier);
-      reasons.push(`floor:${why}`);
+
+  let floor = 0;
+  let owner: FloorSource | null = null;
+  for (const [source, tier] of sources) {
+    if (tier === null) continue;
+    const placed = placeFloor(tier, order);
+    if (placed === null) {
+      reasons.push(`ignore:${source}:${tier}`);
+      continue;
+    }
+    if (!placed.exact) reasons.push(`round:${source}:${tier}->${order[placed.index]}`);
+    if (placed.index > floor || owner === null) {
+      if (placed.index > floor && source !== "role") reasons.push(`floor:${source}`);
+      floor = Math.max(floor, placed.index);
+      owner = source;
+    } else if (placed.index === floor && source === "authority") {
+      owner = source;
     }
   }
-  let ceiling = role.tierRange.ceiling;
-  if (idx(ceiling) < idx(floor)) {
-    ceiling = floor;
-    reasons.push("ceiling:raised-to-floor");
+  const lift = owner === "authority" ? "lift:authority" : "lift:floor";
+
+  let ceiling = order.length - 1;
+  const roleCeiling = placeCeiling(role.tierRange.ceiling, order);
+  if (roleCeiling === null) reasons.push(`ignore:ceiling:${role.tierRange.ceiling}`);
+  else {
+    if (!roleCeiling.exact) reasons.push(`round:ceiling:${role.tierRange.ceiling}->${order[roleCeiling.index]}`);
+    ceiling = roleCeiling.index;
   }
+  if (ceiling < floor) {
+    ceiling = floor;
+    reasons.push(lift);
+  }
+
+  let pinned: string | null = null;
   const pin = opts.pinTier;
-  const pinned = pin !== null && idx(pin) >= idx(floor) && idx(pin) <= idx(ceiling) ? pin : null;
-  if (pin !== null && pinned === null) reasons.push("pin:out-of-range");
-  return { floor, ceiling, pinned, reasons };
+  if (pin !== null) {
+    const at = order.indexOf(pin);
+    if (at < 0) reasons.push(`ignore:pin:${pin}`);
+    else if (at < floor) {
+      pinned = order[floor]!;
+      reasons.push(lift);
+    } else if (at > ceiling) {
+      pinned = order[ceiling]!;
+      reasons.push("clamp:ceiling");
+    } else pinned = pin;
+  }
+
+  return { floor: order[floor]!, ceiling: order[ceiling]!, pinned, reasons: [...new Set(reasons)] };
 }
