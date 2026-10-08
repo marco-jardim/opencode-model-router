@@ -368,7 +368,7 @@ export interface ClassifyTrace {
     readonly edgeOnly: boolean;
     /**
      * QA-P12-2-2: `RouteLineParse.malformed` — the sanctioned field for P2.1 to surface a malformed first route line.
-     * Type only for now: `classify()` does not set it yet (absent = not reported).
+     * `classify()` copies it from the parse (absent = not malformed); the P2.1 role path refuses such a dispatch.
      */
     readonly malformed?: true;
   };
