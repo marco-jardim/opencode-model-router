@@ -1079,6 +1079,65 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     } finally { await finish(host); }
   }, 900_000);
 
+  it("S11 repeated with agents defined in the ROUTER override (the production registration path)", async () => {
+    const host = await RoutingHost.start("s11r", {
+      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true, denyAsk: true }, hostConfig: {},
+      overrides: (root: string) => {
+        const agent = (description: string, externalDirectory?: string): Obj => ({ tier: "fast", description, permission: { read: "allow", edit: "allow", ...(externalDirectory ? { external_directory: { [externalDirectory]: "allow" } } : {}) } });
+        return { agents: {
+          "r-deny": agent("S11r deny-by-default, no external_directory rule"),
+          "r-wt1": agent("S11r exact worktree rule", `${root}\\wt-1\\*`),
+          "r-glob": agent("S11r glob rule", `${root}\\wt-*`),
+        } };
+      },
+    });
+    try {
+      const world = await s11World(host);
+      const { wt1, wt2, other, evil } = world;
+      const op = (agent: string, label: string, tool: string, input: Obj, rootPerms: "none" | "allow-all" = "none") => s11Op(host, agent, label, tool, input, rootPerms);
+      const edit = (file: string): Obj => ({ path: file, oldString: "main", newString: "edited" });
+      const agentList = (await host.client.agent.list()).data.filter(a => a.id.startsWith("r-")).map(a => ({ id: a.id, model: a.model, mode: a.mode }));
+      const deny = { read: await op("r-deny", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("r-deny", "edit wt1", "edit", edit(path.join(wt1, "e0.txt"))) };
+      const exact = {
+        read: await op("r-wt1", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("r-wt1", "edit wt1", "edit", edit(path.join(wt1, "e1.txt"))),
+        other: await op("r-wt1", "read other", "read", { path: path.join(other, "x.txt") }), otherEdit: await op("r-wt1", "edit other", "edit", edit(path.join(other, "x.txt"))),
+        evil: await op("r-wt1", "read wt-evil", "read", { path: path.join(evil, "x.txt") }),
+      };
+      const glob = { read: await op("r-glob", "read wt1", "read", { path: path.join(wt1, "m.txt") }), evil: await op("r-glob", "read wt-evil", "read", { path: path.join(evil, "x.txt") }), other: await op("r-glob", "read other", "read", { path: path.join(other, "x.txt") }) };
+      const openRoot = { deny: await op("r-deny", "read wt1 under an allow-all session", "read", { path: path.join(wt1, "m.txt") }, "allow-all"), other: await op("r-wt1", "read other under an allow-all session", "read", { path: path.join(other, "x.txt") }, "allow-all") };
+      const wt2File = await world.addLaterWorktree();
+      const later = { noPattern: await op("r-deny", "read wt2", "read", { path: path.join(wt2, "m.txt") }), exact: await op("r-wt1", "read wt2", "read", { path: path.join(wt2, "m.txt") }), glob: await op("r-glob", "read wt2", "read", { path: path.join(wt2, "m.txt") }), globEdit: await op("r-glob", "edit wt2", "edit", edit(wt2File)) };
+      const disk = { wt1E0: await readFile(path.join(wt1, "e0.txt"), "utf8"), wt1E1: await readFile(path.join(wt1, "e1.txt"), "utf8"), wt2E3: await readFile(wt2File, "utf8"), other: await readFile(path.join(other, "x.txt"), "utf8") };
+      await save("S11-router", { agentList, deny, exact, glob, openRoot, later, disk, routerWarnings: host.routerLogLines(), hostErrors: host.errorLines() });
+      // Registration path: the router override's `agents` block (tier fast -> the host agent record carries the tier's model), with explicit
+      // `permission` maps; the router publishes the policy and its own evaluate hook re-evaluates it. Same outcomes as for host-defined agents:
+      expect(agentList.map(a => a.id).sort()).toEqual(["r-deny", "r-glob", "r-wt1"]);
+      expect(agentList.every(a => a.model?.id === "claude-sonnet-5-5" && a.model.variant === "low")).toBe(true);
+      const denied = "Permission denied: external_directory";
+      const rejected = (o: { state?: Obj }, message: string) => expect(o.state).toMatchObject({ status: "error", errorType: "permission.rejected", errorMessage: message });
+      rejected(deny.read, denied); rejected(deny.edit, denied);
+      expect(exact.read.state).toMatchObject({ status: "completed" });
+      expect(exact.edit.state).toMatchObject({ status: "completed" });
+      expect(exact.read.evaluates.map(e => [e.action, e.effectIn])).toEqual([["external_directory", "allow"], ["read", "allow"]]);
+      rejected(exact.other, denied); rejected(exact.otherEdit, denied); rejected(exact.evil, denied);
+      expect(glob.read.state).toMatchObject({ status: "completed" });
+      expect(glob.evil.state).toMatchObject({ status: "completed" }); // the same over-match of `wt-*`
+      rejected(glob.other, denied);
+      rejected(later.noPattern, denied); rejected(later.exact, denied);
+      expect(later.glob.state).toMatchObject({ status: "completed" });
+      expect(later.globEdit.state).toMatchObject({ status: "completed" });
+      expect(disk).toEqual({ wt1E0: "main\n", wt1E1: "edited\n", wt2E3: "edited\n", other: "other\n" });
+      // DIFFERENCE from host-defined agents: under a parent session that grants everything, a router-registered agent is still refused its
+      // missing external_directory rule - by the router's own evaluate hook ("Permission denied by plugin agent <name>", the event already
+      // arrives as a deny) - whereas the host-defined deny-by-default agent was allowed (S11 test above, section 10).
+      rejected(openRoot.deny, "Permission denied by plugin agent r-deny: external_directory");
+      rejected(openRoot.other, "Permission denied by plugin agent r-wt1: external_directory");
+      expect(openRoot.deny.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "deny" });
+      expect(host.routerLogLines()).toEqual([]);
+      expect(host.errorLines()).toEqual([]);
+    } finally { await finish(host); }
+  }, 900_000);
+
   it("S12 the router override's agents block changed WITHOUT restarting the host: when the host agent list and the orchestrator's subagent catalog follow", async () => {
     const AGENT = (description: string) => ({ tier: "fast", description, readOnly: true });
     const NEXT = { agents: { reviewer: AGENT("S12 reviewer description TWO"), newbie: AGENT("S12 newbie description") } };
