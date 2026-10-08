@@ -241,7 +241,7 @@
       "callID": "toolu_smoke_28",
       "childID": "ses_ee28a79b1ffeInfZQ9mBWlXOzj",
       "parentText": "<subagent sessionID=\"ses_ee28a79b1ffeInfZQ9mBWlXOzj\" state=\"completed\">\nDONE: read my saved output\n</subagent>\nDONE: read my saved output",
-      "firstUser": "{\"id\":\"msg_11d75872c001DFmDrca3wZr4ZN\",\"time\":{\"created\":1791495604039},\"text\":\"You are a subagent spawned by another session.\\nTASK: find every needle and show the changes\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6ImdyZXAiLCJpbnB1dCI6eyJwYXR0ZXJuIjoibmVlZGxlIiwicGF0aCI6IkM6XFxVc2Vyc1xcTWFycXVpbmhvXFxBcHBEYXRhXFxMb2NhbFxcVGVtcFxcb21yLXNtb2tlLXRtcC0yOTI4OC0xNzkxNDk1NDMwNTYyXFxvbXItcDMyLXJvbGVzLXJvb3RzLW1oYXNtSFxcd3QtMSJ9fSx7InRvb2wiOiJyb3V0ZXJfZ2l0X2RpZmYiLCJpbnB1dCI6e319XSwiZmluYWwiOiJET05FOiBuZWVkbGVzLnR4dDoxIGJpZy50eHQ6MSJ9\\nOMR_NONCE=629869ac-80d7-43ec-b2fb-8f74f697b980\",\"type\":\"user\"}",
+      "firstUser": "{\"id\":\"msg_11d75872c001DFmDrca3wZr4ZN\",\"time\":{\"created\":1791495604039},\"text\":\"You are a subagent spawned by another session.\\nTASK: find every needle and show the changes\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=629869ac-80d7-43ec-b2fb-8f74f697b980\",\"type\":\"user\"}",
       "states": [
         {
           "text": "",
@@ -319,7 +319,7 @@
       "callID": "toolu_smoke_32",
       "childID": "ses_ee28a610cffeZpgSMnSf2zNN6A",
       "parentText": "<subagent sessionID=\"ses_ee28a610cffeZpgSMnSf2zNN6A\" state=\"completed\">\nDONE: tried\n</subagent>\nDONE: tried",
-      "firstUser": "{\"id\":\"msg_11d759f8c0013KEWuBUfi3Y46x\",\"time\":{\"created\":1791495610272},\"text\":\"You are a subagent spawned by another session.\\nTASK: read a saved output\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtcm9vdHMtbWhhc21IXFxkYXRhXFxvcGVuY29kZVxcdG9vbC1vdXRwdXRcXHRvb2xfMTFkNzU4ZTZlMDAxR25SOWJOVlg4a3NBdzgifX1dLCJmaW5hbCI6IkRPTkU6IHRyaWVkIn0=\\nOMR_NONCE=f3f793b2-7513-4023-8f6b-4b0cb2e532ed\",\"type\":\"user\"}",
+      "firstUser": "{\"id\":\"msg_11d759f8c0013KEWuBUfi3Y46x\",\"time\":{\"created\":1791495610272},\"text\":\"You are a subagent spawned by another session.\\nTASK: read a saved output\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=f3f793b2-7513-4023-8f6b-4b0cb2e532ed\",\"type\":\"user\"}",
       "states": [
         {
           "text": "",
@@ -380,7 +380,7 @@
       "callID": "toolu_smoke_36",
       "childID": "ses_ee28a57d8ffe5pkU1cYBIrskwt",
       "parentText": "<subagent sessionID=\"ses_ee28a57d8ffe5pkU1cYBIrskwt\" state=\"completed\">\nDONE: m.txt:1\n</subagent>\nDONE: m.txt:1",
-      "firstUser": "{\"id\":\"msg_11d75a8c1001xA58r16ftV1PfN\",\"time\":{\"created\":1791495612628},\"text\":\"You are a subagent spawned by another session.\\nTASK: read m.txt\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtcm9vdHMtbWhhc21IXFx3dC1sYXRlLTFcXG0udHh0In19XSwiZmluYWwiOiJET05FOiBtLnR4dDoxIn0=\\nOMR_NONCE=62af3d2e-d374-4b88-8a32-2af0befbc315\",\"type\":\"user\"}",
+      "firstUser": "{\"id\":\"msg_11d75a8c1001xA58r16ftV1PfN\",\"time\":{\"created\":1791495612628},\"text\":\"You are a subagent spawned by another session.\\nTASK: read m.txt\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=62af3d2e-d374-4b88-8a32-2af0befbc315\",\"type\":\"user\"}",
       "states": [
         {
           "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-roots-mhasmH\\wt-late-1\\m.txt, lines 1-1\n1: main",
@@ -456,7 +456,7 @@
       "callID": "toolu_smoke_40",
       "childID": "ses_ee28a4f80ffeCPkRzOrN2lhA2o",
       "parentText": "<subagent sessionID=\"ses_ee28a4f80ffeCPkRzOrN2lhA2o\" state=\"completed\">\nDONE: m.txt:1\n</subagent>\nDONE: m.txt:1",
-      "firstUser": "{\"id\":\"msg_11d75b12e001RtJkSIb0U3OlmZ\",\"time\":{\"created\":1791495614786},\"text\":\"You are a subagent spawned by another session.\\nTASK: read m.txt\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtcm9vdHMtbWhhc21IXFx3dC11bmNvdmVyZWQtMVxcbS50eHQifX1dLCJmaW5hbCI6IkRPTkU6IG0udHh0OjEifQ==\\nOMR_NONCE=fee9261a-6357-4891-b0bc-d85c36da1eb2\",\"type\":\"user\"}",
+      "firstUser": "{\"id\":\"msg_11d75b12e001RtJkSIb0U3OlmZ\",\"time\":{\"created\":1791495614786},\"text\":\"You are a subagent spawned by another session.\\nTASK: read m.txt\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=fee9261a-6357-4891-b0bc-d85c36da1eb2\",\"type\":\"user\"}",
       "states": [
         {
           "text": "",
@@ -517,7 +517,7 @@
       "callID": "toolu_smoke_44",
       "childID": "ses_ee28a474fffeYMhzvub2SIuDnw",
       "parentText": "<subagent sessionID=\"ses_ee28a474fffeYMhzvub2SIuDnw\" state=\"completed\">\nDONE: exit code 0\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: exit code 0\n\n[router ✓ verified: checker]",
-      "firstUser": "{\"id\":\"msg_11d75b93a001JvVmSEz7d0TkuO\",\"time\":{\"created\":1791495616844},\"text\":\"You are a subagent spawned by another session.\\nTASK: run the smoke marker\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJvdXRlcl9ydW4iLCJpbnB1dCI6eyJzY3JpcHQiOiJzbW9rZS1tYXJrZXIiLCJjd2QiOiJDOlxcVXNlcnNcXE1hcnF1aW5ob1xcQXBwRGF0YVxcTG9jYWxcXFRlbXBcXG9tci1zbW9rZS10bXAtMjkyODgtMTc5MTQ5NTQzMDU2Mlxcb21yLXAzMi1yb2xlcy1yb290cy1taGFzbUhcXHd0LWxhdGUtMSJ9fSx7InRvb2wiOiJyb3V0ZXJfcnVuIiwiaW5wdXQiOnsic2NyaXB0Ijoic21va2UtbWFya2VyIiwiY3dkIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtcm9vdHMtbWhhc21IXFx3dC0xIn19XSwiZmluYWwiOiJET05FOiBleGl0IGNvZGUgMCJ9\\nOMR_NONCE=2b2e3c24-555d-4cb5-8e03-0ab70a7b6856\",\"type\":\"user\"}",
+      "firstUser": "{\"id\":\"msg_11d75b93a001JvVmSEz7d0TkuO\",\"time\":{\"created\":1791495616844},\"text\":\"You are a subagent spawned by another session.\\nTASK: run the smoke marker\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=2b2e3c24-555d-4cb5-8e03-0ab70a7b6856\",\"type\":\"user\"}",
       "states": [
         {
           "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.5 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",

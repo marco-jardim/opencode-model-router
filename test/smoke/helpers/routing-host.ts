@@ -98,6 +98,22 @@ export function redactText(text: string): string {
   return out;
 }
 export function redact(value: unknown): unknown { return JSON.parse(redactText(JSON.stringify(value))) as unknown; }
+/** A `CHILD_SCRIPT64=<base64>` run in any recorded text (see {@link scriptLine}). */
+const SCRIPT64_RE = /CHILD_SCRIPT64=([A-Za-z0-9+/=]+)/g;
+/**
+ * Issue #84 P3.1 (QA-P31-1-1): base64 hides the scripted steps — their absolute paths included — from the redaction and from a grep
+ * of the evidence. Every `CHILD_SCRIPT64=<base64>` in every string of `value` becomes `CHILD_SCRIPT64(decoded)=<text>`: the decoded
+ * script, passed through {@link redactText} BEFORE it is inserted, then JSON-escaped (it often sits inside a JSON-encoded message, which
+ * stays parseable). Run it before clipping, so no clipped base64 fragment survives.
+ */
+export function decodeScriptsForEvidence(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(SCRIPT64_RE, (_whole, encoded: string) => `CHILD_SCRIPT64(decoded)=${JSON.stringify(redactText(Buffer.from(encoded, "base64").toString("utf8"))).slice(1, -1)}`);
+  }
+  if (Array.isArray(value)) return value.map(decodeScriptsForEvidence);
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, decodeScriptsForEvidence(v)]));
+  return value;
+}
 export function clip(value: unknown, max = 600): unknown {
   if (typeof value === "string") return value.length > max ? `${value.slice(0, max / 2)}...[clipped, ${value.length} chars]` : value;
   if (Array.isArray(value)) return value.map(v => clip(v, max));
@@ -420,10 +436,11 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    const entered=Date.now(),enteredN=tick();
    const first=!firstEvaluate.has(e.sessionID); firstEvaluate.add(e.sessionID);
    const effectIn=e.effect;
+   const messageIn=e.message;
    if(cfg.denyAsk&&e.effect==='ask'){e.effect='deny';e.message='PROBE_ASK_AS_DENY: '+e.action;}
    const deny=cfg.deny&&(cfg.deny.agent===undefined||cfg.deny.agent===e.agent)&&(cfg.deny.actions||[]).includes(e.action);
    if(deny){e.effect='deny';e.message='PLUGIN_GUARD_DENIED: '+e.action;}
-   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),effectIn,effectOut:e.effect,first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
+   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),effectIn,messageIn,effectOut:e.effect,first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
   });
  }
  // Opt-in decisions keyed by the session TITLE (looked up with session.get(event.sessionID), so the decision is per session, not per agent).
@@ -506,6 +523,23 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'mix-nonce',replaced:last,with:lastNonceLine,__instance:instance,__iid:iid});
   });
  }
+ // Opt-in (issue #84 P3.1, QA-P31-1-2): AFTER the router's execute.before approved a call, a path or filePath equal to one of
+ // cfg.retarget[].from (case-insensitive) is replaced by its "to", so the HOST's own permission request (external_directory) for
+ // the new path reaches the permission evaluate hooks, the router's included.
+ if(Array.isArray(cfg.retarget)&&cfg.retarget.length>0){
+  await ctx.tool.hook('execute.before',e=>{
+   if(!e.input||typeof e.input!=='object')return;
+   for(const key of ['path','filePath']){
+    const value=e.input[key];
+    if(typeof value!=='string')continue;
+    const rule=cfg.retarget.find(r=>typeof r.from==='string'&&r.from.toLowerCase()===value.toLowerCase());
+    if(!rule)continue;
+    e.input={...e.input,[key]:rule.to};
+    log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'retarget',from:value,to:rule.to,__instance:instance,__iid:iid});
+    return;
+   }
+  });
+ }
  let dumped=false;
  await ctx.session.hook('context',e=>{
   if(dumped)return; dumped=true;
@@ -525,7 +559,8 @@ export default {id:'routing-smoke-probe',async setup(ctx){
 /** Issue #84 P3.1 (I9): a native v2 plugin loaded BEFORE the router (HostOptions.preProbe). For a session whose title contains
  * `breakSystemTitleContains`, its context hook replaces `event.system` with a copy whose iterator throws ONCE, and only when the
  * calling stack contains `routerStackNeedle` (the router checkout's directory name): the router's own context hook then fails for
- * that step (an injected, real-host hook error) while the host's later iterations of the same array work. Records `preprobe.*`. */
+ * that step (an injected, real-host hook error) while the host's later iterations of the same array work. `breakEvaluateTitleContains`
+ * does the same to the router's permission evaluate hook through `event.resources` (a Proxy). Records `preprobe.*`. */
 export const PRE_PROBE_PLUGIN = `import {appendFileSync,readFileSync} from 'node:fs';
 const NL=String.fromCharCode(10);
 const log=(x)=>appendFileSync(process.env.SMOKE_EVENTS,JSON.stringify({...x,__t:Date.now()})+NL);
@@ -551,6 +586,28 @@ export default {id:'routing-smoke-preprobe',async setup(ctx){
    if(!armed.has(sid)){armed.add(sid);log({type:'preprobe.decision',sessionID:sid,title,decision:'armed'});}
   }catch(error){log({type:'preprobe.decision',sessionID:sid,title,decision:'arm-failed',error:String(error)});}
  });
+ // QA-P31-1-2 (c): the same for the router's permission evaluate hook. For a session whose title contains
+ // breakEvaluateTitleContains, event.resources becomes a Proxy whose FIRST property read from a stack that contains the router's
+ // directory name throws once: the router's evaluate hook fails for that evaluation; every other reader (the host) is unaffected.
+ const trippedEvaluate=new Set();
+ if(cfg.breakEvaluateTitleContains){
+  await ctx.permission.hook('evaluate',async e=>{
+   if(trippedEvaluate.has(e.sessionID))return;
+   let title;try{title=(await ctx.session.get({sessionID:e.sessionID})).title;}catch{}
+   if(typeof title!=='string'||!title.includes(cfg.breakEvaluateTitleContains))return;
+   const needle=String(cfg.routerStackNeedle||'').toLowerCase();
+   const sid=e.sessionID;
+   const action=e.action;
+   try{
+    const original=Array.isArray(e.resources)?e.resources:[];
+    e.resources=new Proxy(original,{get(target,prop,receiver){
+     if(!trippedEvaluate.has(sid)&&needle!==''&&String(new Error().stack||'').toLowerCase().includes(needle)){trippedEvaluate.add(sid);log({type:'preprobe.decision',sessionID:sid,title,hook:'evaluate',action,decision:'threw-in-router-evaluate'});throw new Error('PREPROBE_EVALUATE_TRAP');}
+     return Reflect.get(target,prop,receiver);
+    }});
+    log({type:'preprobe.decision',sessionID:sid,title,hook:'evaluate',action,decision:'armed-evaluate'});
+   }catch(error){log({type:'preprobe.decision',sessionID:sid,title,hook:'evaluate',action,decision:'arm-evaluate-failed',error:String(error)});}
+  });
+ }
 }};`;
 
 // ------------------------------------------------------------------ the host ----
@@ -584,7 +641,14 @@ export interface HostOptions {
   /** Runs once the (empty) project directory exists and BEFORE the host process starts: e.g. a git repository whose worktrees the router lists at role-agent registration (plugin start). */
   readonly prepare?: (dirs: { readonly root: string; readonly project: string }) => Promise<void>;
   /** Issue #84 P3.1: load {@link PRE_PROBE_PLUGIN} BEFORE the router with this configuration (written to a JSON file it reads). */
-  readonly preProbe?: { readonly breakSystemTitleContains: string; readonly routerStackNeedle: string };
+  readonly preProbe?: {
+    /** The router's context hook fails once for a session whose title contains this (I9 catalog failure). */
+    readonly breakSystemTitleContains?: string;
+    /** The router's permission evaluate hook fails once for a session whose title contains this (I9 evaluate error). */
+    readonly breakEvaluateTitleContains?: string;
+    /** A string only the router's own stack frames contain (the checkout's directory name). */
+    readonly routerStackNeedle: string;
+  };
   /** Extra `providers` entries of opencode.json (merged with the scripted anthropic provider). */
   readonly providers?: Obj;
   /** Replaces the default `plugins` entries after ROOT (the probe is always last). */
@@ -613,6 +677,8 @@ export interface HostOptions {
     readonly nonce?: boolean;
     /** Issue #84 P3.1 (I5): a subagent call whose description contains `descriptionContains` gets the router's last prompt line (`OMR_NONCE=…`) of the previous other subagent call instead of its own (runs after the router's execute.before). */
     readonly mixNonce?: { readonly descriptionContains: string };
+    /** Issue #84 P3.1 (QA-P31-1-2): after the router's execute.before, a call's `path`/`filePath` equal to `from` becomes `to` (the host then asks its own permissions for `to`). `$ROOT` in either is the host's temp root. */
+    readonly retarget?: readonly { readonly from: string; readonly to: string }[];
   };
 }
 export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonly fail: number }
@@ -695,7 +761,8 @@ export class RoutingHost {
     await writeFile(path.join(probe, "server.mjs"), PROBE_PLUGIN);
     for (const file of [this.logs.hooks, this.logs.events]) await writeFile(file, "");
     const probeConfig = path.join(this.root, "probe-config.json");
-    if (this.options.probe) await writeFile(probeConfig, JSON.stringify(this.options.probe));
+    // `$ROOT` in any probe string (e.g. a `retarget` path) is this host's temp root, which only exists from here on.
+    if (this.options.probe) await writeFile(probeConfig, JSON.stringify(this.options.probe).replaceAll("$ROOT", JSON.stringify(this.root).slice(1, -1)));
     // Issue #84 P3.1: the optional pre-probe, loaded BEFORE the router (plugin order = hook order).
     const preProbe = this.options.preProbe ? path.join(this.root, "pre-probe-plugin") : undefined;
     const preProbeConfig = path.join(this.root, "pre-probe-config.json");

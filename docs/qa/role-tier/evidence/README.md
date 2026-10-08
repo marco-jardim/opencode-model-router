@@ -9,6 +9,18 @@ what the host did so a reviewer can check the claims without rerunning. Placehol
 redacted home directory and user-name segments of temp paths. `ses_…` are session ids of the isolated host, which is gone after
 the run.
 
+QA round 1 (QA-P31-1-1): run 4 wrote each child's script as `CHILD_SCRIPT64=<base64>` inside `firstUser`, and 22 of those
+scripts held unredacted temp paths, invisible to a grep. Those 22 runs were replaced in place by
+`CHILD_SCRIPT64(scrubbed)=[script omitted: …]`; a script's steps remain readable as that child's tool `states` (redacted). The 5
+scripts without a path (web tools, the authority request, empty steps) are unchanged. From the next run on, `save()` writes every
+script decoded and redacted (`CHILD_SCRIPT64(decoded)=…`). `test/unit/roles.evidence.test.ts` checks every file here, including
+every base64 script decoded.
+
+The files are run 4's. The scenarios QA round 1 added are not in them yet; they appear when the smoke is run again:
+- `retargets`, `otherRoot`, `evalBroken`, `preprobeEvaluate` and `disk.unknownMarkers` in `I5-I9.json`;
+- `disk.probeMarker` in `I3-I4.json`;
+- the request body's `wireModel` / `effort` in every request view.
+
 ## How the evidence is produced
 
 Every test starts its own isolated OpenCode v2 host (`test/smoke/helpers/routing-host.ts`):
@@ -18,8 +30,8 @@ Every test starts its own isolated OpenCode v2 host (`test/smoke/helpers/routing
   evaluations.
 
 The host runs in roles mode (`routing.delegation: "roles"`, `routing.engine: "enforce"`). Before the host starts, its project
-becomes a git repository (the main checkout) with a sibling worktree `wt-1`. `routing.workRoots` covers worktrees named
-`wt-late-*`, which are created after start.
+becomes a git repository (the main checkout) with a sibling worktree `wt-1`, and from QA round 1 on a second one, `wt-2`.
+`routing.workRoots` covers worktrees named `wt-late-*`, which are created after start.
 
 The scripted root dispatches role agents with route lines. A role child follows a base64 script (`CHILD_SCRIPT64`): it really
 attempts every scripted call, forbidden ones included. Assertions are on host state only:
@@ -53,7 +65,11 @@ On Windows PowerShell: `$env:RUN_OC_SMOKE_ROLES = "1"; npx vitest run --config v
 The test writes the files to `<OMR_SMOKE_REAL_TMPDIR>\omr-roles-smoke\`: the real temp directory that the smoke temp guard
 (`test/setup/smoke-tmp-guard.ts`) records, or the OS temp directory without it. Never into the repository. Copy them here only
 after checking them:
-- no user name or home path (grep for the user name, its 8.3 short form and `C:\Users`);
-- no credential (grep `sk-`, `key`, `token`, `Bearer`, `Basic`).
+1. **Decode base64 first:** every `CHILD_SCRIPT64=<base64>` run that is still base64 (any file older than the decoder in
+   `save()`) must be decoded before grepping, because a grep cannot see a path inside base64.
+2. **Then grep, in the text and in every decoded script:**
+   - no user name or home path: the user name, its 8.3 short form, `C:\Users` in any escaping;
+   - no credential: `sk-`, `key`, `token`, `Bearer`, `Basic`.
+3. **Run the unit guard,** which does both: `npx vitest run test/unit/roles.evidence.test.ts`.
 
 The smoke uses no real provider key and never touches the live host, the user's OpenCode config or the live outcomes store.

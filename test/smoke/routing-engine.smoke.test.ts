@@ -33,10 +33,11 @@ const BASE_COMMIT = "71815eb";
  * Base of scenario 6 ("v1 untouched"), repinned by #84 P3.1. The Phase 3.2 base 71815eb is stale: later releases changed the v1 suite and
  * package.json on purpose (#67, #77, #83 among them), so "nothing under test/smoke changed since 71815eb" no longer holds and never will
  * again. What must hold is that the v1 entry points do not change across #84 (plan §2.7, I8): the v1 suite files `smoke:keyless` runs,
- * the smoke vitest config, the v1 preflight and the `smoke:keyless` / `smoke:v1` scripts. Base: `bd1ecd1` = master before #84 (`eeab36b`,
- * the #83 merge) plus the one repair #83 had left stale INSIDE the v1 suite (subagent-tiers.smoke.test.ts pinned FAST_MODEL to the old
- * Sonnet fast tier; bd1ecd1 aligned that literal with #83's Haiku fast tier — no v1 behaviour change). Every later #84 change must leave
- * these paths byte-identical; new #84 smoke files (roles, role spikes) and the v2 harness are additions outside the v1 suite.
+ * the smoke vitest config and its temp guard (`test/setup/smoke-tmp-guard.ts`), the v1 preflight and the `smoke:keyless` / `smoke:v1`
+ * scripts. Base: `bd1ecd1`, a commit on the #84 rta line (its parent is `66dcdff`), not on master. For every guarded path it is equivalent
+ * to master before #84 (`eeab36b`, the #83 merge) except one literal: #83 had left subagent-tiers.smoke.test.ts pinning FAST_MODEL to the
+ * old Sonnet fast tier, and bd1ecd1 aligned it with #83's Haiku fast tier (no v1 behaviour change). Every later #84 change must leave
+ * these paths byte-identical; new #84 smoke files (roles, role spikes), the v2 harness and this file are outside the guarded set.
  */
 const V1_BASE_COMMIT = "bd1ecd1";
 /** `RESUME_END_WAIT_MS` of `src/index.ts`: the longest the delegate runner waits for a child's execution end after the child returned. */
@@ -539,10 +540,10 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
     }
   }, 300_000);
   it("6 v1 untouched: the v1 smoke suite, its config, its preflight and the smoke:keyless / smoke:v1 scripts are byte-identical to the v1 base (V1_BASE_COMMIT)", async () => {
-    await runScenario("6-v1-untouched", `The v1 entry points are unchanged since ${V1_BASE_COMMIT} (master before #84 plus the #83 literal repair of the v1 suite, see V1_BASE_COMMIT): the v1 suite smoke:keyless runs (registration, subagent-tiers, deferred-catalog, depth-effort, the scripted-provider helper and its test, fetch-safe-port), vitest.smoke.config.ts, scripts/smoke-v1-preflight.mjs, and the package.json scripts smoke:keyless and smoke:v1 (the alias of smoke:keyless behind a preflight that fails clearly when \`opencode\` on PATH is not 1.x, QA-3.2-11, QA-3.2-R2-2). Repinned by #84 P3.1 from the stale Phase 3.2 base ${BASE_COMMIT}. Every other test/smoke change since the v1 base is recorded, not asserted.`, async s => {
+    await runScenario("6-v1-untouched", `The v1 entry points are unchanged since ${V1_BASE_COMMIT} (master before #84 plus the #83 literal repair of the v1 suite, see V1_BASE_COMMIT): the v1 suite smoke:keyless runs (registration, subagent-tiers, deferred-catalog, depth-effort, the scripted-provider helper and its test, fetch-safe-port), vitest.smoke.config.ts, its temp guard test/setup/smoke-tmp-guard.ts, scripts/smoke-v1-preflight.mjs, and the package.json scripts smoke:keyless and smoke:v1 (the alias of smoke:keyless behind a preflight that fails clearly when \`opencode\` on PATH is not 1.x, QA-3.2-11, QA-3.2-R2-2). Repinned by #84 P3.1 from the stale Phase 3.2 base ${BASE_COMMIT}. Every other test/smoke change since the v1 base is recorded, not asserted.`, async s => {
       const git = (...args: string[]) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", windowsHide: true }).trim();
       const v1Files = ["registration.smoke.test.ts", "subagent-tiers.smoke.test.ts", "deferred-catalog.smoke.test.ts", "depth-effort.smoke.test.ts", "helpers/scripted-provider.ts", "helpers/scripted-provider.test.ts", "helpers/fetch-safe-port.ts"];
-      const v1Paths = [...v1Files.map(file => `test/smoke/${file}`), "vitest.smoke.config.ts", "scripts/smoke-v1-preflight.mjs"];
+      const v1Paths = [...v1Files.map(file => `test/smoke/${file}`), "vitest.smoke.config.ts", "test/setup/smoke-tmp-guard.ts", "scripts/smoke-v1-preflight.mjs"];
       const changedV1 = v1Paths.filter(file => git("diff", "--name-only", V1_BASE_COMMIT, "--", file) !== "");
       const scriptsOf = (json: string): Record<string, unknown> => (JSON.parse(json) as { scripts?: Record<string, unknown> }).scripts ?? {};
       const baseScripts = scriptsOf(git("show", `${V1_BASE_COMMIT}:package.json`));

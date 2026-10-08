@@ -26,8 +26,8 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  ROOT, RoutingHost, SMOKE_PRESET, agentWithoutModel, arr, clip, obj, redact, ref, scriptLine, stopAllHosts, str,
-  type Dispatched, type HostOptions, type Obj, type ScriptStep,
+  ROOT, RoutingHost, SMOKE_PRESET, agentWithoutModel, arr, clip, decodeScriptsForEvidence, effectiveEffort, obj, redact, ref, scriptLine,
+  stopAllHosts, str, type Dispatched, type HostOptions, type Obj, type ScriptStep,
 } from "./helpers/routing-host";
 import { SHIPPED_ROLE_SPECS, classifyAction, separationProblem } from "../../src/router/roles";
 import type { DecisionRow } from "../../src/routing/outcomes/types";
@@ -63,18 +63,35 @@ const VERIFIED = "[router \u2713 verified: deterministic]";
 const REFUSAL_RE = /No tool named "[^"]+" is currently available|Tool is not available for this request|\[router\] Refused for role agent|Permission denied/;
 const EXECUTE_BEFORE_REFUSAL = /\[router\] Refused for role agent explorer in this dispatch/;
 
-// ---- the repository world: main checkout = the host project, one sibling worktree, an unrelated directory ----
-interface World { main: string; wt1: string; other: string; addWorktree(name: string): Promise<string> }
+// ---- the repository world: main checkout = the host project, two sibling worktrees, an unrelated directory ----
+interface World { main: string; wt1: string; wt2: string; other: string; addWorktree(name: string): Promise<string> }
+/**
+ * The package.json scripts `routing.run.scripts` allows. Each writes `<name>.txt` into its cwd, so a refused run is provable by its
+ * marker's absence: `smoke-marker` (the runner's own runs), `probe-marker` (a forbidden explorer attempt, QA-P31-1-3) and
+ * `unknown-marker` (an unknown binding's attempt, QA-P31-1-2).
+ */
+const RUN_SCRIPTS = ["smoke-marker", "probe-marker", "unknown-marker"] as const;
 /** Built in HostOptions.prepare, i.e. BEFORE the host (and the router's role-agent registration) starts. */
 async function makeWorld(root: string, project: string): Promise<World> {
   const main = project;
-  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false", ...args], { cwd: main, encoding: "utf8", windowsHide: true });
+  // QA-P31 N3: no user or system git configuration, no hooks, no signing reach the fixture repository.
+  const emptyConfig = path.join(root, "empty.gitconfig");
+  await writeFile(emptyConfig, "");
+  const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: "1" };
+  const git = (...args: string[]) => execFileSync("git", [
+    "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false", "-c", "core.hooksPath=", "-c", "commit.gpgsign=false", ...args,
+  ], { cwd: main, encoding: "utf8", windowsHide: true, env: gitEnv });
   git("init", "-q", "-b", "main");
   const files: Record<string, string> = {
     "m.txt": "main\n",
     "parser.ts": "export function parse(text: string): string[] {\n  return text.split(' ');\n}\n",
-    "package.json": `${JSON.stringify({ name: "roles-smoke-world", version: "1.0.0", private: true, scripts: { "smoke-marker": "node smoke-marker.js" } }, null, 2)}\n`,
-    "smoke-marker.js": "require('fs').writeFileSync(require('path').join(process.cwd(), 'smoke-marker.txt'), 'ran\\n');\n",
+    "package.json": `${JSON.stringify({
+      name: "roles-smoke-world", version: "1.0.0", private: true,
+      scripts: Object.fromEntries(RUN_SCRIPTS.map(name => [name, name === "smoke-marker" ? "node smoke-marker.js" : `node smoke-marker.js ${name}`])),
+    }, null, 2)}\n`,
+    "smoke-marker.js": "require('fs').writeFileSync(require('path').join(process.cwd(), (process.argv[2] || 'smoke-marker') + '.txt'), 'ran\\n');\n",
+    // QA-P31-1-2 (a): the files the probe's `retarget` rewrites to wt-1/m.txt after the router approved the read.
+    "i9-retarget.txt": "retarget source\n",
   };
   for (let i = 0; i < 8; i++) files[`e${i}.txt`] = "main\n";
   // A tracked file the roots test rewrites in wt-1, so `router_git_diff` returns ~64 KiB / 10 000+ lines (above the host's truncation bound).
@@ -84,13 +101,15 @@ async function makeWorld(root: string, project: string): Promise<World> {
   git("commit", "-q", "-m", "init");
   const wt1 = path.join(root, "wt-1");
   git("worktree", "add", "-q", wt1, "-b", "wt-1");
+  const wt2 = path.join(root, "wt-2"); // a second worktree registered at start (another dispatch's work root, QA-P31-1-2)
+  git("worktree", "add", "-q", wt2, "-b", "wt-2");
   const other = path.join(root, "other");
   await mkdir(other, { recursive: true });
   await writeFile(path.join(other, "x.txt"), "OTHER_SECRET\n");
   await writeFile(path.join(main, "main-only-dirty.txt"), "dirty\n"); // untracked in the main checkout only
   await writeFile(path.join(wt1, "wt1-only-untracked.txt"), "wt1\n"); // untracked in wt-1 only
   return {
-    main, wt1, other,
+    main, wt1, wt2, other,
     addWorktree: async (name: string) => { const dir = path.join(root, name); git("worktree", "add", "-q", dir, "-b", name); return dir; },
   };
 }
@@ -104,7 +123,7 @@ interface RolesHostOptions {
 }
 /**
  * An isolated host in roles mode with engine enforce, its repository world prepared before it starts; `routing.workRoots` covers
- * `<root>\wt-late-*` (worktrees created later), `routing.run` allows `smoke-marker`.
+ * `<root>\wt-late-*` (worktrees created later), `routing.run` allows {@link RUN_SCRIPTS}.
  */
 async function startRolesHost(name: string, extra: RolesHostOptions = {}): Promise<{ host: RoutingHost; w: World }> {
   let world: World | undefined;
@@ -114,7 +133,7 @@ async function startRolesHost(name: string, extra: RolesHostOptions = {}): Promi
     routing: (root: string) => ({
       engine: "enforce", delegation: "roles",
       workRoots: [path.join(root, "wt-late-*")],
-      run: { scripts: ["smoke-marker"], timeoutMs: 120_000 },
+      run: { scripts: [...RUN_SCRIPTS], timeoutMs: 120_000 },
       ...extra.routing,
     }),
     ...(extra.overrides ? { overrides: extra.overrides } : {}),
@@ -128,7 +147,8 @@ async function startRolesHost(name: string, extra: RolesHostOptions = {}): Promi
 async function save(name: string, observed: Obj): Promise<void> {
   await mkdir(OUT, { recursive: true });
   const file = path.join(OUT, `${name}.json`);
-  await writeFile(file, `${JSON.stringify(redact(clip({ test: name, recordedAt: new Date().toISOString(), observed }, 4000)), null, 2)}\n`);
+  // QA-P31-1-1: decode (and redact) every CHILD_SCRIPT64 run FIRST — before clipping can cut one — then clip and redact the whole.
+  await writeFile(file, `${JSON.stringify(redact(clip(decodeScriptsForEvidence({ test: name, recordedAt: new Date().toISOString(), observed }), 4000)), null, 2)}\n`);
   console.log(`[roles-smoke] observations written to ${file}`);
 }
 async function finish(host: RoutingHost): Promise<void> {
@@ -143,8 +163,10 @@ function roleInput(agent: string, description: string, routeFields: string | nul
   return { agent, description, prompt: [...(routeFields === null ? [] : [`[route ${routeFields}]`]), ...body].join("\n"), background: false, ...extra };
 }
 interface StateView { tool?: string; status?: string; errorType?: string; errorMessage?: string; text: string; input?: unknown }
-interface RequestView { seq: number; catalogModel?: string; tier?: Tier; toolNames: string[]; reply: string }
-interface EvaluateView { action?: string; resources: string[]; effectIn?: unknown; effectOut?: unknown }
+/** One provider request: the catalog ref the host's http.request hook saw, the request BODY's model and the effort the provider is told (QA-P31 N2). */
+interface RequestView { seq: number; catalogModel?: string; tier?: Tier; wireModel?: string; effort?: unknown; toolNames: string[]; reply: string }
+/** One permission evaluation as the probe saw it, after the router's evaluate hook: effect and message (QA-P31-1-2). */
+interface EvaluateView { action?: string; resources: string[]; effectIn?: unknown; messageIn?: string; effectOut?: unknown }
 interface ChildView {
   label: string; callID: string; childID: string; parentStatus?: string; parentText: string;
   agent?: string; title?: string; model?: string; parentID?: string; firstUser: string;
@@ -176,6 +198,16 @@ function expectCompleted(state: StateView | undefined, label: string): void {
 function expectText(state: StateView | undefined, pattern: RegExp, label: string): void {
   expect(state?.text ?? "", `${label}: ${describeState(state)}`).toMatch(pattern);
 }
+/**
+ * QA-P31 N2: the provider request's BODY agrees with the catalog ref the host's http.request hook reported: the body names that model id
+ * and the effort the provider is told (the last in-band effort, else the top-level `output_config.effort`) is the ref's variant — the
+ * smoke preset's variants are efforts (low / medium / xhigh), which spike S1/S7 showed reach Anthropic Messages as `output_config.effort`.
+ */
+function expectWireMatches(r: RequestView, label: string): void {
+  const [ref, variant] = (r.catalogModel ?? "").split("#");
+  expect(r.wireModel, `${label}: the body's model vs the catalog ref ${r.catalogModel}`).toBe(ref?.split("/")[1]);
+  expect(r.effort, `${label}: the effective effort vs the catalog ref ${r.catalogModel}`).toBe(variant);
+}
 function expectRefused(state: StateView | undefined, label: string): void {
   expect(state, `${label}: the scripted call was attempted (a tool state exists)`).toBeDefined();
   expect(state!.status, `${label}: ${describeState(state)}`).toBe("error");
@@ -198,15 +230,20 @@ async function viewOf(host: RoutingHost, root: string, call: Dispatched, label: 
   const context = await host.client.session.context({ sessionID: childID });
   const firstUser = context.find(m => obj(m).type === "user" || obj(m).role === "user");
   const evaluates = (await host.events()).filter(e => e.type === "probe.lifecycle" && e.point === "evaluate" && e.sessionID === childID)
-    .map(e => ({ action: str(e.action), resources: arr(e.resources).map(String), effectIn: e.effectIn, effectOut: e.effectOut }));
+    .map(e => {
+      const view: EvaluateView = { action: str(e.action), resources: arr(e.resources).map(String), effectIn: e.effectIn, effectOut: e.effectOut };
+      if (str(e.messageIn) !== undefined) view.messageIn = str(e.messageIn);
+      return view;
+    });
   const output = str(obj(obj(call.after.result).output).output) ?? "";
   const view: ChildView = {
     label, callID: call.callID, childID, parentText: [parentView(host, root, call.callID), output].join("\n"),
     firstUser: firstUser === undefined ? "" : JSON.stringify(firstUser),
     states: toolParts(context).slice(since.states).map(stateOf),
     requests: host.requestsOf(childID).filter(r => r.kind === "primary").slice(since.requests).map(r => {
-      const request: RequestView = { seq: r.seq, toolNames: r.toolNames, reply: r.reply };
+      const request: RequestView = { seq: r.seq, toolNames: r.toolNames, reply: r.reply, effort: effectiveEffort(r) };
       if (r.catalogModel !== undefined) request.catalogModel = r.catalogModel;
+      if (r.model !== undefined) request.wireModel = r.model;
       const tier = wireTier(r.catalogModel);
       if (tier !== undefined) request.tier = tier;
       return request;
@@ -312,6 +349,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         expect(v.requests.length, `${v.label}: the child reached the provider`).toBeGreaterThan(0);
         for (const r of v.requests) {
           expect(r.tier, `${v.label}: the wire model ${r.catalogModel} is a preset tier`).toBeDefined();
+          expectWireMatches(r, v.label);
           expect(rankOf(r.tier), `${v.label}: ${r.catalogModel} >= floor ${floor}; row ${rowLine(row)}`).toBeGreaterThanOrEqual(rankOf(floor));
           expect(rankOf(r.tier), `${v.label}: ${r.catalogModel} <= ceiling ${spec.tierRange.ceiling}; row ${rowLine(row)}`).toBeLessThanOrEqual(rankOf(spec.tierRange.ceiling));
         }
@@ -323,6 +361,10 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       }
       // tier=heavy pin: the heavy model reaches the provider; the resume asking for fast stays on the running rung (heavy).
       expect(pinned.requests.map(r => r.tier), `pin: ${rowLine(dispatchRowOf(rows, pinned.childID))}`).toEqual(["heavy"]);
+      // The request bodies of the pin, the kept rung, the FAIL and the raised resume agree with their catalog refs too (QA-P31 N2).
+      for (const [label, view] of [["pin", pinned], ["kept rung", keptRung], ["FAIL", failed], ["raised", raised]] as const) {
+        for (const r of view.requests) expectWireMatches(r, label);
+      }
       expect(keptRung.childID).toBe(pinned.childID);
       expect(keptRung.requests.length).toBeGreaterThan(0);
       for (const r of keptRung.requests) expect(r.tier, `resume below the running rung: ${r.catalogModel}`).toBe("heavy");
@@ -352,7 +394,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         { tool: "shell", input: { command: `node -e "require('fs').writeFileSync('shell-${label}.txt','x')"`, description: "smoke shell attempt" } }, // 3 shell
         { tool: "read", input: { path: path.join(w.other, "x.txt") } }, // 4 outside the repository
         { tool: "read", input: { path: path.join(host.project, "m.txt") } }, // 5 the main checkout is not this dispatch's work root
-        { tool: "router_run", input: { script: "smoke-marker", cwd: w.wt1 } }, // 6 exec is not in the explorer's grant
+        { tool: "router_run", input: { script: "probe-marker", cwd: w.wt1 } }, // 6 exec is not in the explorer's grant (its own marker, QA-P31-1-3)
         { tool: "read", input: { path: path.join(w.wt1, "m.txt") } }, // 7 control: inside the work root
       ];
       const runnerSteps: ScriptStep[] = [
@@ -372,7 +414,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const perParent: {
         parent: "none" | "allow-all"; explorer: ChildView; runner: ChildView; researcher: ChildView; implementer: ChildView;
         grandchildren: string[]; titleAfter: string | undefined; secretReachedProvider: boolean;
-        disk: { e0: string; e1Main: string; shellRan: boolean; wt1Marker: boolean; mainMarker: boolean };
+        disk: { e0: string; e1Main: string; shellRan: boolean; wt1Marker: boolean; mainMarker: boolean; probeMarker: boolean };
       }[] = [];
       for (const parent of ["none", "allow-all"] as const) {
         const root = await host.newRoot(`i3 root ${parent}`, undefined, host.project, parent === "none" ? [] : undefined);
@@ -388,6 +430,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
           disk: {
             e0: await readFile(path.join(w.wt1, "e0.txt"), "utf8"), e1Main: await readFile(path.join(host.project, "e1.txt"), "utf8"),
             shellRan: existsSync(path.join(host.project, `shell-${parent}.txt`)),
+            probeMarker: existsSync(path.join(w.wt1, "probe-marker.txt")) || existsSync(path.join(host.project, "probe-marker.txt")),
             wt1Marker: existsSync(path.join(w.wt1, "smoke-marker.txt")), mainMarker: existsSync(path.join(host.project, "smoke-marker.txt")),
           },
         });
@@ -435,6 +478,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         // ... and nothing happened on the host: file unchanged, no shell file, no nested child, title not renamed, the secret never reached the provider.
         expect(p.disk.e0, at("wt-1/e0.txt unchanged")).toBe("main\n");
         expect(p.disk.shellRan, at("shell did not run")).toBe(false);
+        expect(p.disk.probeMarker, at("the explorer's router_run (probe-marker, allowed in routing.run.scripts) did not run")).toBe(false);
         expect(p.grandchildren, at("no nested child")).toEqual([]);
         expect(p.titleAfter ?? "", at("execute did not rename the child")).not.toContain("renamed by execute");
         expect(p.secretReachedProvider, at("the outside file's content never reached the provider")).toBe(false);
@@ -477,10 +521,19 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
     } finally { await finish(host); }
   }, 900_000);
 
-  it("I5 + I9: identical parallel dispatches bind exactly by their own nonces; a child carrying two dispatches' markers is unknown (max ∩ local, external_directory denied); a router context-hook error empties the catalog and annotates the parent", async () => {
+  it("I5 + I9: identical parallel dispatches bind exactly by their own nonces; a child carrying two dispatches' markers is unknown (max ∩ local: edit, router_run and external_directory denied); an exact child of ANOTHER worktree is denied external_directory of wt-1; a router context-hook error empties the catalog and annotates the parent; a router evaluate-hook error denies with an explicit message", async () => {
+    // QA-P31-1-2 (a): reads the ROUTER's execute.before approves (the session directory for the unknown child, wt-2 for the wt-2 child) are
+    // rewritten by the probe to wt-1/m.txt AFTER that check, so the HOST asks external_directory for wt-1 and the router's evaluate decides.
+    const RETARGET_TO = path.join("$ROOT", "wt-1", "m.txt");
     const { host, w } = await startRolesHost("i5", {
-      probe: { mixNonce: { descriptionContains: "I5 MIX" } },
-      preProbe: { breakSystemTitleContains: "I9 BREAK", routerStackNeedle: path.basename(ROOT).toLowerCase() },
+      probe: {
+        mixNonce: { descriptionContains: "I5 MIX" },
+        retarget: [
+          { from: path.join("$ROOT", "project", "i9-retarget.txt"), to: RETARGET_TO },
+          { from: path.join("$ROOT", "wt-2", "i9-retarget.txt"), to: RETARGET_TO },
+        ],
+      },
+      preProbe: { breakSystemTitleContains: "I9 BREAK context", breakEvaluateTitleContains: "I9 BREAK evaluate", routerStackNeedle: path.basename(ROOT).toLowerCase() },
     });
     try {
       const root = await host.newRoot("i5 root", undefined, host.project, []);
@@ -492,30 +545,52 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       host.provider.barrier = undefined;
       const twins = await Promise.all(twinCalls.map((call, i) => viewOf(host, root, call, `I5 twin ${i}`)));
       // (2) One parent turn with a normal dispatch and one whose prompt nonce line the probe swaps for the other's (after the router's hook).
-      const pairSteps = (file: string): ScriptStep[] => [
-        { tool: "edit", input: { path: path.join(w.wt1, file), oldString: "main", newString: "edited" } },
+      //     Both ask `needs=edit,shell`, so the exact sibling's grant holds edit AND router_run (QA-P31-1-2 (b)); the unknown child gets neither.
+      const pairRoute = `class=implement risk=low scope=single needs=edit,shell ${rootField(w.wt1)}`;
+      const normalSteps: ScriptStep[] = [
+        { tool: "edit", input: { path: path.join(w.wt1, "e2.txt"), oldString: "main", newString: "edited" } },
         { tool: "read", input: { path: path.join(w.wt1, "m.txt") } },
         { tool: "read", input: { path: path.join(host.project, "m.txt") } },
       ];
+      const mixedSteps: ScriptStep[] = [
+        { tool: "edit", input: { path: path.join(w.wt1, "e3.txt"), oldString: "main", newString: "edited" } }, // 0 edit: not in max ∩ local
+        { tool: "read", input: { path: path.join(w.wt1, "m.txt") } }, // 1 the sibling worktree (refused before the host asks)
+        { tool: "read", input: { path: path.join(host.project, "m.txt") } }, // 2 local inside the session directory: allowed
+        { tool: "read", input: { path: path.join(host.project, "i9-retarget.txt") } }, // 3 approved, then retargeted to wt-1/m.txt: external_directory
+        { tool: "router_run", input: { script: "unknown-marker", cwd: w.wt1 } }, // 4 router_run (allowed in routing.run.scripts)
+      ];
       const pairCalls = await host.callMany(root, [
-        roleInput("general", "I5 pair", `class=implement risk=low scope=single needs=edit ${rootField(w.wt1)}`, ["TASK: update e2.txt", scriptLine(pairSteps("e2.txt"), "DONE: e2.txt:1")]),
-        roleInput("general", "I5 MIX", `class=implement risk=low scope=single needs=edit ${rootField(w.wt1)}`, ["TASK: update e3.txt", scriptLine(pairSteps("e3.txt"), "DONE: e3.txt:1")]),
+        roleInput("general", "I5 pair", pairRoute, ["TASK: update e2.txt", scriptLine(normalSteps, "DONE: e2.txt:1")]),
+        roleInput("general", "I5 MIX", pairRoute, ["TASK: update e3.txt", scriptLine(mixedSteps, "DONE: e3.txt:1")]),
       ]);
       const pair = await Promise.all(pairCalls.map((call, i) => viewOf(host, root, call, `I5 pair ${i}`)));
       const normal = pair.find(v => !(v.title ?? "").includes("I5 MIX"))!;
       const mixed = pair.find(v => (v.title ?? "").includes("I5 MIX"))!;
       const mixDecision = (await host.events()).find(e => e.type === "probe.decision" && e.decision === "mix-nonce");
-      // (3) I9: the pre-probe makes the router's context hook throw on this child's first step.
+      // (3) QA-P31-1-2 (a): an EXACT child whose work root is wt-2: its approved read of wt-2 is retargeted to wt-1 (registered at start, so the
+      //     host's max policy allows it): the router's per-session narrowing must deny external_directory.
+      const otherRoot = await runChild(host, root, roleInput("explorer", "I9 other root", `class=search risk=low scope=single ${rootField(w.wt2)}`, [
+        "TASK: read the retarget file",
+        scriptLine([{ tool: "read", input: { path: path.join(w.wt2, "i9-retarget.txt") } }], "DONE: i9-retarget.txt:1"),
+      ]), "exact child of wt-2");
+      const retargets = (await host.events()).filter(e => e.type === "probe.decision" && e.decision === "retarget").map(e => ({ sessionID: e.sessionID, from: e.from, to: e.to }));
+      // (4) I9: the pre-probe makes the router's context hook throw on this child's first step.
       const broken = await runChild(host, root, roleInput("explorer", "I9 BREAK context", "class=search risk=low scope=single", ["TASK: read m.txt", scriptLine([{ tool: "read", input: { path: path.join(host.project, "m.txt") } }], "DONE: m.txt:1")]), "I9 context error");
-      const preprobe = (await host.events()).filter(e => e.type === "preprobe.decision" && e.sessionID === broken.childID).map(e => e.decision);
-      const disk = { e2: await readFile(path.join(w.wt1, "e2.txt"), "utf8"), e3: await readFile(path.join(w.wt1, "e3.txt"), "utf8") };
+      // (5) QA-P31-1-2 (c): the pre-probe makes the router's permission evaluate hook throw on this child's first evaluation.
+      const evalBroken = await runChild(host, root, roleInput("explorer", "I9 BREAK evaluate", "class=search risk=low scope=single", ["TASK: read m.txt", scriptLine([{ tool: "read", input: { path: path.join(host.project, "m.txt") } }], "DONE: m.txt:1")]), "I9 evaluate error");
+      const preprobeOf = async (child: string) => (await host.events()).filter(e => e.type === "preprobe.decision" && e.sessionID === child).map(e => e.decision);
+      const preprobe = await preprobeOf(broken.childID);
+      const preprobeEvaluate = await preprobeOf(evalBroken.childID);
+      const markers = ["unknown-marker.txt"].flatMap(name => [w.wt1, w.wt2, host.project].map(dir => path.join(dir, name))).filter(file => existsSync(file));
+      const disk = { e2: await readFile(path.join(w.wt1, "e2.txt"), "utf8"), e3: await readFile(path.join(w.wt1, "e3.txt"), "utf8"), unknownMarkers: markers.length };
       const generalExternal = await externalDirectoryRules(host, "general");
-      const children = [...twins, normal, mixed, broken].map(v => v.childID);
+      const children = [...twins, normal, mixed, otherRoot, broken, evalBroken].map(v => v.childID);
       const rows = await waitRows(host, "I5 rows", rs => children.every(c => bindingNote(rs, c) !== undefined));
       await save("I5-I9", {
         barrier, twins: twins.map(v => ({ ...v, titleNonce: titleNonce(v.title), promptNonce: promptNonce(v.firstUser), binding: rowView(bindingNote(rows, v.childID)) })),
         normal: { ...normal, binding: rowView(bindingNote(rows, normal.childID)) }, mixed: { ...mixed, titleNonce: titleNonce(mixed.title), promptNonce: promptNonce(mixed.firstUser), binding: rowView(bindingNote(rows, mixed.childID)) },
-        mixDecision, broken, preprobe, disk, generalExternal, unknownBindings: unknownBindings(rows),
+        otherRoot: { ...otherRoot, binding: rowView(bindingNote(rows, otherRoot.childID)) }, retargets,
+        mixDecision, broken, preprobe, evalBroken, preprobeEvaluate, disk, generalExternal, unknownBindings: unknownBindings(rows),
         routerWarnings: host.routerLogLines(), hostErrors: host.errorLines(), providerErrors: host.provider.errors,
       });
 
@@ -542,12 +617,32 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         expect(r.toolNames).toContain("read");
         expect(r.toolNames).toContain("router_request_authority");
       }
+      expect(mixed.states.length, `the unknown child attempted every scripted call: ${describeStates(mixed.states)}`).toBe(mixedSteps.length);
       expectRefused(mixed.states[0], "unknown binding: edit");
-      expectRefused(mixed.states[1], "unknown binding: read in the sibling worktree (external_directory)");
+      expectRefused(mixed.states[1], "unknown binding: read in the sibling worktree (refused by the router before the host asks)");
       expectCompleted(mixed.states[2], "unknown binding: read inside the session directory");
       expect(disk.e3).toBe("main\n");
-      // ... while the exact sibling of the same turn edits and reads its work root.
+      // QA-P31-1-2 (a): the approved read, retargeted to wt-1 after the router's execute.before, makes the HOST ask external_directory for wt-1;
+      // its max policy allows it (wt-1 is registered), and the router's evaluate hook denies it for the unknown binding, with its message.
+      const external = (v: ChildView) => v.evaluates.filter(e => e.action === "external_directory");
+      expect(retargets.map(r => r.sessionID), JSON.stringify(retargets)).toContain(mixed.childID);
+      expectRefused(mixed.states[3], "unknown binding: external_directory of wt-1 (retargeted read)");
+      expect(external(mixed).length, `external_directory evaluations of the unknown child: ${JSON.stringify(mixed.evaluates)}`).toBeGreaterThan(0);
+      for (const e of external(mixed)) {
+        expect(e.resources.map(norm), JSON.stringify(e)).toEqual([`${norm(w.wt1)}/*`]);
+        expect(e.effectIn, JSON.stringify(e)).toBe("deny");
+        expect(e.messageIn ?? "", JSON.stringify(e)).toMatch(/binding unknown/);
+      }
+      // QA-P31-1-2 (b): router_run (allowed in routing.run.scripts, granted to the exact sibling) is refused for the unknown binding, and its
+      // marker exists nowhere on disk.
+      const runState = mixed.states[4];
+      expect(runState, "the unknown child's router_run attempt").toBeDefined();
+      if (runState!.status === "error") expectRefused(runState, "unknown binding: router_run");
+      else expectText(runState, /\[router_run\] error: refused/, "unknown binding: router_run refused by the tool itself");
+      expect(disk.unknownMarkers, "no unknown-marker.txt in wt-1, wt-2 or the main checkout").toBe(0);
+      // ... while the exact sibling of the same turn holds edit AND router_run, edits and reads its work root.
       expect(normal.requests[0]?.toolNames).toContain("edit");
+      expect(normal.requests[0]?.toolNames, "the exact sibling's grant holds router_run (needs=shell)").toContain("router_run");
       // Its third call reads the MAIN checkout: outside its work root wt-1, so refused (run 2: by the router's execute.before) — the mirror
       // image of the unknown child, which may read the session directory but not wt-1.
       expectStatuses(normal.states, ["completed", "completed", "error"], "exact sibling of the mixed child");
@@ -555,6 +650,16 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(normal.states[2]?.errorMessage, describeState(normal.states[2])).toMatch(/outside this dispatch's work root/);
       expect(disk.e2).toBe("edited\n");
       expect(unknownBindings(rows), "the only unknown binding is the mixed child").toEqual([mixed.childID]);
+      // QA-P31-1-2 (a): an EXACT child of wt-2 — its read of wt-2 approved, then retargeted to wt-1 — is denied external_directory of wt-1 by the
+      // router's per-session narrowing (P-13), although the host's max policy allows every registered worktree.
+      expect(bindingNote(rows, otherRoot.childID)?.binding).toBe("exact");
+      expect(retargets.map(r => r.sessionID), JSON.stringify(retargets)).toContain(otherRoot.childID);
+      expectRefused(otherRoot.states[0], "exact child of wt-2: external_directory of wt-1");
+      expect(external(otherRoot).length, `external_directory evaluations of the wt-2 child: ${JSON.stringify(otherRoot.evaluates)}`).toBeGreaterThan(0);
+      for (const e of external(otherRoot)) {
+        expect(e.effectIn, JSON.stringify(e)).toBe("deny");
+        expect(e.messageIn ?? "", JSON.stringify(e)).toMatch(/outside this dispatch's work root/);
+      }
       // I9 hook error: the router's context hook failed for the first step (the pre-probe's trap fired inside the router), the catalog of that step was empty,
       // the call of that step was refused, and the PARENT's result carries the router's annotation.
       expect(preprobe, "the injected error fired inside the router's context hook").toEqual(["armed", "threw-in-router-iteration"]);
@@ -562,6 +667,16 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(broken.states[0]?.status, `I9 first call: ${describeState(broken.states[0])}`).toBe("error");
       expect(broken.parentText).toContain(`[router] @explorer had no tools for at least one step`);
       expect(broken.parentText).toContain(broken.childID);
+      // QA-P31-1-2 (c), I9 evaluate error: the injected error fired INSIDE the router's evaluate hook (the trap only throws for the router's
+      // own stack), and the router denied the evaluation with its explicit fail-closed message — never an allow, never the raw error.
+      expect(preprobeEvaluate, "the injected error fired inside the router's evaluate hook").toContain("threw-in-router-evaluate");
+      expectRefused(evalBroken.states[0], "I9 evaluate error: the read is refused");
+      expect(evalBroken.states[0]?.errorMessage ?? "", describeState(evalBroken.states[0])).toMatch(/could not check/);
+      expect(evalBroken.states[0]?.errorMessage ?? "", describeState(evalBroken.states[0])).not.toContain("PREPROBE_EVALUATE_TRAP");
+      const trapped = evalBroken.evaluates.filter(e => e.action === "read");
+      expect(trapped.length, JSON.stringify(evalBroken.evaluates)).toBeGreaterThan(0);
+      expect(trapped[0]!.effectIn, JSON.stringify(trapped[0])).toBe("deny");
+      expect(trapped[0]!.messageIn ?? "", JSON.stringify(trapped[0])).toMatch(/could not check/);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
   }, 900_000);
@@ -594,7 +709,10 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(fresh!.grant ?? []).not.toContain("edit");
       expect(first.requests[0]?.toolNames).toContain("router_request_authority");
       for (const name of ["edit", "write", "patch", "apply_patch"]) expect(first.requests[0]?.toolNames).not.toContain(name);
-      expect(rankOf(first.requests[0]?.tier)).toBeGreaterThanOrEqual(rankOf("fast"));
+      // QA-P31 N2: the fresh dispatch ran exactly on the tier its decision row records (local grant: inside [fast, heavy]).
+      expect(fresh!.tier, rowLine(fresh)).toBeDefined();
+      expect(first.requests[0]?.tier, `fresh request ${first.requests[0]?.catalogModel} vs row ${rowLine(fresh)}`).toBe(fresh!.tier);
+      for (const r of first.requests) expectWireMatches(r, "ladder fresh");
       // edit refused, the request recorded, the child ESCALATEs, nothing written, the parent annotated.
       expectRefused(first.states[0], "edit before the authority request");
       expectCompleted(first.states[1], "router_request_authority");
