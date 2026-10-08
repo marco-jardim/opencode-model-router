@@ -118,3 +118,12 @@ The 25-call tier budget is unchanged in tiers mode (E7 is addressed by role budg
 - Host log: plugin-load line for `D:\git\opencode-model-router` at 19:08:16Z; 0 genuine `failed to load plugin` lines since 19:00Z.
 - `/api/agent`: Build, General, Explore, Compaction, Title, Summary, Plan, model-router-grader, fast, medium, heavy, runner, reviewer, researcher — tiers mode as expected (the override has no `delegation` yet).
 - Next: override migration validated in a temp HOME (candidate and kill switch), then the write and restart 2 of 2.
+### DF-2 step 2 — owner override migration (2026-10-08T19:10Z local 16:10)
+
+| Item | Value |
+|---|---|
+| Validation | temp HOME on code identical to `ae67429` in `src` (report `C:\Users\Marquinho\AppData\Local\Temp\Claude\df2-validate-A.json` / `-B.json`): candidate → delegation `roles`, workRoots `["D:/git/omr-rta-*"]`, engine/profile/margin kept, 0 notices, 7 roles enabled (explorer, researcher, runner fast–medium; implementer, general fast–heavy; reviewer heavy; architect medium–heavy), no `agents`/`subagentTiers`; kill switch (pre-DF-2 file) → tiers mode, `subagentTiers.explore = fast`, agents runner/reviewer/researcher, 0 notices |
+| Backup (kill switch) | `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc.bak-2026-10-08_16-10-50` (SHA-256 `700E2587…88F8`) |
+| New override SHA-256 | `E73373581618F1193A4E3AF9264FD59E603C1D66B2ECF100C4F3C246A1C50750` (copy at `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`) |
+| Config diff | `routing` += `delegation: "roles"`, `workRoots: ["D:/git/omr-rta-*"]`; removed `subagentTiers.explore`; removed custom `agents` runner, reviewer, researcher (replaced by shipped roles) |
+| Restart 2 of 2 (R8) | requested — roles mode is decided at plugin start |
