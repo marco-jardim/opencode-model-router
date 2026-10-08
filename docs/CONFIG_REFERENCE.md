@@ -997,6 +997,55 @@ How the variant ladder is built and bounded:
 
 ---
 
+## Roles delegation (#84)
+
+Opt-in, **OpenCode v2 only**. With `routing.delegation: "tiers"` (the default) nothing below has any effect and v2 behaves exactly as before; `routing.exploration.rate` is then `0` whatever it is set to. On v1 these keys are validated but inert, with one logged line per process, `roles delegation requires OpenCode v2; using tiers`, when any of `routing.delegation: "roles"`, `roleAgents`, `routing.exploration`, `routing.run` or `routing.workRoots` is set (logged at plugin start with the roles runtime, #84 P2.1; until then the keys are simply inert on v1). A bad entry is dropped with a notice (`/router` lists it); it never drops the layer or the `routing` block. With `delegation: "roles"`, resolving the role table adds its own notices to `/router`, each starting with `roles mode (OpenCode v2 only): ` (they describe what v2 does; on v1 the keys stay inert): an unknown `roleAgents` name, a clamped range or budget, a role disabled by its range or by `deny`, and the #81 `agents` decisions below. If the table cannot be resolved at all, the config still loads and one notice says so: `roles: the role table could not be resolved (<reason>); no role agent will be registered`.
+
+The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`, `reviewer`, `architect`, `general`) are defined in code (`SHIPPED_ROLE_SPECS`, `src/router/roles.ts`), not in `tiers.json`, so no configuration can widen their authority. `roleAgents` only narrows them. No role is granted `execute` (Code Mode), `subagent`, `task` or `delegate`, and no grant combines local, exec or write actions with egress (`webfetch`, `websearch`, `context7`).
+
+- **`general` replaces the host's native `general`, in roles mode only.** With `delegation: "roles"` the router registers `general` with its own prompt and policy in place of the host's native agent of that name; in tiers mode and on v1 the native `general` is untouched.
+- **Assurance.** `runner` ships `deterministic` (its result is a router-observed run); every other role ships `none`. A dispatch's effective detection is `deterministic` when the router's gate runs its acceptance checks, else the weaker of the route line's claim and the prompt's `[acceptance]` block; the role default applies only when neither exists, so a role never claims evidence its dispatch does not carry.
+- **#81 `agents` with a role name** (roles mode only; in tiers mode and on v1 they are validated and registered exactly as before). An entry that passes the separation rule replaces the shipped role of that name (notice `agents.<name> replaces the shipped role agent <name> in roles mode`). One that fails it (for example `read` together with `webfetch`, or a read-only agent that also gets the context7 tools) is dropped in roles mode with a notice, and the shipped role stays.
+- **Tier ranges** are positions in the active preset's cost order (`costRatio`, else listing order). A role keeps the preset's tiers inside its shipped range, starting at the cheapest one: a `fast`/`medium`/`heavy` tier outside the range ends it, and a tier with another name (`mini`) between two of its tiers is kept with the role's smallest shipped budget (notice; `roleAgents.<name>.budget` may raise it to twice that). A role with no tier of the preset inside its range is disabled with a notice. So is a role whose range spans tiers that the preset's `costRatio` orders against their names (say `heavy` cheaper than `medium`): its tier floors are names, and on such an order they would invert, so the role fails closed. The bundled presets are all ordered `fast` < `medium` < `heavy`.
+- **`deny` cannot gut a role.** A role left without any action of the class it is defined by (`researcher`: egress; `runner`: `router_run`; every other role: local reads) is disabled with a notice.
+
+| Key | Type | Default | Values / range | Layers |
+|---|---|---|---|---|
+| `routing.delegation` | `string` | `"tiers"` | `tiers \| roles` | tiers.json, global, project |
+| `roleAgents` | `Record<string, object>` | `{}` | keys are shipped role names; unknown names are noticed and ignored | tiers.json, global (stripped from the project layer) |
+| `roleAgents.<name>.enabled` | `boolean` | `true` | `false` removes the role; `true` cannot revive a role that is disabled by default | as `roleAgents` |
+| `roleAgents.<name>.description` | `string` | shipped text | non-empty, at most 1000 characters | as `roleAgents` |
+| `roleAgents.<name>.prompt` | `string` | shipped text | non-empty, at most 20000 characters; always followed by a fixed block, `Router contract (overrides the text above):`, with the work-root rule, the return contract and (roles that can edit) the `ESCALATE: authority` rule | as `roleAgents` |
+| `roleAgents.<name>.tierRange` | `{ floor?, ceiling? }` | shipped range | tier names of the active preset; clamped into the shipped range with a notice | as `roleAgents` |
+| `roleAgents.<name>.budget` | `Record<tier, number>` | shipped budget | tiers the role already has; `> 0` and at most 2 × the shipped value (clamped with a notice) | as `roleAgents` |
+| `roleAgents.<name>.deny` | `string[]` | `[]` | actions to remove: `read \| glob \| grep \| router_git \| router_run \| edit \| webfetch \| websearch \| context7 \| execute`; can only narrow | as `roleAgents` |
+| `routing.exploration.rate` | `number` | `0` | `[0, 0.2]` | global only; `0` unless `delegation` is `roles` on v2 |
+| `routing.exploration.requireDetection` | `string` | `"deterministic"` | fixed; any other value is ignored with a notice | global only |
+| `routing.run.scripts` | `string[]` | `["test", "typecheck", "lint", "build"]` | `package.json` script names `router_run` may run; any `test:*` script is always allowed | global only |
+| `routing.run.commands` | `Record<string, { argv, args? }>` | `{ "test-files": … }` (below) | `argv`: non-empty array of non-empty strings; `args`: patterns for the caller's arguments | global only |
+| `routing.run.timeoutMs` | `integer` | `600000` | `[1000, 3600000]` | global only |
+| `routing.workRoots` | `string[]` | `[]` | absolute globs, see below | global only |
+
+**`routing.run.commands`.** `package.json` scripts take no caller arguments, so a run with arguments needs a command entry. The shipped default (replaced as a whole when you set `commands`) is `"test-files": { "argv": ["npm", "run", "test", "--"], "args": ["test/*", "--maxWorkers=*"] }`: a scoped test run through `router_run`'s hardened npm path. `args` lists the arguments a caller may pass: each pattern is an exact string or a prefix ending in `*` (`test/*`); an argument starting with `-` only matches a pattern that itself starts with `-`; an entry without `args` takes none. Every argument must also match `^[A-Za-z0-9_./:=@+-]{1,200}$`. Confinement is enforced by `router_run` itself, whatever the patterns say: an argument with a `..` segment, an absolute, drive or UNC path is refused, and an option-like argument (leading `-`, `@` or `+`) only matches a pattern with the same leading character — so `test/*` admits `test/unit/x.test.ts` but never `test/../../x`.
+
+**`routing.workRoots`.** Absolute globs naming where role dispatches may work besides the session directory and the worktrees git lists at registration (for example `D:/git/omr-rta-*`). Each entry needs an absolute static prefix with at least one real directory (`*`, `/**` and `D:/**` are refused), no `.` or `..` segment, and must be written in the **canonical long form**: a segment such as `PROGRA~1` is an 8.3 short name that can alias another directory and is refused, in every segment (`D:/git/OMR-RT~1*` and `D:/git/*/PROGRA~1/x` included). Never put `*` alone. **Over-match:** `*` crosses separators, so `D:/git/omr-rta-*` grants every directory that starts with `omr-rta-`; the registered policy cannot tell dispatches apart, and the router narrows each session to its own work root when it evaluates a permission.
+
+Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting`):
+
+<!-- roles-defaults: v2 -->
+```jsonc
+{
+  "delegation": "tiers",
+  "exploration": { "rate": 0, "requireDetection": "deterministic" },
+  "run": {
+    "scripts": ["test", "typecheck", "lint", "build"],
+    "commands": { "test-files": { "argv": ["npm", "run", "test", "--"], "args": ["test/*", "--maxWorkers=*"] } },
+    "timeoutMs": 600000
+  },
+  "workRoots": []
+}
+```
+
 ## Validation rules
 
 `validateConfig` throws on `tiers.json` load if any of these are violated:

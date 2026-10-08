@@ -5,9 +5,21 @@ import {
   ROUTING_DEFAULTS,
   ROUTING_ENGINES,
   ROUTING_TASK_CLASSES,
+  resolveRolesRouting,
   resolveRouting,
   validateConfig,
+  ROLE_NOTICE_PREFIX,
 } from "../../src/router/config";
+import {
+  AUTHORITY_ACTIONS,
+  EXPLORATION_MAX_RATE,
+  ROLES_V1_NOTICE,
+  RUN_TIMEOUT_BOUNDS,
+  sanitizeExploration,
+  sanitizeRun,
+  workRootProblem,
+} from "../../src/router/roles-config";
+import { CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS } from "../../src/router/roles";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
@@ -663,5 +675,102 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       if (cells?.[1] !== severities.get(id)) wrong.push(`${id}: doc ${cells?.[1] ?? "(no row)"}, code ${severities.get(id)}`);
     }
     expect(wrong).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Roles delegation keys (#84): the "Roles delegation" section of CONFIG_REFERENCE.md.
+// ---------------------------------------------------------------------------
+
+describe("docs drift: roles delegation keys (#84)", () => {
+  const doc = read("docs/CONFIG_REFERENCE.md");
+  const defaults = resolveRolesRouting(validateConfig(JSON.parse(read("tiers.json"))), "v2");
+  const rolesKeys = [
+    "routing.delegation", "roleAgents", "roleAgents.<name>.enabled", "roleAgents.<name>.description", "roleAgents.<name>.prompt",
+    "roleAgents.<name>.tierRange", "roleAgents.<name>.budget", "roleAgents.<name>.deny", "routing.exploration.rate",
+    "routing.exploration.requireDetection", "routing.run.scripts", "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots",
+  ];
+
+  it("documents every key, and a missing one is detected", () => {
+    expect(rolesKeys.filter((key) => keyRow(doc, key) === undefined)).toEqual([]);
+    const fixture = rolesKeys.filter((key) => key !== "routing.workRoots").map((key) => `| \`${key}\` |`).join("\n");
+    expect(rolesKeys.filter((key) => keyRow(fixture, key) === undefined)).toEqual(["routing.workRoots"]);
+  });
+
+  it("the Default column is what resolveRolesRouting applies", () => {
+    const cell = (key: string) => keyRow(doc, key)?.[2];
+    expect(cell("routing.delegation")).toBe(defaultCell(defaults.delegation));
+    expect(cell("routing.exploration.rate")).toBe(defaultCell(defaults.exploration.rate));
+    expect(cell("routing.exploration.requireDetection")).toBe(defaultCell(defaults.exploration.requireDetection));
+    expect(cell("routing.run.timeoutMs")).toBe(defaultCell(defaults.run.timeoutMs));
+    expect(cell("routing.run.scripts")).toBe(`\`${JSON.stringify(defaults.run.scripts).replace(/,/g, ", ")}\``);
+    expect(cell("roleAgents")).toBe("`{}`");
+    expect(cell("routing.workRoots")).toBe("`[]`");
+    expect(defaults.workRoots).toEqual([]);
+    expect(Object.keys(defaults.run.commands)).toEqual(["test-files"]);
+  });
+
+  it("the resolved-defaults block is what resolveRolesRouting applies", () => {
+    const block = /<!-- roles-defaults: v2 -->\s*```jsonc\r?\n([\s\S]*?)```/.exec(doc);
+    expect(block).not.toBeNull();
+    const documented = parseJsonc(block![1]!) as Record<string, unknown>;
+    const { inert: _inert, ...code } = defaults;
+    expect(documented).toEqual(JSON.parse(JSON.stringify(code)));
+  });
+
+  it("the documented ranges are the ones the sanitisers enforce", () => {
+    expect(keyRow(doc, "routing.exploration.rate")?.[3]).toBe(`\`[0, ${EXPLORATION_MAX_RATE}]\``);
+    expect(sanitizeExploration({ rate: EXPLORATION_MAX_RATE }).issues).toEqual([]);
+    expect(sanitizeExploration({ rate: EXPLORATION_MAX_RATE + 0.001 }).issues).toHaveLength(1);
+    expect(keyRow(doc, "routing.run.timeoutMs")?.[3]).toBe(`\`[${RUN_TIMEOUT_BOUNDS.min}, ${RUN_TIMEOUT_BOUNDS.max}]\``);
+    for (const [t, ok] of [[RUN_TIMEOUT_BOUNDS.min, true], [RUN_TIMEOUT_BOUNDS.max, true], [RUN_TIMEOUT_BOUNDS.min - 1, false], [RUN_TIMEOUT_BOUNDS.max + 1, false]] as const) {
+      expect(sanitizeRun({ timeoutMs: t }).issues.length === 0, `timeoutMs ${t}`).toBe(ok);
+    }
+    const actions = (keyRow(doc, "roleAgents.<name>.deny")?.[3] ?? "").match(/[a-z_0-9]+(?=[ `\\|])/g) ?? [];
+    for (const action of AUTHORITY_ACTIONS) expect(actions, action).toContain(action);
+  });
+
+  it("states the command-argument pattern rule and the workRoots rules the code enforces", () => {
+    const text = doc.replace(/\s+/g, " ");
+    expect(text).toContain("an exact string or a prefix ending in `*`");
+    expect(text).toContain("canonical long form");
+    expect(text).toContain("`*` crosses separators");
+    expect(workRootProblem("D:/git/omr-rta-*")).toBeUndefined();
+    expect(workRootProblem("D:/**")).toBeDefined();
+    expect(workRootProblem("D:/PROGRA~1/x")).toBeDefined();
+    expect(text).toContain("roles delegation requires OpenCode v2; using tiers");
+    expect(ROLES_V1_NOTICE).toBe("roles delegation requires OpenCode v2; using tiers");
+    expect(text).toContain("never `test/../../x`");
+    expect(text).toContain("`D:/git/OMR-RT~1*` and `D:/git/*/PROGRA~1/x` included");
+    expect(workRootProblem("D:/git/OMR-RT~1*")).toBeDefined();
+    expect(workRootProblem("D:/git/*/PROGRA~1/x")).toBeDefined();
+  });
+
+  it("quotes the role-table notice prefix and failure notice the code emits (QA-P11-2)", () => {
+    const text = doc.replace(/\s+/g, " ");
+    expect(text).toContain(`each starting with \`${ROLE_NOTICE_PREFIX}\``);
+    expect(text).toContain("`roles: the role table could not be resolved (<reason>); no role agent will be registered`");
+    expect(text).toContain("`costRatio` orders against their names");
+  });
+
+  it("states the role rules the code enforces (QA-P11-1)", () => {
+    const text = doc.replace(/\s+/g, " ");
+    // custom prompts end with the router contract block
+    expect(text).toContain(`\`${CONTRACT_HEADING}\``);
+    // host-native role names
+    for (const name of HOST_NATIVE_ROLE_NAMES) expect(text).toContain(`\`${name}\` replaces the host's native \`${name}\`, in roles mode only`);
+    // assurance defaults
+    const deterministic = SHIPPED_ROLE_SPECS.filter((s) => s.assurance === "deterministic").map((s) => s.agent);
+    expect(deterministic).toEqual(["runner"]);
+    expect(SHIPPED_ROLE_SPECS.filter((s) => s.assurance !== "deterministic").every((s) => s.assurance === "none")).toBe(true);
+    expect(text).toContain("`runner` ships `deterministic`");
+    expect(text).toContain("every other role ships `none`");
+    // defining classes named in the doc
+    expect([DEFINING_CLASS.research, DEFINING_CLASS.run]).toEqual(["egress", "exec"]);
+    expect(Object.entries(DEFINING_CLASS).filter(([k]) => k !== "research" && k !== "run").every(([, c]) => c === "local")).toBe(true);
+    expect(text).toContain("(`researcher`: egress; `runner`: `router_run`; every other role: local reads)");
+    // exploration is off outside roles mode
+    expect(resolveRolesRouting(validateConfig({ ...JSON.parse(read("tiers.json")), routing: { exploration: { rate: 0.1 } } }), "v2").exploration.rate).toBe(0);
+    expect(text).toContain("`routing.exploration.rate` is then `0`");
   });
 });
