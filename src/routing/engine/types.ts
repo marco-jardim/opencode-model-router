@@ -14,7 +14,9 @@
  */
 
 import type { ResolvedRouting } from "../../router/config";
+import type { ExplorationConfig } from "../../router/roles";
 import type { Detection, Need, TaskFacts } from "../classify/types";
+import type { ClassifiedDispatch, EffectiveDetection } from "../roles/policy";
 import type {
   AgentRef,
   CostUnit,
@@ -34,7 +36,7 @@ import type {
  *  - `role-tier-rung`  — a `routing.roles` agent on a rung of the tier that owns the class
  *                        (applied at dispatch by a per-call `model` override).
  */
-export type CandidateSource = "tier" | "role-own-model" | "role-tier-rung";
+export type CandidateSource = "tier" | "role-own-model" | "role-tier-rung" | "role-range";
 
 /** One `(agent, model#variant)` the engine may dispatch, with what the kernel needs to price it. */
 export interface Candidate {
@@ -267,4 +269,100 @@ export interface Decision {
    * stay capped at the class's owning tier (A25). `null` when the pick is not a candidate.
    */
   readonly pickRank: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Role dispatches (role-tier-assurance plan §2.1, §2.3, P1.2 T1.2.3/T1.2.4) — additive
+// ---------------------------------------------------------------------------
+
+/**
+ * The tier window of one role dispatch, as `roles/policy.tierBounds` returns it (tier names of the escalate ladder):
+ * `floor`/`ceiling` already include the authority floor, `floorTier` and the running rung; `pinned` is the route-line
+ * `tier=` already lifted or clamped into the window (null = no pin).
+ */
+export interface RoleWindow {
+  readonly floor: string;
+  readonly ceiling: string;
+  readonly pinned: string | null;
+}
+
+/** One tier of a role ladder: its rank on the escalate ladder and its first candidate (`null` when every rung was a duplicate). */
+export interface RoleLadderTier {
+  readonly tier: string;
+  readonly rank: number;
+  readonly first: number | null;
+}
+
+/**
+ * The candidate graph of a role dispatch (T1.2.3): the rungs of every tier in `[floor, ceiling]`, all run by the role agent
+ * (`AgentRef` origin `role`, outcome keys `class|role:<agent>|provider/model#variant`). Every rung is priced through its
+ * simulated runner path under `ladders.roleEscalatePolicy` (the escalate policy restricted to the window).
+ */
+export interface RoleLadder extends Ladder {
+  /** The role agent. */
+  readonly role: string;
+  /** Ranks of the window on the escalate ladder; `null` when the window could not be placed (then there are no candidates). */
+  readonly floorRank: number | null;
+  readonly ceilingRank: number | null;
+  readonly tiers: readonly RoleLadderTier[];
+  /** Candidate index of the static default: the class's taxonomy tier clamped into the window; `null` when there are no candidates. */
+  readonly staticDefault: number | null;
+  /** Candidate index of the pinned tier (`RoleWindow.pinned`); `null` when not pinned. */
+  readonly pinnedIndex: number | null;
+  /** Window, default and pin notes for the decision row (`default:clamp:floor`, `pinned:heavy`, ...). */
+  readonly reasons: readonly string[];
+}
+
+/** `routing.exploration` for one dispatch (T1.2.4): the rate (clamped to `[0, MAX_EXPLORATION_RATE]`) and the RNG seed. */
+export interface RoleExploration extends Pick<ExplorationConfig, "rate"> {
+  /** The decision row's id: the only seed of the exploration draw (same id → same draw). */
+  readonly decisionID: string;
+}
+
+export interface RoleDecisionInput {
+  /**
+   * The classify result (`ClassifyResult` itself: `facts`, `trace.rules`, `trace.routeLine`). The kernel reads the
+   * EFFECTIVE risk and scope from it (`roles/policy.effectiveFactsOf`, raise-only, QA-P12-1-1): never-down, `U` and
+   * exploration use that risk.
+   */
+  readonly classified: ClassifiedDispatch;
+  readonly ladder: RoleLadder;
+  /**
+   * The EFFECTIVE detection (§2.1, A34; `roles/policy.effectiveDetection`): `deterministic` only when the router's own
+   * gate runs the checks. Never `ClassifyResult.detection` (the route line's claim).
+   */
+  readonly detection: EffectiveDetection;
+  /** `routing.engine`: only `enforce` applies a kernel switch or explores. */
+  readonly engine: ResolvedRouting["engine"];
+  readonly routing: KernelRouting;
+  readonly store: EngineStoreView | null;
+  /** A resume: the rung the child runs on. The dispatch never moves below it and is never switched or explored. */
+  readonly resume?: { readonly model: string; readonly variant: string | null } | null;
+  /** Absent/null or rate 0 = no exploration. */
+  readonly exploration?: RoleExploration | null;
+  readonly orchestrator?: OrchestratorCost | null;
+  readonly remainingTurns?: number;
+}
+
+export interface RoleDecision {
+  /** The kernel's decision with `chosen` = {@link base} (`pinned` = the window has a pin). */
+  readonly decision: Decision;
+  /** The policy's pick before the kernel: the pinned tier, else the static default, raised to the running rung on a resume. */
+  readonly base: Candidate | null;
+  /**
+   * What the router sets as the per-call model. `null` = no candidate (reason `window:no-candidates`): P2.1 REFUSES the
+   * role dispatch. It never falls back to `buildEscalatePolicy`/`buildLadder` or to a tier agent on its own (QA-P12-1-5).
+   */
+  readonly dispatch: Candidate | null;
+  /** `enforce` applied the kernel's switch (`dispatch` = `decision.target`); never on a resume, a pin or an exploration draw. */
+  readonly switched: boolean;
+  /** `dispatch` was drawn by exploration (reason `explore`). */
+  readonly explore: boolean;
+  /** Probability that this policy dispatches `dispatch` for this input, in (0, 1]; 1 when no draw was possible. */
+  readonly propensity: number;
+  /**
+   * `RoleLadder.reasons` plus `resume:running`, `resume:off-ladder` (raised to the running model's capability rank),
+   * `resume:off-ladder:lift` (unknown rank: raised to the window ceiling), `kept:resume`, `explore`.
+   */
+  readonly reasons: readonly string[];
 }
