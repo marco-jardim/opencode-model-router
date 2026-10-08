@@ -44,17 +44,28 @@
  * - Credential redaction of the output is best effort (URL userinfo and credential-like
  *   query parameters), not a secret scanner; credential-like environment variables are
  *   not passed to the run.
+ * - Agents and credential stores stay reachable (QA-P13-2-6): the ssh-agent socket
+ *   (SSH_AUTH_SOCK), git credential helpers and the OS keychain, cloud CLI caches under
+ *   the home directory (~/.aws, ~/.config/gcloud, ~/.azure, ~/.docker/config.json, …),
+ *   and environment variables whose values carry credentials under other names (for
+ *   example a URL with userinfo). A script can use them as the user can.
+ * - Argument confinement is lexical (QA-P13-2-1): a caller argument never names an
+ *   absolute, drive, UNC or URL path or a `..` segment, but a symlink or junction inside
+ *   the work root, and the contents of an `@response` file, are repository content.
  */
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import type { RunConfig } from "./roles";
 import {
-  dropPartialCredential, envLookup, errorMessage, firstOutside, isFullPath, realFileOrUndefined, spawnBounded,
-  stripUrlUserinfo, workRootGuards, type BoundedLabel, type BoundedResult,
+  checkWorkRootAnswer, dropPartialCredential, envLookup, errorMessage, firstOutside, isFullPath, readBoundedRegularFile as readBounded,
+  realFileOrUndefined, spawnBounded, stripUrlUserinfo, workRootGuards, type BoundedLabel, type BoundedResult, type WorkRootAnswer,
 } from "./git-tools";
 
 export { isFullPath } from "./git-tools";
+export type { WorkRootAnswer } from "./git-tools";
 
 export const RUN_TOOL_NAME = "router_run";
 /** Every caller argument must match this allowlist (no spaces, quotes or shell metacharacters on any platform). */
@@ -108,10 +119,12 @@ export interface RunToolDeps {
   /** Effective `routing.run` (global layer only, P1.1). Read on every call. */
   config: () => RunConfig;
   /**
-   * The work root bound to a session (P2.1 wires it to the dispatch binding). null, or
-   * anything that is not a non-empty string, means unbound: the tool refuses (I9).
+   * The session's work-root answer (P2.1 wires it to the dispatch binding; the type is
+   * shared with router_git_*, QA-P13-2-8). `{ role: false }` → refused (router_run is
+   * for role sessions only); `{ role: true, root: null }` → refused (I9); `{ role: true,
+   * root }` → `cwd` must name that root. Any other answer is reported as an error.
    */
-  resolveWorkRoot: (sessionID: string) => string | null;
+  resolveWorkRoot: (sessionID: string) => WorkRootAnswer;
   /** P1.4 `run` signal. A throwing recorder never hides the run's result. */
   recordRun?: (e: RunRecord) => void;
   /**
@@ -186,17 +199,24 @@ export function optionLead(arg: string): string | undefined {
 }
 
 /**
- * The argument names a path outside the work root (QA-P13-1-1): a `..` segment
- * anywhere, or the argument, its value after `=`, or its text after an option lead
- * starting with `/`, `\` or a drive (`X:`). On win32 a leading `/switch` is refused by
- * the same rule.
+ * The argument may name a path outside the work root (QA-P13-1-1, QA-P13-2-1). Lexical:
+ * - a piece starting with `/`, `\` or a drive (`X:`), where pieces start at the
+ *   argument, after its option lead, after a two-character short option (`-o/abs`,
+ *   `-I../x`) and after every `=`, `:`, `@` or `+` (`--define=K=/abs`, `pkg@/abs`);
+ * - `:/` or `//` anywhere (URLs such as `file:///D:/x`, UNC, `--alias=x:/abs`);
+ * - a `..` segment bounded by `/`, `\`, `=`, `:`, `@`, `+` or the ends, also right
+ *   after a two-character short option (`-r../x.js`).
+ * On win32 a leading `/switch` is refused by the same rule. Symlinks inside the work
+ * root and the contents of `@response` files are repository content (not checked).
  */
 export function escapesWorkRoot(arg: string): boolean {
-  const parts = new Set([arg, arg.replace(/^[-@+]+/, "")]);
-  const eq = arg.indexOf("=");
-  if (eq !== -1) parts.add(arg.slice(eq + 1));
-  for (const part of parts) if (/^([\\/]|[A-Za-z]:)/.test(part)) return true;
-  return /(^|[\\/=:@+])\.\.($|[\\/])/.test(arg);
+  if (/:[\\/]|[\\/]{2}/.test(arg)) return true;
+  const short = /^-[^-]/.test(arg) ? arg.slice(2) : undefined;
+  const starts = [arg, arg.replace(/^[-@+]+/, ""), ...(short !== undefined ? [short] : [])];
+  for (let index = 0; index < arg.length; index++) if ("=:@+".includes(arg[index]!)) starts.push(arg.slice(index + 1));
+  if (starts.some(start => /^([\\/]|[A-Za-z]:)/.test(start))) return true;
+  const dots = /(^|[\\/=:@+])\.\.($|[\\/=:@+])/;
+  return dots.test(arg) || (short !== undefined && dots.test(short));
 }
 
 /**
@@ -242,12 +262,15 @@ function insideAny(path: string, guards: readonly string[]): boolean {
  *   npm_lifecycle_* and npm_package_*), NODE_OPTIONS, PREFIX (npm's global-config
  *   location) and credential-like variables (isCredentialEnv) unless passed through;
  * - PATH: relative entries and entries inside the guarded directories removed, so a
- *   `#!/usr/bin/env node` tool or a bare name cannot resolve into the repository;
+ *   `#!/usr/bin/env node` tool or a bare name cannot resolve into the repository; each
+ *   entry is tested as written and by its real path (a link into the repository counts
+ *   as inside, QA-P13-2-3e);
  * - set: CI=1; on win32 ComSpec (the validated shell) and NoDefaultCurrentDirectoryInExePath=1.
  */
 export function runEnvironment(base: NodeJS.ProcessEnv, platform: NodeJS.Platform, shell?: string,
   options: { guards?: readonly string[]; passthrough?: readonly string[] } = {}): NodeJS.ProcessEnv {
   const passthrough = new Set((options.passthrough ?? []).map(name => name.toUpperCase()));
+  const guards = options.guards ?? [];
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined || /^npm_/i.test(key) || /^(NODE_OPTIONS|PREFIX)$/i.test(key)) continue;
@@ -256,7 +279,9 @@ export function runEnvironment(base: NodeJS.ProcessEnv, platform: NodeJS.Platfor
       const separator = platform === "win32" ? ";" : ":";
       env[key] = value.split(separator).filter(entry => {
         const dir = entry.replace(/^"|"$/g, "");
-        return dir !== "" && isFullPath(dir, platform) && !insideAny(dir, options.guards ?? []);
+        if (dir === "" || !isFullPath(dir, platform) || insideAny(dir, guards)) return false;
+        const real = guards.length > 0 ? nativeRealpath(dir) : undefined;
+        return real === undefined || !insideAny(real, guards);
       }).join(separator);
       continue;
     }
@@ -297,6 +322,11 @@ function foundFile(path: string, platform: NodeJS.Platform): Found | undefined {
   return real === undefined ? undefined : { found: pathApi(platform).normalize(path), real };
 }
 
+/** An operator-given executable path with a `..` segment is refused, never normalised (QA-P13-2-7). */
+function refuseDotDot(path: string, what: string): void {
+  if (/(^|[\\/])\.\.([\\/]|$)/.test(path)) throw refuse(`${what} must not contain a ".." segment: ${path}`);
+}
+
 /** Both the found spelling and the real path are outside every guarded directory (G4). */
 function outside(file: Found, guards: readonly string[]): boolean {
   return !insideAny(file.real, guards) && !insideAny(file.found, guards);
@@ -317,6 +347,7 @@ function stemOf(path: string): string {
 export function resolveNodeExecutable(host: RunHost, guards: readonly string[]): string {
   const P = pathApi(host.platform);
   if (host.nodeExecPath !== undefined) {
+    refuseDotDot(host.nodeExecPath, "node executable");
     const file = foundFile(host.nodeExecPath, host.platform);
     if (file === undefined) throw refuse(`node executable is not an absolute path to a file: ${host.nodeExecPath}`);
     if (!outside(file, guards)) throw refuse(`refusing a node executable inside the work root: ${file.found}`);
@@ -403,6 +434,7 @@ export function resolveCommandExecutable(program: string, host: RunHost, guards:
     return file.found;
   };
   if (isFullPath(program, host.platform)) {
+    refuseDotDot(program, "command executable");
     const file = foundFile(program, host.platform);
     if (file === undefined) throw refuse(`command executable not found: ${program}`);
     if (!outside(file, guards)) throw refuse(`refusing a command executable inside the work root: ${file.found}`);
@@ -418,49 +450,93 @@ export function resolveCommandExecutable(program: string, host: RunHost, guards:
     : `refusing a command executable inside the work root: ${candidates[0]!.found}`);
 }
 
+/** Where npm reads its user and global config files; pinned on the command line (QA-P13-2-2). */
+export interface NpmConfigPins { userconfig: string; globalconfig: string }
+
 /**
  * Flags that pin npm's script shell and node options, keep npm in the work root's
- * package and write no npm log file (they outrank every npmrc file and the environment).
+ * package, write no npm log file, and pin the user and global config files (a project
+ * `.npmrc` can otherwise move `userconfig` to a repository file, which could then move
+ * `globalconfig`). Command line flags outrank npmrc files and the environment, with one
+ * exception npm 11 shows in `config ls -l` ("overridden by user"): the user's own
+ * `~/.npmrc` may still set `globalconfig`; that file is user-owned, outside every work root.
  */
-export function npmHardeningFlags(shell: string): string[] {
-  return [`--script-shell=${shell}`, "--node-options=", "--workspaces=false", "--update-notifier=false", "--logs-max=0"];
+export function npmHardeningFlags(shell: string, pins: NpmConfigPins): string[] {
+  return [`--script-shell=${shell}`, "--node-options=", "--workspaces=false", "--update-notifier=false", "--logs-max=0",
+    `--userconfig=${pins.userconfig}`, `--globalconfig=${pins.globalconfig}`];
+}
+
+export { readBoundedRegularFile } from "./git-tools";
+
+/** A config file of the work root, bounded and regular; failures are refusals. */
+function readConfigFile(path: string, label: string): string | undefined {
+  try { return readBounded(path, MAX_CONFIG_FILE_BYTES, label); } catch (error) { throw refuse(errorMessage(error)); }
+}
+
+/** npm's `${VAR}` / `${VAR?}` substitution (@npmcli/config env-replace), with the environment the npm child sees. */
+export function npmEnvReplace(text: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): string {
+  return text.replace(/(?<!\\)(\\*)\$\{([^${}?]+)(\?)?\}/g, (original, escapes: string, name: string, modifier: string | undefined) => {
+    const value = platform === "win32" ? envLookup(env, name) : env[name];
+    if (escapes.length % 2) return original.slice((escapes.length + 1) / 2);
+    return escapes.slice(escapes.length / 2) + (value ?? (modifier === "?" ? "" : `\${${name}}`));
+  });
+}
+
+type IniDecode = (text: string) => Record<string, unknown>;
+const iniCache = new Map<string, IniDecode>();
+
+/**
+ * npm's own ini parser, loaded from the resolved npm install (never from the repository):
+ * the `.npmrc` checks must read keys exactly as npm does (`\r` line breaks, comments
+ * cutting unquoted keys at `;`/`#`, JSON-decoded quoted keys, `key[]` arrays).
+ */
+export function loadNpmIni(npmCli: string, platform: NodeJS.Platform, guards: readonly string[]): IniDecode {
+  const P = pathApi(platform);
+  const dir = P.join(P.dirname(P.dirname(npmCli)), "node_modules", "ini");
+  const cached = iniCache.get(dir);
+  if (cached !== undefined) return cached;
+  const real = nativeRealpath(dir);
+  if (real === undefined) throw refuse(`npm's ini parser is missing from the npm install (${dir})`);
+  if (insideAny(real, guards) || insideAny(dir, guards)) throw refuse(`refusing npm's ini parser inside the work root: ${dir}`);
+  let loaded: { decode?: unknown; parse?: unknown };
+  try { loaded = createRequire(npmCli)(dir) as typeof loaded; } catch (error) {
+    throw refuse(`cannot load npm's ini parser from ${dir} (${errorMessage(error)})`);
+  }
+  const decode = typeof loaded.decode === "function" ? loaded.decode : loaded.parse;
+  if (typeof decode !== "function") throw refuse(`npm's ini parser at ${dir} has no decode function`);
+  const bound: IniDecode = text => (decode as IniDecode)(text);
+  iniCache.set(dir, bound);
+  return bound;
 }
 
 /**
- * A regular file's text, read through one descriptor (QA-P13-1-8): opened without
- * blocking (a FIFO cannot hang the call), fstat-checked as a regular file, and read
- * up to `max` bytes; undefined when missing. Errors never quote the file's contents.
+ * The config files npm would use by default, for the npm child's environment: the user
+ * config `<HOME | USERPROFILE | homedir>/.npmrc`, and the global config
+ * `<prefix>/etc/npmrc` with the prefix of npm's builtin `npmrc` (env-substituted), else
+ * npm's default (win32: the node directory; POSIX: its parent; DESTDIR prepended).
  */
-export function readBoundedRegularFile(path: string, max: number, label: string): string | undefined {
-  let fd: number;
-  try {
-    fd = openSync(path, fsConstants.O_RDONLY | (process.platform === "win32" ? 0 : (fsConstants.O_NONBLOCK ?? 0)));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw refuse(`${label} is not readable (${(error as NodeJS.ErrnoException).code ?? "error"})`);
+export function npmConfigPins(node: string, npmCli: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform, guards: readonly string[]): NpmConfigPins {
+  const P = pathApi(platform);
+  const get = (name: string) => (platform === "win32" ? envLookup(env, name) : env[name]) || undefined;
+  const home = get("HOME") ?? (platform === "win32" ? get("USERPROFILE") : undefined) ?? homedir();
+  const builtin = readConfigFile(P.join(P.dirname(P.dirname(npmCli)), "npmrc"), "npm's builtin npmrc");
+  let prefix: string | undefined;
+  if (builtin !== undefined) {
+    const value = loadNpmIni(npmCli, platform, guards)(builtin).prefix;
+    if (typeof value === "string" && value !== "") prefix = P.resolve(npmEnvReplace(value, env, platform));
   }
-  try {
-    if (!fstatSync(fd).isFile()) throw refuse(`${label} is not a regular file`);
-    const buffer = Buffer.alloc(max + 1);
-    let length = 0;
-    while (length < buffer.length) {
-      const read = readSync(fd, buffer, length, buffer.length - length, null);
-      if (read === 0) break;
-      length += read;
-    }
-    if (length > max) throw refuse(`${label} is larger than ${max / (1024 * 1024)} MiB`);
-    return buffer.subarray(0, length).toString("utf8").replace(/^\uFEFF/, "");
-  } catch (error) {
-    if (error instanceof RunRefused) throw error;
-    throw refuse(`${label} is not readable (${(error as NodeJS.ErrnoException).code ?? "error"})`);
-  } finally {
-    closeSync(fd);
+  if (prefix === undefined) {
+    const execPath = platform === "win32" ? node : (realFileOrUndefined(node) ?? node);
+    prefix = platform === "win32" ? P.dirname(execPath) : P.dirname(P.dirname(execPath));
+    const destdir = get("DESTDIR");
+    if (destdir !== undefined) prefix = P.join(destdir, prefix);
   }
+  return { userconfig: P.resolve(home, ".npmrc"), globalconfig: P.resolve(prefix, "etc", "npmrc") };
 }
 
 /** The work root's package.json scripts (QA-P13-1-4: every npm plan needs one in the root itself). */
 function packageScripts(root: string, platform: NodeJS.Platform): Record<string, unknown> {
-  const text = readBoundedRegularFile(pathApi(platform).join(root, "package.json"), MAX_CONFIG_FILE_BYTES, "package.json");
+  const text = readConfigFile(pathApi(platform).join(root, "package.json"), "package.json");
   if (text === undefined) throw refuse("no readable package.json in the work root (npm would walk up to another package)");
   let pkg: unknown;
   try { pkg = JSON.parse(text); } catch {
@@ -474,25 +550,31 @@ function requireScript(scripts: Record<string, unknown>, name: string): void {
   if (!Object.hasOwn(scripts, name) || typeof scripts[name] !== "string") throw refuse(`package.json has no script "${name}"`);
 }
 
-/** Keys of an npmrc text (ini: comments, sections and `key[]` arrays handled; values ignored). */
-export function npmrcKeys(text: string): string[] {
-  const keys: string[] = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line === "" || line.startsWith("#") || line.startsWith(";") || line.startsWith("[")) continue;
-    const eq = line.indexOf("=");
-    const key = (eq === -1 ? line : line.slice(0, eq)).trim().replace(/^["']|["']$/g, "").replace(/\[\]$/, "").toLowerCase();
-    if (key) keys.push(key);
+/**
+ * Refuse a work-root .npmrc that selects workspaces: npm would run another package's
+ * scripts (QA-P13-1-4). Keys are read with npm's own ini parser (QA-P13-2-2) and compared
+ * case-insensitively; a key using `${…}` substitution is refused outright (npm
+ * substitutes keys too, so `work${X?}space` is `workspace`).
+ */
+function checkNpmrc(root: string, platform: NodeJS.Platform, decode: IniDecode): void {
+  const text = readConfigFile(pathApi(platform).join(root, ".npmrc"), ".npmrc");
+  if (text === undefined) return;
+  let parsed: Record<string, unknown>;
+  try { parsed = decode(text); } catch { throw refuse("the work root's .npmrc cannot be parsed"); }
+  for (const key of Object.keys(parsed)) {
+    if (key.includes("${")) throw refuse(`the work root's .npmrc has a key with environment substitution: npm would rewrite it`);
+    if (NPMRC_WORKSPACE_KEYS.has(key.toLowerCase())) throw refuse(`the work root's .npmrc sets "${key}": npm would run another package's scripts`);
   }
-  return keys;
 }
 
-/** Refuse a work-root .npmrc that selects workspaces: npm would run another package's scripts (QA-P13-1-4). */
-function checkNpmrc(root: string, platform: NodeJS.Platform): void {
-  const text = readBoundedRegularFile(pathApi(platform).join(root, ".npmrc"), MAX_CONFIG_FILE_BYTES, ".npmrc");
-  if (text === undefined) return;
-  const key = npmrcKeys(text).find(found => NPMRC_WORKSPACE_KEYS.has(found));
-  if (key !== undefined) throw refuse(`the work root's .npmrc sets "${key}": npm would run another package's scripts`);
+/** node, npm-cli.js, the shell and the hardening flags of an npm plan, after the work-root config checks. */
+function npmLaunch(root: string, host: RunHost, guards: readonly string[]): { node: string; flags: string[]; cli: string; shell: string } {
+  const node = resolveNodeExecutable(host, guards);
+  const shell = resolveSystemShell(host, guards);
+  const cli = resolveNpmCli(node, host.platform, guards);
+  checkNpmrc(root, host.platform, loadNpmIni(cli, host.platform, guards));
+  const env = runEnvironment(host.env, host.platform, shell, { guards, passthrough: host.envPassthrough ?? [] });
+  return { node, cli, shell, flags: npmHardeningFlags(shell, npmConfigPins(node, cli, env, host.platform, guards)) };
 }
 
 function effectiveTimeout(ms: unknown): number {
@@ -585,13 +667,13 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
       argv = [...fixed, ...args];
     } else if (pinned === "npm") {
       refuseUncForShell(root, host.platform);
-      checkNpmrc(root, host.platform);
       checkNpmArgv(fixed, packageScripts(root, host.platform), name);
       // Caller options before `--` would be npm flags and could undo the hardening flags.
       if (!fixed.includes("--") && args.some(arg => arg.startsWith("-"))) throw refuse(`option-like arguments to the npm command "${name}" need a "--" in its argv`);
-      executable = resolveNodeExecutable(host, guarded());
-      shell = resolveSystemShell(host, guarded());
-      argv = [resolveNpmCli(executable, host.platform, guarded()), ...npmHardeningFlags(shell), ...fixed, ...args];
+      const launch = npmLaunch(root, host, guarded());
+      executable = launch.node;
+      shell = launch.shell;
+      argv = [launch.cli, ...launch.flags, ...fixed, ...args];
     } else {
       executable = resolveCommandExecutable(program!, host, guarded());
       argv = [...fixed, ...args];
@@ -599,11 +681,11 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
   } else if (scriptAllowed(config.scripts ?? [], name)) {
     if (args.length > 0) throw refuse(`package.json scripts take no caller arguments; declare a routing.run.commands entry with "args" for "${name}"`);
     refuseUncForShell(root, host.platform);
-    checkNpmrc(root, host.platform);
     requireScript(packageScripts(root, host.platform), name);
-    executable = resolveNodeExecutable(host, guarded());
-    shell = resolveSystemShell(host, guarded());
-    argv = [resolveNpmCli(executable, host.platform, guarded()), ...npmHardeningFlags(shell), "run", name];
+    const launch = npmLaunch(root, host, guarded());
+    executable = launch.node;
+    shell = launch.shell;
+    argv = [launch.cli, ...launch.flags, "run", name];
   } else {
     throw refuse(`"${name}" is not in routing.run.scripts or routing.run.commands`);
   }
@@ -688,7 +770,8 @@ export function routerRunTool(deps: RunToolDeps) {
     description: "Run one allowlisted package.json script or configured command in this dispatch's work root and report its exit code. "
       + "No shell is spawned by the tool; arguments are accepted only when the entry declares them, each 1-200 characters of [A-Za-z0-9_./:=@+-], never a path outside the work root. "
       + "cwd must be the dispatch's work root. Output (stdout and stderr) is bounded to 64 KiB; URL credentials in it are redacted (best effort, not a secret scanner) "
-      + "and credential-like environment variables are not passed to the run. The run is time-limited.",
+      + "and credential-like environment variables are not passed to the run; agents and credential stores (ssh-agent, git credential helpers, "
+      + "cloud CLI caches in the home directory) stay reachable to scripts. The run is time-limited.",
     args: {
       script: tool.schema.string().describe("Entry name: a script listed in routing.run.scripts (e.g. test, typecheck) or a routing.run.commands entry"),
       args: tool.schema.array(tool.schema.string()).optional().describe("Arguments, only for command entries that declare them"),
@@ -697,8 +780,11 @@ export function routerRunTool(deps: RunToolDeps) {
     async execute(input, context) {
       try {
         const platform = deps.platform ?? process.platform;
-        // Authority first (P-10, I9): nothing else is looked at for an unbound session.
-        const root = authorizeCwd(deps.resolveWorkRoot(context.sessionID), (input as { cwd?: unknown } | undefined)?.cwd, platform);
+        // Authority first (P-10, I9, QA-P13-2-8): nothing else is looked at for an unbound session.
+        const answer = checkWorkRootAnswer(deps.resolveWorkRoot(context.sessionID));
+        if (!answer.role) throw refuse("router_run is only available to role sessions (this session is not one)");
+        if (answer.root === null) throw refuse("this session has no bound work root (I9); router_run only runs in a dispatch's work root");
+        const root = authorizeCwd(answer.root, (input as { cwd?: unknown } | undefined)?.cwd, platform);
         const parsed = inputSchema.parse(input);
         const plan = planRun(parsed, root, deps.config(), {
           platform, env: deps.env ?? process.env, envPassthrough: deps.envPassthrough ?? [],

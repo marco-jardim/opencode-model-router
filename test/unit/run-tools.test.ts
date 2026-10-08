@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { nearestCheckout, spawnBounded, workRootGuards } from "../../src/router/git-tools";
+import { homedir, tmpdir } from "node:os";
+import { join, parse } from "node:path";
+import { gitEnvironment, gitExecutable, mainWorktree, nearestCheckout, spawnBounded, workRootGuards } from "../../src/router/git-tools";
 import type { RunConfig } from "../../src/router/roles";
 import {
-  argAllowed, authorizeCwd, capRendered, dropLeadingPartial, escapesWorkRoot, isCredentialEnv, isFullPath, npmHardeningFlags, npmrcKeys, optionLead,
+  argAllowed, authorizeCwd, capRendered, dropLeadingPartial, escapesWorkRoot, isCredentialEnv, isFullPath, loadNpmIni, npmConfigPins, npmEnvReplace,
+  npmHardeningFlags, optionLead, type WorkRootAnswer,
   planRun, readBoundedRegularFile, renderRunOutput, resolveCommandExecutable, resolveNodeExecutable, resolveNpmCli, resolveSystemShell, routerRunTool,
   runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, RUN_RENDERED_MAX_BYTES, RUN_TAIL_BYTES, scriptAllowed, validateRunArgs,
   type RunRecord, type RunToolDeps,
@@ -56,22 +57,35 @@ function project(dir: string, scripts: Record<string, string> = { test: "node pr
   ].join("\n"));
 }
 type Execute = (args: unknown, context: unknown) => Promise<string>;
+function git(dir: string, ...args: string[]): string {
+  return execFileSync(gitExecutable(), ["-c", "gc.auto=0", "-c", "maintenance.auto=false", ...args], { cwd: dir, env: gitEnvironment(), encoding: "utf8" });
+}
+/** A role session bound to `dir` (the shared WorkRootAnswer, QA-P13-2-8). */
+const bind = (dir: string | null): WorkRootAnswer => ({ role: true, root: dir });
 function context(sessionID = "child", directory = root) {
   return { sessionID, messageID: "m", agent: "runner", directory, worktree: directory, abort: new AbortController().signal,
     metadata: () => undefined, ask: async () => undefined };
 }
 function makeTool(over: Partial<RunToolDeps> = {}, records: RunRecord[] = []) {
-  const t = routerRunTool({ config: () => config(), resolveWorkRoot: () => root, recordRun: e => { records.push(e); }, env: testEnv(), ...over });
+  const t = routerRunTool({ config: () => config(), resolveWorkRoot: () => bind(root), recordRun: e => { records.push(e); }, env: testEnv(), ...over });
   return (args: unknown, ctx = context()) => (t.execute as unknown as Execute)(args, ctx);
 }
 
 describe("router_run authority (P-10, I9)", () => {
-  it("refuses an unbound session and spawns nothing", async () => {
+  it("refuses an unbound or non-role session, fails closed on a malformed answer, and spawns nothing (QA-P13-2-8)", async () => {
     project(root);
-    for (const bound of [null, undefined, "", 42]) {
-      const run = makeTool({ resolveWorkRoot: () => bound as string | null });
-      expect(await run({ script: "test", cwd: root })).toMatch(/^\[router_run\] error: refused: this session has no bound work root \(I9\)/);
+    expect(await makeTool({ resolveWorkRoot: () => bind(null) })({ script: "test", cwd: root }))
+      .toMatch(/^\[router_run\] error: refused: this session has no bound work root \(I9\)/);
+    expect(await makeTool({ resolveWorkRoot: () => ({ role: false }) })({ script: "test", cwd: root }))
+      .toBe("[router_run] error: refused: router_run is only available to role sessions (this session is not one)");
+    for (const answer of [null, undefined, root, "", 42, {}, { role: true }, { role: "yes", root }]) {
+      expect(await makeTool({ resolveWorkRoot: () => answer as unknown as WorkRootAnswer })({ script: "test", cwd: root }))
+        .toBe("[router_run] error: Invalid work-root answer: expected { role: false } or { role: true, root }");
     }
+    for (const relative of ["", "relative/dir", ...(WIN ? ["\\tmp", "C:tmp"] : [])]) {
+      expect(await makeTool({ resolveWorkRoot: () => bind(relative) })({ script: "test", cwd: root })).toBe("[router_run] error: Bound work root is not an absolute path");
+    }
+    expect(await makeTool({ resolveWorkRoot: () => { throw new Error("lookup https://u:pw9@h/x failed"); } })({ script: "test", cwd: root })).not.toContain("pw9");
     expect(childProcess.spawn).not.toHaveBeenCalled();
     expect(existsSync(join(root, "ran.json"))).toBe(false);
   });
@@ -90,7 +104,7 @@ describe("router_run authority (P-10, I9)", () => {
   }, SPAWN_TIMEOUT);
   it("runs in a sibling-directory work root although the session directory is elsewhere", async () => {
     project(root); project(sibling);
-    const run = makeTool({ resolveWorkRoot: () => sibling });
+    const run = makeTool({ resolveWorkRoot: () => bind(sibling) });
     const out = await run({ script: "test", cwd: sibling }, context("child", root));
     expect(out).toMatch(/exit code: 0/);
     expect(existsSync(join(sibling, "ran.json"))).toBe(true);
@@ -177,10 +191,12 @@ describe("router_run execution", () => {
     const [executable, argv, options] = calls[0]! as unknown as [string, string[], childProcess.SpawnOptions];
     expect(executable).toMatch(WIN ? /\\node\.exe$/i : /\/node$/);
     expect(argv[0]).toMatch(/[\\/]node_modules[\\/]npm[\\/]bin[\\/]npm-cli\.js$/);
-    expect(argv.slice(1, 6)).toEqual(npmHardeningFlags(argv[1]!.slice("--script-shell=".length)));
+    const pins = { userconfig: argv[6]!.slice("--userconfig=".length), globalconfig: argv[7]!.slice("--globalconfig=".length) };
+    expect(argv.slice(1, 8)).toEqual(npmHardeningFlags(argv[1]!.slice("--script-shell=".length), pins));
     expect(argv[1]).toMatch(WIN ? /^--script-shell=[A-Za-z]:\\.*\\cmd\.exe$/i : /^--script-shell=\//);
     expect(argv).toContain("--logs-max=0");
-    expect(argv.slice(6)).toEqual(["run", "test"]);
+    expect(pins.userconfig.toLowerCase()).toBe(join(home, ".npmrc").toLowerCase());
+    expect(argv.slice(8)).toEqual(["run", "test"]);
     expect(options.shell).toBe(false);
     expect(String(options.cwd)).toBe(root);
     expect(options.env?.CI).toBe("1");
@@ -368,8 +384,10 @@ describe("router_run hijack resistance (#77 G4)", () => {
     expect(planRun({ script: "test", cwd: root }, root, config({ timeoutMs: 2 ** 40 }), { platform: process.platform, env: testEnv() }).timeoutMs).toBe(2 ** 31 - 1);
     const npmCommand = planRun({ script: "unit", args: ["test/a.ts"], cwd: root }, root,
       config({ commands: { unit: { argv: ["npm", "run", "test", "--"], args: ["test/*"] } } }), { platform: process.platform, env: testEnv() });
-    expect(npmCommand.argv.slice(1, 6)).toEqual(npmHardeningFlags(npmCommand.argv[1]!.slice("--script-shell=".length)));
-    expect(npmCommand.argv.slice(6)).toEqual(["run", "test", "--", "test/a.ts"]);
+    expect(npmCommand.argv.slice(1, 6)).toEqual(plan.argv.slice(1, 6));
+    expect(npmCommand.argv[6]).toMatch(/^--userconfig=/);
+    expect(npmCommand.argv[7]).toMatch(/^--globalconfig=/);
+    expect(npmCommand.argv.slice(8)).toEqual(["run", "test", "--", "test/a.ts"]);
   });
 });
 
@@ -453,7 +471,7 @@ describe("router_run work roots", () => {
     mkdirSync(spaced);
     project(spaced);
     const records: RunRecord[] = [];
-    const out = await makeTool({ resolveWorkRoot: () => spaced }, records)({ script: "test", cwd: spaced });
+    const out = await makeTool({ resolveWorkRoot: () => bind(spaced) }, records)({ script: "test", cwd: spaced });
     expect(out).toMatch(/exit code: 0/);
     expect(JSON.parse(readFileSync(join(spaced, "ran.json"), "utf8")).cwd.toLowerCase()).toBe(realpathSync.native(spaced).toLowerCase());
     expect(records.map(r => r.exitCode)).toEqual([0]);
@@ -485,7 +503,7 @@ describe("router_run work roots", () => {
     if (short === "" || short.toLowerCase() === long.toLowerCase() || !short.includes("~")) ctx.skip("8.3 names are disabled on this volume");
     expect(authorizeCwd(long, short)).toBe(realpathSync.native(long));
     expect(authorizeCwd(short, long)).toBe(realpathSync.native(long));
-    expect(await makeTool({ resolveWorkRoot: () => long })({ script: "test", cwd: short })).toMatch(/exit code: 0/);
+    expect(await makeTool({ resolveWorkRoot: () => bind(long) })({ script: "test", cwd: short })).toMatch(/exit code: 0/);
   }, SPAWN_TIMEOUT);
 
   it("refuses a bound root that is missing, a file or relative, and a case-variant cwd only on win32", () => {
@@ -823,9 +841,18 @@ describe("QA-P13-1-1 argument confinement", () => {
       "@/etc/passwd", "--config=C:/x", "-/x", "+/x", "a:..", "x=..\\y"]) {
       expect(escapesWorkRoot(arg), arg).toBe(true);
     }
-    for (const arg of ["test/a.ts", "test/...", "--reporter=dot", "a.b..c", "--grep=xy:z", "test:unit", "@scope/pkg"]) {
+    for (const arg of ["test/a.ts", "test/...", "--reporter=dot", "a.b..c", "--grep=xy:z", "test:unit", "@scope/pkg", "-ofile", "-Isrc", "--x=a+b", "-v"]) {
       expect(escapesWorkRoot(arg), arg).toBe(false);
     }
+  });
+  it("refuses values glued to short options, after a later = : @ +, and URLs (QA-P13-2-1)", () => {
+    const forms = [
+      "-o/abs", "-I../x", "-r../../x.js", "-oC:/x", "-o\\abs", "-I..",                    // glued to a two-character short option
+      "--define=K=/abs", "--define=K=..", "--a=b=C:x",                                    // a later =
+      "--alias=x:/abs", "--alias=x:..", "pkg@/abs", "pkg@..", "x+/abs", "x+..", "a:C:x", // after : @ +
+      "file:///D:/x/evil.mjs", "--test-reporter=file:///tmp/r.mjs", "http://h/x", "x//y", "--x=//host/share", // URLs, UNC, //
+    ];
+    for (const arg of forms) expect(escapesWorkRoot(arg), arg).toBe(true);
   });
   it("treats -, @ and + as option leads that need a pattern with the same lead", () => {
     expect(optionLead("--x")).toBe("-"); expect(optionLead("@file")).toBe("@"); expect(optionLead("+opt")).toBe("+"); expect(optionLead("a")).toBeUndefined();
@@ -843,8 +870,9 @@ describe("QA-P13-1-1 argument confinement", () => {
       runner: { argv: ["node", "--test"], args: ["test/*", "-*"] },
       separated: { argv: ["node", "--", "probe.js"], args: ["-*"] },
     } }) });
-    for (const arg of ["test/../../x/scripts/x.js", "C:/x", "/abs", "--out=../x", "@/etc/passwd"]) {
-      expect(await run({ script: "files", args: [arg], cwd: root })).toMatch(/refused: argument 1 names a path outside the work root/);
+    for (const arg of ["test/../../x/scripts/x.js", "C:/x", "/abs", "--out=../x", "@/etc/passwd", "-o/abs", "-r../../x.js", "--define=K=/abs",
+      "--alias=x:/abs", "pkg@/abs", "--test-reporter=file:///tmp/evil.mjs"]) {
+      expect(await run({ script: "files", args: [arg], cwd: root }), arg).toMatch(/refused: argument 1 names a path outside the work root/);
     }
     expect(await run({ script: "runner", args: ["--require=evil.js"], cwd: root })).toMatch(/refused: option-like arguments to the node command "runner" need a fixed script first/);
     expect(await run({ script: "separated", args: ["--x"], cwd: root })).toMatch(/need a fixed script first/);
@@ -934,33 +962,98 @@ describe("QA-P13-1-4 npm stays in the work root", () => {
     // Depending on the npm version the .npmrc switches to the workspace's script or makes npm fail;
     // either way the hardening flags alone do not keep `npm run test` on the root's script.
     let failed = false;
-    try { execFileSync(node, [cli, ...npmHardeningFlags(shell), "run", "test"], { cwd: root, env: planned.env, stdio: "ignore", windowsHide: true }); } catch { failed = true; }
+    const pins = npmConfigPins(node, cli, planned.env, process.platform, [root]);
+    try { execFileSync(node, [cli, ...npmHardeningFlags(shell, pins), "run", "test"], { cwd: root, env: planned.env, stdio: "ignore", windowsHide: true }); } catch { failed = true; }
     expect(failed || existsSync(join(pkg, "ws-marker.txt"))).toBe(true);
     expect(existsSync(join(root, "ran.json"))).toBe(false);
     rmSync(join(pkg, "ws-marker.txt"), { force: true });
     const run = makeTool({ config: () => config({ commands: { t: { argv: ["npm", "test"] } } }) });
-    for (const text of ["workspace=packages/a\n", "workspaces=true\n", "include-workspace-root = true\n", "workspace[]=packages/a\n", "; c\n[x]\nWorkspace=packages/a\n"]) {
+    for (const text of ["workspace=packages/a\n", "workspaces=true\n", "include-workspace-root = true\n", "workspace[]=packages/a\n", "; c\nWorkspace=packages/a\n"]) {
       writeFileSync(join(root, ".npmrc"), text);
-      expect(await run({ script: "test", cwd: root })).toMatch(/refused: the work root's \.npmrc sets "(workspace|workspaces|include-workspace-root)"/);
+      expect(await run({ script: "test", cwd: root })).toMatch(/refused: the work root's \.npmrc sets "(workspace|workspaces|include-workspace-root|Workspace)"/);
       expect(await run({ script: "t", cwd: root })).toMatch(/refused: the work root's \.npmrc sets/);
     }
     expect(existsSync(join(pkg, "ws-marker.txt"))).toBe(false);
     writeFileSync(join(root, ".npmrc"), "# workspace=packages/a\nfund=false\n");
     expect(await run({ script: "test", cwd: root })).toMatch(/exit code: 0/);
-    expect(npmrcKeys("a=1\n#b=2\n;c\n[s]\n d = 4 \n\"e\"=5\nf[]=6\ng\n")).toEqual(["a", "d", "e", "f", "g"]);
+  }, SPAWN_TIMEOUT);
+  it("reads .npmrc keys with npm's own ini parser: every spelling npm resolves to workspace is refused (QA-P13-2-2)", async () => {
+    workspaces();
+    const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
+    const clean = Object.fromEntries(Object.entries(planned.env).filter(([key]) => !/^npm_/i.test(key)));
+    // `npm config` refuses to run (ENOWORKSPACES) exactly when a workspace is configured.
+    const npmSeesWorkspace = () => {
+      const result = spawnSync(planned.executable, [planned.argv[0]!, "config", "get", "fund"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true });
+      return result.status !== 0 && /ENOWORKSPACES/.test(result.stderr);
+    };
+    const run = makeTool();
+    writeFileSync(join(root, ".npmrc"), "fund=false\n");
+    expect(npmSeesWorkspace()).toBe(false);
+    const spellings = ["fund=false\rworkspace=packages/a\n", "workspace;comment=packages/a\n", "\"work\\u0073pace\"=packages/a\n",
+      "work${ROUTER_RUN_UNSET_VAR?}space=packages/a\n", "workspace#x=packages/a\n"];
+    for (const text of spellings) {
+      writeFileSync(join(root, ".npmrc"), text);
+      // Control: npm itself reads this spelling as the workspace setting.
+      expect(npmSeesWorkspace(), JSON.stringify(text)).toBe(true);
+      expect(await run({ script: "test", cwd: root }), JSON.stringify(text)).toMatch(/^\[router_run\] error: refused: the work root's \.npmrc (sets "workspace"|has a key with environment substitution)/);
+    }
+    const decode = loadNpmIni(planned.argv[0]!, process.platform, [root]);
+    expect(Object.keys(decode("a=1\n#b=2\n;c\n d = 4 \n\"e\"=5\nf[]=6\ng\rh=1\n"))).toEqual(["a", "d", "e", "f", "g", "h"]);
+    expect(loadNpmIni(planned.argv[0]!, process.platform, [root])).toBe(decode);
+    expect(() => loadNpmIni(join(sibling, "no-npm", "bin", "npm-cli.js"), process.platform, [root])).toThrow(/ini parser is missing/);
+  }, SPAWN_TIMEOUT);
+  it("pins userconfig and globalconfig: a project .npmrc cannot move the user config, nor a user config the global one (QA-P13-2-2)", async () => {
+    project(root);
+    const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
+    const flags = planned.argv.slice(1, 8);
+    const clean = Object.fromEntries(Object.entries(planned.env).filter(([key]) => !/^npm_/i.test(key)));
+    const get = (extra: string[], key: string) => execFileSync(planned.executable, [planned.argv[0]!, ...extra, "config", "get", key],
+      { cwd: root, env: clean, encoding: "utf8", windowsHide: true }).trim();
+    // The defaults npm computes itself equal the pins.
+    expect(get([], "userconfig").toLowerCase()).toBe(flags[5]!.slice("--userconfig=".length).toLowerCase());
+    expect(get([], "globalconfig").toLowerCase()).toBe(flags[6]!.slice("--globalconfig=".length).toLowerCase());
+    // A project .npmrc moving userconfig to a repository file.
+    writeFileSync(join(root, "u.npmrc"), "init-version=9.9.9\n");
+    writeFileSync(join(root, ".npmrc"), "userconfig=./u.npmrc\n");
+    expect(get([], "userconfig")).toMatch(/u\.npmrc$/);
+    expect(get([], "init-version")).toBe("9.9.9");
+    expect(get(flags, "userconfig")).not.toMatch(/u\.npmrc$/);
+    expect(get(flags, "init-version")).not.toBe("9.9.9");
+    // The chain project .npmrc → userconfig (a repository file) → globalconfig is closed by the userconfig pin:
+    writeFileSync(join(root, "u.npmrc"), `globalconfig=${join(root, "g.npmrc").replaceAll("\\", "/")}\n`);
+    expect(get([], "globalconfig")).toMatch(/g\.npmrc$/);
+    expect(get(flags, "globalconfig")).not.toMatch(/g\.npmrc$/);
+    // Documented residual: the user's OWN ~/.npmrc can still move globalconfig; npm ranks it above --globalconfig
+    // (`config ls -l`: "overridden by user"). That file is user-owned, outside every work root.
+    writeFileSync(join(home, ".npmrc"), `globalconfig=${join(sibling, "user-chosen.npmrc").replaceAll("\\", "/")}\n`);
+    rmSync(join(root, ".npmrc"));
+    expect(get(flags, "globalconfig")).toMatch(/user-chosen\.npmrc$/);
+    rmSync(join(home, ".npmrc"));
+    // The redirected user file selects a workspace: plain npm fails, the pinned run stays on the root script.
+    writeFileSync(join(root, "u.npmrc"), "workspace=packages/a\n");
+    writeFileSync(join(root, ".npmrc"), "userconfig=./u.npmrc\n");
+    const control = spawnSync(planned.executable, [planned.argv[0]!, "run", "test"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true });
+    expect(control.status).not.toBe(0);
+    expect(existsSync(join(root, "ran.json"))).toBe(false);
+    expect(await makeTool()({ script: "test", cwd: root })).toMatch(/exit code: 0/);
+    expect(existsSync(join(root, "ran.json"))).toBe(true);
+    // npm's ${VAR} substitution, as the npm child sees it.
+    expect(npmEnvReplace("${A}/x/${B?}/${C}", { A: "a" }, "linux")).toBe("a/x//${C}");
+    expect(npmEnvReplace("\\${A}", { A: "a" }, "linux")).toBe("${A}");
+    expect(npmEnvReplace("${appdata}", { APPDATA: "r" }, "win32")).toBe("r");
   }, SPAWN_TIMEOUT);
   it("refuses an npm command entry without a package.json in the work root itself", async () => {
     const nested = join(sibling, "nested");
     mkdirSync(nested);
     project(sibling); // a package.json one level up: npm would walk up to it
-    const run = makeTool({ resolveWorkRoot: () => nested, config: () => config({ commands: { t: { argv: ["npm", "test"] } } }) });
+    const run = makeTool({ resolveWorkRoot: () => bind(nested), config: () => config({ commands: { t: { argv: ["npm", "test"] } } }) });
     expect(await run({ script: "t", cwd: nested })).toMatch(/refused: no readable package\.json in the work root \(npm would walk up/);
     expect(await run({ script: "test", cwd: nested })).toMatch(/refused: no readable package\.json in the work root/);
     expect(existsSync(join(sibling, "ran.json"))).toBe(false);
   }, SPAWN_TIMEOUT);
   it("writes no npm log file (--logs-max=0)", async () => {
     project(root);
-    expect(npmHardeningFlags("/bin/sh")).toContain("--logs-max=0");
+    expect(npmHardeningFlags("/bin/sh", { userconfig: "/h/.npmrc", globalconfig: "/p/etc/npmrc" })).toContain("--logs-max=0");
     expect(await makeTool()({ script: "test", cwd: root })).toMatch(/exit code: 0/);
     const logs = join(home, WIN ? "Local" : ".npm", ...(WIN ? ["npm-cache", "_logs"] : ["_logs"]));
     expect(existsSync(logs) ? readdirSyncSafe(logs) : []).toEqual([]);
@@ -1019,9 +1112,124 @@ describe("QA-P13-1-5 node and npm are always pinned", () => {
   it.skipIf(!WIN)("cmd.exe does not run a program from the work root's current directory (NoDefaultCurrentDirectoryInExePath)", async () => {
     project(root, { test: "evilcmd" });
     writeFileSync(join(root, "evilcmd.cmd"), "@echo off\r\necho evil> \"%~dp0cwd-marker.txt\"\r\n");
+    // Positive control (QA-P13-2-5): the same cmd.exe and environment without the variable does run it.
+    const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
+    const shell = planned.argv[1]!.slice("--script-shell=".length);
+    const withoutVar = Object.fromEntries(Object.entries(planned.env).filter(([key]) => !/^NoDefaultCurrentDirectoryInExePath$/i.test(key)));
+    execFileSync(shell, ["/d", "/s", "/c", "evilcmd"], { cwd: root, env: withoutVar, stdio: "ignore", windowsHide: true });
+    expect(existsSync(join(root, "cwd-marker.txt"))).toBe(true);
+    rmSync(join(root, "cwd-marker.txt"));
     const out = await makeTool()({ script: "test", cwd: root });
     expect(out).not.toMatch(/exit code: 0;/);
     expect(existsSync(join(root, "cwd-marker.txt"))).toBe(false);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("QA-P13-2-3 guard set", () => {
+  const fold = (path: string) => (WIN ? path.toLowerCase() : path);
+  function repo(dir: string) {
+    mkdirSync(dir, { recursive: true });
+    for (const args of [["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]]) git(dir, ...args);
+    writeFileSync(join(dir, "f.txt"), "x\n");
+    git(dir, "add", "-A"); git(dir, "commit", "-qm", "init");
+  }
+  it("guards the checkout of the plugin's working directory, never the working directory itself (a)", () => {
+    const checkout = join(sibling, "plugin-repo");
+    repo(checkout);
+    mkdirSync(join(checkout, "sub"));
+    vi.spyOn(process, "cwd").mockReturnValue(join(checkout, "sub"));
+    const guards = workRootGuards(root).map(fold);
+    expect(guards).toContain(fold(checkout));
+    expect(guards).not.toContain(fold(join(checkout, "sub")));
+    vi.spyOn(process, "cwd").mockReturnValue(sibling);
+    expect(workRootGuards(root).map(fold)).toEqual([fold(root)]);
+  }, SPAWN_TIMEOUT);
+  it("always guards the work root itself, even the home directory or a filesystem root (c)", () => {
+    vi.spyOn(process, "cwd").mockReturnValue(sibling);
+    expect(workRootGuards(homedir()).map(fold)).toContain(fold(homedir()));
+    const fsRoot = parse(root).root;
+    expect(workRootGuards(fsRoot)[0]).toBe(fsRoot);
+  });
+  it("guards a bare repository behind a linked worktree (b)", () => {
+    const source = join(sibling, "source");
+    repo(source);
+    const bare = join(sibling, "bare-repo");
+    git(sibling, "clone", "-q", "--bare", source, bare);
+    const linked = join(sibling, "linked");
+    git(bare, "worktree", "add", "-q", "--detach", linked);
+    expect(fold(mainWorktree(realpathSync.native(linked)) ?? "")).toBe(fold(realpathSync.native(bare)));
+    vi.spyOn(process, "cwd").mockReturnValue(home);
+    expect(workRootGuards(realpathSync.native(linked)).map(fold)).toContain(fold(realpathSync.native(bare)));
+  }, SPAWN_TIMEOUT);
+  it.skipIf(WIN)("deduplicates case-sensitively on POSIX (d)", () => {
+    const upper = join(sibling, "Repo");
+    const lower = join(sibling, "repo");
+    repo(upper); repo(lower);
+    vi.spyOn(process, "cwd").mockReturnValue(lower);
+    expect(workRootGuards(upper)).toEqual([upper, lower]);
+  }, SPAWN_TIMEOUT);
+  it("strips a PATH entry whose real path is inside a guard, and refuses '..' in operator executable paths (e, QA-P13-2-7)", () => {
+    const inside = join(root, "bin");
+    mkdirSync(inside);
+    const link = join(home, "link-into-root");
+    symlinkSync(inside, link, WIN ? "junction" : "dir");
+    const outsideDir = join(sibling, "bin");
+    mkdirSync(outsideDir);
+    const env = runEnvironment({ PATH: [link, outsideDir].join(SEP) }, process.platform, undefined, { guards: [root] });
+    expect(env.PATH).toBe(outsideDir);
+    const tool = join(sibling, WIN ? "tool.exe" : "tool");
+    writeFileSync(tool, "");
+    const s = WIN ? "\\" : "/";
+    const dotted = `${sibling}${s}bin${s}..${s}${WIN ? "tool.exe" : "tool"}`; // names the same file; refused, not normalised
+    expect(() => resolveCommandExecutable(dotted, hostOf({}), [root])).toThrow(/must not contain a "\.\." segment/);
+    expect(() => resolveNodeExecutable(hostOf({}, { nodeExecPath: dotted }), [root])).toThrow(/must not contain a "\.\." segment/);
+    expect(resolveCommandExecutable(tool, hostOf({}), [root])).toBe(tool);
+  });
+});
+
+describe("QA-P13-2-4 bounded pointer files", () => {
+  it("ignores an oversized .git pointer or commondir instead of reading it whole", () => {
+    const checkout = join(sibling, "wt");
+    mkdirSync(checkout);
+    writeFileSync(join(checkout, ".git"), `gitdir: ${"x".repeat(5000)}\n`);
+    expect(mainWorktree(checkout)).toBeUndefined();
+    const gitdir = join(sibling, "gitdir");
+    mkdirSync(gitdir);
+    writeFileSync(join(checkout, ".git"), `gitdir: ${gitdir}\n`);
+    writeFileSync(join(gitdir, "commondir"), "y".repeat(5000));
+    expect(mainWorktree(checkout)).toBeUndefined();
+    writeFileSync(join(gitdir, "commondir"), "../main/.git\n");
+    expect(fold2(mainWorktree(checkout))).toBe(fold2(join(sibling, "main")));
+  });
+  it.skipIf(WIN)("does not block on a FIFO .git pointer", () => {
+    const checkout = join(sibling, "fifo");
+    mkdirSync(checkout);
+    execFileSync("mkfifo", [join(checkout, ".git")]);
+    const started = performance.now();
+    expect(mainWorktree(checkout)).toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+});
+const fold2 = (path: string | undefined) => (WIN ? (path ?? "").toLowerCase() : path ?? "");
+
+describe("QA-P13-2-5 router_run in a real sibling worktree", () => {
+  it("runs in a `git worktree add` sibling bound as the work root, proven by a marker file", async () => {
+    project(root);
+    for (const args of [["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]]) git(root, ...args);
+    git(root, "add", "-A"); git(root, "commit", "-qm", "init");
+    const worktree = join(sibling, "phase-worktree");
+    git(root, "worktree", "add", "-q", "--detach", worktree);
+    const records: RunRecord[] = [];
+    const run = makeTool({ resolveWorkRoot: () => bind(worktree) }, records);
+    const out = await run({ script: "test", cwd: worktree }, context("child", root));
+    expect(out).toMatch(/exit code: 0/);
+    expect(existsSync(join(worktree, "ran.json"))).toBe(true);
+    expect(existsSync(join(root, "ran.json"))).toBe(false);
+    expect(fold2(JSON.parse(readFileSync(join(worktree, "ran.json"), "utf8")).cwd)).toBe(fold2(realpathSync.native(worktree)));
+    expect(await run({ script: "test", cwd: root }, context("child", root))).toMatch(/refused: cwd is not this dispatch's work root/);
+    const guards = workRootGuards(realpathSync.native(worktree)).map(fold2);
+    expect(guards).toContain(fold2(root)); // the sibling's main worktree
+    expect(records.map(r => r.exitCode)).toEqual([0]);
   }, SPAWN_TIMEOUT);
 });
 
@@ -1050,7 +1258,7 @@ describe("QA-P13-1-7 UNC work roots", () => {
     let canonical: string;
     try { canonical = realpathSync.native(unc); } catch { ctx.skip("the admin share cannot be canonicalised"); return; }
     if (!canonical.startsWith("\\\\")) ctx.skip("the admin share canonicalises to a drive path");
-    expect(await makeTool({ resolveWorkRoot: () => unc })({ script: "test", cwd: unc })).toMatch(/refused: the work root is a UNC path/);
+    expect(await makeTool({ resolveWorkRoot: () => bind(unc) })({ script: "test", cwd: unc })).toMatch(/refused: the work root is a UNC path/);
   }, SPAWN_TIMEOUT);
 });
 
@@ -1093,7 +1301,7 @@ describe("QA-P13-1-9 credential environment", () => {
     const out = await makeTool({ env: testEnv({ ROUTER_RUN_FAKE_TOKEN: "s3cr3t", KEEP_PASSWORD: "kept" }), envPassthrough: ["KEEP_PASSWORD"],
       config: () => config({ commands: { e: { argv: ["node", "env.js"] } } }) })({ script: "e", cwd: root });
     expect(out).toContain("TOKEN=absent PASS=kept");
-    const description = (routerRunTool({ config: () => config(), resolveWorkRoot: () => root }) as unknown as { description: string }).description;
+    const description = (routerRunTool({ config: () => config(), resolveWorkRoot: () => bind(root) }) as unknown as { description: string }).description;
     expect(description).toMatch(/best effort, not a secret scanner/);
     expect(description).toMatch(/credential-like environment variables are not passed/);
   }, SPAWN_TIMEOUT);
