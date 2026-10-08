@@ -107,7 +107,7 @@ No test of another phase was modified. P2.1's own assertions in `roles.dispatch-
 | QA-P21-1-12 | nit | Observer ignored `data.message`; retried steps | `937f89e` |
 | QA-P21-1-13 | nit | `dispatchOf` `callID: ""` undocumented | `391813d` |
 | Q1 | question | Widen only an exact binding on resume | `937f89e` |
-| Q2 | question | P2.2 handoffs: budget note prefix; role hint never names a tier agent or model | `02c03ba`, `937f89e` |
+| Q2 | question | Plan T2.1.5 names `test/integration/roles-dispatch.test.ts` while the tests lived in `test/unit/roles.*` → resolved by adding the integration file (round-2 review: "Q2 is resolved by the new test/integration/roles-dispatch.test.ts") | `eb9a986` |
 | QA-P21-2-1 | major | Resume bounds lost the bound grant | `ff1a29d` |
 | QA-P21-2-2 | major | "The router raises the tier" not implemented | `ff1a29d`, `1b59425` |
 | QA-P21-2-3 | minor | No read-only cap from the role dispatch's own `CAP` | `1b59425` |
