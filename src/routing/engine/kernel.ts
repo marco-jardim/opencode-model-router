@@ -52,11 +52,14 @@ import type {
 import { makeKey, normalizeVariant, splitModelRef } from "../outcomes/types";
 import type {
   Candidate,
+  ChosenDispatch,
   Decision,
   DecisionInput,
   DecisionReasonCode,
   IneligibleReason,
   Ladder,
+  RoleDecision,
+  RoleDecisionInput,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -594,4 +597,121 @@ function freezeDecision(d: Decision): Decision {
   Object.freeze(d.costs);
   Object.freeze(d.ineligible);
   return Object.freeze(d);
+}
+
+// ---------------------------------------------------------------------------
+// Role dispatches (role-tier-assurance plan §2.1, §2.3, P1.2 T1.2.3/T1.2.4)
+// ---------------------------------------------------------------------------
+
+/** Upper bound of `routing.exploration.rate` (plan PLAN-14: off by default, at most one dispatch in five). */
+export const MAX_EXPLORATION_RATE = 0.2;
+
+/** The exploration rate actually used: finite values clamped to `[0, MAX_EXPLORATION_RATE]`, anything else 0 (off). */
+export function explorationRate(rate: unknown): number {
+  return isFiniteNumber(rate) && rate > 0 ? Math.min(rate, MAX_EXPLORATION_RATE) : 0;
+}
+
+/**
+ * Deterministic draws in [0, 1) seeded by a string (FNV-1a 32-bit → mulberry32). Pure: the same seed yields the same
+ * sequence, so a decision row can be replayed from its `decisionID`.
+ */
+function seededDraws(seed: string): () => number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  let s = h >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** `a` sits strictly above `b` on the escalate ladder: a higher rank, or `b`'s own model on a higher-effort variant at its rank. */
+function rungAbove(a: Candidate, b: Candidate): boolean {
+  return a.rank > b.rank || (a.rank === b.rank && lowerEffortOnSameModel(b, a));
+}
+
+/**
+ * Decide one ROLE dispatch (T1.2.3, T1.2.4) on a `ladders.buildRoleLadder` graph. Tier-mode {@link decide} is untouched;
+ * this runs it with the role's pick and adds the role rules:
+ *
+ * 1. base = the pinned tier's rung when the window has a pin, else the static default (class tier clamped into
+ *    `[floor, ceiling]`); on a resume, raised to the running rung when that rung is a candidate above it
+ *    (`resume:running`; never below the running rung — the window floor already holds its tier).
+ * 2. `decide` with `chosen` = base, `pin` = pinned, `floorRank` = the window floor: A27 (evidence gate) and A34
+ *    (never-down against the capability rank) apply exactly as in tier mode; every candidate is inside the window.
+ * 3. `enforce` applies the kernel's switch, except on a resume (A30: `kept:resume`, the decision is only logged).
+ * 4. Exploration (T1.2.4, `enforce` only): with rate `r = explorationRate(exploration.rate)` > 0, never when pinned,
+ *    resumed, `facts.risk == high` or `detection != deterministic`; targets = the candidates at or above the floor and
+ *    strictly below the static default. Draw `u, v` from the `decisionID` seed: `u < r` → dispatch target
+ *    `⌊v·|targets|⌋` (reason `explore`, `switched` false). This is the one documented exception to D9 "never down".
+ *    `propensity` = P(dispatch) under this ε-greedy mixture: `(1 − r)·[dispatch = exploit] + r/|targets|·[dispatch ∈ targets]`,
+ *    1 when no draw was possible.
+ *
+ * I2: `dispatch` is always a candidate, so always inside `[floor, ceiling]`. An empty ladder → `dispatch` null.
+ */
+export function decideRole(input: RoleDecisionInput): RoleDecision {
+  const { ladder } = input;
+  const cands = ladder.candidates;
+  const reasons: string[] = [...ladder.reasons];
+  const pinned = ladder.pinnedIndex !== null;
+  let base = ladder.pinnedIndex ?? ladder.staticDefault;
+
+  const resume = input.resume ?? null;
+  if (resume !== null && base !== null) {
+    const running = canonicalRung(resume);
+    const at = cands.findIndex((c) => {
+      const own = canonicalRung(c);
+      return own.model === running.model && own.variant === running.variant;
+    });
+    if (at < 0) reasons.push("resume:off-ladder");
+    else if (rungAbove(cands[at]!, cands[base]!)) {
+      base = at;
+      reasons.push("resume:running");
+    }
+  }
+
+  const chosen: ChosenDispatch = base === null
+    ? { agent: { origin: "role", id: ladder.role }, model: "", variant: null }
+    : { agent: cands[base]!.agent, model: cands[base]!.model, variant: cands[base]!.variant };
+  const decision = decide({
+    facts: input.facts,
+    chosen,
+    ladder,
+    detection: input.detection,
+    pin: pinned,
+    routing: input.routing,
+    store: input.store,
+    floorRank: ladder.floorRank,
+    orchestrator: input.orchestrator ?? null,
+    ...(input.remainingTurns !== undefined ? { remainingTurns: input.remainingTurns } : {}),
+  });
+  if (base === null) {
+    return Object.freeze({ decision, base: null, dispatch: null, switched: false, explore: false, propensity: 1, reasons: Object.freeze(reasons) });
+  }
+
+  const enforce = input.engine === "enforce";
+  const resumed = resume !== null;
+  if (resumed && decision.switched) reasons.push("kept:resume");
+  const switched = enforce && !resumed && decision.switched && decision.target !== null;
+  const exploit = switched ? cands.indexOf(decision.target!) : base;
+
+  const dispatch = exploit;
+  const explore = false;
+  const propensity = 1;
+
+  return Object.freeze({
+    decision,
+    base: cands[base]!,
+    dispatch: cands[dispatch]!,
+    switched: switched && !explore,
+    explore,
+    propensity,
+    reasons: Object.freeze(reasons),
+  });
 }

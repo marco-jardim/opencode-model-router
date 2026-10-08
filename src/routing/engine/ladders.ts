@@ -37,6 +37,10 @@ import type {
   ExclusionReason,
   HostAgentInfo,
   Ladder,
+  PresetRung,
+  RoleLadder,
+  RoleLadderTier,
+  RoleWindow,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -202,7 +206,7 @@ function tryWarn(logger: LadderBuildInput["logger"], message: string): boolean {
 }
 
 /** QA-1.4-10: the catalog lookup is the caller's code; a failure makes the model unpriced (A1), never a throw. */
-function priced(input: LadderBuildInput, model: string): { readonly pricing?: ModelPricing } {
+function priced(input: Pick<LadderBuildInput, "pricing" | "logger">, model: string): { readonly pricing?: ModelPricing } {
   if (input.pricing === undefined) return {};
   try {
     return { pricing: input.pricing(model) };
@@ -511,6 +515,217 @@ export function buildLadder(input: LadderBuildInput): Ladder {
     presetRungs: presetRungs.map((rung) => ({ model: rung.model, variant: rung.variant, rank: rung.rank })),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Role ladders (role-tier-assurance plan §2.1, §2.3, P1.2 T1.2.3)
+// ---------------------------------------------------------------------------
+
+export interface RoleLadderInput {
+  readonly cfg: RouterConfig;
+  readonly facts: Pick<TaskFacts, "class" | "needs">;
+  /** The role agent (outcome-key origin `role`). */
+  readonly role: string;
+  /** `roles/policy.tierBounds(...)` computed with `tiers: escalateLadder(cfg)`. */
+  readonly window: RoleWindow;
+  /** The class's taxonomy tier; absent = `CLASS_STATIC_TIER[facts.class]` (`null` → the window floor). */
+  readonly classTier?: string | null;
+  readonly pricing?: (model: string) => ModelPricing;
+  readonly logger?: { warn(message: string): void };
+  /** The input the runner's policy is built with (same meaning as {@link LadderBuildInput.session}). */
+  readonly session?: LadderSessionPolicyInput;
+}
+
+interface WindowSpan {
+  readonly floor: number;
+  readonly ceiling: number;
+  readonly reasons: readonly string[];
+}
+
+/**
+ * The window on the escalate ladder `order`. Fail closed: a floor off the ladder places nothing (`null`, no candidate);
+ * a ceiling off the ladder or below the floor collapses to the floor (the narrowest window that keeps the floor).
+ */
+function windowSpan(order: readonly string[], window: Pick<RoleWindow, "floor" | "ceiling">): WindowSpan | null {
+  const floor = order.indexOf(window.floor);
+  if (floor < 0) return null;
+  const ceiling = order.indexOf(window.ceiling);
+  if (ceiling < 0) return { floor, ceiling: floor, reasons: [`window:ceiling-off-ladder:${window.ceiling}`] };
+  if (ceiling < floor) return { floor, ceiling: floor, reasons: ["window:ceiling-below-floor"] };
+  return { floor, ceiling, reasons: [] };
+}
+
+/**
+ * The escalation policy of a role dispatch: `buildEscalatePolicy(cfg, session)` with its ladder restricted to the tiers
+ * of `[floor, ceiling]` and `floorTier` = the window floor, so the runner never escalates above the ceiling nor starts
+ * below the floor (I2). The role runner (P2.1) and {@link buildRoleLadder}'s simulated paths use this one policy, which
+ * is what makes `simulate.ts` equal to the runner on role ladders. `null` when the floor is not on the escalate ladder.
+ */
+export function roleEscalatePolicy(
+  cfg: RouterConfig,
+  window: Pick<RoleWindow, "floor" | "ceiling">,
+  session?: LadderSessionPolicyInput,
+): EscalatePolicy | null {
+  const policy = buildEscalatePolicy(cfg, session);
+  const order = ladderOf(cfg, policy.ladder);
+  const span = windowSpan(order, window);
+  if (span === null) return null;
+  return { ...policy, ladder: order.slice(span.floor, span.ceiling + 1), floorTier: order[span.floor]! };
+}
+
+/**
+ * Build the candidate graph of a role dispatch (T1.2.3).
+ *
+ * - Candidates: for every tier of the escalate ladder in `[floor, ceiling]` (tier order, then rung order), the rungs on
+ *   the tier's own model (A25; other-model rungs are `not-modelled`), each run by the role agent (`origin: "role"`) at
+ *   the tier's rank. A `model#variant` already listed on a lower tier is the same outcome key: kept once (`duplicate`).
+ * - Grants: every rung runs the same agent under the same dispatch grant, so `grants` = `facts.needs` (needs a grant
+ *   cannot cover are reported by `grantFor` notes, not by the kernel's per-rung `needs` filter).
+ * - Paths: the attempts the runner makes under {@link roleEscalatePolicy} (`simulateRunner`), as indices into
+ *   `[...candidates, ...reachable]`.
+ * - Static default: the class's taxonomy tier clamped into the window (`default:clamp:floor|ceiling`); no class tier or
+ *   one off the ladder → the floor. Pin: `window.pinned` (re-clamped defensively, `pin:clamp`), reason `pinned:<tier>`.
+ *
+ * Never throws for well-typed input; a window that cannot be placed yields an empty ladder (`window:floor-off-ladder`).
+ */
+export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
+  const { cfg, facts, role } = input;
+  const policy = buildEscalatePolicy(cfg, input.session);
+  const order = ladderOf(cfg, policy.ladder);
+  const agent: AgentRef = { origin: "role", id: role };
+  const grants: readonly Need[] = [...facts.needs];
+  const classTier = input.classTier !== undefined
+    ? input.classTier
+    : (Object.hasOwn(CLASS_STATIC_TIER, facts.class) ? CLASS_STATIC_TIER[facts.class] : null);
+  const classAt = typeof classTier === "string" ? order.indexOf(classTier) : -1;
+  const classRank = classAt >= 0 ? classAt : null;
+  const presetRungs: PresetRung[] = [];
+  order.forEach((tier, rank) => {
+    for (const rung of resolveCandidates(tier, cfg)) presetRungs.push({ model: rung.model, variant: normalizedVariant(rung.variant), rank });
+  });
+
+  const span = windowSpan(order, input.window);
+  if (span === null) {
+    return {
+      role,
+      candidates: [],
+      next: [],
+      classRank,
+      excluded: [],
+      paths: [],
+      presetRungs,
+      floorRank: null,
+      ceilingRank: null,
+      tiers: [],
+      staticDefault: null,
+      pinnedIndex: null,
+      reasons: [`window:floor-off-ladder:${input.window.floor}`],
+    };
+  }
+
+  // --- candidates: the window's tiers, cheapest first --------------------------------------------------
+  const candidates: Candidate[] = [];
+  const excluded: ExcludedCandidate[] = [];
+  const tiers: RoleLadderTier[] = [];
+  const roleRung = (rung: { readonly model: string; readonly variant: string | null; readonly costRatio: number }, tier: string, rank: number): Candidate => ({
+    agent,
+    model: rung.model,
+    variant: normalizedVariant(rung.variant),
+    costRatio: rung.costRatio,
+    rank,
+    tier,
+    source: "role-range",
+    grants,
+    ...priced(input, rung.model),
+  });
+  for (let rank = span.floor; rank <= span.ceiling; rank++) {
+    const tier = order[rank]!;
+    const { kept, dropped } = modelledRungs(cfg, tier);
+    for (const rung of dropped) excluded.push({ agent, model: rung.model, variant: normalizedVariant(rung.variant), why: "not-modelled" });
+    let first: number | null = null;
+    for (const rung of kept) {
+      const candidate = roleRung({ model: rung.model, variant: normalizedVariant(rung.variant), costRatio: rung.costRatio }, tier, rank);
+      if (candidates.some((c) => sameRung(c, candidate))) {
+        excluded.push({ agent, model: candidate.model, variant: candidate.variant, why: "duplicate" });
+        continue;
+      }
+      first ??= candidates.length;
+      candidates.push(candidate);
+    }
+    tiers.push({ tier, rank, first });
+  }
+
+  // --- simulated runner paths under the window's policy ----------------------------------------------------
+  const rolePolicy: EscalatePolicy = { ...policy, ladder: order.slice(span.floor, span.ceiling + 1), floorTier: order[span.floor]! };
+  const reachable: Candidate[] = [];
+  const indexOfRung = (rung: RunnerRung): number | null => {
+    const same = (c: Candidate): boolean => c.tier === rung.tier && sameRung(c, rung);
+    const at = candidates.findIndex(same);
+    if (at >= 0) return at;
+    const known = reachable.findIndex(same);
+    if (known >= 0) return candidates.length + known;
+    const rank = order.indexOf(rung.tier);
+    if (rank < span.floor || rank > span.ceiling) return null; // unreachable under the window policy; defensive
+    reachable.push(roleRung(rung, rung.tier, rank));
+    return candidates.length + reachable.length - 1;
+  };
+  const paths = candidates.map((start) => {
+    const path: number[] = [];
+    for (const attempt of simulateRunner(rolePolicy, (tier) => tierBaseRung(cfg, tier), start)) {
+      const j = indexOfRung(attempt);
+      if (j === null) break;
+      path.push(j);
+    }
+    return path.length > 0 ? path : null;
+  });
+
+  // --- static default and pin --------------------------------------------------------------------------------
+  const reasons: string[] = [...span.reasons];
+  /** First candidate of the first tier at or above `rank` that has one, else of the highest tier below it. */
+  const candidateAt = (rank: number): number | null => {
+    for (const t of tiers) if (t.rank >= rank && t.first !== null) return t.first;
+    for (let i = tiers.length - 1; i >= 0; i--) if (tiers[i]!.first !== null) return tiers[i]!.first;
+    return null;
+  };
+  let target = span.floor;
+  if (classRank === null) reasons.push(typeof classTier === "string" ? `default:off-ladder:${classTier}` : "default:no-class-tier");
+  else if (classRank < span.floor) reasons.push("default:clamp:floor");
+  else if (classRank > span.ceiling) {
+    target = span.ceiling;
+    reasons.push("default:clamp:ceiling");
+  } else target = classRank;
+  const staticDefault = candidateAt(target);
+
+  let pinnedIndex: number | null = null;
+  const pin = input.window.pinned;
+  if (pin !== null) {
+    const at = order.indexOf(pin);
+    if (at < 0) reasons.push(`pin:off-ladder:${pin}`);
+    else {
+      const clamped = Math.min(Math.max(at, span.floor), span.ceiling);
+      if (clamped !== at) reasons.push("pin:clamp");
+      pinnedIndex = candidateAt(clamped);
+      if (pinnedIndex !== null) reasons.push(`pinned:${order[clamped]}`);
+    }
+  }
+
+  return {
+    role,
+    candidates,
+    next: candidates.map(() => null),
+    classRank,
+    excluded,
+    ...(reachable.length > 0 ? { reachable } : {}),
+    paths,
+    presetRungs,
+    floorRank: span.floor,
+    ceilingRank: span.ceiling,
+    tiers,
+    staticDefault,
+    pinnedIndex,
+    reasons,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // resolveChosen
 // ---------------------------------------------------------------------------

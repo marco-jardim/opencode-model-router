@@ -233,6 +233,20 @@ function placeCeiling(tier: string, order: readonly string[]): { index: number; 
 }
 
 /**
+ * `facts` with the effective risk and scope of §2.3: max(`facts`, `opts.classifier`, `opts.routeLine`) — a route line
+ * raises them, never lowers them. {@link tierBounds} uses it for the floor; the role kernel (`engine.decideRole`) takes
+ * its output as `facts`.
+ */
+export function effectiveFacts(
+  facts: TaskFacts,
+  opts: Pick<TierBoundsOptions, "classifier" | "routeLine">,
+): TaskFacts {
+  const risk = highest<Risk>(RISK_ORDER, facts.risk, [opts.classifier?.risk, opts.routeLine?.risk]);
+  const scope = highest<Scope>(SCOPE_ORDER, facts.scope, [opts.classifier?.scope, opts.routeLine?.scope]);
+  return risk === facts.risk && scope === facts.scope ? facts : { ...facts, risk, scope };
+}
+
+/**
  * Tier window of a dispatch (§2.3).
  *
  * - risk/scope = max(`facts`, `opts.classifier`, `opts.routeLine`): a route line can raise them, never
@@ -264,8 +278,7 @@ export function tierBounds(
   const order: readonly string[] = listed.length > 0 ? listed : BUILTIN_TIERS;
   const reasons: string[] = [];
 
-  const risk = highest<Risk>(RISK_ORDER, facts.risk, [opts.classifier?.risk, opts.routeLine?.risk]);
-  const scope = highest<Scope>(SCOPE_ORDER, facts.scope, [opts.classifier?.scope, opts.routeLine?.scope]);
+  const { risk, scope } = effectiveFacts(facts, opts);
   const sources: Array<[FloorSource, string | null]> = [
     ["role", role.tierRange.floor],
     ["authority", authorityFloor(grant, detection, risk, scope)],
