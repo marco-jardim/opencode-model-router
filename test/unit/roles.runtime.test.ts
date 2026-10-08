@@ -900,6 +900,57 @@ describe("QA round 1 (P2.1)", () => {
     expect(snapshot!("uncapped").readCapReached).toBe(false);
   });
 
+  it("QA-P21-3-1: a reached read cap is a stop only with NEED MORE; a resume restarts the counter, keeping the cap", async () => {
+    let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const { hooks, ingest } = await plugin(dir, "v2", { routerOnBudgetSnapshot: (read: typeof snapshot) => { snapshot = read; } });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks, { budgetSnapshot: snapshot! });
+    const onSignal = vi.spyOn(ingest!, "onSignal");
+    const kinds = (child: string) => onSignal.mock.calls.filter(([c]) => c === child).map(([, observation]) => observation.kind);
+    const dispatch = async (callID: string, child: string, prompt: string, resume = false) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "explorer", description: "find", prompt, ...(resume ? { sessionID: child } : {}) } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      if (!resume) sessions[child] = { id: child, parentID: "root", agent: "explorer", title: event.input.description, location: { directory: dir } };
+    };
+    const read = async (child: string, i: number): Promise<string> => {
+      const args = { path: join(dir, `${child}-${i}.ts`) };
+      await v2.toolHooks["execute.before"]({ sessionID: child, agent: "explorer", messageID: "m", id: `${child}-${i}`, tool: "read", input: { ...args } });
+      const output = { title: "", output: `content ${i}`, metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: "explorer", callID: `${child}-${i}`, args: { filePath: args.path } }, output);
+      return output.output;
+    };
+    const finish = async (callID: string, child: string, text: string): Promise<string> => {
+      const event = parentCall(callID, child, "explorer", text);
+      await v2.toolHooks["execute.after"](event);
+      return resultText(event);
+    };
+    const atCap = async (callID: string, child: string) => {
+      await dispatch(callID, child, "CAP:3\nFind the loader");
+      for (const i of [1, 2, 3]) await read(child, i);
+      expect(snapshot!(child).readCapReached).toBe(true);
+    };
+
+    // DONE at exactly the cap: a finished task, no budget note, no budget signal.
+    await atCap("d1", "c-done");
+    expect(await finish("d1", "c-done", "DONE: the loader is src/loader.ts:12")).not.toContain(ROUTER_BUDGET_NOTE_PREFIX);
+    expect(kinds("c-done")).not.toContain("budget");
+    // An unrelated ESCALATE at the cap is not a budget stop either (both guards observed: incomplete).
+    await atCap("e1", "c-esc");
+    expect(await finish("e1", "c-esc", "ESCALATE: the loader lives in another repository")).not.toContain(ROUTER_BUDGET_NOTE_PREFIX);
+    expect(kinds("c-esc")).not.toContain("budget");
+    expect(kinds("c-esc")).toContain("incomplete");
+    // NEED MORE at the cap: the note; the resume "continue and finish" restarts the counter with the same cap; DONE: no note.
+    await atCap("n1", "c-more");
+    expect(await finish("n1", "c-more", "NEED MORE: budget\nread 3 of 6 files")).toContain(`${ROUTER_BUDGET_NOTE_PREFIX} @explorer`);
+    expect(kinds("c-more")).toContain("budget");
+    await dispatch("n2", "c-more", "continue and finish", true);
+    expect(snapshot!("c-more").readCapReached).toBe(false);
+    expect(await read("c-more", 4)).toContain("[cap: 1/3]");
+    expect(await finish("n2", "c-more", "DONE: all six files read")).not.toContain(ROUTER_BUDGET_NOTE_PREFIX);
+  });
+
   it("QA-P21-2-4: a role whose agent registration failed is not live — the dispatch takes the tier path, the protocol stays tiers", async () => {
     registration.broken = true;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

@@ -1086,10 +1086,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     if (routed === undefined || routed.parentSessionID !== parentSessionID) return;
     if (routed.resumeID !== null) guardStore.beginDispatch(routed.resumeID);
     // QA-P21-2-3: the dispatch's own read-only cap. A resume names its child: registered now; a fresh child when it binds.
+    // QA-P21-3-1: every routed resume starts a new round of the child's read counter (the previous cap kept unless it names one),
+    // so a "continue and finish" resume after a CAP stop does not inherit the exhausted counter.
     const cap = roleDispatchCap(args.prompt);
-    if (cap !== null) {
-      if (routed.resumeID !== null) registerRoleCap(routed.resumeID, routed.agent, cap);
-      else rememberPendingRoleCap(callID, routed.agent, cap);
+    if (routed.resumeID !== null) {
+      if (!sessionStore.resumeRoleSession(routed.resumeID, cap) && cap !== null) registerRoleCap(routed.resumeID, routed.agent, cap);
+    } else if (cap !== null) {
+      rememberPendingRoleCap(callID, routed.agent, cap);
     }
     if (routed.decisionID === null) return; // engine static: no rows
     const current: DispatchText = {
@@ -1122,11 +1125,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const spec = childSessionID ? roleOfSession(childSessionID) ?? roleSpecOf(args.subagent_type) : undefined;
     if (!childSessionID || spec === undefined) return;
     rememberRoleSession(childSessionID, spec.agent);
-    // QA-P21-1-3: the snapshot includes the read-only CAP state: a child that reached its read cap stopped on its budget (I7).
+    // QA-P21-1-3: the snapshot includes the read-only CAP state. QA-P21-3-1: a reached read cap is a budget stop only when the
+    // child says so (`NEED MORE`, as the gate's claim check): a `DONE` or an unrelated `ESCALATE` at the cap is not one.
     const snapshot = roleBudgetSnapshot(childSessionID);
+    const capStop = snapshot.readCapReached === true && parseReturnPrefix(finalReturnText)?.prefix === "need-more";
     // Handoff 22: the guard's stop folded with the host's own (step limit, context overflow), as the v2 adapter observed them.
     const budgetObserved = foldBudgetObservation(
-      snapshot.readCapReached === true ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
+      capStop ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
       hostBudgetOf?.(childSessionID, roleAgentSteps(spec)),
     );
     const request = requestedAuthority(childSessionID);

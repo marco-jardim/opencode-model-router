@@ -949,7 +949,9 @@ export async function registerV2Hooks(
         await hostBudget.settled(child, hostSettleMs);
         // QA-P21-1-3: the plugin's snapshot (guard stop OR the read-only CAP reached), as its signals read it.
         const snapshot = options.budgetSnapshot?.(child);
-        const stopped = snapshot === undefined ? budgetExhausted(child) : snapshot.stopped || snapshot.readCapReached === true;
+        // QA-P21-3-1: a reached read cap counts only with a `NEED MORE` return (a DONE at the cap is a finished task).
+        const capStop = snapshot?.readCapReached === true && contract?.prefix === "need-more";
+        const stopped = snapshot === undefined ? budgetExhausted(child) : snapshot.stopped || capStop;
         if (stopped) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child));
         else if (hostBudget.observe(child, hostStepLimitOf(roles, agent)) === true) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child, "host"));
         for (const annotation of takeSubagentAnnotations(child)) notices.push(annotation.text);
