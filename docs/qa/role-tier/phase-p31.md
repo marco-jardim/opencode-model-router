@@ -25,7 +25,9 @@ Branch `rta/p31` (worktree `D:\git\omr-rta-p31`). Plan §5 P3.1, tasks T3.1.1–
 | `83e00f6` | Run-3 updates: DF2-F1 fixed behaviour asserted (incl. the live shape and a `cwd:` outside the work root); grader rows expected; the 2.0.24 `outputPaths` observation made the only asserted branch |
 | `20d4d2d` | Merge `origin/rta/main` into `rta/p31`: the DF2-F1 fix (`rta/p33-fix-1`, `verifyRoot`) and the grader-signal fix (`rta/p33-fix-2`) |
 | `2d3eaa2` | T3.1.2 `test/unit/roles.v1-fallback.test.ts`; scenario 6 of `test/smoke/routing-engine.smoke.test.ts` repinned; run-4 evidence and its `README.md` (T3.1.3); this report |
-| uncommitted | QA round 1 fixes (Findings below) |
+| `a976569` | QA round 1 fixes: I9 host proofs, evidence scrub and guard (`test/unit/roles.evidence.test.ts`), v1 base wording, argument schemas, request-body checks |
+| `07c3554` | Evidence regenerated from smoke run 5 (7/7) |
+| uncommitted | QA round 2 nits: the README and this report for run 5; scenario 6 description; the evidence guard checks the real home and user name |
 
 ### Harness additions (`test/smoke/helpers/routing-host.ts`, additive; earlier smokes unchanged)
 
@@ -47,7 +49,7 @@ Branch `rta/p31` (worktree `D:\git\omr-rta-p31`). Plan §5 P3.1, tasks T3.1.1–
 |---|---|
 | I2 | For 11 role × class dispatches the model is inside `[floor, ceiling]`. The row's tier matches it, and the request body names that model and that variant's effort (QA-P31 N2). A `tier=heavy pin` reaches heavy. A resume never goes below the running rung. After a deterministic FAIL, the resume of the same session runs one tier up. |
 | I3 + I4 | Under a parent without grants and under an allow-all parent, forbidden calls are attempted and refused or absent, and disk, sessions and provider stay unchanged. Covered calls: edit, `execute`, `subagent`, `shell`, reads outside the work root, `router_run` (its own `probe-marker`, absent on disk: QA-P31-1-3; a foreign `cwd` for the runner). Researcher and implementer catalogs keep local/exec/write apart from egress, and so do the host's agent records. A non-role control proves the inputs are well-formed. |
-| I5 + I9 | Identical parallel dispatches bind `exact` by their own nonces. A child with two dispatches' markers binds `unknown`: max ∩ local, edit refused, and `router_run` refused with no marker on disk although its exact sibling holds `router_run`. Its `external_directory` of `wt-1`, reached through `retarget`, is denied by the router's evaluate hook with "binding unknown". An exact child of `wt-2` is denied `external_directory` of `wt-1` ("outside this dispatch's work root"). A router context-hook error empties that step's catalog and annotates the parent. A router evaluate-hook error is a deny with the router's "could not check" message. The `external_directory`, evaluate-error and other-root parts are QA round 1 additions, awaiting their first host run. |
+| I5 + I9 | Identical parallel dispatches bind `exact` by their own nonces. A child with two dispatches' markers binds `unknown`: max ∩ local, edit refused, and `router_run` refused with no marker on disk although its exact sibling holds `router_run`. Its `external_directory` of `wt-1`, reached through `retarget`, is denied by the router's evaluate hook with "binding unknown". An exact child of `wt-2` is denied `external_directory` of `wt-1` ("outside this dispatch's work root"). A router context-hook error empties that step's catalog and annotates the parent. A router evaluate-hook error is a deny with the router's "could not check" message. The `external_directory`, evaluate-error and other-root parts were added in QA round 1 and passed on the host in run 5. |
 | Ladder | `general` without an edit need: edit refused → `router_request_authority` → `ESCALATE: authority` annotation → resume of the same session → edit allowed. The fresh dispatch runs exactly on its row's tier (QA-P31 N2); the floor is recomputed on resume (medium or above), and the resume row records the widening. |
 | Work roots / handoffs | Path resource formats, refusals thrown in `execute.before` reaching the child, glob/grep search roots, `router_git_status` on the bound root, and `router_run` in a worktree created after start (`workRoots` glob). A later worktree without a pattern is refused. DF2-F1 fixed. Own truncated outputs on 2.0.24 (see the observation below). |
 | Budget + signals | Enforced role budget: `NEED MORE: budget` for the child, `[router budget]` for the parent, and the resume continues. Signal rows of all seven kinds (`verdict`, `run`, `grader`, `incomplete`, `budget`, `authority`, `redispatch`). A grader verdict is a `grader` row, never a `verdict` row. |
@@ -74,10 +76,10 @@ hooks or signing (QA-P31 N3).
 
 ### T3.1.3 — evidence
 
-`docs/qa/role-tier/evidence/` holds the seven redacted JSON files of run 4 and a `README.md` (what each file proves and how
-to regenerate).
-- **QA-P31-1-1:** 22 `CHILD_SCRIPT64=<base64>` runs in 5 files held unredacted temp paths inside the base64. They were replaced in place by `CHILD_SCRIPT64(scrubbed)=[script omitted: …]`; the steps remain readable as the child's tool states. Future runs decode and redact every script in `save()`.
-- **Guard:** `test/unit/roles.evidence.test.ts` checks every evidence file, and every base64 script in it decoded, for user paths, the home directory and credentials. It would have failed on the files as committed in `2d3eaa2`. The README checklist now says: decode base64, then grep.
+`docs/qa/role-tier/evidence/` holds the seven redacted JSON files of **run 5** (`07c3554`; 2.0.24, `rta/p31` @ `a976569`,
+7/7) and a `README.md` (what each file proves and how to regenerate).
+- **QA-P31-1-1:** run 4's files held 22 `CHILD_SCRIPT64=<base64>` runs in 5 files with unredacted temp paths inside the base64; they were scrubbed in place in `a976569`. Since then `save()` decodes and redacts every script (`CHILD_SCRIPT64(decoded)=…`), and run 5's files were written that way.
+- **Guard:** `test/unit/roles.evidence.test.ts` checks every evidence file, and every base64 script in it decoded, for user paths, credentials, the real home and the user name. The real home comes from the test setup's `REAL_HOME`, its real path and the 8.3 home prefix of the real temp dir (QA round 2 N3). The guard would have failed on the files as committed in `2d3eaa2`. The README checklist says: decode base64, then grep, then run the guard.
 
 ## Tests
 
@@ -87,13 +89,14 @@ to regenerate).
 | 2 | `b9ee732` | 4/7 passed | **Test**: the exact sibling's read of the main checkout was correctly refused (outside its work root); the host's grep caps at 100 matches, so nothing was truncated (now a 64 KiB `router_git_diff`). **Product**: no `grader` signal row — `graderSignal` had no call site and a role's grader verdict was written as a weight-1 `verdict` row (§2.6, I6); fixed in `rta/p33-fix-2`. |
 | 3 | `9aa0d5c` | 5/7 passed | **Test**: the DF2-F1 observation pin did not reproduce with a scripted child that changes no files; the fix (`rta/p33-fix-1`) was then merged and the test asserts the fixed behaviour, incl. the live shape (child writes the file). The grader tier lookup missed the host's `opus#default` variant (now mapped by model). **Host 2.0.24 observation**: tool-success events carry no `outputPaths`, so a role child's own truncated outputs are unreadable (fail closed, R9(5)). |
 | 4 | `20d4d2d` | **7/7 passed** | — |
-| 5 | QA round 1 fixes | pending (executor) | — |
+| 5 | `a976569` | **7/7 passed** | — (QA round 1 additions included: the I9 host proofs (a) `external_directory` denied for the unknown binding and for an exact child of `wt-2`, (b) `router_run` refused for the unknown binding with no marker on disk, (c) the evaluate-hook error denied with the router's message; request-body checks; `probe-marker`) |
 
 | Other run | Result |
 |---|---|
 | `npm run smoke:v1` (OpenCode 1.18.35 first on PATH) | exit 0 (executor) |
 | `npm run smoke:routing` scenario 6, after `2d3eaa2` | passed (executor) |
 | `test-files test/unit/roles.v1-fallback.test.ts test/unit/roles.evidence.test.ts` (QA round 1) | 2 files, 11/11 passed (v1 fallback 2, evidence guard 9) |
+| `test-files test/unit/roles.evidence.test.ts test/unit/roles.v1-fallback.test.ts` (QA round 2, run-5 evidence) | 2 files, 12/12 passed (evidence guard 10, v1 fallback 2) |
 | `test-files test/unit/docs-drift.test.ts test/unit/roles.v1-fallback.test.ts` (before QA) | 2 files, 47/47 passed |
 | `typecheck` | exit 0 |
 
@@ -108,7 +111,7 @@ The host limitation (no `outputPaths` on 2.0.24) is recorded in R9(5).
 
 ## Findings
 
-| Id | Severity | Finding (short) | Fix (uncommitted) |
+| Id | Severity | Finding (short, round 1) | Fix (`a976569`) |
 |---|---|---|---|
 | QA-P31-1-1 | major | Evidence `firstUser` kept base64 scripts with `C:\Users\…` (22 lines, 5 files) | `save()` decodes + redacts every script; 22 runs scrubbed in place; unit guard `roles.evidence.test.ts`; README checklist |
 | QA-P31-1-2 | major | I9 clauses claimed but not host-tested: unknown binding's `external_directory`, unknown binding's `router_run`, evaluate-hook error | `probe.retarget` + `messageIn`; the unknown child's retargeted read, its `router_run` (sibling holds `router_run`), an exact child of `wt-2`; the pre-probe evaluate trap. Asserted in the I5 + I9 test |
@@ -119,9 +122,16 @@ The host limitation (no `outputPaths` on 2.0.24) is recorded in R9(5).
 | QA-P31 N2 | nit | I2 without the request body; ladder tier `>= fast` | body model + effective effort; exact row tier |
 | QA-P31 N3 | nit | Fixture git used the user's config | `GIT_CONFIG_GLOBAL` = empty file, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=`, `commit.gpgsign=false` |
 
+| Id | Severity | Finding (short, round 2) | Fix (uncommitted) |
+|---|---|---|---|
+| QA-P31-2 N1 | nit | The evidence README and this report still described run 4 / a pending re-run | both refreshed for run 5 |
+| QA-P31-2 N2 | nit | Scenario 6 description said "master before #84 plus the #83 literal repair" | matches the `V1_BASE_COMMIT` comment (rta-line commit, parent `66dcdff`; equals `eeab36b` for the guarded paths except the literal) |
+| QA-P31-2 N3 | nit | The evidence guard checked the test's private `homedir()`, not the real home | checks `REAL_HOME` (test setup), its real path, the 8.3 home prefix of the real temp dir, and `os.userInfo().username` (as a path segment when the name is also a role or tier word, e.g. CI's `runner`) |
+
 | Round | Verdict |
 |---|---|
-| 1 | FAIL — 2 major, 3 minor, 3 nit; all fixed, the smoke re-run is pending |
+| 1 | FAIL — 2 major, 3 minor, 3 nit; all fixed (`a976569`), smoke run 5: 7/7 |
+| 2 | PASS — 0 new defects; 3 nits, all fixed |
 
 ## Handoffs
 
@@ -130,9 +140,9 @@ The host limitation (no `outputPaths` on 2.0.24) is recorded in R9(5).
 | P3.2 | Document R9(5): on OpenCode 2.0.24 a role child cannot read its own truncated tool outputs (no `outputPaths` on `session.tool.success`; fails closed). |
 | P3.2 | Document that role budgets stop a child only in enforcement mode `enforced`. In `advisory` the child gets a warning banner, the call runs, and the parent gets no `[router budget]` note. |
 | P3.2 | Document that worktrees created after plugin start are covered only by `routing.workRoots` (role max policies list worktrees at registration). |
-| P3.3 | Not covered by the smoke: the host's ripgrep link-following inside the work root (phase-p23 residual); the host budget observer's step-limit and context-overflow path (phase-p21 handoff; the smoke covers the guard budget). |
-| P3.3 | wave2-handoffs P3.1 item 2: POSIX-only tests on Linux CI are not part of this phase. |
-| Executor | Re-run the roles smoke for the QA round 1 additions. If the new I9 evaluate-error case shows the raw trap message instead of the router's "could not check" deny, the router read `event.resources` outside its fail-closed handler: that is a product finding, not a test fix. |
+| P3.3 (residual) | Host ripgrep link-following inside the work root is not exercised by the smoke (phase-p23 residual). |
+| P3.3 (residual) | The host budget observer's step-limit and context-overflow path is not exercised (phase-p21 handoff; the smoke covers the guard's enforced budget). |
+| P3.3 (residual) | POSIX-only tests run via Linux CI, not in this phase (wave2-handoffs P3.1 item 2). |
 
 ## Takeovers
 
@@ -140,4 +150,4 @@ None.
 
 ## Verdict
 
-Pending QA round 2.
+PASS — 0 open blocking, critical or major findings after QA round 2.
