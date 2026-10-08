@@ -1047,14 +1047,17 @@ function register(child: string, over: Partial<DispatchInput> = {}): void {
 const reasonOf = (r: LogRow): string => (r.kind === "verdict" ? `verdict:${r.verdict}` : r.kind === "decision" ? r.reason : r.kind);
 
 describe("ingest.onSignal", () => {
-  it("one row per attempt and kind; verdict refused; the store, its Beta and decay untouched (QA-P14-1-6, 1-14)", async () => {
+  it("one row per attempt and kind; verdict and grader refused; the store, its Beta and decay untouched (QA-P14-1-6, 1-14)", async () => {
     const h = ingestHarness();
     register("c1");
     expect(h.ingest.onSignal?.("c1", obs("run", "pass", 1))).toBe(true);
     const store = h.bundles[0]!.store;
     const before = { revision: store.revision, snapshot: JSON.stringify(store.snapshot()), posterior: store.posterior(R_FAST) };
     expect(h.ingest.onSignal?.("c1", obs("run", "pass", 1))).toBe(false);
-    expect(h.ingest.onSignal?.("c1", obs("grader", "pass", 0.5))).toBe(true);
+    expect(h.ingest.onSignal?.("c1", obs("incomplete", "fail", 0.5))).toBe(true);
+    expect(h.ingest.onSignal?.("c1", obs("incomplete", "fail", 0.5))).toBe(false);
+    // QA-P33F2-1 N2: grader rows follow the store like verdict rows: only onVerdict writes them.
+    expect(h.ingest.onSignal?.("c1", obs("grader", "pass", 0.5))).toBe(false);
     expect(h.ingest.onSignal?.("c1", obs("grader", "fail", 0.5))).toBe(false);
     expect(h.ingest.onSignal?.("c1", obs("verdict", "fail", 1))).toBe(false);
     expect(h.ingest.onSignal?.("c1", obs("verdict", "pass", 1))).toBe(false);
@@ -1064,7 +1067,7 @@ describe("ingest.onSignal", () => {
     expect(store.keys()).toEqual([]);
 
     const rows = (await h.rows()) as DecisionRow[];
-    expect(rows.map(reasonOf)).toEqual(["note:signal:run:pass", "note:signal:grader:pass"]);
+    expect(rows.map(reasonOf)).toEqual(["note:signal:run:pass", "note:signal:incomplete:fail"]);
     expect(rows[0]).toMatchObject({
       kind: "decision",
       decisionID: "dec-1",
@@ -1100,9 +1103,9 @@ describe("ingest.onSignal", () => {
   it("onVerdict writes the verdict signal row of a role dispatch only when the store takes the verdict (QA-P14-1-6)", async () => {
     const h = ingestHarness();
     register("c1");
-    h.ingest.onVerdict("c1", "unverifiable");
-    h.ingest.onVerdict("c1", "fail");
-    h.ingest.onVerdict("c1", "pass"); // the store already scored the attempt: no row of either kind
+    h.ingest.onVerdict("c1", "unverifiable", undefined);
+    h.ingest.onVerdict("c1", "fail", undefined);
+    h.ingest.onVerdict("c1", "pass", undefined); // the store already scored the attempt: no row of either kind
     const rows = await h.rows();
     expect(rows.map(reasonOf)).toEqual(["verdict:unverifiable", "verdict:fail", "note:signal:verdict:fail"]);
     expect((rows[2] as DecisionRow).signalWeight).toBe(-1);
@@ -1114,7 +1117,7 @@ describe("ingest.onSignal", () => {
   it("a pass the store converts on a later false refusal is a failure in the role statistics (residual QA-P14-1-6)", async () => {
     const h = ingestHarness();
     register("c1");
-    h.ingest.onVerdict("c1", "pass");
+    h.ingest.onVerdict("c1", "pass", undefined);
     h.ingest.onFalseRefusal("c1");
     const rows = await h.rows();
     expect(rows.map(reasonOf)).toEqual(["verdict:pass", "note:signal:verdict:pass", "refusal"]);
@@ -1125,7 +1128,7 @@ describe("ingest.onSignal", () => {
   it("onVerdict of a tier-mode dispatch writes no signal row", async () => {
     const h = ingestHarness({ roleAgentIds: undefined });
     register("c2", { agent: "medium", model: "anthropic/claude-sonnet-5-5#high", tier: "medium" });
-    h.ingest.onVerdict("c2", "pass");
+    h.ingest.onVerdict("c2", "pass", undefined);
     expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass"]);
   });
 
@@ -1141,7 +1144,7 @@ describe("ingest.onSignal", () => {
     } satisfies Partial<IngestSettings>;
     const OPUS = { tier: "heavy", model: "anthropic/claude-opus-5-5" };
 
-    it("an independent grader is a `grader` row of ±0.5, not a `verdict` row of 1; the store and the verdict row are unchanged", async () => {
+    it("an independent grader is a `grader` row of ±0.5, not a `verdict` row of 1, and its verdict row follows the store", async () => {
       const h = ingestHarness(LADDER);
       register("c1");
       register("c2", { decisionID: "dec-2" });
@@ -1151,10 +1154,67 @@ describe("ingest.onSignal", () => {
       expect(rows.map(reasonOf)).toEqual(["verdict:pass", "note:signal:grader:pass", "verdict:fail", "note:signal:grader:fail"]);
       expect((rows[1] as DecisionRow)).toMatchObject({ signal: "grader", signalWeight: 0.5, role: "implementer", tier: "fast" });
       expect((rows[3] as DecisionRow)).toMatchObject({ signal: "grader", signalWeight: -0.5 });
-      expect(h.bundles[0]!.store.keys()).toEqual([R_FAST]); // the store took both verdicts, as before
+      expect(h.bundles[0]!.store.keys()).toEqual([R_FAST]); // the store took both verdicts, at 0.5 each (below)
       const fast = summarizeRoles(null, rows, { since: null, until: null }).byRoleTier[0];
       expect(fast).toMatchObject({ role: "implementer", tier: "fast", positiveMass: 0.5, negativeMass: 0.5 });
       expect(fast?.signals.find((s) => s.kind === "verdict")).toMatchObject({ pass: 0, fail: 0, positive: 0, negative: 0 });
+    });
+
+    // QA-P33F2-1-1: role routing reads the Beta store (kernel); a grader verdict used to move it by a full observation.
+    it("the store: a same-model grader leaves the posterior unchanged; an independent one moves it by 0.5; a deterministic verdict by 1", async () => {
+      const h = ingestHarness(LADDER);
+      register("probe");
+      expect(h.ingest.onSignal?.("probe", obs("budget", "none", 0))).toBe(true); // acquires the bundle; the store stays empty
+      const store = h.bundles[0]!.store;
+      const n = (): number => store.posterior(R_FAST).n;
+      const at0 = { n: n(), revision: store.revision };
+      register("same", { decisionID: "dec-same" });
+      h.ingest.onVerdict("same", "pass", { tier: "heavy", model: "anthropic/claude-haiku-4-5" }); // the producer's model
+      expect(n()).toBe(at0.n);
+      expect(store.revision).toBe(at0.revision);
+      expect(store.keys()).toEqual([]);
+      register("indep", { decisionID: "dec-indep" });
+      h.ingest.onVerdict("indep", "pass", OPUS);
+      expect(n()).toBeCloseTo(at0.n + 0.5, 12);
+      expect(store.posterior(R_FAST).alpha - store.posterior(R_FAST).prior.alpha).toBeCloseTo(0.5, 12);
+      register("indep-fail", { decisionID: "dec-indep-fail" });
+      h.ingest.onVerdict("indep-fail", "fail", OPUS);
+      expect(n()).toBeCloseTo(at0.n + 1, 12);
+      register("det", { decisionID: "dec-det" });
+      h.ingest.onVerdict("det", "pass", undefined);
+      expect(n()).toBeCloseTo(at0.n + 2, 12);
+      // The lifetime counters count each verdict the store took once.
+      expect(store.snapshot().entries[R_FAST]?.counts).toMatchObject({ pass: 2, fail: 1 });
+    });
+
+    it("a not-independent grader leaves the attempt unscored: a later deterministic verdict or false refusal scores it as its first", async () => {
+      const h = ingestHarness(LADDER);
+      register("c1");
+      register("c2", { decisionID: "dec-2" });
+      const SAME = { tier: "heavy", model: "anthropic/claude-haiku-4-5" };
+      h.ingest.onVerdict("c1", "pass", SAME);
+      h.ingest.onVerdict("c1", "fail", undefined); // the deterministic gate of the same attempt still counts
+      h.ingest.onVerdict("c2", "pass", SAME);
+      h.ingest.onFalseRefusal("c2"); // the first terminal signal: no pass to override
+      const rows = await h.rows();
+      expect(rows.map(reasonOf)).toEqual(["verdict:fail", "note:signal:verdict:fail", "refusal"]);
+      expect(rows[2]).not.toHaveProperty("overrides");
+      expect(h.bundles[0]!.store.posterior(R_FAST).n).toBeCloseTo(2, 12);
+    });
+
+    it("a refusal after an independent grader's pass takes back only its 0.5 and the row says it overrides the pass", async () => {
+      const h = ingestHarness(LADDER);
+      register("c1");
+      h.ingest.onVerdict("c1", "pass", OPUS);
+      h.ingest.onFalseRefusal("c1");
+      const rows = await h.rows();
+      expect(rows.map(reasonOf)).toEqual(["verdict:pass", "note:signal:grader:pass", "refusal"]);
+      expect(rows[2]).toMatchObject({ kind: "refusal", overrides: "pass" });
+      const post = h.bundles[0]!.store.posterior(R_FAST);
+      expect(post.alpha - post.prior.alpha).toBeCloseTo(0, 12);
+      expect(post.beta - post.prior.beta).toBeCloseTo(1, 12);
+      const fast = summarizeRoles(null, rows, { since: null, until: null }).byRoleTier[0];
+      expect(fast?.signals.find((s) => s.kind === "grader")).toMatchObject({ pass: 0, fail: 1, positive: 0, negative: 0.5 });
     });
 
     it("the host's `#default` variant of a preset model is matched by model (live: anthropic/claude-opus-5-5#default)", async () => {
@@ -1164,7 +1224,7 @@ describe("ingest.onSignal", () => {
       expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass", "note:signal:grader:pass"]);
     });
 
-    it("a grader that is not independent, or not known to be, moves no mass: no signal row (the verdict row stays)", async () => {
+    it("a grader that is not independent, or not known to be, moves nothing: no store change, no verdict row, no signal row", async () => {
       const h = ingestHarness(LADDER);
       const cases: Array<[string, Partial<DispatchInput>, { tier: string | null; model: string | null }]> = [
         ["same-model", {}, { tier: "heavy", model: "anthropic/claude-haiku-4-5" }], // the producer's model
@@ -1173,18 +1233,42 @@ describe("ingest.onSignal", () => {
         ["unknown-grader", {}, { tier: null, model: null }], // a checker verdict without grader facts (verdictGraderOf)
         ["off-preset", {}, { tier: "ultra", model: "openai/gpt-5" }], // neither the model nor the tier is on the order
       ];
+      register("probe");
+      expect(h.ingest.onSignal?.("probe", obs("budget", "none", 0))).toBe(true); // acquires the bundle
+      const store = h.bundles[0]!.store;
+      const before = store.revision;
       for (const [child, over, grader] of cases) {
         register(child, { decisionID: `dec-${child}`, ...over });
         h.ingest.onVerdict(child, "pass", grader);
+        h.ingest.onVerdict(child, "fail", grader);
       }
-      expect((await h.rows()).map(reasonOf)).toEqual(cases.map(() => "verdict:pass"));
+      expect((await h.rows()).map(reasonOf)).toEqual(["note:signal:budget:none"]);
+      expect(store.revision).toBe(before);
+      expect(store.keys()).toEqual([]);
     });
 
     it("without a tier order (a config-less ingest) no grader is independent", async () => {
       const h = ingestHarness();
       register("c1");
       h.ingest.onVerdict("c1", "pass", OPUS);
-      expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass"]);
+      register("c2", { decisionID: "dec-2" });
+      h.ingest.onVerdict("c2", "pass", undefined);
+      expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass", "note:signal:verdict:pass"]);
+      expect(h.bundles[0]!.store.posterior(R_FAST).n).toBeCloseTo(1, 12); // only the deterministic one
+    });
+
+    it("N3: the grader ranks at the LOWER of its model's tier and the tier the checker asked for", async () => {
+      const h = ingestHarness(LADDER);
+      // Producer on medium (sonnet). The grader ran opus (heavy) but the checker asked for fast: it ranks fast < medium.
+      register("c1", { tier: "medium", model: "anthropic/claude-sonnet-5-5" });
+      h.ingest.onVerdict("c1", "pass", { tier: "fast", model: "anthropic/claude-opus-5-5" });
+      // Asked for heavy, ran haiku (fast): ranks fast < medium.
+      register("c2", { tier: "medium", model: "anthropic/claude-sonnet-5-5", decisionID: "dec-2" });
+      h.ingest.onVerdict("c2", "pass", { tier: "heavy", model: "anthropic/claude-haiku-4-5" });
+      // Both heavy: independent.
+      register("c3", { tier: "medium", model: "anthropic/claude-sonnet-5-5", decisionID: "dec-3" });
+      h.ingest.onVerdict("c3", "pass", OPUS);
+      expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass", "note:signal:grader:pass"]);
     });
 
     it("a model off the rungs counts at the requested tier when that tier is on the order; the producer's tier falls back to its model", async () => {
@@ -1194,11 +1278,15 @@ describe("ingest.onSignal", () => {
       expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass", "note:signal:grader:pass"]);
     });
 
-    it("a tier-mode dispatch stays unchanged with a grader: the store and the verdict row only (I1)", async () => {
+    it("a tier-mode dispatch stays unchanged with a grader: the store at full weight and the verdict row only (I1)", async () => {
       const h = ingestHarness({ ...LADDER, roleAgentIds: undefined });
       register("c2", { agent: "medium", model: "anthropic/claude-sonnet-5-5", tier: "medium" });
       h.ingest.onVerdict("c2", "pass", OPUS);
-      expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass"]);
+      register("c3", { agent: "medium", model: "anthropic/claude-sonnet-5-5", tier: "medium", decisionID: "dec-3" });
+      h.ingest.onVerdict("c3", "pass", { tier: "fast", model: "anthropic/claude-sonnet-5-5" }); // not independent: still 1
+      expect((await h.rows()).map(reasonOf)).toEqual(["verdict:pass", "verdict:pass"]);
+      const key = makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5");
+      expect(h.bundles[0]!.store.posterior(key).n).toBeCloseTo(2, 12);
     });
 
     it("verdictGraderOf: a checker verdict names its grader (or an unknown one); any other method is deterministic", () => {

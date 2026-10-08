@@ -94,13 +94,18 @@ export function capEvidence(state: BetaState, maxEffectiveSamples: number): Beta
   return { alpha: state.alpha * scale, beta: state.beta * scale, updatedAt: state.updatedAt };
 }
 
-/** D4: one observation. Decays the stored evidence to `now`, adds +1 to alpha (success) or beta, then caps. */
-export function observe(state: BetaState | undefined, success: boolean, now: number, tuning: OutcomeTuning): BetaState {
+/**
+ * D4: one observation. Decays the stored evidence to `now`, adds `weight` (default 1) to alpha (success) or beta, then caps.
+ * #84 P3.3 fix 2 (QA-P33F2-1-1): an independent grader's verdict of a role dispatch weighs 0.5 (plan §2.6); a weight that is
+ * not a finite number in (0, 1] counts as 1, so no caller can add more than one observation.
+ */
+export function observe(state: BetaState | undefined, success: boolean, now: number, tuning: OutcomeTuning, weight = 1): BetaState {
   const at = Number.isFinite(now) ? now : (state?.updatedAt ?? 0);
+  const w = Number.isFinite(weight) && weight > 0 && weight <= 1 ? weight : 1;
   const base = decayTo(state ?? { alpha: 0, beta: 0, updatedAt: at }, at, tuning);
   const next: BetaState = success
-    ? { alpha: base.alpha + 1, beta: base.beta, updatedAt: base.updatedAt }
-    : { alpha: base.alpha, beta: base.beta + 1, updatedAt: base.updatedAt };
+    ? { alpha: base.alpha + w, beta: base.beta, updatedAt: base.updatedAt }
+    : { alpha: base.alpha, beta: base.beta + w, updatedAt: base.updatedAt };
   return capEvidence(next, tuning.maxEffectiveSamples);
 }
 

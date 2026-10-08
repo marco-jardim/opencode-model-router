@@ -431,8 +431,12 @@ export interface OutcomeStore {
   readonly revision: number;
   /** Hot reload of `routing.outcomes` (applied lazily on the next read/write). */
   configure(tuning: Partial<OutcomeTuning>): void;
-  /** D4: pass → success, fail → failure, unverifiable → strict no-op. Returns whether the Beta changed. */
-  recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal): boolean;
+  /**
+   * D4: pass → success, fail → failure, unverifiable → strict no-op. Returns whether the Beta changed. `weight` (QA-P33F2-1-1,
+   * default 1): the observation's Beta weight in (0, 1] — an independent grader's verdict of a role dispatch weighs 0.5 (plan
+   * §2.6); any other value records nothing. The lifetime counters count the verdict once whatever its weight.
+   */
+  recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal, weight?: number): boolean;
   /** D4: a false refusal is a failure of the key. Returns whether the Beta changed. */
   recordFalseRefusal(key: OutcomeKey, signal: AttemptSignal): boolean;
   /** Accumulate one step into its attempt; a `final` step folds the attempt into `cost(key)`. */

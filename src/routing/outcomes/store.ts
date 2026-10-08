@@ -89,6 +89,8 @@ interface ScoredInfo {
   readonly at: number;
   /** The scoring signal was a `variant` step. */
   readonly variant: boolean;
+  /** QA-P33F2-1-1: the Beta weight the observation carried (1, or 0.5 for an independent grader); absent = 1. */
+  readonly weight?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +420,10 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       });
     },
 
-    recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal): boolean {
+    recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal, weight = 1): boolean {
       if (verdict !== "pass" && verdict !== "fail") return false;
+      // QA-P33F2-1-1: a weighted observation (an independent grader's 0.5) never weighs more than one, nor nothing.
+      if (!(Number.isFinite(weight) && weight > 0 && weight <= 1)) return false;
       const previous = scored.get(signal.attemptID);
       if (previous !== undefined) {
         remember(scored, signal.attemptID, previous, maxScored);
@@ -430,7 +434,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
       const pass = verdict === "pass";
       const variant = signal.step === "variant";
       const t = clockNow();
-      entry.beta = observe(entry.beta, pass, t, tuning);
+      entry.beta = observe(entry.beta, pass, t, tuning, weight);
       const c = entry.counts;
       entry.counts = {
         pass: c.pass + (pass ? 1 : 0),
@@ -439,7 +443,7 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
         variantPass: c.variantPass + (variant && pass ? 1 : 0),
         variantFail: c.variantFail + (variant && !pass ? 1 : 0),
       };
-      remember(scored, signal.attemptID, { key, kind: pass ? "pass" : "fail", at: t, variant }, maxScored);
+      remember(scored, signal.attemptID, { key, kind: pass ? "pass" : "fail", at: t, variant, ...(weight === 1 ? {} : { weight }) }, maxScored);
       revision += 1;
       return true;
     },
@@ -464,7 +468,8 @@ export function createOutcomeStore(options: OutcomeStoreOptions = {}): OutcomeSt
         // of alpha (floored at 0; an approximation once the cap has rescaled the evidence) and move the
         // counters pass → fail.
         const decayed = decayTo(entry.beta, t, tuning);
-        const contribution = decayFactor(t - previous.at, tuning.halfLifeDays);
+        // QA-P33F2-1-1: a weighted pass (an independent grader's 0.5) gives back only what it added.
+        const contribution = decayFactor(t - previous.at, tuning.halfLifeDays) * (previous.weight ?? 1);
         entry.beta = capEvidence(
           { alpha: Math.max(0, decayed.alpha - contribution), beta: decayed.beta + 1, updatedAt: decayed.updatedAt },
           tuning.maxEffectiveSamples,

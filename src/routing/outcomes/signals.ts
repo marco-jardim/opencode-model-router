@@ -252,10 +252,12 @@ export interface TierRung {
 
 /**
  * #84 P3.3 fix 2: the tier of a model reference (`provider/model` or `provider/model#variant`) among `rungs` (cheapest tier
- * first): the first rung with the same model and variant (absent ≡ `default`), else — the variant is not a rung of the preset,
- * as when the host reports the model's default variant (`anthropic/claude-opus-5-5#default`) of a tier that lists another one —
- * the first rung of the same model. The cheapest match wins, so an ambiguous model never ranks higher than it may. Models are
- * compared case-insensitively. Null for an unknown or malformed reference.
+ * first). An exact rung — same model and variant (absent ≡ `default`) — decides, the cheapest exact rung when there are several,
+ * even when the model also sits on a cheaper tier with another variant (`…#high` on `heavy` stays `heavy` although `…#low` is on
+ * `medium`). Only when the variant is no rung of the preset — as when the host reports the model's default variant
+ * (`anthropic/claude-opus-5-5#default`) of a tier that lists another one — the cheapest tier listing the model decides, so a
+ * reference that matches only by model never ranks higher than its cheapest tier. Models are compared case-insensitively. Null
+ * for an unknown or malformed reference. (The ingest's grader rank also caps this by the tier the checker asked for, QA-P33F2-1 N3.)
  */
 export function tierOfModel(model: string | null | undefined, rungs: readonly TierRung[]): string | null {
   const parse = (text: unknown): { readonly id: string; readonly variant: string | null } | null => {
