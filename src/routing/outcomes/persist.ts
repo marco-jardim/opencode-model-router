@@ -34,6 +34,7 @@ import type {
   ReadRowsResult,
   RefusalRow,
   RouteChoice,
+  SignalKind,
   VerdictRow,
   WriteResult,
 } from "./types";
@@ -258,6 +259,13 @@ const LOGGED_MODES: readonly string[] = ["shadow", "advise", "enforce"];
 const COST_UNITS: readonly string[] = ["usd", "ratio"];
 const VERDICT_VALUES: readonly string[] = ["pass", "fail", "unverifiable"];
 
+const SIGNAL_KINDS: readonly string[] = ["verdict", "run", "grader", "incomplete", "budget", "authority", "redispatch"];
+const BINDINGS: readonly string[] = ["exact", "intersection", "unknown"];
+
+function isStringArray(x: unknown): x is string[] {
+  return Array.isArray(x) && x.every((v): v is string => typeof v === "string");
+}
+
 function isOutcomeKey(x: unknown): x is OutcomeKey {
   return typeof x === "string" && parseKey(x) !== null;
 }
@@ -270,7 +278,7 @@ function readChoice(x: unknown): RouteChoice | null {
   if (!isRec(x)) return null;
   const { key, agent, origin, model, variant } = x;
   if (!isOutcomeKey(key) || typeof agent !== "string" || typeof model !== "string" || typeof variant !== "string") return null;
-  if (origin !== "router" && origin !== "host") return null;
+  if (origin !== "router" && origin !== "host" && origin !== "role") return null;
   return { key, agent, origin, model, variant };
 }
 
@@ -405,6 +413,14 @@ export function parseLogLine(line: string): LogRow | null {
     ...(trace === undefined ? {} : { trace }),
     ...(detection === undefined ? {} : { detection }),
     ...(capability === undefined ? {} : { capability }),
+    ...(typeof json.role === "string" ? { role: json.role } : {}),
+    ...(isStringArray(json.grant) ? { grant: [...json.grant] } : {}),
+    ...(isStringArray(json.boundsReasons) ? { boundsReasons: [...json.boundsReasons] } : {}),
+    ...(isFiniteNum(json.budgetUsed) ? { budgetUsed: json.budgetUsed } : {}),
+    ...(oneOf(SIGNAL_KINDS, json.signal) ? { signal: json.signal as SignalKind } : {}),
+    ...(typeof json.explore === "boolean" ? { explore: json.explore } : {}),
+    ...(isFiniteNum(json.propensity) ? { propensity: json.propensity } : {}),
+    ...(oneOf(BINDINGS, json.binding) ? { binding: json.binding as NonNullable<DecisionRow["binding"]> } : {}),
   };
   return row;
 }
