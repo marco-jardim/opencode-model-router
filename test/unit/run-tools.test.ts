@@ -854,6 +854,17 @@ describe("QA-P13-1-1 argument confinement", () => {
     ];
     for (const arg of forms) expect(escapesWorkRoot(arg), arg).toBe(true);
   });
+  it("refuses any /, \\ or .. in a single-dash argument: short-option clusters carry paths at any offset (QA-P13-3-1)", async () => {
+    for (const arg of ["-br../evil.js", "-bc/abs/x.js", "-ofoo/abs", "-x..", "-ab\\c", "-o.../x", "-r./x.js"]) expect(escapesWorkRoot(arg), arg).toBe(true);
+    for (const arg of ["-ofile", "-Isrc", "-v", "-abc", "-n=5", "--out=src/x.js", "--require=./setup.js"]) expect(escapesWorkRoot(arg), arg).toBe(false);
+    project(root);
+    const run = makeTool({ config: () => config({ commands: { files: { argv: ["node", "probe.js"], args: ["-*", "--*"] } } }) });
+    for (const arg of ["-br../evil.js", "-bc/abs/x.js", "-ofoo/abs"]) {
+      expect(await run({ script: "files", args: [arg], cwd: root }), arg).toMatch(/refused: argument 1 names a path outside the work root/);
+    }
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(await run({ script: "files", args: ["--out=src/x.js", "-v"], cwd: root })).toContain("PROBE-OK --out=src/x.js -v");
+  }, SPAWN_TIMEOUT);
   it("treats -, @ and + as option leads that need a pattern with the same lead", () => {
     expect(optionLead("--x")).toBe("-"); expect(optionLead("@file")).toBe("@"); expect(optionLead("+opt")).toBe("+"); expect(optionLead("a")).toBeUndefined();
     expect(argAllowed(["*"], "@file")).toBe(false);
@@ -980,21 +991,28 @@ describe("QA-P13-1-4 npm stays in the work root", () => {
   it("reads .npmrc keys with npm's own ini parser: every spelling npm resolves to workspace is refused (QA-P13-2-2)", async () => {
     workspaces();
     const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
-    const clean = Object.fromEntries(Object.entries(planned.env).filter(([key]) => !/^npm_/i.test(key)));
+    // ROUTER_RUN_EMPTY_VAR is defined and empty: every npm version substitutes `${ROUTER_RUN_EMPTY_VAR}` with "".
+    const clean = { ...Object.fromEntries(Object.entries(planned.env).filter(([key]) => !/^npm_/i.test(key))), ROUTER_RUN_EMPTY_VAR: "" };
+    const npmGet = (key: string) => spawnSync(planned.executable, [planned.argv[0]!, "config", "get", key], { cwd: root, env: clean, encoding: "utf8", windowsHide: true });
     // `npm config` refuses to run (ENOWORKSPACES) exactly when a workspace is configured.
     const npmSeesWorkspace = () => {
-      const result = spawnSync(planned.executable, [planned.argv[0]!, "config", "get", "fund"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true });
+      const result = npmGet("fund");
       return result.status !== 0 && /ENOWORKSPACES/.test(result.stderr);
     };
-    const run = makeTool();
+    const run = makeTool({ env: testEnv({ ROUTER_RUN_EMPTY_VAR: "" }) });
     writeFileSync(join(root, ".npmrc"), "fund=false\n");
     expect(npmSeesWorkspace()).toBe(false);
+    // QA-P13-3-2: the `${VAR?}` modifier exists only in some npm versions (not npm 10.9.9 / 11.5.1); probe it.
+    writeFileSync(join(root, ".npmrc"), "init-version=${ROUTER_RUN_UNSET_VAR?}1.2.3\n");
+    const probe = npmGet("init-version");
+    const questionModifier = probe.status === 0 && probe.stdout.trim() === "1.2.3";
     const spellings = ["fund=false\rworkspace=packages/a\n", "workspace;comment=packages/a\n", "\"work\\u0073pace\"=packages/a\n",
-      "work${ROUTER_RUN_UNSET_VAR?}space=packages/a\n", "workspace#x=packages/a\n"];
+      "work${ROUTER_RUN_EMPTY_VAR}space=packages/a\n", "work${ROUTER_RUN_UNSET_VAR?}space=packages/a\n", "workspace#x=packages/a\n"];
     for (const text of spellings) {
       writeFileSync(join(root, ".npmrc"), text);
-      // Control: npm itself reads this spelling as the workspace setting.
-      expect(npmSeesWorkspace(), JSON.stringify(text)).toBe(true);
+      // Control: npm itself reads this spelling as the workspace setting (the `?` spelling only where npm has the modifier).
+      if (!text.includes("?}") || questionModifier) expect(npmSeesWorkspace(), JSON.stringify(text)).toBe(true);
+      // The refusal never depends on the npm version.
       expect(await run({ script: "test", cwd: root }), JSON.stringify(text)).toMatch(/^\[router_run\] error: refused: the work root's \.npmrc (sets "workspace"|has a key with environment substitution)/);
     }
     const decode = loadNpmIni(planned.argv[0]!, process.platform, [root]);
@@ -1035,12 +1053,44 @@ describe("QA-P13-1-4 npm stays in the work root", () => {
     const control = spawnSync(planned.executable, [planned.argv[0]!, "run", "test"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true });
     expect(control.status).not.toBe(0);
     expect(existsSync(join(root, "ran.json"))).toBe(false);
-    expect(await makeTool()({ script: "test", cwd: root })).toMatch(/exit code: 0/);
-    expect(existsSync(join(root, "ran.json"))).toBe(true);
+    // The pinned flags alone would keep this run on the root script; the tool refuses the redirect outright (QA-P13-3-3).
+    expect(spawnSync(planned.executable, [planned.argv[0]!, ...flags, "run", "test"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true }).status).toBe(0);
+    rmSync(join(root, "ran.json"));
+    expect(await makeTool()({ script: "test", cwd: root })).toMatch(/refused: the work root's \.npmrc sets "userconfig"/);
+    expect(existsSync(join(root, "ran.json"))).toBe(false);
     // npm's ${VAR} substitution, as the npm child sees it.
     expect(npmEnvReplace("${A}/x/${B?}/${C}", { A: "a" }, "linux")).toBe("a/x//${C}");
     expect(npmEnvReplace("\\${A}", { A: "a" }, "linux")).toBe("${A}");
     expect(npmEnvReplace("${appdata}", { APPDATA: "r" }, "win32")).toBe("r");
+  }, SPAWN_TIMEOUT);
+  it("refuses a .npmrc that moves globalconfig, userconfig or prefix: a planted global file beats --globalconfig (QA-P13-3-3)", async () => {
+    const pkg = workspaces();
+    const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
+    const flags = planned.argv.slice(1, 8);
+    expect(flags[6]).toMatch(/^--globalconfig=/);
+    const clean = Object.fromEntries(Object.entries(planned.env).filter(([key]) => !/^npm_/i.test(key)));
+    const planted = join(root, "g.npmrc");
+    writeFileSync(planted, "workspace=packages/a\n");
+    writeFileSync(join(root, ".npmrc"), `globalconfig=${planted.replaceAll("\\", "/")}\n`);
+    // Control: even with every hardening flag (including --globalconfig) npm loads the planted global file:
+    // its workspace setting collides with --workspaces=false (or, depending on the version, ENOWORKSPACES).
+    const control = spawnSync(planned.executable, [planned.argv[0]!, ...flags, "config", "get", "fund"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true });
+    expect(control.status).not.toBe(0);
+    expect(control.stderr).toMatch(/ENOWORKSPACES|--no-workspaces and --workspace/);
+    // Without the planted file the same command succeeds.
+    rmSync(join(root, ".npmrc"));
+    expect(spawnSync(planned.executable, [planned.argv[0]!, ...flags, "config", "get", "fund"], { cwd: root, env: clean, encoding: "utf8", windowsHide: true }).status).toBe(0);
+    const run = makeTool({ config: () => config({ commands: { t: { argv: ["npm", "test"] } } }) });
+    const path = planted.replaceAll("\\", "/");
+    for (const text of [`globalconfig=${path}\n`, `GlobalConfig=${path}\n`, `"global\\u0063onfig"=${path}\n`, `fund=false\rglobalconfig=${path}\n`,
+      `globalconfig;x=${path}\n`, `userconfig=${path}\n`, `prefix=${sibling.replaceAll("\\", "/")}\n`]) {
+      writeFileSync(join(root, ".npmrc"), text);
+      for (const script of ["test", "t"]) {
+        expect(await run({ script, cwd: root }), JSON.stringify(text)).toMatch(/^\[router_run\] error: refused: the work root's \.npmrc sets "(globalconfig|GlobalConfig|userconfig|prefix)": npm would load config files the tool does not check/);
+      }
+    }
+    expect(existsSync(join(pkg, "ws-marker.txt"))).toBe(false);
+    expect(existsSync(join(root, "ran.json"))).toBe(false);
   }, SPAWN_TIMEOUT);
   it("refuses an npm command entry without a package.json in the work root itself", async () => {
     const nested = join(sibling, "nested");

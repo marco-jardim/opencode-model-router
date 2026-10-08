@@ -13,11 +13,17 @@
  *   shell exactly as `npm run <name>` would. The tool pins WHICH npm, node and shell run
  *   them (none may come from the repository or the plugin's checkout, #77 G4) and the
  *   npm settings that would change that: `--script-shell`, `--node-options=`,
- *   `--workspaces=false`, `--update-notifier=false` and `--logs-max=0` on the command
- *   line outrank every npmrc file and the environment; a work-root `.npmrc` that selects
- *   workspaces (`workspace`, `workspaces`, `include-workspace-root`) is refused, because
- *   npm would run another package's scripts. Other repository `.npmrc` settings (cache,
- *   registry, …) still apply to npm itself. The tool does not and cannot make a script safe.
+ *   `--workspaces=false`, `--update-notifier=false`, `--logs-max=0` and `--userconfig`
+ *   on the command line outrank every npmrc file and the environment. `--globalconfig`
+ *   does NOT: npm keeps the command-line value in its default layer, so any npmrc that
+ *   sets `globalconfig` wins over it (QA-P13-3-3). A work-root `.npmrc` is therefore
+ *   refused when it selects workspaces (`workspace`, `workspaces`,
+ *   `include-workspace-root`: npm would run another package's scripts) or moves npm's
+ *   config files (`globalconfig`, `userconfig`, `prefix`: a repository file could then
+ *   select a workspace unchecked). The user's own `~/.npmrc` may still set
+ *   `globalconfig`; that file is user-owned, outside every work root. Other repository
+ *   `.npmrc` settings (cache, registry, …) still apply to npm itself. The tool does not
+ *   and cannot make a script safe.
  * - Because an edit can change what a script does, a grant holding both write and exec
  *   is floored at medium/heavy by the §2.3 floor table: write + exec is as strong as
  *   running code the agent wrote.
@@ -98,6 +104,8 @@ export const NPM_RUN_COMMANDS: ReadonlySet<string> = new Set(["run", "run-script
 const NPM_SAFE_FLAGS: ReadonlySet<string> = new Set(["--silent", "-s", "--quiet", "-q", "--if-present"]);
 /** `.npmrc` keys that make npm run another package's scripts. */
 const NPMRC_WORKSPACE_KEYS: ReadonlySet<string> = new Set(["workspace", "workspaces", "include-workspace-root"]);
+/** `.npmrc` keys that move npm's config files out of the tool's checks (QA-P13-3-3). */
+const NPMRC_LOCATION_KEYS: ReadonlySet<string> = new Set(["globalconfig", "userconfig", "prefix"]);
 /** Credential-bearing environment variable names (QA-P13-1-9). */
 export const CREDENTIAL_ENV_RE = /(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)($|_)/i;
 /** Provider credentials whose names the pattern above does not match. */
@@ -206,10 +214,15 @@ export function optionLead(arg: string): string | undefined {
  * - `:/` or `//` anywhere (URLs such as `file:///D:/x`, UNC, `--alias=x:/abs`);
  * - a `..` segment bounded by `/`, `\`, `=`, `:`, `@`, `+` or the ends, also right
  *   after a two-character short option (`-r../x.js`).
+ * - a single-dash argument (`/^-[^-]/`) with any `/`, `\` or `..` (QA-P13-3-1): yargs
+ *   and minimist read `-br../evil.js` as `-b -r ../evil.js` and `-ofoo/abs` as
+ *   `-o foo/abs`, so a short-option cluster can carry a path at any offset. Paths stay
+ *   available through checked `--long=value` arguments.
  * On win32 a leading `/switch` is refused by the same rule. Symlinks inside the work
  * root and the contents of `@response` files are repository content (not checked).
  */
 export function escapesWorkRoot(arg: string): boolean {
+  if (/^-[^-]/.test(arg) && /[\\/]|\.\./.test(arg)) return true;
   if (/:[\\/]|[\\/]{2}/.test(arg)) return true;
   const short = /^-[^-]/.test(arg) ? arg.slice(2) : undefined;
   const starts = [arg, arg.replace(/^[-@+]+/, ""), ...(short !== undefined ? [short] : [])];
@@ -455,11 +468,12 @@ export interface NpmConfigPins { userconfig: string; globalconfig: string }
 
 /**
  * Flags that pin npm's script shell and node options, keep npm in the work root's
- * package, write no npm log file, and pin the user and global config files (a project
- * `.npmrc` can otherwise move `userconfig` to a repository file, which could then move
- * `globalconfig`). Command line flags outrank npmrc files and the environment, with one
- * exception npm 11 shows in `config ls -l` ("overridden by user"): the user's own
- * `~/.npmrc` may still set `globalconfig`; that file is user-owned, outside every work root.
+ * package, write no npm log file, and pin the user and global config files. Command
+ * line flags outrank npmrc files and the environment except `--globalconfig`: npm keeps
+ * that value in its default layer, so any npmrc setting `globalconfig` beats it
+ * (`config ls -l`: "overridden by user"/"project"). The project `.npmrc` keys that move
+ * config files are refused by checkNpmrc (QA-P13-3-3); the user's own `~/.npmrc` may
+ * still set `globalconfig` (user-owned, outside every work root).
  */
 export function npmHardeningFlags(shell: string, pins: NpmConfigPins): string[] {
   return [`--script-shell=${shell}`, "--node-options=", "--workspaces=false", "--update-notifier=false", "--logs-max=0",
@@ -551,10 +565,12 @@ function requireScript(scripts: Record<string, unknown>, name: string): void {
 }
 
 /**
- * Refuse a work-root .npmrc that selects workspaces: npm would run another package's
- * scripts (QA-P13-1-4). Keys are read with npm's own ini parser (QA-P13-2-2) and compared
- * case-insensitively; a key using `${…}` substitution is refused outright (npm
- * substitutes keys too, so `work${X?}space` is `workspace`).
+ * Refuse a work-root .npmrc that selects workspaces (npm would run another package's
+ * scripts, QA-P13-1-4) or moves npm's config files (`globalconfig` beats the pinned
+ * `--globalconfig`, and a planted global or user file could select a workspace
+ * unchecked, QA-P13-3-3). Keys are read with npm's own ini parser (QA-P13-2-2) and
+ * compared case-insensitively; a key using `${…}` substitution is refused outright
+ * (npm substitutes keys too, so `work${X}space` can be `workspace`).
  */
 function checkNpmrc(root: string, platform: NodeJS.Platform, decode: IniDecode): void {
   const text = readConfigFile(pathApi(platform).join(root, ".npmrc"), ".npmrc");
@@ -564,6 +580,7 @@ function checkNpmrc(root: string, platform: NodeJS.Platform, decode: IniDecode):
   for (const key of Object.keys(parsed)) {
     if (key.includes("${")) throw refuse(`the work root's .npmrc has a key with environment substitution: npm would rewrite it`);
     if (NPMRC_WORKSPACE_KEYS.has(key.toLowerCase())) throw refuse(`the work root's .npmrc sets "${key}": npm would run another package's scripts`);
+    if (NPMRC_LOCATION_KEYS.has(key.toLowerCase())) throw refuse(`the work root's .npmrc sets "${key}": npm would load config files the tool does not check`);
   }
 }
 
