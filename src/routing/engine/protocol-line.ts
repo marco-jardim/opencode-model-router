@@ -12,11 +12,15 @@
  *    least {@link MIN_EVIDENCE_TO_MOVE} effective evidence. Priors alone can move a class in the kernel
  *    (e.g. `margin: 0`), so the evidence gate is what keeps the line static until data exists.
  *
+ * v2 roles mode (plan #84 T2.2.1): with a non-empty role table the line maps class → role agent
+ * ({@link generateRolesTaxonomy}); tiers mode and v1 never pass one, so their line is unchanged.
+ *
  * Pure: no I/O, no clock, no randomness, no module state.
  */
 
 import type { ResolvedRouting, RouterConfig, RouterHost } from "../../router/config";
 import { buildTaskTaxonomy } from "../../router/protocol";
+import type { RoleSpec } from "../../router/roles";
 import {
   CLASS_BASE_RISK,
   CLASS_IMPLIED_NEEDS,
@@ -28,6 +32,7 @@ import type { ModelPricing } from "../outcomes/types";
 import { MIN_EVIDENCE_TO_SWITCH_DOWN, decide, hasMinEvidence } from "./kernel";
 import { buildLadder, type LadderBuildInput, floorRankOf, resolveChosen, roleAgentExclusion, routerTierIds, tierRankOf } from "./ladders";
 import type { EngineStoreView, HostAgentInfo } from "./types";
+import { generateRolesTaxonomy } from "./roles-taxonomy";
 
 /** `best` must carry evidence at least as strong as the prior before a class line moves (= `PRIOR_STRENGTH`). */
 export const MIN_EVIDENCE_TO_MOVE: number = MIN_EVIDENCE_TO_SWITCH_DOWN;
@@ -43,7 +48,15 @@ export interface TaxonomyInput {
   readonly session?: LadderBuildInput["session"];
   readonly parentModel?: string | null;
   readonly logger?: LadderBuildInput["logger"];
+  /**
+   * v2 roles mode (T2.2.1): the enabled role agents (`resolveRoles`). A non-empty table makes the line the
+   * class → role map of {@link generateRolesTaxonomy}; absent or empty, the tier line below is unchanged.
+   */
+  readonly roles?: ReadonlyMap<string, RoleSpec>;
 }
+
+/** The class → role line lives in a leaf module (QA-P22-1-11); re-exported here as part of the `R:` line API. */
+export { CLASS_ROLE_KIND, generateRolesTaxonomy } from "./roles-taxonomy";
 
 function ownRoleList(roles: Readonly<Record<string, readonly string[]>>, cls: string): readonly string[] {
   const list = Object.hasOwn(roles, cls) ? roles[cls] : undefined;
@@ -118,6 +131,10 @@ function v2Segments(input: TaxonomyInput, store: EngineStoreView): string[] {
  * line (`R: by class: …`) where the taxonomy would go, and only when it is non-empty.
  */
 export function generateTaxonomy(input: TaxonomyInput): string {
+  if (input.host === "v2" && input.roles !== undefined) {
+    const roleLine = generateRolesTaxonomy(input.roles);
+    if (roleLine !== "") return roleLine; // roles mode: class → role, never a tier
+  }
   const base = buildTaskTaxonomy(input.cfg);
   let segments: string[];
   if (input.host === "v1") {
