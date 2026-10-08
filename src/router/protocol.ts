@@ -1,4 +1,13 @@
 import type { RouterConfig, Preset, ModeConfig } from "./config";
+import type { RoleSpec } from "./roles";
+
+/**
+ * The roles section of the delegation protocol (contract only; T2.2.1 fills it).
+ * Returns "" until then, so the assembled prompt stays byte-identical.
+ */
+export function buildRolesProtocol(_cfg: RouterConfig, _roles: ReadonlyMap<string, RoleSpec>): string {
+  return "";
+}
 
 // ---------------------------------------------------------------------------
 // Tier / mode helpers
