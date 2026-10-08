@@ -75,3 +75,14 @@ reads 9–10 (R5: the DF-1 probe must carry `CAP:12`).
   passed | 3 skipped (156)`, `Tests 1 failed | 12016 passed | 66 skipped (12083)`. The failure is the known flake
   `test\unit\exec.test.ts` › `lowPriority > runs grandchildren of runArgv below normal priority` (`spawnSync
   powershell.exe ETIMEDOUT`); re-run alone: `42 passed | 2 skipped (44)`.
+
+## DF-1 — §2.9 fixes live (sync 2026-10-08T12:07Z)
+
+| Item | Value |
+|---|---|
+| Pre-flight | Wave 1 CI 16/16 green on PR #85 head `741a835`; capped suite on `741a835`: 165 files passed / 3 skipped, only `test\unit\exec.test.ts` load flakes (3 tests, ETIMEDOUT / timing) which passed alone (42 passed / 2 skipped); base checkout clean on `master` @ `eeab36b`; override SHA-256 unchanged (`700E2587…88F8`) |
+| Rollback tag | `rta/df1-prev` → `eeab36b` |
+| Sync | `git -C D:\git\opencode-model-router switch --no-track -C rta/live origin/rta/main` → `741a8359c4532bdefa7a6d2e6f1bd6be175b169f` |
+| `npm ci` | not needed (`package-lock.json` identical `eeab36b`..`741a835`) |
+| Roles | inert (`routing.delegation` absent → `tiers`) |
+| Restart | requested; liveness probe pending |
