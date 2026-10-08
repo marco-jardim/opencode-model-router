@@ -208,9 +208,44 @@ function claimCall(key: string): boolean {
   return true;
 }
 
+/** Bound on children with pending subagent-result annotations (oldest dropped first). */
+export const MAX_ANNOTATED_CHILDREN = 256;
+/** Bound on annotations kept per child (oldest dropped first). */
+export const MAX_ANNOTATIONS_PER_CHILD = 8;
+
+export interface SubagentAnnotation {
+  readonly kind: "budget" | "authority";
+  readonly text: string;
+}
+
+/** Process-wide: annotations for the parent's `subagent` result, keyed by child session. */
+const subagentAnnotations = new Map<string, SubagentAnnotation[]>();
+
+/**
+ * Seam: record an annotation to be appended to the parent's `subagent` result of `childSessionID`.
+ * Bounded; consumed once by {@link takeSubagentAnnotations}.
+ */
+export function annotateSubagentResult(kind: "budget" | "authority", childSessionID: string, text: string): void {
+  const list = subagentAnnotations.get(childSessionID) ?? [];
+  subagentAnnotations.delete(childSessionID);
+  list.push({ kind, text });
+  while (list.length > MAX_ANNOTATIONS_PER_CHILD) list.shift();
+  subagentAnnotations.set(childSessionID, list);
+  while (subagentAnnotations.size > MAX_ANNOTATED_CHILDREN) subagentAnnotations.delete(subagentAnnotations.keys().next().value as string);
+}
+
+/** The annotations recorded for `childSessionID`, in order; they are removed (a second call returns none). */
+export function takeSubagentAnnotations(childSessionID: string): readonly SubagentAnnotation[] {
+  const list = subagentAnnotations.get(childSessionID);
+  if (list === undefined) return [];
+  subagentAnnotations.delete(childSessionID);
+  return list;
+}
+
 /** Test-only: forget which calls were handled. */
 export function resetDispatchRouting(): void {
   handledCalls.clear();
+  subagentAnnotations.clear();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
