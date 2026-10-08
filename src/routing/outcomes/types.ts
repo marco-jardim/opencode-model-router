@@ -596,6 +596,8 @@ export interface DecisionRow extends LogRowBase {
    * (budget, authority). Readers clamp it per kind (signals.ts `signalMass`), so a row can never carry more than §2.6 allows.
    */
   readonly signalWeight?: number;
+  /** P1.4: the attempt an annotation row belongs to (ingest dedupes signals per attempt and kind; statistics do too). */
+  readonly attemptID?: string;
 }
 
 /**
@@ -607,9 +609,13 @@ export const ANNOTATION_REASON = "note:";
 /** Reason prefix of a signal row: `note:signal:<kind>:<pass|fail|none>`. */
 export const SIGNAL_REASON = "note:signal:";
 
-/** A decision row that annotates a dispatch (a signal row, or any row whose reason starts with {@link ANNOTATION_REASON}). */
+/**
+ * A decision row that annotates a dispatch: its reason starts with {@link ANNOTATION_REASON} (the prefix alone decides;
+ * a `signal` field on a row with any other reason is just a field of a dispatch row). Readers before P1.4 drop annotation
+ * rows only through the C7 decision-id dedupe, so downgrading past P1.4 is unsupported (CHANGELOG, P3.2).
+ */
 export function isAnnotationRow(row: LogRow): boolean {
-  return row.kind === "decision" && (row.signal !== undefined || row.reason.startsWith(ANNOTATION_REASON));
+  return row.kind === "decision" && row.reason.startsWith(ANNOTATION_REASON);
 }
 
 /** The `[acceptance]` depth vocabulary of 1.2 (`Detection`), restated here so this module keeps no runtime import. */

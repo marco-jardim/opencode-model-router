@@ -394,7 +394,12 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
   for (const row of rows) {
     if (row.kind !== "decision") continue;
     if (isAnnotationRow(row)) {
-      const id = JSON.stringify([row.decisionID, row.childSessionID, row.reason, row.signal ?? null, row.binding ?? null]);
+      // Signals: one row per attempt and kind, first wins (ingest's own identity and the store's one-observation rule);
+      // `attemptID` when the row carries it, else the child session. Other annotations: per attempt and reason.
+      const attempt = row.attemptID ?? row.childSessionID;
+      const id = JSON.stringify(row.signal !== undefined
+        ? ["signal", row.decisionID, attempt, row.signal]
+        : ["note", row.decisionID, attempt, row.reason, row.binding ?? null]);
       if (seenNotes.has(id)) continue;
       seenNotes.add(id);
       annotations.push(row);
@@ -413,12 +418,15 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
     }
     return acc;
   };
-  /** Role and tier of an annotation: its dispatch row's, else its own; null without a role. */
+  /**
+   * Role and tier of an annotation: when its dispatch row exists, that row's role AND tier only (a dispatch without a role
+   * is tier mode: unattributed); else the annotation's own. Null without a role.
+   */
   const placeOf = (row: DecisionRow): RoleTierAcc | null => {
     const dispatch = dispatchByID.get(row.decisionID);
-    const role = dispatch?.role ?? row.role;
-    if (role === undefined) return null;
-    return bucket(role, dispatch?.tier ?? row.tier ?? UNKNOWN_TIER);
+    const source = dispatch ?? row;
+    if (source.role === undefined) return null;
+    return bucket(source.role, source.tier ?? UNKNOWN_TIER);
   };
 
   const unknownBindingSeen = new Set<string>();

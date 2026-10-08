@@ -421,8 +421,9 @@ export function parseLogLine(line: string): LogRow | null {
     ...(typeof json.explore === "boolean" ? { explore: json.explore } : {}),
     ...(isFiniteNum(json.propensity) ? { propensity: json.propensity } : {}),
     ...(oneOf(BINDINGS, json.binding) ? { binding: json.binding as NonNullable<DecisionRow["binding"]> } : {}),
-    ...(typeof json.tier === "string" ? { tier: json.tier } : {}),
+    ...(typeof json.tier === "string" && json.tier !== "" ? { tier: json.tier } : {}),
     ...(isFiniteNum(json.signalWeight) ? { signalWeight: json.signalWeight } : {}),
+    ...(typeof json.attemptID === "string" && json.attemptID !== "" ? { attemptID: json.attemptID } : {}),
   };
   return row;
 }
