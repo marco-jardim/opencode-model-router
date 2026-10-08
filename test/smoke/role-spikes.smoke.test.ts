@@ -78,6 +78,30 @@ async function lifecycle(host: RoutingHost, sessionID: string): Promise<{ contex
 }
 const sessionView = (s: Obj | undefined) => (s ? { parentID: s.parentID, agent: s.agent, title: s.title, model: s.model } : undefined);
 
+// ---- group B helpers ----
+const toolStatesOf = (context: Obj[]): Obj[] => context.flatMap(m => arr(obj(m).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
+const stateView = (s: Obj) => ({ status: s.status, errorType: obj(s.error).type, errorMessage: obj(s.error).message, text: arr(s.content).map(c => str(obj(c).text)).join("\n") });
+/** Dispatches one child (foreground) and reports what the host recorded about it and what the parent was told. */
+async function childReport(host: RoutingHost, root: string, input: Obj) {
+  const started = Date.now();
+  const call = await host.dispatch(root, { background: false, model: `${SONNET}#low`, ...input });
+  const child = await host.client.session.get({ sessionID: call.childID });
+  const context = await host.client.session.context({ sessionID: call.childID });
+  const events = (await host.eventsOf(call.childID)).filter(e => typeof e.type === "string" && e.type.startsWith("session.")).map(e => e.type);
+  const decisions = (await host.events()).filter(e => e.type === "probe.decision" && e.sessionID === call.childID);
+  return {
+    childID: call.childID, startedAt: started, endedAt: Date.now(),
+    parentToolStatus: call.after.status, parentToolError: call.after.error, parentOutput: str(obj(obj(call.after.result).output).output),
+    child: { agent: child.agent, title: child.title, outcome: child.outcome, parentID: child.parentID },
+    toolStates: toolStatesOf(context).map(stateView), events, decisions,
+    requests: primary(host, call.childID).map(r => ({ ...wire(r), toolNames: r.toolNames, system: r.system })),
+    evaluates: (await lifecycle(host, call.childID)).evaluates.map(e => ({ action: e.action, denied: e.denied })),
+  };
+}
+type ChildReport = Awaited<ReturnType<typeof childReport>>;
+const readProbe = (file: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "read", input: { path: file } })}`;
+const executeProbe = (code: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "execute", input: { code } })}`;
+const decisionsOf = (r: ChildReport, point: string) => r.decisions.filter(d => d.point === point).map(d => ({ decision: d.decision, action: d.action, removed: d.removed }));
 // ------------------------------------------------------------------------------------------------ the spikes ----
 d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
   it("S1 agent registered without a model: the per-call model and variant reach the provider (Anthropic and OpenAI Responses)", async () => {
@@ -334,4 +358,220 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       expect(host.errorLines()).toEqual([]);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
-  }, 300_000);});
+  }, 300_000);
+
+  // ---------------------------------------------------------------------------------------------- group B ----
+  it("S3 per-session narrowing: evaluate and context hooks keyed by event.sessionID affect ONE child of an agent only", async () => {
+    const host = await startSpikeHost("s3", { [NO_MODEL]: agentWithoutModel() }, {
+      probe: { lifecycle: true, bySession: { denyTitle: "S3 A", denyActions: ["read"], stripTitle: "S3 C", stripTools: ["shell", "write"] } },
+    });
+    try {
+      const file = path.join(host.project, "s3-read.txt");
+      await writeFile(file, "S3\n");
+      const [rootA, rootB, rootC, rootD] = await Promise.all([1, 2, 3, 4].map(i => host.newRoot(`s3 root ${i}`)));
+      const input = (title: string, prompt: string): Obj => ({ agent: NO_MODEL, description: title, prompt });
+      // permission evaluate: two concurrent children of the SAME agent, `read` denied for the child titled "S3 A" only.
+      const [a, b] = await Promise.all([childReport(host, rootA!, input("S3 A", readProbe(file))), childReport(host, rootB!, input("S3 B", readProbe(file)))]);
+      // context hook: two concurrent children of the same agent, `shell` and `write` removed from the catalog of "S3 C" only.
+      const [c, d] = await Promise.all([childReport(host, rootC!, input("S3 C", readProbe(file))), childReport(host, rootD!, input("S3 D", readProbe(file)))]);
+      await save("S3", { a, b, c, d, overlap: { ab: a.startedAt < b.endedAt && b.startedAt < a.endedAt, cd: c.startedAt < d.endedAt && d.startedAt < c.endedAt }, hostErrors: host.errorLines() });
+
+      expect(a.child.agent).toBe(NO_MODEL);
+      expect(b.child.agent).toBe(NO_MODEL);
+      // A: refused, with the plugin's message; B: the read ran. Decided from event.sessionID (title resolved through session.get).
+      expect(a.toolStates).toEqual([expect.objectContaining({ status: "error", errorType: "permission.rejected", errorMessage: "PROBE_SESSION_DENIED: read" })]);
+      expect(b.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(decisionsOf(a, "evaluate")).toEqual([{ decision: "deny", action: "read" }].map(x => expect.objectContaining(x)));
+      expect(decisionsOf(b, "evaluate")).toEqual([{ decision: "pass", action: "read" }].map(x => expect.objectContaining(x)));
+      // the parents see two plain completed children; the refusal is only in A's own session.
+      expect(a.parentToolStatus).toBe("completed");
+      expect(b.parentToolStatus).toBe("completed");
+      expect(a.child.outcome).toBe("succeeded");
+      // context hook: the provider request of C has no shell/write, the request of D has them; read and the rest are untouched.
+      const names = (r: ChildReport) => r.requests.map(x => x.toolNames);
+      expect(names(c)).toHaveLength(2);
+      for (const list of names(c)) {
+        expect(list).not.toContain("shell");
+        expect(list).not.toContain("write");
+        expect(list).toContain("read");
+        expect(list).toContain("edit");
+      }
+      for (const list of names(d)) {
+        expect(list).toContain("shell");
+        expect(list).toContain("write");
+        expect(list).toContain("read");
+      }
+      expect(c.decisions.filter(x => x.point === "context").every(x => x.decision === "strip" && JSON.stringify(x.removed) === JSON.stringify(["shell", "write"]))).toBe(true);
+      expect(d.decisions.filter(x => x.point === "context").every(x => x.decision === "pass")).toBe(true);
+      // the stripped tools come from event.tools of that session only: A and B (not stripped) still advertise them.
+      expect(a.requests[0]?.toolNames).toContain("shell");
+      expect(b.requests[0]?.toolNames).toContain("write");
+    } finally { await finish(host); }
+  }, 300_000);
+
+  it("S3 edge: a plugin hook that throws (evaluate / context) - the host's reaction", async () => {
+    const file = "s3-throw.txt";
+    const observe = async (hook: "evaluate" | "context") => {
+      const host = await startSpikeHost(`s3t-${hook}`, { [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, bySession: { throwTitle: "S3 T", throwHook: hook } } });
+      try {
+        await writeFile(path.join(host.project, file), "S3\n");
+        const root = await host.newRoot("s3 throw root");
+        const report = await childReport(host, root, { agent: NO_MODEL, description: "S3 T", prompt: readProbe(path.join(host.project, file)) });
+        const stillWorks = await childReport(host, root, { agent: NO_MODEL, description: "S3 ok", prompt: readProbe(path.join(host.project, file)) });
+        return { hook, report, stillWorks, hostErrors: host.errorLines(), providerErrors: host.provider.errors };
+      } finally { await finish(host); }
+    };
+    const evaluate = await observe("evaluate");
+    const context = await observe("context");
+    await save("S3-throw", { evaluate, context });
+    expect(evaluate.report.decisions.some(d => d.decision === "throw")).toBe(true);
+    expect(context.report.decisions.some(d => d.decision === "throw")).toBe(true);
+    // evaluate throws: the host does not fail open. The single tool call is refused with the thrown message (error type "unknown", surfaced
+    // in the CHILD's tool state only); the child recovers and ends `succeeded`; the parent sees a plain completed child; the hook stays
+    // registered and the next child of the same agent is evaluated normally.
+    expect(evaluate.report.toolStates).toEqual([expect.objectContaining({ status: "error", errorType: "unknown", errorMessage: "PROBE_HOOK_THROWN evaluate" })]);
+    expect(evaluate.report.events).toContain("session.tool.failed");
+    expect(evaluate.report.child.outcome).toBe("succeeded");
+    expect(evaluate.report.parentToolStatus).toBe("completed");
+    expect(evaluate.stillWorks.toolStates.map(s => s.status)).toEqual(["completed"]);
+    expect(evaluate.hostErrors).toEqual([]);
+    // context throws: the child's very first model request is never made (0 provider requests); the child execution FAILS
+    // (session.execution.failed, outcome failed, no step started) and the error is surfaced in the PARENT's subagent tool call
+    // ("Subagent failed (sessionID: ...): <message>", status error) and as one host ERROR log line "Failed to drain Session".
+    expect(context.report.requests).toHaveLength(0);
+    expect(context.report.events.at(-1)).toBe("session.execution.failed");
+    expect(context.report.events).not.toContain("session.step.started");
+    expect(context.report.child.outcome).toBe("failed");
+    expect(context.report.parentToolStatus).toBe("error");
+    expect(String(obj(context.report.parentToolError).string)).toMatch(/^Tool\.Error: Subagent failed \(sessionID: ses_[A-Za-z0-9]+\): PROBE_HOOK_THROWN context$/);
+    expect(context.hostErrors).toHaveLength(1);
+    expect(context.hostErrors[0]).toContain("Failed to drain Session");
+    expect(context.hostErrors[0]).toContain("PROBE_HOOK_THROWN context");
+    // the failed child does not poison the agent: the next child of the same agent runs.
+    expect(context.stillWorks.toolStates.map(s => s.status)).toEqual(["completed"]);
+  }, 300_000);
+
+  it("S6 tool.hook execute.after on the parent's subagent call appends text the PARENT model sees on its next request", async () => {
+    const NOTE = "S6_APPENDED_NOTE_FOR_THE_PARENT";
+    const host = await startSpikeHost("s6", { [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, afterAppend: { tool: "subagent", text: NOTE } } });
+    try {
+      const root = await host.newRoot("s6 root");
+      const call = await host.dispatch(root, { agent: NO_MODEL, description: "S6", prompt: "S6 child", model: `${SONNET}#low`, background: false });
+      const parentRequests = host.requestsOf(root).filter(r => r.kind === "primary");
+      const withResult = parentRequests.filter(r => r.toolResult);
+      const next = withResult[0];
+      const toolResultBlocks = (next?.messages ?? []).flatMap(m => arr(m.content).map(obj)).filter(b => b.type === "tool_result");
+      const childRequests = primary(host, call.childID);
+      const afterRecord = call.after;
+      await save("S6", { parentRequestCount: parentRequests.length, withResultCount: withResult.length, toolResultBlocks, afterHookResult: afterRecord.result, childMessagesContainNote: childRequests.some(r => JSON.stringify(r.messages).includes(NOTE)), decisions: (await host.events()).filter(e => e.type === "probe.decision") });
+
+      expect(next, "the parent's next provider request after the subagent call").toBeDefined();
+      // the parent's tool_result block (what the parent MODEL receives) carries both the child's text and the appended note.
+      expect(toolResultBlocks).toHaveLength(1);
+      const received = JSON.stringify(toolResultBlocks[0]);
+      expect(received).toContain("CHILD_OK");
+      expect(received).toContain(NOTE);
+      expect(received.indexOf(NOTE)).toBeGreaterThan(received.indexOf("CHILD_OK"));
+      // the note exists only in the parent's view: the child's own requests never carry it.
+      expect(childRequests.some(r => JSON.stringify(r.messages).includes(NOTE))).toBe(false);
+      expect((await host.events()).filter(e => e.type === "probe.decision" && e.point === "execute.after")).toHaveLength(1);
+    } finally { await finish(host); }
+  }, 300_000);
+
+  it("S8 Code Mode execute: inner tools.* calls bypass the permission evaluate hook and the per-session context filter", async () => {
+    const host = await startSpikeHost("s8", { [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, bySession: { keepOnlyTitle: "S8 keep", keepOnly: ["execute", "subagent"] } } });
+    try {
+      const root = await host.newRoot("s8 root");
+      const run = (title: string, code: string) => childReport(host, root, { agent: NO_MODEL, description: title, prompt: executeProbe(code) });
+      const text = (r: ChildReport) => r.toolStates[0]?.text ?? "";
+      await writeFile(path.join(host.project, "s8-native.txt"), "S8\n");
+      const plainKeys = await run("S8 plain", "return { ns: Object.keys(tools), opencode: Object.keys(tools.opencode), browser: Object.keys(tools.browser) }");
+      const plainModels = await run("S8 plain models", "return await tools.opencode.models({})");
+      const plainBrowser = await run("S8 plain browser", "return await tools.browser.tabs({})");
+      const plainRename = await run("S8 plain rename", "return await tools.opencode.session_rename({ title: 'S8 renamed by execute' })");
+      const plainSearch = await run("S8 plain search", "return search({ query: 'rename session', limit: 3 })");
+      const native = await childReport(host, root, { agent: NO_MODEL, description: "S8 native", prompt: readProbe(path.join(host.project, "s8-native.txt")) });
+      const keepKeys = await run("S8 keep", "return { ns: Object.keys(tools), opencode: Object.keys(tools.opencode) }");
+      const keepOutside = await run("S8 keep", "return await tools.opencode.session_rename({ title: 'S8 keep renamed' })");
+      const keepSearch = await run("S8 keep", "return search({ query: 'rename session', limit: 3 })");
+      const renamed = await host.client.session.get({ sessionID: plainRename.childID });
+      const keepRenamed = await host.client.session.get({ sessionID: keepOutside.childID });
+      await save("S8", { plainKeys, plainModels, plainBrowser, plainRename, plainSearch, native, keepKeys, keepOutside, keepSearch, renamedTitle: renamed.title, keepRenamedTitle: keepRenamed.title, hostErrors: host.errorLines() });
+
+      // Code Mode is on by default in the isolated host: `execute` is advertised to the child and runs.
+      expect(plainKeys.requests[0]?.toolNames).toContain("execute");
+      expect(plainKeys.toolStates.map(s => s.status)).toEqual(["completed"]);
+      // The INNER catalog is NOT the agent's tool list: two namespaces, `opencode` (5 host API operations) and `browser` (inert here).
+      const inner = JSON.parse(text(plainKeys)) as { ns: string[]; opencode: string[]; browser: string[] };
+      expect(inner.ns).toEqual(["opencode", "browser"]);
+      expect(inner.opencode).toEqual(["session_rename", "session_move", "models", "list_mcp_resources", "read_mcp_resource"]);
+      expect(inner.browser).toHaveLength(30);
+      expect(inner.browser).toEqual(expect.arrayContaining(["tabs", "navigate", "lighthouse"]));
+      // Inner calls run WITHOUT any permission.hook("evaluate") event: not for `execute` itself, nor for the inner calls (including
+      // the mutating `session_rename`, which really renamed the child's session on the host), nor for search.
+      for (const r of [plainKeys, plainModels, plainBrowser, plainRename, plainSearch, keepKeys, keepOutside, keepSearch]) expect(r.evaluates).toEqual([]);
+      expect(plainModels.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(text(plainModels)).toContain("anthropic/claude-sonnet-5-5");
+      expect(renamed.title).toBe("S8 renamed by execute");
+      expect(plainRename.toolStates[0]?.text).toContain("S8 renamed by execute");
+      // the browser namespace is listed but its operations are not callable.
+      expect(text(plainBrowser)).toBe("Tool 'browser.tabs' is not callable.");
+      // search() sees the inner catalog (and only the inner catalog): it finds the rename operation, not agent tools.
+      expect(text(plainSearch)).toContain("tools.opencode.session_rename");
+      // Control: a NATIVE tool call of the same kind of child does produce an evaluate event.
+      expect(native.evaluates).toEqual([{ action: "read", denied: false }]);
+      // The per-session context hook CAN cut the agent-level catalog (provider request: exactly [subagent, execute]) ...
+      expect(keepKeys.requests.map(r => r.toolNames)).toEqual([["subagent", "execute"], ["subagent", "execute"]]);
+      expect(keepKeys.decisions.filter(d => d.point === "context").every(d => d.decision === "strip" && !(d.after as string[]).includes("read"))).toBe(true);
+      // ... but event.tools has no inner entries, so the Code Mode catalog is unchanged by it (same namespaces, same operations,
+      // search still finds them) and an inner call OUTSIDE the allowlist still runs and mutates host state.
+      const keepInner = JSON.parse(text(keepKeys)) as { ns: string[]; opencode: string[] };
+      expect(keepInner).toEqual({ ns: inner.ns, opencode: inner.opencode });
+      expect(text(keepSearch)).toContain("tools.opencode.session_rename");
+      expect(keepOutside.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(keepRenamed.title).toBe("S8 keep renamed");
+      expect(host.errorLines()).toEqual([]);
+    } finally { await finish(host); }
+  }, 300_000);
+
+  it("S9 rewriting args.agent explore -> explorer in tool.hook execute.before: the child runs as the rewritten agent", async () => {
+    const MARK = "S9_EXPLORER_PROMPT_MARKER";
+    const host = await startSpikeHost("s9", {
+      explorer: agentWithoutModel({ system: MARK, description: "S9 custom explorer", permissions: [{ action: "edit", resource: "*", effect: "deny" }] }),
+      [NO_MODEL]: agentWithoutModel(),
+    }, { probe: { lifecycle: true, rewriteAgent: { from: "explore", to: "explorer" } } });
+    try {
+      const root = await host.newRoot("s9 root");
+      const hostAgents = (await host.client.agent.list()).data.map(a => ({ id: a.id, mode: a.mode, model: a.model, hidden: a.hidden }));
+      const rewritten = await childReport(host, root, { agent: "explore", description: "S9 rewritten", prompt: "S9 child" });
+      const control = await childReport(host, root, { agent: NO_MODEL, description: "S9 control", prompt: "S9 child" });
+      const before = (await host.hooks()).filter(h => h.hook === "before" && h.callID !== undefined && h.sessionID === root && h.tool === "subagent").map(h => obj(h.input));
+      const decision = (await host.events()).find(e => e.type === "probe.decision" && e.point === "execute.before");
+      const view = await host.client.session.get({ sessionID: rewritten.childID });
+      const life = await lifecycle(host, rewritten.childID);
+      const agentRecords = (await host.client.agent.list()).data;
+      const explorerRecord = agentRecords.find(a => a.id === "explorer");
+      const exploreRecord = agentRecords.find(a => a.id === "explore");
+      await save("S9", { explorerPermissions: explorerRecord?.permissions, explorePermissions: exploreRecord?.permissions, hostAgents, rewritten, control, probeBeforeInputs: before, decision, childSession: sessionView(obj(view)), lifecycle: (await lifecycle(host, rewritten.childID)).context });
+
+      // The rewrite is honoured by the host: the child session is created and runs as `explorer`, not `explore`.
+      expect(rewritten.child).toMatchObject({ agent: "explorer", title: "S9 rewritten", outcome: "succeeded" });
+      expect(view.agent).toBe("explorer");
+      expect(obj(decision).inputBefore).toMatchObject({ agent: "explore" });
+      expect(obj(decision).inputAfter).toMatchObject({ agent: "explorer" });
+      // The provider request is the rewritten agent's: its prompt (system) carries the custom marker, the control agent's does not.
+      expect(rewritten.requests).toHaveLength(1);
+      expect(rewritten.requests[0]?.system.startsWith(MARK)).toBe(true);
+      expect(control.requests[0]?.system.includes(MARK)).toBe(false);
+      // The permissions are the rewritten agent's too (the host's own agent record), and the session context hook saw `explorer`.
+      expect(explorerRecord?.permissions).toEqual(expect.arrayContaining([{ action: "edit", resource: "*", effect: "deny" }]));
+      expect(exploreRecord?.permissions).not.toEqual(expect.arrayContaining([{ action: "edit", resource: "*", effect: "deny" }]));
+      expect(obj(life.context).agent).toBe("explorer");
+      expect(sessionView(obj(obj(life.context).got))).toMatchObject({ parentID: root, agent: "explorer", title: "S9 rewritten" });
+      // The parent's call completes as usual; the host's tool-call record shows the pre-rewrite input only to hooks that ran BEFORE the rewrite.
+      expect(rewritten.parentToolStatus).toBe("completed");
+      expect(before[0]).toMatchObject({ agent: "explore" });
+      expect(control.child.agent).toBe(NO_MODEL);
+    } finally { await finish(host); }
+  }, 300_000);
+});

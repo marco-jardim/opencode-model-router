@@ -345,6 +345,46 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
   });
  }
+ // Opt-in decisions keyed by the session TITLE (looked up with session.get(event.sessionID), so the decision is per session, not per agent).
+ const bs=cfg.bySession;
+ if(bs){
+  const titleOf=async(id)=>(await snap(id)).title;
+  const seenDecision=new Set();
+  await ctx.permission.hook('evaluate',async e=>{
+   const title=await titleOf(e.sessionID);
+   if(bs.throwHook==='evaluate'&&title===bs.throwTitle){log('SMOKE_EVENTS',{type:'probe.decision',point:'evaluate',action:e.action,sessionID:e.sessionID,title,decision:'throw',__instance:instance,__iid:iid});throw new Error('PROBE_HOOK_THROWN evaluate');}
+   const deny=title!==undefined&&title===bs.denyTitle&&(bs.denyActions||[]).includes(e.action);
+   if(deny){e.effect='deny';e.message='PROBE_SESSION_DENIED: '+e.action;}
+   log('SMOKE_EVENTS',{type:'probe.decision',point:'evaluate',action:e.action,resources:clone(e.resources),sessionID:e.sessionID,agent:e.agent,title,decision:deny?'deny':'pass',__instance:instance,__iid:iid});
+  });
+  await ctx.session.hook('context',async e=>{
+   const title=await titleOf(e.sessionID);
+   const before=Object.keys(e.tools||{});
+   if(bs.throwHook==='context'&&title===bs.throwTitle){log('SMOKE_EVENTS',{type:'probe.decision',point:'context',sessionID:e.sessionID,title,before,decision:'throw',__instance:instance,__iid:iid});throw new Error('PROBE_HOOK_THROWN context');}
+   const removed=[];
+   if(title!==undefined&&title===bs.stripTitle) for(const n of bs.stripTools||[]) if(e.tools&&n in e.tools){delete e.tools[n];removed.push(n);}
+   if(title!==undefined&&title===bs.keepOnlyTitle) for(const n of before) if(!(bs.keepOnly||[]).includes(n)){delete e.tools[n];removed.push(n);}
+   log('SMOKE_EVENTS',{type:'probe.decision',point:'context',sessionID:e.sessionID,agent:e.agent,title,before,removed,after:Object.keys(e.tools||{}),decision:removed.length?'strip':'pass',__instance:instance,__iid:iid});
+  });
+ }
+ // Opt-in: append text to the result of one tool (execute.after) / rewrite the agent of a subagent call (execute.before).
+ if(cfg.afterAppend){
+  await ctx.tool.hook('execute.after',e=>{
+   if(e.tool!==cfg.afterAppend.tool||e.status!=='completed')return;
+   const r=e.result||{}; const content=Array.isArray(r.content)?[...r.content]:[];
+   const out=r.output&&typeof r.output==='object'&&typeof r.output.output==='string'?{output:{...r.output,output:r.output.output+'\\n\\n'+cfg.afterAppend.text}}:{};
+   e.result={...r,content:[...content,{type:'text',text:cfg.afterAppend.text}],...out};
+   log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.after',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'append',__instance:instance,__iid:iid});
+  });
+ }
+ if(cfg.rewriteAgent){
+  await ctx.tool.hook('execute.before',e=>{
+   if(e.tool!=='subagent'||!e.input||e.input.agent!==cfg.rewriteAgent.from)return;
+   const input=clone(e.input);
+   e.input={...e.input,agent:cfg.rewriteAgent.to};
+   log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'rewrite',inputBefore:input,inputAfter:clone(e.input),__instance:instance,__iid:iid});
+  });
+ }
  let dumped=false;
  await ctx.session.hook('context',e=>{
   if(dumped)return; dumped=true;
@@ -398,7 +438,20 @@ export interface HostOptions {
   /** Seeds written to the outcomes store BEFORE the host starts (through the repo's own store + persister, on the temp dir). */
   readonly seed?: readonly Seed[];
   /** Probe-plugin configuration (written to a JSON file the probe reads): `lifecycle` logs first context/evaluate per session; `deny` = { agent?, actions[] } denies those permission actions. */
-  readonly probe?: { readonly lifecycle?: boolean; readonly deny?: { readonly agent?: string; readonly actions: readonly string[] } };
+  readonly probe?: {
+    readonly lifecycle?: boolean; readonly deny?: { readonly agent?: string; readonly actions: readonly string[] };
+    /** Per-SESSION decisions (the probe resolves the session title with session.get(event.sessionID)). */
+    readonly bySession?: {
+      readonly denyTitle?: string; readonly denyActions?: readonly string[];
+      readonly stripTitle?: string; readonly stripTools?: readonly string[];
+      readonly keepOnlyTitle?: string; readonly keepOnly?: readonly string[];
+      readonly throwTitle?: string; readonly throwHook?: "evaluate" | "context";
+    };
+    /** Appends `text` to the (completed) result of `tool` in tool.hook("execute.after"). */
+    readonly afterAppend?: { readonly tool: string; readonly text: string };
+    /** Rewrites `input.agent` of a `subagent` call from `from` to `to` in tool.hook("execute.before"). */
+    readonly rewriteAgent?: { readonly from: string; readonly to: string };
+  };
 }
 export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonly fail: number }
 export interface Teardown { pid?: number; method: string; taskkill?: Obj; exitCode: number | null | undefined; hostPort: number; hostPortClosed: boolean; providerStopped: boolean; rootRemoved: boolean }
