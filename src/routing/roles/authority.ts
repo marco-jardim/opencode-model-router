@@ -133,6 +133,8 @@ export const AUTHORITY_TEXT = {
     otherCall: "authority request not applied: it belongs to another call than the one being resumed",
     notDynamic: "authority request not applied: the session is no longer a dynamic role",
     notBound: "authority request not applied: the session had no binding when it was resumed — ask again with `router_request_authority`",
+    /** Q1 (P2.1 call site): only an exact binding widens. */
+    bindingUnknown: "authority request not applied: binding unknown: dispatch a fresh task",
   },
 } as const;
 
@@ -381,6 +383,35 @@ export function consumeAuthority(childSessionID: string, deps: AuthorityDeps, op
   const actions = sorted(record.actions).filter((a) => max.has(a));
   const grant = (deps.widen ?? widenBinding)(childSessionID, actions, max);
   return { status: "widened", grant, widened: sorted(grant.actions).filter((a) => !binding.grant.actions.has(a)) };
+}
+
+/**
+ * What {@link consumeAuthority} would do for this resume, without doing it (P2.1 QA nit 2): no record is cleared, nothing is
+ * widened. `widened` are the recorded actions inside the CURRENT role max that the binding does not hold yet (binding.ts `widen`
+ * may still refuse one, e.g. `router_run` without a work root). `exactOnly` (Q1): a binding that is not `exact` is dropped with
+ * {@link AUTHORITY_TEXT}.dropped.bindingUnknown. A record past its TTL reads as none (left for the next access to drop).
+ */
+export type AuthorityPreview =
+  | { status: "none" }
+  | { status: "dropped"; reason: string }
+  | { status: "widened"; widened: readonly AuthorityAction[] };
+
+export function previewAuthority(
+  childSessionID: string,
+  deps: AuthorityDeps,
+  opts: { afterCall: string; exactOnly?: boolean },
+): AuthorityPreview {
+  const record = state().requests.get(childSessionID);
+  if (record === undefined || Date.now() - record.at >= AUTHORITY_TTL_MS) return { status: "none" };
+  if (!record.annotated) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notAnnotated };
+  if (record.callID !== opts.afterCall) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.otherCall };
+  const role = deps.roleOf(childSessionID);
+  if (role === undefined || role.authority.mode === "fixed") return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notDynamic };
+  const max = roleMax(role);
+  const binding = bindingFor(childSessionID, deps, max);
+  if (binding === undefined) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notBound };
+  if (opts.exactOnly === true && binding.kind !== "exact") return { status: "dropped", reason: AUTHORITY_TEXT.dropped.bindingUnknown };
+  return { status: "widened", widened: sorted(record.actions).filter((a) => max.has(a) && !binding.grant.actions.has(a)) };
 }
 
 /** A session was deleted: drops its own request and the requests of its children (it was their parent). */
