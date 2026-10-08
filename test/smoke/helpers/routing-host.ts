@@ -172,6 +172,8 @@ export class RoutingProvider {
   graders = 0;
   /** Held before a grader answers, so a poller can see the producer child between two attempts (the runner removes its children when the delegation ends). */
   graderDelayMs = 0;
+  /** See `loopSource` in `handle`: repeat the READ_ONLY_PROBE tool call on every request after the first tool result. */
+  loopProbe = false;
   private sequence = 0;
   private server = createServer((req, res) => { void this.handle(req, res); });
   async start(): Promise<string> { return `http://127.0.0.1:${await listenOnFetchSafePort(this.server)}/v1`; }
@@ -200,9 +202,15 @@ export class RoutingProvider {
       const grader = system.includes(GRADER_MARK);
       const subagentCall = toolResult || grader ? undefined : /SPIKE_CALL=(\{[^\n]*\})/.exec(lastText)?.[1];
       const delegateCall = toolResult || grader ? undefined : /SPIKE_DELEGATE=(\{[^\n]*\})/.exec(lastText)?.[1];
+      // `loopProbe` (off by default): once any tool result is in the history (even if the last message is no longer one, e.g. the host's max-steps note), keep emitting the READ_ONLY_PROBE call found in the earlier user text, so a
+      // child never finishes by itself and only the host's step limit can stop it.
+      const hadToolResult = toolResult || messages.some(m => m.type === "function_call_output" || this.blocks(m.content).some(b => b.type === "tool_result"));
+      const loopSource = this.loopProbe && hadToolResult && !grader
+        ? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(messages.flatMap(m => this.blocks(m.content)).filter(b => b.type === "text" || b.type === "input_text").map(b => String(b.text ?? "")).filter(text => !/SPIKE_(CALL|DELEGATE)=/.test(text)).join("\n"))?.[1]
+        : undefined;
       // Issue #77: intentionally emit even an unadvertised tool to prove that
       // the HOST rejects it, rather than a cooperative model merely abstaining.
-      const readOnlyProbe = toolResult || grader || subagentCall || delegateCall ? undefined : /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1];
+      const readOnlyProbe = (toolResult && !loopSource) || grader || subagentCall || delegateCall ? undefined : (loopSource ?? /READ_ONLY_PROBE=(\{[^\n]*\})/.exec(lastText)?.[1]);
       const probe = readOnlyProbe ? obj(JSON.parse(readOnlyProbe)) : undefined;
       const toolName = subagentCall ? "subagent" : delegateCall ? "delegate" : str(probe?.tool);
       const toolInput = subagentCall ?? delegateCall ?? (probe ? JSON.stringify(probe.input) : undefined);
@@ -300,8 +308,9 @@ export class RoutingProvider {
 /** Native v2 plugin loaded NEXT TO the router. It only observes: tool hooks (every tool, with the plugin-instance id), the
  * session event stream (with event ids), the provider requests (it tags them with session/agent/kind/model headers) and the host's
  * own `ctx.agent.list()` / `ctx.model.list()` records (dumped once, on the first context hook). It never rewrites anything. */
-export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync} from 'node:fs';
-const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify({...x,__t:Date.now()})+'\\n');
+export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync,readFileSync} from 'node:fs';
+const tick=()=>(globalThis.__smokeSeq=(globalThis.__smokeSeq||0)+1);
+const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify({...x,__t:Date.now(),__n:tick()})+'\\n');
 const clone=(x)=>{try{return structuredClone(x);}catch{return {unclonable:String(x)};}};
 const ser=(error)=>{try{return {string:String(error),props:JSON.parse(JSON.stringify(error,Object.getOwnPropertyNames(error).filter(k=>k!=='stack')))};}catch{return {string:String(error)};}};
 export default {id:'routing-smoke-probe',async setup(ctx){
@@ -316,6 +325,26 @@ export default {id:'routing-smoke-probe',async setup(ctx){
   e.request.headers.set('x-proof-kind',e.kind);
   e.request.headers.set('x-proof-model',e.model.providerID+'/'+e.model.id+(e.model.variant?'#'+e.model.variant:''));
  });
+ // Opt-in (SMOKE_PROBE_CONFIG, written by HostOptions.probe): lifecycle records at the FIRST context build / permission evaluation of
+ // each session (what session.get answers at that moment) and an optional plugin-guard denial. Nothing happens without the file.
+ const cfg=(()=>{try{return process.env.SMOKE_PROBE_CONFIG?JSON.parse(readFileSync(process.env.SMOKE_PROBE_CONFIG,'utf8')):{};}catch{return {};}})();
+ const snap=async(id)=>{try{const s=await ctx.session.get({sessionID:id});return {parentID:s.parentID,agent:s.agent,title:s.title,model:clone(s.model)};}catch(error){return {error:String(error)};}};
+ if(cfg.lifecycle){
+  const firstContext=new Set();
+  const firstEvaluate=new Set();
+  await ctx.session.hook('context',async e=>{
+   if(firstContext.has(e.sessionID))return; firstContext.add(e.sessionID);
+   const entered=Date.now(),enteredN=tick();
+   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'context',sessionID:e.sessionID,agent:e.agent,model:clone(e.model),options:clone(e.options),entered,enteredN,got:await snap(e.sessionID),__instance:instance,__iid:iid});
+  });
+  await ctx.permission.hook('evaluate',async e=>{
+   const entered=Date.now(),enteredN=tick();
+   const first=!firstEvaluate.has(e.sessionID); firstEvaluate.add(e.sessionID);
+   const deny=cfg.deny&&(cfg.deny.agent===undefined||cfg.deny.agent===e.agent)&&(cfg.deny.actions||[]).includes(e.action);
+   if(deny){e.effect='deny';e.message='PLUGIN_GUARD_DENIED: '+e.action;}
+   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
+  });
+ }
  let dumped=false;
  await ctx.session.hook('context',e=>{
   if(dumped)return; dumped=true;
@@ -345,6 +374,14 @@ export const SMOKE_PRESET = {
   heavy: { model: MODELS.opus, variant: "xhigh", costRatio: 20, description: "smoke heavy tier", whenToUse: ["architecture"] },
 };
 
+/** A second scripted provider: the same server answers `/v1/responses` (OpenAI Responses). Pass as `providers` of `HostOptions`. */
+export const OPENAI_PROVIDER: Obj = { openai: { settings: { baseURL: "$BASE_URL", apiKey: "keyless-smoke-fake" } } };
+/** A host agent entry (`hostConfig.agents[name]`) with NO `model` key: the caller's fields are copied, a `model` / `variant` is refused. */
+export function agentWithoutModel(fields: Obj = {}): Obj {
+  if ("model" in fields || "variant" in fields) throw new Error("agentWithoutModel: the entry must not carry a model or variant");
+  return { mode: "subagent", description: "role spike agent without a model", ...fields };
+}
+
 export interface HostOptions {
   /** Router override file content, merged over the smoke preset. `routing.outcomes.path` is always forced to this host's temp directory. */
   readonly overrides?: Obj;
@@ -360,6 +397,8 @@ export interface HostOptions {
   readonly hostConfig?: Obj;
   /** Seeds written to the outcomes store BEFORE the host starts (through the repo's own store + persister, on the temp dir). */
   readonly seed?: readonly Seed[];
+  /** Probe-plugin configuration (written to a JSON file the probe reads): `lifecycle` logs first context/evaluate per session; `deny` = { agent?, actions[] } denies those permission actions. */
+  readonly probe?: { readonly lifecycle?: boolean; readonly deny?: { readonly agent?: string; readonly actions: readonly string[] } };
 }
 export interface Seed { readonly key: OutcomeKey; readonly pass: number; readonly fail: number }
 export interface Teardown { pid?: number; method: string; taskkill?: Obj; exitCode: number | null | undefined; hostPort: number; hostPortClosed: boolean; providerStopped: boolean; rootRemoved: boolean }
@@ -436,6 +475,8 @@ export class RoutingHost {
     await writeFile(path.join(probe, "package.json"), JSON.stringify({ name: "routing-smoke-probe", type: "module", exports: { ".": "./server.mjs", "./server": "./server.mjs" } }));
     await writeFile(path.join(probe, "server.mjs"), PROBE_PLUGIN);
     for (const file of [this.logs.hooks, this.logs.events]) await writeFile(file, "");
+    const probeConfig = path.join(this.root, "probe-config.json");
+    if (this.options.probe) await writeFile(probeConfig, JSON.stringify(this.options.probe));
     if (this.options.seed && this.options.seed.length > 0) await seedOutcomes(this.outcomes, this.options.seed);
     await this.writeOverrides();
     const baseURL = await this.provider.start();
@@ -454,6 +495,7 @@ export class RoutingHost {
       OPENCODE_PASSWORD: password, OPENCODE_TEST_HOME: env.HOME, PWD: this.project,
       OPENCODE_CONFIG_PROJECT_DISABLE: "true", OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_FILEWATCHER_DISABLE: "true",
       SMOKE_HOOKS: this.logs.hooks, SMOKE_EVENTS: this.logs.events, SMOKE_DUMP: this.logs.dump,
+      ...(this.options.probe ? { SMOKE_PROBE_CONFIG: probeConfig } : {}),
     });
     this.envKeys = Object.keys(env).sort();
     // No credential-shaped variable may reach the host; OPENCODE_PASSWORD is the harness's own random one.
@@ -577,6 +619,8 @@ export class RoutingHost {
     for (const e of await this.rawEvents()) for (const dir of [obj(e.location).directory, e.__instance]) if (typeof dir === "string" && dir !== "") dirs.add(dir);
     return [...dirs];
   }
+  /** The opencode.json the harness generated for this host (what the host loaded, e.g. to prove an agent entry has no `model`). */
+  async hostConfigOnDisk(): Promise<Obj> { return obj(JSON.parse(await readFile(path.join(this.root, "config", "opencode", "opencode.json"), "utf8"))); }
   async dump(): Promise<Obj | undefined> { return existsSync(this.logs.dump) ? obj(JSON.parse(await readFile(this.logs.dump, "utf8"))) : undefined; }
 
   /** The scripted root orchestrator: a root session on the scripted model with a session-level allow-all (no `ask` can block headless). */
