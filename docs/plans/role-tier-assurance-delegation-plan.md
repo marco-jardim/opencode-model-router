@@ -4,7 +4,7 @@
 |---|---|
 | Tracking issue | #84 |
 | Base | `master` @ `eeab36b` (v2.3.0 + #78 read-only fast, #82 plugin agents, #83 anthropic fast on Haiku 5.5); the integration branch starts from `origin/docs/role-tier-plan` (= `master` + this plan) |
-| Handover / kickoff | `D:\git\opencode-model-router\docs\plans\role-tier-assurance-delegation-handover.md` |
+| Handover / kickoff | `D:\git\omr-plan-rta\docs\plans\role-tier-assurance-delegation-handover.md` until P0.1, then `D:\git\omr-rta-main\docs\plans\role-tier-assurance-delegation-handover.md` |
 | Self-test | the implementation dogfoods itself: checkpoints DF-1 (after Wave 1) and DF-2 (after Wave 2) run the integration code as the live plugin, and Wave 3 is executed through the new role agents (§0.10, §5) |
 | Host scope | OpenCode **v2** (live: 2.0.24). OpenCode v1 keeps today's tier model (fallback, §2.7) except the mode-independent fixes of §2.9. |
 | Target version | 2.4.0 |
@@ -14,7 +14,9 @@
 **Path convention.** This plan names files by their full path in the base checkout `D:\git\opencode-model-router`
 for readability. **Dispatch prompts must translate every path to the phase worktree** (`D:\git\omr-rta-<id>\…`, e.g.
 `D:\git\opencode-model-router\src\router\roles.ts` → `D:\git\omr-rta-p11\src\router\roles.ts`). The base checkout is
-what the live host loads; nobody writes there before P3.4 (§0.7).
+what the live host loads; only the executor writes there, at DF-1, DF-2 and P3.4 (§0.3.4, §0.7). The plan, the
+handover and `docs\qa\role-tier\dogfood.md` are executor-owned and live in the integration worktree
+`D:\git\omr-rta-main` (§4).
 
 ---
 
@@ -28,7 +30,8 @@ what the live host loads; nobody writes there before P3.4 (§0.7).
      host, a CI failure that cannot be attributed, a non-empty `git status` in the base checkout);
    - the irreversible publish in P3.4 (tag `v2.4.0` → `npm publish`) — the one planned human gate;
    - **whenever an OpenCode v2 restart is needed** — after **every** code sync into the base checkout (DF-1, DF-2, the
-     P3.4 return to `master`: the host imports plugin code once per process, cost-aware plan A8 / spike S7), when the
+     P3.4 return to `master`: the host imports plugin code once per process — cost-aware plan A8, i.e. *its* spike S7,
+     not this plan's S7), when the
      plugin is not loaded, or when host state is stuck: stop, rewrite the handover's resume state first, then tell the
      human (in Portuguese) exactly why and what will be checked after the restart (§0.7);
    - once, at P0.1, only if heavy QA dispatches cannot complete under the owner's guard mode (§0.2.6).
@@ -41,8 +44,9 @@ what the live host loads; nobody writes there before P3.4 (§0.7).
 ### 0.2 Delegation (model-router annotation)
 1. Every task and step carries a tier tag. `[tier:fast]` = read-only lookups (read/glob/grep/`router_git_*`; @fast is
    read-only since #78 and **cannot run commands or edit**). `[tier:medium]` = implementation, tests, running
-   tests/builds and interpreting them, mechanical fixes, docs, merges. `[tier:heavy]` = hard design/security lifts
-   where marked and **every QA review**.
+   tests/builds and interpreting them, mechanical fixes, docs. `[tier:heavy]` = hard design/security lifts
+   where marked and **every QA review**. `[executor]` = the executor itself: merges into `rta/main`, the sync and
+   rollback commands of §0.7 (they swap code under the running host), and edits to the executor-owned files (§4).
 2. **QA is always `[tier:heavy]`**, adversarial, producer ≠ reviewer, reviewer never edits. Every QA dispatch prompt
    starts with the route line `[route class=review risk=high pin]`.
 3. Heavy split: facts are gathered first (@fast or the executor) and pasted into the heavy prompt; heavy does the lift;
@@ -90,7 +94,7 @@ Commit after every green subtask; conventional commits (`feat(roles): …`, `fix
 
 ### 0.5 Tests
 - Scoped only: the phase's new/changed test files listed explicitly plus
-  `npx vitest related <changed src files> --run --maxWorkers=2`. **Never `--pool=threads`.** vitest does not expand
+  `npx vitest related <changed src files> --run --maxWorkers=4`. **Never `--pool=threads`.** vitest does not expand
   globs.
 - The capped full suite (`npx vitest run --maxWorkers=2`, ≈6–7 min) runs only at wave integration, before a dogfood
   sync and in P3.4. Never run the full suite when a scoped run answers the question.
@@ -106,37 +110,50 @@ Commit after every green subtask; conventional commits (`feat(roles): …`, `fix
 - New modules: ≥ 90% branch coverage measured with `--coverage --coverage.include=<file>`.
 
 ### 0.6 QA rounds
-Rounds 1–2: fix **every** finding. From round 3: fix only blocking/critical/major; minors become handoffs. Each phase
+Rounds 1–2: fix **every** finding. From round 3: fix only blocking/critical/major; minors are recorded as handoffs
+marked "accepted — QA round limit". Each phase
 writes `D:\git\opencode-model-router\docs\qa\role-tier\phase-<id>.md` (Pre-flight, Implementation, Tests, Findings,
 Handoffs, Verdict).
 
 ### 0.7 Live-system safety
-- Outside the dogfood checkpoints (DF-1, DF-2) and P3.4 never touch `C:\Users\Marquinho\.config\opencode\*`, the live
-  store `C:\Users\Marquinho\AppData\Local\Temp\opencode-model-router-trajectory`, the live service or the base checkout.
+- Outside the dogfood checkpoints (DF-1, DF-2), P3.4 and a §0.10 kill switch or re-sync (each recorded in its own
+  dogfood.md section) never touch `C:\Users\Marquinho\.config\opencode\*`, the live store
+  `C:\Users\Marquinho\AppData\Local\Temp\opencode-model-router-trajectory`, the live service or the base checkout.
   Read-only copies for evidence are allowed. Never touch `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json`
   (owner state) or print secrets from `C:\Users\Marquinho\.config\opencode\opencode.json`.
 - Never write files through .NET APIs with relative paths (E12).
-- **Sync protocol** (DF-1, DF-2, P3.4): capped full suite green on the code being synced; tag `rta/df<n>-prev` (or
-  `rta/sync-prev`) at the base checkout's current HEAD; move the base checkout (`git -C D:\git\opencode-model-router
-  switch -C rta/live origin/rta/main` at DF-1, `git -C D:\git\opencode-model-router merge --ff-only origin/rta/main` on
-  `rta/live` at DF-2); `npm ci` **only** if `D:\git\opencode-model-router\package-lock.json` changed and never while a
-  restart may be pending (DF4 incident of the cost-aware plan); a needed `npm ci` finishes **before** the restart
-  request. The synced code is **not live** until the host restarts (plugin code is imported once per process; config
-  files hot-reload, code does not): rewrite the handover resume state, ask the human to restart OpenCode v2, stop
-  (§0.1). After the restart, the **liveness probe**: `/router` shows `build=<synced sha>`
-  (`D:\git\opencode-model-router\src\router\build-info.ts`; ask the human to paste the line if the executor cannot run
-  the command); a plugin-load line for opencode-model-router newer than the restart and no `failed to load plugin` in
+- **Sync protocol** (DF-1, DF-2, P3.4) `[executor]`: capped full suite green on the code being synced (the
+  wave-integration run counts if nothing outside `docs\` changed since); tag `rta/df<n>-prev` (or `rta/sync-prev`) at
+  the base checkout's current HEAD — a re-sync keeps the original tag; move the base checkout
+  (`git -C D:\git\opencode-model-router switch --no-track -C rta/live origin/rta/main` at DF-1,
+  `git -C D:\git\opencode-model-router merge --ff-only origin/rta/main` on `rta/live` at DF-2); `npm ci` **only** if
+  `git -C D:\git\opencode-model-router diff --quiet <previous HEAD> HEAD -- package-lock.json` exits non-zero, never
+  while a restart may be pending (DF4 incident of the cost-aware plan), and always finished **before** the restart
+  request.
+- **Restart and liveness.** Synced code is **not live** until the host restarts (plugin code is imported once per
+  process; config files hot-reload, code does not): rewrite the handover resume state, ask the human to restart
+  OpenCode v2 and to paste the `/router` line `router: engine=… build=…` together with "retomar" (handover §7), stop
+  (§0.1). The **liveness probe** after the restart: in the pasted `build=<version>+<sha7>`
+  (`D:\git\opencode-model-router\src\router\build-info.ts`) `<sha7>` equals the first 7 hex digits of the synced
+  commit; a plugin-load line for opencode-model-router newer than the restart and no `failed to load plugin` in
   `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`; `opencode api get
-  '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` lists the router agents. Agent-config changes
-  apply at the next orchestrator prompt.
-- **Rollback**: first the config kill switch where one exists (from DF-2: `"delegation": "tiers"` in the override —
-  hot reload, instant); otherwise, or if still broken, restore the owner config from its `.bak-<timestamp>` file,
-  `git -C D:\git\opencode-model-router reset --hard rta/df<n>-prev`, and ask for a restart (a code rollback needs one
-  too). A stale `D:\git\opencode-model-router\.git\index.lock` is removed only after confirming no git process runs.
-- Owner config changes happen only at DF-2 and P3.4, **only after the liveness probe shows the code that accepts the
-  new keys** (the old code rejects unknown values and an invalid value drops the whole layer, including `routing`,
-  #80), always validated in a temp HOME first and backed up as
-  `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc.bak-<yyyy-MM-dd_HH-mm-ss>`.
+  '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` (works on the live 2.0.24, used 2026-10-07)
+  lists the router agents. A marker with the previous sha means the host was not restarted: ask again, no rollback.
+  A marker `unknown`, a load failure or missing router agents → rollback and a critical finding for the owning phase.
+  Routing keys of the override hot-reload; whether agent registrations follow an override change without a restart is
+  settled by spike S12.
+- **Rollback** `[executor]`, in order: (1) restore the newest override `.bak-<timestamp>` taken by this checkpoint (hot
+  reload; for DF-2 this is the §0.10 kill switch); (2) only if the code is broken: DF-1 →
+  `git -C D:\git\opencode-model-router switch master`; DF-2 → `git -C D:\git\opencode-model-router reset --hard
+  rta/df2-prev` on `rta/live`; P3.4 → `git -C D:\git\opencode-model-router switch --detach rta/sync-prev` (never reset
+  `master`; keep `rta/live` until the P3.4 probe passes); (3) `npm ci` if `package-lock.json` differs between the two
+  commits, finished before (4) the restart stop — a code rollback is not live until a restart either. A stale
+  `D:\git\opencode-model-router\.git\index.lock` is removed only after confirming no git process runs.
+- Owner config changes happen only at DF-2, P3.4 and a §0.10 kill switch, **only after the liveness probe shows code
+  that accepts every key being written** (code that does not know a key rejects it, and an invalid value drops the
+  whole layer, including `routing`, #80), always validated in a temp HOME first and backed up as
+  `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc.bak-<yyyy-MM-dd_HH-mm-ss>`. After every
+  write the file's SHA-256 is recorded in dogfood.md (the pre-flight baseline, §5).
 
 ### 0.8 Wave integration
 [tier:medium] When every phase of a wave has passed QA and is merged: typecheck and the capped full suite on
@@ -154,7 +171,8 @@ E11). A wave closes only when CI is green. [tier:heavy] Hot-file merge conflicts
 4. Senior heavy QA after every phase; fix every finding of rounds 1–2; from round 3 fix only blocking/critical/major;
    never loop reviews to exhaustion on the same implementation.
 5. Always delegate through the model-router, preferring atomic tasks. Complex coding may go to `[tier:heavy]` for the
-   heavy lift; running and collecting tests goes to lighter delegations.
+   heavy lift; running and collecting tests goes to lighter delegations. In roles mode (from DF-2) the heavy lift goes
+   to `implementer` with the first line `[route class=implement risk=high tier=heavy pin]` (§0.10).
 6. Never run the full suite when not needed; test what the change touches; accelerate with parallelism (§0.5).
 7. QA is always a heavy-tier task; adversarial review of the work done; commit often.
 8. Linear: not used by this project (the repo `.env` holds only `OPENCODE_API_KEY`; no Linear references). Progress
@@ -165,19 +183,25 @@ E11). A wave closes only when CI is green. [tier:heavy] Hot-file merge conflicts
 ### 0.10 Self-test (dogfooding)
 The plan uses its own implementation as a live self-test as soon as it is safe:
 - **DF-1** (after Wave 1 integration): the §2.9 fixes (reader guard profile, uncharged denials, criterion handling)
-  go live in the base checkout after the owner's restart; the executor's own QA and lookup dispatches from Wave 2 on are the test — they must no
-  longer hit "non-producing" denials or truncated-criterion "NOT ACCEPTED" verdicts. Roles code is inert
-  (`delegation: "tiers"`).
+  go live in the base checkout after the owner's restart; the executor's own QA and lookup dispatches from Wave 2 on
+  are the test — they must no longer receive "non-producing" guard warnings or denials, nor truncated-criterion
+  "NOT ACCEPTED" verdicts. The tier agents' 25-call total budget is unchanged in tiers mode (E7 is solved by role
+  budgets, proven at DF-2). Roles code is inert (`delegation: "tiers"`).
 - **DF-2** (after Wave 2 integration): roles mode goes live for the owner (`routing.delegation: "roles"`), and **Wave 3
   is executed through the role agents**: lookups → `explorer`, test runs → `runner`, implementation → `implementer`,
-  QA → `reviewer` (heavy, satisfies "QA is always heavy"), design → `architect`, web/docs research → `researcher`.
-  The tier agents stay callable as fallback. Every role dispatch of the executor is evidence: decision rows with role,
+  QA → `reviewer` (heavy, satisfies "QA is always heavy"), design → `architect`, web/docs research → `researcher`,
+  complex coding → `implementer` with the first line `[route class=implement risk=high tier=heavy pin]`. Every role
+  dispatch names its phase worktree as the work root (§2.2). The tier agents stay callable as a recorded fallback. Every role dispatch of the executor is evidence: decision rows with role,
   grant, bounds and signal fields; authority requests; budget behaviour; `router_run` use.
 - A defect found by self-test is a QA finding of the phase that owns the code (or of P3.3 once Wave 3 runs). If it
-  blocks work, switch the owner override back to `delegation: "tiers"` (hot reload), fix, re-sync (restart stop),
-  re-enable.
-- Records: `D:\git\opencode-model-router\docs\qa\role-tier\dogfood.md` (one section per checkpoint: sync SHA, rollback
-  tag, liveness evidence, config diff, observations, `routing:stats` excerpt with bounded `--since/--until`).
+  blocks work, use the **kill switch**: restore the pre-DF-2 override backup (hot reload: tiers mode,
+  `subagentTiers.explore` and the custom `runner`/`reviewer`/`researcher` agents return; registration timing per S12),
+  fix, re-sync (restart stop), re-apply the validated migration.
+- Records: `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md`, written and committed by the executor on `rta/main`
+  only, never in the base checkout: a P0.1 baseline section, then one section per checkpoint or kill-switch event
+  (sync SHA, rollback tag, liveness evidence, override SHA-256, config diff, observations, `routing:stats` excerpt with
+  bounded `--since/--until`). It holds aggregated counts and the decision-row fields role, grant, bounds, signal and
+  model only — never prompt text, tool arguments or file contents from the live store.
 
 ---
 
@@ -268,11 +292,21 @@ Action classes: **local** = `read`, `glob`, `grep`, `router_git_*`; **exec** = `
 
 Rules:
 - **Separation rule (I4):** no grant contains (local or exec or write) together with egress. Needs `web` on a local
-  role → local grant + note "use `researcher`". Needs `shell`/`network`/`external_dir` in roles mode → never granted;
+  role → local grant + note "use `researcher`". Needs `shell`/`network` in roles mode → never granted;
   `shell` maps to exec (`router_run`) and the note "raw shell is outside roles mode — dispatch a tier agent
   explicitly". Residual risk, documented: exec runs repo scripts that may reach the network; untrusted repo content
   is a prompt-injection vector the separation rule does not cover.
 - No role is granted `subagent`, `task` or `delegate`.
+- **Work root (R3).** Every role dispatch has one work root: the session directory, or a worktree of the same
+  repository (listed by `git worktree list --porcelain`) named in the dispatch's ENVIRONMENT — this plan's executor
+  dispatches into `D:\git\omr-rta-<id>` from a session in `D:\git\opencode-model-router`. `local`, `exec` and `write`
+  apply inside the work root only. An `external_dir` need (`D:\git\opencode-model-router\src\routing\classify\rules.ts:558`)
+  that resolves inside the dispatch's work root is satisfied, not refused; any other path outside it is denied (reads
+  elsewhere, e.g. the host log, go to a tier agent or the executor). Role max policies allow `external_directory` only
+  for the repository's worktree roots (recomputed from `git worktree list --porcelain` whenever agents are re-applied),
+  never globally; the evaluate hook narrows to the dispatch's own work root. `router_run` takes `cwd`, which must equal
+  the work root. Owners: P1.1 (spec, validator), P1.2 (work root in the grant), P1.3 (`cwd`), P2.1 (max policy),
+  P2.3 (enforcement); spike S11 settles the host behaviour.
 - Host native `explore` dispatched in roles mode is aliased to `explorer` (spike S9).
 - The router tiers `fast`/`medium`/`heavy` stay registered and callable (explicit-tier dispatch keeps today's
   behaviour); the roles protocol stops advertising them.
@@ -317,8 +351,9 @@ export function resolveRoles(cfg: RouterConfig, host: "v1" | "v2"): ReadonlyMap<
 // D:\git\opencode-model-router\src\routing\classify\types.ts — P1.2 first commit (additive)
 //   RouteLine gains `tier?: string` and `budget?: number`
 // D:\git\opencode-model-router\src\routing\roles\policy.ts — P1.2 first commit
-export interface DispatchGrant { actions: ReadonlySet<AuthorityAction>; notes: readonly string[] }
-export function grantFor(role: RoleSpec, facts: TaskFacts, widened: readonly AuthorityAction[]): DispatchGrant;
+export interface DispatchGrant { actions: ReadonlySet<AuthorityAction>; notes: readonly string[]; workRoot: string }
+export function grantFor(role: RoleSpec, facts: TaskFacts, widened: readonly AuthorityAction[],
+  workRoot: string): DispatchGrant; // workRoot = session dir or a registered worktree root (§2.2)
 export function authorityFloor(grant: DispatchGrant, detection: Detection, risk: Risk, scope: Scope): string;
 export function tierBounds(role: RoleSpec, grant: DispatchGrant, facts: TaskFacts, detection: Detection,
   opts: { floorTier: string | null; runningTier: string | null; pinTier: string | null; tiers: readonly string[] }):
@@ -421,8 +456,9 @@ effective deterministic detection; removing the tier agents; raw shell inside ro
 | 3 | P3.2 | `D:\git\opencode-model-router\docs\ROLES.md` (new), `D:\git\opencode-model-router\docs\adr\0006-role-tier-assurance-delegation.md` (new), `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md`, `D:\git\opencode-model-router\docs\ROUTING_ENGINE.md`, `D:\git\opencode-model-router\docs\READ_ONLY_TIERS.md`, `D:\git\opencode-model-router\README.md`, `D:\git\opencode-model-router\CHANGELOG.md`, `D:\git\opencode-model-router\docs\plans\README.md`, `D:\git\opencode-model-router\test\unit\docs-drift.test.ts` |
 | 3 | P3.3 | read-only; fixes on the branch `rta/p33-fix-<n>` owned by the executor, one file owner at a time |
 | 3 | P3.4 | `D:\git\opencode-model-router\package.json`, `D:\git\opencode-model-router\package-lock.json`, `D:\git\opencode-model-router\CHANGELOG.md` (release entry, after P3.2 merges), `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (with backup), the base checkout's switch back to `master` |
-| 1→2 | DF-1 (executor) | the base checkout `D:\git\opencode-model-router` (local branch `rta/live`, tag `rta/df1-prev`), `D:\git\opencode-model-router\docs\qa\role-tier\dogfood.md` (new) |
-| 2→3 | DF-2 (executor) | the base checkout (`rta/live` fast-forward, tag `rta/df2-prev`), `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (with backup), `D:\git\opencode-model-router\docs\qa\role-tier\dogfood.md` |
+| all | executor | `D:\git\omr-rta-main\docs\plans\role-tier-assurance-delegation-plan.md`, `D:\git\omr-rta-main\docs\plans\role-tier-assurance-delegation-handover.md`, `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` (new in P0.1) — written only in the integration worktree and committed on `rta/main`, never in the base checkout; phases hand proposed amendments (e.g. T0.1.3) to the executor |
+| 1→2 | DF-1 (executor) | the base checkout `D:\git\opencode-model-router` (local branch `rta/live`, tag `rta/df1-prev`) |
+| 2→3 | DF-2 (executor) | the base checkout (`rta/live` fast-forward, tag `rta/df2-prev`), `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (with backup) |
 
 Every phase also owns `D:\git\opencode-model-router\docs\qa\role-tier\phase-<id>.md`. The integration worktree
 `D:\git\omr-rta-main` (branch `rta/main`) is the executor's; nobody else writes there.
@@ -437,23 +473,37 @@ Every phase also owns `D:\git\opencode-model-router\docs\qa\role-tier\phase-<id>
 2. [tier:medium] `npm run typecheck` green; the phase's contract dependencies present on `rta/main`.
 3. [tier:fast] Owned files not owned by another active phase (§4); handoffs of earlier QA reports listed.
 4. [tier:medium] Baseline: the test files the phase touches pass before any change (counts recorded).
-5. [tier:fast] `git -C D:\git\opencode-model-router status --porcelain` empty; live config file unchanged.
+5. [executor] `git -C D:\git\opencode-model-router status --porcelain` empty and its `HEAD` equal to the sha recorded at
+   the last checkpoint (`eeab36b` before DF-1); SHA-256 of
+   `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` equal to the last value recorded in
+   dogfood.md (an owner edit to it, to `state.json` or to `opencode.json` is recorded as an owner change, not an
+   incident).
 
 **Standard Definition of Done** (every phase): every task committed and pushed with `Refs #84`; typecheck green; the
 phase's test files and `vitest related` green; new modules ≥ 90% branch coverage; QA PASS with 0 open
 blocking/critical/major and every round-1/2 finding fixed; QA report written; merged into `rta/main` by the executor;
-ownership respected; base checkout and live system untouched.
+ownership respected; the base checkout and the owner override unchanged by the phase (checkpoint and kill-switch
+writes are the executor's, recorded in dogfood.md).
 
 ### Wave 0 — Host facts and baseline
 
 #### P0.1 Spikes and baseline
 Goal: settle every host behaviour the design depends on before product code.
 
-Pre-flight: standard, plus
-- [tier:medium] create `rta/main` from `origin/docs/role-tier-plan` (= `master` @ `eeab36b` + this plan), push, create
-  the integration worktree `D:\git\omr-rta-main` on `rta/main`, open the draft PR `rta/main → master`;
-- [tier:medium] capped full suite on `rta/main` (record counts);
-- [tier:fast] record the owner's `enforcementMode` from `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json` (read-only); apply §0.2.6.
+Pre-flight (this order):
+1. [executor] `git -C D:\git\opencode-model-router fetch origin`; create and push `rta/main` from
+   `origin/docs/role-tier-plan` (= `master` @ `eeab36b` + this plan and its handover);
+   `git -C D:\git\opencode-model-router worktree add D:\git\omr-rta-main rta/main`; `npm ci` there; open the draft PR
+   `rta/main → master`. From here on the plan, the handover and dogfood.md are edited only in `D:\git\omr-rta-main`.
+2. Standard steps 1–5 for `D:\git\omr-rta-p01` (step 5 records the first baseline).
+3. [tier:medium] Capped full suite in `D:\git\omr-rta-main` (record counts).
+4. [tier:fast] Record the owner's `enforcementMode` from
+   `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json` (read-only); apply §0.2.6.
+5. [executor] Baseline section of `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md`: the §0.7 liveness commands run
+   once against the live host on `master` code with their outputs (the `/router` marker format is read from
+   `D:\git\opencode-model-router\src\router\build-info.ts`, no human round trip); the override's SHA-256 and the base
+   checkout HEAD; the three DF-1 self-test probes run once on `master` code with their guard footers recorded. If a
+   §0.7 command does not work on 2.0.24, amend §0.7 (R<n>) with the verified equivalent.
 
 Tasks:
 - T0.1.1 [tier:medium] Extend `D:\git\opencode-model-router\test\smoke\helpers\routing-host.ts` (agents registered
@@ -471,18 +521,25 @@ Tasks:
   - S8 Code Mode: are inner `tools.*` calls inside `execute` evaluated by the permission `evaluate` hook, and can the
     per-session context hook restrict the Code Mode catalog to an allowlist;
   - S9 rewriting `agent: "explore"` → `"explorer"` in `subagent` args in `execute.before`;
-  - S10 does the router's verification gate run the acceptance checks for a role child (feeds effective detection).
+  - S10 does the router's verification gate run the acceptance checks for a role child (feeds effective detection);
+  - S11 a deny-by-default role-style agent dispatched from a session located in `D:\git\opencode-model-router` reads,
+    edits and calls a `router_run`-style tool inside a sibling worktree of the same repository: is
+    `external_directory` asked or denied, can a max policy allow it for listed worktree roots only, and in which
+    directory does the tool execute (feeds §2.2 work root);
+  - S12 change the global override's `agents` block without restarting the host: do `/api/agent` and the
+    orchestrator's agent list change, and when (feeds §0.7 and DF-2 step 3).
 - T0.1.2 [tier:fast] S5: locate where verification criteria are assembled and cut (start at
   `D:\git\opencode-model-router\src\verify\dod.ts:62` and `D:\git\opencode-model-router\src\verify\checker.ts`); list
   file:line; confirm or amend P1.5's ownership.
 - T0.1.3 [tier:medium] Run the spikes once (serial); write `D:\git\opencode-model-router\docs\qa\role-tier\spikes.md`
-  with each result and its design consequence (confirm §2 or amend via §9).
+  with each result and its design consequence (confirm §2, or propose an amendment that the executor writes into §9 in
+  `D:\git\omr-rta-main`).
 - T0.1.4 [tier:heavy] [route class=review risk=high pin] Senior QA of the spikes.
 
 Tests: the spike file asserts the observed host behaviour so a host upgrade that changes it fails loudly; it stays as a
 regression smoke. Edge cases: two parallel children of the same agent and title (S2); a hook that throws (S3); a
 child resumed twice (S7); `execute` with a tool outside the allowlist (S8).
-Acceptance: S1–S10 each answered with host-state evidence; every §2 mechanism confirmed or replaced by an amendment
+Acceptance: S1–S12 each answered with host-state evidence; every §2 mechanism confirmed or replaced by an amendment
 that keeps I1–I9.
 DoD: standard; spikes report committed.
 QA: `[tier:heavy]` adversarial — scripted-provider artefacts, event-ordering assumptions, conclusions stronger than
@@ -505,7 +562,8 @@ Tasks:
   `["test","typecheck","lint","build"]` plus `test:*`, `commands`, `timeoutMs` default 600000; global only).
 - T1.1.3 [tier:heavy] Shipped role specs in `D:\git\opencode-model-router\tiers.json` `roleAgents` per §2.2 (authority,
   ranges, budgets, assurance, guard, prompts with the return contract); the separation validator over every grant
-  (shipped, user-narrowed, and #81 agents with a shipped name in roles mode only).
+  (shipped, user-narrowed, and #81 agents with a shipped name in roles mode only); the work-root rule of §2.2 in the
+  role specs.
 - T1.1.4 [tier:medium] Narrowing-only customisation; per-entry drop with a notice; never drop the layer or `routing`.
 - T1.1.5 [tier:medium] v1: validate, one notice, inert (§2.7).
 - T1.1.6 [tier:medium] `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md` rows for the new keys (so
@@ -530,7 +588,8 @@ Tasks:
   `D:\git\opencode-model-router\src\routing\classify\route-line.ts` (identity key at line 160 extended; first-line
   rule A22 applies), `RouteLine` fields in `D:\git\opencode-model-router\src\routing\classify\types.ts`, plus the
   policy signatures in `D:\git\opencode-model-router\src\routing\roles\policy.ts`.
-- T1.2.1 [tier:heavy] `grantFor`: fixed/dynamic, needs mapping (`shell`/`network` → exec + note, `external_dir` → note,
+- T1.2.1 [tier:heavy] `grantFor`: fixed/dynamic, work root from the dispatch ENVIRONMENT (§2.2), needs mapping
+  (`shell`/`network` → exec + note, `external_dir` inside the work root → satisfied, elsewhere → note,
   `web` on local roles → note), route-line `needs=`, widened grants, separation resolution; `authorityFloor` per §2.3
   including the write + exec row and max-over-rows.
 - T1.2.2 [tier:medium] `tierBounds`: range ∩ authority floor ∩ `escalate.floorTier` ∩ running rung; risk/scope =
@@ -561,7 +620,8 @@ Pre-flight: standard; [tier:fast] read `D:\git\opencode-model-router\src\router\
 kill tree, redaction, executable resolution) for reuse.
 
 Tasks:
-- T1.3.1 [tier:heavy] `D:\git\opencode-model-router\src\router\run-tools.ts`: `router_run({ script, args? })` for a
+- T1.3.1 [tier:heavy] `D:\git\opencode-model-router\src\router\run-tools.ts`: `router_run({ script, args?, cwd })` (`cwd` must equal the
+  dispatch's work root, §2.2; default: the session directory) for a
   name in `routing.run.scripts` (package.json scripts) or `routing.run.commands`; `router_run` never spawns a shell
   itself (`shell: false`, argv asserted); npm runs as `node <npm-cli.js>` resolved from the Node install (no `.cmd`
   shims), with `--script-shell=<absolute system shell>` and `--node-options=` on the command line so a repo `.npmrc`
@@ -578,7 +638,8 @@ Tests (edge cases): a script outside the allowlist; missing `package.json`; args
 `$(`, `%PATH%`, `^`, `!`, `"`, `<`, `>`, `--output`; args on an entry that declares none; a planted
 `node_modules\.bin\npm.cmd`; a repo `.npmrc` with `script-shell=.\evil.cmd` and with `node-options=--require .\evil.js`
 (neither honoured, marker file never created); timeout with a hanging grandchild; output > 64 KiB; secret at the cut
-point; Windows path with spaces; POSIX path; exit code propagation.
+point; Windows path with spaces; POSIX path; exit code propagation; `cwd` outside every registered work root (refused);
+`cwd` = a sibling worktree (runs there, proven by a marker file).
 Acceptance: no caller-controlled shell; every injection, hijack and `.npmrc` case refused or neutralised; green on
 Windows and Linux CI.
 DoD: standard. QA: `[tier:heavy]` — execution outside the named entry, executable or shell hijack, env injection,
@@ -666,17 +727,22 @@ DoD: standard. QA: `[tier:heavy]` — any path to a union, to authority beyond t
 [tier:medium] **Wave 1 integration** (§0.8).
 
 #### Checkpoint DF-1 — the §2.9 fixes live (self-test)
-Pre-flight: Wave 1 CI green; capped full suite green on `rta/main`; base checkout clean on `master` @ `eeab36b`.
+Pre-flight: Wave 1 CI green; capped full suite green on `rta/main` (the wave-integration run counts if nothing outside
+`docs\` changed since); base checkout clean on `master` @ `eeab36b`.
 Steps:
-1. [tier:medium] Sync per §0.7 (tag `rta/df1-prev` at the base HEAD; `switch -C rta/live origin/rta/main`; `npm ci`
-   only if the lockfile changed, finished before the restart request). Roles stay inert (`delegation: "tiers"`).
-2. **Restart stop** (§0.1): handover §2 → "next: DF-1 liveness probe, then step 3"; ask the human to restart
-   OpenCode v2; stop. On resume: the §0.7 liveness probe (`build=` marker equals the synced sha, agent list, no load
-   error). A failed probe → rollback (§0.7) and a critical finding for the owning Wave-1 phase.
-3. [tier:medium] Self-test probes (record in `D:\git\opencode-model-router\docs\qa\role-tier\dogfood.md`):
-   a read-only `fast` dispatch doing 10 consecutive reads is not denied; a `[route class=review risk=high pin]`
-   heavy dispatch doing 12 reads is not denied; a delegation with a long acceptance block gets a verdict whose
-   criteria are whole (no mid-sentence cut). Use the live decision log (read-only copy) as evidence.
+1. [executor] Sync per §0.7 (tag `rta/df1-prev` at the base HEAD; `switch --no-track -C rta/live origin/rta/main`;
+   `npm ci` only if the lockfile changed, finished before the restart request). Roles stay inert
+   (`delegation: "tiers"`).
+2. **Restart stop** (§0.1, handover §7): handover §2 → "next: DF-1 liveness probe, then step 3"; ask the human to
+   restart OpenCode v2 and paste the `/router` line; stop. On resume: the §0.7 liveness probe and its outcomes
+   (previous sha → ask again; `unknown`, load failure or missing agents → rollback and a critical finding for the
+   owning Wave-1 phase).
+3. [tier:medium] Self-test probes, recorded in `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` against the P0.1
+   baseline. Under `advisory` the old guard warns instead of denying, so each probe asserts no `DENIED` **and** no
+   `[⚠ GUARD:read_budget]` footer: a read-only `fast` dispatch with 10 consecutive reads; a
+   `[route class=review risk=high pin]` heavy dispatch with `CAP:none` + `reason:` making 20 reads (below the
+   unchanged 25-call tier budget); a delegation with a long acceptance block whose verdict criteria are whole (no
+   mid-sentence cut). Evidence: the delegates' tool results and a read-only copy of the live decision log.
 4. [tier:medium] Comment on #84 (DF-1 done, evidence link).
 Acceptance: liveness probe and self-test probes pass; no plugin load error; local rollback tag `rta/df1-prev` exists. If a probe fails, the owning Wave-1 phase
 gets a finding, fixed on its branch, re-merged and re-synced before Wave 2 starts.
@@ -694,7 +760,8 @@ Tasks:
 - T2.1.1 [tier:heavy] Role agent registration in `D:\git\opencode-model-router\src\compat\v2-hooks.ts` (agent
   transform) using `D:\git\opencode-model-router\src\router\read-only.ts` and
   `D:\git\opencode-model-router\src\router\plugin-agents.ts`: the floor tier's model as registered fallback (S1), role
-  prompt verbatim, steps from the top budget, the role's **max** policy deny-by-default and fail-closed, `explore`
+  prompt verbatim, steps from the top budget, the role's **max** policy deny-by-default and fail-closed (`external_directory` allowed only
+  for the repository's worktree roots, §2.2), `explore`
   alias (S9), nothing on v1 or in tiers mode.
 - T2.1.2 [tier:heavy] Role path in `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`: classify → `grantFor` →
   effective detection (S10) → `tierBounds` → kernel (static default; `enforce` applies the decision; exploration) →
@@ -750,7 +817,8 @@ Pre-flight: standard; P2.1 merged into `rta/main` (P1.6 already merged); ownersh
 
 Tasks:
 - T2.3.1 [tier:heavy] Permission `evaluate` hook keyed by session in `D:\git\opencode-model-router\src\compat\v2-hooks.ts`:
-  lazy `bind`; allow iff the action is in the dispatch grant (sensitive-read asks kept, `router_run` allowlist), deny
+  lazy `bind`; allow iff the action is in the dispatch grant and, for paths, inside its work root (sensitive-read
+  asks kept, `router_run` allowlist and `cwd`), deny
   otherwise; never widens the agent's max policy; errors fail closed for role agents and leave others unchanged.
 - T2.3.2 [tier:heavy] Context hook: per-session catalog filtering to the grant (including the Code Mode catalog per
   S8); `router_request_authority` advertised only for dynamic roles.
@@ -763,37 +831,45 @@ Tests (edge cases): `general` with `needs=[]` → local only, edit denied, reque
 `needs=web,edit` → local grant + note; `needs=shell` → exec + note; parallel identical dispatches → intersection;
 inherited parent-session `shell`/`*` allow cannot re-open anything (#77 P2 lesson); hook throws → deny for role
 agents, unchanged for others (I9); sibling sessions unaffected by another session's catalog filter; Code Mode inner
-call outside the allowlist denied (if S8 enabled `execute`).
+call outside the allowlist denied (if S8 enabled `execute`); a path in the dispatch's own worktree work root allowed,
+a path in another worktree or outside the repository denied; `router_run` with a foreign `cwd` denied.
 Acceptance: I3, I4, I5, I9 hold against the spike hook shapes.
 DoD: standard. QA: `[tier:heavy]` — privilege escalation, session confusion, fail-open on errors.
 
 [tier:medium] **Wave 2 integration** (§0.8).
 
 #### Checkpoint DF-2 — roles mode live; Wave 3 runs through the role agents (self-test)
-Pre-flight: Wave 2 CI green; capped full suite green on `rta/main`; DF-1 record complete.
+Pre-flight: Wave 2 CI green; capped full suite green on `rta/main` (the wave-integration run counts if nothing outside
+`docs\` changed since); DF-1 record complete.
 Steps:
-1. [tier:medium] Sync per §0.7 (tag `rta/df2-prev`; fast-forward `rta/live` to `origin/rta/main`; `npm ci` only if the
-   lockfile changed, finished first). **Restart stop** (§0.1): handover §2 → "next: DF-2 liveness probe, then step 2";
-   ask for the restart; stop. On resume: the §0.7 liveness probe.
-2. [tier:medium] Owner migration — only after the liveness probe passed (the pre-sync code would reject
-   `delegation: "roles"` and drop the whole override layer, #80) — validated first in a temp HOME with the synced code,
-   then written with a backup:
+1. [executor] Sync per §0.7 (tag `rta/df2-prev`; fast-forward `rta/live` to `origin/rta/main`; `npm ci` only if the
+   lockfile changed, finished first). **Restart stop** (§0.1, handover §7): handover §2 → "next: DF-2 liveness probe,
+   then step 2"; ask for the restart and the `/router` line; stop. On resume: the §0.7 liveness probe and its outcomes.
+2. [executor] Owner migration — only after the liveness probe passed (code that predates Wave 1 rejects the new keys
+   and drops the whole override layer, #80; the DF-1 code validates `routing.delegation` but has no role runtime) —
+   validated first in a temp HOME with the synced code, then written with a backup (this backup is the kill switch;
+   record the new SHA-256):
    add `"delegation": "roles"` to the existing `routing` block (keep `engine`, `profile`, `margin`); remove
    `subagentTiers.explore` (aliased to `explorer`); remove the custom `agents` `runner`, `reviewer`, `researcher`
    (replaced by shipped roles); exploration stays 0.
 3. [tier:medium] At the next orchestrator prompt verify through
    `opencode api get '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` that the role agents exist
-   with their max policies, and that the executor's system prompt now carries the roles protocol.
-4. [tier:medium] Self-test probes, each recorded with its decision row: `explorer` lookup (fast model, local grant);
-   `runner` running a scoped test through `router_run`; `implementer` small edit with deterministic acceptance
-   (floor per §2.3); `general` with no needs denied `edit`, then `router_request_authority` → resume → edit granted;
-   `reviewer` QA dispatch on heavy; `researcher` web lookup without local reads.
-5. [tier:medium] From here on, **all Wave 3 dispatches use role agents** (§0.10); tier agents only as fallback when a
-   role defect blocks work (record it).
+   with their max policies, and that the executor's system prompt now carries the roles protocol. If S12 showed that
+   agent registrations need a restart, step 2 ends with a second restart stop (handover §7 "DF-2b") and this step
+   runs after it.
+4. [tier:medium] Self-test probes on a phase-worktree work root, each recorded with its decision row: `explorer`
+   lookup (fast model, local grant); `runner` running a scoped test through `router_run` with `cwd` = the worktree;
+   `implementer` small edit on a throwaway file with deterministic acceptance (floor per §2.3), reverted afterwards;
+   `implementer` with `[route class=implement risk=high tier=heavy pin]` (heavy model); `general` with no needs denied
+   `edit`, then `router_request_authority` → resume → edit granted; `reviewer` QA dispatch on heavy making 40 calls
+   without a budget cut (role budget, E7); `researcher` web lookup without local reads; a negative probe reading a
+   path outside every registered work root (denied).
+5. [tier:medium] From here on, **all Wave 3 dispatches use role agents** (§0.10); tier agents only as a recorded
+   fallback when a role defect blocks work.
 6. [tier:medium] Comment on #84 (DF-2 done, evidence link).
-Acceptance: probes pass; I2–I5 observed on the live host for the executor's own dispatches; rollback path tested in a
-temp HOME (override backup restores `delegation: "tiers"`).
-Rollback: §0.7 (code tag and override backup); `delegation: "tiers"` is the hot-reloadable kill switch.
+Acceptance: probes pass; I2–I5 observed on the live host for the executor's own dispatches; kill switch tested in a
+temp HOME (the pre-DF-2 backup yields tiers mode, the custom agents and explore → fast).
+Rollback: §0.7 — first the kill switch (pre-DF-2 override backup, hot reload), then the code tag and a restart.
 
 ### Wave 3 — Proof, documentation, global QA, enablement
 
@@ -872,15 +948,18 @@ Tasks:
 - T3.4.1 [tier:medium] Version 2.4.0 in `D:\git\opencode-model-router\package.json` and
   `D:\git\opencode-model-router\package-lock.json`; `D:\git\opencode-model-router\CHANGELOG.md` release entry; PR
   `rta/main → master` ready; CI green on the exact head; merge; CI green on the merge SHA.
-- T3.4.2 [tier:medium] Re-validate the owner override (migrated at DF-2) against the final code in a temp HOME before
-  the sync; adjust only if a P3.x change requires it (with a backup); exploration stays 0 (recommend 0.05 in the
-  summary, the owner decides).
-- T3.4.3 [tier:medium] Move the base checkout back to `master`: `git -C D:\git\opencode-model-router switch master`,
+- T3.4.2 [executor] Before the sync, validate the owner override (migrated at DF-2) against the final code in a temp
+  HOME. If a P3.x change needs an adjustment, prepare and validate it there, but write it (with a backup) only after
+  the T3.4.3 liveness probe shows the final code. Exploration stays 0 (recommend 0.05 in the summary, the owner
+  decides).
+- T3.4.3 [executor] Move the base checkout back to `master`: `git -C D:\git\opencode-model-router switch master`,
   `merge --ff-only origin/master` (now containing the release), per the §0.7 sync protocol (tag `rta/sync-prev`).
   This is a code sync → **restart stop**, combined with the T3.4.4 publish question in one message to the human
-  ("restart, then publish or not"). On resume: the liveness probe (`build=` marker equals the merge sha); verify through
+  (handover §7). On resume: the §0.7 liveness probe (`<sha7>` of the merge commit) and its outcomes; verify through
   `opencode api get '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` that role agents exist with
-  their max policies; probe dispatch to `explorer` gets the fast model; delete the local `rta/live` branch.
+  their max policies; write a T3.4.2 adjustment if one was prepared; re-run the DF-2 step-4 probe set on the final
+  code; act on the publish answer only if all pass — otherwise roll back (§0.7), do not publish, and ask again;
+  delete the local `rta/live` branch only after the probes pass.
 - T3.4.4 [tier:medium] **Human gate:** ask for confirmation, then push tag `v2.4.0` (publish workflow with provenance);
   verify `npm view opencode-model-router@2.4.0` and a clean install on an isolated 2.0.24 host.
 - T3.4.5 [tier:medium] Final capped suite on `master`; cleanup of `D:\git\omr-rta-*` worktrees (including
@@ -888,7 +967,7 @@ Tasks:
   `rta/df1-prev`, `rta/df2-prev`, `rta/sync-prev` tags; close #84 with the summary (evidence, dogfood stats, rollback).
 
 Tests (edge cases): the temp-HOME validation of the owner override (invalid layer → abort before writing); rollback
-dry-run (restore the backup in a temp HOME, delegation back to tiers).
+dry-run: the pre-DF-2 backup in a temp HOME yields tiers mode, the custom agents and explore → fast.
 Acceptance: global criteria §6 met; owner live config in roles mode with a verified rollback path.
 DoD: §7. QA: `[tier:heavy]` [route class=review risk=high pin] release review — artefacts, CI on the merge SHA, clean
 install, owner migration evidence.
@@ -900,7 +979,8 @@ install, owner migration evidence.
 2. v1: goldens, v1 unit suites and `npm run smoke:v1` green; v1 prompt/agents/tools hash-equal the base except §2.9.
 3. v2 tiers mode: every pre-existing test unmodified and green except the documented §2.9 goldens.
 4. v2 roles mode: router-set models within bounds; shipped grants satisfy the separation rule; the authority ladder
-   works end to end on the real host; zero unknown bindings in normal dispatches.
+   works end to end on the real host; zero unknown bindings in normal dispatches; role dispatches work inside a
+   sibling-worktree work root, and paths outside every work root are denied.
 5. `router_run`: no caller-controlled shell; injection, hijack and `.npmrc` tests pass on Windows and Linux CI.
 6. Read-only agents and reviews are never denied by the producer guard; denied calls are not charged; budget
    exhaustion is recorded as `budget` and resumable.
@@ -910,9 +990,11 @@ install, owner migration evidence.
 9. Docs, ADR 0006, CONFIG_REFERENCE, README, CHANGELOG complete; docs-drift green.
 10. CI 12/12 green on the merge SHA; capped full suite green on `master`.
 11. Global QA: zero open blocking/critical/major.
-12. Owner config migrated with backup, validated before the sync, verified live; 2.4.0 published after human
+12. Owner config migrated at DF-2 with a backup: validated in a temp HOME against the synced code, written only after
+    the liveness probe, verified live, and re-validated against the final code in P3.4; 2.4.0 published after human
     confirmation.
-13. Self-test: DF-1 and DF-2 recorded in `D:\git\opencode-model-router\docs\qa\role-tier\dogfood.md`; Wave 3 executed
+13. Self-test: P0.1 baseline, DF-1 and DF-2 recorded in `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` (on
+    `master` after the merge); Wave 3 executed
     through role agents, with the executor's own decision rows showing role, grant, bounds and signal fields, and
     every role-defect fallback to tier agents recorded and fixed.
 
@@ -926,8 +1008,8 @@ install, owner migration evidence.
 
 ## 8. Global QA
 P3.3: three fresh `[tier:heavy]` reviewers (areas A/B/C) in parallel, each given the diff `master@eeab36b..rta/main`,
-every phase QA report, the spikes report and this plan, each split into ≤ 15-information-call dispatches while the
-old guard is live (§0.2.6); rounds per §0.6.
+every phase QA report, the spikes report and this plan, dispatched to the `reviewer` role (roles
+mode since DF-2, role budget) and split by area when a dispatch is cut (resume the same session); rounds per §0.6.
 
 ## 9. Amendments
 - R0 (pre-execution review, `[tier:heavy]`, findings PLAN-1…PLAN-21): route-line keys owned by P1.2 (PLAN-1);
@@ -946,11 +1028,24 @@ old guard is live (§0.2.6); rounds per §0.6.
   code into the base checkout on the local branch `rta/live` and Wave 3 runs through the role agents (§0.10); stop and
   notify the human whenever an OpenCode v2 restart is needed (§0.1); owner operating rules added verbatim (§0.9);
   integration starts from `origin/docs/role-tier-plan`; the owner's `enforcementMode` is back to `advisory`.
-- R2 (handover review, 2026-10-07): plugin **code** is imported once per process (cost-aware plan A8, spike S7
-  disproven), so every code sync into the base checkout needs a host restart — DF-1, DF-2 and the P3.4 return to
+- R2 (handover review, 2026-10-07): plugin **code** is imported once per process (cost-aware plan A8 — *its* spike
+  S7, not this plan's S7), so every code sync into the base checkout needs a host restart — DF-1, DF-2 and the P3.4 return to
   `master` are planned restart stops with a liveness probe (`build=` marker); only config hot-reloads. Owner override
   keys are written only after the code that accepts them is live (#80 layer drop). Rollback order: kill switch, then
   backup + reset + restart.
+- R3 (heavy QA of the handover and R1/R2, findings QA-H-1…QA-H-20, round 1, all fixed): work root for role dispatches
+  in sibling worktrees, `router_run` `cwd`, spike S11 (QA-H-1, critical); DF-1 probes assert the absence of guard
+  footers against a P0.1 baseline (QA-H-2); rollback per checkpoint without resetting `master`, with `npm ci` when the
+  lockfile differs (QA-H-3); kill switch = the pre-DF-2 override backup (QA-H-4); T3.4.2 writes only after the probe
+  (QA-H-5); spike S12 on agent-registration reload and an optional DF-2b restart (QA-H-6); pre-flight step 5 and DoD
+  with recorded baselines (QA-H-7); executor-owned plan/handover/dogfood files in `D:\git\omr-rta-main` (QA-H-8);
+  liveness probe with the real marker format `build=<version>+<sha7>` and the `/router` line pasted by the human
+  (QA-H-9; the claim that `opencode api` is missing was rejected: `opencode api get '/api/agent?…'` ran on the live
+  2.0.24 on 2026-10-07); probe outcomes (QA-H-10); P0.1 pre-flight order (QA-H-11); stale lines (QA-H-12);
+  `--maxWorkers=4` and no duplicate capped suites (QA-H-13); S7 disambiguation (QA-H-14); heavy coding in roles mode
+  (QA-H-15); item 12 and DF-2 wording (QA-H-16); release only after the final probe set (QA-H-17); handover rows
+  (QA-H-18); dogfood redaction (QA-H-19); `--no-track`, kept tags, `[executor]` steps, one round-limit wording
+  (QA-H-20).
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |
@@ -966,5 +1061,6 @@ old guard is live (§0.2.6); rounds per §0.6.
 | Host upgrade changes hook semantics | The spike file stays as a regression smoke; role agents fail closed (I9) |
 | The old guard cuts plan-execution dispatches (E6/E7) | §0.2.4–0.2.6: atomic dispatches, notes file, ≤ 15 information calls, resume the same session; DF-1 removes the cause |
 | A dogfood sync breaks the executor's own plugin (tier/role agents vanish: "Unknown agent", DF4 precedent) | Capped suite before every sync; `npm ci` only on a lockfile change and finished before the restart request; liveness probe after the restart; rollback = kill switch (from DF-2) or reset to the tag + another restart; the executor works directly with its own tools until the plugin is back (§0.9.2) |
-| Every code sync costs a human restart (A8) | Exactly three planned restart stops (DF-1, DF-2, P3.4); fixes found after DF-2 are batched into P3.4's sync, not re-synced one by one, unless they block Wave 3 |
-| A roles-mode defect blocks Wave 3 | `delegation: "tiers"` kill switch (hot reload), fix as a finding, re-sync (restart stop), re-enable (§0.10) |
+| Every code sync costs a human restart (A8) | Three planned restart stops (DF-1, DF-2, P3.4), plus DF-2b only if S12 shows agent registration needs one; fixes found after DF-2 are batched into P3.4's sync, not re-synced one by one, unless they block Wave 3 |
+| A roles-mode defect blocks Wave 3 | Kill switch: the pre-DF-2 override backup (hot reload); fix as a finding, re-sync (restart stop), re-apply the migration (§0.10) |
+| Role agents cannot work in phase worktrees outside the session directory (classifier `external_dir`, deny-by-default) | Work root rule (§2.2, R3); spike S11 before any role code; DF-2 probes run on worktree paths with a negative probe |

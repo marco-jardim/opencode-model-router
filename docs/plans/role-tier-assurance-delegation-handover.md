@@ -1,6 +1,7 @@
 # Handover — Role × Tier × Assurance delegation (#84)
 
-> **Revision:** 1 — plan written, reviewed (PLAN-1…21 → R0) and amended (R1 dogfood + owner rules, R2 restarts);
+> **Revision:** 2 — plan written, reviewed (PLAN-1…21 → R0) and amended (R1 dogfood + owner rules, R2 restarts,
+> R3 heavy QA of this handover: work root, kill switch, liveness probe, baselines);
 > execution **not started**; next: **P0.1 pre-flight** (2026-10-07). The executing orchestrator rewrites §2 and §8 at
 > every phase merge, wave close, dogfood checkpoint and **before every restart request** (plan §0.1).
 > **Plan:** `role-tier-assurance-delegation-plan.md` in this folder. Read it in full before doing anything.
@@ -52,9 +53,13 @@ matter most:
    only, with running and collecting tests in separate lighter dispatches. QA is ALWAYS a heavy-tier
    task: a separate @heavy dispatch (producer ≠ reviewer) whose prompt starts with
    [route class=review risk=high pin]. From DF-2 on, the implementation dogfoods itself: dispatch
-   through the role agents (explorer, runner, implementer, reviewer, architect, researcher); tier
-   agents only as a recorded fallback. Every dispatch has the 7 sections (TASK, EXPECTED OUTCOME,
-   TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT) with full paths in the PHASE WORKTREE.
+   through the role agents (explorer, runner, implementer, reviewer, architect, researcher), with
+   complex coding sent to implementer with the first line
+   [route class=implement risk=high tier=heavy pin]; tier agents only as a recorded fallback.
+   Every dispatch has the 7 sections (TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO,
+   CONTEXT, ENVIRONMENT) with full paths in the PHASE WORKTREE, named as its work root.
+   Steps tagged [executor] (merges, sync/rollback commands, plan/handover/dogfood edits) you do
+   yourself.
 6. Never run the full suite when a scoped run answers the question. Test only what the change
    touches: the phase's test files plus `npx vitest related <changed files> --run --maxWorkers=4`.
    Accelerate with parallel dispatches over disjoint test sets and background smokes. Never
@@ -80,7 +85,9 @@ matter most:
 | Item | Value |
 |---|---|
 | Checkpoint reached | Plan complete and reviewed; nothing executed |
-| **Next task id** | **P0.1 pre-flight** (create `rta/main` from `origin/docs/role-tier-plan`, the integration worktree `D:\git\omr-rta-main`, the draft PR `rta/main → master`; capped full suite baseline) |
+| **Next task id** | **P0.1 pre-flight step 1** (plan §5 P0.1, in this order: create and push `rta/main` from `origin/docs/role-tier-plan`; `worktree add D:\git\omr-rta-main`; `npm ci` there; draft PR `rta/main → master`; then standard steps for `D:\git\omr-rta-p01`, capped suite, `enforcementMode`, dogfood.md baseline) |
+| Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
+| Active worktrees for this plan | `D:\git\omr-plan-rta` → `docs/role-tier-plan` → planning (frozen after P0.1 step 1) |
 | Plan branch | `docs/role-tier-plan` (pushed); first commit `47f1e88`; this handover and R1/R2 in the following commit |
 | `rta/main` | not created |
 | Draft PR `rta/main → master` | not opened |
@@ -90,8 +97,9 @@ matter most:
 | Owner override (`C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`) | `routing {engine: enforce, profile: balanced, margin: 0.2}`; `subagentTiers {explore: fast}`; `agents`: `runner` (fast, explicit shell allowlist), `reviewer` (heavy, readOnly + `router_git_*`/`context7_*`), `researcher` (fast, readOnly + `webfetch`/`websearch`/`brave_*`/`context7_*`) |
 | Live agent models | `fast`, `explore`, `runner`, `researcher`: `anthropic/claude-haiku-5-5#low`; `medium`: `anthropic/claude-sonnet-5-5#medium`; `heavy`, `reviewer`: `anthropic/claude-opus-5-5#xhigh`; `title`/`summary`: `anthropic/claude-haiku-5-5` (pinned in `C:\Users\Marquinho\.config\opencode\opencode.json`) |
 | Dogfood | DF-1 pending; DF-2 pending |
-| Restart stops | none requested yet; three planned (DF-1, DF-2, P3.4) |
-| Plan amendments | R0, R1, R2; next free id: R3 |
+| Restart stops | none requested yet; three planned (DF-1, DF-2, P3.4), plus DF-2b only if spike S12 shows agent registration needs one |
+| Override SHA-256 baseline | not recorded yet (P0.1 pre-flight step 5) |
+| Plan amendments | R0, R1, R2, R3; next free id: R4 |
 
 ---
 
@@ -129,7 +137,7 @@ paths into it (plan "Path convention").
 - **E8 (false "NOT ACCEPTED").** The cited criterion is the router directive at
   `D:\git\opencode-model-router\src\router\dispatch-header.ts:20`. The candidate cut site is
   `D:\git\opencode-model-router\src\verify\dod.ts:62`, still unconfirmed: spike S5 / T0.1.2 settles it.
-- **Spikes decide mechanics.** S1–S10 settle every host behaviour the design relies on. When a spike disproves a
+- **Spikes decide mechanics.** S1–S12 settle every host behaviour the design relies on. When a spike disproves a
   mechanism, write an amendment R<n> whose replacement keeps I1–I9 and continue. Ask the human only if no
   replacement keeps them.
 - **Separation rule.** No grant mixes local read, exec or write with egress. Raw shell is egress, so it never appears
@@ -143,7 +151,17 @@ paths into it (plan "Path convention").
   does not know: owner-config writes happen only after the liveness probe of the code that accepts them. Always
   validate in a temp HOME and keep a `.bak-<yyyy-MM-dd_HH-mm-ss>` backup.
 - **Restarts are expensive (A8).** Plugin code is imported once per process; only config hot-reloads. The plan has
-  exactly three restart stops. Batch post-DF-2 fixes into P3.4's sync unless they block Wave 3.
+  three restart stops (plus DF-2b if S12 requires it). Batch post-DF-2 fixes into P3.4's sync unless they block
+  Wave 3. Whether agent registrations follow an override change without a restart is unproven; S12 settles it.
+- **Work root (R3, the critical finding of the handover QA).** This session lives in `D:\git\opencode-model-router`
+  but every dispatch works in `D:\git\omr-rta-<id>`. The classifier marks such paths `external_dir`
+  (`D:\git\opencode-model-router\src\routing\classify\rules.ts:558`), and today's read-only tiers only work because
+  they carry `external_directory: "allow"` (`D:\git\opencode-model-router\src\router\read-only.ts:119`). Role agents
+  must accept their dispatch's registered worktree as the work root and deny everything outside it; `router_run`
+  takes `cwd`. Spike S11 settles the host side before any role code is written.
+- **Kill switch = the pre-DF-2 override backup**, not just `delegation: "tiers"`: DF-2 also removes
+  `subagentTiers.explore` and the custom `runner`/`reviewer`/`researcher` agents, which tiers mode alone would not
+  bring back.
 - **Literature.** Only L1–L14 are verified. The researcher could not verify Hybrid LLM, SWE-agent, Agentless,
   RAG-MCP, "Lost in the Middle", bandit-routing papers, Progent, AgentDojo (as a separate source) or Greshake et al.
   Do not cite them in the ADR without verifying them first (title, authors, arXiv id, URL).
@@ -158,9 +176,11 @@ paths into it (plan "Path convention").
 
 ## 5. Delegation behaviour observed (expect it again)
 
-- **Cut-offs at about 25 tool calls** (the guard budget), even with `CAP:none` + `reason:`. Resume the **same session
-  id** with "continue and finish; do not end your turn until committed, pushed and `git status` clean". Never restart
-  from scratch. Resuming preserved all work every time.
+- **Cut-offs at about 25 tool calls** (the guard budget), even with `CAP:none` + `reason:`. Under `enforced` the guard
+  denies; under `advisory` it adds `[⚠ GUARD:read_budget]` / `[⚠ GUARD:iteration_cap]` footers telling the delegate
+  to stop, so expect early returns either way. Resume the **same session id** with "continue and finish; do not end
+  your turn until committed, pushed and `git status` clean". Never restart from scratch. Resuming preserved all work
+  every time.
 - **@medium ends a turn mid-task** ("I'll finish…", "Tools are available again…"). Check `git status` / `git log` in
   the worktree and resume the same session.
 - **NEED MORE with zero tool calls.** Re-dispatch once with "attempt the work first: make these three concrete calls
@@ -189,11 +209,12 @@ paths into it (plan "Path convention").
 | "read/draft budget exhausted (3 consecutive non-producing actions)" or "tool-call budget 25 exhausted" | The owner is in `enforced` again (check `state.json` read-only; never write it). Use plan §0.2.6: a notes file every second read, ≤ 15 information calls, split by area. DF-1 removes the cause |
 | "DENIED: you already ran this exact read" after a denial | Same root cause: the denied call was recorded. Read a different range, or take the content from the notes file |
 | `CAP:none` ignored | It needs a `reason:` line in the same dispatch, and it lifts only the read-only counter, not the 25-call budget |
-| After a sync, `/router` does not show `build=<new sha>` | Expected: the code is not live until a restart (A8). Rewrite §2 and send the §7 message; stop. On resume, probe first |
+| After a sync, the pasted `/router` line (`router: engine=… build=<version>+<sha7>`) shows the previous `<sha7>` | The host was not restarted (A8: code is not live until a restart). Ask again with the §7 message; no rollback. `unknown`, a load failure or missing router agents → rollback (plan §0.7) and a critical finding |
+| A role agent is denied a path inside its phase worktree (`external_directory`) | The work-root rule (plan §2.2, R3) is not in effect or the dispatch did not name its worktree in ENVIRONMENT. Before P2.3 this is expected for role code; after DF-2 it is a finding of P2.1/P2.3. Use a tier agent as a recorded fallback meanwhile |
 | After a restart: `failed to load plugin … Cannot find package '@opencode-ai/plugin'` | `npm ci` raced the restart (DF4 incident). Let `npm ci` finish in `D:\git\opencode-model-router` and ask for another restart: the host caches the failed resolve |
 | `Unknown agent: fast` (or a role agent) | The plugin is not loaded. Work directly with your own tools, check `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`, roll back if needed (§0.7), then make a restart stop |
 | Fast-forward blocked by `.git\index.lock` | Confirm no git process runs (`Get-Process git -ErrorAction SilentlyContinue`), then remove the lock |
-| Config change not reflected | Wrong file. The target is `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`, not `tiers.json` or `opencode.json`. Agent changes apply at the next orchestrator prompt |
+| Config change not reflected | Wrong file. The target is `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`, not `tiers.json` or `opencode.json`. Routing keys hot-reload; agent registrations follow the S12 result (possibly only after a restart) |
 | Routing silently back to defaults after an override write | The layer was dropped by an invalid value (#80). Restore the backup at once, then validate in a temp HOME |
 | `tsx` probe fails on `@opencode-ai/plugin` exports | Probe through a temporary vitest file in the phase worktree that writes its output to a file; delete the file afterwards |
 | vitest finds no files for a glob | vitest does not expand globs under pwsh; list the files |
@@ -216,18 +237,24 @@ paths into it (plan "Path convention").
 Rewrite §2 first (next task id = the liveness probe of the checkpoint), commit and push the handover in
 `D:\git\omr-rta-main`, then send:
 
-- DF-1: "DF-1 sincronizado (`rta/live` @ `<sha>`, rollback `rta/df1-prev`). O código novo só fica ativo depois de
-  reiniciar o OpenCode v2. Reinicie e diga 'retomar'."
-- DF-2: "DF-2 sincronizado (`rta/live` @ `<sha>`, rollback `rta/df2-prev`). Depois do restart eu valido o código,
-  migro seu override para o modo roles (com backup) e passo a executar a Wave 3 pelos role agents. Reinicie e diga
-  'retomar'."
-- P3.4: "Merge em `master` feito (`<sha>`), CI verde. Preciso de duas coisas: reiniciar o OpenCode v2 (a base volta
-  para `master`) e sua confirmação para publicar a 2.4.0 no npm (push da tag `v2.4.0`). Reinicie e diga 'retomar e
-  publicar' ou 'retomar sem publicar'."
+Every message ends with the same request, because the executor cannot run `/router` itself:
+"Depois de reiniciar, rode `/router` e cole aqui a linha `router: engine=… build=…` junto com 'retomar'."
+
+- DF-1: "DF-1 sincronizado (`rta/live` @ `<sha7>`, rollback `rta/df1-prev`). O código novo só fica ativo depois de
+  reiniciar o OpenCode v2."
+- DF-2: "DF-2 sincronizado (`rta/live` @ `<sha7>`, rollback `rta/df2-prev`). Depois do restart eu valido o código,
+  migro seu override para o modo roles (com backup, que é o kill switch) e passo a executar a Wave 3 pelos role
+  agents."
+- DF-2b (only if S12 showed agent registration needs a restart): "Override migrado para o modo roles (backup
+  `<arquivo .bak>`). Os novos agentes só aparecem depois de mais um restart do OpenCode v2."
+- P3.4: "Merge em `master` feito (`<sha7>`), CI verde. Preciso de duas coisas: reiniciar o OpenCode v2 (a base volta
+  para `master`) e sua decisão sobre publicar a 2.4.0 no npm (push da tag `v2.4.0`). Só publico se as verificações
+  depois do restart passarem. Responda 'retomar e publicar' ou 'retomar sem publicar'."
 - Unplanned: state the cause in one line (log excerpt), the rollback already applied and what will be checked after
   the restart.
 
-On resume, always run the liveness probe (plan §0.7) before anything else.
+On resume, always run the liveness probe (plan §0.7) before anything else. If the pasted `<sha7>` is the previous
+one, the host was not restarted: ask again, do not roll back.
 
 ---
 
