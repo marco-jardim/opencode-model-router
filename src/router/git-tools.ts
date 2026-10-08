@@ -243,13 +243,34 @@ function defaultCandidates(): readonly string[] {
   return loadedCandidates;
 }
 
+/**
+ * First candidate (a real path) outside every guarded directory (guards are
+ * canonicalised when they exist), or undefined. Nothing is spawned (G4).
+ */
+export function firstOutside(candidates: readonly string[], guarded: readonly string[]): string | undefined {
+  const guards = guarded.map(dir => existsSync(dir) ? realpath(dir) : dir);
+  return candidates.find(candidate => !guards.some(dir => inside(dir, candidate)));
+}
+
 /** First candidate whose real path is outside every guarded directory. Nothing is spawned. */
 export function selectGitExecutable(candidates: readonly string[], guarded: readonly string[]): string {
   if (candidates.length === 0) throw new Error("Git executable not found (Git for Windows install or absolute PATH entries)");
-  const guards = guarded.map(dir => existsSync(dir) ? realpath(dir) : dir);
-  for (const candidate of candidates) if (!guards.some(dir => inside(dir, candidate))) return candidate;
+  const selected = firstOutside(candidates, guarded);
+  if (selected !== undefined) return selected;
   throw new Error(`Refusing git executable inside the session repository: ${candidates[0]}`);
 }
+
+/** `path` is `root` or below it (lexical; callers pass real paths). */
+export function isInside(root: string, path: string): boolean { return inside(root, path); }
+
+/** The real path of an existing regular file, or undefined (missing, a directory, a broken link). */
+export function realFileOrUndefined(path: string): string | undefined { return realFile(path); }
+
+/** Environment lookup by case-insensitive name (Windows semantics). */
+export function envLookup(env: NodeJS.ProcessEnv, name: string): string | undefined { return envValue(env, name); }
+
+/** The nearest directory at or above `directory` holding `.git` (a checkout or a linked worktree). */
+export function nearestCheckout(directory: string): string | undefined { return nearestRepository(directory); }
 
 /** Git executable for the plugin process, without session guards (setup and tests). */
 export function gitExecutable(): string {
@@ -301,7 +322,11 @@ export function dropPartialCredential(text: string): string {
   return cut === -1 ? text : text.slice(0, start + cut);
 }
 
-async function killTree(child: ChildProcess): Promise<void> {
+/** How a bounded run names itself in errors ("<message> timed out") and warnings ("<tag>: … terminating <program> directly"). */
+export interface BoundedLabel { message: string; tag: string; program: string }
+const GIT_LABEL: BoundedLabel = { message: "Git inspection", tag: "router_git", program: "git" };
+
+async function killTree(child: ChildProcess, label: BoundedLabel): Promise<void> {
   const pid = child.pid;
   if (pid === undefined) return;
   if (process.platform !== "win32") {
@@ -314,39 +339,63 @@ async function killTree(child: ChildProcess): Promise<void> {
     const killer = spawn(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"],
       { shell: false, windowsHide: true, stdio: "ignore" });
     killer.once("error", error => {
-      console.warn(`[model-router] router_git: taskkill failed to start (${error.message}); terminating git directly`);
-      killDirect(child);
+      console.warn(`[model-router] ${label.tag}: taskkill failed to start (${error.message}); terminating ${label.program} directly`);
+      killDirect(child, label);
       done();
     });
     killer.once("close", () => done());
   });
 }
 
-function killDirect(child: ChildProcess): void {
+function killDirect(child: ChildProcess, label: BoundedLabel): void {
   try { child.kill("SIGKILL"); } catch (error) {
-    console.warn(`[model-router] router_git: could not terminate git directly (${errorMessage(error)})`);
+    console.warn(`[model-router] ${label.tag}: could not terminate ${label.program} directly (${errorMessage(error)})`);
   }
 }
 
-interface BoundedOptions { signal?: AbortSignal; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv }
-interface BoundedResult { code: number | null; output: Buffer; stderr: Buffer; truncated: boolean }
+export interface BoundedOptions {
+  signal?: AbortSignal; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv;
+  /**
+   * Keep running past `maxBytes` (the head) and retain only the last `tailBytes` of
+   * the remaining output. Absent: the process tree is stopped at `maxBytes` (router_git).
+   */
+  tailBytes?: number;
+  /** Collect stderr into the same bounded stream as stdout, in arrival order (absent: a separate 8 KiB stderr). */
+  mergeStderr?: boolean;
+  /** Resolve with `failure` set, keeping the output so far, instead of rejecting on timeout or abort. */
+  settleOnFailure?: boolean;
+  /** Error/warning wording; default router_git's. */
+  label?: BoundedLabel;
+}
+export interface BoundedResult {
+  code: number | null; output: Buffer; stderr: Buffer; truncated: boolean;
+  /** `tailBytes` mode: the last bytes after the head, and how many bytes between head and tail were dropped. */
+  tail?: Buffer; omitted?: number;
+  /** `settleOnFailure` mode: why the run was stopped ("<message> timed out" / "<message> aborted"). */
+  failure?: string;
+}
 
 /**
  * Spawn with byte, time and abort bounds. Settles on `close`, or shortly after
  * `exit` when helpers that inherited the pipes (MSYS sh/sleep re-parented away
- * from taskkill's tree) keep `close` from firing (G7).
+ * from taskkill's tree) keep `close` from firing (G7). Never a shell.
  */
-function spawnBounded(executable: string, args: readonly string[], cwd: string, options: BoundedOptions = {}): Promise<BoundedResult> {
-  if (options.signal?.aborted) return Promise.reject(new Error("Git inspection aborted"));
-  if (!isDirectory(cwd)) return Promise.reject(new Error("Git inspection directory does not exist"));
+export function spawnBounded(executable: string, args: readonly string[], cwd: string, options: BoundedOptions = {}): Promise<BoundedResult> {
+  const label = options.label ?? GIT_LABEL;
+  if (options.signal?.aborted) return Promise.reject(new Error(`${label.message} aborted`));
+  if (!isDirectory(cwd)) return Promise.reject(new Error(`${label.message} directory does not exist`));
   return new Promise((resolveResult, reject) => {
     const child = spawn(executable, args, { cwd, env: options.env ?? gitEnvironment(), shell: false, windowsHide: true,
       detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
     const max = options.maxBytes ?? MAX_BYTES;
+    const tailMax = options.tailBytes;
     const chunks: Buffer[] = [];
     const errors: Buffer[] = [];
+    const tails: Buffer[] = [];
     let bytes = 0;
     let errorBytes = 0;
+    let tailBytes = 0;
+    let overflow = 0;
     let truncated = false;
     let exited = false;
     let settled = false;
@@ -367,31 +416,50 @@ function spawnBounded(executable: string, args: readonly string[], cwd: string, 
       child.stdout.destroy(); child.stderr.destroy();
       outcome();
     };
+    const result = (code: number | null): BoundedResult => {
+      const base: BoundedResult = { code, output: Buffer.concat(chunks), stderr: Buffer.concat(errors), truncated };
+      if (tailMax !== undefined) {
+        const tail = Buffer.concat(tails);
+        const kept = tail.subarray(Math.max(0, tail.length - tailMax));
+        Object.assign(base, { tail: kept, omitted: overflow - kept.length });
+      }
+      if (failure !== undefined) base.failure = failure;
+      return base;
+    };
     const finish = (code: number | null) => {
       if (settled) return;
-      const done = () => settle(() => failure ? reject(new Error(failure))
-        : resolveResult({ code, output: Buffer.concat(chunks), stderr: Buffer.concat(errors), truncated }));
+      const done = () => settle(() => failure && !options.settleOnFailure ? reject(new Error(failure)) : resolveResult(result(code)));
       if (!killing) { done(); return; }
       void Promise.race([killing, new Promise(wait => setTimeout(wait, KILL_WAIT_MS))]).then(done);
     };
     const stop = () => {
       if (killing || settled) return;
-      killing = killTree(child).catch((error: unknown) => {
-        console.warn(`[model-router] router_git: could not kill the git process tree (${errorMessage(error)})`);
-        killDirect(child);
+      killing = killTree(child, label).catch((error: unknown) => {
+        console.warn(`[model-router] ${label.tag}: could not kill the ${label.program} process tree (${errorMessage(error)})`);
+        killDirect(child, label);
       });
-      later(KILL_FALLBACK_MS, () => { if (!exited) killDirect(child); });
+      later(KILL_FALLBACK_MS, () => { if (!exited) killDirect(child, label); });
       later(SETTLE_GRACE_MS, () => finish(null));
     };
-    const abort = () => { failure ??= "Git inspection aborted"; stop(); };
-    const deadline = later(options.timeoutMs ?? DEADLINE_MS, () => { failure ??= "Git inspection timed out"; stop(); });
+    const abort = () => { failure ??= `${label.message} aborted`; stop(); };
+    const deadline = later(options.timeoutMs ?? DEADLINE_MS, () => { failure ??= `${label.message} timed out`; stop(); });
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
+    const keepTail = (rest: Buffer) => {
+      // Rolling window: memory stays near tailMax however much the process prints.
+      overflow += rest.length;
+      tails.push(rest);
+      tailBytes += rest.length;
+      while (tails.length > 1 && tailBytes - tails[0]!.length >= tailMax!) tailBytes -= tails.shift()!.length;
+    };
     const collect = (chunk: Buffer) => {
       const kept = chunk.subarray(0, Math.max(0, max - bytes));
       if (kept.length) chunks.push(kept);
       bytes += kept.length;
-      if (kept.length < chunk.length) { truncated = true; stop(); }
+      if (kept.length < chunk.length) {
+        truncated = true;
+        if (tailMax === undefined) stop(); else keepTail(chunk.subarray(kept.length));
+      }
     };
     const collectError = (chunk: Buffer) => {
       const kept = chunk.subarray(0, Math.max(0, 8 * 1024 - errorBytes));
@@ -399,7 +467,7 @@ function spawnBounded(executable: string, args: readonly string[], cwd: string, 
       errorBytes += kept.length;
     };
     child.stdout.on("data", collect);
-    child.stderr.on("data", collectError);
+    child.stderr.on("data", options.mergeStderr ? collect : collectError);
     child.once("error", error => settle(() => reject(error)));
     child.once("exit", code => {
       exited = true;
@@ -707,7 +775,23 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   return `${output}${output.endsWith("\n") || output === "" ? "" : "\n"}[router_git] skipped tracked directories replaced by symlinks/junctions: ${linked.slice(0, 20).join(", ")}${linked.length > 20 ? ", ..." : ""}`;
 }
 
-export function gitTools() {
+/**
+ * Work-root resolver for router_git_* (R6/P-18; P1.3 injects, P2.1 wires it to the
+ * dispatch binding). Its answer for a call's sessionID:
+ * - `undefined`: not a role session. The tool behaves exactly as without a resolver
+ *   (`context.directory` / `context.worktree`, I1).
+ * - `null`: a role session without a binding (or with `workRoot: null`). The tool
+ *   refuses and spawns nothing (I9).
+ * - a string: the absolute work root bound to the session. The tool inspects that
+ *   directory (its repository is discovered from it, never above its checkout) and
+ *   ignores `context.directory`/`context.worktree`, which under the v2 bridge name
+ *   the main checkout rather than a sibling worktree (S11, P-10).
+ * A throwing resolver is reported as a tool error; nothing is spawned.
+ */
+export type GitWorkRootResolver = (sessionID: string) => string | null | undefined;
+export interface GitToolsOptions { resolveWorkRoot?: GitWorkRootResolver }
+
+export function gitTools(opts: GitToolsOptions = {}) {
   // G4: resolve the git executable once, at plugin load.
   const executables = defaultCandidates();
   const inputSchema = tool.schema.object({
@@ -726,6 +810,14 @@ export function gitTools() {
     },
     async execute(input, context) {
       try {
+        if (opts.resolveWorkRoot) {
+          const root = opts.resolveWorkRoot(context.sessionID);
+          if (root === null) return "[router_git] error: refused: this role session has no bound work root (I9)";
+          if (root !== undefined) {
+            if (typeof root !== "string" || !isAbsolute(root)) throw new Error("Bound work root is not an absolute path");
+            return await inspectGit(operation, inputSchema.parse(input), root, context.abort, { executables });
+          }
+        }
         return await inspectGit(operation, inputSchema.parse(input), context.directory, context.abort, { worktree: context.worktree, executables });
       } catch (error) {
         // G12: report, never throw into the session; messages are credential-redacted.
