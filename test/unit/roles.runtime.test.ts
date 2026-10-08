@@ -4,7 +4,7 @@
  * the authority ladder's resume, session eviction, P-5 foreground, signals with the real guard state. Tiers mode and v1 unchanged.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
@@ -28,7 +28,7 @@ import {
 import {
   resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
 } from "../../src/routing/wire/dispatch";
-import { verificationScope } from "../../src/verify/paths";
+import { canonicalAuthorityPath, verificationScope } from "../../src/routing/roles/work-root";
 import { runSignal } from "../../src/routing/outcomes/signals";
 import { registerRoleAgents } from "../../src/router/role-agents";
 import { rememberDispatch } from "../../src/router/sessions";
@@ -745,31 +745,74 @@ describe("QA round 1 (P2.1)", () => {
     expect(roleGateOutsideWorkRoot(null, block(), "")).toBe(true); // no validated work root
     expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", outsideWorkRoot: true, env: {} })).toBe(false);
     expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", outsideWorkRoot: false, env: {} })).toBe(true);
-    const route = async (id: string, prompt: string) => {
-      const event = { sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "implementer", description: "x", prompt } as Record<string, unknown> };
+    const route = async (id: string, prompt: string, extra: Record<string, unknown> = {}) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "implementer", description: "x", prompt, ...extra } as Record<string, unknown> };
       await v2.toolHooks["execute.before"](event);
       return routedRoleOf(id)!.detection;
     };
     expect(await route("df1a", `[route class=implement risk=low scope=single]\n${block()}`)).toBe("deterministic");
+    expect(routedRoleOf("df1a")!.verifyRoot).toBe(root);
     expect(await route("df1b", `[route class=implement risk=low scope=single]\n${block("sub")}`)).toBe("deterministic");
     expect(await route("df1c", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`)).not.toBe("deterministic");
-    // root= naming no worktree of this repository: no work root, so the gate cannot back a deterministic detection.
+    // root= naming no worktree of this repository: no work root, so the gate cannot back a deterministic detection; it is
+    // verified in the canonical session directory (QA-P33F1-1-3).
     expect(await route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`)).not.toBe("deterministic");
     expect(routedRoleOf("df1d")!.workRoot).toBeNull();
+    expect(routedRoleOf("df1d")!.verifyRoot).toBe(root);
+    // QA-P33F1-1 nit 3: the call's own cwd argument wins over the block's cwd:, exactly as in the after-hook.
+    expect(roleGateOutsideWorkRoot(root, block(), "", join(root, ".."))).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, block(join(root, "..")), "", root)).toBe(false);
+    expect(roleGateOutsideWorkRoot(root, block(), "", "  ")).toBe(false); // a blank argument names no cwd
+    expect(await route("df1e", `[route class=implement risk=low scope=single]\n${block()}`, { cwd: join(root, "..") })).not.toBe("deterministic");
+    expect(await route("df1f", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`, { cwd: root })).toBe("deterministic");
+    // QA-P33F1-1-2: a UNC/device cwd is never inside (refused before any filesystem call).
+    expect(roleGateOutsideWorkRoot(root, block("//server/share/x"), "")).toBe(true);
   });
 
-  it("DF2-F1: verificationScope — tiers unchanged (I1); a role dispatch's work root is the default, an outside cwd is flagged", () => {
-    const root = join(tmpdir(), "scope-root");
-    expect(verificationScope(undefined, undefined)).toEqual({ cwd: undefined, requested: undefined, outside: false });
-    expect(verificationScope("/elsewhere", undefined)).toEqual({ cwd: "/elsewhere", requested: "/elsewhere", outside: false });
-    expect(verificationScope("rel", null)).toEqual({ cwd: "rel", requested: "rel", outside: false });
-    expect(verificationScope(undefined, root)).toEqual({ cwd: root, requested: root, workRoot: root, outside: false });
-    expect(verificationScope("pkg", root)).toEqual({ cwd: join(root, "pkg"), requested: join(root, "pkg"), workRoot: root, outside: false });
-    const away = join(tmpdir(), "elsewhere");
-    expect(verificationScope(away, root)).toEqual({ cwd: root, requested: away, workRoot: root, outside: true });
-    // The containment test is on the canonical spelling (8.3 names, links), as in the gate.
-    const alias = join(tmpdir(), "SCOPE-~1");
-    expect(verificationScope(alias, root, (p) => (p === alias ? root : p)).outside).toBe(false);
+  it("DF2-F1 / QA-P33F1-1-2: verificationScope — tiers unchanged (I1); a role root is the default; P2.3's containment rule", () => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-root-")));
+    const away = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-away-")));
+    try {
+      expect(verificationScope(undefined, undefined)).toEqual({ cwd: undefined, requested: undefined, outside: false });
+      expect(verificationScope("/elsewhere", undefined)).toEqual({ cwd: "/elsewhere", requested: "/elsewhere", outside: false });
+      expect(verificationScope("rel", null)).toEqual({ cwd: "rel", requested: "rel", outside: false });
+      expect(verificationScope(undefined, root)).toEqual({ cwd: root, requested: root, workRoot: root, outside: false });
+      expect(verificationScope("pkg", root)).toEqual({ cwd: join(root, "pkg"), requested: join(root, "pkg"), workRoot: root, outside: false });
+      expect(verificationScope(away, root)).toEqual({ cwd: root, requested: undefined, workRoot: root, outside: true, refused: away });
+      expect(verificationScope(`${root}-v2`, root).outside).toBe(true); // a sibling prefix
+      // The checked CANONICAL directory is what the checks run in (a link inside the root is resolved) …
+      const kind = process.platform === "win32" ? "junction" : "dir";
+      mkdirSync(join(root, "real-pkg"));
+      symlinkSync(join(root, "real-pkg"), join(root, "pkg-link"), kind);
+      expect(verificationScope("pkg-link", root)).toMatchObject({ cwd: join(root, "real-pkg"), requested: join(root, "real-pkg"), outside: false });
+      // … and a link inside the root that leads out of it is outside.
+      symlinkSync(away, join(root, "out-link"), kind);
+      expect(verificationScope("out-link", root)).toMatchObject({ outside: true, cwd: root, refused: "out-link" });
+      // UNC/device paths and 8.3 spellings: refused before any filesystem call (P2.3's rule, also at dispatch time).
+      const realpath = vi.fn((p: string) => p);
+      const lstat = vi.fn(() => undefined);
+      const canonical = (p: string, b: string) => canonicalAuthorityPath(p, b, { platform: "win32", realpath, lstat });
+      for (const cwd of ["\\\\server\\share\\x", "\\\\?\\C:\\x", "//server/share", "C:\\Users\\PROGRA~1\\x"]) {
+        expect(verificationScope(cwd, "C:\\repo\\wt", canonical)).toMatchObject({ outside: true, refused: cwd, cwd: "C:\\repo\\wt" });
+      }
+      expect(realpath).not.toHaveBeenCalled();
+      expect(lstat).not.toHaveBeenCalled();
+    } finally {
+      for (const dir of [root, away]) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("QA-P33F1-1-2 (POSIX): a cwd `<root>/link/..` is where the filesystem says (outside), not `<root>`", () => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-root-")));
+    const away = realpathSync.native(mkdtempSync(join(tmpdir(), "scope-away-")));
+    try {
+      mkdirSync(join(away, "deep"));
+      symlinkSync(join(away, "deep"), join(root, "link"), "dir");
+      expect(verificationScope("link/..", root)).toMatchObject({ outside: true, cwd: root });
+      expect(roleGateOutsideWorkRoot(root, `Do it\n[acceptance]\ncwd: ${join(root, "link")}/..\ncheck: fileExists path=x\n[/acceptance]`, "")).toBe(true);
+    } finally {
+      for (const dir of [root, away]) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
   });
 
   it("QA-P21-1-3: a role child that hit its read-only CAP is a budget stop for the signals and gets the resume note", async () => {

@@ -265,6 +265,27 @@ describe("accept() — a role dispatch is verified in its work root (DF2-F1)", (
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it("QA-P33F1-1-2: a cwd the caller refused (refusedCwd) is refused unresolved: no canonicalisation, no check", async () => {
+    const { exec, fileExists, d, dod } = setup();
+    const canonicalPath = vi.fn((path: string) => path);
+    const unc = "\\\\server\\share\\x";
+    const r = await accept({ dod, workRoot: root, refusedCwd: unc }, wrote(), { ...d, canonicalPath });
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons).toEqual([expect.stringContaining(`the [acceptance] block's cwd ${unc} is outside this role dispatch's work root ${root}`)]);
+    expect(canonicalPath).not.toHaveBeenCalled();
+    expect(exec).not.toHaveBeenCalled();
+    expect(fileExists).not.toHaveBeenCalled();
+  });
+
+  it("QA-P33F1-1 nit 1: a cwd: inside the root but narrower than where the work landed suggests widening it", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod, cwd: join(root, "pkg"), workRoot: root }, wrote(join(root, "other", "x.ts")), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons[0]).toContain(`changed files only outside ${join(root, "pkg")}`);
+    expect(r.verdict.reasons[0]).toContain(`"cwd:" narrows verification to ${join(root, "pkg")} inside the work root ${root}: widen "cwd:"`);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it("I1: a tier dispatch (no work root) keeps the session directory and today's caveat", async () => {
     const { exec, d, dod } = setup();
     const r = await accept({ dod }, wrote(), d);

@@ -44,6 +44,32 @@ vi.mock("../../src/routing/wire/dispatch", async (importOriginal) => {
     },
   };
 });
+// QA-P33F1-1 nit 2: a pass-through spy on the verification wiring — the cwd each dispatch's capture, preparation and deferral use.
+const wired = vi.hoisted(() => ({ calls: [] as Array<{ kind: "start" | "prepare" | "defer"; id: string; cwd: string | undefined }> }));
+vi.mock("../../src/verify/wiring", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/verify/wiring")>();
+  return {
+    ...actual,
+    createVerificationWiring: (...args: Parameters<typeof actual.createVerificationWiring>) => {
+      const wiring = actual.createVerificationWiring(...args);
+      return {
+        ...wiring,
+        startDispatch: (...a: Parameters<typeof wiring.startDispatch>) => {
+          wired.calls.push({ kind: "start", id: a[1], cwd: a[2] });
+          return wiring.startDispatch(...a);
+        },
+        prepareVerification: (...a: Parameters<typeof wiring.prepareVerification>) => {
+          wired.calls.push({ kind: "prepare", id: a[1], cwd: a[3] });
+          return wiring.prepareVerification(...a);
+        },
+        finishDeferred: (...a: Parameters<typeof wiring.finishDeferred>) => {
+          wired.calls.push({ kind: "defer", id: a[1].dispatchID, cwd: a[1].cwd });
+          return wiring.finishDeferred(...a);
+        },
+      };
+    },
+  };
+});
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { resetDispatchRegistry } from "../../src/router/sessions";
@@ -832,6 +858,87 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     expect(outside.detection).not.toBe("deterministic");
     expect(outside.text).toMatch(/outside this role dispatch's work root/);
     expect(outside.text).not.toContain("verified: deterministic");
+  }, 60_000);
+
+  it.skipIf(!hasGit())("QA-P33F1-1: a resume is verified in the child's bound worktree; a null root stays in the session directory; capture, preparation and deferral run there", async () => {
+    wired.calls.length = 0;
+    const base = temp("omr-p33-repo-");
+    const main = join(base, "main");
+    mkdirSync(main);
+    git(["init", "-q"], main);
+    writeFileSync(join(main, "a.ts"), "export const a = 1;\n");
+    git(["add", "a.ts"], main);
+    git(["commit", "-q", "-m", "init"], main);
+    git(["worktree", "add", "-q", "-b", "b1", join(base, "wt-1")], main);
+    const wt1 = realpathSync.native(join(base, "wt-1"));
+    const other = join(base, "other");
+    mkdirSync(other);
+    const { cfg } = home(ROLES);
+    const hooks = await plugin(main);
+    const sessions: Sessions = {};
+    const v2 = host(main, cfg, sessions);
+    await v2.start(hooks, { listWorktrees: gitWorktreeList });
+    /** The child (optionally) writes `file`, then returns; the parent's result text. */
+    const finish = async (callID: string, child: string, input: Record<string, unknown>, file?: string): Promise<string> => {
+      if (file !== undefined) {
+        writeFileSync(file, "probe\n");
+        await hooks["tool.execute.after"]({ tool: "write", sessionID: child, callID: `${callID}-w`, args: { filePath: file } }, { title: "", output: "", metadata: {} });
+      }
+      const text = "DONE: finished (probe.txt:1)";
+      const event = {
+        sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input, status: "completed",
+        result: { output: { status: "completed", output: text, sessionID: child }, content: [{ type: "text", text }] },
+      };
+      await v2.toolHooks["execute.after"]!(event);
+      return resultText(event);
+    };
+    const at = (kind: "start" | "prepare" | "defer", callID: string) => wired.calls.filter((c) => c.kind === kind && c.id === `task:root:${callID}`).map((c) => c.cwd);
+
+    // 1-1: dispatched with root=wt1 and bound exactly; then resumed with "continue and finish" — no route line.
+    const first = await dispatch(v2, sessions, "rs1", "k1", "implementer", `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nStart the probe`, wt1, "probe");
+    expect(await catalog(v2, "k1", "implementer")).toContain("edit");
+    expect(kindOf(cfg, "k1")).toBe("exact");
+    await finish("rs1", "k1", first);
+    const resume = async (callID: string, cwd?: string) => {
+      const prompt = `continue and finish\n[acceptance]\n${cwd === undefined ? "" : `cwd: ${cwd}\n`}check: fileExists path=resume-probe.txt\n[/acceptance]`;
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "implementer", sessionID: "k1", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"]!(event);
+      const routed = routedRoleOf(callID)!;
+      return { routed, text: await finish(callID, "k1", event.input, join(wt1, "resume-probe.txt")) };
+    };
+    const plain = await resume("rs2");
+    expect(plain.routed.workRoot).not.toBe(wt1); // the resume prompt's own root: the session directory …
+    expect(plain.routed.grant.workRoot).toBe(wt1); // … but the child keeps its bound worktree,
+    expect(plain.routed.verifyRoot).toBe(wt1); // and that is where it is verified
+    expect(plain.routed.detection).toBe("deterministic");
+    expect(plain.text).toContain("[router \u2713 verified: deterministic]");
+    expect(at("start", "rs2")).toEqual([wt1]);
+    expect(at("prepare", "rs2")).toEqual([wt1]);
+    // The documented `cwd: <worktree>` is accepted on a resume (it was refused against the session directory).
+    const named = await resume("rs3", wt1);
+    expect(named.routed.detection).toBe("deterministic");
+    expect(named.text).toContain("[router \u2713 verified: deterministic]");
+    expect(named.text).not.toMatch(/outside this role dispatch's work root/);
+
+    // 1-3: a root= that is no worktree → no work root; verified in the canonical session directory: the outside cwd: is
+    // refused, never deferred, and nothing runs in it.
+    const nullRoot = await dispatch(v2, sessions, "nr1", "k2", "implementer",
+      `[route class=implement risk=low scope=single needs=edit root=${other}]\nDo it\n[acceptance]\ncwd: ${other}\ncheck: testsPass\n[/acceptance]`, main, "null root");
+    expect(routedRoleOf("nr1")!.workRoot).toBeNull();
+    expect(routedRoleOf("nr1")!.verifyRoot).toBe(main);
+    expect(routedRoleOf("nr1")!.detection).not.toBe("deterministic");
+    const refused = await finish("nr1", "k2", nullRoot);
+    expect(refused).toMatch(/outside this role dispatch's work root/);
+    expect(at("start", "nr1")).toEqual([main]);
+    expect(at("prepare", "nr1")).toEqual([main]);
+    expect(at("defer", "nr1")).toEqual([]);
+
+    // nit 2: a deferred role dispatch is captured and deferred in its worktree, not the session directory.
+    const deferred = await dispatch(v2, sessions, "dd1", "k3", "implementer",
+      `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nDo it\n[acceptance]\ncheck: testsPass\n[/acceptance]`, wt1, "deferred");
+    await finish("dd1", "k3", deferred, join(wt1, "deferred.txt"));
+    expect(at("start", "dd1")).toEqual([wt1]);
+    expect(at("defer", "dd1")).toEqual([wt1]);
   }, 60_000);
 });
 

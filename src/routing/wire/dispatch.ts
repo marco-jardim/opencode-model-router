@@ -55,8 +55,8 @@ import { resolveEnforcementMode } from "../../router/enforcement";
 import { roleGuardProfile } from "../../router/guard-profile";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../../router/roles";
 import { parseVerifyDirectives } from "../../verify/directives";
-import { buildDelegationDoD, canonicalPath } from "../../verify/dispatch";
-import { verificationScope } from "../../verify/paths";
+import { buildDelegationDoD } from "../../verify/dispatch";
+import { requestedVerificationCwd, verificationScope } from "../roles/work-root";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
@@ -151,6 +151,11 @@ export interface RoleRouted {
   readonly grant: DispatchGrant;
   /** The validated work root (canonical long form), or null (no `root=` match, or the session directory could not be resolved). */
   readonly workRoot: string | null;
+  /**
+   * #84 P3.3 DF2-F1 (QA-P33F1-1-1, 1-3): where the router's gate verifies this dispatch — the grant's work root (a resume keeps the
+   * child's bound root, whatever its prompt's route line says), else the canonical session directory (no validated work root).
+   */
+  readonly verifyRoot: string;
   /** The route line's `root=` as written, or null. */
   readonly requestedRoot: string | null;
   /** Work-root, grant and catalog notes (for the dispatch header / parent result). */
@@ -611,20 +616,33 @@ export function roleGateDeferred(cfg: RouterConfig, prompt: string, description:
 
 /**
  * #84 P3.3 DF2-F1: the router's gate verifies a role dispatch in its work root (index.ts `verificationScopeOf` → gate
- * `Delegation.workRoot`). It cannot when the dispatch has no validated work root (`workRoot: null`), or when the prompt's
- * `[acceptance]` block names a `cwd:` outside that root (the gate refuses it: unverifiable). Then the router's gate cannot back a
- * `deterministic` detection. Fails toward "outside" on any error (a weaker detection, never a stronger one).
+ * `Delegation.workRoot`). It cannot when the dispatch has no validated work root (`workRoot: null`), or when the requested cwd —
+ * the call's `cwd` argument, else the `[acceptance]` block's `cwd:` (`requestedVerificationCwd`, the after-hook's order, nit 3) —
+ * lies outside that root by P2.3's rule (`verificationScope`; the gate refuses it: unverifiable). Then the router's gate cannot
+ * back a `deterministic` detection. `workRoot` is the GRANT's root (QA-P33F1-1-1: a resume keeps the child's bound root). Fails
+ * toward "outside" on any error (a weaker detection, never a stronger one).
  *
  * What the decision row records is decided HERE, at dispatch: a gate that later reports the delegation unverifiable for a reason
  * only the return shows (every change outside the work root, a timeout, a verifier error) does not rewrite the row — its verdict
  * carries the caveat (`[router ⚠ UNVERIFIED …]`) and is never accepted as verified.
  */
-export function roleGateOutsideWorkRoot(workRoot: string | null, prompt: string, description: string): boolean {
+export function roleGateOutsideWorkRoot(workRoot: string | null, prompt: string, description: string, argsCwd?: unknown): boolean {
   if (workRoot === null) return true;
   try {
-    return verificationScope(buildDelegationDoD({ prompt, description }).cwd, workRoot, canonicalPath).outside;
+    return verificationScope(requestedVerificationCwd(argsCwd, buildDelegationDoD({ prompt, description }).cwd), workRoot).outside;
   } catch {
     return true;
+  }
+}
+
+/** QA-P33F1-1-1 / 1-3: where the gate verifies a role dispatch — the grant's work root, else the canonical session directory. */
+function verifyRootOf(grant: DispatchGrant, sessionDirectory: string, realpath: (path: string) => string): string {
+  if (grant.workRoot !== null) return grant.workRoot;
+  try {
+    const real = realpath(sessionDirectory);
+    return typeof real === "string" && real !== "" ? real : sessionDirectory;
+  } catch {
+    return sessionDirectory;
   }
 }
 
@@ -1331,7 +1349,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       cfg: rp.cfg, bypassed: deps.isBypassed?.(call.sessionID) === true, acceptance, ...(deps.env === undefined ? {} : { env: deps.env }),
       // QA-P21-1-2, QA-P21-2 nit 3
       deferred: roleGateDeferred(rp.cfg, prompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false }),
-      outsideWorkRoot: roleGateOutsideWorkRoot(root.workRoot, prompt, description), // DF2-F1
+      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, prompt, description, args.cwd), // DF2-F1, QA-P33F1-1-1, nit 3
     });
     const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance });
 
@@ -1458,6 +1476,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       window: { floor: bounds.floor, ceiling: bounds.ceiling, pinned: bounds.pinned },
       grant,
       workRoot: root.workRoot,
+      verifyRoot: verifyRootOf(grant, sessionDirectory, workRootDeps.realpath),
       requestedRoot: root.requested,
       notes,
       detection,
@@ -1510,7 +1529,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
    * unknown-binding grant (role max ∩ local, I9) — on a resume never below the child's running tier — and, as a routed role
    * dispatch, it is forced to the foreground (P-5).
    */
-  const decideDelegateRoleDispatch = (call: RouteCall, rp: RolePrepared): RouteOutcome => {
+  const decideDelegateRoleDispatch = (call: RouteCall, rp: RolePrepared, session: SessionView): RouteOutcome => {
     const agent = rp.spec.agent;
     const max = new Set<AuthorityAction>(roleMaxActions(rp.spec) ?? []);
     const grant: DispatchGrant = { actions: new Set(LOCAL_ACTIONS.filter((a) => max.has(a))), notes: [DELEGATE_DISPATCH_NOTE], workRoot: null };
@@ -1543,6 +1562,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       window: { floor: bounds.floor, ceiling: bounds.ceiling, pinned: null },
       grant,
       workRoot: null,
+      verifyRoot: verifyRootOf(grant, session.directory ?? deps.directory, workRootDeps.realpath),
       requestedRoot: null,
       notes: [DELEGATE_DISPATCH_NOTE, ...(placed.dropped === null ? [] : [placed.dropped])],
       detection,
@@ -1572,7 +1592,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     try {
       // QA-P21-1-1: a delegate's dispatch is never parsed (it must not pin or steer), but it runs on the router's floor rung of
       // the unknown-binding window, in the foreground — never on a model the delegate names (I2).
-      if (session.parentID !== null) return decideDelegateRoleDispatch(call, rp);
+      if (session.parentID !== null) return decideDelegateRoleDispatch(call, rp, session);
       return await decideRoleDispatch(call, rp, session);
     } catch (error) {
       if (error instanceof RoleDispatchRefusal) throw error;
