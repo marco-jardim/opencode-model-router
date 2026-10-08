@@ -48,6 +48,7 @@ import {
   FLUSH_MIN_INTERVAL_MS,
   LADDER_STEP_KINDS,
   LOG_ROW_VERSION,
+  SIGNAL_KINDS,
   MAX_QUEUED_ROWS,
   MAX_CORRUPT_COPIES,
   OUTCOMES_CORRUPT_PREFIX,
@@ -259,7 +260,6 @@ const LOGGED_MODES: readonly string[] = ["shadow", "advise", "enforce"];
 const COST_UNITS: readonly string[] = ["usd", "ratio"];
 const VERDICT_VALUES: readonly string[] = ["pass", "fail", "unverifiable"];
 
-const SIGNAL_KINDS: readonly string[] = ["verdict", "run", "grader", "incomplete", "budget", "authority", "redispatch"];
 const BINDINGS: readonly string[] = ["exact", "intersection", "unknown"];
 
 function isStringArray(x: unknown): x is string[] {
@@ -421,6 +421,8 @@ export function parseLogLine(line: string): LogRow | null {
     ...(typeof json.explore === "boolean" ? { explore: json.explore } : {}),
     ...(isFiniteNum(json.propensity) ? { propensity: json.propensity } : {}),
     ...(oneOf(BINDINGS, json.binding) ? { binding: json.binding as NonNullable<DecisionRow["binding"]> } : {}),
+    ...(typeof json.tier === "string" ? { tier: json.tier } : {}),
+    ...(isFiniteNum(json.signalWeight) ? { signalWeight: json.signalWeight } : {}),
   };
   return row;
 }

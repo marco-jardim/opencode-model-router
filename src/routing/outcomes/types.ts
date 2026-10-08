@@ -68,6 +68,9 @@ export type AgentOrigin = "router" | "host" | "role";
 /** Kind of signal an outcome observation carries (role/tier assurance, plan §2.4). */
 export type SignalKind = "verdict" | "run" | "grader" | "incomplete" | "budget" | "authority" | "redispatch";
 
+/** Fixed order of signal kinds (persistence validation, statistics). */
+export const SIGNAL_KINDS: readonly SignalKind[] = ["verdict", "run", "grader", "incomplete", "budget", "authority", "redispatch"];
+
 export interface AgentRef {
   readonly origin: AgentOrigin;
   readonly id: string;
@@ -586,6 +589,27 @@ export interface DecisionRow extends LogRowBase {
   readonly propensity?: number;
   /** How the grant was bound to the child's permissions. */
   readonly binding?: "exact" | "intersection" | "unknown";
+  /** P1.4: preset tier the dispatch ran at (role × tier statistics; the outcome key does not name it). */
+  readonly tier?: string;
+  /**
+   * P1.4: signed evidence mass of a signal row (`signal` set): > 0 success, < 0 failure, 0 recorded without mass
+   * (budget, authority). Readers clamp it per kind (signals.ts `signalMass`), so a row can never carry more than §2.6 allows.
+   */
+  readonly signalWeight?: number;
+}
+
+/**
+ * Reason prefix of a decision row written AFTER its dispatch to annotate it (an outcome signal, a binding): it shares the
+ * dispatch's `decisionID` and is never a dispatch of its own. `summarize` leaves every annotation row out.
+ */
+export const ANNOTATION_REASON = "note:";
+
+/** Reason prefix of a signal row: `note:signal:<kind>:<pass|fail|none>`. */
+export const SIGNAL_REASON = "note:signal:";
+
+/** A decision row that annotates a dispatch (a signal row, or any row whose reason starts with {@link ANNOTATION_REASON}). */
+export function isAnnotationRow(row: LogRow): boolean {
+  return row.kind === "decision" && (row.signal !== undefined || row.reason.startsWith(ANNOTATION_REASON));
 }
 
 /** The `[acceptance]` depth vocabulary of 1.2 (`Detection`), restated here so this module keeps no runtime import. */
@@ -958,6 +982,58 @@ export interface StatsTable {
    * fields) are not counted in either.
    */
   readonly neverDown: { readonly below: number; readonly recorded: number };
+}
+
+/** One signal kind of a role × tier bucket. Masses are clamped per kind (I6: no positive mass from self-report; I7: none for budget/authority). */
+export interface SignalKindStats {
+  readonly kind: SignalKind;
+  readonly pass: number;
+  readonly fail: number;
+  /** Rows recorded without mass (budget, authority, or a row without a weight). */
+  readonly none: number;
+  readonly positive: number;
+  readonly negative: number;
+}
+
+/** Σ of the dispatched key's `costs` entry over the bucket's dispatch rows of one unit. Units are never summed together. */
+export interface CostUnitRow {
+  readonly unit: CostUnit;
+  readonly total: number;
+  readonly rows: number;
+}
+
+/** P1.4: statistics of one role × tier bucket over the window (rendering is P2.2). */
+export interface RoleTierStatsRow {
+  readonly role: string;
+  /** Preset tier of the dispatch rows (`DecisionRow.tier`); `unknown` when a row carries none. */
+  readonly tier: string;
+  /** Windowed `dispatch` rows of the role at this tier (fresh and resumed; annotation rows excluded). */
+  readonly dispatches: number;
+  /** Fixed order: SIGNAL_KINDS. */
+  readonly signals: readonly SignalKindStats[];
+  readonly positiveMass: number;
+  readonly negativeMass: number;
+  readonly budgetExhaustions: number;
+  readonly authorityRequests: number;
+  readonly unknownBindings: number;
+  /** Dispatch rows drawn by exploration (`explore: true`). */
+  readonly explored: number;
+  /** n-weighted store token means per attempt over the bucket's dispatched keys (lifetime, not windowed); null without samples. */
+  readonly tokensPerDispatch: TokenMeans | null;
+  /** n-weighted store `measuredUSD` per attempt over the bucket's dispatched keys (lifetime); null without samples. */
+  readonly measuredUSD: MeanStat | null;
+  /** One entry per unit present, sorted by unit name. */
+  readonly costUnits: readonly CostUnitRow[];
+}
+
+/** P1.4: role × tier statistics. Rows without a role (tier mode) are not counted here; `summarize` is unchanged for them. */
+export interface RoleStatsTable {
+  readonly version: 1;
+  readonly window: { readonly since: string | null; readonly until: string | null };
+  /** Sorted by role, then tier. */
+  readonly byRoleTier: readonly RoleTierStatsRow[];
+  /** Windowed signal and unknown-binding rows whose dispatch has no role (or no decision row to join). */
+  readonly unattributed: { readonly signals: number; readonly unknownBindings: number };
 }
 
 /** What the CLI reads from a directory (a Persister satisfies it). */
