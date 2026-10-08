@@ -1001,6 +1001,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       const titles = { exec: exec.probeNotool.childTitle, execDeny: exec.probeExplicitDeny.childTitle };
       await save("S11", { base, deny, exact, glob, spelling, later, notool, narrowed, exec, openRoot, toolReport, disk, titles, hostErrors: host.errorLines() });
 
+      let spellingApplicable: Obj = {};
       const rejected = (o: { state?: Obj }, message: string) => expect(o.state).toMatchObject({ status: "error", errorType: "permission.rejected", errorMessage: message });
       const denied = "Permission denied: external_directory";
       // (1) default agent: external_directory is ASKED for the sibling worktree (resource "<worktree>/*"); the probe turned the ask into a deny so nothing hangs.
@@ -1073,16 +1074,20 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       rejected(exact.evil, denied);
       //     - `..` is normalised before matching (wt-1\..\other resolves to the unrelated directory and is refused);
       rejected(exact.dotdot, denied);
-      //     - letter case does not matter on this Windows host (a rule written in upper case still grants the path) ...
-      expect(spelling.upperRule.state).toMatchObject({ status: "completed" });
-      //     - ... but the 8.3 / long spelling of the root DOES: a rule in the long spelling does not grant a path in the short spelling,
-      //       and a rule in the short spelling does not grant a path in the long spelling (both refused).
-      expect(norm(realpathSync.native(host.root))).not.toBe(norm(host.root));
-      rejected(spelling.longRule, denied);
-      rejected(exact.longPath, denied);
+      //     - letter case: matching folds case on win32 only (src/router/read-only.ts:27), so the upper-case-rule check is a win32 fact ...
+      const windows = process.platform === "win32";
+      if (windows) expect(spelling.upperRule.state).toMatchObject({ status: "completed" });
+      //     - ... and the 8.3 / long spelling of the root matters only when the temp root HAS an 8.3 component (then a rule in the long spelling
+      //       does not grant a path given in the short spelling, and a rule in the short spelling does not grant a path given in the long one).
+      const hasShortComponent = windows && norm(realpathSync.native(host.root)) !== norm(host.root);
+      if (hasShortComponent) { rejected(spelling.longRule, denied); rejected(exact.longPath, denied); }
+      spellingApplicable = { windows, hasShortComponent };
+      await save("S11-applicability", { spellingApplicable, note: "the upper-case rule check runs on win32 only; the 8.3/long spelling checks run only when the temp root has an 8.3 component, otherwise they are not applicable" });
       // (10) the session-level grant decides before the agent's policy: the SAME deny-by-default agent without an external_directory rule
       //      reads the sibling worktree when the parent session grants everything (newRoot's default), and is refused when it grants nothing (2).
       expect(openRoot.state).toMatchObject({ status: "completed" });
+      //      and the host advertises it the FULL catalog, including the tools its policy does not list.
+      for (const name of ["execute", "shell", "subagent", "wt_probe"]) expect(openRoot.toolNames, `open root: ${name}`).toContain(name);
       // (11) router_git_status of a child whose session lives in the main checkout reports the MAIN checkout's status, not the sibling worktree's
       //      (the compat layer resolves router_git_* against the session location, v2-hooks.ts:356-358).
       expect(exact.gitStatus.state).toMatchObject({ status: "completed" });
@@ -1108,7 +1113,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
 
   it("S11 repeated with agents defined in the ROUTER override (the production registration path)", async () => {
     const host = await RoutingHost.start("s11r", {
-      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true, denyAsk: true }, hostConfig: {},
+      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true, denyAsk: true, cwdTool: true }, hostConfig: {},
       overrides: (root: string) => {
         const agent = (description: string, externalDirectory?: string): Obj => ({ tier: "fast", description, permission: { read: "allow", edit: "allow", ...(externalDirectory ? { external_directory: { [externalDirectory]: "allow" } } : {}) } });
         return { agents: {
@@ -1132,10 +1137,16 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       };
       const glob = { read: await op("r-glob", "read wt1", "read", { path: path.join(wt1, "m.txt") }), evil: await op("r-glob", "read wt-evil", "read", { path: path.join(evil, "x.txt") }), other: await op("r-glob", "read other", "read", { path: path.join(other, "x.txt") }) };
       const openRoot = { deny: await op("r-deny", "read wt1 under an allow-all session", "read", { path: path.join(wt1, "m.txt") }, "allow-all"), other: await op("r-wt1", "read other under an allow-all session", "read", { path: path.join(other, "x.txt") }, "allow-all") };
+      const openCatalog = {
+        exec: await op("r-deny", "execute under an allow-all session", "execute", { code: "return await tools.opencode.session_rename({ title: 'S11r renamed by execute' })" }, "allow-all"),
+        pluginTool: await op("r-deny", "plugin tool under an allow-all session", "wt_probe", { path: path.join(wt1, "m.txt") }, "allow-all"),
+        subagentTool: await op("r-wt1", "catalog under an allow-all session", "read", { path: path.join(wt1, "m.txt") }, "allow-all"),
+      };
       const wt2File = await world.addLaterWorktree();
       const later = { noPattern: await op("r-deny", "read wt2", "read", { path: path.join(wt2, "m.txt") }), exact: await op("r-wt1", "read wt2", "read", { path: path.join(wt2, "m.txt") }), glob: await op("r-glob", "read wt2", "read", { path: path.join(wt2, "m.txt") }), globEdit: await op("r-glob", "edit wt2", "edit", edit(wt2File)) };
       const disk = { wt1E0: await readFile(path.join(wt1, "e0.txt"), "utf8"), wt1E1: await readFile(path.join(wt1, "e1.txt"), "utf8"), wt2E3: await readFile(wt2File, "utf8"), other: await readFile(path.join(other, "x.txt"), "utf8") };
-      await save("S11-router", { agentList, deny, exact, glob, openRoot, later, disk, routerWarnings: host.routerLogLines(), hostErrors: host.errorLines() });
+      const pluginToolReports = (await host.events()).filter(e => e.type === "probe.tool").length;
+      await save("S11-router", { agentList, deny, exact, glob, openRoot, openCatalog, pluginToolReports, later, disk, routerWarnings: host.routerLogLines(), hostErrors: host.errorLines() });
       // Registration path: the router override's `agents` block (tier fast -> the host agent record carries the tier's model), with explicit
       // `permission` maps; the router publishes the policy and its own evaluate hook re-evaluates it. Same outcomes as for host-defined agents:
       expect(agentList.map(a => a.id).sort()).toEqual(["r-deny", "r-glob", "r-wt1"]);
@@ -1160,6 +1171,18 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       rejected(openRoot.deny, "Permission denied by plugin agent r-deny: external_directory");
       rejected(openRoot.other, "Permission denied by plugin agent r-wt1: external_directory");
       expect(openRoot.deny.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "deny" });
+      // The same router-registered agents under that allow-all parent also get a STRIPPED tool catalog: the router's own context hook removes
+      // the tools the policy does not grant (src/compat/v2-hooks.ts:395-411; on an error it empties the catalog), so execute, subagent and the
+      // plugin tool are not advertised and calls to them fail with "Tool is not available for this request: <name>" without running (the scripted inner session_rename does not rename the session).
+      for (const o of [openRoot.deny, openCatalog.exec, openCatalog.pluginTool]) {
+        for (const name of ["execute", "subagent", "wt_probe"]) expect(o.toolNames, `${o.label}: ${name}`).not.toContain(name);
+        expect([...o.toolNames].sort()).toEqual(["edit", "read", "write"]);
+      }
+      expect(openCatalog.subagentTool.toolNames).not.toContain("execute");
+      expect(openCatalog.exec.state).toMatchObject({ status: "error", errorType: "tool.execution", errorMessage: "Tool is not available for this request: execute" });
+      expect(openCatalog.pluginTool.state).toMatchObject({ status: "error", errorType: "tool.execution", errorMessage: "Tool is not available for this request: wt_probe" });
+      expect(openCatalog.exec.childTitle).toBe("S11 r-deny execute under an allow-all session");
+      expect(pluginToolReports).toBe(0);
       expect(host.routerLogLines()).toEqual([]);
       expect(host.errorLines()).toEqual([]);
     } finally { await finish(host); }
