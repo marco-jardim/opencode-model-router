@@ -22,12 +22,12 @@ refer to the base commit `eeab36b`):
 | E5 | `gpt-6-luna-fast` searched the Code Mode catalog for "shell", found nothing and returned NEED MORE although direct tools existed; denying `execute` removed the confusion | session `ses_ee9cf7d50ffeq270hLk5fBJMwY`, #77 |
 | E6 | Read-only agents were denied by the producer-oriented guard ("read/draft budget exhausted (3 consecutive non-producing actions)"), the read-only `fast` tier and a heavy review alike, even with `CAP:none` + `reason:`; denied calls were charged to the budget and later counted as repeats | `src/guard/guards.ts:223-227`, sessions `ses_ee6f0ba89ffenfzGLa5sDIrf6R`, `ses_ee6e6dee9ffef2QQoPWOt1Pn6G` |
 | E7 | Many dispatches were cut at 25 tool calls (`DEFAULT_GUARD_BUDGET`, cumulative × 3); resuming the same session id preserved all work every time | `src/guard/enforce.ts:20,27,43-56` |
-| E8 | ≥ 10 false "NOT ACCEPTED" verdicts citing a criterion cut mid-sentence; the criterion was a router instruction, not an outcome | `src/router/dispatch-header.ts:20`; cut site `src/verify/dod.ts:62` |
+| E8 | ≥ 10 false "NOT ACCEPTED" verdicts citing a criterion cut mid-sentence; the criterion was a router instruction, not an outcome | `src/router/dispatch-header.ts:20`; candidate cut site `src/verify/dod.ts:62` (confirmed by spike S5) |
 | E9 | Shell allow-patterns were bypassable (newline, `&`, `\|`, backtick, `$(`); the v1 action name `bash` silently failed on v2 (`shell`) until a real-host smoke caught it | QA-81-R2-7, #81 smoke |
 | E10 | Host facts: the per-call `model` overrides the agent model; `session.created` carries parentID/agent/title; tool hooks reach only the session location's instance; `execute.before` does not fire for the runner's internal `native.execute`; same-model variant steps travel in-band | [`../qa/cost-aware-routing/phase-3.2.md`](../qa/cost-aware-routing/phase-3.2.md) |
 | E11 | GitHub CI runs only on PRs/master; Windows jobs flake on temp-dir cleanup and tight timing | PR #76/#78/#82/#83 runs |
 | E12 | A subagent's relative-path .NET write landed an empty file in the base checkout | #81 step 6 |
-| E13 | The owner's custom `researcher` combined local reads with web egress; its `brave_*` tools need Code Mode `execute`, which also exposes the whole Code Mode catalog | owner override, #81 review |
+| E13 | The owner's custom `researcher` combined local reads with web egress; its `brave_*` tools need Code Mode `execute`, which also exposes the whole Code Mode catalog | owner override, #81 review, PLAN-3 |
 
 Spikes S1–S12 against OpenCode 2.0.24 ([`../qa/role-tier/spikes.md`](../qa/role-tier/spikes.md)) settled the host
 behaviour the design depends on; their proposals P-1…P-19 are amendment R6 of the plan.
@@ -38,8 +38,9 @@ behaviour the design depends on; their proposals P-1…P-19 are amendment R6 of 
 
 A dispatch is **role × tier × assurance**. The orchestrator picks the role (intent); the router picks the tier and
 always sets the per-call `model` (E10); the effective detection of the dispatch bounds how cheap the tier may be.
-`routing.delegation: "roles"` turns it on; the default `"tiers"` leaves v2 byte-identical to the base except the
-mode-independent fixes of D12. Role agents and role tools are registered only when the plugin **starts** in roles
+`routing.delegation: "roles"` turns it on; the default `"tiers"` leaves v2 (and v1) byte-identical to the base except
+the mode-independent fixes of D12, the dispatch header naming a route line's `root=`, and the I7 budget-incomplete rule
+(a `NEED MORE: budget` return backed by the guard's state is `incomplete`, not a failure). Role agents and role tools are registered only when the plugin **starts** in roles
 mode; a runtime switch logs a restart notice (R8).
 
 ### D2 — A small, explicit role set, defined in code
@@ -67,13 +68,16 @@ deterministic detection, low risk and a single-file scope, else `medium` (`heavy
 write + exec → `medium` with deterministic detection, else `heavy`. The window floor is the max of the role floor, this
 floor, `escalate.floorTier`, the running rung on a resume and a raise recorded after a verification FAIL; risk and
 scope are raise-only from the route line. Write authority reaches the cheapest tier only behind checks the router runs
-itself; edit + execution never runs on `fast`.
+itself in the dispatch's work root; edit + execution never runs on `fast`.
 
 ### D5 — Detection is effective, never claimed
 
-`deterministic` only when the router's own gate will run the acceptance checks for the dispatch; otherwise the weaker
-of the route-line claim and the prompt's `[acceptance]` block, capped at `grader` (A34, `effectiveDetection`). Role
-defaults are `deterministic` for `runner` (a router-observed run) and `none` for every other role.
+Detection has three inputs only: whether the router's own gate will run the acceptance checks for the dispatch in its
+work root (`deterministic`), the route-line `d=` claim and the prompt's `[acceptance]` block. Without the gate it is
+the weaker of the claim and the block, capped at `grader` (A34, `effectiveDetection`); with neither it is `none`, for
+every role. A role dispatch's checks run in its routed work root by default, a `cwd:` outside that root is refused, and
+a dispatch whose checks cannot run in the root is not `deterministic` (dogfood finding DF2-F1, fixed). The roles'
+default assurance (`deterministic` for `runner`, `none` for the others) is descriptive and never enters the routing.
 
 ### D6 — Dynamic authority with exact binding and a resume-based ladder
 
@@ -106,12 +110,16 @@ repository content run by npm's script shell (E9).
 A role dispatch's call budget is the role's budget for the routed tier (`budget=` raises it up to 2×), cumulative × 3;
 refused calls are not charged. On exhaustion the child returns `NEED MORE: budget` with a summary, the parent's result
 gets a `[router budget]` note, and the same session is resumed (E7). The host `steps` limit is 2 × the top role budget
-+ `REFUSAL_CAP` + 5, so the router's stop always comes first (S4, R7, R8). Tier agents keep 25 / × 3.
++ `REFUSAL_CAP` + 5, so the router's stop always comes first (S4, R7, R8). Tier agents keep 25 / × 3, and so does a
+role dispatch that a floor lifts above its role's ceiling (the role has no budget for that tier). A role dispatch has a
+read-only call cap only when it carries `CAP:N` or `CAP:none`.
 
 ### D10 — Outcome evidence only from external verification
 
-Deterministic pass/fail and a router-observed acceptance run after the child's last edit weigh 1; an independent
-grader (tier ≥ producer, another model) 0.5; an explicit `NEED MORE`/`ESCALATE` without a budget stop or authority
+Deterministic pass/fail weighs 1. A router-observed run weighs 1 (success only) when the child's own `router_run` of
+every npm-script-form acceptance check (`npm test`, `npm run <name>`) exited 0 after its last edit; only checks of that
+form are matched to runs, so a dispatch without one gets no `run` signal and a check of any other form is covered only
+by the deterministic verdict. An independent grader (tier ≥ producer, another model) weighs 0.5; an explicit `NEED MORE`/`ESCALATE` without a budget stop or authority
 request 0.5 against; a re-dispatch of the same task to a higher tier within 30 minutes 0.5 against the earlier
 attempt; `DONE` alone 0; budget and authority events are recorded with no penalty (I6, I7).
 
@@ -124,7 +132,8 @@ below the floor; seeded by the decision id, logged with `explore` and `propensit
 ### D12 — Mode-independent fixes ship with it (v1, tiers mode and roles mode)
 
 E6: a reader guard profile (no consecutive-non-producing denial) for the read-only `fast` tier, `class=review|recon|search`
-dispatches, `CAP:none` + `reason:` dispatches and reader roles; refused calls are neither charged nor recorded as
+dispatches (v2 with a non-`static` routing engine only: the class comes from the engine's dispatch record),
+`CAP:none` + `reason:` dispatches and reader roles; refused calls are neither charged nor recorded as
 executed. E8: verification never cuts a criterion (whole criteria within 4000 code points, the rest omitted and not
 graded), the router header is stripped before criteria are inferred, router directives are not gradable, and a
 progress-note return is `incomplete`, not `fail`. The dispatch header's `Working directory:` names a route line's
@@ -157,7 +166,10 @@ no role agent, tool, hook or prompt change is registered (I8).
 ## Consequences
 
 - Savings come first from structural defaults (reading roles on cheap tiers); learned switching adds savings only once
-  outcome signal exists.
+  outcome signal exists. The `run` signal is narrow (npm-script-form checks only), so most positive evidence still
+  comes from the deterministic gate.
+- Acceptance checks run in the dispatch's work root; a role dispatch whose checks cannot run there is not
+  `deterministic`, so its write authority stays on `medium`/`heavy` instead of reaching `fast`.
 - Separation costs utility: a task needing both the web and the repository becomes two dispatches composed by the
   orchestrator. The cost was not measured here; L13 reports 77% task success with its defence vs 84% undefended on
   AgentDojo.

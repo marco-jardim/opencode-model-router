@@ -40,15 +40,17 @@ A role dispatch is **role × tier × assurance**:
 
 - **Role** — chosen by the orchestrator, by intent (`subagent(agent="explorer", …)`). The role carries a capability
   contract (its maximum authority), a prompt with the return contract, a guard profile, a call budget per tier and a
-  default assurance.
+  descriptive default assurance (what its dispatches usually carry; never an input of the routing).
 - **Tier** — chosen by the router for every dispatch: the class's static tier, clamped into the role's tier range and
   raised to the [authority floor](#tier-floor); with `routing.engine: "enforce"` the kernel's expected-cost decision
   (A27 evidence gate) may move it inside that window. The router always sets the per-call `model`; the orchestrator
   never does.
-- **Assurance** — the **effective** detection of the dispatch: `deterministic` only when the router's own verification
-  gate will run the acceptance checks for this dispatch; otherwise the weaker of the route line's `d=` claim and the
-  prompt's `[acceptance]` block, capped at `grader` (`effectiveDetection`, A34). A claim alone is never deterministic.
-  The role's default assurance applies only when the dispatch carries neither.
+- **Assurance** — the **effective** detection of the dispatch, computed from three inputs only: whether the router's
+  own verification gate will run the acceptance checks for this dispatch in its work root (`deterministic`), the route
+  line's `d=` claim and the prompt's `[acceptance]` block. Without the gate it is the weaker of the claim and the block,
+  capped at `grader` (`effectiveDetection`, A34): a claim alone is never deterministic, and a dispatch with neither is
+  `none` — for every role. The role's default assurance in the table below is descriptive only: it never raises or
+  lowers a dispatch's detection.
 
 ## Turning it on
 
@@ -101,6 +103,9 @@ actions. Tier ranges are placed on the active preset's cost order; the bundled p
 | `architect` | `design` | Read-only design analysis: framing, options, tradeoffs and a recommendation. | `fixed` | `read`, `glob`, `grep`, `router_git` | `medium`–`heavy` | `none` | `reader` | `medium` 80 · `heavy` 120 | 255 |
 | `general` | `general` | General-purpose work in the work root; its authority follows the task's needs (local, edit, router_run). | `dynamic` | `read`, `glob`, `grep`, `router_git`, `edit`, `router_run` | `fast`–`heavy` | `none` | `producer` | `fast` 40 · `medium` 80 · `heavy` 120 | 255 |
 
+- **Default assurance is descriptive.** `runner` ships `deterministic` because its results are router-observed runs,
+  every other role ships `none`; neither value enters the routing. A runner dispatch is `deterministic` only when the
+  router's gate runs its acceptance checks, like any other role's.
 - **Fixed** roles get their whole max on every dispatch. **Dynamic** roles start from a base and add what the task
   needs: `implementer` starts with local + `edit`, `general` with local only; the classifier's `needs` and the route
   line's `needs=` add `edit` (`edit`) and `router_run` (`shell` or `network`), always inside the max.
@@ -175,6 +180,9 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
   bindings get no `external_directory` at all.
 - `router_run` takes `cwd`, which must name the bound work root; `router_git_*` run in the bound work root, never in
   the session location.
+- **Acceptance checks run in the work root.** The deterministic checks of a role dispatch's `[acceptance]` block run in
+  its routed work root by default; a `cwd:` outside that root is refused. When the checks cannot run in the work root,
+  the dispatch's detection is not `deterministic`, so the [floor](#tier-floor) is computed without the router's gate.
 
 ## Tier floor
 
@@ -182,7 +190,9 @@ The window of a role dispatch is `[floor, ceiling]`:
 
 - floor = max(the role's range floor, the authority floor below, `enforcement.escalate.floorTier`, the child's running
   tier on a resume, a raise the router recorded after a verification FAIL of this child);
-- ceiling = the role's range ceiling; when the floor is above it, the floor wins and the range widens upward only;
+- ceiling = the role's range ceiling; when the floor is above it, the floor wins and the range widens upward only
+  (the dispatch then runs on a tier the role has no budget for, and gets the tier agents' 25-call budget, see
+  [Budgets](#budgets));
 - risk and scope = max(classifier, route line): the route line can raise them, never lower them;
 - a route-line `tier=` pin is honoured inside the window; below the floor it is lifted (reason `lift:authority` or
   `lift:floor`), above the ceiling it is clamped (`clamp:ceiling`).
@@ -196,10 +206,10 @@ The window of a role dispatch is `[floor, ceiling]`:
 | write without exec | `fast` if risk `low` and scope `single`, else `medium` | `medium` | `medium`; `heavy` if risk `high` |
 | write + exec | `medium` | `heavy` | `heavy` |
 
-Write authority goes to the cheapest tier only behind checks the router runs itself, and edit + execution never runs
-on `fast`: an edit can change what a script does, so write + exec is treated like running code the agent wrote. After
-a verification FAIL the router raises the child's floor for its next resume itself; the orchestrator never sets
-`tier=` or `model` for that.
+Write authority goes to the cheapest tier only behind checks the router runs itself in the dispatch's work root, and
+edit + execution never runs on `fast`: an edit can change what a script does, so write + exec is treated like running
+code the agent wrote. After a verification FAIL the router raises the child's floor for its next resume itself; the
+orchestrator never sets `tier=` or `model` for that.
 
 ## Dynamic authority and the ladder
 
@@ -213,7 +223,7 @@ fires for plugin tools.
 prompt's last line is `OMR_NONCE=<n>`. The child is bound to its dispatch at its first context build. A binding is
 **exact** only through that nonce; a missing, foreign or conflicting nonce makes it **unknown**: role max ∩ local
 actions, no `router_run`, no `external_directory`, a note telling the child to call `router_request_authority`, a
-decision row with `binding: unknown` and the advisor finding `role-binding-unknown`. Ambiguity never widens authority.
+`note:binding:unknown` annotation row and the advisor finding `role-binding-unknown`. Ambiguity never widens authority.
 Errors fail closed: a context-hook error leaves the role child an empty tool catalog, a permission-hook error denies.
 
 **The ladder** (dynamic roles only):
@@ -232,14 +242,15 @@ Errors fail closed: a context-hook error leaves the role child an empty tool cat
 | Item | Value |
 |---|---|
 | Role dispatch total | the role's budget for the routed tier (table above); `budget=<n>` on the route line raises it, never above 2 × |
+| Routed tier outside the role's range | when a floor (`enforcement.escalate.floorTier`, a running rung, the authority floor) lifts the dispatch above the role's ceiling, the role has no budget for that tier: the dispatch gets the tier agents' 25 calls (raised by `budget=` up to 2 ×) |
 | Cumulative ceiling across resumes | total × 3 |
 | Refused calls | not charged to the budget, not recorded as executed by the repeat check; a round is stopped for refusals once it has min(budget, `REFUSAL_CAP` = 10) of them and executed + refused calls reach the budget |
 | Host `steps` of a role agent | 2 × top role budget + `REFUSAL_CAP` + 5 (95 or 255 for the shipped roles) |
 | Tier agents (`fast`, `medium`, `heavy`) | unchanged: 25 calls, cumulative × 3 |
 
 Reader roles are never denied for "non-producing" reads; producer roles keep the read/draft guard. `CAP:N` (or
-`CAP:none` with a `reason:` line) changes only the read-only call counter, and a role dispatch has a read-only cap only
-when it carries one.
+`CAP:none` with a `reason:` line) changes only the read-only call counter, and a role dispatch has a read-only call cap
+only when it carries `CAP:N` or `CAP:none`; without one, only the total budget above bounds it.
 
 **Exhaustion is not failure.** When the budget runs out the child is told to return `NEED MORE: budget` with a
 progress summary, and the parent's result gets a note starting with `[router budget]` (also when the host's step limit
@@ -255,16 +266,25 @@ failures (I7).
 | Signal | Weight | When |
 |---|---|---|
 | `verdict` | 1 (pass or fail) | the router's deterministic gate |
-| `run` | 1 (success only) | a router-observed `router_run` of every acceptance command, exit 0, started after the child's last edit |
+| `run` | 1 (success only) | the child's own `router_run` of every npm-script-form acceptance check, the latest run of each exited 0 and started after the child's last edit (see below) |
 | `grader` | 0.5 (pass or fail) | an independent grader: tier ≥ the producer's tier **and** another model |
 | `incomplete` | 0.5 (failure) | an explicit `NEED MORE` / `ESCALATE` return without an observed budget stop or authority request |
 | `redispatch` | 0.5 (failure, on the earlier attempt) | the same task (compared over its TASK section) sent again to a higher tier within 30 minutes |
 | `budget`, `authority` | 0 (recorded, no tier penalty) | an observed budget stop; an authority request |
 | `DONE` alone | 0 (no signal) | self-report never moves evidence |
 
+**The `run` signal matches npm-script-form checks only.** An acceptance check counts for it only when its command is
+exactly `npm test` or `npm run <name>` (also `npm t`, `npm run-script <name>` and the `npm.cmd` spellings), with no
+further arguments, and it is matched only to a `router_run` of that
+same script name (`test` for `npm test`; a `routing.run.commands` entry such as `test-files` never matches). A
+dispatch with no check of that form gets no `run` signal. A check of any other form (a file check, another command) is
+never matched to a run, so a `run` signal never shows that such a check passed: that is the deterministic gate's
+`verdict`. The child's edits must also have been observed.
+
 A return without a contract prefix gives no signal. For verification, a progress note (no contract marker, ending with
-a first-person "I'll continue …") or a budget stop is `incomplete`: never accepted, no next tier, no evidence. Signals are written as annotation rows of the decision log (`note:signal:<kind>:<pass|fail|none>`), which
-is why downgrading below the release that introduced them is unsupported.
+a first-person "I'll continue …") or a budget stop is `incomplete`: never accepted, no next tier, no evidence. Signals
+are written as annotation rows of the decision log (`note:signal:<kind>:<pass|fail|none>`), which is why downgrading
+below the release that introduced them is unsupported.
 
 ## Exploration
 
@@ -351,16 +371,21 @@ keeps the tier model.
 - `/router` lists the role table with ranges and authority, and the advisor findings `role-separation`,
   `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`, `native-explore-aliased`,
   `roles-none-enabled` and `role-usage-share` ([cost doctor](./ROUTING_ENGINE.md#the-cost-doctor)).
-- Decision rows of role dispatches carry `role`, `grant`, `detection`, `boundsReasons`, `budgetUsed`, `signal`,
-  `explore`, `propensity` and `binding`; `/router stats` and `npm run routing:stats` break dispatches down by role and
-  tier, with signals by kind, budget stops, authority requests, unknown bindings and exploration.
+- The **dispatch row** of a role dispatch (written unless the engine is `static`) carries `role`, `tier`, `grant`,
+  `detection`, `boundsReasons`, `explore` and `propensity`; a resume also records the child's current `binding`.
+- **Annotation rows** come later and share the dispatch's `decisionID`; they are never counted as dispatches: a
+  `note:binding:<kind>` row with `binding` when the child binds (its binding kind), and a
+  `note:signal:<kind>:<pass|fail|none>` row with `signal` for each outcome signal.
+- `/router stats` and `npm run routing:stats` break dispatches down by role and tier, with signals by kind, budget
+  stops, authority requests, unknown bindings and exploration.
 
 ## Limits
 
 - **Not an OS sandbox.** Roles are host permission policies plus router hooks. Script bodies, repository content, the
   user's credential stores and anything the host itself does (its own search, its tool-output store) are outside them.
-- **Acceptance checks of a role dispatch** in a worktree run in the session directory unless the `[acceptance]` block
-  names `cwd: <work root>` (dogfood finding DF2-F1); put the work root there.
+- **The `run` signal is narrow.** Only npm-script-form acceptance checks are matched to `router_run` runs (see
+  [Outcome signals](#outcome-signals)); dispatches checked any other way earn positive evidence only through the
+  deterministic gate's verdict.
 - **The rules classifier is noisy.** It may attribute `edit` or `shell` to a task that does not mention them, which
   grants a dynamic role more of its max than the task needs (always within the max and the separation rule) and makes
   the ladder rarely needed (DF2-F2). Use `needs=` on the route line to be explicit.

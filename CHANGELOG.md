@@ -14,21 +14,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `architect`, `general` — and the router picks the tier and the per-call model of every dispatch. Decided at plugin
   start: restart OpenCode after switching. See [Roles mode](docs/ROLES.md) and
   [ADR 0006](docs/adr/0006-role-tier-assurance-delegation.md).
-  - Role contracts in code (`SHIPPED_ROLE_SPECS`): maximum authority, tier range, default assurance, guard profile,
-    call budget per tier; `roleAgents.<name>` (global only) can only narrow them.
+  - Role contracts in code (`SHIPPED_ROLE_SPECS`): maximum authority, tier range, a descriptive default assurance,
+    guard profile, call budget per tier; `roleAgents.<name>` (global only) can only narrow them. A role whose tier
+    range the active preset's `costRatio` orders against the tier names is disabled with a notice.
   - Least privilege with capability separation: no grant mixes local, exec or write actions with egress; Code Mode
     `execute`, shell and delegation are denied to every role; `researcher` is web and docs only.
   - Tier floor from authority × effective detection (`authorityFloor`): edits reach `fast` only behind the router's
-    own deterministic checks on a low-risk single-file change; edit + run never below `medium`.
+    own deterministic checks on a low-risk single-file change; edit + run never below `medium`. After a verification
+    FAIL of a role child the router raises its tier on the next resume itself; the orchestrator never sets `tier=`
+    or `model`.
   - Dynamic authority for `implementer` and `general`, with nonce-exact binding and a resume-based ladder
     (`router_request_authority` → `ESCALATE: authority` → resume the same session; widening only for exact bindings).
   - Work roots: `root=` on the route line (a git worktree of the repository) and `routing.workRoots` globs; the router
-    narrows each session to its own root.
-  - `router_run`: allowlisted `package.json` scripts and `routing.run.commands` with fixed argv, argument patterns,
-    pinned npm script shell and config files, refused `.npmrc` keys and a credential-stripped environment.
+    narrows each session to its own root. A role dispatch's acceptance checks run in its work root; a `cwd:` outside
+    it is refused.
+  - `router_run`: `package.json` scripts listed by exact name and `routing.run.commands` with fixed argv, argument
+    patterns, pinned npm script shell and config files, refused `.npmrc` keys and a credential-stripped environment;
+    single-dash arguments carrying `/`, `\` or `..` are refused.
   - Role budgets (`budget=` up to 2×), `NEED MORE: budget` with a `[router budget]` resume note, never a tier penalty.
+    Role agents' host `steps` = 2 × the top role budget + `REFUSAL_CAP` (10) + 5. A role dispatch has a read-only
+    call cap only when it carries `CAP:N` or `CAP:none`.
   - Outcome signals from external verification only (deterministic/run 1, independent grader 0.5, incomplete 0.5,
-    re-dispatch 0.5, `DONE` alone 0); role × tier statistics and the advisor findings `role-separation`,
+    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only); role × tier statistics
+    and the advisor findings `role-separation`,
     `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`,
     `native-explore-aliased`, `roles-none-enabled`, `role-usage-share`.
   - Exploration of cheaper rungs (`routing.exploration.rate`, off by default, at most 0.2, `enforce` and deterministic
@@ -50,8 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Behaviour change (#84): guard and verification fixes for every host and mode** (v1, v2 tiers mode and roles mode;
   each ships with a before/after golden):
-  - **Reader guard profile.** The read-only `fast` tier, dispatches routed `class=review|recon|search`, dispatches with
-    `CAP:none` + `reason:` and reader roles are no longer denied or warned for "consecutive non-producing" reads;
+  - **Reader guard profile.** The read-only `fast` tier, dispatches routed `class=review|recon|search` (OpenCode v2
+    with a routing engine other than `static`; never on v1), dispatches with `CAP:none` + `reason:` and reader roles are no longer denied or warned for "consecutive non-producing" reads;
     readers are told to emit their final answer instead of to take a producing action.
   - **Uncharged denials.** A refused call is no longer charged to the call budget nor recorded as executed by the
     repeat check; a round is stopped for refusals only when it has min(budget, 10) of them and its executed plus refused

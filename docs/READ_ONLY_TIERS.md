@@ -194,7 +194,8 @@ not apply — when:
 
 - it runs on a read-only tier (`fast` by default, see above);
 - its routed task class is `review`, `recon` or `search` (the class comes from the routing engine's dispatch record,
-  so this needs `routing.engine` other than `static`);
+  so this needs OpenCode v2 with `routing.engine` other than `static`; it never applies on v1, where the engine is
+  always `static`);
 - it carries `CAP:none` with a `reason:` line (for that dispatch round only);
 - it is a reader role in roles mode: `explorer`, `researcher`, `runner`, `reviewer`, `architect`.
 
@@ -206,7 +207,8 @@ once it has at least min(budget, 10) of them **and** its executed plus refused c
 
 **Reader roles and read-only tiers.** The reader roles of [roles mode](./ROLES.md) get both halves: a deny-by-default
 max policy with the same sensitive-read asks as this page, and the reader profile. They differ from the read-only
-tiers in authority: `runner` and `reviewer` also hold `router_run` (a fixed-argv run tool, never a shell), and
+tiers in authority: `runner` and `reviewer` also hold `router_run` (a fixed-argv run tool with no shell controlled by the caller; npm script bodies still run in npm's
+pinned script shell), and
 `researcher` holds only web and documentation egress, without local reads. No role gets Code Mode `execute`, shell,
 edits outside `implementer`/`general`, or delegation.
 

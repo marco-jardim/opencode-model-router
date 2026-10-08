@@ -1148,7 +1148,7 @@ With `routing.delegation: "roles"` the orchestrator stops picking tiers: it disp
 | `architect` | read-only design analysis | medium–heavy |
 | `general` | anything else; authority follows the task's needs | fast–heavy |
 
-- **Least privilege.** Each role has a fixed maximum authority, and no role holds the web together with reads, runs or edits. Commands run through `router_run` (allowlisted scripts and commands, fixed argv, no shell); raw shell stays with the tier agents.
+- **Least privilege.** Each role has a fixed maximum authority, and no role holds the web together with reads, runs or edits. Commands run through `router_run` (allowlisted scripts and commands, fixed argv, no shell controlled by the caller; npm script bodies still run in npm's pinned script shell); raw shell stays with the tier agents.
 - **Authority sets the floor.** Reading may use the cheapest tier; an edit goes below `medium` only when the router itself runs the acceptance checks on a low-risk, single-file change, and edit + run never goes below `medium` (`heavy` without those checks).
 - **Budgets per role.** A role that runs out of calls returns `NEED MORE: budget` and is resumed in the same session; that is never counted as a failure.
 - **Evidence from verification only.** Deterministic checks and router-observed runs count; a bare `DONE` does not.
