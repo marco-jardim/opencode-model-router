@@ -10,6 +10,8 @@ import type { RouterConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
+import { INCOMPLETE_REASON_PREFIX } from "./checker";
+import { stripDispatchHeader } from "../router/dispatch-header";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
@@ -553,10 +555,13 @@ export function buildDelegationDoD(
   args: { prompt?: string; description?: string; acceptance?: string },
   hints: InferHints = {},
 ): DoD {
-  const blockSource = args.acceptance ?? args.prompt ?? args.description ?? "";
+  // R6/P-15 (§2.9 E8): the router's dispatch header is a directive, never a
+  // criterion — parse and infer from the orchestrator's prompt behind it.
+  const prompt = typeof args.prompt === "string" ? stripDispatchHeader(args.prompt) : args.prompt;
+  const blockSource = args.acceptance ?? prompt ?? args.description ?? "";
   const explicit = parseDoDFromDispatch(blockSource);
   if (explicit) return explicit;
-  const dispatch = args.prompt ?? args.description ?? "";
+  const dispatch = prompt ?? args.description ?? "";
   return inferDoD(dispatch, "", hints);
 }
 
@@ -603,6 +608,14 @@ export function buildForcingNote(
     reasons.length > 0
       ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
       : "- (no reasons provided)";
+  // §2.9 E8: a progress note is incomplete, not a failed result.
+  if (reasons.length > 0 && reasons.every((r) => r.startsWith(INCOMPLETE_REASON_PREFIX))) {
+    return (
+      `[router \u26a0 INCOMPLETE] The delegate returned a progress note, not a result:\n` +
+      `${body}\n` +
+      `NEXT: resume the same delegation so it can finish; do not treat the prior result as complete.`
+    );
+  }
   const next =
     escalation?.nextTier
       ? `NEXT: address the above, then re-run via \`Task(subagent_type="${escalation.nextTier}")\`` +

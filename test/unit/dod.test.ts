@@ -54,10 +54,13 @@ describe("summarizeDispatch", () => {
     expect(summarizeDispatch("  foo   bar   baz  ")).toBe("foo bar baz");
   });
 
-  it("slices to 120 chars max", () => {
+  // §2.9 E8 golden — before: sliced to 120 chars max (a criterion cut mid-text);
+  // after: the whole line; fitCriteria omits a criterion over the budget instead.
+  it("returns the whole line, never cut", () => {
     const long = "ab ".repeat(50); // >150 chars with spaces
     const result = summarizeDispatch(long);
-    expect(result.length).toBeLessThanOrEqual(120);
+    expect(result).toBe(long.trim());
+    expect(result.length).toBe(149);
   });
 
   it("single line input", () => {

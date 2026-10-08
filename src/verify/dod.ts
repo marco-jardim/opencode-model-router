@@ -54,14 +54,67 @@ const CLOSE_TAG_RE = /^\s*\[\/(acceptance|dod)\]\s*$/i;
 // summarizeDispatch
 // ---------------------------------------------------------------------------
 
+/**
+ * Router-protocol lines (§2.9 E8): a `[router]` line, a `[route …]` line, and the
+ * `CAP:` / `VERIFY:` / `VERIFY_WAIT:` / `reason:` directives. They steer the
+ * router; they are never the task's outcome, so they never become a criterion.
+ */
+const DIRECTIVE_LINE_RE = /^(?:\[router\]|\[route(?:\s[^\]]*)?\]$|(?:VERIFY_WAIT|VERIFY|CAP|reason)\s*:)/i;
+
+/**
+ * The dispatch's first non-empty line that is not a router directive,
+ * whitespace-collapsed and WHOLE (§2.9 E8: a criterion is never cut mid-text;
+ * fitCriteria drops a criterion over the verification budget instead).
+ */
 export function summarizeDispatch(text: string): string {
   if (!text) return "";
   const lines = text.split("\n");
   for (const line of lines) {
     const trimmed = line.trim().replace(/\s+/g, " ");
-    if (trimmed) return trimmed.slice(0, 120);
+    if (trimmed && !DIRECTIVE_LINE_RE.test(trimmed)) return trimmed;
   }
   return "";
+}
+
+// ---------------------------------------------------------------------------
+// fitCriteria — the verification text budget (§2.9 E8)
+// ---------------------------------------------------------------------------
+
+/** Budget for the criteria text sent to a grader, in code points. */
+export const CRITERIA_BUDGET_CHARS = 4000;
+
+/** Length in code points (a surrogate pair counts once), so the budget is multi-byte safe. */
+export function codePointLength(text: string): number {
+  return Array.from(text).length;
+}
+
+/**
+ * Whole criteria only: each criterion, in order, is kept when it fits in what is
+ * left of the budget, otherwise omitted (never cut). One criterion longer than
+ * the whole budget is omitted. `omitted` criteria are not graded.
+ */
+export function fitCriteria(
+  criteria: readonly string[],
+  budget: number = CRITERIA_BUDGET_CHARS,
+): { criteria: string[]; omitted: number } {
+  const kept: string[] = [];
+  let used = 0;
+  let omitted = 0;
+  for (const criterion of criteria) {
+    const length = codePointLength(criterion);
+    if (used + length <= budget) {
+      kept.push(criterion);
+      used += length;
+    } else {
+      omitted += 1;
+    }
+  }
+  return { criteria: kept, omitted };
+}
+
+/** "1 criterion omitted" / "n criteria omitted". */
+export function omittedCriteriaText(omitted: number): string {
+  return `${omitted} ${omitted === 1 ? "criterion" : "criteria"} omitted`;
 }
 
 // ---------------------------------------------------------------------------

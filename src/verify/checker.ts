@@ -7,6 +7,39 @@
 
 import type { Verdict } from "./types";
 import { scrubText } from "../guard/scrub";
+import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
+
+// ---------------------------------------------------------------------------
+// Progress notes (§2.9 E8)
+// ---------------------------------------------------------------------------
+
+/** Reason prefix of a verdict that classifies the return as a progress note. */
+export const INCOMPLETE_REASON_PREFIX = "incomplete:";
+
+export const INCOMPLETE_REASON =
+  `${INCOMPLETE_REASON_PREFIX} the delegate returned a progress note (no DONE:, NEED MORE: or ESCALATE:), not a result; resume the same delegation to let it finish`;
+
+/** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
+const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*\s*:/m;
+
+/** Wording of a return that announces more work instead of reporting a result. */
+const PROGRESS_RE =
+  /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue|complete|proceed|keep going|wrap up)\b|\bcontinuing\b|\b(?:still|now) working\b|\bwork in progress\b/i;
+
+/** Only the end of a return decides: a progress note ends by announcing the next step. */
+const PROGRESS_TAIL_CHARS = 400;
+
+/**
+ * A progress-note return: no return-contract marker (DONE:, NEED MORE:,
+ * ESCALATE:, …) on any line, and its last PROGRESS_TAIL_CHARS characters
+ * announce further work ("I'll finish …", "continuing …"). Classified
+ * `incomplete`, not `fail` (§2.9 E8).
+ */
+export function isProgressNote(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0 || CONTRACT_MARKER_RE.test(trimmed)) return false;
+  return PROGRESS_RE.test(trimmed.slice(-PROGRESS_TAIL_CHARS));
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -111,6 +144,11 @@ function sanitizeOneLine(value: string): string {
     : cleaned;
 }
 
+/** The note for criteria over the verification budget (prompt line and verdict caveat). */
+function omittedNote(omitted: number): string {
+  return `(${omittedCriteriaText(omitted)}: over the ${CRITERIA_BUDGET_CHARS}-character verification budget; not graded)`;
+}
+
 export function buildGradingPrompt(input: CheckerInput): { system: string; prompt: string } {
   const lines: string[] = [];
 
@@ -122,9 +160,12 @@ export function buildGradingPrompt(input: CheckerInput): { system: string; promp
   }
 
   lines.push("## Acceptance criteria (ALL must be satisfied)");
-  for (let i = 0; i < input.criteria.length; i++) {
-    lines.push(`${i + 1}. ${input.criteria[i]}`);
+  // §2.9 E8: whole criteria only; those over the budget are named as omitted, not graded.
+  const { criteria, omitted } = fitCriteria(input.criteria);
+  for (let i = 0; i < criteria.length; i++) {
+    lines.push(`${i + 1}. ${criteria[i]}`);
   }
+  if (omitted > 0) lines.push(omittedNote(omitted));
 
   lines.push("");
   lines.push("## Artefact to evaluate");
@@ -214,6 +255,25 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     return { pass: false, method: "none", skipped: true, reasons: ["no criteria to grade"] };
   }
 
+  // 1b. §2.9 E8: a progress note is incomplete, not a failure (unverifiable
+  // never moves outcome evidence and never escalates the tier).
+  if (isProgressNote(input.artefact.finalReturnText)) {
+    return {
+      pass: false,
+      outcome: "unverifiable",
+      method: "checker",
+      reasons: [INCOMPLETE_REASON],
+      caveats: [INCOMPLETE_REASON],
+    };
+  }
+
+  // 1c. §2.9 E8: every criterion is over the verification budget — nothing gradable.
+  const { criteria: gradable, omitted } = fitCriteria(input.criteria);
+  if (gradable.length === 0) {
+    const reason = `no criterion fits the verification budget ${omittedNote(omitted)}`;
+    return { pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason] };
+  }
+
   // 2. Determine grader tier
   const graderTier = atLeastProducerTier(input.producerTier, {
     ladder: deps.ladder,
@@ -265,12 +325,15 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     };
   }
 
-  // 7. Return verdict
+  // 7. Return verdict. Criteria omitted from grading (§2.9 E8) make a pass
+  // unverifiable with a caveat: what was not graded is not verified.
+  const partial = omitted > 0;
   return {
-    pass: parsed.pass === true,
-    outcome: parsed.pass ? "pass" : "fail",
+    pass: parsed.pass === true && !partial,
+    outcome: parsed.pass ? (partial ? "unverifiable" : "pass") : "fail",
     method: "checker",
     reasons: parsed.reasons.map(scrubText),
     evidence: scrubText("grader=" + graderTier),
+    ...(partial ? { caveats: [omittedNote(omitted)] } : {}),
   };
 }
