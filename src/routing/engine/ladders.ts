@@ -17,12 +17,14 @@
 import {
   ROUTING_RESERVED_AGENTS,
   resolveCandidates,
+  resolveActiveTiers,
   resolvePresetName,
   type ResolvedRouting,
   type ResolvedCandidate,
   type RouterConfig,
   type TierConfig,
 } from "../../router/config";
+import { presetTierOrder } from "../../router/roles";
 import { buildEscalatePolicy, type EscalatePolicy, type LadderSessionPolicyInput } from "../../escalate/ladder";
 import { variantCovered } from "../../escalate/variants";
 import { CLASS_STATIC_TIER, NEEDS, type Need, type TaskFacts } from "../classify/types";
@@ -555,13 +557,16 @@ function windowSpan(order: readonly string[], window: Pick<RoleWindow, "floor" |
 }
 
 /**
- * The tier order of every role dispatch (QA-P12-1-5): the escalate ladder of `buildEscalatePolicy(cfg, session)`,
- * de-duplicated and restricted to tiers with at least one rung. Pass it as `tierBounds(..., { tiers })` AND build the
+ * The tier order of every role dispatch (QA-P12-1-5, plan R7): `presetTierOrder` of the active preset (cheapest to
+ * dearest by `costRatio`, else listing order — the order role tier ranges are placed on), restricted to tiers with at
+ * least one rung. Pass it as `tierBounds(..., { tiers })` AND build the
  * ladder with the same `cfg`/`session` ({@link buildRoleLadder}, {@link roleEscalatePolicy} use it), so the window and
  * the ladder can never disagree on tier names.
  */
-export function roleTierOrder(cfg: RouterConfig, session?: LadderSessionPolicyInput): readonly string[] {
-  return ladderOf(cfg, buildEscalatePolicy(cfg, session).ladder);
+export function roleTierOrder(cfg: RouterConfig, _session?: LadderSessionPolicyInput): readonly string[] {
+  // One tier order for role ranges (`router/roles.ts`) and role ladders: the active preset's cost order. The only
+  // narrowing is the one every ladder applies: tiers without a rung are left out. The session never changes tiers.
+  return ladderOf(cfg, presetTierOrder(resolveActiveTiers(cfg)));
 }
 
 /**
