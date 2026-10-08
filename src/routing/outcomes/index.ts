@@ -71,6 +71,7 @@ export {
 export { USAGE, parseStatsArgs, renderMarkdown, runStatsCli, summarize, summarizeRoles } from "./stats";
 export type { ParseStatsResult, StatsArgs } from "./stats";
 export {
+  REDISPATCH_MAX_EARLIER,
   REDISPATCH_MIN_TOKENS,
   REDISPATCH_SIMILARITY,
   REDISPATCH_WINDOW_MS,

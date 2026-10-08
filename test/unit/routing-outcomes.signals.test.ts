@@ -6,6 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   acquireOutcomes,
@@ -16,6 +17,7 @@ import {
   type OutcomesBundle,
 } from "../../src/routing/outcomes";
 import {
+  REDISPATCH_MAX_EARLIER,
   REDISPATCH_WINDOW_MS,
   SAME_TASK_LINE_SHARE,
   SIGNAL_MASS_CAPS,
@@ -511,6 +513,34 @@ describe("detectRedispatch", () => {
     expect(detectRedispatch(cur, [prev({ returnPrefix: "done" })], TIERS)).not.toBeNull();
     expect(detectRedispatch(cur, [prev({ returnPrefix: "none" })], TIERS)).not.toBeNull();
     expect(detectRedispatch(cur, [prev({ returnPrefix: "need-more", budgetExhausted: false, authorityRequested: false })], TIERS)).not.toBeNull();
+  });
+
+  it("reads only the most recent REDISPATCH_MAX_EARLIER dispatches of the parent (QA-P14-3-1)", () => {
+    expect(REDISPATCH_MAX_EARLIER).toBe(100);
+    const filler = Array.from({ length: 120 }, (_, i) =>
+      d(`F${i}`, sevenSection(`Unrelated chore ${i} on component c${i} with helper h${i}.`, "ok"), "medium", T0 + (i + 1) * 1000),
+    );
+    const oldest = d("OLD", PROMPT_A, "fast", T0);
+    const cur = d("CUR", PROMPT_A_AGAIN, "medium", T0 + 10 * MIN);
+    expect(detectRedispatch(cur, [oldest, ...filler], TIERS)).toBeNull(); // 121 earlier: the oldest falls outside the 100
+    const recent = d("NEW", PROMPT_A, "fast", T0 + 200_000);
+    expect(detectRedispatch(cur, [oldest, ...filler, recent], TIERS)?.previous).toBe(recent);
+  });
+
+  it("stays linear: 500 earlier dispatches, 100 dissimilar candidates, one call under a coarse 500 ms bound (QA-P14-3-1)", () => {
+    const context = Array.from({ length: 20 }, (_, i) => `Shared context line ${i}: the repository conventions and the review checklist apply.`);
+    const many = Array.from({ length: 500 }, (_, i) =>
+      d(
+        `F${i}`,
+        [sevenSection(`Investigate unrelated topic ${i} named item${i} in module m${i}/file${i}.ts thoroughly.`, `Report for item${i}.`), ...context].join("\n"),
+        "fast",
+        T0 + i * 1000,
+      ),
+    );
+    const cur = d("CUR", [sevenSection("Port the legacy scheduler to the new queue API with retries.", "Scheduler ported."), ...context].join("\n"), "medium", T0 + 600_000);
+    const started = performance.now();
+    expect(detectRedispatch(cur, many, TIERS)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(500);
   });
 });
 

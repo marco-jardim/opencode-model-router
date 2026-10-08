@@ -306,6 +306,11 @@ export const REDISPATCH_MIN_TOKENS = 3;
 export const SIBLING_SHARED_MIN = 2;
 /** A sibling whose compared lines lie at least this much inside the compared pair is an earlier attempt of the same task. */
 export const SAME_TASK_LINE_SHARE = 0.8;
+/**
+ * Only the most recent earlier dispatches of the parent are considered (QA-P14-3-1). The window is 30 min, so a re-dispatch
+ * candidate older than the 100 most recent dispatches of one parent is unrealistic; the bound keeps the call synchronous-safe.
+ */
+export const REDISPATCH_MAX_EARLIER = 100;
 
 export interface DispatchText {
   readonly decisionID: string;
@@ -461,6 +466,7 @@ export function taskSimilarity(a: string, b: string): number {
  * The most recent earlier attempt of the same task decides: a lower tier gets a failure (0.5); the same or a higher
  * tier, a resume, an unknown tier, or an attempt whose stop may have been budget or authority ({@link penalisable}) gets
  * nothing. Residual: with fewer than two siblings a template cannot be learnt (pass the prompt without the router header).
+ * Only the {@link REDISPATCH_MAX_EARLIER} most recent dispatches of the parent are read; each prompt is parsed once.
  */
 export function detectRedispatch(
   current: DispatchText,
@@ -471,8 +477,28 @@ export function detectRedispatch(
   if (current.resume === true || !Number.isFinite(current.at) || current.class === null) return null;
   const windowMs = options.windowMs ?? REDISPATCH_WINDOW_MS;
   const threshold = options.threshold ?? REDISPATCH_SIMILARITY;
-  const family = earlier.filter((d) => d.parentSessionID === current.parentSessionID && d.decisionID !== current.decisionID);
+  let family = earlier.filter((d) => d.parentSessionID === current.parentSessionID && d.decisionID !== current.decisionID);
+  if (family.length > REDISPATCH_MAX_EARLIER) {
+    // QA-P14-3-1: only the most recent dispatches of the parent (stable: ties keep their input order).
+    const at = (d: DispatchText): number => (Number.isFinite(d.at) ? d.at : Number.NEGATIVE_INFINITY);
+    family = [...family].sort((x, y) => (at(x) > at(y) ? -1 : at(x) < at(y) ? 1 : 0)).slice(0, REDISPATCH_MAX_EARLIER);
+  }
   const role = current.role ?? null;
+
+  // QA-P14-3-1: every prompt is parsed once per call, and one count map (line → dispatches of family ∪ current containing
+  // it) serves every leave-one-out count, so the cost is C × F × L, not C × F² parses.
+  const parsed = new Map<DispatchText, { readonly lines: PromptLines; readonly texts: ReadonlySet<string> }>();
+  const parse = (d: DispatchText): { readonly lines: PromptLines; readonly texts: ReadonlySet<string> } => {
+    let entry = parsed.get(d);
+    if (entry === undefined) {
+      const lines = promptLines(d.prompt);
+      entry = { lines, texts: new Set(lines.lines.map((l) => l.text)) };
+      parsed.set(d, entry);
+    }
+    return entry;
+  };
+  const counts = new Map<string, number>();
+  for (const d of [...family, current]) for (const t of parse(d).texts) counts.set(t, (counts.get(t) ?? 0) + 1);
 
   const candidates = family
     .filter((d) => {
@@ -484,28 +510,30 @@ export function detectRedispatch(
     })
     .sort((x, y) => y.at - x.at);
 
-  const currentLines = promptLines(current.prompt);
+  const currentLines = parse(current).lines;
   for (const previous of candidates) {
-    const previousLines = promptLines(previous.prompt);
+    const previousParsed = parse(previous);
+    const previousLines = previousParsed.lines;
     const sectionMode = currentLines.hasTask && previousLines.hasTask;
     const compared = (p: PromptLines): string[] => p.lines.filter((l) => !sectionMode || l.section === "TASK").map((l) => l.text);
     const pair = new Set([...compared(currentLines), ...compared(previousLines)]);
     // Leave-one-out (QA-P14-2-1): a sibling's own template lines (present in ≥ SIBLING_SHARED_MIN OTHER dispatches of the
     // parent, `current` included, `previous` and the sibling itself excluded) do not count when judging whether the
     // sibling is an earlier attempt of the same task; the raw share decides only when nothing else is left.
-    const others = (d: DispatchText): Array<Set<string>> =>
-      [...family, current].filter((o) => o !== d && o !== previous).map((o) => new Set(promptLines(o.prompt).lines.map((l) => l.text)));
+    // count(t) − [sibling has t] (always 1: t is one of its lines) − [previous has t].
+    const othersWith = (t: string): number => (counts.get(t) ?? 0) - 1 - (previousParsed.texts.has(t) ? 1 : 0);
     const siblings = family.filter((d) => {
       if (d === previous) return false;
-      const own = compared(promptLines(d.prompt));
+      const own = compared(parse(d).lines);
       if (own.length === 0) return false;
-      const rest = others(d);
-      const specific = own.filter((t) => rest.filter((set) => set.has(t)).length < SIBLING_SHARED_MIN);
+      const specific = own.filter((t) => othersWith(t) < SIBLING_SHARED_MIN);
       const judged = specific.length > 0 ? specific : own;
       return judged.filter((t) => pair.has(t)).length / judged.length < SAME_TASK_LINE_SHARE;
     });
-    const boilerplate = sharedLines(siblings.map((d) => d.prompt));
-    const text = (p: PromptLines): string => compared(p).filter((t) => !boilerplate.has(t)).join("\n");
+    // Lines shared with ≥ SIBLING_SHARED_MIN siblings (as `sharedLines`, from the parsed sets).
+    const siblingCounts = new Map<string, number>();
+    for (const d of siblings) for (const t of parse(d).texts) siblingCounts.set(t, (siblingCounts.get(t) ?? 0) + 1);
+    const text = (p: PromptLines): string => compared(p).filter((t) => (siblingCounts.get(t) ?? 0) < SIBLING_SHARED_MIN).join("\n");
     const similarity = taskSimilarity(text(currentLines), text(previousLines));
     if (similarity < threshold) continue;
     // The most recent earlier attempt of the same task decides.
