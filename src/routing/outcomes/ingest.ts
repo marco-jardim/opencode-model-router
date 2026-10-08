@@ -41,7 +41,10 @@ import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
 import { pricingState, tokenSampleFromEvent } from "./cost";
 import { resolveOutcomesDir } from "./persist";
+import type { SignalObservation } from "./signals";
+import { isSignalObservation, signalRow } from "./signals";
 import type {
+  AgentOrigin,
   AttemptSignal,
   Clock,
   LoggedRoutingMode,
@@ -57,7 +60,7 @@ import type {
   Verdict,
   VerdictRow,
 } from "./types";
-import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, safeNow, splitModelRef } from "./types";
+import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, normalizeVariant, safeNow, splitModelRef } from "./types";
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -73,6 +76,11 @@ export interface IngestSettings {
   readonly tuning: OutcomeTuning;
   /** Ids of the active preset's router tier agents (origin `router`); every other agent is `host`. */
   readonly routerAgentIds: ReadonlySet<string>;
+  /**
+   * P1.4: agent names of the resolved role agents (origin `role`, key `class|role:<agent>|…`). Absent or empty in tiers
+   * mode and on v1, so keys stay `router`/`host` there. Filled by P2.1 from `resolveRoles`.
+   */
+  readonly roleAgentIds?: ReadonlySet<string>;
 }
 
 const settingsCache = new WeakMap<RouterConfig, IngestSettings | null>();
@@ -404,6 +412,13 @@ export interface Ingest {
   onVerdict(childSessionID: string, outcome: Verdict): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
   onFalseRefusal(childSessionID: string): void;
+  /**
+   * P1.4: append a signal row (signals.ts) for the child's current attempt. Rows only: the Beta store, its decay and the
+   * verdict/refusal rows are untouched. Recorded under the same gates as a verdict (registered, trusted class, keyable);
+   * a repeat of the same attempt, kind and outcome writes nothing (C7). Returns whether a row was enqueued. Never throws.
+   * Optional only so that existing test doubles still satisfy `Ingest`; `createIngest` and {@link NOOP_INGEST} implement it.
+   */
+  onSignal?(childSessionID: string, observation: SignalObservation): boolean;
   /** A session was deleted: the child's open attempt is folded and its registry entry dropped; children of the session too. */
   onSessionGone(sessionID: string): void;
   /** Idle/deleted flush point (D15): coalesced and throttled by the flusher, never awaited. No-op without recorded data. */
@@ -421,6 +436,7 @@ export const NOOP_INGEST: Ingest = Object.freeze({
   onExecutionEnded: () => undefined,
   onVerdict: () => undefined,
   onFalseRefusal: () => undefined,
+  onSignal: () => false,
   onSessionGone: () => undefined,
   requestFlush: () => undefined,
   sweep: () => undefined,
@@ -452,6 +468,10 @@ interface Target {
   readonly record: DispatchRecord;
   readonly settings: IngestSettings;
   readonly key: OutcomeKey;
+  readonly origin: AgentOrigin;
+  /** `provider/model`. */
+  readonly model: string;
+  readonly variant: string;
 }
 
 export function createIngest(deps: IngestDeps): Ingest {
@@ -510,9 +530,9 @@ export function createIngest(deps: IngestDeps): Ingest {
     const ref = splitModelRef(record.model);
     if (ref === null) return unkeyable(`${record.agent}|${record.model}`, childSessionID, `model "${record.model}" is not provider/model`);
     const variant = record.variant ?? ref.variant;
-    const origin = classifyAgentOrigin(record.agent, settings.routerAgentIds);
+    const origin: AgentOrigin = settings.roleAgentIds?.has(record.agent) === true ? "role" : classifyAgentOrigin(record.agent, settings.routerAgentIds);
     const key = makeKey(cls, { origin, id: record.agent }, ref.provider, ref.model, variant);
-    return { record, settings, key };
+    return { record, settings, key, origin, model: `${ref.provider}/${ref.model}`, variant: normalizeVariant(variant) };
   };
 
   // One warning per model reference (QA-2.1-12), not per child: every child of an unresolved agent says the same.
@@ -741,6 +761,43 @@ export function createIngest(deps: IngestDeps): Ingest {
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("false refusal failed", error, { childSessionID });
+      }
+    },
+
+    onSignal(childSessionID: string, observation: SignalObservation): boolean {
+      try {
+        if (!isSignalObservation(observation)) return false;
+        const target = targetOf(childSessionID);
+        if (target === null) return false;
+        const { record, settings, key } = target;
+        // C7: the same attempt, kind and outcome is one row (process-wide, per outcomes directory); another outcome of the
+        // same kind is a row of its own, as a decisive verdict may follow an unverifiable one.
+        const identity = `signal|${settings.outcomesDir}|${record.attemptId}|${observation.kind}|${observation.outcome}`;
+        if (!boundedAdd(signalled, identity, SIGNAL_CAP)) return false;
+        const bundle = bundleFor(settings);
+        if (bundle === null) return false;
+        const row = signalRow(
+          {
+            ts: new Date(safeNow(now)).toISOString(),
+            sessionID: record.parentSessionID ?? "",
+            // A registration without a decision row still gets a stable id of its own (no dispatch row to join).
+            decisionID: record.decisionID ?? `attempt:${record.attemptId}`,
+            mode: settings.engine,
+            childSessionID,
+            facts: record.facts,
+            chosen: { key, agent: record.agent, origin: target.origin, model: target.model, variant: target.variant },
+            step: record.step,
+            ...(target.origin === "role" ? { role: record.agent } : {}),
+            ...(record.tier === null ? {} : { tier: record.tier }),
+          },
+          observation,
+        );
+        bundle.flusher.enqueue(row);
+        touchDispatch(childSessionID, safeNow(now));
+        return true;
+      } catch (error) {
+        warn("signal failed", error, { childSessionID });
+        return false;
       }
     },
     onSessionGone(sessionID: string): void {
