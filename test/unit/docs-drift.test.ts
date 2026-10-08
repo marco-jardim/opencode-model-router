@@ -18,6 +18,7 @@ import {
   sanitizeRun,
   workRootProblem,
 } from "../../src/router/roles-config";
+import { CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS } from "../../src/router/roles";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
@@ -738,5 +739,30 @@ describe("docs drift: roles delegation keys (#84)", () => {
     expect(workRootProblem("D:/PROGRA~1/x")).toBeDefined();
     expect(text).toContain("roles delegation requires OpenCode v2; using tiers");
     expect(ROLES_V1_NOTICE).toBe("roles delegation requires OpenCode v2; using tiers");
+    expect(text).toContain("never `test/../../x`");
+    expect(text).toContain("`D:/git/OMR-RT~1*` and `D:/git/*/PROGRA~1/x` included");
+    expect(workRootProblem("D:/git/OMR-RT~1*")).toBeDefined();
+    expect(workRootProblem("D:/git/*/PROGRA~1/x")).toBeDefined();
+  });
+
+  it("states the role rules the code enforces (QA-P11-1)", () => {
+    const text = doc.replace(/\s+/g, " ");
+    // custom prompts end with the router contract block
+    expect(text).toContain(`\`${CONTRACT_HEADING}\``);
+    // host-native role names
+    for (const name of HOST_NATIVE_ROLE_NAMES) expect(text).toContain(`\`${name}\` replaces the host's native \`${name}\`, in roles mode only`);
+    // assurance defaults
+    const deterministic = SHIPPED_ROLE_SPECS.filter((s) => s.assurance === "deterministic").map((s) => s.agent);
+    expect(deterministic).toEqual(["runner"]);
+    expect(SHIPPED_ROLE_SPECS.filter((s) => s.assurance !== "deterministic").every((s) => s.assurance === "none")).toBe(true);
+    expect(text).toContain("`runner` ships `deterministic`");
+    expect(text).toContain("every other role ships `none`");
+    // defining classes named in the doc
+    expect([DEFINING_CLASS.research, DEFINING_CLASS.run]).toEqual(["egress", "exec"]);
+    expect(Object.entries(DEFINING_CLASS).filter(([k]) => k !== "research" && k !== "run").every(([, c]) => c === "local")).toBe(true);
+    expect(text).toContain("(`researcher`: egress; `runner`: `router_run`; every other role: local reads)");
+    // exploration is off outside roles mode
+    expect(resolveRolesRouting(validateConfig({ ...JSON.parse(read("tiers.json")), routing: { exploration: { rate: 0.1 } } }), "v2").exploration.rate).toBe(0);
+    expect(text).toContain("`routing.exploration.rate` is then `0`");
   });
 });

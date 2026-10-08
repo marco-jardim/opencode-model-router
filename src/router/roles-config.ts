@@ -25,6 +25,20 @@ export type DelegationMode = (typeof DELEGATION_MODES)[number];
 
 export const EXPLORATION_MAX_RATE = 0.2;
 export const DEFAULT_RUN_SCRIPTS: readonly string[] = ["test", "typecheck", "lint", "build"];
+/**
+ * Default `routing.run.commands` (#84, P1.3 handoff): package.json scripts take no caller
+ * arguments, so a scoped test run needs a command entry. `npm run test -- <files>` goes through
+ * router_run's hardened npm path (npm-cli.js of the node install, pinned script shell). The
+ * patterns admit `test/...` paths and `--maxWorkers=N` only; confinement (no `..` segment, no
+ * absolute or drive path, option-like leads `-`/`@`/`+` only against a pattern with the same
+ * lead) is enforced by router_run itself (P1.3). A user `routing.run.commands` replaces it.
+ */
+export const DEFAULT_RUN_COMMANDS: RunConfig["commands"] = Object.freeze({
+  "test-files": Object.freeze({
+    argv: Object.freeze(["npm", "run", "test", "--"]),
+    args: Object.freeze(["test/*", "--maxWorkers=*"]),
+  }),
+});
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
 export const RUN_TIMEOUT_BOUNDS = { min: 1_000, max: 3_600_000 } as const;
 export const ROLES_V1_NOTICE = "roles delegation requires OpenCode v2; using tiers";
@@ -203,8 +217,10 @@ export function workRootProblem(entry: string): string | undefined {
   if (globAt !== -1) segments.pop();
   const real = segments.filter((s) => s !== "");
   if (real.length === 0) return "has no static directory before its first wildcard";
-  if (entry.split(/[\\/]/).some((s) => s === ".." || s === ".")) return "contains a . or .. segment";
-  if (real.some((s) => /~\d/.test(s))) return "contains an 8.3 short-name component; use the long form of the path";
+  const all = entry.split(/[\\/]/);
+  if (all.some((s) => s === ".." || s === ".")) return "contains a . or .. segment";
+  // Every segment, wildcard ones and those after the first wildcard included (QA-P11-1-6).
+  if (all.some((s) => /~\d/.test(s))) return "contains an 8.3 short-name component; use the long form of the path";
   return undefined;
 }
 

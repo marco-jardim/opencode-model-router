@@ -213,15 +213,43 @@ function role(
 }
 
 /**
- * The shipped role agents (v2, `routing.delegation: "roles"`). They live in code, not in
- * tiers.json, for four reasons: (1) authority must never come from a file that is deep-merged
- * with user layers (a user `roleAgents.x.authority` would widen it); (2) a `roleAgents` key in
- * tiers.json would make `resolveRolesRouting` treat every config as "roles keys set" and print
- * the v1 notice; (3) `buildConfig` reports every non-customisable field of `roleAgents` as an
- * unknown-field notice; (4) a new top-level tiers.json key changes tiers mode (I1) and the
- * docs-drift guard. Users narrow them through `roleAgents` (global layer only). Implementer and general default to `none`: the effective
- * assurance is the weaker of the route-line claim and the prompt's `[acceptance]` block, so the
- * role never claims more than the dispatch proves (§2.1).
+ * Role agents that share their name with a host-native agent. In roles mode the router
+ * registers each with its own prompt and policy, replacing the host's native agent of that
+ * name; in tiers mode and on v1 the native agent is untouched (P2.1 implements, T2.1.1).
+ */
+export const HOST_NATIVE_ROLE_NAMES: readonly string[] = Object.freeze(["general"]);
+
+/**
+ * The action class each role kind is defined by. `roleAgents.<name>.deny` may narrow a role,
+ * but a role left without any action of its class is disabled with a notice (QA-P11-1-8).
+ */
+export const DEFINING_CLASS: Readonly<Record<RoleKind, ActionClass>> = Object.freeze({
+  explore: "local",
+  research: "egress",
+  run: "exec",
+  implement: "local",
+  review: "local",
+  design: "local",
+  general: "local",
+});
+
+/**
+ * The shipped role agents (v2, `routing.delegation: "roles"`).
+ *
+ * They live in code, not in tiers.json, for four reasons: (1) authority must never come from a
+ * file that is deep-merged with user layers (a user `roleAgents.x.authority` would widen it);
+ * (2) a `roleAgents` key in tiers.json would make `resolveRolesRouting` treat every config as
+ * "roles keys set" and print the v1 notice; (3) `buildConfig` reports every non-customisable
+ * field of `roleAgents` as an unknown-field notice; (4) a new top-level tiers.json key changes
+ * tiers mode (I1) and the docs-drift guard. Users narrow them through `roleAgents` (global layer
+ * only).
+ *
+ * Assurance (QA-P11-1-5): implementer and general ship `none`. A dispatch's effective detection
+ * is `deterministic` when the router's gate runs its acceptance checks, else the weaker of the
+ * route-line claim and the prompt's `[acceptance]` block (§2.1); the role default applies only
+ * when neither exists, and `none` never claims evidence the dispatch does not carry.
+ *
+ * `general` is also a host-native agent name: see {@link HOST_NATIVE_ROLE_NAMES}.
  */
 export const SHIPPED_ROLE_SPECS: readonly RoleSpec[] = Object.freeze([
   role("explorer", "explore", "fixed", LOCAL, ["fast", "medium"], "none", "reader", { fast: 30, medium: 40 },
@@ -310,34 +338,80 @@ export interface RoleTable {
   readonly replacedRoles: readonly string[];
 }
 
-function freezeMap<K, V>(map: Map<K, V>): ReadonlyMap<K, V> {
-  const readOnly = (): never => {
-    throw new TypeError("the role table is read-only");
-  };
-  Object.defineProperties(map, { set: { value: readOnly }, delete: { value: readOnly }, clear: { value: readOnly } });
-  return Object.freeze(map);
+/**
+ * Read-only view of the role table. It is not a `Map`, so `Map.prototype.set.call(table, …)`
+ * cannot reach the entries (QA-P11-1-10); the backing map is a private field.
+ */
+class RoleMap implements ReadonlyMap<string, RoleSpec> {
+  readonly #map: Map<string, RoleSpec>;
+
+  constructor(entries: Iterable<readonly [string, RoleSpec]>) {
+    this.#map = new Map(entries);
+    Object.freeze(this);
+  }
+
+  get size(): number {
+    return this.#map.size;
+  }
+
+  get(key: string): RoleSpec | undefined {
+    return this.#map.get(key);
+  }
+
+  has(key: string): boolean {
+    return this.#map.has(key);
+  }
+
+  forEach(callbackfn: (value: RoleSpec, key: string, map: ReadonlyMap<string, RoleSpec>) => void, thisArg?: unknown): void {
+    this.#map.forEach((value, key) => callbackfn.call(thisArg, value, key, this));
+  }
+
+  entries() {
+    return this.#map.entries();
+  }
+
+  keys() {
+    return this.#map.keys();
+  }
+
+  values() {
+    return this.#map.values();
+  }
+
+  [Symbol.iterator]() {
+    return this.#map[Symbol.iterator]();
+  }
 }
 
-const EMPTY_TABLE: RoleTable = Object.freeze({
-  roles: freezeMap(new Map<string, RoleSpec>()),
-  issues: Object.freeze([]),
-  droppedAgents: Object.freeze([]),
-  replacedRoles: Object.freeze([]),
-});
+/** A fresh empty table per call: nothing is shared between callers (QA-P11-1-10). */
+function emptyTable(): RoleTable {
+  return Object.freeze({
+    roles: new RoleMap([]),
+    issues: Object.freeze([]),
+    droppedAgents: Object.freeze([]),
+    replacedRoles: Object.freeze([]),
+  });
+}
+
+/** Heading of the block a custom prompt always ends with. */
+export const CONTRACT_HEADING = "Router contract (overrides the text above):";
 
 /**
- * A custom `roleAgents.<name>.prompt` replaces the shipped text, but never the contract lines:
- * the work-root rule, the return contract and (for roles that can edit) the edit-denied rule are
- * appended when the custom text does not already contain them, so customisation cannot drop them.
+ * A custom `roleAgents.<name>.prompt` replaces the shipped text, never the contract: a fixed,
+ * delimited block with the work-root rule, the return contract and (for roles that can edit) the
+ * edit-denied rule is always appended, last, so text in the custom prompt can neither drop nor
+ * neutralise it (QA-P11-1-4). Applied once per resolution to the configured text.
  */
 export function withContract(prompt: string, shipped: RoleSpec): string {
   const lines = [WORK_ROOT_RULE, RETURN_CONTRACT, ...(shipped.authority.allow.includes("edit") ? [EDIT_DENIED_RULE] : [])];
-  const missing = lines.filter((line) => !prompt.includes(line));
-  return missing.length === 0 ? prompt : [prompt, ...missing].join("\n");
+  return `${prompt.trimEnd()}\n\n${CONTRACT_HEADING}\n${lines.join("\n")}`;
 }
 
-/** Tier names of a preset from cheapest to dearest: by `costRatio` when every tier has one, else as listed. */
-function tierOrder(preset: Preset): string[] {
+/**
+ * Tier names of a preset from cheapest to dearest: by `costRatio` when every tier has one,
+ * else as listed. Role tier ranges are positions in this order; consumers must use it too.
+ */
+export function presetTierOrder(preset: Preset): string[] {
   const names = Object.keys(preset);
   const costs = names.map((n) => (preset[n] as { costRatio?: unknown } | undefined)?.costRatio);
   if (!costs.every((c) => typeof c === "number" && Number.isFinite(c))) return names;
@@ -345,24 +419,57 @@ function tierOrder(preset: Preset): string[] {
 }
 
 /**
- * The shipped range placed on the active preset, narrowing only: a range whose tiers all exist
- * is kept; otherwise it shrinks to the preset's tiers inside it on the fast..heavy scale.
- * Undefined when no tier of the preset lies inside it.
+ * The shipped range placed on the active preset's cost order, narrowing only (QA-P11-1-2). It
+ * starts at the cheapest canonical tier (fast/medium/heavy) inside the shipped range and runs up
+ * the cost order while it stays inside: a canonical tier outside the shipped range ends it and
+ * is never included; a non-canonical tier (say `mini`) is included only below a canonical tier
+ * that is inside. Undefined when no canonical tier of the preset lies inside the range.
  */
 function placeRange(range: RoleSpec["tierRange"], order: readonly string[]): RoleSpec["tierRange"] | undefined {
-  const f = order.indexOf(range.floor);
-  const c = order.indexOf(range.ceiling);
-  if (f !== -1 && c !== -1) return f <= c ? { floor: range.floor, ceiling: range.ceiling } : undefined;
   const lo = CANONICAL_TIERS.indexOf(range.floor);
   const hi = CANONICAL_TIERS.indexOf(range.ceiling);
-  if (lo === -1 || hi === -1) return undefined;
-  const inside = order.filter((t) => {
-    const k = CANONICAL_TIERS.indexOf(t);
-    return k >= lo && k <= hi;
-  });
-  const first = inside[0];
-  const last = inside[inside.length - 1];
-  return first === undefined || last === undefined ? undefined : { floor: first, ceiling: last };
+  const inside = (tier: string): boolean => {
+    const k = CANONICAL_TIERS.indexOf(tier);
+    return k !== -1 && k >= lo && k <= hi;
+  };
+  const start = order.findIndex(inside);
+  if (start === -1) return undefined;
+  let end = start;
+  for (let i = start + 1; i < order.length; i++) {
+    const tier = order[i]!;
+    if (inside(tier)) end = i;
+    else if (CANONICAL_TIERS.includes(tier)) break;
+  }
+  return { floor: order[start]!, ceiling: order[end]! };
+}
+
+/**
+ * A budget for every tier of the placed range (QA-P11-1-2): a tier the shipped budget does not
+ * name gets the role's smallest shipped budget, with a notice (`roleAgents.<name>.budget` may
+ * then set it up to twice that); budgets of tiers outside the range are dropped.
+ */
+function placeBudget(spec: RoleSpec, range: RoleSpec["tierRange"], order: readonly string[], preset: string, issues: RolesIssue[]): Record<string, number> {
+  const smallest = Math.min(...Object.values(spec.budget));
+  const budget: Record<string, number> = {};
+  for (const tier of order.slice(order.indexOf(range.floor), order.indexOf(range.ceiling) + 1)) {
+    if (Object.hasOwn(spec.budget, tier)) budget[tier] = spec.budget[tier]!;
+    else {
+      budget[tier] = smallest;
+      issues.push({
+        path: `roleAgents.${spec.agent}.budget.${tier}`,
+        message: `role ${spec.agent}: tier ${tier} of preset ${preset} has no shipped budget; using ${smallest} (roleAgents.${spec.agent}.budget.${tier} may set up to ${2 * smallest})`,
+      });
+    }
+  }
+  return budget;
+}
+
+/** Tiers of the spec's range (positions in `order`) without a budget > 0. */
+function budgetGaps(spec: RoleSpec, order: readonly string[]): string[] {
+  const f = order.indexOf(spec.tierRange.floor);
+  const c = order.indexOf(spec.tierRange.ceiling);
+  if (f === -1 || c === -1 || f > c) return [`tierRange ${spec.tierRange.floor}..${spec.tierRange.ceiling} is not a range of the preset`];
+  return order.slice(f, c + 1).filter((t) => !(Object.hasOwn(spec.budget, t) && spec.budget[t]! > 0)).map((t) => `no budget for tier ${t}`);
 }
 
 /**
@@ -377,9 +484,9 @@ export function resolveRoleTable(
   host: "v1" | "v2",
   opts: { context7?: boolean; shipped?: readonly RoleSpec[] } = {},
 ): RoleTable {
-  if (host !== "v2" || cfg.routing?.delegation !== "roles") return EMPTY_TABLE;
+  if (host !== "v2" || cfg.routing?.delegation !== "roles") return emptyTable();
   const shipped = opts.shipped ?? SHIPPED_ROLE_SPECS;
-  const order = tierOrder(resolveActiveTiers(cfg));
+  const order = presetTierOrder(resolveActiveTiers(cfg));
   const custom = cfg.roleAgents ?? {};
   const agents: Record<string, unknown> = cfg.agents ?? {};
   const roles = new Map<string, RoleSpec>();
@@ -413,15 +520,27 @@ export function resolveRoleTable(
       issues.push({ path: `${base}.tierRange`, message: `role ${spec.agent}: no tier of preset ${cfg.activePreset} lies inside ${spec.tierRange.floor}..${spec.tierRange.ceiling}; role disabled` });
       continue;
     }
-    if (placed.floor !== spec.tierRange.floor || placed.ceiling !== spec.tierRange.ceiling) {
-      issues.push({ path: `${base}.tierRange`, message: `role ${spec.agent}: preset ${cfg.activePreset} lacks part of ${spec.tierRange.floor}..${spec.tierRange.ceiling}; using ${placed.floor}..${placed.ceiling}` });
+    // A shipped spec's budget names exactly its canonical tiers, cheapest first (roleSpecProblems).
+    const shippedTiers = Object.keys(spec.budget).join(",");
+    const placedTiers = order.slice(order.indexOf(placed.floor), order.indexOf(placed.ceiling) + 1).join(",");
+    if (placedTiers !== shippedTiers) {
+      issues.push({ path: `${base}.tierRange`, message: `role ${spec.agent}: preset ${cfg.activePreset} does not match ${spec.tierRange.floor}..${spec.tierRange.ceiling}; using ${placed.floor}..${placed.ceiling} (${placedTiers})` });
     }
-    const narrowed = narrowRoleSpec({ ...spec, tierRange: placed }, Object.hasOwn(custom, spec.agent) ? custom[spec.agent] : undefined, order);
+    const placedSpec: RoleSpec = { ...spec, tierRange: placed, budget: placeBudget(spec, placed, order, cfg.activePreset, issues) };
+    const own = Object.hasOwn(custom, spec.agent) ? custom[spec.agent] : undefined;
+    const narrowed = narrowRoleSpec(placedSpec, own, order);
     issues.push(...narrowed.issues);
     if (!narrowed.spec.enabled) continue;
-    if (narrowed.spec.prompt !== spec.prompt) narrowed.spec = { ...narrowed.spec, prompt: withContract(narrowed.spec.prompt, spec) };
-    // Narrowing cannot create a violation; validate anyway (I4).
-    const problems = roleSpecProblems(narrowed.spec);
+    // `deny` may only narrow: a role left without the class it is defined by is disabled (QA-P11-1-8).
+    const definedBy = DEFINING_CLASS[spec.kind];
+    if (!narrowed.spec.authority.allow.some((a) => ACTION_CLASS[a] === definedBy)) {
+      const left = narrowed.spec.authority.allow.join(", ") || "no action";
+      issues.push({ path: `${base}.deny`, message: `${base}.deny removes every ${definedBy} action of role ${spec.agent}, which it is defined by (left: ${left}); role disabled` });
+      continue;
+    }
+    if (own?.prompt !== undefined) narrowed.spec = { ...narrowed.spec, prompt: withContract(own.prompt, spec) };
+    // Narrowing cannot create a violation or a tier without a budget; validate anyway (I4).
+    const problems = [...roleSpecProblems(narrowed.spec), ...budgetGaps(narrowed.spec, order)];
     if (problems.length > 0) {
       issues.push({ path: base, message: `role ${spec.agent} after customisation is invalid (${problems.join("; ")}); not registered` });
       continue;
@@ -429,7 +548,7 @@ export function resolveRoleTable(
     roles.set(spec.agent, freezeSpec(narrowed.spec));
   }
   return Object.freeze({
-    roles: freezeMap(roles),
+    roles: new RoleMap(roles),
     issues: Object.freeze(issues),
     droppedAgents: Object.freeze(droppedAgents),
     replacedRoles: Object.freeze(replacedRoles),

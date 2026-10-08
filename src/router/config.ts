@@ -15,8 +15,10 @@ import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
 import type { PluginLogger } from "./logger";
 import { sanitizePluginAgents, type PluginAgentConfig } from "./plugin-agents";
-import type { ExplorationConfig, RunConfig } from "./roles";
+// Runtime cycle config <-> roles: both sides use the other only inside functions, never at module evaluation.
+import { resolveRoleTable, type ExplorationConfig, type RunConfig } from "./roles";
 import {
+  DEFAULT_RUN_COMMANDS,
   DEFAULT_RUN_SCRIPTS,
   DEFAULT_RUN_TIMEOUT_MS,
   ROLES_V1_NOTICE,
@@ -2750,7 +2752,19 @@ function buildConfig(
   for (const issue of collectRolesIssues(rawRouting, rawRoleAgents)) notices.push({ message: issue.message });
   dropIgnoredCandidates(cfg);
   applyPluginAgents(cfg, layers, notices);
+  applyRoleNotices(cfg, notices);
   return cfg;
+}
+
+/**
+ * Roles mode (#84): the notices of resolving the role table — unknown `roleAgents` names,
+ * clamped budgets and ranges, disabled roles, #81 `agents` that replace or are dropped for a
+ * role — so they reach `/router` with the other config notices. Pure; the host is not known
+ * here, so the table is resolved as on v2 (on v1 the roles keys stay inert).
+ */
+function applyRoleNotices(cfg: RouterConfig, notices: ConfigNotice[]): void {
+  if (cfg.routing?.delegation !== "roles") return;
+  for (const issue of resolveRoleTable(cfg, "v2").issues) notices.push({ message: issue.message });
 }
 
 /**
@@ -3150,19 +3164,6 @@ export interface ResolvedRolesRouting {
   readonly inert: boolean;
 }
 
-/**
- * Default `routing.run.commands` (#84, P1.3 handoff): package.json scripts take no caller
- * arguments, so a scoped test run needs a command entry. `npm run test -- <files>` goes through
- * router_run's hardened npm path (npm-cli.js of the node install, pinned script shell); callers
- * may pass only `test/...` paths and `--maxWorkers=N`. A user `routing.run.commands` replaces it.
- */
-export const DEFAULT_RUN_COMMANDS: RunConfig["commands"] = Object.freeze({
-  "test-files": Object.freeze({
-    argv: Object.freeze(["npm", "run", "test", "--"]),
-    args: Object.freeze(["test/*", "--maxWorkers=*"]),
-  }),
-});
-
 let warnedRolesInertOnV1 = false;
 
 /** Test-only: re-arm the once-per-process "roles delegation requires v2" notice. */
@@ -3172,9 +3173,11 @@ export function resetRolesWarnings(): void {
 
 /**
  * Defaults for `routing.delegation`, `exploration`, `run` and `workRoots`. On v1 (`routerHost`
- * `v1`) delegation is always `tiers`, exploration is off, and one notice says so when any of
- * delegation `roles`, `roleAgents`, `exploration` or `run` was set. Switching `delegation` is
- * only a config value here; registration follows a hot reload elsewhere.
+ * `v1`) delegation is always `tiers`, and one notice says so when any of delegation `roles`,
+ * `roleAgents`, `exploration`, `run` or `workRoots` was set. Exploration is off (rate 0) unless
+ * the effective delegation is `roles`. Switching `delegation` is only a config value here;
+ * registration follows a hot reload elsewhere. The plugin logs the v1 notice at start-up by
+ * calling this with its logger next to `resolveRouting` (wired with the roles runtime, #84 P2.1).
  */
 export function resolveRolesRouting(
   cfg: RouterConfig | undefined,
@@ -3183,17 +3186,19 @@ export function resolveRolesRouting(
 ): ResolvedRolesRouting {
   const r: RoutingConfig = cfg?.routing ?? {};
   const requested = r.delegation ?? "tiers";
-  const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined || r.run !== undefined;
+  const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined
+    || r.run !== undefined || r.workRoots !== undefined;
   const inert = host === "v1" && touched;
   if (inert && !warnedRolesInertOnV1) {
     warnedRolesInertOnV1 = true;
     if (logger) logger.warn(ROLES_V1_NOTICE);
     else console.warn(`[model-router] ${ROLES_V1_NOTICE}`);
   }
+  const delegation: DelegationMode = host === "v1" ? "tiers" : requested;
   return Object.freeze({
-    delegation: host === "v1" ? "tiers" : requested,
+    delegation,
     exploration: Object.freeze({
-      rate: host === "v1" ? 0 : (r.exploration?.rate ?? 0),
+      rate: delegation === "roles" ? (r.exploration?.rate ?? 0) : 0,
       requireDetection: "deterministic" as const,
     }),
     run: Object.freeze({
