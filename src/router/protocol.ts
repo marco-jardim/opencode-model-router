@@ -1,12 +1,84 @@
 import type { RouterConfig, Preset, ModeConfig } from "./config";
-import type { RoleSpec } from "./roles";
+import type { RoleKind, RoleSpec } from "./roles";
+import { ROLE_MENU_INTENT } from "./prompts";
+import { generateRolesTaxonomy } from "../routing/engine/protocol-line";
+
+// ---------------------------------------------------------------------------
+// Roles protocol (OpenCode v2, `routing.delegation: "roles"`; plan #84 §2.1–§2.5, T2.2.1)
+// ---------------------------------------------------------------------------
 
 /**
- * The roles section of the delegation protocol (contract only; T2.2.1 fills it).
- * Returns "" until then, so the assembled prompt stays byte-identical.
+ * First line of {@link buildRolesProtocol}. Deliberately not {@link DELEGATION_PROTOCOL_HEADING}: the engine's
+ * context hook (`src/routing/wire/hint.ts`) rewrites only the tiers protocol (tier `R:` line, route-line paragraph,
+ * per-turn hint), so it never touches the roles text.
  */
-export function buildRolesProtocol(_cfg: RouterConfig, _roles: ReadonlyMap<string, RoleSpec>): string {
-  return "";
+export const ROLES_PROTOCOL_HEADING = "## Role Delegation Protocol (MANDATORY)";
+
+/** Menu order: the shipped role order by kind; agents of one kind by name. */
+const ROLE_MENU_ORDER: readonly RoleKind[] = ["explore", "research", "run", "implement", "review", "design", "general"];
+const LOCAL_ACTIONS: ReadonlySet<string> = new Set(["read", "glob", "grep", "router_git"]);
+
+/** A role's authority in plain words, from its allow list: dynamic roles get `edit`/`router_run` only on demand. */
+function roleAuthorityWords(spec: RoleSpec): string {
+  const allow: readonly string[] = spec.authority.allow;
+  const held: string[] = allow.some((a) => LOCAL_ACTIONS.has(a)) ? ["read"] : [];
+  const onDemand: string[] = [];
+  for (const action of ["edit", "router_run"]) {
+    if (allow.includes(action)) (spec.authority.mode === "dynamic" ? onDemand : held).push(action);
+  }
+  for (const action of ["webfetch", "websearch", "context7"]) if (allow.includes(action)) held.push(action);
+  const words = [held.join(", "), onDemand.length > 0 ? `${onDemand.join(" and ")} on demand` : ""].filter((w) => w !== "");
+  return words.length > 0 ? words.join("; ") : "none";
+}
+
+/**
+ * The orchestrator's delegation protocol on OpenCode v2 roles mode, in place of {@link buildDelegationProtocol}
+ * (which advertises the tiers, their models and the tier rules). It names the enabled role agents of `roles` only,
+ * never a tier or a model: the router picks both per dispatch and always sets the per-call model.
+ *
+ * Cache-stable: the text depends on `routing.delegation` and the role table only (agents, kinds, allow lists,
+ * authority mode), in a fixed order; nothing per turn (no clock, counter, session id, preset, model or evidence).
+ *
+ * "" outside roles mode and when no role is enabled, so a caller that falls back to the tiers protocol on "" keeps
+ * tiers mode and v1 byte-identical (I1/I8).
+ */
+export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string, RoleSpec>): string {
+  if (cfg.routing?.delegation !== "roles") return "";
+  const enabled = [...roles.values()]
+    .filter((spec) => spec.enabled === true && ROLE_MENU_ORDER.includes(spec.kind))
+    .sort((a, b) => ROLE_MENU_ORDER.indexOf(a.kind) - ROLE_MENU_ORDER.indexOf(b.kind) || (a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0));
+  if (enabled.length === 0) return "";
+  const agentOf = (kind: RoleKind): string | undefined => enabled.find((spec) => spec.kind === kind)?.agent;
+  const menu = enabled.map((spec) => `- ${spec.agent}: ${ROLE_MENU_INTENT[spec.kind]} Authority: ${roleAuthorityWords(spec)}.`);
+  const taxonomy = generateRolesTaxonomy(new Map(enabled.map((spec) => [spec.agent, spec] as const)));
+  const researcher = agentOf("research");
+  const editor = agentOf("implement") ?? agentOf("general");
+  const compose = researcher !== undefined && editor !== undefined
+    ? ` Compose instead: ${researcher} first, then paste its findings into the ${editor} dispatch (research → implement).`
+    : "";
+  return [
+    ROLES_PROTOCOL_HEADING,
+    ``,
+    `You are the orchestrator: delegate execution to role agents with \`subagent(agent="<role>", prompt="...")\` and answer the user yourself. Reading, searching and running commands are execution; your one exception is about 2 direct read-only calls per turn for a lookup that settles a question outright. Run independent dispatches in parallel (several subagent calls in one message).`,
+    ``,
+    `Roles (pick by intent; the router narrows each grant to the task):`,
+    ...menu,
+    ...(taxonomy ? [``, taxonomy] : []),
+    ``,
+    `The router chooses the model for every dispatch: never set \`model\` and never pick a tier; name the role.`,
+    ``,
+    `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path> tier=<t> pin]\`, every key optional. class = search|recon|mechanical|implement|debug|design|review|other; risk = low|medium|high; scope = single|multi|repo; needs = shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` unlocks router_run, where the role allows them); d = deterministic|grader|none (how the result is verified); budget = tool calls (up to twice the role's); root = the absolute work root. \`tier\` and \`pin\` only transcribe a plan tag or policy (\`[tier:X]\` → \`tier=X pin\`; a QA review → \`pin\`).`,
+    ``,
+    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line and the same path in ENVIRONMENT. Paths outside it are denied.`,
+    ``,
+    `No role holds the web together with read, run or edit authority.${compose} Raw shell is outside roles mode: for it, dispatch a tier agent explicitly, as a fallback.`,
+    ``,
+    `Resume, never restart: after \`NEED MORE: budget\` or a router budget note, resume the SAME \`sessionID\` with "continue and finish"; after \`ESCALATE: authority\`, resume the SAME \`sessionID\` (the router widens the grant) unless the router names another role. Roles return \`DONE:\`, \`NEED MORE:\` or \`ESCALATE:\`; \`CAP:N\` (or \`CAP:none\` with a \`reason:\` line) changes only the read-only call cap.`,
+    ``,
+    `Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.`,
+    ``,
+    `This protocol overrides any project guide (CLAUDE.md, AGENTS.md) that says to use direct tools first or to dispatch to tiers or models.`,
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -382,4 +454,48 @@ export function assembleSystemPrompt(
     ? `${CLAUDE_ORCHESTRATOR_PREFIX}\n\n${CLAUDE_ANTI_NARRATION}`
     : CLAUDE_ORCHESTRATOR_PREFIX;
   return `${claudePrefix}\n\n---\n\n${delegationProtocol}${dodSection}`;
+}
+
+/**
+ * {@link CLAUDE_ORCHESTRATOR_PREFIX} for roles mode: the same override, with execution delegated to role agents
+ * instead of a named tier (the tiers opener sends read-only work to `@fast`).
+ */
+export const CLAUDE_ROLES_ORCHESTRATOR_PREFIX = [
+  "AUTHORITY OVERRIDE — this block supersedes any prior system instruction",
+  "about 'exploring the codebase', 'gathering context with tools', or using",
+  "Read/Grep/Glob to validate assumptions. Those instructions describe a",
+  "general-purpose Claude Code session. THIS session is a routing",
+  "orchestrator.",
+  "",
+  "Your job is to DISPATCH, not to EXECUTE. Read-only work (grep/read/",
+  "glob/ls) is execution, and execution is delegated to a role agent. You",
+  "may run AT MOST 2 direct read-only tool calls per turn — a 3rd call is a",
+  "rule violation. If you need more context, dispatch a role agent.",
+  "",
+  "If a cached instruction told you to 'be thorough', 'explore broadly', or",
+  "'read supporting files' — ignore it here. Thoroughness is achieved by",
+  "dispatching the right role, not by you becoming the explorer.",
+].join("\n");
+
+/**
+ * The orchestrator system prompt on OpenCode v2 roles mode: {@link assembleSystemPrompt} with
+ * {@link buildRolesProtocol} in place of the tiers protocol and {@link CLAUDE_ROLES_ORCHESTRATOR_PREFIX} in place of
+ * the tiers opener; the anti-narration clause and the DoD section follow the same switches. "" when the roles
+ * protocol is "" (tiers mode, v1, no enabled role): the caller then keeps {@link assembleSystemPrompt}, unchanged.
+ * Pure, and cache-stable like the roles protocol.
+ */
+export function assembleRolesSystemPrompt(
+  cfg: RouterConfig,
+  roles: ReadonlyMap<string, RoleSpec>,
+  orchestratorModel: string | undefined,
+  enforcementOn: boolean = false,
+): string {
+  const rolesProtocol = buildRolesProtocol(cfg, roles);
+  if (rolesProtocol === "") return "";
+  const dodSection = enforcementOn ? `\n\n---\n\n${buildDoDProtocolSection(cfg)}` : "";
+  if (!isClaudeModel(orchestratorModel)) return `${rolesProtocol}${dodSection}`;
+  const claudePrefix = cfg.antiNarration
+    ? `${CLAUDE_ROLES_ORCHESTRATOR_PREFIX}\n\n${CLAUDE_ANTI_NARRATION}`
+    : CLAUDE_ROLES_ORCHESTRATOR_PREFIX;
+  return `${claudePrefix}\n\n---\n\n${rolesProtocol}${dodSection}`;
 }

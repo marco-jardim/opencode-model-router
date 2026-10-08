@@ -12,16 +12,21 @@
  *    least {@link MIN_EVIDENCE_TO_MOVE} effective evidence. Priors alone can move a class in the kernel
  *    (e.g. `margin: 0`), so the evidence gate is what keeps the line static until data exists.
  *
+ * v2 roles mode (plan #84 T2.2.1): with a non-empty role table the line maps class → role agent
+ * ({@link generateRolesTaxonomy}); tiers mode and v1 never pass one, so their line is unchanged.
+ *
  * Pure: no I/O, no clock, no randomness, no module state.
  */
 
 import type { ResolvedRouting, RouterConfig, RouterHost } from "../../router/config";
 import { buildTaskTaxonomy } from "../../router/protocol";
+import type { RoleKind, RoleSpec } from "../../router/roles";
 import {
   CLASS_BASE_RISK,
   CLASS_IMPLIED_NEEDS,
   CLASS_STATIC_TIER,
   TASK_CLASSES,
+  type TaskClass,
   type TaskFacts,
 } from "../classify/types";
 import type { ModelPricing } from "../outcomes/types";
@@ -43,6 +48,51 @@ export interface TaxonomyInput {
   readonly session?: LadderBuildInput["session"];
   readonly parentModel?: string | null;
   readonly logger?: LadderBuildInput["logger"];
+  /**
+   * v2 roles mode (T2.2.1): the enabled role agents (`resolveRoles`). A non-empty table makes the line the
+   * class → role map of {@link generateRolesTaxonomy}; absent or empty, the tier line below is unchanged.
+   */
+  readonly roles?: ReadonlyMap<string, RoleSpec>;
+}
+
+/**
+ * The role kind that does each task class in roles mode (plan §2.2). `runner` and `researcher` have no class of
+ * their own: the orchestrator picks them by intent (running checks, web research) from the role menu.
+ */
+export const CLASS_ROLE_KIND: Readonly<Record<TaskClass, RoleKind>> = Object.freeze({
+  search: "explore",
+  recon: "explore",
+  mechanical: "implement",
+  implement: "implement",
+  debug: "implement",
+  design: "design",
+  review: "review",
+  other: "general",
+});
+
+/**
+ * The roles-mode `R:` line: each class → the enabled role agent of {@link CLASS_ROLE_KIND}, else `general`, else
+ * the class is left out. Classes sharing an agent are grouped (`search/recon→explorer`), in `TASK_CLASSES` order;
+ * of two enabled agents of one kind the first by name wins. Depends on the table only (no tiers, no models, no
+ * evidence), so the text is stable for the whole session. "" when no class has an agent.
+ */
+export function generateRolesTaxonomy(roles: ReadonlyMap<string, RoleSpec>): string {
+  const byKind = new Map<RoleKind, string>();
+  for (const spec of roles.values()) {
+    if (spec.enabled !== true) continue;
+    const held = byKind.get(spec.kind);
+    if (held === undefined || spec.agent < held) byKind.set(spec.kind, spec.agent);
+  }
+  const groups = new Map<string, TaskClass[]>();
+  for (const cls of TASK_CLASSES) {
+    const agent = byKind.get(CLASS_ROLE_KIND[cls]) ?? byKind.get("general");
+    if (agent === undefined) continue;
+    const classes = groups.get(agent);
+    if (classes === undefined) groups.set(agent, [cls]);
+    else classes.push(cls);
+  }
+  if (groups.size === 0) return "";
+  return `R: ${[...groups].map(([agent, classes]) => `${classes.join("/")}→${agent}`).join(" ")}`;
 }
 
 function ownRoleList(roles: Readonly<Record<string, readonly string[]>>, cls: string): readonly string[] {
@@ -118,6 +168,10 @@ function v2Segments(input: TaxonomyInput, store: EngineStoreView): string[] {
  * line (`R: by class: …`) where the taxonomy would go, and only when it is non-empty.
  */
 export function generateTaxonomy(input: TaxonomyInput): string {
+  if (input.host === "v2" && input.roles !== undefined) {
+    const roleLine = generateRolesTaxonomy(input.roles);
+    if (roleLine !== "") return roleLine; // roles mode: class → role, never a tier
+  }
   const base = buildTaskTaxonomy(input.cfg);
   let segments: string[];
   if (input.host === "v1") {
