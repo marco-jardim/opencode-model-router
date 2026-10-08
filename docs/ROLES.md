@@ -49,7 +49,9 @@ A role dispatch is **role × tier × assurance**:
   own verification gate will run the acceptance checks for this dispatch in its work root (`deterministic`), the route
   line's `d=` claim and the prompt's `[acceptance]` block. Without the gate it is the weaker of the claim and the block,
   capped at `grader` (`effectiveDetection`, A34): a claim alone is never deterministic, and a dispatch with neither is
-  `none` — for every role. The role's default assurance in the table below is descriptive only: it never raises or
+  `none` — for every role. **Unlike a tier dispatch, a role dispatch without a `d=` claim is `none` even when its prompt
+  has an `[acceptance]` block** (unless the gate runs its checks): write `d=grader` (or `d=deterministic`, which counts
+  as `grader` without the gate) on the route line to claim it. The role's default assurance in the table below is descriptive only: it never raises or
   lowers a dispatch's detection.
 
 ## Turning it on
@@ -155,8 +157,9 @@ name. At dispatch time a grant that would mix them loses its egress, with a note
   into a `researcher` prompt. The rule separates roles, not the session.
 - **Host `grep` (ripgrep) may follow links inside the work root**, which the router does not see.
 - **The host's tool-output folder.** Reading roles keep the host's inherited `external_directory` allow for its
-  tool-output folder, so they can read their own truncated tool outputs; the router narrows it per session to the
-  files the host names in that session's structured `outputPaths` (never free text).
+  tool-output folder; the router narrows it per session to the files the host names in that session's structured
+  `outputPaths` (never free text). On OpenCode 2.0.24 those events carry no `outputPaths`, so nothing is allowed there
+  (see [Limits](#limits)).
 
 ## Work roots
 
@@ -191,7 +194,7 @@ The window of a role dispatch is `[floor, ceiling]`:
 - floor = max(the role's range floor, the authority floor below, `enforcement.escalate.floorTier`, the child's running
   tier on a resume, a raise the router recorded after a verification FAIL of this child);
 - ceiling = the role's range ceiling; when the floor is above it, the floor wins and the range widens upward only
-  (the dispatch then runs on a tier the role has no budget for, and gets the tier agents' 25-call budget, see
+  (when the role has no budget for the tier it then runs on, the dispatch gets the tier agents' 25-call budget, see
   [Budgets](#budgets));
 - risk and scope = max(classifier, route line): the route line can raise them, never lower them;
 - a route-line `tier=` pin is honoured inside the window; below the floor it is lifted (reason `lift:authority` or
@@ -242,7 +245,7 @@ Errors fail closed: a context-hook error leaves the role child an empty tool cat
 | Item | Value |
 |---|---|
 | Role dispatch total | the role's budget for the routed tier (table above); `budget=<n>` on the route line raises it, never above 2 × |
-| Routed tier outside the role's range | when a floor (`enforcement.escalate.floorTier`, a running rung, the authority floor) lifts the dispatch above the role's ceiling, the role has no budget for that tier: the dispatch gets the tier agents' 25 calls (raised by `budget=` up to 2 ×) |
+| Routed tier outside the role's range | when a floor (`enforcement.escalate.floorTier`, a running rung, the authority floor) lifts the dispatch above the role's ceiling, and when the role has no budget for that tier, the dispatch gets the tier agents' 25 calls (raised by `budget=` up to 2 ×) |
 | Cumulative ceiling across resumes | total × 3 |
 | Refused calls | not charged to the budget, not recorded as executed by the repeat check; a round is stopped for refusals once it has min(budget, `REFUSAL_CAP` = 10) of them and executed + refused calls reach the budget |
 | Host `steps` of a role agent | 2 × top role budget + `REFUSAL_CAP` + 5 (95 or 255 for the shipped roles) |
@@ -265,9 +268,9 @@ failures (I7).
 
 | Signal | Weight | When |
 |---|---|---|
-| `verdict` | 1 (pass or fail) | the router's deterministic gate |
+| `verdict` | 1 (pass or fail) | the router's deterministic checks (never an LLM grader) |
 | `run` | 1 (success only) | the child's own `router_run` of every npm-script-form acceptance check, the latest run of each exited 0 and started after the child's last edit (see below) |
-| `grader` | 0.5 (pass or fail) | an independent grader: tier ≥ the producer's tier **and** another model |
+| `grader` | 0.5 (pass or fail) | an independent LLM grader: tier ≥ the producer's tier **and** another model (see below) |
 | `incomplete` | 0.5 (failure) | an explicit `NEED MORE` / `ESCALATE` return without an observed budget stop or authority request |
 | `redispatch` | 0.5 (failure, on the earlier attempt) | the same task (compared over its TASK section) sent again to a higher tier within 30 minutes |
 | `budget`, `authority` | 0 (recorded, no tier penalty) | an observed budget stop; an authority request |
@@ -275,11 +278,19 @@ failures (I7).
 
 **The `run` signal matches npm-script-form checks only.** An acceptance check counts for it only when its command is
 exactly `npm test` or `npm run <name>` (also `npm t`, `npm run-script <name>` and the `npm.cmd` spellings), with no
-further arguments, and it is matched only to a `router_run` of that
-same script name (`test` for `npm test`; a `routing.run.commands` entry such as `test-files` never matches). A
-dispatch with no check of that form gets no `run` signal. A check of any other form (a file check, another command) is
-never matched to a run, so a `run` signal never shows that such a check passed: that is the deterministic gate's
-`verdict`. The child's edits must also have been observed.
+further arguments. It is matched by **`router_run` entry name**: the check `npm test` needs a run of the entry `test`,
+`npm run <name>` a run of the entry `<name>`, whether that entry is a `package.json` script or a `routing.run.commands`
+entry of the same name (a command named `test` counts for `npm test`; one named `test-files` never does). A dispatch
+with no check of that form gets no `run` signal. A check of any other form (a file check, another command) is never
+matched to a run, so a `run` signal never shows that such a check passed: that is the deterministic gate's `verdict`.
+The child's edits must also have been observed.
+
+**Graders weigh half, and only when independent.** When an LLM grader (not the deterministic checks) judges a role
+dispatch, there is never a weight-1 `verdict` signal. An independent grader's pass or fail writes a verdict row that
+moves the outcome store by 0.5 (not one full observation) and a `grader` signal row. A grader that is not independent
+— below the producer's tier, on the same model, or not known to be independent — records nothing at all: no store
+change, no verdict row, no signal row. A false refusal after an independent grader's pass takes back only that 0.5 and
+adds one failure; after its failure it tops the failure up to one. Tier dispatches keep full-weight grader verdicts.
 
 A return without a contract prefix gives no signal. For verification, a progress note (no contract marker, ending with
 a first-person "I'll continue …") or a budget stop is `incomplete`: never accepted, no next tier, no evidence. Signals
@@ -385,7 +396,10 @@ keeps the tier model.
   user's credential stores and anything the host itself does (its own search, its tool-output store) are outside them.
 - **The `run` signal is narrow.** Only npm-script-form acceptance checks are matched to `router_run` runs (see
   [Outcome signals](#outcome-signals)); dispatches checked any other way earn positive evidence only through the
-  deterministic gate's verdict.
+  deterministic gate's verdict (weight 1) or an independent grader's verdict (weight 0.5).
+- **Truncated tool outputs are unreadable on OpenCode 2.0.24.** Its tool-success events carry no `outputPaths`, so the
+  router has no file to allow and a role child cannot read its own truncated tool outputs (it fails closed); narrow the
+  call instead.
 - **The rules classifier is noisy.** It may attribute `edit` or `shell` to a task that does not mention them, which
   grants a dynamic role more of its max than the task needs (always within the max and the separation rule) and makes
   the ladder rarely needed (DF2-F2). Use `needs=` on the route line to be explicit.
@@ -400,7 +414,8 @@ keeps the tier model.
 | Role agent registration (max policy, steps, aliases) | `src/router/role-agents.ts`, `src/compat/v2-hooks.ts` |
 | Grant, authority floor, tier window | `src/routing/roles/policy.ts` |
 | Binding and the authority ladder | `src/routing/roles/binding.ts`, `src/routing/roles/authority.ts` |
-| Role dispatch path, work root resolution | `src/routing/wire/dispatch.ts` |
+| Role dispatch path, work root resolution | `src/routing/wire/dispatch.ts`, `src/routing/roles/work-root.ts` |
+| Acceptance checks in the work root (gate refusal of a foreign `cwd:`) | `src/verify/gate.ts` |
 | Role ladders, `decideRole`, exploration | `src/routing/engine/ladders.ts`, `src/routing/engine/kernel.ts` |
 | Guard profiles and budgets | `src/router/guard-profile.ts`, `src/guard/` |
 | `router_run` | `src/router/run-tools.ts` |

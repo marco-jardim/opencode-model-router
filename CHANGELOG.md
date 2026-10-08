@@ -35,8 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Role agents' host `steps` = 2 × the top role budget + `REFUSAL_CAP` (10) + 5. A role dispatch has a read-only
     call cap only when it carries `CAP:N` or `CAP:none`.
   - Outcome signals from external verification only (deterministic/run 1, independent grader 0.5, incomplete 0.5,
-    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only); role × tier statistics
-    and the advisor findings `role-separation`,
+    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only). An LLM grader's verdict of
+    a role dispatch moves the outcome store by 0.5 with a `grader` signal row only when the grader is independent
+    (tier ≥ the producer's, another model); any other grader records nothing (no store change, no verdict row), so
+    `routing:stats` shows fewer verdict rows for role dispatches. Role × tier statistics and the advisor findings
+    `role-separation`,
     `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`,
     `native-explore-aliased`, `roles-none-enabled`, `role-usage-share`.
   - Exploration of cheaper rungs (`routing.exploration.rate`, off by default, at most 0.2, `enforce` and deterministic

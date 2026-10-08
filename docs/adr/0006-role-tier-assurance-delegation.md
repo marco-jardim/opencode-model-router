@@ -75,7 +75,9 @@ itself in the dispatch's work root; edit + execution never runs on `fast`.
 Detection has three inputs only: whether the router's own gate will run the acceptance checks for the dispatch in its
 work root (`deterministic`), the route-line `d=` claim and the prompt's `[acceptance]` block. Without the gate it is
 the weaker of the claim and the block, capped at `grader` (A34, `effectiveDetection`); with neither it is `none`, for
-every role. A role dispatch's checks run in its routed work root by default, a `cwd:` outside that root is refused, and
+every role. Unlike a tier dispatch, a role dispatch without a `d=` claim is `none` even when its prompt has an
+`[acceptance]` block (unless the gate runs its checks): the orchestrator writes `d=grader` or `d=deterministic` to claim
+it. A role dispatch's checks run in its routed work root by default, a `cwd:` outside that root is refused, and
 a dispatch whose checks cannot run in the root is not `deterministic` (dogfood finding DF2-F1, fixed). The roles'
 default assurance (`deterministic` for `runner`, `none` for the others) is descriptive and never enters the routing.
 
@@ -111,7 +113,7 @@ A role dispatch's call budget is the role's budget for the routed tier (`budget=
 refused calls are not charged. On exhaustion the child returns `NEED MORE: budget` with a summary, the parent's result
 gets a `[router budget]` note, and the same session is resumed (E7). The host `steps` limit is 2 × the top role budget
 + `REFUSAL_CAP` + 5, so the router's stop always comes first (S4, R7, R8). Tier agents keep 25 / × 3, and so does a
-role dispatch that a floor lifts above its role's ceiling (the role has no budget for that tier). A role dispatch has a
+role dispatch that a floor lifts above its role's ceiling, when the role has no budget for that tier. A role dispatch has a
 read-only call cap only when it carries `CAP:N` or `CAP:none`.
 
 ### D10 — Outcome evidence only from external verification
@@ -119,8 +121,11 @@ read-only call cap only when it carries `CAP:N` or `CAP:none`.
 Deterministic pass/fail weighs 1. A router-observed run weighs 1 (success only) when the child's own `router_run` of
 every npm-script-form acceptance check (`npm test`, `npm run <name>`) exited 0 after its last edit; only checks of that
 form are matched to runs, so a dispatch without one gets no `run` signal and a check of any other form is covered only
-by the deterministic verdict. An independent grader (tier ≥ producer, another model) weighs 0.5; an explicit `NEED MORE`/`ESCALATE` without a budget stop or authority
-request 0.5 against; a re-dispatch of the same task to a higher tier within 30 minutes 0.5 against the earlier
+by the deterministic verdict. An LLM grader's verdict of a role dispatch is never a weight-1 `verdict`: an independent
+grader (tier ≥ producer, another model) moves the outcome store by 0.5 and writes a `grader` signal row, and a grader
+that is not independent (or not known to be) records nothing — no store change, no verdict row, no signal row; a false
+refusal after an independent grader's pass takes back only its 0.5. An explicit `NEED MORE`/`ESCALATE` without a budget
+stop or authority request weighs 0.5 against; a re-dispatch of the same task to a higher tier within 30 minutes 0.5 against the earlier
 attempt; `DONE` alone 0; budget and authority events are recorded with no penalty (I6, I7).
 
 ### D11 — Exploration is experimental and off by default
