@@ -635,10 +635,13 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
 
   it("S11 work root in a sibling worktree: external_directory defaults, per-path allowance, glob coverage of a later worktree, plugin tool cwd", async () => {
     const host = await RoutingHost.start("s11", {
-      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true, denyAsk: true, cwdTool: true },
+      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER,
+      probe: { lifecycle: true, denyAsk: true, cwdTool: true, bySession: { denyTitle: "S11 role-wt1 narrowed", denyActions: ["external_directory"] } },
       hostConfig: (root: string) => {
         const base: Obj[] = [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }, { action: "edit", resource: "*", effect: "allow" }, { action: "wt_probe", resource: "*", effect: "allow" }];
         return { agents: {
+          // deny-by-default like `base` but WITHOUT the explicit allow for the plugin tool wt_probe
+          "role-notool": agentWithoutModel({ permissions: [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }] }),
           "role-base": agentWithoutModel(), // the host defaults: external_directory = ask
           "role-deny": agentWithoutModel({ permissions: base }), // deny-by-default, explicit allows, no external_directory rule
           "role-wt1": agentWithoutModel({ permissions: [...base, { action: "external_directory", resource: `${root}\\wt-1\\*`, effect: "allow" }] }),
@@ -662,7 +665,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
         const root = await host.newRoot(`s11 ${agent} ${label}`, undefined, host.project, []);
         const r = await childReport(host, root, { agent, description: `S11 ${agent} ${label}`, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool, input })}` });
         const evaluates = (await lifecycle(host, r.childID)).evaluates.map(e => ({ action: e.action, resources: arr(e.resources).map(norm), effectIn: e.effectIn, effectOut: e.effectOut }));
-        return { agent, label, state: r.toolStates[0], evaluates, sessionAgent: r.child.agent };
+        return { agent, label, state: r.toolStates[0], evaluates, sessionAgent: r.child.agent, toolNames: r.requests[0]?.toolNames ?? [] };
       };
       const edit = (dir: string, file: string): Obj => ({ path: path.join(dir, file), oldString: "main", newString: "edited" });
       // -- the worktree that existed when the host started
@@ -674,6 +677,9 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
         tool: await op("role-wt1", "tool wt1", "wt_probe", { path: path.join(wt1, "m.txt") }),
       };
       const glob = { read: await op("role-glob", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-glob", "edit wt1", "edit", edit(wt1, "e2.txt")), other: await op("role-glob", "read other", "read", { path: path.join(other, "x.txt") }) };
+      // -- (a) a plugin tool NOT in the agent's allows, under deny-by-default; (b) the evaluate hook narrows an ALLOWED external path per session
+      const notool = await op("role-notool", "tool not allowed", "wt_probe", { path: path.join(wt1, "m.txt") });
+      const narrowed = await op("role-wt1", "narrowed", "read", { path: path.join(wt1, "m.txt") });
       // -- a SECOND worktree created after the host started and the agents were registered
       git("worktree", "add", "-q", wt2, "-b", "wt2");
       const later = {
@@ -685,7 +691,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       };
       const toolReport = (await host.events()).filter(e => e.type === "probe.tool").map(e => obj(e.report));
       const disk = { wt1E1: await readFile(path.join(wt1, "e1.txt"), "utf8"), wt1E2: await readFile(path.join(wt1, "e2.txt"), "utf8"), wt2E3: await readFile(path.join(wt2, "e3.txt"), "utf8"), mainE1: await readFile(path.join(host.project, "e1.txt"), "utf8"), mainE3: await readFile(path.join(host.project, "e3.txt"), "utf8"), other: await readFile(path.join(other, "x.txt"), "utf8") };
-      await save("S11", { base, deny, exact, glob, later, toolReport, disk, hostErrors: host.errorLines() });
+      await save("S11", { base, deny, exact, glob, later, notool, narrowed, toolReport, disk, hostErrors: host.errorLines() });
 
       const rejected = (o: { state?: Obj }, message: string) => expect(o.state).toMatchObject({ status: "error", errorType: "permission.rejected", errorMessage: message });
       // (1) default agent: external_directory is ASKED for the sibling worktree (resource "<worktree>/*"); the probe turned the ask into a deny so nothing hangs.
@@ -720,7 +726,19 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       expect(disk.wt2E3).toBe("edited\n");
       expect(disk.mainE3).toBe("main\n");
       rejected(later.globOther, "Permission denied: external_directory");
-      // (6) a plugin tool is neither permission-evaluated (no evaluate event, even for the sibling path) nor moved: it runs in the MAIN
+      // (7) a plugin tool is bounded by the agent's MAX policy at the host's catalog: under deny-by-default WITHOUT an explicit allow for it,
+      //     the host does not advertise it (absent from the provider request's tools) and refuses a call to it ("No tool named ... is
+      //     currently available", tool.execution), the tool never runs and no evaluate event fires. With the explicit allow it is advertised.
+      expect(notool.toolNames).not.toContain("wt_probe");
+      expect(exact.tool.toolNames).toContain("wt_probe");
+      expect(notool.state).toMatchObject({ status: "error", errorType: "tool.execution", errorMessage: 'No tool named "wt_probe" is currently available. Please use a tool from the available tool list.' });
+      expect(notool.evaluates).toEqual([]);
+      // (8) the plugin evaluate hook DOES fire for an external_directory the max policy allows (effectIn "allow") and can narrow it for ONE session:
+      //     the session titled "S11 role-wt1 narrowed" is refused by the plugin although its agent's policy allows the path, while the same agent's
+      //     other children (exact.read above) read it.
+      expect(narrowed.evaluates).toHaveLength(1);
+      expect(narrowed.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "allow", effectOut: "allow" });
+      rejected(narrowed, "PROBE_SESSION_DENIED: external_directory");      // (6) a plugin tool is neither permission-evaluated (no evaluate event, even for the sibling path) nor moved: it runs in the MAIN
       //     checkout (process.cwd() = the host project = the session location); its context carries no directory/worktree field.
       expect(exact.tool.state).toMatchObject({ status: "completed" });
       expect(exact.tool.evaluates).toEqual([]);
