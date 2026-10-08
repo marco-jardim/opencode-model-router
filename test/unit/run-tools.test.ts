@@ -10,7 +10,7 @@ import {
   argAllowed, authorizeCwd, capRendered, dropLeadingPartial, escapesWorkRoot, isCredentialEnv, isFullPath, loadNpmIni, npmConfigPins, npmEnvReplace,
   npmHardeningFlags, optionLead, type WorkRootAnswer,
   planRun, readBoundedRegularFile, renderRunOutput, resolveCommandExecutable, resolveNodeExecutable, resolveNpmCli, resolveSystemShell, routerRunTool,
-  runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, RUN_RENDERED_MAX_BYTES, RUN_TAIL_BYTES, scriptAllowed, validateRunArgs,
+  runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, RUN_RENDERED_MAX_BYTES, RUN_STDERR_TAIL_BYTES, RUN_TAIL_BYTES, scriptAllowed, validateRunArgs,
   type RunRecord, type RunToolDeps,
 } from "../../src/router/run-tools";
 
@@ -224,10 +224,47 @@ describe("router_run execution", () => {
     expect(out).toMatch(/exit code: 0/);
     expect(out).toContain("HEAD-START");
     expect(out).toContain("TAIL-END");
-    expect(out).toContain("STDERR-END");
-    expect(out).toMatch(/\[router_run\] output truncated: \d+ bytes omitted; showing at most the first 16384 and the last 49152 bytes \(bound 65536 bytes\)/);
+    // Wherever the stderr chunk arrived relative to stdout (on Linux often 100+ KB earlier), it is shown exactly once.
+    expect(out.split("STDERR-END").length - 1).toBe(1);
+    expect(out).toMatch(new RegExp(`\\[router_run\\] output truncated: \\d+ bytes omitted; showing at most the first ${RUN_HEAD_BYTES} and the last ${RUN_TAIL_BYTES} bytes, `
+      + `plus the last ${RUN_STDERR_TAIL_BYTES} bytes of stderr when not shown \\(bound ${RUN_OUTPUT_BYTES} bytes\\)`));
+    expect(RUN_HEAD_BYTES + RUN_TAIL_BYTES + RUN_STDERR_TAIL_BYTES).toBe(RUN_OUTPUT_BYTES);
     expect(Buffer.byteLength(out)).toBeLessThan(RUN_OUTPUT_BYTES + 1024);
   }, SPAWN_TIMEOUT);
+  it("keeps the stderr tail when stderr arrived before the shown stdout tail (Linux pipe interleaving)", async () => {
+    project(root);
+    // Deterministic form of the CI interleaving: the merged stream holds stderr's last line in the middle,
+    // behind more than the 16 KiB head of stdout and ahead of more than the 40 KiB tail of stdout.
+    writeFileSync(join(root, "early.js"), [
+      "process.stdout.write('first stdout\\n'.repeat(2000));",
+      "setTimeout(() => process.stderr.write('FAILURE-SUMMARY: 3 failed\\n'), 300);",
+      "setTimeout(() => process.stdout.write('later stdout\\n'.repeat(8000)), 600);",
+    ].join("\n"));
+    const records: RunRecord[] = [];
+    const out = await makeTool({ config: () => config({ commands: { early: { argv: ["node", "early.js"] } } }) }, records)({ script: "early", cwd: root });
+    expect(out).toMatch(/exit code: 0/);
+    expect(out).toMatch(/\[router_run\] stderr tail \(last 26 bytes; stdout and stderr are separate pipes[^\n]*\nFAILURE-SUMMARY: 3 failed\n$/);
+    expect(out.split("FAILURE-SUMMARY").length - 1).toBe(1);
+    expect(Buffer.byteLength(out)).toBeLessThanOrEqual(RUN_RENDERED_MAX_BYTES + 200);
+    // stderr written last and delivered last is already in the merged tail: no duplicate section.
+    writeFileSync(join(root, "late.js"), "process.stdout.write('stdout line\\n'.repeat(20000)); setTimeout(() => process.stderr.write('LATE-STDERR\\n'), 300);");
+    const late = await makeTool({ config: () => config({ commands: { late: { argv: ["node", "late.js"] } } }) })({ script: "late", cwd: root });
+    expect(late.split("LATE-STDERR").length - 1).toBe(1);
+    expect(late).not.toContain("[router_run] stderr tail");
+  }, SPAWN_TIMEOUT);
+  it("renders the stderr tail bounded and redacted, never a credential cut at its start", () => {
+    const base = { output: Buffer.from("head\n"), truncated: true, omitted: 100, tail: Buffer.from("x\nmerged tail\n") };
+    const cut = renderRunOutput({ ...base, stderrTail: Buffer.from("ob:hunter2secret@host/x\nlast https://u:pw9@h/y\n"), stderrTotal: 9000 });
+    for (const fragment of ["hunter2", "secret", "pw9"]) expect(cut).not.toContain(fragment);
+    expect(cut).toMatch(/\[router_run\] stderr tail \(last \d+ bytes;[^\n]*\nlast https:\/\/h\/y\n$/);
+    // Whole stderr kept (total = window): nothing dropped at its start.
+    expect(renderRunOutput({ ...base, stderrTail: Buffer.from("only line"), stderrTotal: 9 })).toMatch(/\nonly line\n$/);
+    // Already shown, empty, or nothing omitted: no section.
+    expect(renderRunOutput({ ...base, stderrTail: Buffer.from("merged tail\n"), stderrTotal: 12 })).not.toContain("stderr tail");
+    expect(renderRunOutput({ ...base, stderrTail: Buffer.from(" \n"), stderrTotal: 2 })).not.toContain("stderr tail");
+    expect(renderRunOutput({ ...base, omitted: 0, stderrTail: Buffer.from("e\n"), stderrTotal: 2 })).not.toContain("stderr tail");
+    expect(renderRunOutput({ ...base, stderrTail: Buffer.alloc(0), stderrTotal: 0 })).not.toContain("stderr tail");
+  });
   it("never shows a credential cut at the head or tail boundary", async () => {
     project(root);
     // The credential straddles byte RUN_HEAD_BYTES: the head ends inside it.
@@ -801,6 +838,20 @@ describe("spawnBounded tail mode", () => {
     expect(renderRunOutput(result)).toMatch(/^abc|def/);
     expect(result.stderr.length).toBe(0);
   }, SPAWN_TIMEOUT);
+  it("keeps a separate rolling stderr tail when stderr is merged (stderrTailBytes)", async () => {
+    const script = "process.stderr.write('E'.repeat(300) + 'ERR-LAST\\n'); setTimeout(() => process.stdout.write('o'.repeat(100000)), 300);";
+    const result = await spawnBounded(process.execPath, ["-e", script], root,
+      { env: process.env, maxBytes: 1000, tailBytes: 500, mergeStderr: true, stderrTailBytes: 64, timeoutMs: 60_000 });
+    expect(result.code).toBe(0);
+    expect(result.tail!.toString()).toBe("o".repeat(500)); // the merged tail lost the stderr line
+    expect(result.stderrTail!.toString()).toBe(`${"E".repeat(55)}ERR-LAST\n`);
+    expect(result.stderrTotal).toBe(309);
+    const plain = await spawnBounded(process.execPath, ["-e", "process.stderr.write('x')"], root, { env: process.env, mergeStderr: true, timeoutMs: 60_000 });
+    expect(plain.stderrTail).toBeUndefined();
+    const separate = await spawnBounded(process.execPath, ["-e", "process.stderr.write('y')"], root, { env: process.env, stderrTailBytes: 8, timeoutMs: 60_000 });
+    expect(separate.stderrTail).toBeUndefined(); // only with mergeStderr; router_git keeps its separate stderr (I1)
+    expect(separate.stderr.toString()).toBe("y");
+  }, SPAWN_TIMEOUT);
   it("settles on failure with partial output instead of rejecting, and rejects without settleOnFailure", async () => {
     const hang = "console.log('partial'); setInterval(() => {}, 1000);";
     const settled = await spawnBounded(process.execPath, ["-e", hang], root, { env: process.env, timeoutMs: 1_500, tailBytes: 100, settleOnFailure: true, label: { message: "router_run", tag: "router_run", program: "the run" } });
@@ -1287,9 +1338,10 @@ describe("QA-P13-1-6 guards cover the plugin's checkout and a sibling worktree's
   it("includes the work root and the plugin working directory's checkout, never a filesystem root", () => {
     const guards = workRootGuards(root).map(dir => dir.toLowerCase());
     expect(guards).toContain(root.toLowerCase());
+    // The plugin's checkout is guarded; its working directory itself is not (QA-P13-2-3a), so outside a checkout only the root remains.
     const pluginCheckout = nearestCheckout(process.cwd());
     if (pluginCheckout !== undefined) expect(guards).toContain(pluginCheckout.toLowerCase());
-    expect(guards).toContain(process.cwd().toLowerCase());
+    else expect(guards).toEqual([root.toLowerCase()]);
     for (const dir of guards) expect(dir === join(dir, "..").toLowerCase()).toBe(false);
   });
 });
