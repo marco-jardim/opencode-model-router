@@ -25,7 +25,10 @@ import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/ro
 import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
-import { resetDispatchRouting, roleGateDeferred, roleRouterGate, routedRoleOf, strippedRouteRoot } from "../../src/routing/wire/dispatch";
+import {
+  resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
+} from "../../src/routing/wire/dispatch";
+import { verificationScope } from "../../src/verify/paths";
 import { runSignal } from "../../src/routing/outcomes/signals";
 import { registerRoleAgents } from "../../src/router/role-agents";
 import { rememberDispatch } from "../../src/router/sessions";
@@ -725,6 +728,48 @@ describe("QA round 1 (P2.1)", () => {
     };
     expect(await route("q2a", `[route class=implement risk=low scope=single]\nDo it\n${acceptance}`)).not.toBe("deterministic");
     expect(await route("q2b", `[route class=implement risk=low scope=single]\nVERIFY: required\nDo it\n${acceptance}`)).toBe("deterministic");
+  });
+
+  it("DF2-F1 (#84 P3.3): the detection is deterministic only when the gate can run the checks in the dispatch's work root", async () => {
+    const { dir, cfg } = home(ROLES);
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks);
+    const root = realpathSync.native(dir);
+    const block = (cwd?: string) => `Do it\n[acceptance]\n${cwd === undefined ? "" : `cwd: ${cwd}\n`}check: fileExists path=x.txt\n[/acceptance]`;
+    expect(roleGateOutsideWorkRoot(root, block(), "")).toBe(false); // no cwd: → the work root
+    expect(roleGateOutsideWorkRoot(root, block("sub"), "")).toBe(false); // relative → inside the work root
+    expect(roleGateOutsideWorkRoot(root, block(join(root, "sub")), "")).toBe(false);
+    expect(roleGateOutsideWorkRoot(root, block(join(root, "..")), "")).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, block(`${root}-v2`), "")).toBe(true); // a sibling prefix is outside
+    expect(roleGateOutsideWorkRoot(null, block(), "")).toBe(true); // no validated work root
+    expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", outsideWorkRoot: true, env: {} })).toBe(false);
+    expect(roleRouterGate({ cfg, bypassed: false, acceptance: "deterministic", outsideWorkRoot: false, env: {} })).toBe(true);
+    const route = async (id: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "implementer", description: "x", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      return routedRoleOf(id)!.detection;
+    };
+    expect(await route("df1a", `[route class=implement risk=low scope=single]\n${block()}`)).toBe("deterministic");
+    expect(await route("df1b", `[route class=implement risk=low scope=single]\n${block("sub")}`)).toBe("deterministic");
+    expect(await route("df1c", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`)).not.toBe("deterministic");
+    // root= naming no worktree of this repository: no work root, so the gate cannot back a deterministic detection.
+    expect(await route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`)).not.toBe("deterministic");
+    expect(routedRoleOf("df1d")!.workRoot).toBeNull();
+  });
+
+  it("DF2-F1: verificationScope — tiers unchanged (I1); a role dispatch's work root is the default, an outside cwd is flagged", () => {
+    const root = join(tmpdir(), "scope-root");
+    expect(verificationScope(undefined, undefined)).toEqual({ cwd: undefined, requested: undefined, outside: false });
+    expect(verificationScope("/elsewhere", undefined)).toEqual({ cwd: "/elsewhere", requested: "/elsewhere", outside: false });
+    expect(verificationScope("rel", null)).toEqual({ cwd: "rel", requested: "rel", outside: false });
+    expect(verificationScope(undefined, root)).toEqual({ cwd: root, requested: root, workRoot: root, outside: false });
+    expect(verificationScope("pkg", root)).toEqual({ cwd: join(root, "pkg"), requested: join(root, "pkg"), workRoot: root, outside: false });
+    const away = join(tmpdir(), "elsewhere");
+    expect(verificationScope(away, root)).toEqual({ cwd: root, requested: away, workRoot: root, outside: true });
+    // The containment test is on the canonical spelling (8.3 names, links), as in the gate.
+    const alias = join(tmpdir(), "SCOPE-~1");
+    expect(verificationScope(alias, root, (p) => (p === alias ? root : p)).outside).toBe(false);
   });
 
   it("QA-P21-1-3: a role child that hit its read-only CAP is a budget stop for the signals and gets the resume note", async () => {

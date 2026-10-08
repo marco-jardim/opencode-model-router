@@ -27,6 +27,35 @@ export function resolveBaseDir(cwd: string | undefined, routerDir: string): stri
   return join(routerDir, cwd);
 }
 
+/** Where one dispatch is verified ({@link verificationScope}). */
+export interface VerificationScope {
+  /** The directory the change capture, the change set and the (deferred) checks use; undefined = the router's own. */
+  readonly cwd: string | undefined;
+  /** The gate's `Delegation.cwd`: the requested directory, which the gate refuses when it lies outside `workRoot`. */
+  readonly requested: string | undefined;
+  /** The role dispatch's validated work root (the gate's `Delegation.workRoot`); absent for every other dispatch. */
+  readonly workRoot?: string;
+  /** `requested` lies outside `workRoot`: the gate refuses it, so nothing may run there (no deferral, `cwd` = the work root). */
+  readonly outside: boolean;
+}
+
+/**
+ * #84 P3.3 DF2-F1: where a dispatch is verified. No work root (a tier dispatch, a role dispatch without a validated root): the
+ * explicit `cwd` exactly as before (I1). A role dispatch's work root: the explicit `cwd` resolved against the work root, else
+ * the work root itself; a `cwd` outside it is `outside` (refused by the gate) and every process then stays in the work root.
+ * `canonical` spells one directory one way (8.3 names, links) for the containment test; the gate uses the same function.
+ */
+export function verificationScope(
+  explicit: string | undefined,
+  workRoot: string | null | undefined,
+  canonical: (path: string) => string = (path) => path,
+): VerificationScope {
+  if (typeof workRoot !== "string" || workRoot === "") return { cwd: explicit, requested: explicit, outside: false };
+  const requested = resolveBaseDir(explicit?.trim() ? explicit : undefined, workRoot);
+  const outside = !isWithinDir(canonical(requested), canonical(workRoot));
+  return { cwd: outside ? workRoot : requested, requested, workRoot, outside };
+}
+
 /**
  * Resolve a (possibly relative) path against a base directory. Absolute paths
  * are returned unchanged so downstream fs seams that special-case absolute

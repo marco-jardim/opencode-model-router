@@ -55,7 +55,8 @@ import { resolveEnforcementMode } from "../../router/enforcement";
 import { roleGuardProfile } from "../../router/guard-profile";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../../router/roles";
 import { parseVerifyDirectives } from "../../verify/directives";
-import { buildDelegationDoD } from "../../verify/dispatch";
+import { buildDelegationDoD, canonicalPath } from "../../verify/dispatch";
+import { verificationScope } from "../../verify/paths";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
@@ -568,8 +569,13 @@ export function roleRouterGate(input: {
    * detection is never `deterministic` on its account. Absent = not deferred.
    */
   readonly deferred?: boolean;
+  /**
+   * #84 P3.3 DF2-F1: the gate cannot run the checks in the dispatch's work root ({@link roleGateOutsideWorkRoot}), so the
+   * detection is never `deterministic` on its account. Absent = it can.
+   */
+  readonly outsideWorkRoot?: boolean;
 }): boolean {
-  if (input.bypassed || input.deferred === true || input.acceptance !== "deterministic") return false;
+  if (input.bypassed || input.deferred === true || input.outsideWorkRoot === true || input.acceptance !== "deterministic") return false;
   let mode = "off";
   try {
     mode = resolveEnforcementMode({ config: input.cfg, env: { ...(input.env ?? process.env) } }).mode;
@@ -598,6 +604,25 @@ export function roleGateDeferred(cfg: RouterConfig, prompt: string, description:
     });
     if (directives.mode !== "deferred") return false;
     return buildDelegationDoD({ prompt, description }).checks.some((check) => check.kind === "testsPass");
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * #84 P3.3 DF2-F1: the router's gate verifies a role dispatch in its work root (index.ts `verificationScopeOf` → gate
+ * `Delegation.workRoot`). It cannot when the dispatch has no validated work root (`workRoot: null`), or when the prompt's
+ * `[acceptance]` block names a `cwd:` outside that root (the gate refuses it: unverifiable). Then the router's gate cannot back a
+ * `deterministic` detection. Fails toward "outside" on any error (a weaker detection, never a stronger one).
+ *
+ * What the decision row records is decided HERE, at dispatch: a gate that later reports the delegation unverifiable for a reason
+ * only the return shows (every change outside the work root, a timeout, a verifier error) does not rewrite the row — its verdict
+ * carries the caveat (`[router ⚠ UNVERIFIED …]`) and is never accepted as verified.
+ */
+export function roleGateOutsideWorkRoot(workRoot: string | null, prompt: string, description: string): boolean {
+  if (workRoot === null) return true;
+  try {
+    return verificationScope(buildDelegationDoD({ prompt, description }).cwd, workRoot, canonicalPath).outside;
   } catch {
     return true;
   }
@@ -1306,6 +1331,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       cfg: rp.cfg, bypassed: deps.isBypassed?.(call.sessionID) === true, acceptance, ...(deps.env === undefined ? {} : { env: deps.env }),
       // QA-P21-1-2, QA-P21-2 nit 3
       deferred: roleGateDeferred(rp.cfg, prompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false }),
+      outsideWorkRoot: roleGateOutsideWorkRoot(root.workRoot, prompt, description), // DF2-F1
     });
     const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance });
 

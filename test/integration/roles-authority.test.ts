@@ -778,6 +778,61 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     expect(replaced.effect).toBe("deny");
     expect(replaced.message).toMatch(/no longer a worktree/);
   }, 60_000);
+
+  // #84 P3.3 DF2-F1 (DF-2 step 4, live): an implementer dispatched with root=<sibling worktree> and `check: fileExists
+  // path=<worktree>\tmp-df2-probe.txt` got `[router ⚠ UNVERIFIED: none] … the producer changed files only outside <session dir>`
+  // while its detection was recorded `deterministic`: the gate ran the checks in the SESSION directory.
+  it.skipIf(!hasGit())("DF2-F1: a role dispatch into a sibling worktree is verified in that worktree; a cwd: outside it is refused and never deterministic", async () => {
+    const base = temp("omr-p33-repo-");
+    const main = join(base, "main");
+    mkdirSync(main);
+    git(["init", "-q"], main);
+    writeFileSync(join(main, "a.ts"), "export const a = 1;\n");
+    git(["add", "a.ts"], main);
+    git(["commit", "-q", "-m", "init"], main);
+    git(["worktree", "add", "-q", "-b", "b1", join(base, "wt-1")], main);
+    const wt1 = realpathSync.native(join(base, "wt-1"));
+    const { cfg } = home(ROLES);
+    const hooks = await plugin(main);
+    const sessions: Sessions = {};
+    const v2 = host(main, cfg, sessions);
+    await v2.start(hooks, { listWorktrees: gitWorktreeList });
+    /** Dispatch, let the child write `file` in its worktree (observed like the host's write), return; the parent's result text. */
+    const run = async (callID: string, child: string, acceptance: string, file: string) => {
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nWrite the probe file\n[acceptance]\n${acceptance}\n[/acceptance]`;
+      const input = await dispatch(v2, sessions, callID, child, "implementer", prompt, wt1, "probe");
+      const routed = routedRoleOf(callID);
+      writeFileSync(file, "probe\n");
+      await hooks["tool.execute.after"]({ tool: "write", sessionID: child, callID: `${callID}-w`, args: { filePath: file } }, { title: "", output: "", metadata: {} });
+      const text = `DONE: wrote ${file}:1`;
+      const event = {
+        sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input, status: "completed",
+        result: { output: { status: "completed", output: text, sessionID: child }, content: [{ type: "text", text }] },
+      };
+      await v2.toolHooks["execute.after"]!(event);
+      return { workRoot: routed?.workRoot, detection: routed?.detection, text: resultText(event) };
+    };
+    // The live case: an absolute check path in the worktree, no `cwd:` → verified there, and the deterministic detection holds.
+    const live = await run("df1", "c1", `check: fileExists path=${join(wt1, "tmp-df2-probe.txt")}`, join(wt1, "tmp-df2-probe.txt"));
+    expect(live.workRoot).toBe(wt1);
+    expect(live.detection).toBe("deterministic");
+    expect(live.text).not.toMatch(/only outside|UNVERIFIED/);
+    expect(live.text).toContain("[router \u2713 verified: deterministic]");
+    // A relative check path resolves in the work root, not the session directory.
+    const relative = await run("df2", "c2", "check: fileExists path=rel-probe.txt", join(wt1, "rel-probe.txt"));
+    expect(relative.detection).toBe("deterministic");
+    expect(relative.text).toContain("[router \u2713 verified: deterministic]");
+    // An explicit `cwd:` inside the work root still wins.
+    mkdirSync(join(wt1, "pkg"));
+    const inside = await run("df3", "c3", `cwd: ${join(wt1, "pkg")}\ncheck: fileExists path=in-pkg.txt`, join(wt1, "pkg", "in-pkg.txt"));
+    expect(inside.detection).toBe("deterministic");
+    expect(inside.text).toContain("[router \u2713 verified: deterministic]");
+    // An explicit `cwd:` outside the work root (here the session directory): refused, and the row never says deterministic.
+    const outside = await run("df4", "c4", `cwd: ${main}\ncheck: fileExists path=${join(wt1, "out-probe.txt")}`, join(wt1, "out-probe.txt"));
+    expect(outside.detection).not.toBe("deterministic");
+    expect(outside.text).toMatch(/outside this role dispatch's work root/);
+    expect(outside.text).not.toContain("verified: deterministic");
+  }, 60_000);
 });
 
 describe("QA round 1 (P2.3)", () => {
