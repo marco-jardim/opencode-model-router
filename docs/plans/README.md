@@ -44,6 +44,15 @@ This directory holds design/implementation plans for `opencode-model-router`.
     — kickoff prompt, execution state, planning-session considerations,
     troubleshooting, and the resume point after every host restart.
 
+- [`role-tier-assurance-delegation-plan.md`](./role-tier-assurance-delegation-plan.md)
+  — Role × Tier × Assurance delegation (#84; target `2.4.0`, OpenCode v2 only,
+  v1 keeps the tier model): the orchestrator picks a role, the router picks the
+  tier per dispatch under an authority × detection floor, least-privilege role
+  contracts with capability separation, dynamic authority with a resume-based
+  ladder for `general`, a structured `router_run` tool, role-aware guards and
+  budgets, and outcome evidence only from external verification. Revised
+  hypotheses grounded in the literature and the 2026-10-06/07 run evidence.
+
 ## Related records
 
 - Architecture decision records: [`../adr/`](../adr/)
