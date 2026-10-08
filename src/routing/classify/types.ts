@@ -282,6 +282,12 @@ export interface RouteLine {
   readonly needs?: readonly Need[];
   /** Present only when `d=` carried a valid DETECTIONS value; then source is `plan`. */
   readonly detection?: Detection;
+  /** `tier=fast|medium|heavy`; the engine checks it against the active tier list. */
+  readonly tier?: string;
+  /** `budget=<int>`, 1..10000. */
+  readonly budget?: number;
+  /** `root=<absolute path>` (Windows drive/UNC or POSIX); quote it to carry spaces. */
+  readonly root?: string;
   /** Bare `pin` flag (or `pin=true|yes|1`). */
   readonly pin: boolean;
   /** Keys that were unknown or whose values were invalid (for logging only). */
