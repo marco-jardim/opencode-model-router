@@ -710,18 +710,19 @@ describe("QA round 1", () => {
 
   it("QA-P12-1-5: one tier order for tierBounds and the ladder; an empty window says so and dispatches nothing", () => {
     const cfg = cfgOf(TIERS, { ladder: ["fast", "heavy"] });
-    expect(roleTierOrder(cfg)).toEqual(["fast", "heavy"]);
+    // plan R7: the order is the preset's (presetTierOrder), not the configured escalate ladder
+    expect(roleTierOrder(cfg)).toEqual(["fast", "medium", "heavy"]);
     expect(roleTierOrder(CFG)).toEqual(escalateLadder(CFG));
     const bounds = tierBounds(EXPLORER, grantOf(...LOCAL), facts({ class: "search" }), "none", {
       floorTier: null, runningTier: null, pinTier: null, tiers: roleTierOrder(cfg),
     });
     const ladder = buildRoleLadder({ cfg, facts: { class: "search", needs: [] }, role: "explorer", window: bounds });
-    expect(ladder.candidates.map((c) => c.tier)).toEqual(["fast"]);
+    expect(ladder.candidates.map((c) => c.tier)).toEqual(["fast", "medium"]);
     // a window named on another order than the ladder's: no candidate, no dispatch, never a fallback
-    const mismatched = buildRoleLadder({ cfg, facts: { class: "search", needs: [] }, role: "explorer", window: win("medium", "medium") });
+    const mismatched = buildRoleLadder({ cfg, facts: { class: "search", needs: [] }, role: "explorer", window: win("ghost", "ghost") });
     expect(mismatched.reasons).toContain("window:no-candidates");
     expect(decideRole(input(mismatched)).dispatch).toBeNull();
-    expect(roleEscalatePolicy(cfg, win("medium", "medium"))).toBeNull();
+    expect(roleEscalatePolicy(cfg, win("ghost", "ghost"))).toBeNull();
   });
 
   it("QA-P12-1-7: the ladder's paths are simulated under roleEscalatePolicy (a ladder ending below heavy never escalates past it)", () => {

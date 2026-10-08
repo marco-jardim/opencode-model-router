@@ -36,7 +36,7 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { AuthorityAction } from "../../router/roles";
-import type { DispatchGrant } from "./policy";
+import { GRANT_NOTES, type DispatchGrant } from "./policy";
 
 export interface PendingDispatch {
   parentSessionID: string;
@@ -113,7 +113,7 @@ export const BINDING_NOTES = {
   claimed: "binding unknown: the dispatch named by this session's nonce is already bound to another session",
   beyondMax: (actions: readonly AuthorityAction[]): string => `outside the role max, dropped: ${actions.join(", ")}`,
   noWorkRoot: "router_run needs a bound work root (root=) — not granted",
-  separation: "egress dropped: a grant never mixes local, exec or write actions with egress (separation rule)",
+  separation: GRANT_NOTES.separation,
   widened: (actions: readonly AuthorityAction[]): string => `authority widened on resume: ${actions.join(", ")}`,
   notBound: "no binding for this session: nothing widened",
 } as const;
