@@ -1,0 +1,876 @@
+{
+  "test": "budget-signals",
+  "recordedAt": "2026-10-08T21:41:26.254Z",
+  "observed": {
+    "budget": {
+      "label": "budget",
+      "callID": "toolu_smoke_1",
+      "childID": "ses_ee289ade0ffen5sul329JpAh7T",
+      "parentText": "<subagent sessionID=\"ses_ee289ade0ffen5sul329JpAh7T\" state=\"completed\">\nNEED MORE: budget\nread e0.txt to e2.txt; e3.txt and e4.txt remain\n</subagent>\n[router budget] @explorer stopped on its tool-call budget before finishing: this is not a failed result. NEXT: resume the same sessionID (\"ses_ee289ade0ffen5sul329JpAh7T\") with @explorer and the prompt \"continue and finish\"; do not start a new task and do not set `model` (the router keeps the child's tier).\nNEED MORE: budget\nread e0.txt to e2.txt; e3.txt and e4.txt remain\n\n[router budget] @explorer stopped on its tool-call budget before finishing: this is not a failed result. NEXT: resume the same sessionID (\"ses_ee289ade0ffen5sul329JpAh7T\") with @explorer and the prompt \"continue and finish\"; do not start a new task and do not set `model` (the router keeps the child's tier).",
+      "firstUser": "{\"id\":\"msg_11d7652c9001caHlFmqkOfaE4I\",\"time\":{\"created\":1791495656172},\"text\":\"You are a subagent spawned by another session.\\nTASK: read the five e files\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtc2lnbmFscy1wNWNTS1JcXHByb2plY3RcXGUwLnR4dCJ9fSx7InRvb2wiOiJyZWFkIiwiaW5wdXQiOnsicGF0aCI6IkM6XFxVc2Vyc1xcTWFycXVpbmhvXFxBcHBEYXRhXFxMb2NhbFxcVGVtcFxcb21yLXNtb2tlLXRtcC0yOTI4OC0xNzkxNDk1NDMwNTYyXFxvbXItcDMyLXJvbGVzLXNpZ25hbHMtcDVjU0tSXFxwcm9qZWN0XFxlMS50eHQifX0seyJ0b29sIjoicmVhZCIsImlucHV0Ijp7InBhdGgiOiJDOlxcVXNlcnNcXE1hcnF1aW5ob1xcQXBwRGF0YVxcTG9jYWxcXFRlbXBcXG9tci1zbW9rZS10bXAtMjkyODgtMTc5MTQ5NTQzMDU2Mlxcb21yLXAzMi1yb2xlcy1zaWduYWxzLXA1Y1NLUlxccHJvamVjdFxcZTIudHh0In19LHsidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtc2lnbmFscy1wNWNTS1JcXHByb2plY3RcXGUzLnR4dCJ9fSx7InRvb2wiOiJyZWFkIiwiaW5wdXQiOnsicGF0aCI6IkM6XFxVc2Vyc1xcTWFycXVpbmhvXFxBcHBEYXRhXFxMb2NhbFxcVGVtcFxcb21yLXNtb2tlLXRtcC0yOTI4OC0xNzkxNDk1NDMwNTYyXFxvbXItcDMyLXJvbGVzLXNpZ25hbHMtcDVjU0tSXFxwcm9qZWN0XFxlNC50eHQifX1dLCJmaW5hbCI6Ik5FRUQgTU9SRTogYnVkZ2V0XG5yZWFkIGUwLnR4dCB0byBlMi50eHQ7IGUzLnR4dCBhbmQgZTQudHh0IHJlbWFpbiJ9\\nOMR_NONCE=7528532e-9508-4b1b-9597-f77bb7c9a4b7\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e0.txt, lines 1-1\n1: main",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e0.txt"
+          },
+          "tool": "read",
+          "status": "completed"
+        },
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e1.txt, lines 1-1\n1: main",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e1.txt"
+          },
+          "tool": "read",
+          "status": "completed"
+        },
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e2.txt, lines 1-1\n1: main",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e2.txt"
+          },
+          "tool": "read",
+          "status": "completed"
+        },
+        {
+          "text": "",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e3.txt"
+          },
+          "tool": "read",
+          "status": "error",
+          "errorType": "unknown",
+          "errorMessage": "DENIED: tool-call budget 3 exhausted. Stop now and return `NEED MORE: budget` with a progress summary: what is done, what remains, and the evidence so far.\n[budget 3/3 | deliverable=n/a | reads_since_produce=3] NEXT: return `NEED MORE: budget` with a progress summary"
+        },
+        {
+          "text": "",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e4.txt"
+          },
+          "tool": "read",
+          "status": "error",
+          "errorType": "unknown",
+          "errorMessage": "DENIED: tool-call budget 3 exhausted. Stop now and return `NEED MORE: budget` with a progress summary: what is done, what remains, and the evidence so far.\n[budget 3/3 | deliverable=n/a | reads_since_produce=3] NEXT: return `NEED MORE: budget` with a progress summary"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 2,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 3,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 4,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 5,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 6,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 7,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "read",
+          "resources": [
+            "e0.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "e1.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "e2.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "signals budget [nonce 7528532e-9508-4b1b-9597-f77bb7c9a4b7]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "budgetResume": {
+      "label": "budget resume",
+      "callID": "toolu_smoke_9",
+      "childID": "ses_ee289ade0ffen5sul329JpAh7T",
+      "parentText": "<subagent sessionID=\"ses_ee289ade0ffen5sul329JpAh7T\" state=\"completed\">\nDONE: e3.txt:1 e4.txt:1\n</subagent>\nDONE: e3.txt:1 e4.txt:1",
+      "firstUser": "{\"id\":\"msg_11d7652c9001caHlFmqkOfaE4I\",\"time\":{\"created\":1791495656172},\"text\":\"You are a subagent spawned by another session.\\nTASK: read the five e files\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtc2lnbmFscy1wNWNTS1JcXHByb2plY3RcXGUwLnR4dCJ9fSx7InRvb2wiOiJyZWFkIiwiaW5wdXQiOnsicGF0aCI6IkM6XFxVc2Vyc1xcTWFycXVpbmhvXFxBcHBEYXRhXFxMb2NhbFxcVGVtcFxcb21yLXNtb2tlLXRtcC0yOTI4OC0xNzkxNDk1NDMwNTYyXFxvbXItcDMyLXJvbGVzLXNpZ25hbHMtcDVjU0tSXFxwcm9qZWN0XFxlMS50eHQifX0seyJ0b29sIjoicmVhZCIsImlucHV0Ijp7InBhdGgiOiJDOlxcVXNlcnNcXE1hcnF1aW5ob1xcQXBwRGF0YVxcTG9jYWxcXFRlbXBcXG9tci1zbW9rZS10bXAtMjkyODgtMTc5MTQ5NTQzMDU2Mlxcb21yLXAzMi1yb2xlcy1zaWduYWxzLXA1Y1NLUlxccHJvamVjdFxcZTIudHh0In19LHsidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtc2lnbmFscy1wNWNTS1JcXHByb2plY3RcXGUzLnR4dCJ9fSx7InRvb2wiOiJyZWFkIiwiaW5wdXQiOnsicGF0aCI6IkM6XFxVc2Vyc1xcTWFycXVpbmhvXFxBcHBEYXRhXFxMb2NhbFxcVGVtcFxcb21yLXNtb2tlLXRtcC0yOTI4OC0xNzkxNDk1NDMwNTYyXFxvbXItcDMyLXJvbGVzLXNpZ25hbHMtcDVjU0tSXFxwcm9qZWN0XFxlNC50eHQifX1dLCJmaW5hbCI6Ik5FRUQgTU9SRTogYnVkZ2V0XG5yZWFkIGUwLnR4dCB0byBlMi50eHQ7IGUzLnR4dCBhbmQgZTQudHh0IHJlbWFpbiJ9\\nOMR_NONCE=7528532e-9508-4b1b-9597-f77bb7c9a4b7\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e3.txt, lines 1-1\n1: main",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e3.txt"
+          },
+          "tool": "read",
+          "status": "completed"
+        },
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e4.txt, lines 1-1\n1: main",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e4.txt"
+          },
+          "tool": "read",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 10,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 11,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 12,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "read",
+          "resources": [
+            "e0.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "e1.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "e2.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "e3.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "read",
+          "resources": [
+            "e4.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "signals budget [nonce 7528532e-9508-4b1b-9597-f77bb7c9a4b7]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "verdictPass": "<subagent sessionID=\"ses_ee28992a0ffe6DOM0Ow2in6Q6G\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: deterministic]\nCHILD_OK\n\n[router ✓ verified: deterministic]",
+    "verdictFail": "<subagent sessionID=\"ses_ee289894affeKwUEIX14fB9WFl\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\lexer-never-created.ts\nNEXT: resume the same sessionID (\"ses_ee289894affeKwUEIX14fB9WFl\") with @architect and the findings (it already runs on its highest tier, heavy); set neither `model` nor `tier=`; do not start a new task and do not treat the prior result as complete.\nCHILD_OK\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\lexer-never-created.ts\nNEXT: resume the same sessionID (\"ses_ee289894affeKwUEIX14fB9WFl\") with @architect and the findings (it already runs on its highest tier, heavy); set neither `model` nor `tier=`; do not start a new task and do not treat the prior result as complete.",
+    "run": {
+      "label": "run",
+      "callID": "toolu_smoke_20",
+      "childID": "ses_ee2898108ffe0VpZgvAuX45VF0",
+      "parentText": "<subagent sessionID=\"ses_ee2898108ffe0VpZgvAuX45VF0\" state=\"completed\">\nDONE: e5.txt:1 edited; smoke-marker exit code 0\n</subagent>\n\n\n[router ✓ verified: deterministic]\nDONE: e5.txt:1 edited; smoke-marker exit code 0\n\n[router ✓ verified: deterministic]",
+      "firstUser": "{\"id\":\"msg_11d767fa6001vvVT3QN4O0HERp\",\"time\":{\"created\":1791495667647},\"text\":\"You are a subagent spawned by another session.\\nTASK: update e5.txt and run the smoke-marker script\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6ImVkaXQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtc2lnbmFscy1wNWNTS1JcXHByb2plY3RcXGU1LnR4dCIsIm9sZFN0cmluZyI6Im1haW4iLCJuZXdTdHJpbmciOiJlZGl0ZWQifX0seyJ0b29sIjoicm91dGVyX3J1biIsImlucHV0Ijp7InNjcmlwdCI6InNtb2tlLW1hcmtlciIsImN3ZCI6IkM6XFxVc2Vyc1xcTWFycXVpbmhvXFxBcHBEYXRhXFxMb2NhbFxcVGVtcFxcb21yLXNtb2tlLXRtcC0yOTI4OC0xNzkxNDk1NDMwNTYyXFxvbXItcDMyLXJvbGVzLXNpZ25hbHMtcDVjU0tSXFxwcm9qZWN0In19XSwiZmluYWwiOiJET05FOiBlNS50eHQ6MSBlZGl0ZWQ7IHNtb2tlLW1hcmtlciBleGl0IGNvZGUgMCJ9\\n[acceptance]\\ncheck: run command=\\\"npm run smoke-marker\\\"\\n[/acceptance]\\nOMR_NONCE=71cefd53-21f5-4d72-8713-6daf0a95d849\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Edited e5.txt (1 replacement)",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e5.txt",
+            "oldString": "main",
+            "newString": "edited"
+          },
+          "tool": "edit",
+          "status": "completed"
+        },
+        {
+          "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.6 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",
+          "input": {
+            "script": "smoke-marker",
+            "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project"
+          },
+          "tool": "router_run",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 21,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "router_run",
+            "write"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "tier": "medium"
+        },
+        {
+          "seq": 22,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "router_run",
+            "write"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "tier": "medium"
+        },
+        {
+          "seq": 23,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "router_run",
+            "write"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "tier": "medium"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "edit",
+          "resources": [
+            "e5.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "implementer",
+      "title": "signals run [nonce 71cefd53-21f5-4d72-8713-6daf0a95d849]",
+      "model": "anthropic/claude-sonnet-5-5#medium",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "grader": {
+      "label": "grader",
+      "callID": "toolu_smoke_25",
+      "childID": "ses_ee2896e8dffexzdGlyHmZ5IPRU",
+      "parentText": "<subagent sessionID=\"ses_ee2896e8dffexzdGlyHmZ5IPRU\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: checker]\nCHILD_OK\n\n[router ✓ verified: checker]",
+      "firstUser": "{\"id\":\"msg_11d769221001gZGQW2yOKobOWN\",\"time\":{\"created\":1791495672375},\"text\":\"You are a subagent spawned by another session.\\nVERIFY: required\\nTASK: say where parse is defined\\n[acceptance]\\ncriteria: the reply names where parse is defined\\n[/acceptance]\\nOMR_NONCE=0c4055a0-74e3-461d-984a-426af2b19498\",\"type\":\"user\"}",
+      "states": [],
+      "requests": [
+        {
+          "seq": 26,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "signals grader [nonce 0c4055a0-74e3-461d-984a-426af2b19498]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6",
+      "gradersRan": 1,
+      "graderRequests": [
+        {
+          "session": "ses_ee2896aeaffeuElNPLpb04G5Ud",
+          "agent": "model-router-grader",
+          "catalogModel": "anthropic/claude-opus-5-5#default",
+          "tier": "heavy"
+        }
+      ]
+    },
+    "incomplete": {
+      "label": "incomplete",
+      "callID": "toolu_smoke_29",
+      "childID": "ses_ee2896427ffe4GuHfdlyWH7RiU",
+      "parentText": "<subagent sessionID=\"ses_ee2896427ffe4GuHfdlyWH7RiU\" state=\"completed\">\nNEED MORE: the lexer module is missing from the context\n</subagent>\nNEED MORE: the lexer module is missing from the context",
+      "firstUser": "{\"id\":\"msg_11d769ca8001OpLYsmqJm3M28z\",\"time\":{\"created\":1791495675072},\"text\":\"You are a subagent spawned by another session.\\nTASK: sketch the parser design\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJlYWQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtc2lnbmFscy1wNWNTS1JcXHByb2plY3RcXHBhcnNlci50cyJ9fV0sImZpbmFsIjoiTkVFRCBNT1JFOiB0aGUgbGV4ZXIgbW9kdWxlIGlzIG1pc3NpbmcgZnJvbSB0aGUgY29udGV4dCJ9\\nOMR_NONCE=3349f90a-fd8a-4192-80ba-c442c1f6d47f\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\parser.ts, lines 1-3\n1: export function parse(text: string): string[] {\n2:   return text.split(' ');\n3: }",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\parser.ts"
+          },
+          "tool": "read",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 30,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+          "tier": "heavy"
+        },
+        {
+          "seq": 31,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+          "tier": "heavy"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "read",
+          "resources": [
+            "parser.ts"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "architect",
+      "title": "signals incomplete [nonce 3349f90a-fd8a-4192-80ba-c442c1f6d47f]",
+      "model": "anthropic/claude-opus-5-5#xhigh",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "authority": {
+      "label": "authority",
+      "callID": "toolu_smoke_33",
+      "childID": "ses_ee2895a65ffeTOXmkelVfo76pF",
+      "parentText": "<subagent sessionID=\"ses_ee2895a65ffeTOXmkelVfo76pF\" state=\"completed\">\nESCALATE: authority\nedit is needed\n</subagent>\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the result must be written to a file\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee2895a65ffeTOXmkelVfo76pF\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.\nESCALATE: authority\nedit is needed\n\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the result must be written to a file\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee2895a65ffeTOXmkelVfo76pF\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.",
+      "firstUser": "{\"id\":\"msg_11d76a65400126BCWeJOVyWIyp\",\"time\":{\"created\":1791495677548},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJvdXRlcl9yZXF1ZXN0X2F1dGhvcml0eSIsImlucHV0Ijp7ImFjdGlvbnMiOlsiZWRpdCJdLCJyZWFzb24iOiJ0aGUgcmVzdWx0IG11c3QgYmUgd3JpdHRlbiB0byBhIGZpbGUifX1dLCJmaW5hbCI6IkVTQ0FMQVRFOiBhdXRob3JpdHlcbmVkaXQgaXMgbmVlZGVkIn0=\\nOMR_NONCE=a6ca1cc0-15be-4913-9743-45bf2c4dc8cf\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Authority request recorded: edit. Stop now and return `ESCALATE: authority` naming edit and why; the parent resumes this task with the wider grant.",
+          "input": {
+            "actions": [
+              "edit"
+            ],
+            "reason": "the result must be written to a file"
+          },
+          "tool": "router_request_authority",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 34,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 35,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "general",
+      "title": "signals authority [nonce a6ca1cc0-15be-4913-9743-45bf2c4dc8cf]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "first": {
+      "label": "redispatch first",
+      "callID": "toolu_smoke_37",
+      "childID": "ses_ee289511fffe28MVQeYTjgxV6m",
+      "parentText": "<subagent sessionID=\"ses_ee289511fffe28MVQeYTjgxV6m\" state=\"completed\">\nDONE: parser.ts:1 parse\n</subagent>\nDONE: parser.ts:1 parse",
+      "firstUser": "{\"id\":\"msg_11d76afa1001OePCsUCUhLXINK\",\"time\":{\"created\":1791495679939},\"text\":\"You are a subagent spawned by another session.\\nTASK: find the exported entry points of parser.ts and list them with file:line\\nCHILD_SCRIPT64=eyJzdGVwcyI6W10sImZpbmFsIjoiRE9ORTogcGFyc2VyLnRzOjEgcGFyc2UifQ==\\nOMR_NONCE=2d90ec60-2ec5-49da-a58b-154340090a2a\",\"type\":\"user\"}",
+      "states": [],
+      "requests": [
+        {
+          "seq": 38,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "signals redispatch first [nonce 2d90ec60-2ec5-49da-a58b-154340090a2a]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "again": {
+      "label": "redispatch again",
+      "callID": "toolu_smoke_40",
+      "childID": "ses_ee28948f5ffeYGVmTFkI3ZKmKP",
+      "parentText": "<subagent sessionID=\"ses_ee28948f5ffeYGVmTFkI3ZKmKP\" state=\"completed\">\nDONE: parser.ts:1 parse\n</subagent>\nDONE: parser.ts:1 parse",
+      "firstUser": "{\"id\":\"msg_11d76b7cd0015DyNkBh7HoHKd5\",\"time\":{\"created\":1791495682021},\"text\":\"You are a subagent spawned by another session.\\nTASK: find the exported entry points of parser.ts and list them with file:line\\nCHILD_SCRIPT64=eyJzdGVwcyI6W10sImZpbmFsIjoiRE9ORTogcGFyc2VyLnRzOjEgcGFyc2UifQ==\\nOMR_NONCE=28186229-2981-4ccc-9750-83a219a8a2d7\",\"type\":\"user\"}",
+      "states": [],
+      "requests": [
+        {
+          "seq": 41,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "tier": "medium"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "explorer",
+      "title": "signals redispatch again [nonce 28186229-2981-4ccc-9750-83a219a8a2d7]",
+      "model": "anthropic/claude-sonnet-5-5#medium",
+      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+    },
+    "found": {
+      "verdictPass": true,
+      "verdictFail": true,
+      "run": true,
+      "grader": true,
+      "incomplete": true,
+      "budget": true,
+      "authority": true,
+      "redispatch": true
+    },
+    "kinds": [
+      "authority",
+      "budget",
+      "grader",
+      "incomplete",
+      "redispatch",
+      "run",
+      "verdict"
+    ],
+    "signals": [
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495655491:5bfd1a717eb5a278:1",
+        "reason": "note:signal:budget:none",
+        "role": "explorer",
+        "tier": "fast",
+        "facts": {
+          "class": "search",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee289ade0ffen5sul329JpAh7T",
+        "signal": "budget",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495662262:5bfd1a717eb5a278:3",
+        "reason": "note:signal:verdict:pass",
+        "role": "architect",
+        "tier": "heavy",
+        "facts": {
+          "class": "design",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee28992a0ffe6DOM0Ow2in6Q6G",
+        "signal": "verdict",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495664785:5bfd1a717eb5a278:4",
+        "reason": "note:signal:verdict:fail",
+        "role": "architect",
+        "tier": "heavy",
+        "facts": {
+          "class": "design",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee289894affeKwUEIX14fB9WFl",
+        "signal": "verdict",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495667044:5bfd1a717eb5a278:5",
+        "reason": "note:signal:run:pass",
+        "role": "implementer",
+        "tier": "medium",
+        "facts": {
+          "class": "implement",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [
+            "shell",
+            "edit"
+          ],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee2898108ffe0VpZgvAuX45VF0",
+        "signal": "run",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495667044:5bfd1a717eb5a278:5",
+        "reason": "note:signal:verdict:pass",
+        "role": "implementer",
+        "tier": "medium",
+        "facts": {
+          "class": "implement",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [
+            "shell",
+            "edit"
+          ],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee2898108ffe0VpZgvAuX45VF0",
+        "signal": "verdict",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495671744:5bfd1a717eb5a278:6",
+        "reason": "note:signal:grader:pass",
+        "role": "explorer",
+        "tier": "fast",
+        "facts": {
+          "class": "search",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee2896e8dffexzdGlyHmZ5IPRU",
+        "signal": "grader",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495674437:5bfd1a717eb5a278:7",
+        "reason": "note:signal:incomplete:fail",
+        "role": "architect",
+        "tier": "heavy",
+        "facts": {
+          "class": "design",
+          "risk": "high",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee2896427ffe4GuHfdlyWH7RiU",
+        "signal": "incomplete",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495676848:5bfd1a717eb5a278:8",
+        "reason": "note:signal:authority:none",
+        "role": "general",
+        "tier": "fast",
+        "facts": {
+          "class": "search",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee2895a65ffeTOXmkelVfo76pF",
+        "signal": "authority",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495679261:5bfd1a717eb5a278:9",
+        "reason": "note:signal:redispatch:fail",
+        "role": "explorer",
+        "tier": "fast",
+        "facts": {
+          "class": "search",
+          "risk": "low",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee289511fffe28MVQeYTjgxV6m",
+        "signal": "redispatch",
+        "pinned": false,
+        "switched": false
+      }
+    ],
+    "disk": {
+      "e5": "edited\n",
+      "marker": true,
+      "wt1": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\wt-1"
+    },
+    "unknownBindings": [],
+    "routerWarnings": [],
+    "hostErrors": [],
+    "providerErrors": []
+  }
+}

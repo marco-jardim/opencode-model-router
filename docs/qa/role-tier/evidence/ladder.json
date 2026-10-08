@@ -1,0 +1,297 @@
+{
+  "test": "ladder",
+  "recordedAt": "2026-10-08T21:39:41.647Z",
+  "observed": {
+    "first": {
+      "label": "ladder fresh",
+      "callID": "toolu_smoke_1",
+      "childID": "ses_ee28b466dffec7B8Uklyx5d5LY",
+      "parentText": "<subagent sessionID=\"ses_ee28b466dffec7B8Uklyx5d5LY\" state=\"completed\">\nESCALATE: authority\nedit is needed to write the entry points into e1.txt\n</subagent>\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the entry points must be written into e1.txt\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee28b466dffec7B8Uklyx5d5LY\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.\nESCALATE: authority\nedit is needed to write the entry points into e1.txt\n\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the entry points must be written into e1.txt\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee28b466dffec7B8Uklyx5d5LY\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.",
+      "firstUser": "{\"id\":\"msg_11d74ba260010D1tijiIEEObCY\",\"time\":{\"created\":1791495551547},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6ImVkaXQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtbGFkZGVyLVF5NUxqWlxcd3QtMVxcZTEudHh0Iiwib2xkU3RyaW5nIjoibWFpbiIsIm5ld1N0cmluZyI6ImVkaXRlZCJ9fSx7InRvb2wiOiJyb3V0ZXJfcmVxdWVzdF9hdXRob3JpdHkiLCJpbnB1dCI6eyJhY3Rpb25zIjpbImVkaXQiXSwicmVhc29uIjoidGhlIGVudHJ5IHBvaW50cyBtdXN0IGJlIHdyaXR0ZW4gaW50byBlMS50eHQifX1dLCJmaW5hbCI6IkVTQ0FMQVRFOiBhdXRob3JpdHlcbmVkaXQgaXMgbmVlZGVkIHRvIHdyaXRlIHRoZSBlbnRyeSBwb2ludHMgaW50byBlMS50eHQifQ==\\nOMR_NONCE=d242f896-2164-4a4e-8a43-c928993c0065\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-ladder-Qy5LjZ\\wt-1\\e1.txt",
+            "oldString": "main",
+            "newString": "edited"
+          },
+          "tool": "edit",
+          "status": "error",
+          "errorType": "unknown",
+          "errorMessage": "[router] Refused for role agent general in this dispatch: edit is not in this dispatch's grant (read, glob, grep, router_git)"
+        },
+        {
+          "text": "Authority request recorded: edit. Stop now and return `ESCALATE: authority` naming edit and why; the parent resumes this task with the wider grant.",
+          "input": {
+            "actions": [
+              "edit"
+            ],
+            "reason": "the entry points must be written into e1.txt"
+          },
+          "tool": "router_request_authority",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 2,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 3,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        },
+        {
+          "seq": 4,
+          "toolNames": [
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "tier": "fast"
+        }
+      ],
+      "evaluates": [],
+      "parentStatus": "completed",
+      "agent": "general",
+      "title": "ladder general [nonce d242f896-2164-4a4e-8a43-c928993c0065]",
+      "model": "anthropic/claude-sonnet-5-5#low",
+      "parentID": "ses_ee28b53d5ffe34Qjbe7QwYIvX0"
+    },
+    "resumed": {
+      "label": "ladder resume",
+      "callID": "toolu_smoke_6",
+      "childID": "ses_ee28b466dffec7B8Uklyx5d5LY",
+      "parentText": "<subagent sessionID=\"ses_ee28b466dffec7B8Uklyx5d5LY\" state=\"completed\">\nDONE: e1.txt:1 edited\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: e1.txt:1 edited\n\n[router ✓ verified: checker]",
+      "firstUser": "{\"id\":\"msg_11d74ba260010D1tijiIEEObCY\",\"time\":{\"created\":1791495551547},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6ImVkaXQiLCJpbnB1dCI6eyJwYXRoIjoiQzpcXFVzZXJzXFxNYXJxdWluaG9cXEFwcERhdGFcXExvY2FsXFxUZW1wXFxvbXItc21va2UtdG1wLTI5Mjg4LTE3OTE0OTU0MzA1NjJcXG9tci1wMzItcm9sZXMtbGFkZGVyLVF5NUxqWlxcd3QtMVxcZTEudHh0Iiwib2xkU3RyaW5nIjoibWFpbiIsIm5ld1N0cmluZyI6ImVkaXRlZCJ9fSx7InRvb2wiOiJyb3V0ZXJfcmVxdWVzdF9hdXRob3JpdHkiLCJpbnB1dCI6eyJhY3Rpb25zIjpbImVkaXQiXSwicmVhc29uIjoidGhlIGVudHJ5IHBvaW50cyBtdXN0IGJlIHdyaXR0ZW4gaW50byBlMS50eHQifX1dLCJmaW5hbCI6IkVTQ0FMQVRFOiBhdXRob3JpdHlcbmVkaXQgaXMgbmVlZGVkIHRvIHdyaXRlIHRoZSBlbnRyeSBwb2ludHMgaW50byBlMS50eHQifQ==\\nOMR_NONCE=d242f896-2164-4a4e-8a43-c928993c0065\",\"type\":\"user\"}",
+      "states": [
+        {
+          "text": "Edited <home>/<user>/Local/Temp/omr-smoke-tmp-29288-1791495430562/omr-p32-roles-ladder-Qy5LjZ/wt-1/e1.txt (1 replacement)",
+          "input": {
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-ladder-Qy5LjZ\\wt-1\\e1.txt",
+            "oldString": "main",
+            "newString": "edited"
+          },
+          "tool": "edit",
+          "status": "completed"
+        }
+      ],
+      "requests": [
+        {
+          "seq": 7,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "write"
+          ],
+          "reply": "tool",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "tier": "medium"
+        },
+        {
+          "seq": 8,
+          "toolNames": [
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "router_git_blame",
+            "router_git_diff",
+            "router_git_log",
+            "router_git_ls_files",
+            "router_git_show",
+            "router_git_status",
+            "router_request_authority",
+            "write"
+          ],
+          "reply": "text",
+          "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "tier": "medium"
+        }
+      ],
+      "evaluates": [
+        {
+          "action": "external_directory",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-29288-1791495430562/omr-p32-roles-ladder-Qy5LjZ/wt-1/*"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        },
+        {
+          "action": "edit",
+          "resources": [
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-29288-1791495430562/omr-p32-roles-ladder-Qy5LjZ/wt-1/e1.txt"
+          ],
+          "effectIn": "allow",
+          "effectOut": "allow"
+        }
+      ],
+      "parentStatus": "completed",
+      "agent": "general",
+      "title": "ladder general [nonce d242f896-2164-4a4e-8a43-c928993c0065]",
+      "model": "anthropic/claude-sonnet-5-5#medium",
+      "parentID": "ses_ee28b53d5ffe34Qjbe7QwYIvX0"
+    },
+    "afterFirst": "main\n",
+    "afterResume": "edited\n",
+    "generalExternal": [
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-ladder-Qy5LjZ\\project\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-ladder-Qy5LjZ\\wt-1\\*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-ladder-Qy5LjZ\\wt-late-*",
+        "effect": "allow"
+      },
+      {
+        "action": "external_directory",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-ladder-Qy5LjZ\\data\\opencode\\tool-output\\*",
+        "effect": "allow"
+      }
+    ],
+    "fresh": {
+      "decisionID": "ses_ee28b53d5ffe34Qjbe7QwYIvX0:1791495551015:a82229d34d72b68e:1",
+      "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.58 ratio); role @general on fast in fast..heavy",
+      "role": "general",
+      "tier": "fast",
+      "grant": [
+        "glob",
+        "grep",
+        "read",
+        "router_git"
+      ],
+      "boundsReasons": [],
+      "detection": {
+        "effective": "none"
+      },
+      "facts": {
+        "class": "search",
+        "risk": "medium",
+        "scope": "single",
+        "needs": [],
+        "confidence": 0.9,
+        "source": "route-line"
+      },
+      "resume": false,
+      "childSessionID": null,
+      "explore": false,
+      "propensity": 1,
+      "pinned": false,
+      "switched": false
+    },
+    "resumeRow": {
+      "decisionID": "ses_ee28b53d5ffe34Qjbe7QwYIvX0:1791495553265:a82229d34d72b68e:2",
+      "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (7.5564 ratio); role @general on medium in medium..heavy [default:no-class-tier; resume:off-ladder; authority widened on resume: edit]",
+      "role": "general",
+      "tier": "medium",
+      "grant": [
+        "edit",
+        "glob",
+        "grep",
+        "read",
+        "router_git"
+      ],
+      "binding": "exact",
+      "boundsReasons": [
+        "floor:authority"
+      ],
+      "detection": {
+        "effective": "none"
+      },
+      "facts": {
+        "class": "other",
+        "risk": "medium",
+        "scope": "single",
+        "needs": [],
+        "confidence": 0.2,
+        "source": "rules"
+      },
+      "resume": true,
+      "childSessionID": "ses_ee28b466dffec7B8Uklyx5d5LY",
+      "explore": false,
+      "propensity": 1,
+      "pinned": false,
+      "switched": false
+    },
+    "signals": [
+      {
+        "decisionID": "ses_ee28b53d5ffe34Qjbe7QwYIvX0:1791495551015:a82229d34d72b68e:1",
+        "reason": "note:signal:authority:none",
+        "role": "general",
+        "tier": "fast",
+        "facts": {
+          "class": "search",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee28b466dffec7B8Uklyx5d5LY",
+        "signal": "authority",
+        "pinned": false,
+        "switched": false
+      }
+    ],
+    "unknownBindings": [],
+    "routerWarnings": [],
+    "hostErrors": [],
+    "providerErrors": []
+  }
+}
