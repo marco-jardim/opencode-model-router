@@ -111,4 +111,10 @@ The 25-call tier budget is unchanged in tiers mode (E7 is addressed by role budg
 | Rollback tag | `rta/df2-prev` → `741a835` |
 | Sync | `git -C D:\git\opencode-model-router merge --ff-only origin/rta/main` → `ae674298942a2a2ca05adc0ba97ef17f654aa865` |
 | `npm ci` | not needed (`package-lock.json` identical `741a835`..`ae67429`) |
-| Restart | requested (1 of 2, R8); liveness probe pending; override migration follows the probe |
+| Restart 1 of 2 (R8) | owner restarted at 2026-10-08T19:08Z (service `opencode serve --service` PID 65852 started 19:08:11Z) |
+### DF-2 liveness probe after restart 1 (2026-10-08T19:15Z) — PASS
+
+- `/router` line pasted by the owner: `router: engine=enforce build=2.3.0+ae67429` → matches the synced commit.
+- Host log: plugin-load line for `D:\git\opencode-model-router` at 19:08:16Z; 0 genuine `failed to load plugin` lines since 19:00Z.
+- `/api/agent`: Build, General, Explore, Compaction, Title, Summary, Plan, model-router-grader, fast, medium, heavy, runner, reviewer, researcher — tiers mode as expected (the override has no `delegation` yet).
+- Next: override migration validated in a temp HOME (candidate and kill switch), then the write and restart 2 of 2.
