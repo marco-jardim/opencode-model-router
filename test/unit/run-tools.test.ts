@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnBounded } from "../../src/router/git-tools";
+import { nearestCheckout, spawnBounded, workRootGuards } from "../../src/router/git-tools";
 import type { RunConfig } from "../../src/router/roles";
 import {
-  argAllowed, authorizeCwd, dropLeadingPartial, isFullPath, npmHardeningFlags, planRun, renderRunOutput, resolveCommandExecutable,
-  resolveNodeExecutable, resolveNpmCli, resolveSystemShell, routerRunTool, runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, scriptAllowed, validateRunArgs,
+  argAllowed, authorizeCwd, capRendered, dropLeadingPartial, escapesWorkRoot, isCredentialEnv, isFullPath, npmHardeningFlags, npmrcKeys, optionLead,
+  planRun, readBoundedRegularFile, renderRunOutput, resolveCommandExecutable, resolveNodeExecutable, resolveNpmCli, resolveSystemShell, routerRunTool,
+  runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, RUN_RENDERED_MAX_BYTES, RUN_TAIL_BYTES, scriptAllowed, validateRunArgs,
   type RunRecord, type RunToolDeps,
 } from "../../src/router/run-tools";
 
@@ -176,9 +177,10 @@ describe("router_run execution", () => {
     const [executable, argv, options] = calls[0]! as unknown as [string, string[], childProcess.SpawnOptions];
     expect(executable).toMatch(WIN ? /\\node\.exe$/i : /\/node$/);
     expect(argv[0]).toMatch(/[\\/]node_modules[\\/]npm[\\/]bin[\\/]npm-cli\.js$/);
-    expect(argv.slice(1, 5)).toEqual(npmHardeningFlags(argv[1]!.slice("--script-shell=".length)));
+    expect(argv.slice(1, 6)).toEqual(npmHardeningFlags(argv[1]!.slice("--script-shell=".length)));
     expect(argv[1]).toMatch(WIN ? /^--script-shell=[A-Za-z]:\\.*\\cmd\.exe$/i : /^--script-shell=\//);
-    expect(argv.slice(5)).toEqual(["run", "test"]);
+    expect(argv).toContain("--logs-max=0");
+    expect(argv.slice(6)).toEqual(["run", "test"]);
     expect(options.shell).toBe(false);
     expect(String(options.cwd)).toBe(root);
     expect(options.env?.CI).toBe("1");
@@ -253,10 +255,20 @@ describe("router_run hijack resistance (#77 G4)", () => {
   }
   const markers = (dir: string) => ["shell-marker.txt", "node-marker.txt", "npm-marker.txt"].filter(name => existsSync(join(dir, name)));
 
-  it("ignores a repo .npmrc script-shell and node-options", async () => {
+  it("ignores a repo .npmrc script-shell and node-options (npm config get as the positive control)", async () => {
     project(root); plantEvil(root);
-    writeFileSync(join(root, ".npmrc"), WIN ? "script-shell=.\\evil.cmd\r\nnode-options=--require .\\evil.js\r\n"
+    writeFileSync(join(root, ".npmrc"), WIN ? "script-shell=.\\evil.cmd\r\nnode-options=--require ./evil.js\r\n"
       : "script-shell=./evil.sh\nnode-options=--require ./evil.js\n");
+    const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
+    const flags = planned.argv.slice(1, 6);
+    const get = (extra: string[], key: string) => execFileSync(planned.executable, [planned.argv[0]!, ...extra, "config", "get", key],
+      { cwd: root, env: planned.env, encoding: "utf8", windowsHide: true }).trim();
+    // Without the flags npm resolves the repository's values: the attack is real on this npm.
+    expect(get([], "script-shell")).toMatch(/evil\.(cmd|sh)$/);
+    expect(get([], "node-options")).toMatch(/evil\.js/);
+    // With the flags the command line wins.
+    expect(get(flags, "script-shell")).toBe(flags[0]!.slice("--script-shell=".length));
+    expect(get(flags, "node-options")).not.toMatch(/evil/);
     const out = await makeTool()({ script: "test", cwd: root });
     expect(out).toMatch(/exit code: 0/);
     expect(markers(root)).toEqual([]);
@@ -271,17 +283,43 @@ describe("router_run hijack resistance (#77 G4)", () => {
     execFileSync(plan.executable, [plan.argv[0]!, "run", "test"], { cwd: sibling, env: plan.env, stdio: "ignore", windowsHide: true });
     expect(markers(sibling)).toEqual(WIN ? ["node-marker.txt"] : ["shell-marker.txt"]);
   }, SPAWN_TIMEOUT);
-  it("drops inherited npm_config_*, NODE_OPTIONS and PREFIX from the environment", async () => {
+  it("drops inherited npm_config_*, NODE_OPTIONS and PREFIX: planted userconfig and PREFIX/etc/npmrc, with positive controls", async () => {
     project(root); plantEvil(root);
+    const evilJs = join(root, "evil.js").replaceAll("\\", "/");
+    const userrc = join(sibling, "user.npmrc");
+    writeFileSync(userrc, `node-options=--require ${evilJs}\n`);
+    const prefix = join(sibling, "prefix");
+    mkdirSync(join(prefix, "etc"), { recursive: true });
+    writeFileSync(join(prefix, "etc", "npmrc"), `node-options=--require ${evilJs}\n`);
+    const planned = planRun({ script: "test", cwd: root }, root, config(), { platform: process.platform, env: testEnv() });
+    // The worker inherits npm_config_* from `npx vitest`; controls start from a base without them.
+    const clean = (extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
+      ...Object.fromEntries(Object.entries(testEnv()).filter(([key]) => !/^(npm_|NODE_OPTIONS$|PREFIX$)/i.test(key))), ...extra });
+    const rawRun = (env: NodeJS.ProcessEnv) => execFileSync(planned.executable, [planned.argv[0]!, "run", "test"], { cwd: root, env, stdio: "ignore", windowsHide: true });
+    // Controls: plain npm (no flags, environment as given) honours each planted file.
+    rawRun(clean({ npm_config_userconfig: userrc }));
+    expect(markers(root)).toEqual(["node-marker.txt"]);
+    rmSync(join(root, "node-marker.txt"));
+    rawRun(clean({ npm_config_globalconfig: join(prefix, "etc", "npmrc") }));
+    expect(markers(root)).toEqual(["node-marker.txt"]);
+    rmSync(join(root, "node-marker.txt"));
+    // PREFIX names the global config only where this npm honours it (`config get globalconfig` decides; not on win32 npm 11).
+    const globalconfig = execFileSync(planned.executable, [planned.argv[0]!, "config", "get", "globalconfig"],
+      { cwd: root, env: clean({ PREFIX: prefix }), encoding: "utf8", windowsHide: true }).trim();
+    if (globalconfig.toLowerCase() === join(prefix, "etc", "npmrc").toLowerCase()) {
+      rawRun(clean({ PREFIX: prefix }));
+      expect(markers(root)).toEqual(["node-marker.txt"]);
+      rmSync(join(root, "node-marker.txt"));
+    }
     const evilShell = join(root, WIN ? "evil.cmd" : "evil.sh");
-    const env = testEnv({ npm_config_script_shell: evilShell, NPM_CONFIG_NODE_OPTIONS: `--require ${join(root, "evil.js")}`,
-      NODE_OPTIONS: `--require ${join(root, "evil.js")}`, npm_config_userconfig: join(root, ".npmrc"), PREFIX: root });
+    const env = testEnv({ npm_config_script_shell: evilShell, NPM_CONFIG_NODE_OPTIONS: `--require ${evilJs}`,
+      NODE_OPTIONS: `--require ${evilJs}`, npm_config_userconfig: userrc, PREFIX: prefix });
     const out = await makeTool({ env })({ script: "test", cwd: root });
     expect(out).toMatch(/exit code: 0/);
     expect(markers(root)).toEqual([]);
     const hardened = runEnvironment({ Path: "p", npm_config_x: "1", NPM_CONFIG_Y: "2", Npm_Lifecycle_Event: "z", node_options: "n", NODE_OPTIONS: "n", ci: "0", COMSPEC: "x" }, "win32", "C:\\Windows\\System32\\cmd.exe");
-    expect(hardened).toEqual({ Path: "p", CI: "1", ComSpec: "C:\\Windows\\System32\\cmd.exe" });
-    expect(runEnvironment({ PATH: "p", ci: "0" }, "linux")).toEqual({ PATH: "p", ci: "0", CI: "1" });
+    expect(hardened).toEqual({ Path: "", CI: "1", NoDefaultCurrentDirectoryInExePath: "1", ComSpec: "C:\\Windows\\System32\\cmd.exe" });
+    expect(runEnvironment({ PATH: "p", ci: "0" }, "linux")).toEqual({ PATH: "", ci: "0", CI: "1" });
   }, SPAWN_TIMEOUT);
   it("never uses a planted node_modules/.bin npm shim, even first on PATH", async () => {
     project(root); plantEvil(root);
@@ -330,8 +368,8 @@ describe("router_run hijack resistance (#77 G4)", () => {
     expect(planRun({ script: "test", cwd: root }, root, config({ timeoutMs: 2 ** 40 }), { platform: process.platform, env: testEnv() }).timeoutMs).toBe(2 ** 31 - 1);
     const npmCommand = planRun({ script: "unit", args: ["test/a.ts"], cwd: root }, root,
       config({ commands: { unit: { argv: ["npm", "run", "test", "--"], args: ["test/*"] } } }), { platform: process.platform, env: testEnv() });
-    expect(npmCommand.argv.slice(1, 5)).toEqual(npmHardeningFlags(npmCommand.argv[1]!.slice("--script-shell=".length)));
-    expect(npmCommand.argv.slice(5)).toEqual(["run", "test", "--", "test/a.ts"]);
+    expect(npmCommand.argv.slice(1, 6)).toEqual(npmHardeningFlags(npmCommand.argv[1]!.slice("--script-shell=".length)));
+    expect(npmCommand.argv.slice(6)).toEqual(["run", "test", "--", "test/a.ts"]);
   });
 });
 
@@ -438,13 +476,13 @@ describe("router_run work roots", () => {
     expect(existsSync(join(sibling, "ran.json"))).toBe(false);
   }, SPAWN_TIMEOUT);
 
-  it.skipIf(!WIN)("expands an 8.3 short-name cwd to the canonical work root", async () => {
+  it.skipIf(!WIN)("expands an 8.3 short-name cwd to the canonical work root", async (ctx) => {
     const long = join(sibling, "a rather long directory name");
     mkdirSync(long);
     project(long);
     const short = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
       `(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${long}').ShortPath`], { encoding: "utf8", windowsHide: true }).trim();
-    if (short === "" || short.toLowerCase() === long.toLowerCase() || !short.includes("~")) return; // 8.3 names disabled on this volume
+    if (short === "" || short.toLowerCase() === long.toLowerCase() || !short.includes("~")) ctx.skip("8.3 names are disabled on this volume");
     expect(authorizeCwd(long, short)).toBe(realpathSync.native(long));
     expect(authorizeCwd(short, long)).toBe(realpathSync.native(long));
     expect(await makeTool({ resolveWorkRoot: () => long })({ script: "test", cwd: short })).toMatch(/exit code: 0/);
@@ -535,9 +573,9 @@ describe("router_run plan validation", () => {
   });
   it("uses the default timeout when none is configured and tolerates a missing commands map", () => {
     project(root);
-    const cfg = { scripts: ["test"] } as RunConfig;
+    const cfg = { scripts: ["test"] } as unknown as RunConfig;
     expect(planRun({ script: "test", cwd: root }, root, cfg, hostOf(testEnv())).timeoutMs).toBe(600_000);
-    expect(() => planRun({ script: "other", cwd: root }, root, { } as RunConfig, hostOf(testEnv()))).toThrow(/not in routing\.run/);
+    expect(() => planRun({ script: "other", cwd: root }, root, { } as unknown as RunConfig, hostOf(testEnv()))).toThrow(/not in routing\.run/);
     for (const ms of [0, -5, Number.NaN, "5" as never]) expect(plan("test", { timeoutMs: ms }).timeoutMs).toBe(600_000);
     expect(plan("test", { timeoutMs: 1500.9 }).timeoutMs).toBe(1500);
   });
@@ -618,7 +656,8 @@ describe("router_run node and npm lookup", () => {
   it("accepts the node seam only as an absolute file outside the work root", () => {
     expect(() => resolveNodeExecutable(hostOf({}, { nodeExecPath: "node" }), [root])).toThrow(/not an absolute path to a file/);
     expect(() => resolveNodeExecutable(hostOf({}, { nodeExecPath: join(sibling, "missing") }), [root])).toThrow(/not an absolute path to a file/);
-    expect(resolveNodeExecutable(hostOf({}, { nodeExecPath: process.execPath }), [root]).toLowerCase()).toBe(realpathSync.native(process.execPath).toLowerCase());
+    // Returned as found, not as its real path (a version-manager directory link stays as given, QA-P13-1-3).
+    expect(resolveNodeExecutable(hostOf({}, { nodeExecPath: process.execPath }), [root])).toBe(process.execPath);
   });
   it("finds npm-cli.js beside node, and refuses a missing or in-root one", () => {
     const prefix = join(sibling, "prefix");
@@ -642,7 +681,7 @@ describe("router_run node and npm lookup", () => {
   });
   it("treats the platform seam as POSIX when asked: /bin/sh only", () => {
     if (WIN) expect(() => resolveSystemShell({ platform: "linux", env: {} }, [root])).toThrow(/no absolute system shell/);
-    else expect(resolveSystemShell({ platform: "linux", env: {} }, [root])).toBe(realpathSync.native("/bin/sh"));
+    else expect(resolveSystemShell({ platform: "linux", env: {} }, [root])).toBe("/bin/sh");
     expect(() => resolveNpmCli("/nonexistent/bin/node", "linux", [root])).toThrow(/npm-cli\.js not found/);
   });
 });
@@ -653,10 +692,10 @@ describe("router_run system shell and ComSpec", () => {
     writeFileSync(join(root, "evil.sh"), "#!/bin/sh\necho evil > \"$(dirname \"$0\")/shell-marker.txt\"\n");
     chmodSync(join(root, "evil.sh"), 0o755);
     writeFileSync(join(root, ".npmrc"), "script-shell=./evil.sh\n");
-    expect(resolveSystemShell(hostOf({}), [root])).toBe(realpathSync.native("/bin/sh"));
+    expect(resolveSystemShell(hostOf({}), [root])).toBe("/bin/sh"); // as found, never its realpath (busybox, bash's sh mode)
     expect(await makeTool()({ script: "test", cwd: root })).toMatch(/exit code: 0/);
     expect(existsSync(join(root, "shell-marker.txt"))).toBe(false);
-    expect(JSON.parse(readFileSync(join(root, "ran.json"), "utf8")).shell).toBe(realpathSync.native("/bin/sh"));
+    expect(JSON.parse(readFileSync(join(root, "ran.json"), "utf8")).shell).toBe("/bin/sh");
   }, SPAWN_TIMEOUT);
 
   describe.skipIf(!WIN)("win32 ComSpec", () => {
@@ -691,7 +730,8 @@ describe("router_run system shell and ComSpec", () => {
       const noShellEnv = Object.fromEntries(Object.entries(testEnv()).filter(([key]) => !/^(SystemRoot|ComSpec)$/i.test(key)));
       const none = planRun({ script: "plain", cwd: root }, root, cfg, hostOf({ ...noShellEnv, SystemRoot: fakeRoot, ComSpec: "cmd.exe" }));
       expect(none.executable.toLowerCase()).toBe(realpathSync.native(tool).toLowerCase());
-      const npmPlan = () => planRun({ script: "n", cwd: root }, root, config({ commands: { n: { argv: ["npm", "--version"] } } }), hostOf({ ...noShellEnv, SystemRoot: fakeRoot, ComSpec: "cmd.exe" }));
+      project(root);
+      const npmPlan = () => planRun({ script: "n", cwd: root }, root, config({ commands: { n: { argv: ["npm", "test"] } } }), hostOf({ ...noShellEnv, SystemRoot: fakeRoot, ComSpec: "cmd.exe" }));
       expect(npmPlan).toThrow(/no absolute system shell/);
     });
   });
@@ -765,4 +805,296 @@ describe("router_run output rendering edge cases", () => {
     expect(emptyHead.startsWith("[router_run] output truncated: 3 bytes omitted;")).toBe(true);
     expect(emptyHead.endsWith("y\n")).toBe(true);
   });
+  it("caps the decoded text when invalid UTF-8 expands to U+FFFD (QA-P13-1-13)", () => {
+    const tail = Buffer.concat([Buffer.from("\n"), Buffer.alloc(RUN_TAIL_BYTES - 1, 0xff)]);
+    const invalid = renderRunOutput({ output: Buffer.alloc(RUN_HEAD_BYTES, 0xff), truncated: true, omitted: 10, tail });
+    expect(Buffer.byteLength(invalid)).toBeLessThanOrEqual(RUN_RENDERED_MAX_BYTES);
+    expect(invalid).toContain("[router_run] rendered output capped at");
+    expect(capRendered("short")).toBe("short");
+    const capped = capRendered(`ok https://bob:${"p".repeat(200)}`, 60);
+    expect(Buffer.byteLength(capped)).toBeLessThanOrEqual(60 + 200); // the notice may exceed a tiny cap
+    expect(capped).not.toContain("bob:");
+  });
+});
+
+describe("QA-P13-1-1 argument confinement", () => {
+  it("refuses .. segments and absolute or drive paths, also after = or an option lead", () => {
+    for (const arg of ["test/../../x/scripts/x.js", "..", "../x", "a/..", "--out=../x", "--out=/etc/x", "/abs", "\\abs", "C:/x", "c:x",
+      "@/etc/passwd", "--config=C:/x", "-/x", "+/x", "a:..", "x=..\\y"]) {
+      expect(escapesWorkRoot(arg), arg).toBe(true);
+    }
+    for (const arg of ["test/a.ts", "test/...", "--reporter=dot", "a.b..c", "--grep=xy:z", "test:unit", "@scope/pkg"]) {
+      expect(escapesWorkRoot(arg), arg).toBe(false);
+    }
+  });
+  it("treats -, @ and + as option leads that need a pattern with the same lead", () => {
+    expect(optionLead("--x")).toBe("-"); expect(optionLead("@file")).toBe("@"); expect(optionLead("+opt")).toBe("+"); expect(optionLead("a")).toBeUndefined();
+    expect(argAllowed(["*"], "@file")).toBe(false);
+    expect(argAllowed(["*"], "+opt")).toBe(false);
+    expect(argAllowed(["@*"], "@file")).toBe(true);
+    expect(argAllowed(["-*"], "@file")).toBe(false);
+    expect(argAllowed(["+opt"], "+opt")).toBe(true);
+    expect(argAllowed(["", 5 as never], "x")).toBe(false);
+  });
+  it("refuses escaping arguments through the tool and option-like ones for a node entry without a fixed script", async () => {
+    project(root);
+    const run = makeTool({ config: () => config({ commands: {
+      files: { argv: ["node", "probe.js"], args: ["test/*", "*", "-*", "@*"] },
+      runner: { argv: ["node", "--test"], args: ["test/*", "-*"] },
+      separated: { argv: ["node", "--", "probe.js"], args: ["-*"] },
+    } }) });
+    for (const arg of ["test/../../x/scripts/x.js", "C:/x", "/abs", "--out=../x", "@/etc/passwd"]) {
+      expect(await run({ script: "files", args: [arg], cwd: root })).toMatch(/refused: argument 1 names a path outside the work root/);
+    }
+    expect(await run({ script: "runner", args: ["--require=evil.js"], cwd: root })).toMatch(/refused: option-like arguments to the node command "runner" need a fixed script first/);
+    expect(await run({ script: "separated", args: ["--x"], cwd: root })).toMatch(/need a fixed script first/);
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(await run({ script: "files", args: ["--flag", "@resp", "test/a.ts"], cwd: root })).toContain("PROBE-OK --flag @resp test/a.ts");
+  }, SPAWN_TIMEOUT);
+});
+
+describe("QA-P13-1-2 background processes", () => {
+  const background = [
+    "const { spawn } = require('child_process');",
+    "const c = spawn(process.execPath, ['-e', \"require('fs').writeFileSync('bg.pid', String(process.pid)); setInterval(() => {}, 1000)\"], { stdio: 'ignore' });",
+    "c.unref(); const t = setInterval(() => { if (require('fs').existsSync('bg.pid')) { clearInterval(t); process.exit(0); } }, 50);",
+  ].join("\n");
+  const kill = (pid: number) => { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } };
+
+  it.skipIf(WIN)("kills a background child left by a normally exiting run (POSIX process group; win32 has no tree after the parent exits)", async () => {
+    project(root);
+    writeFileSync(join(root, "bg.js"), background);
+    const out = await makeTool({ config: () => config({ commands: { bg: { argv: ["node", "bg.js"] } } }) })({ script: "bg", cwd: root });
+    expect(out).toMatch(/exit code: 0/);
+    const pid = Number(readFileSync(join(root, "bg.pid"), "utf8"));
+    try { expect(await waitUntil(() => !alive(pid))).toBe(true); } finally { kill(pid); }
+  }, SPAWN_TIMEOUT);
+  it.skipIf(WIN)("router_git keeps its behaviour: without killGroupOnSettle the group is not killed (I1)", async () => {
+    writeFileSync(join(root, "bg.js"), background);
+    const result = await spawnBounded(process.execPath, ["bg.js"], root, { env: process.env, timeoutMs: 60_000 });
+    expect(result.code).toBe(0);
+    const pid = Number(readFileSync(join(root, "bg.pid"), "utf8"));
+    try { expect(alive(pid)).toBe(true); } finally { kill(pid); }
+  }, SPAWN_TIMEOUT);
+});
+
+describe("QA-P13-1-3 executables as found", () => {
+  it.skipIf(!WIN)("accepts ComSpec only when it names cmd.exe; returns a PATH tool by its found (junction) spelling", () => {
+    const system32 = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe").toLowerCase();
+    const other = join(sibling, "pwsh.exe");
+    writeFileSync(other, "");
+    expect(resolveSystemShell({ platform: "win32", env: { ComSpec: other } }, [root]).toLowerCase()).toBe(system32);
+    const realBin = join(sibling, "real-bin");
+    const linkBin = join(home, "link-bin");
+    mkdirSync(realBin);
+    writeFileSync(join(realBin, "tool.exe"), "");
+    symlinkSync(realBin, linkBin, "junction");
+    expect(resolveCommandExecutable("tool", { platform: "win32", env: { PATH: linkBin } }, [root])).toBe(join(linkBin, "tool.exe"));
+    expect(() => resolveCommandExecutable("tool", { platform: "win32", env: { PATH: linkBin } }, [realBin])).toThrow(/inside the work root/);
+  });
+  it.skipIf(WIN)("spawns symlinked node by its found path and finds npm-cli.js beside the found and the real node (Homebrew)", () => {
+    const brew = join(sibling, "brew");
+    const cellarBin = join(brew, "Cellar", "node", "24", "bin");
+    mkdirSync(cellarBin, { recursive: true });
+    mkdirSync(join(brew, "bin"));
+    writeFileSync(join(cellarBin, "node"), "");
+    symlinkSync(join(cellarBin, "node"), join(brew, "bin", "node"));
+    const found = join(brew, "bin", "node");
+    expect(resolveNodeExecutable({ platform: "linux", env: {}, nodeExecPath: found }, [root])).toBe(found);
+    expect(() => resolveNpmCli(found, "linux", [root])).toThrow(/npm-cli\.js not found/);
+    const viaReal = join(brew, "Cellar", "node", "24", "lib", "node_modules", "npm", "bin");
+    mkdirSync(viaReal, { recursive: true });
+    writeFileSync(join(viaReal, "npm-cli.js"), "");
+    expect(resolveNpmCli(found, "linux", [root])).toBe(join(viaReal, "npm-cli.js"));
+    const viaFound = join(brew, "lib", "node_modules", "npm", "bin");
+    mkdirSync(viaFound, { recursive: true });
+    writeFileSync(join(viaFound, "npm-cli.js"), "");
+    expect(resolveNpmCli(found, "linux", [root])).toBe(join(viaFound, "npm-cli.js"));
+    expect(() => resolveNodeExecutable({ platform: "linux", env: {}, nodeExecPath: found }, [cellarBin])).toThrow(/inside the work root/);
+  });
+});
+
+describe("QA-P13-1-4 npm stays in the work root", () => {
+  function workspaces() {
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "ws-root", private: true, workspaces: ["packages/*"], scripts: { test: "node probe.js" } }));
+    project(root, { test: "node probe.js" });
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "ws-root", private: true, workspaces: ["packages/*"], scripts: { test: "node probe.js" } }));
+    const pkg = join(root, "packages", "a");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "a", version: "1.0.0", scripts: { test: "node -e \"require('fs').writeFileSync('ws-marker.txt','x')\"" } }));
+    return pkg;
+  }
+  it("refuses a work-root .npmrc that selects workspaces (positive control: npm with the flags does not run the root script)", async () => {
+    const pkg = workspaces();
+    writeFileSync(join(root, ".npmrc"), "workspace=packages/a\n");
+    const planned = planRun({ script: "probe", cwd: root }, root, config({ scripts: [], commands: { probe: { argv: ["node", "probe.js"] } } }), { platform: process.platform, env: testEnv() });
+    const shell = resolveSystemShell({ platform: process.platform, env: testEnv() }, [root]);
+    const node = planned.executable;
+    const cli = resolveNpmCli(node, process.platform, [root]);
+    // Depending on the npm version the .npmrc switches to the workspace's script or makes npm fail;
+    // either way the hardening flags alone do not keep `npm run test` on the root's script.
+    let failed = false;
+    try { execFileSync(node, [cli, ...npmHardeningFlags(shell), "run", "test"], { cwd: root, env: planned.env, stdio: "ignore", windowsHide: true }); } catch { failed = true; }
+    expect(failed || existsSync(join(pkg, "ws-marker.txt"))).toBe(true);
+    expect(existsSync(join(root, "ran.json"))).toBe(false);
+    rmSync(join(pkg, "ws-marker.txt"), { force: true });
+    const run = makeTool({ config: () => config({ commands: { t: { argv: ["npm", "test"] } } }) });
+    for (const text of ["workspace=packages/a\n", "workspaces=true\n", "include-workspace-root = true\n", "workspace[]=packages/a\n", "; c\n[x]\nWorkspace=packages/a\n"]) {
+      writeFileSync(join(root, ".npmrc"), text);
+      expect(await run({ script: "test", cwd: root })).toMatch(/refused: the work root's \.npmrc sets "(workspace|workspaces|include-workspace-root)"/);
+      expect(await run({ script: "t", cwd: root })).toMatch(/refused: the work root's \.npmrc sets/);
+    }
+    expect(existsSync(join(pkg, "ws-marker.txt"))).toBe(false);
+    writeFileSync(join(root, ".npmrc"), "# workspace=packages/a\nfund=false\n");
+    expect(await run({ script: "test", cwd: root })).toMatch(/exit code: 0/);
+    expect(npmrcKeys("a=1\n#b=2\n;c\n[s]\n d = 4 \n\"e\"=5\nf[]=6\ng\n")).toEqual(["a", "d", "e", "f", "g"]);
+  }, SPAWN_TIMEOUT);
+  it("refuses an npm command entry without a package.json in the work root itself", async () => {
+    const nested = join(sibling, "nested");
+    mkdirSync(nested);
+    project(sibling); // a package.json one level up: npm would walk up to it
+    const run = makeTool({ resolveWorkRoot: () => nested, config: () => config({ commands: { t: { argv: ["npm", "test"] } } }) });
+    expect(await run({ script: "t", cwd: nested })).toMatch(/refused: no readable package\.json in the work root \(npm would walk up/);
+    expect(await run({ script: "test", cwd: nested })).toMatch(/refused: no readable package\.json in the work root/);
+    expect(existsSync(join(sibling, "ran.json"))).toBe(false);
+  }, SPAWN_TIMEOUT);
+  it("writes no npm log file (--logs-max=0)", async () => {
+    project(root);
+    expect(npmHardeningFlags("/bin/sh")).toContain("--logs-max=0");
+    expect(await makeTool()({ script: "test", cwd: root })).toMatch(/exit code: 0/);
+    const logs = join(home, WIN ? "Local" : ".npm", ...(WIN ? ["npm-cache", "_logs"] : ["_logs"]));
+    expect(existsSync(logs) ? readdirSyncSafe(logs) : []).toEqual([]);
+  }, SPAWN_TIMEOUT);
+});
+function readdirSyncSafe(dir: string): string[] {
+  try { return readdirSync(dir); } catch { return []; }
+}
+
+describe("QA-P13-1-5 node and npm are always pinned", () => {
+  const plan = (cfg: Partial<RunConfig>, script = "c", args?: string[]) =>
+    planRun({ script, args, cwd: root }, root, config(cfg), hostOf(testEnv()));
+  it("routes bare node/npm spellings to the pinned install and refuses them by path or by real name", () => {
+    project(root);
+    const pinnedNode = resolveNodeExecutable(hostOf(testEnv()), [root]);
+    for (const program of ["node", "node.exe", "NODE"]) expect(plan({ commands: { c: { argv: [program, "probe.js"] } } }).executable).toBe(pinnedNode);
+    expect(plan({ commands: { c: { argv: ["npm.cmd", "test"] } } }).argv[0]).toMatch(/npm-cli\.js$/);
+    for (const program of ["/usr/bin/npm", "/usr/local/bin/node", "C:\\Program Files\\nodejs\\node.exe", "nodejs", "npm-cli.js"]) {
+      expect(() => plan({ commands: { c: { argv: [program, "x"] } } })).toThrow(/is node or npm|is a shell|absolute or a bare name|not found/);
+    }
+    const copy = join(sibling, WIN ? "node.exe" : "node");
+    writeFileSync(copy, "");
+    expect(() => plan({ commands: { c: { argv: [copy] } } })).toThrow(/is node or npm/);
+  });
+  it("allows only npm script runners, a fixed script name for run, and no npm options before --", () => {
+    project(root, { test: "node probe.js", build: "node probe.js" });
+    for (const fixed of [["exec", "--", "evil"], ["x"], ["install"], ["--prefix=..", "run", "test"], ["ru", "test"], []]) {
+      expect(() => plan({ commands: { c: { argv: ["npm", ...fixed] } } }), fixed.join(" ")).toThrow(/must start with one of run, run-script, test, start, stop, restart/);
+    }
+    for (const fixed of [["run"], ["run", "--", "test"], ["run-script"]]) {
+      expect(() => plan({ commands: { c: { argv: ["npm", ...fixed] } } }), fixed.join(" ")).toThrow(/must name its script right after "run/);
+    }
+    for (const fixed of [["run", "test", "--workspace=a"], ["test", "--scr=x"], ["run", "test", "-C", "x"], ["run", "-w", "test"]]) {
+      expect(() => plan({ commands: { c: { argv: ["npm", ...fixed] } } }), fixed.join(" ")).toThrow(/fixes the npm option/);
+    }
+    expect(() => plan({ commands: { c: { argv: ["npm", "run", "missing"] } } })).toThrow(/package\.json has no script "missing"/);
+    expect(() => plan({ commands: { c: { argv: ["npm", "start"] } } })).toThrow(/package\.json has no script "start"/);
+    expect(plan({ commands: { c: { argv: ["npm", "run", "build", "--silent", "--", "--x=1"] } } }).argv.slice(-5)).toEqual(["run", "build", "--silent", "--", "--x=1"]);
+    expect(plan({ commands: { c: { argv: ["npm", "run-script", "test", "--if-present"] } } }).argv.slice(-3)).toEqual(["run-script", "test", "--if-present"]);
+  });
+  it("strips relative and guarded PATH entries from the run's PATH", async () => {
+    project(root);
+    const inside = join(root, "bin");
+    const outsideDir = join(sibling, "bin");
+    mkdirSync(inside); mkdirSync(outsideDir);
+    const pathKey = Object.keys(process.env).find(key => key.toUpperCase() === "PATH") ?? "PATH";
+    const env = testEnv({ [pathKey]: [inside, "relative/bin", outsideDir, process.env[pathKey] ?? ""].join(SEP) });
+    const out = await makeTool({ env, config: () => config({ commands: { p: { argv: ["node", "-p", "process.env.PATH"] } } }) })({ script: "p", cwd: root });
+    expect(out).toMatch(/exit code: 0/);
+    expect(out).toContain(outsideDir);
+    expect(out).not.toContain(inside + SEP);
+    expect(out).not.toContain("relative/bin");
+    const stripped = runEnvironment({ PATH: ["/a", "rel", "", "/work/x", "/b"].join(":") }, "linux", undefined, { guards: ["/work"] });
+    expect(stripped.PATH).toBe("/a:/b");
+  }, SPAWN_TIMEOUT);
+  it.skipIf(!WIN)("cmd.exe does not run a program from the work root's current directory (NoDefaultCurrentDirectoryInExePath)", async () => {
+    project(root, { test: "evilcmd" });
+    writeFileSync(join(root, "evilcmd.cmd"), "@echo off\r\necho evil> \"%~dp0cwd-marker.txt\"\r\n");
+    const out = await makeTool()({ script: "test", cwd: root });
+    expect(out).not.toMatch(/exit code: 0;/);
+    expect(existsSync(join(root, "cwd-marker.txt"))).toBe(false);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("QA-P13-1-6 guards cover the plugin's checkout and a sibling worktree's main checkout", () => {
+  it("includes the work root and the plugin working directory's checkout, never a filesystem root", () => {
+    const guards = workRootGuards(root).map(dir => dir.toLowerCase());
+    expect(guards).toContain(root.toLowerCase());
+    const pluginCheckout = nearestCheckout(process.cwd());
+    if (pluginCheckout !== undefined) expect(guards).toContain(pluginCheckout.toLowerCase());
+    expect(guards).toContain(process.cwd().toLowerCase());
+    for (const dir of guards) expect(dir === join(dir, "..").toLowerCase()).toBe(false);
+  });
+});
+
+describe("QA-P13-1-7 UNC work roots", () => {
+  it("refuses a UNC root for script and npm plans, before any file access", () => {
+    const unc = "\\\\localhost\\C$\\no-such-router-run-root";
+    const host = { platform: "win32" as const, env: {} };
+    expect(() => planRun({ script: "test", cwd: unc }, unc, config(), host)).toThrow(/work root is a UNC path/);
+    expect(() => planRun({ script: "t", cwd: unc }, unc, config({ commands: { t: { argv: ["npm", "test"] } } }), host)).toThrow(/work root is a UNC path/);
+  });
+  it.skipIf(!WIN)("refuses a real UNC work root through the tool (admin share)", async (ctx) => {
+    project(root);
+    const unc = `\\\\localhost\\${root[0]}$${root.slice(2)}`;
+    if (!existsSync(unc)) ctx.skip("the localhost admin share is not available");
+    let canonical: string;
+    try { canonical = realpathSync.native(unc); } catch { ctx.skip("the admin share cannot be canonicalised"); return; }
+    if (!canonical.startsWith("\\\\")) ctx.skip("the admin share canonicalises to a drive path");
+    expect(await makeTool({ resolveWorkRoot: () => unc })({ script: "test", cwd: unc })).toMatch(/refused: the work root is a UNC path/);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("QA-P13-1-8 package.json is read as a bounded regular file", () => {
+  it("refuses a directory, never quotes invalid JSON, and reads at most max+1 bytes", () => {
+    mkdirSync(join(root, "package.json"));
+    expect(() => planRun({ script: "test", cwd: root }, root, config(), hostOf(testEnv()))).toThrow(/package\.json is not a regular file/);
+    rmSync(join(root, "package.json"), RM);
+    writeFileSync(join(root, "package.json"), '{"scripts": "hunter2-secret');
+    let message = "";
+    try { planRun({ script: "test", cwd: root }, root, config(), hostOf(testEnv())); } catch (error) { message = (error as Error).message; }
+    expect(message).toBe("no readable package.json in the work root (not valid JSON)");
+    writeFileSync(join(root, "big.txt"), "x".repeat(100));
+    expect(() => readBoundedRegularFile(join(root, "big.txt"), 50, "big.txt")).toThrow(/larger than/);
+    expect(readBoundedRegularFile(join(root, "big.txt"), 100, "big.txt")).toBe("x".repeat(100));
+    expect(readBoundedRegularFile(join(root, "missing.txt"), 100, "missing.txt")).toBeUndefined();
+  });
+  it.skipIf(WIN)("refuses a FIFO and a character device without blocking", () => {
+    execFileSync("mkfifo", [join(root, "package.json")]);
+    const started = performance.now();
+    expect(() => planRun({ script: "test", cwd: root }, root, config(), hostOf(testEnv()))).toThrow(/not a regular file/);
+    expect(performance.now() - started).toBeLessThan(5_000);
+    rmSync(join(root, "package.json"));
+    symlinkSync("/dev/zero", join(root, "package.json"));
+    expect(() => planRun({ script: "test", cwd: root }, root, config(), hostOf(testEnv()))).toThrow(/not a regular file/);
+  });
+});
+
+describe("QA-P13-1-9 credential environment", () => {
+  it("strips credential-like variables unless passed through, and says so in the description", async () => {
+    for (const name of ["GITHUB_TOKEN", "GH_TOKEN", "NODE_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_KEY", "AWS_SECRET_ACCESS_KEY",
+      "AWS_ACCESS_KEY_ID", "HF_TOKEN", "DB_PASSWORD", "MY_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "SSH_PRIVATE_KEY", "DATABASE_URL", "apikey"]) {
+      expect(isCredentialEnv(name), name).toBe(true);
+    }
+    for (const name of ["PATH", "HOME", "SSH_AUTH_SOCK", "TOKENIZER_MODE", "KEYBOARD", "CI"]) expect(isCredentialEnv(name), name).toBe(false);
+    const env = runEnvironment({ HOME: "/h", GITHUB_TOKEN: "t", OPENAI_API_KEY: "k", DATABASE_URL: "u" }, "linux", undefined, { passthrough: ["database_url"] });
+    expect(env).toEqual({ HOME: "/h", DATABASE_URL: "u", CI: "1" });
+    project(root);
+    writeFileSync(join(root, "env.js"), "console.log('TOKEN=' + (process.env.ROUTER_RUN_FAKE_TOKEN ?? 'absent') + ' PASS=' + (process.env.KEEP_PASSWORD ?? 'absent'));");
+    const out = await makeTool({ env: testEnv({ ROUTER_RUN_FAKE_TOKEN: "s3cr3t", KEEP_PASSWORD: "kept" }), envPassthrough: ["KEEP_PASSWORD"],
+      config: () => config({ commands: { e: { argv: ["node", "env.js"] } } }) })({ script: "e", cwd: root });
+    expect(out).toContain("TOKEN=absent PASS=kept");
+    const description = (routerRunTool({ config: () => config(), resolveWorkRoot: () => root }) as unknown as { description: string }).description;
+    expect(description).toMatch(/best effort, not a secret scanner/);
+    expect(description).toMatch(/credential-like environment variables are not passed/);
+  }, SPAWN_TIMEOUT);
 });
