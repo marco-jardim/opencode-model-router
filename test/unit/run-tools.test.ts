@@ -38,7 +38,7 @@ afterEach(() => {
 });
 
 const config = (over: Partial<RunConfig> = {}): RunConfig => ({
-  scripts: ["test", "typecheck", "lint", "build", "test:*"], commands: {}, timeoutMs: 60_000, ...over,
+  scripts: ["test", "typecheck", "lint", "build", "test:unit"], commands: {}, timeoutMs: 60_000, ...over,
 });
 /** The run's environment: npm's cache, logs and user config stay in a temp home (tests use temp dirs only). */
 const testEnv = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
@@ -126,9 +126,11 @@ describe("router_run allowlist", () => {
     expect(childProcess.spawn).not.toHaveBeenCalled();
     expect(await run({ script: "test:unit", cwd: root })).toMatch(/package\.json script "test:unit": exit code: 0/);
   }, SPAWN_TIMEOUT);
-  it("matches script entries exactly or by a trailing-* prefix; a bare * matches nothing", () => {
-    expect(scriptAllowed(["test", "test:*"], "test")).toBe(true);
-    expect(scriptAllowed(["test:*"], "test:unit")).toBe(true);
+  it("R9: matches script entries exactly; a trailing * is no prefix and a bare * matches nothing", () => {
+    expect(scriptAllowed(["test", "test:unit"], "test")).toBe(true);
+    expect(scriptAllowed(["test", "test:unit"], "test:unit")).toBe(true);
+    expect(scriptAllowed(["test"], "test:unit")).toBe(false);
+    expect(scriptAllowed(["test:*"], "test:unit")).toBe(false);
     expect(scriptAllowed(["test:*"], "test:")).toBe(false);
     expect(scriptAllowed(["test:*"], "test")).toBe(false);
     expect(scriptAllowed(["test:*"], "testx")).toBe(false);

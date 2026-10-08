@@ -581,7 +581,7 @@ Tasks:
 - T1.1.2 [tier:medium] Keys in `D:\git\opencode-model-router\src\router\config.ts` (validators, defaults, layers):
   `routing.delegation` (`"tiers"` default; global and project layers), `roleAgents` (tiers.json + global only),
   `routing.exploration` (`rate` default 0, max 0.2; global only), `routing.run` (`scripts` default
-  `["test","typecheck","lint","build"]` plus `test:*`, `commands`, `timeoutMs` default 600000; global only), `routing.workRoots` (absolute globs, default `[]`, global only, never `*`).
+  `["test","typecheck","lint","build"]` exact names only (R9; was "plus `test:*`"), `commands`, `timeoutMs` default 600000; global only), `routing.workRoots` (absolute globs, default `[]`, global only, never `*`).
 - T1.1.3 [tier:heavy] Shipped role specs in `D:\git\opencode-model-router\tiers.json` `roleAgents` per §2.2 (authority,
   ranges, budgets, assurance, guard, prompts with the return contract); the separation validator over every grant
   (shipped, user-narrowed, and #81 agents with a shipped name in roles mode only); the work-root rule of §2.2 in the
@@ -1161,6 +1161,17 @@ prompt (§0.2.3).
   `docs\ROUTING_ENGINE.md`; P2.3 edited P2.1's own tests where I9/A7 required it; the advisor finding is named
   `roles-on-legacy-host` (docs-drift ids cannot contain digits). (9) DF-1 self-test finding fixed on `rta/fx2`
   (budget claim read from the return prefix; summary-before-claim still counts).
+- R9 (Wave 3 / P3.3, 2026-10-08; DF-2 self-test, P3.1 real-host smoke, P3.2 QA). (1) `routing.run.scripts` takes exact
+  `package.json` script names only: the `test:*` wildcard of T1.1.2 is dropped (it was never reachable; dead helper
+  removed); scoped runs use `routing.run.commands` (default `test-files`). (2) DF2-F1: a role dispatch's acceptance
+  checks run in its verification root = the child's bound work root (resumes keep it) or the canonical session
+  directory; a `cwd:` outside it is refused and detection is then not `deterministic` (P2.3 containment rule).
+  (3) Grader verdicts of role dispatches are `grader` signals (weight 0.5) and move the outcome store at 0.5 only when
+  the grader is independent (tier ≥ producer, different model); a non-independent grader records nothing (§2.6, I6).
+  (4) In roles mode a missing `d=` claim counts as `none` even with an `[acceptance]` block (`effectiveDetection`);
+  orchestrators write `d=grader`/`d=deterministic` to claim detection. (5) Observed on host 2.0.24: tool-success
+  events carry no `outputPaths`, so a role child cannot read its own truncated tool outputs (fails closed); recorded
+  as a limitation. (6) A role's default assurance is descriptive only.
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |

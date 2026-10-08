@@ -404,6 +404,12 @@ export interface DeferredFinishInput {
    * the gate reads it live, as before.
    */
   readonly budget?: BudgetSnapshot;
+  /**
+   * #84 P3.3 DF2-F1 (fix-1 review nit): the role dispatch's verification root (the gate's `Delegation.workRoot`). `router_verify`
+   * hands it to its gate, which then re-checks the stored cwd's containment and gives the role's hints. Absent (tier dispatches):
+   * the gate runs as before (I1).
+   */
+  readonly workRoot?: string;
 }
 
 /** Deferred budget snapshots kept for `router_verify` (by handle; oldest dropped first, like the pending registry's bound). */
@@ -906,12 +912,12 @@ export interface VerificationWiring {
   graderSessions: Set<string>;
   /** Stop a plugin-created child; v1 deletes it, a host runner owns v2 cleanup. Never throws. */
   disposeChildSession(sid: string): Promise<void>;
-  /** Run one grader turn, parented to the caller's session when given. */
+  /** Run one grader turn, parented to the caller's session when given. `model`: the model it was dispatched on (null = host default). */
   dispatchGrader(
     req: GraderRequest,
     parentSessionID?: string,
     inFlight?: Set<string>,
-  ): Promise<{ sessionID: string; text: string }>;
+  ): Promise<{ sessionID: string; text: string; model?: string | null }>;
   /**
    * Deps for the acceptance gate; graders are parented to parentSessionID.
    *
@@ -1223,16 +1229,21 @@ export function createVerificationWiring(deps: {
     parentSessionID?: string,
     inFlight?: Set<string>,
     creatorSessionID: string | null = parentSessionID ?? null,
-  ): Promise<{ sessionID: string; text: string }> => {
+  ): Promise<{ sessionID: string; text: string; model: string | null }> => {
+    // #84 P3.3 fix 2: the model the grader is dispatched on travels with its answer (checker.ts GraderResult.model → the
+    // verdict's `grader`), so the outcome signals can check its independence (plan §2.6). Null: the host's default model.
+    const modelRef = (model: { providerID: string; modelID: string } | null): string | null =>
+      model === null ? null : `${model.providerID}/${model.modelID}`;
     if (deps.childRunner) {
       const cfg = getConfig();
       const controller = new AbortController();
+      const model = tierModel(cfg, req.tier);
       let sid: string | undefined;
       try {
-        return await withTimeout(deps.childRunner.run({
+        const answer = await withTimeout(deps.childRunner.run({
           parentSessionID,
           cwd: req.cwd,
-          model: tierModel(cfg, req.tier) ?? undefined,
+          model: model ?? undefined,
           system: req.system,
           prompt: req.prompt,
           signal: controller.signal,
@@ -1243,6 +1254,7 @@ export function createVerificationWiring(deps: {
             notifyChildCreated(sessionID, creatorSessionID);
           },
         }), graderTimeoutMs(req.tier, cfg.enforcement?.verify?.graderTimeoutMs), "grader prompt");
+        return { sessionID: answer.sessionID, text: answer.text, model: modelRef(model) };
       } finally {
         controller.abort();
         if (sid) {
@@ -1262,13 +1274,14 @@ export function createVerificationWiring(deps: {
       ...(req.cwd ? { query: { directory: req.cwd } } : {}),
     });
     const sid: string | undefined = created?.data?.id;
-    if (!sid) return { sessionID: "", text: "" };
+    if (!sid) return { sessionID: "", text: "", model: null };
     graderSessions.add(sid);
     inFlight?.add(sid);
     notifyChildCreated(sid, creatorSessionID);
     try {
       const cfg = getConfig();
-      const model = tierModel(cfg, req.tier) ?? undefined;
+      const tiered = tierModel(cfg, req.tier);
+      const model = tiered ?? undefined;
       // Time-boxed for the same reason as the producer prompt, but with a
       // sharper edge: a grader that never answers must not be able to hold the
       // gate open. The RouterTimeoutError is deliberately allowed to propagate
@@ -1296,7 +1309,7 @@ export function createVerificationWiring(deps: {
       );
       const responseError = graderPromptResponseError(res);
       if (responseError) throw responseError;
-      return { sessionID: sid, text: extractAssistantText(res) };
+      return { sessionID: sid, text: extractAssistantText(res), model: modelRef(tiered) };
     } finally {
       graderSessions.delete(sid);
       inFlight?.delete(sid);
@@ -1605,6 +1618,8 @@ export function createVerificationWiring(deps: {
 
   /** #84 P2.1 (handoff 24): deferred budget snapshots by handle, read by `router_verify` (bounded, oldest out). */
   const deferredBudgets = new Map<string, BudgetSnapshot>();
+  /** #84 P3.3 DF2-F1: the work roots of deferred role dispatches by handle, read by `router_verify` (same bound as the budgets). */
+  const deferredWorkRoots = new Map<string, string>();
   const finishDeferred: VerificationWiring["finishDeferred"] = async (store, input) => {
     const producerTier = canonicalTier(input.producerTier);
     // The live reference promise (no signal: never awaited here). Its settled value at this moment
@@ -1676,6 +1691,11 @@ export function createVerificationWiring(deps: {
         deferredBudgets.delete(reg.handle);
         deferredBudgets.set(reg.handle, input.budget);
         while (deferredBudgets.size > MAX_DEFERRED_BUDGETS) deferredBudgets.delete(deferredBudgets.keys().next().value as string);
+      }
+      if (input.workRoot !== undefined) {
+        deferredWorkRoots.delete(reg.handle);
+        deferredWorkRoots.set(reg.handle, input.workRoot);
+        while (deferredWorkRoots.size > MAX_DEFERRED_BUDGETS) deferredWorkRoots.delete(deferredWorkRoots.keys().next().value as string);
       }
       // 2.4.5 (pending.ts R14): queued, never awaited: the queue's own timer starts the run later.
       // An unattributed change set is not queued (nothing could run; it stays listed instead).
@@ -1866,9 +1886,11 @@ export function createVerificationWiring(deps: {
     };
     let res: GateResult;
     let timedOut = false;
+    // #84 P3.3 DF2-F1: a deferred role dispatch is judged in its work root, as its synchronous gate would be.
+    const workRoot = deferredWorkRoots.get(entry.handle);
     try {
       res = await withTimeout(
-        accept({ dod, trivial: false, mode: "modeA", cwd: entry.cwd }, artefact, gateDeps),
+        accept({ dod, trivial: false, mode: "modeA", cwd: entry.cwd, ...(workRoot !== undefined ? { workRoot } : {}) }, artefact, gateDeps),
         deadline.remaining(),
         "verification gate",
       );
@@ -2220,6 +2242,7 @@ export function createVerificationWiring(deps: {
     disposeVerification: () => {
       dispatchStarts.clear();
       deferredBudgets.clear();
+      deferredWorkRoots.clear();
       // 2.4.5: abort the background run first, so nothing re-queues while the coordinator stops.
       background?.dispose();
       return coordinator.dispose();

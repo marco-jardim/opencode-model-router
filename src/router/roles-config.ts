@@ -191,11 +191,6 @@ export function sanitizeRun(value: unknown): Sanitized<Partial<RunConfig>> {
   return { value: out, issues };
 }
 
-/** True when `name` may be run by `router_run`: a listed script, or any `test:*` script. */
-export function isRunScriptAllowed(name: string, scripts: readonly string[]): boolean {
-  return scripts.includes(name) || /^test:[A-Za-z0-9_.:-]+$/.test(name);
-}
-
 /**
  * Why `entry` is not an acceptable work root, or undefined. An entry needs an absolute static
  * prefix with at least one real path segment (so `*`, `/**`, `D:/**` are refused) in its

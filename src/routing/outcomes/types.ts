@@ -40,6 +40,22 @@ export function verdictOf(verdict: Pick<VerificationVerdict, "pass" | "outcome">
   return verdict.outcome ?? (verdict.pass ? "pass" : "fail");
 }
 
+/** #84 P3.3 fix 2: the LLM grader of a gate verdict — the tier the checker asked for and its model (null: unknown). */
+export interface VerdictGrader {
+  readonly tier: string | null;
+  readonly model: string | null;
+}
+
+/**
+ * Who judged a gate verdict, for `Ingest.onVerdict` (plan §2.6, I6): a `checker` verdict was judged by an LLM grader — its
+ * `grader` (verify/types.ts), else an unknown one (no tier, no model: never independent) — and any other verdict by deterministic
+ * checks (`undefined`).
+ */
+export function verdictGraderOf(verdict: Pick<VerificationVerdict, "method" | "grader">): VerdictGrader | undefined {
+  if (verdict.method !== "checker") return undefined;
+  return { tier: verdict.grader?.tier ?? null, model: verdict.grader?.model ?? null };
+}
+
 /**
  * Kind of attempt a row or signal belongs to. `dispatch` = an orchestrator dispatch routed in
  * `execute.before` (2.2); the others are `delegate` ladder attempts (1.5 / 2.3): `variant` = same model,
@@ -415,8 +431,12 @@ export interface OutcomeStore {
   readonly revision: number;
   /** Hot reload of `routing.outcomes` (applied lazily on the next read/write). */
   configure(tuning: Partial<OutcomeTuning>): void;
-  /** D4: pass → success, fail → failure, unverifiable → strict no-op. Returns whether the Beta changed. */
-  recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal): boolean;
+  /**
+   * D4: pass → success, fail → failure, unverifiable → strict no-op. Returns whether the Beta changed. `weight` (QA-P33F2-1-1,
+   * default 1): the observation's Beta weight in (0, 1] — an independent grader's verdict of a role dispatch weighs 0.5 (plan
+   * §2.6); any other value records nothing. The lifetime counters count the verdict once whatever its weight.
+   */
+  recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal, weight?: number): boolean;
   /** D4: a false refusal is a failure of the key. Returns whether the Beta changed. */
   recordFalseRefusal(key: OutcomeKey, signal: AttemptSignal): boolean;
   /** Accumulate one step into its attempt; a `final` step folds the attempt into `cost(key)`. */

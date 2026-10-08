@@ -26,6 +26,12 @@ export interface Verdict {
    * this verdict classified, concatenated across testsPass checks. Absent when no check classified.
    */
   failures?: FailureClassification;
+  /**
+   * #84 P3.3 fix 2 (plan §2.6, I6): the LLM grader that judged this verdict (checker.ts runChecker, only once a grader
+   * session answered): the tier the checker asked for and the model the grader was dispatched on (`provider/model`, null when
+   * the router does not know it). Outcome signals weigh such a verdict as a grader's, never as a deterministic check's.
+   */
+  grader?: { readonly tier: string; readonly model: string | null };
 }
 
 export interface ExecResult {

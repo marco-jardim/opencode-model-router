@@ -402,7 +402,8 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
   const annotations: DecisionRow[] = [];
   const seenNotes = new Set<string>();
   // Residual QA-P14-1-6: a refusal that records `overrides: "pass"` turned the attempt's store pass into a failure (as
-  // `summarize` moves that pass to a fail). The attempt's `verdict:pass` signal then counts as a failure of 1. Every row
+  // `summarize` moves that pass to a fail). The attempt's `verdict:pass` signal then counts as a failure of 1, and its
+  // `grader:pass` signal (#84 P3.3 fix 2: grader verdicts follow the store too) as a failure of the grader's 0.5. Every row
   // handed in, not only the window: the refusal may land in another window than the signal.
   const converted = new Set<string>();
   for (const row of rows) if (row.kind === "refusal" && row.overrides === "pass") converted.add(row.attemptID);
@@ -485,7 +486,7 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
       continue;
     }
     const cell = acc.signals.get(kind) ?? { pass: 0, fail: 0, none: 0, positive: 0, negative: 0 };
-    const overridden = kind === "verdict" && row.attemptID !== undefined && converted.has(row.attemptID) && (row.signalWeight ?? 0) > 0;
+    const overridden = (kind === "verdict" || kind === "grader") && row.attemptID !== undefined && converted.has(row.attemptID) && (row.signalWeight ?? 0) > 0;
     const mass = signalMass(kind, overridden ? -1 : row.signalWeight);
     if (mass.positive > 0) cell.pass += 1;
     else if (mass.negative > 0) cell.fail += 1;

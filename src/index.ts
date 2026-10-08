@@ -84,7 +84,7 @@ import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
-import { isAnnotationRow, verdictOf, type LogRow } from "./routing/outcomes/types";
+import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./routing/outcomes/types";
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
@@ -148,7 +148,7 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
-import { requestedVerificationCwd, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
 import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
@@ -1745,7 +1745,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 // R2-2: a failed/timed-out producer may never deliver host confirmation. The ladder's
                 // verdict still needs its decision row; the same callback is idempotent after host progress/result.
                 attempt.confirmProducer?.();
-                ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict));
+                // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+                ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict), verdictGraderOf(gateRes.verdict));
               }
 
               const action = nextAction(
@@ -2314,6 +2315,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // DF2-F1: a role dispatch is verified in its verification root (capture, change set, checks, deferral); a requested
             // cwd outside that root is refused by the gate below, never deferred to run there later.
             const scope = verificationScopeOf(input.callID, input?.args, dod);
+            const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
             const effectiveCwd = scope.cwd;
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
@@ -2336,6 +2338,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 producerTier,
                 description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
                 cwd: effectiveCwd,
+                // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
+                ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
                 dod,
                 dispatchedAt: start.dispatchedAt,
                 // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
@@ -2413,6 +2417,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     ...(scope.requested ? { cwd: scope.requested } : {}),
                     ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
                     ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
+                    // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
+                    ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
                   },
                   artefact,
                   gateDeps,
@@ -2458,7 +2464,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
             res = applyDispatchCaveats(res, verification);
             // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
-            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict));
+            // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);

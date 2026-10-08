@@ -288,6 +288,73 @@ describe("recordVerdict (D4)", () => {
     expect(p.beta).toBe(2);
   });
 
+  // #84 P3.3 fix 2 (QA-P33F2-1-1): an independent grader's verdict of a role dispatch is half an observation (plan §2.6).
+  it("a weighted verdict adds its weight to the Beta; the counters count it once; the default stays 1", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    expect(store.recordVerdict(K(), "pass", signal("a"), 0.5)).toBe(true);
+    expect(store.recordVerdict(K(), "fail", signal("b"), 0.5)).toBe(true);
+    expect(store.recordVerdict(K(), "pass", signal("c"))).toBe(true);
+    const entry = store.snapshot().entries[K()];
+    expect(entry?.beta).toEqual({ alpha: 1.5, beta: 0.5, updatedAt: T0 });
+    expect(entry?.counts).toEqual({ pass: 2, fail: 1, falseRefusals: 0, variantPass: 0, variantFail: 0 });
+    expect(store.posterior(K()).n).toBe(2);
+  });
+
+  it("a weight outside (0, 1] records nothing and leaves the attempt unscored", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    for (const weight of [0, -0.5, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(store.recordVerdict(K(), "pass", signal("a"), weight), String(weight)).toBe(false);
+    }
+    expect(store.revision).toBe(0);
+    expect(store.keys()).toEqual([]);
+    expect(store.recordVerdict(K(), "pass", signal("a"), 1)).toBe(true);
+  });
+
+  it("a false refusal after a weighted pass takes back only that pass's weight", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    store.recordVerdict(K(), "pass", signal("full"));
+    expect(store.recordVerdict(K(), "pass", signal("half"), 0.5)).toBe(true);
+    expect(store.recordFalseRefusal(K(), signal("half"))).toBe(true);
+    const entry = store.snapshot().entries[K()];
+    expect(entry?.beta.alpha).toBeCloseTo(1, 12); // the full pass stays
+    expect(entry?.beta.beta).toBeCloseTo(1, 12);
+    expect(entry?.counts).toMatchObject({ pass: 1, fail: 1, falseRefusals: 1 });
+  });
+
+  // QA-P33F2-2 N-a: the attempt ends at one full failure, as after a weighted pass.
+  it("a false refusal after a weighted FAIL tops beta up by 1 − weight × decay; a repeat adds nothing", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    expect(store.recordVerdict(K(), "fail", signal("half"), 0.5)).toBe(true);
+    expect(store.recordFalseRefusal(K(), signal("half"))).toBe(true);
+    const entry = store.snapshot().entries[K()];
+    expect(entry?.beta.alpha).toBe(0);
+    expect(entry?.beta.beta).toBeCloseTo(1, 12);
+    expect(entry?.counts).toEqual({ pass: 0, fail: 1, falseRefusals: 1, variantPass: 0, variantFail: 0 });
+    const revision = store.revision;
+    expect(store.recordFalseRefusal(K(), signal("half"))).toBe(false); // already a full failure: the lifetime counter only
+    expect(store.snapshot().entries[K()]?.beta).toEqual(entry?.beta);
+    expect(store.snapshot().entries[K()]?.counts.falseRefusals).toBe(2);
+    expect(store.revision).toBe(revision + 1);
+  });
+
+  it("the top-up is measured at the refusal: a weighted fail a day earlier still ends at one failure now", () => {
+    const c = clock();
+    const store = createOutcomeStore({ now: c.now });
+    store.recordVerdict(K(), "fail", signal("half"), 0.5);
+    c.advance(DAY_MS);
+    expect(store.recordFalseRefusal(K(), signal("half"))).toBe(true);
+    const beta = store.snapshot().entries[K()]?.beta;
+    expect(beta?.beta).toBeCloseTo(1, 12);
+    expect(beta?.updatedAt).toBe(T0 + DAY_MS);
+  });
+
+  it("a false refusal after a full fail stays a lifetime-counter change only (unchanged)", () => {
+    const store = createOutcomeStore({ now: clock().now });
+    store.recordVerdict(K(), "fail", signal("full"));
+    expect(store.recordFalseRefusal(K(), signal("full"))).toBe(false);
+    expect(store.snapshot().entries[K()]?.beta).toEqual({ alpha: 0, beta: 1, updatedAt: T0 });
+  });
+
   it("unverifiable is a strict no-op: false, no revision bump, snapshot deep-equal", () => {
     const store = createOutcomeStore({ now: clock().now });
     store.recordVerdict(K(), "pass", signal("a"));

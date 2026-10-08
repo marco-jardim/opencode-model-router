@@ -244,10 +244,12 @@ export const DEFINING_CLASS: Readonly<Record<RoleKind, ActionClass>> = Object.fr
  * tiers mode (I1) and the docs-drift guard. Users narrow them through `roleAgents` (global layer
  * only).
  *
- * Assurance (QA-P11-1-5): implementer and general ship `none`. A dispatch's effective detection
- * is `deterministic` when the router's gate runs its acceptance checks, else the weaker of the
- * route-line claim and the prompt's `[acceptance]` block (§2.1); the role default applies only
- * when neither exists, and `none` never claims evidence the dispatch does not carry.
+ * Assurance (QA-P11-1-5): implementer and general ship `none`. The role's default assurance is
+ * descriptive only: it never sets a dispatch's detection. The effective detection comes only from
+ * the router's gate (`deterministic` when it runs the acceptance checks), the route line's `d=`
+ * claim and the prompt's `[acceptance]` block (§2.1, `routing/roles/policy.ts` effectiveDetection:
+ * otherwise the weaker of the two, capped at `grader`); in roles mode a missing claim counts as
+ * `none`, so no dispatch claims evidence it does not carry.
  *
  * `general` is also a host-native agent name: see {@link HOST_NATIVE_ROLE_NAMES}.
  */
