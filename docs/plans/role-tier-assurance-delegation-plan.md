@@ -381,7 +381,7 @@ export type SignalKind = "verdict" | "run" | "grader" | "incomplete" | "budget" 
 //   DecisionRow optional extension: role, grant, detection, boundsReasons, budgetUsed, signal, explore, propensity, binding
 // D:\git\opencode-model-router\src\routing\roles\binding.ts — P1.6 first commit
 export function registerPending(entry: PendingDispatch): void;          // keyed by parent + callID
-export function bind(childSessionID: string, getSession: SessionLookup): Promise<Binding>; // ambiguous → intersection, unknown → local
+export function bind(childSessionID: string, getSession: SessionLookup): Promise<Binding>; // R7: nonce marker → exact; no/unmatched nonce → unknown (max ∩ local); signatures take maxOf/max (see R7)
 export function widen(childSessionID: string, actions: readonly AuthorityAction[]): DispatchGrant;
 export function evict(sessionOrCallID: string): void;
 // D:\git\opencode-model-router\src\router\guard-profile.ts — P1.5 first commit
@@ -396,7 +396,7 @@ export function annotateSubagentResult(kind: "budget" | "authority", childSessio
 ### 2.5 Dynamic authority and the authority ladder
 - Grant = role max ∩ needs-derived actions (classifier `needs` and route-line `needs=`) ∪ grants widened on resume.
 - **Binding** child ↔ dispatch is lazy, at the child's first context build or permission evaluation:
-  `session.get(child)` → parentID/agent/title → pending dispatch. **Ambiguous → intersection; unknown → local only,
+  `session.get(child)` → parentID/agent/title → pending dispatch. **(R7) Exact only through the router-inserted nonce (anchored markers); no nonce, foreign or conflicting markers → unknown = role max ∩ local,
   plus a note telling the child to call `router_request_authority`.** Never a union. The work root survives an intersection only if every candidate
   shares it, otherwise `workRoot: null`; an unknown binding has `workRoot: null`. Pending entries live until the
   parent's `subagent` call completes (`execute.after`), capped at 30 min. Every unknown binding writes a row
@@ -414,7 +414,7 @@ export function annotateSubagentResult(kind: "budget" | "authority", childSessio
   command after the child's last edit (1); grader pass with grader tier ≥ producer tier **and** grader model ≠
   producer model (0.5). Negative: deterministic fail (1); grader fail (0.5); `NEED MORE`/`ESCALATE` without budget
   exhaustion or authority request (0.5); re-dispatch of the same task to a higher tier within 30 min (0.5 on the
-  previous attempt), similarity computed over the TASK + EXPECTED OUTCOME sections (or the text left after removing
+  previous attempt), similarity computed over the TASK section only (R7) (or the text left after removing
   lines shared with ≥ 2 sibling dispatches). DONE alone: 0. Budget exhaustion and authority requests: recorded, no
   tier penalty.
 - Role agents: total budget per role/tier (`budget=` raises it up to 2×), cumulative = budget × 3; `CAP:N` /
@@ -430,14 +430,14 @@ the only v1 changes are the mode-independent fixes of §2.9, each with a before/
 ### 2.8 Invariants (each has an owner and tests)
 | Id | Invariant | Owner phases (tests) |
 |---|---|---|
-| I1 | Without `routing.delegation: "roles"`, v2 is byte-identical to the base except §2.9 | P1.1, P2.1, P2.2 (D1/D2 suites, goldens) |
+| I1 | Without `routing.delegation: "roles"`, v2 is byte-identical to the base except §2.9, T1.5.3a (header names `root=`) and the I7 budget-incomplete rule (R7) | P1.1, P2.1, P2.2 (D1/D2 suites, goldens) |
 | I2 | Every role dispatch on v2 gets a router-set model within `[floor, ceiling]`, never below the authority floor | P1.2 (property test), P2.1, P3.1 |
 | I3 | A role child can never use an action outside its dispatch grant: unlisted tools are absent from its catalog (host without session grants; router context-hook stripping under a granting parent), native actions outside the policy are refused (host or router `evaluate`), `router_run`/`router_git_*` refuse a foreign `cwd` themselves (R6/P-17; proven under a parent without grants and under an allow-all parent) | P2.3, P3.1 |
 | I4 | No shipped or accepted grant violates the separation rule | P1.1 (validator), P1.2, P3.1 |
 | I5 | Binding ambiguity never widens authority | P1.6 (property test), P2.3, P3.1 |
 | I6 | Positive evidence never comes from self-report | P1.4 |
 | I7 | Budget exhaustion never counts as a tier failure | P1.4, P1.5 |
-| I8 | v1 is byte-identical to the base except §2.9 | P1.1, P3.1 (hash + `smoke:v1`) |
+| I8 | v1 is byte-identical to the base except §2.9, T1.5.3a and the I7 budget-incomplete rule (R7) | P1.1, P3.1 (hash + `smoke:v1`) |
 | I9 | Role-agent enforcement fails closed: a context-hook error → empty catalog (annotated); an unknown/absent binding → max policy ∩ local actions, `router_run` refuses, `external_directory` denied; an `evaluate` error → deny with a message (R6/P-2, P-3, P-17) | P2.3, P3.1 |
 
 ### 2.9 Mode-independent fixes (apply to v1, tiers mode and roles mode)
@@ -465,7 +465,7 @@ effective deterministic detection; removing the tier agents; raw shell inside ro
 | 1 | P1.2 | `D:\git\opencode-model-router\src\routing\roles\policy.ts` (new), `D:\git\opencode-model-router\src\routing\classify\route-line.ts`, `D:\git\opencode-model-router\src\routing\classify\types.ts` (additive), `D:\git\opencode-model-router\src\routing\engine\kernel.ts`, `D:\git\opencode-model-router\src\routing\engine\ladders.ts`, `D:\git\opencode-model-router\src\routing\engine\types.ts` (additive), `D:\git\opencode-model-router\src\routing\engine\simulate.ts`, `D:\git\opencode-model-router\src\routing\engine\index.ts`, `D:\git\opencode-model-router\test\unit\roles.policy.test.ts` (new), `D:\git\opencode-model-router\test\unit\roles.kernel.test.ts` (new), `D:\git\opencode-model-router\test\unit\route-line.roles.test.ts` (new) |
 | 1 | P1.3 | `D:\git\opencode-model-router\src\router\run-tools.ts` (new), `D:\git\opencode-model-router\src\router\git-tools.ts` (work-root resolver injection only, R6/P-18), `D:\git\opencode-model-router\test\unit\run-tools.test.ts` (new) |
 | 1 | P1.4 | `D:\git\opencode-model-router\src\routing\outcomes\types.ts`, `D:\git\opencode-model-router\src\routing\outcomes\signals.ts` (new), `D:\git\opencode-model-router\src\routing\outcomes\ingest.ts`, `D:\git\opencode-model-router\src\routing\outcomes\stats.ts`, `D:\git\opencode-model-router\src\routing\outcomes\persist.ts`, `D:\git\opencode-model-router\src\routing\outcomes\index.ts`, `D:\git\opencode-model-router\test\unit\routing-outcomes.signals.test.ts` (new) |
-| 1 | P1.5 | `D:\git\opencode-model-router\src\router\guard-profile.ts` (new), `D:\git\opencode-model-router\src\guard\guards.ts`, `D:\git\opencode-model-router\src\guard\enforce.ts`, `D:\git\opencode-model-router\src\router\dispatch-header.ts`, `D:\git\opencode-model-router\src\verify\dod.ts`, `D:\git\opencode-model-router\src\verify\checker.ts` (S5 confirms or amends), `D:\git\opencode-model-router\src\verify\dispatch.ts` (header strip in `buildDelegationDoD`, R6/P-15), `D:\git\opencode-model-router\test\unit\guards.roles.test.ts` (new), `D:\git\opencode-model-router\test\unit\verify.criteria.test.ts` (new) |
+| 1 | P1.5 | `D:\git\opencode-model-router\src\router\guard-profile.ts` (new), `D:\git\opencode-model-router\src\verify\gate.ts`, `D:\git\opencode-model-router\src\verify\wiring.ts`, `D:\git\opencode-model-router\src\escalate\ladder.ts`, `D:\git\opencode-model-router\src\guard\store.ts`, `D:\git\opencode-model-router\src\router\sessions.ts` (cap getters), `D:\git\opencode-model-router\src\index.ts` (cap/root pass-through lines only, R7), `D:\git\opencode-model-router\src\guard\guards.ts`, `D:\git\opencode-model-router\src\guard\enforce.ts`, `D:\git\opencode-model-router\src\router\dispatch-header.ts`, `D:\git\opencode-model-router\src\verify\dod.ts`, `D:\git\opencode-model-router\src\verify\checker.ts` (S5 confirms or amends), `D:\git\opencode-model-router\src\verify\dispatch.ts` (header strip in `buildDelegationDoD`, R6/P-15), `D:\git\opencode-model-router\test\unit\guards.roles.test.ts` (new), `D:\git\opencode-model-router\test\unit\verify.criteria.test.ts` (new) |
 | 1 | P1.6 | `D:\git\opencode-model-router\src\routing\roles\binding.ts` (new), `D:\git\opencode-model-router\src\routing\roles\authority.ts` (new), `D:\git\opencode-model-router\test\unit\roles.binding.test.ts` (new), `D:\git\opencode-model-router\test\unit\roles.authority.test.ts` (new) |
 | 2 | P2.1 | `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`, `D:\git\opencode-model-router\src\routing\wire\runtime.ts`, `D:\git\opencode-model-router\src\compat\v2-hooks.ts`, `D:\git\opencode-model-router\src\index.ts`, `D:\git\opencode-model-router\src\v2.ts`, `D:\git\opencode-model-router\src\router\read-only.ts`, `D:\git\opencode-model-router\src\router\plugin-agents.ts`, `D:\git\opencode-model-router\test\integration\roles-dispatch.test.ts` (new) |
 | 2 | P2.2 | `D:\git\opencode-model-router\src\router\protocol.ts`, `D:\git\opencode-model-router\src\router\prompts.ts`, `D:\git\opencode-model-router\src\routing\engine\protocol-line.ts`, `D:\git\opencode-model-router\src\routing\wire\hint.ts`, `D:\git\opencode-model-router\src\routing\advisor\findings.ts`, `D:\git\opencode-model-router\src\routing\advisor\index.ts`, `D:\git\opencode-model-router\src\routing\commands\stats.ts`, `D:\git\opencode-model-router\src\commands\output.ts`, `D:\git\opencode-model-router\scripts\routing-stats.ts`, `D:\git\opencode-model-router\test\integration\roles-protocol.test.ts` (new), `D:\git\opencode-model-router\test\golden\roles-protocol.golden.test.ts` (new) |
@@ -744,7 +744,7 @@ Tasks:
 - T1.6.3 [tier:medium] Tests in `D:\git\opencode-model-router\test\unit\roles.binding.test.ts` and
   `D:\git\opencode-model-router\test\unit\roles.authority.test.ts`.
 
-Tests (edge cases): two identical parallel dispatches (intersection); binding after the parent call completed
+Tests (edge cases): two identical parallel dispatches (each binds exactly by its nonce; a child carrying both markers → unknown, R7); binding after the parent call completed
 (local); parent deleted; the same child resumed twice; widening outside the max; request replay; request from a fixed
 role (refused); two plugin instances (process-wide registry, one decision); property test over random interleavings:
 the bound grant ⊆ every candidate grant; candidates with different work roots → `workRoot: null`; property: the bound
@@ -789,7 +789,7 @@ Tasks:
 - T2.1.1 [tier:heavy] Role agent registration in `D:\git\opencode-model-router\src\compat\v2-hooks.ts` (agent
   transform) using `D:\git\opencode-model-router\src\router\read-only.ts` and
   `D:\git\opencode-model-router\src\router\plugin-agents.ts`: the floor tier's model as registered fallback (S1), role
-  prompt verbatim, steps from the top budget, the role's **max** policy deny-by-default and fail-closed (`external_directory` allowed only
+  prompt verbatim, steps = top budget + `REFUSAL_CAP` (10) + margin (R6/P-4, R7), the role's **max** policy deny-by-default and fail-closed (`external_directory` allowed only
   for the repository's worktree roots, §2.2), `explore`
   alias (S9), nothing on v1 or in tiers mode.
 - T2.1.2 [tier:heavy] Role path in `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`: classify → resolve the
@@ -1122,6 +1122,29 @@ prompt (§0.2.3).
   root (P1.3 owns the resolver injection in `src\router\git-tools.ts`, P2.1 wires it); P-19 role agents are always
   router-registered. Round-3 minors of P0.1 are handoffs listed in `phase-p01.md` (P1.1, P2.1, P2.3); the pre-existing
   `6 v1 untouched` smoke failure (stale pin `71815eb`) is a P3.1 handoff.
+- R7 (Wave 1 QA, 2026-10-08; phase reports `docs\qa\role-tier\phase-p1{1..6}.md`). Contract changes accepted from QA:
+  P1.2 — `tierBounds(role, grant, classified: ClassifiedDispatch, detection: EffectiveDetection, opts)` and
+  `decideRole({ classified, … })` compute raise-only risk/scope internally; `effectiveDetection({ routerGate, claim,
+  acceptance })` computes A34 (no other `as EffectiveDetection` in `src`); `grantFor(…, workRoot: null)` withholds
+  write and run (null = "no validated root", never "unknown binding"); `roleTierOrder(cfg, session)` is the one tier
+  order and must equal P1.1's `presetTierOrder` (Wave 1 integration); `dispatch: null` → P2.1 refuses the role
+  dispatch. P1.6 — nonces come from `newDispatchNonce()` (`/^[A-Za-z0-9_-]{16,128}$/`), markers only at anchors
+  (description suffix ` [nonce <n>]`, last prompt line `OMR_NONCE=<n>`); exact binding only by nonce, everything else
+  `unknown` = role max ∩ local (no intersection path); `bind(child, lookup, { maxOf })`, `widen(child, actions, max)`,
+  `evictCall(parent, callID)` + `evict(session)`, `Binding.budget`; authority records attach to a call in
+  `markAnnotated`, `consumeAuthority(…, { afterCall })` returns a `ConsumeResult`; versioned registry keys. P1.4 —
+  re-dispatch similarity over TASK only, identifier overlap, class/role match, leave-one-out boilerplate,
+  `REDISPATCH_MAX_EARLIER = 100`; `onSignal` refuses `verdict` (written by `onVerdict` only); `GuardObservation`
+  required. P1.5 — `REFUSAL_CAP = 10`; P-4 becomes `steps = top budget + REFUSAL_CAP + margin`; `budgetExhausted` means
+  a real enforced stop in the current round; incomplete verdicts carry `incomplete: true` and are never accepted;
+  ownership adds `src\verify\gate.ts`, `src\verify\wiring.ts`, `src\escalate\ladder.ts`, `src\guard\store.ts`,
+  `src\router\sessions.ts` and the cap/root pass-through lines of `src\index.ts`; I1/I8 additionally exempt
+  T1.5.3a (header names `root=` in every mode) and the I7 budget-incomplete rule. P1.3 — `router_run` and
+  `router_git_*` take `resolveWorkRoot(sessionID): WorkRootAnswer` (`{role:false} | {role:true, root|null}`);
+  single-dash arguments carrying `/`, `\` or `..` are refused; work-root `.npmrc` with `workspace*`,
+  `globalconfig`, `userconfig` or `prefix` is refused. P1.1 — role specs live in code (`SHIPPED_ROLE_SPECS`), not in
+  `tiers.json`; role-table notices carry the prefix `roles mode (OpenCode v2 only): `; roles whose range a preset's
+  cost order inverts are disabled. Every P2.1 handoff is listed in the phase reports.
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |
