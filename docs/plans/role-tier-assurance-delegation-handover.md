@@ -1,7 +1,7 @@
 # Handover — Role × Tier × Assurance delegation (#84)
 
-> **Revision:** 2 — plan written, reviewed (PLAN-1…21 → R0) and amended (R1 dogfood + owner rules, R2 restarts,
-> R3 heavy QA of this handover: work root, kill switch, liveness probe, baselines);
+> **Revision:** 3 — plan written, reviewed (PLAN-1…21 → R0) and amended (R1 dogfood + owner rules, R2 restarts,
+> R3 and R4 = two heavy QA rounds of this handover: work root via `root=`, kill switch, liveness probe, baselines);
 > execution **not started**; next: **P0.1 pre-flight** (2026-10-07). The executing orchestrator rewrites §2 and §8 at
 > every phase merge, wave close, dogfood checkpoint and **before every restart request** (plan §0.1).
 > **Plan:** `role-tier-assurance-delegation-plan.md` in this folder. Read it in full before doing anything.
@@ -57,7 +57,8 @@ matter most:
    complex coding sent to implementer with the first line
    [route class=implement risk=high tier=heavy pin]; tier agents only as a recorded fallback.
    Every dispatch has the 7 sections (TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO,
-   CONTEXT, ENVIRONMENT) with full paths in the PHASE WORKTREE, named as its work root.
+   CONTEXT, ENVIRONMENT) with full paths in the PHASE WORKTREE, named as its work root by the
+   route-line key root= (e.g. [route class=review risk=high root=D:\git\omr-rta-p11 pin]).
    Steps tagged [executor] (merges, sync/rollback commands, plan/handover/dogfood edits) you do
    yourself.
 6. Never run the full suite when a scoped run answers the question. Test only what the change
@@ -88,7 +89,7 @@ matter most:
 | **Next task id** | **P0.1 pre-flight step 1** (plan §5 P0.1, in this order: create and push `rta/main` from `origin/docs/role-tier-plan`; `worktree add D:\git\omr-rta-main`; `npm ci` there; draft PR `rta/main → master`; then standard steps for `D:\git\omr-rta-p01`, capped suite, `enforcementMode`, dogfood.md baseline) |
 | Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
 | Active worktrees for this plan | `D:\git\omr-plan-rta` → `docs/role-tier-plan` → planning (frozen after P0.1 step 1) |
-| Plan branch | `docs/role-tier-plan` (pushed); first commit `47f1e88`; this handover and R1/R2 in the following commit |
+| Plan branch | `docs/role-tier-plan` (pushed): `47f1e88` plan, `f23c9a7` handover + R1/R2, `8dcf455` R3, then R4 (handover revision 3) |
 | `rta/main` | not created |
 | Draft PR `rta/main → master` | not opened |
 | Base checkout | `D:\git\opencode-model-router` on `master` @ `eeab36b`, clean |
@@ -99,7 +100,7 @@ matter most:
 | Dogfood | DF-1 pending; DF-2 pending |
 | Restart stops | none requested yet; three planned (DF-1, DF-2, P3.4), plus DF-2b only if spike S12 shows agent registration needs one |
 | Override SHA-256 baseline | not recorded yet (P0.1 pre-flight step 5) |
-| Plan amendments | R0, R1, R2, R3; next free id: R4 |
+| Plan amendments | R0, R1, R2, R3, R4; next free id: R5 |
 
 ---
 
@@ -157,8 +158,12 @@ paths into it (plan "Path convention").
   but every dispatch works in `D:\git\omr-rta-<id>`. The classifier marks such paths `external_dir`
   (`D:\git\opencode-model-router\src\routing\classify\rules.ts:558`), and today's read-only tiers only work because
   they carry `external_directory: "allow"` (`D:\git\opencode-model-router\src\router\read-only.ts:119`). Role agents
-  must accept their dispatch's registered worktree as the work root and deny everything outside it; `router_run`
-  takes `cwd`. Spike S11 settles the host side before any role code is written.
+  take their work root from the route-line key `root=` (every dispatch carries it from P0.1 on; older code ignores
+  it), accept only registered worktrees of this repository, and deny everything outside. Worktrees created after the
+  DF-2 registration are covered by the `routing.workRoots` pattern `D:/git/omr-rta-*` that the DF-2 migration adds
+  (removed again in T3.4.5). `router_run` takes `cwd`. The router's dispatch header still says "Working directory:
+  `D:\git\opencode-model-router`" until P1.5 T1.5.3a; the ENVIRONMENT section and `root=` win. Spike S11 settles the
+  host side before any role code is written.
 - **Kill switch = the pre-DF-2 override backup**, not just `delegation: "tiers"`: DF-2 also removes
   `subagentTiers.explore` and the custom `runner`/`reviewer`/`researcher` agents, which tiers mode alone would not
   bring back.
@@ -206,7 +211,7 @@ paths into it (plan "Path convention").
 
 | Symptom | What to do |
 |---|---|
-| "read/draft budget exhausted (3 consecutive non-producing actions)" or "tool-call budget 25 exhausted" | The owner is in `enforced` again (check `state.json` read-only; never write it). Use plan §0.2.6: a notes file every second read, ≤ 15 information calls, split by area. DF-1 removes the cause |
+| "read/draft budget exhausted (3 consecutive non-producing actions)" or "tool-call budget 25 exhausted" | The owner is in `enforced` again (check `state.json` read-only; never write it). Use plan §0.2.6: a notes file every second read, ≤ 15 information calls, split by area. DF-1 removes the 3-read denial and the charging of denied calls; the 25-call tier budget remains until roles mode (DF-2) |
 | "DENIED: you already ran this exact read" after a denial | Same root cause: the denied call was recorded. Read a different range, or take the content from the notes file |
 | `CAP:none` ignored | It needs a `reason:` line in the same dispatch, and it lifts only the read-only counter, not the 25-call budget |
 | After a sync, the pasted `/router` line (`router: engine=… build=<version>+<sha7>`) shows the previous `<sha7>` | The host was not restarted (A8: code is not live until a restart). Ask again with the §7 message; no rollback. `unknown`, a load failure or missing router agents → rollback (plan §0.7) and a critical finding |

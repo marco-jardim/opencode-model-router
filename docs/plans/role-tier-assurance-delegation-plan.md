@@ -16,7 +16,8 @@ for readability. **Dispatch prompts must translate every path to the phase workt
 `D:\git\opencode-model-router\src\router\roles.ts` → `D:\git\omr-rta-p11\src\router\roles.ts`). The base checkout is
 what the live host loads; only the executor writes there, at DF-1, DF-2 and P3.4 (§0.3.4, §0.7). The plan, the
 handover and `docs\qa\role-tier\dogfood.md` are executor-owned and live in the integration worktree
-`D:\git\omr-rta-main` (§4).
+`D:\git\omr-rta-main` (§4). Exception to the translation rule: executor-owned files are always cited at their
+`D:\git\omr-rta-main\…` path, so delegates never read a stale copy of the plan.
 
 ---
 
@@ -64,7 +65,9 @@ handover and `docs\qa\role-tier\dogfood.md` are executor-owned and live in the i
    cannot complete, the executor asks the human once (P0.1) whether to set `enforcementMode: advisory` for the
    duration of the plan; the executor never changes the owner's state itself.
 7. Every dispatch prompt follows the 7-section structure (TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO,
-   CONTEXT, ENVIRONMENT) with full **worktree** paths.
+   CONTEXT, ENVIRONMENT) with full **worktree** paths, and its route line carries `root=D:\git\omr-rta-<id>` (the
+   phase worktree; e.g. `[route class=review risk=high root=D:\git\omr-rta-p11 pin]`). Code before P1.2 ignores the
+   unknown key, so this is safe from P0.1 on.
 
 ### 0.3 Parallelism with safe file ownership
 1. **One writer per file at any time.** Each phase owns the files listed in §4; a file owned by an active phase is
@@ -139,11 +142,14 @@ Handoffs, Verdict).
   `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`; `opencode api get
   '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` (works on the live 2.0.24, used 2026-10-07)
   lists the router agents. A marker with the previous sha means the host was not restarted: ask again, no rollback.
+  A marker with any other sha means the sync went wrong: compare `git -C D:\git\opencode-model-router log -1` with
+  the intended commit, fix the checkout, ask for another restart; no blind rollback.
   A marker `unknown`, a load failure or missing router agents → rollback and a critical finding for the owning phase.
   Routing keys of the override hot-reload; whether agent registrations follow an override change without a restart is
   settled by spike S12.
 - **Rollback** `[executor]`, in order: (1) restore the newest override `.bak-<timestamp>` taken by this checkpoint (hot
-  reload; for DF-2 this is the §0.10 kill switch); (2) only if the code is broken: DF-1 →
+  reload; for DF-2 this is the §0.10 kill switch; if S12 showed agent registration needs a restart, a restart stop
+  follows even without a code rollback); (2) only if the code is broken: DF-1 →
   `git -C D:\git\opencode-model-router switch master`; DF-2 → `git -C D:\git\opencode-model-router reset --hard
   rta/df2-prev` on `rta/live`; P3.4 → `git -C D:\git\opencode-model-router switch --detach rta/sync-prev` (never reset
   `master`; keep `rta/live` until the P3.4 probe passes); (3) `npm ci` if `package-lock.json` differs between the two
@@ -153,7 +159,8 @@ Handoffs, Verdict).
   that accepts every key being written** (code that does not know a key rejects it, and an invalid value drops the
   whole layer, including `routing`, #80), always validated in a temp HOME first and backed up as
   `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc.bak-<yyyy-MM-dd_HH-mm-ss>`. After every
-  write the file's SHA-256 is recorded in dogfood.md (the pre-flight baseline, §5).
+  write the file's SHA-256 is recorded in dogfood.md (the pre-flight baseline, §5) and a copy is kept at
+  `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`.
 
 ### 0.8 Wave integration
 [tier:medium] When every phase of a wave has passed QA and is merged: typecheck and the capped full suite on
@@ -172,7 +179,10 @@ E11). A wave closes only when CI is green. [tier:heavy] Hot-file merge conflicts
    never loop reviews to exhaustion on the same implementation.
 5. Always delegate through the model-router, preferring atomic tasks. Complex coding may go to `[tier:heavy]` for the
    heavy lift; running and collecting tests goes to lighter delegations. In roles mode (from DF-2) the heavy lift goes
-   to `implementer` with the first line `[route class=implement risk=high tier=heavy pin]` (§0.10).
+   to `implementer` with the first line `[route class=implement risk=high tier=heavy pin]` (§0.10). Exceptions done
+   by the executor itself (`[executor]`, §0.2.1): merges into `rta/main`, the §0.7 sync and rollback commands, the
+   dogfood probes, and edits to the executor-owned files — operations a delegate must not perform on the live checkout
+   or the integration branch.
 6. Never run the full suite when not needed; test what the change touches; accelerate with parallelism (§0.5).
 7. QA is always a heavy-tier task; adversarial review of the work done; commit often.
 8. Linear: not used by this project (the repo `.env` holds only `OPENCODE_API_KEY`; no Linear references). Progress
@@ -297,16 +307,21 @@ Rules:
   explicitly". Residual risk, documented: exec runs repo scripts that may reach the network; untrusted repo content
   is a prompt-injection vector the separation rule does not cover.
 - No role is granted `subagent`, `task` or `delegate`.
-- **Work root (R3).** Every role dispatch has one work root: the session directory, or a worktree of the same
-  repository (listed by `git worktree list --porcelain`) named in the dispatch's ENVIRONMENT — this plan's executor
-  dispatches into `D:\git\omr-rta-<id>` from a session in `D:\git\opencode-model-router`. `local`, `exec` and `write`
-  apply inside the work root only. An `external_dir` need (`D:\git\opencode-model-router\src\routing\classify\rules.ts:558`)
+- **Work root (R3, R4).** Every role dispatch has one work root: the session directory, or a worktree of the same
+  repository (listed by `git worktree list --porcelain`) named by the route-line key `root=<absolute path>` (P1.2) and
+  repeated in ENVIRONMENT; without `root=` the work root is the session directory. This plan's executor dispatches
+  into `D:\git\omr-rta-<id>` from a session in `D:\git\opencode-model-router`. `local`, `exec` and `write` apply
+  inside the work root only. An `external_dir` need (`D:\git\opencode-model-router\src\routing\classify\rules.ts:558`)
   that resolves inside the dispatch's work root is satisfied, not refused; any other path outside it is denied (reads
-  elsewhere, e.g. the host log, go to a tier agent or the executor). Role max policies allow `external_directory` only
-  for the repository's worktree roots (recomputed from `git worktree list --porcelain` whenever agents are re-applied),
-  never globally; the evaluate hook narrows to the dispatch's own work root. `router_run` takes `cwd`, which must equal
-  the work root. Owners: P1.1 (spec, validator), P1.2 (work root in the grant), P1.3 (`cwd`), P2.1 (max policy),
-  P2.3 (enforcement); spike S11 settles the host behaviour.
+  elsewhere, e.g. the host log, go to a tier agent or the executor). Role max policies allow `external_directory` for
+  the worktree roots listed by `git worktree list --porcelain` **at agent registration**, plus the global-layer
+  patterns `routing.workRoots` (absolute globs, default `[]`), never `*`; a worktree created after registration is
+  covered only by a pattern or by the next registration. The evaluate hook narrows to the dispatch's own root and
+  re-checks it against a fresh `git worktree list` at evaluation. `external_directory` is a local-class action for the
+  separation validator: roles without local actions (`researcher`) get none. `router_run` takes `cwd`, which must
+  equal the work root. The executor never names `D:\git\omr-plan-rta` or the unrelated worktrees of the handover's §3
+  as a work root. Owners: P1.1 (spec, `routing.workRoots`, validator), P1.2 (`root=`), P1.3 (`cwd`), P1.5 (header
+  line), P2.1 (resolution, max policy), P2.3 (enforcement); spike S11 settles the host behaviour.
 - Host native `explore` dispatched in roles mode is aliased to `explorer` (spike S9).
 - The router tiers `fast`/`medium`/`heavy` stay registered and callable (explicit-tier dispatch keeps today's
   behaviour); the roles protocol stops advertising them.
@@ -344,16 +359,17 @@ export interface RoleSpec { agent: string; kind: RoleKind; description: string; 
   authority: { mode: "fixed" | "dynamic"; allow: readonly AuthorityAction[]; deny: readonly AuthorityAction[] };
   tierRange: { floor: string; ceiling: string }; assurance: Detection; guard: "reader" | "producer";
   budget: Readonly<Record<string, number>>; enabled: boolean; codeModeAllow: readonly string[] }
-export interface RolesRoutingConfig { delegation: "tiers" | "roles" }
+export interface RolesRoutingConfig { delegation: "tiers" | "roles"; workRoots: readonly string[] }
 export interface ExplorationConfig { rate: number; requireDetection: "deterministic" }
 export interface RunConfig { scripts: readonly string[]; commands: Readonly<Record<string, { argv: readonly string[]; args?: readonly string[] }>>; timeoutMs: number }
 export function resolveRoles(cfg: RouterConfig, host: "v1" | "v2"): ReadonlyMap<string, RoleSpec>; // empty on v1 / tiers mode
 // D:\git\opencode-model-router\src\routing\classify\types.ts — P1.2 first commit (additive)
-//   RouteLine gains `tier?: string` and `budget?: number`
+//   RouteLine gains `tier?: string`, `budget?: number` and `root?: string` (absolute work root, §2.2)
 // D:\git\opencode-model-router\src\routing\roles\policy.ts — P1.2 first commit
-export interface DispatchGrant { actions: ReadonlySet<AuthorityAction>; notes: readonly string[]; workRoot: string }
+export interface DispatchGrant { actions: ReadonlySet<AuthorityAction>; notes: readonly string[];
+  workRoot: string | null } // null → no path outside the session directory, no router_run
 export function grantFor(role: RoleSpec, facts: TaskFacts, widened: readonly AuthorityAction[],
-  workRoot: string): DispatchGrant; // workRoot = session dir or a registered worktree root (§2.2)
+  workRoot: string | null): DispatchGrant; // resolved and validated by the caller (P2.1, §2.2)
 export function authorityFloor(grant: DispatchGrant, detection: Detection, risk: Risk, scope: Scope): string;
 export function tierBounds(role: RoleSpec, grant: DispatchGrant, facts: TaskFacts, detection: Detection,
   opts: { floorTier: string | null; runningTier: string | null; pinTier: string | null; tiers: readonly string[] }):
@@ -380,7 +396,8 @@ export function annotateSubagentResult(kind: "budget" | "authority", childSessio
 - Grant = role max ∩ needs-derived actions (classifier `needs` and route-line `needs=`) ∪ grants widened on resume.
 - **Binding** child ↔ dispatch is lazy, at the child's first context build or permission evaluation:
   `session.get(child)` → parentID/agent/title → pending dispatch. **Ambiguous → intersection; unknown → local only,
-  plus a note telling the child to call `router_request_authority`.** Never a union. Pending entries live until the
+  plus a note telling the child to call `router_request_authority`.** Never a union. The work root survives an intersection only if every candidate
+  shares it, otherwise `workRoot: null`; an unknown binding has `workRoot: null`. Pending entries live until the
   parent's `subagent` call completes (`execute.after`), capped at 30 min. Every unknown binding writes a row
   (`binding: unknown`) and raises the advisor finding `role-binding-unknown`.
 - Enforcement: the agent registration carries the role's **max** policy (deny-by-default, fail-closed,
@@ -454,7 +471,7 @@ effective deterministic detection; removing the tier agents; raw shell inside ro
 | 2 | P2.3 | after P2.1 merges: `D:\git\opencode-model-router\src\compat\v2-hooks.ts`, `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`, `D:\git\opencode-model-router\src\index.ts`, `D:\git\opencode-model-router\test\integration\roles-authority.test.ts` (new) |
 | 3 | P3.1 | `D:\git\opencode-model-router\test\smoke\roles.smoke.test.ts` (new), `D:\git\opencode-model-router\test\smoke\helpers\routing-host.ts`, `D:\git\opencode-model-router\docs\qa\role-tier\evidence\` (new) |
 | 3 | P3.2 | `D:\git\opencode-model-router\docs\ROLES.md` (new), `D:\git\opencode-model-router\docs\adr\0006-role-tier-assurance-delegation.md` (new), `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md`, `D:\git\opencode-model-router\docs\ROUTING_ENGINE.md`, `D:\git\opencode-model-router\docs\READ_ONLY_TIERS.md`, `D:\git\opencode-model-router\README.md`, `D:\git\opencode-model-router\CHANGELOG.md`, `D:\git\opencode-model-router\docs\plans\README.md`, `D:\git\opencode-model-router\test\unit\docs-drift.test.ts` |
-| 3 | P3.3 | read-only; fixes on the branch `rta/p33-fix-<n>` owned by the executor, one file owner at a time |
+| 3 | P3.3 | review is read-only; fixes in the worktree `D:\git\omr-rta-p33` on branches `rta/p33-fix-<n>` (switched inside it, one at a time), dispatched by the executor |
 | 3 | P3.4 | `D:\git\opencode-model-router\package.json`, `D:\git\opencode-model-router\package-lock.json`, `D:\git\opencode-model-router\CHANGELOG.md` (release entry, after P3.2 merges), `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (with backup), the base checkout's switch back to `master` |
 | all | executor | `D:\git\omr-rta-main\docs\plans\role-tier-assurance-delegation-plan.md`, `D:\git\omr-rta-main\docs\plans\role-tier-assurance-delegation-handover.md`, `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` (new in P0.1) — written only in the integration worktree and committed on `rta/main`, never in the base checkout; phases hand proposed amendments (e.g. T0.1.3) to the executor |
 | 1→2 | DF-1 (executor) | the base checkout `D:\git\opencode-model-router` (local branch `rta/live`, tag `rta/df1-prev`) |
@@ -476,8 +493,10 @@ Every phase also owns `D:\git\opencode-model-router\docs\qa\role-tier\phase-<id>
 5. [executor] `git -C D:\git\opencode-model-router status --porcelain` empty and its `HEAD` equal to the sha recorded at
    the last checkpoint (`eeab36b` before DF-1); SHA-256 of
    `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` equal to the last value recorded in
-   dogfood.md (an owner edit to it, to `state.json` or to `opencode.json` is recorded as an owner change, not an
-   incident).
+   dogfood.md. A mismatch is diffed against the copy kept at the last record
+   (`C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`): an owner edit (confirmed with the owner if
+   unclear) is recorded as an owner change; anything else is a blocking incident (a test writing the real config,
+   cost-aware A14). Owner edits to `state.json` or `opencode.json` are recorded, not incidents.
 
 **Standard Definition of Done** (every phase): every task committed and pushed with `Refs #84`; typecheck green; the
 phase's test files and `vitest related` green; new modules ≥ 90% branch coverage; QA PASS with 0 open
@@ -495,7 +514,8 @@ Pre-flight (this order):
    `origin/docs/role-tier-plan` (= `master` @ `eeab36b` + this plan and its handover);
    `git -C D:\git\opencode-model-router worktree add D:\git\omr-rta-main rta/main`; `npm ci` there; open the draft PR
    `rta/main → master`. From here on the plan, the handover and dogfood.md are edited only in `D:\git\omr-rta-main`.
-2. Standard steps 1–5 for `D:\git\omr-rta-p01` (step 5 records the first baseline).
+2. Standard steps 1–4 for `D:\git\omr-rta-p01`; standard step 5 only computes the base HEAD and the override SHA-256
+   (no baseline exists yet); step 5 below writes them as the first baseline.
 3. [tier:medium] Capped full suite in `D:\git\omr-rta-main` (record counts).
 4. [tier:fast] Record the owner's `enforcementMode` from
    `C:\Users\Marquinho\.config\opencode\opencode-model-router.state.json` (read-only); apply §0.2.6.
@@ -525,7 +545,8 @@ Tasks:
   - S11 a deny-by-default role-style agent dispatched from a session located in `D:\git\opencode-model-router` reads,
     edits and calls a `router_run`-style tool inside a sibling worktree of the same repository: is
     `external_directory` asked or denied, can a max policy allow it for listed worktree roots only, and in which
-    directory does the tool execute (feeds §2.2 work root);
+    directory does the tool execute, and a worktree created after the agent was registered, with and without a matching
+    `routing.workRoots` pattern (feeds §2.2 work root);
   - S12 change the global override's `agents` block without restarting the host: do `/api/agent` and the
     orchestrator's agent list change, and when (feeds §0.7 and DF-2 step 3).
 - T0.1.2 [tier:fast] S5: locate where verification criteria are assembled and cut (start at
@@ -559,7 +580,7 @@ Tasks:
 - T1.1.2 [tier:medium] Keys in `D:\git\opencode-model-router\src\router\config.ts` (validators, defaults, layers):
   `routing.delegation` (`"tiers"` default; global and project layers), `roleAgents` (tiers.json + global only),
   `routing.exploration` (`rate` default 0, max 0.2; global only), `routing.run` (`scripts` default
-  `["test","typecheck","lint","build"]` plus `test:*`, `commands`, `timeoutMs` default 600000; global only).
+  `["test","typecheck","lint","build"]` plus `test:*`, `commands`, `timeoutMs` default 600000; global only), `routing.workRoots` (absolute globs, default `[]`, global only, never `*`).
 - T1.1.3 [tier:heavy] Shipped role specs in `D:\git\opencode-model-router\tiers.json` `roleAgents` per §2.2 (authority,
   ranges, budgets, assurance, guard, prompts with the return contract); the separation validator over every grant
   (shipped, user-narrowed, and #81 agents with a shipped name in roles mode only); the work-root rule of §2.2 in the
@@ -584,11 +605,12 @@ Goal: total, pure policy functions; `tier=`/`budget=` route keys; kernel candida
 Pre-flight: standard; P1.1 and P1.4 contract commits merged.
 
 Tasks:
-- T1.2.0 [tier:medium] First commit: route-line keys `tier=fast|medium|heavy` and `budget=<int>` in
+- T1.2.0 [tier:medium] First commit: route-line keys `tier=fast|medium|heavy`, `budget=<int>` and
+  `root=<absolute path>` in
   `D:\git\opencode-model-router\src\routing\classify\route-line.ts` (identity key at line 160 extended; first-line
   rule A22 applies), `RouteLine` fields in `D:\git\opencode-model-router\src\routing\classify\types.ts`, plus the
   policy signatures in `D:\git\opencode-model-router\src\routing\roles\policy.ts`.
-- T1.2.1 [tier:heavy] `grantFor`: fixed/dynamic, work root from the dispatch ENVIRONMENT (§2.2), needs mapping
+- T1.2.1 [tier:heavy] `grantFor`: fixed/dynamic, the `workRoot` argument (resolved and validated by the caller, P2.1), needs mapping
   (`shell`/`network` → exec + note, `external_dir` inside the work root → satisfied, elsewhere → note,
   `web` on local roles → note), route-line `needs=`, widened grants, separation resolution; `authorityFloor` per §2.3
   including the write + exec row and max-over-rows.
@@ -621,7 +643,8 @@ kill tree, redaction, executable resolution) for reuse.
 
 Tasks:
 - T1.3.1 [tier:heavy] `D:\git\opencode-model-router\src\router\run-tools.ts`: `router_run({ script, args?, cwd })` (`cwd` must equal the
-  dispatch's work root, §2.2; default: the session directory) for a
+  dispatch's work root, §2.2; default: the bound dispatch's work root through a resolver injected by P2.1; unbound or
+  `workRoot: null` → refused) for a
   name in `routing.run.scripts` (package.json scripts) or `routing.run.commands`; `router_run` never spawns a shell
   itself (`shell: false`, argv asserted); npm runs as `node <npm-cli.js>` resolved from the Node install (no `.cmd`
   shims), with `--script-shell=<absolute system shell>` and `--node-options=` on the command line so a repo `.npmrc`
@@ -675,7 +698,7 @@ DoD: standard. QA: `[tier:heavy]` — can self-report, budget events or boilerpl
 #### P1.5 Guard profiles, budgets and verification text (mode-independent §2.9 + role budgets)
 Goal: E6, E7, E8 fixed at the root for every mode; role budgets available.
 
-Pre-flight: standard; spikes S4, S5, S10 read.
+Pre-flight: standard; spikes S4, S5, S10 read; P1.2 contract commit (`RouteLine.root`) merged.
 
 Tasks:
 - T1.5.0 [tier:medium] First commit: `D:\git\opencode-model-router\src\router\guard-profile.ts` contracts;
@@ -689,6 +712,9 @@ Tasks:
 - T1.5.3 [tier:heavy] Verification text (files confirmed by S5): never cut a criterion mid-text; drop whole criteria
   over the budget with "n criteria omitted" (not graded); exclude `D:\git\opencode-model-router\src\router\dispatch-header.ts`
   directives from gradable criteria; classify a progress-note return as `incomplete`.
+- T1.5.3a [tier:medium] `D:\git\opencode-model-router\src\router\dispatch-header.ts` (≈ line 23): the
+  `Working directory:` line names the route line's `root=` when present and stays byte-identical otherwise (P1.2
+  contract `RouteLine.root`); unit tests for both cases.
 - T1.5.4 [tier:medium] Before/after goldens for the §2.9 behaviour change; tests in
   `D:\git\opencode-model-router\test\unit\guards.roles.test.ts` and `D:\git\opencode-model-router\test\unit\verify.criteria.test.ts`
   (including an E8 reproduction with the truncated criterion → no FAIL, and an E6 reproduction).
@@ -720,7 +746,8 @@ Tasks:
 Tests (edge cases): two identical parallel dispatches (intersection); binding after the parent call completed
 (local); parent deleted; the same child resumed twice; widening outside the max; request replay; request from a fixed
 role (refused); two plugin instances (process-wide registry, one decision); property test over random interleavings:
-the bound grant ⊆ every candidate grant.
+the bound grant ⊆ every candidate grant; candidates with different work roots → `workRoot: null`; property: the bound
+root ∈ {the common root, null}.
 Acceptance: I5 holds under all generated interleavings.
 DoD: standard. QA: `[tier:heavy]` — any path to a union, to authority beyond the max, or to a stale binding.
 
@@ -737,7 +764,8 @@ Steps:
    restart OpenCode v2 and paste the `/router` line; stop. On resume: the §0.7 liveness probe and its outcomes
    (previous sha → ask again; `unknown`, load failure or missing agents → rollback and a critical finding for the
    owning Wave-1 phase).
-3. [tier:medium] Self-test probes, recorded in `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` against the P0.1
+3. [executor] Self-test probes (the executor's own dispatches), recorded in
+   `D:\git\omr-rta-main\docs\qa\role-tier\dogfood.md` against the P0.1
    baseline. Under `advisory` the old guard warns instead of denying, so each probe asserts no `DENIED` **and** no
    `[⚠ GUARD:read_budget]` footer: a read-only `fast` dispatch with 10 consecutive reads; a
    `[route class=review risk=high pin]` heavy dispatch with `CAP:none` + `reason:` making 20 reads (below the
@@ -763,10 +791,12 @@ Tasks:
   prompt verbatim, steps from the top budget, the role's **max** policy deny-by-default and fail-closed (`external_directory` allowed only
   for the repository's worktree roots, §2.2), `explore`
   alias (S9), nothing on v1 or in tiers mode.
-- T2.1.2 [tier:heavy] Role path in `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`: classify → `grantFor` →
+- T2.1.2 [tier:heavy] Role path in `D:\git\opencode-model-router\src\routing\wire\dispatch.ts`: classify → resolve the
+  work root (`root=`, else the session directory; it must be the session directory or a root listed by
+  `git worktree list --porcelain`, otherwise `workRoot: null` with a note) → `grantFor` →
   effective detection (S10) → `tierBounds` → kernel (static default; `enforce` applies the decision; exploration) →
   always set `args.model`; pins and resumes per §2.3; rows with the §2.4 extension; `registerPending` (P1.6).
-- T2.1.3 [tier:medium] `D:\git\opencode-model-router\src\index.ts`: register `router_run` (P1.3) for roles that grant
+- T2.1.3 [tier:medium] `D:\git\opencode-model-router\src\index.ts`: register `router_run` (P1.3, with the bound work-root resolver) for roles that grant
   it and `router_request_authority` (P1.6) for dynamic roles; guard profiles and role budgets (P1.5); signal ingestion
   call sites (P1.4) including the parent result's final text; the protocol switch at the "Inject delegation protocol"
   site (≈ line 2396) to `buildRolesProtocol` (P2.2 contract) on v2 roles mode.
@@ -849,15 +879,17 @@ Steps:
    and drops the whole override layer, #80; the DF-1 code validates `routing.delegation` but has no role runtime) —
    validated first in a temp HOME with the synced code, then written with a backup (this backup is the kill switch;
    record the new SHA-256):
-   add `"delegation": "roles"` to the existing `routing` block (keep `engine`, `profile`, `margin`); remove
+   add `"delegation": "roles"` and `"workRoots": ["D:/git/omr-rta-*"]` (Wave 3 worktrees are created after this
+   registration, R4) to the existing `routing` block (keep `engine`, `profile`, `margin`); remove
    `subagentTiers.explore` (aliased to `explorer`); remove the custom `agents` `runner`, `reviewer`, `researcher`
    (replaced by shipped roles); exploration stays 0.
-3. [tier:medium] At the next orchestrator prompt verify through
+3. [executor] At the next orchestrator prompt verify through
    `opencode api get '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` that the role agents exist
    with their max policies, and that the executor's system prompt now carries the roles protocol. If S12 showed that
    agent registrations need a restart, step 2 ends with a second restart stop (handover §7 "DF-2b") and this step
    runs after it.
-4. [tier:medium] Self-test probes on a phase-worktree work root, each recorded with its decision row: `explorer`
+4. [executor] Self-test probes (the executor's own dispatches) on a phase-worktree work root, each recorded with its
+   decision row: `explorer`
    lookup (fast model, local grant); `runner` running a scoped test through `router_run` with `cwd` = the worktree;
    `implementer` small edit on a throwaway file with deterministic acceptance (floor per §2.3), reverted afterwards;
    `implementer` with `[route class=implement risk=high tier=heavy pin]` (heavy model); `general` with no needs denied
@@ -931,7 +963,7 @@ Tasks:
   signals, stats, I1/I2/I6/I7, simulate parity.
 - T3.3.3 [tier:heavy] [route class=review risk=high pin] Area C — docs, v1 fallback, test quality, CI, evidence
   reproducibility, release readiness.
-- T3.3.4 [tier:medium] Fixes per §0.6 on `rta/p33-fix-<n>` branches, one file owner at a time; re-review rounds per §0.6.
+- T3.3.4 [tier:medium] Fixes per §0.6 in `D:\git\omr-rta-p33` on `rta/p33-fix-<n>` branches, one file owner at a time; re-review rounds per §0.6.
 
 Tests: every fix adds a regression test that fails before the fix (mutation check recorded in the QA report).
 Acceptance: every global criterion (§6) checked with evidence in `D:\git\opencode-model-router\docs\qa\role-tier\global.md`.
@@ -952,17 +984,22 @@ Tasks:
   HOME. If a P3.x change needs an adjustment, prepare and validate it there, but write it (with a backup) only after
   the T3.4.3 liveness probe shows the final code. Exploration stays 0 (recommend 0.05 in the summary, the owner
   decides).
-- T3.4.3 [executor] Move the base checkout back to `master`: `git -C D:\git\opencode-model-router switch master`,
-  `merge --ff-only origin/master` (now containing the release), per the §0.7 sync protocol (tag `rta/sync-prev`).
+- T3.4.3 [executor] Move the base checkout back to `master`: `git -C D:\git\opencode-model-router fetch origin`,
+  `switch master`, `merge --ff-only origin/master` (now containing the release); assert that
+  `git -C D:\git\opencode-model-router rev-parse HEAD` equals the T3.4.1 merge sha, else stop before any restart
+  request (stale `origin/master` would put pre-roles code under a roles override, #80); all per the §0.7 sync protocol
+  (tag `rta/sync-prev`).
   This is a code sync → **restart stop**, combined with the T3.4.4 publish question in one message to the human
   (handover §7). On resume: the §0.7 liveness probe (`<sha7>` of the merge commit) and its outcomes; verify through
   `opencode api get '/api/agent?location%5Bdirectory%5D=D%3A%5Cgit%5Copencode-model-router'` that role agents exist with
-  their max policies; write a T3.4.2 adjustment if one was prepared; re-run the DF-2 step-4 probe set on the final
+  their max policies; write a T3.4.2 adjustment if one was prepared (if it changes agents and S12 requires a restart, a restart stop
+  comes before the probe set); re-run the DF-2 step-4 probe set on the final
   code; act on the publish answer only if all pass — otherwise roll back (§0.7), do not publish, and ask again;
   delete the local `rta/live` branch only after the probes pass.
 - T3.4.4 [tier:medium] **Human gate:** ask for confirmation, then push tag `v2.4.0` (publish workflow with provenance);
   verify `npm view opencode-model-router@2.4.0` and a clean install on an isolated 2.0.24 host.
-- T3.4.5 [tier:medium] Final capped suite on `master`; cleanup of `D:\git\omr-rta-*` worktrees (including
+- T3.4.5 [tier:medium] Final capped suite on `master`; [executor] remove `routing.workRoots` from the owner override
+  (backup, temp-HOME validation, hot reload) once no phase worktree remains; cleanup of `D:\git\omr-rta-*` worktrees (including
   `D:\git\omr-rta-main`), `D:\git\omr-plan-rta`, `rta/*` and `docs/role-tier-plan` branches (local and origin) and the
   `rta/df1-prev`, `rta/df2-prev`, `rta/sync-prev` tags; close #84 with the summary (evidence, dogfood stats, rollback).
 
@@ -1010,6 +1047,8 @@ install, owner migration evidence.
 P3.3: three fresh `[tier:heavy]` reviewers (areas A/B/C) in parallel, each given the diff `master@eeab36b..rta/main`,
 every phase QA report, the spikes report and this plan, dispatched to the `reviewer` role (roles
 mode since DF-2, role budget) and split by area when a dispatch is cut (resume the same session); rounds per §0.6.
+CI runs, the host log and anything outside the reviewer's work root are gathered by the executor and pasted into the
+prompt (§0.2.3).
 
 ## 9. Amendments
 - R0 (pre-execution review, `[tier:heavy]`, findings PLAN-1…PLAN-21): route-line keys owned by P1.2 (PLAN-1);
@@ -1046,6 +1085,16 @@ mode since DF-2, role budget) and split by area when a dispatch is cut (resume t
   (QA-H-15); item 12 and DF-2 wording (QA-H-16); release only after the final probe set (QA-H-17); handover rows
   (QA-H-18); dogfood redaction (QA-H-19); `--no-track`, kept tags, `[executor]` steps, one round-limit wording
   (QA-H-20).
+- R4 (heavy QA round 2, findings QA-H2-1…QA-H2-13, all fixed): the work root comes from the route-line key `root=`
+  (P1.2), is resolved and validated by P2.1 and shown in the dispatch header (P1.5 T1.5.3a); `DispatchGrant.workRoot`
+  is nullable and survives a binding intersection only when shared; role max policies cover worktrees listed at
+  registration plus `routing.workRoots` patterns (DF-2 adds `D:/git/omr-rta-*`), and the evaluate hook re-checks
+  against a fresh worktree list; `external_directory` is a local-class action; P3.3 fixes live in
+  `D:\git\omr-rta-p33`; T3.4.3 fetches and asserts the merge sha before any restart; a liveness marker with an
+  unexpected sha is a sync error, not a rollback; first-baseline wording in P0.1; override mismatches diffed against a
+  kept copy (A14 class stays an incident); dogfood probes are `[executor]`; §0.9.5 lists the executor's exceptions;
+  the 25-call tier budget remains until DF-2; executor-owned files always cited at `D:\git\omr-rta-main`; reviewers
+  receive CI and host-log facts from the executor.
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |
@@ -1059,7 +1108,7 @@ mode since DF-2, role budget) and split by area when a dispatch is cut (resume t
 | Exec + network from repo scripts; untrusted repo content as injection | Documented residual risk; write + exec floors medium/heavy; not an OS sandbox |
 | Orchestrators keep naming tiers | Tier agents stay valid; advisor reports role usage share |
 | Host upgrade changes hook semantics | The spike file stays as a regression smoke; role agents fail closed (I9) |
-| The old guard cuts plan-execution dispatches (E6/E7) | §0.2.4–0.2.6: atomic dispatches, notes file, ≤ 15 information calls, resume the same session; DF-1 removes the cause |
+| The old guard cuts plan-execution dispatches (E6/E7) | §0.2.4–0.2.6: atomic dispatches, notes file, ≤ 15 information calls, resume the same session; DF-1 removes the 3-read denial and the charging of denied calls; the 25-call tier budget remains until roles mode (DF-2) |
 | A dogfood sync breaks the executor's own plugin (tier/role agents vanish: "Unknown agent", DF4 precedent) | Capped suite before every sync; `npm ci` only on a lockfile change and finished before the restart request; liveness probe after the restart; rollback = kill switch (from DF-2) or reset to the tag + another restart; the executor works directly with its own tools until the plugin is back (§0.9.2) |
 | Every code sync costs a human restart (A8) | Three planned restart stops (DF-1, DF-2, P3.4), plus DF-2b only if S12 shows agent registration needs one; fixes found after DF-2 are batched into P3.4's sync, not re-synced one by one, unless they block Wave 3 |
 | A roles-mode defect blocks Wave 3 | Kill switch: the pre-DF-2 override backup (hot reload); fix as a finding, re-sync (restart stop), re-apply the migration (§0.10) |
