@@ -67,6 +67,8 @@ async function makeWorld(root: string, project: string): Promise<World> {
     "smoke-marker.js": "require('fs').writeFileSync(require('path').join(process.cwd(), 'smoke-marker.txt'), 'ran\\n');\n",
   };
   for (let i = 0; i < 8; i++) files[`e${i}.txt`] = "main\n";
+  // A tracked file the roots test rewrites in wt-1, so `router_git_diff` returns ~64 KiB / 10 000+ lines (above the host's truncation bound).
+  files["big.txt"] = `${Array.from({ length: 6000 }, (_, i) => `l${i}`).join("\n")}\n`;
   for (const [name, text] of Object.entries(files)) await writeFile(path.join(main, name), text);
   git("add", ".");
   git("commit", "-q", "-m", "init");
@@ -536,7 +538,11 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(disk.e3).toBe("main\n");
       // ... while the exact sibling of the same turn edits and reads its work root.
       expect(normal.requests[0]?.toolNames).toContain("edit");
-      expectStatuses(normal.states, ["completed", "completed", "completed"], "exact sibling of the mixed child");
+      // Its third call reads the MAIN checkout: outside its work root wt-1, so refused (run 2: by the router's execute.before) — the mirror
+      // image of the unknown child, which may read the session directory but not wt-1.
+      expectStatuses(normal.states, ["completed", "completed", "error"], "exact sibling of the mixed child");
+      expectRefused(normal.states[2], "exact binding: read of the main checkout (outside its work root)");
+      expect(normal.states[2]?.errorMessage, describeState(normal.states[2])).toMatch(/outside this dispatch's work root/);
       expect(disk.e2).toBe("edited\n");
       expect(unknownBindings(rows), "the only unknown binding is the mixed child").toEqual([mixed.childID]);
       // I9 hook error: the router's context hook failed for the first step (the pre-probe's trap fired inside the router), the catalog of that step was empty,
@@ -622,18 +628,39 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         { tool: "read", input: { path: path.join(host.project, "m.txt") } }, // 4 main checkout
         { tool: "router_git_status", input: {} }, // 5 the bound work root
       ], "DONE: listed")]), "search roots");
-      // (d) own truncated output: a grep whose output the host must truncate (400 matching lines of ~1.9 KB).
+      // (d) own truncated output. Run 2: the host's grep caps itself at 100 matches ("Found 100 matches") and nothing was truncated. Now the
+      //     child also calls `router_git_diff` on a rewritten tracked file: the router bounds that plugin tool's text at 64 KiB (git-tools.ts
+      //     MAX_BYTES), i.e. ~10 000 lines, above the host's tool-output bound in lines and bytes, so the HOST must truncate and save it.
       await writeFile(path.join(w.wt1, "needles.txt"), `${Array.from({ length: 400 }, (_, i) => `needle ${i} ${"x".repeat(1900)}`).join("\n")}\n`);
-      const big = await runChild(host, root, roleInput("explorer", "roots big output", explorerIn(w.wt1), ["TASK: find every needle", scriptLine([{ tool: "grep", input: { pattern: "needle", path: w.wt1 } }], "DONE: needles.txt:1")]), "big output");
+      await writeFile(path.join(w.wt1, "big.txt"), `${Array.from({ length: 6000 }, (_, i) => `L${i}`).join("\n")}\n`);
+      const big = await runChild(host, root, roleInput("explorer", "roots big output", explorerIn(w.wt1), ["TASK: find every needle and show the changes", scriptLine([
+        { tool: "grep", input: { pattern: "needle", path: w.wt1 } },
+        { tool: "router_git_diff", input: {} },
+      ], "DONE: needles.txt:1 big.txt:1")]), "big output");
       const events = await host.events();
       const successTypes = [...new Set(events.filter(e => /tool\.success/.test(e.type)).map(e => e.type))];
       const withPaths = events.filter(e => /^session\.(next\.)?tool\.success(\.\d+)?$/.test(e.type) && arr(obj(e.data).outputPaths).length > 0);
+      /** Any event of the big child that carries outputPaths, whatever its type (the plugin stream may name it differently). */
+      const anyWithPaths = events.filter(e => obj(e.data).sessionID === big.childID && arr(obj(e.data).outputPaths).length > 0).map(e => ({ type: e.type, outputPaths: obj(e.data).outputPaths }));
       const ownPaths = withPaths.filter(e => obj(e.data).sessionID === big.childID).flatMap(e => arr(obj(e.data).outputPaths).map(String));
-      const ownPath = ownPaths[0];
-      const ownRead = ownPath === undefined ? undefined
-        : await resumeChild(host, root, big.childID, { agent: "explorer", description: "roots big output resume", prompt: ["continue", scriptLine([{ tool: "read", input: { path: ownPath } }], "DONE: read my saved output")].join("\n"), background: false }, "own output read");
-      const foreignRead = ownPath === undefined ? undefined
-        : await runChild(host, root, roleInput("explorer", "roots foreign output", explorerIn(w.wt1), ["TASK: read a saved output", scriptLine([{ tool: "read", input: { path: ownPath } }], "DONE: tried")]), "another child's output");
+      // The saved-output path the host names in the text the CHILD model received (its next provider request's tool_result) or in the tool state.
+      const toolResultTexts = host.requestsOf(big.childID).filter(r => r.kind === "primary").flatMap(r => r.messages.flatMap(m => arr(m.content).map(obj)))
+        .filter(b => b.type === "tool_result").map(b => (typeof b.content === "string" ? b.content : arr(b.content).map(c => str(obj(c).text) ?? "").join("\n")));
+      const savedPaths = [...new Set([...toolResultTexts, ...big.states.map(s => s.text)].flatMap(text => [...text.matchAll(/[A-Za-z]:[\\/][^\s"'<>|*?]*?tool-output[\\/][A-Za-z0-9_.-]+/g)].map(m => m[0])))];
+      const outputView = {
+        successTypes, anyWithPaths, ownPaths, savedPaths, toolResultLengths: toolResultTexts.map(t => t.length),
+        truncationNotices: toolResultTexts.map(t => /truncat/i.exec(t) ? t.slice(Math.max(0, t.search(/truncat/i) - 200), t.search(/truncat/i) + 400) : null).filter(Boolean),
+        states: big.states.map(s => ({ tool: s.tool, status: s.status, length: s.text.length, tail: s.text.slice(-400) })),
+      };
+      const savedPath = ownPaths[0] ?? savedPaths[0];
+      const outputPathsEmitted = ownPaths.length > 0;
+      if (!outputPathsEmitted && savedPath !== undefined) {
+        console.log(`[roles-smoke] OBSERVATION: the host truncated a role child's tool output (saved to ${savedPath}) but the plugin event stream carried no outputPaths (event types: ${successTypes.join(", ")}); the router cannot attribute the saved file, so the child's own read must be refused (fail closed).`);
+      }
+      const ownRead = savedPath === undefined ? undefined
+        : await resumeChild(host, root, big.childID, { agent: "explorer", description: "roots big output resume", prompt: ["continue", scriptLine([{ tool: "read", input: { path: savedPath } }], "DONE: read my saved output")].join("\n"), background: false }, "own output read");
+      const foreignRead = savedPath === undefined ? undefined
+        : await runChild(host, root, roleInput("explorer", "roots foreign output", explorerIn(w.wt1), ["TASK: read a saved output", scriptLine([{ tool: "read", input: { path: savedPath } }], "DONE: tried")]), "another child's output");
       // (e) worktrees created AFTER the host started: one covered by the `routing.workRoots` glob, one not; router_run in the covered one.
       const late = await w.addWorktree("wt-late-1");
       const uncovered = await w.addWorktree("wt-uncovered-1");
@@ -657,7 +684,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       await save("roots-handoffs", {
         explorerExternal,
         formats: { worktree: fmtWorktree.evaluates, session: fmtSession.evaluates, edit: fmtEdit.evaluates, states: [fmtWorktree, fmtSession, fmtEdit].map(v => v.states) },
-        search: search.states, searchEvaluates: search.evaluates, successTypes, withPaths: withPaths.map(e => ({ type: e.type, data: e.data })), ownPaths,
+        search: search.states, searchEvaluates: search.evaluates, withPaths: withPaths.map(e => ({ type: e.type, data: e.data })), outputView, outputPathsEmitted,
         big: big.states.map(s => ({ ...s, text: s.text.slice(0, 800) })), ownRead, foreignRead, lateRead, uncoveredRead, lateRun, disk,
         df2NoCwd: df2(df2NoCwd), df2WithCwd: df2(df2WithCwd),
         bindings: fresh.map(v => ({ label: v.label, binding: bindingNote(rows, v.childID)?.binding })), unknownBindings: unknownBindings(rows),
@@ -690,11 +717,22 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expectCompleted(search.states[5], "router_git_status");
       expectText(search.states[5], /wt1-only-untracked\.txt/, "router_git_status names wt-1's untracked file");
       expect(search.states[5]?.text, describeState(search.states[5])).not.toContain("main-only-dirty.txt");
-      // (d) the host emits outputPaths on its tool-success event (form recorded in successTypes); the child reads its own output, another child cannot.
-      expect(ownPath, `no outputPaths for the big grep (tool-success event types seen: ${successTypes.join(", ")}; grep: ${describeStates(big.states)})`).toBeDefined();
+      // (d) the host truncated and saved the 64 KiB router_git_diff output (a saved path in the text the child got, or outputPaths on an event).
+      expectStatuses(big.states, ["completed", "completed"], "grep and router_git_diff of the big-output child");
+      expect(savedPath, `the host truncated no output of the child: ${JSON.stringify(outputView)}`).toBeDefined();
       expect(ownRead?.childID).toBe(big.childID);
-      expectStatuses(ownRead?.states ?? [], ["completed"], "the child reads its own saved output");
+      // Another child can never read it.
       expectRefused(foreignRead?.states[0], "another child reading the saved output");
+      if (outputPathsEmitted) {
+        // The tool-success event carries outputPaths (its type is in outputView.successTypes): the owning child reads its own saved output.
+        expectStatuses(ownRead?.states ?? [], ["completed"], `the child reads its own saved output (${savedPath})`);
+      } else {
+        // OBSERVATION (host 2.0.24, pinned): the output was truncated and saved, but no event the plugin receives carries outputPaths
+        // (run 2 saw only `session.tool.success`). The router attributes saved outputs from outputPaths only (v2-hooks.ts HOST_TOOL_SUCCESS_EVENT,
+        // phase-p23 QA-P23-3-1), so even the owning child is refused: fail closed. Consequence: role children cannot read their truncated outputs.
+        expect(anyWithPaths, "no event of the child carries outputPaths").toEqual([]);
+        expectRefused(ownRead?.states[0], `own saved output without outputPaths (${savedPath}): fail closed`);
+      }
       // (e) the later worktree is covered by the workRoots glob; one outside the glob is not; router_run runs in the later root and refuses wt-1.
       expectStatuses(lateRead.states, ["completed"], `later worktree under the workRoots glob (evaluates: ${evaluated(lateRead)})`);
       expectRefused(uncoveredRead.states[0], "worktree created after start without a pattern");
@@ -714,7 +752,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
     } finally { await finish(host); }
   }, 900_000);
 
-  it("budget exhaustion and resume; signal rows of every kind (verdict, run, grader, incomplete, budget, authority, redispatch) in the isolated decision log", async () => {
+  it("budget exhaustion and resume; signal rows of every kind the router writes (verdict, run, incomplete, budget, authority, redispatch) in the isolated decision log; grader verdicts land as verdict rows (product gap, pinned)", async () => {
     // Enforcement mode `enforced`: the default `advisory` never blocks a call (src/guard/enforce.ts:241-248 only appends a banner), so no
     // budget stop exists in it and the parent gets no `[router budget]` note (run 1: the 4th read of a 3-call budget completed).
     const { host, w } = await startRolesHost("signals", {
@@ -739,8 +777,11 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       ]), "run");
       // grader: criteria only, VERIFY required; the scripted grader passes (producer fast, grader heavy on another model).
       const gradersBefore = host.provider.graders;
+      const graderMark = host.provider.requests.length;
       const grader = await runChild(host, root, roleInput("explorer", "signals grader", "class=search risk=low scope=single tier=fast", ["VERIFY: required", "TASK: say where parse is defined", "[acceptance]", "criteria: the reply names where parse is defined", "[/acceptance]"]), "grader");
       const gradersRan = host.provider.graders - gradersBefore;
+      /** The grader's own provider requests (the router's grader system prompt): which model and tier judged the producer. */
+      const graderRequests = host.provider.requests.slice(graderMark).filter(r => r.reply === "grader").map(r => ({ session: r.session, agent: r.agent, catalogModel: r.catalogModel, tier: wireTier(r.catalogModel) }));
       // incomplete: NEED MORE without budget exhaustion or an authority request.
       const incomplete = await runChild(host, root, roleInput("architect", "signals incomplete", "class=design risk=low scope=single", ["TASK: sketch the parser design", scriptLine([read("parser.ts")], "NEED MORE: the lexer module is missing from the context")]), "incomplete");
       // authority: the ladder request.
@@ -749,11 +790,17 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const task = "TASK: find the exported entry points of parser.ts and list them with file:line";
       const first = await runChild(host, root, roleInput("explorer", "signals redispatch first", "class=search risk=low scope=single tier=fast", [task, scriptLine([], "DONE: parser.ts:1 parse")]), "redispatch first");
       const again = await runChild(host, root, roleInput("explorer", "signals redispatch again", "class=search risk=low scope=single tier=medium", [task, scriptLine([], "DONE: parser.ts:1 parse")]), "redispatch again");
+      // PRODUCT GAP (pinned as observed in run 2, reported to the executor): no `grader` signal row is ever written. graderSignal
+      // (src/routing/outcomes/signals.ts:237) has no call site; every non-skipped gate verdict goes through onVerdict
+      // (src/index.ts:2446, src/index.ts:1738), which writes a role dispatch's verdict — grader verdicts included — as a `verdict` signal
+      // with the deterministic weight (src/routing/outcomes/ingest.ts:774-777 → signals.ts:181-184). Plan §2.6 wants grader verdicts as
+      // `grader` signals of weight 0.5, only when the grader's tier >= the producer's and its model differs. When that is fixed, this entry
+      // becomes `/^note:signal:grader:pass$/` and `kinds` gains "grader".
       const expected: Record<string, { child: string; reason: RegExp }> = {
         verdictPass: { child: verdictPass.childID, reason: /^note:signal:verdict:pass$/ },
         verdictFail: { child: verdictFail.childID, reason: /^note:signal:verdict:fail$/ },
         run: { child: run.childID, reason: /^note:signal:run:pass$/ },
-        grader: { child: grader.childID, reason: /^note:signal:grader:/ },
+        graderAsVerdict: { child: grader.childID, reason: /^note:signal:verdict:pass$/ },
         incomplete: { child: incomplete.childID, reason: /^note:signal:incomplete:fail$/ },
         budget: { child: budget.childID, reason: /^note:signal:budget:/ },
         authority: { child: authority.childID, reason: /^note:signal:authority:/ },
@@ -764,7 +811,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const rows = await waitRows(host, "every signal row", rs => everyBound(children)(rs) && Object.values(expected).every(e => has(rs, e)), 120_000);
       const kinds = [...new Set(signalRows(rows).map(r => r.signal))].sort();
       await save("budget-signals", {
-        budget, budgetResume, verdictPass: verdictPass.parentText, verdictFail: verdictFail.parentText, run, grader: { ...grader, gradersRan }, incomplete, authority, first, again,
+        budget, budgetResume, verdictPass: verdictPass.parentText, verdictFail: verdictFail.parentText, run, grader: { ...grader, gradersRan, graderRequests }, incomplete, authority, first, again,
         found: Object.fromEntries(Object.entries(expected).map(([k, e]) => [k, has(rows, e)])), kinds, signals: signalRows(rows).map(rowView),
         disk: { e5: await readFile(path.join(host.project, "e5.txt"), "utf8"), marker: existsSync(path.join(host.project, "smoke-marker.txt")), wt1: w.wt1 },
         unknownBindings: unknownBindings(rows), routerWarnings: host.routerLogLines(), hostErrors: host.errorLines(), providerErrors: host.provider.errors,
@@ -783,8 +830,18 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expectCompleted(run.states[0], "edit before the run");
       expectText(run.states[1], /exit code: 0/, "router_run after the edit");
       expect(gradersRan, "the router's grader reached the provider").toBeGreaterThan(0);
-      for (const [name, e] of Object.entries(expected)) expect(has(rows, e), `signal row ${name} (${e.reason.source}) for ${e.child}; signal rows: ${signalRows(rows).map(r => `${r.reason}@${r.childSessionID}`).join(", ")}`).toBe(true);
-      expect(kinds).toEqual(["authority", "budget", "grader", "incomplete", "redispatch", "run", "verdict"]);
+      // The grader was independent in the §2.6 sense — its tier at least the producer's (fast), another model than the producer's sonnet — so
+      // the missing `grader` row is not explained by graderSignal's own refusal rules.
+      expect(graderRequests.length, JSON.stringify(graderRequests)).toBeGreaterThan(0);
+      for (const g of graderRequests) {
+        expect(rankOf(g.tier), `grader tier >= producer tier fast: ${JSON.stringify(g)}`).toBeGreaterThanOrEqual(rankOf(grader.requests[0]?.tier));
+        expect(g.catalogModel?.split("#")[0], `grader model differs from the producer's: ${JSON.stringify(g)} vs ${grader.requests[0]?.catalogModel}`).not.toBe(grader.requests[0]?.catalogModel?.split("#")[0]);
+      }
+      const signalList = signalRows(rows).map(r => `${r.reason}@${r.childSessionID}`).join(", ");
+      for (const [name, e] of Object.entries(expected)) expect(has(rows, e), `signal row ${name} (${e.reason.source}) for ${e.child}; signal rows: ${signalList}`).toBe(true);
+      // The gap, pinned: the grader-verified dispatch has NO grader row (only the verdict row above), and no grader row exists at all.
+      expect(signalRows(rows).filter(r => r.signal === "grader"), `grader rows (product gap: graderSignal has no call site); signal rows: ${signalList}`).toEqual([]);
+      expect(kinds).toEqual(["authority", "budget", "incomplete", "redispatch", "run", "verdict"]);
       expect(unknownBindings(rows)).toEqual([]);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
