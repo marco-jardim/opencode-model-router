@@ -4,6 +4,7 @@ import ModelRouterPlugin from "./index";
 import { createV2Runtime } from "./compat/v2-client";
 import { registerV2Hooks } from "./compat/v2-hooks";
 import type { Ingest } from "./routing/outcomes/ingest";
+import type { BudgetSnapshot } from "./guard/enforce";
 
 /** Keep the routing engine shared; translate only the host API at this boundary. */
 export default {
@@ -16,6 +17,7 @@ export default {
     let ingest: Ingest | undefined;
     // #84 P2.1: the plugin's `/bypass` state, read by the role dispatch path (the router's own gate will not run while bypassed, S10/P-9).
     let isBypassed: (() => boolean) | undefined;
+    let budgetSnapshot: ((childSessionID: string) => BudgetSnapshot) | undefined;
     // #84 P2.1 (handoff 22): the host's own stops of role children (step limit, context overflow), observed by the adapter from the
     // event stream and folded into the plugin's budget signals. The adapter hands its observer back once registered.
     let observeHostBudget: ((childSessionID: string, stepLimit: number | null) => boolean | "unobserved") | undefined;
@@ -38,11 +40,13 @@ export default {
       },
       routerOnIngest: (created: Ingest) => { ingest = created; },
       routerOnBypassState: (read: () => boolean) => { isBypassed = read; },
+      // QA-P21-1-3: the plugin's budget snapshot (guard state + read-only CAP state) for the adapter's budget notice.
+      routerOnBudgetSnapshot: (read: (childSessionID: string) => BudgetSnapshot) => { budgetSnapshot = read; },
       routerHostBudget: (childSessionID: string, stepLimit: number | null) => observeHostBudget?.(childSessionID, stepLimit),
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     return registerV2Hooks(ctx, hooks, runtime, {
-      ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}),
+      ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),
       onHostBudget: (observe) => { observeHostBudget = observe; },
     });
   },
