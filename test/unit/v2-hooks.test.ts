@@ -31,6 +31,10 @@ afterEach(async () => {
   invalidateConfigCache();
 });
 
+// The two eviction tests drive the real execute.before 1000+ times (each call reloads the config from disk, ~4 ms): ~4-5 s on an
+// idle machine, so the default 5 s is flaky under load. The 1000 bound is the behaviour under test, so the loop cannot shrink.
+const BOUNDED_LIMIT_TIMEOUT_MS = 30_000;
+
 function fixture() {
   const registrations: Array<{ dispose: ReturnType<typeof vi.fn> }> = [];
   const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
@@ -413,7 +417,7 @@ describe("OpenCode 2 hook adapter", () => {
       await f.toolHooks["execute.after"](after);
       expect(after.result.output.output).toBe(expected);
     }
-  });
+  }, BOUNDED_LIMIT_TIMEOUT_MS);
 
   it("combines the verification notice and banner on a background acknowledgement without grading", async () => {
     const f = fixture(); const afterHook = vi.fn();
@@ -791,7 +795,7 @@ describe("OpenCode 2 hook adapter", () => {
     const newest = { ...oldest, id: "call-1000", result };
     await f.toolHooks["execute.after"](newest);
     expect(newest.result).not.toBe(result);
-  });
+  }, BOUNDED_LIMIT_TIMEOUT_MS);
 
   it("registers the real argument schema and carries cancellation into custom tools", async () => {
     const f = fixture(); const execute = vi.fn(async (_args: any, _context: any) => "Tool result");

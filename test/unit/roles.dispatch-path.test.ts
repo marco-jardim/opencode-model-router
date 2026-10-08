@@ -220,7 +220,9 @@ describe("role dispatch path", () => {
 
   it("enforce: an implementer in a listed worktree gets the canonical root, edit, the authority floor and a row with the role extension", async () => {
     const world = makeWorld({ delegation: "roles", engine: "enforce" });
-    const rootText = `${world.worktree.replace(/\\/g, "/").toUpperCase()}/`; // another spelling of the same worktree
+    // Another spelling of the same worktree: upper-cased only where paths are case-insensitive (win32); elsewhere a different case is a different path.
+    const spelled = world.worktree.replace(/\\/g, "/");
+    const rootText = `${process.platform === "win32" ? spelled.toUpperCase() : spelled}/`;
     const input = { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${rootText}]\nadd a guard to parse()` };
     const c = call(world, input);
     const outcome = await world.router.route(c);

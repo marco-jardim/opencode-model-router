@@ -118,7 +118,8 @@ const TASK_ID_RE = /^\s*task_id\s*:/i;
 /** Leading decoration: markdown marks, list bullets, quotes, emoji, punctuation (anything but a letter or a digit). */
 const LEAD_RE = /^[^\p{L}\p{N}]+/u;
 const LIST_NUMBER_RE = /^\d+[.)]\s+/;
-const PREFIX_RE = /^(DONE|NEED[\s_-]*MORE|ESCALATE)\b[*_`\s]*(?:[:.!\-\u2013\u2014]|$)[*_`\s]*(.*)$/i;
+// Bounded runs ({0,16}): the child's text is uncontrolled, and an open-ended `[*_`\s]*` next to `(.*)` is polynomial (CodeQL js/polynomial-redos).
+const PREFIX_RE = /^(DONE|NEED[\s_-]{0,8}MORE|ESCALATE)\b[*_`\s]{0,16}(?:[:.!\-\u2013\u2014]|$)[*_`\s]{0,16}(.*)$/i;
 const CLAIM_RE = /^(budget|authority)\b/i;
 
 /**
@@ -367,8 +368,9 @@ export interface RedispatchOptions {
   readonly threshold?: number;
 }
 
+// Bounded runs ({0,16}/{0,8}): the prompt is uncontrolled text, and the adjacent open-ended `\s*`/`[*_]*` runs were polynomial (CodeQL js/polynomial-redos).
 const SECTION_RE =
-  /^[\s>#*_]*(?:\d+\s*[.)]\s*)?[*_]*\s*(TASK|EXPECTED OUTCOME|REQUIRED TOOLS|TOOLS|MUST DO|MUST NOT DO|CONTEXT|ENVIRONMENT)(?:\s*\([^)\n]*\))?\s*[*_]*\s*:[*_]*(.*)$/;
+  /^[\s>#*_]{0,16}(?:\d{1,4}\s{0,8}[.)]\s{0,8})?[*_]{0,8}\s{0,8}(TASK|EXPECTED OUTCOME|REQUIRED TOOLS|TOOLS|MUST DO|MUST NOT DO|CONTEXT|ENVIRONMENT)(?:\s{0,8}\([^)\n]{0,256}\))?\s{0,8}[*_]{0,8}\s{0,8}:[*_]{0,8}(.*)$/;
 
 interface PromptLines {
   /** Normalized non-empty content lines with their section (a header's inline content belongs to its section). */

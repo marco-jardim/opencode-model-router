@@ -660,6 +660,8 @@ export async function registerV2Hooks(
      * a role session's `external_directory` is evaluated. Default: `gitWorktreeList` (dispatch.ts).
      */
     listWorktrees?: (cwd: string) => Promise<string>;
+    /** Role-agent registration (roles mode): the repository's worktree roots for the `external_directory` allow rules. Default: `listWorktrees` (role-agents.ts, a real `git worktree list`). */
+    listRegistrationWorktrees?: (directory: string) => Promise<string[]>;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -1067,6 +1069,7 @@ export async function registerV2Hooks(
       if (rolesStarted) {
         const registration = await registerRoleAgents(next.agent, routerConfig, {
           context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce,
+          ...(options.listRegistrationWorktrees ? { listWorktrees: options.listRegistrationWorktrees } : {}),
         });
         // #84 P2.3 (T2.3.3, §2.5): the ladder tool is a plugin tool, advertised to a deny-by-default agent only with an explicit
         // allow (S11 (a)); the router's catalog filter then keeps it for dynamic roles only. Fixed roles never get it.

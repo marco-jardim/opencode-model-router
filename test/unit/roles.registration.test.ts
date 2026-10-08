@@ -388,7 +388,9 @@ describe("roleAgentAlias (P-7)", () => {
 // Through the v2 adapter (agent transform, permission/context hooks, execute.before)
 // ---------------------------------------------------------------------------
 
-function fixture(directory: string) {
+// `registrationWorktrees` stubs the registration-time `git worktree list`: a spawn of real git against a non-repository temp
+// directory costs seconds on Windows CI (it blew the 5 s test timeout) and none of the stubbed tests assert on worktrees.
+function fixture(directory: string, registrationWorktrees: (directory: string) => Promise<string[]> = async () => []) {
   const sessionHooks: Record<string, (event: any) => Promise<void>> = {};
   const toolHooks: Record<string, (event: any) => Promise<void>> = {};
   const permissionHooks: Record<string, (event: PermissionEvaluation) => Promise<void>> = {};
@@ -424,7 +426,7 @@ function fixture(directory: string) {
   return {
     ctx, agents, sessionHooks, toolHooks, permissionHooks,
     async start(hooks: Record<string, any> = {}) {
-      const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks);
+      const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { listRegistrationWorktrees: registrationWorktrees });
       cleanups.push(cleanup);
     },
   };
@@ -438,7 +440,7 @@ describe("v2 adapter in roles mode", () => {
   it.skipIf(!hasGit())("publishes the max policies, protects every role agent (P-19) and strips its catalog", async () => {
     const { main, wt } = repoWithWorktree();
     home({ routing: { delegation: "roles" } });
-    const f = fixture(main);
+    const f = fixture(main, listWorktrees); // a real repository: the real git listing
     const generalBefore = JSON.parse(JSON.stringify(f.agents.general));
     // #84 P2.3 (approved amendment of this P2.1 test): each role's child below is bound EXACTLY to a dispatch whose grant is the
     // role max with the sibling worktree as work root, so the max policy is what decides. An unbound child is narrowed to
