@@ -2,15 +2,27 @@ import {
   evaluateGuards,
   updateState,
   recordBlock,
+  recordDenied,
   forcingMessage,
   observationOk,
+  budgetSpent,
 } from "./guards";
 import type { GuardPolicy, GuardCall, GuardState } from "./guards";
 import { scrubText } from "./scrub";
 import { resolveEnforcementMode } from "../router/enforcement";
 import type { EnforcementMode } from "../router/enforcement";
 import type { RouterConfig } from "../router/config";
+import {
+  GUARD_CUMULATIVE_MULTIPLIER,
+  TIER_GUARD_BUDGET,
+  positiveBudget,
+  readerReason,
+} from "../router/guard-profile";
 import type { GuardProfile } from "../router/guard-profile";
+import { getActiveTiers } from "../router/protocol";
+import { isReadOnlyTier } from "../router/read-only";
+import { READ_ONLY_TOOLS, lookupDispatch } from "../router/sessions";
+import type { Cap } from "../router/sessions";
 
 /**
  * Default total tool-call ceiling for an enforced subagent delegation. This is a
@@ -18,14 +30,14 @@ import type { GuardProfile } from "../router/guard-profile";
  * Deliberately generous so enforced mode never false-stops ordinary work;
  * tuned with field data in Phase 4.3 (preliminary).
  */
-export const DEFAULT_GUARD_BUDGET = 25;
+export const DEFAULT_GUARD_BUDGET = TIER_GUARD_BUDGET;
 
 /**
  * The cumulative ceiling spans resumed dispatches: it is this multiple of the
  * effective per-dispatch budget (configured or default), giving resumed
  * subagents bounded room without unbounded same-session loops.
  */
-export const CUMULATIVE_BUDGET_MULTIPLIER = 3;
+export const CUMULATIVE_BUDGET_MULTIPLIER = GUARD_CUMULATIVE_MULTIPLIER;
 
 /** Default-case cumulative budget, retained for imports/tests. */
 export const CUMULATIVE_GUARD_BUDGET =
@@ -40,24 +52,112 @@ export interface GuardStoreLike {
 
 /** Build a GuardPolicy from config for a given subagent tier. deliverableSignal
  * is null in Wave 1 (Mode A/B signal wiring lands in Wave 2/4), which disables
- * the deliverable-first clause — the honest common case (M5). */
+ * the deliverable-first clause — the honest common case (M5).
+ *
+ * Without `profile` (tier agents) the result is unchanged: the configured or
+ * default budget (25) and cumulative ×3. A role `profile` (§2.6) supplies the
+ * total and cumulative budgets, the reader/producer kind, and the
+ * `NEED MORE: budget` exhaustion instruction; an invalid profile budget falls
+ * back to the tier budget, and the cumulative ceiling is never below it. */
 export function buildGuardPolicy(
   cfg: RouterConfig,
   tier: string | null,
-  _profile?: GuardProfile | undefined,
+  profile?: GuardProfile | undefined,
 ): GuardPolicy {
   const g = cfg.enforcement?.guard ?? {};
-  const budget = g.budget ?? DEFAULT_GUARD_BUDGET;
+  const tierBudget = g.budget ?? DEFAULT_GUARD_BUDGET;
+  const budget = profile ? (positiveBudget(profile.budget) ?? tierBudget) : tierBudget;
+  const cumulative = profile
+    ? Math.max(budget, positiveBudget(profile.cumulative) ?? budget * CUMULATIVE_BUDGET_MULTIPLIER)
+    : budget * CUMULATIVE_BUDGET_MULTIPLIER;
   return {
     budget,
-    cumulativeBudget: budget * CUMULATIVE_BUDGET_MULTIPLIER,
+    cumulativeBudget: cumulative,
     readDraftCap: g.readDraftCap ?? 3,
     sameOpRetryCap: g.sameOpRetryCap ?? 1,
     blockSelfScript: g.blockSelfScript ?? true,
     deliverableFirst: g.deliverableFirst ?? true,
     blockScriptWrites: g.blockScriptWrites ?? false,
     deliverableSignal: null,
+    ...(profile ? { reader: profile.kind === "reader", needMoreOnExhaustion: true } : {}),
   };
+}
+
+/**
+ * §2.9 E6: does this tier dispatch read rather than produce? A role profile
+ * decides alone; otherwise a read-only tier (#78), a routed class
+ * review/recon/search (the process-wide dispatch registry), or an uncapped
+ * dispatch (`cap` when the caller knows it, else the session's own cap banner,
+ * see noteCapBanner).
+ */
+function isReaderDispatch(
+  cfg: RouterConfig,
+  tier: string | null,
+  sessionID: string,
+  state: GuardState,
+  profile: GuardProfile | undefined,
+  cap: Cap | null | undefined,
+): boolean {
+  let readOnlyTier = false;
+  if (tier !== null && cfg.presets) {
+    const tiers = getActiveTiers(cfg);
+    const definition = tiers && Object.prototype.hasOwnProperty.call(tiers, tier) ? tiers[tier] : undefined;
+    readOnlyTier = definition !== undefined && isReadOnlyTier(tier, definition);
+  }
+  return (
+    readerReason({
+      profile,
+      readOnlyTier,
+      taskClass: lookupDispatch(sessionID)?.facts.class ?? null,
+      cap: cap !== undefined ? cap : state.uncapped === true ? "none" : null,
+    }) !== null
+  );
+}
+
+// The read-only cap banner the session store appends (sessions.ts buildCapBanner):
+// `[cap: N/M]` (M = ∞ for a justified CAP:none), then optional `[⚠ …]` lines.
+const CAP_BANNER_MARK = "[cap: ";
+const CAP_BANNER_RE = /^\[cap: \d+\/(∞|\d+)\](?:\n\[⚠ [^\n]*\])*$/;
+
+/**
+ * Wave-1 bridge (§2.9 E6, CAP:none + reason:): the guard is not handed the
+ * dispatch's cap, but the session store has already appended its cap banner to
+ * this read-only result (index.ts runs recordToolCall before guardAfterCall).
+ * Only a banner that ends the output and follows a paragraph break counts, and
+ * only for a tiered session (tracked by the store, so its banner is always the
+ * last text), so tool content cannot forge it. Superseded by an explicit `cap`.
+ */
+function noteCapBanner(state: GuardState, tier: string | null, tool: string, output: unknown): void {
+  if (tier === null || !READ_ONLY_TOOLS.has(tool) || typeof output !== "string") return;
+  const at = output.lastIndexOf(CAP_BANNER_MARK);
+  if (at === -1 || (at !== 0 && !output.startsWith("\n\n", at - 2))) return;
+  const match = CAP_BANNER_RE.exec(output.slice(at));
+  if (match) state.uncapped = match[1] === "∞";
+}
+
+// budgetExhausted: process-wide (one guard store per plugin instance; every instance
+// guards the same child), bounded, most recently guarded sessions kept.
+const MAX_TRACKED_BUDGETS = 1000;
+const trackedBudgets = new Map<string, { state: GuardState; cumulativeBudget?: number }>();
+
+function trackBudget(sessionID: string, state: GuardState, policy: GuardPolicy): void {
+  trackedBudgets.delete(sessionID);
+  trackedBudgets.set(sessionID, { state, cumulativeBudget: policy.cumulativeBudget });
+  // Re-inserted above, so the first key is the least recently guarded session.
+  while (trackedBudgets.size > MAX_TRACKED_BUDGETS) {
+    trackedBudgets.delete(trackedBudgets.keys().next().value as string);
+  }
+}
+
+/**
+ * True when the guarded session has used its whole per-dispatch or cumulative
+ * tool-call budget (P-5: the parent's result carries no such signal; the
+ * after-hook annotates it from this). False for a session never guarded
+ * (enforcement off) or no longer tracked; a resume restores the per-dispatch room.
+ */
+export function budgetExhausted(sessionID: string): boolean {
+  const tracked = trackedBudgets.get(sessionID);
+  return tracked !== undefined && budgetSpent(tracked.state, tracked);
 }
 
 export interface BeforeResult {
@@ -88,8 +188,12 @@ export function guardBeforeCall(params: {
   store: GuardStoreLike;
   env: Record<string, string | undefined>;
   trivial?: boolean;
+  /** Role dispatch guard profile (§2.6); absent for tier agents. */
+  profile?: GuardProfile;
+  /** The dispatch's honoured CAP directive when the caller knows it; absent = read from the cap banner. */
+  cap?: Cap | null;
 }): BeforeResult {
-  const { cfg, tier, sessionID, tool, toolArgs, store, env, trivial } = params;
+  const { cfg, tier, sessionID, tool, toolArgs, store, env, trivial, profile, cap } = params;
   let mode = resolveEnforcementMode({ config: cfg, tier: tier ?? undefined, env }).mode;
   if (
     mode === "enforced" &&
@@ -100,16 +204,20 @@ export function guardBeforeCall(params: {
   }
   if (mode === "off") return { block: false, mode };
 
-  const policy = buildGuardPolicy(cfg, tier);
+  const policy = buildGuardPolicy(cfg, tier, profile);
   const state = store.ensure(sessionID, policy);
+  trackBudget(sessionID, state, policy);
+  if (isReaderDispatch(cfg, tier, sessionID, state, profile, cap)) policy.reader = true;
   const call: GuardCall = { tool, args: (toolArgs ?? {}) as Record<string, unknown> };
   const decision = evaluateGuards(state, call, policy);
 
   if (decision.allow) return { block: false, mode, guard: null };
 
   if (mode === "enforced") {
-    // Count the refused attempt so the budget cannot be spun, then signal a block.
-    updateState(state, call, { ok: false }, policy);
+    // §2.9 E6: the refused call never runs, so it is not charged to the budget
+    // and not recorded as executed by the repeat check; CLAUSE 3c bounds a loop
+    // of refusals instead.
+    recordDenied(state, call, policy);
     recordBlock(state, decision);
     const message = scrubText(`${decision.observation}\n${forcingMessage(state, policy)}`);
     return { block: true, mode, message, guard: decision.guard };
@@ -138,12 +246,15 @@ export function guardAfterCall(params: {
   toolArgs: unknown;
   output: { output?: unknown };
   store: GuardStoreLike;
+  /** Role dispatch guard profile (§2.6); absent for tier agents. */
+  profile?: GuardProfile;
 }): void {
-  const { cfg, tier, sessionID, tool, toolArgs, output, store } = params;
+  const { cfg, tier, sessionID, tool, toolArgs, output, store, profile } = params;
   const state = store.get(sessionID);
   if (!state) return;
-  const policy = buildGuardPolicy(cfg, tier);
+  const policy = buildGuardPolicy(cfg, tier, profile);
   const call: GuardCall = { tool, args: (toolArgs ?? {}) as Record<string, unknown> };
+  noteCapBanner(state, tier, tool, output?.output);
   updateState(state, call, { ok: observationOk(output?.output) }, policy);
   const note = store.takePendingNote(sessionID);
   if (note) {

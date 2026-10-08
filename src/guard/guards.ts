@@ -18,6 +18,14 @@ export interface GuardPolicy {
   deliverableIsScript?: boolean;
   /** opt-in; default false. When true, WRITE/EDIT/PATCH/MULTIEDIT to a script-extension path is treated as self_script. Off by default because writing source files is the normal coding deliverable. */
   blockScriptWrites?: boolean;
+  /**
+   * Reader profile (§2.9 E6): reading is the work, so there is no read/draft
+   * (consecutive-non-producing) denial and the forcing message never asks for a
+   * write. Absent/false = producer profile (unchanged).
+   */
+  reader?: boolean;
+  /** Role budget (§2.6): on exhaustion the child is told to return `NEED MORE: budget` with a progress summary. */
+  needMoreOnExhaustion?: boolean;
 }
 
 export interface GuardCall {
@@ -51,6 +59,14 @@ export interface GuardState {
   ttfa: number | null;
   seen: Map<string, number>;
   lastBlock: string | null;
+  /**
+   * Enforced denials in dispatch round `round` (§2.9 E6). A denied call is not
+   * charged to the budget, so this separate count bounds a loop of refused calls.
+   * Set lazily; absent = none.
+   */
+  denied?: { round: number; count: number };
+  /** The session's read-only cap banner showed `CAP:none` (a justified uncapped dispatch). Set lazily. */
+  uncapped?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +208,7 @@ export function evaluateGuards(
     return {
       allow: false,
       guard: "iteration_cap",
-      observation: `DENIED: tool-call budget ${state.budget} exhausted. Stop now and emit your final answer with what you have.`,
+      observation: `DENIED: tool-call budget ${state.budget} exhausted. ${stopInstruction(policy)}`,
     };
   }
 
@@ -206,7 +222,19 @@ export function evaluateGuards(
     return {
       allow: false,
       guard: "cumulative_iteration_cap",
-      observation: `DENIED: cumulative tool-call budget ${policy.cumulativeBudget} exhausted across ${state.dispatches} dispatches. Stop now and emit your final answer with what you have.`,
+      observation: `DENIED: cumulative tool-call budget ${policy.cumulativeBudget} exhausted across ${state.dispatches} dispatches. ${stopInstruction(policy)}`,
+    };
+  }
+
+  // CLAUSE 3c: refused calls. A denied call is not charged to the budget
+  // (§2.9 E6), so a model that keeps repeating refused calls would never reach
+  // CLAUSE 3; after `budget` refusals in this dispatch every call is refused.
+  const denied = deniedThisDispatch(state);
+  if (denied >= state.budget) {
+    return {
+      allow: false,
+      guard: "denied_cap",
+      observation: `DENIED: ${denied} refused tool calls in this dispatch. Stop now and emit your final answer with what you have.`,
     };
   }
 
@@ -219,8 +247,12 @@ export function evaluateGuards(
     };
   }
 
-  // CLAUSE 5: read_budget
-  if (kind === "read" && state.consecutiveNonProducing >= policy.readDraftCap) {
+  // CLAUSE 5: read_budget — producer profile only (§2.9 E6: a reader's reads are its work)
+  if (
+    kind === "read" &&
+    policy.reader !== true &&
+    state.consecutiveNonProducing >= policy.readDraftCap
+  ) {
     return {
       allow: false,
       guard: "read_budget",
@@ -295,6 +327,55 @@ export function updateState(
 }
 
 // ---------------------------------------------------------------------------
+// Budget helpers
+// ---------------------------------------------------------------------------
+
+/** What a budget denial tells the child to do. */
+function stopInstruction(policy: GuardPolicy): string {
+  return policy.needMoreOnExhaustion === true
+    ? "Stop now and return `NEED MORE: budget` with a progress summary: what is done, what remains, and the evidence so far."
+    : "Stop now and emit your final answer with what you have.";
+}
+
+/** Enforced denials counted in the current dispatch round. */
+function deniedThisDispatch(state: GuardState): number {
+  return state.denied?.round === state.dispatches ? state.denied.count : 0;
+}
+
+/** True when no further call fits the per-dispatch or the cumulative budget. */
+export function budgetSpent(
+  state: GuardState,
+  policy: Pick<GuardPolicy, "cumulativeBudget">,
+): boolean {
+  return (
+    state.toolCallCount >= state.budget ||
+    (policy.cumulativeBudget !== undefined &&
+      state.totalToolCallCount >= policy.cumulativeBudget)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// recordDenied
+// ---------------------------------------------------------------------------
+
+/**
+ * Record a call the guard REFUSED (§2.9 E6). It did not run, so it is not
+ * charged: the tool-call counts, the read/draft streak, the repeat-check
+ * fingerprints and the deliverable state stay as they were. Only the attempt
+ * metrics move: the per-dispatch denial count (CLAUSE 3c) and, for a refused
+ * throwaway script, the self-script count the scorecard reports.
+ */
+export function recordDenied(
+  state: GuardState,
+  call: GuardCall,
+  policy: GuardPolicy,
+): GuardState {
+  if (classify(call, policy) === "self_script") state.selfScriptCount += 1;
+  state.denied = { round: state.dispatches, count: deniedThisDispatch(state) + 1 };
+  return state;
+}
+
+// ---------------------------------------------------------------------------
 // recordBlock
 // ---------------------------------------------------------------------------
 
@@ -323,7 +404,11 @@ export function forcingMessage(state: GuardState, policy: GuardPolicy): string {
   const next =
     policy.deliverableSignal != null && !state.deliverableExecuted
       ? `run the deliverable (${policy.deliverableSignal})`
-      : "take a producing action (write/edit) or emit your final answer";
+      : policy.needMoreOnExhaustion === true && budgetSpent(state, policy)
+        ? "return `NEED MORE: budget` with a progress summary"
+        : policy.reader === true
+          ? "emit your final answer"
+          : "take a producing action (write/edit) or emit your final answer";
 
   return `[budget ${state.toolCallCount}/${state.budget} | deliverable=${deliverable} | reads_since_produce=${state.consecutiveNonProducing}] NEXT: ${next}`;
 }

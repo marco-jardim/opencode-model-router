@@ -45,12 +45,15 @@ describe("concurrency isolation", () => {
 
     // Register two subagent sessions with NON-trivial dispatch text so the
     // guard is fully enforced (no trivial-bypass for either session).
+    // §2.9 E6 golden — before: agent "fast"; after: "medium", because the
+    // read-only fast tier now gets the reader profile (no read/draft denial),
+    // and these tests exercise the producer read budget per session.
     await hooks["chat.message"](
-      { sessionID: "CC_A", agent: "fast" },
+      { sessionID: "CC_A", agent: "medium" },
       { parts: [{ type: "text", text: "analyze the module deeply" }] },
     );
     await hooks["chat.message"](
-      { sessionID: "CC_B", agent: "fast" },
+      { sessionID: "CC_B", agent: "medium" },
       { parts: [{ type: "text", text: "inspect the other module deeply" }] },
     );
   });
