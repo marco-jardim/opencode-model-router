@@ -504,11 +504,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // every role branch below is skipped there and both stay byte-identical (§2.7, I1, I8).
   // -------------------------------------------------------------------------
   const isV2Host = ctx.routerHost === "v2";
+  /**
+   * QA-P21-1-8 (plan R8): the role runtime exists only when the plugin STARTED in roles mode — its role tools are registered at
+   * start and its role agents only then (the v2 adapter logs "restart OpenCode" when the config switches to roles at runtime).
+   */
+  const startedInRoles = isV2Host && cfg.routing?.delegation === "roles";
   const NO_ROLES: ReadonlyMap<string, RoleSpec> = new Map();
   const roleTables = new WeakMap<RouterConfig, ReadonlyMap<string, RoleSpec>>();
   /** The role agents of the current config, cached per config object (hot reload builds a new one). */
   const rolesNow = (): ReadonlyMap<string, RoleSpec> => {
-    if (!isV2Host) return NO_ROLES;
+    if (!startedInRoles) return NO_ROLES;
     const current = cfg;
     let roles = roleTables.get(current);
     if (roles === undefined) {
@@ -561,6 +566,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /** Handoff 13 (P1.4 `run` signal): router-observed runs and edit times of role children, bounded per child and overall. */
   const roleRuns = new Map<string, RunRecord[]>();
   const roleEdits = new Map<string, number[]>();
+  /** QA-P21-1-7: role children that made a tool call while the router was bypassed (their edits were not recorded). */
+  const roleBypassedCalls = new Set<string>();
+  const noteBypassedRoleCall = (sessionID: unknown): void => {
+    if (typeof sessionID !== "string" || roleOfSession(sessionID) === undefined) return;
+    roleBypassedCalls.add(sessionID);
+    while (roleBypassedCalls.size > ROLE_STATE_MAX) roleBypassedCalls.delete(roleBypassedCalls.values().next().value!);
+  };
   const pushBounded = <T>(map: Map<string, T[]>, key: string, value: T): void => {
     const list = map.get(key) ?? [];
     map.delete(key);
@@ -705,6 +717,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let bypassed = false;
   // #84 P2.1: the v2 adapter's role path reads the bypass state (the router gate does not run while bypassed, S10/P-9).
   (ctx as RouterPluginInput & { routerOnBypassState?: (read: () => boolean) => void }).routerOnBypassState?.(() => bypassed);
+  /** QA-P21-1-3: the budget snapshot of a role child as the signals AND the adapter's budget notice read it (guard + read cap). */
+  const roleBudgetSnapshot = (childSessionID: string) => captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  (ctx as RouterPluginInput & { routerOnBudgetSnapshot?: (read: typeof roleBudgetSnapshot) => void }).routerOnBudgetSnapshot?.(roleBudgetSnapshot);
   /** #84 P2.1 (handoff 22): the v2 adapter's host-side budget observation of a role child (step limit, context overflow). */
   const hostBudgetOf = (ctx as RouterPluginInput & {
     routerHostBudget?: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation | undefined;
@@ -1000,6 +1015,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roles: () => rolesNow(),
     dispatchOf: (child: string) => {
       const parent = lookupDispatch(child)?.parentSessionID;
+      // QA-P21-1-13: `callID: ""` = not attached yet. authority.ts reads only the parent (to drop the request with it);
+      // `markAnnotated` attaches the request to the parent's call in the adapter's execute.after.
       return typeof parent === "string" && parent !== "" ? { parentSessionID: parent, callID: "" } : undefined;
     },
     bindingOf: (child: string) => currentBinding(child, { maxOf: roleMaxOf }),
@@ -1060,10 +1077,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const spec = childSessionID ? roleOfSession(childSessionID) ?? roleSpecOf(args.subagent_type) : undefined;
     if (!childSessionID || spec === undefined) return;
     rememberRoleSession(childSessionID, spec.agent);
-    const snapshot = captureBudget(childSessionID);
+    // QA-P21-1-3: the snapshot includes the read-only CAP state: a child that reached its read cap stopped on its budget (I7).
+    const snapshot = roleBudgetSnapshot(childSessionID);
     // Handoff 22: the guard's stop folded with the host's own (step limit, context overflow), as the v2 adapter observed them.
     const budgetObserved = foldBudgetObservation(
-      snapshot.tracked ? snapshot.stopped : "unobserved",
+      snapshot.readCapReached === true ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
       hostBudgetOf?.(childSessionID, roleAgentSteps(spec)),
     );
     const request = requestedAuthority(childSessionID);
@@ -1073,7 +1091,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const run = runSignal({
       childSessionID,
       runs: roleRuns.get(childSessionID) ?? [],
-      editsObserved: true,
+      // QA-P21-1-7: a child that made any tool call while the router was bypassed has unrecorded edits.
+      editsObserved: !roleBypassedCalls.has(childSessionID),
       edits: roleEdits.get(childSessionID) ?? [],
       acceptance: acceptanceScripts(args.prompt, args.description),
     });
@@ -1096,6 +1115,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roleSessions.delete(sessionID);
     roleRuns.delete(sessionID);
     roleEdits.delete(sessionID);
+    roleBypassedCalls.delete(sessionID);
     for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
   };
   return {
@@ -1934,7 +1954,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // bypassed (the work-root resolver and the authority tool are authority, not routing), and marked a child session: role
       // agents are subagents, so the guard engages from their first call. Never on v1 / in tiers mode (no role table).
       if (rememberRoleSession(input?.sessionID, input?.agent)) sessionStore.markChildSession(input.sessionID);
-      if (bypassed) return;
+      if (bypassed) {
+        noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
+        return;
+      }
       if (input?.tool === "task") {
         const depth = await depthGuard.checkDispatch(input.sessionID);
         if (depth.block) {
@@ -2106,7 +2129,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const isPlugin = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier);
         if ((definition && isReadOnlyTier(tier, definition)) || isPlugin) output.output = filterSensitiveGrep(output.output);
       }
-      if (bypassed) return;
+      if (bypassed) {
+        noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
+        return;
+      }
       sessionStore.recordToolCall(input, output);
 
       // #84 P2.1 (handoffs 13, 15-17, 23): role children only (roles mode on v2). Edit times feed the `run` signal; the parent's
@@ -2362,7 +2388,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const incomplete = isIncompleteVerdict(res.verdict);
               let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
               // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
-              const roleHint = roleProducer && !incomplete && childSessionID ? roleEscalationHintFor(cfg, childSessionID) : null;
+              // QA-P21-1-4: only after a FAIL (an unverifiable result keeps the generic line: there is nothing to escalate on).
+              const roleHint = roleProducer && !incomplete && res.verdict.outcome === "fail" && childSessionID
+                ? roleEscalationHintFor(cfg, childSessionID) : null;
               const genericNext = "NEXT: address the above and re-run the delegation; do not treat the prior result as complete.";
               if (roleHint !== null && note.endsWith(genericNext)) note = note.slice(0, note.length - genericNext.length) + scrubText(roleHint);
               output.output =
