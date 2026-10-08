@@ -45,6 +45,16 @@ type Tier = (typeof TIERS)[number];
 const TIER_OF_WIRE: Readonly<Record<string, Tier>> = Object.fromEntries(TIERS.map(t => [`${SMOKE_PRESET[t].model}#${SMOKE_PRESET[t].variant}`, t]));
 const rankOf = (tier: string | undefined): number => (tier === undefined ? -1 : (TIERS as readonly string[]).indexOf(tier));
 const wireTier = (catalogModel: string | undefined): Tier | undefined => (catalogModel === undefined ? undefined : TIER_OF_WIRE[catalogModel]);
+/**
+ * Like {@link wireTier}, but a variant that is no preset rung (run 3: the grader ran on `anthropic/claude-opus-5-5#default`) maps by
+ * MODEL: the highest preset tier on that model (opus → heavy; sonnet → medium, its fast and medium rungs differ only by variant).
+ */
+function modelTier(catalogModel: string | undefined): Tier | undefined {
+  const exact = wireTier(catalogModel);
+  if (exact !== undefined || catalogModel === undefined) return exact;
+  const model = catalogModel.split("#")[0];
+  return [...TIERS].reverse().find(t => SMOKE_PRESET[t].model === model);
+}
 const maxTier = (a: string, b: string): string => (rankOf(a) >= rankOf(b) ? a : b);
 const SPEC = new Map(SHIPPED_ROLE_SPECS.map(s => [s.agent, s] as const));
 const norm = (value: unknown): string => String(value).replaceAll("\\", "/").toLowerCase();
@@ -609,7 +619,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
     } finally { await finish(host); }
   }, 600_000);
 
-  it("work roots and host handoffs: path resource formats, execute.before refusals surfaced to the child, glob/grep search roots, own truncated outputs, router_git_* and router_run in worktrees (one created after start), DF2-F1 observation", async () => {
+  it("work roots and host handoffs: path resource formats, execute.before refusals surfaced to the child, glob/grep search roots, own truncated outputs (2.0.24: unreadable, fail closed), router_git_* and router_run in worktrees (one created after start), DF2-F1 fixed", async () => {
     const { host, w } = await startRolesHost("roots");
     try {
       const root = await host.newRoot("roots root", undefined, host.project, []);
@@ -652,11 +662,9 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         truncationNotices: toolResultTexts.map(t => /truncat/i.exec(t) ? t.slice(Math.max(0, t.search(/truncat/i) - 200), t.search(/truncat/i) + 400) : null).filter(Boolean),
         states: big.states.map(s => ({ tool: s.tool, status: s.status, length: s.text.length, tail: s.text.slice(-400) })),
       };
-      const savedPath = ownPaths[0] ?? savedPaths[0];
-      const outputPathsEmitted = ownPaths.length > 0;
-      if (!outputPathsEmitted && savedPath !== undefined) {
-        console.log(`[roles-smoke] OBSERVATION: the host truncated a role child's tool output (saved to ${savedPath}) but the plugin event stream carried no outputPaths (event types: ${successTypes.join(", ")}); the router cannot attribute the saved file, so the child's own read must be refused (fail closed).`);
-      }
+      // The saved file is named only in the text the child model got: 2.0.24 puts no outputPaths on any event a plugin receives (run 3).
+      const savedPath = savedPaths[0] ?? ownPaths[0];
+      console.log(`[roles-smoke] OBSERVATION (host 2.0.24): the host truncated a role child's tool output (saved to ${savedPath ?? "<no saved path found>"}) but the plugin event stream carried no outputPaths (tool-success event types: ${successTypes.join(", ") || "<none>"}; events with outputPaths: ${anyWithPaths.length}); the router attributes saved outputs from outputPaths only, so the child's own read is refused (fail closed): role children cannot read their truncated outputs on this host.`);
       const ownRead = savedPath === undefined ? undefined
         : await resumeChild(host, root, big.childID, { agent: "explorer", description: "roots big output resume", prompt: ["continue", scriptLine([{ tool: "read", input: { path: savedPath } }], "DONE: read my saved output")].join("\n"), background: false }, "own output read");
       const foreignRead = savedPath === undefined ? undefined
@@ -670,23 +678,40 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         { tool: "router_run", input: { script: "smoke-marker", cwd: late } },
         { tool: "router_run", input: { script: "smoke-marker", cwd: w.wt1 } },
       ], "DONE: exit code 0")]), "router_run in the later worktree");
-      // (f) DF2-F1 (observation, fixed in P3.3): a deterministic check on an absolute path in the worktree, without and with `cwd:`.
-      const accept = (cwd?: string) => ["[acceptance]", ...(cwd === undefined ? [] : [`cwd: ${cwd}`]), `check: fileExists path=${path.join(w.wt1, "m.txt")}`, "[/acceptance]"];
-      const df2NoCwd = await runChild(host, root, roleInput("explorer", "DF2-F1 without cwd", explorerIn(w.wt1), ["TASK: confirm that m.txt exists", ...accept()]), "DF2-F1 without cwd");
-      const df2WithCwd = await runChild(host, root, roleInput("explorer", "DF2-F1 with cwd", explorerIn(w.wt1), ["TASK: confirm that m.txt exists", ...accept(w.wt1)]), "DF2-F1 with cwd");
+      // (f) DF2-F1 FIXED (P3.3, `verifyRoot`, merged at 9cfae27): the router's gate verifies a role dispatch in its work root.
+      //     - an existing file in the worktree, without `cwd:` and with `cwd: <work root>`: verified, detection deterministic;
+      //     - the live DF2-F1 shape: the CHILD writes a new file in its worktree and `fileExists` on it is verified without `cwd:`;
+      //     - a `cwd:` OUTSIDE the work root (the main checkout) is refused by the gate (unverifiable) and the dispatch is not
+      //       decided as deterministic (routing/wire/dispatch.ts roleGateOutsideWorkRoot).
+      const accept = (file: string, cwd?: string) => ["[acceptance]", ...(cwd === undefined ? [] : [`cwd: ${cwd}`]), `check: fileExists path=${file}`, "[/acceptance]"];
+      const existing = path.join(w.wt1, "m.txt");
+      const df2NoCwd = await runChild(host, root, roleInput("explorer", "DF2-F1 without cwd", explorerIn(w.wt1), ["TASK: confirm that m.txt exists", ...accept(existing)]), "DF2-F1 without cwd");
+      const df2WithCwd = await runChild(host, root, roleInput("explorer", "DF2-F1 with cwd", explorerIn(w.wt1), ["TASK: confirm that m.txt exists", ...accept(existing, w.wt1)]), "DF2-F1 with cwd");
+      const created = path.join(w.wt1, "df2-live-created.txt");
+      const df2Live = await runChild(host, root, roleInput("implementer", "DF2-F1 live shape", `class=mechanical risk=low scope=single needs=edit ${rootField(w.wt1)}`, [
+        "TASK: create the throwaway file df2-live-created.txt in the work root",
+        scriptLine([{ tool: "write", input: { path: created, content: "created by the role child\n" } }], "DONE: df2-live-created.txt:1 created"),
+        ...accept(created),
+      ]), "DF2-F1 live shape (child writes, no cwd)");
+      const createdOnDisk = existsSync(created);
+      const df2Outside = await runChild(host, root, roleInput("explorer", "DF2-F1 cwd outside", explorerIn(w.wt1), ["TASK: confirm that m.txt exists", ...accept(existing, host.project)]), "DF2-F1 cwd outside the work root");
       const disk = {
         wt1E1: await readFile(path.join(w.wt1, "e1.txt"), "utf8"), lateMarker: existsSync(path.join(late, "smoke-marker.txt")),
         wt1Marker: existsSync(path.join(w.wt1, "smoke-marker.txt")), mainMarker: existsSync(path.join(host.project, "smoke-marker.txt")),
       };
-      const fresh = [fmtWorktree, fmtSession, fmtEdit, search, big, lateRead, uncoveredRead, lateRun, df2NoCwd, df2WithCwd, ...(foreignRead ? [foreignRead] : [])];
+      const fresh = [fmtWorktree, fmtSession, fmtEdit, search, big, lateRead, uncoveredRead, lateRun, df2NoCwd, df2WithCwd, df2Live, df2Outside, ...(foreignRead ? [foreignRead] : [])];
       const rows = await waitRows(host, "roots rows", everyBound(fresh.map(v => v.childID)));
-      const df2 = (v: ChildView) => ({ parentText: v.parentText, verified: v.parentText.includes(VERIFIED), notAccepted: v.parentText.includes("NOT ACCEPTED"), row: rowView(dispatchRowOf(rows, v.childID)) });
+      const df2 = (v: ChildView) => ({
+        parentText: v.parentText, verified: v.parentText.includes(VERIFIED), notAccepted: v.parentText.includes("NOT ACCEPTED"),
+        cwdRefused: v.parentText.includes("is outside this role dispatch's work root"), detection: dispatchRowOf(rows, v.childID)?.detection?.effective,
+        row: rowView(dispatchRowOf(rows, v.childID)),
+      });
       await save("roots-handoffs", {
         explorerExternal,
         formats: { worktree: fmtWorktree.evaluates, session: fmtSession.evaluates, edit: fmtEdit.evaluates, states: [fmtWorktree, fmtSession, fmtEdit].map(v => v.states) },
-        search: search.states, searchEvaluates: search.evaluates, withPaths: withPaths.map(e => ({ type: e.type, data: e.data })), outputView, outputPathsEmitted,
+        search: search.states, searchEvaluates: search.evaluates, withPaths: withPaths.map(e => ({ type: e.type, data: e.data })), outputView, savedPath,
         big: big.states.map(s => ({ ...s, text: s.text.slice(0, 800) })), ownRead, foreignRead, lateRead, uncoveredRead, lateRun, disk,
-        df2NoCwd: df2(df2NoCwd), df2WithCwd: df2(df2WithCwd),
+        df2NoCwd: df2(df2NoCwd), df2WithCwd: df2(df2WithCwd), df2Live: { ...df2(df2Live), states: df2Live.states, createdOnDisk }, df2Outside: df2(df2Outside),
         bindings: fresh.map(v => ({ label: v.label, binding: bindingNote(rows, v.childID)?.binding })), unknownBindings: unknownBindings(rows),
         routerWarnings: host.routerLogLines(), hostErrors: host.errorLines(), providerErrors: host.provider.errors,
       });
@@ -717,22 +742,18 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expectCompleted(search.states[5], "router_git_status");
       expectText(search.states[5], /wt1-only-untracked\.txt/, "router_git_status names wt-1's untracked file");
       expect(search.states[5]?.text, describeState(search.states[5])).not.toContain("main-only-dirty.txt");
-      // (d) the host truncated and saved the 64 KiB router_git_diff output (a saved path in the text the child got, or outputPaths on an event).
+      // (d) OBSERVATION (host 2.0.24, pinned, runs 2-3): the host truncates and saves the 64 KiB router_git_diff output (the saved path is in the
+      //     text the child got), emits `session.tool.success` — and no event a plugin receives carries outputPaths. The router attributes saved
+      //     outputs from outputPaths only (v2-hooks.ts HOST_TOOL_SUCCESS_EVENT, phase-p23 QA-P23-3-1), so EVEN THE OWNING CHILD is refused:
+      //     fail closed. Consequence: role children cannot read their truncated outputs on 2.0.24. Another child is refused too.
       expectStatuses(big.states, ["completed", "completed"], "grep and router_git_diff of the big-output child");
       expect(savedPath, `the host truncated no output of the child: ${JSON.stringify(outputView)}`).toBeDefined();
+      expect(successTypes, JSON.stringify(outputView)).toContain("session.tool.success");
+      expect(anyWithPaths, `no event of the child carries outputPaths: ${JSON.stringify(outputView)}`).toEqual([]);
+      expect(ownPaths).toEqual([]);
       expect(ownRead?.childID).toBe(big.childID);
-      // Another child can never read it.
+      expectRefused(ownRead?.states[0], `own saved output without outputPaths (${savedPath}): fail closed`);
       expectRefused(foreignRead?.states[0], "another child reading the saved output");
-      if (outputPathsEmitted) {
-        // The tool-success event carries outputPaths (its type is in outputView.successTypes): the owning child reads its own saved output.
-        expectStatuses(ownRead?.states ?? [], ["completed"], `the child reads its own saved output (${savedPath})`);
-      } else {
-        // OBSERVATION (host 2.0.24, pinned): the output was truncated and saved, but no event the plugin receives carries outputPaths
-        // (run 2 saw only `session.tool.success`). The router attributes saved outputs from outputPaths only (v2-hooks.ts HOST_TOOL_SUCCESS_EVENT,
-        // phase-p23 QA-P23-3-1), so even the owning child is refused: fail closed. Consequence: role children cannot read their truncated outputs.
-        expect(anyWithPaths, "no event of the child carries outputPaths").toEqual([]);
-        expectRefused(ownRead?.states[0], `own saved output without outputPaths (${savedPath}): fail closed`);
-      }
       // (e) the later worktree is covered by the workRoots glob; one outside the glob is not; router_run runs in the later root and refuses wt-1.
       expectStatuses(lateRead.states, ["completed"], `later worktree under the workRoots glob (evaluates: ${evaluated(lateRead)})`);
       expectRefused(uncoveredRead.states[0], "worktree created after start without a pattern");
@@ -741,18 +762,27 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(disk.lateMarker).toBe(true);
       expect(disk.wt1Marker).toBe(false);
       expect(disk.mainMarker).toBe(false);
-      // (f) DF2-F1 pinned as observed on 2026-10-08 (dogfood.md): without `cwd:` the router's gate does not verify a fileExists check on a path
-      //     in the worktree while the dispatch is still decided as deterministic; with `cwd: <work root>` it verifies. P3.3 changes this.
-      expect(dispatchRowOf(rows, df2NoCwd.childID)?.detection?.effective).toBe("deterministic");
-      expect(df2(df2NoCwd).verified, `DF2-F1 without cwd: ${df2NoCwd.parentText}`).toBe(false);
-      expect(df2(df2WithCwd).verified, `DF2-F1 with cwd: ${df2WithCwd.parentText}`).toBe(true);
+      // (f) DF2-F1 fixed: verified in the work root with and without `cwd:`, detection deterministic.
+      for (const v of [df2NoCwd, df2WithCwd]) {
+        expect(df2(v).verified, `${v.label}: ${v.parentText}`).toBe(true);
+        expect(df2(v).detection, `${v.label}: ${rowLine(dispatchRowOf(rows, v.childID))}`).toBe("deterministic");
+      }
+      //     The live shape: the child's write landed in the worktree and the check on it, without `cwd:`, is verified (deterministic).
+      expectStatuses(df2Live.states, ["completed"], "DF2-F1 live shape: the child writes the file in its worktree");
+      expect(createdOnDisk, "the written file exists in the worktree").toBe(true);
+      expect(df2(df2Live).verified, `DF2-F1 live shape: ${df2Live.parentText}`).toBe(true);
+      expect(df2(df2Live).detection, rowLine(dispatchRowOf(rows, df2Live.childID))).toBe("deterministic");
+      //     A `cwd:` outside the work root: refused by the gate (unverifiable, never verified) and not decided as deterministic.
+      expect(df2(df2Outside).cwdRefused, `DF2-F1 cwd outside: ${df2Outside.parentText}`).toBe(true);
+      expect(df2(df2Outside).verified, df2Outside.parentText).toBe(false);
+      expect(df2(df2Outside).detection, rowLine(dispatchRowOf(rows, df2Outside.childID))).not.toBe("deterministic");
       for (const v of fresh) expect(bindingNote(rows, v.childID)?.binding, v.label).toBe("exact");
       expect(unknownBindings(rows)).toEqual([]);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
   }, 900_000);
 
-  it("budget exhaustion and resume; signal rows of every kind the router writes (verdict, run, incomplete, budget, authority, redispatch) in the isolated decision log; grader verdicts land as verdict rows (product gap, pinned)", async () => {
+  it("budget exhaustion and resume; signal rows of every kind (verdict, run, grader, incomplete, budget, authority, redispatch) in the isolated decision log; a grader verdict is a grader row, never a verdict row", async () => {
     // Enforcement mode `enforced`: the default `advisory` never blocks a call (src/guard/enforce.ts:241-248 only appends a banner), so no
     // budget stop exists in it and the parent gets no `[router budget]` note (run 1: the 4th read of a 3-call budget completed).
     const { host, w } = await startRolesHost("signals", {
@@ -781,7 +811,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const grader = await runChild(host, root, roleInput("explorer", "signals grader", "class=search risk=low scope=single tier=fast", ["VERIFY: required", "TASK: say where parse is defined", "[acceptance]", "criteria: the reply names where parse is defined", "[/acceptance]"]), "grader");
       const gradersRan = host.provider.graders - gradersBefore;
       /** The grader's own provider requests (the router's grader system prompt): which model and tier judged the producer. */
-      const graderRequests = host.provider.requests.slice(graderMark).filter(r => r.reply === "grader").map(r => ({ session: r.session, agent: r.agent, catalogModel: r.catalogModel, tier: wireTier(r.catalogModel) }));
+      const graderRequests = host.provider.requests.slice(graderMark).filter(r => r.reply === "grader").map(r => ({ session: r.session, agent: r.agent, catalogModel: r.catalogModel, tier: modelTier(r.catalogModel) }));
       // incomplete: NEED MORE without budget exhaustion or an authority request.
       const incomplete = await runChild(host, root, roleInput("architect", "signals incomplete", "class=design risk=low scope=single", ["TASK: sketch the parser design", scriptLine([read("parser.ts")], "NEED MORE: the lexer module is missing from the context")]), "incomplete");
       // authority: the ladder request.
@@ -790,17 +820,15 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const task = "TASK: find the exported entry points of parser.ts and list them with file:line";
       const first = await runChild(host, root, roleInput("explorer", "signals redispatch first", "class=search risk=low scope=single tier=fast", [task, scriptLine([], "DONE: parser.ts:1 parse")]), "redispatch first");
       const again = await runChild(host, root, roleInput("explorer", "signals redispatch again", "class=search risk=low scope=single tier=medium", [task, scriptLine([], "DONE: parser.ts:1 parse")]), "redispatch again");
-      // PRODUCT GAP (pinned as observed in run 2, reported to the executor): no `grader` signal row is ever written. graderSignal
-      // (src/routing/outcomes/signals.ts:237) has no call site; every non-skipped gate verdict goes through onVerdict
-      // (src/index.ts:2446, src/index.ts:1738), which writes a role dispatch's verdict — grader verdicts included — as a `verdict` signal
-      // with the deterministic weight (src/routing/outcomes/ingest.ts:774-777 → signals.ts:181-184). Plan §2.6 wants grader verdicts as
-      // `grader` signals of weight 0.5, only when the grader's tier >= the producer's and its model differs. When that is fixed, this entry
-      // becomes `/^note:signal:grader:pass$/` and `kinds` gains "grader".
+      // Plan §2.6 (the P3.3 fix on rta/p33-fix-2 for the run-2 finding: graderSignal had no call site and a role's grader verdict was
+      // written as a `verdict` row of deterministic weight): a role dispatch's GRADER verdict lands as `note:signal:grader:<pass|fail>`
+      // (weight 0.5, only when the grader's tier >= the producer's and its model differs) and never as a `verdict` row; deterministic
+      // verdicts stay `verdict` rows. This test expects the FIXED behaviour; on code before that fix it fails here on purpose.
       const expected: Record<string, { child: string; reason: RegExp }> = {
         verdictPass: { child: verdictPass.childID, reason: /^note:signal:verdict:pass$/ },
         verdictFail: { child: verdictFail.childID, reason: /^note:signal:verdict:fail$/ },
         run: { child: run.childID, reason: /^note:signal:run:pass$/ },
-        graderAsVerdict: { child: grader.childID, reason: /^note:signal:verdict:pass$/ },
+        grader: { child: grader.childID, reason: /^note:signal:grader:pass$/ },
         incomplete: { child: incomplete.childID, reason: /^note:signal:incomplete:fail$/ },
         budget: { child: budget.childID, reason: /^note:signal:budget:/ },
         authority: { child: authority.childID, reason: /^note:signal:authority:/ },
@@ -830,18 +858,19 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expectCompleted(run.states[0], "edit before the run");
       expectText(run.states[1], /exit code: 0/, "router_run after the edit");
       expect(gradersRan, "the router's grader reached the provider").toBeGreaterThan(0);
-      // The grader was independent in the §2.6 sense — its tier at least the producer's (fast), another model than the producer's sonnet — so
-      // the missing `grader` row is not explained by graderSignal's own refusal rules.
+      // The grader was independent in the §2.6 sense — its tier (by model when its variant is no preset rung: run 3 saw opus#default) at
+      // least the producer's (fast), another model than the producer's sonnet — so the independence rule admits its verdict as a signal.
       expect(graderRequests.length, JSON.stringify(graderRequests)).toBeGreaterThan(0);
       for (const g of graderRequests) {
-        expect(rankOf(g.tier), `grader tier >= producer tier fast: ${JSON.stringify(g)}`).toBeGreaterThanOrEqual(rankOf(grader.requests[0]?.tier));
+        expect(g.tier, `grader model maps to a preset tier: ${JSON.stringify(g)}`).toBeDefined();
+        expect(rankOf(g.tier), `grader tier >= producer tier ${grader.requests[0]?.tier}: ${JSON.stringify(g)}`).toBeGreaterThanOrEqual(rankOf(grader.requests[0]?.tier));
         expect(g.catalogModel?.split("#")[0], `grader model differs from the producer's: ${JSON.stringify(g)} vs ${grader.requests[0]?.catalogModel}`).not.toBe(grader.requests[0]?.catalogModel?.split("#")[0]);
       }
       const signalList = signalRows(rows).map(r => `${r.reason}@${r.childSessionID}`).join(", ");
       for (const [name, e] of Object.entries(expected)) expect(has(rows, e), `signal row ${name} (${e.reason.source}) for ${e.child}; signal rows: ${signalList}`).toBe(true);
-      // The gap, pinned: the grader-verified dispatch has NO grader row (only the verdict row above), and no grader row exists at all.
-      expect(signalRows(rows).filter(r => r.signal === "grader"), `grader rows (product gap: graderSignal has no call site); signal rows: ${signalList}`).toEqual([]);
-      expect(kinds).toEqual(["authority", "budget", "incomplete", "redispatch", "run", "verdict"]);
+      // The grader verdict is a `grader` row only: no `verdict` signal row for the grader-verified dispatch (run 2/3 before the fix: verdict:pass).
+      expect(signalRows(rows).filter(r => r.childSessionID === grader.childID && r.signal === "verdict").map(r => r.reason), `verdict rows of the grader dispatch; signal rows: ${signalList}`).toEqual([]);
+      expect(kinds).toEqual(["authority", "budget", "grader", "incomplete", "redispatch", "run", "verdict"]);
       expect(unknownBindings(rows)).toEqual([]);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
