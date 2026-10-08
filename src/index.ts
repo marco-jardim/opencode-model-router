@@ -73,7 +73,7 @@ import type { WorkRootAnswer } from "./router/git-tools";
 import { roleGuardProfile, type GuardProfile } from "./router/guard-profile";
 import { currentBinding } from "./routing/roles/binding";
 import { authorityTool, requestedAuthority } from "./routing/roles/authority";
-import { roleEscalationHintFor, roleMaxActions, routedRoleOf, strippedRouteRoot } from "./routing/wire/dispatch";
+import { roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot } from "./routing/wire/dispatch";
 import { roleTierOrder } from "./routing/engine/ladders";
 import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
 import type { IngestSettings } from "./routing/outcomes/ingest";
@@ -509,6 +509,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * start and its role agents only then (the v2 adapter logs "restart OpenCode" when the config switches to roles at runtime).
    */
   const startedInRoles = isV2Host && cfg.routing?.delegation === "roles";
+  /** QA-P21-2-4: the v2 adapter's "this role agent is registered" check (absent on v1 and before the adapter is set up). */
+  const roleLiveOf = (ctx as RouterPluginInput & { routerRoleLive?: (agent: string) => boolean | undefined }).routerRoleLive;
   const NO_ROLES: ReadonlyMap<string, RoleSpec> = new Map();
   const roleTables = new WeakMap<RouterConfig, ReadonlyMap<string, RoleSpec>>();
   /** The role agents of the current config, cached per config object (hot reload builds a new one). */
@@ -525,7 +527,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
       roleTables.set(current, roles);
     }
-    return roles;
+    // QA-P21-2-4: a role whose agent registration failed is not live (the v2 adapter's check; undefined = not known yet).
+    const live = roleLiveOf === undefined ? [...roles] : [...roles].filter(([name]) => roleLiveOf(name) !== false);
+    return live.length === roles.size ? roles : new Map(live);
   };
   const roleSpecOf = (agent: unknown): RoleSpec | undefined => (typeof agent === "string" ? rolesNow().get(agent) : undefined);
   /** `maxOf` of every `currentBinding` call (handoff 33). */
@@ -915,6 +919,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   } catch (error) {
     logger.warn("[verify] router_verify not registered: the enforcement mode could not be resolved", { error: scrubText(String(error)) });
   }
+  // QA-P21-2 nit 3: the role path's deferral check follows it (nothing is deferred without router_verify).
+  (ctx as RouterPluginInput & { routerOnVerifyEnabled?: (read: () => boolean) => void }).routerOnVerifyEnabled?.(() => routerVerifyEnabled);
   /**
    * 2.4.2 + 2.4.3b: a delegation defers only when `router_verify` exists to verify it later. A
    * footer never names a tool this instance did not register; without it the delegation keeps the
@@ -1035,6 +1041,39 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       return match === null ? [] : [match[1] !== undefined ? "test" : (match[2] as string)];
     });
   };
+  /**
+   * QA-P21-2-3: the read-only cap a role dispatch asks for itself — `CAP:N`, or `CAP:none` with a `reason:` line (an unjustified
+   * `CAP:none` is no cap, as for tier dispatches); `null` when it names none (then the child gets no read-only cap).
+   */
+  const roleDispatchCap = (prompt: unknown): Cap | null => {
+    if (typeof prompt !== "string") return null;
+    const parsed = parseCapDirective(prompt);
+    return parsed === "none" && !/\breason:/i.test(prompt) ? null : parsed;
+  };
+  /** Caps of fresh role dispatches, by the parent's call, until the child binds (bounded, oldest out). */
+  const pendingRoleCaps = new Map<string, { agent: string; cap: Cap }>();
+  const rememberPendingRoleCap = (callID: string, agent: string, cap: Cap): void => {
+    pendingRoleCaps.delete(callID);
+    pendingRoleCaps.set(callID, { agent, cap });
+    while (pendingRoleCaps.size > ROLE_STATE_MAX) pendingRoleCaps.delete(pendingRoleCaps.keys().next().value!);
+  };
+  /**
+   * The role child's read-only counter with the dispatch's cap, independent of `subagentTiers` (the session store's producer
+   * registration: no trivial downgrade). The cap is keyed by the role agent's name, which is never a tier.
+   */
+  const registerRoleCap = (child: string, agent: string, cap: Cap): void => {
+    sessionStore.registerProducerSession(child, agent, { ...cfg, tierCaps: { ...(cfg.tierCaps ?? {}), [agent]: cap } } as RouterConfig);
+  };
+  /** A fresh role child's first call: its exact binding names the dispatch's call, whose cap is registered once. */
+  const applyPendingRoleCap = (child: string): void => {
+    if (pendingRoleCaps.size === 0) return;
+    const binding = currentBinding(child, { maxOf: roleMaxOf });
+    const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
+    const pending = callID === undefined ? undefined : pendingRoleCaps.get(callID);
+    if (callID === undefined || pending === undefined) return;
+    pendingRoleCaps.delete(callID);
+    registerRoleCap(child, pending.agent, pending.cap);
+  };
   /** The prompt as the orchestrator wrote it: without the router's nonce line (handoff 18; role dispatches carry no header). */
   const withoutNonceLine = (prompt: string): string => prompt.replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
   /**
@@ -1046,6 +1085,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const routed = routedRoleOf(callID);
     if (routed === undefined || routed.parentSessionID !== parentSessionID) return;
     if (routed.resumeID !== null) guardStore.beginDispatch(routed.resumeID);
+    // QA-P21-2-3: the dispatch's own read-only cap. A resume names its child: registered now; a fresh child when it binds.
+    const cap = roleDispatchCap(args.prompt);
+    if (cap !== null) {
+      if (routed.resumeID !== null) registerRoleCap(routed.resumeID, routed.agent, cap);
+      else rememberPendingRoleCap(callID, routed.agent, cap);
+    }
     if (routed.decisionID === null) return; // engine static: no rows
     const current: DispatchText = {
       decisionID: routed.decisionID,
@@ -1953,7 +1998,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // #84 P2.1: a role child's own call names its role agent (the v2 adapter passes the calling agent). Remembered even while
       // bypassed (the work-root resolver and the authority tool are authority, not routing), and marked a child session: role
       // agents are subagents, so the guard engages from their first call. Never on v1 / in tiers mode (no role table).
-      if (rememberRoleSession(input?.sessionID, input?.agent)) sessionStore.markChildSession(input.sessionID);
+      if (rememberRoleSession(input?.sessionID, input?.agent)) {
+        sessionStore.markChildSession(input.sessionID);
+        applyPendingRoleCap(input.sessionID); // QA-P21-2-3
+      }
       if (bypassed) {
         noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
         return;
@@ -2389,8 +2437,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
               // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
               // QA-P21-1-4: only after a FAIL (an unverifiable result keeps the generic line: there is nothing to escalate on).
+              // QA-P21-2-2: the hint promises the raise, and records it for this parent's next resume of the child.
               const roleHint = roleProducer && !incomplete && res.verdict.outcome === "fail" && childSessionID
-                ? roleEscalationHintFor(cfg, childSessionID) : null;
+                ? roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID) : null;
               const genericNext = "NEXT: address the above and re-run the delegation; do not treat the prior result as complete.";
               if (roleHint !== null && note.endsWith(genericNext)) note = note.slice(0, note.length - genericNext.length) + scrubText(roleHint);
               output.output =
