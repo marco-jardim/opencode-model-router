@@ -103,3 +103,12 @@ reads 9–10 (R5: the DF-1 probe must carry `CAP:12`).
 | 3. long `[acceptance]` criteria, `VERIFY:required` | `[router ✓ verified: checker]` | `[router ✓ verified: checker]`; no `NOT ACCEPTED`, no truncated criterion |
 
 The 25-call tier budget is unchanged in tiers mode (E7 is addressed by role budgets at DF-2).
+## DF-2 — roles mode (sync 2026-10-08T19:04Z)
+
+| Item | Value |
+|---|---|
+| Pre-flight | Wave 2 CI 17/17 green on PR #85 head `ae67429`; capped suite on `ae67429`: 173 files passed / 3 skipped, only the known `test\unit\exec.test.ts` lowPriority flake (passed alone 42/2); DF-1 record complete; base clean on `rta/live` @ `741a835`; override SHA-256 unchanged (`700E2587…88F8`) |
+| Rollback tag | `rta/df2-prev` → `741a835` |
+| Sync | `git -C D:\git\opencode-model-router merge --ff-only origin/rta/main` → `ae674298942a2a2ca05adc0ba97ef17f654aa865` |
+| `npm ci` | not needed (`package-lock.json` identical `741a835`..`ae67429`) |
+| Restart | requested (1 of 2, R8); liveness probe pending; override migration follows the probe |
