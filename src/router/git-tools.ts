@@ -461,6 +461,13 @@ export interface BoundedOptions {
   tailBytes?: number;
   /** Collect stderr into the same bounded stream as stdout, in arrival order (absent: a separate 8 KiB stderr). */
   mergeStderr?: boolean;
+  /**
+   * With `mergeStderr`: also keep the last `stderrTailBytes` of stderr on their own.
+   * stdout and stderr are separate pipes with no relative order (on Linux a large
+   * stdout write can still be draining when a later stderr write arrives), so the tail
+   * of the merged stream need not contain the final stderr lines.
+   */
+  stderrTailBytes?: number;
   /** Resolve with `failure` set, keeping the output so far, instead of rejecting on timeout or abort. */
   settleOnFailure?: boolean;
   /** Error/warning wording; default router_git's. */
@@ -479,6 +486,28 @@ export interface BoundedResult {
   tail?: Buffer; omitted?: number;
   /** `settleOnFailure` mode: why the run was stopped ("<message> timed out" / "<message> aborted"). */
   failure?: string;
+  /** `stderrTailBytes` mode: the last stderr bytes, and how many stderr bytes arrived in total. */
+  stderrTail?: Buffer; stderrTotal?: number;
+}
+
+/** A rolling window over a byte stream: memory stays near `max` however much is pushed. */
+function rollingWindow(max: number) {
+  const parts: Buffer[] = [];
+  let size = 0;
+  let total = 0;
+  return {
+    push(chunk: Buffer) {
+      total += chunk.length;
+      parts.push(chunk);
+      size += chunk.length;
+      while (parts.length > 1 && size - parts[0]!.length >= max) size -= parts.shift()!.length;
+    },
+    value(): Buffer {
+      const all = Buffer.concat(parts);
+      return all.subarray(Math.max(0, all.length - max));
+    },
+    total: () => total,
+  };
 }
 
 /**
@@ -495,6 +524,7 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
       detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
     const max = options.maxBytes ?? MAX_BYTES;
     const tailMax = options.tailBytes;
+    const errorTail = options.mergeStderr && options.stderrTailBytes !== undefined ? rollingWindow(options.stderrTailBytes) : undefined;
     const chunks: Buffer[] = [];
     const errors: Buffer[] = [];
     const tails: Buffer[] = [];
@@ -535,6 +565,7 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
         Object.assign(base, { tail: kept, omitted: overflow - kept.length });
       }
       if (failure !== undefined) base.failure = failure;
+      if (errorTail !== undefined) Object.assign(base, { stderrTail: errorTail.value(), stderrTotal: errorTail.total() });
       return base;
     };
     const finish = (code: number | null) => {
@@ -578,7 +609,8 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
       errorBytes += kept.length;
     };
     child.stdout.on("data", collect);
-    child.stderr.on("data", options.mergeStderr ? collect : collectError);
+    child.stderr.on("data", !options.mergeStderr ? collectError
+      : errorTail === undefined ? collect : (chunk: Buffer) => { collect(chunk); errorTail.push(chunk); });
     child.once("error", error => settle(() => reject(error)));
     child.once("exit", code => {
       exited = true;

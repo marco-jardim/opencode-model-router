@@ -79,10 +79,18 @@ export const RUN_ARG_RE = /^[A-Za-z0-9_./:=@+-]{1,200}$/;
 /** An entry name: never option-like (it is an npm argv element). */
 export const RUN_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:@+-]{0,199}$/;
 export const RUN_MAX_ARGS = 50;
-/** Output bound: the first RUN_HEAD_BYTES and the last RUN_TAIL_BYTES of stdout+stderr (raw bytes). */
+/**
+ * Output bound (raw bytes): the first RUN_HEAD_BYTES and the last RUN_TAIL_BYTES of
+ * stdout+stderr in arrival order, plus the last RUN_STDERR_TAIL_BYTES of stderr on their
+ * own when the output was cut and they are not already shown. stdout and stderr are
+ * separate pipes without a relative order, so a script's final stderr lines (a test
+ * runner's failure summary) can arrive before the last stdout bytes and fall out of the
+ * merged tail; the stderr tail keeps them.
+ */
 export const RUN_OUTPUT_BYTES = 64 * 1024;
 export const RUN_HEAD_BYTES = 16 * 1024;
-export const RUN_TAIL_BYTES = RUN_OUTPUT_BYTES - RUN_HEAD_BYTES;
+export const RUN_STDERR_TAIL_BYTES = 8 * 1024;
+export const RUN_TAIL_BYTES = RUN_OUTPUT_BYTES - RUN_HEAD_BYTES - RUN_STDERR_TAIL_BYTES;
 /**
  * Bound of the rendered text in UTF-8 bytes (QA-P13-1-13): invalid UTF-8 decodes to
  * U+FFFD (3 bytes per invalid byte), so the decoded text is capped again.
@@ -736,10 +744,12 @@ export function capRendered(text: string, max = RUN_RENDERED_MAX_BYTES): string 
 /**
  * Bounded, credential-redacted output: at each cut point the partial token is dropped
  * first (dropPartialCredential at the head's end, dropLeadingPartial at the tail's
- * start), then complete credentials are redacted (stripUrlUserinfo), then the notice;
- * the decoded text is capped again (capRendered).
+ * start), then complete credentials are redacted (stripUrlUserinfo), then the notice.
+ * When bytes were omitted, the stderr tail follows unless the shown text already holds
+ * it (stdout and stderr have no relative order, see RUN_OUTPUT_BYTES). The decoded text
+ * is capped again (capRendered).
  */
-export function renderRunOutput(result: Pick<BoundedResult, "output" | "truncated" | "tail" | "omitted">): string {
+export function renderRunOutput(result: Pick<BoundedResult, "output" | "truncated" | "tail" | "omitted" | "stderrTail" | "stderrTotal">): string {
   const tail = result.tail ?? Buffer.alloc(0);
   const omitted = result.omitted ?? 0;
   if (!result.truncated || (omitted === 0 && result.tail !== undefined)) {
@@ -747,8 +757,23 @@ export function renderRunOutput(result: Pick<BoundedResult, "output" | "truncate
   }
   const head = stripUrlUserinfo(dropPartialCredential(result.output.toString("utf8")));
   const rest = result.tail === undefined ? "" : stripUrlUserinfo(dropLeadingPartial(tail.toString("utf8")));
-  const notice = `[router_run] output truncated: ${omitted > 0 ? `${omitted} bytes omitted; ` : ""}showing at most the first ${RUN_HEAD_BYTES} and the last ${RUN_TAIL_BYTES} bytes (bound ${RUN_OUTPUT_BYTES} bytes)`;
-  return capRendered(`${head}${head.endsWith("\n") || head === "" ? "" : "\n"}${notice}\n${rest}`);
+  const notice = `[router_run] output truncated: ${omitted > 0 ? `${omitted} bytes omitted; ` : ""}showing at most the first ${RUN_HEAD_BYTES} and the last ${RUN_TAIL_BYTES} bytes, `
+    + `plus the last ${RUN_STDERR_TAIL_BYTES} bytes of stderr when not shown (bound ${RUN_OUTPUT_BYTES} bytes)`;
+  const body = `${head}${head.endsWith("\n") || head === "" ? "" : "\n"}${notice}\n${rest}`;
+  return capRendered(`${body}${stderrSection(result, body)}`);
+}
+
+/** The stderr tail of a cut run, unless the shown text already holds it. */
+function stderrSection(result: Pick<BoundedResult, "omitted" | "stderrTail" | "stderrTotal">, shown: string): string {
+  const raw = result.stderrTail;
+  if (raw === undefined || raw.length === 0 || (result.omitted ?? 0) === 0) return "";
+  let text = raw.toString("utf8");
+  if ((result.stderrTotal ?? raw.length) > raw.length) text = dropLeadingPartial(text); // the window may start inside a credential
+  text = stripUrlUserinfo(text);
+  const trimmed = text.trim();
+  if (trimmed === "" || shown.includes(trimmed)) return "";
+  const label = `[router_run] stderr tail (last ${Buffer.byteLength(text)} bytes; stdout and stderr are separate pipes, so these lines may appear above out of order or have been omitted):`;
+  return `${shown.endsWith("\n") || shown === "" ? "" : "\n"}${label}\n${text}${text.endsWith("\n") ? "" : "\n"}`;
 }
 
 function statusLine(plan: RunPlan, result: BoundedResult, ms: number): string {
@@ -764,7 +789,7 @@ export async function executeRunPlan(plan: RunPlan, signal?: AbortSignal): Promi
   const started = performance.now();
   const result = await spawnBounded(plan.executable, plan.argv, plan.cwd, {
     env: plan.env, timeoutMs: plan.timeoutMs, signal, maxBytes: RUN_HEAD_BYTES, tailBytes: RUN_TAIL_BYTES,
-    mergeStderr: true, settleOnFailure: true, label: RUN_LABEL, killGroupOnSettle: true,
+    mergeStderr: true, stderrTailBytes: RUN_STDERR_TAIL_BYTES, settleOnFailure: true, label: RUN_LABEL, killGroupOnSettle: true,
   });
   const ms = performance.now() - started;
   const output = renderRunOutput(result);
