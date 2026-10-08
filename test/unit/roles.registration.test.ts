@@ -436,7 +436,9 @@ const evaluation = (agent: string, action: string, resources: string[]): Permiss
   sessionID: "child", agent, action, resources, effect: "allow",
 } as unknown as PermissionEvaluation);
 
-describe("v2 adapter in roles mode", () => {
+// Each test here builds the whole v2 adapter (config load, role-agent registration, hook wiring) on a temp directory; on a loaded
+// Windows runner that alone exceeded the default 5 s (the "aliases explore" test timed out there with git already stubbed).
+describe("v2 adapter in roles mode", { timeout: 60_000 }, () => {
   it.skipIf(!hasGit())("publishes the max policies, protects every role agent (P-19) and strips its catalog", async () => {
     const { main, wt } = repoWithWorktree();
     home({ routing: { delegation: "roles" } });
