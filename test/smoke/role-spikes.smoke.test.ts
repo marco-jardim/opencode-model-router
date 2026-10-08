@@ -1213,4 +1213,63 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     expect(obj(viaReload.extra).afterCommand).toEqual(TWO);
     expect(viaReload.view).toEqual({ list: TWO, api: TWO });
   }, 900_000);
+  it("S12 beyond a description: dispatch a new agent, tighten a permission, remove an agent, resume an old child - all without restarting the host", async () => {
+    const agent = (description: string, permission: Obj): Obj => ({ tier: "fast", description, permission });
+    const host = await RoutingHost.start("s12b", {
+      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true }, hostConfig: {},
+      overrides: { agents: { worker: agent("S12 worker", { read: "allow", edit: "allow" }), doomed: agent("S12 doomed", { read: "allow" }) } },
+    });
+    try {
+      const files = Object.fromEntries(["f1", "f2", "f3", "f4"].map(n => [n, path.join(host.project, `s12-${n}.txt`)]));
+      for (const f of Object.values(files)) await writeFile(f, "main\n");
+      const editProbe = (f: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "edit", input: { path: f, oldString: "main", newString: "edited" } })}`;
+      const ids = async () => (await host.client.agent.list()).data.map(a => a.id).filter(id => ["worker", "doomed", "newbie"].includes(id)).sort();
+      const root = await host.newRoot("s12b root", undefined, host.project, []);
+      const first = await childReport(host, root, { agent: "worker", description: "S12b first", prompt: editProbe(files.f1!) });
+      const diskBefore = await readFile(files.f1!, "utf8");
+      const listBefore = await ids();
+      await host.writeOverrides({ agents: { worker: agent("S12 worker", { read: "allow", edit: "deny" }), newbie: agent("S12 newbie", { read: "allow", edit: "allow" }) } });
+      const listAfterWrite = await ids();
+      // the next dispatch is the next prompt of the root: it refreshes the router's agents before its own model request
+      const fresh = await childReport(host, root, { agent: "worker", description: "S12b fresh", prompt: editProbe(files.f2!) });
+      const listAfterPrompt = await ids();
+      const resumed = await childReport(host, root, { agent: "worker", description: "S12b resumed", prompt: editProbe(files.f3!), sessionID: first.childID });
+      const newbie = await childReport(host, root, { agent: "newbie", description: "S12b newbie", prompt: editProbe(files.f4!) });
+      const removedCall = await host.call(root, "subagent", { agent: "doomed", description: "S12b doomed", prompt: "S12b child", model: `${SONNET}#low`, background: false });
+      const disk = Object.fromEntries(await Promise.all(Object.entries(files).map(async ([k, f]) => [k, await readFile(f, "utf8")])));
+      await save("S12-beyond", { first, diskBefore, listBefore, listAfterWrite, fresh, listAfterPrompt, resumed, newbie, removedCall: { status: removedCall.after.status, error: removedCall.after.error, result: removedCall.after.result, childID: removedCall.childID }, disk, hostErrors: host.errorLines() });
+      const noEdit = { status: "error", errorType: "tool.execution", errorMessage: 'No tool named "edit" is currently available. Please use a tool from the available tool list.' };
+      // before the change the worker edits (f1 edited); writing the override changes neither agent list at once.
+      expect(first.child.agent).toBe("worker");
+      expect(first.requests[0]?.toolNames).toContain("edit");
+      expect(first.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(diskBefore).toBe("edited\n");
+      expect(listBefore).toEqual(["doomed", "worker"]);
+      expect(listAfterWrite).toEqual(["doomed", "worker"]);
+      // the next dispatch (= the next prompt of the root) applies the whole change: agent list now has newbie and no doomed ...
+      expect(listAfterPrompt).toEqual(["newbie", "worker"]);
+      // ... a FRESH worker child no longer has `edit` in its catalog and its edit is refused with the file untouched ...
+      expect(fresh.child.agent).toBe("worker");
+      expect(fresh.requests[0]?.toolNames).not.toContain("edit");
+      expect(fresh.toolStates).toEqual([expect.objectContaining(noEdit)]);
+      expect(disk.f2).toBe("main\n");
+      // ... the OLD child, resumed after the change, keeps its history (its first edit stays completed) but its new request has no `edit` tool
+      // and the new edit is refused (f3 untouched): the tightened permission applies to a resumed session too ...
+      expect(resumed.childID).toBe(first.childID);
+      expect(resumed.requests.at(-1)?.toolNames).not.toContain("edit");
+      expect(resumed.toolStates.map(s => s.status)).toEqual(["completed", "error"]);
+      expect(resumed.toolStates.at(-1)).toEqual(expect.objectContaining(noEdit));
+      expect(disk.f3).toBe("main\n");
+      // ... a NEW agent is dispatchable at once (child agent newbie, its edit runs), and a REMOVED agent is refused by the host before any child exists.
+      expect(newbie.child.agent).toBe("newbie");
+      expect(newbie.toolStates.map(s => s.status)).toEqual(["completed"]);
+      expect(disk.f4).toBe("edited\n");
+      expect(removedCall.after.status).toBe("error");
+      expect(String(obj(removedCall.after.error).string)).toBe("Tool.Error: Unknown agent: doomed");
+      expect(removedCall.childID).toBeUndefined();
+      expect((await host.children(root)).map(c => c.id).sort()).toEqual([first.childID, fresh.childID, newbie.childID].sort());
+      expect(host.errorLines()).toEqual([]);
+    } finally { await finish(host); }
+  }, 900_000);
+
 });
