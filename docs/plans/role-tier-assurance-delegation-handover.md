@@ -85,10 +85,9 @@ matter most:
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **Wave 1 in progress** (2026-10-08). P0.1 merged (`085a792`). Worktrees `D:\git\omr-rta-p11`…`p16` created, `npm ci` + typecheck + baselines done (all green). Contract commits of P1.1 (`a5dd117`), P1.4 (`b5a4e40`), P1.5 (`9c486e5`), P1.2 (`46ad5ac`) merged into `rta/main` (head `adeb651`). Also pushed, not yet merged: P1.1 `face379` (T1.1.2/T1.1.4/T1.1.5 config keys, 37 tests), P1.3 `e7f9a7e` + `d5fb29a` (git-tools resolver + `router_run`, 18 tests) |
-| **Next task id** | Parallel, each in its own worktree (rebase/merge `origin/rta/main` first): **P1.6 T1.6.0** (contract; P1.1 + P1.2 contracts now on `rta/main`); **P1.1 T1.1.3** [heavy] (shipped role specs + separation validator), then T1.1.6, T1.1.7; **P1.2 T1.2.1** [heavy] (`grantFor`, `authorityFloor` is done) and T1.2.2 (`tierBounds`; contract has placeholders), then T1.2.3 [heavy], T1.2.4, T1.2.5; **P1.3 T1.3.3** (remaining tests: Linux/POSIX branches, hanging grandchild, abort, spaces, 8.3/junction cwd, ComSpec, Bun node, `spawnBounded` tail, coverage ≥ 90%); **P1.4 T1.4.2** [heavy] (`signals.ts`), T1.4.3–T1.4.5 (add a `parseLogLine` round-trip test for the new row fields); **P1.5 T1.5.1** [heavy] … T1.5.4 (P-15: strip the whole header in `src\verify\dispatch.ts`). Then QA per phase. Handoff to P1.1 from P1.3: package.json scripts take no caller args, so ship a default `routing.run.commands` entry for scoped test runs (e.g. vitest with an args pattern) and document that `commands.args` entries are exact strings or `prefix*` patterns |
-| Incidents | 2026-10-08 ≈05:12Z: the P1.2 producer (`ses_ee61306b7ffeyST3MJoDdHFEeb`) ran `cd D:\git\omr-rta-p12; [IO.File]::WriteAllText('src\…')` — .NET resolved the relative path against the process directory, so `src\routing\classify\route-line.ts` and `types.ts` were modified in the **base checkout** (E12 again). Content was byte-identical to commit `46ad5ac` (blob hashes checked); restored with `git checkout --`; base back to clean `eeab36b`; the live host was not restarted, so nothing loaded. Mitigation: every dispatch's MUST NOT DO now says "never call `[IO.File]`/.NET file APIs at all; edit files only with the edit/write tools and absolute paths" |
-| Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
+| Checkpoint reached | **Wave 1 merged** into `rta/main` (2026-10-08): P1.1–P1.6 QA PASS, phase reports in `docs\qa\role-tier\phase-p1{1..6}.md`, integration fixups `rta/w1i` merged (`fd7eae9`), capped full suite green (166 files passed / 3 skipped, 12631 tests); R7 written. CI on PR #85 pending at the time of writing |
+| **Next task id** | **Wave 1 close**: CI 12/12 green on PR #85 head → comment on #84 → **DF-1** (plan §5: sync `rta/live` in the base checkout, `npm ci` only if the lockfile changed, then the restart stop) |
+| Incidents | (1) 2026-10-08 ≈05:12Z: P1.2 contract producer wrote the base checkout via relative-path .NET `WriteAllText`; restored (`git checkout --`), host never loaded it; all dispatches now forbid .NET file APIs. (2) 07:51Z and 07:55Z: 6 + 4 concurrent heavy subagents died with `Failed to drain Session … Decode error (200 POST http://127.0.0.1:3863/) … socket connection was closed`. Port 3863 is the `opencode-anthropic-fix` plugin's v2 bridge (`D:\git\opencode-anthropic-fix\lib\host\v2-transport.mjs:188-257`); an upstream mid-stream failure makes the bridge `response.destroy()` (:238) and OpenCode treats it as a non-retryable unknown error. Root upstream error not logged (plugin logs to stderr, debug off). Mitigation: ≤ 3 concurrent heavy dispatches, foreground; resume the same session. Also observed: OpenCode snapshot index corrupt since 2026-10-07 11:45Z (owner not yet asked to fix); 82 leaked MCP `node.exe` processes since 2026-10-06 (not ours, not killed) || Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
 | Active worktrees for this plan | `D:\git\omr-rta-main` → `rta/main` (integration, executor only); `D:\git\omr-rta-p01` → `rta/p01` (P0.1); `D:\git\omr-plan-rta` → `docs/role-tier-plan` (frozen) |
 | Plan branch | `docs/role-tier-plan` (pushed, frozen): `47f1e88` plan, `f23c9a7` handover + R1/R2, `8dcf455` R3, `a8b1905` R4 |
 | `rta/main` | created from `origin/docs/role-tier-plan` @ `a8b1905`, pushed |
@@ -101,7 +100,7 @@ matter most:
 | Dogfood | DF-1 pending; DF-2 pending |
 | Restart stops | none requested yet; three planned (DF-1, DF-2, P3.4); DF-2b not needed (S12, R6/P-14) |
 | Override SHA-256 baseline | `700E25876937EB740748AB4B10EAF1CDDD4C7E29C7FDD8B84F23C609B0BE88F8` (dogfood.md Baseline; copy at `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`) |
-| Plan amendments | R0–R6; next free id: R7 |
+| Plan amendments | R0–R7; next free id: R8 |
 | Reference sessions (P0.1) | producer `ses_ee69d18aaffeG5XhB066ODnp2f` (spikes); reviewers `ses_ee672f085ffeHGQTnuwSgAruHy` (area 1), `ses_ee672bf60ffehoOgt7YSyo3wvd` (area 2) |
 
 ---
@@ -114,7 +113,7 @@ matter most:
 | `D:\git\omr-plan-rta` | `docs/role-tier-plan` | Where the plan and this handover were written; frozen once `rta/main` exists; removed in T3.4.5 |
 | `D:\git\omr-rta-main` | `rta/main` (created in P0.1, `npm ci` done) | Integration worktree; executor only; merges, plan amendments, handover, dogfood record |
 | `D:\git\omr-rta-p01` | `rta/p01` (merged, idle; removed in T3.4.5) | P0.1 spikes; also the place to re-run `test\smoke\role-spikes.smoke.test.ts` (`$env:RUN_OC_SMOKE_ROLE_SPIKES='1'`, `--config vitest.smoke.config.ts`, ≈ 4.5 min) |
-| `D:\git\omr-rta-<id>` | `rta/<id>` | One per phase: `p01`, `p11`…`p16`, `p21`…`p23`, `p31`…`p34`. Open now: `p01` (merged, idle), `p11`, `p12`, `p13`, `p14`, `p15`, `p16` (all `npm ci` done) |
+| `D:\git\omr-rta-<id>` | `rta/<id>` | One per phase: `p01`, `p11`…`p16`, `p21`…`p23`, `p31`…`p34`. Open now: `p01`, `p11`…`p16` (all merged, idle), `w1i` (Wave 1 integration, merged) |
 | `D:\git\opencode` | (host source, tags `v1.18.34`, `v2.0.22`) | Read-only reference for hook, permission and agent semantics; the live host is 2.0.24 |
 | `D:\git\opencode-model-router-agent-options-gate` (`fix/agent-options-provider-gate`), `D:\git\opencode-model-router-release` (`release/1.13.0`), `D:\git\opencode-model-router-v2` (`fix/gate-task-cwd`), `C:\Users\Marquinho\AppData\Local\Temp\omr-regress`, `C:\Users\Marquinho\AppData\Local\Temp\opencode\omr-old` | — | Older worktrees unrelated to this plan. **Do not touch or remove** |
 
@@ -271,12 +270,12 @@ one, the host was not restarted: ask again, do not roll back.
 | Phase | Worktree | Status | QA rounds / verdict | Merge sha | Report |
 |---|---|---|---|---|---|
 | P0.1 | `D:\git\omr-rta-p01` | merged | 3 rounds (36 → 17 → 1 major, all fixed); PASS | `085a792` | `docs\qa\role-tier\phase-p01.md` |
-| P1.1 | `D:\git\omr-rta-p11` | in progress | — | — | `docs\qa\role-tier\phase-p11.md` |
-| P1.2 | `D:\git\omr-rta-p12` | in progress | — | — | `docs\qa\role-tier\phase-p12.md` |
-| P1.3 | `D:\git\omr-rta-p13` | in progress | — | — | `docs\qa\role-tier\phase-p13.md` |
-| P1.4 | `D:\git\omr-rta-p14` | in progress | — | — | `docs\qa\role-tier\phase-p14.md` |
-| P1.5 | `D:\git\omr-rta-p15` | in progress | — | — | `docs\qa\role-tier\phase-p15.md` |
-| P1.6 | `D:\git\omr-rta-p16` | in progress | — | — | `docs\qa\role-tier\phase-p16.md` |
+| P1.1 | `D:\git\omr-rta-p11` | merged | see report | `fd7eae9` (wave) | `docs\qa\role-tier\phase-p11.md` |
+| P1.2 | `D:\git\omr-rta-p12` | merged | see report | `fd7eae9` (wave) | `docs\qa\role-tier\phase-p12.md` |
+| P1.3 | `D:\git\omr-rta-p13` | merged | see report | `fd7eae9` (wave) | `docs\qa\role-tier\phase-p13.md` |
+| P1.4 | `D:\git\omr-rta-p14` | merged | see report | `fd7eae9` (wave) | `docs\qa\role-tier\phase-p14.md` |
+| P1.5 | `D:\git\omr-rta-p15` | merged | see report | `fd7eae9` (wave) | `docs\qa\role-tier\phase-p15.md` |
+| P1.6 | `D:\git\omr-rta-p16` | merged | see report | `fd7eae9` (wave) | `docs\qa\role-tier\phase-p16.md` |
 | DF-1 | base checkout (`rta/live`) | pending | — | — | `docs\qa\role-tier\dogfood.md` |
 | P2.1 | `D:\git\omr-rta-p21` | pending | — | — | `docs\qa\role-tier\phase-p21.md` |
 | P2.2 | `D:\git\omr-rta-p22` | pending | — | — | `docs\qa\role-tier\phase-p22.md` |
