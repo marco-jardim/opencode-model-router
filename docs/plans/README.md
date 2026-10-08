@@ -52,6 +52,9 @@ This directory holds design/implementation plans for `opencode-model-router`.
   ladder for `general`, a structured `router_run` tool, role-aware guards and
   budgets, and outcome evidence only from external verification. Revised
   hypotheses grounded in the literature and the 2026-10-06/07 run evidence.
+  - Handover: [`role-tier-assurance-delegation-handover.md`](./role-tier-assurance-delegation-handover.md)
+    — kickoff prompt, execution state, worktrees, planning considerations,
+    troubleshooting, restart-stop messages and the phase log.
 
 ## Related records
 
