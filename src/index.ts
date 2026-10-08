@@ -84,7 +84,10 @@ import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
-import { verdictOf } from "./routing/outcomes/types";
+import { isAnnotationRow, verdictOf, type LogRow } from "./routing/outcomes/types";
+import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
+import { roleAgentSteps } from "./router/role-agents";
+import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
@@ -99,7 +102,7 @@ import {
   hostConfigFromAgents,
   runAdvisor,
 } from "./routing/advisor";
-import type { AdvisorCatalogModel, HostConfigView } from "./routing/advisor";
+import type { AdvisorCatalogModel, AdvisorExtras, HostConfigView } from "./routing/advisor";
 import {
   findOrphanedStrongPatterns,
   normalizeCatalog,
@@ -177,6 +180,34 @@ function describeError(error: unknown): string {
   }
 }
 
+/**
+ * #84 P2.2 (advisor `tierDispatches`): dispatch rows WITHOUT a role at or after `since` — non-annotation `dispatch` decision rows,
+ * the first row per decision id (as `summarizeRoles` keeps them), whose row names no role and whose chosen key is not a role's.
+ */
+function tierDispatchCount(rows: readonly LogRow[], since: number): number {
+  const seen = new Set<string>();
+  let count = 0;
+  for (const row of rows) {
+    if (row.kind !== "decision" || isAnnotationRow(row) || row.step !== "dispatch" || seen.has(row.decisionID)) continue;
+    seen.add(row.decisionID);
+    const t = Date.parse(row.ts);
+    if (!Number.isFinite(t) || t < since) continue;
+    if (typeof row.role === "string" || row.chosen?.origin === "role") continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * #84 P2.1 (handoffs 22, 23): one budget observation from the guard's and the host's. A stop seen by either is a stop; without a
+ * host observer (v1, or a host that does not hand one) the guard's alone; otherwise anything unobserved leaves it unobserved.
+ */
+function foldBudgetObservation(guard: HostBudgetObservation, host: HostBudgetObservation | undefined): HostBudgetObservation {
+  if (guard === true || host === true) return true;
+  if (host === undefined) return guard;
+  return guard === "unobserved" || host === "unobserved" ? "unobserved" : false;
+}
+
 function saveActivePreset(presetName: string, projectDir?: string): void {
   const cfg = loadConfig(projectDir);
   const resolved = resolvePresetName(cfg, presetName);
@@ -213,7 +244,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -245,7 +276,8 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string)
   return buildRouterHelp(
     resolveEnforcementMode({ config: cfg, env: process.env }).mode,
     // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
-    { stats: cfg.routing !== undefined },
+    // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }) },
   );
 }
 
@@ -673,6 +705,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   let bypassed = false;
   // #84 P2.1: the v2 adapter's role path reads the bypass state (the router gate does not run while bypassed, S10/P-9).
   (ctx as RouterPluginInput & { routerOnBypassState?: (read: () => boolean) => void }).routerOnBypassState?.(() => bypassed);
+  /** #84 P2.1 (handoff 22): the v2 adapter's host-side budget observation of a role child (step limit, context overflow). */
+  const hostBudgetOf = (ctx as RouterPluginInput & {
+    routerHostBudget?: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation | undefined;
+  }).routerHostBudget;
 
   warnConfigIssues(cfg, logger);
 
@@ -697,9 +733,30 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // The catalog comes from `config.providers()` (the call `/router` already makes for the model check, enriched with cost and capabilities
   // by the v2 adapter), so the doctor does not ask the host for the model list a second time (QA-2.4-3). `prefetched` is that call's result
   // when the caller already has it.
+  /** #84 P2.2: the window of the decision log the roles checks of the cost doctor read. */
+  const ADVISOR_ROLE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+  /**
+   * #84 P2.2: the extras of the cost doctor's roles checks — the host and, in roles mode with a live engine, the role × tier
+   * statistics and the tier dispatch count of the decision log over {@link ADVISOR_ROLE_WINDOW_MS}. Tiers mode and v1 read nothing
+   * (`{ host }` only, which no tier check reads); a read failure leaves the statistics out, so those checks stay silent.
+   */
+  const advisorExtras = async (): Promise<AdvisorExtras> => {
+    const host = isV2Host ? "v2" as const : "v1" as const;
+    if (rolesNow().size === 0) return { host };
+    const live = ingestSettings(cfg, "v2");
+    if (live === null) return { host }; // engine static: no decision log
+    try {
+      const read = await createPersister(live.outcomesDir, nodePersistDeps({ warn: () => undefined })).readRows();
+      const since = Date.now() - ADVISOR_ROLE_WINDOW_MS;
+      return { host, roleStats: summarizeRoles(null, read.rows, { since, until: null }), tierDispatches: tierDispatchCount(read.rows, since) };
+    } catch (error) {
+      logger.warn("[router] cost doctor: the role statistics are unavailable", { error: describeError(error) });
+      return { host };
+    }
+  };
   const gatherAdvisorInputs = async (
     prefetched?: { raw: unknown } | null,
-  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
+  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null; extras: AdvisorExtras }> => {
     const attempt = async <T>(label: string, call: (() => Promise<T>) | undefined): Promise<T | null> => {
       if (call === undefined) return null;
       try {
@@ -709,13 +766,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         return null;
       }
     };
-    const [agents, providers] = await Promise.all([
+    const [agents, providers, extras] = await Promise.all([
       attempt("host agent list", ctx.routerAgents),
       prefetched !== undefined ? Promise.resolve(prefetched) : attempt("model catalog", fetchCatalogRaw),
+      advisorExtras(),
     ]);
     return {
       host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary),
       catalog: providers === null ? null : catalogFromProviders(providers.raw),
+      extras,
     };
   };
   const advisorNotifier = ctx.routerHost === "v2"
@@ -780,8 +839,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
     const routing = resolveRouting(cfg, "v2");
     if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
-    const { host, catalog } = await gatherAdvisorInputs(prefetched);
-    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), {
+    const { host, catalog, extras } = await gatherAdvisorInputs(prefetched);
+    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger, extras), {
       hostKnown: host !== null,
       catalogKnown: catalog !== null && catalog.length > 0,
       primaryKnown: lastPrimary !== null,
@@ -1002,7 +1061,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     if (!childSessionID || spec === undefined) return;
     rememberRoleSession(childSessionID, spec.agent);
     const snapshot = captureBudget(childSessionID);
-    const budgetObserved = snapshot.tracked ? snapshot.stopped : "unobserved" as const;
+    // Handoff 22: the guard's stop folded with the host's own (step limit, context overflow), as the v2 adapter observed them.
+    const budgetObserved = foldBudgetObservation(
+      snapshot.tracked ? snapshot.stopped : "unobserved",
+      hostBudgetOf?.(childSessionID, roleAgentSteps(spec)),
+    );
     const request = requestedAuthority(childSessionID);
     const authorityObserved = request !== undefined && (!request.annotated || request.callID === callID);
     const signal = returnSignal({ text: finalReturnText, budgetExhausted: budgetObserved, authorityRequested: authorityObserved });
@@ -1377,6 +1440,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     cwd: effectiveCwd,
                     dod,
                     dispatchedAt: dispatchStart.dispatchedAt,
+                    // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+                    budget: captureBudget(producerSid, sessionStore.readCapReached(producerSid)),
                   })
                 : undefined;
               // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
@@ -1596,7 +1661,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 state,
                 {
                   pass: gateRes.accepted, outcome: gateRes.verdict.outcome, reasons: gateRes.verdict.reasons,
-                  // §2.9 E8 / R7 (handoff 25): the structured incomplete flag; absent when false, so the action is unchanged.
+                  // Handoff 25, R7 (I1/I8 exemption: §2.9 E8, the I7 budget-incomplete rule): the structured incomplete flag; absent
+                  // when false, so the action is unchanged.
                   ...(isIncompleteVerdict(gateRes.verdict) ? { incomplete: true } : {}),
                 },
                 policy,
@@ -1619,6 +1685,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   false,
                   gateRes.verdict.method,
                 );
+                // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): no flag when false, so the note is unchanged.
                 const note = scrubText(buildForcingNote(gateRes.verdict.reasons, isIncompleteVerdict(gateRes.verdict) ? { incomplete: true } : undefined));
                 return withDepthBanner(
                   `[router status: unmet] The delegated result was not accepted after ` +
@@ -1958,7 +2025,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 parsed === "none" && !/\breason:/i.test(args.prompt) ? null : parsed;
               const baseline = cfg.tierCaps?.[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5;
               const cap = override ?? baseline;
-              // Handoff 30: on v2 shadow/advise/enforce the engine stripped the route line already; its `root=` comes from the router.
+              // Handoff 30, R7 (I1/I8 exemption: T1.5.3a, the header names `root=`): on v2 shadow/advise/enforce the engine stripped the
+              // route line already; its `root=` comes from the router. No root → the header is byte-identical to before.
               const root = routeLineRoot(args.prompt) ?? (typeof input.callID === "string" ? strippedRouteRoot(input.callID) : undefined);
               const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root }) +
                 DISPATCH_HEADER_SEPARATOR + args.prompt;
@@ -2167,6 +2235,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 cwd: effectiveCwd,
                 dod,
                 dispatchedAt: start.dispatchedAt,
+                // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+                budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
               });
               if (finish.deferred) {
                 output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
@@ -2200,7 +2270,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               producerSessionID: childSessionID ?? "",
               producerTier,
               ...(roleProducer ? { returnContract: true } : {}),
-              // Handoff 24 (§2.9 E8, R7; every mode): the guard's budget state when the task returned, not when the gate runs.
+              // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule; every mode): the guard's budget state when the task
+              // returned, not when the gate runs. Without a stop it judges like the live read it replaces.
               budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
             };
 
@@ -2287,7 +2358,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);
               const nextTier = res.verdict.outcome !== "unverifiable" && li >= 0 && li < ladder.length - 1 ? ladder[li + 1] : null;
-              const incomplete = isIncompleteVerdict(res.verdict); // handoff 25: absent when false, so the note is unchanged
+              // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): absent when false, so the note is unchanged.
+              const incomplete = isIncompleteVerdict(res.verdict);
               let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
               // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
               const roleHint = roleProducer && !incomplete && childSessionID ? roleEscalationHintFor(cfg, childSessionID) : null;
@@ -2908,7 +2980,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             text = `routing-stats: ${describeError(error)}`;
           }
         } else {
-          text = buildRouterOutput(cfg, args, projectDir);
+          // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
