@@ -26,7 +26,8 @@ import type { RouterConfig } from "../router/config";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
 import { bind, currentBinding, evict as evictBinding, evictCall, type SessionLookup } from "../routing/roles/binding";
 import {
-  consumeAuthority, discardAuthority, evictAuthority, markAnnotated, quoteChildText, requestedAuthority, roleMax, type AuthorityDeps,
+  AUTHORITY_TEXT, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText, requestedAuthority,
+  type AuthorityDeps,
 } from "../routing/roles/authority";
 import { budgetExhausted, type BudgetSnapshot } from "../guard/enforce";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
@@ -178,7 +179,7 @@ export interface HostBudgetObserver {
 }
 
 /** Q1 (P2.3 decision at the P2.1 call site): an authority request of a child whose binding is not exact is never applied. */
-export const AUTHORITY_BINDING_UNKNOWN_DROP = "authority request not applied: binding unknown: dispatch a fresh task.";
+export const AUTHORITY_BINDING_UNKNOWN_DROP = `${AUTHORITY_TEXT.dropped.bindingUnknown}.`;
 
 /** QA-P21-1-8: logged once when `routing.delegation` becomes `roles` while OpenCode runs in tiers mode. */
 export const ROLES_RESTART_NOTICE =
@@ -231,7 +232,9 @@ export function createHostBudgetObserver(max = 1000): HostBudgetObserver {
     if (typeof error === "string") return error;
     if (!error || typeof error !== "object") return "";
     const e = error as Record<string, unknown>;
-    return [e.type, e.name, e.message].filter((part) => typeof part === "string").join(" ");
+    // QA-P21-2 nit 1: a host error may carry its text one level down (`error.data.message`).
+    const data = e.data !== null && typeof e.data === "object" ? (e.data as Record<string, unknown>) : undefined;
+    return [e.type, e.name, e.message, data?.message].filter((part) => typeof part === "string").join(" ");
   };
   const classify = (state: ChildState, error: unknown): void => {
     if (state.failure === "overflow") return;
@@ -325,6 +328,10 @@ export async function registerV2Hooks(
      * `captureBudget(child, readCapReached)` its signals read). Absent: the guard's `budgetExhausted` alone.
      */
     budgetSnapshot?: (childSessionID: string) => BudgetSnapshot;
+    /** QA-P21-2-4: receives the adapter's "this role agent is registered" check, so the plugin's role runtime follows it. */
+    onRoleLive?: (isLive: (agent: string) => boolean) => void;
+    /** QA-P21-2 nit 3: `router_verify` is registered (index.ts `routerVerifyEnabled`); nothing is deferred otherwise. */
+    routerVerifyEnabled?: () => boolean;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -355,6 +362,12 @@ export async function registerV2Hooks(
    * ("restart OpenCode"), and a switch back to tiers drops the role agents on the next build. Plan amendment R8.
    */
   let rolesStarted: boolean | undefined;
+  /**
+   * QA-P21-2-4: a role agent is live only when its registration succeeded (the agent map the transform publishes holds it as a
+   * role agent). Set once the agent map exists; until then nothing is registered.
+   */
+  let registeredRole: (agent: string) => boolean = () => false;
+  options.onRoleLive?.((agent) => rolesStarted === true && registeredRole(agent));
   const engine = createEngineRuntime({
     loadConfig: () => loadConfig(ctx.location.directory),
     listAgents: async () => (await ctx.agent.list()).data,
@@ -366,7 +379,9 @@ export async function registerV2Hooks(
     runtime: engine, getSession: sessionOf, graderAgent: V2_GRADER_AGENT, directory: ctx.location.directory,
     logger: { warn: (message, extra) => ingestLogger.warn(message, extra), debug: (message, extra) => console.debug(message, extra ?? "") },
     ...(options.isBypassed === undefined ? {} : { isBypassed: () => options.isBypassed?.() === true }),
-    rolesEnabled: () => rolesStarted === true, // QA-P21-1-8
+    // QA-P21-1-8 / QA-P21-2-4: started in roles mode AND this role agent's registration succeeded.
+    rolesEnabled: (agent) => rolesStarted === true && registeredRole(agent),
+    ...(options.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: options.routerVerifyEnabled }),
   });
   // #84 P2.1: the role table of a config (empty in tiers mode, where every role branch below is skipped), cached per config object.
   // QA-P21-1-8: also empty unless this instance STARTED in roles mode (its role agents and tools are registered only then).
@@ -384,7 +399,9 @@ export async function registerV2Hooks(
       }
       roleTables.set(cfg, roles);
     }
-    return roles;
+    // QA-P21-2-4: only the role agents whose registration succeeded are live.
+    const live = [...roles].filter(([name]) => registeredRole(name));
+    return live.length === roles.size ? roles : new Map(live);
   };
   const maxOfRoles = (roles: ReadonlyMap<string, RoleSpec>) => (agent: string) => roleMaxActions(roles.get(agent));
   /** Handoff 32: what the binding reads of a child session (parent, agent, title, first message text). */
@@ -466,6 +483,7 @@ export async function registerV2Hooks(
       variant: agent.model?.variant,
     };
     let config: LegacyConfig = { agent: {}, command: {} };
+    registeredRole = (agent) => roleAgentOf(config.agent[agent]) === agent; // QA-P21-2-4
     let originals = new Map<string, string>();
     let agentOptions = new Map<string, Record<string, unknown>>();
     const warnedPermissions = new Set<string>();
@@ -836,27 +854,21 @@ export async function registerV2Hooks(
         let afterRoute: (() => void) | undefined;
         if (resumeID !== undefined && roles.has(args.agent)) {
           hostBudget.begin(resumeID); // handoff 22: the host's step count starts over with the resumed attempt
-          const request = requestedAuthority(resumeID);
-          if (request !== undefined) {
-            const deps = authorityDeps(roles, args.agent);
-            const afterCall = lastCallOfChild.get(resumeID) ?? "";
-            const binding = currentBinding(resumeID, { maxOf: maxOfRoles(roles) });
-            if (binding?.kind !== "exact") {
-              afterRoute = () => {
-                evictAuthority(resumeID);
-                annotateSubagentResult("authority", resumeID, `[router] ${AUTHORITY_BINDING_UNKNOWN_DROP}`);
-              };
-            } else {
-              const spec = deps.roleOf(resumeID);
-              if (request.annotated && request.callID === afterCall && spec !== undefined && spec.authority.mode === "dynamic") {
-                const max = roleMax(spec);
-                widened = request.actions.filter((action) => max.has(action) && !binding.grant.actions.has(action));
-              }
-              afterRoute = () => {
-                const consumed = consumeAuthority(resumeID, deps, { afterCall });
-                if (consumed.status === "dropped") annotateSubagentResult("authority", resumeID, `[router] ${consumed.reason}.`);
-              };
-            }
+          // QA-P21-2 nit 2: one preview (authority.ts) decides what consumeAuthority would do; Q1 via `exactOnly`.
+          const deps = authorityDeps(roles, args.agent);
+          const afterCall = lastCallOfChild.get(resumeID) ?? "";
+          const preview = previewAuthority(resumeID, deps, { afterCall, exactOnly: true });
+          if (preview.status === "widened") widened = [...preview.widened];
+          if (preview.status === "dropped" && preview.reason === AUTHORITY_TEXT.dropped.bindingUnknown) {
+            afterRoute = () => {
+              evictAuthority(resumeID); // consumeAuthority would widen a non-exact binding: the request is dropped here instead
+              annotateSubagentResult("authority", resumeID, `[router] ${AUTHORITY_BINDING_UNKNOWN_DROP}`);
+            };
+          } else if (preview.status !== "none") {
+            afterRoute = () => {
+              const consumed = consumeAuthority(resumeID, deps, { afterCall });
+              if (consumed.status === "dropped") annotateSubagentResult("authority", resumeID, `[router] ${consumed.reason}.`);
+            };
           }
         }
         const routed = await dispatchRouter.route({

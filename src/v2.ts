@@ -21,6 +21,8 @@ export default {
     // #84 P2.1 (handoff 22): the host's own stops of role children (step limit, context overflow), observed by the adapter from the
     // event stream and folded into the plugin's budget signals. The adapter hands its observer back once registered.
     let observeHostBudget: ((childSessionID: string, stepLimit: number | null) => boolean | "unobserved") | undefined;
+    let roleLive: ((agent: string) => boolean) | undefined;
+    let verifyEnabled: (() => boolean) | undefined;
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
@@ -43,11 +45,16 @@ export default {
       // QA-P21-1-3: the plugin's budget snapshot (guard state + read-only CAP state) for the adapter's budget notice.
       routerOnBudgetSnapshot: (read: (childSessionID: string) => BudgetSnapshot) => { budgetSnapshot = read; },
       routerHostBudget: (childSessionID: string, stepLimit: number | null) => observeHostBudget?.(childSessionID, stepLimit),
+      // QA-P21-2-4: the adapter's "this role agent is registered" check; QA-P21-2 nit 3: whether router_verify is registered.
+      routerRoleLive: (agent: string) => roleLive?.(agent),
+      routerOnVerifyEnabled: (read: () => boolean) => { verifyEnabled = read; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     return registerV2Hooks(ctx, hooks, runtime, {
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),
+      ...(verifyEnabled ? { routerVerifyEnabled: verifyEnabled } : {}),
       onHostBudget: (observe) => { observeHostBudget = observe; },
+      onRoleLive: (isLive) => { roleLive = isLive; },
     });
   },
 } satisfies Plugin.Plugin & { server: typeof ModelRouterPlugin };
