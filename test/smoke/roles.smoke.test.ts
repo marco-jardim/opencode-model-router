@@ -7,13 +7,16 @@
  * - Without RUN_OC_SMOKE_ROLES=1 every test is skipped (the normal `vitest run` excludes test/smoke anyway).
  * - Every test starts its OWN isolated host (helpers/routing-host.ts: allow-listed environment, private HOME, keyless scripted Anthropic
  *   provider, the router loaded from THIS checkout next to the probe plugin) in roles mode (`routing.delegation: "roles"`,
- *   `routing.engine: "enforce"`), a git repository (the host's project = the main checkout) with a sibling `git worktree add`, and a
- *   `routing.workRoots` glob that covers a worktree created after the host started. Temp roots use their long (non-8.3) spelling.
+ *   `routing.engine: "enforce"`). BEFORE the host starts, the project becomes a git repository (the main checkout) with a sibling
+ *   `git worktree add` (`wt-1`): the router lists the worktrees when it registers the role agents (plugin start) and writes their
+ *   `external_directory` rules into the role max policies. `routing.workRoots` holds a glob that covers a worktree created AFTER the
+ *   host started. Temp roots use their long (non-8.3) spelling.
  * - The scripted root dispatches role agents with `SPIKE_CALL` / `SPIKE_CALLS` and route lines; a role child follows a
  *   `CHILD_SCRIPT64` (base64, so the router's classifier never sees the script's tool names or paths): it ATTEMPTS every scripted
  *   call, forbidden ones included, and then answers the scripted text.
  * - Assertions are on HOST state only: the provider's wire requests (model, variant, advertised tools), the host's session / agent /
  *   context API, files on disk, the probe's hook and event records, and the decision rows the router wrote into the isolated store.
+ *   Every tool-status assertion prints the host's tool error text, so a failure names the refusal.
  * - Observations of each test are written (redacted) to <OMR_SMOKE_REAL_TMPDIR>/omr-roles-smoke/<test>.json; never into the repository.
  */
 import { afterAll, describe, expect, it } from "vitest";
@@ -50,44 +53,11 @@ const VERIFIED = "[router \u2713 verified: deterministic]";
 const REFUSAL_RE = /No tool named "[^"]+" is currently available|Tool is not available for this request|\[router\] Refused for role agent|Permission denied/;
 const EXECUTE_BEFORE_REFUSAL = /\[router\] Refused for role agent explorer in this dispatch/;
 
-interface RolesHostOptions {
-  readonly routing?: Obj;
-  readonly overrides?: Obj;
-  readonly probe?: HostOptions["probe"];
-  readonly preProbe?: HostOptions["preProbe"];
-  readonly agents?: Record<string, Obj>;
-}
-/** An isolated host in roles mode with engine enforce; `routing.workRoots` covers `<root>\wt-late-*`, `routing.run` allows `smoke-marker`. */
-async function startRolesHost(name: string, extra: RolesHostOptions = {}): Promise<RoutingHost> {
-  return RoutingHost.start(`roles-${name}`, {
-    longPaths: true,
-    routing: (root: string) => ({
-      engine: "enforce", delegation: "roles",
-      workRoots: [path.join(root, "wt-late-*")],
-      run: { scripts: ["smoke-marker"], timeoutMs: 120_000 },
-      ...extra.routing,
-    }),
-    ...(extra.overrides ? { overrides: extra.overrides } : {}),
-    probe: { lifecycle: true, ...extra.probe },
-    ...(extra.preProbe ? { preProbe: extra.preProbe } : {}),
-    hostConfig: extra.agents ? { agents: extra.agents } : {},
-  });
-}
-async function save(name: string, observed: Obj): Promise<void> {
-  await mkdir(OUT, { recursive: true });
-  const file = path.join(OUT, `${name}.json`);
-  await writeFile(file, `${JSON.stringify(redact(clip({ test: name, recordedAt: new Date().toISOString(), observed }, 4000)), null, 2)}\n`);
-  console.log(`[roles-smoke] observations written to ${file}`);
-}
-async function finish(host: RoutingHost): Promise<void> {
-  const teardown = await host.stop();
-  expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
-}
-
 // ---- the repository world: main checkout = the host project, one sibling worktree, an unrelated directory ----
 interface World { main: string; wt1: string; other: string; addWorktree(name: string): Promise<string> }
-async function makeWorld(host: RoutingHost): Promise<World> {
-  const main = host.project;
+/** Built in HostOptions.prepare, i.e. BEFORE the host (and the router's role-agent registration) starts. */
+async function makeWorld(root: string, project: string): Promise<World> {
+  const main = project;
   const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false", ...args], { cwd: main, encoding: "utf8", windowsHide: true });
   git("init", "-q", "-b", "main");
   const files: Record<string, string> = {
@@ -100,17 +70,58 @@ async function makeWorld(host: RoutingHost): Promise<World> {
   for (const [name, text] of Object.entries(files)) await writeFile(path.join(main, name), text);
   git("add", ".");
   git("commit", "-q", "-m", "init");
-  const wt1 = path.join(host.root, "wt-1");
+  const wt1 = path.join(root, "wt-1");
   git("worktree", "add", "-q", wt1, "-b", "wt-1");
-  const other = path.join(host.root, "other");
+  const other = path.join(root, "other");
   await mkdir(other, { recursive: true });
   await writeFile(path.join(other, "x.txt"), "OTHER_SECRET\n");
   await writeFile(path.join(main, "main-only-dirty.txt"), "dirty\n"); // untracked in the main checkout only
   await writeFile(path.join(wt1, "wt1-only-untracked.txt"), "wt1\n"); // untracked in wt-1 only
   return {
     main, wt1, other,
-    addWorktree: async (name: string) => { const dir = path.join(host.root, name); git("worktree", "add", "-q", dir, "-b", name); return dir; },
+    addWorktree: async (name: string) => { const dir = path.join(root, name); git("worktree", "add", "-q", dir, "-b", name); return dir; },
   };
+}
+
+interface RolesHostOptions {
+  readonly routing?: Obj;
+  readonly overrides?: Obj;
+  readonly probe?: HostOptions["probe"];
+  readonly preProbe?: HostOptions["preProbe"];
+  readonly agents?: Record<string, Obj>;
+}
+/**
+ * An isolated host in roles mode with engine enforce, its repository world prepared before it starts; `routing.workRoots` covers
+ * `<root>\wt-late-*` (worktrees created later), `routing.run` allows `smoke-marker`.
+ */
+async function startRolesHost(name: string, extra: RolesHostOptions = {}): Promise<{ host: RoutingHost; w: World }> {
+  let world: World | undefined;
+  const host = await RoutingHost.start(`roles-${name}`, {
+    longPaths: true,
+    prepare: async ({ root, project }) => { world = await makeWorld(root, project); },
+    routing: (root: string) => ({
+      engine: "enforce", delegation: "roles",
+      workRoots: [path.join(root, "wt-late-*")],
+      run: { scripts: ["smoke-marker"], timeoutMs: 120_000 },
+      ...extra.routing,
+    }),
+    ...(extra.overrides ? { overrides: extra.overrides } : {}),
+    probe: { lifecycle: true, ...extra.probe },
+    ...(extra.preProbe ? { preProbe: extra.preProbe } : {}),
+    hostConfig: extra.agents ? { agents: extra.agents } : {},
+  });
+  if (world === undefined) throw new Error("the repository world was not prepared");
+  return { host, w: world };
+}
+async function save(name: string, observed: Obj): Promise<void> {
+  await mkdir(OUT, { recursive: true });
+  const file = path.join(OUT, `${name}.json`);
+  await writeFile(file, `${JSON.stringify(redact(clip({ test: name, recordedAt: new Date().toISOString(), observed }, 4000)), null, 2)}\n`);
+  console.log(`[roles-smoke] observations written to ${file}`);
+}
+async function finish(host: RoutingHost): Promise<void> {
+  const teardown = await host.stop();
+  expect(teardown.hostPortClosed && teardown.providerStopped && teardown.rootRemoved).toBe(true);
 }
 
 // ---- dispatches and what the host recorded about them ----
@@ -121,7 +132,7 @@ function roleInput(agent: string, description: string, routeFields: string | nul
 }
 interface StateView { tool?: string; status?: string; errorType?: string; errorMessage?: string; text: string; input?: unknown }
 interface RequestView { seq: number; catalogModel?: string; tier?: Tier; toolNames: string[]; reply: string }
-interface EvaluateView { action?: string; resources: string[]; effectIn?: unknown }
+interface EvaluateView { action?: string; resources: string[]; effectIn?: unknown; effectOut?: unknown }
 interface ChildView {
   label: string; callID: string; childID: string; parentStatus?: string; parentText: string;
   agent?: string; title?: string; model?: string; parentID?: string; firstUser: string;
@@ -140,6 +151,24 @@ function stateOf(part: Obj): StateView {
   if (str(obj(s.error).message) !== undefined) view.errorMessage = str(obj(s.error).message);
   return view;
 }
+/** One line per tool state with the host's error type and message (or the start of its output): every status assertion prints it. */
+const describeState = (s: StateView | undefined): string =>
+  (s === undefined ? "<no tool state>" : `${s.tool ?? "?"} ${s.status ?? "?"}${s.errorType ? ` [${s.errorType}]` : ""}: ${(s.errorMessage ?? s.text).slice(0, 400)}`);
+const describeStates = (states: readonly StateView[]): string => (states.length === 0 ? "<no tool states>" : states.map((s, i) => `#${i} ${describeState(s)}`).join(" | "));
+function expectStatuses(states: readonly StateView[], expected: readonly string[], label: string): void {
+  expect(states.map(s => s.status), `${label}: ${describeStates(states)}`).toEqual(expected);
+}
+function expectCompleted(state: StateView | undefined, label: string): void {
+  expect(state?.status, `${label}: ${describeState(state)}`).toBe("completed");
+}
+function expectText(state: StateView | undefined, pattern: RegExp, label: string): void {
+  expect(state?.text ?? "", `${label}: ${describeState(state)}`).toMatch(pattern);
+}
+function expectRefused(state: StateView | undefined, label: string): void {
+  expect(state, `${label}: the scripted call was attempted (a tool state exists)`).toBeDefined();
+  expect(state!.status, `${label}: ${describeState(state)}`).toBe("error");
+  expect(state!.errorMessage ?? "", `${label}: ${describeState(state)}`).toMatch(REFUSAL_RE);
+}
 /** What the PARENT model was given for one of its tool calls: the tool_result block (by tool_use_id) of its own later provider request. */
 function parentView(host: RoutingHost, root: string, callID: string): string {
   for (const r of [...host.requestsOf(root)].reverse()) {
@@ -157,7 +186,7 @@ async function viewOf(host: RoutingHost, root: string, call: Dispatched, label: 
   const context = await host.client.session.context({ sessionID: childID });
   const firstUser = context.find(m => obj(m).type === "user" || obj(m).role === "user");
   const evaluates = (await host.events()).filter(e => e.type === "probe.lifecycle" && e.point === "evaluate" && e.sessionID === childID)
-    .map(e => ({ action: str(e.action), resources: arr(e.resources).map(String), effectIn: e.effectIn }));
+    .map(e => ({ action: str(e.action), resources: arr(e.resources).map(String), effectIn: e.effectIn, effectOut: e.effectOut }));
   const output = str(obj(obj(call.after.result).output).output) ?? "";
   const view: ChildView = {
     label, callID: call.callID, childID, parentText: [parentView(host, root, call.callID), output].join("\n"),
@@ -192,10 +221,10 @@ async function resumeChild(host: RoutingHost, root: string, childID: string, inp
 }
 const titleNonce = (title: string | undefined): string | undefined => /\[nonce ([A-Za-z0-9_-]+)\]$/.exec(title ?? "")?.[1];
 const promptNonce = (text: string): string | undefined => [...text.matchAll(/OMR_NONCE=([A-Za-z0-9_-]+)/g)].at(-1)?.[1];
-function expectRefused(state: StateView | undefined, label: string): void {
-  expect(state, `${label}: the scripted call was attempted (a tool state exists)`).toBeDefined();
-  expect(state!.status, `${label}: ${state!.errorMessage ?? state!.text}`).toBe("error");
-  expect(state!.errorMessage ?? "", label).toMatch(REFUSAL_RE);
+/** The `external_directory` rules of a role agent's host record (the max policy the router registered). */
+async function externalDirectoryRules(host: RoutingHost, agent: string): Promise<Obj[]> {
+  const record = (await host.client.agent.list()).data.find(a => a.id === agent);
+  return arr(record?.permissions).map(obj).filter(r => r.action === "external_directory");
 }
 
 // ---- the isolated decision log ----
@@ -216,15 +245,15 @@ async function waitRows(host: RoutingHost, label: string, predicate: (rows: Deci
 const everyBound = (children: readonly string[]) => (rows: DecisionRow[]): boolean => children.every(c => dispatchRowOf(rows, c) !== undefined);
 const rowView = (r: DecisionRow | undefined) => (r === undefined ? undefined : {
   decisionID: r.decisionID, reason: r.reason, role: r.role, tier: r.tier, grant: r.grant, binding: r.binding, boundsReasons: r.boundsReasons, detection: r.detection,
-  facts: r.facts, resume: r.resume, childSessionID: r.childSessionID, signal: r.signal, explore: r.explore, propensity: r.propensity, pinned: r.pinned,
+  facts: r.facts, resume: r.resume, childSessionID: r.childSessionID, signal: r.signal, explore: r.explore, propensity: r.propensity, pinned: r.pinned, switched: r.switched,
 });
+const rowLine = (r: DecisionRow | undefined): string => (r === undefined ? "<no row>" : JSON.stringify({ tier: r.tier, reason: r.reason, boundsReasons: r.boundsReasons, switched: r.switched, detection: r.detection }));
 
 // --------------------------------------------------------------------------------------------------------- the tests ----
 d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   it("I2: per role and class the per-call model is inside [floor, ceiling]; a tier=heavy pin reaches the heavy model; a resume never runs below the running rung; the router raises the tier after a verification FAIL", async () => {
-    const host = await startRolesHost("i2");
+    const { host, w } = await startRolesHost("i2");
     try {
-      const w = await makeWorld(host);
       const root = await host.newRoot("i2 root", undefined, host.project, []);
       // minFloor: the authority floor (plan §2.3) computed from the ROUTE LINE; the classifier can only raise risk/scope, so it is a lower bound.
       const cases: { agent: string; fields: string; minFloor: Tier; task: string }[] = [
@@ -248,9 +277,11 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       // Pin, then a resume that asks for fast: the running rung (heavy) is kept.
       const pinned = await runChild(host, root, roleInput("implementer", "I2 pin heavy", `class=implement risk=low scope=single needs=edit tier=heavy pin ${rootField(w.wt1)}`, ["TASK: rename the parse helper"]), "pin heavy");
       const keptRung = await resumeChild(host, root, pinned.childID, roleInput("implementer", "I2 pin heavy resume", `class=mechanical risk=low scope=single needs=edit tier=fast ${rootField(w.wt1)}`, ["TASK: continue"]), "resume asks for fast");
-      // A verification FAIL (deterministic fileExists on a file that never exists), then a resume: the router raises the floor itself.
+      // A verification FAIL (deterministic fileExists on a file that never exists), then a resume WITHOUT tier=: the router raises the floor itself.
+      // The fresh dispatch is pinned to fast (honoured inside [fast, medium]): unpinned, the enforce kernel may already pick medium, the
+      // explorer's ceiling, and a raise above the ceiling cannot be observed (run 1: the unpinned dispatch went out on medium).
       const absent = path.join(host.project, "i2-never-created.txt");
-      const failed = await runChild(host, root, roleInput("explorer", "I2 fail then raise", "class=search risk=low scope=single", ["TASK: find where parse is exported", "[acceptance]", `check: fileExists path=${absent}`, "[/acceptance]"]), "verification FAIL");
+      const failed = await runChild(host, root, roleInput("explorer", "I2 fail then raise", "class=search risk=low scope=single tier=fast", ["TASK: find where parse is exported", "[acceptance]", `check: fileExists path=${absent}`, "[/acceptance]"]), "verification FAIL");
       const raised = await resumeChild(host, root, failed.childID, roleInput("explorer", "I2 fail then raise resume", "class=search risk=low scope=single", ["TASK: address the findings and finish"]), "resume after FAIL");
       const children = [...views.map(x => x.v.childID), pinned.childID, failed.childID];
       const rows = await waitRows(host, "I2 rows", rs => everyBound(children)(rs) && resumeRowsOf(rs, pinned.childID).length > 0 && resumeRowsOf(rs, failed.childID).length > 0);
@@ -264,14 +295,14 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       for (const { c, v } of views) {
         const spec = SPEC.get(c.agent)!;
         const floor = maxTier(spec.tierRange.floor, c.minFloor);
+        const row = dispatchRowOf(rows, v.childID);
         expect(v.agent, v.label).toBe(c.agent);
         expect(v.requests.length, `${v.label}: the child reached the provider`).toBeGreaterThan(0);
         for (const r of v.requests) {
           expect(r.tier, `${v.label}: the wire model ${r.catalogModel} is a preset tier`).toBeDefined();
-          expect(rankOf(r.tier), `${v.label}: ${r.catalogModel} >= floor ${floor}`).toBeGreaterThanOrEqual(rankOf(floor));
-          expect(rankOf(r.tier), `${v.label}: ${r.catalogModel} <= ceiling ${spec.tierRange.ceiling}`).toBeLessThanOrEqual(rankOf(spec.tierRange.ceiling));
+          expect(rankOf(r.tier), `${v.label}: ${r.catalogModel} >= floor ${floor}; row ${rowLine(row)}`).toBeGreaterThanOrEqual(rankOf(floor));
+          expect(rankOf(r.tier), `${v.label}: ${r.catalogModel} <= ceiling ${spec.tierRange.ceiling}; row ${rowLine(row)}`).toBeLessThanOrEqual(rankOf(spec.tierRange.ceiling));
         }
-        const row = dispatchRowOf(rows, v.childID);
         expect(row, `${v.label}: a dispatch row joined by the child's binding note`).toBeDefined();
         expect(row!.role, v.label).toBe(c.agent);
         expect(row!.tier, `${v.label}: the row's tier is the tier that reached the provider`).toBe(v.requests[0]!.tier);
@@ -279,18 +310,18 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         expect(separationProblem(row!.grant ?? []), `${v.label}: the dispatch grant (I4)`).toBeUndefined();
       }
       // tier=heavy pin: the heavy model reaches the provider; the resume asking for fast stays on the running rung (heavy).
-      expect(pinned.requests.map(r => r.tier)).toEqual(["heavy"]);
+      expect(pinned.requests.map(r => r.tier), `pin: ${rowLine(dispatchRowOf(rows, pinned.childID))}`).toEqual(["heavy"]);
       expect(keptRung.childID).toBe(pinned.childID);
       expect(keptRung.requests.length).toBeGreaterThan(0);
       for (const r of keptRung.requests) expect(r.tier, `resume below the running rung: ${r.catalogModel}`).toBe("heavy");
       expect(resumeRowsOf(rows, pinned.childID).map(r => r.tier)).toContain("heavy");
       // Verification FAIL at fast, the parent told the router raises it; the resumed child runs on medium (raise-only floor).
-      expect(failed.requests[0]?.tier).toBe("fast");
+      expect(failed.requests[0]?.tier, `fresh FAIL dispatch pinned to fast: ${rowLine(dispatchRowOf(rows, failed.childID))}`).toBe("fast");
       expect(failed.parentText).toContain("NOT ACCEPTED");
       expect(failed.parentText).toMatch(/the router raises it to medium/);
       expect(raised.childID).toBe(failed.childID);
       expect(raised.requests.length).toBeGreaterThan(0);
-      for (const r of raised.requests) expect(r.tier, `resume after FAIL: ${r.catalogModel}`).toBe("medium");
+      for (const r of raised.requests) expect(r.tier, `resume after FAIL: ${r.catalogModel}; ${resumeRowsOf(rows, failed.childID).map(rowLine).join(" ")}`).toBe("medium");
       expect(resumeRowsOf(rows, failed.childID).map(r => r.tier)).toContain("medium");
       // zero unknown bindings in normal dispatches
       expect(unknownBindings(rows)).toEqual([]);
@@ -300,9 +331,8 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   }, 900_000);
 
   it("I3 + I4: forbidden calls ATTEMPTED by role children are refused or absent under a parent without grants AND under an allow-all parent; files on disk unchanged; router_run refuses a foreign cwd; shipped grants never mix local/exec/write with egress", async () => {
-    const host = await startRolesHost("i3", { agents: { "smoke-control": agentWithoutModel({ description: "non-role control agent (host defaults)" }) } });
+    const { host, w } = await startRolesHost("i3", { agents: { "smoke-control": agentWithoutModel({ description: "non-role control agent (host defaults)" }) } });
     try {
-      const w = await makeWorld(host);
       const forbidden = (label: string): ScriptStep[] => [
         { tool: "edit", input: { path: path.join(w.wt1, "e0.txt"), oldString: "main", newString: "edited" } }, // 0 edit by explorer
         { tool: "execute", input: { code: `return await tools.opencode.session_rename({ title: 'I3 renamed by execute ${label}' })` } }, // 1 Code Mode
@@ -370,12 +400,13 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         const classes = [...allowed].map(action => [action, classifyAction(action)] as const);
         return { agent: a.id, allowed: [...allowed].sort(), classes, problem: separationProblem(allowed) };
       });
+      const explorerExternal = await externalDirectoryRules(host, "explorer");
       const children = perParent.flatMap(p => [p.explorer, p.runner, p.researcher, p.implementer].map(v => v.childID));
       const rows = await waitRows(host, "I3 rows", everyBound(children));
       await save("I3-I4", {
         perParent: perParent.map(p => ({ ...p, explorer: { ...p.explorer, toolNames: p.explorer.requests[0]?.toolNames } })),
         control: { agent: control.agent, states: control.states, title: controlTitle, shellControlRan: existsSync(path.join(host.project, "shell-control.txt")) },
-        records, grants: children.map(c => ({ child: c, row: rowView(dispatchRowOf(rows, c)) })),
+        records, explorerExternal, grants: children.map(c => ({ child: c, row: rowView(dispatchRowOf(rows, c)) })),
         unknownBindings: unknownBindings(rows), routerWarnings: host.routerLogLines(), hostErrors: host.errorLines(), providerErrors: host.provider.errors,
       });
 
@@ -386,9 +417,9 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
           for (const r of p.explorer.requests) expect(r.toolNames, at(`explorer catalog has no ${name}`)).not.toContain(name);
         }
         // I3 refusals: every forbidden call was attempted and refused; the in-root read ran.
-        expect(p.explorer.states.length, at("explorer attempted every scripted call")).toBe(forbidden(p.parent).length);
+        expect(p.explorer.states.length, at(`explorer attempted every scripted call: ${describeStates(p.explorer.states)}`)).toBe(forbidden(p.parent).length);
         ["edit", "execute", "subagent", "shell", "read outside the repository", "read of the main checkout", "router_run"].forEach((label, i) => expectRefused(p.explorer.states[i], at(`explorer ${label}`)));
-        expect(p.explorer.states[7]?.status, at("explorer read inside its work root")).toBe("completed");
+        expectCompleted(p.explorer.states[7], at(`explorer read inside its work root (registered external_directory rules: ${JSON.stringify(explorerExternal)})`));
         // ... and nothing happened on the host: file unchanged, no shell file, no nested child, title not renamed, the secret never reached the provider.
         expect(p.disk.e0, at("wt-1/e0.txt unchanged")).toBe("main\n");
         expect(p.disk.shellRan, at("shell did not run")).toBe(false);
@@ -396,9 +427,9 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         expect(p.titleAfter ?? "", at("execute did not rename the child")).not.toContain("renamed by execute");
         expect(p.secretReachedProvider, at("the outside file's content never reached the provider")).toBe(false);
         // router_run: the foreign cwd is refused by the tool itself (no marker in the main checkout); its own work root runs (exit 0, marker in wt-1).
-        expect(p.runner.states.length, at("runner attempted both runs")).toBe(2);
-        expect(p.runner.states[0]?.text, at("router_run foreign cwd")).toMatch(/\[router_run\] error: refused: cwd is not this dispatch's work root/);
-        expect(p.runner.states[1]?.text, at("router_run own work root")).toMatch(/\[router_run\] package\.json script "smoke-marker": exit code: 0/);
+        expect(p.runner.states.length, at(`runner attempted both runs: ${describeStates(p.runner.states)}`)).toBe(2);
+        expectText(p.runner.states[0], /\[router_run\] error: refused: cwd is not this dispatch's work root/, at("router_run foreign cwd"));
+        expectText(p.runner.states[1], /\[router_run\] package\.json script "smoke-marker": exit code: 0/, at("router_run own work root"));
         expect(p.disk.mainMarker, at("no marker in the main checkout")).toBe(false);
         expect(p.disk.wt1Marker, at("marker in wt-1")).toBe(true);
         // I4 catalogs: the researcher has no local/exec/write tool; the implementer no egress tool; each forbidden call refused.
@@ -415,7 +446,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       }
       // The control proves the attempted inputs are well-formed: the same shell and execute calls run for a non-role agent.
       expect(control.agent).toBe("smoke-control");
-      expect(control.states.map(s => s.status)).toEqual(["completed", "completed"]);
+      expectStatuses(control.states, ["completed", "completed"], "control (non-role agent)");
       expect(existsSync(path.join(host.project, "shell-control.txt"))).toBe(true);
       expect(controlTitle).toBe("I3 control renamed by execute");
       // I4: every shipped role registered on the host (all seven), none mixing local/exec/write with egress.
@@ -435,12 +466,11 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   }, 900_000);
 
   it("I5 + I9: identical parallel dispatches bind exactly by their own nonces; a child carrying two dispatches' markers is unknown (max ∩ local, external_directory denied); a router context-hook error empties the catalog and annotates the parent", async () => {
-    const host = await startRolesHost("i5", {
+    const { host, w } = await startRolesHost("i5", {
       probe: { mixNonce: { descriptionContains: "I5 MIX" } },
       preProbe: { breakSystemTitleContains: "I9 BREAK", routerStackNeedle: path.basename(ROOT).toLowerCase() },
     });
     try {
-      const w = await makeWorld(host);
       const root = await host.newRoot("i5 root", undefined, host.project, []);
       // (1) Two IDENTICAL dispatches in ONE parent turn; their first requests are held until both are in flight.
       host.provider.holdUntilOverlap("I5_HOLD", 2);
@@ -467,12 +497,13 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const broken = await runChild(host, root, roleInput("explorer", "I9 BREAK context", "class=search risk=low scope=single", ["TASK: read m.txt", scriptLine([{ tool: "read", input: { path: path.join(host.project, "m.txt") } }], "DONE: m.txt:1")]), "I9 context error");
       const preprobe = (await host.events()).filter(e => e.type === "preprobe.decision" && e.sessionID === broken.childID).map(e => e.decision);
       const disk = { e2: await readFile(path.join(w.wt1, "e2.txt"), "utf8"), e3: await readFile(path.join(w.wt1, "e3.txt"), "utf8") };
+      const generalExternal = await externalDirectoryRules(host, "general");
       const children = [...twins, normal, mixed, broken].map(v => v.childID);
       const rows = await waitRows(host, "I5 rows", rs => children.every(c => bindingNote(rs, c) !== undefined));
       await save("I5-I9", {
         barrier, twins: twins.map(v => ({ ...v, titleNonce: titleNonce(v.title), promptNonce: promptNonce(v.firstUser), binding: rowView(bindingNote(rows, v.childID)) })),
         normal: { ...normal, binding: rowView(bindingNote(rows, normal.childID)) }, mixed: { ...mixed, titleNonce: titleNonce(mixed.title), promptNonce: promptNonce(mixed.firstUser), binding: rowView(bindingNote(rows, mixed.childID)) },
-        mixDecision, broken, preprobe, disk, unknownBindings: unknownBindings(rows),
+        mixDecision, broken, preprobe, disk, generalExternal, unknownBindings: unknownBindings(rows),
         routerWarnings: host.routerLogLines(), hostErrors: host.errorLines(), providerErrors: host.provider.errors,
       });
 
@@ -483,7 +514,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
         expect(titleNonce(v.title), `${v.label}: title nonce`).toBeDefined();
         expect(promptNonce(v.firstUser), `${v.label}: the first message carries the title's nonce`).toBe(titleNonce(v.title));
         expect(bindingNote(rows, v.childID)?.binding, v.label).toBe("exact");
-        expect(v.states.map(s => s.status), `${v.label}: the exact grant reads the work root`).toEqual(["completed"]);
+        expectStatuses(v.states, ["completed"], `${v.label}: the exact grant reads the work root (registered external_directory rules: ${JSON.stringify(generalExternal)})`);
       }
       expect(titleNonce(twins[0]!.title)).not.toBe(titleNonce(twins[1]!.title));
       expect(new Set(twins.map(v => dispatchRowOf(rows, v.childID)?.decisionID)).size).toBe(2);
@@ -501,18 +532,18 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       }
       expectRefused(mixed.states[0], "unknown binding: edit");
       expectRefused(mixed.states[1], "unknown binding: read in the sibling worktree (external_directory)");
-      expect(mixed.states[2]?.status, "unknown binding: read inside the session directory").toBe("completed");
+      expectCompleted(mixed.states[2], "unknown binding: read inside the session directory");
       expect(disk.e3).toBe("main\n");
       // ... while the exact sibling of the same turn edits and reads its work root.
       expect(normal.requests[0]?.toolNames).toContain("edit");
-      expect(normal.states.map(s => s.status)).toEqual(["completed", "completed", "completed"]);
+      expectStatuses(normal.states, ["completed", "completed", "completed"], "exact sibling of the mixed child");
       expect(disk.e2).toBe("edited\n");
       expect(unknownBindings(rows), "the only unknown binding is the mixed child").toEqual([mixed.childID]);
       // I9 hook error: the router's context hook failed for the first step (the pre-probe's trap fired inside the router), the catalog of that step was empty,
       // the call of that step was refused, and the PARENT's result carries the router's annotation.
       expect(preprobe, "the injected error fired inside the router's context hook").toEqual(["armed", "threw-in-router-iteration"]);
       expect(broken.requests[0]?.toolNames, "the failed step's catalog is empty").toEqual([]);
-      expect(broken.states[0]?.status).toBe("error");
+      expect(broken.states[0]?.status, `I9 first call: ${describeState(broken.states[0])}`).toBe("error");
       expect(broken.parentText).toContain(`[router] @explorer had no tools for at least one step`);
       expect(broken.parentText).toContain(broken.childID);
       expect(host.provider.errors).toEqual([]);
@@ -520,9 +551,8 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   }, 900_000);
 
   it("ladder: general without an edit need → edit refused → router_request_authority → ESCALATE: authority annotation → resume of the SAME session → edit allowed, floor recomputed", async () => {
-    const host = await startRolesHost("ladder");
+    const { host, w } = await startRolesHost("ladder");
     try {
-      const w = await makeWorld(host);
       const root = await host.newRoot("ladder root", undefined, host.project, []);
       const target = path.join(w.wt1, "e1.txt");
       const edit: ScriptStep = { tool: "edit", input: { path: target, oldString: "main", newString: "edited" } };
@@ -533,11 +563,12 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const afterFirst = await readFile(target, "utf8");
       const resumed = await resumeChild(host, root, first.childID, { agent: "general", description: "ladder general resume", prompt: ["continue", scriptLine([edit], "DONE: e1.txt:1 edited")].join("\n"), background: false }, "ladder resume");
       const afterResume = await readFile(target, "utf8");
+      const generalExternal = await externalDirectoryRules(host, "general");
       const rows = await waitRows(host, "ladder rows", rs => everyBound([first.childID])(rs) && resumeRowsOf(rs, first.childID).length > 0 && signalRows(rs).some(r => r.signal === "authority"));
       const fresh = dispatchRowOf(rows, first.childID);
       const resumeRow = resumeRowsOf(rows, first.childID).at(-1);
       await save("ladder", {
-        first, resumed, afterFirst, afterResume, fresh: rowView(fresh), resumeRow: rowView(resumeRow), signals: signalRows(rows).map(rowView),
+        first, resumed, afterFirst, afterResume, generalExternal, fresh: rowView(fresh), resumeRow: rowView(resumeRow), signals: signalRows(rows).map(rowView),
         unknownBindings: unknownBindings(rows), routerWarnings: host.routerLogLines(), hostErrors: host.errorLines(), providerErrors: host.provider.errors,
       });
 
@@ -550,8 +581,8 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(rankOf(first.requests[0]?.tier)).toBeGreaterThanOrEqual(rankOf("fast"));
       // edit refused, the request recorded, the child ESCALATEs, nothing written, the parent annotated.
       expectRefused(first.states[0], "edit before the authority request");
-      expect(first.states[1]?.status).toBe("completed");
-      expect(first.states[1]?.text).toMatch(/Authority request recorded: edit/);
+      expectCompleted(first.states[1], "router_request_authority");
+      expectText(first.states[1], /Authority request recorded: edit/, "router_request_authority");
       expect(afterFirst).toBe("main\n");
       expect(first.parentText).toContain("[router] @general asked for more authority: edit.");
       expect(first.parentText).toContain(first.childID);
@@ -560,7 +591,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       expect(resumed.requests.length).toBeGreaterThan(0);
       expect(resumed.requests[0]?.toolNames).toContain("edit");
       for (const r of resumed.requests) expect(rankOf(r.tier), `resumed on ${r.catalogModel}`).toBeGreaterThanOrEqual(rankOf("medium"));
-      expect(resumed.states[0]?.status).toBe("completed");
+      expectCompleted(resumed.states[0], `edit after the widening (registered external_directory rules: ${JSON.stringify(generalExternal)})`);
       expect(afterResume).toBe("edited\n");
       expect(resumeRow, "the resume's decision row").toBeDefined();
       expect(resumeRow!.grant).toContain("edit");
@@ -573,11 +604,11 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   }, 600_000);
 
   it("work roots and host handoffs: path resource formats, execute.before refusals surfaced to the child, glob/grep search roots, own truncated outputs, router_git_* and router_run in worktrees (one created after start), DF2-F1 observation", async () => {
-    const host = await startRolesHost("roots");
+    const { host, w } = await startRolesHost("roots");
     try {
-      const w = await makeWorld(host);
       const root = await host.newRoot("roots root", undefined, host.project, []);
       const explorerIn = (dir: string) => `class=search risk=low scope=single ${rootField(dir)}`;
+      const explorerExternal = await externalDirectoryRules(host, "explorer");
       // (a) path resource formats (the probe logs every evaluate it receives, with the host's resources).
       const fmtWorktree = await runChild(host, root, roleInput("explorer", "roots read worktree", explorerIn(w.wt1), ["TASK: read m.txt", scriptLine([{ tool: "read", input: { path: path.join(w.wt1, "m.txt") } }], "DONE: m.txt:1")]), "read in the worktree");
       const fmtSession = await runChild(host, root, roleInput("explorer", "roots read session dir", "class=search risk=low scope=single", ["TASK: read m.txt", scriptLine([{ tool: "read", input: { path: path.join(host.project, "m.txt") } }], "DONE: m.txt:1")]), "read in the session directory");
@@ -624,6 +655,7 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       const rows = await waitRows(host, "roots rows", everyBound(fresh.map(v => v.childID)));
       const df2 = (v: ChildView) => ({ parentText: v.parentText, verified: v.parentText.includes(VERIFIED), notAccepted: v.parentText.includes("NOT ACCEPTED"), row: rowView(dispatchRowOf(rows, v.childID)) });
       await save("roots-handoffs", {
+        explorerExternal,
         formats: { worktree: fmtWorktree.evaluates, session: fmtSession.evaluates, edit: fmtEdit.evaluates, states: [fmtWorktree, fmtSession, fmtEdit].map(v => v.states) },
         search: search.states, searchEvaluates: search.evaluates, successTypes, withPaths: withPaths.map(e => ({ type: e.type, data: e.data })), ownPaths,
         big: big.states.map(s => ({ ...s, text: s.text.slice(0, 800) })), ownRead, foreignRead, lateRead, uncoveredRead, lateRun, disk,
@@ -634,39 +666,40 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
 
       // (a) resource formats on the real host: external_directory `<canonical dir>/*` and a canonical absolute read path outside the
       //     Location; a Location-relative read path inside it; an edit outside the Location is canonical absolute.
-      expect(fmtWorktree.states.map(s => s.status)).toEqual(["completed"]);
+      const evaluated = (v: ChildView) => JSON.stringify(v.evaluates);
+      expectStatuses(fmtWorktree.states, ["completed"], `read in the worktree (registered external_directory rules: ${JSON.stringify(explorerExternal)}; evaluates: ${evaluated(fmtWorktree)})`);
       const extDir = fmtWorktree.evaluates.find(e => e.action === "external_directory");
-      expect(extDir?.resources.map(norm)).toEqual([`${norm(w.wt1)}/*`]);
-      expect(fmtWorktree.evaluates.find(e => e.action === "read")?.resources.map(norm)).toEqual([norm(path.join(w.wt1, "m.txt"))]);
-      expect(fmtSession.states.map(s => s.status)).toEqual(["completed"]);
-      expect(fmtSession.evaluates.find(e => e.action === "read")?.resources.map(norm)).toEqual(["m.txt"]);
-      expect(fmtSession.evaluates.some(e => e.action === "external_directory")).toBe(false);
-      expect(fmtEdit.states.map(s => s.status)).toEqual(["completed"]);
-      expect(fmtEdit.evaluates.find(e => e.action === "edit")?.resources.map(norm)).toEqual([norm(path.join(w.wt1, "e1.txt"))]);
+      expect(extDir?.resources.map(norm), evaluated(fmtWorktree)).toEqual([`${norm(w.wt1)}/*`]);
+      expect(fmtWorktree.evaluates.find(e => e.action === "read")?.resources.map(norm), evaluated(fmtWorktree)).toEqual([norm(path.join(w.wt1, "m.txt"))]);
+      expectStatuses(fmtSession.states, ["completed"], "read in the session directory");
+      expect(fmtSession.evaluates.find(e => e.action === "read")?.resources.map(norm), evaluated(fmtSession)).toEqual(["m.txt"]);
+      expect(fmtSession.evaluates.some(e => e.action === "external_directory"), evaluated(fmtSession)).toBe(false);
+      expectStatuses(fmtEdit.states, ["completed"], `edit in the worktree (evaluates: ${evaluated(fmtEdit)})`);
+      expect(fmtEdit.evaluates.find(e => e.action === "edit")?.resources.map(norm), evaluated(fmtEdit)).toEqual([norm(path.join(w.wt1, "e1.txt"))]);
       expect(disk.wt1E1).toBe("edited\n");
       // (b) glob search roots: inside runs; another directory and the default (the main checkout) are refused.
-      expect(search.states.length).toBe(6);
-      expect(search.states[0]?.status).toBe("completed");
+      expect(search.states.length, describeStates(search.states)).toBe(6);
+      expectCompleted(search.states[0], "glob inside the root");
       expectRefused(search.states[1], "glob outside the root");
       expectRefused(search.states[2], "glob with the default search root (main checkout)");
       // (c) refusal by throwing in execute.before reaches the CHILD as the tool's error (the grep include is visible to execute.before only).
       expectRefused(search.states[3], "grep include outside the root");
-      expect(search.states[3]?.errorMessage).toMatch(EXECUTE_BEFORE_REFUSAL);
+      expect(search.states[3]?.errorMessage, describeState(search.states[3])).toMatch(EXECUTE_BEFORE_REFUSAL);
       expectRefused(search.states[4], "read of the main checkout");
       // router_git_status answers for the bound work root (wt-1's untracked file), not the session directory.
-      expect(search.states[5]?.status).toBe("completed");
-      expect(search.states[5]?.text).toContain("wt1-only-untracked.txt");
-      expect(search.states[5]?.text).not.toContain("main-only-dirty.txt");
+      expectCompleted(search.states[5], "router_git_status");
+      expectText(search.states[5], /wt1-only-untracked\.txt/, "router_git_status names wt-1's untracked file");
+      expect(search.states[5]?.text, describeState(search.states[5])).not.toContain("main-only-dirty.txt");
       // (d) the host emits outputPaths on its tool-success event (form recorded in successTypes); the child reads its own output, another child cannot.
-      expect(ownPath, `no outputPaths for the big grep (tool-success event types seen: ${successTypes.join(", ")})`).toBeDefined();
+      expect(ownPath, `no outputPaths for the big grep (tool-success event types seen: ${successTypes.join(", ")}; grep: ${describeStates(big.states)})`).toBeDefined();
       expect(ownRead?.childID).toBe(big.childID);
-      expect(ownRead?.states.map(s => s.status)).toEqual(["completed"]);
+      expectStatuses(ownRead?.states ?? [], ["completed"], "the child reads its own saved output");
       expectRefused(foreignRead?.states[0], "another child reading the saved output");
       // (e) the later worktree is covered by the workRoots glob; one outside the glob is not; router_run runs in the later root and refuses wt-1.
-      expect(lateRead.states.map(s => s.status)).toEqual(["completed"]);
+      expectStatuses(lateRead.states, ["completed"], `later worktree under the workRoots glob (evaluates: ${evaluated(lateRead)})`);
       expectRefused(uncoveredRead.states[0], "worktree created after start without a pattern");
-      expect(lateRun.states[0]?.text).toMatch(/\[router_run\] package\.json script "smoke-marker": exit code: 0/);
-      expect(lateRun.states[1]?.text).toMatch(/\[router_run\] error: refused: cwd is not this dispatch's work root/);
+      expectText(lateRun.states[0], /\[router_run\] package\.json script "smoke-marker": exit code: 0/, "router_run in the later worktree");
+      expectText(lateRun.states[1], /\[router_run\] error: refused: cwd is not this dispatch's work root/, "router_run with wt-1 as a foreign cwd");
       expect(disk.lateMarker).toBe(true);
       expect(disk.wt1Marker).toBe(false);
       expect(disk.mainMarker).toBe(false);
@@ -682,11 +715,12 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   }, 900_000);
 
   it("budget exhaustion and resume; signal rows of every kind (verdict, run, grader, incomplete, budget, authority, redispatch) in the isolated decision log", async () => {
-    const host = await startRolesHost("signals", {
-      overrides: { roleAgents: { explorer: { budget: { fast: 3 } } }, enforcement: { verify: { minGraderTier: "heavy" } } },
+    // Enforcement mode `enforced`: the default `advisory` never blocks a call (src/guard/enforce.ts:241-248 only appends a banner), so no
+    // budget stop exists in it and the parent gets no `[router budget]` note (run 1: the 4th read of a 3-call budget completed).
+    const { host, w } = await startRolesHost("signals", {
+      overrides: { roleAgents: { explorer: { budget: { fast: 3 } } }, enforcement: { mode: "enforced", verify: { minGraderTier: "heavy" } } },
     });
     try {
-      const w = await makeWorld(host);
       const root = await host.newRoot("signals root", undefined, host.project, []);
       const read = (file: string): ScriptStep => ({ tool: "read", input: { path: path.join(host.project, file) } });
       // budget: explorer at fast with a role budget of 3 calls attempts 5 reads, returns NEED MORE: budget; the resume continues.
@@ -738,21 +772,18 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
 
       // Budget: three reads ran on fast, the rest were refused with the NEED MORE: budget instruction; the parent got the [router budget] note.
       expect(budget.requests[0]?.tier).toBe("fast");
-      expect(budget.states.slice(0, 3).map(s => s.status)).toEqual(["completed", "completed", "completed"]);
-      for (const s of budget.states.slice(3)) {
-        expect(s.status).toBe("error");
-        expect(s.errorMessage ?? "").toContain("NEED MORE: budget");
-      }
+      expectStatuses(budget.states, ["completed", "completed", "completed", "error", "error"], "explorer with a 3-call budget attempts 5 reads");
+      for (const s of budget.states.slice(3)) expect(s.errorMessage ?? "", describeState(s)).toContain("NEED MORE: budget");
       expect(budget.parentText).toContain("[router budget] @explorer stopped on its tool-call budget before finishing");
       expect(budget.parentText).toContain(budget.childID);
       // ... and the resume of the SAME session continues: both remaining reads run.
       expect(budgetResume.childID).toBe(budget.childID);
-      expect(budgetResume.states.map(s => s.status)).toEqual(["completed", "completed"]);
+      expectStatuses(budgetResume.states, ["completed", "completed"], "the resumed explorer reads the remaining files");
       // The run signal's preconditions on the host: the edit landed and router_run exited 0 after it.
-      expect(run.states[0]?.status).toBe("completed");
-      expect(run.states[1]?.text).toMatch(/exit code: 0/);
+      expectCompleted(run.states[0], "edit before the run");
+      expectText(run.states[1], /exit code: 0/, "router_run after the edit");
       expect(gradersRan, "the router's grader reached the provider").toBeGreaterThan(0);
-      for (const [name, e] of Object.entries(expected)) expect(has(rows, e), `signal row ${name} (${e.reason.source}) for ${e.child}`).toBe(true);
+      for (const [name, e] of Object.entries(expected)) expect(has(rows, e), `signal row ${name} (${e.reason.source}) for ${e.child}; signal rows: ${signalRows(rows).map(r => `${r.reason}@${r.childSessionID}`).join(", ")}`).toBe(true);
       expect(kinds).toEqual(["authority", "budget", "grader", "incomplete", "redispatch", "run", "verdict"]);
       expect(unknownBindings(rows)).toEqual([]);
       expect(host.provider.errors).toEqual([]);
@@ -760,9 +791,8 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
   }, 900_000);
 
   it("exploration: with routing.exploration.rate 0.2 an eligible deterministic dispatch is sometimes drawn below the static default; the row says explore + propensity and the model stays inside [floor, ceiling]", async () => {
-    const host = await startRolesHost("explore", { routing: { exploration: { rate: 0.2 } } });
+    const { host } = await startRolesHost("explore", { routing: { exploration: { rate: 0.2 } } });
     try {
-      await makeWorld(host);
       const root = await host.newRoot("explore root", undefined, host.project, []);
       const present = path.join(host.project, "m.txt");
       // explorer, class implement: static default medium (CLASS_STATIC_TIER), floor fast (local grant), detection deterministic (router-gated fileExists).
@@ -778,10 +808,10 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
 
       const explored = draws.filter(v => dispatchRowOf(rows, v.childID)?.explore === true);
       const exploited = draws.filter(v => dispatchRowOf(rows, v.childID)?.explore !== true);
-      expect(explored.length, `an exploration row within ${draws.length} eligible dispatches`).toBeGreaterThan(0);
+      expect(explored.length, `an exploration row within ${draws.length} eligible dispatches: ${drawn.map(x => `${x.tier}:${rowLine(dispatchRowOf(rows, draws.find(v => v.label === x.label)!.childID))}`).join(" ")}`).toBeGreaterThan(0);
       for (const v of explored) {
         const row = dispatchRowOf(rows, v.childID)!;
-        expect(row.propensity).toBeCloseTo(0.2, 6);
+        expect(row.propensity, rowLine(row)).toBeCloseTo(0.2, 6);
         expect(row.reason).toContain("exploration draw");
         expect(row.detection?.effective).toBe("deterministic");
         expect(v.requests[0]?.tier, `explored dispatch on ${v.requests[0]?.catalogModel}`).toBe("fast"); // the one target: at the floor, below the default
@@ -790,8 +820,8 @@ d("roles mode on the real OpenCode v2 host (issue #84, P3.1)", () => {
       for (const v of exploited) {
         const row = dispatchRowOf(rows, v.childID)!;
         if (row.switched) continue; // an enforce switch is not an exploration draw (recorded in the evidence)
-        expect(row.propensity).toBeCloseTo(0.8, 6);
-        expect(v.requests[0]?.tier).toBe("medium");
+        expect(row.propensity, rowLine(row)).toBeCloseTo(0.8, 6);
+        expect(v.requests[0]?.tier, rowLine(row)).toBe("medium");
       }
       for (const v of draws) for (const r of v.requests) expect(rankOf(r.tier), `I2 for ${v.label}`).toBeLessThanOrEqual(rankOf("medium"));
       expect(unknownBindings(rows)).toEqual([]);

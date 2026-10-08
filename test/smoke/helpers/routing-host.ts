@@ -581,6 +581,8 @@ export interface HostOptions {
   readonly routing?: Obj | null | ((root: string) => Obj);
   /** Use the long (realpath, non-8.3) spelling of the temp root, so the project, worktrees and every path under it are canonical (role work roots refuse 8.3 spellings). */
   readonly longPaths?: boolean;
+  /** Runs once the (empty) project directory exists and BEFORE the host process starts: e.g. a git repository whose worktrees the router lists at role-agent registration (plugin start). */
+  readonly prepare?: (dirs: { readonly root: string; readonly project: string }) => Promise<void>;
   /** Issue #84 P3.1: load {@link PRE_PROBE_PLUGIN} BEFORE the router with this configuration (written to a JSON file it reads). */
   readonly preProbe?: { readonly breakSystemTitleContains: string; readonly routerStackNeedle: string };
   /** Extra `providers` entries of opencode.json (merged with the scripted anthropic provider). */
@@ -685,6 +687,7 @@ export class RoutingHost {
     }
     this.project = path.join(this.root, "project");
     await mkdir(this.project, { recursive: true });
+    if (this.options.prepare) await this.options.prepare({ root: this.root, project: this.project });
     await mkdir(this.outcomes, { recursive: true });
     const probe = path.join(this.root, "probe-plugin");
     await mkdir(probe, { recursive: true });
