@@ -36,6 +36,18 @@ const ROUTE_MENTION_RE = /\[route/i;
  */
 const NEEDS_LIST_RE = /(\bneeds=[a-z_]*)((?:\s*,\s*[a-z_]+(?![a-z_]|\s*=))+)/gi;
 const LINE_SPLIT_RE = /(\r\n|\n|\r)/;
+/** `root="D:\my dir"`: the only way to carry whitespace in a value; extracted before tokenising. */
+const QUOTED_ROOT_RE = /\broot\s*=\s*"([^"]*)"/gi;
+const QUOTED_PLACEHOLDER_RE = /^@q(\d+)$/;
+/** `tier=` literals the parser can know; the engine validates against the active tier list. */
+const TIER_NAMES = ["fast", "medium", "heavy"] as const;
+export const ROUTE_BUDGET_MAX = 10000;
+const ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/)/;
+
+/** An absolute Windows (drive or UNC) or POSIX path; relative paths and NUL are rejected. */
+function isAbsolutePath(value: string): boolean {
+  return ABSOLUTE_PATH_RE.test(value) && !value.includes("\0");
+}
 
 function isMember<T extends string>(values: readonly T[], value: string): value is T {
   return (values as readonly string[]).includes(value);
@@ -71,10 +83,15 @@ function parseFields(body: string): RouteLine {
   let needs: readonly Need[] | undefined;
   let detection: Detection | undefined;
   let pin = false;
+  let tier: string | undefined;
+  let budget: number | undefined;
+  let root: string | undefined;
   const ignored: string[] = [];
   const seen = new Set<string>();
 
+  const quotedRoots: string[] = [];
   const tokens = body
+    .replace(QUOTED_ROOT_RE, (_whole, path: string) => `root=@q${quotedRoots.push(path) - 1}`)
     .replace(/\s*=\s*/g, "=")
     .replace(NEEDS_LIST_RE, (_whole, head: string, tail: string) => head + tail.replace(/\s+/g, ""))
     .split(/\s+/)
@@ -82,7 +99,8 @@ function parseFields(body: string): RouteLine {
   for (const token of tokens) {
     const eq = token.indexOf("=");
     const key = stripTail((eq === -1 ? token : token.slice(0, eq)).toLowerCase());
-    const value = eq === -1 ? null : stripTail(token.slice(eq + 1).toLowerCase());
+    const rawValue = eq === -1 ? null : token.slice(eq + 1);
+    const value = rawValue === null ? null : stripTail(rawValue.toLowerCase());
     if (key === "") {
       ignored.push(token);
       continue;
@@ -121,6 +139,23 @@ function parseFields(body: string): RouteLine {
         else pin = parsed;
         break;
       }
+      case "tier":
+        if (value !== null && isMember(TIER_NAMES, value)) tier = value;
+        else ignored.push(key);
+        break;
+      case "budget": {
+        const n = value !== null && /^\d+$/.test(value) ? Number(value) : 0;
+        if (n >= 1 && n <= ROUTE_BUDGET_MAX) budget = n;
+        else ignored.push(key);
+        break;
+      }
+      case "root": {
+        const q = value === null ? null : QUOTED_PLACEHOLDER_RE.exec(value);
+        const candidate = q ? quotedRoots[Number(q[1])] : rawValue === null ? undefined : stripTail(rawValue);
+        if (candidate !== undefined && isAbsolutePath(candidate)) root = candidate;
+        else ignored.push(key);
+        break;
+      }
       default:
         ignored.push(key);
     }
@@ -132,6 +167,9 @@ function parseFields(body: string): RouteLine {
     ...(scope ? { scope } : {}),
     ...(needs ? { needs } : {}),
     ...(detection ? { detection } : {}),
+    ...(tier ? { tier } : {}),
+    ...(budget !== undefined ? { budget } : {}),
+    ...(root ? { root } : {}),
     pin,
     ignored,
   };
@@ -157,7 +195,7 @@ function isRecognisable(line: string, inFence: boolean): boolean {
 }
 
 function canonical(line: RouteLine): string {
-  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin]);
+  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root]);
 }
 
 /**
@@ -189,12 +227,18 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   const risk = keep("risk", first.risk, (l) => l.risk);
   const scope = keep("scope", first.scope, (l) => l.scope);
   const needs = keep("needs", first.needs, (l) => l.needs);
+  const tier = keep("tier", first.tier, (l) => l.tier);
+  const budget = keep("budget", first.budget, (l) => l.budget);
+  const root = keep("root", first.root, (l) => l.root);
   if (lines.some((l) => l.detection !== undefined)) ignored.push("conflict:d");
   return {
     ...(taskClass ? { class: taskClass } : {}),
     ...(risk ? { risk } : {}),
     ...(scope ? { scope } : {}),
     ...(needs ? { needs } : {}),
+    ...(tier ? { tier } : {}),
+    ...(budget !== undefined ? { budget } : {}),
+    ...(root ? { root } : {}),
     // The first line is the directive; a later line cannot take its pin away or add one (A22).
     pin: first.pin,
     ignored,

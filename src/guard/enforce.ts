@@ -10,6 +10,7 @@ import { scrubText } from "./scrub";
 import { resolveEnforcementMode } from "../router/enforcement";
 import type { EnforcementMode } from "../router/enforcement";
 import type { RouterConfig } from "../router/config";
+import type { GuardProfile } from "../router/guard-profile";
 
 /**
  * Default total tool-call ceiling for an enforced subagent delegation. This is a
@@ -40,7 +41,11 @@ export interface GuardStoreLike {
 /** Build a GuardPolicy from config for a given subagent tier. deliverableSignal
  * is null in Wave 1 (Mode A/B signal wiring lands in Wave 2/4), which disables
  * the deliverable-first clause — the honest common case (M5). */
-export function buildGuardPolicy(cfg: RouterConfig, tier: string | null): GuardPolicy {
+export function buildGuardPolicy(
+  cfg: RouterConfig,
+  tier: string | null,
+  _profile?: GuardProfile | undefined,
+): GuardPolicy {
   const g = cfg.enforcement?.guard ?? {};
   const budget = g.budget ?? DEFAULT_GUARD_BUDGET;
   return {
