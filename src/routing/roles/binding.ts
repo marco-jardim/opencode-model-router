@@ -27,6 +27,8 @@
  * tombstoned for the TTL, so an in-flight lookup never stores a binding to them), LRU-bounded by
  * {@link BOUND_MAX}; a resume returns the cached binding with its widened grant.
  *
+ * Residual (accepted): a child that lost both own markers but whose anchors carry a live, unclaimed sibling's nonce binds to it (unguessable UUID).
+ *
  * State lives on `globalThis` under a versioned `Symbol.for` key, so every copy of this module in the process
  * (two plugin instances) shares one registry and one decision per child; a foreign value there is replaced.
  */
