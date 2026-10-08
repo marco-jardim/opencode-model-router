@@ -145,6 +145,8 @@ export interface WireRequest {
   system: string;
   messages: Obj[];
   toolNames: string[];
+  /** The raw tool definitions of the request (name, description, schema) as the provider received them. */
+  toolDefs: Obj[];
   /** Every top-level field except messages/system/tools/input/instructions. */
   payload: Obj;
   /** Estimate: request body length / 4 (the scripted provider's own number, NOT a measurement of a real provider). */
@@ -220,7 +222,7 @@ export class RoutingProvider {
       const request: WireRequest = {
         seq: ++this.sequence, protocol: responses ? "responses" : "anthropic", model: str(body.model), catalogModel: header("x-proof-model"),
         session: header("x-proof-session"), agent: header("x-proof-agent"), kind: header("x-proof-kind"), stream: body.stream === true, system, messages,
-        toolNames, payload: fields, inputTokens, lastText, toolResult, reply: grader ? "grader" : toolName ? "tool" : "text",
+        toolNames, toolDefs: arr(tools).map(obj), payload: fields, inputTokens, lastText, toolResult, reply: grader ? "grader" : toolName ? "tool" : "text",
       };
       this.requests.push(request);
       if (toolName && !probe && !toolNames.includes(toolName)) throw new Error(`Fixture requested ${toolName} but the request carries no such tool (${toolNames.join(",")})`);
@@ -308,7 +310,7 @@ export class RoutingProvider {
 /** Native v2 plugin loaded NEXT TO the router. It only observes: tool hooks (every tool, with the plugin-instance id), the
  * session event stream (with event ids), the provider requests (it tags them with session/agent/kind/model headers) and the host's
  * own `ctx.agent.list()` / `ctx.model.list()` records (dumped once, on the first context hook). It never rewrites anything. */
-export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync,readFileSync} from 'node:fs';
+export const PROBE_PLUGIN = `import {appendFileSync,writeFileSync,readFileSync,existsSync} from 'node:fs';
 const tick=()=>(globalThis.__smokeSeq=(globalThis.__smokeSeq||0)+1);
 const log=(file,x)=>appendFileSync(process.env[file],JSON.stringify({...x,__t:Date.now(),__n:tick()})+'\\n');
 const clone=(x)=>{try{return structuredClone(x);}catch{return {unclonable:String(x)};}};
@@ -340,9 +342,11 @@ export default {id:'routing-smoke-probe',async setup(ctx){
   await ctx.permission.hook('evaluate',async e=>{
    const entered=Date.now(),enteredN=tick();
    const first=!firstEvaluate.has(e.sessionID); firstEvaluate.add(e.sessionID);
+   const effectIn=e.effect;
+   if(cfg.denyAsk&&e.effect==='ask'){e.effect='deny';e.message='PROBE_ASK_AS_DENY: '+e.action;}
    const deny=cfg.deny&&(cfg.deny.agent===undefined||cfg.deny.agent===e.agent)&&(cfg.deny.actions||[]).includes(e.action);
    if(deny){e.effect='deny';e.message='PLUGIN_GUARD_DENIED: '+e.action;}
-   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
+   log('SMOKE_EVENTS',{type:'probe.lifecycle',point:'evaluate',sessionID:e.sessionID,agent:e.agent,action:e.action,resources:clone(e.resources),effectIn,effectOut:e.effect,first,denied:!!deny,entered,enteredN,got:first?await snap(e.sessionID):undefined,__instance:instance,__iid:iid});
   });
  }
  // Opt-in decisions keyed by the session TITLE (looked up with session.get(event.sessionID), so the decision is per session, not per agent).
@@ -384,6 +388,17 @@ export default {id:'routing-smoke-probe',async setup(ctx){
    e.input={...e.input,agent:cfg.rewriteAgent.to};
    log('SMOKE_EVENTS',{type:'probe.decision',point:'execute.before',tool:e.tool,callID:e.id,sessionID:e.sessionID,decision:'rewrite',inputBefore:input,inputAfter:clone(e.input),__instance:instance,__iid:iid});
   });
+ }
+ // Opt-in custom tool wt_probe: reports where the host runs a plugin tool (process.cwd(), the context it is handed, the plugin's own location).
+ if(cfg.cwdTool){
+  const {tool}=await import(process.env.SMOKE_PLUGIN_TOOL_URL);
+  await ctx.tool.transform(editor=>{editor.add({name:'wt_probe',description:'Reports the directory a plugin tool runs in.',input:tool.schema.object({path:tool.schema.string().describe('a path to test')}),options:{codemode:false},execute:async(args,context)=>{
+   const scalars={};for(const k of Object.keys(context||{})){const v=context[k];if(v===null||['string','number','boolean'].includes(typeof v))scalars[k]=v;}
+   let sessionLocation;try{sessionLocation=(await ctx.session.get({sessionID:context.sessionID})).location;}catch(error){sessionLocation={error:String(error)};}
+   const report={cwd:process.cwd(),contextKeys:Object.keys(context||{}),contextScalars:scalars,pluginLocation:clone(ctx.location),sessionLocation:clone(sessionLocation),pathExists:existsSync(args.path),arg:args.path};
+   log('SMOKE_EVENTS',{type:'probe.tool',tool:'wt_probe',sessionID:context.sessionID,report,__instance:instance,__iid:iid});
+   return {content:JSON.stringify(report)};
+  }});});
  }
  let dumped=false;
  await ctx.session.hook('context',e=>{
@@ -434,12 +449,12 @@ export interface HostOptions {
   /** Skip the router plugin (control host). */
   readonly withoutRouter?: boolean;
   /** Merged over the generated opencode.json (the host's own config: agents, providers…). */
-  readonly hostConfig?: Obj;
+  readonly hostConfig?: Obj | ((root: string) => Obj);
   /** Seeds written to the outcomes store BEFORE the host starts (through the repo's own store + persister, on the temp dir). */
   readonly seed?: readonly Seed[];
   /** Probe-plugin configuration (written to a JSON file the probe reads): `lifecycle` logs first context/evaluate per session; `deny` = { agent?, actions[] } denies those permission actions. */
   readonly probe?: {
-    readonly lifecycle?: boolean; readonly deny?: { readonly agent?: string; readonly actions: readonly string[] };
+    readonly lifecycle?: boolean; readonly denyAsk?: boolean; readonly cwdTool?: boolean; readonly deny?: { readonly agent?: string; readonly actions: readonly string[] };
     /** Per-SESSION decisions (the probe resolves the session title with session.get(event.sessionID)). */
     readonly bySession?: {
       readonly denyTitle?: string; readonly denyActions?: readonly string[];
@@ -541,14 +556,14 @@ export class RoutingHost {
       model: ref(root),
       plugins: [...(this.options.withoutRouter ? [] : [ROOT]), probe],
       providers: { anthropic: { settings: { baseURL, apiKey: "keyless-smoke-fake" } }, ...this.resolveProviders(baseURL) },
-      ...obj(this.options.hostConfig),
+      ...obj(typeof this.options.hostConfig === "function" ? this.options.hostConfig(this.root) : this.options.hostConfig),
     }));
     const password = randomBytes(24).toString("base64url");
     Object.assign(env, {
       OPENCODE_PASSWORD: password, OPENCODE_TEST_HOME: env.HOME, PWD: this.project,
       OPENCODE_CONFIG_PROJECT_DISABLE: "true", OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_FILEWATCHER_DISABLE: "true",
       SMOKE_HOOKS: this.logs.hooks, SMOKE_EVENTS: this.logs.events, SMOKE_DUMP: this.logs.dump,
-      ...(this.options.probe ? { SMOKE_PROBE_CONFIG: probeConfig } : {}),
+      ...(this.options.probe ? { SMOKE_PROBE_CONFIG: probeConfig, SMOKE_PLUGIN_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href } : {}),
     });
     this.envKeys = Object.keys(env).sort();
     // No credential-shaped variable may reach the host; OPENCODE_PASSWORD is the harness's own random one.

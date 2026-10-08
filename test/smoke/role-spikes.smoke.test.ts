@@ -13,7 +13,7 @@
  * - Groups B (S3, S6, S8, S9) and C (S10, S11, S12) extend this file: reuse `startSpikeHost`, `wire`, `save` below.
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -574,4 +574,241 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1 group A)", () => {
       expect(control.child.agent).toBe(NO_MODEL);
     } finally { await finish(host); }
   }, 300_000);
+
+
+  // ---------------------------------------------------------------------------------------------- group C ----
+  it("S10 the router's verification gate treats a non-tier custom agent exactly like fast/medium (it is gated by tool + mode, not by agent name)", async () => {
+    const agents = { explorer: agentWithoutModel({ description: "S10 custom explorer role" }), implementer: agentWithoutModel({ description: "S10 custom implementer role" }) };
+    const OK = "[router \u2713 verified: deterministic]";
+    const run = async (name: string, overrides: Obj, subjects: string[]) => {
+      const host = await startSpikeHost(name, agents, { overrides });
+      try {
+        const present = path.join(host.project, "s10-present.txt");
+        const absent = path.join(host.project, "s10-absent.txt");
+        await writeFile(present, "x\n");
+        const rows: Record<string, { output: string; content: string; status: unknown }> = {};
+        for (const agent of subjects) {
+          for (const [label, file] of [["present", present], ["absent", absent]] as const) {
+            const root = await host.newRoot(`${name} ${agent} ${label}`);
+            const call = await host.dispatch(root, { agent, description: `S10 ${agent} ${label}`, prompt: `S10 do the work\n[acceptance]\ncheck: fileExists path=${file}\n[/acceptance]`, model: `${SONNET}#low`, background: false });
+            const res = obj(call.after.result);
+            rows[`${agent}/${label}`] = { status: call.after.status, output: String(obj(res.output).output), content: arr(res.content).map(c => str(obj(c).text)).join("") };
+          }
+        }
+        return { rows, graders: host.provider.graders, hostErrors: host.errorLines() };
+      } finally { await finish(host); }
+    };
+    const enforced = await run("s10-enforced", { enforcement: { mode: "enforced" } }, ["fast", "medium", "explorer", "implementer"]);
+    const standard = await run("s10-default", {}, ["explorer"]);
+    const off = await run("s10-off", { enforcement: { mode: "off" } }, ["explorer", "fast"]);
+    const never = await run("s10-never", { enforcement: { mode: "enforced", verify: { require: "never" } } }, ["explorer", "fast"]);
+    await save("S10", { enforced, standard, off, never });
+
+    const rejected = (r: { output: string }) => r.output.includes("[router \u26a0 NOT ACCEPTED]") && r.output.includes("file not found:") && r.output.includes("s10-absent.txt");
+    for (const agent of ["fast", "medium", "explorer", "implementer"]) {
+      const present = enforced.rows[`${agent}/present`]!;
+      const absent = enforced.rows[`${agent}/absent`]!;
+      expect(present.status).toBe("completed");
+      // pass: the deterministic fileExists checker ran for EVERY agent (no grader: graders stay 0) and appended the verified line.
+      expect(present.output, agent).toBe(`CHILD_OK\n\n${OK}`);
+      expect(present.content, agent).toContain(OK);
+      // fail: NOT ACCEPTED with the checker's reason, appended to the text the parent receives.
+      expect(rejected(absent), agent).toBe(true);
+      expect(absent.content, agent).toContain("NOT ACCEPTED");
+    }
+    expect(enforced.graders).toBe(0);
+    // The ONLY difference is the escalation hint: ladder names (fast/medium) get "re-run via subagent(agent=\"next\") (escalated from X)",
+    // any other agent gets the generic "re-run the delegation" (index.ts:2023-2026: ladder.indexOf(producerTier) < 0 -> nextTier null).
+    expect(enforced.rows["fast/absent"]!.output).toContain("`subagent(agent=\"medium\")` (escalated from fast)");
+    expect(enforced.rows["medium/absent"]!.output).toContain("`subagent(agent=\"heavy\")` (escalated from medium)");
+    for (const agent of ["explorer", "implementer"]) {
+      expect(enforced.rows[`${agent}/absent`]!.output).toContain("NEXT: address the above and re-run the delegation; do not treat the prior result as complete.");
+      expect(enforced.rows[`${agent}/absent`]!.output).not.toContain("escalated from");
+    }
+    // The gate also runs with the default (advisory) enforcement mode; it is switched off only by mode "off" or verify.require "never".
+    expect(standard.rows["explorer/present"]!.output).toBe(`CHILD_OK\n\n${OK}`);
+    expect(rejected(standard.rows["explorer/absent"]!)).toBe(true);
+    for (const result of [off, never]) for (const row of Object.values(result.rows)) expect(row.output).toBe("CHILD_OK");
+    for (const result of [enforced, standard, off, never]) expect(result.hostErrors).toEqual([]);
+  }, 900_000);
+
+
+  it("S11 work root in a sibling worktree: external_directory defaults, per-path allowance, glob coverage of a later worktree, plugin tool cwd", async () => {
+    const host = await RoutingHost.start("s11", {
+      routing: { engine: "shadow" }, providers: OPENAI_PROVIDER, probe: { lifecycle: true, denyAsk: true, cwdTool: true },
+      hostConfig: (root: string) => {
+        const base: Obj[] = [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }, { action: "edit", resource: "*", effect: "allow" }, { action: "wt_probe", resource: "*", effect: "allow" }];
+        return { agents: {
+          "role-base": agentWithoutModel(), // the host defaults: external_directory = ask
+          "role-deny": agentWithoutModel({ permissions: base }), // deny-by-default, explicit allows, no external_directory rule
+          "role-wt1": agentWithoutModel({ permissions: [...base, { action: "external_directory", resource: `${root}\\wt-1\\*`, effect: "allow" }] }),
+          "role-glob": agentWithoutModel({ permissions: [...base, { action: "external_directory", resource: `${root}\\wt-*`, effect: "allow" }] }),
+        } };
+      },
+    });
+    try {
+      const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: host.project, encoding: "utf8", windowsHide: true });
+      git("init", "-q", "-b", "main");
+      for (const name of ["m.txt", "e1.txt", "e2.txt", "e3.txt"]) await writeFile(path.join(host.project, name), "main\n");
+      git("add", "."); git("commit", "-q", "-m", "init");
+      const wt1 = path.join(host.root, "wt-1");
+      const wt2 = path.join(host.root, "wt-2");
+      const other = path.join(host.root, "other");
+      git("worktree", "add", "-q", wt1, "-b", "wt1");
+      await mkdir(other, { recursive: true });
+      await writeFile(path.join(other, "x.txt"), "other\n");
+      const norm = (value: unknown) => String(value).replaceAll("\\", "/").toLowerCase();
+      const op = async (agent: string, label: string, tool: string, input: Obj) => {
+        const root = await host.newRoot(`s11 ${agent} ${label}`, undefined, host.project, []);
+        const r = await childReport(host, root, { agent, description: `S11 ${agent} ${label}`, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool, input })}` });
+        const evaluates = (await lifecycle(host, r.childID)).evaluates.map(e => ({ action: e.action, resources: arr(e.resources).map(norm), effectIn: e.effectIn, effectOut: e.effectOut }));
+        return { agent, label, state: r.toolStates[0], evaluates, sessionAgent: r.child.agent };
+      };
+      const edit = (dir: string, file: string): Obj => ({ path: path.join(dir, file), oldString: "main", newString: "edited" });
+      // -- the worktree that existed when the host started
+      const base = { read: await op("role-base", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-base", "edit wt1", "edit", edit(wt1, "e1.txt")) };
+      const deny = { read: await op("role-deny", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-deny", "edit wt1", "edit", edit(wt1, "e1.txt")) };
+      const exact = {
+        read: await op("role-wt1", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-wt1", "edit wt1", "edit", edit(wt1, "e1.txt")),
+        other: await op("role-wt1", "read other", "read", { path: path.join(other, "x.txt") }),
+        tool: await op("role-wt1", "tool wt1", "wt_probe", { path: path.join(wt1, "m.txt") }),
+      };
+      const glob = { read: await op("role-glob", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-glob", "edit wt1", "edit", edit(wt1, "e2.txt")), other: await op("role-glob", "read other", "read", { path: path.join(other, "x.txt") }) };
+      // -- a SECOND worktree created after the host started and the agents were registered
+      git("worktree", "add", "-q", wt2, "-b", "wt2");
+      const later = {
+        noPattern: await op("role-deny", "read wt2", "read", { path: path.join(wt2, "m.txt") }),
+        exactPattern: await op("role-wt1", "read wt2", "read", { path: path.join(wt2, "m.txt") }),
+        globRead: await op("role-glob", "read wt2", "read", { path: path.join(wt2, "m.txt") }),
+        globEdit: await op("role-glob", "edit wt2", "edit", edit(wt2, "e3.txt")),
+        globOther: await op("role-glob", "read other again", "read", { path: path.join(other, "x.txt") }),
+      };
+      const toolReport = (await host.events()).filter(e => e.type === "probe.tool").map(e => obj(e.report));
+      const disk = { wt1E1: await readFile(path.join(wt1, "e1.txt"), "utf8"), wt1E2: await readFile(path.join(wt1, "e2.txt"), "utf8"), wt2E3: await readFile(path.join(wt2, "e3.txt"), "utf8"), mainE1: await readFile(path.join(host.project, "e1.txt"), "utf8"), mainE3: await readFile(path.join(host.project, "e3.txt"), "utf8"), other: await readFile(path.join(other, "x.txt"), "utf8") };
+      await save("S11", { base, deny, exact, glob, later, toolReport, disk, hostErrors: host.errorLines() });
+
+      const rejected = (o: { state?: Obj }, message: string) => expect(o.state).toMatchObject({ status: "error", errorType: "permission.rejected", errorMessage: message });
+      // (1) default agent: external_directory is ASKED for the sibling worktree (resource "<worktree>/*"); the probe turned the ask into a deny so nothing hangs.
+      for (const o of [base.read, base.edit]) {
+        rejected(o, "PROBE_ASK_AS_DENY: external_directory");
+        expect(o.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "ask", effectOut: "deny" });
+        expect(o.evaluates[0]!.resources).toEqual([`${norm(wt1)}/*`]);
+      }
+      // (2) deny-by-default role agent without an external_directory rule: refused by the host itself (no evaluate event reaches plugins).
+      for (const o of [deny.read, deny.edit]) { rejected(o, "Permission denied: external_directory"); expect(o.evaluates).toEqual([]); }
+      // (3) an external_directory rule for the worktree root only: read and edit inside it run (external_directory allow, then the action's own allow)...
+      expect(exact.read.state).toMatchObject({ status: "completed" });
+      expect(exact.edit.state).toMatchObject({ status: "completed" });
+      expect(exact.read.evaluates.map(e => [e.action, e.effectIn])).toEqual([["external_directory", "allow"], ["read", "allow"]]);
+      expect(exact.edit.evaluates.map(e => [e.action, e.effectIn])).toEqual([["external_directory", "allow"], ["edit", "allow"]]);
+      expect(disk.wt1E1).toBe("edited\n");
+      expect(disk.mainE1).toBe("main\n");
+      // ... while a path in a third, unrelated directory stays denied and untouched.
+      rejected(exact.other, "Permission denied: external_directory");
+      expect(disk.other).toBe("other\n");
+      // (4) the glob rule `<root>\wt-*` covers wt-1 too.
+      expect(glob.read.state).toMatchObject({ status: "completed" });
+      expect(glob.edit.state).toMatchObject({ status: "completed" });
+      expect(disk.wt1E2).toBe("edited\n");
+      rejected(glob.other, "Permission denied: external_directory");
+      // (5) a worktree created AFTER the host started: (a) no pattern -> denied; exact pattern for the old worktree -> denied;
+      //     (b) glob `wt-*` registered at start -> covered (read and edit), the unrelated directory is still denied.
+      rejected(later.noPattern, "Permission denied: external_directory");
+      rejected(later.exactPattern, "Permission denied: external_directory");
+      expect(later.globRead.state).toMatchObject({ status: "completed" });
+      expect(later.globEdit.state).toMatchObject({ status: "completed" });
+      expect(disk.wt2E3).toBe("edited\n");
+      expect(disk.mainE3).toBe("main\n");
+      rejected(later.globOther, "Permission denied: external_directory");
+      // (6) a plugin tool is neither permission-evaluated (no evaluate event, even for the sibling path) nor moved: it runs in the MAIN
+      //     checkout (process.cwd() = the host project = the session location); its context carries no directory/worktree field.
+      expect(exact.tool.state).toMatchObject({ status: "completed" });
+      expect(exact.tool.evaluates).toEqual([]);
+      expect(toolReport).toHaveLength(1);
+      const reported = toolReport[0]!;
+      expect(norm(reported.cwd)).toBe(norm(host.project));
+      expect(norm(obj(reported.sessionLocation).directory)).toBe(norm(host.project));
+      expect(norm(obj(reported.pluginLocation).directory)).toBe(norm(host.project));
+      expect(reported.contextKeys).toEqual(["sessionID", "agent", "messageID", "id", "progress", "signal"]);
+      expect(reported.pathExists).toBe(true);
+      expect(host.errorLines()).toEqual([]);
+    } finally { await finish(host); }
+  }, 900_000);
+
+
+  it("S12 the router override's agents block changed WITHOUT restarting the host: when the host agent list and the orchestrator's subagent catalog follow", async () => {
+    const AGENT = (description: string) => ({ tier: "fast", description, readOnly: true });
+    const NEXT = { agents: { reviewer: AGENT("S12 reviewer description TWO"), newbie: AGENT("S12 newbie description") } };
+    const subagentDescription = (r: WireRequest | undefined) => JSON.stringify(r?.toolDefs.find(t => t.name === "subagent") ?? null);
+    const scenario = async (name: string, change: (host: RoutingHost) => Promise<Obj>) => {
+      const host = await startSpikeHost(name, {}, { hostConfig: {}, overrides: { agents: { reviewer: AGENT("S12 reviewer description ONE") } } });
+      try {
+        const view = async () => {
+          const list = (await host.client.agent.list()).data.filter(a => ["reviewer", "newbie"].includes(a.id)).map(a => `${a.id}=${a.description}`);
+          const api = arr(obj(await host.getJson("/api/agent")).data).map(a => obj(a)).filter(a => ["reviewer", "newbie"].includes(String(a.id))).map(a => `${a.id}=${a.description}`);
+          return { list, api };
+        };
+        const ping = async (label: string) => {
+          const root = await host.newRoot(`${name} ${label}`);
+          const mark = host.provider.requests.length;
+          await host.prompt(root, `S12 ping ${label}`);
+          const description = subagentDescription(host.provider.requests.slice(mark).find(r => r.session === root && r.kind === "primary"));
+          return { one: description.includes("description ONE"), two: description.includes("description TWO"), newbie: description.includes("newbie") };
+        };
+        const before = { view: await view(), ping: await ping("before") };
+        await host.writeOverrides(NEXT);
+        const afterWrite = await view();
+        // bounded wait: does anything change on its own?
+        const started = Date.now();
+        let changedByItselfAfterMs: number | undefined;
+        while (Date.now() - started < 30_000 && changedByItselfAfterMs === undefined) {
+          if (JSON.stringify(await view()).includes("TWO")) changedByItselfAfterMs = Date.now() - started; else await delay(1_000);
+        }
+        const changed = await change(host);
+        return { before, afterWrite, changedByItselfAfterMs, extra: changed, view: await view(), hostErrors: host.errorLines() };
+      } finally { await finish(host); }
+    };
+    const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+    // (A) the next ordinary prompt
+    const viaPrompt = await scenario("s12-prompt", async host => {
+      const ping = async (label: string) => {
+        const root = await host.newRoot(`s12 ${label}`);
+        const mark = host.provider.requests.length;
+        await host.prompt(root, `S12 ping ${label}`);
+        const d = subagentDescription(host.provider.requests.slice(mark).find(r => r.session === root && r.kind === "primary"));
+        return { one: d.includes("description ONE"), two: d.includes("description TWO"), newbie: d.includes("newbie") };
+      };
+      const first = await ping("first prompt after the change");
+      return { first, second: await ping("second prompt") };
+    });
+    // (B) /router-reload without any other prompt
+    const viaReload = await scenario("s12-reload", async host => {
+      const root = await host.newRoot("s12 reload");
+      await host.client.session.command({ sessionID: root, name: "router-reload", text: "" });
+      await host.settle(root).catch(() => undefined);
+      const afterCommand = (await host.client.agent.list()).data.filter(a => ["reviewer", "newbie"].includes(a.id)).map(a => `${a.id}=${a.description}`);
+      return { afterCommand };
+    });
+    await save("S12", { viaPrompt, viaReload });
+
+    const ONE = ["reviewer=S12 reviewer description ONE"];
+    const TWO = ["reviewer=S12 reviewer description TWO", "newbie=S12 newbie description"];
+    for (const run of [viaPrompt, viaReload]) {
+      // before: the first description everywhere (host list, /api/agent, and the orchestrator's `subagent` tool description).
+      expect(run.before.view).toEqual({ list: ONE, api: ONE });
+      expect(run.before.ping).toEqual({ one: true, two: false, newbie: false });
+      // writing the file changes nothing by itself: not immediately, and not within the 30 s we waited.
+      expect(run.afterWrite).toEqual({ list: ONE, api: ONE });
+      expect(run.changedByItselfAfterMs).toBeUndefined();
+      expect(run.hostErrors).toEqual([]);
+    }
+    // (A) the FIRST prompt after the change already carries the new catalog in its own provider request (the router refreshes in the
+    // session "prompt" hook, before the model request), the host list and /api/agent follow, and it stays that way.
+    expect(obj(viaPrompt.extra).first).toEqual({ one: false, two: true, newbie: true });
+    expect(obj(viaPrompt.extra).second).toEqual({ one: false, two: true, newbie: true });
+    expect(viaPrompt.view).toEqual({ list: TWO, api: TWO });
+    // (B) the /router-reload command alone (no ordinary prompt) also brings both the host list and /api/agent to the new block.
+    expect(obj(viaReload.extra).afterCommand).toEqual(TWO);
+    expect(viaReload.view).toEqual({ list: TWO, api: TWO });
+  }, 900_000);
 });
