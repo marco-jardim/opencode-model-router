@@ -29,6 +29,8 @@ import {
 import type { CheckerInput, GraderDispatch } from "../../src/verify/checker";
 import { buildDelegationDoD, buildForcingNote } from "../../src/verify/dispatch";
 import { accept, gateResult } from "../../src/verify/gate";
+import { applyDispatchCaveats } from "../../src/verify/wiring";
+import { INCOMPLETE_GIVE_UP_REASON, nextAction } from "../../src/escalate/ladder";
 import {
   DISPATCH_HEADER_SEPARATOR,
   buildDispatchHeader,
@@ -280,7 +282,7 @@ describe("progress-note return → incomplete, not fail", () => {
     const grader = vi.fn<GraderDispatch>();
     const v = await runChecker(checkerInput(["the guard has a reader profile"], "I'll finish the tests next."), { dispatchGrader: grader });
     expect(grader).not.toHaveBeenCalled();
-    expect(v).toEqual({ pass: false, outcome: "unverifiable", method: "checker", reasons: [INCOMPLETE_REASON], caveats: [INCOMPLETE_REASON] });
+    expect(v).toEqual({ pass: false, outcome: "unverifiable", method: "checker", reasons: [INCOMPLETE_REASON], caveats: [INCOMPLETE_REASON], incomplete: true });
     expect(isIncompleteVerdict(v)).toBe(true);
     // QA-P15-1-1 before: accepted with a caveat; after: never accepted, still not a failure.
     for (const strict of [false, true]) {
@@ -317,10 +319,27 @@ describe("progress-note return → incomplete, not fail", () => {
       expect(note).not.toContain("NOT ACCEPTED");
       expect(note).not.toContain("heavy");
     }
-    // Any other reason keeps the existing rendering (golden).
-    expect(buildForcingNote(["check failed", INCOMPLETE_REASON])).toBe(
-      `[router \u26a0 NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- check failed\n- ${INCOMPLETE_REASON}\nNEXT: address the above and re-run the delegation; do not treat the prior result as complete.`,
+    // Any other verdict keeps the existing rendering (golden).
+    expect(buildForcingNote(["check failed"])).toBe(
+      `[router \u26a0 NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- check failed\nNEXT: address the above and re-run the delegation; do not treat the prior result as complete.`,
     );
+    // QA-P15-2-4: the structured flag alone renders INCOMPLETE.
+    expect(buildForcingNote(["anything"], { incomplete: true })).toContain("[router \u26a0 INCOMPLETE]");
+  });
+
+  it("QA-P15-2-4: the flag survives a caveat appended by applyDispatchCaveats", () => {
+    const v = incompleteVerdict(
+      { finalReturnText: "I'll finish the tests next.", producerSessionID: "", producerTier: "medium" },
+      { progressNotes: true },
+    )!;
+    const gated = applyDispatchCaveats(gateResult(v, "inferred"), { contaminatedBy: "bash" });
+    expect(gated.verdict.reasons).toHaveLength(2); // before: every(isIncompleteReason) failed here
+    expect(isIncompleteVerdict(gated.verdict)).toBe(true);
+    expect(gated.accepted).toBe(false);
+    expect(buildForcingNote(gated.verdict.reasons)).toContain("[router \u26a0 INCOMPLETE]");
+    expect(buildForcingNote(gated.verdict.reasons, { incomplete: isIncompleteVerdict(gated.verdict) })).toContain("[router \u26a0 INCOMPLETE]");
+    // A reason-only lookalike without the flag is not incomplete for the gate.
+    expect(isIncompleteVerdict({ pass: false, outcome: "unverifiable", method: "checker", reasons: [INCOMPLETE_REASON] })).toBe(false);
   });
 });
 
@@ -346,14 +365,14 @@ describe("QA-P15-1-2: NEED MORE: budget and a guard stop are incomplete (I7)", (
     expect(grader).toHaveBeenCalledTimes(1);
   });
 
-  it("budgetExhausted(child) without a contract marker is a budget stop; DONE:/ESCALATE: are graded", async () => {
-    const exhausted = (sid: string) => sid === "producer";
+  it("a guard stop without a contract marker is a budget stop; DONE:/ESCALATE: are graded", async () => {
+    const stoppedSnap = (sid: string) => ({ tracked: true, stopped: sid === "producer", usedUp: true });
     const grader = vi.fn(passing);
-    const stop = await runChecker(checkerInput(["x"], "Partial summary of the work so far"), { dispatchGrader: grader, budgetExhausted: exhausted });
+    const stop = await runChecker(checkerInput(["x"], "Partial summary of the work so far"), { dispatchGrader: grader, budgetSnapshot: stoppedSnap });
     expect(stop.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
     expect(grader).not.toHaveBeenCalled();
     for (const text of ["DONE: finished on the last call", "ESCALATE: authority"]) {
-      await runChecker(checkerInput(["x"], text), { dispatchGrader: grader, budgetExhausted: exhausted });
+      await runChecker(checkerInput(["x"], text), { dispatchGrader: grader, budgetSnapshot: stoppedSnap });
     }
     expect(grader).toHaveBeenCalledTimes(2);
   });
@@ -367,9 +386,111 @@ describe("QA-P15-1-2: NEED MORE: budget and a guard stop are incomplete (I7)", (
 
   it("incompleteVerdict without progress-note classification ignores wording", () => {
     const input = { finalReturnText: "I'll finish the tests next.", producerSessionID: "p", producerTier: "medium" };
-    expect(incompleteVerdict(input, { progressNotes: false, budgetExhausted: () => false })).toBeNull();
-    expect(incompleteVerdict(input, { progressNotes: true, budgetExhausted: () => false })?.reasons).toEqual([INCOMPLETE_REASON]);
+    const room = () => ({ tracked: true, stopped: false, usedUp: false });
+    expect(incompleteVerdict(input, { progressNotes: false, budgetSnapshot: room })).toBeNull();
+    expect(incompleteVerdict(input, { progressNotes: true, budgetSnapshot: room })?.reasons).toEqual([INCOMPLETE_REASON]);
     expect(incompleteVerdict({ ...input, producerSessionID: "" }, { progressNotes: false })).toBeNull();
+  });
+});
+
+describe("QA round 2 — verification", () => {
+  const passing: GraderDispatch = async () => ({ sessionID: "g", text: '{"pass":true,"reasons":[]}' });
+  const claim = "NEED MORE: budget\nDone: A. Remaining: B.";
+
+  it("2-2: a NEED MORE: budget claim is honoured only when the snapshot backs it", async () => {
+    const cases: Array<[{ tracked: boolean; stopped: boolean; usedUp: boolean; readCapReached?: boolean }, boolean]> = [
+      [{ tracked: false, stopped: false, usedUp: false }, true], // enforcement off: cannot be checked
+      [{ tracked: true, stopped: false, usedUp: true }, true], // budget or refusals used up
+      [{ tracked: true, stopped: false, usedUp: false, readCapReached: true }, true], // read-only cap reached
+      [{ tracked: true, stopped: false, usedUp: false }, false], // room left: graded normally
+      [{ tracked: true, stopped: false, usedUp: false, readCapReached: false }, false],
+    ];
+    for (const [budget, honoured] of cases) {
+      const grader = vi.fn(passing);
+      const v = await runChecker({ ...checkerInput(["x"], claim), budget }, { dispatchGrader: grader });
+      expect(v.reasons[0] === BUDGET_INCOMPLETE_REASON).toBe(honoured);
+      expect(grader).toHaveBeenCalledTimes(honoured ? 0 : 1);
+    }
+  });
+
+  it("2-5: the gate judges the snapshot captured at return, not the live guard", async () => {
+    const dod = { kind: "checker" as const, checks: [], criteria: ["x"], deliverable: null, source: "explicit" as const };
+    const base = { changedFiles: [], declaredOutputs: [], producerSessionID: "p", producerTier: "medium" };
+    const live = vi.fn(() => ({ tracked: true, stopped: true, usedUp: true }));
+    // Captured "stopped": incomplete, though the live guard is never asked.
+    const stopped = await accept(
+      { dod },
+      { ...base, finalReturnText: "Partial summary", budget: { tracked: true, stopped: true, usedUp: true } },
+      { deterministic: {} as never, checker: { dispatchGrader: passing, budgetSnapshot: live } },
+    );
+    expect(stopped).toMatchObject({ accepted: false, verdict: { reasons: [BUDGET_INCOMPLETE_REASON], incomplete: true } });
+    // Captured "room left": graded, although the live guard now says stopped (a later round).
+    const graded = await accept(
+      { dod },
+      { ...base, finalReturnText: "Partial summary", budget: { tracked: true, stopped: false, usedUp: false } },
+      { deterministic: {} as never, checker: { dispatchGrader: passing, budgetSnapshot: live } },
+    );
+    expect(graded).toMatchObject({ accepted: true, verdict: { outcome: "pass" } });
+    expect(live).not.toHaveBeenCalled();
+    // No snapshot: the gate reads the guard when it runs.
+    const fallback = await accept({ dod }, { ...base, finalReturnText: "Partial summary" }, { deterministic: {} as never, checker: { dispatchGrader: passing, budgetSnapshot: live } });
+    expect(fallback.verdict.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
+    expect(live).toHaveBeenCalledWith("p");
+  });
+
+  it("2-6: a contract follower's progress note under a deterministic DoD is incomplete, checks not run", async () => {
+    const dod = { kind: "deterministic" as const, checks: [{ kind: "testsPass" as const, command: "npm test" }], criteria: [], deliverable: null, source: "explicit" as const };
+    const artefact = { changedFiles: [], finalReturnText: "Edited guards.ts. I'll finish the tests next.", declaredOutputs: [], producerSessionID: "", producerTier: "medium" };
+    const res = await accept({ dod }, artefact, { deterministic: {} as never, checker: { dispatchGrader: vi.fn<GraderDispatch>() } });
+    expect(res).toMatchObject({ accepted: false, verdict: { outcome: "unverifiable", reasons: [INCOMPLETE_REASON], incomplete: true } });
+  });
+
+  it.each([
+    "If you'd like, I'll continue with the docs.",
+    "I'll continue once you confirm the scope.",
+    "Let me know when you want me to continue; I'll continue when asked.",
+    "I would continue with the refactor next.",
+    "Unless told otherwise, I'll finish the docs.",
+    "Shall I continue?",
+    "Done with the guard. Should I finish the docs too?",
+  ])("2-7: conditional offer or question is not a progress note: %j", (text) => {
+    expect(isProgressNote(text)).toBe(false);
+  });
+
+  it("2-9: the delegate ladder gives up on an incomplete return with its own reason", () => {
+    const policy = { ladder: ["fast", "medium", "heavy"], maxTotalAttempts: 3, maxRetriesPerTier: 1 } as never;
+    const state = { currentTier: "medium", totalAttempts: 1, escalations: 0, retriesAtTier: 0, cumulativeCost: 1, firstAttemptCost: 1 } as never;
+    const byFlag = nextAction(state, { pass: false, outcome: "unverifiable", reasons: ["x"], incomplete: true }, policy);
+    expect(byFlag).toEqual({ action: "give_up", reason: INCOMPLETE_GIVE_UP_REASON });
+    expect(INCOMPLETE_GIVE_UP_REASON).toContain("resume the same session");
+    const byReason = nextAction(state, { pass: false, outcome: "unverifiable", reasons: [BUDGET_INCOMPLETE_REASON] }, policy);
+    expect(byReason.reason).toBe(INCOMPLETE_GIVE_UP_REASON);
+    const unavailable = nextAction(state, { pass: false, outcome: "unverifiable", reasons: ["grader timed out"] }, policy);
+    expect(unavailable.reason).toBe("verification unavailable; no producer escalation");
+    expect(nextAction(state, { pass: false, outcome: "unverifiable" }, policy).reason).toBe("verification unavailable; no producer escalation");
+  });
+
+  it.each([
+    ["**VERIFY:required**\nDo it.", "Do it."],
+    ["`CAP:8`\nDo it.", "Do it."],
+    ["VERIFY:required.\nDo it.", "Do it."],
+    ["_VERIFY_WAIT: 30s_\nDo it.", "Do it."],
+    ["**CAP: none**\n**Reason:** whole repo\nDo it.", "Do it."],
+    ["**Verify** the output.\nNext.", "**Verify** the output."],
+  ])("2-10: wrapped or punctuated directive %j is skipped", (text, criterion) => {
+    expect(summarizeDispatch(text)).toBe(criterion);
+  });
+
+  it("2-11: a first sentence over the budget yields no graded criterion (unverifiable), not the generic text", async () => {
+    const line = `${"word ".repeat(900)}end. Short tail.`;
+    const [criterion] = inferDoD(line, "", {}).criteria;
+    expect(criterion).toBe(line);
+    expect(criterion).not.toBe("the delegated task is completed as described in the dispatch");
+    const grader = vi.fn<GraderDispatch>();
+    const v = await runChecker(checkerInput([criterion!]), { dispatchGrader: grader });
+    expect(grader).not.toHaveBeenCalled();
+    expect(v).toMatchObject({ pass: false, outcome: "unverifiable" });
+    expect(v.reasons[0]).toContain("1 criterion omitted");
   });
 });
 

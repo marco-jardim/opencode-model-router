@@ -8,7 +8,8 @@
 import type { Verdict } from "./types";
 import { scrubText } from "../guard/scrub";
 import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
-import { budgetExhausted as guardBudgetExhausted } from "../guard/enforce";
+import { captureBudget } from "../guard/enforce";
+import type { BudgetSnapshot } from "../guard/enforce";
 
 // ---------------------------------------------------------------------------
 // Incomplete returns (§2.9 E8, I7)
@@ -29,9 +30,16 @@ export function isIncompleteReason(reason: string): boolean {
   return INCOMPLETE_REASONS.has(reason);
 }
 
-/** An incomplete verdict: unverifiable, every reason a router incomplete reason. Never accepted (gate.ts). */
-export function isIncompleteVerdict(verdict: Pick<Verdict, "outcome" | "reasons">): boolean {
-  return verdict.outcome === "unverifiable" && verdict.reasons.length > 0 && verdict.reasons.every(isIncompleteReason);
+/**
+ * QA-P15-2-4: a verdict carries `incomplete: true` structurally (set only by
+ * incompleteVerdict), so caveats appended later (wiring.ts applyDispatchCaveats)
+ * never turn it back into an ordinary unverifiable result.
+ */
+export type IncompleteFlag = { incomplete?: boolean };
+
+/** An incomplete verdict (the structured flag). Never accepted (gate.ts gateResult). */
+export function isIncompleteVerdict(verdict: object): boolean {
+  return (verdict as IncompleteFlag).incomplete === true;
 }
 
 /** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
@@ -43,8 +51,12 @@ const NEED_MORE_BUDGET_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b
 /** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
 const ANNOUNCE_RE = /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue)\b/i;
 
-/** Deferral to separate work: a finished result, not a progress note. */
-const DEFERRAL_RE = /\b(?:follow[- ]?up|later|separately|another (?:PR|change|task)|next (?:PR|release))\b/i;
+/**
+ * Deferral to separate work, or a conditional offer ("If you'd like, I'll
+ * continue…", "I'll continue once you confirm…", QA-P15-2-7): a finished
+ * result, not a progress note.
+ */
+const DEFERRAL_RE = /\b(?:follow[- ]?up|later|separately|another (?:PR|change|task)|next (?:PR|release)|if|once|when|unless|would|want)\b/i;
 
 const SENTENCE_END = new Set([".", "!", "?", "\u2026"]);
 
@@ -71,6 +83,8 @@ function finalSentence(text: string): string {
 export function isProgressNote(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed.length === 0 || CONTRACT_MARKER_RE.test(trimmed)) return false;
+  // QA-P15-2-7: a final question ("Shall I continue?") asks; it does not announce.
+  if (trimmed.endsWith("?")) return false;
   const last = finalSentence(trimmed);
   return ANNOUNCE_RE.test(last) && !DEFERRAL_RE.test(last);
 }
@@ -78,26 +92,48 @@ export function isProgressNote(text: string): boolean {
 const DEFAULT_LADDER = ["fast", "medium", "heavy"];
 
 function incomplete(reason: string): Verdict {
-  return { pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason] };
+  const verdict: Verdict & IncompleteFlag = {
+    pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason], incomplete: true,
+  };
+  return verdict;
 }
 
 /**
- * The incomplete verdict of a return, or null (§2.9 E8, I7):
- * - budget: a `NEED MORE: budget` line, or the guard stopped the producer
- *   (budgetExhausted) and it returned no contract marker — for every agent;
+ * The guard state a `NEED MORE: budget` claim is checked against (QA-P15-2-2):
+ * honoured when the guard did not track the session (enforcement off: nothing
+ * can be checked), or the budget/refusals were used up, or the read-only cap
+ * was reached. Any other claim is graded normally (P1.4 §2.6 scores it).
+ */
+function claimHonoured(snapshot: BudgetSnapshot): boolean {
+  return !snapshot.tracked || snapshot.usedUp || snapshot.readCapReached === true;
+}
+
+/**
+ * The incomplete verdict of a return, or null (§2.9 E8, I7), judged on the
+ * budget snapshot captured when the task returned (`budget`, QA-P15-2-5; absent
+ * → read now through `budgetSnapshot`, default the live guard):
+ * - budget: the guard STOPPED the producer in that round (enforced) and it
+ *   returned no contract marker, or a `NEED MORE: budget` line the snapshot
+ *   backs (claimHonoured) — for every agent;
  * - progress note (only when `progressNotes`): for an agent that follows the
  *   return contract — `returnContract`, else a router tier of the ladder.
  * Incomplete is never accepted, never escalates and never moves evidence.
  */
 export function incompleteVerdict(
-  input: { finalReturnText: string; producerSessionID: string; producerTier: string; returnContract?: boolean },
-  opts: { progressNotes: boolean; ladder?: readonly string[]; budgetExhausted?: (sessionID: string) => boolean },
+  input: {
+    finalReturnText: string;
+    producerSessionID: string;
+    producerTier: string;
+    returnContract?: boolean;
+    budget?: BudgetSnapshot;
+  },
+  opts: { progressNotes: boolean; ladder?: readonly string[]; budgetSnapshot?: (sessionID: string) => BudgetSnapshot },
 ): Verdict | null {
   const text = input.finalReturnText;
-  const exhausted = opts.budgetExhausted ?? guardBudgetExhausted;
+  const snapshot = input.budget ?? (opts.budgetSnapshot ?? captureBudget)(input.producerSessionID);
   if (
-    NEED_MORE_BUDGET_RE.test(text) ||
-    (input.producerSessionID !== "" && exhausted(input.producerSessionID) && !CONTRACT_MARKER_RE.test(text))
+    (snapshot.stopped && !CONTRACT_MARKER_RE.test(text)) ||
+    (NEED_MORE_BUDGET_RE.test(text) && claimHonoured(snapshot))
   ) {
     return incomplete(BUDGET_INCOMPLETE_REASON);
   }
@@ -143,8 +179,8 @@ export interface CheckerDeps {
   dispatchGrader: GraderDispatch;
   ladder?: string[];             // default ["fast","medium","heavy"]
   minGraderTier?: string | null; // optional floor
-  /** Did the guard stop this producer session? Default: the live guard (enforce.ts budgetExhausted). */
-  budgetExhausted?: (sessionID: string) => boolean;
+  /** The guard's budget state of a producer session when no snapshot was captured. Default: the live guard (captureBudget). */
+  budgetSnapshot?: (sessionID: string) => BudgetSnapshot;
 }
 
 export interface CheckerInput {
@@ -156,6 +192,8 @@ export interface CheckerInput {
   workingDir?: string;
   /** The producer follows the DONE:/NEED MORE:/ESCALATE: return contract (role agents); absent = a router tier of the ladder. */
   returnContract?: boolean;
+  /** The producer's budget state captured when its task returned (QA-P15-2-5). */
+  budget?: BudgetSnapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +366,7 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
   // incomplete — never accepted, never escalated, never outcome evidence.
   const stopped = incompleteVerdict(
     { ...input, finalReturnText: input.artefact.finalReturnText },
-    { progressNotes: true, ladder: deps.ladder, budgetExhausted: deps.budgetExhausted },
+    { progressNotes: true, ladder: deps.ladder, budgetSnapshot: deps.budgetSnapshot },
   );
   if (stopped) return stopped;
 

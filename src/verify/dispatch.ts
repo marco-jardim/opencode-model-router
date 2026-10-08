@@ -602,15 +602,18 @@ export function shouldVerifyTask(
  */
 export function buildForcingNote(
   reasons: string[],
-  escalation?: { producerTier?: string; nextTier?: string | null },
+  escalation?: { producerTier?: string; nextTier?: string | null; incomplete?: boolean },
 ): string {
   const body =
     reasons.length > 0
       ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
       : "- (no reasons provided)";
   // §2.9 E8 / I7: a progress note or a budget stop is incomplete, not a failed result.
-  // Exact match on the router's own reasons (QA-P15-1-6): a grader's "incomplete: …" stays a failure.
-  if (reasons.length > 0 && reasons.every(isIncompleteReason)) {
+  // QA-P15-2-4: the verdict's structured flag (`incomplete`); a caller that cannot
+  // pass it is recognised by the router's own incomplete reason among the reasons,
+  // matched exactly (QA-P15-1-6: a grader's "incomplete: …" stays a failure), so a
+  // caveat appended after it does not change the rendering.
+  if (escalation?.incomplete === true || reasons.some(isIncompleteReason)) {
     return (
       `[router \u26a0 INCOMPLETE] The delegate stopped before a final result:\n` +
       `${body}\n` +

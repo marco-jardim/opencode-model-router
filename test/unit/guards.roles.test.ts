@@ -14,6 +14,7 @@ import {
   DEFAULT_GUARD_BUDGET,
   budgetExhausted,
   buildGuardPolicy,
+  captureBudget,
   guardAfterCall,
   guardBeforeCall,
 } from "../../src/guard/enforce";
@@ -215,12 +216,14 @@ describe("E6 — reader profile: no consecutive-non-producing denial", () => {
     for (let i = 0; i < 40; i++) {
       expect(call(store, cfg, s, "read", read(i), { profile: reader40 }).before.block).toBe(false);
     }
-    expect(budgetExhausted(s)).toBe(true);
+    // QA-P15-2-1: using the whole budget is not a stop; the refusal of call 41 is.
+    expect(budgetExhausted(s)).toBe(false);
     const r = call(store, cfg, s, "read", read(40), { profile: reader40 }).before;
     expect(r.block).toBe(true);
     expect(r.guard).toBe("iteration_cap");
     expect(r.message).toContain("NEED MORE: budget");
     expect(r.message).toContain("progress summary");
+    expect(budgetExhausted(s)).toBe(true);
   });
 
   it("read-only fast tier (#78) with 40 reads → no denial", () => {
@@ -451,8 +454,10 @@ describe("role budget at the limit and budgetExhausted", () => {
       expect(call(store, cfg, s, "write", { filePath: `o${i}.ts` }, { profile: producer5 }).before.block).toBe(false);
     }
     expect(store.get(s)?.toolCallCount).toBe(5);
-    expect(budgetExhausted(s)).toBe(true);
+    // QA-P15-2-1 (before: true here): a child that finishes at exactly its budget was not stopped.
+    expect(budgetExhausted(s)).toBe(false);
     const r = call(store, cfg, s, "write", { filePath: "o5.ts" }, { profile: producer5 }).before;
+    expect(budgetExhausted(s)).toBe(true);
     expect(r.block).toBe(true);
     expect(r.guard).toBe("iteration_cap");
     expect(r.message).toContain("DENIED: tool-call budget 5 exhausted. Stop now and return `NEED MORE: budget` with a progress summary");
@@ -479,14 +484,17 @@ describe("role budget at the limit and budgetExhausted", () => {
     const s = sid("cumulative");
     call(store, cfg, s, "write", { filePath: "a" }, { profile });
     call(store, cfg, s, "write", { filePath: "b" }, { profile });
+    expect(budgetExhausted(s)).toBe(false);
+    expect(call(store, cfg, s, "write", { filePath: "b2" }, { profile }).before.guard).toBe("iteration_cap");
     expect(budgetExhausted(s)).toBe(true);
     store.beginDispatch(s);
-    expect(budgetExhausted(s)).toBe(false);
+    expect(budgetExhausted(s)).toBe(false); // the stop belongs to round 1
     call(store, cfg, s, "write", { filePath: "c" }, { profile });
-    expect(budgetExhausted(s)).toBe(true);
+    expect(budgetExhausted(s)).toBe(false);
     const r = call(store, cfg, s, "write", { filePath: "d" }, { profile }).before;
     expect(r.guard).toBe("cumulative_iteration_cap");
     expect(r.message).toContain("NEED MORE: budget");
+    expect(budgetExhausted(s)).toBe(true);
   });
 
   it("budgetExhausted tracks a bounded set: the least recently guarded session is dropped", () => {
@@ -495,6 +503,7 @@ describe("role budget at the limit and budgetExhausted", () => {
     const profile: GuardProfile = { kind: "producer", budget: 1, cumulative: 3 };
     const first = sid("bounded");
     call(store, cfg, first, "write", { filePath: "a" }, { profile });
+    call(store, cfg, first, "write", { filePath: "b" }, { profile }); // refused: a stop
     expect(budgetExhausted(first)).toBe(true);
     for (let i = 0; i < 1000; i++) {
       guardBeforeCall({ cfg, tier: "medium", sessionID: sid("filler"), tool: "read", toolArgs: read(i), store, env });
@@ -541,17 +550,19 @@ describe("role budget at the limit and budgetExhausted", () => {
 describe("QA-P15-1-4/5: refusal cap = min(budget, REFUSAL_CAP)", () => {
   const selfScript = { command: 'node -e "1"' };
 
-  it("REFUSAL_CAP is 10; a role child with budget 40 is stopped after 10 refusals and reported exhausted", () => {
+  it("REFUSAL_CAP is 10; a role child (budget 40) with 30 calls run is stopped after 10 refusals and reported exhausted", () => {
     expect(REFUSAL_CAP).toBe(10);
     const store = createGuardStore();
     const cfg = cfgOf("enforced");
     const s = sid("refusals");
+    for (let i = 0; i < 30; i++) call(store, cfg, s, "read", read(100 + i), { profile: reader40 });
     for (let i = 0; i < 10; i++) {
       expect(budgetExhausted(s)).toBe(false);
       expect(call(store, cfg, s, "bash", selfScript, { profile: reader40 }).before.guard).toBe("anti_self_script");
     }
-    expect(budgetExhausted(s)).toBe(true);
+    expect(budgetExhausted(s)).toBe(false); // used up is not yet a stop (QA-P15-2-1)
     const stop = call(store, cfg, s, "read", read(0), { profile: reader40 }).before;
+    expect(budgetExhausted(s)).toBe(true);
     expect(stop.guard).toBe("denied_cap");
     expect(stop.message).toContain("DENIED: 10 refused tool calls in this dispatch (limit 10). Stop now and return `NEED MORE: budget` with a progress summary");
     expect(stop.message).toContain("NEXT: return `NEED MORE: budget` with a progress summary");
@@ -561,10 +572,20 @@ describe("QA-P15-1-4/5: refusal cap = min(budget, REFUSAL_CAP)", () => {
     expect(budgetExhausted(s)).toBe(false);
   });
 
+  it("QA-P15-2-3: 10 refusals do not stop a tier child before its base budget would", () => {
+    const store = createGuardStore();
+    const cfg = cfgOf("enforced");
+    const s = sid("refusals-early");
+    for (let i = 0; i < 10; i++) call(store, cfg, s, "bash", selfScript);
+    // Before: denied_cap here (min(25, 10) refusals); after: 0 run + 10 refused < 25.
+    expect(call(store, cfg, s, "write", { filePath: "a.ts" }).before.block).toBe(false);
+  });
+
   it("a tier producer at its refusal cap is told to emit its final answer, not to write", () => {
     const store = createGuardStore();
     const cfg = cfgOf("enforced");
     const s = sid("refusals-tier");
+    for (let i = 0; i < 15; i++) call(store, cfg, s, "write", { filePath: `w${i}.ts` });
     for (let i = 0; i < 10; i++) call(store, cfg, s, "bash", selfScript);
     const stop = call(store, cfg, s, "write", { filePath: "a.ts" }).before;
     expect(stop.message).toContain("DENIED: 10 refused tool calls in this dispatch (limit 10). Stop now and emit your final answer with what you have.");
@@ -580,6 +601,10 @@ describe("QA-P15-1-4/5: refusal cap = min(budget, REFUSAL_CAP)", () => {
     expect(refusalCap(state)).toBe(REFUSAL_CAP);
     expect(guardStopped(state, policy)).toBe(false);
     for (let i = 0; i < 10; i++) recordDenied(state, { tool: "read", args: read(i) }, policy);
+    expect(refusalsSpent(state)).toBe(false); // 0 run + 10 refused < 40 (QA-P15-2-3)
+    state.toolCallCount = 29;
+    expect(refusalsSpent(state)).toBe(false);
+    state.toolCallCount = 30;
     expect(refusalsSpent(state)).toBe(true);
     expect(guardStopped(state, policy)).toBe(true);
   });
@@ -626,5 +651,57 @@ describe("QA-P15-1-11: redundant_read wording", () => {
     const producer = sid("redundant-producer");
     call(store, cfg, producer, "read", read(0));
     expect(call(store, cfg, producer, "read", read(0)).before.message).toContain("Reuse the result you already have; take a producing action or finish.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA round 2 (P1.5)
+// ---------------------------------------------------------------------------
+
+describe("QA-P15-2-1: budgetExhausted means an enforced stop in the current round", () => {
+  it("advisory mode never stops: 30 calls past a budget of 25 → false", () => {
+    const store = createGuardStore();
+    const cfg = cfgOf("advisory");
+    const s = sid("advisory-stop");
+    for (let i = 0; i < 30; i++) call(store, cfg, s, "write", { filePath: `a${i}` });
+    expect(store.get(s)?.toolCallCount).toBe(30);
+    expect(store.get(s)?.stopped).toBeUndefined();
+    expect(budgetExhausted(s)).toBe(false);
+    expect(captureBudget(s)).toEqual({ tracked: true, stopped: false, usedUp: true });
+  });
+
+  it("each stop guard records {round, guard}; other refusals do not", () => {
+    const store = createGuardStore();
+    const cfg = cfgOf("enforced");
+    const s = sid("stop-record");
+    const profile: GuardProfile = { kind: "producer", budget: 3, cumulative: 9 };
+    call(store, cfg, s, "bash", { command: 'node -e "1"' }, { profile });
+    expect(store.get(s)?.stopped).toBeUndefined();
+    for (const f of ["a", "b", "c"]) call(store, cfg, s, "write", { filePath: f }, { profile });
+    expect(store.get(s)?.stopped).toBeUndefined();
+    expect(call(store, cfg, s, "write", { filePath: "d" }, { profile }).before.guard).toBe("iteration_cap");
+    expect(store.get(s)?.stopped).toEqual({ round: 1, guard: "iteration_cap" });
+  });
+});
+
+describe("QA-P15-2-2/2-5: captureBudget", () => {
+  it("snapshots tracked / stopped / usedUp and carries the read-cap flag", () => {
+    expect(captureBudget("")).toEqual({ tracked: false, stopped: false, usedUp: false });
+    expect(captureBudget("never-guarded", true)).toEqual({ tracked: false, stopped: false, usedUp: false, readCapReached: true });
+    const store = createGuardStore();
+    const cfg = cfgOf("enforced");
+    const s = sid("capture");
+    const profile: GuardProfile = { kind: "producer", budget: 2, cumulative: 9 };
+    call(store, cfg, s, "write", { filePath: "a" }, { profile });
+    expect(captureBudget(s, false)).toEqual({ tracked: true, stopped: false, usedUp: false, readCapReached: false });
+    call(store, cfg, s, "write", { filePath: "b" }, { profile });
+    expect(captureBudget(s)).toEqual({ tracked: true, stopped: false, usedUp: true });
+    call(store, cfg, s, "write", { filePath: "c" }, { profile });
+    const snapshot = captureBudget(s);
+    expect(snapshot).toEqual({ tracked: true, stopped: true, usedUp: true });
+    // A snapshot is a value: a later resume does not change what was captured.
+    store.beginDispatch(s);
+    expect(captureBudget(s).stopped).toBe(false);
+    expect(snapshot.stopped).toBe(true);
   });
 });

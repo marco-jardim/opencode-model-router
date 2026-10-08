@@ -66,13 +66,34 @@ const VERIFY_LINE_RE = /^VERIFY:\s*\w+\s*$/;
 const VERIFY_WAIT_LINE_RE = /^VERIFY_WAIT:\s*\S+\s*$/;
 const REASON_LINE_RE = /^reason\s*:/i;
 
+const WRAPPERS = new Set(["*", "_", "`"]);
+const TRAILING_PUNCTUATION = new Set([".", ",", ";", "!"]);
+
+/**
+ * QA-P15-2-10: a directive wrapped in markdown (`**VERIFY:required**`,
+ * `` `CAP:8` ``) or ending in punctuation (`VERIFY:required.`) is still a
+ * directive. Linear scans, no backtracking.
+ */
+function unwrapDirective(line: string): string {
+  let start = 0;
+  let end = line.length;
+  while (start < end && WRAPPERS.has(line[start]!)) start++;
+  while (end > start && (WRAPPERS.has(line[end - 1]!) || TRAILING_PUNCTUATION.has(line[end - 1]!))) end--;
+  return line.slice(start, end).trim();
+}
+
+function isCapLine(line: string): boolean {
+  return CAP_LINE_RE.test(unwrapDirective(line));
+}
+
 function isDirectiveLine(line: string, hasCap: boolean): boolean {
+  const bare = unwrapDirective(line);
   return (
-    ROUTER_LINE_RE.test(line) ||
-    CAP_LINE_RE.test(line) ||
-    VERIFY_LINE_RE.test(line) ||
-    VERIFY_WAIT_LINE_RE.test(line) ||
-    (hasCap && REASON_LINE_RE.test(line))
+    ROUTER_LINE_RE.test(bare) ||
+    CAP_LINE_RE.test(bare) ||
+    VERIFY_LINE_RE.test(bare) ||
+    VERIFY_WAIT_LINE_RE.test(bare) ||
+    (hasCap && REASON_LINE_RE.test(bare))
   );
 }
 
@@ -104,11 +125,17 @@ function leadingSentences(line: string, budget: number): string {
  * the verification budget, else its leading whole sentences that fit.
  */
 export function summarizeDispatch(text: string, budget: number = CRITERIA_BUDGET_CHARS): string {
+  const line = firstTaskLine(text);
+  return line ? leadingSentences(line, budget) : "";
+}
+
+/** The dispatch's first non-empty line that is not a router directive, whitespace-collapsed; "" if none. */
+function firstTaskLine(text: string): string {
   if (!text) return "";
   const lines = text.split("\n").map((line) => line.trim().replace(/\s+/g, " "));
-  const hasCap = lines.some((line) => CAP_LINE_RE.test(line));
+  const hasCap = lines.some(isCapLine);
   for (const line of lines) {
-    if (line && !isDirectiveLine(line, hasCap)) return leadingSentences(line, budget);
+    if (line && !isDirectiveLine(line, hasCap)) return line;
   }
   return "";
 }
@@ -342,12 +369,12 @@ export function inferDoD(dispatchText: string, tier: string, hints: InferHints):
   const criteria: string[] = [];
 
   if (checks.length === 0) {
-    const summary = summarizeDispatch(dispatchText);
-    criteria.push(
-      summary.length > 0
-        ? summary
-        : "the delegated task is completed as described in the dispatch",
-    );
+    const line = firstTaskLine(dispatchText);
+    const summary = line ? leadingSentences(line, CRITERIA_BUDGET_CHARS) : "";
+    // QA-P15-2-11: a first sentence over the budget is kept whole, never replaced
+    // by the generic text; the grader budget (fitCriteria) omits it, so no
+    // criterion is graded and the verdict is unverifiable.
+    criteria.push(summary || line || "the delegated task is completed as described in the dispatch");
   }
 
   const rawPath = hints.declaredPath != null ? hints.declaredPath.trim() : "";

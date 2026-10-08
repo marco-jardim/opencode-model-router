@@ -96,6 +96,7 @@ import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateRes
 // wiring's narrower structural type silently discarded it, and the grader ran
 // against the router's directory while claiming to check the producer's.
 import type { GraderRequest } from "./checker";
+import { isIncompleteVerdict } from "./checker";
 export type { GraderRequest };
 
 /**
@@ -668,7 +669,7 @@ export function formatVerifyReport(
     if (judged.accepted) {
       lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.outcome, judged.verdict.caveats, verdict.notes).trim()));
     } else {
-      lines.push(indent(scrubText(buildForcingNote(verdict.reasons, { producerTier: item.producerTier, nextTier: result.nextTier ?? null }))));
+      lines.push(indent(scrubText(buildForcingNote(verdict.reasons, { producerTier: item.producerTier, nextTier: result.nextTier ?? null, incomplete: isIncompleteVerdict(verdict) }))));
       lines.push(indent(ROUTER_VERIFY_NO_RETRY_TEXT));
     }
     blocks.push(lines.join("\n"));

@@ -68,6 +68,12 @@ export interface GuardState {
   denied?: { round: number; count: number };
   /** Dispatch round whose policy last set `budget` (QA-P15-1-9: a resume takes its own budget). Set lazily. */
   budgetRound?: number;
+  /**
+   * QA-P15-2-1: an ENFORCED stop — a call refused by iteration_cap,
+   * cumulative_iteration_cap or denied_cap in dispatch round `round`. Advisory
+   * mode never sets it. Set lazily.
+   */
+  stopped?: { round: number; guard: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,12 +357,18 @@ export function refusalCap(state: GuardState): number {
   return Math.min(state.budget, REFUSAL_CAP);
 }
 
-/** True when this dispatch round reached its refusal cap (CLAUSE 3c). */
+/**
+ * True when this dispatch round reached its refusal cap (CLAUSE 3c): at least
+ * refusalCap refusals AND executed + refused calls reach the per-dispatch budget
+ * (QA-P15-2-3: refusals never stop a child before its base budget would).
+ * Steps stay bounded by budget + REFUSAL_CAP.
+ */
 export function refusalsSpent(state: GuardState): boolean {
-  return deniedThisDispatch(state) >= refusalCap(state);
+  const denied = deniedThisDispatch(state);
+  return denied >= refusalCap(state) && state.toolCallCount + denied >= state.budget;
 }
 
-/** The guard stops the child: its budget is spent or its refusals are (budgetExhausted reports this). */
+/** Budget or refusals used up (validates a `NEED MORE: budget` claim; not itself a stop). */
 export function guardStopped(
   state: GuardState,
   policy: Pick<GuardPolicy, "cumulativeBudget">,

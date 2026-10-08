@@ -128,16 +128,48 @@ function trackBudget(sessionID: string, state: GuardState, policy: GuardPolicy):
   }
 }
 
+/** Guards whose ENFORCED refusal is a stop: the child must return now (QA-P15-2-1). */
+const STOP_GUARDS: ReadonlySet<string> = new Set(["iteration_cap", "cumulative_iteration_cap", "denied_cap"]);
+
 /**
- * True when the guard has stopped the session: its whole per-dispatch or
- * cumulative tool-call budget is used, or its refusal cap (CLAUSE 3c,
- * QA-P15-1-4) is reached. P-5: the parent's result carries no such signal; the
- * after-hook annotates it from this. False for a session never guarded
- * (enforcement off) or no longer tracked; a resume restores the per-dispatch room.
+ * True when the guard really STOPPED the session in its current dispatch round:
+ * an enforced refusal by iteration_cap, cumulative_iteration_cap or denied_cap
+ * (QA-P15-2-1). Never in advisory mode (nothing is refused), never for a child
+ * that merely finished at exactly its budget, false after a resume and for a
+ * session never guarded or no longer tracked. P-5: the after-hook annotates the
+ * parent's result from this.
  */
 export function budgetExhausted(sessionID: string): boolean {
   const tracked = trackedBudgets.get(sessionID);
-  return tracked !== undefined && guardStopped(tracked.state, tracked);
+  return tracked !== undefined && tracked.state.stopped?.round === tracked.state.dispatches;
+}
+
+/** What the guard knew about a producer session when its task returned (QA-P15-2-2, 2-5). */
+export interface BudgetSnapshot {
+  /** The guard tracked the session (false: enforcement off, never guarded, or evicted). */
+  tracked: boolean;
+  /** budgetExhausted: an enforced stop in the returning round. */
+  stopped: boolean;
+  /** Budget or refusals used up — validates a `NEED MORE: budget` claim. */
+  usedUp: boolean;
+  /** The session store's read-only counter reached its cap (calls >= cap). */
+  readCapReached?: boolean;
+}
+
+/**
+ * Capture a producer session's budget state at the moment its task returns
+ * (QA-P15-2-5): the gate judges that snapshot, not the live state at
+ * verification time. `readCapReached` comes from the session store
+ * (sessions.ts readCapReached), which the guard cannot see.
+ */
+export function captureBudget(sessionID: string, readCapReached?: boolean): BudgetSnapshot {
+  const tracked = sessionID === "" ? undefined : trackedBudgets.get(sessionID);
+  return {
+    tracked: tracked !== undefined,
+    stopped: tracked !== undefined && tracked.state.stopped?.round === tracked.state.dispatches,
+    usedUp: tracked !== undefined && guardStopped(tracked.state, tracked),
+    ...(readCapReached !== undefined ? { readCapReached } : {}),
+  };
 }
 
 export interface BeforeResult {
@@ -199,6 +231,9 @@ export function guardBeforeCall(params: {
     // of refusals instead.
     recordDenied(state, call, policy);
     recordBlock(state, decision);
+    if (decision.guard !== null && STOP_GUARDS.has(decision.guard)) {
+      state.stopped = { round: state.dispatches, guard: decision.guard };
+    }
     const message = scrubText(`${decision.observation}\n${forcingMessage(state, policy)}`);
     return { block: true, mode, message, guard: decision.guard };
   }
