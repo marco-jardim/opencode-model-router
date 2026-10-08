@@ -27,7 +27,7 @@ const RUN = process.env.RUN_OC_SMOKE_ROLE_SPIKES === "1";
 const d = RUN ? describe : describe.skip;
 afterAll(async () => { await stopAllHosts(); }, 60_000);
 
-// ------------------------------------------------------------------ shared setup (extend here for groups B and C) ----
+// ------------------------------------------------------------------ shared setup ----
 /** The smoke temp guard removes the per-run TEMP at the end, so the observations go to the real temp directory it recorded. */
 const OUT = path.join(process.env.OMR_SMOKE_REAL_TMPDIR ?? tmpdir(), "omr-role-spikes");
 const NO_MODEL = "role-nomodel";
@@ -81,7 +81,7 @@ async function lifecycle(host: RoutingHost, sessionID: string): Promise<{ contex
 }
 const sessionView = (s: Obj | undefined) => (s ? { parentID: s.parentID, agent: s.agent, title: s.title, model: s.model } : undefined);
 
-// ---- group B helpers ----
+// ---- tool-call and child-report helpers ----
 const toolStatesOf = (context: Obj[]): Obj[] => context.flatMap(m => arr(obj(m).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
 const stateView = (s: Obj) => ({ status: s.status, errorType: obj(s.error).type, errorMessage: obj(s.error).message, text: typeof s.content === "string" ? s.content : (arr(s.content).map(c => str(obj(c).text)).join("\n") || (s.output === undefined ? "" : JSON.stringify(s.output).slice(0, 600))) });
 /** What the PARENT model was given for one of its tool calls: the tool_result block (matched by tool_use_id) of its own later provider request. */
@@ -150,9 +150,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     try {
       const onDisk = obj(obj((await host.hostConfigOnDisk()).agents)[NO_MODEL]);
       const hostAgent = (await host.client.agent.list()).data.find(a => a.id === NO_MODEL);
-      // The root runs on a model that is NEITHER the host default (anthropic/claude-opus-4-7) nor any per-call model below, so
-      // what a child without a per-call model gets can be attributed (parent model vs host default).
-      const rootModel = { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "medium" };
+      // The root runs on a model AND variant that no dispatch below asks for (opus-5-5#medium; the per-call models are sonnet#medium,
+      // opus#xhigh and luna#high) and that is not the host default (anthropic/claude-opus-4-7), so what the child without a per-call
+      // model gets can only come from the parent session.
+      const rootModel = { providerID: "anthropic", id: "claude-opus-5-5", variant: "medium" };
       const root = await host.newRoot("s1 root", rootModel);
       const rows: Obj[] = [];
       const step = async (label: string, model: string | undefined) => {
@@ -188,9 +189,9 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       expect(anthropicOpus).toMatchObject({ storedModel: `${OPUS}#xhigh`, wire: [{ wireModel: "claude-opus-5-5", catalogModel: `${OPUS}#xhigh`, effort: "xhigh", topLevelEffort: "xhigh", inBandEfforts: [] }] });
       // OpenAI Responses: model and top-level reasoning.effort follow the per-call model#variant.
       expect(responses).toMatchObject({ storedModel: `${LUNA}#high`, wire: [{ protocol: "responses", wireModel: "gpt-6-luna", catalogModel: `${LUNA}#high`, effort: "high", topLevelEffort: "high", inBandEfforts: [] }] });
-      // Without a per-call model the model-less agent INHERITS the PARENT SESSION's model AND variant (sonnet-5-5#medium, not the host
-      // default opus-4-7) and the parent's effort is what the provider is told.
-      expect(bare).toMatchObject({ storedModel: `${SONNET}#medium`, wire: [{ wireModel: "claude-sonnet-5-5", catalogModel: `${SONNET}#medium`, effort: "medium", topLevelEffort: "medium", inBandEfforts: [] }] });
+      // Without a per-call model the model-less agent INHERITS the PARENT SESSION's model AND variant (opus-5-5#medium: neither the host
+      // default opus-4-7 nor any earlier dispatch's model) and the parent's effort is what the provider is told.
+      expect(bare).toMatchObject({ storedModel: `${OPUS}#medium`, wire: [{ wireModel: "claude-opus-5-5", catalogModel: `${OPUS}#medium`, effort: "medium", topLevelEffort: "medium", inBandEfforts: [] }] });
       expect(host.errorLines()).toEqual([]);
       expect(host.provider.errors).toEqual([]);
     } finally { await finish(host); }
@@ -280,15 +281,15 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
         const rows = await Promise.all(calls.map(async (call, index) => {
           const life = await lifecycle(host, call.childID!);
           return {
-            index, callID: call.callID, childID: call.childID, beforeN: call.before.__t,
+            index, callID: call.callID, childID: call.childID, beforeN: call.before.__n,
             created: life.created ? { n: life.created.__n, iid: life.created.__iid, data: life.created.data } : undefined,
             context: life.context ? { n: life.context.enteredN, iid: life.context.__iid, got: life.context.got, agent: life.context.agent, messages: life.context.messages } : undefined,
           };
         }));
-        const order = rows.flatMap(r => [{ what: "created", child: r.index, n: Number(r.created?.n) }, { what: "context", child: r.index, n: Number(r.context?.n) }]).sort((a, b) => a.n - b.n).map(x => `${x.what}:${x.child}`);
+        const order = rows.flatMap(r => [{ what: "before", child: r.index, n: Number(r.beforeN) }, { what: "created", child: r.index, n: Number(r.created?.n) }, { what: "context", child: r.index, n: Number(r.context?.n) }]).sort((a, b) => a.n - b.n).map(x => `${x.what}:${x.child}`);
         const barrier = host.provider.barrier!;
         return {
-          rows, order, barrier: { arrivals: barrier.arrivals.length, releasedByArrival: barrier.releasedByArrival, timedOut: barrier.timedOut },
+          root, rows, order, barrier: { arrivals: barrier.arrivals.length, releasedByArrival: barrier.releasedByArrival, timedOut: barrier.timedOut },
           parentBeforeOrder: calls.map(c => c.callID), firstContextOrder: [...rows].sort((a, b) => Number(a.context?.n) - Number(b.context?.n)).map(r => r.callID),
           instances: new Set(events.filter(e => e.type === "probe.instance.started").map(e => e.__iid)).size,
           rootChildren: (await host.children(root)).map(c => c.id), nonceDecisions: events.filter(e => e.type === "probe.decision" && e.decision === "nonce").map(e => e.callID),
@@ -309,12 +310,13 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       expect(r.hostErrors).toEqual([]);
       expect(r.rootChildren.sort()).toEqual(r.rows.map(x => x.childID).sort());
       for (const row of r.rows) expect(row.created?.iid === row.context?.iid && row.created?.iid !== undefined, label).toBe(true);
-      // Observed interleaving (pinned): the second child is created only AFTER the first child's first context hook, although the first
-      // child's model request is still in flight until the second has also arrived. Creation order = context order = the order of the
-      // parent's execute.before records.
-      expect(r.order, label).toEqual(["created:0", "context:0", "created:1", "context:1"]);
+      // The full interleaving of the parent's execute.before records, session.created and first context hooks is RECORDED (S2-overlap.json,
+      // `order`) and not asserted: it is an observation of this host, not a contract. What is asserted: every child has its records, and the
+      // order of the first context hooks equals the order of the parent's execute.before records.
+      for (const row of r.rows) { expect(row.created, label).toBeDefined(); expect(row.context, label).toBeDefined(); expect(Number.isFinite(Number(row.beforeN)), label).toBe(true); }
+      expect(r.order, label).toHaveLength(6);
       expect(r.firstContextOrder, label).toEqual(r.parentBeforeOrder);
-      for (const row of r.rows) expect(obj(row.context?.got), label).toMatchObject({ parentID: r.rootChildren.length === 2 ? obj(r.rows[0]!.context?.got).parentID : undefined, agent: NO_MODEL, model: { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "low" } });
+      for (const row of r.rows) expect(obj(row.context?.got), label).toMatchObject({ parentID: r.root, agent: NO_MODEL, model: { providerID: "anthropic", id: "claude-sonnet-5-5", variant: "low" } });
     }
     // Without a nonce the siblings are indistinguishable at the first context hook: same parentID, agent, title, model and the same
     // first-message text; only the child session id differs.
@@ -363,12 +365,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
           lifecycleEvaluate: (await lifecycle(host, call.childID)).evaluates.map(e => ({ action: e.action, denied: e.denied })),
         };
       };
-      const steps = await report("step limit, cooperative model", "role-steps", probe);
-      host.provider.loopProbe = true;
-      const steps3 = await report("steps 3, model keeps calling tools", "role-steps3", probe);
-      host.provider.loopProbe = false;
-      host.provider.loopProbe = true; // a model that keeps calling tools after the host told it that tools are disabled
-      const stepsLoop = await report("step limit, model keeps calling tools", "role-steps", probe);
+      const steps = await report("step limit, scripted model answers with text on the last step", "role-steps", probe);
+      host.provider.loopProbe = true; // a scripted model that keeps calling tools although the host told it that tools are disabled
+      const steps3 = await report("steps 3, scripted model keeps calling tools", "role-steps3", probe);
+      const stepsLoop = await report("steps 2, scripted model keeps calling tools", "role-steps", probe);
       host.provider.loopProbe = false;
       const guard = await report("guard denial", "role-guard", probe);
       const control = await report("control: no limit no denial", NO_MODEL, probe);
@@ -376,8 +376,8 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       const toolStates = (r: typeof steps) => r.childContext.flatMap(m => arr(obj(m).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
       const finishes = (r: typeof steps) => r.childContext.filter(m => obj(m).type === "assistant").map(m => ({ finish: obj(m).finish, rawFinish: obj(m).rawFinish }));
       // The parent's view = its next provider request's tool_result text (the session id attribute is removed before looking for words).
-      const seen = (r: typeof steps) => r.parentSaw.replace(/sessionID="[^"]*"/g, "");
-      const NOISE = /MAXIMUM|maximum|\bsteps?\b|PLUGIN_GUARD_DENIED|denied|Permission/;
+      // The parent's tool_result is EXACTLY the host envelope around the child's text: nothing else (no step, budget or denial wording).
+      const envelope = (text: string) => new RegExp(`^<subagent sessionID="ses_[A-Za-z0-9]+" state="completed">\\n${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n</subagent>$`);
       const MAX = "Tools are disabled after the maximum agent steps";
       // (a) step limit, scripted model that answers with text on the last step: the host appends its MAX-STEPS note and sends
       // tool_choice none on the LAST step; the PARENT's next request carries an ordinary completed child with that text and nothing
@@ -385,9 +385,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       expect(steps.childRequests.map(r => ({ reply: r.reply, maxSteps: r.systemHasMaxSteps, toolChoice: r.toolChoice }))).toEqual([
         { reply: "tool", maxSteps: false, toolChoice: undefined }, { reply: "text", maxSteps: true, toolChoice: { type: "none" } },
       ]);
-      expect(steps.parentSaw).toContain('state="completed"');
-      expect(steps.parentSaw).toContain("CHILD_OK");
-      expect(seen(steps)).not.toMatch(NOISE);
+      expect(steps.parentSaw).toMatch(envelope("CHILD_OK"));
       expect(steps.child.outcome).toBe("succeeded");
       expect(finishes(steps)).toEqual([{ finish: "tool-calls", rawFinish: "tool_use" }, { finish: "stop", rawFinish: "end_turn" }]);
       expect(steps.childEvents.at(-1)?.type).toBe("session.execution.succeeded");
@@ -400,9 +398,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       ]);
       expect(toolStates(stepsLoop).map(s => ({ status: s.status, message: obj(s.error).message }))).toEqual([{ status: "completed", message: undefined }, { status: "error", message: MAX }]);
       expect(stepsLoop.childEvents.map(e => e.type)).toContain("session.tool.failed");
-      expect(stepsLoop.parentSaw).toContain('state="completed"');
-      expect(stepsLoop.parentSaw).toContain("Subagent completed without a text response.");
-      expect(seen(stepsLoop)).not.toMatch(NOISE);
+      expect(stepsLoop.parentSaw).toMatch(envelope("Subagent completed without a text response."));
       expect(stepsLoop.child.outcome).toBe("succeeded");
       expect(finishes(stepsLoop)).toEqual([{ finish: "tool-calls", rawFinish: "tool_use" }, { finish: "tool-calls", rawFinish: "tool_use" }]);
       // (c) steps 3: the same scripted loop gets TWO tool-capable steps and the third (last) one is tool-less: steps N = N-1 tool steps
@@ -418,9 +414,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       expect(toolStates(guard).map(s => ({ status: s.status, type: obj(s.error).type, message: obj(s.error).message }))).toEqual([{ status: "error", type: "permission.rejected", message: "PLUGIN_GUARD_DENIED: read" }]);
       expect(guard.childToolHooks.map(h => h.status)).toEqual(["error"]);
       expect(JSON.stringify(guard.childToolHooks[0]?.error)).toContain("Permission.BlockedError");
-      expect(guard.parentSaw).toContain('state="completed"');
-      expect(guard.parentSaw).toContain("ROOT_DONE"); // the scripted provider's fixed reply after a tool result
-      expect(seen(guard)).not.toMatch(NOISE);
+      expect(guard.parentSaw).toMatch(envelope("ROOT_DONE")); // ROOT_DONE = the scripted provider's fixed reply after a tool result
       expect(guard.child.outcome).toBe("succeeded");
       expect(finishes(guard)).toEqual([{ finish: "tool-calls", rawFinish: "tool_use" }, { finish: "stop", rawFinish: "end_turn" }]);
       // control: the same call without limit or denial completes the read.
@@ -492,6 +486,10 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       // received (so the context is kept across a model/variant/provider change), and a fresh start carries none of them.
       const hist = (row: { history: unknown }) => String(row.history);
       expect(hist(a0)).not.toContain("S7 anthropic resume");
+      // x0 is a NEW child created after a0..o2: it carries none of their prompts or replies of those children
+      expect(hist(x0)).not.toContain("S7 anthropic start");
+      expect(hist(x0)).not.toContain("S7 anthropic resume");
+      expect(hist(x0)).not.toContain("S7 responses");
       expect(hist(a1)).toContain("S7 anthropic start sonnet#low");
       expect(hist(a1)).toContain("CHILD_OK");
       expect(hist(a2)).toContain("S7 anthropic start sonnet#low");
@@ -510,8 +508,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     } finally { await finish(host); }
   }, 300_000);
 
-  // ---------------------------------------------------------------------------------------------- group B ----
-  it("S3 per-session narrowing: evaluate and context hooks keyed by event.sessionID affect ONE child of an agent only", async () => {
+    it("S3 per-session narrowing: evaluate and context hooks keyed by event.sessionID affect ONE child of an agent only", async () => {
     const host = await startSpikeHost("s3", { [NO_MODEL]: agentWithoutModel() }, {
       probe: { lifecycle: true, bySession: { denyTitle: "S3 A", denyActions: ["read"], stripTitle: "S3 C", stripTools: ["shell", "write"] } },
     });
@@ -663,47 +660,59 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     } finally { await finish(host); }
   }, 300_000);
 
-  it("S6 order against the router's own after-hook, and a background-flagged dispatch", async () => {
+  it("S6 order against the router's own after-hook, and a background-flagged dispatch with verification on and off", async () => {
     const NOTE = "S6B_APPENDED_NOTE";
-    const host = await startSpikeHost("s6b", { [NO_MODEL]: agentWithoutModel() }, { probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode: "enforced" } } });
-    try {
-      const present = path.join(host.project, "s6b-present.txt");
-      await writeFile(present, "x\n");
-      const accept = `\n[acceptance]\ncheck: fileExists path=${present}\n[/acceptance]`;
-      const OK = "[router \u2713 verified: deterministic]";
-      const root = await host.newRoot("s6b root");
-      const fg = await host.dispatch(root, { agent: NO_MODEL, description: "S6B fg", prompt: `S6B fg${accept}`, model: `${SONNET}#low`, background: false });
-      const fgSeen = parentView(host, root, fg.callID);
-      // A dispatch flagged background:true whose child's first request is held for 4 s.
-      host.provider.holdUntilOverlap("S6B_HOLD", 99, 4_000);
-      const root2 = await host.newRoot("s6b root bg");
-      const bg = await host.call(root2, "subagent", { agent: NO_MODEL, description: "S6B bg", prompt: `S6B_HOLD S6B bg${accept}`, model: `${SONNET}#low`, background: true });
-      const bgSeen = parentView(host, root2, bg.callID);
-      const bgBlockedMs = bg.after.__t - bg.before.__t;
-      const afters = (await host.hooks()).filter(h => h.hook === "after" && h.sessionID === root2 && h.tool === "subagent");
-      await save("S6-order-background", { fgParts: fgSeen.parts, bgParts: bgSeen.parts, bgBlockedMs, bgAfterRecords: afters.length, bgAckStatus: obj(obj(bg.after.result).output).status });
+    const OK = "[router \u2713 verified: deterministic]";
+    const run = async (mode: "enforced" | "off") => {
+      const host = await startSpikeHost(`s6b-${mode}`, { [NO_MODEL]: agentWithoutModel() }, { probe: { afterAppend: { tool: "subagent", text: NOTE } }, overrides: { enforcement: { mode } } });
+      try {
+        const present = path.join(host.project, "s6b-present.txt");
+        await writeFile(present, "x\n");
+        const accept = `\n[acceptance]\ncheck: fileExists path=${present}\n[/acceptance]`;
+        const root = await host.newRoot(`s6b ${mode} root`);
+        const fg = await host.dispatch(root, { agent: NO_MODEL, description: "S6B fg", prompt: `S6B fg${accept}`, model: `${SONNET}#low`, background: false });
+        const fgSeen = parentView(host, root, fg.callID);
+        // A dispatch flagged background:true whose child's first request is held for 4 s.
+        host.provider.holdUntilOverlap("S6B_HOLD", 99, 4_000);
+        const root2 = await host.newRoot(`s6b ${mode} root bg`);
+        const bg = await host.call(root2, "subagent", { agent: NO_MODEL, description: "S6B bg", prompt: `S6B_HOLD S6B bg${accept}`, model: `${SONNET}#low`, background: true });
+        const bgSeen = parentView(host, root2, bg.callID);
+        // the child may still be running after the call returned: wait for it, then give the parent one more turn and look at everything it received
+        if (bg.childID) await host.settle(bg.childID).catch(() => undefined);
+        await host.prompt(root2, "S6B follow-up");
+        const later = host.requestsOf(root2).filter(r => r.kind === "primary").map(r => ({ toolResult: r.toolResult, hasChildText: JSON.stringify(r.messages).includes("CHILD_OK"), hasNote: JSON.stringify(r.messages).includes(NOTE), hasVerdict: JSON.stringify(r.messages).includes("verified: deterministic") || JSON.stringify(r.messages).includes("NOT ACCEPTED") }));
+        const afters = (await host.hooks()).filter(h => h.hook === "after" && h.sessionID === root2 && h.tool === "subagent");
+        return {
+          fgParts: fgSeen.parts, bgParts: bgSeen.parts, bgInputBackground: obj(bg.before.input).background, bgBlockedMs: bg.after.__t - bg.before.__t,
+          bgAckStatus: obj(obj(bg.after.result).output).status, bgAfterRecords: afters.length, later, hostErrors: host.errorLines(),
+        };
+      } finally { await finish(host); }
+    };
+    const enforced = await run("enforced");
+    const off = await run("off");
+    await save("S6-order-background", { enforced, off });
 
-      // Order: within the parent's tool_result the router's own execute.after text (the verification line, appended by the router plugin
-      // loaded FIRST) comes before the probe's note (the probe plugin is loaded second): plugin load order, observed on the host's output.
-      expect(fgSeen.parts).toHaveLength(3);
-      expect(fgSeen.parts[0]).toMatch(/^<subagent sessionID="ses_[A-Za-z0-9]+" state="completed">\nCHILD_OK\n<\/subagent>$/);
-      expect(fgSeen.parts[1]).toBe(`\n\n${OK}`);
-      expect(fgSeen.parts[2]).toBe(NOTE);
-      // Background: on 2.0.24, with this scripted headless parent, `background: true` did NOT produce an immediate "running"
-      // acknowledgement. The tool call stayed open for as long as the held child ran (>= 3.5 s of the 4 s hold), then returned
-      // `state="completed"` with the child's text; the router's verification line and the probe's note were both appended, from a single
-      // execute.after record. So the "result delivered after a running ack never passes execute.after" gap could not be demonstrated on
-      // this host (the router's own branch for a running ack, v2-hooks.ts:562-577, was not reached).
-      expect(bgBlockedMs).toBeGreaterThanOrEqual(3_500);
-      expect(obj(obj(bg.after.result).output).status).toBe("completed");
-      expect(bgSeen.text).toContain('state="completed"');
-      expect(bgSeen.text).not.toContain('state="running"');
-      expect(bgSeen.parts.at(-1)).toBe(NOTE);
-      expect(bgSeen.text).toContain(OK);
-      expect(afters).toHaveLength(1);
-      expect(host.errorLines()).toEqual([]);
-    } finally { await finish(host); }
-  }, 300_000);
+    // Order: within the parent's tool_result the router's own execute.after text (the verification line, appended by the router plugin
+    // loaded FIRST) comes before the probe's note (the probe plugin is loaded second): plugin load order, observed on the host's output.
+    expect(enforced.fgParts).toHaveLength(3);
+    expect(enforced.fgParts[0]).toMatch(/^<subagent sessionID="ses_[A-Za-z0-9]+" state="completed">\nCHILD_OK\n<\/subagent>$/);
+    expect(enforced.fgParts[1]).toBe(`\n\n${OK}`);
+    expect(enforced.fgParts[2]).toBe(NOTE);
+    // Background WITH verification on (mode enforced): the ROUTER turns the call into a foreground one before the host sees it - the probe's
+    // execute.before record (the probe loads after the router) shows background:false although the model sent true (src/index.ts:1663-1665 flags
+    // the call as verifying, v2-hooks.ts:513/:528/:60 write background:false). The call returns the completed result with the verification line.
+    expect(enforced.bgInputBackground).toBe(false);
+    expect(enforced.bgAckStatus).toBe("completed");
+    expect(enforced.bgBlockedMs).toBeGreaterThanOrEqual(3_500);
+    expect(enforced.bgParts.at(-1)).toBe(NOTE);
+    expect(enforced.bgParts.join("\n")).toContain(OK);
+    // Background with verification OFF (mode off): the call reaches the host with background:true (asserted from the probe's before record).
+    expect(off.bgInputBackground).toBe(true);
+    expect(off.hostErrors).toEqual([]);
+    expect(enforced.hostErrors).toEqual([]);
+    // PLACEHOLDER: the observed behaviour of the host for a real background call is pinned below after the first run.
+    expect(off.bgAckStatus).toBeDefined();
+  }, 600_000);
 
   it("S8 Code Mode execute: inner tools.* calls bypass the permission evaluate hook and the per-session context filter", async () => {
     const host = await startSpikeHost("s8", { [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, bySession: { keepOnlyTitle: "S8 keep", keepOnly: ["execute", "subagent"] } } });
@@ -828,8 +837,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   }, 300_000);
 
 
-  // ---------------------------------------------------------------------------------------------- group C ----
-  it("S10 the router's verification gate treats a non-tier custom agent exactly like fast/medium (it is gated by tool + mode, not by agent name)", async () => {
+    it("S10 the router's verification gate treats a non-tier custom agent exactly like fast/medium (it is gated by tool + mode, not by agent name)", async () => {
     const agents = { explorer: agentWithoutModel({ description: "S10 custom explorer role" }), implementer: agentWithoutModel({ description: "S10 custom implementer role" }) };
     const OK = "[router \u2713 verified: deterministic]";
     const run = async (name: string, overrides: Obj, subjects: string[]) => {

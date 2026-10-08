@@ -61,7 +61,7 @@ export interface HostClient {
   command: { list(): Promise<{ data: { name: string }[] }> };
   debug: { location: { list(): Promise<{ directory: string }[]> } };
 }
-export interface HookRecord { __t: number; hook: "before" | "after"; iid: string; instance?: string; sessionID: string; callID: string; agent?: string; tool: string; input?: Obj; status?: string; result?: Obj; error?: Obj }
+export interface HookRecord { __t: number; __n?: number; hook: "before" | "after"; iid: string; instance?: string; sessionID: string; callID: string; agent?: string; tool: string; input?: Obj; status?: string; result?: Obj; error?: Obj }
 export interface EventRecord { __t?: number; id?: string; type: string; created?: number; location?: unknown; data?: Obj; __instance?: string; __iid?: string; [key: string]: unknown }
 export interface SessionTimeline { id: string; parentID?: string; firstSeen: number; snapshots: { at: number; agent?: string; model?: string; input: number; output: number; cost: number }[] }
 export interface Dispatched { before: HookRecord; after: HookRecord; childID: string | undefined; callID: string }
@@ -210,6 +210,7 @@ export class RoutingProvider {
       // `SPIKE_CALLS=[{…},{…}]`: ONE reply carrying several `subagent` tool calls (Anthropic Messages only), so one parent turn spawns siblings.
       const multiSource = toolResult || grader ? undefined : /SPIKE_CALLS=(\[[^\n]*\])/.exec(lastText)?.[1];
       const multi = multiSource ? (JSON.parse(multiSource) as Obj[]) : undefined;
+      if (multi && responses) throw new Error("SPIKE_CALLS is supported on the Anthropic Messages protocol only");
       // `loopProbe` (off by default): once any tool result is in the history (even if the last message is no longer one, e.g. the host's max-steps note), keep emitting the READ_ONLY_PROBE call found in the earlier user text, so a
       // child never finishes by itself and only the host's step limit can stop it.
       const hadToolResult = toolResult || messages.some(m => m.type === "function_call_output" || this.blocks(m.content).some(b => b.type === "tool_result"));
@@ -254,15 +255,17 @@ export class RoutingProvider {
     const barrier = this.barrier!;
     const release = barrier.waiting;
     await new Promise<void>(resolve => {
-      release.push(resolve);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = () => { if (timer !== undefined) clearTimeout(timer); resolve(); };
+      release.push(done);
       barrier.arrivals.push(seq);
       if (release.length >= barrier.n) {
         barrier.releasedByArrival = true;
         for (const fn of release.splice(0)) fn();
         return;
       }
-      setTimeout(() => {
-        const at = release.indexOf(resolve);
+      timer = setTimeout(() => {
+        const at = release.indexOf(done);
         if (at >= 0) { release.splice(at, 1); barrier.timedOut = true; resolve(); }
       }, barrier.timeoutMs);
     });
@@ -767,6 +770,7 @@ export class RoutingHost {
     const seen = new Set((await this.hooks()).filter(h => h.hook === "after" && h.sessionID === rootID && h.tool === "subagent").map(h => h.callID));
     await this.client.session.prompt({ sessionID: rootID, text: `SPIKE_CALLS=${JSON.stringify(inputs)}` });
     const afters = await waitFor(`${inputs.length} subagent execute.after of ${rootID}`, async () => {
+      if (this.provider.errors.length > 0) throw new Error(`scripted provider error while waiting: ${this.provider.errors.at(-1)}`);
       const found = (await this.hooks()).filter(h => h.hook === "after" && h.sessionID === rootID && h.tool === "subagent" && !seen.has(h.callID));
       return found.length >= inputs.length ? found : undefined;
     }, timeoutMs);
