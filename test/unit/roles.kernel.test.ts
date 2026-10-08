@@ -44,7 +44,14 @@ import type { RouteLine } from "../../src/routing/classify/types";
 /** `tierBounds` on a classify shape built from plain facts (and an optional route line), with an effective detection. */
 function tierBounds(spec: RoleSpec, grant: DispatchGrant, f: TaskFacts, d: Detection, o: TierBoundsOptions & { routeLine?: Partial<RouteLine> | null }) {
   const routeLine = o.routeLine ? ({ pin: false, ignored: [], ...o.routeLine } as RouteLine) : null;
-  return tierBoundsOf(spec, grant, classifiedOf(f, routeLine), effectiveDetection(d), o);
+  return tierBoundsOf(spec, grant, classifiedOf(f, routeLine), eff(d), o);
+}
+
+/** QA-P12-2-1: a plain depth as the A34 inputs that yield it (deterministic = the router's own gate runs the checks). */
+function eff(d: Detection) {
+  return effectiveDetection(d === "deterministic"
+    ? { routerGate: true, claim: null, acceptance: null }
+    : { routerGate: false, claim: d, acceptance: d });
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +135,7 @@ function input(ladder: RoleLadder, over: InputOver = {}): RoleDecisionInput {
   return {
     classified: classifiedOf(f ?? facts()),
     ladder,
-    detection: effectiveDetection(detection ?? "deterministic"),
+    detection: eff(detection ?? "deterministic"),
     engine: "enforce",
     routing: ROUTING,
     store: null,
@@ -588,7 +595,7 @@ describe("property I2: every role dispatch lies in [floor, ceiling] and never be
       const routeLine: RouteLine | null = next() < 0.3 ? { risk: oneOf(next, RISKS), scope: oneOf(next, SCOPES), pin: false, ignored: [] } : null;
       const classified = classifiedOf(raw, routeLine);
       const f = effectiveFactsOf(classified);
-      const bounds = tierBoundsOf(spec, grant, classified, effectiveDetection(detection), {
+      const bounds = tierBoundsOf(spec, grant, classified, eff(detection), {
         floorTier: next() < 0.3 ? oneOf(next, ORDER) : null,
         runningTier: next() < 0.3 ? oneOf(next, ORDER) : null,
         pinTier: next() < 0.3 ? oneOf(next, [...ORDER, "turbo"]) : null,
@@ -604,7 +611,7 @@ describe("property I2: every role dispatch lies in [floor, ceiling] and never be
       const d = decideRole({
         classified,
         ladder,
-        detection: effectiveDetection(detection),
+        detection: eff(detection),
         engine: next() < 0.8 ? "enforce" : "static",
         routing: ROUTING,
         store: next() < 0.9 ? storeOf({ p, n }) : null,
@@ -658,6 +665,20 @@ describe("QA round 1", () => {
       const d = decideRole({ ...input(ladder, { exploration: { rate: 0.2, decisionID: `h${i}` } }), classified: rulesHigh });
       expect(d.explore).toBe(false);
     }
+  });
+
+  it("QA-P12-2-1: a deterministic claim without the router's gate is grader for the kernel: no exploration", () => {
+    const ladder = ladderFor("implement", win("fast", "heavy"));
+    const claimed = effectiveDetection({ routerGate: false, claim: "deterministic", acceptance: "deterministic" });
+    expect(claimed).toBe("grader");
+    const gated = effectiveDetection({ routerGate: true, claim: null, acceptance: null });
+    let explored = 0;
+    for (let i = 0; i < 100; i++) {
+      const exploration = { rate: 0.2, decisionID: `g${i}` };
+      expect(decideRole({ ...input(ladder, { exploration }), detection: claimed }).explore).toBe(false);
+      if (decideRole({ ...input(ladder, { exploration }), detection: gated }).explore) explored += 1;
+    }
+    expect(explored).toBeGreaterThan(0);
   });
 
   describe("QA-P12-1-3: a resume on a model off the ladder is never moved below it", () => {

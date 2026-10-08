@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
 import type { AuthorityAction, RoleKind, RoleSpec } from "../../src/router/roles";
 import {
   DETECTIONS,
@@ -26,13 +28,23 @@ import type { RouteLine } from "../../src/routing/classify/types";
 type BoundsOptions = TierBoundsOptions & EffectiveFactsSources;
 
 /**
+ * QA-P12-2-1: a plain depth as the A34 inputs that yield it — `deterministic` = the router's own gate runs the checks;
+ * otherwise the route-line claim and the `[acceptance]` block agree on `d`.
+ */
+function eff(d: Detection) {
+  return effectiveDetection(d === "deterministic"
+    ? { routerGate: true, claim: null, acceptance: null }
+    : { routerGate: false, claim: d, acceptance: d });
+}
+
+/**
  * QA-P12-1-1 (R7): `tierBounds` takes the classify shape and an EFFECTIVE detection. This adapter keeps the
  * tables below readable: `o.classifier` becomes `trace.rules` (over `facts`), `o.routeLine` becomes `trace.routeLine`.
  */
 function tierBounds(spec: RoleSpec, grant: DispatchGrant, f: TaskFacts, d: Detection, o: BoundsOptions) {
   const rules: TaskFacts = o.classifier ? { ...f, ...o.classifier } : f;
   const routeLine = o.routeLine ? ({ pin: false, ignored: [], ...o.routeLine } as RouteLine) : null;
-  return tierBoundsOf(spec, grant, { facts: f, trace: { rules, routeLine } }, effectiveDetection(d), o);
+  return tierBoundsOf(spec, grant, { facts: f, trace: { rules, routeLine } }, eff(d), o);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +286,16 @@ describe("grantFor — work root", () => {
     expect(sorted(grantFor(ROLES.researcher, facts(["web"]), [], null))).toEqual(set("webfetch", "websearch", "context7"));
   });
 
+  it("QA-P12-2-3: grantFor(…, null) means 'no validated root' for a known binding — it is not the unknown-binding grant", () => {
+    // An unknown binding is the role max ∩ LOCAL (P1.6): for the researcher that is nothing; grantFor(…, null) keeps egress,
+    // so reusing it for an unknown binding would widen authority.
+    const unknownBinding = new Set(ROLES.researcher.authority.allow.filter((a) => LOCAL.includes(a)));
+    const noRoot = grantFor(ROLES.researcher, facts(["web"]), [], null);
+    expect(unknownBinding.size).toBe(0);
+    expect(noRoot.actions.size).toBeGreaterThan(0);
+    expect([...noRoot.actions].some((a) => !unknownBinding.has(a))).toBe(true);
+  });
+
   it("no work-root note when router_run was never in the grant", () => {
     expect(grantFor(ROLES.explorer, facts(), [], null).notes).toEqual([]);
   });
@@ -467,15 +489,42 @@ describe("tierBounds — risk and scope are raise-only", () => {
       facts: facts([], "low", "single"),
       trace: { rules: facts([], "low", "multi"), routeLine: { scope: "single", pin: false, ignored: [] } as RouteLine },
     };
-    const b = tierBoundsOf(ROLES.implementer, g, classified, effectiveDetection("deterministic"), opts());
+    const b = tierBoundsOf(ROLES.implementer, g, classified, eff("deterministic"), opts());
     expect(b.floor).toBe("medium");
     expect(b.reasons).toContain("floor:authority");
   });
 
-  it("effectiveDetection brands an already-resolved detection and never raises one", () => {
-    expect(effectiveDetection("deterministic")).toBe("deterministic");
-    expect(effectiveDetection("grader")).toBe("grader");
-    expect(effectiveDetection("maybe" as Detection)).toBe("none");
+  it("QA-P12-2-1: effectiveDetection computes A34 — deterministic only from the router's gate, else the weaker, capped at grader", () => {
+    const D: ReadonlyArray<Detection | null> = [null, "none", "grader", "deterministic"];
+    const level = (d: Detection | null): number => (d === "grader" ? 1 : d === "deterministic" ? 2 : 0);
+    for (const claim of D) {
+      for (const acceptance of D) {
+        expect(effectiveDetection({ routerGate: true, claim, acceptance })).toBe("deterministic");
+        const want = Math.min(level(claim), level(acceptance), 1) === 1 ? "grader" : "none";
+        expect(effectiveDetection({ routerGate: false, claim, acceptance })).toBe(want);
+      }
+    }
+    // a claim alone is never deterministic, and an unknown value is none
+    expect(effectiveDetection({ routerGate: false, claim: "deterministic", acceptance: "deterministic" })).toBe("grader");
+    expect(effectiveDetection({ routerGate: false, claim: "maybe" as Detection, acceptance: "grader" })).toBe("none");
+  });
+
+  it("QA-P12-2-1: no module outside roles/policy.ts casts to EffectiveDetection", () => {
+    const root = join(process.cwd(), "src");
+    const files: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) walk(path);
+        else if (entry.name.endsWith(".ts")) files.push(path);
+      }
+    };
+    walk(root);
+    expect(files.length).toBeGreaterThan(50);
+    const casting = files
+      .filter((f) => /\bas\s+EffectiveDetection\b/.test(readFileSync(f, "utf8")))
+      .map((f) => relative(root, f).replace(/\\/g, "/"));
+    expect(casting).toEqual(["routing/roles/policy.ts"]);
   });
 });
 

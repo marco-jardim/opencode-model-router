@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseRouteLine } from "../../src/routing/classify/route-line";
+import type { ClassifyTrace } from "../../src/routing/classify/types";
 
 const parse = (text: string, positions: "first" | "any" = "first") => parseRouteLine(text, { positions });
 
@@ -85,11 +86,18 @@ describe("QA-P12-1-6: work roots are local paths; a malformed first route line i
     }
   });
 
-  it("adds `malformed` to the ignored list of a route line parsed elsewhere", () => {
+  it("QA-P12-2-2: a route line parsed elsewhere keeps its own ignored list; the flag is on the parse only", () => {
     const r = parse("[route class=debug\nbody\n[route tier=heavy]", "any");
     expect(r.line?.tier).toBe("heavy");
-    expect(r.line?.ignored).toEqual(["malformed"]);
+    expect(r.line?.ignored).toEqual([]);
     expect(r.malformed).toBe(true);
+  });
+
+  it("QA-P12-2-2: ClassifyTrace.routeLines has an optional malformed field (absent when not reported)", () => {
+    const reported: ClassifyTrace["routeLines"] = { count: 0, conflict: false, edgeOnly: true, malformed: true };
+    const legacy: ClassifyTrace["routeLines"] = { count: 0, conflict: false, edgeOnly: true };
+    expect(reported.malformed).toBe(true);
+    expect(legacy.malformed).toBeUndefined();
   });
 
   it("does not flag other tags, valid lines, fenced or indented text, or a [route mention after the first line", () => {

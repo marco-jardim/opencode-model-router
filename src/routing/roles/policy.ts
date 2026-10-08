@@ -16,8 +16,12 @@ export interface DispatchGrant {
   actions: ReadonlySet<AuthorityAction>;
   notes: readonly string[];
   /**
-   * null → local only: no write and no run (`edit` and `router_run` withheld), no path outside the session
-   * directory. A fixed egress role (researcher) keeps its egress: it touches no file.
+   * null → NO VALIDATED WORK ROOT (the binding is known; `root=` was absent or did not resolve to a worktree): no write
+   * and no run (`edit` and `router_run` withheld), no path outside the session directory. A fixed egress role
+   * (researcher) keeps its egress: it touches no file.
+   *
+   * It does NOT mean "unknown binding" (QA-P12-2-3): a child whose dispatch is unknown (P1.6 `bind` → `unknown`) gets the
+   * role max ∩ LOCAL — egress dropped too — and must never be granted through `grantFor(…, null)`.
    */
   workRoot: string | null;
 }
@@ -36,16 +40,37 @@ declare const EFFECTIVE_DETECTION: unique symbol;
 /**
  * The EFFECTIVE detection of a dispatch (§2.1, A34): `deterministic` only when the router's own gate runs the acceptance
  * checks for this dispatch, otherwise the weaker of the route-line claim and the prompt's `[acceptance]` block — never
- * `ClassifyResult.detection` (a claim) as is. Built only with {@link effectiveDetection}.
+ * `ClassifyResult.detection` (a claim) as is. Built only with {@link effectiveDetection}: no other module may cast to it
+ * (a test scans `src` for the cast).
  */
 export type EffectiveDetection = Detection & { readonly [EFFECTIVE_DETECTION]: true };
 
+/** What A34 computes the effective detection from. */
+export interface EffectiveDetectionInput {
+  /** The router's own gate (`src/verify/deterministic.ts`) will run this dispatch's acceptance checks. */
+  readonly routerGate: boolean;
+  /** The route line's `d=` claim (`ClassifyResult.detection`), or null. */
+  readonly claim: Detection | null;
+  /** The depth of the prompt's `[acceptance]` block, or null when it has none. */
+  readonly acceptance: Detection | null;
+}
+
+const DETECTION_STRENGTH: Readonly<Record<Detection, number>> = { none: 0, grader: 1, deterministic: 2 };
+
+function strength(d: Detection | null): number {
+  return d !== null && Object.hasOwn(DETECTION_STRENGTH, d) ? DETECTION_STRENGTH[d] : 0; // absent or unknown → none
+}
+
 /**
- * Brand a detection the caller has ALREADY resolved as effective (A34). It never raises a value; an unknown value is
- * `none` (the strictest column of §2.3). Do not pass `ClassifyResult.detection` here: that is the route line's claim.
+ * A34 (QA-P12-2-1): `deterministic` only when the router's own gate runs the checks; otherwise the weaker of
+ * `claim ?? "none"` and `acceptance ?? "none"`, capped at `grader` (a claim alone is never deterministic). Absent or
+ * unknown values count as `none`. (Same order as `engine/plan.weakerDetection`, restated here: importing the engine
+ * from the policy would close an import cycle.)
  */
-export function effectiveDetection(detection: Detection): EffectiveDetection {
-  return ((DETECTIONS as readonly string[]).includes(detection) ? detection : "none") as EffectiveDetection;
+export function effectiveDetection(input: EffectiveDetectionInput): EffectiveDetection {
+  if (input.routerGate === true) return "deterministic" as EffectiveDetection;
+  const weaker = Math.min(strength(input.claim), strength(input.acceptance), DETECTION_STRENGTH.grader);
+  return DETECTIONS.find((d) => DETECTION_STRENGTH[d] === weaker)! as EffectiveDetection;
 }
 
 const BUILTIN_TIERS = ["fast", "medium", "heavy"] as const;
@@ -109,8 +134,9 @@ export const GRANT_NOTES = {
  *   `web` → no action, note when the result has no egress; `external_dir` → satisfied by a non-null
  *   work root (P2.1 resolves and validates it), otherwise a note; unknown needs are ignored.
  * - separation (I4): local/exec/write together with egress → egress dropped + note.
- * - `workRoot` null → local only: `edit` and `router_run` withheld + note (I9: no binding, no write, no run);
- *   egress of a fixed egress role is kept. The work root is copied unchanged.
+ * - `workRoot` null = "no validated work root" for a KNOWN binding → local only: `edit` and `router_run` withheld
+ *   + note (no write, no run); egress of a fixed egress role is kept. The work root is copied unchanged.
+ *   Not for an unknown binding (QA-P12-2-3): that is the role max ∩ LOCAL (P1.6/P2.3), never `grantFor(…, null)`.
  */
 export function grantFor(
   role: RoleSpec,

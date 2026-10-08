@@ -321,8 +321,7 @@ export interface RouteLineParse {
   /**
    * QA-P12-1-6: the first non-empty line starts like a route line (`[route` then a blank, `]` or the end; not
    * fenced, quoted or indented) but is not one (unbalanced, too long, ...). That line stays text and is neither
-   * applied nor stripped (tier mode unchanged); when another route line was parsed its `ignored` also gets
-   * `"malformed"`. Absent otherwise.
+   * applied nor stripped, and no `ignored` list changes (tier mode unchanged, QA-P12-2-2). Absent otherwise.
    */
   readonly malformed?: true;
 }
@@ -363,7 +362,16 @@ export interface ClassifyTrace {
   readonly rules: TaskFacts;
   readonly routeLine: RouteLine | null;
   /** Route lines seen in the prompt, for the decision row (QA-1.2-2). */
-  readonly routeLines: { readonly count: number; readonly conflict: boolean; readonly edgeOnly: boolean };
+  readonly routeLines: {
+    readonly count: number;
+    readonly conflict: boolean;
+    readonly edgeOnly: boolean;
+    /**
+     * QA-P12-2-2: `RouteLineParse.malformed` — the sanctioned field for P2.1 to surface a malformed first route line.
+     * Type only for now: `classify()` does not set it yet (absent = not reported).
+     */
+    readonly malformed?: true;
+  };
   /** The backend was not consulted although the rules were unsure: the task names a credential (QA-1.2-1). */
   readonly backendSkipped?: "credentials";
   readonly backend: {

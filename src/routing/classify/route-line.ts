@@ -324,9 +324,9 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
     return { line: null, count: 0, stripped: kept.join(""), conflict: false, edgeOnly: true, ...(malformed ? { malformed } : {}) };
   }
   const conflict = new Set(parsed.map(canonical)).size > 1;
-  const line = conflict ? resolveConflict(parsed) : parsed[0]!;
   return {
-    line: malformed ? { ...line, ignored: [...line.ignored, "malformed"] } : line,
+    // QA-P12-2-2: the flag lives on the parse result only; the line's `ignored` list is the tier-mode one.
+    line: conflict ? resolveConflict(parsed) : parsed[0]!,
     count: parsed.length,
     stripped: kept.join(""),
     conflict,
