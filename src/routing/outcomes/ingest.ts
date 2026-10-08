@@ -41,7 +41,10 @@ import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
 import { pricingState, tokenSampleFromEvent } from "./cost";
 import { resolveOutcomesDir } from "./persist";
+import type { SignalObservation } from "./signals";
+import { SIGNAL_MASS_CAPS, isSignalObservation, signalRow, verdictSignal } from "./signals";
 import type {
+  AgentOrigin,
   AttemptSignal,
   Clock,
   LoggedRoutingMode,
@@ -57,7 +60,7 @@ import type {
   Verdict,
   VerdictRow,
 } from "./types";
-import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, safeNow, splitModelRef } from "./types";
+import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, normalizeVariant, safeNow, splitModelRef } from "./types";
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -73,6 +76,11 @@ export interface IngestSettings {
   readonly tuning: OutcomeTuning;
   /** Ids of the active preset's router tier agents (origin `router`); every other agent is `host`. */
   readonly routerAgentIds: ReadonlySet<string>;
+  /**
+   * P1.4: agent names of the resolved role agents (origin `role`, key `class|role:<agent>|…`). Absent or empty in tiers
+   * mode and on v1, so keys stay `router`/`host` there. Filled by P2.1 from `resolveRoles`.
+   */
+  readonly roleAgentIds?: ReadonlySet<string>;
 }
 
 const settingsCache = new WeakMap<RouterConfig, IngestSettings | null>();
@@ -387,6 +395,15 @@ export interface IngestDeps {
   readonly acquire?: (options: AcquireOutcomesOptions) => OutcomesBundle;
 }
 
+/** P1.4: options of {@link Ingest.onSignal}. */
+export interface SignalOptions {
+  /**
+   * The decision id of the attempt the signal is about; the child's current registration must carry it, else nothing is
+   * written (a re-registered or evicted child). Required for `redispatch` (the previous attempt, `RedispatchMatch.previous`).
+   */
+  readonly expectDecisionID?: string;
+}
+
 export interface Ingest {
   /**
    * `session.step.ended` (and `session.step.failed`, when it carries a cost or tokens) of a registered child. Awaits
@@ -404,6 +421,16 @@ export interface Ingest {
   onVerdict(childSessionID: string, outcome: Verdict): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
   onFalseRefusal(childSessionID: string): void;
+  /**
+   * P1.4: append a signal row (signals.ts) for the child's current attempt. Rows only: the Beta store, its decay and the
+   * verdict/refusal rows are untouched. `verdict` is refused (`onVerdict` writes it when the store takes the verdict);
+   * `redispatch` needs `expectDecisionID`. Gated like a verdict (registered, keyable, trusted class), except that the
+   * zero-mass kinds (`budget`, `authority`) are written under class `unknown` when the class is not trusted. The dispatch
+   * must have a decision id (the row annotates its decision row). One row per attempt and kind (C7: a repeat, even with
+   * another outcome, writes nothing). Returns whether a row was enqueued. Never throws. Optional only so that existing test
+   * doubles still satisfy `Ingest`; `createIngest` and {@link NOOP_INGEST} implement it.
+   */
+  onSignal?(childSessionID: string, observation: SignalObservation, options?: SignalOptions): boolean;
   /** A session was deleted: the child's open attempt is folded and its registry entry dropped; children of the session too. */
   onSessionGone(sessionID: string): void;
   /** Idle/deleted flush point (D15): coalesced and throttled by the flusher, never awaited. No-op without recorded data. */
@@ -421,6 +448,7 @@ export const NOOP_INGEST: Ingest = Object.freeze({
   onExecutionEnded: () => undefined,
   onVerdict: () => undefined,
   onFalseRefusal: () => undefined,
+  onSignal: () => false,
   onSessionGone: () => undefined,
   requestFlush: () => undefined,
   sweep: () => undefined,
@@ -452,6 +480,10 @@ interface Target {
   readonly record: DispatchRecord;
   readonly settings: IngestSettings;
   readonly key: OutcomeKey;
+  readonly origin: AgentOrigin;
+  /** `provider/model`. */
+  readonly model: string;
+  readonly variant: string;
 }
 
 export function createIngest(deps: IngestDeps): Ingest {
@@ -489,7 +521,7 @@ export function createIngest(deps: IngestDeps): Ingest {
   };
 
   /** Registered, trusted and keyable? Otherwise nothing may be recorded for the child. */
-  const targetOf = (childSessionID: string): Target | null => {
+  const targetOf = (childSessionID: string, untrusted: "skip" | "unknown" = "skip"): Target | null => {
     // Registry first: most `session.step.ended` events belong to sessions that are not registered children
     // (the orchestrator's own), and the settings may cost a config fingerprint check.
     const record = lookupDispatch(childSessionID);
@@ -499,20 +531,22 @@ export function createIngest(deps: IngestDeps): Ingest {
     const settings = deps.settings();
     if (settings === null) return null;
     const confidence = record.facts.confidence;
+    const rawClass = record.facts.class;
     // Phase 1.2 handoff (QA-1.2-27): a class below the threshold is "unknown" for learning, not a class of
-    // its own. No fallback class, no store call, no row.
-    if (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < settings.minClassConfidence) {
-      return null;
-    }
-    const cls = record.facts.class;
-    if (typeof cls !== "string" || cls === "" || cls === "unknown") return null;
+    // its own. No fallback class, no store call, no row. P1.4 (`untrusted: "unknown"`): a zero-mass role signal
+    // (budget, authority) is still a row, keyed under class `unknown`; it never reaches the store.
+    const trusted =
+      typeof confidence === "number" && Number.isFinite(confidence) && confidence >= settings.minClassConfidence &&
+      typeof rawClass === "string" && rawClass !== "" && rawClass !== "unknown";
+    if (!trusted && untrusted === "skip") return null;
+    const cls = trusted ? rawClass : "unknown";
     if (record.model === null) return unkeyable(`${record.agent}|`, childSessionID, "the dispatch registered no model");
     const ref = splitModelRef(record.model);
     if (ref === null) return unkeyable(`${record.agent}|${record.model}`, childSessionID, `model "${record.model}" is not provider/model`);
     const variant = record.variant ?? ref.variant;
-    const origin = classifyAgentOrigin(record.agent, settings.routerAgentIds);
+    const origin: AgentOrigin = settings.roleAgentIds?.has(record.agent) === true ? "role" : classifyAgentOrigin(record.agent, settings.routerAgentIds);
     const key = makeKey(cls, { origin, id: record.agent }, ref.provider, ref.model, variant);
-    return { record, settings, key };
+    return { record, settings, key, origin, model: `${ref.provider}/${ref.model}`, variant: normalizeVariant(variant) };
   };
 
   // One warning per model reference (QA-2.1-12), not per child: every child of an unresolved agent says the same.
@@ -590,6 +624,36 @@ export function createIngest(deps: IngestDeps): Ingest {
     void current.bundle.release().catch((error: unknown) => warn("releasing the outcomes bundle failed", error));
     return true;
   };
+  /**
+   * P1.4: enqueue one signal row for the target's attempt: one per attempt and kind (C7, the store's one-observation
+   * rule), process-wide per outcomes directory. Needs the dispatch's decision id: without it there is no decision row
+   * to annotate and a pre-P1.4 reader would count the row as a dispatch (QA-P14-1-11).
+   */
+  const appendSignal = (target: Target, childSessionID: string, observation: SignalObservation, bundle: OutcomesBundle): boolean => {
+    const { record, settings, key } = target;
+    if (record.decisionID === null) return false;
+    if (!boundedAdd(signalled, `signal|${settings.outcomesDir}|${record.attemptId}|${observation.kind}`, SIGNAL_CAP)) return false;
+    bundle.flusher.enqueue(
+      signalRow(
+        {
+          ts: new Date(safeNow(now)).toISOString(),
+          sessionID: record.parentSessionID ?? "",
+          decisionID: record.decisionID,
+          mode: settings.engine,
+          childSessionID,
+          facts: record.facts,
+          chosen: { key, agent: record.agent, origin: target.origin, model: target.model, variant: target.variant },
+          step: record.step,
+          attemptID: record.attemptId,
+          ...(target.origin === "role" ? { role: record.agent } : {}),
+          ...(record.tier === null ? {} : { tier: record.tier }),
+        },
+        observation,
+      ),
+    );
+    return true;
+  };
+
   return {
     async onStepEnded(event: IngestEvent): Promise<void> {
       try {
@@ -706,6 +770,11 @@ export function createIngest(deps: IngestDeps): Ingest {
           step: record.step,
         };
         bundle.flusher.enqueue(row);
+        // P1.4 (QA-P14-1-6): a role dispatch's verdict signal row follows the store: written only for a verdict it took.
+        if (outcome !== "unverifiable" && target.origin === "role") {
+          const signal = verdictSignal(outcome);
+          if (signal !== null) appendSignal(target, childSessionID, signal, bundle);
+        }
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("verdict failed", error, { childSessionID });
@@ -741,6 +810,28 @@ export function createIngest(deps: IngestDeps): Ingest {
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("false refusal failed", error, { childSessionID });
+      }
+    },
+
+    onSignal(childSessionID: string, observation: SignalObservation, options: SignalOptions = {}): boolean {
+      try {
+        if (!isSignalObservation(observation)) return false;
+        // QA-P14-1-6: verdict rows follow the store; only onVerdict writes them.
+        if (observation.kind === "verdict") return false;
+        // QA-P14-1-5: a re-dispatch failure belongs to one earlier attempt and must name it.
+        if (observation.kind === "redispatch" && options.expectDecisionID === undefined) return false;
+        const caps = SIGNAL_MASS_CAPS[observation.kind];
+        const target = targetOf(childSessionID, caps.positive === 0 && caps.negative === 0 ? "unknown" : "skip");
+        if (target === null) return false;
+        if (options.expectDecisionID !== undefined && target.record.decisionID !== options.expectDecisionID) return false;
+        const bundle = bundleFor(target.settings);
+        if (bundle === null) return false;
+        if (!appendSignal(target, childSessionID, observation, bundle)) return false;
+        touchDispatch(childSessionID, safeNow(now));
+        return true;
+      } catch (error) {
+        warn("signal failed", error, { childSessionID });
+        return false;
       }
     },
     onSessionGone(sessionID: string): void {

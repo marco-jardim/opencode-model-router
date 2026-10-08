@@ -68,8 +68,49 @@ export {
   resolveOutcomesDir,
 } from "./persist";
 
-export { USAGE, parseStatsArgs, renderMarkdown, runStatsCli, summarize } from "./stats";
+export { USAGE, parseStatsArgs, renderMarkdown, runStatsCli, summarize, summarizeRoles } from "./stats";
 export type { ParseStatsResult, StatsArgs } from "./stats";
+export {
+  REDISPATCH_MAX_EARLIER,
+  REDISPATCH_MIN_TOKENS,
+  REDISPATCH_SIMILARITY,
+  REDISPATCH_WINDOW_MS,
+  SAME_TASK_LINE_SHARE,
+  SIBLING_SHARED_MIN,
+  SIGNAL_MASS_CAPS,
+  SIGNAL_WEIGHTS,
+  detectRedispatch,
+  graderSignal,
+  isSignalObservation,
+  parseReturnPrefix,
+  returnSignal,
+  runSignal,
+  sameModel,
+  sharedLines,
+  signalMass,
+  signalReason,
+  signalRow,
+  signedWeight,
+  taskSection,
+  taskSimilarity,
+  tierRank,
+  verdictSignal,
+} from "./signals";
+export type {
+  DispatchText,
+  GraderVerdictInput,
+  GuardObservation,
+  RedispatchMatch,
+  RedispatchOptions,
+  ReturnContract,
+  ReturnPrefix,
+  ReturnSignalInput,
+  RunRecord,
+  RunSignalInput,
+  SignalObservation,
+  SignalOutcome,
+  SignalRowInput,
+} from "./signals";
 
 export interface AcquireOutcomesOptions {
   /** Outcomes directory (already resolved with `resolveOutcomesDir`). */
