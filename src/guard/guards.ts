@@ -1,5 +1,6 @@
 import { fingerprintToolCall } from "./fingerprint";
 import { READ_ONLY_TOOLS } from "../router/sessions";
+import { REFUSAL_CAP } from "../router/guard-profile";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -65,8 +66,8 @@ export interface GuardState {
    * Set lazily; absent = none.
    */
   denied?: { round: number; count: number };
-  /** The session's read-only cap banner showed `CAP:none` (a justified uncapped dispatch). Set lazily. */
-  uncapped?: boolean;
+  /** Dispatch round whose policy last set `budget` (QA-P15-1-9: a resume takes its own budget). Set lazily. */
+  budgetRound?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,22 +229,25 @@ export function evaluateGuards(
 
   // CLAUSE 3c: refused calls. A denied call is not charged to the budget
   // (§2.9 E6), so a model that keeps repeating refused calls would never reach
-  // CLAUSE 3; after `budget` refusals in this dispatch every call is refused.
-  const denied = deniedThisDispatch(state);
-  if (denied >= state.budget) {
+  // CLAUSE 3; after min(budget, REFUSAL_CAP) refusals in this dispatch every
+  // call is refused (QA-P15-1-4).
+  if (refusalsSpent(state)) {
     return {
       allow: false,
       guard: "denied_cap",
-      observation: `DENIED: ${denied} refused tool calls in this dispatch. Stop now and emit your final answer with what you have.`,
+      observation: `DENIED: ${deniedThisDispatch(state)} refused tool calls in this dispatch (limit ${refusalCap(state)}). ${stopInstruction(policy)}`,
     };
   }
 
   // CLAUSE 4: redundancy
   if (kind === "read" && (state.seen.get(fp) ?? 0) >= policy.sameOpRetryCap) {
+    const next = policy.reader === true
+      ? "continue with a different call or finish"
+      : "take a producing action or finish";
     return {
       allow: false,
       guard: "redundant_read",
-      observation: `DENIED: you already ran this exact read (${fp}). Reuse the result you already have; take a producing action or finish.`,
+      observation: `DENIED: you already ran this exact read (${fp}). Reuse the result you already have; ${next}.`,
     };
   }
 
@@ -342,6 +346,24 @@ function deniedThisDispatch(state: GuardState): number {
   return state.denied?.round === state.dispatches ? state.denied.count : 0;
 }
 
+/** Refusals allowed in one dispatch round: min(budget, REFUSAL_CAP). */
+export function refusalCap(state: GuardState): number {
+  return Math.min(state.budget, REFUSAL_CAP);
+}
+
+/** True when this dispatch round reached its refusal cap (CLAUSE 3c). */
+export function refusalsSpent(state: GuardState): boolean {
+  return deniedThisDispatch(state) >= refusalCap(state);
+}
+
+/** The guard stops the child: its budget is spent or its refusals are (budgetExhausted reports this). */
+export function guardStopped(
+  state: GuardState,
+  policy: Pick<GuardPolicy, "cumulativeBudget">,
+): boolean {
+  return budgetSpent(state, policy) || refusalsSpent(state);
+}
+
 /** True when no further call fits the per-dispatch or the cumulative budget. */
 export function budgetSpent(
   state: GuardState,
@@ -404,8 +426,10 @@ export function forcingMessage(state: GuardState, policy: GuardPolicy): string {
   const next =
     policy.deliverableSignal != null && !state.deliverableExecuted
       ? `run the deliverable (${policy.deliverableSignal})`
-      : policy.needMoreOnExhaustion === true && budgetSpent(state, policy)
-        ? "return `NEED MORE: budget` with a progress summary"
+      : refusalsSpent(state) || (policy.needMoreOnExhaustion === true && budgetSpent(state, policy))
+        ? policy.needMoreOnExhaustion === true
+          ? "return `NEED MORE: budget` with a progress summary"
+          : "emit your final answer"
         : policy.reader === true
           ? "emit your final answer"
           : "take a producing action (write/edit) or emit your final answer";

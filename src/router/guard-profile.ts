@@ -22,6 +22,14 @@ export const TIER_GUARD_BUDGET = 25;
 /** Cumulative ceiling across resumed dispatches = this multiple of the total budget. */
 export const GUARD_CUMULATIVE_MULTIPLIER = 3;
 
+/**
+ * Refused tool calls allowed per dispatch round before every call is refused
+ * (QA-P15-1-4): min(budget, REFUSAL_CAP). Refusals are not charged to the
+ * budget, so a child can take up to budget + REFUSAL_CAP steps; the host
+ * `steps` limit must sit above that (P-4: steps = top budget + REFUSAL_CAP + margin).
+ */
+export const REFUSAL_CAP = 10;
+
 /** A route-line `budget=` raises a role budget to at most this multiple of it. */
 export const ROUTE_BUDGET_RAISE_MAX = 2;
 

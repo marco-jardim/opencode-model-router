@@ -5,7 +5,7 @@ import {
   recordDenied,
   forcingMessage,
   observationOk,
-  budgetSpent,
+  guardStopped,
 } from "./guards";
 import type { GuardPolicy, GuardCall, GuardState } from "./guards";
 import { scrubText } from "./scrub";
@@ -21,7 +21,7 @@ import {
 import type { GuardProfile } from "../router/guard-profile";
 import { getActiveTiers } from "../router/protocol";
 import { isReadOnlyTier } from "../router/read-only";
-import { READ_ONLY_TOOLS, lookupDispatch } from "../router/sessions";
+import { lookupDispatch } from "../router/sessions";
 import type { Cap } from "../router/sessions";
 
 /**
@@ -87,14 +87,14 @@ export function buildGuardPolicy(
  * §2.9 E6: does this tier dispatch read rather than produce? A role profile
  * decides alone; otherwise a read-only tier (#78), a routed class
  * review/recon/search (the process-wide dispatch registry), or an uncapped
- * dispatch (`cap` when the caller knows it, else the session's own cap banner,
- * see noteCapBanner).
+ * dispatch: `cap` is the CURRENT dispatch round's honoured CAP directive, read by
+ * the caller from the session store (sessions.ts getCap), which a resume resets
+ * (QA-P15-1-3) — so it is known before the first call and never outlives a round.
  */
 function isReaderDispatch(
   cfg: RouterConfig,
   tier: string | null,
   sessionID: string,
-  state: GuardState,
   profile: GuardProfile | undefined,
   cap: Cap | null | undefined,
 ): boolean {
@@ -109,30 +109,9 @@ function isReaderDispatch(
       profile,
       readOnlyTier,
       taskClass: lookupDispatch(sessionID)?.facts.class ?? null,
-      cap: cap !== undefined ? cap : state.uncapped === true ? "none" : null,
+      cap: cap ?? null,
     }) !== null
   );
-}
-
-// The read-only cap banner the session store appends (sessions.ts buildCapBanner):
-// `[cap: N/M]` (M = ∞ for a justified CAP:none), then optional `[⚠ …]` lines.
-const CAP_BANNER_MARK = "[cap: ";
-const CAP_BANNER_RE = /^\[cap: \d+\/(∞|\d+)\](?:\n\[⚠ [^\n]*\])*$/;
-
-/**
- * Wave-1 bridge (§2.9 E6, CAP:none + reason:): the guard is not handed the
- * dispatch's cap, but the session store has already appended its cap banner to
- * this read-only result (index.ts runs recordToolCall before guardAfterCall).
- * Only a banner that ends the output and follows a paragraph break counts, and
- * only for a tiered session (tracked by the store, so its banner is always the
- * last text), so tool content cannot forge it. Superseded by an explicit `cap`.
- */
-function noteCapBanner(state: GuardState, tier: string | null, tool: string, output: unknown): void {
-  if (tier === null || !READ_ONLY_TOOLS.has(tool) || typeof output !== "string") return;
-  const at = output.lastIndexOf(CAP_BANNER_MARK);
-  if (at === -1 || (at !== 0 && !output.startsWith("\n\n", at - 2))) return;
-  const match = CAP_BANNER_RE.exec(output.slice(at));
-  if (match) state.uncapped = match[1] === "∞";
 }
 
 // budgetExhausted: process-wide (one guard store per plugin instance; every instance
@@ -150,14 +129,15 @@ function trackBudget(sessionID: string, state: GuardState, policy: GuardPolicy):
 }
 
 /**
- * True when the guarded session has used its whole per-dispatch or cumulative
- * tool-call budget (P-5: the parent's result carries no such signal; the
- * after-hook annotates it from this). False for a session never guarded
+ * True when the guard has stopped the session: its whole per-dispatch or
+ * cumulative tool-call budget is used, or its refusal cap (CLAUSE 3c,
+ * QA-P15-1-4) is reached. P-5: the parent's result carries no such signal; the
+ * after-hook annotates it from this. False for a session never guarded
  * (enforcement off) or no longer tracked; a resume restores the per-dispatch room.
  */
 export function budgetExhausted(sessionID: string): boolean {
   const tracked = trackedBudgets.get(sessionID);
-  return tracked !== undefined && budgetSpent(tracked.state, tracked);
+  return tracked !== undefined && guardStopped(tracked.state, tracked);
 }
 
 export interface BeforeResult {
@@ -190,7 +170,7 @@ export function guardBeforeCall(params: {
   trivial?: boolean;
   /** Role dispatch guard profile (§2.6); absent for tier agents. */
   profile?: GuardProfile;
-  /** The dispatch's honoured CAP directive when the caller knows it; absent = read from the cap banner. */
+  /** The current dispatch round's honoured CAP directive (sessions.ts getCap); "none" = CAP:none + reason:. */
   cap?: Cap | null;
 }): BeforeResult {
   const { cfg, tier, sessionID, tool, toolArgs, store, env, trivial, profile, cap } = params;
@@ -207,7 +187,7 @@ export function guardBeforeCall(params: {
   const policy = buildGuardPolicy(cfg, tier, profile);
   const state = store.ensure(sessionID, policy);
   trackBudget(sessionID, state, policy);
-  if (isReaderDispatch(cfg, tier, sessionID, state, profile, cap)) policy.reader = true;
+  if (isReaderDispatch(cfg, tier, sessionID, profile, cap)) policy.reader = true;
   const call: GuardCall = { tool, args: (toolArgs ?? {}) as Record<string, unknown> };
   const decision = evaluateGuards(state, call, policy);
 
@@ -254,7 +234,6 @@ export function guardAfterCall(params: {
   if (!state) return;
   const policy = buildGuardPolicy(cfg, tier, profile);
   const call: GuardCall = { tool, args: (toolArgs ?? {}) as Record<string, unknown> };
-  noteCapBanner(state, tier, tool, output?.output);
   updateState(state, call, { ok: observationOk(output?.output) }, policy);
   const note = store.takePendingNote(sessionID);
   if (note) {

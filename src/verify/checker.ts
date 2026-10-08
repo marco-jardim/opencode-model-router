@@ -8,37 +8,102 @@
 import type { Verdict } from "./types";
 import { scrubText } from "../guard/scrub";
 import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
+import { budgetExhausted as guardBudgetExhausted } from "../guard/enforce";
 
 // ---------------------------------------------------------------------------
-// Progress notes (§2.9 E8)
+// Incomplete returns (§2.9 E8, I7)
 // ---------------------------------------------------------------------------
 
-/** Reason prefix of a verdict that classifies the return as a progress note. */
-export const INCOMPLETE_REASON_PREFIX = "incomplete:";
-
+/** Verdict reason: the return is a progress note. Matched exactly, never by prefix (QA-P15-1-6). */
 export const INCOMPLETE_REASON =
-  `${INCOMPLETE_REASON_PREFIX} the delegate returned a progress note (no DONE:, NEED MORE: or ESCALATE:), not a result; resume the same delegation to let it finish`;
+  "incomplete: the delegate returned a progress note (no DONE:, NEED MORE: or ESCALATE:), not a result; resume the same delegation to let it finish";
+
+/** Verdict reason: the producer stopped at its tool-call budget (I7: never a tier failure). */
+export const BUDGET_INCOMPLETE_REASON =
+  "incomplete: the delegate stopped at its tool-call budget (NEED MORE: budget), not with a result; resume the same delegation to let it finish";
+
+const INCOMPLETE_REASONS: ReadonlySet<string> = new Set([INCOMPLETE_REASON, BUDGET_INCOMPLETE_REASON]);
+
+/** One of the router's own incomplete reasons (a grader reason "incomplete: …" is not). */
+export function isIncompleteReason(reason: string): boolean {
+  return INCOMPLETE_REASONS.has(reason);
+}
+
+/** An incomplete verdict: unverifiable, every reason a router incomplete reason. Never accepted (gate.ts). */
+export function isIncompleteVerdict(verdict: Pick<Verdict, "outcome" | "reasons">): boolean {
+  return verdict.outcome === "unverifiable" && verdict.reasons.length > 0 && verdict.reasons.every(isIncompleteReason);
+}
 
 /** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
-const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*\s*:/m;
+const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*[ \t]*:/m;
 
-/** Wording of a return that announces more work instead of reporting a result. */
-const PROGRESS_RE =
-  /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue|complete|proceed|keep going|wrap up)\b|\bcontinuing\b|\b(?:still|now) working\b|\bwork in progress\b/i;
+/** `NEED MORE: budget` at the start of a line (QA-P15-1-2). */
+const NEED_MORE_BUDGET_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
 
-/** Only the end of a return decides: a progress note ends by announcing the next step. */
-const PROGRESS_TAIL_CHARS = 400;
+/** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
+const ANNOUNCE_RE = /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue)\b/i;
+
+/** Deferral to separate work: a finished result, not a progress note. */
+const DEFERRAL_RE = /\b(?:follow[- ]?up|later|separately|another (?:PR|change|task)|next (?:PR|release))\b/i;
+
+const SENTENCE_END = new Set([".", "!", "?", "\u2026"]);
+
+/** The last sentence of a text: after the last sentence end or line break that is followed by more text. */
+function finalSentence(text: string): string {
+  let end = text.length;
+  while (end > 0 && (SENTENCE_END.has(text[end - 1]!) || /\s/.test(text[end - 1]!))) end--;
+  let start = end;
+  while (start > 0) {
+    const ch = text[start - 1]!;
+    if (ch === "\n" || (/\s/.test(ch) && start >= 2 && SENTENCE_END.has(text[start - 2]!))) break;
+    start--;
+  }
+  return text.slice(start, end);
+}
 
 /**
- * A progress-note return: no return-contract marker (DONE:, NEED MORE:,
- * ESCALATE:, …) on any line, and its last PROGRESS_TAIL_CHARS characters
- * announce further work ("I'll finish …", "continuing …"). Classified
- * `incomplete`, not `fail` (§2.9 E8).
+ * A progress-note return (QA-P15-1-1): no return-contract marker on any line,
+ * and its FINAL sentence is a first-person announcement of finishing or
+ * continuing ("I'll finish the tests next", "let me continue with …") that is
+ * not a deferral to separate work. Applied only to agents that follow the
+ * return contract (runChecker), never in place of grading for others.
  */
 export function isProgressNote(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed.length === 0 || CONTRACT_MARKER_RE.test(trimmed)) return false;
-  return PROGRESS_RE.test(trimmed.slice(-PROGRESS_TAIL_CHARS));
+  const last = finalSentence(trimmed);
+  return ANNOUNCE_RE.test(last) && !DEFERRAL_RE.test(last);
+}
+
+const DEFAULT_LADDER = ["fast", "medium", "heavy"];
+
+function incomplete(reason: string): Verdict {
+  return { pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason] };
+}
+
+/**
+ * The incomplete verdict of a return, or null (§2.9 E8, I7):
+ * - budget: a `NEED MORE: budget` line, or the guard stopped the producer
+ *   (budgetExhausted) and it returned no contract marker — for every agent;
+ * - progress note (only when `progressNotes`): for an agent that follows the
+ *   return contract — `returnContract`, else a router tier of the ladder.
+ * Incomplete is never accepted, never escalates and never moves evidence.
+ */
+export function incompleteVerdict(
+  input: { finalReturnText: string; producerSessionID: string; producerTier: string; returnContract?: boolean },
+  opts: { progressNotes: boolean; ladder?: readonly string[]; budgetExhausted?: (sessionID: string) => boolean },
+): Verdict | null {
+  const text = input.finalReturnText;
+  const exhausted = opts.budgetExhausted ?? guardBudgetExhausted;
+  if (
+    NEED_MORE_BUDGET_RE.test(text) ||
+    (input.producerSessionID !== "" && exhausted(input.producerSessionID) && !CONTRACT_MARKER_RE.test(text))
+  ) {
+    return incomplete(BUDGET_INCOMPLETE_REASON);
+  }
+  const contract = input.returnContract ?? (opts.ladder ?? DEFAULT_LADDER).includes(input.producerTier);
+  if (opts.progressNotes && contract && isProgressNote(text)) return incomplete(INCOMPLETE_REASON);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +143,8 @@ export interface CheckerDeps {
   dispatchGrader: GraderDispatch;
   ladder?: string[];             // default ["fast","medium","heavy"]
   minGraderTier?: string | null; // optional floor
+  /** Did the guard stop this producer session? Default: the live guard (enforce.ts budgetExhausted). */
+  budgetExhausted?: (sessionID: string) => boolean;
 }
 
 export interface CheckerInput {
@@ -87,6 +154,8 @@ export interface CheckerInput {
   producerSessionID: string;
   /** Effective producer working directory; scopes the grader + informs its prompt. */
   workingDir?: string;
+  /** The producer follows the DONE:/NEED MORE:/ESCALATE: return contract (role agents); absent = a router tier of the ladder. */
+  returnContract?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,17 +324,13 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     return { pass: false, method: "none", skipped: true, reasons: ["no criteria to grade"] };
   }
 
-  // 1b. §2.9 E8: a progress note is incomplete, not a failure (unverifiable
-  // never moves outcome evidence and never escalates the tier).
-  if (isProgressNote(input.artefact.finalReturnText)) {
-    return {
-      pass: false,
-      outcome: "unverifiable",
-      method: "checker",
-      reasons: [INCOMPLETE_REASON],
-      caveats: [INCOMPLETE_REASON],
-    };
-  }
+  // 1b. §2.9 E8 / I7: a budget stop, or a contract follower's progress note, is
+  // incomplete — never accepted, never escalated, never outcome evidence.
+  const stopped = incompleteVerdict(
+    { ...input, finalReturnText: input.artefact.finalReturnText },
+    { progressNotes: true, ladder: deps.ladder, budgetExhausted: deps.budgetExhausted },
+  );
+  if (stopped) return stopped;
 
   // 1c. §2.9 E8: every criterion is over the verification budget — nothing gradable.
   const { criteria: gradable, omitted } = fitCriteria(input.criteria);

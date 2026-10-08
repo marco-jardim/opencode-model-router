@@ -376,6 +376,15 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
       return subagentCapState.get(sessionID)?.tierName ?? null;
     },
 
+    /**
+     * The current dispatch round's honoured cap: "none" only for CAP:none with a
+     * reason: line, else a number; null for an untracked session. A resume
+     * re-registers and replaces it (QA-P15-1-3: the guard's reader signal).
+     */
+    getCap(sessionID: string): Cap | null {
+      return subagentCapState.get(sessionID)?.cap ?? null;
+    },
+
     /** Returns true when the session was classified as trivial at dispatch time. */
     isTrivial(sessionID: string): boolean {
       return subagentCapState.get(sessionID)?.trivial === true;

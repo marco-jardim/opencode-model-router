@@ -10,7 +10,7 @@ import type { RouterConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
-import { INCOMPLETE_REASON_PREFIX } from "./checker";
+import { isIncompleteReason } from "./checker";
 import { stripDispatchHeader } from "../router/dispatch-header";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { basename, dirname, join, resolve } from "node:path";
@@ -608,10 +608,11 @@ export function buildForcingNote(
     reasons.length > 0
       ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
       : "- (no reasons provided)";
-  // §2.9 E8: a progress note is incomplete, not a failed result.
-  if (reasons.length > 0 && reasons.every((r) => r.startsWith(INCOMPLETE_REASON_PREFIX))) {
+  // §2.9 E8 / I7: a progress note or a budget stop is incomplete, not a failed result.
+  // Exact match on the router's own reasons (QA-P15-1-6): a grader's "incomplete: …" stays a failure.
+  if (reasons.length > 0 && reasons.every(isIncompleteReason)) {
     return (
-      `[router \u26a0 INCOMPLETE] The delegate returned a progress note, not a result:\n` +
+      `[router \u26a0 INCOMPLETE] The delegate stopped before a final result:\n` +
       `${body}\n` +
       `NEXT: resume the same delegation so it can finish; do not treat the prior result as complete.`
     );

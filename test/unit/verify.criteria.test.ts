@@ -18,14 +18,17 @@ import {
   summarizeDispatch,
 } from "../../src/verify/dod";
 import {
+  BUDGET_INCOMPLETE_REASON,
   INCOMPLETE_REASON,
   buildGradingPrompt,
+  incompleteVerdict,
+  isIncompleteVerdict,
   isProgressNote,
   runChecker,
 } from "../../src/verify/checker";
 import type { CheckerInput, GraderDispatch } from "../../src/verify/checker";
 import { buildDelegationDoD, buildForcingNote } from "../../src/verify/dispatch";
-import { gateResult } from "../../src/verify/gate";
+import { accept, gateResult } from "../../src/verify/gate";
 import {
   DISPATCH_HEADER_SEPARATOR,
   buildDispatchHeader,
@@ -246,48 +249,174 @@ describe("grading prompt and verdict under the budget", () => {
 describe("progress-note return → incomplete, not fail", () => {
   it.each([
     "I've updated guards.ts. I'll finish the tests next.",
-    "Read the three files; continuing with the enforce.ts changes.",
     "Partial work so far. Let me continue with the remaining criteria.",
-    "Still working on the header strip.",
-    "Changes staged — I\u2019m going to complete the commit after typecheck.",
+    "Changes staged — I\u2019m going to finish the commit after typecheck.",
+    "Read the three files; I will continue with enforce.ts",
   ])("%s", (text) => {
     expect(isProgressNote(text)).toBe(true);
   });
 
+  // QA-P15-1-1: ordinary finished wording is not a progress note.
   it.each([
     "",
+    "The full suite is now working.",
+    "Still working as designed: all 33 tests pass.",
+    "Read the three files; continuing with the enforce.ts changes.",
+    "Changes staged — I\u2019m going to complete the commit after typecheck.",
+    "Implemented and tested. I'll finish the docs in a follow-up.",
+    "I'll finish the docs in a follow-up. All tests pass.",
+    "Work in progress notes are in NOTES.md.",
     "DONE: implemented; I'll continue to monitor nothing.",
     "**NEED MORE:** budget — I'll finish after a resume.",
-    "> ESCALATE: authority. Continuing is impossible.",
+    "> ESCALATE: authority. I'll continue once granted.",
     "Summary\n\nDONE: all tests pass",
     "Implemented the reader profile. All 33 tests pass.",
-    `I'll finish the tests next.${" Evidence line.".repeat(40)}`, // the announcement is not at the end
+    `I'll finish the tests next.${" Evidence line.".repeat(40)}`, // not the final sentence
   ])("not a progress note: %j", (text) => {
     expect(isProgressNote(text)).toBe(false);
   });
 
-  it("the checker classifies it without dispatching the grader", async () => {
+  it("a contract follower's progress note: no grading, NOT accepted, no next-tier hint", async () => {
     const grader = vi.fn<GraderDispatch>();
     const v = await runChecker(checkerInput(["the guard has a reader profile"], "I'll finish the tests next."), { dispatchGrader: grader });
     expect(grader).not.toHaveBeenCalled();
     expect(v).toEqual({ pass: false, outcome: "unverifiable", method: "checker", reasons: [INCOMPLETE_REASON], caveats: [INCOMPLETE_REASON] });
-    expect(INCOMPLETE_REASON.startsWith("incomplete:")).toBe(true);
-    // Never a failure: accepted with a caveat by default, refused only under strictUnverifiable.
-    expect(gateResult(v, "inferred").accepted).toBe(true);
-    expect(gateResult(v, "inferred", true).accepted).toBe(false);
-    expect(gateResult(v, "inferred", true).verdict.outcome).toBe("unverifiable");
+    expect(isIncompleteVerdict(v)).toBe(true);
+    // QA-P15-1-1 before: accepted with a caveat; after: never accepted, still not a failure.
+    for (const strict of [false, true]) {
+      const g = gateResult(v, "inferred", strict);
+      expect(g.accepted).toBe(false);
+      expect(g.verdict.outcome).toBe("unverifiable"); // index.ts gives no next tier to unverifiable
+    }
+  });
+
+  it("an agent outside the return contract is graded, never classified by wording", async () => {
+    const grader = vi.fn<GraderDispatch>(async () => ({ sessionID: "g", text: '{"pass":true,"reasons":[]}' }));
+    const builtIn = { ...checkerInput(["docs written"], "I'll finish the tests next."), producerTier: "general" };
+    expect(await runChecker(builtIn, { dispatchGrader: grader })).toMatchObject({ outcome: "pass" });
+    expect(grader).toHaveBeenCalledTimes(1);
+    // A role agent follows the contract when the caller says so (P2.1).
+    const role = { ...builtIn, producerTier: "explorer", returnContract: true };
+    expect((await runChecker(role, { dispatchGrader: grader })).reasons).toEqual([INCOMPLETE_REASON]);
+  });
+
+  it("QA-P15-1-6: a grader reason starting with 'incomplete:' stays a failure", () => {
+    const graderFail = { pass: false, outcome: "fail" as const, method: "checker" as const, reasons: ["incomplete: tests missing"] };
+    expect(isIncompleteVerdict(graderFail)).toBe(false);
+    expect(isIncompleteVerdict({ outcome: "unverifiable", reasons: ["incomplete: tests missing"] })).toBe(false);
+    expect(gateResult(graderFail, "inferred")).toMatchObject({ accepted: false, verdict: { outcome: "fail" } });
+    expect(buildForcingNote(["incomplete: tests missing"], { producerTier: "medium", nextTier: "heavy" })).toContain("[router \u26a0 NOT ACCEPTED]");
+    expect(buildForcingNote(["incomplete: tests missing"], { producerTier: "medium", nextTier: "heavy" })).toContain('Task(subagent_type="heavy")');
   });
 
   it("renders as INCOMPLETE with resume guidance, not NOT ACCEPTED", () => {
-    const note = buildForcingNote([INCOMPLETE_REASON], { producerTier: "medium", nextTier: "heavy" });
-    expect(note.startsWith("[router \u26a0 INCOMPLETE] The delegate returned a progress note, not a result:\n- incomplete: ")).toBe(true);
-    expect(note).toContain("NEXT: resume the same delegation so it can finish");
-    expect(note).not.toContain("NOT ACCEPTED");
-    expect(note).not.toContain("heavy");
+    for (const reason of [INCOMPLETE_REASON, BUDGET_INCOMPLETE_REASON]) {
+      const note = buildForcingNote([reason], { producerTier: "medium", nextTier: "heavy" });
+      expect(note.startsWith("[router \u26a0 INCOMPLETE] The delegate stopped before a final result:\n- incomplete: ")).toBe(true);
+      expect(note).toContain("NEXT: resume the same delegation so it can finish");
+      expect(note).not.toContain("NOT ACCEPTED");
+      expect(note).not.toContain("heavy");
+    }
     // Any other reason keeps the existing rendering (golden).
     expect(buildForcingNote(["check failed", INCOMPLETE_REASON])).toBe(
       `[router \u26a0 NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- check failed\n- ${INCOMPLETE_REASON}\nNEXT: address the above and re-run the delegation; do not treat the prior result as complete.`,
     );
+  });
+});
+
+describe("QA-P15-1-2: NEED MORE: budget and a guard stop are incomplete (I7)", () => {
+  const passing: GraderDispatch = async () => ({ sessionID: "g", text: '{"pass":true,"reasons":[]}' });
+
+  it.each([
+    "NEED MORE: budget\nDone: guards.ts. Remaining: tests.",
+    "Summary first.\n**NEED MORE:** `budget` — done: X; remaining: Y",
+    "> need more: budget",
+  ])("%j → incomplete for any agent, the grader is not dispatched", async (text) => {
+    const grader = vi.fn<GraderDispatch>();
+    const input = { ...checkerInput(["x"], text), producerTier: "general" };
+    const v = await runChecker(input, { dispatchGrader: grader });
+    expect(grader).not.toHaveBeenCalled();
+    expect(v.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
+    expect(gateResult(v, "explicit")).toMatchObject({ accepted: false, verdict: { outcome: "unverifiable" } });
+  });
+
+  it("NEED MORE for anything but budget is graded", async () => {
+    const grader = vi.fn(passing);
+    await runChecker(checkerInput(["x"], "NEED MORE: context — which file holds the cap?"), { dispatchGrader: grader });
+    expect(grader).toHaveBeenCalledTimes(1);
+  });
+
+  it("budgetExhausted(child) without a contract marker is a budget stop; DONE:/ESCALATE: are graded", async () => {
+    const exhausted = (sid: string) => sid === "producer";
+    const grader = vi.fn(passing);
+    const stop = await runChecker(checkerInput(["x"], "Partial summary of the work so far"), { dispatchGrader: grader, budgetExhausted: exhausted });
+    expect(stop.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
+    expect(grader).not.toHaveBeenCalled();
+    for (const text of ["DONE: finished on the last call", "ESCALATE: authority"]) {
+      await runChecker(checkerInput(["x"], text), { dispatchGrader: grader, budgetExhausted: exhausted });
+    }
+    expect(grader).toHaveBeenCalledTimes(2);
+  });
+
+  it("the gate classifies a budget stop before the deterministic checks too", async () => {
+    const dod = { kind: "deterministic" as const, checks: [{ kind: "testsPass" as const, command: "npm test" }], criteria: [], deliverable: null, source: "explicit" as const };
+    const artefact = { changedFiles: [], finalReturnText: "NEED MORE: budget — tests not run yet", declaredOutputs: [], producerSessionID: "p", producerTier: "medium" };
+    const res = await accept({ dod }, artefact, { deterministic: {} as never, checker: { dispatchGrader: vi.fn<GraderDispatch>() } });
+    expect(res).toMatchObject({ accepted: false, verdict: { outcome: "unverifiable", reasons: [BUDGET_INCOMPLETE_REASON] } });
+  });
+
+  it("incompleteVerdict without progress-note classification ignores wording", () => {
+    const input = { finalReturnText: "I'll finish the tests next.", producerSessionID: "p", producerTier: "medium" };
+    expect(incompleteVerdict(input, { progressNotes: false, budgetExhausted: () => false })).toBeNull();
+    expect(incompleteVerdict(input, { progressNotes: true, budgetExhausted: () => false })?.reasons).toEqual([INCOMPLETE_REASON]);
+    expect(incompleteVerdict({ ...input, producerSessionID: "" }, { progressNotes: false })).toBeNull();
+  });
+});
+
+describe("QA-P15-1-7: inferred criteria keep whole sentences; explicit lists (golden)", () => {
+  it("a line over the budget keeps its leading whole sentences", () => {
+    expect(summarizeDispatch("One two. Three four. Five six.", 20)).toBe("One two. Three four.");
+    expect(summarizeDispatch("v1.2 is out. Next step follows.", 14)).toBe("v1.2 is out.");
+    expect(summarizeDispatch("A first sentence that is far too long. Short.", 10)).toBe("");
+    const emoji = "\u{1F600}".repeat(4);
+    expect(summarizeDispatch(`${emoji}. ${emoji}. tail`, 5)).toBe(`${emoji}.`);
+  });
+
+  it("an inferred first line over 4000 characters becomes whole sentences that are graded", () => {
+    const sentence = "The guard keeps the reader profile for every review dispatch.";
+    const line = Array.from({ length: 100 }, () => sentence).join(" ");
+    expect(codePointLength(line)).toBeGreaterThan(CRITERIA_BUDGET_CHARS);
+    const [criterion] = inferDoD(line, "", {}).criteria;
+    expect(codePointLength(criterion!)).toBeLessThanOrEqual(CRITERIA_BUDGET_CHARS);
+    expect(criterion!.endsWith(sentence)).toBe(true);
+    expect(line.startsWith(criterion!)).toBe(true);
+    expect(fitCriteria([criterion!]).omitted).toBe(0);
+  });
+
+  it("explicit [acceptance] list over 4000 characters — before: every criterion graded; after: the overflow is omitted, not graded", () => {
+    const a = `first ${"a".repeat(2994)}`;
+    const b = `second ${"b".repeat(2993)}`;
+    const dod = buildDelegationDoD({ prompt: ["Do it.", "[acceptance]", `criteria: ${a}`, `criteria: ${b}`, "[/acceptance]"].join("\n") });
+    expect(dod.criteria).toEqual([a, b]); // the DoD itself is unchanged
+    const { prompt } = buildGradingPrompt(checkerInput(dod.criteria));
+    expect(prompt).toContain(`1. ${a}\n(1 criterion omitted: over the 4000-character verification budget; not graded)`);
+    expect(prompt).not.toContain(b);
+  });
+});
+
+describe("QA-P15-1-8: only whole-line directives are skipped", () => {
+  it.each([
+    ["Verify: the output matches the golden", "Verify: the output matches the golden"],
+    ["Reason: the cache is stale, rebuild it", "Reason: the cache is stale, rebuild it"],
+    ["reason: x\nmore", "reason: x"],
+    ["VERIFY: required now please\nnext", "VERIFY: required now please"],
+    ["verify: required\nnext", "verify: required"],
+    ["CAP:8 and read the file", "CAP:8 and read the file"],
+    ["CAP: none\nreason: whole repo\nReview it.", "Review it."],
+    ["cap:12\nReason: why\nReview it.", "Review it."],
+    ["VERIFY_WAIT: 30s\nVERIFY: required\nDo it.", "Do it."],
+  ])("%j → %j", (text, criterion) => {
+    expect(summarizeDispatch(text)).toBe(criterion);
   });
 });
 

@@ -55,23 +55,60 @@ const CLOSE_TAG_RE = /^\s*\[\/(acceptance|dod)\]\s*$/i;
 // ---------------------------------------------------------------------------
 
 /**
- * Router-protocol lines (§2.9 E8): a `[router]` line, a `[route …]` line, and the
- * `CAP:` / `VERIFY:` / `VERIFY_WAIT:` / `reason:` directives. They steer the
- * router; they are never the task's outcome, so they never become a criterion.
+ * Router-protocol lines (§2.9 E8, QA-P15-1-8): a `[router]` / `[route …]` line and
+ * the whole-line directives `CAP:<n|none>`, `VERIFY:<word>`, `VERIFY_WAIT:<value>`;
+ * `reason:` only when a CAP line is present. They steer the router, they are
+ * never the task's outcome. "Verify: …" / "Reason: …" task lines stay criteria.
  */
-const DIRECTIVE_LINE_RE = /^(?:\[router\]|\[route(?:\s[^\]]*)?\]$|(?:VERIFY_WAIT|VERIFY|CAP|reason)\s*:)/i;
+const ROUTER_LINE_RE = /^(?:\[router\]|\[route(?:\s[^\]]*)?\]$)/i;
+const CAP_LINE_RE = /^CAP\s*:\s*(?:\d+|none)\s*$/i;
+const VERIFY_LINE_RE = /^VERIFY:\s*\w+\s*$/;
+const VERIFY_WAIT_LINE_RE = /^VERIFY_WAIT:\s*\S+\s*$/;
+const REASON_LINE_RE = /^reason\s*:/i;
+
+function isDirectiveLine(line: string, hasCap: boolean): boolean {
+  return (
+    ROUTER_LINE_RE.test(line) ||
+    CAP_LINE_RE.test(line) ||
+    VERIFY_LINE_RE.test(line) ||
+    VERIFY_WAIT_LINE_RE.test(line) ||
+    (hasCap && REASON_LINE_RE.test(line))
+  );
+}
+
+const SENTENCE_ENDS = new Set([".", "!", "?", "\u2026"]);
+
+/**
+ * QA-P15-1-7: a line over the budget keeps its leading WHOLE sentences that fit
+ * (cut only between sentences: a sentence end followed by a space); "" when even
+ * the first sentence does not fit.
+ */
+function leadingSentences(line: string, budget: number): string {
+  if (codePointLength(line) <= budget) return line;
+  let kept = 0;
+  let points = 0;
+  let segment = 0;
+  for (let i = 0; i < line.length; i++) {
+    if (!SENTENCE_ENDS.has(line[i]!) || line[i + 1] !== " ") continue;
+    points += codePointLength(line.slice(segment, i + 1));
+    if (points > budget) break;
+    kept = i + 1;
+    segment = i + 1;
+  }
+  return line.slice(0, kept);
+}
 
 /**
  * The dispatch's first non-empty line that is not a router directive,
- * whitespace-collapsed and WHOLE (§2.9 E8: a criterion is never cut mid-text;
- * fitCriteria drops a criterion over the verification budget instead).
+ * whitespace-collapsed and never cut mid-sentence (§2.9 E8): whole when it fits
+ * the verification budget, else its leading whole sentences that fit.
  */
-export function summarizeDispatch(text: string): string {
+export function summarizeDispatch(text: string, budget: number = CRITERIA_BUDGET_CHARS): string {
   if (!text) return "";
-  const lines = text.split("\n");
+  const lines = text.split("\n").map((line) => line.trim().replace(/\s+/g, " "));
+  const hasCap = lines.some((line) => CAP_LINE_RE.test(line));
   for (const line of lines) {
-    const trimmed = line.trim().replace(/\s+/g, " ");
-    if (trimmed && !DIRECTIVE_LINE_RE.test(trimmed)) return trimmed;
+    if (line && !isDirectiveLine(line, hasCap)) return leadingSentences(line, budget);
   }
   return "";
 }
