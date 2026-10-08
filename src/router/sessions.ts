@@ -440,6 +440,21 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
       touch(sessionID);
     },
 
+    /**
+     * #84 QA-P21-3-1: a routed resume of a role child (the host gives no chat.message for it): start a new dispatch round of its
+     * read-only counter, as a same-tier re-registration does — calls back to 0, `seen` and totalCalls kept, the previous cap kept
+     * unless the resume names one. False (nothing done) when the child has no read-only cap state.
+     */
+    resumeRoleSession(sessionID: string, cap: Cap | null): boolean {
+      const existing = subagentCapState.get(sessionID);
+      if (existing === undefined) return false;
+      if (cap !== null) existing.cap = cap;
+      existing.calls = 0;
+      existing.dispatches += 1;
+      touch(sessionID);
+      return true;
+    },
+
     /** Remove a session from tracking (used to clean up delegate producer sessions). */
     unregister(sessionID: string): void {
       evict(sessionID);

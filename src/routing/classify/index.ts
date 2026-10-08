@@ -325,6 +325,8 @@ function resultOf(
         count: prepared.parsed.count,
         conflict: prepared.parsed.conflict,
         edgeOnly: prepared.parsed.edgeOnly,
+        // QA-P12-2-2 (P2.1): surface a malformed first route line; absent otherwise (tier rows copy only the three fields above).
+        ...(prepared.parsed.malformed === true ? { malformed: true as const } : {}),
       },
       ...(skipped ? { backendSkipped: skipped } : {}),
       backend:

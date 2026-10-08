@@ -12,13 +12,27 @@ import { getActiveTiers } from "../router/protocol";
 import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrides } from "../router/subagents";
 import { warnAgentOptionsEffortOnce } from "../router/agent-options";
 import { pluginAgentMarker } from "../router/plugin-agents";
+import { registerRoleAgents, roleAgentAlias, roleAgentOf, roleAgentSteps } from "../router/role-agents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { GRADER_SYSTEM } from "../verify/checker";
 import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
-import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
+import {
+  annotateSubagentResult, childSessionOf, createDispatchRouter, forgetRoutedRole, roleMaxActions, routedRoleOf, takeSubagentAnnotations,
+} from "../routing/wire/dispatch";
+import type { RouterConfig } from "../router/config";
+import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
+import { bind, currentBinding, evict as evictBinding, evictCall, type SessionLookup } from "../routing/roles/binding";
+import {
+  AUTHORITY_TEXT, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText, requestedAuthority,
+  type AuthorityDeps,
+} from "../routing/roles/authority";
+import { budgetExhausted, type BudgetSnapshot } from "../guard/enforce";
+import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
+import { parseReturnPrefix } from "../routing/outcomes/signals";
+import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
@@ -53,11 +67,15 @@ function taskArgs(toolName: string, input: unknown): any {
   return input;
 }
 
-function nativeArgs(toolName: string, args: any, original: any, verifying: boolean): any {
+/**
+ * `foreground` (#84 P-5): a role dispatch is forced to the foreground whatever the verification settings, so the router can
+ * annotate its result (budget, authority) in `execute.after`. A separate flag: it never marks the call as verifying.
+ */
+function nativeArgs(toolName: string, args: any, original: any, verifying: boolean, foreground = false): any {
   if (!args || typeof args !== "object") return args;
   if (toolName === "subagent") {
     const { subagent_type, task_id, ...rest } = args;
-    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying ? { background: false } : {}) };
+    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying || foreground ? { background: false } : {}) };
   }
   if (toolName === "shell") { const { cwd, ...rest } = args; return { ...rest, ...(cwd === undefined ? {} : { workdir: cwd }) }; }
   if (["read", "write", "edit"].includes(toolName)) {
@@ -85,13 +103,236 @@ function translateAdded(before: string, after: string): string {
   return after.slice(0, prefix) + v2Instructions(after.slice(prefix, after.length - suffix)) + after.slice(after.length - suffix);
 }
 
+// ---------------------------------------------------------------------------
+// #84 P2.1 (T2.1.3, T2.1.4): role-dispatch helpers of the adapter. Roles mode on v2 only; tiers mode never reaches them.
+// ---------------------------------------------------------------------------
+
+/** The text of one session-context message: its `text`, else its text parts (`content` or `parts`) joined. */
+function messageText(message: unknown): string | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const m = message as Record<string, unknown>;
+  if (typeof m.text === "string") return m.text;
+  const parts = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : undefined;
+  if (parts === undefined) return undefined;
+  const texts = parts.flatMap((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text"
+    && typeof (part as Record<string, unknown>).text === "string" ? [(part as Record<string, unknown>).text as string] : []);
+  return texts.length > 0 ? texts.join("\n") : undefined;
+}
+
+/**
+ * Handoff 32: `SessionLookup.firstText` — the text parts of the session's first user message, joined (the binding reads the
+ * nonce from its last line). A context without a user message falls back to its first message with text.
+ */
+export function firstMessageText(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  const isUser = (m: unknown): boolean => !!m && typeof m === "object"
+    && ((m as Record<string, unknown>).role === "user" || (m as Record<string, unknown>).type === "user");
+  const user = messages.find(isUser);
+  return user !== undefined ? messageText(user) : messages.map(messageText).find((text) => text !== undefined);
+}
+
+/**
+ * T2.1.4 (P-5, S6): resume guidance appended to the parent's result when a role child was stopped before finishing — by the
+ * router's guard on its call budget (`guard`), or by the host itself: its step limit or a context overflow (`host`, handoff 22).
+ */
+export function roleBudgetNotice(agent: string, childSessionID: string, cause: "guard" | "host" = "guard"): string {
+  const what = cause === "guard" ? "its tool-call budget" : "the host's step or context limit";
+  // P2.2 handoff: the roles protocol tells the orchestrator to resume on a note that starts with ROUTER_BUDGET_NOTE_PREFIX.
+  return `${ROUTER_BUDGET_NOTE_PREFIX} @${agent} stopped on ${what} before finishing: this is not a failed result. `
+    + `NEXT: resume the same sessionID ("${childSessionID}") with @${agent} and the prompt "continue and finish"; `
+    + "do not start a new task and do not set `model` (the router keeps the child's tier).";
+}
+
+// ---------------------------------------------------------------------------
+// #84 P2.1 (handoff 22): the host's own budget stops of a child, from the event stream (spike S4)
+// ---------------------------------------------------------------------------
+
+/** A budget stop as handed to the signals: observed true/false, or not observable for this attempt. */
+export type HostBudgetObservation = boolean | "unobserved";
+
+/**
+ * S4 (measured on 2.0.24): a tool call made on the last allowed step is answered by the host with this error
+ * (`session.tool.failed`). Only a model that ignores the step's `tool_choice: none` makes such a call.
+ */
+export const HOST_STEP_LIMIT_TOOL_ERROR = /maximum agent steps/i;
+/**
+ * NOT measured (S4 covers step limits and guard denials only): how a context-overflow failure is recognised in a
+ * `session.step.failed` / `session.execution.failed` error (`type` and `message`). A failure that matches nothing here makes the
+ * attempt's host observation `unobserved`, never `false`.
+ */
+export const HOST_CONTEXT_OVERFLOW_ERROR = /context.?(?:overflow|length|window|limit)|prompt is too long|too many tokens|maximum context/i;
+
+export interface HostBudgetObserver {
+  /** A role child's attempt starts again (a resume): its counters start over. */
+  begin(childSessionID: string): void;
+  /** Every host event (only step/tool/execution events of a session are read). Never throws. */
+  onEvent(type: string, data: unknown): void;
+  /**
+   * The host stopped the child's current attempt: `true` when it ran `stepLimit` steps (S4: the last of N allowed steps carries the
+   * host's max-steps note and `tool_choice: none`), a tool call was refused for the step limit, or a step failed with a context
+   * overflow; `false` when its execution ended without any of these and without an unrecognised failure; else `unobserved`.
+   */
+  observe(childSessionID: string, stepLimit: number | null): HostBudgetObservation;
+  /** Resolves when the child's execution end was seen, or after `timeoutMs` (the event may trail the tool result). */
+  settled(childSessionID: string, timeoutMs: number): Promise<void>;
+  forget(sessionID: string): void;
+}
+
+/** Q1 (P2.3 decision at the P2.1 call site): an authority request of a child whose binding is not exact is never applied. */
+export const AUTHORITY_BINDING_UNKNOWN_DROP = `${AUTHORITY_TEXT.dropped.bindingUnknown}.`;
+
+/** QA-P21-1-8: logged once when `routing.delegation` becomes `roles` while OpenCode runs in tiers mode. */
+export const ROLES_RESTART_NOTICE =
+  "roles mode (OpenCode v2 only): routing.delegation is now `roles`, but this OpenCode instance started in tiers mode; restart OpenCode to register the role agents and tools (tiers mode stays active until then)";
+
+/** Bounded per-instance state (oldest child first out). */
+export function createHostBudgetObserver(max = 1000): HostBudgetObserver {
+  interface ChildState {
+    steps: number;
+    /** QA-P21-1-12: assistant messages already counted as a step (a retried step that keeps its message counts once). */
+    stepMessages: Set<string>;
+    toolLimit: boolean;
+    failure: "overflow" | "other" | null;
+    ended: boolean;
+    waiters: Set<() => void>;
+  }
+  const children = new Map<string, ChildState>();
+  /**
+   * One host step. QA-P21-1-12: a step event that names an assistant message already counted (a provider retry that reuses its
+   * message) is the same step and counts once. A retry under a NEW message id cannot be told apart from a new step on the event
+   * stream (no retry marker): it counts again, which can only make the step-limit observation earlier, never miss one.
+   */
+  const countStep = (state: ChildState, event: Record<string, unknown>): void => {
+    const message = event.assistantMessageID;
+    if (typeof message === "string" && message !== "") {
+      if (state.stepMessages.has(message)) return;
+      state.stepMessages.add(message);
+    }
+    state.steps += 1;
+  };
+  const wake = (state: ChildState): void => {
+    for (const waiter of [...state.waiters]) waiter();
+    state.waiters.clear();
+  };
+  const stateOf = (id: string): ChildState => {
+    let state = children.get(id);
+    if (state === undefined) {
+      state = { steps: 0, stepMessages: new Set(), toolLimit: false, failure: null, ended: false, waiters: new Set() };
+      children.set(id, state);
+      while (children.size > max) {
+        const oldest = children.keys().next().value as string;
+        const dropped = children.get(oldest);
+        children.delete(oldest);
+        if (dropped !== undefined) wake(dropped);
+      }
+    }
+    return state;
+  };
+  const errorText = (error: unknown): string => {
+    if (typeof error === "string") return error;
+    if (!error || typeof error !== "object") return "";
+    const e = error as Record<string, unknown>;
+    // QA-P21-2 nit 1: a host error may carry its text one level down (`error.data.message`).
+    const data = e.data !== null && typeof e.data === "object" ? (e.data as Record<string, unknown>) : undefined;
+    return [e.type, e.name, e.message, data?.message].filter((part) => typeof part === "string").join(" ");
+  };
+  const classify = (state: ChildState, error: unknown): void => {
+    if (state.failure === "overflow") return;
+    state.failure = HOST_CONTEXT_OVERFLOW_ERROR.test(errorText(error)) ? "overflow" : "other";
+  };
+  return {
+    begin(id) {
+      const old = children.get(id);
+      children.delete(id);
+      if (old !== undefined) wake(old);
+      stateOf(id);
+    },
+    onEvent(type, data) {
+      if (!data || typeof data !== "object") return;
+      const event = data as Record<string, unknown>;
+      const id = event.sessionID;
+      if (typeof id !== "string" || id === "") return;
+      // QA-P21-1-12: the error text is read from `error` (type/name/message) and from the event's own `message` field.
+      const failureOf = (): string => [errorText(event.error), typeof event.message === "string" ? event.message : ""].filter(Boolean).join(" ");
+      if (type === "session.step.ended") {
+        countStep(stateOf(id), event);
+      } else if (type === "session.step.failed") {
+        const state = stateOf(id);
+        countStep(state, event);
+        classify(state, failureOf());
+      } else if (type === "session.tool.failed") {
+        if (HOST_STEP_LIMIT_TOOL_ERROR.test(failureOf())) stateOf(id).toolLimit = true;
+      } else if (EXECUTION_END_TYPES.has(type)) {
+        const state = stateOf(id);
+        if (type === "session.execution.failed" && (event.error !== undefined || typeof event.message === "string")) classify(state, failureOf());
+        state.ended = true;
+        wake(state);
+      }
+    },
+    observe(id, stepLimit) {
+      const state = children.get(id);
+      if (state === undefined) return "unobserved";
+      if (state.toolLimit || state.failure === "overflow" || (stepLimit !== null && stepLimit > 0 && state.steps >= stepLimit)) return true;
+      return !state.ended || state.failure === "other" ? "unobserved" : false;
+    },
+    settled(id, timeoutMs) {
+      const state = stateOf(id);
+      if (state.ended || !(timeoutMs > 0)) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const done = (): void => {
+          clearTimeout(timer);
+          state.waiters.delete(done);
+          resolve();
+        };
+        const timer = setTimeout(done, timeoutMs);
+        timer.unref?.();
+        state.waiters.add(done);
+      });
+    },
+    forget(id) {
+      const state = children.get(id);
+      children.delete(id);
+      if (state !== undefined) wake(state);
+    },
+  };
+}
+
+/**
+ * Handoffs 34 and 37: the parent's annotation when a role child stopped with `ESCALATE: authority` after recording a request
+ * (`router_request_authority`). The child's reasons are quoted as data, never as instructions.
+ */
+export function roleAuthorityNotice(agent: string, childSessionID: string, actions: readonly string[], reasons: readonly string[]): string {
+  const why = reasons.length > 0 ? ` Reasons: ${reasons.map(quoteChildText).join("; ")}.` : "";
+  return `[router] @${agent} asked for more authority: ${actions.join(", ")}.${why} `
+    + `NEXT: if the task needs it, resume the same sessionID ("${childSessionID}") with @${agent} to continue with the wider grant `
+    + "(the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.";
+}
+
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
 export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
   runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession">>,
-  /** `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing. */
-  options: { ingest?: Ingest } = {},
+  /**
+   * `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing.
+   * `isBypassed`: the plugin's `/bypass` state (#84 P2.1: the role path's router-gate condition, S10/P-9).
+   * `hostBudget`: the host-side budget observer (handoff 22); a private one when absent. `onHostBudget` receives its `observe`,
+   * so the plugin's signals read the same observations (src/v2.ts).
+   * `hostSettleMs`: how long a role dispatch's result waits for the child's execution-end event (default 500 ms).
+   */
+  options: {
+    ingest?: Ingest; isBypassed?: () => boolean; hostBudget?: HostBudgetObserver; hostSettleMs?: number;
+    onHostBudget?: (observe: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation) => void;
+    /**
+     * QA-P21-1-3: the plugin's budget snapshot of a child (guard state AND the session store's read-only CAP state, the same
+     * `captureBudget(child, readCapReached)` its signals read). Absent: the guard's `budgetExhausted` alone.
+     */
+    budgetSnapshot?: (childSessionID: string) => BudgetSnapshot;
+    /** QA-P21-2-4: receives the adapter's "this role agent is registered" check, so the plugin's role runtime follows it. */
+    onRoleLive?: (isLive: (agent: string) => boolean) => void;
+    /** QA-P21-2 nit 3: `router_verify` is registered (index.ts `routerVerifyEnabled`); nothing is deferred otherwise. */
+    routerVerifyEnabled?: () => boolean;
+  } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
   // casts confined to this adapter, rather than weakening the v2 event types.
@@ -115,6 +356,18 @@ export async function registerV2Hooks(
   // M7 (2.2): dispatch routing and the protocol/hint adaptation share one runtime; it touches nothing (no host call, no
   // store, no disk) while routing.engine is static, which is the default and what every config without a `routing` block is.
   const sessionOf = (sessionID: string): Promise<unknown> => ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]);
+  /**
+   * QA-P21-1-8: this instance started in roles mode (set by the first agent build at setup). Role agents, role routing and the
+   * role tools (index.ts registers them at start) exist only then; a switch to roles at runtime is refused with a notice
+   * ("restart OpenCode"), and a switch back to tiers drops the role agents on the next build. Plan amendment R8.
+   */
+  let rolesStarted: boolean | undefined;
+  /**
+   * QA-P21-2-4: a role agent is live only when its registration succeeded (the agent map the transform publishes holds it as a
+   * role agent). Set once the agent map exists; until then nothing is registered.
+   */
+  let registeredRole: (agent: string) => boolean = () => false;
+  options.onRoleLive?.((agent) => rolesStarted === true && registeredRole(agent));
   const engine = createEngineRuntime({
     loadConfig: () => loadConfig(ctx.location.directory),
     listAgents: async () => (await ctx.agent.list()).data,
@@ -125,6 +378,69 @@ export async function registerV2Hooks(
   const dispatchRouter = createDispatchRouter({
     runtime: engine, getSession: sessionOf, graderAgent: V2_GRADER_AGENT, directory: ctx.location.directory,
     logger: { warn: (message, extra) => ingestLogger.warn(message, extra), debug: (message, extra) => console.debug(message, extra ?? "") },
+    ...(options.isBypassed === undefined ? {} : { isBypassed: () => options.isBypassed?.() === true }),
+    // QA-P21-1-8 / QA-P21-2-4: started in roles mode AND this role agent's registration succeeded.
+    rolesEnabled: (agent) => rolesStarted === true && registeredRole(agent),
+    ...(options.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: options.routerVerifyEnabled }),
+  });
+  // #84 P2.1: the role table of a config (empty in tiers mode, where every role branch below is skipped), cached per config object.
+  // QA-P21-1-8: also empty unless this instance STARTED in roles mode (its role agents and tools are registered only then).
+  const roleTables = new WeakMap<RouterConfig, ReadonlyMap<string, RoleSpec>>();
+  const NO_ROLES: ReadonlyMap<string, RoleSpec> = new Map();
+  const rolesOf = (cfg: RouterConfig): ReadonlyMap<string, RoleSpec> => {
+    if (rolesStarted !== true) return NO_ROLES;
+    let roles = roleTables.get(cfg);
+    if (roles === undefined) {
+      try {
+        roles = resolveRoles(cfg, "v2");
+      } catch (error) {
+        roles = new Map();
+        ingestLogger.warn("[router] roles: the role table could not be resolved; no role runtime for this config", { error: String(error) });
+      }
+      roleTables.set(cfg, roles);
+    }
+    // QA-P21-2-4: only the role agents whose registration succeeded are live.
+    const live = [...roles].filter(([name]) => registeredRole(name));
+    return live.length === roles.size ? roles : new Map(live);
+  };
+  const maxOfRoles = (roles: ReadonlyMap<string, RoleSpec>) => (agent: string) => roleMaxActions(roles.get(agent));
+  /** Handoff 32: what the binding reads of a child session (parent, agent, title, first message text). */
+  const bindingLookup: SessionLookup = async (id) => {
+    const session = await ctx.session.get({ sessionID: id } as Parameters<typeof ctx.session.get>[0]) as unknown as Record<string, unknown>;
+    let firstText: string | undefined;
+    try {
+      firstText = firstMessageText(await ctx.session.context({ sessionID: id } as Parameters<typeof ctx.session.context>[0]));
+    } catch {
+      firstText = undefined; // the title marker still binds
+    }
+    const text = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+    return {
+      ...(text(session.parentID) === undefined ? {} : { parentID: text(session.parentID) }),
+      ...(text(session.agent) === undefined ? {} : { agent: text(session.agent) }),
+      ...(text(session.title) === undefined ? {} : { title: text(session.title) }),
+      ...(firstText === undefined ? {} : { firstText }),
+    };
+  };
+  /** Handoff 22: the host's own stops of role children (step limit, context overflow), from the event stream. */
+  const hostBudget = options.hostBudget ?? createHostBudgetObserver();
+  options.onHostBudget?.((childSessionID, stepLimit) => hostBudget.observe(childSessionID, stepLimit));
+  const hostSettleMs = options.hostSettleMs ?? 500;
+  /** The host `steps` limit the router registers for a role agent (P-4); null for any other agent. */
+  const hostStepLimitOf = (roles: ReadonlyMap<string, RoleSpec>, agent: string): number | null => {
+    const spec = roles.get(agent);
+    return spec === undefined ? null : roleAgentSteps(spec);
+  };
+  /** Handoff 36: the parent's last `subagent` call of each role child (the call a resume follows, `consumeAuthority` `afterCall`). */
+  const lastCallOfChild = new Map<string, string>();
+  const rememberLastCall = (child: string, callID: string): void => {
+    lastCallOfChild.delete(child);
+    lastCallOfChild.set(child, callID);
+    while (lastCallOfChild.size > 1000) lastCallOfChild.delete(lastCallOfChild.keys().next().value!);
+  };
+  const authorityDeps = (roles: ReadonlyMap<string, RoleSpec>, fallbackAgent: string | undefined): AuthorityDeps => ({
+    roleOf: (child) => roles.get(lookupDispatch(child)?.agent ?? fallbackAgent ?? ""),
+    roles: () => roles,
+    bindingOf: (child) => currentBinding(child, { maxOf: maxOfRoles(roles) }),
   });
   const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger });
   let eventTask: Promise<void> | undefined;
@@ -167,12 +483,19 @@ export async function registerV2Hooks(
       variant: agent.model?.variant,
     };
     let config: LegacyConfig = { agent: {}, command: {} };
+    registeredRole = (agent) => roleAgentOf(config.agent[agent]) === agent; // QA-P21-2-4
     let originals = new Map<string, string>();
     let agentOptions = new Map<string, Record<string, unknown>>();
     const warnedPermissions = new Set<string>();
     const warnPermissionOnce = (message: string) => {
       if (warnedPermissions.has(message)) return;
       warnedPermissions.add(message);
+      ingestLogger.warn(message);
+    };
+    const warnedRoles = new Set<string>();
+    const warnRoleOnce = (key: string, message: string) => {
+      if (warnedRoles.has(key)) return;
+      warnedRoles.add(key);
       ingestLogger.warn(message);
     };
     // Plugin agents (#81) are protected like read-only tiers: readOnly ones and explicit-permission ones
@@ -226,6 +549,19 @@ export async function registerV2Hooks(
       // Names in the setup seed are host built-in agents (not opencode.json entries the config hook can tell apart).
       Object.defineProperty(next, HOST_SEED_AGENTS, { value: new Set(Object.keys(baseSeed)), enumerable: false });
       await hooks.config?.(next);
+      const routerConfig = loadConfig(ctx.location.directory);
+      // #84 P2.1: the role agents (roles mode only; tiers mode returns at once). Built like plugin agents, so the transform
+      // below publishes their max policy and protectedAgent() holds for each; fail closed (no role agent) on any error.
+      // QA-P21-1-8: only when this instance STARTED in roles mode; a runtime switch to roles registers nothing (a restart does).
+      const rolesRequested = routerConfig.routing?.delegation === "roles";
+      rolesStarted ??= rolesRequested;
+      if (rolesStarted) {
+        await registerRoleAgents(next.agent, routerConfig, {
+          context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce,
+        });
+      } else if (rolesRequested) {
+        warnRoleOnce("roles:restart", ROLES_RESTART_NOTICE);
+      }
       for (const name of Object.keys(next.agent)) if (!Object.hasOwn(baseSeed, name)) routerCreated.add(name);
       const nextOptions = new Map<string, Record<string, unknown>>();
       for (const [name, definition] of Object.entries(next.agent)) {
@@ -240,7 +576,7 @@ export async function registerV2Hooks(
       config = next;
       originals = nextOriginals;
       agentOptions = nextOptions;
-      return loadConfig(ctx.location.directory);
+      return routerConfig;
     };
     lastConfig = await buildConfig();
     let refreshChain: Promise<void> = Promise.resolve();
@@ -478,9 +814,22 @@ export async function registerV2Hooks(
 
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       const args = await scopedArgs(event);
+      // #84 P2.1 (P-2, handoffs 11/32/33): a role child binds to its dispatch before its tool runs, so `router_run` and
+      // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
+      const callerRoles = rolesOf(loadConfig(ctx.location.directory));
+      if (callerRoles.size > 0 && typeof event.agent === "string" && callerRoles.has(event.agent)) {
+        const binding = await bind(String(event.sessionID), bindingLookup, { maxOf: maxOfRoles(callerRoles) });
+        dispatchRouter.noteBinding(String(event.sessionID), binding); // QA-P21-1-11: the observed kind, once per child
+      }
+      // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
+      let roleForeground = false;
       if (event.tool === "subagent" && args && typeof args.agent === "string") {
         // The model `subagentTiers` would fill in when the call names none (unchanged behaviour: only then, only for a mapped agent).
         const cfg = loadConfig(ctx.location.directory);
+        // #84 P-7: roles mode dispatches the host-native `explore` as the `explorer` role agent. Legacy shape: nativeArgs
+        // derives `agent` from `subagent_type`; `args.agent` is set too, so everything below keys on the role name.
+        const alias = roleAgentAlias(args.agent, cfg, (name) => roleAgentOf(config.agent[name]) === name);
+        if (alias !== undefined) { args.agent = alias; args.subagent_type = alias; }
         let tierModel: string | undefined;
         if (args.model === undefined) {
           if (cfg.subagentTiers?.[args.agent]) {
@@ -495,10 +844,42 @@ export async function registerV2Hooks(
         }
         // M7 (2.2): the engine goes first. Static (the default) returns untouched without any host call; shadow/advise only
         // log and strip `[route …]`; enforce may also replace agent and model. `subagentTiers` then only fills a missing model.
+        // #84 P2.1 (handoff 36): a resume of a role child applies the authority its previous call recorded and annotated; the
+        // widened actions recompute the tier floor in `route()`. QA-P21-1-10: the request is only READ before routing and
+        // consumed once `route()` succeeded — a refused dispatch keeps it and queues no notice. Q1 (P2.3 call site): only an
+        // EXACT binding widens; any other drops the request ("binding unknown: dispatch a fresh task"), shown on this result.
+        const roles = rolesOf(cfg);
+        const resumeID = typeof args.sessionID === "string" && args.sessionID !== "" ? args.sessionID : undefined;
+        let widened: AuthorityAction[] | undefined;
+        let afterRoute: (() => void) | undefined;
+        if (resumeID !== undefined && roles.has(args.agent)) {
+          hostBudget.begin(resumeID); // handoff 22: the host's step count starts over with the resumed attempt
+          // QA-P21-2 nit 2: one preview (authority.ts) decides what consumeAuthority would do; Q1 via `exactOnly`.
+          const deps = authorityDeps(roles, args.agent);
+          const afterCall = lastCallOfChild.get(resumeID) ?? "";
+          const preview = previewAuthority(resumeID, deps, { afterCall, exactOnly: true });
+          if (preview.status === "widened") widened = [...preview.widened];
+          if (preview.status === "dropped" && preview.reason === AUTHORITY_TEXT.dropped.bindingUnknown) {
+            afterRoute = () => {
+              evictAuthority(resumeID); // consumeAuthority would widen a non-exact binding: the request is dropped here instead
+              annotateSubagentResult("authority", resumeID, `[router] ${AUTHORITY_BINDING_UNKNOWN_DROP}`);
+            };
+          } else if (preview.status !== "none") {
+            afterRoute = () => {
+              const consumed = consumeAuthority(resumeID, deps, { afterCall });
+              if (consumed.status === "dropped") annotateSubagentResult("authority", resumeID, `[router] ${consumed.reason}.`);
+            };
+          }
+        }
         const routed = await dispatchRouter.route({
           callID: event.id, sessionID: event.sessionID, agent: event.agent, args, tierModel, cfg,
+          ...(widened === undefined ? {} : { widened }),
         });
+        afterRoute?.();
         if (routed.prompt !== undefined) args.prompt = routed.prompt;
+        // #84 P2.1-C: a fresh role dispatch carries its nonce at the END of the description (title marker, handoff 31).
+        if (routed.description !== undefined) args.description = routed.description;
+        if (routed.role !== undefined) roleForeground = true;
         if (routed.agent !== undefined) { args.agent = routed.agent; args.subagent_type = routed.agent; }
         if (routed.model !== undefined) args.model = routed.model;
         if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
@@ -525,7 +906,7 @@ export async function registerV2Hooks(
           const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
           output.args.prompt = translateAdded(prompt, output.args.prompt);
         }
-        event.input = nativeArgs(event.tool, output.args, original, verifying);
+        event.input = nativeArgs(event.tool, output.args, original, verifying, roleForeground);
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
         throw error;
@@ -533,11 +914,76 @@ export async function registerV2Hooks(
       // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
       dispatchRouter.commit(event.id, event.input);
     }));
+    /**
+     * #84 P2.1 (T2.1.4; handoffs 28, 34, 37): the parent's `subagent` call of a role child ended. Computed BEFORE the legacy hook
+     * (whose signals read the authority record and the guard state): the notices for the parent's result — resume guidance when
+     * the guard stopped the child on its budget, the child's recorded authority request on `ESCALATE: authority`, a request this
+     * resume dropped. `finish()` runs after the legacy hook: the request is attached to this call on `ESCALATE: authority`
+     * (`markAnnotated`), else dropped (`discardAuthority`); then the call's pending binding entry is evicted (`evictCall`).
+     * `undefined` for every call that is not a role dispatch (tiers mode: always).
+     */
+    const roleAfterCall = async (end: {
+      readonly id: string; readonly sessionID: string; readonly status: string; readonly result: unknown; readonly input: unknown;
+    }): Promise<{ readonly notice: string | undefined; readonly finish: () => void; readonly child: string | null } | undefined> => {
+      const record = (value: unknown): Record<string, unknown> | undefined =>
+        value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+      const routedRole = routedRoleOf(end.id);
+      const calledAgent = record(end.input)?.agent;
+      const agent = routedRole?.agent ?? (typeof calledAgent === "string" ? calledAgent : undefined);
+      const roles = rolesOf(loadConfig(ctx.location.directory));
+      if (agent === undefined || (routedRole === undefined && !roles.has(agent))) return undefined;
+      const child = end.status === "completed" ? childSessionOf(end.result) : null;
+      const structured = record(end.result)?.output;
+      const running = record(structured)?.status === "running";
+      const output = record(structured)?.output;
+      const text = typeof output === "string" ? output : contentText(record(end.result)?.content);
+      const contract = child === null || running ? null : parseReturnPrefix(text);
+      const escalated = contract?.prefix === "escalate" && contract.claim === "authority";
+      const notices: string[] = [];
+      if (child !== null && !running) {
+        const request = requestedAuthority(child);
+        if (escalated && request !== undefined && request.actions.length > 0 && (!request.annotated || request.callID === end.id)) {
+          annotateSubagentResult("authority", child, roleAuthorityNotice(agent, child, request.actions, request.reasons));
+        }
+        // Handoff 22: the host's own stop (step limit, context overflow) counts like the guard's; its events may trail the result.
+        await hostBudget.settled(child, hostSettleMs);
+        // QA-P21-1-3: the plugin's snapshot (guard stop OR the read-only CAP reached), as its signals read it.
+        const snapshot = options.budgetSnapshot?.(child);
+        // QA-P21-3-1: a reached read cap counts only with a `NEED MORE` return (a DONE at the cap is a finished task).
+        const capStop = snapshot?.readCapReached === true && contract?.prefix === "need-more";
+        const stopped = snapshot === undefined ? budgetExhausted(child) : snapshot.stopped || capStop;
+        if (stopped) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child));
+        else if (hostBudget.observe(child, hostStepLimitOf(roles, agent)) === true) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child, "host"));
+        for (const annotation of takeSubagentAnnotations(child)) notices.push(annotation.text);
+      }
+      return {
+        notice: notices.length > 0 ? notices.join("\n\n") : undefined,
+        child,
+        finish: () => {
+          try {
+            if (child !== null) {
+              if (!running && !(escalated && markAnnotated(child, end.id, end.sessionID))) discardAuthority(child, end.id);
+              rememberLastCall(child, end.id);
+            }
+            evictCall(end.sessionID, end.id);
+          } catch (error) {
+            ingestLogger.warn("[router] roles: the finished role dispatch could not be released", { error: String(error) });
+          }
+        },
+      };
+    };
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
       dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
-      const banner = depthBanners.get(event.id);
+      const role = event.tool === "subagent" ? await roleAfterCall({
+        id: event.id, sessionID: String(event.sessionID), status: event.status,
+        result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
+      }) : undefined;
+      try {
+      const depthBanner = depthBanners.get(event.id);
+      // The role notices ride with the depth banner: appended last to the parent's result on every path below.
+      const banner = role?.notice === undefined ? depthBanner : depthBanner === undefined ? role.notice : `${depthBanner}\n\n${role.notice}`;
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
       if (event.status !== "completed") return;
@@ -577,7 +1023,16 @@ export async function registerV2Hooks(
       }
       const text = event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string"
         ? structured.output : contentText(event.result.content);
-      const output = { title: "", output: text, metadata: { ...event.result.metadata } };
+      // QA-P21-1-3: the plugin's signals and gate read the child from the legacy metadata; a role result names it there too when
+      // the host reports it only in the structured output (spike S1: `result.output.sessionID`). Tier calls: unchanged.
+      const resultMetadata = event.result.metadata as Record<string, unknown> | undefined;
+      const output = {
+        title: "", output: text,
+        metadata: {
+          ...resultMetadata,
+          ...(role?.child != null && resultMetadata?.sessionID === undefined && resultMetadata?.sessionId === undefined ? { sessionID: role.child } : {}),
+        },
+      };
       await within(hookContext(event), async () => {
         await legacy["tool.execute.after"]?.({
           ...event, tool: legacyToolName(event.tool),
@@ -615,6 +1070,10 @@ export async function registerV2Hooks(
           : structured && typeof structured === "object" && typeof structured.output === "string"
             ? { output: { ...structured, output: final } } : {}),
       };
+      } finally {
+        role?.finish();
+        if (event.tool === "subagent") forgetRoutedRole(event.id);
+      }
     }));
 
     // V2 events are immutable facts. A completed-text warning is a synthetic
@@ -624,6 +1083,7 @@ export async function registerV2Hooks(
         if (abort.signal.aborted) break;
         try {
           const data = event.data as Record<string, any>;
+          hostBudget.onEvent(event.type, data); // handoff 22 (S4): step counts, step-limit tool refusals, overflow failures
           if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
             await ingesting(event.type, () => ingest.onStepEnded(event));
@@ -633,6 +1093,14 @@ export async function registerV2Hooks(
           if (event.type === "session.created") dispatchRouter.onSessionCreated({ sessionID: data.sessionID, parentID: data.parentID, agent: data.agent, title: data.title });
           if (event.type === "session.deleted") {
             runtime?.forgetSession?.(data.sessionID);
+            // #84 P2.1 (handoff 35): the session's binding (as a parent: its pending dispatches and children's bindings) and its
+            // authority requests go with it.
+            if (typeof data.sessionID === "string") {
+              evictBinding(data.sessionID);
+              evictAuthority(data.sessionID);
+              lastCallOfChild.delete(data.sessionID);
+              hostBudget.forget(data.sessionID);
+            }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {
             // The v2 equivalents of session.idle: coalesced, throttled flush (D15); never awaited.

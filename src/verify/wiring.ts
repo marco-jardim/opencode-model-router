@@ -97,6 +97,7 @@ import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateRes
 // against the router's directory while claiming to check the producer's.
 import type { GraderRequest } from "./checker";
 import { isIncompleteVerdict } from "./checker";
+import type { BudgetSnapshot } from "../guard/enforce";
 export type { GraderRequest };
 
 /**
@@ -397,7 +398,16 @@ export interface DeferredFinishInput {
   readonly cwd: string | undefined;
   readonly dod: DoD;
   readonly dispatchedAt: number;
+  /**
+   * #84 P2.1 (handoff 24, R7): the producer's guard budget state captured when its task returned (enforce.ts captureBudget with
+   * sessions.ts readCapReached). A later `router_verify` judges THIS snapshot, never the live state at verification time. Absent:
+   * the gate reads it live, as before.
+   */
+  readonly budget?: BudgetSnapshot;
 }
+
+/** Deferred budget snapshots kept for `router_verify` (by handle; oldest dropped first, like the pending registry's bound). */
+export const MAX_DEFERRED_BUDGETS = 1000;
 
 /**
  * What finishDeferred decided. `deferred: false` means the delegation is NOT deferred and the
@@ -1593,6 +1603,8 @@ export function createVerificationWiring(deps: {
     return plans.find(p => "unverifiable" in p) ?? plans[0] ?? unfinished;
   };
 
+  /** #84 P2.1 (handoff 24): deferred budget snapshots by handle, read by `router_verify` (bounded, oldest out). */
+  const deferredBudgets = new Map<string, BudgetSnapshot>();
   const finishDeferred: VerificationWiring["finishDeferred"] = async (store, input) => {
     const producerTier = canonicalTier(input.producerTier);
     // The live reference promise (no signal: never awaited here). Its settled value at this moment
@@ -1659,6 +1671,12 @@ export function createVerificationWiring(deps: {
         return { deferred: false, reason: "unregistered", detail: `${reg.code}: ${reg.detail}` };
       }
       deferred = true;
+      // #84 P2.1 (handoff 24, R7): the budget captured at return travels with the handle to `router_verify`.
+      if (input.budget !== undefined) {
+        deferredBudgets.delete(reg.handle);
+        deferredBudgets.set(reg.handle, input.budget);
+        while (deferredBudgets.size > MAX_DEFERRED_BUDGETS) deferredBudgets.delete(deferredBudgets.keys().next().value as string);
+      }
       // 2.4.5 (pending.ts R14): queued, never awaited: the queue's own timer starts the run later.
       // An unattributed change set is not queued (nothing could run; it stays listed instead).
       if (background !== undefined && changedFiles !== "unavailable") {
@@ -1843,6 +1861,8 @@ export function createVerificationWiring(deps: {
       declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
       producerSessionID: entry.producerSessionID,
       producerTier: entry.producerTier,
+      // #84 P2.1 (handoff 24, R7): the snapshot captured when the task returned; absent → read live, as before.
+      ...(deferredBudgets.has(entry.handle) ? { budget: deferredBudgets.get(entry.handle) as BudgetSnapshot } : {}),
     };
     let res: GateResult;
     let timedOut = false;
@@ -2199,6 +2219,7 @@ export function createVerificationWiring(deps: {
     },
     disposeVerification: () => {
       dispatchStarts.clear();
+      deferredBudgets.clear();
       // 2.4.5: abort the background run first, so nothing re-queues while the coordinator stops.
       background?.dispose();
       return coordinator.dispose();

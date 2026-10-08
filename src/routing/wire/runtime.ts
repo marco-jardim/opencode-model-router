@@ -15,11 +15,13 @@
 import type { LadderSessionPolicyInput } from "../../escalate/ladder";
 import {
   resolveClassifierForPreset,
+  resolveRolesRouting,
   resolveRouting,
   resolveVariantSteps,
   type ResolvedRouting,
   type RouterConfig,
 } from "../../router/config";
+import { resolveRoles, type RoleSpec } from "../../router/roles";
 import { createClassifierBackend, type ClassifyDeps } from "../classify";
 import type { ClassifierBackend, ClassifierSettings, HostGenerate } from "../classify/types";
 import type { EngineStoreView } from "../engine/types";
@@ -74,12 +76,42 @@ export interface Prepared {
   readonly enqueue: (row: LogRow) => void;
 }
 
+/**
+ * Everything one ROLE dispatch needs (#84 P2.1 T2.1.2). Unlike {@link Prepared} it exists in every engine mode, `static`
+ * included: a role dispatch always gets a router-set model (I2). Only `routing.delegation: "roles"` on v2 produces one.
+ */
+export interface RolePrepared {
+  readonly cfg: RouterConfig;
+  /** The resolved role table (`resolveRoles(cfg, "v2")`). */
+  readonly roles: ReadonlyMap<string, RoleSpec>;
+  /** The dispatched role. */
+  readonly spec: RoleSpec;
+  readonly routing: ResolvedRouting;
+  /** `routing.engine`: `static` decides the static default and writes no row. */
+  readonly engine: ResolvedRouting["engine"];
+  /** `routing.exploration.rate` (0 unless roles mode; the kernel clamps it). */
+  readonly exploration: number;
+  readonly catalog: WireCatalog;
+  readonly session: LadderSessionPolicyInput;
+  /** The outcome store (posteriors); `null` when the engine is static. */
+  readonly store: EngineStoreView | null;
+  /** The decision-log queue; `null` when the engine is static (no rows). */
+  readonly enqueue: ((row: LogRow) => void) | null;
+  readonly classifyDeps: ClassifyDeps;
+}
+
 export interface EngineRuntime {
   /**
    * `null` when the engine is static (or the host is not v2): nothing was touched. Never throws. `cfg` is the config the caller
    * already loaded (one `loadConfig` per hook call); without it the runtime loads its own.
    */
   prepare(cfg?: RouterConfig): Promise<Prepared | null>;
+  /**
+   * #84 P2.1: `null` unless `agent` is an enabled role agent of `routing.delegation: "roles"` on v2 (tiers mode: `null` before any
+   * host call). For a role agent it THROWS when the dispatch cannot be prepared: the caller refuses the role dispatch (fail closed).
+   * Optional so that hand-made runtimes keep compiling; `createEngineRuntime` always provides it.
+   */
+  prepareRoles?(agent: string, cfg?: RouterConfig): Promise<RolePrepared | null>;
   /** The dispatching session's view of the host's agents (evaluated permissions included). */
   agents(parentAgent: string | undefined, sessionRules: readonly PermissionRule[]): Promise<AgentView | null>;
   /** The classifier dependencies for this config (backend memoized). */
@@ -146,7 +178,48 @@ export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
     return routingMemo.routing;
   };
 
-  return {
+  const classifyDepsFor = (cfg: RouterConfig, routing: ResolvedRouting): ClassifyDeps => {
+    const settings = resolveClassifierForPreset(routing.classifier, cfg.activePreset);
+    const key = JSON.stringify([
+      settings.backend, settings.model, settings.baseUrl, settings.apiKeyEnv, settings.timeoutMs, settings.samples, settings.maxStateChars,
+    ]);
+    if (classifierMemo === null || classifierMemo.key !== key) {
+      const memoSettings: ClassifierSettings = {
+        backend: settings.backend,
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        apiKeyEnv: settings.apiKeyEnv,
+        timeoutMs: settings.timeoutMs,
+        samples: settings.samples,
+        maxStateChars: settings.maxStateChars,
+      };
+      classifierMemo = {
+        key,
+        settings: memoSettings,
+        backend: createClassifierBackend(memoSettings, {
+          ...(deps.generate === undefined ? {} : { generate: deps.generate }),
+          logger: deps.logger,
+        }),
+      };
+    }
+    return {
+      cfg,
+      settings: classifierMemo.settings,
+      minClassConfidence: routing.minClassConfidence,
+      backend: classifierMemo.backend,
+      logger: deps.logger,
+    };
+  };
+
+  const sessionPolicyOf = (cfg: RouterConfig, routing: ResolvedRouting): LadderSessionPolicyInput => ({
+    host: "v2",
+    variantSteps: resolveVariantSteps(cfg, "v2"),
+    maxContextFraction: routing.sessionReuse.maxContextFraction,
+    catalog: (model) => catalog.entry(model),
+    warn: (message) => deps.logger.warn(message),
+  });
+
+  const self: EngineRuntime = {
     async prepare(given): Promise<Prepared | null> {
       try {
         const cfg = given ?? deps.loadConfig();
@@ -209,35 +282,50 @@ export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
     },
 
     classifyDeps(prepared): ClassifyDeps {
-      const settings = resolveClassifierForPreset(prepared.routing.classifier, prepared.cfg.activePreset);
-      const key = JSON.stringify([
-        settings.backend, settings.model, settings.baseUrl, settings.apiKeyEnv, settings.timeoutMs, settings.samples, settings.maxStateChars,
-      ]);
-      if (classifierMemo === null || classifierMemo.key !== key) {
-        const memoSettings: ClassifierSettings = {
-          backend: settings.backend,
-          model: settings.model,
-          baseUrl: settings.baseUrl,
-          apiKeyEnv: settings.apiKeyEnv,
-          timeoutMs: settings.timeoutMs,
-          samples: settings.samples,
-          maxStateChars: settings.maxStateChars,
-        };
-        classifierMemo = {
-          key,
-          settings: memoSettings,
-          backend: createClassifierBackend(memoSettings, {
-            ...(deps.generate === undefined ? {} : { generate: deps.generate }),
-            logger: deps.logger,
-          }),
-        };
+      return classifyDepsFor(prepared.cfg, prepared.routing);
+    },
+
+    async prepareRoles(agent, given): Promise<RolePrepared | null> {
+      if (disposed) return null;
+      let cfg: RouterConfig;
+      let roles: ReadonlyMap<string, RoleSpec>;
+      try {
+        cfg = given ?? deps.loadConfig();
+        // Tiers mode (and v1, which never reaches this v2 runtime): an empty table before any host call (I1).
+        roles = resolveRoles(cfg, "v2");
+      } catch (error) {
+        // Not known to be a role dispatch: the tier path decides (and fails safe) as before.
+        deps.logger.warn("[router] routing: the role table could not be resolved", { error: describeError(error) });
+        return null;
       }
+      const spec = roles.get(agent);
+      if (spec === undefined) return null;
+      const routing = routingOf(cfg);
+      let store: EngineStoreView | null = null;
+      let enqueue: ((row: LogRow) => void) | null = null;
+      if (routing.engine !== "static") {
+        // The tier engine's own preparation: the same store and decision-log queue (A3: one writer per process).
+        const prepared = await self.prepare(cfg);
+        if (prepared !== null) {
+          store = prepared.store;
+          enqueue = prepared.enqueue;
+        }
+      } else {
+        await catalog.ensure(); // static: no store, no rows, but the catalog decides whether a tier variant exists
+      }
+      if (disposed) return null;
       return {
-        cfg: prepared.cfg,
-        settings: classifierMemo.settings,
-        minClassConfidence: prepared.routing.minClassConfidence,
-        backend: classifierMemo.backend,
-        logger: deps.logger,
+        cfg,
+        roles,
+        spec,
+        routing,
+        engine: routing.engine,
+        exploration: resolveRolesRouting(cfg, "v2").exploration.rate,
+        catalog,
+        session: sessionPolicyOf(cfg, routing),
+        store,
+        enqueue,
+        classifyDeps: classifyDepsFor(cfg, routing),
       };
     },
 
@@ -251,6 +339,7 @@ export function createEngineRuntime(deps: RuntimeDeps): EngineRuntime {
       while (releasing.size > 0) await Promise.allSettled([...releasing]);
     },
   };
+  return self;
 }
 
 /** The session's own permission rules (`Session.Info.permissions`). */

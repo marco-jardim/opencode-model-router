@@ -15,6 +15,7 @@ import {
   resolveVerifyBudget,
   resolveDepthLimit,
   resolveRouting,
+  resolveRolesRouting,
   resolveVariantSteps,
   routerStatusLines,
   warnConfigIssues,
@@ -63,13 +64,30 @@ import {
   CLAUDE_ORCHESTRATOR_PREFIX,
   CLAUDE_ANTI_NARRATION,
   assembleSystemPrompt,
+  assembleRolesSystemPrompt,
   DELEGATE_TOOL_DESCRIPTION,
 } from "./router/protocol";
+import { resolveRoles, type RoleSpec } from "./router/roles";
+import { routerRunTool, type RunRecord } from "./router/run-tools";
+import type { WorkRootAnswer } from "./router/git-tools";
+import { roleGuardProfile, type GuardProfile } from "./router/guard-profile";
+import { currentBinding } from "./routing/roles/binding";
+import { authorityTool, requestedAuthority } from "./routing/roles/authority";
+import { roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot } from "./routing/wire/dispatch";
+import { roleTierOrder } from "./routing/engine/ladders";
+import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
+import type { IngestSettings } from "./routing/outcomes/ingest";
+import { captureBudget } from "./guard/enforce";
+import { isIncompleteVerdict } from "./verify/checker";
+import { lookupDispatch } from "./router/sessions";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
 import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
 import type { Ingest } from "./routing/outcomes/ingest";
-import { verdictOf } from "./routing/outcomes/types";
+import { isAnnotationRow, verdictOf, type LogRow } from "./routing/outcomes/types";
+import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
+import { roleAgentSteps } from "./router/role-agents";
+import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
@@ -84,7 +102,7 @@ import {
   hostConfigFromAgents,
   runAdvisor,
 } from "./routing/advisor";
-import type { AdvisorCatalogModel, HostConfigView } from "./routing/advisor";
+import type { AdvisorCatalogModel, AdvisorExtras, HostConfigView } from "./routing/advisor";
 import {
   findOrphanedStrongPatterns,
   normalizeCatalog,
@@ -162,6 +180,34 @@ function describeError(error: unknown): string {
   }
 }
 
+/**
+ * #84 P2.2 (advisor `tierDispatches`): dispatch rows WITHOUT a role at or after `since` — non-annotation `dispatch` decision rows,
+ * the first row per decision id (as `summarizeRoles` keeps them), whose row names no role and whose chosen key is not a role's.
+ */
+function tierDispatchCount(rows: readonly LogRow[], since: number): number {
+  const seen = new Set<string>();
+  let count = 0;
+  for (const row of rows) {
+    if (row.kind !== "decision" || isAnnotationRow(row) || row.step !== "dispatch" || seen.has(row.decisionID)) continue;
+    seen.add(row.decisionID);
+    const t = Date.parse(row.ts);
+    if (!Number.isFinite(t) || t < since) continue;
+    if (typeof row.role === "string" || row.chosen?.origin === "role") continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * #84 P2.1 (handoffs 22, 23): one budget observation from the guard's and the host's. A stop seen by either is a stop; without a
+ * host observer (v1, or a host that does not hand one) the guard's alone; otherwise anything unobserved leaves it unobserved.
+ */
+function foldBudgetObservation(guard: HostBudgetObservation, host: HostBudgetObservation | undefined): HostBudgetObservation {
+  if (guard === true || host === true) return true;
+  if (host === undefined) return guard;
+  return guard === "unobserved" || host === "unobserved" ? "unobserved" : false;
+}
+
 function saveActivePreset(presetName: string, projectDir?: string): void {
   const cfg = loadConfig(projectDir);
   const resolved = resolvePresetName(cfg, presetName);
@@ -198,7 +244,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -230,7 +276,8 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string)
   return buildRouterHelp(
     resolveEnforcementMode({ config: cfg, env: process.env }).mode,
     // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
-    { stats: cfg.routing !== undefined },
+    // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }) },
   );
 }
 
@@ -451,13 +498,115 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
   const routerWarn = { warn: (message: string) => logger.warn(message) };
+
+  // -------------------------------------------------------------------------
+  // #84 P2.1 (T2.1.3): the role runtime of roles mode on OpenCode v2. `rolesNow()` is empty on v1 and in tiers mode, so
+  // every role branch below is skipped there and both stay byte-identical (§2.7, I1, I8).
+  // -------------------------------------------------------------------------
+  const isV2Host = ctx.routerHost === "v2";
+  /**
+   * QA-P21-1-8 (plan R8): the role runtime exists only when the plugin STARTED in roles mode — its role tools are registered at
+   * start and its role agents only then (the v2 adapter logs "restart OpenCode" when the config switches to roles at runtime).
+   */
+  const startedInRoles = isV2Host && cfg.routing?.delegation === "roles";
+  /** QA-P21-2-4: the v2 adapter's "this role agent is registered" check (absent on v1 and before the adapter is set up). */
+  const roleLiveOf = (ctx as RouterPluginInput & { routerRoleLive?: (agent: string) => boolean | undefined }).routerRoleLive;
+  const NO_ROLES: ReadonlyMap<string, RoleSpec> = new Map();
+  const roleTables = new WeakMap<RouterConfig, ReadonlyMap<string, RoleSpec>>();
+  /** The role agents of the current config, cached per config object (hot reload builds a new one). */
+  const rolesNow = (): ReadonlyMap<string, RoleSpec> => {
+    if (!startedInRoles) return NO_ROLES;
+    const current = cfg;
+    let roles = roleTables.get(current);
+    if (roles === undefined) {
+      try {
+        roles = resolveRoles(current, "v2");
+      } catch (error) {
+        roles = NO_ROLES;
+        logger.warn("[router] roles: the role table could not be resolved; no role runtime for this config", { error: describeError(error) });
+      }
+      roleTables.set(current, roles);
+    }
+    // QA-P21-2-4: a role whose agent registration failed is not live (the v2 adapter's check; undefined = not known yet).
+    const live = roleLiveOf === undefined ? [...roles] : [...roles].filter(([name]) => roleLiveOf(name) !== false);
+    return live.length === roles.size ? roles : new Map(live);
+  };
+  const roleSpecOf = (agent: unknown): RoleSpec | undefined => (typeof agent === "string" ? rolesNow().get(agent) : undefined);
+  /** `maxOf` of every `currentBinding` call (handoff 33). */
+  const roleMaxOf = (agent: string) => roleMaxActions(rolesNow().get(agent));
+  /** Role child sessions → their role agent: from the tool hooks' calling agent and `session.created` (bounded, oldest out). */
+  const roleSessions = new Map<string, string>();
+  const ROLE_STATE_MAX = 1000;
+  const rememberRoleSession = (sessionID: unknown, agent: unknown): boolean => {
+    if (typeof sessionID !== "string" || sessionID === "" || typeof agent !== "string" || roleSpecOf(agent) === undefined) return false;
+    roleSessions.delete(sessionID);
+    roleSessions.set(sessionID, agent);
+    while (roleSessions.size > ROLE_STATE_MAX) roleSessions.delete(roleSessions.keys().next().value!);
+    return true;
+  };
+  /** The role of a session: what its tool hooks named, else what the dispatch registry recorded for it. */
+  const roleOfSession = (sessionID: unknown): RoleSpec | undefined => typeof sessionID !== "string" || sessionID === ""
+    ? undefined : roleSpecOf(roleSessions.get(sessionID) ?? lookupDispatch(sessionID)?.agent);
+  /**
+   * Handoff 11 (P-10, P-18): the ONE work-root resolver of `router_run` and `router_git_*`, from the child's binding (bound by the
+   * adapter's `execute.before` before any tool of the child runs). Not a role session → `{ role: false }` (git keeps today's
+   * directory; `router_run` refuses); a role session without a binding or a work root → `{ role: true, root: null }` (I9).
+   */
+  const resolveWorkRoot = (sessionID: string): WorkRootAnswer => {
+    if (roleOfSession(sessionID) === undefined) return { role: false };
+    return { role: true, root: currentBinding(sessionID, { maxOf: roleMaxOf })?.grant.workRoot ?? null };
+  };
+  /**
+   * Handoff 27: the guard profile of a role child — the role's budget for the tier it runs on (the dispatch registry's tier, else
+   * the role's floor, which is its registered fallback model, P-1), raised by the dispatch's `budget=` (the bound dispatch budget).
+   */
+  const roleGuardProfileOf = (sessionID: unknown, agent: unknown): GuardProfile | undefined => {
+    const spec = roleSpecOf(agent) ?? roleOfSession(sessionID);
+    if (spec === undefined || typeof sessionID !== "string") return undefined;
+    const record = lookupDispatch(sessionID);
+    const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
+    return roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
+  };
+  /** Handoff 13 (P1.4 `run` signal): router-observed runs and edit times of role children, bounded per child and overall. */
+  const roleRuns = new Map<string, RunRecord[]>();
+  const roleEdits = new Map<string, number[]>();
+  /** QA-P21-1-7: role children that made a tool call while the router was bypassed (their edits were not recorded). */
+  const roleBypassedCalls = new Set<string>();
+  const noteBypassedRoleCall = (sessionID: unknown): void => {
+    if (typeof sessionID !== "string" || roleOfSession(sessionID) === undefined) return;
+    roleBypassedCalls.add(sessionID);
+    while (roleBypassedCalls.size > ROLE_STATE_MAX) roleBypassedCalls.delete(roleBypassedCalls.values().next().value!);
+  };
+  const pushBounded = <T>(map: Map<string, T[]>, key: string, value: T): void => {
+    const list = map.get(key) ?? [];
+    map.delete(key);
+    list.push(value);
+    while (list.length > 64) list.shift();
+    map.set(key, list);
+    while (map.size > ROLE_STATE_MAX) map.delete(map.keys().next().value!);
+  };
+  const ROLE_EDIT_TOOLS: ReadonlySet<string> = new Set(["edit", "write", "patch", "multiedit", "apply_patch"]);
+  /** Handoffs 16-18: the parent's role dispatches (by call), for the re-dispatch signal; bounded, oldest out. */
+  const roleDispatchTexts = new Map<string, DispatchText>();
+  /** IngestSettings.roleAgentIds from `resolveRoles` (handoff 21): the same object per base settings, so ingestion keeps its caches. */
+  const roleIngestSettings = new WeakMap<IngestSettings, IngestSettings>();
+  const withRoleAgents = (settings: IngestSettings | null): IngestSettings | null => {
+    const roles = rolesNow();
+    if (settings === null || roles.size === 0) return settings;
+    let extended = roleIngestSettings.get(settings);
+    if (extended === undefined) {
+      extended = Object.freeze({ ...settings, roleAgentIds: new Set(roles.keys()) });
+      roleIngestSettings.set(settings, extended);
+    }
+    return extended;
+  };
   // M6 (2.1.3, QA-2.1-7): the one telemetry ingest of this plugin instance. v2 only (D1); every call is a no-op unless
   // routing.engine != static. Verdicts and false refusals come from the hooks below; the v2 adapter receives this same
   // instance through `routerOnIngest` and feeds it the step and session events, so there is a single settings source.
   const ingestAbort = new AbortController();
   const ingest: Ingest | undefined = ctx.routerHost === "v2" ? (() => {
     const core = createIngest({
-      settings: () => ingestSettings(cfg, "v2"),
+      settings: () => withRoleAgents(ingestSettings(cfg, "v2")),
       logger,
       ...(ctx.routerCatalog
         ? { pricing: createCatalogPricing(ctx.routerCatalog, { logger, cacheKey: ctx.directory, signal: ingestAbort.signal }) }
@@ -472,6 +621,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     ? createAttemptRecorder({ host: "v2", config: () => cfg, logger })
     : undefined;
   resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
+  // #84 P2.1 (handoff 1): v1 + any roles key: the "roles delegation requires OpenCode v2" notice, once, at startup.
+  resolveRolesRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger);
   const depthTracker = createDepthTracker({
     async getParent(id) {
       if (sessionRootMemo.get(id) === true) return null;
@@ -568,6 +719,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // subagent tracking, cap enforcement, and narration detection for the
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
+  // #84 P2.1: the v2 adapter's role path reads the bypass state (the router gate does not run while bypassed, S10/P-9).
+  (ctx as RouterPluginInput & { routerOnBypassState?: (read: () => boolean) => void }).routerOnBypassState?.(() => bypassed);
+  /** QA-P21-1-3: the budget snapshot of a role child as the signals AND the adapter's budget notice read it (guard + read cap). */
+  const roleBudgetSnapshot = (childSessionID: string) => captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  (ctx as RouterPluginInput & { routerOnBudgetSnapshot?: (read: typeof roleBudgetSnapshot) => void }).routerOnBudgetSnapshot?.(roleBudgetSnapshot);
+  /** #84 P2.1 (handoff 22): the v2 adapter's host-side budget observation of a role child (step limit, context overflow). */
+  const hostBudgetOf = (ctx as RouterPluginInput & {
+    routerHostBudget?: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation | undefined;
+  }).routerHostBudget;
 
   warnConfigIssues(cfg, logger);
 
@@ -592,9 +752,30 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // The catalog comes from `config.providers()` (the call `/router` already makes for the model check, enriched with cost and capabilities
   // by the v2 adapter), so the doctor does not ask the host for the model list a second time (QA-2.4-3). `prefetched` is that call's result
   // when the caller already has it.
+  /** #84 P2.2: the window of the decision log the roles checks of the cost doctor read. */
+  const ADVISOR_ROLE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+  /**
+   * #84 P2.2: the extras of the cost doctor's roles checks — the host and, in roles mode with a live engine, the role × tier
+   * statistics and the tier dispatch count of the decision log over {@link ADVISOR_ROLE_WINDOW_MS}. Tiers mode and v1 read nothing
+   * (`{ host }` only, which no tier check reads); a read failure leaves the statistics out, so those checks stay silent.
+   */
+  const advisorExtras = async (): Promise<AdvisorExtras> => {
+    const host = isV2Host ? "v2" as const : "v1" as const;
+    if (rolesNow().size === 0) return { host };
+    const live = ingestSettings(cfg, "v2");
+    if (live === null) return { host }; // engine static: no decision log
+    try {
+      const read = await createPersister(live.outcomesDir, nodePersistDeps({ warn: () => undefined })).readRows();
+      const since = Date.now() - ADVISOR_ROLE_WINDOW_MS;
+      return { host, roleStats: summarizeRoles(null, read.rows, { since, until: null }), tierDispatches: tierDispatchCount(read.rows, since) };
+    } catch (error) {
+      logger.warn("[router] cost doctor: the role statistics are unavailable", { error: describeError(error) });
+      return { host };
+    }
+  };
   const gatherAdvisorInputs = async (
     prefetched?: { raw: unknown } | null,
-  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null }> => {
+  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null; extras: AdvisorExtras }> => {
     const attempt = async <T>(label: string, call: (() => Promise<T>) | undefined): Promise<T | null> => {
       if (call === undefined) return null;
       try {
@@ -604,13 +785,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         return null;
       }
     };
-    const [agents, providers] = await Promise.all([
+    const [agents, providers, extras] = await Promise.all([
       attempt("host agent list", ctx.routerAgents),
       prefetched !== undefined ? Promise.resolve(prefetched) : attempt("model catalog", fetchCatalogRaw),
+      advisorExtras(),
     ]);
     return {
       host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary),
       catalog: providers === null ? null : catalogFromProviders(providers.raw),
+      extras,
     };
   };
   const advisorNotifier = ctx.routerHost === "v2"
@@ -675,8 +858,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
     const routing = resolveRouting(cfg, "v2");
     if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
-    const { host, catalog } = await gatherAdvisorInputs(prefetched);
-    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger), {
+    const { host, catalog, extras } = await gatherAdvisorInputs(prefetched);
+    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger, extras), {
       hostKnown: host !== null,
       catalogKnown: catalog !== null && catalog.length > 0,
       primaryKnown: lastPrimary !== null,
@@ -736,6 +919,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   } catch (error) {
     logger.warn("[verify] router_verify not registered: the enforcement mode could not be resolved", { error: scrubText(String(error)) });
   }
+  // QA-P21-2 nit 3: the role path's deferral check follows it (nothing is deferred without router_verify).
+  (ctx as RouterPluginInput & { routerOnVerifyEnabled?: (read: () => boolean) => void }).routerOnVerifyEnabled?.(() => routerVerifyEnabled);
   /**
    * 2.4.2 + 2.4.3b: a delegation defers only when `router_verify` exists to verify it later. A
    * footer never names a tool this instance did not register; without it the delegation keeps the
@@ -824,6 +1009,165 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     runnerCatalogLoad = load;
     return load;
   };
+
+  // #84 P2.1 (T2.1.3): the tools of roles mode. The tool map is fixed at plugin start (like `router_verify`): in tiers mode and on
+  // v1 the set is exactly the previous one (router_run and router_request_authority are not registered; router_git_* keep their
+  // directory resolution). Switching to roles mode registers them on the next start.
+  const rolesAtStart = rolesNow().size > 0;
+  const dynamicRolesAtStart = [...rolesNow().values()].some((spec) => spec.authority.mode === "dynamic");
+  /** `router_request_authority` dependencies (P1.6): the role by child session; only the parent of `dispatchOf` is read. */
+  const authorityDeps = {
+    roleOf: (child: string) => roleOfSession(child),
+    roles: () => rolesNow(),
+    dispatchOf: (child: string) => {
+      const parent = lookupDispatch(child)?.parentSessionID;
+      // QA-P21-1-13: `callID: ""` = not attached yet. authority.ts reads only the parent (to drop the request with it);
+      // `markAnnotated` attaches the request to the parent's call in the adapter's execute.after.
+      return typeof parent === "string" && parent !== "" ? { parentSessionID: parent, callID: "" } : undefined;
+    },
+    bindingOf: (child: string) => currentBinding(child, { maxOf: roleMaxOf }),
+  };
+  /** Exact npm forms of a deterministic check's command → the `routing.run` script it names (`npm test`, `npm run <name>`). */
+  const NPM_SCRIPT_RE = /^npm(?:\.cmd)?\s+(?:(test|t)|run(?:-script)?\s+([A-Za-z0-9_][A-Za-z0-9_.:@+-]*))$/;
+  /** The acceptance commands of a role dispatch as `routing.run` names (handoff 13): only exact npm script forms count. */
+  const acceptanceScripts = (prompt: unknown, description: unknown): string[] => {
+    const dod = buildDelegationDoD({
+      prompt: typeof prompt === "string" ? prompt : undefined,
+      description: typeof description === "string" ? description : undefined,
+    });
+    if (dod.kind !== "deterministic") return [];
+    return dod.checks.flatMap((check) => {
+      const match = typeof check.command === "string" ? NPM_SCRIPT_RE.exec(check.command.trim()) : null;
+      return match === null ? [] : [match[1] !== undefined ? "test" : (match[2] as string)];
+    });
+  };
+  /**
+   * QA-P21-2-3: the read-only cap a role dispatch asks for itself — `CAP:N`, or `CAP:none` with a `reason:` line (an unjustified
+   * `CAP:none` is no cap, as for tier dispatches); `null` when it names none (then the child gets no read-only cap).
+   */
+  const roleDispatchCap = (prompt: unknown): Cap | null => {
+    if (typeof prompt !== "string") return null;
+    const parsed = parseCapDirective(prompt);
+    return parsed === "none" && !/\breason:/i.test(prompt) ? null : parsed;
+  };
+  /** Caps of fresh role dispatches, by the parent's call, until the child binds (bounded, oldest out). */
+  const pendingRoleCaps = new Map<string, { agent: string; cap: Cap }>();
+  const rememberPendingRoleCap = (callID: string, agent: string, cap: Cap): void => {
+    pendingRoleCaps.delete(callID);
+    pendingRoleCaps.set(callID, { agent, cap });
+    while (pendingRoleCaps.size > ROLE_STATE_MAX) pendingRoleCaps.delete(pendingRoleCaps.keys().next().value!);
+  };
+  /**
+   * The role child's read-only counter with the dispatch's cap, independent of `subagentTiers` (the session store's producer
+   * registration: no trivial downgrade). The cap is keyed by the role agent's name, which is never a tier.
+   */
+  const registerRoleCap = (child: string, agent: string, cap: Cap): void => {
+    sessionStore.registerProducerSession(child, agent, { ...cfg, tierCaps: { ...(cfg.tierCaps ?? {}), [agent]: cap } } as RouterConfig);
+  };
+  /** A fresh role child's first call: its exact binding names the dispatch's call, whose cap is registered once. */
+  const applyPendingRoleCap = (child: string): void => {
+    if (pendingRoleCaps.size === 0) return;
+    const binding = currentBinding(child, { maxOf: roleMaxOf });
+    const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
+    const pending = callID === undefined ? undefined : pendingRoleCaps.get(callID);
+    if (callID === undefined || pending === undefined) return;
+    pendingRoleCaps.delete(callID);
+    registerRoleCap(child, pending.agent, pending.cap);
+  };
+  /** The prompt as the orchestrator wrote it: without the router's nonce line (handoff 18; role dispatches carry no header). */
+  const withoutNonceLine = (prompt: string): string => prompt.replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
+  /**
+   * The parent's `task` call of a routed role dispatch (before it runs): a resume opens a new guard round for the child (its
+   * budget and `budgetExhausted` are per round), and the re-dispatch signal (P1.4, handoff 16) compares the dispatch with the
+   * parent's earlier role dispatches: a failure lands on the previous attempt, addressed by its decision id.
+   */
+  const noteRoleDispatch = (callID: string, parentSessionID: string, args: Record<string, unknown>): void => {
+    const routed = routedRoleOf(callID);
+    if (routed === undefined || routed.parentSessionID !== parentSessionID) return;
+    if (routed.resumeID !== null) guardStore.beginDispatch(routed.resumeID);
+    // QA-P21-2-3: the dispatch's own read-only cap. A resume names its child: registered now; a fresh child when it binds.
+    // QA-P21-3-1: every routed resume starts a new round of the child's read counter (the previous cap kept unless it names one),
+    // so a "continue and finish" resume after a CAP stop does not inherit the exhausted counter.
+    const cap = roleDispatchCap(args.prompt);
+    if (routed.resumeID !== null) {
+      if (!sessionStore.resumeRoleSession(routed.resumeID, cap) && cap !== null) registerRoleCap(routed.resumeID, routed.agent, cap);
+    } else if (cap !== null) {
+      rememberPendingRoleCap(callID, routed.agent, cap);
+    }
+    if (routed.decisionID === null) return; // engine static: no rows
+    const current: DispatchText = {
+      decisionID: routed.decisionID,
+      parentSessionID,
+      childSessionID: routed.resumeID,
+      class: routed.class,
+      role: routed.agent,
+      prompt: withoutNonceLine(typeof args.prompt === "string" ? args.prompt : ""),
+      tier: routed.tier,
+      at: Date.now(),
+      resume: routed.resumeID !== null,
+    };
+    const match = detectRedispatch(current, [...roleDispatchTexts.values()], roleTierOrder(cfg));
+    if (match !== null && match.previous.childSessionID !== null) {
+      ingest?.onSignal?.(match.previous.childSessionID, match.observation, { expectDecisionID: match.previous.decisionID });
+    }
+    roleDispatchTexts.delete(callID);
+    roleDispatchTexts.set(callID, current);
+    while (roleDispatchTexts.size > 200) roleDispatchTexts.delete(roleDispatchTexts.keys().next().value!);
+  };
+  /**
+   * The parent's `task` call of a role child returned (P1.4, handoffs 15-17, 23): the return signal with the REAL guard state
+   * (budget: the guard's enforced stop, `unobserved` when the guard never tracked the child; authority: the child's recorded
+   * request for this call), the router-observed run signal, and the dispatch text's end state for later re-dispatch checks.
+   * Verdict rows stay with `onVerdict`.
+   */
+  const observeRoleReturn = (callID: string, args: Record<string, unknown>, output: unknown): void => {
+    const { finalReturnText, childSessionID } = parseTaskResult(output);
+    const spec = childSessionID ? roleOfSession(childSessionID) ?? roleSpecOf(args.subagent_type) : undefined;
+    if (!childSessionID || spec === undefined) return;
+    rememberRoleSession(childSessionID, spec.agent);
+    // QA-P21-1-3: the snapshot includes the read-only CAP state. QA-P21-3-1: a reached read cap is a budget stop only when the
+    // child says so (`NEED MORE`, as the gate's claim check): a `DONE` or an unrelated `ESCALATE` at the cap is not one.
+    const snapshot = roleBudgetSnapshot(childSessionID);
+    const capStop = snapshot.readCapReached === true && parseReturnPrefix(finalReturnText)?.prefix === "need-more";
+    // Handoff 22: the guard's stop folded with the host's own (step limit, context overflow), as the v2 adapter observed them.
+    const budgetObserved = foldBudgetObservation(
+      capStop ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
+      hostBudgetOf?.(childSessionID, roleAgentSteps(spec)),
+    );
+    const request = requestedAuthority(childSessionID);
+    const authorityObserved = request !== undefined && (!request.annotated || request.callID === callID);
+    const signal = returnSignal({ text: finalReturnText, budgetExhausted: budgetObserved, authorityRequested: authorityObserved });
+    if (signal !== null) ingest?.onSignal?.(childSessionID, signal);
+    const run = runSignal({
+      childSessionID,
+      runs: roleRuns.get(childSessionID) ?? [],
+      // QA-P21-1-7: a child that made any tool call while the router was bypassed has unrecorded edits.
+      editsObserved: !roleBypassedCalls.has(childSessionID),
+      edits: roleEdits.get(childSessionID) ?? [],
+      acceptance: acceptanceScripts(args.prompt, args.description),
+    });
+    if (run !== null) ingest?.onSignal?.(childSessionID, run);
+    const sent = roleDispatchTexts.get(callID);
+    if (sent !== undefined) {
+      roleDispatchTexts.set(callID, {
+        ...sent,
+        childSessionID: sent.childSessionID ?? childSessionID,
+        endedAt: Date.now(),
+        returnPrefix: parseReturnPrefix(finalReturnText)?.prefix ?? null,
+        returned: signal?.kind === "budget" || signal?.kind === "authority" ? signal.kind : null,
+        budgetExhausted: budgetObserved,
+        authorityRequested: authorityObserved,
+      });
+    }
+  };
+  /** Forget a deleted session's role state (as a child, and as the parent of role dispatches). */
+  const forgetRoleSession = (sessionID: string): void => {
+    roleSessions.delete(sessionID);
+    roleRuns.delete(sessionID);
+    roleEdits.delete(sessionID);
+    roleBypassedCalls.delete(sessionID);
+    for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
+  };
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
@@ -846,7 +1190,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
-      ...gitTools(),
+      ...gitTools(rolesAtStart ? { resolveWorkRoot } : {}),
+      // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
+      ...(rolesAtStart ? {
+        router_run: routerRunTool({
+          config: () => resolveRolesRouting(cfg, "v2").run,
+          resolveWorkRoot,
+          recordRun: (run) => pushBounded(roleRuns, run.sessionID, run),
+        }),
+      } : {}),
+      // #84 P2.1: the authority ladder (P1.6) for dynamic roles (`general`).
+      ...(rolesAtStart && dynamicRolesAtStart ? { router_request_authority: authorityTool(authorityDeps) } : {}),
       ...(enableDelegateTool ? { delegate: tool({
         description: DELEGATE_TOOL_DESCRIPTION,
         args: {
@@ -1156,6 +1510,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     cwd: effectiveCwd,
                     dod,
                     dispatchedAt: dispatchStart.dispatchedAt,
+                    // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+                    budget: captureBudget(producerSid, sessionStore.readCapReached(producerSid)),
                   })
                 : undefined;
               // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
@@ -1373,7 +1729,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
               const action = nextAction(
                 state,
-                { pass: gateRes.accepted, outcome: gateRes.verdict.outcome, reasons: gateRes.verdict.reasons },
+                {
+                  pass: gateRes.accepted, outcome: gateRes.verdict.outcome, reasons: gateRes.verdict.reasons,
+                  // Handoff 25, R7 (I1/I8 exemption: §2.9 E8, the I7 budget-incomplete rule): the structured incomplete flag; absent
+                  // when false, so the action is unchanged.
+                  ...(isIncompleteVerdict(gateRes.verdict) ? { incomplete: true } : {}),
+                },
                 policy,
                 sessionAware ? { dispatchPromptChars: args.task.length } : undefined,
               );
@@ -1394,7 +1755,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                   false,
                   gateRes.verdict.method,
                 );
-                const note = scrubText(buildForcingNote(gateRes.verdict.reasons));
+                // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): no flag when false, so the note is unchanged.
+                const note = scrubText(buildForcingNote(gateRes.verdict.reasons, isIncompleteVerdict(gateRes.verdict) ? { incomplete: true } : undefined));
                 return withDepthBanner(
                   `[router status: unmet] The delegated result was not accepted after ` +
                   `${state.totalAttempts} attempt(s) across ${state.escalations} escalation(s) ` +
@@ -1638,7 +2000,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // non-subagent sessions or when enforcement is off (GA-1 preserved).
     // -----------------------------------------------------------------------
     "tool.execute.before": async (input: any, output: any) => {
-      if (bypassed) return;
+      // #84 P2.1: a role child's own call names its role agent (the v2 adapter passes the calling agent). Remembered even while
+      // bypassed (the work-root resolver and the authority tool are authority, not routing), and marked a child session: role
+      // agents are subagents, so the guard engages from their first call. Never on v1 / in tiers mode (no role table).
+      if (rememberRoleSession(input?.sessionID, input?.agent)) {
+        sessionStore.markChildSession(input.sessionID);
+        applyPendingRoleCap(input.sessionID); // QA-P21-2-3
+      }
+      if (bypassed) {
+        noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
+        return;
+      }
       if (input?.tool === "task") {
         const depth = await depthGuard.checkDispatch(input.sessionID);
         if (depth.block) {
@@ -1729,7 +2101,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 parsed === "none" && !/\breason:/i.test(args.prompt) ? null : parsed;
               const baseline = cfg.tierCaps?.[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5;
               const cap = override ?? baseline;
-              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root: routeLineRoot(args.prompt) }) +
+              // Handoff 30, R7 (I1/I8 exemption: T1.5.3a, the header names `root=`): on v2 shadow/advise/enforce the engine stripped the
+              // route line already; its `root=` comes from the router. No root → the header is byte-identical to before.
+              const root = routeLineRoot(args.prompt) ?? (typeof input.callID === "string" ? strippedRouteRoot(input.callID) : undefined);
+              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root }) +
                 DISPATCH_HEADER_SEPARATOR + args.prompt;
               args.prompt = prompt;
               if (process.env.MODEL_ROUTER_DISPATCH_DEBUG === "1" && !dispatchDebugLogged) {
@@ -1746,6 +2121,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       } catch {
         // Best-effort: malformed args or debug I/O must never break a dispatch.
       }
+      // #84 P2.1: a routed role dispatch of this session (roles mode on v2 only): resume round, re-dispatch signal.
+      if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string"
+        && output?.args && typeof output.args === "object") {
+        try {
+          noteRoleDispatch(input.callID, input.sessionID, output.args as Record<string, unknown>);
+        } catch (error) {
+          logger.warn("[router] roles: the role dispatch could not be noted", { error: describeError(error) });
+        }
+      }
       const sid = input?.sessionID;
       if (!sid || !sessionStore.isSubagent(sid) || typeof input?.tool !== "string") {
         return;
@@ -1755,6 +2139,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       sessionStore.touchIfTracked(sid);
       let res;
       try {
+        // Handoff 27: a role child is guarded with its role profile (reader/producer, role budget); tier agents get none.
+        const profile = roleGuardProfileOf(sid, input?.agent);
         res = guardBeforeCall({
           cfg,
           tier: sessionStore.getTier(sid),
@@ -1765,6 +2151,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           toolArgs: output?.args,
           store: guardStore,
           env: process.env,
+          ...(profile === undefined ? {} : { profile }),
         });
       } catch {
         return; // never break a real session on a guard-internal error
@@ -1795,8 +2182,24 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const isPlugin = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier);
         if ((definition && isReadOnlyTier(tier, definition)) || isPlugin) output.output = filterSensitiveGrep(output.output);
       }
-      if (bypassed) return;
+      if (bypassed) {
+        noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
+        return;
+      }
       sessionStore.recordToolCall(input, output);
+
+      // #84 P2.1 (handoffs 13, 15-17, 23): role children only (roles mode on v2). Edit times feed the `run` signal; the parent's
+      // `task` return feeds the return/run signals, read BEFORE any router note is put in front of the child's text.
+      try {
+        if (typeof input?.sessionID === "string" && ROLE_EDIT_TOOLS.has(input?.tool) && roleOfSession(input.sessionID) !== undefined) {
+          pushBounded(roleEdits, input.sessionID, Date.now());
+        }
+        if (input?.tool === "task" && typeof input.callID === "string" && rolesNow().size > 0) {
+          observeRoleReturn(input.callID, input?.args && typeof input.args === "object" ? input.args : {}, output);
+        }
+      } catch (error) {
+        logger.warn("[router] roles: the role return could not be observed", { error: describeError(error) });
+      }
 
       // Best-effort false-refusal observation alongside the existing guard path.
       // Keep scorecards unchanged; counts live in the TTL-managed trajectory.
@@ -1847,6 +2250,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           readOnly: READ_ONLY_TOOLS.has(input.tool),
         });
         try {
+          const profile = roleGuardProfileOf(sid, input?.agent); // handoff 27, as in the before-hook
           guardAfterCall({
             cfg,
             tier: sessionStore.getTier(sid),
@@ -1855,6 +2259,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             toolArgs: input?.args,
             output,
             store: guardStore,
+            ...(profile === undefined ? {} : { profile }),
           });
         } catch {
           // best-effort: enforcement must never crash a real session
@@ -1909,6 +2314,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 cwd: effectiveCwd,
                 dod,
                 dispatchedAt: start.dispatchedAt,
+                // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+                budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
               });
               if (finish.deferred) {
                 output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
@@ -1932,6 +2339,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               gateDeadline.dispose();
               throw error;
             }
+            // #84 P2.1: a role agent follows the return contract (handoff 26; roles mode only).
+            const roleProducer = roleSpecOf(producerTier) !== undefined;
             const artefact = {
               changedFiles: verification.changedFiles,
               changeBaseline: verification.changeBaseline,
@@ -1939,6 +2348,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
               producerSessionID: childSessionID ?? "",
               producerTier,
+              ...(roleProducer ? { returnContract: true } : {}),
+              // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule; every mode): the guard's budget state when the task
+              // returned, not when the gate runs. Without a stop it judges like the live read it replaces.
+              budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
             };
 
             // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
@@ -2024,7 +2437,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);
               const nextTier = res.verdict.outcome !== "unverifiable" && li >= 0 && li < ladder.length - 1 ? ladder[li + 1] : null;
-              const note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier }));
+              // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): absent when false, so the note is unchanged.
+              const incomplete = isIncompleteVerdict(res.verdict);
+              let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
+              // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
+              // QA-P21-1-4: only after a FAIL (an unverifiable result keeps the generic line: there is nothing to escalate on).
+              // QA-P21-2-2: the hint promises the raise, and records it for this parent's next resume of the child.
+              const roleHint = roleProducer && !incomplete && res.verdict.outcome === "fail" && childSessionID
+                ? roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID) : null;
+              const genericNext = "NEXT: address the above and re-run the delegation; do not treat the prior result as complete.";
+              if (roleHint !== null && note.endsWith(genericNext)) note = note.slice(0, note.length - genericNext.length) + scrubText(roleHint);
               output.output =
                 typeof output.output === "string"
                   ? output.output + "\n\n" + note
@@ -2089,6 +2511,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               if (key.startsWith(`${id}:`)) depthBanners.delete(key);
             }
             warnedNoCallID.delete(id);
+            forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);
@@ -2125,6 +2548,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         ) {
           try {
             sessionStore.markChildSession(info.id);
+            rememberRoleSession(info.id, info.agent); // #84 P2.1: a role child is known before its first tool call (v2 carries the agent)
           } catch {
             // best-effort: classification must never crash a real session
           }
@@ -2460,7 +2884,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
-      let systemPrompt = assembleSystemPrompt(cfg, orchestratorModel, enfOn);
+      // #84 P2.1 (T2.1.3): v2 roles mode carries the roles protocol (P2.2); "" (v1, tiers mode, no enabled role) keeps today's prompt.
+      const rolesPrompt = isV2Host ? assembleRolesSystemPrompt(cfg, rolesNow(), orchestratorModel, enfOn) : "";
+      let systemPrompt = rolesPrompt !== "" ? rolesPrompt : assembleSystemPrompt(cfg, orchestratorModel, enfOn);
       // A28 (D1): on v1 only, and only with an explicit `routing.roles`, the `R:` line lists those agents as destinations (prose; no model
       // override). Anything else leaves `systemPrompt` the very string it is: the v1 protocol stays byte-identical.
       // Any failure leaves the baseline prompt (QA-2.4-13): the line is an extra, never a reason to lose the protocol.
@@ -2636,7 +3062,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             text = `routing-stats: ${describeError(error)}`;
           }
         } else {
-          text = buildRouterOutput(cfg, args, projectDir);
+          // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
