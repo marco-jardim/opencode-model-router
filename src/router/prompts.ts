@@ -18,6 +18,22 @@ import {
   type RouterConfig,
   type TierConfig,
 } from "./config";
+import type { RoleKind } from "./roles";
+
+/**
+ * Roles protocol (v2 roles mode, plan #84 T2.2.1): the intent of each role kind as the orchestrator's role menu
+ * shows it, one line each. Keyed by kind, never by tier or model; the menu appends the role's authority in plain
+ * words from its (possibly narrowed) allow list, so a narrowing in `roleAgents.<name>.deny` shows there.
+ */
+export const ROLE_MENU_INTENT: Readonly<Record<RoleKind, string>> = Object.freeze({
+  explore: "read-only lookups: files, symbols, facts, git history.",
+  research: "web and library docs; no local files.",
+  run: "runs allowlisted scripts and commands (tests, typecheck, lint, build); never edits.",
+  implement: "scoped code changes.",
+  review: "senior QA review: defects, risks, regressions; never edits.",
+  design: "design: framing, options, tradeoffs, a recommendation; never edits.",
+  general: "small mixed tasks.",
+});
 
 /**
  * Provider-neutral tool-authority clause, appended once to every tier agent's assembled prompt (see src/index.ts).

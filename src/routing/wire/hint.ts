@@ -12,10 +12,16 @@
  * The hint and the generated `R:` line come from the same kernel, but the hint is only emitted when the kernel says
  * `switched` for the class's static tier, i.e. when it agrees with a move the line itself could make (QA focus: a hint
  * must never contradict the `R:` line). Errors are logged and the system prompt stays as the legacy hook built it.
+ *
+ * Roles mode (`routing.delegation: "roles"`, plan #84 T2.2.1): nothing is added or rewritten — no per-turn hint, no tier
+ * `R:` line, no route-line paragraph. The roles protocol carries its own class → role line and route-line keys, and a
+ * hint or a tier line would name tiers; a system part that changes per turn would also cost the orchestrator its
+ * prompt cache. The check reads the config and, independently, the roles protocol's heading among the router's parts.
  */
 
 import {
   DELEGATION_PROTOCOL_HEADING,
+  ROLES_PROTOCOL_HEADING,
   buildRouteLineProtocol,
   swapTaxonomyLine,
 } from "../../router/protocol";
@@ -175,6 +181,9 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
   return {
     async augment(input, system, added): Promise<void> {
       try {
+        // Roles mode: no hint part, and the protocol text stays exactly as the legacy hook built it.
+        if (input.cfg?.routing?.delegation === "roles") return;
+        if (system.some((text) => added.has(text) && text.includes(ROLES_PROTOCOL_HEADING))) return;
         const protocolAt: number[] = [];
         system.forEach((text, index) => {
           if (added.has(text) && text.includes(DELEGATION_PROTOCOL_HEADING)) protocolAt.push(index);
