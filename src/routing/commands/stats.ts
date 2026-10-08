@@ -10,6 +10,9 @@
  *
  * Failure policy (§0.10.10): never throws. A usage error or an unreadable store comes back as text with a non-zero `exit`, exactly
  * as the script prints it on stderr; a failing flush is logged and the table is read from disk as it is.
+ *
+ * Role rows (P2.2): the "By role × tier" section is rendered by `runStatsCli` itself (`summarizeRoles` + `renderRoleMarkdown`), which is
+ * why the in-session output and the script agree for role rows; a log without role rows renders exactly as before.
  */
 
 import { readFileSync } from "node:fs";

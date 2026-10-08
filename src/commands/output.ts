@@ -15,6 +15,7 @@ import type { RouterConfig, ModeConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { resolvePromptStyle } from "../router/prompts";
 import type { Catalog, ModelIssue } from "../router/catalog";
+import type { RoleSpec } from "../router/roles";
 
 /** `/tiers` */
 export function buildTiersOutput(cfg: RouterConfig): string {
@@ -210,8 +211,25 @@ export function buildOverridesOutput(v: OverridesView): string {
   ].join("\n");
 }
 
+/**
+ * Role lines of `/router` in roles mode: one per enabled role, `name (kind): floor..ceiling | authority`. Authority is the
+ * mode and the allowed actions, with the denied ones when any. Empty without roles (tiers mode, v1): nothing is added.
+ */
+export function buildRoleLines(roles: Iterable<RoleSpec>): string[] {
+  const lines: string[] = [];
+  for (const role of roles) {
+    const { mode, allow, deny } = role.authority;
+    const denied = deny.length > 0 ? `; denied: ${deny.join(", ")}` : "";
+    lines.push(
+      `- \`${role.agent}\` (${role.kind}): tiers ${role.tierRange.floor}..${role.tierRange.ceiling} | authority ${mode}: ${allow.join(", ") || "none"}${denied}`,
+    );
+  }
+  return lines.length === 0 ? [] : ["Roles:", ...lines];
+}
+
 /** Bare `/router`. */
-export function buildRouterHelp(current: string, options: { stats?: boolean } = {}): string {
+export function buildRouterHelp(current: string, options: { stats?: boolean; roles?: Iterable<RoleSpec> } = {}): string {
+  const roleLines = options.roles === undefined ? [] : buildRoleLines(options.roles);
   return [
     `# Model Router`,
     `Enforcement: **${current}**`,
@@ -224,6 +242,7 @@ export function buildRouterHelp(current: string, options: { stats?: boolean } = 
       ? ["- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats` (in a clone))"]
       : []),
     "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+    ...(roleLines.length > 0 ? ["", ...roleLines] : []),
   ].join("\n");
 }
 

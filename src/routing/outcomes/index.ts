@@ -68,7 +68,7 @@ export {
   resolveOutcomesDir,
 } from "./persist";
 
-export { USAGE, parseStatsArgs, renderMarkdown, runStatsCli, summarize, summarizeRoles } from "./stats";
+export { USAGE, hasRoleRows, parseStatsArgs, renderMarkdown, renderRoleMarkdown, runStatsCli, summarize, summarizeRoles } from "./stats";
 export type { ParseStatsResult, StatsArgs } from "./stats";
 export {
   REDISPATCH_MAX_EARLIER,

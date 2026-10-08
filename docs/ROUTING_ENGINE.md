@@ -453,6 +453,13 @@ The cost doctor looks for money and reliability problems **outside** the routing
 | `native-role-unmatched-rung` | info | A role agent's own model matches no preset rung, so it is priced at the owning tier's first rung (live engine only). |
 | `tier-agent-unavailable` | warning | A router tier's agent is absent, hidden or primary; the engine is then inert for it. |
 | `classifier-model-missing` | warning | `classifier.model` of a `host` backend is not in the catalog. |
+| `role-separation` | warning | Roles mode: a `agents` entry named like a shipped role breaks the separation rule (I4); it is dropped and the shipped role stays. |
+| `roles-on-legacy-host` | info | `routing.delegation: roles` on OpenCode v1, where it does nothing. |
+| `role-budget-low` | warning | Roles mode: a role ran out of budget in at least 20% of its dispatches (5+ dispatches). |
+| `role-range-clamped` | info | Roles mode: a role's tier range or budget was placed on the preset's tiers or clamped. |
+| `role-binding-unknown` | warning | Roles mode: child sessions that could not be bound to a role dispatch (`binding: unknown`). |
+| `native-explore-aliased` | info | Roles mode: the host's native `explore` is aliased to the `explorer` role. |
+| `role-usage-share` | info | Roles mode: share of role dispatches versus dispatches that named a tier directly. |
 
 Suggestions come from the live catalog only and never from hard-coded model ids ("cheapest" means lowest `input + output` price among priced models). A check that cannot know (no catalog, no agent list) says nothing.
 
