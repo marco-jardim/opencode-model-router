@@ -357,7 +357,7 @@ describe("loadConfig — user overrides file", () => {
   it("warns and falls back when the override root is not an object", () => {
     writeOverride(JSON.stringify(["not", "an", "object"]));
     const cfg = loadConfig();
-    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-sonnet-5-5");
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-haiku-5-5");
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("expected a JSON object at root"),
     );
@@ -369,7 +369,7 @@ describe("loadConfig — user overrides file", () => {
       JSON.stringify({ presets: { anthropic: { fast: { model: 123 } } } }),
     );
     const cfg = loadConfig();
-    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-sonnet-5-5");
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-haiku-5-5");
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("must be a non-empty string"),
     );
@@ -386,7 +386,7 @@ describe("loadConfig — user overrides file", () => {
       }),
     );
     const cfg = loadConfig();
-    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-sonnet-5-5");
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-haiku-5-5");
     // and the warning names the offending value, not just the field
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("must be 'provider/model' (got 'claude-sonnet-5')"),
@@ -829,7 +829,7 @@ describe("loadConfig — global + project override hierarchy", () => {
     const anthropic = loadConfig().presets.anthropic!;
     expect(anthropic.medium!.model).toBe("anthropic/project-medium");
     // fell back to the bundled fast model (global dropped)
-    expect(anthropic.fast!.model).toBe("anthropic/claude-sonnet-5-5");
+    expect(anthropic.fast!.model).toBe("anthropic/claude-haiku-5-5");
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("combined overrides are invalid"),
     );

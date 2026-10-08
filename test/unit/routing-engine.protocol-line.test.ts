@@ -36,12 +36,22 @@ function sha256(text: string): string {
 /** Issue #77: rename moved from fast to medium; all other protocol bytes retained. */
 const R_HASH = "6ace4a35c29f8972a86e67e705830aaff964c78997b654c4b13a139b5b0563fe";
 
+/**
+ * The `anthropic` fast tier moved from Sonnet 5.5 to Haiku 5.5 (low). The previous D2 hashes are kept here: the lineage
+ * test below proves the new protocol is the old one with only that model name changed.
+ */
+const ANTHROPIC_FAST_SONNET_D2 = {
+  raw: "96c9fa385ca8104f72730ab9aff1d6b6d83a98c1be6c8dd857a6ed129fb38b60",
+  v2: "85d07a3a46c79abc1b15caa65bfff0757912d5e33a6b8ec0deff6b81fae592b1",
+  chars: 3249,
+} as const;
+
 const D2: Readonly<Record<string, { raw: string; rawChars: number; v2: string; v2Chars: number }>> = {
   anthropic: {
-    raw: "96c9fa385ca8104f72730ab9aff1d6b6d83a98c1be6c8dd857a6ed129fb38b60",
-    rawChars: 3249,
-    v2: "85d07a3a46c79abc1b15caa65bfff0757912d5e33a6b8ec0deff6b81fae592b1",
-    v2Chars: 3249,
+    raw: "a1b84e7a68b96016cafdef434aa5fdd2d8824ad7e363fa481b4ea4f3eedff130",
+    rawChars: 3248,
+    v2: "75b71b88e8dc6b2b38701015492abecb4962983374630181979fc9293ed36cc5",
+    v2Chars: 3248,
   },
   "hybrid-2": {
     raw: "f79fde6484ae5a8f4ca64dc0b1a89910bd55e12f649f39e54e4817d770877211",
@@ -115,6 +125,19 @@ describe("D2 snapshot: raw protocol text (0.P.3)", () => {
       expect(sha256(buildTaskTaxonomy(cfg))).toBe(R_HASH);
     });
   }
+});
+
+describe("D2 lineage: anthropic fast tier on Haiku 5.5", () => {
+  it("the protocol is the Sonnet-era text with only the fast model name changed", () => {
+    const cfg = shipped("anthropic");
+    const raw = buildDelegationProtocol(cfg);
+    const v2 = v2Instructions(raw);
+    expect(raw.split("claude-haiku-5-5").length - 1).toBe(1);
+    const back = (text: string) => text.replace("claude-haiku-5-5", "claude-sonnet-5-5");
+    expect(sha256(back(raw))).toBe(ANTHROPIC_FAST_SONNET_D2.raw);
+    expect(back(raw)).toHaveLength(ANTHROPIC_FAST_SONNET_D2.chars);
+    expect(sha256(back(v2))).toBe(ANTHROPIC_FAST_SONNET_D2.v2);
+  });
 });
 
 describe("D2 snapshot: v2-adapted protocol text", () => {

@@ -46,11 +46,11 @@
     "anthropic": {
       "fast": {
         "readOnly": true,
-        "model": "anthropic/claude-sonnet-5-5",
+        "model": "anthropic/claude-haiku-5-5",
         "variant": "low",
         "effort": "low",
         "costRatio": 1,
-        "description": "Sonnet 5.5 low for exploration, search, and simple reads",
+        "description": "Haiku 5.5 low for exploration, search, and simple reads",
         "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",

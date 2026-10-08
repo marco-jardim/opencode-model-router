@@ -27,6 +27,7 @@ import { summarize } from "../../src/routing/outcomes/stats";
 const logger = { warn: vi.fn() };
 
 const SONNET = "anthropic/claude-sonnet-5-5";
+const HAIKU_FAST = "anthropic/claude-haiku-5-5"; // the bundled anthropic preset's fast tier
 const OPUS = "anthropic/claude-opus-5-5";
 const HAIKU = "anthropic/claude-haiku-4-5";
 const ALLOW_ALL = [{ action: "*", resource: "*", effect: "allow" }];
@@ -87,6 +88,7 @@ function catalog() {
   return [
     { providerID: "anthropic", id: "claude-sonnet-5-5", variants: variants("low", "medium", "high"), limit: { context: 200_000, output: 32_000 }, cost: [] },
     { providerID: "anthropic", id: "claude-opus-5-5", variants: variants("low", "medium", "high", "xhigh"), limit: { context: 200_000, output: 32_000 }, cost: [] },
+    { providerID: "anthropic", id: "claude-haiku-5-5", variants: variants("low", "medium", "high"), limit: { context: 200_000, output: 32_000 }, cost: [] },
     { providerID: "anthropic", id: "claude-haiku-4-5", variants: variants("high", "max"), limit: { context: 200_000, output: 32_000 }, cost: [] },
   ];
 }
@@ -1007,7 +1009,7 @@ describe("plan route lines and subagentTiers", () => {
     const world = await makeWorld({ engine: "enforce", roles: {} }, { subagentTiers: { general: "fast" } });
     await world.start();
     const kept = await routed(world, { agent: "general", prompt: "[route class=other]\nAnything." });
-    expect(kept).toMatchObject({ agent: "general", model: `${SONNET}#low` });
+    expect(kept).toMatchObject({ agent: "general", model: `${HAIKU_FAST}#low` });
     world.seed(KEYS.medium, 0, 20);
     world.seed(KEYS.heavy, 20, 0);
     const switched = await routed(world, { agent: "medium", prompt: IMPLEMENT() });
@@ -1188,7 +1190,7 @@ describe("registration from the FINAL input (QA-2.2-2)", () => {
     world.emit({ type: "session.created", data: { sessionID: "by-fast", parentID: "root", agent: "fast", title: "rewritten" } });
     await vi.waitFor(() => { expect(lookupDispatch("by-fast")).toBeDefined(); });
     expect(lookupDispatch("by-medium")).toBeUndefined();
-    expect(lookupDispatch("by-fast")).toMatchObject({ agent: "fast", model: SONNET, variant: "low", tier: "fast", parentSessionID: "root" });
+    expect(lookupDispatch("by-fast")).toMatchObject({ agent: "fast", model: HAIKU_FAST, variant: "low", tier: "fast", parentSessionID: "root" });
   });
 
   it("a legacy hook that sets a model: the registration carries it; a resume is registered from the final input", async () => {

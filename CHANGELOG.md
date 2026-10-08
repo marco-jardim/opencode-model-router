@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered after startup still get the tier model.
 ### Changed
 
+- `anthropic` preset: `fast` tier now uses Claude Haiku 5.5 (low) instead of Sonnet 5.5 (low).
 - **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
   Code Mode, delegation and unspecified MCP tools are denied, including inherited
   ask grants outside the permitted actions, even
