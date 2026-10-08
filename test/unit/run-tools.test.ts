@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gitEnvironment, gitExecutable, gitTools } from "../../src/router/git-tools";
+import { spawnBounded } from "../../src/router/git-tools";
 import type { RunConfig } from "../../src/router/roles";
 import {
-  argAllowed, authorizeCwd, dropLeadingPartial, npmHardeningFlags, planRun, renderRunOutput, resolveCommandExecutable,
-  resolveNodeExecutable, routerRunTool, runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, scriptAllowed, validateRunArgs,
+  argAllowed, authorizeCwd, dropLeadingPartial, isFullPath, npmHardeningFlags, planRun, renderRunOutput, resolveCommandExecutable,
+  resolveNodeExecutable, resolveNpmCli, resolveSystemShell, routerRunTool, runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, scriptAllowed, validateRunArgs,
   type RunRecord, type RunToolDeps,
 } from "../../src/router/run-tools";
 
@@ -335,29 +335,434 @@ describe("router_run hijack resistance (#77 G4)", () => {
   });
 });
 
-describe("router_git work-root resolver (R6/P-18)", () => {
-  function repository(dir: string) {
-    const git = (...args: string[]) => execFileSync(gitExecutable(), ["-c", "gc.auto=0", "-c", "maintenance.auto=false", ...args], { cwd: dir, env: gitEnvironment(), encoding: "utf8" });
-    git("init", "-q");
-    git("config", "user.email", "t@example.com"); git("config", "user.name", "t"); git("config", "commit.gpgsign", "false");
-    writeFileSync(join(dir, "bound.txt"), "x\n");
-    git("add", "-A"); git("commit", "-qm", "init");
-  }
-  const call = (tools: ReturnType<typeof gitTools>, name: string, directory: string) =>
-    (tools[name]!.execute as unknown as Execute)({}, context("child", directory));
+/** Run `fn` while process.execPath names `value` (a Bun-style runtime path); synchronous callers only. */
+function withExecPath<T>(value: string, fn: () => T): T {
+  const original = process.execPath;
+  process.execPath = value;
+  try { return fn(); } finally { process.execPath = original; }
+}
+const NODE_NAME = WIN ? "node.exe" : "node";
+const SEP = WIN ? ";" : ":";
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; } };
+async function waitUntil(check: () => boolean, ms = 10_000) {
+  const end = Date.now() + ms;
+  while (!check() && Date.now() < end) await new Promise(r => setTimeout(r, 100));
+  return check();
+}
+const hostOf = (env: NodeJS.ProcessEnv, extra: { nodeExecPath?: string } = {}) => ({ platform: process.platform, env, ...extra });
 
-  it("uses the bound root, refuses an unbound role session, and keeps today's behaviour for undefined", async () => {
-    repository(sibling);
-    const bound = gitTools({ resolveWorkRoot: () => sibling });
-    expect(await call(bound, "router_git_ls_files", root)).toBe("bound.txt\n");
-    const unbound = gitTools({ resolveWorkRoot: () => null });
-    expect(await call(unbound, "router_git_ls_files", sibling)).toBe("[router_git] error: refused: this role session has no bound work root (I9)");
-    const notRole = gitTools({ resolveWorkRoot: () => undefined });
-    expect(await call(notRole, "router_git_ls_files", sibling)).toBe("bound.txt\n");
-    expect(await call(gitTools(), "router_git_ls_files", sibling)).toBe("bound.txt\n");
-    const relative = gitTools({ resolveWorkRoot: () => "relative/dir" });
-    expect(await call(relative, "router_git_ls_files", sibling)).toBe("[router_git] error: Bound work root is not an absolute path");
-    const throwing = gitTools({ resolveWorkRoot: () => { throw new Error("binding lookup failed"); } });
-    expect(await call(throwing, "router_git_ls_files", sibling)).toBe("[router_git] error: binding lookup failed");
+describe("router_run timeout, abort and signals", () => {
+  const hangTree = [
+    "const { spawn } = require('child_process');",
+    "spawn(process.execPath, ['-e', \"require('fs').writeFileSync('grand.pid', String(process.pid)); console.log('grandchild-up'); setInterval(() => {}, 1000)\"], { stdio: ['ignore', 'inherit', 'inherit'] });",
+    "console.log('parent-started'); setInterval(() => {}, 1000);",
+  ].join("\n");
+
+  it("kills a hanging grandchild on timeout, keeps the partial output and reports exit null", async () => {
+    project(root);
+    writeFileSync(join(root, "hangtree.js"), hangTree);
+    const records: RunRecord[] = [];
+    const run = makeTool({ config: () => config({ timeoutMs: 8_000, commands: { tree: { argv: ["node", "hangtree.js"] } } }) }, records);
+    const out = await run({ script: "tree", cwd: root });
+    expect(out).toMatch(/^\[router_run\] command "tree": timed out after 8000 ms, process tree killed; exit code: none/);
+    expect(out).toContain("parent-started");
+    expect(records.map(r => r.exitCode)).toEqual([null]);
+    expect(existsSync(join(root, "grand.pid"))).toBe(true);
+    const pid = Number(readFileSync(join(root, "grand.pid"), "utf8"));
+    expect(await waitUntil(() => !alive(pid))).toBe(true);
   }, SPAWN_TIMEOUT);
+
+  it("aborts a running process tree through context.abort and records a null exit", async () => {
+    project(root);
+    writeFileSync(join(root, "hangtree.js"), hangTree);
+    const records: RunRecord[] = [];
+    const run = makeTool({ config: () => config({ timeoutMs: 60_000, commands: { tree: { argv: ["node", "hangtree.js"] } } }) }, records);
+    const controller = new AbortController();
+    const pending = run({ script: "tree", cwd: root }, { ...context(), abort: controller.signal });
+    expect(await waitUntil(() => existsSync(join(root, "grand.pid")))).toBe(true);
+    controller.abort();
+    const out = await pending;
+    expect(out).toMatch(/^\[router_run\] command "tree": aborted, process tree killed; exit code: none/);
+    expect(records.map(r => r.exitCode)).toEqual([null]);
+    const pid = Number(readFileSync(join(root, "grand.pid"), "utf8"));
+    expect(await waitUntil(() => !alive(pid))).toBe(true);
+  }, SPAWN_TIMEOUT);
+
+  it("spawns nothing for an already-aborted signal and records nothing", async () => {
+    project(root);
+    const records: RunRecord[] = [];
+    const controller = new AbortController();
+    controller.abort();
+    const out = await makeTool({}, records)({ script: "test", cwd: root }, { ...context(), abort: controller.signal });
+    expect(out).toBe("[router_run] error: router_run aborted");
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+    expect(records).toEqual([]);
+  }, SPAWN_TIMEOUT);
+
+  it.skipIf(WIN)("reports a process killed by a signal as having no exit code", async () => {
+    project(root);
+    writeFileSync(join(root, "selfkill.js"), "console.log('about to die'); process.kill(process.pid, 'SIGKILL');");
+    const records: RunRecord[] = [];
+    const out = await makeTool({ config: () => config({ commands: { die: { argv: ["node", "selfkill.js"] } } }) }, records)({ script: "die", cwd: root });
+    expect(out).toMatch(/exit code: none \(killed by a signal\)/);
+    expect(records.map(r => r.exitCode)).toEqual([null]);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("router_run work roots", () => {
+  it("runs in a work root whose path contains spaces", async () => {
+    const spaced = join(sibling, "work root with spaces");
+    mkdirSync(spaced);
+    project(spaced);
+    const records: RunRecord[] = [];
+    const out = await makeTool({ resolveWorkRoot: () => spaced }, records)({ script: "test", cwd: spaced });
+    expect(out).toMatch(/exit code: 0/);
+    expect(JSON.parse(readFileSync(join(spaced, "ran.json"), "utf8")).cwd.toLowerCase()).toBe(realpathSync.native(spaced).toLowerCase());
+    expect(records.map(r => r.exitCode)).toEqual([0]);
+  }, SPAWN_TIMEOUT);
+
+  it("canonicalises a symlink or junction cwd to the bound root and refuses one pointing elsewhere", async () => {
+    project(root); project(sibling);
+    const link = join(home, "link-to-root");
+    const foreign = join(home, "link-to-sibling");
+    symlinkSync(root, link, WIN ? "junction" : "dir");
+    symlinkSync(sibling, foreign, WIN ? "junction" : "dir");
+    expect(authorizeCwd(root, link)).toBe(root);
+    expect(authorizeCwd(link, root)).toBe(root);
+    expect(authorizeCwd(link, link)).toBe(root);
+    expect(() => authorizeCwd(root, foreign)).toThrow(/cwd is not this dispatch's work root/);
+    const run = makeTool();
+    expect(await run({ script: "test", cwd: link })).toMatch(/exit code: 0/);
+    expect(JSON.parse(readFileSync(join(root, "ran.json"), "utf8")).cwd.toLowerCase()).toBe(root.toLowerCase());
+    expect(await run({ script: "test", cwd: foreign })).toMatch(/refused: cwd is not this dispatch's work root/);
+    expect(existsSync(join(sibling, "ran.json"))).toBe(false);
+  }, SPAWN_TIMEOUT);
+
+  it.skipIf(!WIN)("expands an 8.3 short-name cwd to the canonical work root", async () => {
+    const long = join(sibling, "a rather long directory name");
+    mkdirSync(long);
+    project(long);
+    const short = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      `(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${long}').ShortPath`], { encoding: "utf8", windowsHide: true }).trim();
+    if (short === "" || short.toLowerCase() === long.toLowerCase() || !short.includes("~")) return; // 8.3 names disabled on this volume
+    expect(authorizeCwd(long, short)).toBe(realpathSync.native(long));
+    expect(authorizeCwd(short, long)).toBe(realpathSync.native(long));
+    expect(await makeTool({ resolveWorkRoot: () => long })({ script: "test", cwd: short })).toMatch(/exit code: 0/);
+  }, SPAWN_TIMEOUT);
+
+  it("refuses a bound root that is missing, a file or relative, and a case-variant cwd only on win32", () => {
+    writeFileSync(join(root, "file.txt"), "x");
+    expect(() => authorizeCwd(join(root, "nope"), root)).toThrow(/bound work root does not exist/);
+    expect(() => authorizeCwd(join(root, "file.txt"), root)).toThrow(/bound work root does not exist/);
+    expect(() => authorizeCwd(root, 42)).toThrow(/cwd must be the absolute path/);
+    expect(isFullPath("/usr/bin", "linux")).toBe(true);
+    expect(isFullPath("usr/bin", "linux")).toBe(false);
+    expect(isFullPath("C:\\a", "win32")).toBe(true);
+    expect(isFullPath("C:/a", "win32")).toBe(true);
+    expect(isFullPath("\\\\host\\share\\a", "win32")).toBe(true);
+    expect(isFullPath("\\a", "win32")).toBe(false);
+    expect(isFullPath("C:a", "win32")).toBe(false);
+    expect(isFullPath("/a", "win32")).toBe(false);
+  });
+});
+
+describe("router_run tool boundary", () => {
+  it("reports schema violations as errors and spawns nothing", async () => {
+    project(root);
+    const run = makeTool();
+    expect(await run({ script: "test", cwd: root, extra: 1 })).toMatch(/^\[router_run\] error: /);
+    expect(await run({ script: "test", cwd: root, args: [5] })).toMatch(/^\[router_run\] error: /);
+    expect(await run({ script: "x".repeat(201), cwd: root })).toMatch(/^\[router_run\] error: /);
+    expect(await run(undefined)).toMatch(/refused: cwd must be the absolute path/);
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+  it("does not call recordRun on a refusal and calls it with the exit code on success", async () => {
+    project(root);
+    const records: RunRecord[] = [];
+    const run = makeTool({ config: () => config({ commands: { ok: { argv: ["node", "probe.js", "exit", "0"] }, bad: { argv: ["node", "probe.js", "exit", "9"] } } }) }, records);
+    expect(await run({ script: "deploy", cwd: root })).toMatch(/refused/);
+    expect(await run({ script: "ok", cwd: sibling })).toMatch(/refused/);
+    expect(records).toEqual([]);
+    expect(await run({ script: "ok", cwd: root })).toMatch(/exit code: 0/);
+    expect(await run({ script: "bad", cwd: root })).toMatch(/exit code: 9/);
+    expect(records).toEqual([
+      { sessionID: "child", script: "ok", exitCode: 0, at: expect.any(Number) },
+      { sessionID: "child", script: "bad", exitCode: 9, at: expect.any(Number) },
+    ]);
+    expect(records[0]!.at).toBeLessThanOrEqual(records[1]!.at);
+  }, SPAWN_TIMEOUT);
+  it("uses the process environment when none is injected and honours the node seam", async () => {
+    project(root);
+    const config1 = () => config({ commands: { probe: { argv: ["node", "probe.js", "hello"] } } });
+    expect(await makeTool({ env: undefined, config: config1 })({ script: "probe", cwd: root })).toContain("PROBE-OK hello");
+    expect(await makeTool({ nodeExecPath: process.execPath, config: config1 })({ script: "probe", cwd: root })).toContain("PROBE-OK hello");
+    expect(await makeTool({ nodeExecPath: join(sibling, "no-such-node"), config: config1 })({ script: "probe", cwd: root })).toMatch(/refused: node executable is not an absolute path to a file/);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("router_run plan validation", () => {
+  const plan = (script: string, cfg: Partial<RunConfig>, args?: string[]) =>
+    planRun({ script, args, cwd: root }, root, config(cfg), hostOf(testEnv()));
+
+  it("refuses malformed command argv", () => {
+    for (const argv of [[], [""], ["node", ""], [1], "node", null, undefined]) {
+      expect(() => plan("c", { commands: { c: { argv } as never } })).toThrow(/has no valid argv/);
+    }
+    for (const bad of ["a\0b", "a\nb", "a\rb"]) {
+      expect(() => plan("c", { commands: { c: { argv: ["node", bad] } } })).toThrow(/without NUL or line breaks/);
+    }
+    expect(() => plan("-x", {})).toThrow(/invalid entry name/);
+    expect(() => planRun({ script: 5 as never, cwd: root }, root, config(), hostOf(testEnv()))).toThrow(/invalid entry name/);
+  });
+  it("lets commands win over scripts of the same name and plans a node command with declared args", () => {
+    project(root);
+    const planned = plan("test", { commands: { test: { argv: ["node", "probe.js", "--flag"], args: ["a/*"] } } }, ["a/b"]);
+    expect(planned.kind).toBe("command");
+    expect(planned.argv).toEqual(["probe.js", "--flag", "a/b"]);
+    expect(planned.cwd).toBe(root);
+    expect(planned.env.CI).toBe("1");
+  });
+  it("validates package.json: size, BOM, JSON, scripts shape", () => {
+    const set = (text: string) => writeFileSync(join(root, "package.json"), text);
+    expect(() => plan("test", {})).toThrow(/no readable package\.json/);
+    set("{ not json"); expect(() => plan("test", {})).toThrow(/no readable package\.json/);
+    set(" ".repeat(4 * 1024 * 1024 + 1)); expect(() => plan("test", {})).toThrow(/larger than 4 MiB/);
+    for (const text of ["null", "[]", "5", "{}", '{"scripts":null}', '{"scripts":5}', '{"scripts":{"test":5}}', '{"scripts":{"other":"x"}}']) {
+      set(text); expect(() => plan("test", {})).toThrow(/package\.json has no script "test"/);
+    }
+    set('\uFEFF{"scripts":{"test":"node x.js"}}');
+    expect(plan("test", {}).argv.slice(-2)).toEqual(["run", "test"]);
+  });
+  it("uses the default timeout when none is configured and tolerates a missing commands map", () => {
+    project(root);
+    const cfg = { scripts: ["test"] } as RunConfig;
+    expect(planRun({ script: "test", cwd: root }, root, cfg, hostOf(testEnv())).timeoutMs).toBe(600_000);
+    expect(() => planRun({ script: "other", cwd: root }, root, { } as RunConfig, hostOf(testEnv()))).toThrow(/not in routing\.run/);
+    for (const ms of [0, -5, Number.NaN, "5" as never]) expect(plan("test", { timeoutMs: ms }).timeoutMs).toBe(600_000);
+    expect(plan("test", { timeoutMs: 1500.9 }).timeoutMs).toBe(1500);
+  });
+  it("plans an absolute-path executable command and refuses missing, inside-root and shell targets", () => {
+    const tool = join(sibling, WIN ? "mytool.exe" : "mytool");
+    writeFileSync(tool, "");
+    const planned = plan("abs", { commands: { abs: { argv: [tool, "--x"] } } });
+    expect(planned.executable.toLowerCase()).toBe(realpathSync.native(tool).toLowerCase());
+    expect(planned.argv).toEqual(["--x"]);
+    expect(() => plan("abs", { commands: { abs: { argv: [join(sibling, "missing.exe")] } } })).toThrow(/command executable not found/);
+    const inside = join(root, WIN ? "inner.exe" : "inner");
+    writeFileSync(inside, "");
+    expect(() => plan("abs", { commands: { abs: { argv: [inside] } } })).toThrow(/inside the work root/);
+    if (WIN) {
+      writeFileSync(join(sibling, "data.txt"), "");
+      expect(() => plan("abs", { commands: { abs: { argv: [join(sibling, "data.txt")] } } })).toThrow(/\.exe or \.com/);
+      expect(() => plan("abs", { commands: { abs: { argv: [join(sibling, "x.cmd")] } } })).toThrow(/\.exe or \.com/);
+    }
+    expect(() => plan("abs", { commands: { abs: { argv: ["nonexistent-tool-xyz"] } } })).toThrow(/not found on an absolute PATH entry/);
+  });
+  it("runs an absolute-path executable command through router_run", async () => {
+    const copy = join(sibling, WIN ? "copied-node.exe" : "copied-node");
+    copyFileSync(process.execPath, copy);
+    if (!WIN) chmodSync(copy, 0o755);
+    const out = await makeTool({ config: () => config({ commands: { ver: { argv: [copy, "--version"] } } }) })({ script: "ver", cwd: root });
+    expect(out).toMatch(/command "ver": exit code: 0/);
+    expect(out).toContain(process.version);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("router_run node and npm lookup", () => {
+  function fakeBunLayout() {
+    const bunDir = join(home, "bun-node-1a2b3c");
+    const other = join(home, "other-bin");
+    mkdirSync(bunDir); mkdirSync(other);
+    const bun = join(bunDir, WIN ? "bun.exe" : "bun");
+    writeFileSync(bun, "");
+    return { bunDir, other, bun };
+  }
+  it("under a Bun-style runtime skips Bun's temporary node link and picks the PATH node", () => {
+    const { bunDir, other, bun } = fakeBunLayout();
+    const real = join(other, NODE_NAME);
+    writeFileSync(real, "");
+    const env = { PATH: [`"${bunDir}"`, "", "relative/bin", `"${other}"`].join(SEP) } as NodeJS.ProcessEnv;
+    withExecPath(bun, () => {
+      expect(resolveNodeExecutable(hostOf(env), [root]).toLowerCase()).toBe(realpathSync.native(real).toLowerCase());
+    });
+  });
+  it("skips a PATH node that is the runtime's own hard link, and reports when none remains", () => {
+    const { bunDir, other, bun } = fakeBunLayout();
+    linkSync(bun, join(other, NODE_NAME));
+    const env = { PATH: `${bunDir}${SEP}${other}` } as NodeJS.ProcessEnv;
+    withExecPath(bun, () => {
+      expect(() => resolveNodeExecutable(hostOf(env), [root])).toThrow(/node executable not found/);
+      expect(() => resolveNodeExecutable(hostOf({}), [root])).toThrow(/node executable not found/);
+    });
+  });
+  it.skipIf(WIN)("skips a PATH node that resolves to bun", () => {
+    const { other, bun } = fakeBunLayout();
+    symlinkSync(bun, join(other, "node"));
+    withExecPath(bun, () => {
+      expect(() => resolveNodeExecutable(hostOf({ PATH: other } as NodeJS.ProcessEnv), [root])).toThrow(/node executable not found/);
+    });
+  });
+  it("refuses a Bun-style PATH whose only node is inside the work root, and falls through to a later one", () => {
+    const { bun, other } = fakeBunLayout();
+    const inside = join(root, "bin");
+    mkdirSync(inside);
+    writeFileSync(join(inside, NODE_NAME), "");
+    const onlyInside = { PATH: inside } as NodeJS.ProcessEnv;
+    withExecPath(bun, () => {
+      expect(() => resolveNodeExecutable(hostOf(onlyInside), [root])).toThrow(/refusing a node executable inside the work root/);
+      writeFileSync(join(other, NODE_NAME), "");
+      const both = { PATH: `${inside}${SEP}${other}` } as NodeJS.ProcessEnv;
+      expect(resolveNodeExecutable(hostOf(both), [root]).toLowerCase()).toBe(realpathSync.native(join(other, NODE_NAME)).toLowerCase());
+    });
+  });
+  it("accepts the node seam only as an absolute file outside the work root", () => {
+    expect(() => resolveNodeExecutable(hostOf({}, { nodeExecPath: "node" }), [root])).toThrow(/not an absolute path to a file/);
+    expect(() => resolveNodeExecutable(hostOf({}, { nodeExecPath: join(sibling, "missing") }), [root])).toThrow(/not an absolute path to a file/);
+    expect(resolveNodeExecutable(hostOf({}, { nodeExecPath: process.execPath }), [root]).toLowerCase()).toBe(realpathSync.native(process.execPath).toLowerCase());
+  });
+  it("finds npm-cli.js beside node, and refuses a missing or in-root one", () => {
+    const prefix = join(sibling, "prefix");
+    mkdirSync(join(prefix, "node_modules", "npm", "bin"), { recursive: true });
+    const node = join(prefix, NODE_NAME);
+    writeFileSync(node, "");
+    expect(() => resolveNpmCli(node, process.platform, [root])).toThrow(/npm-cli\.js not found/);
+    const cli = join(prefix, "node_modules", "npm", "bin", "npm-cli.js");
+    writeFileSync(cli, "");
+    expect(resolveNpmCli(node, process.platform, [root]).toLowerCase()).toBe(realpathSync.native(cli).toLowerCase());
+    expect(() => resolveNpmCli(node, process.platform, [prefix])).toThrow(/refusing npm-cli\.js inside the work root/);
+  });
+  it.skipIf(WIN)("finds npm-cli.js under ../lib/node_modules/npm on POSIX layouts", () => {
+    const prefix = join(sibling, "prefix");
+    mkdirSync(join(prefix, "bin"), { recursive: true });
+    mkdirSync(join(prefix, "lib", "node_modules", "npm", "bin"), { recursive: true });
+    const node = join(prefix, "bin", "node");
+    const cli = join(prefix, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    writeFileSync(node, ""); writeFileSync(cli, "");
+    expect(resolveNpmCli(node, "linux", [root])).toBe(realpathSync.native(cli));
+  });
+  it("treats the platform seam as POSIX when asked: /bin/sh only", () => {
+    if (WIN) expect(() => resolveSystemShell({ platform: "linux", env: {} }, [root])).toThrow(/no absolute system shell/);
+    else expect(resolveSystemShell({ platform: "linux", env: {} }, [root])).toBe(realpathSync.native("/bin/sh"));
+    expect(() => resolveNpmCli("/nonexistent/bin/node", "linux", [root])).toThrow(/npm-cli\.js not found/);
+  });
+});
+
+describe("router_run system shell and ComSpec", () => {
+  it.skipIf(WIN)("pins /bin/sh as npm's script shell, never a repo .npmrc script-shell (evil.sh)", async () => {
+    project(root);
+    writeFileSync(join(root, "evil.sh"), "#!/bin/sh\necho evil > \"$(dirname \"$0\")/shell-marker.txt\"\n");
+    chmodSync(join(root, "evil.sh"), 0o755);
+    writeFileSync(join(root, ".npmrc"), "script-shell=./evil.sh\n");
+    expect(resolveSystemShell(hostOf({}), [root])).toBe(realpathSync.native("/bin/sh"));
+    expect(await makeTool()({ script: "test", cwd: root })).toMatch(/exit code: 0/);
+    expect(existsSync(join(root, "shell-marker.txt"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(root, "ran.json"), "utf8")).shell).toBe(realpathSync.native("/bin/sh"));
+  }, SPAWN_TIMEOUT);
+
+  describe.skipIf(!WIN)("win32 ComSpec", () => {
+    const system32 = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe");
+    it("uses a valid ComSpec, falls back to System32 cmd.exe for a relative or in-root one", () => {
+      const real = realpathSync.native(system32).toLowerCase();
+      expect(resolveSystemShell(hostOf({ ComSpec: system32 }), [root]).toLowerCase()).toBe(real);
+      expect(resolveSystemShell(hostOf({ ComSpec: "cmd.exe" }), [root]).toLowerCase()).toBe(real);
+      expect(resolveSystemShell(hostOf({ ComSpec: "..\\evil\\cmd.exe" }), [root]).toLowerCase()).toBe(real);
+      expect(resolveSystemShell(hostOf({}), [root]).toLowerCase()).toBe(real);
+      const planted = join(root, "cmd.exe");
+      writeFileSync(planted, "");
+      expect(resolveSystemShell(hostOf({ ComSpec: planted }), [root]).toLowerCase()).toBe(real);
+    });
+    it("refuses when every candidate is relative, missing or inside the work root", () => {
+      const fakeRoot = join(root, "fake-windows");
+      mkdirSync(join(fakeRoot, "System32"), { recursive: true });
+      writeFileSync(join(fakeRoot, "System32", "cmd.exe"), "");
+      const env = { SystemRoot: fakeRoot, ComSpec: "cmd.exe" } as NodeJS.ProcessEnv;
+      expect(() => resolveSystemShell(hostOf(env), [root])).toThrow(/no absolute system shell/);
+      expect(() => resolveSystemShell(hostOf({ SystemRoot: join(sibling, "none") }), [root])).toThrow(/no absolute system shell/);
+    });
+    it("plans a validated ComSpec into the run environment, and tolerates no shell for a plain command", () => {
+      const tool = join(sibling, "plain.exe");
+      writeFileSync(tool, "");
+      const cfg = config({ commands: { plain: { argv: [tool] } } });
+      const ok = planRun({ script: "plain", cwd: root }, root, cfg, hostOf(testEnv({ ComSpec: "cmd.exe" })));
+      expect(ok.env.ComSpec?.toLowerCase()).toBe(realpathSync.native(system32).toLowerCase());
+      const fakeRoot = join(root, "fake-windows");
+      mkdirSync(join(fakeRoot, "System32"), { recursive: true });
+      writeFileSync(join(fakeRoot, "System32", "cmd.exe"), "");
+      const noShellEnv = Object.fromEntries(Object.entries(testEnv()).filter(([key]) => !/^(SystemRoot|ComSpec)$/i.test(key)));
+      const none = planRun({ script: "plain", cwd: root }, root, cfg, hostOf({ ...noShellEnv, SystemRoot: fakeRoot, ComSpec: "cmd.exe" }));
+      expect(none.executable.toLowerCase()).toBe(realpathSync.native(tool).toLowerCase());
+      const npmPlan = () => planRun({ script: "n", cwd: root }, root, config({ commands: { n: { argv: ["npm", "--version"] } } }), hostOf({ ...noShellEnv, SystemRoot: fakeRoot, ComSpec: "cmd.exe" }));
+      expect(npmPlan).toThrow(/no absolute system shell/);
+    });
+  });
+});
+
+describe("router_run command resolution on POSIX paths (platform seam)", () => {
+  it("resolves bare names only from absolute PATH entries and refuses shells and shims by stem", () => {
+    const posix = (env: NodeJS.ProcessEnv) => ({ platform: "linux" as const, env });
+    expect(() => resolveCommandExecutable("tool", posix({ PATH: "/nonexistent-dir-a:relative" }), [root])).toThrow(/not found on an absolute PATH entry/);
+    expect(() => resolveCommandExecutable("/usr/bin/bash", posix({}), [root])).toThrow(/is a shell/);
+    expect(() => resolveCommandExecutable("/opt/yarn", posix({}), [root])).toThrow(/reads repository configuration/);
+    expect(() => resolveCommandExecutable("rel/tool", posix({}), [root])).toThrow(/absolute or a bare name/);
+    expect(() => resolveCommandExecutable("/nonexistent/tool", posix({}), [root])).toThrow(/command executable not found/);
+    expect(() => resolveCommandExecutable("tool.cmd", posix({ PATH: "/nonexistent" }), [root])).not.toThrow(/\.exe or \.com/);
+  });
+  it.skipIf(WIN)("resolves a real bare-name tool on POSIX and refuses one inside the work root", () => {
+    const dir = join(sibling, "bin");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "mytool"), "");
+    expect(resolveCommandExecutable("mytool", hostOf({ PATH: `"${dir}"` }), [root])).toBe(realpathSync.native(join(dir, "mytool")));
+    expect(() => resolveCommandExecutable("mytool", hostOf({ PATH: dir }), [dir])).toThrow(/inside the work root/);
+  });
+});
+
+describe("spawnBounded tail mode", () => {
+  const script = (lines: number) => `let s=''; for (let i=0;i<${lines};i++) s += 'L'+String(i).padStart(5,'0')+'\\n'; process.stdout.write(s);`;
+  const full = (lines: number) => Array.from({ length: lines }, (_, i) => `L${String(i).padStart(5, "0")}\n`).join("");
+
+  it("keeps the first maxBytes, a rolling window of the last tailBytes and counts the omitted middle", async () => {
+    const lines = 5000, total = full(lines);
+    const result = await spawnBounded(process.execPath, ["-e", script(lines)], root, { env: process.env, maxBytes: 1000, tailBytes: 500, timeoutMs: 60_000 });
+    expect(result.code).toBe(0);
+    expect(result.truncated).toBe(true);
+    expect(result.output.toString()).toBe(total.slice(0, 1000));
+    expect(result.tail!.toString()).toBe(total.slice(total.length - 500));
+    expect(result.omitted).toBe(total.length - 1000 - 500);
+    expect(result.failure).toBeUndefined();
+    const text = renderRunOutput(result);
+    expect(text).toContain(`[router_run] output truncated: ${total.length - 1500} bytes omitted;`);
+    expect(text.endsWith(total.slice(total.length - 400))).toBe(true);
+  }, SPAWN_TIMEOUT);
+  it("reports no omission when the output fits the head and tail", async () => {
+    const result = await spawnBounded(process.execPath, ["-e", "process.stdout.write('abc\\n'); process.stderr.write('def\\n')"], root,
+      { env: process.env, maxBytes: 1000, tailBytes: 500, mergeStderr: true, timeoutMs: 60_000 });
+    expect(result.truncated).toBe(false);
+    expect(result.tail!.length).toBe(0);
+    expect(result.omitted).toBe(0);
+    expect(result.output.toString().replace(/\r/g, "").split("\n").filter(Boolean).sort()).toEqual(["abc", "def"]);
+    expect(renderRunOutput(result)).toMatch(/^abc|def/);
+    expect(result.stderr.length).toBe(0);
+  }, SPAWN_TIMEOUT);
+  it("settles on failure with partial output instead of rejecting, and rejects without settleOnFailure", async () => {
+    const hang = "console.log('partial'); setInterval(() => {}, 1000);";
+    const settled = await spawnBounded(process.execPath, ["-e", hang], root, { env: process.env, timeoutMs: 1_500, tailBytes: 100, settleOnFailure: true, label: { message: "router_run", tag: "router_run", program: "the run" } });
+    expect(settled.failure).toBe("router_run timed out");
+    expect(settled.output.toString()).toContain("partial");
+    await expect(spawnBounded(process.execPath, ["-e", hang], root, { env: process.env, timeoutMs: 1_500 })).rejects.toThrow(/Git inspection timed out/);
+    await expect(spawnBounded(process.execPath, ["-e", "1"], join(root, "missing"), { env: process.env })).rejects.toThrow(/directory does not exist/);
+  }, SPAWN_TIMEOUT);
+});
+
+describe("router_run output rendering edge cases", () => {
+  it("renders every truncation shape", () => {
+    const out = (o: Partial<Parameters<typeof renderRunOutput>[0]>) => renderRunOutput({ output: Buffer.from(""), truncated: false, ...o });
+    expect(out({ output: Buffer.from("plain\n") })).toBe("plain\n");
+    expect(out({ output: Buffer.from("a"), tail: Buffer.from("b"), omitted: 0, truncated: true })).toBe("ab");
+    const noTail = out({ output: Buffer.from("head-without-newline"), truncated: true });
+    expect(noTail).toMatch(/^head-without-newline\n\[router_run\] output truncated: showing at most/);
+    expect(noTail.endsWith("\n")).toBe(true);
+    const emptyHead = out({ output: Buffer.from(""), truncated: true, omitted: 3, tail: Buffer.from("x\ny\n") });
+    expect(emptyHead.startsWith("[router_run] output truncated: 3 bytes omitted;")).toBe(true);
+    expect(emptyHead.endsWith("y\n")).toBe(true);
+  });
 });
