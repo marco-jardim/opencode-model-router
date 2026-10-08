@@ -240,24 +240,37 @@ describe("/router stats equals scripts/routing-stats.ts for role rows", () => {
     expect(result.stdout).toBe(direct);
   });
 
-  it("the script prints the same bytes", () => {
+  // Node without default type stripping (< 22.18) cannot run the script: skipped there; the driver equality above still holds.
+  it.skipIf(!scriptRuns())("the script prints the same bytes", async () => {
     const dir = storeWith(MIXED);
-    let script: string;
-    try {
-      script = execFileSync(process.execPath, ["scripts/routing-stats.ts", "--dir", dir], { cwd: process.cwd(), encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
-    } catch (error) {
-      // Node without default type stripping (< 22.18): the script cannot run here; the driver equality above still holds.
-      if (/ERR_UNKNOWN_FILE_EXTENSION|Unknown file extension/.test(String((error as { stderr?: unknown }).stderr))) return;
-      throw error;
-    }
+    const script = execFileSync(process.execPath, ["scripts/routing-stats.ts", "--dir", dir], { cwd: process.cwd(), encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
     expect(script).toContain("### By role × tier");
-    const outputs: string[] = [];
-    return runStatsCommand(`--dir ${dir}`, { cfg: tiersCfg(), host: "v1", logger }).then((result) => {
-      outputs.push(result.stdout);
-      expect(script).toBe(outputs[0]);
-    });
+    const result = await runStatsCommand(`--dir ${dir}`, { cfg: tiersCfg(), host: "v1", logger });
+    expect(script).toBe(result.stdout);
+  });
+
+  it("a tier-only log WITH a verdict signal row renders byte-identical to the tier report, in markdown and JSON", async () => {
+    const rows: LogRow[] = [TIER_ROW, signal(TIER_ROW, "verdict", "pass", 1, 20)];
+    const roles = summarizeRoles(null, rows, WINDOW);
+    expect(roles.byRoleTier).toEqual([]);
+    expect(roles.unattributed.signals).toBeGreaterThan(0); // the tier signal is unattributed, yet no role section
+    const md: string[] = [];
+    await runStatsCli([], fakeIo(rows, md));
+    expect(md.join("")).toBe(renderMarkdown(summarize(null, rows, WINDOW)));
+    const json: string[] = [];
+    await runStatsCli(["--json"], fakeIo(rows, json));
+    expect(json.join("")).toBe(JSON.stringify(summarize(null, rows, WINDOW), null, 2) + "\n");
   });
 });
+
+function scriptRuns(): boolean {
+  try {
+    execFileSync(process.execPath, ["scripts/routing-stats.ts", "--help"], { cwd: process.cwd(), stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Advisor findings: each fires and clears
@@ -267,10 +280,41 @@ function findingIds(findings: readonly Finding[]): FindingId[] {
   return findings.map((f) => f.id);
 }
 
-const run = (cfg: RouterConfig, extras: AdvisorExtras = {}) => runAdvisor(cfg, null, null, undefined, extras);
+const run = (cfg: RouterConfig, extras: AdvisorExtras = {}) => runAdvisor(cfg, null, null, undefined, { host: "v2", ...extras });
+/** No `host` in the extras: the host generation is unknown. */
+const runUnknownHost = (cfg: RouterConfig, extras: AdvisorExtras = {}) => runAdvisor(cfg, null, null, undefined, extras);
 
 describe("advisor role findings fire and clear", () => {
-  const ROLE_IDS: FindingId[] = ["role-separation", "roles-on-legacy-host", "role-budget-low", "role-range-clamped", "role-binding-unknown", "native-explore-aliased", "role-usage-share"];
+  const ALL_DISABLED = Object.fromEntries(["explorer", "researcher", "runner", "implementer", "reviewer", "architect", "general"].map((n) => [n, { enabled: false }]));
+
+  it("an unknown host (no extras.host) keeps every role finding silent", () => {
+    const stats = summarizeRoles(null, MIXED, WINDOW);
+    const violating = rolesCfg({ subagentTiers: { explore: "fast" }, agents: { implementer: { description: "x", model: "anthropic/claude-sonnet-5-5", allowTools: ["edit", "bash", "webfetch"] } } } as unknown as Partial<RouterConfig>);
+    // The same config does fire with the host known to be v2 (so the silence is the host, not the fixture).
+    expect(findingIds(run(violating, { roleStats: stats, tierDispatches: 50 }))).toEqual(expect.arrayContaining(["role-separation", "native-explore-aliased", "role-binding-unknown"]));
+    for (const id of ROLE_IDS) expect(findingIds(runUnknownHost(violating, { roleStats: stats, tierDispatches: 50 }))).not.toContain(id);
+    expect(findingIds(runUnknownHost(rolesCfg({ roleAgents: ALL_DISABLED } as unknown as Partial<RouterConfig>)))).not.toContain("roles-none-enabled");
+  });
+
+  it("roles-none-enabled (info) fires on v2 roles mode with no enabled role and clears with one, on v1 or in tiers mode", () => {
+    const none = rolesCfg({ roleAgents: ALL_DISABLED } as unknown as Partial<RouterConfig>);
+    const fired = run(none).find((f) => f.id === "roles-none-enabled");
+    expect(fired?.severity).toBe("info");
+    expect(fired?.notify).toBe(false);
+    expect(findingIds(run(rolesCfg()))).not.toContain("roles-none-enabled");
+    expect(findingIds(run(rolesCfg({ roleAgents: { ...ALL_DISABLED, general: { enabled: true } } } as unknown as Partial<RouterConfig>)))).not.toContain("roles-none-enabled");
+    expect(findingIds(run(none, { host: "v1" }))).not.toContain("roles-none-enabled");
+    expect(findingIds(run({ ...tiersCfg(), roleAgents: ALL_DISABLED } as RouterConfig))).not.toContain("roles-none-enabled");
+  });
+
+  it("buildRoleLines skips a disabled role", () => {
+    const roles = [...resolveRoles(rolesCfg(), "v2").values()];
+    const off = roles.map((r) => (r.agent === "architect" ? { ...r, enabled: false } : r));
+    expect(buildRoleLines(off).some((l) => l.includes("`architect`"))).toBe(false);
+    expect(buildRoleLines(off).some((l) => l.includes("`explorer`"))).toBe(true);
+  });
+
+  const ROLE_IDS: FindingId[] = ["role-separation", "roles-on-legacy-host", "role-budget-low", "role-range-clamped", "role-binding-unknown", "native-explore-aliased", "role-usage-share", "roles-none-enabled"];
 
   it("tiers mode: no role finding at all, whatever the statistics say", () => {
     const stats = summarizeRoles(null, MIXED, WINDOW);
