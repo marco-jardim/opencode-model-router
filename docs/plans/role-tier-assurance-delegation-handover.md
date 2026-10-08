@@ -85,8 +85,8 @@ matter most:
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **DF-2 done — roles mode live for the owner** (2026-10-08T19:20Z): restart 2 done, 7 role agents registered, roles protocol in the system prompt, step-4 probes recorded in dogfood.md (findings DF2-F1 major, DF2-F2 minor). From now on Wave 3 runs through role agents |
-| **Next task id** | **Wave 3**: P3.1 (real-host proof) and P3.2 (docs) in parallel via role agents (worktrees `D:\git\omr-rta-p31`, `p32`), then P3.3 global QA (fix DF2-F1 and DF2-F2 there or as `rta/p33-fix-<n>`), then P3.4 release. Workaround for DF2-F1: every role `[acceptance]` block carries `cwd: <work root>` || Incidents | (1) 2026-10-08 ≈05:12Z: P1.2 contract producer wrote the base checkout via relative-path .NET `WriteAllText`; restored (`git checkout --`), host never loaded it; all dispatches now forbid .NET file APIs. (2) 07:51Z and 07:55Z: 6 + 4 concurrent heavy subagents died with `Failed to drain Session … Decode error (200 POST http://127.0.0.1:3863/) … socket connection was closed`. Port 3863 is the `opencode-anthropic-fix` plugin's v2 bridge (`D:\git\opencode-anthropic-fix\lib\host\v2-transport.mjs:188-257`); an upstream mid-stream failure makes the bridge `response.destroy()` (:238) and OpenCode treats it as a non-retryable unknown error. Root upstream error not logged (plugin logs to stderr, debug off). Mitigation: ≤ 3 concurrent heavy dispatches, foreground; resume the same session. Also observed: OpenCode snapshot index corrupt since 2026-10-07 11:45Z (owner not yet asked to fix); 82 leaked MCP `node.exe` processes since 2026-10-06 (not ours, not killed) || Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
+| Checkpoint reached | **Wave 3: P3.1 and P3.2 merged** (rta/main `88d5144`, 2026-10-08 ≈22:45Z), executed through role agents. P3.1: real-host roles smoke 7/7 on 2.0.24 (run 5), smoke:v1 green on 1.18.35, v1 fallback proof, evidence in `docs\qa\role-tier\evidence\`. P3.2: ROLES.md, ADR 0006, CHANGELOG, docs-drift pins. P3.3 fixes already merged: `rta/p33-fix-1` (DF2-F1: role checks run in the bound work root) and `rta/p33-fix-2` (grader verdicts → grader signals at 0.5 when independent; R9 exact script names). R9 written |
+| **Next task id** | **P3.3 pre-flight** (capped suite on `88d5144` running; then CI green on PR #85), then **P3.3 global QA**: three `reviewer` dispatches (areas A security, B economy/engine, C docs/v1/tests/release), diff `eeab36b..rta/main`, with phase reports, spikes, plan, CI facts pasted; open item to give area B: DF2-F2 (classifier attributes `edit` to edit-free prompts). Fixes on `rta/p33-fix-<n>` in `D:\git\omr-rta-p33`. Then P3.4 || Incidents | (1) 2026-10-08 ≈05:12Z: P1.2 contract producer wrote the base checkout via relative-path .NET `WriteAllText`; restored (`git checkout --`), host never loaded it; all dispatches now forbid .NET file APIs. (2) 07:51Z and 07:55Z: 6 + 4 concurrent heavy subagents died with `Failed to drain Session … Decode error (200 POST http://127.0.0.1:3863/) … socket connection was closed`. Port 3863 is the `opencode-anthropic-fix` plugin's v2 bridge (`D:\git\opencode-anthropic-fix\lib\host\v2-transport.mjs:188-257`); an upstream mid-stream failure makes the bridge `response.destroy()` (:238) and OpenCode treats it as a non-retryable unknown error. Root upstream error not logged (plugin logs to stderr, debug off). Mitigation: ≤ 3 concurrent heavy dispatches, foreground; resume the same session. Also observed: OpenCode snapshot index corrupt since 2026-10-07 11:45Z (owner not yet asked to fix); 82 leaked MCP `node.exe` processes since 2026-10-06 (not ours, not killed) || Base directory | `D:\git\opencode-model-router` — branch `master`, `eeab36b` |
 | Active worktrees for this plan | `D:\git\omr-rta-main` → `rta/main` (integration, executor only); `D:\git\omr-rta-p01` → `rta/p01` (P0.1); `D:\git\omr-plan-rta` → `docs/role-tier-plan` (frozen) |
 | Plan branch | `docs/role-tier-plan` (pushed, frozen): `47f1e88` plan, `f23c9a7` handover + R1/R2, `8dcf455` R3, `a8b1905` R4 |
 | `rta/main` | created from `origin/docs/role-tier-plan` @ `a8b1905`, pushed |
@@ -99,7 +99,7 @@ matter most:
 | Dogfood | DF-1 pending; DF-2 pending |
 | Restart stops | DF-1 (12:34Z), DF-2 sync (19:08Z), DF-2 post-migration (19:11Z) done; P3.4 later |
 | Override SHA-256 baseline | `E73373581618F1193A4E3AF9264FD59E603C1D66B2ECF100C4F3C246A1C50750` since DF-2 (was `700E2587…88F8`; copy at `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`) |
-| Plan amendments | R0–R8; next free id: R9 |
+| Plan amendments | R0–R9; next free id: R10 |
 | Reference sessions (P0.1) | producer `ses_ee69d18aaffeG5XhB066ODnp2f` (spikes); reviewers `ses_ee672f085ffeHGQTnuwSgAruHy` (area 1), `ses_ee672bf60ffehoOgt7YSyo3wvd` (area 2) |
 
 ---
@@ -280,7 +280,7 @@ one, the host was not restarted: ask again, do not roll back.
 | P2.2 | `D:\git\omr-rta-p22` | merged | see report | `ae67429` (wave) | `docs\qa\role-tier\phase-p22.md` |
 | P2.3 | `D:\git\omr-rta-p23` | merged | see report | `ae67429` (wave) | `docs\qa\role-tier\phase-p23.md` |
 | DF-2 | base checkout (`rta/live`) | live in roles mode; probes recorded | — | `ae67429` | `docs\qa\role-tier\dogfood.md` |
-| P3.1 | `D:\git\omr-rta-p31` | pending | — | — | `docs\qa\role-tier\phase-p31.md` |
-| P3.2 | `D:\git\omr-rta-p32` | pending | — | — | `docs\qa\role-tier\phase-p32.md` |
+| P3.1 | `D:\git\omr-rta-p31` | merged | see report | `88d5144` | `docs\qa\role-tier\phase-p31.md` |
+| P3.2 | `D:\git\omr-rta-p32` | merged | see report | `88d5144` | `docs\qa\role-tier\phase-p32.md` |
 | P3.3 | `D:\git\omr-rta-main` + `rta/p33-fix-<n>` | pending | — | — | `docs\qa\role-tier\global.md` |
 | P3.4 | `D:\git\omr-rta-main`, base checkout | pending | — | — | `docs\qa\role-tier\phase-p34.md` |
