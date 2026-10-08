@@ -25,7 +25,7 @@ Goal: the orchestrator sees roles on v2 roles mode; stats and advisor speak role
 | f1b39db | QA round 1 fixes, protocol |
 | b55736d | QA round 2 fixes |
 
-Final roles protocol size: at most the tiers protocol on every preset (size guard in the golden test is green). The round-2 wording change pushed it 19 bytes over on the smallest preset, so the work-root aside was shortened to "(quote a path with spaces)".
+Final roles protocol size: at most the tiers protocol on every preset, asserted by the size guard in `test/golden/roles-protocol.golden.test.ts` (green at b55736d; after round 1 it measured 3256 B against 3282–3346 B for the tiers protocol, 4139–4203 B with the advise/enforce route-line paragraph). The round-2 wording change pushed it 19 bytes over on the smallest preset, so the work-root aside was shortened to "(quote a path with spaces)".
 
 Surface added:
 - Roles protocol, `R:` line and the absent hint part appear only on v2 roles mode with at least one enabled role. Tiers mode and v1 are byte-identical to before.
@@ -82,7 +82,7 @@ Round 1: FAIL (4 major, 8 minor, 3 nit, all fixed). Round 2: PASS (1 minor, 3 ni
 | QA-P22-2-3 | nit | runner intent "scripts and commands" | b55736d |
 | QA-P22-2-4 | nit | roles heading matched only at a line start | b55736d |
 
-The remaining round-1 minors not itemised above (1-7, 1-9, 1-11) were fixed in f1b39db and 10f1d5e.
+The remaining round-1 minors not itemised above were all fixed in f1b39db (confirmed by the round-2 review): 1-7 (`d=` counts only when an `[acceptance]` block backs it), 1-9 (quote a `root=` path with spaces), 1-11 (taxonomy moved to the leaf module `src/routing/engine/roles-taxonomy.ts`, no import cycle).
 
 Deviations recorded (executor amends §4):
 
