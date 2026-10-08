@@ -471,9 +471,13 @@ describe("v2 adapter in roles mode", () => {
       await f.permissionHooks.evaluate(edit);
       const canEdit = spec.authority.allow.includes("edit");
       expect([name, edit.effect]).toEqual([name, canEdit ? "allow" : "deny"]);
+      // QA-P23-A6: these refusals are the MAX policy's (its message), not the per-dispatch narrowing's.
+      const label = canEdit ? "plugin agent" : "read-only agent";
+      if (!canEdit) expect([name, edit.message]).toEqual([name, `Permission denied by ${label} ${name}: edit`]);
       const outside = as(evaluation(name, "external_directory", ["C:/Windows/*"]));
       await f.permissionHooks.evaluate(outside);
       expect([name, outside.effect]).toEqual([name, "deny"]);
+      expect([name, outside.message]).toEqual([name, `Permission denied by ${label} ${name}: external_directory`]);
       const sibling = as(evaluation(name, "external_directory", [join(wt, "*").replaceAll("\\", "/")]));
       await f.permissionHooks.evaluate(sibling);
       expect([name, sibling.effect]).toEqual([name, name === "researcher" ? "deny" : "allow"]);

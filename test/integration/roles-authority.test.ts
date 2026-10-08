@@ -12,15 +12,38 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import {
-  canonicalAuthorityPath, insideWorkRoot, registerV2Hooks, roleActionOf, roleAuthorityDecision, roleCatalogFailureNotice, roleToolKept,
+  canonicalAuthorityPath, insideWorkRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision, roleCatalogFailureNotice,
+  roleToolKept, toolCallPaths, unsafeSearchPattern,
 } from "../../src/compat/v2-hooks";
+import { evaluatePermission } from "../../src/router/read-only";
+import { SHIPPED_ROLE_SPECS } from "../../src/router/roles";
+import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
+
+// QA-P23-B2: a pass-through spy on the adapter's dispatch router — the tests read which observed bindings it is told about.
+const noted = vi.hoisted(() => ({ calls: [] as Array<{ child: string; kind: string }> }));
+vi.mock("../../src/routing/wire/dispatch", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/routing/wire/dispatch")>();
+  return {
+    ...actual,
+    createDispatchRouter: (deps: Parameters<typeof actual.createDispatchRouter>[0]) => {
+      const router = actual.createDispatchRouter(deps);
+      return {
+        ...router,
+        noteBinding: (child: string, binding: Parameters<typeof router.noteBinding>[1]) => {
+          noted.calls.push({ child, kind: binding.kind });
+          router.noteBinding(child, binding);
+        },
+      };
+    },
+  };
+});
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { resetDispatchRegistry } from "../../src/router/sessions";
@@ -31,7 +54,9 @@ import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { BINDING_NOTES, bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { GRANT_NOTES } from "../../src/routing/roles/policy";
 import { resetAuthorityForTests } from "../../src/routing/roles/authority";
-import { createDispatchRouter, resetDispatchRouting, roleMaxActions, routedRoleOf } from "../../src/routing/wire/dispatch";
+import {
+  createDispatchRouter, gitWorktreeList, parseWorktreeList, resetDispatchRouting, roleMaxActions, routedRoleOf,
+} from "../../src/routing/wire/dispatch";
 import { createEngineRuntime } from "../../src/routing/wire/runtime";
 import { resolveRoles } from "../../src/router/roles";
 
@@ -51,6 +76,7 @@ afterEach(async () => {
   resetDispatchRouting();
   resetDispatchRegistry();
   resetIngestState();
+  noted.calls.length = 0;
 });
 
 function temp(prefix = "omr-p23-"): string {
@@ -147,8 +173,8 @@ function host(directory: string, cfg: RouterConfig, sessions: Sessions) {
   };
   return {
     ctx, agents, toolHooks, sessionHooks, permissionHooks,
-    async start(hooks: Record<string, any>) {
-      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0 }));
+    async start(hooks: Record<string, any>, options: Parameters<typeof registerV2Hooks>[3] = {}) {
+      cleanups.push(await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { hostSettleMs: 0, ...options }));
     },
   };
 }
@@ -239,19 +265,107 @@ describe("enforcement helpers (T2.3.1, T2.3.2)", () => {
     expect(canonicalAuthorityPath(join(root, "*"), root)).toBeUndefined();
     expect(canonicalAuthorityPath("", root)).toBeUndefined();
     const touched: string[] = [];
-    const realpath = (p: string) => { touched.push(p); return p; };
-    const win = { platform: "win32" as const, realpath };
+    // A win32 realpath normalises `..` lexically, as the OS does before it touches the filesystem.
+    const realpath = (p: string) => { touched.push(p); return win32.normalize(p); };
+    const lstat = (p: string) => { touched.push(`lstat:${p}`); throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); };
+    const win = { platform: "win32" as const, realpath, lstat };
     expect(canonicalAuthorityPath("C:\\git\\OMR-RT~1\\a.ts", "C:\\git", win)).toBeUndefined();
     expect(canonicalAuthorityPath("C:\\git\\wt\\FILE~12.TXT", "C:\\git", win)).toBeUndefined();
     expect(canonicalAuthorityPath("\\\\attacker\\share\\x", "C:\\git", win)).toBeUndefined();
     expect(canonicalAuthorityPath("//attacker/share/x", "C:\\git", win)).toBeUndefined();
     expect(canonicalAuthorityPath("\\\\?\\C:\\Windows\\x", "C:\\git", win)).toBeUndefined();
     expect(canonicalAuthorityPath("C:Windows\\x", "C:\\git", win)).toBeUndefined();
+    expect(canonicalAuthorityPath("\\Windows\\x", "C:\\git", win)).toBeUndefined(); // rooted, no drive
     expect(touched).toEqual([]);
     expect(canonicalAuthorityPath("C:/git/wt/../other/x.ts", "C:\\git", win)).toBe("C:\\git\\other\\x.ts");
     // An ancestor that cannot be resolved for another reason than "missing" refuses.
     const denied = (p: string): string => { throw Object.assign(new Error(`EACCES ${p}`), { code: "EACCES" }); };
     expect(canonicalAuthorityPath("C:\\git\\x", "C:\\git", { platform: "win32", realpath: denied })).toBeUndefined();
+  });
+
+  it("QA-P23-A1: the raw path goes to realpath first; only a truly missing tail is peeled; dangling links and `..` in a missing tail refuse", () => {
+    const enoent = (p: string) => Object.assign(new Error(`ENOENT ${p}`), { code: "ENOENT" });
+    const seen: string[] = [];
+    // The raw string reaches realpath unnormalised (POSIX semantics: links before `..`).
+    const posixReal = (p: string): string => { seen.push(p); if (p === "/r/link/../x") return "/elsewhere/x"; throw enoent(p); };
+    expect(canonicalAuthorityPath("link/../x", "/r", { platform: "linux", realpath: posixReal, lstat: (p) => { throw enoent(p); } })).toBe("/elsewhere/x");
+    expect(seen[0]).toBe("/r/link/../x");
+    // An entry lstat sees but realpath cannot resolve: a dangling link refuses, wherever it is in the path.
+    const exists = new Set(["/r", "/r/dangling"]);
+    const real = (p: string): string => { if (p === "/r") return "/r"; throw enoent(p); };
+    const lstat = (p: string): unknown => { if (exists.has(p)) return {}; throw enoent(p); };
+    expect(canonicalAuthorityPath("/r/dangling", "/r", { platform: "linux", realpath: real, lstat })).toBeUndefined();
+    expect(canonicalAuthorityPath("/r/dangling/x/y", "/r", { platform: "linux", realpath: real, lstat })).toBeUndefined();
+    expect(canonicalAuthorityPath("/r/new/x", "/r", { platform: "linux", realpath: real, lstat })).toBe("/r/new/x");
+    // A `..` left in the missing tail refuses (it could climb over the existing ancestor).
+    expect(canonicalAuthorityPath("/r/missing/../x", "/r", { platform: "linux", realpath: real, lstat })).toBeUndefined();
+    // Another lstat error refuses as well.
+    const lstatDenied = (p: string): unknown => { throw Object.assign(new Error(`EACCES ${p}`), { code: "EACCES" }); };
+    expect(canonicalAuthorityPath("/r/x", "/r", { platform: "linux", realpath: real, lstat: lstatDenied })).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("QA-P23-A1 (POSIX): `<root>/link/../x` resolves through the link, outside the root", () => {
+    const base = temp();
+    const root = join(base, "root");
+    const inner = join(base, "outside", "inner");
+    mkdirSync(root);
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(join(base, "outside", "secret.txt"), "s");
+    symlinkSync(inner, join(root, "link"), "dir");
+    const existing = canonicalAuthorityPath(`${root}/link/../secret.txt`, root)!;
+    expect(existing).toBe(join(realpathSync.native(base), "outside", "secret.txt"));
+    expect(insideWorkRoot(existing, root)).toBe(false);
+    const missing = canonicalAuthorityPath("link/../missing/x.ts", root)!;
+    expect(insideWorkRoot(missing, root)).toBe(false);
+  });
+
+  it("QA-P23-A1: a dangling link (a junction on win32) inside the root is refused, not peeled", (ctx) => {
+    const base = temp();
+    const root = join(base, "root");
+    mkdirSync(root);
+    try {
+      symlinkSync(join(base, "nowhere"), join(root, "dangling"), process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      ctx.skip(); // no link creation on this machine
+      return;
+    }
+    expect(canonicalAuthorityPath(join(root, "dangling"), root)).toBeUndefined();
+    expect(canonicalAuthorityPath(join(root, "dangling", "x.ts"), root)).toBeUndefined();
+    expect(roleAuthorityDecision({
+      action: "edit", paths: [join(root, "dangling", "x.ts")], dynamic: false, sessionDirectory: root, fallbackRoot: root,
+      binding: { kind: "exact", grant: { actions: new Set(["read", "edit"] as const), notes: [], workRoot: root } },
+    }).allow).toBe(false);
+  });
+
+  it("QA-P23-A2/A3: every path a call names — filePath, path, file_path, edits[], patch headers; none or an unreadable patch → undefined", () => {
+    expect(toolCallPaths("edit", { filePath: "/a", path: "b", file_path: "/c" })).toEqual(["/a", "b", "/c"]);
+    expect(toolCallPaths("edit", { edits: [{ filePath: "/a" }, { path: "/b" }, { file_path: "/c" }, null] })).toEqual(["/a", "/b", "/c"]);
+    expect(toolCallPaths("edit", { oldString: "x" })).toBeUndefined();
+    const patch = ["*** Begin Patch", "*** Update File: src/a.ts", "*** Move to: ../out.ts", "@@", "-a", "+b", "*** Add File: /tmp/x.ts", "+x",
+      "  *** Delete File: c.ts", "*** End Patch"].join("\n");
+    expect(patchPaths(patch)).toEqual(["src/a.ts", "../out.ts", "/tmp/x.ts", "c.ts"]);
+    expect(toolCallPaths("apply_patch", { patchText: patch })).toEqual(["src/a.ts", "../out.ts", "/tmp/x.ts", "c.ts"]);
+    expect(patchPaths("--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-a\n+b\n")).toBeUndefined(); // unified diff: not the host format → refused
+    expect(patchPaths("*** Begin Patch\n*** Add File:   \n+x\n*** End Patch")).toBeUndefined();
+    expect(toolCallPaths("apply_patch", { patchText: "*** Begin Patch\n*** End Patch" })).toBeUndefined();
+    expect(toolCallPaths("apply_patch", {})).toBeUndefined();
+  });
+
+  it("QA-P23-A9: search patterns that reach outside their root by themselves", () => {
+    for (const bad of ["/etc/**", "\\Windows\\*", "C:/x/**", "c:*.ts", "\\\\server\\share\\*", "//server/share/*", "../other/**", "src/../../x", "a/..", ".."]) {
+      expect(unsafeSearchPattern(bad), bad).toBe(true);
+    }
+    for (const ok of ["**/*.ts", "src/*.{ts,tsx}", "a..b/*.ts", "*.d.ts", "..foo"]) expect(unsafeSearchPattern(ok), ok).toBe(false);
+  });
+
+  it("QA-P23-A4: parseWorktreeList drops prunable entries and keeps git's order", () => {
+    const porcelain = [
+      "worktree /repo/main", "HEAD 1", "branch refs/heads/main", "",
+      "worktree /repo/wt-1", "HEAD 2", "branch refs/heads/b1", "prunable gitdir file points to non-existent location", "",
+      "worktree /repo/wt-2", "HEAD 3", "detached", "",
+      "worktree /repo/wt-3", "HEAD 4", "prunable", "",
+    ].join("\r\n");
+    expect(parseWorktreeList(porcelain)).toEqual(["/repo/main", "/repo/wt-2"]);
   });
 
   it("work-root containment uses the max policy's matcher: the root and below; never a prefix sibling; case folded on win32 only", () => {
@@ -505,9 +619,15 @@ describe("hook errors (I9, P-3)", () => {
     expect(tier.message).toBeUndefined();
     v2.ctx.agent.list.mockRejectedValueOnce(new Error("boom"));
     expect(await evaluate(v2, "root", "build", "read", [join(dir, "a.ts")])).toEqual(expect.objectContaining({ effect: "allow" }));
-    // An error inside the role check itself (the session lookup for relative paths) refuses too.
+    await expect(v2.ctx.agent.list()).rejects.toThrow("boom"); // still queued: a non-protected agent never reads the agent list
+    // QA-P23-B3: an error inside the role check itself — the child is bound first, then the session lookup for its relative path
+    // fails — refuses with the explicit message.
+    expect(await catalog(v2, "x1", "explorer")).toContain("read");
+    expect(kindOf(cfg, "x1")).toBe("exact");
     v2.ctx.session.get.mockRejectedValueOnce(new Error("lookup down"));
-    expect((await evaluate(v2, "x1", "explorer", "read", ["src/a.ts"])).effect).toBe("deny");
+    const failed = await evaluate(v2, "x1", "explorer", "read", ["src/a.ts"]);
+    expect(failed.effect).toBe("deny");
+    expect(failed.message).toMatch(/could not check this dispatch's authority/);
   });
 
   it("context: any error empties a role session's catalog and is annotated for the parent; other agents still see the error", async () => {
@@ -559,12 +679,18 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     const hooks = await plugin(main);
     const sessions: Sessions = {};
     const v2 = host(main, cfg, sessions);
-    await v2.start(hooks);
+    let listed = 0;
+    await v2.start(hooks, { listWorktrees: (cwd) => { listed += 1; return gitWorktreeList(cwd); } });
     const slash = (p: string) => p.replaceAll("\\", "/");
     await dispatch(v2, sessions, "e1", "x1", "explorer", `[route class=search risk=low scope=single root=${wt1}]\nfind the parser`, main);
     expect(routedRoleOf("e1")?.workRoot).toBe(wt1);
     expect(await catalog(v2, "x1", "explorer")).toEqual(["glob", "grep", "read", "router_git_diff", "router_git_status"]);
     const ext = (path: string) => evaluate(v2, "x1", "explorer", "external_directory", [`${slash(path)}/*`]);
+    // QA-P23-A12 / N2: concurrent evaluations of one child share one binding and one `git worktree list` run.
+    const concurrent = await Promise.all([...Array(6).keys()].map((i) => (i % 2 === 0 ? ext(wt1) : ext(join(wt1, "src")))));
+    expect(concurrent.map((event) => event.effect)).toEqual(Array(6).fill("allow"));
+    expect(listed).toBe(1);
+    expect(new Set(noted.calls.filter((call) => call.child === "x1").map((call) => call.kind))).toEqual(new Set(["exact"]));
     expect((await ext(wt1)).effect).toBe("allow");
     expect((await ext(join(wt1, "src", "deep"))).effect).toBe("allow");
     const sibling = await ext(wt2); // the max policy lists every worktree; only the per-session narrowing refuses it
@@ -610,7 +736,138 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     await toolCall(v2, "y1", "general", "read", { path: join(wt1, "a.ts") });
     expect(await tools.router_run!.execute({ script: "test", cwd: wt1 }, toolCtx("y1"))).toMatch(/no bound work root \(I9\)/);
     await expect(toolCall(v2, "y1", "general", "router_run", { script: "test", cwd: wt1 })).rejects.toThrow(/not in this dispatch's grant/);
+    // QA-P23-A9: a glob pattern or grep include that climbs out of its search root is refused, in evaluate and in execute.before.
+    await expect(toolCall(v2, "x1", "explorer", "glob", { pattern: "../wt-2/**", path: wt1 })).rejects.toThrow(/reaches outside its search root/);
+    await expect(toolCall(v2, "x1", "explorer", "grep", { pattern: "x", include: `${slash(wt2)}/*.ts`, path: wt1 })).rejects.toThrow(/reaches outside/);
+    const globEvent = { sessionID: "x1", agent: "explorer", action: "glob", resources: ["../wt-2/**"], effect: "allow", metadata: { root: wt1, path: wt1 } };
+    await v2.permissionHooks.evaluate!(globEvent);
+    expect(globEvent.effect).toBe("deny");
+    // N1: the host asserts no external_directory for glob/grep — their search root (metadata.path, default `.`) is checked here.
+    const grepHere = { sessionID: "x1", agent: "explorer", action: "grep", resources: ["export"], effect: "allow", metadata: { root: ".", path: wt1 } };
+    await v2.permissionHooks.evaluate!(grepHere);
+    expect(grepHere.effect).toBe("allow");
+    const grepDefault = { sessionID: "x1", agent: "explorer", action: "grep", resources: ["export"], effect: "allow", metadata: { root: "." } };
+    await v2.permissionHooks.evaluate!(grepDefault);
+    expect(grepDefault.effect).toBe("deny"); // `.` is the base checkout, not this dispatch's root
+    // QA-P23-A4: a listed root whose `.git` is no longer a linked worktree's file (here: a directory in its place) does not count.
+    await dispatch(v2, sessions, "e2", "x2", "explorer", `[route class=search risk=low scope=single root=${wt2}]\nfind the parser`, main);
+    expect(routedRoleOf("e2")?.workRoot).toBe(wt2);
+    expect(await catalog(v2, "x2", "explorer")).toContain("read");
+    rmSync(join(wt2, ".git"), { force: true });
+    mkdirSync(join(wt2, ".git"));
+    const replaced = await evaluate(v2, "x2", "explorer", "external_directory", [`${slash(wt2)}/*`]);
+    expect(replaced.effect).toBe("deny");
+    expect(replaced.message).toMatch(/no longer a worktree/);
   }, 60_000);
+});
+
+describe("QA round 1 (P2.3)", () => {
+  async function started(override: Record<string, unknown> = ROLES) {
+    const { dir, cfg } = home(override);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    return { dir, cfg, hooks, sessions, v2 };
+  }
+
+  it("B4: the ladder's explicit allow is published for dynamic roles only — never fixed roles, tiers or the grader", async () => {
+    const { v2 } = await started();
+    for (const spec of SHIPPED_ROLE_SPECS) {
+      const effect = evaluatePermission(v2.agents[spec.agent].permissions, "router_request_authority", "*");
+      expect([spec.agent, effect]).toEqual([spec.agent, spec.authority.mode === "dynamic" ? "allow" : "deny"]);
+    }
+    for (const name of ["fast", "medium", "heavy", V2_GRADER_AGENT]) {
+      expect([name, evaluatePermission(v2.agents[name]?.permissions ?? [], "router_request_authority", "*")]).not.toEqual([name, "allow"]);
+    }
+  });
+
+  it("B1 + N3: a role session's protected-catalog or binding-lookup failure empties its catalog AND annotates the parent, again on the next attempt", async () => {
+    const { dir, v2, sessions } = await started();
+    await dispatch(v2, sessions, "e1", "x1", "explorer", "[route class=search risk=low scope=single]\nfind the parser", dir);
+    v2.ctx.agent.list.mockRejectedValueOnce(new Error("agents down"));
+    expect(await catalog(v2, "x1", "explorer")).toEqual([]);
+    const first = parentCall("e1", "x1", "explorer", "DONE: nothing");
+    await v2.toolHooks["execute.after"]!(first);
+    expect(resultText(first)).toContain(roleCatalogFailureNotice("explorer", "x1"));
+    // N3: the call ended (catalogFailures cleared): a failure of the next attempt — here the binding lookup — is annotated again.
+    await dispatch(v2, sessions, "e2", "x2", "explorer", "[route class=search risk=low scope=single]\nfind the lexer", dir);
+    v2.ctx.session.get.mockRejectedValueOnce(new Error("lookup down"));
+    expect(await catalog(v2, "x2", "explorer")).toEqual([]);
+    // B2: a binding the registry could not keep was never reported as observed; the later, stored one is.
+    expect(noted.calls.filter((call) => call.child === "x2").map((call) => call.kind)).toEqual([]);
+    expect(await catalog(v2, "x2", "explorer")).toContain("read");
+    expect(new Set(noted.calls.filter((call) => call.child === "x2").map((call) => call.kind))).toEqual(new Set(["exact"]));
+    const second = parentCall("e2", "x2", "explorer", "DONE: nothing");
+    await v2.toolHooks["execute.after"]!(second);
+    expect(resultText(second)).toContain(roleCatalogFailureNotice("explorer", "x2"));
+    v2.ctx.agent.list.mockRejectedValueOnce(new Error("agents down"));
+    expect(await catalog(v2, "x1", "explorer")).toEqual([]);
+    const third = parentCall("e3", "x1", "explorer", "DONE: nothing");
+    await v2.toolHooks["execute.after"]!(third);
+    expect(resultText(third)).toContain(roleCatalogFailureNotice("explorer", "x1"));
+  });
+
+  it("A8: no agent on the event and a failing session lookup — a known role session is denied; an unknown session is unchanged", async () => {
+    const { dir, v2, sessions } = await started();
+    await dispatch(v2, sessions, "e1", "x1", "explorer", "[route class=search risk=low scope=single]\nfind the parser", dir);
+    expect(await catalog(v2, "x1", "explorer")).toContain("read"); // bound
+    v2.ctx.session.get.mockRejectedValueOnce(new Error("lookup down"));
+    const known: Record<string, unknown> = { sessionID: "x1", action: "read", resources: [join(dir, "a.ts")], effect: "allow" };
+    await v2.permissionHooks.evaluate!(known);
+    expect(known).toMatchObject({ effect: "deny", message: expect.stringMatching(/could not check this dispatch's authority/) });
+    v2.ctx.session.get.mockRejectedValueOnce(new Error("lookup down"));
+    const stranger: Record<string, unknown> = { sessionID: "nobody", action: "read", resources: [join(dir, "a.ts")], effect: "allow" };
+    await v2.permissionHooks.evaluate!(stranger);
+    expect(stranger.effect).toBe("allow");
+    await expect(v2.toolHooks["execute.before"]!({ sessionID: "x1", messageID: "m", id: "t-noagent", tool: "read", input: { path: join(dir, "a.ts") } }))
+      .rejects.toThrow(/calling agent is unknown/);
+  });
+
+  it("A7: a role session's call to any tool outside the role classes is refused — subagent, shell, todowrite, MCP tools", async () => {
+    const { dir, v2, sessions } = await started();
+    await dispatch(v2, sessions, "g1", "y1", "general", "[route class=implement risk=low scope=single needs=edit]\nfix the parser", dir);
+    for (const [tool, input] of [["subagent", { agent: "implementer", description: "x", prompt: "do it" }], ["shell", { command: "npm test" }],
+      ["todowrite", { todos: [] }], ["mcp_tool", {}], ["router_verify", {}]] as const) {
+      await expect(toolCall(v2, "y1", "general", tool, { ...input }), tool).rejects.toThrow(/outside every role's authority/);
+    }
+    await toolCall(v2, "y1", "general", "router_request_authority", { actions: ["router_run"], reason: "x" }); // the ladder stays callable
+  });
+
+  it("A2/A3/A5: every path of an edit/write/apply_patch call is checked; a call naming none, or an empty evaluation, is refused", async () => {
+    const { dir, v2, sessions } = await started();
+    await dispatch(v2, sessions, "i1", "w1", "implementer", "[route class=implement risk=low scope=single needs=edit]\nfix the parser", dir);
+    const outside = join(dirname(dir), "elsewhere.ts");
+    const inside = join(dir, "src", "a.ts");
+    await toolCall(v2, "w1", "implementer", "edit", { path: inside, oldString: "a", newString: "b" });
+    await expect(toolCall(v2, "w1", "implementer", "edit", { path: inside, file_path: outside, oldString: "a", newString: "b" })).rejects.toThrow(/outside this dispatch's work root/);
+    await expect(toolCall(v2, "w1", "implementer", "edit", { path: inside, edits: [{ filePath: inside }, { filePath: outside }] })).rejects.toThrow(/outside/);
+    await expect(toolCall(v2, "w1", "implementer", "write", { content: "x" })).rejects.toThrow(/no path to check/);
+    const patch = (lines: string[]) => ({ patchText: ["*** Begin Patch", ...lines, "*** End Patch"].join("\n") });
+    await toolCall(v2, "w1", "implementer", "apply_patch", patch(["*** Update File: src/a.ts", "@@", "-a", "+b", "*** Add File: src/b.ts", "+b"]));
+    await expect(toolCall(v2, "w1", "implementer", "apply_patch", patch(["*** Update File: src/a.ts", "@@", "-a", "+b", `*** Add File: ${outside}`, "+x"]))).rejects.toThrow(/outside/);
+    await expect(toolCall(v2, "w1", "implementer", "apply_patch", patch(["*** Update File: src/a.ts", "*** Move to: ../elsewhere.ts", "@@", "-a", "+b"]))).rejects.toThrow(/outside/);
+    await expect(toolCall(v2, "w1", "implementer", "apply_patch", patch(["*** Delete File: ../elsewhere.ts"]))).rejects.toThrow(/outside/);
+    await expect(toolCall(v2, "w1", "implementer", "apply_patch", { patchText: "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n" })).rejects.toThrow(/no path to check/);
+    // A5: the host always names the resource; an evaluation without one is refused for read/edit.
+    expect((await evaluate(v2, "w1", "implementer", "edit", [])).effect).toBe("deny");
+    expect((await evaluate(v2, "w1", "implementer", "read", [])).effect).toBe("deny");
+    expect((await evaluate(v2, "w1", "implementer", "edit", ["src/a.ts"])).effect).toBe("allow"); // Location-relative, as the host sends it
+  });
+
+  it("A11: a plugin directory that does not resolve yet is not cached as unresolvable", async () => {
+    const { dir: homeDir, cfg } = home(ROLES);
+    const hooks = await plugin(homeDir);
+    const later = join(homeDir, "later");
+    const sessions: Sessions = { lost: { id: "lost", parentID: "root", agent: "explorer", title: "no marker", location: { directory: later } } };
+    const v2 = host(later, cfg, sessions);
+    await v2.start(hooks);
+    const before = await evaluate(v2, "lost", "explorer", "read", [join(later, "a.ts")]);
+    expect(before.effect).toBe("deny");
+    expect(before.message).toMatch(/no work root could be resolved/);
+    mkdirSync(later);
+    expect((await evaluate(v2, "lost", "explorer", "read", [join(realpathSync.native(later), "a.ts")])).effect).toBe("allow");
+  });
 });
 
 describe("tiers mode is untouched (I1)", () => {
