@@ -59,8 +59,9 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
     ? ` Compose: ${researcher} first, then paste its findings into the ${editor} dispatch.`
     : "";
   // QA-P22-1-8: a tier agent is the exception for a command `router_run` refuses, never the default.
-  const rawShell = runner !== undefined
-    ? `Only when \`${runner}\` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.`
+  // QA-P22-2-1: keyed on the router_run grant of ANY enabled role (the implementer holds it too), not on a `run` role.
+  const rawShell = enabled.some((spec) => spec.authority.allow.includes("router_run"))
+    ? `Only when \`router_run\` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.`
     : `For a command, ask the user or dispatch a tier agent explicitly.`;
   return [
     ROLES_PROTOCOL_HEADING,
@@ -74,9 +75,9 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
     `The router chooses the model for every dispatch: never set \`model\` and never pick a tier; name the role.`,
     ``,
     // QA-P22-1-1: `tier`/`pin` are not in the template; only a plan's `[tier:X]` tag is transcribed.
-    `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]\`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` unlocks router_run); d=deterministic|grader|none (counts only when the prompt's \`[acceptance]\` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries \`[tier:X]\`, add \`tier=X pin\`; never otherwise.`,
+    `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]\`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` unlocks router_run, where the role allows them); d=deterministic|grader|none (counts only when the prompt's \`[acceptance]\` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries \`[tier:X]\`, add \`tier=X pin\`; never otherwise.`,
     ``,
-    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line (quote a path that contains spaces: \`root="D:\\my dir"\`) and the same path in ENVIRONMENT.`,
+    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line (quote a path with spaces) and the same path in ENVIRONMENT.`,
     ``,
     `No role holds the web together with read, run or edit authority.${compose} Raw shell is outside roles mode. ${rawShell}`,
     ``,
