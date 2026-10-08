@@ -8,6 +8,7 @@ import {
   resolveRolesRouting,
   resolveRouting,
   validateConfig,
+  ROLE_NOTICE_PREFIX,
 } from "../../src/router/config";
 import {
   AUTHORITY_ACTIONS,
@@ -743,6 +744,13 @@ describe("docs drift: roles delegation keys (#84)", () => {
     expect(text).toContain("`D:/git/OMR-RT~1*` and `D:/git/*/PROGRA~1/x` included");
     expect(workRootProblem("D:/git/OMR-RT~1*")).toBeDefined();
     expect(workRootProblem("D:/git/*/PROGRA~1/x")).toBeDefined();
+  });
+
+  it("quotes the role-table notice prefix and failure notice the code emits (QA-P11-2)", () => {
+    const text = doc.replace(/\s+/g, " ");
+    expect(text).toContain(`each starting with \`${ROLE_NOTICE_PREFIX}\``);
+    expect(text).toContain("`roles: the role table could not be resolved (<reason>); no role agent will be registered`");
+    expect(text).toContain("`costRatio` orders against their names");
   });
 
   it("states the role rules the code enforces (QA-P11-1)", () => {

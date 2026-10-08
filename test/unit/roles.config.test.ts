@@ -10,8 +10,11 @@ import {
   overridePath,
   resetRolesWarnings,
   resolveRolesRouting,
+  setRoleTableResolverForTest,
   validateConfig,
+  ROLE_NOTICE_PREFIX,
 } from "../../src/router/config";
+import { inspect } from "node:util";
 import {
   isRunScriptAllowed,
   narrowRoleSpec,
@@ -264,6 +267,34 @@ describe("layers (loadConfig)", () => {
     expect(text).toContain("roleAgents.implementer.budget.heavy 999 is above twice the shipped 120; clamped to 240");
     expect(text).toContain("agents.researcher");
     expect(text).toContain("dropped in roles mode, the shipped role agent is kept");
+    // QA-P11-2-1: every role-table notice says it is about roles mode on v2 (also true when loaded on v1)
+    const roleNotices = getConfigNotices(project).map((n) => n.message)
+      .filter((m) => /roleAgents\.reviwer is not a shipped|budget\.heavy 999|agents\.researcher /.test(m));
+    expect(roleNotices).toHaveLength(3);
+    for (const m of roleNotices) expect(m.startsWith(ROLE_NOTICE_PREFIX)).toBe(true);
+    expect(ROLE_NOTICE_PREFIX).toBe("roles mode (OpenCode v2 only): ");
+  });
+
+  it("reports a role table that cannot be resolved as one notice and still loads (QA-P11-2-2)", () => {
+    try {
+      for (const [thrown, reason] of [[new Error("boom"), "boom"], ["plain", "plain"]] as const) {
+        setRoleTableResolverForTest(() => {
+          throw thrown;
+        });
+        const project = setup({ routing: { delegation: "roles", margin: 0.3 } }, undefined);
+        const cfg = loadConfig(project);
+        expect(cfg.routing?.delegation).toBe("roles");
+        expect(cfg.routing?.margin).toBe(0.3);
+        const messages = getConfigNotices(project).map((n) => n.message);
+        expect(messages).toContain(`roles: the role table could not be resolved (${reason}); no role agent will be registered`);
+      }
+    } finally {
+      setRoleTableResolverForTest();
+    }
+    // restored: the real resolver runs again
+    const project = setup({ routing: { delegation: "roles" }, roleAgents: { reviwer: {} } }, undefined);
+    loadConfig(project);
+    expect(getConfigNotices(project).map((n) => n.message).join("\n")).toContain(`${ROLE_NOTICE_PREFIX}roleAgents.reviwer`);
   });
 
   it("does not resolve the role table, nor report its notices, in tiers mode", () => {
@@ -513,8 +544,10 @@ describe("resolveRoles (T1.1.3)", () => {
     const odd = resolveRoleTable(costed({ fast: 1, heavy: 5, medium: 20 }), "v2");
     expect(odd.roles.get("explorer")!.tierRange).toEqual({ floor: "fast", ceiling: "fast" });
     expect(odd.roles.get("explorer")!.budget).toEqual({ fast: 30 });
-    expect(odd.roles.get("architect")!.tierRange).toEqual({ floor: "heavy", ceiling: "medium" });
-    expect(odd.roles.get("architect")!.budget).toEqual({ heavy: 120, medium: 80 });
+    // ...while a role spanning medium and heavy would see them inverted: disabled (QA-P11-2-3)
+    expect(odd.roles.has("architect")).toBe(false);
+    expect(odd.roles.has("implementer")).toBe(false);
+    expect(odd.roles.get("reviewer")!.tierRange).toEqual({ floor: "heavy", ceiling: "heavy" });
     // every role: each tier between floor and ceiling in the cost order has a budget > 0
     for (const table of [mini, odd, resolveRoleTable(costed({ medium: 1, fast: 2, heavy: 3 }), "v2")]) {
       for (const spec of table.roles.values()) {
@@ -541,16 +574,25 @@ describe("resolveRoles (T1.1.3)", () => {
     expect(odd.issues.filter((i) => i.path.endsWith(".tierRange"))).toHaveLength(SHIPPED_ROLE_SPECS.length);
   });
 
-  it("places a range on a preset whose cost order inverts the tier names, with a notice", () => {
+  it("disables every role whose range the preset's cost order inverts, fail closed (QA-P11-2-3)", () => {
     const inverted = rolesMode({
       presets: { anthropic: { fast: { ...tier("fast"), costRatio: 20 }, medium: { ...tier("medium"), costRatio: 5 }, heavy: { ...tier("heavy"), costRatio: 1 } } },
     });
     const t = resolveRoleTable(inverted, "v2");
-    // cost order heavy < medium < fast: explorer keeps exactly its tiers, cheapest first
-    expect(t.roles.get("explorer")!.tierRange).toEqual({ floor: "medium", ceiling: "fast" });
-    expect(t.roles.get("explorer")!.budget).toEqual({ medium: 40, fast: 30 });
+    // cost order heavy < medium < fast: only the single-tier reviewer survives
+    expect([...t.roles.keys()]).toEqual(["reviewer"]);
     expect(t.roles.get("reviewer")!.tierRange).toEqual({ floor: "heavy", ceiling: "heavy" });
-    expect(t.issues.find((i) => i.path === "roleAgents.explorer.tierRange")?.message).toMatch(/using medium\.\.fast \(medium,fast\)/);
+    expect(t.issues.find((i) => i.path === "roleAgents.explorer.tierRange")?.message)
+      .toBe("role explorer: preset anthropic makes medium cheaper than fast (costRatio), against the tier names its range and floors use; role disabled");
+    expect(t.issues.filter((i) => /against the tier names/.test(i.message))).toHaveLength(SHIPPED_ROLE_SPECS.length - 1);
+  });
+
+  it("leaves every bundled preset's roles intact: no inversion, no notice", () => {
+    const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as { presets: Record<string, unknown> };
+    for (const preset of Object.keys(bundled.presets)) {
+      const t = resolveRoleTable(validateConfig({ ...bundled, activePreset: preset, routing: { delegation: "roles" } }), "v2");
+      expect([preset, [...t.roles.keys()], t.issues]).toEqual([preset, SHIPPED_ROLE_SPECS.map((s) => s.agent), []]);
+    }
   });
 
   it.each<[string, string, RegExp]>([
@@ -590,6 +632,19 @@ describe("resolveRoles (T1.1.3)", () => {
     expect(a.roles).not.toBe(b.roles);
     expect(a.issues).not.toBe(b.issues);
     expect(a.roles.size + b.roles.size).toBe(0);
+  });
+
+  it("names itself RoleMap and inspects like a Map, through a copy (QA-P11-2-5)", () => {
+    const t = resolveRoleTable(rolesMode(), "v2");
+    expect(Object.prototype.toString.call(t.roles)).toBe("[object RoleMap]");
+    const shown = inspect(t.roles, { depth: 0 });
+    expect(shown).toMatch(/^Map\(7\) \{/);
+    for (const name of SHIPPED_ROLE_SPECS.map((s) => s.agent)) expect(shown).toContain(`'${name}'`);
+    const custom = (t.roles as unknown as Record<symbol, () => Map<string, RoleSpec>>)[Symbol.for("nodejs.util.inspect.custom")]!;
+    const copy = custom.call(t.roles);
+    expect([...copy.keys()]).toEqual([...t.roles.keys()]);
+    copy.clear();
+    expect(t.roles.size).toBe(SHIPPED_ROLE_SPECS.length);
   });
 
   it.each<[string, (s: RoleSpec) => Partial<RoleSpec>, RegExp]>([

@@ -2756,15 +2756,33 @@ function buildConfig(
   return cfg;
 }
 
+/** Prefix of every role-table notice: they describe roles mode, which only OpenCode v2 runs (QA-P11-2-1). */
+export const ROLE_NOTICE_PREFIX = "roles mode (OpenCode v2 only): ";
+
+/** The role-table resolver used for notices; replaceable in tests only. */
+let roleTableResolver: typeof resolveRoleTable = resolveRoleTable;
+
+/** Test-only: replace the resolver {@link applyRoleNotices} calls; no argument restores it. */
+export function setRoleTableResolverForTest(resolver?: typeof resolveRoleTable): void {
+  roleTableResolver = resolver ?? resolveRoleTable;
+}
+
 /**
  * Roles mode (#84): the notices of resolving the role table — unknown `roleAgents` names,
  * clamped budgets and ranges, disabled roles, #81 `agents` that replace or are dropped for a
  * role — so they reach `/router` with the other config notices. Pure; the host is not known
- * here, so the table is resolved as on v2 (on v1 the roles keys stay inert).
+ * here, so the table is resolved as on v2 and every notice says it is about roles mode (on v1
+ * the roles keys stay inert). It never throws: a failure is one notice, and the config loads
+ * (QA-P11-2-2).
  */
 function applyRoleNotices(cfg: RouterConfig, notices: ConfigNotice[]): void {
   if (cfg.routing?.delegation !== "roles") return;
-  for (const issue of resolveRoleTable(cfg, "v2").issues) notices.push({ message: issue.message });
+  try {
+    for (const issue of roleTableResolver(cfg, "v2").issues) notices.push({ message: `${ROLE_NOTICE_PREFIX}${issue.message}` });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    notices.push({ message: `roles: the role table could not be resolved (${reason}); no role agent will be registered` });
+  }
 }
 
 /**

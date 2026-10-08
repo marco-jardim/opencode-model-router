@@ -338,6 +338,9 @@ export interface RoleTable {
   readonly replacedRoles: readonly string[];
 }
 
+/** Node's `util.inspect` hook (a registered symbol, so no `node:util` import is needed). */
+const INSPECT_CUSTOM: unique symbol = Symbol.for("nodejs.util.inspect.custom");
+
 /**
  * Read-only view of the role table. It is not a `Map`, so `Map.prototype.set.call(table, …)`
  * cannot reach the entries (QA-P11-1-10); the backing map is a private field.
@@ -380,6 +383,15 @@ class RoleMap implements ReadonlyMap<string, RoleSpec> {
 
   [Symbol.iterator]() {
     return this.#map[Symbol.iterator]();
+  }
+
+  get [Symbol.toStringTag](): string {
+    return "RoleMap";
+  }
+
+  /** `util.inspect` shows the entries like a Map's; a copy, so an inspector cannot change the table (QA-P11-2-5). */
+  [INSPECT_CUSTOM](): Map<string, RoleSpec> {
+    return new Map(this.#map);
   }
 }
 
@@ -464,6 +476,23 @@ function placeBudget(spec: RoleSpec, range: RoleSpec["tierRange"], order: readon
   return budget;
 }
 
+/**
+ * Two canonical tiers of the shipped range that the preset's cost order puts against their
+ * canonical name order (`heavy` cheaper than `medium`, say), or undefined. Such a role is
+ * disabled (QA-P11-2-3): the §2.3 tier floors are canonical names, and on an inverted order a
+ * floor of `medium` would sit above a ceiling of `heavy`. Fail closed; the bundled presets are
+ * all ordered fast < medium < heavy.
+ */
+function costInversion(range: RoleSpec["tierRange"], order: readonly string[]): readonly [lowerName: string, higherName: string] | undefined {
+  const lo = CANONICAL_TIERS.indexOf(range.floor);
+  const hi = CANONICAL_TIERS.indexOf(range.ceiling);
+  const present = CANONICAL_TIERS.slice(lo, hi + 1).filter((t) => order.includes(t));
+  for (let i = 1; i < present.length; i++) {
+    if (order.indexOf(present[i]!) < order.indexOf(present[i - 1]!)) return [present[i - 1]!, present[i]!];
+  }
+  return undefined;
+}
+
 /** Tiers of the spec's range (positions in `order`) without a budget > 0. */
 function budgetGaps(spec: RoleSpec, order: readonly string[]): string[] {
   const f = order.indexOf(spec.tierRange.floor);
@@ -514,6 +543,14 @@ export function resolveRoleTable(
         issues.push({ path: `agents.${spec.agent}`, message: `agents.${spec.agent} replaces the shipped role agent ${spec.agent} in roles mode` });
         continue;
       }
+    }
+    const inversion = costInversion(spec.tierRange, order);
+    if (inversion !== undefined) {
+      issues.push({
+        path: `${base}.tierRange`,
+        message: `role ${spec.agent}: preset ${cfg.activePreset} makes ${inversion[1]} cheaper than ${inversion[0]} (costRatio), against the tier names its range and floors use; role disabled`,
+      });
+      continue;
     }
     const placed = placeRange(spec.tierRange, order);
     if (placed === undefined) {
