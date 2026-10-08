@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, lstatSync, realpathSync, statSync, type Stats } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
 import { lstat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import { filterSensitiveDiff, isSensitivePath, sensitiveGitPathspecs } from "./sensitive-paths";
@@ -10,7 +11,7 @@ export type GitOperation = typeof GIT_OPERATIONS[number];
 export const GIT_TOOL_NAMES = GIT_OPERATIONS.map(name => `router_git_${name}`);
 export interface GitInput { path?: string; ref?: string; limit?: number; mode?: "patch" | "stat" | "name-only" | "cached" }
 /** Extra inspection context: the session's project worktree (discovery boundary) and pre-resolved executables. */
-export interface GitInspectOptions { worktree?: string; executables?: readonly string[] }
+export interface GitInspectOptions { worktree?: string; executables?: readonly string[]; guards?: readonly string[] }
 
 const MAX_BYTES = 64 * 1024;
 const DEADLINE_MS = 15_000;
@@ -272,6 +273,63 @@ export function envLookup(env: NodeJS.ProcessEnv, name: string): string | undefi
 /** The nearest directory at or above `directory` holding `.git` (a checkout or a linked worktree). */
 export function nearestCheckout(directory: string): string | undefined { return nearestRepository(directory); }
 
+/**
+ * Absolute and, on win32, rooted at a drive letter or UNC host: a root-relative `\dir`
+ * or a drive-relative `C:dir` names no one directory.
+ */
+export function isFullPath(path: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (platform !== "win32") return path.startsWith("/");
+  return /^[A-Za-z]:[\\/]|^[\\/]{2}[^\\/]+[\\/][^\\/]/.test(path);
+}
+
+/**
+ * The main worktree of the checkout at `checkout` (QA-P13-1-6): the checkout itself
+ * when `.git` is a directory; for a linked worktree (`.git` file → gitdir →
+ * `commondir`) the directory holding the common `.git`. Undefined when unreadable.
+ */
+export function mainWorktree(checkout: string): string | undefined {
+  try {
+    const dotGit = join(checkout, ".git");
+    const stats = lstatSync(dotGit);
+    if (stats.isDirectory()) return checkout;
+    if (!stats.isFile() || stats.size > 64 * 1024) return undefined;
+    const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"))?.[1];
+    if (!pointer) return undefined;
+    const gitdir = resolve(checkout, pointer);
+    const commondirFile = join(gitdir, "commondir");
+    if (!existsSync(commondirFile)) return undefined;
+    const common = resolve(gitdir, readFileSync(commondirFile, "utf8").trim());
+    return common.replace(/[\\/]+$/, "").toLowerCase().endsWith(".git") ? dirname(common) : undefined;
+  } catch { return undefined; }
+}
+
+function guardable(dir: string): boolean {
+  if (dirname(dir) === dir) return false; // a filesystem root would refuse every executable
+  try { return realpath(dir).toLowerCase() !== realpath(homedir()).toLowerCase(); } catch { return true; }
+}
+
+/**
+ * Directories no executable may come from for a run or inspection in `root` (#77 G4,
+ * QA-P13-1-6): the root, its checkout and that checkout's main worktree (a sibling
+ * worktree's main checkout is the same repository), and the plugin's working
+ * directory with its checkout and main worktree. Filesystem roots and the home
+ * directory are never guards.
+ */
+export function workRootGuards(root: string): string[] {
+  const out: string[] = [];
+  const add = (dir: string | undefined) => {
+    if (dir === undefined || !guardable(dir)) return;
+    if (!out.some(known => known.toLowerCase() === dir.toLowerCase())) out.push(dir);
+  };
+  for (const start of [root, process.cwd()]) {
+    add(start);
+    const checkout = nearestRepository(start);
+    add(checkout);
+    if (checkout !== undefined) add(mainWorktree(checkout));
+  }
+  return out;
+}
+
 /** Git executable for the plugin process, without session guards (setup and tests). */
 export function gitExecutable(): string {
   return selectGitExecutable(defaultCandidates(), []);
@@ -366,6 +424,13 @@ export interface BoundedOptions {
   settleOnFailure?: boolean;
   /** Error/warning wording; default router_git's. */
   label?: BoundedLabel;
+  /**
+   * POSIX: SIGKILL the child's process group when the call settles, also after a
+   * normal exit, so a background process left behind by the run cannot outlive it
+   * (QA-P13-1-2; router_run only). Ignored on win32: once the parent has exited
+   * there is no tree left to walk. Absent: router_git's behaviour (I1).
+   */
+  killGroupOnSettle?: boolean;
 }
 export interface BoundedResult {
   code: number | null; output: Buffer; stderr: Buffer; truncated: boolean;
@@ -414,6 +479,11 @@ export function spawnBounded(executable: string, args: readonly string[], cwd: s
       timers.clear();
       options.signal?.removeEventListener("abort", abort);
       child.stdout.destroy(); child.stderr.destroy();
+      if (options.killGroupOnSettle && process.platform !== "win32" && child.pid !== undefined) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch (error) {
+          if (errorCode(error) !== "ESRCH") console.warn(`[model-router] ${label.tag}: could not kill the process group (${errorMessage(error)})`);
+        }
+      }
       outcome();
     };
     const result = (code: number | null): BoundedResult => {
@@ -722,7 +792,7 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   const boundary = sessionBoundary(session, options.worktree);
   // G4: never run a git that lives in the session's tree, checked before anything is spawned.
   const nearest = nearestRepository(session);
-  const executable = selectGitExecutable(options.executables ?? defaultCandidates(), [session, boundary, ...(nearest ? [nearest] : [])]);
+  const executable = selectGitExecutable(options.executables ?? defaultCandidates(), [session, boundary, ...(nearest ? [nearest] : []), ...(options.guards ?? [])]);
   const inherited = await inheritedConfig(executable, budget);
   const trusted = inherited.filter(pair => pair.startsWith("safe.directory=")).flatMap(pair => ["-c", pair]);
   const base = [...hardeningArgs(), ...trusted];
@@ -776,20 +846,38 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
 }
 
 /**
- * Work-root resolver for router_git_* (R6/P-18; P1.3 injects, P2.1 wires it to the
- * dispatch binding). Its answer for a call's sessionID:
- * - `undefined`: not a role session. The tool behaves exactly as without a resolver
- *   (`context.directory` / `context.worktree`, I1).
- * - `null`: a role session without a binding (or with `workRoot: null`). The tool
- *   refuses and spawns nothing (I9).
- * - a string: the absolute work root bound to the session. The tool inspects that
- *   directory (its repository is discovered from it, never above its checkout) and
- *   ignores `context.directory`/`context.worktree`, which under the v2 bridge name
- *   the main checkout rather than a sibling worktree (S11, P-10).
- * A throwing resolver is reported as a tool error; nothing is spawned.
+ * A work-root resolver's answer for one session (R6/P-18, QA-P13-1-10). It is explicit
+ * so that a lost binding can never read as "not a role session" (fail closed):
+ * - `{ role: false }`: not a role session. The tool behaves exactly as without a
+ *   resolver (`context.directory` / `context.worktree`, I1).
+ * - `{ role: true, root: null }`: a role session without a binding (or with
+ *   `workRoot: null`). The tool refuses and spawns nothing (I9).
+ * - `{ role: true, root }`: the absolute work root bound to the session (a drive or
+ *   UNC path on win32, never root-relative). The tool inspects that directory (its
+ *   repository is discovered from it, never above its checkout) and ignores
+ *   `context.directory`/`context.worktree`, which under the v2 bridge name the main
+ *   checkout rather than a sibling worktree (S11, P-10).
+ * Any other answer, or a throwing resolver, is reported as a tool error; nothing is spawned.
  */
-export type GitWorkRootResolver = (sessionID: string) => string | null | undefined;
+export type WorkRootAnswer = { role: false } | { role: true; root: string | null };
+/** P1.3 injects, P2.1 wires it to the dispatch binding. */
+export type GitWorkRootResolver = (sessionID: string) => WorkRootAnswer;
 export interface GitToolsOptions { resolveWorkRoot?: GitWorkRootResolver }
+
+/** Validate a resolver answer; throws for anything that is not a WorkRootAnswer. */
+export function checkWorkRootAnswer(answer: unknown): WorkRootAnswer {
+  if (typeof answer === "object" && answer !== null && "role" in answer) {
+    const { role } = answer as { role: unknown };
+    if (role === false) return { role: false };
+    if (role === true && "root" in answer) {
+      const { root } = answer as { root: unknown };
+      if (root === null) return { role: true, root: null };
+      if (typeof root === "string" && isFullPath(root)) return { role: true, root };
+      throw new Error("Bound work root is not an absolute path");
+    }
+  }
+  throw new Error("Invalid work-root answer: expected { role: false } or { role: true, root }");
+}
 
 export function gitTools(opts: GitToolsOptions = {}) {
   // G4: resolve the git executable once, at plugin load.
@@ -811,11 +899,11 @@ export function gitTools(opts: GitToolsOptions = {}) {
     async execute(input, context) {
       try {
         if (opts.resolveWorkRoot) {
-          const root = opts.resolveWorkRoot(context.sessionID);
-          if (root === null) return "[router_git] error: refused: this role session has no bound work root (I9)";
-          if (root !== undefined) {
-            if (typeof root !== "string" || !isAbsolute(root)) throw new Error("Bound work root is not an absolute path");
-            return await inspectGit(operation, inputSchema.parse(input), root, context.abort, { executables });
+          const answer = checkWorkRootAnswer(opts.resolveWorkRoot(context.sessionID));
+          if (answer.role) {
+            if (answer.root === null) return "[router_git] error: refused: this role session has no bound work root (I9)";
+            return await inspectGit(operation, inputSchema.parse(input), answer.root, context.abort,
+              { executables, guards: workRootGuards(answer.root) });
           }
         }
         return await inspectGit(operation, inputSchema.parse(input), context.directory, context.abort, { worktree: context.worktree, executables });
