@@ -2,23 +2,23 @@
  * Child-session binding (plan §2.4, §2.5; spikes S2, amendments P-2 and R7; invariants I5, I9).
  *
  * A role dispatch registers a pending entry in `execute.before` (keyed by parent session + callID) with a
- * router-generated nonce ({@link newDispatchNonce}) that P2.1 writes into the child's description
- * ({@link nonceTitleSuffix}) and prompt ({@link noncePromptLine}). The child session binds lazily, at its first
- * context hook (or permission evaluation), from `session.get(child)`: parentID, agent, title, first message.
+ * router-generated nonce ({@link newDispatchNonce}); P2.1 appends {@link nonceTitleSuffix} to the `subagent`
+ * description and {@link noncePromptLine} as the LAST line of its prompt. The child session binds lazily, at its
+ * first context hook (or permission evaluation), from `session.get(child)`: parentID, agent, title, first
+ * message.
  *
- * Decision (one per child, process-wide; only marker nonces count, never bare tokens):
+ * Decision (one per child, process-wide; R7: no nonce → unknown):
  * - no parentID/agent, or a failed lookup → unknown, not cached (the next hook retries);
- * - markers: the first message's markers are preferred, the title's are used when it has none; both present
- *   and different → unknown. Exactly one marked nonce, naming a live entry of the child's parent and agent
- *   that no other child has claimed → exact (the entry is claimed: one dispatch binds at most one child);
- *   intersection with them instead while live nonce-less entries of that parent and agent exist. Several,
- *   retired, foreign, unregistered or claimed markers → unknown;
- * - no marker: unknown when any live entry of the parent and agent carries a nonce; otherwise (nonce-less
- *   entries only) the entry this child claimed before → exact; one entry → exact and claimed (unknown when
- *   another child claimed it); several (claimed or not) → intersection; none → unknown.
- * Every grant is ∩ the role max (`maxOf(agent)`, required), then the separation rule (I4: egress dropped when
- * mixed) and the work-root rule (I9: no `router_run` without an absolute work root). Unknown = max ∩ local.
- * Never a union. Each caller's view is ∩ its own max, so no caller's options widen another caller's view.
+ * - markers are read only at their anchors: the title's trailing ` [nonce <n>]` suffix and the prompt's last
+ *   non-empty line `OMR_NONCE=<n>` (quoted marker syntax anywhere else is plain text). Both present and
+ *   different → unknown; none → unknown;
+ * - the nonce names a live entry of the child's parent and agent that no other child has claimed → exact (the
+ *   entry is claimed: one dispatch binds at most one child); a retired, unregistered, foreign or claimed nonce →
+ *   unknown. Two identical parallel dispatches therefore each bind exactly by their own nonce.
+ * Every caller sees the decision ∩ its own role max (`maxOf(agent)`, required), then the separation rule (I4:
+ * egress dropped when mixed) and the work-root rule (I9: no `router_run` without an absolute work root). An
+ * unknown binding is max ∩ local, whatever `policy.grantFor` would give. Never a union. The `intersection` kind
+ * stays in the contract but is never produced under R7.
  *
  * Lifetimes: a pending entry lives until `evictCall(parent, callID)` (the parent's call completed,
  * `execute.after`), at most {@link PENDING_TTL_MS} (checked on access) and {@link PENDING_MAX} entries (oldest
@@ -27,11 +27,8 @@
  * tombstoned for the TTL, so an in-flight lookup never stores a binding to them), LRU-bounded by
  * {@link BOUND_MAX}; a resume returns the cached binding with its widened grant.
  *
- * Residual (documented, P2.1 obligation): the nonce-less counting path is safe only for a child deciding while
- * its own dispatch is pending; in roles mode every dispatch must carry a router nonce.
- *
- * State lives on `globalThis` under a `Symbol.for` key, so every copy of this module in the process (two
- * plugin instances) shares one registry and one decision per child; a foreign value there is replaced.
+ * State lives on `globalThis` under a versioned `Symbol.for` key, so every copy of this module in the process
+ * (two plugin instances) shares one registry and one decision per child; a foreign value there is replaced.
  */
 
 import { randomUUID } from "node:crypto";
@@ -44,7 +41,7 @@ export interface PendingDispatch {
   callID: string;
   agent: string;
   description: string;
-  /** Router-generated per-dispatch nonce ({@link newDispatchNonce}); "" only for the nonce-less counting path. */
+  /** Router-generated per-dispatch nonce ({@link newDispatchNonce}): 16–128 of `A-Z a-z 0-9 _ -`, else refused. */
   nonce: string;
   grant: DispatchGrant;
   /** Call budget of the dispatch: finite and > 0, otherwise the entry is refused. */
@@ -59,15 +56,13 @@ export type SessionLookup = (
 
 export interface Binding {
   childSessionID: string;
+  /** `intersection` is part of the contract but never produced under R7 (ambiguity → unknown). */
   kind: "exact" | "intersection" | "unknown";
   grant: DispatchGrant;
   /** callIDs of the pending dispatches that matched. */
   candidates: readonly string[];
   decisionID: string | null;
-  /**
-   * Call budget of the matched dispatch; the smallest one for an intersection. null (unknown binding) means
-   * the role's default budget — never unlimited.
-   */
+  /** Call budget of the matched dispatch. null (unknown binding) means the role's default budget — never unlimited. */
   budget: number | null;
 }
 
@@ -88,6 +83,13 @@ export const BOUND_MAX = 4096;
 const RETIRED_MAX = 1024;
 const DELETED_MAX = 4096;
 
+/** A valid dispatch nonce. */
+export const NONCE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+/** The title marker: only a trailing suffix counts. */
+const TITLE_MARKER = / \[nonce ([A-Za-z0-9_-]{16,128})\]$/;
+/** The prompt marker: only the whole last non-empty line counts. */
+const PROMPT_MARKER = /^OMR_NONCE=([A-Za-z0-9_-]{16,128})$/;
+
 /** The local action class (§2.2). */
 export const LOCAL_ACTIONS: readonly AuthorityAction[] = Object.freeze(["read", "glob", "grep", "router_git"]);
 const EGRESS: ReadonlySet<AuthorityAction> = new Set<AuthorityAction>(["webfetch", "websearch", "context7", "execute"]);
@@ -103,13 +105,10 @@ export const BINDING_NOTES = {
     "binding unknown: this session could not be matched to its dispatch; local actions only, no work root, no router_run — call `router_request_authority` to ask for more",
   lookupFailed: "binding unknown: session lookup failed",
   noParent: "binding unknown: the session lookup reported no parent or agent",
-  noCandidate: "binding unknown: no pending dispatch of this parent and agent",
-  noNonce: "binding unknown: this session carries no dispatch nonce, and its parent's dispatches of this agent are nonce-bound",
+  noNonce: "binding unknown: this session carries no dispatch nonce",
   foreignNonce: "binding unknown: the dispatch named by this session's nonce is not pending for its parent and agent",
-  markers: "binding unknown: the session carries several or disagreeing dispatch nonces",
+  markers: "binding unknown: the session's title and first message name different dispatch nonces",
   claimed: "binding unknown: the dispatch named by this session's nonce is already bound to another session",
-  intersection: (count: number): string =>
-    `binding ambiguous between ${count} dispatches: the grant is their intersection`,
   beyondMax: (actions: readonly AuthorityAction[]): string => `outside the role max, dropped: ${actions.join(", ")}`,
   noWorkRoot: "router_run needs a bound work root (root=) — not granted",
   separation: "egress dropped: a grant never mixes local, exec or write actions with egress (separation rule)",
@@ -117,7 +116,7 @@ export const BINDING_NOTES = {
   notBound: "no binding for this session: nothing widened",
 } as const;
 
-/** A fresh, unguessable per-dispatch nonce (never a provider tool-call id). */
+/** A fresh, unguessable per-dispatch nonce (never a provider tool-call id); matches {@link NONCE_PATTERN}. */
 export function newDispatchNonce(): string {
   return randomUUID();
 }
@@ -127,13 +126,10 @@ export function nonceTitleSuffix(nonce: string): string {
   return ` [nonce ${nonce}]`;
 }
 
-/** Prompt line carrying a dispatch nonce (P-2); P2.1 appends it to the `subagent` prompt. */
+/** Prompt line carrying a dispatch nonce (P-2); P2.1 appends it as the LAST line of the `subagent` prompt. */
 export function noncePromptLine(nonce: string): string {
   return `OMR_NONCE=${nonce}`;
 }
-
-/** Both nonce markers; group 1 or 2 is the nonce. */
-const NONCE_MARKER = /\[nonce ([^\]\s]{1,128})\]|OMR_NONCE=([^\s\][)(<>"'`,;]{1,128})/g;
 
 // ---------------------------------------------------------------------------
 // Process-wide registry
@@ -174,7 +170,8 @@ interface Registry {
   readonly deleted: Map<string, number>;
 }
 
-const REGISTRY_KEY = Symbol.for("opencode-model-router.role-binding");
+/** Versioned: a copy of another registry layout uses another key instead of fighting over this one. */
+const REGISTRY_KEY = Symbol.for("opencode-model-router.role-binding@2");
 
 function isRegistry(value: unknown): value is Registry {
   if (typeof value !== "object" || value === null) return false;
@@ -207,13 +204,9 @@ function remember<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
   }
 }
 
-function retire(reg: Registry, nonce: string, now: number): void {
-  if (nonce !== "") remember(reg.retired, nonce, now, RETIRED_MAX);
-}
-
 function removePending(reg: Registry, key: string, slot: PendingSlot, now: number): void {
   reg.pending.delete(key);
-  retire(reg, slot.entry.nonce, now);
+  remember(reg.retired, slot.entry.nonce, now, RETIRED_MAX);
 }
 
 /** Drops expired pending entries (their nonces retire), expired retired nonces and deleted-session tombstones. */
@@ -221,6 +214,11 @@ function prune(reg: Registry, now: number): void {
   for (const [key, slot] of reg.pending) if (now - slot.start >= PENDING_TTL_MS) removePending(reg, key, slot, now);
   for (const [nonce, at] of reg.retired) if (now - at >= PENDING_TTL_MS) reg.retired.delete(nonce);
   for (const [id, at] of reg.deleted) if (now - at >= PENDING_TTL_MS) reg.deleted.delete(id);
+}
+
+function isDeleted(reg: Registry, id: string, now: number): boolean {
+  const at = reg.deleted.get(id);
+  return at !== undefined && now - at < PENDING_TTL_MS;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,24 +297,7 @@ function exact(childSessionID: string, entry: PendingDispatch): Binding {
   };
 }
 
-function intersection(childSessionID: string, entries: readonly PendingDispatch[]): Binding {
-  const [first, ...rest] = entries as [PendingDispatch, ...PendingDispatch[]];
-  const actions = ordered(first.grant.actions);
-  for (const entry of rest) for (const a of [...actions]) if (!entry.grant.actions.has(a)) actions.delete(a);
-  const sharedRoot = entries.every((e) => e.grant.workRoot === first.grant.workRoot);
-  const sharedDecision = entries.every((e) => e.decisionID === first.decisionID);
-  const notes = [BINDING_NOTES.intersection(entries.length), ...entries.flatMap((e) => e.grant.notes)];
-  return {
-    childSessionID,
-    kind: "intersection",
-    grant: { actions, notes: [...new Set(notes)], workRoot: sharedRoot ? first.grant.workRoot : null },
-    candidates: entries.map((e) => e.callID),
-    decisionID: sharedDecision ? first.decisionID : null,
-    budget: Math.min(...entries.map((e) => e.budget)),
-  };
-}
-
-/** Unknown: the local class, narrowed by every view to max ∩ local (I9). */
+/** Unknown: the local class, narrowed by every view to max ∩ local (I9) — never derived from a dispatch grant. */
 function unknown(childSessionID: string, cause: string): Binding {
   return {
     childSessionID,
@@ -332,15 +313,14 @@ function unknown(childSessionID: string, cause: string): Binding {
 // Matching
 // ---------------------------------------------------------------------------
 
-function markers(text: unknown): Set<string> {
-  const found = new Set<string>();
-  if (typeof text !== "string") return found;
-  for (const match of text.matchAll(NONCE_MARKER)) found.add((match[1] ?? match[2])!);
-  return found;
+function titleNonce(title: unknown): string | undefined {
+  return typeof title === "string" ? TITLE_MARKER.exec(title.trimEnd())?.[1] : undefined;
 }
 
-function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  return a.size === b.size && [...a].every((x) => b.has(x));
+function promptNonce(text: unknown): string | undefined {
+  if (typeof text !== "string") return undefined;
+  const last = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "").pop();
+  return last === undefined ? undefined : PROMPT_MARKER.exec(last)?.[1];
 }
 
 function text(value: unknown): string | undefined {
@@ -363,56 +343,33 @@ async function decide(childSessionID: string, getSession: SessionLookup): Promis
   if (parent === undefined || agent === undefined) {
     return { binding: unknown(childSessionID, BINDING_NOTES.noParent), parentSessionID: parent, agent, cacheable: false };
   }
-  const reg = registry();
-  prune(reg, Date.now());
   const out = (binding: Binding): Decision => ({ binding, parentSessionID: parent, agent, cacheable: true });
-  const sameRole = [...reg.pending.values()].filter((s) => s.entry.parentSessionID === parent && s.entry.agent === agent);
-  const mine = (s: PendingSlot): boolean => s.claimedBy === undefined || s.claimedBy === childSessionID;
-  // Claimed nonce-less entries stay in the pool: a late child that claimed one must not push that
-  // dispatch's real child onto another entry (more entries → a narrower intersection, never a wrong exact).
-  const nonceless = sameRole.filter((s) => s.entry.nonce === "");
-
-  const fromTitle = markers(session.title);
-  const fromPrompt = markers(session.firstText);
-  if (fromTitle.size > 0 && fromPrompt.size > 0 && !sameSet(fromTitle, fromPrompt)) {
+  const fromTitle = titleNonce(session.title);
+  const fromPrompt = promptNonce(session.firstText);
+  if (fromTitle !== undefined && fromPrompt !== undefined && fromTitle !== fromPrompt) {
     return out(unknown(childSessionID, BINDING_NOTES.markers));
   }
-  const marked = fromPrompt.size > 0 ? fromPrompt : fromTitle;
-  if (marked.size > 1) return out(unknown(childSessionID, BINDING_NOTES.markers));
-  if (marked.size === 1) {
-    const nonce = [...marked][0]!;
-    // Live nonces are unique and never retired (registerPending refuses both), so a retired, unregistered or
-    // forged nonce finds no slot.
-    const slot = [...reg.pending.values()].find((s) => s.entry.nonce === nonce);
-    if (slot === undefined || slot.entry.parentSessionID !== parent || slot.entry.agent !== agent) {
-      return out(unknown(childSessionID, BINDING_NOTES.foreignNonce));
-    }
-    if (!mine(slot)) return out(unknown(childSessionID, BINDING_NOTES.claimed));
-    if (nonceless.length > 0) return out(intersection(childSessionID, [slot.entry, ...nonceless.map((s) => s.entry)]));
-    slot.claimedBy = childSessionID;
-    return out(exact(childSessionID, slot.entry));
+  const nonce = fromPrompt ?? fromTitle;
+  if (nonce === undefined) return out(unknown(childSessionID, BINDING_NOTES.noNonce));
+  const reg = registry();
+  prune(reg, Date.now());
+  // Live nonces are unique and never retired (registerPending refuses both), so a retired, unregistered or
+  // forged nonce finds no slot.
+  const slot = [...reg.pending.values()].find((s) => s.entry.nonce === nonce);
+  if (slot === undefined || slot.entry.parentSessionID !== parent || slot.entry.agent !== agent) {
+    return out(unknown(childSessionID, BINDING_NOTES.foreignNonce));
   }
-  if (sameRole.some((s) => s.entry.nonce !== "")) return out(unknown(childSessionID, BINDING_NOTES.noNonce));
-  const claimed = nonceless.find((s) => s.claimedBy === childSessionID);
-  if (claimed !== undefined) return out(exact(childSessionID, claimed.entry));
-  if (nonceless.length === 1) {
-    const only = nonceless[0]!;
-    if (!mine(only)) return out(unknown(childSessionID, BINDING_NOTES.claimed));
-    only.claimedBy = childSessionID;
-    return out(exact(childSessionID, only.entry));
+  if (slot.claimedBy !== undefined && slot.claimedBy !== childSessionID) {
+    return out(unknown(childSessionID, BINDING_NOTES.claimed));
   }
-  if (nonceless.length >= 2) return out(intersection(childSessionID, nonceless.map((s) => s.entry)));
-  return out(unknown(childSessionID, BINDING_NOTES.noCandidate));
-}
-
-function isDeleted(reg: Registry, id: string, now: number): boolean {
-  const at = reg.deleted.get(id);
-  return at !== undefined && now - at < PENDING_TTL_MS;
+  slot.claimedBy = childSessionID;
+  return out(exact(childSessionID, slot.entry));
 }
 
 function validEntry(entry: PendingDispatch): boolean {
   return typeof entry === "object" && entry !== null && text(entry.parentSessionID) !== undefined
-    && text(entry.callID) !== undefined && text(entry.agent) !== undefined && typeof entry.nonce === "string"
+    && text(entry.callID) !== undefined && text(entry.agent) !== undefined
+    && typeof entry.nonce === "string" && NONCE_PATTERN.test(entry.nonce)
     && typeof entry.grant === "object" && entry.grant !== null && entry.grant.actions instanceof Set
     && typeof entry.budget === "number" && Number.isFinite(entry.budget) && entry.budget > 0;
 }
@@ -422,11 +379,11 @@ function validEntry(entry: PendingDispatch): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Registers a dispatch, keyed by parent + callID. Refused (no-op): invalid entries (empty ids, a non-Set grant,
- * a budget that is not finite and > 0), a deleted parent, a retired nonce, a nonce another live dispatch
- * holds, an entry already older than the TTL. The grant is copied (a later mutation cannot widen it) and a
- * work root that is not an absolute path becomes null. Re-registering a key replaces the entry; a changed
- * nonce retires the old one and resets the claim.
+ * Registers a dispatch, keyed by parent + callID. Refused (no-op): invalid entries (empty ids, a nonce outside
+ * {@link NONCE_PATTERN}, a non-Set grant, a budget that is not finite and > 0), a deleted parent, a retired
+ * nonce, a nonce another live dispatch holds, an entry already older than the TTL. The grant is copied (a later
+ * mutation cannot widen it) and a work root that is not an absolute path becomes null. Re-registering a key
+ * replaces the entry; a changed nonce retires the old one and resets the claim.
  */
 export function registerPending(entry: PendingDispatch): void {
   if (!validEntry(entry)) return;
@@ -436,14 +393,14 @@ export function registerPending(entry: PendingDispatch): void {
   const key = pendingKey(entry.parentSessionID, entry.callID);
   const previous = reg.pending.get(key);
   if (isDeleted(reg, entry.parentSessionID, now) || reg.retired.has(entry.nonce)) return;
-  if (entry.nonce !== "" && [...reg.pending].some(([k, s]) => k !== key && s.entry.nonce === entry.nonce)) return;
+  if ([...reg.pending].some(([k, s]) => k !== key && s.entry.nonce === entry.nonce)) return;
   const start = Number.isFinite(entry.registeredAt) ? Math.min(entry.registeredAt, now) : now;
   if (now - start >= PENDING_TTL_MS) {
-    retire(reg, entry.nonce, now);
+    remember(reg.retired, entry.nonce, now, RETIRED_MAX);
     return;
   }
   const keepClaim = previous !== undefined && previous.entry.nonce === entry.nonce;
-  if (previous !== undefined && !keepClaim) retire(reg, previous.entry.nonce, now);
+  if (previous !== undefined && !keepClaim) remember(reg.retired, previous.entry.nonce, now, RETIRED_MAX);
   const grant: DispatchGrant = { ...copyGrant(entry.grant), workRoot: rootOrNull(entry.grant.workRoot) };
   const stored: PendingDispatch = Object.freeze({ ...entry, grant });
   remember(reg.pending, key, { entry: stored, start, claimedBy: keepClaim ? previous.claimedBy : undefined }, Infinity);

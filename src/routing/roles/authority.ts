@@ -1,21 +1,23 @@
 /**
  * Authority ladder (plan §2.5, R6, R7): the `router_request_authority` tool definition and its state. P2.1
- * registers the tool for dynamic role agents and wires the dependencies (role and running dispatch by child
- * session, the role table); nothing is registered here.
+ * registers the tool for dynamic role agents and wires the dependencies (role by child session, the role
+ * table, optionally the running dispatch); nothing is registered here.
  *
  * - Not a role child, or a fixed role → refused (fixed authority is never widened), naming the role to use.
- * - Dynamic role: actions inside the role max (allow − deny; `execute` never) are recorded for the child under
- *   the parent's running call, and the child is told to stop with `ESCALATE: authority`; actions outside it
- *   are refused, naming the role that has them (egress → `researcher`, …); `router_run` without a bound work
- *   root is refused (I9); actions already granted are reported as such.
- * - A replay (the same call, every action already recorded) changes nothing and returns the same text.
- * - The record is tied to that call: P2.1 calls `markAnnotated(child, callID)` when the call ends with
- *   `ESCALATE: authority` (and annotates the parent's result), `discardAuthority(child, callID)` otherwise.
- *   Only the first resume after that annotated call applies it: `consumeAuthority(child, deps, { afterCall })`
- *   widens by recorded ∩ the CURRENT role max (binding.ts `widen` bounds it again) and clears the record;
- *   any other resume drops it. Records expire after {@link AUTHORITY_TTL_MS} and go with the parent.
+ * - Dynamic role: actions inside the role max (allow − deny; `execute` never) are recorded for the child and
+ *   the child is told to stop with `ESCALATE: authority`; actions outside it are refused, naming the role that
+ *   has them (egress → `researcher`, …); `router_run` without a bound work root is refused (I9); actions
+ *   already granted are reported as such. A request needs no binding and no known call: unknown children can
+ *   use the ladder.
+ * - A replay (every action already on the unattached record) changes nothing and returns the same text.
+ * - The record is tied to a call when it is annotated: P2.1 calls `markAnnotated(child, callID)` in
+ *   `execute.after` when the call ended with `ESCALATE: authority` (and annotates the parent's result), and
+ *   `discardAuthority(child, callID)` otherwise. Only the first resume after that annotated call applies it:
+ *   `consumeAuthority(child, deps, { afterCall })` widens by recorded ∩ the CURRENT role max (binding.ts
+ *   `widen` bounds it again) and clears the record; any other outcome drops it and says why. Records expire
+ *   after {@link AUTHORITY_TTL_MS} and go with their parent.
  *
- * State lives on `globalThis` under a `Symbol.for` key (one state for every plugin instance in the process).
+ * State lives on `globalThis` under a versioned `Symbol.for` key (one state for every plugin instance).
  */
 
 import { tool } from "@opencode-ai/plugin";
@@ -28,10 +30,10 @@ export const AUTHORITY_TOOL_NAME = "router_request_authority";
 export interface AuthorityDeps {
   /** Role of a child session; undefined → not a role child. */
   roleOf(childSessionID: string): RoleSpec | undefined;
-  /** The parent's running `subagent` call that runs this child (P2.1 tracks it); undefined → none. */
-  dispatchOf(childSessionID: string): { parentSessionID: string; callID: string } | undefined;
   /** Enabled roles, to name the role to use in a refusal. */
   roles(): ReadonlyMap<string, RoleSpec>;
+  /** The parent's running call for this child, when P2.1 knows it: only its parent is kept (for eviction). */
+  dispatchOf?(childSessionID: string): { parentSessionID: string; callID: string } | undefined;
   /** The child's binding. Default: binding.ts `currentBinding` ∩ the child's role max. */
   bindingOf?(childSessionID: string): Binding | undefined;
   /** The resume path's widening. Default: binding.ts `widen`. */
@@ -56,19 +58,27 @@ export interface AuthorityResult {
   /** Actions of this request already in the child's grant. */
   granted: readonly AuthorityAction[];
   refused: readonly AuthorityRefusal[];
-  /** True when every recorded action was already on record for the same call (state unchanged). */
+  /** True when every recorded action was already on the unattached record (state unchanged). */
   replay: boolean;
   text: string;
 }
 
 export interface AuthorityRecord {
-  parentSessionID: string;
-  callID: string;
+  /** Known from `dispatchOf` or `markAnnotated`; used to drop the record with its parent. */
+  parentSessionID: string | undefined;
+  /** The call the record is attached to (set by `markAnnotated`). */
+  callID: string | undefined;
   actions: readonly AuthorityAction[];
-  /** Child-supplied, control tokens stripped; present them with {@link quoteChildText}. */
+  /** Child-supplied, cleaned by {@link cleanReason}; present them with {@link quoteChildText}. */
   reasons: readonly string[];
   annotated: boolean;
 }
+
+/** The resume path's outcome; a dropped request carries a reason P2.1 can show the parent or the child. */
+export type ConsumeResult =
+  | { status: "none" }
+  | { status: "dropped"; reason: string }
+  | { status: "widened"; grant: DispatchGrant; widened: readonly AuthorityAction[] };
 
 /** Children with a request kept at most (oldest first out). */
 export const AUTHORITY_REQUESTS_MAX = 512;
@@ -104,8 +114,10 @@ const CONTROL_TOKENS: readonly RegExp[] = [
   /\bCAP\s*:\s*(?:none|\d+)\b/gi,
   /\b(?:task_id|session_?id)\s*[=:]\s*\S*/gi,
 ];
+/** Return-contract prefixes a child-supplied text must not lead with. */
+const RETURN_PREFIX = /^(?:(?:ESCALATE|DONE|NEED\s+MORE)\s*:\s*)+/i;
 
-/** Refusal reasons (exact texts, shared with the tests). */
+/** Refusal and drop reasons (exact texts, shared with the tests and P2.1). */
 export const AUTHORITY_TEXT = {
   notRole: "router_request_authority is only for role agents",
   fixed: (agent: string): string => `${agent} has a fixed authority that is never widened`,
@@ -113,10 +125,15 @@ export const AUTHORITY_TEXT = {
   shell: "raw shell is outside roles mode — request `router_run` for repository scripts, or dispatch a tier agent explicitly",
   unknown: `unknown action; requestable: ${REQUESTABLE}`,
   noWorkRoot: "router_run needs a work root bound to this dispatch (root=) — return `ESCALATE: authority` so the parent re-dispatches with root=",
-  noDispatch: "no running dispatch of this session is known to the router — nothing recorded",
   outside: (agent: string, role: string | undefined): string => role === undefined
     ? `outside ${agent}'s authority and no role grants it — dispatch a tier agent explicitly`
     : `outside ${agent}'s authority — dispatch \`${role}\` for it`,
+  dropped: {
+    notAnnotated: "authority request not applied: its call did not end with an annotated `ESCALATE: authority`",
+    otherCall: "authority request not applied: it belongs to another call than the one being resumed",
+    notDynamic: "authority request not applied: the session is no longer a dynamic role",
+    notBound: "authority request not applied: the session had no binding when it was resumed — ask again with `router_request_authority`",
+  },
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -124,8 +141,8 @@ export const AUTHORITY_TEXT = {
 // ---------------------------------------------------------------------------
 
 interface RequestRecord {
-  parentSessionID: string;
-  callID: string;
+  parentSessionID: string | undefined;
+  callID: string | undefined;
   actions: Set<AuthorityAction>;
   reasons: string[];
   at: number;
@@ -137,7 +154,8 @@ interface AuthorityState {
   readonly requests: Map<string, RequestRecord>;
 }
 
-const STATE_KEY = Symbol.for("opencode-model-router.role-authority");
+/** Versioned: a copy of another state layout uses another key instead of fighting over this one. */
+const STATE_KEY = Symbol.for("opencode-model-router.role-authority@2");
 
 function state(): AuthorityState {
   const existing: unknown = Reflect.get(globalThis, STATE_KEY);
@@ -206,11 +224,15 @@ function parseAction(raw: string): Parsed {
   return { kind: "refused", reason: AUTHORITY_TEXT.unknown };
 }
 
-/** One line, router control tokens removed, at most 500 characters. */
+/**
+ * One line of child-supplied text, safe inside router-framed text: router control tokens removed, square
+ * brackets turned into parentheses, no leading `ESCALATE:`/`DONE:`/`NEED MORE:`, at most 500 characters.
+ */
 export function cleanReason(reason: string): string {
   let text = reason;
-  for (const pattern of CONTROL_TOKENS) text = text.replace(pattern, "[removed]");
-  return text.replace(/\s+/g, " ").trim().slice(0, REASON_CHARS);
+  for (const pattern of CONTROL_TOKENS) text = text.replace(pattern, "(removed)");
+  text = text.replaceAll("[", "(").replaceAll("]", ")").replace(/\s+/g, " ").trim();
+  return text.replace(RETURN_PREFIX, "").trim().slice(0, REASON_CHARS);
 }
 
 /** Presents a child-supplied text inside router-framed text as quoted data, never as instructions. */
@@ -238,10 +260,13 @@ function bindingFor(childSessionID: string, deps: AuthorityDeps, max: ReadonlySe
   return deps.bindingOf ? deps.bindingOf(childSessionID) : currentBinding(childSessionID, { maxOf: () => max });
 }
 
-function validDispatch(value: unknown): value is { parentSessionID: string; callID: string } {
-  if (typeof value !== "object" || value === null) return false;
-  const d = value as { parentSessionID?: unknown; callID?: unknown };
-  return typeof d.parentSessionID === "string" && d.parentSessionID !== "" && typeof d.callID === "string" && d.callID !== "";
+function nonEmpty(value: unknown): value is string {
+  return typeof value === "string" && value !== "";
+}
+
+function parentOf(childSessionID: string, deps: AuthorityDeps): string | undefined {
+  const dispatch = deps.dispatchOf?.(childSessionID);
+  return typeof dispatch === "object" && dispatch !== null && nonEmpty(dispatch.parentSessionID) ? dispatch.parentSessionID : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,20 +309,16 @@ export function requestAuthority(childSessionID: string, input: AuthorityRequest
     else inside.push(action);
   }
   if (inside.length === 0) return done([], granted, false);
-  const dispatch = deps.dispatchOf(childSessionID);
-  if (!validDispatch(dispatch)) {
-    for (const action of inside) refused.push({ action, reason: AUTHORITY_TEXT.noDispatch });
-    return done([], granted, false);
-  }
   const { requests } = state();
   const existing = liveRecord(childSessionID);
-  const sameCall = existing !== undefined && !existing.annotated
-    && existing.parentSessionID === dispatch.parentSessionID && existing.callID === dispatch.callID;
-  const replay = sameCall && inside.every((a) => existing.actions.has(a));
+  // An annotated record belongs to a finished call; a new request starts a new, unattached record.
+  const open = existing !== undefined && !existing.annotated ? existing : undefined;
+  const replay = open !== undefined && inside.every((a) => open.actions.has(a));
   if (!replay) {
-    const record: RequestRecord = sameCall ? existing : {
-      parentSessionID: dispatch.parentSessionID, callID: dispatch.callID, actions: new Set(), reasons: [], at: Date.now(), annotated: false,
+    const record: RequestRecord = open ?? {
+      parentSessionID: undefined, callID: undefined, actions: new Set(), reasons: [], at: Date.now(), annotated: false,
     };
+    record.parentSessionID ??= parentOf(childSessionID, deps);
     for (const action of inside) record.actions.add(action);
     const reason = cleanReason(input.reason);
     if (reason !== "" && !record.reasons.includes(reason) && record.reasons.length < REASONS_MAX) record.reasons.push(reason);
@@ -320,43 +341,46 @@ export function requestedAuthority(childSessionID: string): AuthorityRecord | un
 }
 
 /**
- * The parent's call `callID` ended with `ESCALATE: authority` and P2.1 annotated its result: the request made
- * under that call becomes consumable by the next resume. False when no live request of that call exists.
+ * The parent's call `callID` ended with `ESCALATE: authority` and P2.1 annotated its result: the open request
+ * is attached to that call and becomes consumable by the next resume. True when a request is attached to
+ * `callID` (repeating it is harmless); false when there is no live request, or it is attached to another call.
  */
-export function markAnnotated(childSessionID: string, callID: string): boolean {
+export function markAnnotated(childSessionID: string, callID: string, parentSessionID?: string): boolean {
   const record = liveRecord(childSessionID);
-  if (record === undefined || record.callID !== callID) return false;
+  if (record === undefined || !nonEmpty(callID)) return false;
+  if (record.annotated) return record.callID === callID;
+  record.callID = callID;
   record.annotated = true;
+  if (nonEmpty(parentSessionID)) record.parentSessionID ??= parentSessionID;
   return true;
 }
 
-/** The parent's call `callID` ended without `ESCALATE: authority`: its unannotated request is dropped. */
+/** The parent's call `callID` ended without `ESCALATE: authority`: an open request, or one of that call, is dropped. */
 export function discardAuthority(childSessionID: string, callID: string): void {
   const record = liveRecord(childSessionID);
-  if (record !== undefined && record.callID === callID && !record.annotated) state().requests.delete(childSessionID);
+  if (record !== undefined && (!record.annotated || record.callID === callID)) state().requests.delete(childSessionID);
 }
 
 /**
  * Resume path (P2.1, `execute.before` of a resume of `childSessionID`; `afterCall` = the call being resumed
- * after). Applies the request only when it was made under `afterCall` and annotated: recorded ∩ the current
- * role max → `widen`. The record is cleared in every case — a request widens at most once, on the first
- * resume after its call. Undefined when nothing applies (no record, another call, not annotated, not a
- * dynamic role, not bound).
+ * after). Applies the request only when it is attached to `afterCall`: recorded ∩ the current role max →
+ * `widen`. The record is cleared in every case — a request widens at most once, on the first resume after its
+ * call; a dropped request carries the reason (P2.1 shows it).
  */
-export function consumeAuthority(childSessionID: string, deps: AuthorityDeps, opts: { afterCall: string }):
-  { grant: DispatchGrant; widened: readonly AuthorityAction[] } | undefined {
+export function consumeAuthority(childSessionID: string, deps: AuthorityDeps, opts: { afterCall: string }): ConsumeResult {
   const record = liveRecord(childSessionID);
-  if (record === undefined) return undefined;
+  if (record === undefined) return { status: "none" };
   state().requests.delete(childSessionID);
-  if (!record.annotated || record.callID !== opts.afterCall) return undefined;
+  if (!record.annotated) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notAnnotated };
+  if (record.callID !== opts.afterCall) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.otherCall };
   const role = deps.roleOf(childSessionID);
-  if (role === undefined || role.authority.mode === "fixed") return undefined;
+  if (role === undefined || role.authority.mode === "fixed") return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notDynamic };
   const max = roleMax(role);
   const binding = bindingFor(childSessionID, deps, max);
-  if (binding === undefined) return undefined;
+  if (binding === undefined) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notBound };
   const actions = sorted(record.actions).filter((a) => max.has(a));
   const grant = (deps.widen ?? widenBinding)(childSessionID, actions, max);
-  return { grant, widened: sorted(grant.actions).filter((a) => !binding.grant.actions.has(a)) };
+  return { status: "widened", grant, widened: sorted(grant.actions).filter((a) => !binding.grant.actions.has(a)) };
 }
 
 /** A session was deleted: drops its own request and the requests of its children (it was their parent). */
