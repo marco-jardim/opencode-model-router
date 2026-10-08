@@ -15,6 +15,20 @@ import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
 import type { PluginLogger } from "./logger";
 import { sanitizePluginAgents, type PluginAgentConfig } from "./plugin-agents";
+import type { ExplorationConfig, RunConfig } from "./roles";
+import {
+  DEFAULT_RUN_SCRIPTS,
+  DEFAULT_RUN_TIMEOUT_MS,
+  ROLES_V1_NOTICE,
+  collectRolesIssues,
+  sanitizeDelegation,
+  sanitizeExploration,
+  sanitizeRoleAgents,
+  sanitizeRun,
+  sanitizeWorkRoots,
+  type DelegationMode,
+  type RoleAgentCustomisation,
+} from "./roles-config";
 
 /**
  * Filename of the optional user overrides file (global and project copies share
@@ -305,6 +319,14 @@ export interface RoutingConfig {
   outcomes?: OutcomesConfig;
   sessionReuse?: SessionReuseConfig;
   advisor?: AdvisorConfig;
+  /** `tiers` (default) or `roles`; global and project layers. Inert on v1. */
+  delegation?: DelegationMode;
+  /** Global only. `rate` 0..0.2, default 0; `requireDetection` is fixed. Inert on v1. */
+  exploration?: Partial<ExplorationConfig>;
+  /** Global only. `router_run` allow-list. Inert on v1. */
+  run?: Partial<RunConfig>;
+  /** Global only. Absolute globs with a static long-form prefix; default none. */
+  workRoots?: string[];
 }
 
 export interface RouterConfig {
@@ -388,6 +410,11 @@ export interface RouterConfig {
    * layer. Absent ⇒ nothing is registered.
    */
   agents?: Record<string, PluginAgentConfig>;
+  /**
+   * Narrowing-only customisation of the shipped role agents (agent name → partial spec).
+   * tiers.json and the global override only; validated per entry, never dropping the layer.
+   */
+  roleAgents?: Record<string, RoleAgentCustomisation>;
   /** Experimental, opt-in features. Off by default. */
   experimental?: { verifiedDelegateTool?: boolean };
   /** Cost-aware routing engine (#74). Absent = today's static routing, byte for byte. */
@@ -1780,6 +1807,16 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   const roles = validateRoles(routing);
   if (roles !== undefined) out.roles = roles;
 
+  // Roles keys (#84): tolerant per entry, never throw (see roles-config.ts).
+  const delegation = sanitizeDelegation(routing.delegation).value;
+  if (delegation !== undefined) out.delegation = delegation;
+  const exploration = sanitizeExploration(routing.exploration).value;
+  if (exploration !== undefined) out.exploration = exploration;
+  const run = sanitizeRun(routing.run).value;
+  if (run !== undefined) out.run = run;
+  const workRoots = sanitizeWorkRoots(routing.workRoots).value;
+  if (workRoots !== undefined) out.workRoots = workRoots;
+
   const outcomes = readBlock(routing, "outcomes", "routing");
   if (outcomes !== undefined) {
     const o: OutcomesConfig = {};
@@ -2049,9 +2086,11 @@ export function validateConfig(raw: unknown): RouterConfig {
   validateTaskPromptRepair(obj);
   validateFalseRefusalDetection(obj);
   const routing = validateRouting(obj.routing);
+  // Never throws: a bad entry is dropped, and buildConfig reports it as a notice.
+  const roleAgents = sanitizeRoleAgents(obj.roleAgents).value;
 
   const cfg = raw as RouterConfig;
-  return withValidatedSnapshots(cfg, { enforcement, routing });
+  return withValidatedSnapshots(cfg, { enforcement, routing, roleAgents });
 }
 
 /**
@@ -2166,6 +2205,28 @@ const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: stri
   ["outcomes", "path"],
 ];
 
+/** Roles keys (#84) a project layer must not carry; `routing.delegation` is allowed there. */
+const GLOBAL_ONLY_ROLES_ROUTING_KEYS = ["exploration", "run", "workRoots"] as const;
+
+function stripGlobalOnlyRolesKeys(data: Record<string, unknown>): string[] {
+  const dropped: string[] = [];
+  if (Object.hasOwn(data, "roleAgents")) {
+    delete data.roleAgents;
+    dropped.push("roleAgents");
+  }
+  const routing = data.routing;
+  if (isPlainObject(routing)) {
+    for (const key of GLOBAL_ONLY_ROLES_ROUTING_KEYS) {
+      if (Object.hasOwn(routing, key)) {
+        delete routing[key];
+        dropped.push(`routing.${key}`);
+      }
+    }
+    if (dropped.length > 0 && Object.keys(routing).length === 0) delete data.routing;
+  }
+  return dropped;
+}
+
 /** Remove the global-only `routing` keys from a project layer; returns what was dropped. */
 function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
   const routing = data.routing;
@@ -2213,6 +2274,15 @@ function collectOverrideLayers(
         notices?.push({
           source: p,
           message: `ignoring ${dropped.join(", ")} from ${p}: only the global override may set it`,
+        });
+      }
+      // #84: a repository may pick `routing.delegation`, but not customise role agents, grant
+      // exploration, define `router_run` commands or widen the work roots.
+      const rolesDropped = stripGlobalOnlyRolesKeys(data);
+      if (rolesDropped.length > 0) {
+        notices?.push({
+          source: p,
+          message: `ignoring ${rolesDropped.join(", ")} from ${p}: only tiers.json or the global override may set it`,
         });
       }
       // A18 (#81): a cloned repository must not register agents, let alone
@@ -2436,6 +2506,10 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "outcomes",
     "sessionReuse",
     "advisor",
+    "delegation",
+    "exploration",
+    "run",
+    "workRoots",
   ],
   detection: ["deterministic", "grader", "none"],
   classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
@@ -2672,6 +2746,8 @@ function buildConfig(
   applyTierDefaults(cfg);
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
   for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
+  const rawRoleAgents = isPlainObject(rawUsed) ? rawUsed.roleAgents : undefined;
+  for (const issue of collectRolesIssues(rawRouting, rawRoleAgents)) notices.push({ message: issue.message });
   dropIgnoredCandidates(cfg);
   applyPluginAgents(cfg, layers, notices);
   return cfg;
@@ -3061,6 +3137,59 @@ export function resolveRouting(
       notify: r.advisor?.notify ?? d.advisor.notify,
     }),
     applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
+  });
+}
+
+/** The roles keys with their defaults applied, for one host (#84). Never mutates `cfg`. */
+export interface ResolvedRolesRouting {
+  readonly delegation: DelegationMode;
+  readonly exploration: Readonly<ExplorationConfig>;
+  readonly run: Readonly<RunConfig>;
+  readonly workRoots: readonly string[];
+  /** True on v1 when roles keys were set: they are validated but have no effect. */
+  readonly inert: boolean;
+}
+
+let warnedRolesInertOnV1 = false;
+
+/** Test-only: re-arm the once-per-process "roles delegation requires v2" notice. */
+export function resetRolesWarnings(): void {
+  warnedRolesInertOnV1 = false;
+}
+
+/**
+ * Defaults for `routing.delegation`, `exploration`, `run` and `workRoots`. On v1 (`routerHost`
+ * `v1`) delegation is always `tiers`, exploration is off, and one notice says so when any of
+ * delegation `roles`, `roleAgents`, `exploration` or `run` was set. Switching `delegation` is
+ * only a config value here; registration follows a hot reload elsewhere.
+ */
+export function resolveRolesRouting(
+  cfg: RouterConfig | undefined,
+  host: RouterHost,
+  logger?: Pick<PluginLogger, "warn">,
+): ResolvedRolesRouting {
+  const r: RoutingConfig = cfg?.routing ?? {};
+  const requested = r.delegation ?? "tiers";
+  const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined || r.run !== undefined;
+  const inert = host === "v1" && touched;
+  if (inert && !warnedRolesInertOnV1) {
+    warnedRolesInertOnV1 = true;
+    if (logger) logger.warn(ROLES_V1_NOTICE);
+    else console.warn(`[model-router] ${ROLES_V1_NOTICE}`);
+  }
+  return Object.freeze({
+    delegation: host === "v1" ? "tiers" : requested,
+    exploration: Object.freeze({
+      rate: host === "v1" ? 0 : (r.exploration?.rate ?? 0),
+      requireDetection: "deterministic" as const,
+    }),
+    run: Object.freeze({
+      scripts: Object.freeze([...(r.run?.scripts ?? DEFAULT_RUN_SCRIPTS)]),
+      commands: Object.freeze({ ...(r.run?.commands ?? {}) }),
+      timeoutMs: r.run?.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
+    }),
+    workRoots: Object.freeze([...(r.workRoots ?? [])]),
+    inert,
   });
 }
 
