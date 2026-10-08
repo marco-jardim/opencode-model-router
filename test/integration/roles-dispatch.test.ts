@@ -19,10 +19,10 @@ import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders
 import { acquireOutcomes } from "../../src/routing/outcomes";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
-import { resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { bind, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
-  PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, resetDispatchRouting, routedRoleOf,
-  type DispatchRouter, type RouteOutcome,
+  PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
+  roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
 
@@ -75,7 +75,7 @@ function temp(prefix: string): string {
   return dir;
 }
 
-function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string } = {}): World {
+function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string; routerVerifyEnabled?: () => boolean } = {}): World {
   const main = opts.main ?? temp("omr-p21-int-main-");
   let captured: OutcomesBundle | null = null;
   const runtime = createEngineRuntime({
@@ -97,6 +97,7 @@ function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string }
     logger,
     listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0\nbranch refs/heads/main\n`,
     env: {},
+    ...(opts.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: opts.routerVerifyEnabled }),
   });
   cleanups.push(async () => { await runtime.dispose(); });
   return {
@@ -330,6 +331,64 @@ describe("detection and binding rows", () => {
       [exact.decisionID, "child-e", "note:binding:exact", "exact"],
       [unknown.decisionID, "child-u", "note:binding:unknown", "unknown"],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA round 2 of P2.1: the resume path
+// ---------------------------------------------------------------------------
+
+describe("QA round 2: the resume path", () => {
+  const maxOf = (cfg: RouterConfig) => (agent: string) => roleMaxActions(resolveRoles(cfg, "v2").get(agent));
+
+  it("QA-P21-2-1: an exactly bound child keeps its grant on a resume — edit + the widened router_run is a write+exec floor, never fast", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const acceptance = `VERIFY: required\n[acceptance]\ncheck: fileExists path=${join(world.main, "out.txt")}\n[/acceptance]`;
+    const input = { agent: "general", prompt: `[route class=mechanical risk=low scope=single needs=edit root=${world.main}]\nfix a typo in one comment of src/a.ts\n${acceptance}`, description: "typo" };
+    const c = call(world, input);
+    const fresh = await world.router.route(c);
+    expect(fresh.role!.detection).toBe("deterministic");
+    expect(fresh.role!.tier).toBe("fast"); // write without exec, deterministic, low/single
+    world.router.commit(c.callID, applied(input, fresh));
+    world.router.onSessionCreated({ sessionID: "child-g", parentID: "root", agent: "general", title: fresh.description });
+    const binding = await bind("child-g", async () => ({ parentID: "root", agent: "general", title: fresh.description!, firstText: fresh.prompt! }), { maxOf: maxOf(world.cfg) });
+    expect(binding.kind).toBe("exact");
+    expect([...binding.grant.actions]).toContain("edit");
+    const resume = async (prompt: string) => (await world.router.route({ ...call(world, { agent: "general", sessionID: "child-g", prompt }), widened: ["router_run"] })).role!;
+    const deterministic = await resume(`continue\n${acceptance}`);
+    expect([...deterministic.grant.actions]).toEqual(expect.arrayContaining(["edit", "router_run"]));
+    expect(deterministic.tier).toBe("medium"); // write + exec, deterministic
+    expect((await resume("continue")).tier).toBe("heavy"); // write + exec, no detection
+  });
+
+  it("QA-P21-2-2: a raise recorded after a FAIL is applied by that parent's next resume only, once", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const [model, variant] = tierRef(world.cfg, "fast").split("#") as [string, string | undefined];
+    rememberDispatch("child-x", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
+      agent: "explorer", model, variant: variant ?? null, tier: "fast", parentSessionID: "root", step: "dispatch", picked: "explorer",
+    });
+    const hint = roleEscalationAfterFail(world.cfg, "child-x", "root");
+    expect(hint).toContain("the router raises it to medium");
+    expect(pendingResumeRaise("child-x", "another-parent")).toBeNull();
+    expect(pendingResumeRaise("child-x", "root")).toBe("medium");
+    const resume = async () => (await world.router.route(call(world, { agent: "explorer", sessionID: "child-x", prompt: "[route class=search risk=low scope=single]\naddress the findings" }))).role!;
+    const raised = await resume();
+    expect(raised.window.floor).toBe("medium");
+    expect(raised.tier).toBe("medium");
+    expect(pendingResumeRaise("child-x", "root")).toBeNull();
+    expect((await resume()).window.floor).toBe("fast"); // consumed once
+  });
+
+  it("QA-P21-2 nit 3: without router_verify nothing is deferred, so the router's gate backs a deterministic detection", async () => {
+    const cfg = config({ delegation: "roles", engine: "static" });
+    const prompt = "[route class=implement risk=low scope=single]\nchange x\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+    expect(roleGateDeferred(cfg, prompt, "")).toBe(true);
+    expect(roleGateDeferred(cfg, prompt, "", { verifyEnabled: false })).toBe(false);
+    const withVerify = makeWorld(cfg);
+    expect((await withVerify.router.route(call(withVerify, { agent: "implementer", prompt }))).role!.detection).not.toBe("deterministic");
+    const withoutVerify = makeWorld(cfg, { routerVerifyEnabled: () => false });
+    expect((await withoutVerify.router.route(call(withoutVerify, { agent: "implementer", prompt }))).role!.detection).toBe("deterministic");
   });
 });
 

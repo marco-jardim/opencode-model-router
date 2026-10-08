@@ -22,7 +22,9 @@ import { resetDispatchRegistry } from "../../src/router/sessions";
 import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
-import { requestedAuthority, resetAuthorityForTests } from "../../src/routing/roles/authority";
+import {
+  AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
+} from "../../src/routing/roles/authority";
 import { resetDispatchRouting, roleGateDeferred, roleRouterGate, routedRoleOf, strippedRouteRoot } from "../../src/routing/wire/dispatch";
 import { runSignal } from "../../src/routing/outcomes/signals";
 import { registerRoleAgents } from "../../src/router/role-agents";
@@ -47,6 +49,20 @@ vi.mock("../../src/routing/advisor", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/routing/advisor")>();
   return { ...actual, runAdvisor: vi.fn(actual.runAdvisor) };
 });
+// QA-P21-2-4: role agent registration can be made to fail for real (every preset model unusable), like an unusable floor tier.
+const registration = vi.hoisted(() => ({ broken: false }));
+vi.mock("../../src/router/role-agents", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/router/role-agents")>();
+  const unusable = (cfg: any) => ({
+    ...cfg,
+    presets: Object.fromEntries(Object.entries(cfg.presets ?? {}).map(([name, tiers]) => [name,
+      Object.fromEntries(Object.entries(tiers as Record<string, object>).map(([tier, def]) => [tier, { ...def, model: "no-slash" }]))])),
+  });
+  return {
+    ...actual,
+    registerRoleAgents: vi.fn((agents: any, cfg: any, opts: any) => actual.registerRoleAgents(agents, registration.broken ? unusable(cfg) : cfg, opts)),
+  };
+});
 // A pass-through spy on the run signal: the tests read what the plugin hands it (QA-P21-1-7 editsObserved).
 vi.mock("../../src/routing/outcomes/signals", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/routing/outcomes/signals")>();
@@ -66,6 +82,7 @@ afterEach(async () => {
   resetDispatchRouting();
   resetDispatchRegistry();
   resetIngestState();
+  registration.broken = false;
 });
 
 function temp(prefix = "omr-p21c-"): string {
@@ -749,12 +766,13 @@ describe("QA round 1 (P2.1)", () => {
     };
     const failed = await verify("v1", "r1", `check: fileExists path=${join(dir, "missing.txt")}`);
     expect(failed).toContain("NOT ACCEPTED");
-    expect(failed).toContain('resume the same task_id ("r1")');
-    expect(failed).toContain("with the findings above");
+    expect(failed).toContain('resume the same sessionID ("r1")');
+    expect(failed).toContain("with @implementer and the findings");
+    expect(failed).toContain("set neither `model` nor `tier=`");
     expect(failed).not.toContain("subagent_type");
     expect(failed).not.toMatch(/Task\(/);
     const unverifiable = await verify("v2", "r2", "criteria: the parser accepts every fixture");
-    expect(unverifiable).not.toContain('resume the same task_id ("r2")');
+    expect(unverifiable).not.toContain('resume the same sessionID ("r2")');
     expect(unverifiable).not.toContain("subagent_type");
   }, 60_000);
 
@@ -821,6 +839,111 @@ describe("QA round 1 (P2.1)", () => {
     o.onEvent("session.execution.succeeded", { sessionID: "m3" });
     expect(o.observe("m3", 3)).toBe(false); // 2 distinct steps
     expect(o.observe("m3", 2)).toBe(true);
+  });
+
+  it("QA-P21-2-2: after a verification FAIL the router raises the resumed child itself (consumed once, by that parent)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks);
+    rememberDispatch("rx", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
+      agent: "explorer", model: "anthropic/x", variant: null, tier: "fast", parentSessionID: "root", step: "dispatch",
+    });
+    const args = { subagent_type: "explorer", description: "find", prompt: `Find the loader\n[acceptance]\ncheck: fileExists path=${join(dir, "missing.txt")}\n[/acceptance]` };
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "f1" }, { args: { ...args } });
+    const output = { title: "", output: "DONE: found it", metadata: { sessionId: "rx" } };
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: "f1", args }, output);
+    expect(output.output).toContain("the router raises it to medium");
+    expect(output.output).not.toContain("[route tier=");
+    const resume = async (id: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "explorer", sessionID: "rx", prompt: "[route class=search risk=low scope=single]\naddress the findings" } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      return routedRoleOf(id)!;
+    };
+    const raised = await resume("f2");
+    expect(raised.tier).toBe("medium");
+    expect(raised.notes).toContain("raise:verification-fail:medium");
+    expect((await resume("f3")).notes.some((note) => note.startsWith("raise:"))).toBe(false); // consumed once
+  }, 60_000);
+
+  it("QA-P21-2-3: a role dispatch's own CAP:3 caps its child's reads (banners, CAP REACHED, budget note); no CAP, no cap", async () => {
+    let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir, "v2", { routerOnBudgetSnapshot: (read: typeof snapshot) => { snapshot = read; } });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks, { budgetSnapshot: snapshot! });
+    const fresh = async (callID: string, child: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "explorer", description: "find", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      sessions[child] = { id: child, parentID: "root", agent: "explorer", title: event.input.description, location: { directory: dir } };
+    };
+    const read = async (child: string, i: number): Promise<string> => {
+      const args = { path: join(dir, `${child}-${i}.ts`) };
+      await v2.toolHooks["execute.before"]({ sessionID: child, agent: "explorer", messageID: "m", id: `${child}-${i}`, tool: "read", input: { ...args } });
+      const output = { title: "", output: `content ${i}`, metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: "explorer", callID: `${child}-${i}`, args: { filePath: args.path } }, output);
+      return output.output;
+    };
+    await fresh("k1", "capped", "CAP:3\nFind the loader");
+    const outputs = [await read("capped", 1), await read("capped", 2), await read("capped", 3)];
+    expect(outputs[0]).toContain("[cap: 1/3]");
+    expect(outputs[2]).toContain("CAP REACHED (3/3)");
+    expect(snapshot!("capped").readCapReached).toBe(true);
+    const event = parentCall("k1", "capped", "explorer", "NEED MORE: budget\nread 3 files");
+    await v2.toolHooks["execute.after"](event);
+    expect(resultText(event)).toContain(`${ROUTER_BUDGET_NOTE_PREFIX} @explorer`);
+
+    await fresh("k2", "uncapped", "Find the loader");
+    expect(await read("uncapped", 1)).not.toContain("[cap:");
+    expect(snapshot!("uncapped").readCapReached).toBe(false);
+  });
+
+  it("QA-P21-2-4: a role whose agent registration failed is not live — the dispatch takes the tier path, the protocol stays tiers", async () => {
+    registration.broken = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let live: ((agent: string) => boolean) | undefined;
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir, "v2", { routerRoleLive: (agent: string) => live?.(agent) });
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { onRoleLive: (isLive) => { live = isLive; } });
+    expect(JSON.stringify(warn.mock.calls)).toContain("role agent registration failed");
+    expect(live!("explorer")).toBe(false);
+    const event = { sessionID: "root", agent: "build", messageID: "m", id: "l1", tool: "subagent", input: { agent: "explorer", description: "find", prompt: "find x" } as Record<string, unknown> };
+    await v2.toolHooks["execute.before"](event);
+    expect(event.input.description).toBe("find"); // no nonce
+    expect(event.input.model).toBeUndefined(); // no role model
+    expect(routedRoleOf("l1")).toBeUndefined();
+    const output = { system: [] as string[] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: "root", model: { providerID: "openai", modelID: "gpt-x" } }, output);
+    const enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off";
+    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
+  });
+
+  it("QA-P21-2 nit 1: a context overflow named in error.data.message is a stop", () => {
+    const o = createHostBudgetObserver();
+    o.onEvent("session.step.failed", { sessionID: "n1", error: { type: "provider", data: { message: "prompt is too long: 230000 tokens" } } });
+    expect(o.observe("n1", 100)).toBe(true);
+  });
+
+  it("QA-P21-2 nit 2: previewAuthority decides like consumeAuthority without consuming anything", () => {
+    const general = resolveRoles(home(ROLES).cfg, "v2").get("general")!;
+    const binding = (kind: "exact" | "unknown") => ({
+      childSessionID: "pa", kind, grant: { actions: new Set(["read"] as const), notes: [], workRoot: "/w" }, candidates: [], decisionID: null, budget: null,
+    });
+    let kind: "exact" | "unknown" = "exact";
+    const deps = { roleOf: () => general, roles: () => new Map([["general", general]]), bindingOf: () => binding(kind) as never };
+    expect(previewAuthority("pa", deps, { afterCall: "c1", exactOnly: true })).toEqual({ status: "none" });
+    requestAuthority("pa", { actions: ["edit"], reason: "patch" }, deps);
+    expect(previewAuthority("pa", deps, { afterCall: "c1", exactOnly: true })).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.notAnnotated });
+    markAnnotated("pa", "c1", "root");
+    expect(previewAuthority("pa", deps, { afterCall: "c2", exactOnly: true })).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.otherCall });
+    expect(previewAuthority("pa", deps, { afterCall: "c1", exactOnly: true })).toEqual({ status: "widened", widened: ["edit"] });
+    kind = "unknown";
+    expect(previewAuthority("pa", deps, { afterCall: "c1", exactOnly: true })).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.bindingUnknown });
+    expect(previewAuthority("pa", deps, { afterCall: "c1" })).toEqual({ status: "widened", widened: ["edit"] });
+    expect(requestedAuthority("pa")).toMatchObject({ annotated: true, callID: "c1" }); // nothing consumed
   });
 
   it("P2.2: the budget note starts with the protocol's prefix", () => {
