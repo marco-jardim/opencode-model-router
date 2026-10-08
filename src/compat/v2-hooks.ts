@@ -493,26 +493,19 @@ export interface RoleAuthorityInput {
   readonly ownOutputs?: ReadonlySet<string>;
 }
 
-/** The host's truncation marker (OpenCode v2 `tool-output-store.ts`: `... output truncated; full content saved to <path> ...`). */
-const TRUNCATION_MARKER = /\.\.\. output truncated; full content saved to (.+?) \.\.\./g;
 /** The shape of a tool-output store file: `<data>/tool-output/tool_<id>` (`MANAGED_DIRECTORY`, `tool_${Identifier.ascending()}`). */
 const TOOL_OUTPUT_FILE = /[\\/]tool-output[\\/]tool_[A-Za-z0-9_-]+$/;
 /** The host's tool-output `external_directory` rule (`path.join(Global.Path.data, "tool-output", "*")`). */
 const TOOL_OUTPUT_GLOB = /[\\/]tool-output[\\/]\*$/;
 
 /**
- * QA-P23-2-A1: the files named by the host's truncation markers in a tool result's text, when they have the tool-output store's
- * shape (absolute, `…/tool-output/tool_<id>`, no wildcard). Anything else in a marker — a path a file's content made up — is
- * ignored.
+ * QA-P23-3-1: the host's tool-success event — the only source of a session's own truncated outputs (its structured
+ * `outputPaths`). OpenCode source (`packages/schema/src/session-event.ts` `SessionEvent.Tool.Success`, published by
+ * `session/runner/publish-llm-event.ts` with the `outputPaths` of `ToolOutputStore.bound`, `tool/registry.ts`):
+ * `session.next.tool.success`, versioned `.<n>` when published; the plugin protocol the router builds against (2.0.22) names it
+ * `session.tool.success`. Exactly these names; no other event, and never text in a tool result, makes an output a session's own.
  */
-export function truncationMarkerPaths(text: string): string[] {
-  const out: string[] = [];
-  for (const match of text.matchAll(TRUNCATION_MARKER)) {
-    const path = match[1]!.trim();
-    if ((posix.isAbsolute(path) || win32.isAbsolute(path)) && TOOL_OUTPUT_FILE.test(path) && !/[*?\0]/.test(path) && !out.includes(path)) out.push(path);
-  }
-  return out;
-}
+export const HOST_TOOL_SUCCESS_EVENT = /^session\.(?:next\.)?tool\.success(?:\.\d+)?$/;
 
 /** `target` (canonical) is exactly one of the session's own truncated outputs (win32 case folding, the max policy's matcher). */
 function ownOutput(target: string, outputs: ReadonlySet<string> | undefined): boolean {
@@ -855,21 +848,19 @@ export async function registerV2Hooks(
     }
   };
   /**
-   * QA-P23-2-A1: per session, the canonical paths of its OWN truncated tool outputs — named by the host's truncation marker in
-   * that session's own tool results (`execute.after`) or by the host's `outputPaths` on that session's events; a marker path must
-   * sit in the host's tool-output directory when the role agents' inherited rules named it (`hostOutputDirs`). Bounded (1000
-   * sessions, 64 files each, oldest first out); cleared on `session.deleted`.
+   * QA-P23-2-A1 / QA-P23-3-1: per session, the canonical paths of its OWN truncated tool outputs — ONLY the structured
+   * `outputPaths` the host puts on that session's own tool-success event ({@link HOST_TOOL_SUCCESS_EVENT}). Free text (a
+   * truncation marker in a tool result, a file's content, a run's output) never makes a file a session's own. A path must have the
+   * tool-output store's shape (`…/tool-output/tool_<id>`) before and after canonicalisation. Bounded (1000 sessions, 64 files each,
+   * oldest first out); cleared on `session.deleted`.
    */
   const ownOutputs = new Map<string, Set<string>>();
-  const hostOutputDirs = new Set<string>();
-  const rememberOutputs = (sessionID: unknown, paths: readonly string[], fromHost: boolean): void => {
+  const rememberOutputs = (sessionID: unknown, paths: readonly string[]): void => {
     if (typeof sessionID !== "string" || sessionID === "" || paths.length === 0) return;
     for (const path of paths) {
-      if (!TOOL_OUTPUT_FILE.test(path) || /[*?\0]/.test(path)) continue;
+      if (!(posix.isAbsolute(path) || win32.isAbsolute(path)) || !TOOL_OUTPUT_FILE.test(path) || /[*?\0]/.test(path)) continue;
       const canonical = canonicalAuthorityPath(path, path.replace(/[\\/][^\\/]+$/, ""));
       if (canonical === undefined || !TOOL_OUTPUT_FILE.test(canonical)) continue;
-      const dir = canonical.replace(/[\\/][^\\/]+$/, "");
-      if (!fromHost && hostOutputDirs.size > 0 && ![...hostOutputDirs].some((known) => permissionMatches(dir, known))) continue;
       const files = ownOutputs.get(sessionID) ?? new Set<string>();
       ownOutputs.delete(sessionID);
       files.delete(canonical);
@@ -1155,10 +1146,6 @@ export async function registerV2Hooks(
               const outputs = inherited.filter((rule) => rule.action === "external_directory" && rule.effect === "allow"
                 && TOOL_OUTPUT_GLOB.test(rule.resource));
               rules = [...rules, ...outputs.map((rule) => ({ action: rule.action, resource: rule.resource, effect: rule.effect }))];
-              for (const rule of outputs) {
-                const dir = rule.resource.replace(/[\\/]\*$/, "");
-                hostOutputDirs.add(canonicalAuthorityPath(dir, dir) ?? dir);
-              }
             }
             agent.permissions = publishReadOnlyPermissions(
               name, rules, inherited, warnPermissionOnce, { plugin: marker !== undefined },
@@ -1613,15 +1600,6 @@ export async function registerV2Hooks(
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
       dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
-      // QA-P23-2-A1: the files the host's truncation markers name in this session's OWN tool result (never throws).
-      try {
-        const raw = (event as { result?: unknown }).result as Record<string, unknown> | undefined;
-        const structured = raw?.output as Record<string, unknown> | string | undefined;
-        const texts = [contentText(raw?.content), typeof structured === "string" ? structured : typeof structured?.output === "string" ? structured.output : ""];
-        rememberOutputs(event.sessionID, truncationMarkerPaths(texts.join("\n")), false);
-      } catch {
-        // a malformed result names no output file
-      }
       const role = event.tool === "subagent" ? await roleAfterCall({
         id: event.id, sessionID: String(event.sessionID), status: event.status,
         result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
@@ -1730,9 +1708,9 @@ export async function registerV2Hooks(
         try {
           const data = event.data as Record<string, any>;
           hostBudget.onEvent(event.type, data); // handoff 22 (S4): step counts, step-limit tool refusals, overflow failures
-          // QA-P23-2-A1: the host names a tool result's saved full output on that session's tool event (`outputPaths`).
-          if (data && Array.isArray(data.outputPaths)) {
-            rememberOutputs(data.sessionID, data.outputPaths.filter((path: unknown): path is string => typeof path === "string"), true);
+          // QA-P23-2-A1 / QA-P23-3-1: the host names a tool result's saved full output on that session's tool-success event only.
+          if (HOST_TOOL_SUCCESS_EVENT.test(event.type) && data && Array.isArray(data.outputPaths)) {
+            rememberOutputs(data.sessionID, data.outputPaths.filter((path: unknown): path is string => typeof path === "string"));
           }
           if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
