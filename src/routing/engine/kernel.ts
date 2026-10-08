@@ -701,9 +701,31 @@ export function decideRole(input: RoleDecisionInput): RoleDecision {
   const switched = enforce && !resumed && decision.switched && decision.target !== null;
   const exploit = switched ? cands.indexOf(decision.target!) : base;
 
-  const dispatch = exploit;
-  const explore = false;
-  const propensity = 1;
+  // --- exploration (T1.2.4) --------------------------------------------------------------------------------
+  const rate = enforce ? explorationRate(input.exploration?.rate) : 0;
+  const targets: number[] = [];
+  const def = ladder.staticDefault;
+  const floorRank = ladder.floorRank;
+  const eligible = rate > 0 && !pinned && !resumed && input.facts.risk !== "high" && input.detection === "deterministic";
+  if (eligible && def !== null && floorRank !== null) {
+    for (let k = 0; k < cands.length; k++) {
+      if (cands[k]!.rank >= floorRank && rungAbove(cands[def]!, cands[k]!)) targets.push(k);
+    }
+  }
+  let dispatch = exploit;
+  let explore = false;
+  let propensity = 1;
+  if (targets.length > 0) {
+    const draw = seededDraws(input.exploration!.decisionID);
+    const u = draw();
+    const v = draw();
+    if (u < rate) {
+      explore = true;
+      dispatch = targets[Math.min(targets.length - 1, Math.floor(v * targets.length))]!;
+      reasons.push("explore");
+    }
+    propensity = (dispatch === exploit ? 1 - rate : 0) + (targets.includes(dispatch) ? rate / targets.length : 0);
+  }
 
   return Object.freeze({
     decision,
