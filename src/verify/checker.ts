@@ -10,6 +10,7 @@ import { scrubText } from "../guard/scrub";
 import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
 import { captureBudget } from "../guard/enforce";
 import type { BudgetSnapshot } from "../guard/enforce";
+import { parseReturnPrefix } from "../routing/outcomes/signals";
 
 // ---------------------------------------------------------------------------
 // Incomplete returns (§2.9 E8, I7)
@@ -45,8 +46,15 @@ export function isIncompleteVerdict(verdict: object): boolean {
 /** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
 const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*[ \t]*:/m;
 
-/** `NEED MORE: budget` at the start of a line (QA-P15-1-2). */
-const NEED_MORE_BUDGET_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
+/**
+ * `NEED MORE: budget` claimed by the RETURN PREFIX only (the first non-empty line after unwrapping the
+ * task envelope and markdown/list decoration; DF-1 fix): a later line quoting it, or a DONE:/ESCALATE:
+ * return, is never a budget claim.
+ */
+function claimsNeedMoreBudget(text: string): boolean {
+  const contract = parseReturnPrefix(text);
+  return contract !== null && contract.prefix === "need-more" && contract.claim === "budget";
+}
 
 /** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
 const ANNOUNCE_RE = /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue)\b/i;
@@ -133,7 +141,7 @@ export function incompleteVerdict(
   const snapshot = input.budget ?? (opts.budgetSnapshot ?? captureBudget)(input.producerSessionID);
   if (
     (snapshot.stopped && !CONTRACT_MARKER_RE.test(text)) ||
-    (NEED_MORE_BUDGET_RE.test(text) && claimHonoured(snapshot))
+    (claimsNeedMoreBudget(text) && claimHonoured(snapshot))
   ) {
     return incomplete(BUDGET_INCOMPLETE_REASON);
   }
