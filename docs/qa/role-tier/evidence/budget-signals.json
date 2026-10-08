@@ -1,34 +1,34 @@
 {
   "test": "budget-signals",
-  "recordedAt": "2026-10-08T21:41:26.254Z",
+  "recordedAt": "2026-10-08T22:34:19.383Z",
   "observed": {
     "budget": {
       "label": "budget",
       "callID": "toolu_smoke_1",
-      "childID": "ses_ee289ade0ffen5sul329JpAh7T",
-      "parentText": "<subagent sessionID=\"ses_ee289ade0ffen5sul329JpAh7T\" state=\"completed\">\nNEED MORE: budget\nread e0.txt to e2.txt; e3.txt and e4.txt remain\n</subagent>\n[router budget] @explorer stopped on its tool-call budget before finishing: this is not a failed result. NEXT: resume the same sessionID (\"ses_ee289ade0ffen5sul329JpAh7T\") with @explorer and the prompt \"continue and finish\"; do not start a new task and do not set `model` (the router keeps the child's tier).\nNEED MORE: budget\nread e0.txt to e2.txt; e3.txt and e4.txt remain\n\n[router budget] @explorer stopped on its tool-call budget before finishing: this is not a failed result. NEXT: resume the same sessionID (\"ses_ee289ade0ffen5sul329JpAh7T\") with @explorer and the prompt \"continue and finish\"; do not start a new task and do not set `model` (the router keeps the child's tier).",
-      "firstUser": "{\"id\":\"msg_11d7652c9001caHlFmqkOfaE4I\",\"time\":{\"created\":1791495656172},\"text\":\"You are a subagent spawned by another session.\\nTASK: read the five e files\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=7528532e-9508-4b1b-9597-f77bb7c9a4b7\",\"type\":\"user\"}",
+      "childID": "ses_ee2594248ffeTimjDws1ihsbOM",
+      "parentText": "<subagent sessionID=\"ses_ee2594248ffeTimjDws1ihsbOM\" state=\"completed\">\nNEED MORE: budget\nread e0.txt to e2.txt; e3.txt and e4.txt remain\n</subagent>\n[router budget] @explorer stopped on its tool-call budget before finishing: this is not a failed result. NEXT: resume the same sessionID (\"ses_ee2594248ffeTimjDws1ihsbOM\") with @explorer and the prompt \"continue and finish\"; do not start a new task and do not set `model` (the router keeps the child's tier).\nNEED MORE: budget\nread e0.txt to e2.txt; e3.txt and e4.txt remain\n\n[router budget] @explorer stopped on its tool-call budget before finishing: this is not a failed result. NEXT: resume the same sessionID (\"ses_ee2594248ffeTimjDws1ihsbOM\") with @explorer and the prompt \"continue and finish\"; do not start a new task and do not set `model` (the router keeps the child's tier).",
+      "firstUser": "{\"id\":\"msg_11da6be4c0014H6IsohaCLlTj4\",\"time\":{\"created\":1791498829412},\"text\":\"You are a subagent spawned by another session.\\nTASK: read the five e files\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e0.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e1.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e2.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e3.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e4.txt\\\"}}],\\\"final\\\":\\\"NEED MORE: budget\\\\nread e0.txt to e2.txt; e3.txt and e4.txt remain\\\"}\\nOMR_NONCE=528b0c1a-8bef-4619-a8f6-b826037b7550\",\"type\":\"user\"}",
       "states": [
         {
-          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e0.txt, lines 1-1\n1: main",
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e0.txt, lines 1-1\n1: main",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e0.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e0.txt"
           },
           "tool": "read",
           "status": "completed"
         },
         {
-          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e1.txt, lines 1-1\n1: main",
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e1.txt, lines 1-1\n1: main",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e1.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e1.txt"
           },
           "tool": "read",
           "status": "completed"
         },
         {
-          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e2.txt, lines 1-1\n1: main",
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e2.txt, lines 1-1\n1: main",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e2.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e2.txt"
           },
           "tool": "read",
           "status": "completed"
@@ -36,7 +36,7 @@
         {
           "text": "",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e3.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e3.txt"
           },
           "tool": "read",
           "status": "error",
@@ -46,7 +46,7 @@
         {
           "text": "",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e4.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e4.txt"
           },
           "tool": "read",
           "status": "error",
@@ -69,7 +69,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -86,7 +88,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -103,7 +107,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -120,7 +126,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -137,7 +145,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -154,7 +164,9 @@
             "router_git_status"
           ],
           "reply": "text",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         }
       ],
@@ -186,29 +198,29 @@
       ],
       "parentStatus": "completed",
       "agent": "explorer",
-      "title": "signals budget [nonce 7528532e-9508-4b1b-9597-f77bb7c9a4b7]",
+      "title": "signals budget [nonce 528b0c1a-8bef-4619-a8f6-b826037b7550]",
       "model": "anthropic/claude-sonnet-5-5#low",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
     "budgetResume": {
       "label": "budget resume",
       "callID": "toolu_smoke_9",
-      "childID": "ses_ee289ade0ffen5sul329JpAh7T",
-      "parentText": "<subagent sessionID=\"ses_ee289ade0ffen5sul329JpAh7T\" state=\"completed\">\nDONE: e3.txt:1 e4.txt:1\n</subagent>\nDONE: e3.txt:1 e4.txt:1",
-      "firstUser": "{\"id\":\"msg_11d7652c9001caHlFmqkOfaE4I\",\"time\":{\"created\":1791495656172},\"text\":\"You are a subagent spawned by another session.\\nTASK: read the five e files\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=7528532e-9508-4b1b-9597-f77bb7c9a4b7\",\"type\":\"user\"}",
+      "childID": "ses_ee2594248ffeTimjDws1ihsbOM",
+      "parentText": "<subagent sessionID=\"ses_ee2594248ffeTimjDws1ihsbOM\" state=\"completed\">\nDONE: e3.txt:1 e4.txt:1\n</subagent>\nDONE: e3.txt:1 e4.txt:1",
+      "firstUser": "{\"id\":\"msg_11da6be4c0014H6IsohaCLlTj4\",\"time\":{\"created\":1791498829412},\"text\":\"You are a subagent spawned by another session.\\nTASK: read the five e files\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e0.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e1.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e2.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e3.txt\\\"}},{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e4.txt\\\"}}],\\\"final\\\":\\\"NEED MORE: budget\\\\nread e0.txt to e2.txt; e3.txt and e4.txt remain\\\"}\\nOMR_NONCE=528b0c1a-8bef-4619-a8f6-b826037b7550\",\"type\":\"user\"}",
       "states": [
         {
-          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e3.txt, lines 1-1\n1: main",
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e3.txt, lines 1-1\n1: main",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e3.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e3.txt"
           },
           "tool": "read",
           "status": "completed"
         },
         {
-          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e4.txt, lines 1-1\n1: main",
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e4.txt, lines 1-1\n1: main",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e4.txt"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e4.txt"
           },
           "tool": "read",
           "status": "completed"
@@ -229,7 +241,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -246,7 +260,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -263,7 +279,9 @@
             "router_git_status"
           ],
           "reply": "text",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         }
       ],
@@ -311,23 +329,23 @@
       ],
       "parentStatus": "completed",
       "agent": "explorer",
-      "title": "signals budget [nonce 7528532e-9508-4b1b-9597-f77bb7c9a4b7]",
+      "title": "signals budget [nonce 528b0c1a-8bef-4619-a8f6-b826037b7550]",
       "model": "anthropic/claude-sonnet-5-5#low",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
-    "verdictPass": "<subagent sessionID=\"ses_ee28992a0ffe6DOM0Ow2in6Q6G\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: deterministic]\nCHILD_OK\n\n[router ✓ verified: deterministic]",
-    "verdictFail": "<subagent sessionID=\"ses_ee289894affeKwUEIX14fB9WFl\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\lexer-never-created.ts\nNEXT: resume the same sessionID (\"ses_ee289894affeKwUEIX14fB9WFl\") with @architect and the findings (it already runs on its highest tier, heavy); set neither `model` nor `tier=`; do not start a new task and do not treat the prior result as complete.\nCHILD_OK\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\lexer-never-created.ts\nNEXT: resume the same sessionID (\"ses_ee289894affeKwUEIX14fB9WFl\") with @architect and the findings (it already runs on its highest tier, heavy); set neither `model` nor `tier=`; do not start a new task and do not treat the prior result as complete.",
+    "verdictPass": "<subagent sessionID=\"ses_ee2592d4effewQQeYaN21z3vlY\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: deterministic]\nCHILD_OK\n\n[router ✓ verified: deterministic]",
+    "verdictFail": "<subagent sessionID=\"ses_ee25926d4ffe9V9MICrfP9qMjz\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\lexer-never-created.ts\nNEXT: resume the same sessionID (\"ses_ee25926d4ffe9V9MICrfP9qMjz\") with @architect and the findings (it already runs on its highest tier, heavy); set neither `model` nor `tier=`; do not start a new task and do not treat the prior result as complete.\nCHILD_OK\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\lexer-never-created.ts\nNEXT: resume the same sessionID (\"ses_ee25926d4ffe9V9MICrfP9qMjz\") with @architect and the findings (it already runs on its highest tier, heavy); set neither `model` nor `tier=`; do not start a new task and do not treat the prior result as complete.",
     "run": {
       "label": "run",
       "callID": "toolu_smoke_20",
-      "childID": "ses_ee2898108ffe0VpZgvAuX45VF0",
-      "parentText": "<subagent sessionID=\"ses_ee2898108ffe0VpZgvAuX45VF0\" state=\"completed\">\nDONE: e5.txt:1 edited; smoke-marker exit code 0\n</subagent>\n\n\n[router ✓ verified: deterministic]\nDONE: e5.txt:1 edited; smoke-marker exit code 0\n\n[router ✓ verified: deterministic]",
-      "firstUser": "{\"id\":\"msg_11d767fa6001vvVT3QN4O0HERp\",\"time\":{\"created\":1791495667647},\"text\":\"You are a subagent spawned by another session.\\nTASK: update e5.txt and run the smoke-marker script\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\n[acceptance]\\ncheck: run command=\\\"npm run smoke-marker\\\"\\n[/acceptance]\\nOMR_NONCE=71cefd53-21f5-4d72-8713-6daf0a95d849\",\"type\":\"user\"}",
+      "childID": "ses_ee2591fb7ffeM1hH3zIBuL6J39",
+      "parentText": "<subagent sessionID=\"ses_ee2591fb7ffeM1hH3zIBuL6J39\" state=\"completed\">\nDONE: e5.txt:1 edited; smoke-marker exit code 0\n</subagent>\n\n\n[router ✓ verified: deterministic]\nDONE: e5.txt:1 edited; smoke-marker exit code 0\n\n[router ✓ verified: deterministic]",
+      "firstUser": "{\"id\":\"msg_11da6e0eb0011oIPRg6hfOgSJ7\",\"time\":{\"created\":1791498838269},\"text\":\"You are a subagent spawned by another session.\\nTASK: update e5.txt and run the smoke-marker script\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\e5.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"router_run\\\",\\\"input\\\":{\\\"script\\\":\\\"smoke-marker\\\",\\\"cwd\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\"}}],\\\"final\\\":\\\"DONE: e5.txt:1 edited; smoke-marker exit code 0\\\"}\\n[acceptance]\\ncheck: run command=\\\"npm run smoke-marker\\\"\\n[/acceptance]\\nOMR_NONCE=e773b16b-d3e0-494e-acab-b3a631587feb\",\"type\":\"user\"}",
       "states": [
         {
           "text": "Edited e5.txt (1 replacement)",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\e5.txt",
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\e5.txt",
             "oldString": "main",
             "newString": "edited"
           },
@@ -335,10 +353,10 @@
           "status": "completed"
         },
         {
-          "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.6 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",
+          "text": "[router_run] package.json script \"smoke-marker\": exit code: 0; duration 0.5 s\n\n> roles-smoke-world@1.0.0 smoke-marker\n> node smoke-marker.js\n\n",
           "input": {
             "script": "smoke-marker",
-            "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project"
+            "cwd": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project"
           },
           "tool": "router_run",
           "status": "completed"
@@ -363,7 +381,9 @@
             "write"
           ],
           "reply": "tool",
+          "effort": "medium",
           "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "medium"
         },
         {
@@ -384,7 +404,9 @@
             "write"
           ],
           "reply": "tool",
+          "effort": "medium",
           "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "medium"
         },
         {
@@ -405,7 +427,9 @@
             "write"
           ],
           "reply": "text",
+          "effort": "medium",
           "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "medium"
         }
       ],
@@ -421,16 +445,16 @@
       ],
       "parentStatus": "completed",
       "agent": "implementer",
-      "title": "signals run [nonce 71cefd53-21f5-4d72-8713-6daf0a95d849]",
+      "title": "signals run [nonce e773b16b-d3e0-494e-acab-b3a631587feb]",
       "model": "anthropic/claude-sonnet-5-5#medium",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
     "grader": {
       "label": "grader",
       "callID": "toolu_smoke_25",
-      "childID": "ses_ee2896e8dffexzdGlyHmZ5IPRU",
-      "parentText": "<subagent sessionID=\"ses_ee2896e8dffexzdGlyHmZ5IPRU\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: checker]\nCHILD_OK\n\n[router ✓ verified: checker]",
-      "firstUser": "{\"id\":\"msg_11d769221001gZGQW2yOKobOWN\",\"time\":{\"created\":1791495672375},\"text\":\"You are a subagent spawned by another session.\\nVERIFY: required\\nTASK: say where parse is defined\\n[acceptance]\\ncriteria: the reply names where parse is defined\\n[/acceptance]\\nOMR_NONCE=0c4055a0-74e3-461d-984a-426af2b19498\",\"type\":\"user\"}",
+      "childID": "ses_ee2590fc2ffedkgPJvCDA5WCIG",
+      "parentText": "<subagent sessionID=\"ses_ee2590fc2ffedkgPJvCDA5WCIG\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ✓ verified: checker]\nCHILD_OK\n\n[router ✓ verified: checker]",
+      "firstUser": "{\"id\":\"msg_11da6f0c8002pD8OFvuiAqHYYE\",\"time\":{\"created\":1791498842329},\"text\":\"You are a subagent spawned by another session.\\nVERIFY: required\\nTASK: say where parse is defined\\n[acceptance]\\ncriteria: the reply names where parse is defined\\n[/acceptance]\\nOMR_NONCE=a6e2c182-7870-4742-b0f8-8d19ce663747\",\"type\":\"user\"}",
       "states": [],
       "requests": [
         {
@@ -447,20 +471,22 @@
             "router_git_status"
           ],
           "reply": "text",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         }
       ],
       "evaluates": [],
       "parentStatus": "completed",
       "agent": "explorer",
-      "title": "signals grader [nonce 0c4055a0-74e3-461d-984a-426af2b19498]",
+      "title": "signals grader [nonce a6e2c182-7870-4742-b0f8-8d19ce663747]",
       "model": "anthropic/claude-sonnet-5-5#low",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6",
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV",
       "gradersRan": 1,
       "graderRequests": [
         {
-          "session": "ses_ee2896aeaffeuElNPLpb04G5Ud",
+          "session": "ses_ee2590cf5ffeUJrbbHGCa5eeSF",
           "agent": "model-router-grader",
           "catalogModel": "anthropic/claude-opus-5-5#default",
           "tier": "heavy"
@@ -470,14 +496,14 @@
     "incomplete": {
       "label": "incomplete",
       "callID": "toolu_smoke_29",
-      "childID": "ses_ee2896427ffe4GuHfdlyWH7RiU",
-      "parentText": "<subagent sessionID=\"ses_ee2896427ffe4GuHfdlyWH7RiU\" state=\"completed\">\nNEED MORE: the lexer module is missing from the context\n</subagent>\nNEED MORE: the lexer module is missing from the context",
-      "firstUser": "{\"id\":\"msg_11d769ca8001OpLYsmqJm3M28z\",\"time\":{\"created\":1791495675072},\"text\":\"You are a subagent spawned by another session.\\nTASK: sketch the parser design\\nCHILD_SCRIPT64(scrubbed)=[script omitted: it held unredacted temp paths; its steps are this child's tool states]\\nOMR_NONCE=3349f90a-fd8a-4192-80ba-c442c1f6d47f\",\"type\":\"user\"}",
+      "childID": "ses_ee2590737ffe4GWSGaswF94FRh",
+      "parentText": "<subagent sessionID=\"ses_ee2590737ffe4GWSGaswF94FRh\" state=\"completed\">\nNEED MORE: the lexer module is missing from the context\n</subagent>\nNEED MORE: the lexer module is missing from the context",
+      "firstUser": "{\"id\":\"msg_11da6f9590011zOOwNfQ3isPjB\",\"time\":{\"created\":1791498844523},\"text\":\"You are a subagent spawned by another session.\\nTASK: sketch the parser design\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"read\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-signals-3Jw2rW\\\\\\\\project\\\\\\\\parser.ts\\\"}}],\\\"final\\\":\\\"NEED MORE: the lexer module is missing from the context\\\"}\\nOMR_NONCE=f5513a38-c2c1-4d43-8c51-1c03d554bf19\",\"type\":\"user\"}",
       "states": [
         {
-          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\parser.ts, lines 1-3\n1: export function parse(text: string): string[] {\n2:   return text.split(' ');\n3: }",
+          "text": "Read file <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\parser.ts, lines 1-3\n1: export function parse(text: string): string[] {\n2:   return text.split(' ');\n3: }",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\project\\parser.ts"
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\project\\parser.ts"
           },
           "tool": "read",
           "status": "completed"
@@ -498,7 +524,9 @@
             "router_git_status"
           ],
           "reply": "tool",
+          "effort": "xhigh",
           "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+          "wireModel": "claude-opus-5-5",
           "tier": "heavy"
         },
         {
@@ -515,7 +543,9 @@
             "router_git_status"
           ],
           "reply": "text",
+          "effort": "xhigh",
           "catalogModel": "anthropic/claude-opus-5-5#xhigh",
+          "wireModel": "claude-opus-5-5",
           "tier": "heavy"
         }
       ],
@@ -531,16 +561,16 @@
       ],
       "parentStatus": "completed",
       "agent": "architect",
-      "title": "signals incomplete [nonce 3349f90a-fd8a-4192-80ba-c442c1f6d47f]",
+      "title": "signals incomplete [nonce f5513a38-c2c1-4d43-8c51-1c03d554bf19]",
       "model": "anthropic/claude-opus-5-5#xhigh",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
     "authority": {
       "label": "authority",
       "callID": "toolu_smoke_33",
-      "childID": "ses_ee2895a65ffeTOXmkelVfo76pF",
-      "parentText": "<subagent sessionID=\"ses_ee2895a65ffeTOXmkelVfo76pF\" state=\"completed\">\nESCALATE: authority\nedit is needed\n</subagent>\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the result must be written to a file\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee2895a65ffeTOXmkelVfo76pF\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.\nESCALATE: authority\nedit is needed\n\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the result must be written to a file\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee2895a65ffeTOXmkelVfo76pF\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.",
-      "firstUser": "{\"id\":\"msg_11d76a65400126BCWeJOVyWIyp\",\"time\":{\"created\":1791495677548},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64=eyJzdGVwcyI6W3sidG9vbCI6InJvdXRlcl9yZXF1ZXN0X2F1dGhvcml0eSIsImlucHV0Ijp7ImFjdGlvbnMiOlsiZWRpdCJdLCJyZWFzb24iOiJ0aGUgcmVzdWx0IG11c3QgYmUgd3JpdHRlbiB0byBhIGZpbGUifX1dLCJmaW5hbCI6IkVTQ0FMQVRFOiBhdXRob3JpdHlcbmVkaXQgaXMgbmVlZGVkIn0=\\nOMR_NONCE=a6ca1cc0-15be-4913-9743-45bf2c4dc8cf\",\"type\":\"user\"}",
+      "childID": "ses_ee258ff84ffenYE7OK1MInZXM7",
+      "parentText": "<subagent sessionID=\"ses_ee258ff84ffenYE7OK1MInZXM7\" state=\"completed\">\nESCALATE: authority\nedit is needed\n</subagent>\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the result must be written to a file\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee258ff84ffenYE7OK1MInZXM7\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.\nESCALATE: authority\nedit is needed\n\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the result must be written to a file\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee258ff84ffenYE7OK1MInZXM7\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.",
+      "firstUser": "{\"id\":\"msg_11da70118001StF04l1gnjOamQ\",\"time\":{\"created\":1791498846506},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"router_request_authority\\\",\\\"input\\\":{\\\"actions\\\":[\\\"edit\\\"],\\\"reason\\\":\\\"the result must be written to a file\\\"}}],\\\"final\\\":\\\"ESCALATE: authority\\\\nedit is needed\\\"}\\nOMR_NONCE=80f22c6e-ff0d-457c-9c32-3443e26d1b20\",\"type\":\"user\"}",
       "states": [
         {
           "text": "Authority request recorded: edit. Stop now and return `ESCALATE: authority` naming edit and why; the parent resumes this task with the wider grant.",
@@ -570,7 +600,9 @@
             "router_request_authority"
           ],
           "reply": "tool",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         },
         {
@@ -588,23 +620,25 @@
             "router_request_authority"
           ],
           "reply": "text",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         }
       ],
       "evaluates": [],
       "parentStatus": "completed",
       "agent": "general",
-      "title": "signals authority [nonce a6ca1cc0-15be-4913-9743-45bf2c4dc8cf]",
+      "title": "signals authority [nonce 80f22c6e-ff0d-457c-9c32-3443e26d1b20]",
       "model": "anthropic/claude-sonnet-5-5#low",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
     "first": {
       "label": "redispatch first",
       "callID": "toolu_smoke_37",
-      "childID": "ses_ee289511fffe28MVQeYTjgxV6m",
-      "parentText": "<subagent sessionID=\"ses_ee289511fffe28MVQeYTjgxV6m\" state=\"completed\">\nDONE: parser.ts:1 parse\n</subagent>\nDONE: parser.ts:1 parse",
-      "firstUser": "{\"id\":\"msg_11d76afa1001OePCsUCUhLXINK\",\"time\":{\"created\":1791495679939},\"text\":\"You are a subagent spawned by another session.\\nTASK: find the exported entry points of parser.ts and list them with file:line\\nCHILD_SCRIPT64=eyJzdGVwcyI6W10sImZpbmFsIjoiRE9ORTogcGFyc2VyLnRzOjEgcGFyc2UifQ==\\nOMR_NONCE=2d90ec60-2ec5-49da-a58b-154340090a2a\",\"type\":\"user\"}",
+      "childID": "ses_ee258f814ffer6LxUBtnACUA33",
+      "parentText": "<subagent sessionID=\"ses_ee258f814ffer6LxUBtnACUA33\" state=\"completed\">\nDONE: parser.ts:1 parse\n</subagent>\nDONE: parser.ts:1 parse",
+      "firstUser": "{\"id\":\"msg_11da7087f001cMpUfHcbjziUYp\",\"time\":{\"created\":1791498848401},\"text\":\"You are a subagent spawned by another session.\\nTASK: find the exported entry points of parser.ts and list them with file:line\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[],\\\"final\\\":\\\"DONE: parser.ts:1 parse\\\"}\\nOMR_NONCE=9faef9b3-88a9-42c4-853a-daa32505c9c7\",\"type\":\"user\"}",
       "states": [],
       "requests": [
         {
@@ -621,23 +655,25 @@
             "router_git_status"
           ],
           "reply": "text",
+          "effort": "low",
           "catalogModel": "anthropic/claude-sonnet-5-5#low",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "fast"
         }
       ],
       "evaluates": [],
       "parentStatus": "completed",
       "agent": "explorer",
-      "title": "signals redispatch first [nonce 2d90ec60-2ec5-49da-a58b-154340090a2a]",
+      "title": "signals redispatch first [nonce 9faef9b3-88a9-42c4-853a-daa32505c9c7]",
       "model": "anthropic/claude-sonnet-5-5#low",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
     "again": {
       "label": "redispatch again",
       "callID": "toolu_smoke_40",
-      "childID": "ses_ee28948f5ffeYGVmTFkI3ZKmKP",
-      "parentText": "<subagent sessionID=\"ses_ee28948f5ffeYGVmTFkI3ZKmKP\" state=\"completed\">\nDONE: parser.ts:1 parse\n</subagent>\nDONE: parser.ts:1 parse",
-      "firstUser": "{\"id\":\"msg_11d76b7cd0015DyNkBh7HoHKd5\",\"time\":{\"created\":1791495682021},\"text\":\"You are a subagent spawned by another session.\\nTASK: find the exported entry points of parser.ts and list them with file:line\\nCHILD_SCRIPT64=eyJzdGVwcyI6W10sImZpbmFsIjoiRE9ORTogcGFyc2VyLnRzOjEgcGFyc2UifQ==\\nOMR_NONCE=28186229-2981-4ccc-9750-83a219a8a2d7\",\"type\":\"user\"}",
+      "childID": "ses_ee258f12dffeveLPhEP3hCt6xo",
+      "parentText": "<subagent sessionID=\"ses_ee258f12dffeveLPhEP3hCt6xo\" state=\"completed\">\nDONE: parser.ts:1 parse\n</subagent>\nDONE: parser.ts:1 parse",
+      "firstUser": "{\"id\":\"msg_11da70f59001jkoYRBseaDmVRw\",\"time\":{\"created\":1791498850153},\"text\":\"You are a subagent spawned by another session.\\nTASK: find the exported entry points of parser.ts and list them with file:line\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[],\\\"final\\\":\\\"DONE: parser.ts:1 parse\\\"}\\nOMR_NONCE=2cd3f2c2-46fa-4ae4-b04c-39febfb5fe32\",\"type\":\"user\"}",
       "states": [],
       "requests": [
         {
@@ -654,16 +690,18 @@
             "router_git_status"
           ],
           "reply": "text",
+          "effort": "medium",
           "catalogModel": "anthropic/claude-sonnet-5-5#medium",
+          "wireModel": "claude-sonnet-5-5",
           "tier": "medium"
         }
       ],
       "evaluates": [],
       "parentStatus": "completed",
       "agent": "explorer",
-      "title": "signals redispatch again [nonce 28186229-2981-4ccc-9750-83a219a8a2d7]",
+      "title": "signals redispatch again [nonce 2cd3f2c2-46fa-4ae4-b04c-39febfb5fe32]",
       "model": "anthropic/claude-sonnet-5-5#medium",
-      "parentID": "ses_ee289bbe5ffe28h2Liwm7CFBY6"
+      "parentID": "ses_ee2594fbfffeMksk4k9cn56IzV"
     },
     "found": {
       "verdictPass": true,
@@ -686,7 +724,7 @@
     ],
     "signals": [
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495655491:5bfd1a717eb5a278:1",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498828868:b591a636452c223c:1",
         "reason": "note:signal:budget:none",
         "role": "explorer",
         "tier": "fast",
@@ -699,13 +737,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee289ade0ffen5sul329JpAh7T",
+        "childSessionID": "ses_ee2594248ffeTimjDws1ihsbOM",
         "signal": "budget",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495662262:5bfd1a717eb5a278:3",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498834242:b591a636452c223c:3",
         "reason": "note:signal:verdict:pass",
         "role": "architect",
         "tier": "heavy",
@@ -718,13 +756,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee28992a0ffe6DOM0Ow2in6Q6G",
+        "childSessionID": "ses_ee2592d4effewQQeYaN21z3vlY",
         "signal": "verdict",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495664785:5bfd1a717eb5a278:4",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498835940:b591a636452c223c:4",
         "reason": "note:signal:verdict:fail",
         "role": "architect",
         "tier": "heavy",
@@ -737,13 +775,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee289894affeKwUEIX14fB9WFl",
+        "childSessionID": "ses_ee25926d4ffe9V9MICrfP9qMjz",
         "signal": "verdict",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495667044:5bfd1a717eb5a278:5",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498837660:b591a636452c223c:5",
         "reason": "note:signal:run:pass",
         "role": "implementer",
         "tier": "medium",
@@ -759,13 +797,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee2898108ffe0VpZgvAuX45VF0",
+        "childSessionID": "ses_ee2591fb7ffeM1hH3zIBuL6J39",
         "signal": "run",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495667044:5bfd1a717eb5a278:5",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498837660:b591a636452c223c:5",
         "reason": "note:signal:verdict:pass",
         "role": "implementer",
         "tier": "medium",
@@ -781,13 +819,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee2898108ffe0VpZgvAuX45VF0",
+        "childSessionID": "ses_ee2591fb7ffeM1hH3zIBuL6J39",
         "signal": "verdict",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495671744:5bfd1a717eb5a278:6",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498841797:b591a636452c223c:6",
         "reason": "note:signal:grader:pass",
         "role": "explorer",
         "tier": "fast",
@@ -800,13 +838,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee2896e8dffexzdGlyHmZ5IPRU",
+        "childSessionID": "ses_ee2590fc2ffedkgPJvCDA5WCIG",
         "signal": "grader",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495674437:5bfd1a717eb5a278:7",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498844011:b591a636452c223c:7",
         "reason": "note:signal:incomplete:fail",
         "role": "architect",
         "tier": "heavy",
@@ -819,13 +857,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee2896427ffe4GuHfdlyWH7RiU",
+        "childSessionID": "ses_ee2590737ffe4GWSGaswF94FRh",
         "signal": "incomplete",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495676848:5bfd1a717eb5a278:8",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498845993:b591a636452c223c:8",
         "reason": "note:signal:authority:none",
         "role": "general",
         "tier": "fast",
@@ -838,13 +876,13 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee2895a65ffeTOXmkelVfo76pF",
+        "childSessionID": "ses_ee258ff84ffenYE7OK1MInZXM7",
         "signal": "authority",
         "pinned": false,
         "switched": false
       },
       {
-        "decisionID": "ses_ee289bbe5ffe28h2Liwm7CFBY6:1791495679261:5bfd1a717eb5a278:9",
+        "decisionID": "ses_ee2594fbfffeMksk4k9cn56IzV:1791498847869:b591a636452c223c:9",
         "reason": "note:signal:redispatch:fail",
         "role": "explorer",
         "tier": "fast",
@@ -857,7 +895,7 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee289511fffe28MVQeYTjgxV6m",
+        "childSessionID": "ses_ee258f814ffer6LxUBtnACUA33",
         "signal": "redispatch",
         "pinned": false,
         "switched": false
@@ -866,7 +904,7 @@
     "disk": {
       "e5": "edited\n",
       "marker": true,
-      "wt1": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-29288-1791495430562\\omr-p32-roles-signals-p5cSKR\\wt-1"
+      "wt1": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-signals-3Jw2rW\\wt-1"
     },
     "unknownBindings": [],
     "routerWarnings": [],

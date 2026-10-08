@@ -1,6 +1,6 @@
 {
   "test": "exploration",
-  "recordedAt": "2026-10-08T21:42:04.834Z",
+  "recordedAt": "2026-10-08T22:34:56.451Z",
   "observed": {
     "draws": [
       {
@@ -8,7 +8,7 @@
         "tier": "medium",
         "model": "anthropic/claude-sonnet-5-5#medium",
         "row": {
-          "decisionID": "ses_ee2892641ffecFVxxpkimVlrSH:1791495694121:95c9754ce39f38f0:1",
+          "decisionID": "ses_ee258bf3cffeqjpKh9AdNlBV6p:1791498865951:7cbbe7a8ac482cd6:1",
           "reason": "kept:evidence: the cheapest option implement|role:explorer|anthropic/claude-sonnet-5-5#low (4.2119 ratio, rank 0, the pick is rank 1) needs ≥ 5 recorded outcomes, it has 0; the chosen dispatch is the cheapest eligible (6.233 ratio); role @explorer on medium in fast..medium [edit is outside this role — use `implementer`]",
           "role": "explorer",
           "tier": "medium",
@@ -42,159 +42,11 @@
       },
       {
         "label": "draw 1",
-        "tier": "medium",
-        "model": "anthropic/claude-sonnet-5-5#medium",
-        "row": {
-          "decisionID": "ses_ee2892641ffecFVxxpkimVlrSH:1791495696301:95c9754ce39f38f0:2",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0047 usd); role @explorer on medium in fast..medium [edit is outside this role — use `implementer`]",
-          "role": "explorer",
-          "tier": "medium",
-          "grant": [
-            "glob",
-            "grep",
-            "read",
-            "router_git"
-          ],
-          "boundsReasons": [],
-          "detection": {
-            "effective": "deterministic"
-          },
-          "facts": {
-            "class": "implement",
-            "risk": "low",
-            "scope": "single",
-            "needs": [
-              "edit"
-            ],
-            "confidence": 0.9,
-            "source": "route-line"
-          },
-          "resume": false,
-          "childSessionID": null,
-          "explore": false,
-          "propensity": 0.8,
-          "pinned": false,
-          "switched": false
-        }
-      },
-      {
-        "label": "draw 2",
-        "tier": "medium",
-        "model": "anthropic/claude-sonnet-5-5#medium",
-        "row": {
-          "decisionID": "ses_ee2892641ffecFVxxpkimVlrSH:1791495698305:95c9754ce39f38f0:3",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0046 usd); role @explorer on medium in fast..medium [edit is outside this role — use `implementer`]",
-          "role": "explorer",
-          "tier": "medium",
-          "grant": [
-            "glob",
-            "grep",
-            "read",
-            "router_git"
-          ],
-          "boundsReasons": [],
-          "detection": {
-            "effective": "deterministic"
-          },
-          "facts": {
-            "class": "implement",
-            "risk": "low",
-            "scope": "single",
-            "needs": [
-              "edit"
-            ],
-            "confidence": 0.9,
-            "source": "route-line"
-          },
-          "resume": false,
-          "childSessionID": null,
-          "explore": false,
-          "propensity": 0.8,
-          "pinned": false,
-          "switched": false
-        }
-      },
-      {
-        "label": "draw 3",
-        "tier": "medium",
-        "model": "anthropic/claude-sonnet-5-5#medium",
-        "row": {
-          "decisionID": "ses_ee2892641ffecFVxxpkimVlrSH:1791495700309:95c9754ce39f38f0:4",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0045 usd); role @explorer on medium in fast..medium [edit is outside this role — use `implementer`]",
-          "role": "explorer",
-          "tier": "medium",
-          "grant": [
-            "glob",
-            "grep",
-            "read",
-            "router_git"
-          ],
-          "boundsReasons": [],
-          "detection": {
-            "effective": "deterministic"
-          },
-          "facts": {
-            "class": "implement",
-            "risk": "low",
-            "scope": "single",
-            "needs": [
-              "edit"
-            ],
-            "confidence": 0.9,
-            "source": "route-line"
-          },
-          "resume": false,
-          "childSessionID": null,
-          "explore": false,
-          "propensity": 0.8,
-          "pinned": false,
-          "switched": false
-        }
-      },
-      {
-        "label": "draw 4",
-        "tier": "medium",
-        "model": "anthropic/claude-sonnet-5-5#medium",
-        "row": {
-          "decisionID": "ses_ee2892641ffecFVxxpkimVlrSH:1791495702209:95c9754ce39f38f0:5",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0044 usd); role @explorer on medium in fast..medium [edit is outside this role — use `implementer`]",
-          "role": "explorer",
-          "tier": "medium",
-          "grant": [
-            "glob",
-            "grep",
-            "read",
-            "router_git"
-          ],
-          "boundsReasons": [],
-          "detection": {
-            "effective": "deterministic"
-          },
-          "facts": {
-            "class": "implement",
-            "risk": "low",
-            "scope": "single",
-            "needs": [
-              "edit"
-            ],
-            "confidence": 0.9,
-            "source": "route-line"
-          },
-          "resume": false,
-          "childSessionID": null,
-          "explore": false,
-          "propensity": 0.8,
-          "pinned": false,
-          "switched": false
-        }
-      },
-      {
-        "label": "draw 5",
         "tier": "fast",
         "model": "anthropic/claude-sonnet-5-5#low",
         "row": {
-          "decisionID": "ses_ee2892641ffecFVxxpkimVlrSH:1791495704319:95c9754ce39f38f0:6",
-          "reason": "explore: exploration draw (propensity 0.2); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0043 usd); role @explorer on fast in fast..medium [explore; edit is outside this role — use `implementer`]",
+          "decisionID": "ses_ee258bf3cffeqjpKh9AdNlBV6p:1791498867727:7cbbe7a8ac482cd6:2",
+          "reason": "explore: exploration draw (propensity 0.2); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0047 usd); role @explorer on fast in fast..medium [explore; edit is outside this role — use `implementer`]",
           "role": "explorer",
           "tier": "fast",
           "grant": [
