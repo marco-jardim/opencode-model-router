@@ -511,7 +511,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     } finally { await finish(host); }
   }, 300_000);
 
-    it("S3 per-session narrowing: evaluate and context hooks keyed by event.sessionID affect ONE child of an agent only", async () => {
+  it("S3 per-session narrowing: evaluate and context hooks keyed by event.sessionID affect ONE child of an agent only", async () => {
     const host = await startSpikeHost("s3", { [NO_MODEL]: agentWithoutModel() }, {
       probe: { lifecycle: true, bySession: { denyTitle: "S3 A", denyActions: ["read"], stripTitle: "S3 C", stripTools: ["shell", "write"] } },
     });
@@ -856,7 +856,7 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   }, 300_000);
 
 
-    it("S10 the router's verification gate treats a non-tier custom agent exactly like fast/medium (it is gated by tool + mode, not by agent name)", async () => {
+  it("S10 the router's verification gate treats a non-tier custom agent exactly like fast/medium (it is gated by tool + mode, not by agent name)", async () => {
     const agents = { explorer: agentWithoutModel({ description: "S10 custom explorer role" }), implementer: agentWithoutModel({ description: "S10 custom implementer role" }) };
     const OK = "[router \u2713 verified: deterministic]";
     const run = async (name: string, overrides: Obj, subjects: string[]) => {
