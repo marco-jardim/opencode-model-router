@@ -187,7 +187,7 @@ describe("roles protocol golden", () => {
     expect(generateRolesTaxonomy).toBe(leaf.generateRolesTaxonomy);
     expect(CLASS_ROLE_KIND).toBe(leaf.CLASS_ROLE_KIND);
     const source = readFileSync(join(process.cwd(), "src", "routing", "engine", "roles-taxonomy.ts"), "utf-8");
-    const imports = source.split("\n").filter((line) => line.startsWith("import "));
+    const imports = source.split(/\r?\n/).filter((line) => line.startsWith("import "));
     expect(imports).toEqual([
       'import type { RoleKind, RoleSpec } from "../../router/roles";',
       'import { TASK_CLASSES, type TaskClass } from "../classify/types";',
