@@ -26,14 +26,21 @@ import type { RoleKind } from "./roles";
  * words from its (possibly narrowed) allow list, so a narrowing in `roleAgents.<name>.deny` shows there.
  */
 export const ROLE_MENU_INTENT: Readonly<Record<RoleKind, string>> = Object.freeze({
-  explore: "read-only lookups: files, symbols, facts, git history.",
+  explore: "lookups: files, symbols, facts, git history.",
   research: "web and library docs; no local files.",
-  run: "runs allowlisted scripts and commands (tests, typecheck, lint, build); never edits.",
+  run: "runs allowlisted scripts (tests, typecheck, lint, build).",
   implement: "scoped code changes.",
-  review: "senior QA review: defects, risks, regressions; never edits.",
-  design: "design: framing, options, tradeoffs, a recommendation; never edits.",
+  review: "senior QA review: defects, risks, regressions.",
+  design: "design: options, tradeoffs, a recommendation.",
   general: "small mixed tasks.",
 });
+
+/**
+ * Opening tag of the note the router appends to a role's result when its tool-call budget ran out (QA-P22-1-6).
+ * The roles protocol tells the orchestrator to resume the same session on it; the runtime (P2.1, T2.1.4) writes
+ * the note with this exact prefix, so the two cannot drift.
+ */
+export const ROUTER_BUDGET_NOTE_PREFIX = "[router budget]";
 
 /**
  * Provider-neutral tool-authority clause, appended once to every tier agent's assembled prompt (see src/index.ts).

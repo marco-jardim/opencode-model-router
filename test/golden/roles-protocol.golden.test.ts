@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { validateConfig, type ResolvedRouting, type RouterConfig } from "../../src/router/config";
+import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import {
   CLAUDE_ROLES_ORCHESTRATOR_PREFIX,
   DELEGATION_PROTOCOL_HEADING,
@@ -18,34 +19,35 @@ import {
 } from "../../src/router/protocol";
 import { resolveRoles, type RoleSpec } from "../../src/router/roles";
 import { CLASS_ROLE_KIND, generateRolesTaxonomy, generateTaxonomy } from "../../src/routing/engine/protocol-line";
+import * as leaf from "../../src/routing/engine/roles-taxonomy";
 import { createSystemAugmenter } from "../../src/routing/wire/hint";
 import type { EngineRuntime, WireLogger } from "../../src/routing/wire/runtime";
 
 const GOLDEN = [
   "## Role Delegation Protocol (MANDATORY)",
   "",
-  "You are the orchestrator: delegate execution to role agents with `subagent(agent=\"<role>\", prompt=\"...\")` and answer the user yourself. Reading, searching and running commands are execution; your one exception is about 2 direct read-only calls per turn for a lookup that settles a question outright. Run independent dispatches in parallel (several subagent calls in one message).",
+  "You are the orchestrator: delegate execution to role agents with `subagent(agent=\"<role>\", prompt=\"...\")` and answer the user yourself. Reading, searching and running commands are execution; you may make about 2 direct read-only calls per turn for a lookup that settles a question. Run independent dispatches in parallel, in one message.",
   "",
   "Roles (pick by intent; the router narrows each grant to the task):",
-  "- explorer: read-only lookups: files, symbols, facts, git history. Authority: read.",
+  "- explorer: lookups: files, symbols, facts, git history. Authority: read.",
   "- researcher: web and library docs; no local files. Authority: webfetch, websearch, context7.",
-  "- runner: runs allowlisted scripts and commands (tests, typecheck, lint, build); never edits. Authority: read, router_run.",
+  "- runner: runs allowlisted scripts (tests, typecheck, lint, build). Authority: read, router_run.",
   "- implementer: scoped code changes. Authority: read; edit and router_run on demand.",
-  "- reviewer: senior QA review: defects, risks, regressions; never edits. Authority: read, router_run.",
-  "- architect: design: framing, options, tradeoffs, a recommendation; never edits. Authority: read.",
+  "- reviewer: senior QA review: defects, risks, regressions. Authority: read, router_run.",
+  "- architect: design: options, tradeoffs, a recommendation. Authority: read.",
   "- general: small mixed tasks. Authority: read; edit and router_run on demand.",
   "",
   "R: search/recon→explorer mechanical/implement/debug→implementer design→architect review→reviewer other→general",
   "",
   "The router chooses the model for every dispatch: never set `model` and never pick a tier; name the role.",
   "",
-  "Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused): `[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path> tier=<t> pin]`, every key optional. class = search|recon|mechanical|implement|debug|design|review|other; risk = low|medium|high; scope = single|multi|repo; needs = shell|web|edit|network|external_dir (`edit` unlocks editing, `shell` unlocks router_run, where the role allows them); d = deterministic|grader|none (how the result is verified); budget = tool calls (up to twice the role's); root = the absolute work root. `tier` and `pin` only transcribe a plan tag or policy (`[tier:X]` → `tier=X pin`; a QA review → `pin`).",
+  "Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): `[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (`edit` unlocks editing, `shell` unlocks router_run); d=deterministic|grader|none (counts only when the prompt's `[acceptance]` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.",
   "",
-  "Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put `root=<absolute path>` on the route line and the same path in ENVIRONMENT. Paths outside it are denied.",
+  "Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put `root=<absolute path>` on the route line (quote a path that contains spaces: `root=\"D:\\my dir\"`) and the same path in ENVIRONMENT.",
   "",
-  "No role holds the web together with read, run or edit authority. Compose instead: researcher first, then paste its findings into the implementer dispatch (research → implement). Raw shell is outside roles mode: for it, dispatch a tier agent explicitly, as a fallback.",
+  "No role holds the web together with read, run or edit authority. Compose: researcher first, then paste its findings into the implementer dispatch. Raw shell is outside roles mode. Only when `runner` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.",
   "",
-  "Resume, never restart: after `NEED MORE: budget` or a router budget note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, resume the SAME `sessionID` (the router widens the grant) unless the router names another role. Roles return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) changes only the read-only call cap.",
+  "Resume, never restart: after `NEED MORE: budget` or a `[router budget]` note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, resume the SAME `sessionID` (the router widens the grant) unless the router names another role; after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier). Roles return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) changes only the read-only call cap.",
   "",
   "Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.",
   "",
@@ -96,6 +98,26 @@ describe("roles protocol golden", () => {
     expect(text).toContain("never set `model`");
   });
 
+  it("QA-P22-1-1: the route-line template offers no tier or pin; only a plan's [tier:X] tag is transcribed", () => {
+    const text = buildRolesProtocol(rolesCfg(), resolveRoles(rolesCfg(), "v2"));
+    const template = /`\[route [^`]*\]`/.exec(text)?.[0];
+    expect(template).toBe("`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]`");
+    expect(text).toContain("Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.");
+    expect(text).not.toMatch(/QA review →|→ `pin`/);
+    expect(text.match(/tier=/g)).toHaveLength(1);
+  });
+
+  it("QA-P22-1-4/6/7/8/9: verification FAIL resume, budget note prefix, d= backing, runner refusal, quoted root", () => {
+    const text = buildRolesProtocol(rolesCfg(), resolveRoles(rolesCfg(), "v2"));
+    expect(text).toContain("after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier)");
+    expect(ROUTER_BUDGET_NOTE_PREFIX).toBe("[router budget]");
+    expect(text).toContain(`a \`${ROUTER_BUDGET_NOTE_PREFIX}\` note, resume the SAME \`sessionID\``);
+    expect(text).toContain("a malformed one is refused for a role");
+    expect(text).toContain("d=deterministic|grader|none (counts only when the prompt's `[acceptance]` block backs it)");
+    expect(text).toContain("Only when `runner` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.");
+    expect(text).toContain("quote a path that contains spaces: `root=\"D:\\my dir\"`");
+  });
+
   it("is cache-stable: identical across calls and independent of the table's insertion order", () => {
     const cfg = rolesCfg();
     const roles = resolveRoles(cfg, "v2");
@@ -120,13 +142,16 @@ describe("roles protocol golden", () => {
     expect(noGeneral).not.toContain("design→");
   });
 
-  it("names the composition roles only when they are enabled", () => {
+  it("names the composition and runner roles only when they are enabled", () => {
     const cfg = rolesCfg();
     const roles = resolveRoles(cfg, "v2");
     const text = buildRolesProtocol(cfg, without(roles, "researcher"));
     expect(text).not.toContain("researcher");
-    expect(text).toContain("No role holds the web together with read, run or edit authority. Raw shell is outside roles mode");
-    expect(buildRolesProtocol(cfg, without(roles, "implementer"))).toContain("into the general dispatch (research → implement)");
+    expect(text).toContain("No role holds the web together with read, run or edit authority. Raw shell is outside roles mode.");
+    expect(buildRolesProtocol(cfg, without(roles, "implementer"))).toContain("into the general dispatch.");
+    const noRunner = buildRolesProtocol(cfg, without(roles, "runner"));
+    expect(noRunner).not.toContain("runner");
+    expect(noRunner).toContain("Raw shell is outside roles mode. For a command, ask the user or dispatch a tier agent explicitly.");
   });
 
   it("shows a narrowed authority from the role's allow list", () => {
@@ -145,6 +170,19 @@ describe("roles protocol golden", () => {
     const routing = { engine: "static", applied: { rolesSource: "shipped" }, roles: {} } as unknown as ResolvedRouting;
     expect(generateTaxonomy({ cfg: rolesCfg(), routing, host: "v2", store: null, agents: null, roles })).toBe(line);
     expect(generateRolesTaxonomy(new Map())).toBe("");
+  });
+
+  it("QA-P22-1-11: the class → role line lives in the leaf module; protocol-line re-exports the same bindings", () => {
+    expect(generateRolesTaxonomy).toBe(leaf.generateRolesTaxonomy);
+    expect(CLASS_ROLE_KIND).toBe(leaf.CLASS_ROLE_KIND);
+    const source = readFileSync(join(process.cwd(), "src", "routing", "engine", "roles-taxonomy.ts"), "utf-8");
+    const imports = source.split("\n").filter((line) => line.startsWith("import "));
+    expect(imports).toEqual([
+      'import type { RoleKind, RoleSpec } from "../../router/roles";',
+      'import { TASK_CLASSES, type TaskClass } from "../classify/types";',
+    ]);
+    const protocol = readFileSync(join(process.cwd(), "src", "router", "protocol.ts"), "utf-8");
+    expect(protocol).not.toMatch(/from "\.\.\/routing\/engine\/protocol-line"/);
   });
 });
 
@@ -209,23 +247,27 @@ describe("roles mode: no per-turn hint part (hint.ts)", () => {
     return { system, prepare };
   }
 
-  it("roles mode leaves the system parts untouched and never prepares the engine", async () => {
-    for (const protocol of [rolesProtocol, tiersProtocol]) {
-      const { system, prepare } = await run(rolesCfg(), protocol);
-      expect(system).toEqual(["host part", protocol]);
+  it("the roles protocol among the router's parts leaves the system untouched and never prepares the engine", async () => {
+    for (const cfg of [rolesCfg(), tiersCfg()]) {
+      const { system, prepare } = await run(cfg, rolesProtocol);
+      expect(system).toEqual(["host part", rolesProtocol]);
       expect(prepare).not.toHaveBeenCalled();
     }
   });
 
-  it("the roles protocol among the router's parts stops the augmenter even without the config flag", async () => {
-    const { system, prepare } = await run(tiersCfg(), rolesProtocol);
-    expect(system).toEqual(["host part", rolesProtocol]);
-    expect(prepare).not.toHaveBeenCalled();
+  it("QA-P22-1-5: a roles config that falls back to the tiers protocol is augmented like tiers mode", async () => {
+    for (const cfg of [rolesCfg(), tiersCfg()]) {
+      const { system, prepare } = await run(cfg, tiersProtocol);
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(system).toEqual(["host part", tiersProtocol]);
+    }
   });
 
-  it("tiers mode still reaches the engine (unchanged path)", async () => {
-    const { system, prepare } = await run(tiersCfg(), tiersProtocol);
+  it("a user part that merely quotes the roles heading does not stop the augmenter", async () => {
+    const prepare = vi.fn(async () => null);
+    const augmenter = createSystemAugmenter({ runtime: { prepare } as unknown as EngineRuntime, getSession: vi.fn(), logger });
+    const system = [`quoted: ${ROLES_PROTOCOL_HEADING}`, tiersProtocol];
+    await augmenter.augment({ sessionID: "ses_2", agent: "build", parentModel: "openai/gpt-5", messages: [], cfg: tiersCfg() }, system, new Set([tiersProtocol]));
     expect(prepare).toHaveBeenCalledTimes(1);
-    expect(system).toEqual(["host part", tiersProtocol]);
   });
 });

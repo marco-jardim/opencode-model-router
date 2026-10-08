@@ -58,6 +58,7 @@ export const FINDING_IDS = [
   "role-binding-unknown",
   "native-explore-aliased",
   "role-usage-share",
+  "roles-none-enabled",
 ] as const;
 export type FindingId = (typeof FINDING_IDS)[number];
 
@@ -90,6 +91,7 @@ export const FINDING_TARGET: Readonly<Record<FindingId, FindingTarget>> = {
   "role-binding-unknown": "router",
   "native-explore-aliased": "router",
   "role-usage-share": "router",
+  "roles-none-enabled": "router",
 };
 
 export interface Finding {
@@ -259,7 +261,7 @@ function activeTierEntries(cfg: RouterConfig): Array<[string, TierConfig]> {
  * roles layer. Every field is optional; a check whose input is absent says nothing.
  */
 export interface AdvisorExtras {
-  /** `v1` makes `routing.delegation: roles` inert (info); absent = treated as v2 by the role checks. */
+  /** `v1` makes `routing.delegation: roles` inert (info); absent = unknown: every role check stays silent. */
   readonly host?: "v1" | "v2";
   /** `summarizeRoles` over the window the caller cares about; `null`/absent = no statistics. */
   readonly roleStats?: RoleStatsTable | null;
@@ -651,11 +653,29 @@ function rolesMode(cfg: RouterConfig): boolean {
   return cfg.routing?.delegation === "roles";
 }
 
-/** The role table as v2 resolves it; `null` unless the config asks for roles mode on a host that is not known to be v1. */
-function activeRoleTable({ cfg, extras }: CheckInput): ReturnType<typeof resolveRoleTable> | null {
-  if (!rolesMode(cfg) || extras.host === "v1") return null;
-  return resolveRoleTable(cfg, "v2");
+/** Roles mode on a host KNOWN to be v2. A missing `extras.host` is unknown, so the role checks say nothing (QA-P22-1-2). */
+function rolesOnV2({ cfg, extras }: CheckInput): boolean {
+  return rolesMode(cfg) && extras.host === "v2";
 }
+
+/** The role table as v2 resolves it; `null` unless the config asks for roles mode and the host is known to be v2. */
+function activeRoleTable(input: CheckInput): ReturnType<typeof resolveRoleTable> | null {
+  if (!rolesOnV2(input)) return null;
+  return resolveRoleTable(input.cfg, "v2");
+}
+
+/** Roles mode on v2 but every role is disabled or invalid: the orchestrator is given the tiers protocol. */
+const rolesNoneEnabled: Check = (input) => {
+  const table = activeRoleTable(input);
+  if (table === null || table.roles.size > 0) return [];
+  return [{
+    id: "roles-none-enabled",
+    severity: "info",
+    subject: "",
+    message: "routing.delegation is `roles` but no role is enabled (all disabled or invalid), so the orchestrator is given the tier protocol instead. Enable a role under roleAgents, or set routing.delegation to `tiers`.",
+    snippet: null,
+  }];
+};
 
 /** A #81 `agents` entry named like a shipped role that breaks the separation rule (I4): dropped, the shipped role stays. */
 const roleSeparation: Check = (input) => {
@@ -674,7 +694,7 @@ const roleSeparation: Check = (input) => {
 };
 
 /** `routing.delegation: roles` on OpenCode v1: inert there (the orchestrator keeps the tier protocol). */
-const rolesOnV1: Check = ({ cfg, extras }) => {
+const rolesOnLegacyHost: Check = ({ cfg, extras }) => {
   if (extras.host !== "v1" || !rolesMode(cfg)) return [];
   return [{
     id: "roles-on-legacy-host",
@@ -716,7 +736,7 @@ const nativeExploreAliased: Check = (input) => {
 /** A role spends its budget in a large share of its dispatches: the budget is too low for the work routed to it. */
 const roleBudgetLow: Check = (input) => {
   const stats = input.extras.roleStats;
-  if (stats === undefined || stats === null || !rolesMode(input.cfg)) return [];
+  if (stats === undefined || stats === null || !rolesOnV2(input)) return [];
   const byRole = new Map<string, { dispatches: number; exhausted: number }>();
   for (const row of stats.byRoleTier) {
     const acc = byRole.get(row.role) ?? { dispatches: 0, exhausted: 0 };
@@ -731,7 +751,7 @@ const roleBudgetLow: Check = (input) => {
       id: "role-budget-low",
       severity: "warning",
       subject: role,
-      message: `Role ${role} ran out of budget in ${acc.exhausted} of ${acc.dispatches} dispatches (${Math.round((100 * acc.exhausted) / acc.dispatches)}%): its work needs more steps than roleAgents.${role}.budget allows, so it keeps returning ESCALATE: budget. Raise roleAgents.${role}.budget for the tiers it runs on.`,
+      message: `Role ${role} ran out of budget in ${acc.exhausted} of ${acc.dispatches} dispatches (${Math.round((100 * acc.exhausted) / acc.dispatches)}%): its work needs more steps than roleAgents.${role}.budget allows, so it keeps returning NEED MORE: budget. Raise roleAgents.${role}.budget for the tiers it runs on.`,
       snippet: null,
     });
   }
@@ -741,7 +761,7 @@ const roleBudgetLow: Check = (input) => {
 /** Child sessions that could not be bound to a role dispatch: their outcomes are not attributed. */
 const roleBindingUnknown: Check = (input) => {
   const stats = input.extras.roleStats;
-  if (stats === undefined || stats === null || !rolesMode(input.cfg)) return [];
+  if (stats === undefined || stats === null || !rolesOnV2(input)) return [];
   let total = stats.unattributed.unknownBindings;
   for (const row of stats.byRoleTier) total += row.unknownBindings;
   if (total <= 0) return [];
@@ -758,7 +778,7 @@ const roleBindingUnknown: Check = (input) => {
 const roleUsageShare: Check = (input) => {
   const stats = input.extras.roleStats;
   const tierDispatches = input.extras.tierDispatches;
-  if (stats === undefined || stats === null || tierDispatches === undefined || !rolesMode(input.cfg)) return [];
+  if (stats === undefined || stats === null || tierDispatches === undefined || !rolesOnV2(input)) return [];
   const roleDispatches = stats.byRoleTier.reduce((sum, row) => sum + row.dispatches, 0);
   const total = roleDispatches + tierDispatches;
   if (total < ROLE_STATS_MIN_DISPATCHES || tierDispatches === 0) return [];
@@ -783,7 +803,8 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["tier-agents", tierAgents],
   ["classifier-model", classifierModel],
   ["role-separation", roleSeparation],
-  ["roles-on-legacy-host", rolesOnV1],
+  ["roles-on-legacy-host", rolesOnLegacyHost],
+  ["roles-none-enabled", rolesNoneEnabled],
   ["role-range", roleRangeClamped],
   ["native-explore", nativeExploreAliased],
   ["role-budget", roleBudgetLow],

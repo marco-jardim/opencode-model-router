@@ -1,7 +1,8 @@
 import type { RouterConfig, Preset, ModeConfig } from "./config";
 import type { RoleKind, RoleSpec } from "./roles";
-import { ROLE_MENU_INTENT } from "./prompts";
-import { generateRolesTaxonomy } from "../routing/engine/protocol-line";
+import { ROLE_MENU_INTENT, ROUTER_BUDGET_NOTE_PREFIX } from "./prompts";
+// The leaf module, not `protocol-line.ts`: that one imports this file (QA-P22-1-11).
+import { generateRolesTaxonomy } from "../routing/engine/roles-taxonomy";
 
 // ---------------------------------------------------------------------------
 // Roles protocol (OpenCode v2, `routing.delegation: "roles"`; plan #84 §2.1–§2.5, T2.2.1)
@@ -53,13 +54,18 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
   const taxonomy = generateRolesTaxonomy(new Map(enabled.map((spec) => [spec.agent, spec] as const)));
   const researcher = agentOf("research");
   const editor = agentOf("implement") ?? agentOf("general");
+  const runner = agentOf("run");
   const compose = researcher !== undefined && editor !== undefined
-    ? ` Compose instead: ${researcher} first, then paste its findings into the ${editor} dispatch (research → implement).`
+    ? ` Compose: ${researcher} first, then paste its findings into the ${editor} dispatch.`
     : "";
+  // QA-P22-1-8: a tier agent is the exception for a command `router_run` refuses, never the default.
+  const rawShell = runner !== undefined
+    ? `Only when \`${runner}\` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.`
+    : `For a command, ask the user or dispatch a tier agent explicitly.`;
   return [
     ROLES_PROTOCOL_HEADING,
     ``,
-    `You are the orchestrator: delegate execution to role agents with \`subagent(agent="<role>", prompt="...")\` and answer the user yourself. Reading, searching and running commands are execution; your one exception is about 2 direct read-only calls per turn for a lookup that settles a question outright. Run independent dispatches in parallel (several subagent calls in one message).`,
+    `You are the orchestrator: delegate execution to role agents with \`subagent(agent="<role>", prompt="...")\` and answer the user yourself. Reading, searching and running commands are execution; you may make about 2 direct read-only calls per turn for a lookup that settles a question. Run independent dispatches in parallel, in one message.`,
     ``,
     `Roles (pick by intent; the router narrows each grant to the task):`,
     ...menu,
@@ -67,13 +73,14 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
     ``,
     `The router chooses the model for every dispatch: never set \`model\` and never pick a tier; name the role.`,
     ``,
-    `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path> tier=<t> pin]\`, every key optional. class = search|recon|mechanical|implement|debug|design|review|other; risk = low|medium|high; scope = single|multi|repo; needs = shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` unlocks router_run, where the role allows them); d = deterministic|grader|none (how the result is verified); budget = tool calls (up to twice the role's); root = the absolute work root. \`tier\` and \`pin\` only transcribe a plan tag or policy (\`[tier:X]\` → \`tier=X pin\`; a QA review → \`pin\`).`,
+    // QA-P22-1-1: `tier`/`pin` are not in the template; only a plan's `[tier:X]` tag is transcribed.
+    `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]\`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` unlocks router_run); d=deterministic|grader|none (counts only when the prompt's \`[acceptance]\` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries \`[tier:X]\`, add \`tier=X pin\`; never otherwise.`,
     ``,
-    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line and the same path in ENVIRONMENT. Paths outside it are denied.`,
+    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line (quote a path that contains spaces: \`root="D:\\my dir"\`) and the same path in ENVIRONMENT.`,
     ``,
-    `No role holds the web together with read, run or edit authority.${compose} Raw shell is outside roles mode: for it, dispatch a tier agent explicitly, as a fallback.`,
+    `No role holds the web together with read, run or edit authority.${compose} Raw shell is outside roles mode. ${rawShell}`,
     ``,
-    `Resume, never restart: after \`NEED MORE: budget\` or a router budget note, resume the SAME \`sessionID\` with "continue and finish"; after \`ESCALATE: authority\`, resume the SAME \`sessionID\` (the router widens the grant) unless the router names another role. Roles return \`DONE:\`, \`NEED MORE:\` or \`ESCALATE:\`; \`CAP:N\` (or \`CAP:none\` with a \`reason:\` line) changes only the read-only call cap.`,
+    `Resume, never restart: after \`NEED MORE: budget\` or a \`${ROUTER_BUDGET_NOTE_PREFIX}\` note, resume the SAME \`sessionID\` with "continue and finish"; after \`ESCALATE: authority\`, resume the SAME \`sessionID\` (the router widens the grant) unless the router names another role; after a verification FAIL, resume the SAME \`sessionID\` with the findings (the router raises the tier). Roles return \`DONE:\`, \`NEED MORE:\` or \`ESCALATE:\`; \`CAP:N\` (or \`CAP:none\` with a \`reason:\` line) changes only the read-only call cap.`,
     ``,
     `Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.`,
     ``,

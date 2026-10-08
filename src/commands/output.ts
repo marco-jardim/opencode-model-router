@@ -218,6 +218,7 @@ export function buildOverridesOutput(v: OverridesView): string {
 export function buildRoleLines(roles: Iterable<RoleSpec>): string[] {
   const lines: string[] = [];
   for (const role of roles) {
+    if (!role.enabled) continue;
     const { mode, allow, deny } = role.authority;
     const denied = deny.length > 0 ? `; denied: ${deny.join(", ")}` : "";
     lines.push(

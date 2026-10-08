@@ -655,9 +655,12 @@ export function renderMarkdown(table: StatsTable): string {
   return blocks.join("\n\n") + "\n";
 }
 
-/** True when the role table has anything to show: tier-only logs render exactly as before (no role section). */
+/**
+ * True when the log has role rows: a role dispatch bucket, or an unknown-binding row (only role dispatches are bound). Unattributed
+ * SIGNAL rows do not count: tier-origin verdict/run signals are written in every mode, so tier-only logs render exactly as before.
+ */
 export function hasRoleRows(table: RoleStatsTable): boolean {
-  return table.byRoleTier.length > 0 || table.unattributed.signals > 0 || table.unattributed.unknownBindings > 0;
+  return table.byRoleTier.length > 0 || table.unattributed.unknownBindings > 0;
 }
 
 /** P2.2: the role × tier section appended to the report when the log has role rows. Same determinism rules as {@link renderMarkdown}. */

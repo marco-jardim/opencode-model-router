@@ -16,7 +16,8 @@
  * Roles mode (`routing.delegation: "roles"`, plan #84 T2.2.1): nothing is added or rewritten — no per-turn hint, no tier
  * `R:` line, no route-line paragraph. The roles protocol carries its own class → role line and route-line keys, and a
  * hint or a tier line would name tiers; a system part that changes per turn would also cost the orchestrator its
- * prompt cache. The check reads the config and, independently, the roles protocol's heading among the router's parts.
+ * prompt cache. The check is the roles protocol's heading among the router's own parts, i.e. the text the orchestrator
+ * actually carries: a roles config with no enabled role falls back to the tiers protocol, augmented as in tiers mode.
  */
 
 import {
@@ -181,8 +182,9 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
   return {
     async augment(input, system, added): Promise<void> {
       try {
-        // Roles mode: no hint part, and the protocol text stays exactly as the legacy hook built it.
-        if (input.cfg?.routing?.delegation === "roles") return;
+        // Roles mode: no hint part, and the protocol text stays exactly as the legacy hook built it. Keyed on the roles
+        // protocol the orchestrator actually carries (QA-P22-1-5): `delegation: "roles"` with no enabled role keeps the
+        // tiers protocol, which is then augmented like tiers mode.
         if (system.some((text) => added.has(text) && text.includes(ROLES_PROTOCOL_HEADING))) return;
         const protocolAt: number[] = [];
         system.forEach((text, index) => {
