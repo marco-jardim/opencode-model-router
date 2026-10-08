@@ -14,7 +14,7 @@
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -83,7 +83,7 @@ const sessionView = (s: Obj | undefined) => (s ? { parentID: s.parentID, agent: 
 
 // ---- group B helpers ----
 const toolStatesOf = (context: Obj[]): Obj[] => context.flatMap(m => arr(obj(m).content).map(obj)).filter(part => part.type === "tool").map(part => obj(part.state));
-const stateView = (s: Obj) => ({ status: s.status, errorType: obj(s.error).type, errorMessage: obj(s.error).message, text: arr(s.content).map(c => str(obj(c).text)).join("\n") });
+const stateView = (s: Obj) => ({ status: s.status, errorType: obj(s.error).type, errorMessage: obj(s.error).message, text: typeof s.content === "string" ? s.content : (arr(s.content).map(c => str(obj(c).text)).join("\n") || (s.output === undefined ? "" : JSON.stringify(s.output).slice(0, 600))) });
 /** What the PARENT model was given for one of its tool calls: the tool_result block (matched by tool_use_id) of its own later provider request. */
 function parentView(host: RoutingHost, root: string, callID: string): { found: boolean; isError: unknown; parts: string[]; text: string } {
   for (const r of [...host.requestsOf(root)].reverse()) {
@@ -117,6 +117,32 @@ type ChildReport = Awaited<ReturnType<typeof childReport>>;
 const readProbe = (file: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "read", input: { path: file } })}`;
 const executeProbe = (code: string) => `READ_ONLY_PROBE=${JSON.stringify({ tool: "execute", input: { code } })}`;
 const decisionsOf = (r: ChildReport, point: string) => r.decisions.filter(d => d.point === point).map(d => ({ decision: d.decision, action: d.action, removed: d.removed }));
+// ---- S11 helpers: a git repo (the host's project = the main checkout) with sibling worktrees and unrelated directories ----
+async function s11World(host: RoutingHost) {
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: host.project, encoding: "utf8", windowsHide: true });
+  git("init", "-q", "-b", "main");
+  for (const name of ["m.txt", "e0.txt", "e1.txt", "e2.txt", "e3.txt"]) await writeFile(path.join(host.project, name), "main\n");
+  git("add", "."); git("commit", "-q", "-m", "init");
+  const wt1 = path.join(host.root, "wt-1");
+  const wt2 = path.join(host.root, "wt-2");
+  const other = path.join(host.root, "other");
+  const evil = path.join(host.root, "wt-evil"); // matches the glob `wt-*` but is a plain directory, not a worktree
+  git("worktree", "add", "-q", wt1, "-b", "wt1");
+  for (const dir of [other, evil, path.join(wt1, "sub", "deep")]) await mkdir(dir, { recursive: true });
+  await writeFile(path.join(other, "x.txt"), "other\n");
+  await writeFile(path.join(evil, "x.txt"), "evil\n");
+  await writeFile(path.join(wt1, "sub", "deep", "n.txt"), "nested\n"); // untracked in wt-1
+  await writeFile(path.join(host.project, "main-only-dirty.txt"), "dirty\n"); // untracked in the main checkout only
+  return { git, wt1, wt2, other, evil, addLaterWorktree: async () => { git("worktree", "add", "-q", wt2, "-b", "wt2"); return path.join(wt2, "e3.txt"); } };
+}
+/** One scripted tool call by a child of `agent`, dispatched from a root session in the main checkout (rootPerms: no inherited grants, or the allow-all default of newRoot). */
+async function s11Op(host: RoutingHost, agent: string, label: string, tool: string, input: Obj, rootPerms: "none" | "allow-all" = "none") {
+  const root = await host.newRoot(`s11 ${agent} ${label}`, undefined, host.project, rootPerms === "allow-all" ? undefined : []);
+  const r = await childReport(host, root, { agent, description: `S11 ${agent} ${label}`, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool, input })}` });
+  const norm = (value: unknown) => String(value).replaceAll("\\", "/").toLowerCase();
+  const evaluates = (await lifecycle(host, r.childID)).evaluates.map(e => ({ action: e.action, resources: arr(e.resources).map(norm), effectIn: e.effectIn, effectOut: e.effectOut }));
+  return { agent, label, state: r.toolStates[0], evaluates, sessionAgent: r.child.agent, childTitle: r.child.title, toolNames: r.requests[0]?.toolNames ?? [] };
+}
 // ------------------------------------------------------------------------------------------------ the spikes ----
 d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   it("S1 agent registered without a model: the per-call model and variant reach the provider (Anthropic and OpenAI Responses)", async () => {
@@ -863,75 +889,101 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
   }, 900_000);
 
 
-  it("S11 work root in a sibling worktree: external_directory defaults, per-path allowance, glob coverage of a later worktree, plugin tool cwd", async () => {
+  it("S11 work root in a sibling worktree (agents defined in the HOST's opencode.json): external_directory defaults, per-path allowance, glob over-match, spelling variants, later worktrees, plugin tool cwd, tool catalog", async () => {
     const host = await RoutingHost.start("s11", {
       routing: { engine: "shadow" }, providers: OPENAI_PROVIDER,
       probe: { lifecycle: true, denyAsk: true, cwdTool: true, bySession: { denyTitle: "S11 role-wt1 narrowed", denyActions: ["external_directory"] } },
       hostConfig: (root: string) => {
-        const base: Obj[] = [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }, { action: "edit", resource: "*", effect: "allow" }, { action: "wt_probe", resource: "*", effect: "allow" }];
+        const base: Obj[] = [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }, { action: "edit", resource: "*", effect: "allow" }, { action: "wt_probe", resource: "*", effect: "allow" }, { action: "router_git_status", resource: "*", effect: "allow" }];
+        const rule = (resource: string): Obj => ({ action: "external_directory", resource, effect: "allow" });
         return { agents: {
           // deny-by-default like `base` but WITHOUT the explicit allow for the plugin tool wt_probe
           "role-notool": agentWithoutModel({ permissions: [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }] }),
           "role-base": agentWithoutModel(), // the host defaults: external_directory = ask
           "role-deny": agentWithoutModel({ permissions: base }), // deny-by-default, explicit allows, no external_directory rule
-          "role-wt1": agentWithoutModel({ permissions: [...base, { action: "external_directory", resource: `${root}\\wt-1\\*`, effect: "allow" }] }),
-          "role-glob": agentWithoutModel({ permissions: [...base, { action: "external_directory", resource: `${root}\\wt-*`, effect: "allow" }] }),
+          "role-wt1": agentWithoutModel({ permissions: [...base, rule(`${root}\\wt-1\\*`)] }),
+          "role-glob": agentWithoutModel({ permissions: [...base, rule(`${root}\\wt-*`)] }),
+          "role-case": agentWithoutModel({ permissions: [...base, rule(`${root.toUpperCase()}\\WT-1\\*`)] }), // same rule, different letter case
+          "role-long": agentWithoutModel({ permissions: [...base, rule(`${realpathSync.native(root)}\\wt-1\\*`)] }), // same rule, long (non-8.3) spelling of the root
+          "role-exec-deny": agentWithoutModel({ permissions: [{ action: "execute", resource: "*", effect: "deny" }] }), // otherwise the host defaults
+          "role-research": agentWithoutModel({ permissions: [{ action: "*", resource: "*", effect: "deny" }, { action: "read", resource: "*", effect: "allow" }, { action: "webfetch", resource: "*", effect: "allow" }, { action: "websearch", resource: "*", effect: "allow" }] }),
         } };
       },
     });
     try {
-      const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: host.project, encoding: "utf8", windowsHide: true });
-      git("init", "-q", "-b", "main");
-      for (const name of ["m.txt", "e1.txt", "e2.txt", "e3.txt"]) await writeFile(path.join(host.project, name), "main\n");
-      git("add", "."); git("commit", "-q", "-m", "init");
-      const wt1 = path.join(host.root, "wt-1");
-      const wt2 = path.join(host.root, "wt-2");
-      const other = path.join(host.root, "other");
-      git("worktree", "add", "-q", wt1, "-b", "wt1");
-      await mkdir(other, { recursive: true });
-      await writeFile(path.join(other, "x.txt"), "other\n");
+      const world = await s11World(host);
+      const { wt1, wt2, other, evil } = world;
       const norm = (value: unknown) => String(value).replaceAll("\\", "/").toLowerCase();
-      const op = async (agent: string, label: string, tool: string, input: Obj) => {
-        const root = await host.newRoot(`s11 ${agent} ${label}`, undefined, host.project, []);
-        const r = await childReport(host, root, { agent, description: `S11 ${agent} ${label}`, prompt: `READ_ONLY_PROBE=${JSON.stringify({ tool, input })}` });
-        const evaluates = (await lifecycle(host, r.childID)).evaluates.map(e => ({ action: e.action, resources: arr(e.resources).map(norm), effectIn: e.effectIn, effectOut: e.effectOut }));
-        return { agent, label, state: r.toolStates[0], evaluates, sessionAgent: r.child.agent, toolNames: r.requests[0]?.toolNames ?? [] };
-      };
-      const edit = (dir: string, file: string): Obj => ({ path: path.join(dir, file), oldString: "main", newString: "edited" });
+      const op = (agent: string, label: string, tool: string, input: Obj, rootPerms: "none" | "allow-all" = "none") => s11Op(host, agent, label, tool, input, rootPerms);
+      const edit = (file: string): Obj => ({ path: file, oldString: "main", newString: "edited" });
+      const wtFile = (name: string) => path.join(wt1, name);
+      const longWt1 = realpathSync.native(wt1);
       // -- the worktree that existed when the host started
-      const base = { read: await op("role-base", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-base", "edit wt1", "edit", edit(wt1, "e1.txt")) };
-      const deny = { read: await op("role-deny", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-deny", "edit wt1", "edit", edit(wt1, "e1.txt")) };
+      const base = { read: await op("role-base", "read wt1", "read", { path: wtFile("m.txt") }), edit: await op("role-base", "edit wt1", "edit", edit(wtFile("e0.txt"))) };
+      const deny = { read: await op("role-deny", "read wt1", "read", { path: wtFile("m.txt") }), edit: await op("role-deny", "edit wt1", "edit", edit(wtFile("e0.txt"))) };
       const exact = {
-        read: await op("role-wt1", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-wt1", "edit wt1", "edit", edit(wt1, "e1.txt")),
+        read: await op("role-wt1", "read wt1", "read", { path: wtFile("m.txt") }), edit: await op("role-wt1", "edit wt1", "edit", edit(wtFile("e1.txt"))),
         other: await op("role-wt1", "read other", "read", { path: path.join(other, "x.txt") }),
-        tool: await op("role-wt1", "tool wt1", "wt_probe", { path: path.join(wt1, "m.txt") }),
+        otherEdit: await op("role-wt1", "edit other", "edit", edit(path.join(other, "x.txt"))),
+        nested: await op("role-wt1", "read nested", "read", { path: path.join(wt1, "sub", "deep", "n.txt") }),
+        evil: await op("role-wt1", "read wt-evil", "read", { path: path.join(evil, "x.txt") }),
+        dotdot: await op("role-wt1", "read wt1/../other", "read", { path: `${wt1}\\..\\other\\x.txt` }),
+        longPath: await op("role-wt1", "read via long path spelling", "read", { path: path.join(longWt1, "m.txt") }),
+        tool: await op("role-wt1", "tool wt1", "wt_probe", { path: wtFile("m.txt") }),
+        gitStatus: await op("role-wt1", "router_git_status", "router_git_status", {}),
       };
-      const glob = { read: await op("role-glob", "read wt1", "read", { path: path.join(wt1, "m.txt") }), edit: await op("role-glob", "edit wt1", "edit", edit(wt1, "e2.txt")), other: await op("role-glob", "read other", "read", { path: path.join(other, "x.txt") }) };
+      const glob = {
+        read: await op("role-glob", "read wt1", "read", { path: wtFile("m.txt") }), edit: await op("role-glob", "edit wt1", "edit", edit(wtFile("e2.txt"))),
+        other: await op("role-glob", "read other", "read", { path: path.join(other, "x.txt") }),
+        otherEdit: await op("role-glob", "edit other", "edit", edit(path.join(other, "x.txt"))),
+        nested: await op("role-glob", "read nested", "read", { path: path.join(wt1, "sub", "deep", "n.txt") }),
+        evil: await op("role-glob", "read wt-evil (a plain directory that is NOT a worktree)", "read", { path: path.join(evil, "x.txt") }),
+      };
+      const spelling = {
+        upperRule: await op("role-case", "read wt1 (rule in upper case)", "read", { path: wtFile("m.txt") }),
+        longRule: await op("role-long", "read wt1 (rule in long spelling, path in the harness spelling)", "read", { path: wtFile("m.txt") }),
+      };
       // -- (a) a plugin tool NOT in the agent's allows, under deny-by-default; (b) the evaluate hook narrows an ALLOWED external path per session
-      const notool = await op("role-notool", "tool not allowed", "wt_probe", { path: path.join(wt1, "m.txt") });
-      const narrowed = await op("role-wt1", "narrowed", "read", { path: path.join(wt1, "m.txt") });
+      const notool = await op("role-notool", "tool not allowed", "wt_probe", { path: wtFile("m.txt") });
+      const narrowed = await op("role-wt1", "narrowed", "read", { path: wtFile("m.txt") });
+      // -- the tool catalog (Code Mode `execute` and the researcher's egress tools)
+      const exec = {
+        base: await op("role-base", "catalog", "read", { path: path.join(host.project, "m.txt") }),
+        denyByDefault: await op("role-deny", "catalog", "read", { path: path.join(host.project, "m.txt") }),
+        explicitDeny: await op("role-exec-deny", "catalog", "read", { path: path.join(host.project, "m.txt") }),
+        research: await op("role-research", "catalog", "read", { path: path.join(host.project, "m.txt") }),
+        probeNotool: await op("role-notool", "execute probe", "execute", { code: "return await tools.opencode.session_rename({ title: 'S11 renamed by execute' })" }),
+        probeExplicitDeny: await op("role-exec-deny", "execute probe", "execute", { code: "return await tools.opencode.session_rename({ title: 'S11 renamed by execute' })" }),
+      };
+      // -- the session-level grant: the same deny-by-default agent under a parent session that grants everything
+      const openRoot = await op("role-deny", "read wt1 under an allow-all session", "read", { path: wtFile("m.txt") }, "allow-all");
       // -- a SECOND worktree created after the host started and the agents were registered
-      git("worktree", "add", "-q", wt2, "-b", "wt2");
+      const wt2File = await world.addLaterWorktree();
       const later = {
         noPattern: await op("role-deny", "read wt2", "read", { path: path.join(wt2, "m.txt") }),
         exactPattern: await op("role-wt1", "read wt2", "read", { path: path.join(wt2, "m.txt") }),
         globRead: await op("role-glob", "read wt2", "read", { path: path.join(wt2, "m.txt") }),
-        globEdit: await op("role-glob", "edit wt2", "edit", edit(wt2, "e3.txt")),
+        globEdit: await op("role-glob", "edit wt2", "edit", edit(wt2File)),
         globOther: await op("role-glob", "read other again", "read", { path: path.join(other, "x.txt") }),
       };
       const toolReport = (await host.events()).filter(e => e.type === "probe.tool").map(e => obj(e.report));
-      const disk = { wt1E1: await readFile(path.join(wt1, "e1.txt"), "utf8"), wt1E2: await readFile(path.join(wt1, "e2.txt"), "utf8"), wt2E3: await readFile(path.join(wt2, "e3.txt"), "utf8"), mainE1: await readFile(path.join(host.project, "e1.txt"), "utf8"), mainE3: await readFile(path.join(host.project, "e3.txt"), "utf8"), other: await readFile(path.join(other, "x.txt"), "utf8") };
-      await save("S11", { base, deny, exact, glob, later, notool, narrowed, toolReport, disk, hostErrors: host.errorLines() });
+      const disk = {
+        wt1E0: await readFile(wtFile("e0.txt"), "utf8"), wt1E1: await readFile(wtFile("e1.txt"), "utf8"), wt1E2: await readFile(wtFile("e2.txt"), "utf8"),
+        wt2E3: await readFile(wt2File, "utf8"), mainE1: await readFile(path.join(host.project, "e1.txt"), "utf8"), mainE3: await readFile(path.join(host.project, "e3.txt"), "utf8"), other: await readFile(path.join(other, "x.txt"), "utf8"),
+      };
+      const titles = { exec: exec.probeNotool.childTitle, execDeny: exec.probeExplicitDeny.childTitle };
+      await save("S11", { base, deny, exact, glob, spelling, later, notool, narrowed, exec, openRoot, toolReport, disk, titles, hostErrors: host.errorLines() });
 
       const rejected = (o: { state?: Obj }, message: string) => expect(o.state).toMatchObject({ status: "error", errorType: "permission.rejected", errorMessage: message });
+      const denied = "Permission denied: external_directory";
       // (1) default agent: external_directory is ASKED for the sibling worktree (resource "<worktree>/*"); the probe turned the ask into a deny so nothing hangs.
       for (const o of [base.read, base.edit]) {
         rejected(o, "PROBE_ASK_AS_DENY: external_directory");
-        expect(o.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "ask", effectOut: "deny" });
+        expect(o.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "ask" });
         expect(o.evaluates[0]!.resources).toEqual([`${norm(wt1)}/*`]);
       }
       // (2) deny-by-default role agent without an external_directory rule: refused by the host itself (no evaluate event reaches plugins).
-      for (const o of [deny.read, deny.edit]) { rejected(o, "Permission denied: external_directory"); expect(o.evaluates).toEqual([]); }
+      for (const o of [deny.read, deny.edit]) { rejected(o, denied); expect(o.evaluates).toEqual([]); }
       // (3) an external_directory rule for the worktree root only: read and edit inside it run (external_directory allow, then the action's own allow)...
       expect(exact.read.state).toMatchObject({ status: "completed" });
       expect(exact.edit.state).toMatchObject({ status: "completed" });
@@ -939,36 +991,28 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       expect(exact.edit.evaluates.map(e => [e.action, e.effectIn])).toEqual([["external_directory", "allow"], ["edit", "allow"]]);
       expect(disk.wt1E1).toBe("edited\n");
       expect(disk.mainE1).toBe("main\n");
-      // ... while a path in a third, unrelated directory stays denied and untouched.
-      rejected(exact.other, "Permission denied: external_directory");
-      expect(disk.other).toBe("other\n");
-      // (4) the glob rule `<root>\wt-*` covers wt-1 too.
+      // ... while a path in a third, unrelated directory stays denied for read AND edit, and the file is untouched.
+      rejected(exact.other, denied);
+      rejected(exact.otherEdit, denied);
+      // refused edits get their own files: the refused edits of the default and the deny-by-default agent left wt-1/e0.txt untouched.
+      expect(disk.wt1E0).toBe("main\n");
+      // (4) the glob rule `<root>\wt-*` covers wt-1 too, and refuses the unrelated directory for read and edit.
       expect(glob.read.state).toMatchObject({ status: "completed" });
       expect(glob.edit.state).toMatchObject({ status: "completed" });
       expect(disk.wt1E2).toBe("edited\n");
-      rejected(glob.other, "Permission denied: external_directory");
+      rejected(glob.other, denied);
+      rejected(glob.otherEdit, denied);
+      expect(disk.other).toBe("other\n");
       // (5) a worktree created AFTER the host started: (a) no pattern -> denied; exact pattern for the old worktree -> denied;
       //     (b) glob `wt-*` registered at start -> covered (read and edit), the unrelated directory is still denied.
-      rejected(later.noPattern, "Permission denied: external_directory");
-      rejected(later.exactPattern, "Permission denied: external_directory");
+      rejected(later.noPattern, denied);
+      rejected(later.exactPattern, denied);
       expect(later.globRead.state).toMatchObject({ status: "completed" });
       expect(later.globEdit.state).toMatchObject({ status: "completed" });
       expect(disk.wt2E3).toBe("edited\n");
       expect(disk.mainE3).toBe("main\n");
-      rejected(later.globOther, "Permission denied: external_directory");
-      // (7) a plugin tool is bounded by the agent's MAX policy at the host's catalog: under deny-by-default WITHOUT an explicit allow for it,
-      //     the host does not advertise it (absent from the provider request's tools) and refuses a call to it ("No tool named ... is
-      //     currently available", tool.execution), the tool never runs and no evaluate event fires. With the explicit allow it is advertised.
-      expect(notool.toolNames).not.toContain("wt_probe");
-      expect(exact.tool.toolNames).toContain("wt_probe");
-      expect(notool.state).toMatchObject({ status: "error", errorType: "tool.execution", errorMessage: 'No tool named "wt_probe" is currently available. Please use a tool from the available tool list.' });
-      expect(notool.evaluates).toEqual([]);
-      // (8) the plugin evaluate hook DOES fire for an external_directory the max policy allows (effectIn "allow") and can narrow it for ONE session:
-      //     the session titled "S11 role-wt1 narrowed" is refused by the plugin although its agent's policy allows the path, while the same agent's
-      //     other children (exact.read above) read it.
-      expect(narrowed.evaluates).toHaveLength(1);
-      expect(narrowed.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "allow", effectOut: "allow" });
-      rejected(narrowed, "PROBE_SESSION_DENIED: external_directory");      // (6) a plugin tool is neither permission-evaluated (no evaluate event, even for the sibling path) nor moved: it runs in the MAIN
+      rejected(later.globOther, denied);
+      // (6) a plugin tool is neither permission-evaluated (no evaluate event, even for the sibling path) nor moved: it runs in the MAIN
       //     checkout (process.cwd() = the host project = the session location); its context carries no directory/worktree field.
       expect(exact.tool.state).toMatchObject({ status: "completed" });
       expect(exact.tool.evaluates).toEqual([]);
@@ -979,10 +1023,61 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
       expect(norm(obj(reported.pluginLocation).directory)).toBe(norm(host.project));
       expect(reported.contextKeys).toEqual(["sessionID", "agent", "messageID", "id", "progress", "signal"]);
       expect(reported.pathExists).toBe(true);
+      // (7) a plugin tool is bounded by the agent's MAX policy at the host's catalog: under deny-by-default WITHOUT an explicit allow for it,
+      //     the host does not advertise it (absent from the provider request's tools) and refuses a call to it ("No tool named ... is
+      //     currently available", tool.execution), the tool never runs and no evaluate event fires. With the explicit allow it is advertised.
+      expect(notool.toolNames).not.toContain("wt_probe");
+      expect(exact.tool.toolNames).toContain("wt_probe");
+      expect(notool.state).toMatchObject({ status: "error", errorType: "tool.execution", errorMessage: 'No tool named "wt_probe" is currently available. Please use a tool from the available tool list.' });
+      expect(notool.evaluates).toEqual([]);
+      // (8) the plugin evaluate hook DOES fire for an external_directory the max policy allows (effectIn "allow") and can narrow it for ONE session:
+      //     the session titled "S11 role-wt1 narrowed" is refused by the plugin although its agent's policy allows the path, while the same agent's
+      //     other children (exact.read above) read it. (effectIn / effectOut are positional: the lifecycle record is written BEFORE the
+      //     session-keyed hook runs, so effectOut "allow" is not the final decision; the tool state is.)
+      expect(narrowed.evaluates).toHaveLength(1);
+      expect(narrowed.evaluates[0]).toMatchObject({ action: "external_directory", effectIn: "allow" });
+      rejected(narrowed, "PROBE_SESSION_DENIED: external_directory");
+      // (9) OBSERVED, see S11.json: nested files, the `wt-evil` sibling, `..`, case and spelling variants.
+      //     - a file nested below the allowed root is covered (the rule `<root>\\wt-1\\*` crosses separators);
+      expect(exact.nested.state).toMatchObject({ status: "completed" });
+      expect(glob.nested.state).toMatchObject({ status: "completed" });
+      //     - the glob `<root>\\wt-*` OVER-MATCHES: a plain directory `wt-evil` that is not a worktree is granted too (the exact rule refuses it);
+      expect(glob.evil.state).toMatchObject({ status: "completed" });
+      rejected(exact.evil, denied);
+      //     - `..` is normalised before matching (wt-1\..\other resolves to the unrelated directory and is refused);
+      rejected(exact.dotdot, denied);
+      //     - letter case does not matter on this Windows host (a rule written in upper case still grants the path) ...
+      expect(spelling.upperRule.state).toMatchObject({ status: "completed" });
+      //     - ... but the 8.3 / long spelling of the root DOES: a rule in the long spelling does not grant a path in the short spelling,
+      //       and a rule in the short spelling does not grant a path in the long spelling (both refused).
+      expect(norm(realpathSync.native(host.root))).not.toBe(norm(host.root));
+      rejected(spelling.longRule, denied);
+      rejected(exact.longPath, denied);
+      // (10) the session-level grant decides before the agent's policy: the SAME deny-by-default agent without an external_directory rule
+      //      reads the sibling worktree when the parent session grants everything (newRoot's default), and is refused when it grants nothing (2).
+      expect(openRoot.state).toMatchObject({ status: "completed" });
+      // (11) router_git_status of a child whose session lives in the main checkout reports the MAIN checkout's status, not the sibling worktree's
+      //      (the compat layer resolves router_git_* against the session location, v2-hooks.ts:356-358).
+      expect(exact.gitStatus.state).toMatchObject({ status: "completed" });
+      expect(exact.gitStatus.state?.text).toContain("main-only-dirty.txt"); // untracked in the main checkout only
+      expect(exact.gitStatus.state?.text).not.toContain("sub"); // wt-1's own untracked directory is not reported
+      // (12) tool catalog: Code Mode `execute` is advertised to the host-default agent and to NO deny-by-default role agent; an explicit
+      //      `execute: deny` on an otherwise default agent removes it too; a call to it fails with "No tool named execute" and does not
+      //      run (the session title is unchanged by the scripted inner session_rename).
+      expect(exec.base.toolNames).toContain("execute");
+      for (const r of [exec.denyByDefault, exec.explicitDeny, exec.research]) expect(r.toolNames).not.toContain("execute");
+      for (const r of [exec.probeNotool, exec.probeExplicitDeny]) expect(r.state).toMatchObject({ status: "error", errorType: "tool.execution", errorMessage: 'No tool named "execute" is currently available. Please use a tool from the available tool list.' });
+      expect(titles).toEqual({ exec: "S11 role-notool execute probe", execDeny: "S11 role-exec-deny execute probe" });
+      expect(exec.probeNotool.evaluates).toEqual([]);
+      // (13) researcher egress as the host advertises it: webfetch and websearch are advertised natively to the default agent, kept by an
+      //      explicit allow under deny-by-default (catalog exactly [read, webfetch, websearch]) and absent without it; no context7_* or
+      //      brave_* tool is advertised by the isolated host (no MCP server is configured in it).
+      for (const name of ["webfetch", "websearch"]) { expect(exec.base.toolNames).toContain(name); expect(exec.research.toolNames).toContain(name); expect(exec.denyByDefault.toolNames).not.toContain(name); }
+      expect([...exec.research.toolNames].sort()).toEqual(["read", "webfetch", "websearch"]);
+      for (const r of [exec.base, exec.denyByDefault, exec.research]) expect(r.toolNames.filter(n => /^(context7|brave)/.test(n))).toEqual([]);
       expect(host.errorLines()).toEqual([]);
     } finally { await finish(host); }
   }, 900_000);
-
 
   it("S12 the router override's agents block changed WITHOUT restarting the host: when the host agent list and the orchestrator's subagent catalog follow", async () => {
     const AGENT = (description: string) => ({ tier: "fast", description, readOnly: true });
