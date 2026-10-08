@@ -162,6 +162,8 @@ export interface RoleRouted {
   readonly resumeID: string | null;
   /** The next tier of the role's range above `tier` (escalation hint, P-8); null at the ceiling. */
   readonly nextTier: string | null;
+  /** The effective task class of the dispatch (re-dispatch signal, handoff 17); null when unknown. */
+  readonly class: string | null;
 }
 
 /**
@@ -386,6 +388,24 @@ export function routedWorkRoot(callID: string): string | null | undefined {
 /** Drop what `route()` kept for `callID` (the adapter calls it once `execute.after` is done with it). */
 export function forgetRoutedRole(callID: string): void {
   routedRoles.delete(callID);
+  strippedRoots.delete(callID);
+}
+
+/**
+ * Handoff 30 (tier dispatches, v2 shadow/advise/enforce): the `root=` of the first-line route line `route()` stripped from the
+ * prompt, so the legacy hook's dispatch header can still name it (T1.5.3a). Process-wide, bounded like {@link routedRoles}.
+ */
+const strippedRoots = new Map<string, string>();
+
+function rememberStrippedRoot(callID: string, root: string): void {
+  strippedRoots.delete(callID);
+  strippedRoots.set(callID, root);
+  while (strippedRoots.size > MAX_ROUTED_ROLES) strippedRoots.delete(strippedRoots.keys().next().value as string);
+}
+
+/** The route line's `root=` of a tier dispatch whose route line `route()` stripped; undefined otherwise. */
+export function strippedRouteRoot(callID: string): string | undefined {
+  return strippedRoots.get(callID);
 }
 
 /** A role's max authority (allow − deny, never `execute`): the `maxOf` of `bind` / `currentBinding` (handoff 33). */
@@ -612,6 +632,7 @@ export function resetDispatchRouting(): void {
   handledCalls.clear();
   subagentAnnotations.clear();
   routedRoles.clear();
+  strippedRoots.clear();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -880,6 +901,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const pin = result.pin;
     // `classify` removes only the first-line route line and returns every other byte unchanged (probe, QA-2.2-5).
     const stripped = result.stripped !== prompt ? result.stripped : undefined;
+    const strippedRoot = stripped === undefined ? undefined : result.trace.routeLine?.root;
+    if (typeof strippedRoot === "string" && strippedRoot !== "") rememberStrippedRoot(call.callID, strippedRoot);
     const callModel = str(args.model) ?? call.tierModel ?? null;
     const resumeID = str(args.sessionID);
     const decisionID = `${call.sessionID}:${safeNow(now)}:${instanceNonce}:${++sequence}`;
@@ -1219,6 +1242,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       decisionID: logged,
       resumeID,
       nextTier: nextRoleTier(tiers, rp.spec.tierRange.ceiling, tier),
+      class: cls,
     };
     rememberRoutedRole(routed);
 
@@ -1451,6 +1475,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       if (entry !== undefined) undoResume(entry);
       // #84 P2.1: a rejected role call leaves no pending binding entry and no routed record behind.
       routedRoles.delete(callID);
+      strippedRoots.delete(callID);
       if (entry?.rolePending === true) {
         try {
           evictCall(entry.parentSessionID, callID);

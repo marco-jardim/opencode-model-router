@@ -14,6 +14,8 @@ export default {
     // The engine consumes directory/client only. V2 has no legacy HTTP server
     // URL or Bun shell context; do not invent either for the adapter.
     let ingest: Ingest | undefined;
+    // #84 P2.1: the plugin's `/bypass` state, read by the role dispatch path (the router's own gate will not run while bypassed, S10/P-9).
+    let isBypassed: (() => boolean) | undefined;
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
@@ -32,8 +34,9 @@ export default {
         await ctx.session.synthetic({ sessionID: notice.sessionID, text: notice.text, description: notice.description, resume: false });
       },
       routerOnIngest: (created: Ingest) => { ingest = created; },
+      routerOnBypassState: (read: () => boolean) => { isBypassed = read; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
-    return registerV2Hooks(ctx, hooks, runtime, ingest ? { ingest } : {});
+    return registerV2Hooks(ctx, hooks, runtime, { ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}) });
   },
 } satisfies Plugin.Plugin & { server: typeof ModelRouterPlugin };

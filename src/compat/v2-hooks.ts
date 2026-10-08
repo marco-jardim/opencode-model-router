@@ -19,7 +19,18 @@ import { GRADER_SYSTEM } from "../verify/checker";
 import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
-import { childSessionOf, createDispatchRouter } from "../routing/wire/dispatch";
+import {
+  annotateSubagentResult, childSessionOf, createDispatchRouter, forgetRoutedRole, roleMaxActions, routedRoleOf, takeSubagentAnnotations,
+} from "../routing/wire/dispatch";
+import type { RouterConfig } from "../router/config";
+import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
+import { bind, currentBinding, evict as evictBinding, evictCall, type SessionLookup } from "../routing/roles/binding";
+import {
+  consumeAuthority, discardAuthority, evictAuthority, markAnnotated, quoteChildText, requestedAuthority, type AuthorityDeps,
+} from "../routing/roles/authority";
+import { budgetExhausted } from "../guard/enforce";
+import { parseReturnPrefix } from "../routing/outcomes/signals";
+import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
@@ -54,11 +65,15 @@ function taskArgs(toolName: string, input: unknown): any {
   return input;
 }
 
-function nativeArgs(toolName: string, args: any, original: any, verifying: boolean): any {
+/**
+ * `foreground` (#84 P-5): a role dispatch is forced to the foreground whatever the verification settings, so the router can
+ * annotate its result (budget, authority) in `execute.after`. A separate flag: it never marks the call as verifying.
+ */
+function nativeArgs(toolName: string, args: any, original: any, verifying: boolean, foreground = false): any {
   if (!args || typeof args !== "object") return args;
   if (toolName === "subagent") {
     const { subagent_type, task_id, ...rest } = args;
-    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying ? { background: false } : {}) };
+    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying || foreground ? { background: false } : {}) };
   }
   if (toolName === "shell") { const { cwd, ...rest } = args; return { ...rest, ...(cwd === undefined ? {} : { workdir: cwd }) }; }
   if (["read", "write", "edit"].includes(toolName)) {
@@ -86,13 +101,62 @@ function translateAdded(before: string, after: string): string {
   return after.slice(0, prefix) + v2Instructions(after.slice(prefix, after.length - suffix)) + after.slice(after.length - suffix);
 }
 
+// ---------------------------------------------------------------------------
+// #84 P2.1 (T2.1.3, T2.1.4): role-dispatch helpers of the adapter. Roles mode on v2 only; tiers mode never reaches them.
+// ---------------------------------------------------------------------------
+
+/** The text of one session-context message: its `text`, else its text parts (`content` or `parts`) joined. */
+function messageText(message: unknown): string | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const m = message as Record<string, unknown>;
+  if (typeof m.text === "string") return m.text;
+  const parts = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : undefined;
+  if (parts === undefined) return undefined;
+  const texts = parts.flatMap((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text"
+    && typeof (part as Record<string, unknown>).text === "string" ? [(part as Record<string, unknown>).text as string] : []);
+  return texts.length > 0 ? texts.join("\n") : undefined;
+}
+
+/**
+ * Handoff 32: `SessionLookup.firstText` — the text parts of the session's first user message, joined (the binding reads the
+ * nonce from its last line). A context without a user message falls back to its first message with text.
+ */
+export function firstMessageText(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  const isUser = (m: unknown): boolean => !!m && typeof m === "object"
+    && ((m as Record<string, unknown>).role === "user" || (m as Record<string, unknown>).type === "user");
+  const user = messages.find(isUser);
+  return user !== undefined ? messageText(user) : messages.map(messageText).find((text) => text !== undefined);
+}
+
+/** T2.1.4 (P-5, S6): resume guidance appended to the parent's result when the guard stopped a role child on its call budget. */
+export function roleBudgetNotice(agent: string, childSessionID: string): string {
+  return `[router] @${agent} stopped on its tool-call budget before finishing: this is not a failed result. `
+    + `NEXT: resume the same sessionID ("${childSessionID}") with @${agent} and the prompt "continue and finish"; `
+    + "do not start a new task and do not set `model` (the router keeps the child's tier).";
+}
+
+/**
+ * Handoffs 34 and 37: the parent's annotation when a role child stopped with `ESCALATE: authority` after recording a request
+ * (`router_request_authority`). The child's reasons are quoted as data, never as instructions.
+ */
+export function roleAuthorityNotice(agent: string, childSessionID: string, actions: readonly string[], reasons: readonly string[]): string {
+  const why = reasons.length > 0 ? ` Reasons: ${reasons.map(quoteChildText).join("; ")}.` : "";
+  return `[router] @${agent} asked for more authority: ${actions.join(", ")}.${why} `
+    + `NEXT: if the task needs it, resume the same sessionID ("${childSessionID}") with @${agent} to continue with the wider grant `
+    + "(the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.";
+}
+
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
 export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
   runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession">>,
-  /** `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing. */
-  options: { ingest?: Ingest } = {},
+  /**
+   * `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing.
+   * `isBypassed`: the plugin's `/bypass` state (#84 P2.1: the role path's router-gate condition, S10/P-9).
+   */
+  options: { ingest?: Ingest; isBypassed?: () => boolean } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
   // casts confined to this adapter, rather than weakening the v2 event types.
@@ -126,6 +190,52 @@ export async function registerV2Hooks(
   const dispatchRouter = createDispatchRouter({
     runtime: engine, getSession: sessionOf, graderAgent: V2_GRADER_AGENT, directory: ctx.location.directory,
     logger: { warn: (message, extra) => ingestLogger.warn(message, extra), debug: (message, extra) => console.debug(message, extra ?? "") },
+    ...(options.isBypassed === undefined ? {} : { isBypassed: () => options.isBypassed?.() === true }),
+  });
+  // #84 P2.1: the role table of a config (empty in tiers mode, where every role branch below is skipped), cached per config object.
+  const roleTables = new WeakMap<RouterConfig, ReadonlyMap<string, RoleSpec>>();
+  const rolesOf = (cfg: RouterConfig): ReadonlyMap<string, RoleSpec> => {
+    let roles = roleTables.get(cfg);
+    if (roles === undefined) {
+      try {
+        roles = resolveRoles(cfg, "v2");
+      } catch (error) {
+        roles = new Map();
+        ingestLogger.warn("[router] roles: the role table could not be resolved; no role runtime for this config", { error: String(error) });
+      }
+      roleTables.set(cfg, roles);
+    }
+    return roles;
+  };
+  const maxOfRoles = (roles: ReadonlyMap<string, RoleSpec>) => (agent: string) => roleMaxActions(roles.get(agent));
+  /** Handoff 32: what the binding reads of a child session (parent, agent, title, first message text). */
+  const bindingLookup: SessionLookup = async (id) => {
+    const session = await ctx.session.get({ sessionID: id } as Parameters<typeof ctx.session.get>[0]) as unknown as Record<string, unknown>;
+    let firstText: string | undefined;
+    try {
+      firstText = firstMessageText(await ctx.session.context({ sessionID: id } as Parameters<typeof ctx.session.context>[0]));
+    } catch {
+      firstText = undefined; // the title marker still binds
+    }
+    const text = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+    return {
+      ...(text(session.parentID) === undefined ? {} : { parentID: text(session.parentID) }),
+      ...(text(session.agent) === undefined ? {} : { agent: text(session.agent) }),
+      ...(text(session.title) === undefined ? {} : { title: text(session.title) }),
+      ...(firstText === undefined ? {} : { firstText }),
+    };
+  };
+  /** Handoff 36: the parent's last `subagent` call of each role child (the call a resume follows, `consumeAuthority` `afterCall`). */
+  const lastCallOfChild = new Map<string, string>();
+  const rememberLastCall = (child: string, callID: string): void => {
+    lastCallOfChild.delete(child);
+    lastCallOfChild.set(child, callID);
+    while (lastCallOfChild.size > 1000) lastCallOfChild.delete(lastCallOfChild.keys().next().value!);
+  };
+  const authorityDeps = (roles: ReadonlyMap<string, RoleSpec>, fallbackAgent: string | undefined): AuthorityDeps => ({
+    roleOf: (child) => roles.get(lookupDispatch(child)?.agent ?? fallbackAgent ?? ""),
+    roles: () => roles,
+    bindingOf: (child) => currentBinding(child, { maxOf: maxOfRoles(roles) }),
   });
   const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger });
   let eventTask: Promise<void> | undefined;
@@ -491,6 +601,14 @@ export async function registerV2Hooks(
 
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       const args = await scopedArgs(event);
+      // #84 P2.1 (P-2, handoffs 11/32/33): a role child binds to its dispatch before its tool runs, so `router_run` and
+      // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
+      const callerRoles = rolesOf(loadConfig(ctx.location.directory));
+      if (callerRoles.size > 0 && typeof event.agent === "string" && callerRoles.has(event.agent)) {
+        await bind(String(event.sessionID), bindingLookup, { maxOf: maxOfRoles(callerRoles) });
+      }
+      // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
+      let roleForeground = false;
       if (event.tool === "subagent" && args && typeof args.agent === "string") {
         // The model `subagentTiers` would fill in when the call names none (unchanged behaviour: only then, only for a mapped agent).
         const cfg = loadConfig(ctx.location.directory);
@@ -512,10 +630,24 @@ export async function registerV2Hooks(
         }
         // M7 (2.2): the engine goes first. Static (the default) returns untouched without any host call; shadow/advise only
         // log and strip `[route …]`; enforce may also replace agent and model. `subagentTiers` then only fills a missing model.
+        // #84 P2.1 (handoff 36): a resume of a role child applies the authority its previous call recorded and annotated; the
+        // widened actions recompute the tier floor in `route()`. A dropped request says why on this call's result.
+        const roles = rolesOf(cfg);
+        const resumeID = typeof args.sessionID === "string" && args.sessionID !== "" ? args.sessionID : undefined;
+        let widened: AuthorityAction[] | undefined;
+        if (resumeID !== undefined && roles.has(args.agent)) {
+          const consumed = consumeAuthority(resumeID, authorityDeps(roles, args.agent), { afterCall: lastCallOfChild.get(resumeID) ?? "" });
+          if (consumed.status === "widened") widened = [...consumed.widened];
+          else if (consumed.status === "dropped") annotateSubagentResult("authority", resumeID, `[router] ${consumed.reason}.`);
+        }
         const routed = await dispatchRouter.route({
           callID: event.id, sessionID: event.sessionID, agent: event.agent, args, tierModel, cfg,
+          ...(widened === undefined ? {} : { widened }),
         });
         if (routed.prompt !== undefined) args.prompt = routed.prompt;
+        // #84 P2.1-C: a fresh role dispatch carries its nonce at the END of the description (title marker, handoff 31).
+        if (routed.description !== undefined) args.description = routed.description;
+        if (routed.role !== undefined) roleForeground = true;
         if (routed.agent !== undefined) { args.agent = routed.agent; args.subagent_type = routed.agent; }
         if (routed.model !== undefined) args.model = routed.model;
         if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
@@ -542,7 +674,7 @@ export async function registerV2Hooks(
           const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
           output.args.prompt = translateAdded(prompt, output.args.prompt);
         }
-        event.input = nativeArgs(event.tool, output.args, original, verifying);
+        event.input = nativeArgs(event.tool, output.args, original, verifying, roleForeground);
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
         throw error;
@@ -550,11 +682,66 @@ export async function registerV2Hooks(
       // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
       dispatchRouter.commit(event.id, event.input);
     }));
+    /**
+     * #84 P2.1 (T2.1.4; handoffs 28, 34, 37): the parent's `subagent` call of a role child ended. Computed BEFORE the legacy hook
+     * (whose signals read the authority record and the guard state): the notices for the parent's result — resume guidance when
+     * the guard stopped the child on its budget, the child's recorded authority request on `ESCALATE: authority`, a request this
+     * resume dropped. `finish()` runs after the legacy hook: the request is attached to this call on `ESCALATE: authority`
+     * (`markAnnotated`), else dropped (`discardAuthority`); then the call's pending binding entry is evicted (`evictCall`).
+     * `undefined` for every call that is not a role dispatch (tiers mode: always).
+     */
+    const roleAfterCall = (end: {
+      readonly id: string; readonly sessionID: string; readonly status: string; readonly result: unknown; readonly input: unknown;
+    }): { readonly notice: string | undefined; readonly finish: () => void } | undefined => {
+      const record = (value: unknown): Record<string, unknown> | undefined =>
+        value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+      const routedRole = routedRoleOf(end.id);
+      const calledAgent = record(end.input)?.agent;
+      const agent = routedRole?.agent ?? (typeof calledAgent === "string" ? calledAgent : undefined);
+      if (agent === undefined || (routedRole === undefined && !rolesOf(loadConfig(ctx.location.directory)).has(agent))) return undefined;
+      const child = end.status === "completed" ? childSessionOf(end.result) : null;
+      const structured = record(end.result)?.output;
+      const running = record(structured)?.status === "running";
+      const output = record(structured)?.output;
+      const text = typeof output === "string" ? output : contentText(record(end.result)?.content);
+      const contract = child === null || running ? null : parseReturnPrefix(text);
+      const escalated = contract?.prefix === "escalate" && contract.claim === "authority";
+      const notices: string[] = [];
+      if (child !== null && !running) {
+        const request = requestedAuthority(child);
+        if (escalated && request !== undefined && request.actions.length > 0 && (!request.annotated || request.callID === end.id)) {
+          annotateSubagentResult("authority", child, roleAuthorityNotice(agent, child, request.actions, request.reasons));
+        }
+        if (budgetExhausted(child)) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child));
+        for (const annotation of takeSubagentAnnotations(child)) notices.push(annotation.text);
+      }
+      return {
+        notice: notices.length > 0 ? notices.join("\n\n") : undefined,
+        finish: () => {
+          try {
+            if (child !== null) {
+              if (!running && !(escalated && markAnnotated(child, end.id, end.sessionID))) discardAuthority(child, end.id);
+              rememberLastCall(child, end.id);
+            }
+            evictCall(end.sessionID, end.id);
+          } catch (error) {
+            ingestLogger.warn("[router] roles: the finished role dispatch could not be released", { error: String(error) });
+          }
+        },
+      };
+    };
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
       dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
-      const banner = depthBanners.get(event.id);
+      const role = event.tool === "subagent" ? roleAfterCall({
+        id: event.id, sessionID: String(event.sessionID), status: event.status,
+        result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
+      }) : undefined;
+      try {
+      const depthBanner = depthBanners.get(event.id);
+      // The role notices ride with the depth banner: appended last to the parent's result on every path below.
+      const banner = role?.notice === undefined ? depthBanner : depthBanner === undefined ? role.notice : `${depthBanner}\n\n${role.notice}`;
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
       if (event.status !== "completed") return;
@@ -632,6 +819,10 @@ export async function registerV2Hooks(
           : structured && typeof structured === "object" && typeof structured.output === "string"
             ? { output: { ...structured, output: final } } : {}),
       };
+      } finally {
+        role?.finish();
+        if (event.tool === "subagent") forgetRoutedRole(event.id);
+      }
     }));
 
     // V2 events are immutable facts. A completed-text warning is a synthetic
@@ -650,6 +841,13 @@ export async function registerV2Hooks(
           if (event.type === "session.created") dispatchRouter.onSessionCreated({ sessionID: data.sessionID, parentID: data.parentID, agent: data.agent, title: data.title });
           if (event.type === "session.deleted") {
             runtime?.forgetSession?.(data.sessionID);
+            // #84 P2.1 (handoff 35): the session's binding (as a parent: its pending dispatches and children's bindings) and its
+            // authority requests go with it.
+            if (typeof data.sessionID === "string") {
+              evictBinding(data.sessionID);
+              evictAuthority(data.sessionID);
+              lastCallOfChild.delete(data.sessionID);
+            }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {
             // The v2 equivalents of session.idle: coalesced, throttled flush (D15); never awaited.
