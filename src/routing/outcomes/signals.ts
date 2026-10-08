@@ -108,8 +108,12 @@ export interface ReturnContract {
   readonly claim: "budget" | "authority" | null;
 }
 
-/** The host's `task` tool output wraps the child's text: `task_id: … <task_result> … </task_result>`. */
-const TASK_RESULT_RE = /<task_result>([\s\S]*?)(?:<\/task_result>|$)/i;
+/**
+ * The host's `task` tool output wraps the child's text: `task_id: … <task_result> … </task_result>`. Unwrapped only when
+ * the wrapper LEADS the text (after `task_id:` lines) and closes at its end: a `<task_result>` mentioned inside the body
+ * is the child's text (QA-P14-2-4).
+ */
+const TASK_RESULT_RE = /^\s*(?:task_id\s*:[^\n]*\n\s*)*<task_result>([\s\S]*?)(?:<\/task_result>\s*$|$)/i;
 const TASK_ID_RE = /^\s*task_id\s*:/i;
 /** Leading decoration: markdown marks, list bullets, quotes, emoji, punctuation (anything but a letter or a digit). */
 const LEAD_RE = /^[^\p{L}\p{N}]+/u;
@@ -142,7 +146,10 @@ export type GuardObservation = boolean | "unobserved";
 export interface ReturnSignalInput {
   /** The child's final assistant text (see {@link parseReturnPrefix}). */
   readonly text: string | null | undefined;
-  /** The guard observed the child's budget exhausted (P1.5). P2.1 must pass the guard's real state. */
+  /**
+   * The child's budget was exhausted: the guard's call budget (P1.5), and equally a host step limit or a context overflow
+   * that ended the child (P2.1 folds those in). P2.1 must pass the real state.
+   */
   readonly budgetExhausted: GuardObservation;
   /** The child called `router_request_authority` (P1.6). P2.1 must pass the real state. */
   readonly authorityRequested: GuardObservation;
@@ -185,7 +192,10 @@ export function tierRank(tier: string | null | undefined, tiers: readonly string
 interface ModelIds {
   /** `provider/model` without `#variant`, lowercased. */
   readonly full: string;
-  /** Last path segment, `.`/`_`/`:` folded to `-` (`anthropic.claude-sonnet-4-5-v1:0` → `anthropic-claude-sonnet-4-5-v1-0`). */
+  /**
+   * Last path segment, every run of non-alphanumerics folded to `-` (`anthropic.claude-sonnet-4-5-v1:0` →
+   * `anthropic-claude-sonnet-4-5-v1-0`, Vertex `claude-sonnet-4-5@20250929` → `claude-sonnet-4-5-20250929`).
+   */
   readonly bare: string;
 }
 
@@ -193,7 +203,7 @@ function modelIds(model: string | null | undefined): ModelIds | null {
   if (typeof model !== "string") return null;
   const hash = model.lastIndexOf("#");
   const full = (hash >= 0 ? model.slice(0, hash) : model).trim().toLowerCase();
-  const bare = full.slice(full.lastIndexOf("/") + 1).replace(/[._:]/g, "-");
+  const bare = full.slice(full.lastIndexOf("/") + 1).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   return full === "" || bare === "" ? null : { full, bare };
 }
 
@@ -306,6 +316,10 @@ export interface DispatchText {
   readonly class: string | null;
   /** Role agent of the dispatch (roles mode). Must match (absent ≡ null). */
   readonly role?: string | null;
+  /**
+   * The orchestrator's ORIGINAL prompt, before the router prepends its header (`[router] …`, dispatch-header.ts, the
+   * route line): the header is identical in every dispatch and, without ≥ 2 siblings to reveal it, would dominate.
+   */
   readonly prompt: string;
   readonly tier: string | null;
   /** Epoch ms of the dispatch. */
@@ -316,6 +330,24 @@ export interface DispatchText {
   readonly resume?: boolean;
   /** How the attempt ended, when known: an attempt that stopped on budget or authority is never penalised (I7). */
   readonly returned?: SignalKind | null;
+  /** The attempt's return contract (`parseReturnPrefix(...).prefix`), when known. */
+  readonly returnPrefix?: ReturnPrefix | null;
+  /** Guard states of the attempt (as for {@link returnSignal}); absent ≡ `unobserved`. */
+  readonly budgetExhausted?: GuardObservation;
+  readonly authorityRequested?: GuardObservation;
+}
+
+/**
+ * May an earlier attempt take a re-dispatch failure (I7, QA-P14-2-3)? Never when it stopped on an observed budget
+ * exhaustion or authority request. Otherwise only when its stop is known not to be one: it returned finished (`DONE` or
+ * no contract prefix), or both guards were observed false. An unfinished or unknown return with an unobserved guard may
+ * have been a budget stop: no penalty.
+ */
+function penalisable(previous: DispatchText): boolean {
+  if (previous.returned === "budget" || previous.returned === "authority") return false;
+  if (previous.budgetExhausted === true || previous.authorityRequested === true) return false;
+  if (previous.budgetExhausted === false && previous.authorityRequested === false) return true;
+  return previous.returnPrefix === "done" || previous.returnPrefix === "none";
 }
 
 export interface RedispatchMatch {
@@ -393,9 +425,17 @@ function dice(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
   return (2 * shared) / (a.size + b.size);
 }
 
+/** Overlap coefficient |a ∩ b| / min(|a|, |b|) of two non-empty sets. */
+function overlap(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
+  let shared = 0;
+  for (const w of a) if (b.has(w)) shared += 1;
+  return shared / Math.min(a.size, b.size);
+}
+
 /**
- * Dice coefficient of the two texts' word sets, capped by the Dice of their identifier words (words with a digit or a
- * dot: plan steps, versions, files) when either text has any: `P1.4` and `P1.5` are different tasks. 0 when either text
+ * Dice coefficient of the two texts' word sets, capped, when BOTH texts have identifier words (a digit or a dot: plan
+ * steps, versions, files), by the overlap coefficient of those: `P1.4` and `P1.5` are different tasks, while a retry that
+ * adds identifiers (`attempt 2`, `lexer.test.ts line 42`) still covers the original's (QA-P14-2-2). 0 when either text
  * has fewer than {@link REDISPATCH_MIN_TOKENS} words.
  */
 export function taskSimilarity(a: string, b: string): number {
@@ -406,19 +446,21 @@ export function taskSimilarity(a: string, b: string): number {
   const ia = new Set([...wa].filter(isIdentifier));
   const ib = new Set([...wb].filter(isIdentifier));
   const all = dice(wa, wb);
-  return ia.size + ib.size === 0 ? all : Math.min(all, dice(ia, ib));
+  return ia.size === 0 || ib.size === 0 ? all : Math.min(all, overlap(ia, ib));
 }
 
 /**
  * Has `current` dispatched again the task of an earlier attempt, to a higher tier, within the window? Candidates: the
  * same parent, class and role, another addressable child, dispatched before `current` and (when known) ended before it,
  * at most `windowMs` after the previous attempt's end (else its start). For each candidate, most recent first:
- * 1. siblings = the parent's other dispatches, minus earlier attempts of the same task (their compared lines lie
- *    ≥ {@link SAME_TASK_LINE_SHARE} inside the pair's), so a third dispatch is not judged against its own history;
+ * 1. siblings = the parent's other dispatches, minus earlier attempts of the same task (their compared lines, without
+ *    their own template lines found in ≥ 2 other dispatches, lie ≥ {@link SAME_TASK_LINE_SHARE} inside the pair's), so a
+ *    third dispatch is not judged against its own history and a templated sibling still teaches the template;
  * 2. lines shared with ≥ {@link SIBLING_SHARED_MIN} siblings are boilerplate and removed BEFORE comparing;
  * 3. the TASK sections alone are compared (the whole remaining text when either prompt has no TASK header).
  * The most recent earlier attempt of the same task decides: a lower tier gets a failure (0.5); the same or a higher
- * tier, a resume, an unknown tier, or an attempt that ended on budget or authority gets nothing.
+ * tier, a resume, an unknown tier, or an attempt whose stop may have been budget or authority ({@link penalisable}) gets
+ * nothing. Residual: with fewer than two siblings a template cannot be learnt (pass the prompt without the router header).
  */
 export function detectRedispatch(
   current: DispatchText,
@@ -448,11 +490,19 @@ export function detectRedispatch(
     const sectionMode = currentLines.hasTask && previousLines.hasTask;
     const compared = (p: PromptLines): string[] => p.lines.filter((l) => !sectionMode || l.section === "TASK").map((l) => l.text);
     const pair = new Set([...compared(currentLines), ...compared(previousLines)]);
+    // Leave-one-out (QA-P14-2-1): a sibling's own template lines (present in ≥ SIBLING_SHARED_MIN OTHER dispatches of the
+    // parent, `current` included, `previous` and the sibling itself excluded) do not count when judging whether the
+    // sibling is an earlier attempt of the same task; the raw share decides only when nothing else is left.
+    const others = (d: DispatchText): Array<Set<string>> =>
+      [...family, current].filter((o) => o !== d && o !== previous).map((o) => new Set(promptLines(o.prompt).lines.map((l) => l.text)));
     const siblings = family.filter((d) => {
       if (d === previous) return false;
       const own = compared(promptLines(d.prompt));
       if (own.length === 0) return false;
-      return own.filter((t) => pair.has(t)).length / own.length < SAME_TASK_LINE_SHARE;
+      const rest = others(d);
+      const specific = own.filter((t) => rest.filter((set) => set.has(t)).length < SIBLING_SHARED_MIN);
+      const judged = specific.length > 0 ? specific : own;
+      return judged.filter((t) => pair.has(t)).length / judged.length < SAME_TASK_LINE_SHARE;
     });
     const boilerplate = sharedLines(siblings.map((d) => d.prompt));
     const text = (p: PromptLines): string => compared(p).filter((t) => !boilerplate.has(t)).join("\n");
@@ -462,7 +512,7 @@ export function detectRedispatch(
     const from = tierRank(previous.tier, tiers);
     const to = tierRank(current.tier, tiers);
     if (from === null || to === null || to <= from) return null;
-    if (previous.returned === "budget" || previous.returned === "authority") return null;
+    if (!penalisable(previous)) return null;
     return { previous, similarity, observation: observe("redispatch", "fail", SIGNAL_WEIGHTS.redispatch) };
   }
   return null;

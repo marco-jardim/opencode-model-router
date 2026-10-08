@@ -31,7 +31,7 @@ import type {
   TokenMeans,
   VerdictRow,
 } from "./types";
-import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, SIGNAL_KINDS, STATS_EXIT, isAnnotationRow } from "./types";
+import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, SIGNAL_KINDS, STATS_EXIT, isAnnotationRow, parseKey } from "./types";
 import { createOutcomeStore } from "./store";
 import { signalMass } from "./signals";
 
@@ -320,6 +320,16 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
 
 const UNKNOWN_TIER = "unknown";
 
+/**
+ * Role of a decision row: its `role`, else the agent of its dispatched key when that key has origin `role` (QA-P14-2-5:
+ * a role dispatch row written without `role` is still the role's; P2.1 should write `role` anyway).
+ */
+function roleOf(row: DecisionRow): string | undefined {
+  if (row.role !== undefined) return row.role;
+  const parts = parseKey(dispatchedKey(row));
+  return parts !== null && parts.agent.origin === "role" ? parts.agent.id : undefined;
+}
+
 interface RoleTierAcc {
   readonly role: string;
   readonly tier: string;
@@ -374,7 +384,7 @@ function pooledUSD(store: OutcomeStoreView, keys: ReadonlySet<OutcomeKey>): Mean
 
 /**
  * Role × tier statistics over `since ≤ ts < until`. Only rows of role dispatches count: a dispatch row is a non-annotation
- * `dispatch` decision row with `role` set; signal rows (`signal` set) and unknown-binding rows are attributed to the role
+ * `dispatch` decision row with a role (`role`, else a role-origin dispatched key: {@link roleOf}); signal rows and unknown-binding rows are attributed to the role
  * and tier of the dispatch row they join on `decisionID` (any window: the dispatch may precede the window), else to their
  * own `role`/`tier`. Rows are deduplicated like `summarize` (C7): the first dispatch row per decision id, and identical
  * annotation rows once. Signal masses are clamped per kind (`signalMass`): I6 and I7 hold whatever a row claims.
@@ -391,6 +401,11 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
   const dispatchByID = new Map<string, DecisionRow>();
   const annotations: DecisionRow[] = [];
   const seenNotes = new Set<string>();
+  // Residual QA-P14-1-6: a refusal that records `overrides: "pass"` turned the attempt's store pass into a failure (as
+  // `summarize` moves that pass to a fail). The attempt's `verdict:pass` signal then counts as a failure of 1. Every row
+  // handed in, not only the window: the refusal may land in another window than the signal.
+  const converted = new Set<string>();
+  for (const row of rows) if (row.kind === "refusal" && row.overrides === "pass") converted.add(row.attemptID);
   for (const row of rows) {
     if (row.kind !== "decision") continue;
     if (isAnnotationRow(row)) {
@@ -425,8 +440,9 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
   const placeOf = (row: DecisionRow): RoleTierAcc | null => {
     const dispatch = dispatchByID.get(row.decisionID);
     const source = dispatch ?? row;
-    if (source.role === undefined) return null;
-    return bucket(source.role, source.tier ?? UNKNOWN_TIER);
+    const role = roleOf(source);
+    if (role === undefined) return null;
+    return bucket(role, source.tier ?? UNKNOWN_TIER);
   };
 
   const unknownBindingSeen = new Set<string>();
@@ -442,8 +458,9 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
   let unattributedSignals = 0;
   let unattributedBindings = 0;
   for (const row of dispatchByID.values()) {
-    if (!inWindow(row) || row.role === undefined) continue;
-    const acc = bucket(row.role, row.tier ?? UNKNOWN_TIER);
+    const role = roleOf(row);
+    if (!inWindow(row) || role === undefined) continue;
+    const acc = bucket(role, row.tier ?? UNKNOWN_TIER);
     if (noteUnknownBinding(row, acc)) unattributedBindings += 1;
     if (row.step !== "dispatch") continue;
     acc.dispatches += 1;
@@ -468,7 +485,8 @@ export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly Lo
       continue;
     }
     const cell = acc.signals.get(kind) ?? { pass: 0, fail: 0, none: 0, positive: 0, negative: 0 };
-    const mass = signalMass(kind, row.signalWeight);
+    const overridden = kind === "verdict" && row.attemptID !== undefined && converted.has(row.attemptID) && (row.signalWeight ?? 0) > 0;
+    const mass = signalMass(kind, overridden ? -1 : row.signalWeight);
     if (mass.positive > 0) cell.pass += 1;
     else if (mass.negative > 0) cell.fail += 1;
     else cell.none += 1;
