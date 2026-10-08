@@ -2,6 +2,7 @@ import { isAbsolute, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthorityAction, RoleSpec } from "../../src/router/roles";
 import type { TaskFacts } from "../../src/routing/classify/types";
+import { tmpdir } from "node:os";
 import * as authority from "../../src/routing/roles/authority";
 import * as binding from "../../src/routing/roles/binding";
 import {
@@ -218,7 +219,9 @@ describe("bind: the role max bounds every grant", () => {
       expect(b.kind, agent).toBe("unknown");
       expect(acts(b), agent).toEqual(want);
       expect(b.grant.workRoot, agent).toBeNull();
-      const policy = grantFor(spec(agent), {} as TaskFacts, [], null);
+      // what grantFor gives with a validated work root; the unknown binding must not be derived from it
+      const realFacts: TaskFacts = { class: "other", risk: "low", scope: "single", needs: ["edit"], confidence: 0.9, source: "rules" };
+      const policy = grantFor(spec(agent), realFacts, [], tmpdir());
       expect(acts(b).every((a) => LOCAL.includes(a) && MAX[agent]!.includes(a)), agent).toBe(true);
       if (agent === "implementer") expect([...policy.actions]).toContain("edit"); // what grantFor would give
     }
