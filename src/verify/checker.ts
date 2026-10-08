@@ -10,6 +10,7 @@ import { scrubText } from "../guard/scrub";
 import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
 import { captureBudget } from "../guard/enforce";
 import type { BudgetSnapshot } from "../guard/enforce";
+import { parseReturnPrefix } from "../routing/outcomes/signals";
 
 // ---------------------------------------------------------------------------
 // Incomplete returns (§2.9 E8, I7)
@@ -45,8 +46,39 @@ export function isIncompleteVerdict(verdict: object): boolean {
 /** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
 const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*[ \t]*:/m;
 
-/** `NEED MORE: budget` at the start of a line (QA-P15-1-2). */
-const NEED_MORE_BUDGET_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
+/** `NEED MORE: budget` at the start of a line (QA-P15-1-2); the fallback when the first line carries no prefix. */
+const NEED_MORE_BUDGET_LINE_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
+
+/** A `SCOPE GROWTH:` / `NEED CONTEXT:` first line: a contract prefix unknown to parseReturnPrefix that still decides. */
+const OTHER_CONTRACT_FIRST_LINE_RE = /^(?:NEED[\s_-]*CONTEXT|SCOPE[\s_-]*GROWTH)\b[*_`\s]*:/i;
+
+/** The first non-empty line, past a leading `task_id:` / `<task_result>` envelope, with leading decoration stripped. */
+function firstLine(text: string): string {
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/^\s*<task_result>/i, "");
+    if (line.trim() === "" || /^\s*task_id\s*:/i.test(line)) continue;
+    return line.replace(/^[^\p{L}\p{N}]+/u, "").replace(/^\d+[.)]\s+/, "");
+  }
+  return "";
+}
+
+/**
+ * Two contract definitions coexist on purpose. CONTRACT_MARKER_RE (above) is an any-line test that also knows
+ * NEED CONTEXT / SCOPE GROWTH; the stop branch keeps it so a guard-stopped producer that wrote any marker
+ * anywhere is not forced to "incomplete" over a result it did state. parseReturnPrefix (signals.ts) is the
+ * FIRST-line contract (DONE / NEED MORE / ESCALATE) used for the claim decision below.
+ *
+ * `NEED MORE: budget` is claimed by the return prefix (the first non-empty line after unwrapping the task
+ * envelope and markdown/list decoration; DF-1 fix). A DONE:/ESCALATE: first line decides: a later line
+ * quoting the claim is never one. When the first line carries no prefix (a progress summary before the
+ * claim, as the guard's own message asks for), a line-start `NEED MORE: budget` still counts (I7).
+ */
+function claimsNeedMoreBudget(text: string): boolean {
+  const contract = parseReturnPrefix(text);
+  if (contract === null) return false;
+  if (contract.prefix === "none") return !OTHER_CONTRACT_FIRST_LINE_RE.test(firstLine(text)) && NEED_MORE_BUDGET_LINE_RE.test(text);
+  return contract.prefix === "need-more" && contract.claim === "budget";
+}
 
 /** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
 const ANNOUNCE_RE = /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue)\b/i;
@@ -113,7 +145,7 @@ function claimHonoured(snapshot: BudgetSnapshot): boolean {
  * budget snapshot captured when the task returned (`budget`, QA-P15-2-5; absent
  * → read now through `budgetSnapshot`, default the live guard):
  * - budget: the guard STOPPED the producer in that round (enforced) and it
- *   returned no contract marker, or a `NEED MORE: budget` line the snapshot
+ *   returned no contract marker, or a `NEED MORE: budget` claim (return prefix, or, with no prefix, a line) the snapshot
  *   backs (claimHonoured) — for every agent;
  * - progress note (only when `progressNotes`): for an agent that follows the
  *   return contract — `returnContract`, else a router tier of the ladder.
@@ -133,7 +165,7 @@ export function incompleteVerdict(
   const snapshot = input.budget ?? (opts.budgetSnapshot ?? captureBudget)(input.producerSessionID);
   if (
     (snapshot.stopped && !CONTRACT_MARKER_RE.test(text)) ||
-    (NEED_MORE_BUDGET_RE.test(text) && claimHonoured(snapshot))
+    (claimsNeedMoreBudget(text) && claimHonoured(snapshot))
   ) {
     return incomplete(BUDGET_INCOMPLETE_REASON);
   }

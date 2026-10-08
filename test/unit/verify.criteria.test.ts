@@ -348,8 +348,11 @@ describe("QA-P15-1-2: NEED MORE: budget and a guard stop are incomplete (I7)", (
 
   it.each([
     "NEED MORE: budget\nDone: guards.ts. Remaining: tests.",
+    "**NEED MORE:** `budget` — done: X; remaining: Y",
     "Summary first.\n**NEED MORE:** `budget` — done: X; remaining: Y",
+    "Summary first.\nNEED MORE: budget",
     "> need more: budget",
+    "task_id: ses_1\n<task_result>\n- **NEED MORE: budget** — done: X\n</task_result>",
   ])("%j → incomplete for any agent, the grader is not dispatched", async (text) => {
     const grader = vi.fn<GraderDispatch>();
     const input = { ...checkerInput(["x"], text), producerTier: "general" };
@@ -585,5 +588,46 @@ A hand-back with zero tool calls is recorded as a false refusal.`;
     expect(routeLineRoot("Do it.")).toBeUndefined();
     const prompt = "[route class=implement root=/srv/wt]\nDo it.";
     expect(buildDispatchHeader({ ...base, root: routeLineRoot(prompt) })).toContain("Working directory: /srv/wt.");
+  });
+});
+
+describe("DF-1 fix: the budget claim is read only from the return prefix", () => {
+  const passing: GraderDispatch = async () => ({ sessionID: "g", text: '{"pass":true,"reasons":[]}' });
+  const room = () => ({ tracked: true, stopped: false, usedUp: true, readCapReached: true });
+
+  it.each([
+    "DONE: implemented.\n\n- `NEED MORE: budget` at the cap → note and `budget` signal",
+    "task_id: ses_1\n<task_result>\nDONE: implemented.\n- `NEED MORE: budget` at the cap\n</task_result>",
+    "ESCALATE: authority\nNEED MORE: budget",
+  ])("%j is graded, not incomplete", async (text) => {
+    const grader = vi.fn(passing);
+    const v = await runChecker(checkerInput(["x"], text), { dispatchGrader: grader, budgetSnapshot: room });
+    expect(grader).toHaveBeenCalledTimes(1);
+    expect(v.reasons).not.toEqual([BUDGET_INCOMPLETE_REASON]);
+    expect(isIncompleteVerdict(v)).toBe(false);
+    const input = { finalReturnText: text, producerSessionID: "p", producerTier: "medium" };
+    expect(incompleteVerdict(input, { progressNotes: false, budgetSnapshot: room })).toBeNull();
+  });
+
+  it("QA-FX2-1-1: a guard-stopped producer's summary line before the claim is a budget stop", async () => {
+    const stopped = () => ({ tracked: true, stopped: true, usedUp: true });
+    const grader = vi.fn(passing);
+    const v = await runChecker(checkerInput(["x"], "Progress: guards.ts done.\nNEED MORE: budget"), { dispatchGrader: grader, budgetSnapshot: stopped });
+    expect(v.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
+    expect(grader).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "SCOPE GROWTH: needs a design call.\n- `NEED MORE: budget` at the cap",
+    "**NEED CONTEXT:** which file?\nNEED MORE: budget",
+    "task_id: ses_1\n<task_result>\nSCOPE GROWTH: bigger than scoped\nNEED MORE: budget\n</task_result>",
+  ])("QA-FX2-2-1: %j — a SCOPE GROWTH/NEED CONTEXT first line decides, no budget claim", (text) => {
+    const input = { finalReturnText: text, producerSessionID: "p", producerTier: "medium" };
+    expect(incompleteVerdict(input, { progressNotes: false, budgetSnapshot: room })).toBeNull();
+  });
+
+  it("a prefix claim is still incomplete", () => {
+    const input = { finalReturnText: "NEED MORE: budget\nDONE: later", producerSessionID: "p", producerTier: "medium" };
+    expect(incompleteVerdict(input, { progressNotes: false, budgetSnapshot: room })?.reasons).toEqual([BUDGET_INCOMPLETE_REASON]);
   });
 });
