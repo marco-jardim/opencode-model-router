@@ -22,11 +22,11 @@ import {
 import { ACTION_CLASS, CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS } from "../../src/router/roles";
 import type { AuthorityAction, RoleSpec } from "../../src/router/roles";
 import { ROLE_DENIED_ACTIONS, ROLE_STEPS_MARGIN, roleAgentSteps } from "../../src/router/role-agents";
-import { GUARD_CUMULATIVE_MULTIPLIER, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "../../src/router/guard-profile";
+import { GUARD_CUMULATIVE_MULTIPLIER, REFUSAL_CAP, roleGuardProfile, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "../../src/router/guard-profile";
 import { DEFAULT_RUN_TIMEOUT_MS, RUN_ARG_RE, RUN_MAX_ARGS, RUN_OUTPUT_BYTES } from "../../src/router/run-tools";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
-import { authorityFloor, GRANT_NOTES } from "../../src/routing/roles/policy";
-import { REDISPATCH_WINDOW_MS, SIGNAL_MASS_CAPS, SIGNAL_WEIGHTS } from "../../src/routing/outcomes/signals";
+import { authorityFloor, effectiveDetection, GRANT_NOTES } from "../../src/routing/roles/policy";
+import { REDISPATCH_WINDOW_MS, runSignal, SIGNAL_MASS_CAPS, SIGNAL_WEIGHTS } from "../../src/routing/outcomes/signals";
 import { CRITERIA_BUDGET_CHARS } from "../../src/verify/dod";
 import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
 import { parseJsonc } from "../../src/router/jsonc";
@@ -839,11 +839,18 @@ function expectedRoleRow(spec: RoleSpec): string[] {
   ];
 }
 
-/** Every difference between the guide's roles table and `specs`, cell by cell. */
+/** The header of the guide's roles table: the columns {@link expectedRoleRow} fills, in its order. */
+const ROLE_TABLE_HEADER: readonly string[] = [
+  "Agent", "Kind", "Shipped description (intent)", "Authority mode", "Authority (max)", "Tier range", "Default assurance", "Guard",
+  "Budget (calls per tier)", "Host steps",
+];
+
+/** Every difference between the guide's roles table and `specs`, cell by cell (header included). */
 function roleTableProblems(doc: string, specs: readonly RoleSpec[]): string[] {
   const table = tableAfter(doc, "roles-table");
   if (table === undefined) return ["no roles table"];
   const problems: string[] = [];
+  if (JSON.stringify(table.header) !== JSON.stringify(ROLE_TABLE_HEADER)) problems.push(`header ${table.header.join(" | ")}`);
   const byAgent = new Map(table.rows.map((row) => [row[0] ?? "", row] as const));
   for (const spec of specs) {
     const row = byAgent.get(tick(spec.agent));
@@ -937,6 +944,12 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
       "reviewer column 5: doc `read`, `glob`, `grep`, `router_git`, `router_run`, code `read`, `glob`, `grep`, `router_git`, `router_run`, `edit`",
     ]);
     expect(roleTableProblems("# no table\n", SHIPPED_ROLE_SPECS)).toEqual(["no roles table"]);
+    // swapped header columns: the rows still match by position, the header pin catches the mislabelling
+    const swapped = guide.replace("| Tier range | Default assurance |", "| Default assurance | Tier range |");
+    expect(swapped).not.toBe(guide);
+    expect(roleTableProblems(swapped, SHIPPED_ROLE_SPECS)).toEqual([
+      `header ${[...ROLE_TABLE_HEADER.slice(0, 5), "Default assurance", "Tier range", ...ROLE_TABLE_HEADER.slice(7)].join(" | ")}`,
+    ]);
   });
 
   it("the floor table of ROLES.md is authorityFloor for every grant, detection, risk and scope", () => {
@@ -960,13 +973,48 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(floorTableProblems("no table", authorityFloor)).toEqual(["no floor table"]);
   });
 
-  it("the action-class table names every role action under its class", () => {
+  it("the action-class table names every role action in exactly one row, the row of its class", () => {
     const rows = guide.split(/\r?\n/).filter((line) => /^\| (local|exec|write|egress) \|/.test(line)).map(cellsOf);
     expect(rows.map((row) => row[0])).toEqual(["local", "exec", "write", "egress"]);
     const hostName = (action: string): string => (action === "router_git" ? "router_git_*" : action === "context7" ? "context7_*" : action);
-    for (const [action, cls] of Object.entries(ACTION_CLASS)) {
-      expect(rows.find((row) => row[0] === cls)?.[1], action).toContain(tick(hostName(action)));
-    }
+    /** Actions not named in exactly one row, the row of their class. */
+    const misplaced = (table: readonly string[][]): string[] => Object.entries(ACTION_CLASS)
+      .filter(([action, cls]) => {
+        const naming = table.filter((row) => (row[1] ?? "").includes(tick(hostName(action)))).map((row) => row[0]);
+        return JSON.stringify(naming) !== JSON.stringify([cls]);
+      })
+      .map(([action]) => action);
+    expect(misplaced(rows)).toEqual([]);
+    // negative fixtures: an action listed under a second class, and one moved to the wrong class
+    const edited = (cls: string, cell: (text: string) => string): string[][] => rows.map((row) => (row[0] === cls ? [cls, cell(row[1] ?? "")] : row));
+    expect(misplaced(edited("exec", (text) => `${text}, \`edit\``))).toEqual(["edit"]);
+    const grepMoved = edited("local", (text) => text.replace("`grep`, ", "")).map((row) => (row[0] === "egress" ? ["egress", `${row[1]}, \`grep\``] : row));
+    expect(misplaced(grepMoved)).toEqual(["grep"]);
+  });
+
+  it("states what the code does with the role default assurance, the run signal, work-root checks and budgets (QA-P32-1)", () => {
+    // default assurance is descriptive: with no gate, claim or [acceptance] block a dispatch is `none`, whatever the role
+    expect(effectiveDetection({ routerGate: false, claim: null, acceptance: null })).toBe("none");
+    expect(flat).toContain("The role's default assurance in the table below is descriptive only: it never raises or lowers a dispatch's detection.");
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain("This default is descriptive only and never enters the routing");
+    // the run signal: only npm-script-form checks; none → no signal
+    expect(runSignal({ childSessionID: "c", runs: [], edits: [], editsObserved: true, acceptance: [] } as unknown as Parameters<typeof runSignal>[0])).toBeNull();
+    expect(flat).toContain("**The `run` signal matches npm-script-form checks only.**");
+    expect(flat).toContain("A dispatch with no check of that form gets no `run` signal.");
+    // acceptance checks in the work root (DF2-F1 fixed)
+    expect(flat).toContain("**Acceptance checks run in the work root.**");
+    expect(flat).toContain("a `cwd:` outside that root is refused");
+    expect(guide).not.toContain("DF2-F1");
+    // dispatch rows vs annotation rows; budgetUsed is not written
+    for (const doc of [guide, read("docs/ROUTING_ENGINE.md")]) expect(doc).not.toContain("budgetUsed");
+    expect(flat).toContain("`note:binding:<kind>` row with `binding`");
+    expect(flat).toContain("`note:signal:<kind>:<pass|fail|none>` row with `signal`");
+    // a floor above the role's ceiling: the role has no budget for that tier → the tier agents' budget
+    const explorer = SHIPPED_ROLE_SPECS.find((spec) => spec.agent === "explorer")!;
+    expect(Object.hasOwn(explorer.budget, "heavy")).toBe(false);
+    expect(roleGuardProfile(explorer, "heavy").budget).toBe(TIER_GUARD_BUDGET);
+    expect(flat).toContain(`the dispatch gets the tier agents' ${TIER_GUARD_BUDGET} calls`);
+    expect(flat).toContain("has a read-only call cap only when it carries `CAP:N` or `CAP:none`");
   });
 
   it("quotes the budget, steps, signal, exploration and router_run numbers of the code", () => {
@@ -1021,6 +1069,31 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     for (const item of ["Reader guard profile.", "Uncharged denials.", "Whole criteria.", "Header strip.", "Progress notes are incomplete.", "`root=` in the header.",
       "The budget claim is read from the return prefix", "downgrading past this version is unsupported"]) expect(unreleased, item).toContain(item);
     expect(unreleased).toContain(`Explicit \`[acceptance]\` lists over ${CRITERIA_BUDGET_CHARS} code points are no longer graded in full`);
+    // QA-P32-1-5: R8(3), R8(2), R8(7), R7 single-dash, R7 cost-inverted roles, the v2-only class reader case
+    expect(unreleased).toContain("After a verification FAIL of a role child the router raises its tier on the next resume itself; the orchestrator never sets `tier=` or `model`.");
+    expect(unreleased).toContain(`Role agents' host \`steps\` = ${ROUTE_BUDGET_RAISE_MAX} × the top role budget + \`REFUSAL_CAP\` (${REFUSAL_CAP}) + ${ROLE_STEPS_MARGIN}.`);
+    expect(unreleased).toContain("A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`.");
+    expect(unreleased).toContain("single-dash arguments carrying `/`, `\\` or `..` are refused");
+    expect(unreleased).toContain("A role whose tier range the active preset's `costRatio` orders against the tier names is disabled with a notice.");
+    expect(unreleased).toContain("`class=review|recon|search` (OpenCode v2 with a routing engine other than `static`; never on v1)");
+    expect(unreleased).toContain("the `run` signal matches npm-script-form checks only");
+    expect(unreleased).toContain("A role dispatch's acceptance checks run in its work root; a `cwd:` outside it is refused.");
+    expect(unreleased).not.toContain("budgetUsed");
+  });
+
+  it("README and READ_ONLY_TIERS describe router_run's shell precisely; the class reader case is v2-only; ADR wording follows the plan", () => {
+    expect(read("README.md")).toContain("no shell controlled by the caller; npm script bodies still run in npm's pinned script shell");
+    const readOnly = read("docs/READ_ONLY_TIERS.md").replace(/\s+/g, " ");
+    expect(readOnly).toContain("no shell controlled by the caller; npm script bodies still run in npm's pinned script shell");
+    expect(readOnly).toContain("it never applies on v1, where the engine is always `static`");
+    const adr = read("docs/adr/0006-role-tier-assurance-delegation.md");
+    const flatAdr = adr.replace(/\s+/g, " ");
+    expect(adr).toMatch(/^\| E8 \|.*candidate cut site `src\/verify\/dod\.ts:62`/m);
+    expect(adr).toMatch(/^\| E13 \|.*\| owner override, #81 review, PLAN-3 \|\r?$/m);
+    expect(flatAdr).toContain("the dispatch header naming a route line's `root=`, and the I7 budget-incomplete rule");
+    expect(flatAdr).toContain("is descriptive and never enters the routing");
+    expect(flatAdr).toContain("only checks of that form are matched to runs");
+    expect(adr).not.toContain("budgetUsed");
   });
 
   it("links the guide and ADR 0006 from the README, the plans index, the config reference and the routing guide", () => {
