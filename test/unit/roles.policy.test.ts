@@ -14,11 +14,26 @@ import {
 import {
   GRANT_NOTES,
   authorityFloor,
+  effectiveDetection,
   grantFor,
-  tierBounds,
+  tierBounds as tierBoundsOf,
   type DispatchGrant,
+  type EffectiveFactsSources,
   type TierBoundsOptions,
 } from "../../src/routing/roles/policy";
+import type { RouteLine } from "../../src/routing/classify/types";
+
+type BoundsOptions = TierBoundsOptions & EffectiveFactsSources;
+
+/**
+ * QA-P12-1-1 (R7): `tierBounds` takes the classify shape and an EFFECTIVE detection. This adapter keeps the
+ * tables below readable: `o.classifier` becomes `trace.rules` (over `facts`), `o.routeLine` becomes `trace.routeLine`.
+ */
+function tierBounds(spec: RoleSpec, grant: DispatchGrant, f: TaskFacts, d: Detection, o: BoundsOptions) {
+  const rules: TaskFacts = o.classifier ? { ...f, ...o.classifier } : f;
+  const routeLine = o.routeLine ? ({ pin: false, ignored: [], ...o.routeLine } as RouteLine) : null;
+  return tierBoundsOf(spec, grant, { facts: f, trace: { rules, routeLine } }, effectiveDetection(d), o);
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures: the §2.2 classes and the shipped role table, written independently of policy.ts
@@ -244,6 +259,21 @@ describe("grantFor — work root", () => {
     expect(general.notes).toEqual([GRANT_NOTES.shell, GRANT_NOTES.externalDir, GRANT_NOTES.noWorkRoot]);
   });
 
+  it("QA-P12-1-2: no work root → local only: implementer/general with needs=edit,shell keep exactly the local actions", () => {
+    expect(GRANT_NOTES.noWorkRoot).toBe("no valid work root: write and run withheld");
+    for (const spec of [ROLES.implementer, ROLES.general]) {
+      const g = grantFor(spec, facts(["shell", "edit"]), ["edit", "router_run"], null);
+      expect(sorted(g)).toEqual(set("read", "glob", "grep", "router_git"));
+      expect(g.notes).toEqual([GRANT_NOTES.shell, GRANT_NOTES.noWorkRoot]);
+      expect(g.notes).not.toContain(GRANT_NOTES.edit);
+      const rooted = grantFor(spec, facts(["shell", "edit"]), [], ROOT);
+      expect(rooted.actions.has("edit")).toBe(true);
+      expect(rooted.actions.has("router_run")).toBe(true);
+    }
+    // a fixed egress role touches no file: it keeps its egress without a root
+    expect(sorted(grantFor(ROLES.researcher, facts(["web"]), [], null))).toEqual(set("webfetch", "websearch", "context7"));
+  });
+
   it("no work-root note when router_run was never in the grant", () => {
     expect(grantFor(ROLES.explorer, facts(), [], null).notes).toEqual([]);
   });
@@ -339,7 +369,10 @@ describe("grantFor — properties", () => {
       const max = new Set(allow.filter((a) => !deny.includes(a)));
       for (const a of g.actions) expect(max.has(a)).toBe(true);
       expect(violatesSeparation(g.actions)).toBe(false);
-      if (workRoot === null) expect(g.actions.has("router_run")).toBe(false);
+      if (workRoot === null) {
+        expect(g.actions.has("router_run")).toBe(false);
+        expect(g.actions.has("edit")).toBe(false);
+      }
       expect(g.workRoot).toBe(workRoot);
       expect(new Set(g.notes).size).toBe(g.notes.length);
       // A dynamic grant never exceeds the fixed grant of the same (valid, separated) max. With a max that
@@ -370,7 +403,7 @@ describe("grantFor — properties", () => {
 
 const TIERS = ["fast", "medium", "heavy"] as const;
 
-function opts(o: Partial<TierBoundsOptions> = {}): TierBoundsOptions {
+function opts(o: Partial<BoundsOptions> = {}): BoundsOptions {
   return { floorTier: null, runningTier: null, pinTier: null, tiers: TIERS, ...o };
 }
 
@@ -426,6 +459,23 @@ describe("tierBounds — risk and scope are raise-only", () => {
     }));
     expect(b.floor).toBe("medium");
     expect(tierBounds(ROLES.implementer, g, merged, "deterministic", opts({ classifier: null, routeLine: null })).floor).toBe("fast");
+  });
+
+  it("QA-P12-1-1: the classify shape is required — classifier scope multi + [route scope=single] + deterministic + write → medium", () => {
+    // classify() lets the route line override scope: facts.scope is single, trace.rules.scope is multi.
+    const classified = {
+      facts: facts([], "low", "single"),
+      trace: { rules: facts([], "low", "multi"), routeLine: { scope: "single", pin: false, ignored: [] } as RouteLine },
+    };
+    const b = tierBoundsOf(ROLES.implementer, g, classified, effectiveDetection("deterministic"), opts());
+    expect(b.floor).toBe("medium");
+    expect(b.reasons).toContain("floor:authority");
+  });
+
+  it("effectiveDetection brands an already-resolved detection and never raises one", () => {
+    expect(effectiveDetection("deterministic")).toBe("deterministic");
+    expect(effectiveDetection("grader")).toBe("grader");
+    expect(effectiveDetection("maybe" as Detection)).toBe("none");
   });
 });
 
@@ -492,15 +542,17 @@ describe("tierBounds — floors above the role range", () => {
 });
 
 describe("tierBounds — tier names off the order", () => {
-  it("unknown names are ignored with a reason", () => {
+  it("QA-P12-1-4: unknown floor names fail closed to the top of the order; an unknown ceiling is ignored", () => {
     const r = role("x", "general", "dynamic", LOCAL, "giant", "huge");
     const b = tierBounds(r, grantOf(...LOCAL), facts(), "none", opts({ floorTier: "giant", runningTier: "tiny" }));
     expect(b).toEqual({
-      floor: "fast",
+      floor: "heavy",
       ceiling: "heavy",
       pinned: null,
-      reasons: ["ignore:role:giant", "ignore:floorTier:giant", "ignore:running:tiny", "ignore:ceiling:huge"],
+      reasons: ["unknown:role:giant->heavy", "unknown:floorTier:giant->heavy", "unknown:running:tiny->heavy", "ignore:ceiling:huge"],
     });
+    const onlyRunning = tierBounds(ROLES.explorer, grantOf(...LOCAL), facts(), "none", opts({ runningTier: "tiny" }));
+    expect(onlyRunning).toMatchObject({ floor: "heavy", ceiling: "heavy", reasons: ["unknown:running:tiny->heavy", "floor:running", "lift:floor"] });
   });
 
   it("a built-in floor missing from the order rounds up (fail-closed)", () => {

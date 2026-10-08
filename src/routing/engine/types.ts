@@ -16,6 +16,7 @@
 import type { ResolvedRouting } from "../../router/config";
 import type { ExplorationConfig } from "../../router/roles";
 import type { Detection, Need, TaskFacts } from "../classify/types";
+import type { ClassifiedDispatch, EffectiveDetection } from "../roles/policy";
 import type {
   AgentRef,
   CostUnit,
@@ -320,13 +321,17 @@ export interface RoleExploration extends Pick<ExplorationConfig, "rate"> {
 
 export interface RoleDecisionInput {
   /**
-   * Classifier facts with the EFFECTIVE risk and scope (`roles/policy.effectiveFacts`: max of the classifier and the route
-   * line): never-down, `U` and exploration read `facts.risk`.
+   * The classify result (`ClassifyResult` itself: `facts`, `trace.rules`, `trace.routeLine`). The kernel reads the
+   * EFFECTIVE risk and scope from it (`roles/policy.effectiveFactsOf`, raise-only, QA-P12-1-1): never-down, `U` and
+   * exploration use that risk.
    */
-  readonly facts: TaskFacts;
+  readonly classified: ClassifiedDispatch;
   readonly ladder: RoleLadder;
-  /** The EFFECTIVE detection (§2.1, A34): `deterministic` only when the router's own gate runs the checks. */
-  readonly detection: Detection;
+  /**
+   * The EFFECTIVE detection (§2.1, A34; `roles/policy.effectiveDetection`): `deterministic` only when the router's own
+   * gate runs the checks. Never `ClassifyResult.detection` (the route line's claim).
+   */
+  readonly detection: EffectiveDetection;
   /** `routing.engine`: only `enforce` applies a kernel switch or explores. */
   readonly engine: ResolvedRouting["engine"];
   readonly routing: KernelRouting;
@@ -344,7 +349,10 @@ export interface RoleDecision {
   readonly decision: Decision;
   /** The policy's pick before the kernel: the pinned tier, else the static default, raised to the running rung on a resume. */
   readonly base: Candidate | null;
-  /** What the router sets as the per-call model; `null` = no candidate (the caller must not dispatch the role). */
+  /**
+   * What the router sets as the per-call model. `null` = no candidate (reason `window:no-candidates`): P2.1 REFUSES the
+   * role dispatch. It never falls back to `buildEscalatePolicy`/`buildLadder` or to a tier agent on its own (QA-P12-1-5).
+   */
   readonly dispatch: Candidate | null;
   /** `enforce` applied the kernel's switch (`dispatch` = `decision.target`); never on a resume, a pin or an exploration draw. */
   readonly switched: boolean;
@@ -352,6 +360,9 @@ export interface RoleDecision {
   readonly explore: boolean;
   /** Probability that this policy dispatches `dispatch` for this input, in (0, 1]; 1 when no draw was possible. */
   readonly propensity: number;
-  /** `RoleLadder.reasons` plus `resume:running`, `resume:off-ladder`, `kept:resume`, `explore`. */
+  /**
+   * `RoleLadder.reasons` plus `resume:running`, `resume:off-ladder` (raised to the running model's capability rank),
+   * `resume:off-ladder:lift` (unknown rank: raised to the window ceiling), `kept:resume`, `explore`.
+   */
   readonly reasons: readonly string[];
 }

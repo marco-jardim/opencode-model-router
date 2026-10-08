@@ -555,10 +555,21 @@ function windowSpan(order: readonly string[], window: Pick<RoleWindow, "floor" |
 }
 
 /**
+ * The tier order of every role dispatch (QA-P12-1-5): the escalate ladder of `buildEscalatePolicy(cfg, session)`,
+ * de-duplicated and restricted to tiers with at least one rung. Pass it as `tierBounds(..., { tiers })` AND build the
+ * ladder with the same `cfg`/`session` ({@link buildRoleLadder}, {@link roleEscalatePolicy} use it), so the window and
+ * the ladder can never disagree on tier names.
+ */
+export function roleTierOrder(cfg: RouterConfig, session?: LadderSessionPolicyInput): readonly string[] {
+  return ladderOf(cfg, buildEscalatePolicy(cfg, session).ladder);
+}
+
+/**
  * The escalation policy of a role dispatch: `buildEscalatePolicy(cfg, session)` with its ladder restricted to the tiers
- * of `[floor, ceiling]` and `floorTier` = the window floor, so the runner never escalates above the ceiling nor starts
- * below the floor (I2). The role runner (P2.1) and {@link buildRoleLadder}'s simulated paths use this one policy, which
- * is what makes `simulate.ts` equal to the runner on role ladders. `null` when the floor is not on the escalate ladder.
+ * of `[floor, ceiling]` on {@link roleTierOrder} and `floorTier` = the window floor, so the runner never escalates above
+ * the ceiling nor starts below the floor (I2). The role runner (P2.1) and {@link buildRoleLadder}'s simulated paths use
+ * this one policy, which is what makes `simulate.ts` equal to the runner on role ladders. `null` when the floor is not on
+ * the order: P2.1 then refuses the role dispatch — it never falls back to the unrestricted `buildEscalatePolicy`.
  */
 export function roleEscalatePolicy(
   cfg: RouterConfig,
@@ -566,7 +577,7 @@ export function roleEscalatePolicy(
   session?: LadderSessionPolicyInput,
 ): EscalatePolicy | null {
   const policy = buildEscalatePolicy(cfg, session);
-  const order = ladderOf(cfg, policy.ladder);
+  const order = roleTierOrder(cfg, session);
   const span = windowSpan(order, window);
   if (span === null) return null;
   return { ...policy, ladder: order.slice(span.floor, span.ceiling + 1), floorTier: order[span.floor]! };
@@ -589,8 +600,7 @@ export function roleEscalatePolicy(
  */
 export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
   const { cfg, facts, role } = input;
-  const policy = buildEscalatePolicy(cfg, input.session);
-  const order = ladderOf(cfg, policy.ladder);
+  const order = roleTierOrder(cfg, input.session);
   const agent: AgentRef = { origin: "role", id: role };
   const grants: readonly Need[] = [...facts.needs];
   const classTier = input.classTier !== undefined
@@ -604,7 +614,9 @@ export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
   });
 
   const span = windowSpan(order, input.window);
-  if (span === null) {
+  // QA-P12-1-7: the one source of the window's policy (the same call the role runner makes).
+  const rolePolicy = roleEscalatePolicy(cfg, input.window, input.session);
+  if (span === null || rolePolicy === null) {
     return {
       role,
       candidates: [],
@@ -618,7 +630,7 @@ export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
       tiers: [],
       staticDefault: null,
       pinnedIndex: null,
-      reasons: [`window:floor-off-ladder:${input.window.floor}`],
+      reasons: [`window:floor-off-ladder:${input.window.floor}`, "window:no-candidates"],
     };
   }
 
@@ -655,7 +667,6 @@ export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
   }
 
   // --- simulated runner paths under the window's policy ----------------------------------------------------
-  const rolePolicy: EscalatePolicy = { ...policy, ladder: order.slice(span.floor, span.ceiling + 1), floorTier: order[span.floor]! };
   const reachable: Candidate[] = [];
   const indexOfRung = (rung: RunnerRung): number | null => {
     const same = (c: Candidate): boolean => c.tier === rung.tier && sameRung(c, rung);
@@ -680,6 +691,7 @@ export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
 
   // --- static default and pin --------------------------------------------------------------------------------
   const reasons: string[] = [...span.reasons];
+  if (candidates.length === 0) reasons.push("window:no-candidates");
   /** First candidate of the first tier at or above `rank` that has one, else of the highest tier below it. */
   const candidateAt = (rank: number): number | null => {
     for (const t of tiers) if (t.rank >= rank && t.first !== null) return t.first;
@@ -704,7 +716,11 @@ export function buildRoleLadder(input: RoleLadderInput): RoleLadder {
       const clamped = Math.min(Math.max(at, span.floor), span.ceiling);
       if (clamped !== at) reasons.push("pin:clamp");
       pinnedIndex = candidateAt(clamped);
-      if (pinnedIndex !== null) reasons.push(`pinned:${order[clamped]}`);
+      if (pinnedIndex !== null) {
+        // QA-P12-1-8: say so when the dispatched rung is not on the requested tier (clamped, or a duplicate rung).
+        const got = candidates[pinnedIndex]!.tier;
+        reasons.push(got === pin ? `pinned:${pin}` : `pinned:${pin}->${got}`);
+      }
     }
   }
 

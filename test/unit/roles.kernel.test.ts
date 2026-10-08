@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { decideRole, explorationRate, MAX_EXPLORATION_RATE } from "../../src/routing/engine/kernel";
-import { buildRoleLadder, escalateLadder, roleEscalatePolicy, type RoleLadderInput } from "../../src/routing/engine/ladders";
+import { buildRoleLadder, escalateLadder, roleEscalatePolicy, roleTierOrder, type RoleLadderInput } from "../../src/routing/engine/ladders";
 import type {
   Candidate,
   EngineStoreView,
@@ -29,7 +29,23 @@ import {
 } from "../../src/routing/classify/types";
 import { emptyCostStats } from "../../src/routing/outcomes/cost";
 import { makeKey, type OutcomeKey } from "../../src/routing/outcomes/types";
-import { authorityFloor, effectiveFacts, tierBounds, type DispatchGrant } from "../../src/routing/roles/policy";
+import {
+  authorityFloor,
+  effectiveDetection,
+  effectiveFacts,
+  effectiveFactsOf,
+  tierBounds as tierBoundsOf,
+  type ClassifiedDispatch,
+  type DispatchGrant,
+  type TierBoundsOptions,
+} from "../../src/routing/roles/policy";
+import type { RouteLine } from "../../src/routing/classify/types";
+
+/** `tierBounds` on a classify shape built from plain facts (and an optional route line), with an effective detection. */
+function tierBounds(spec: RoleSpec, grant: DispatchGrant, f: TaskFacts, d: Detection, o: TierBoundsOptions & { routeLine?: Partial<RouteLine> | null }) {
+  const routeLine = o.routeLine ? ({ pin: false, ignored: [], ...o.routeLine } as RouteLine) : null;
+  return tierBoundsOf(spec, grant, classifiedOf(f, routeLine), effectiveDetection(d), o);
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -99,15 +115,24 @@ function storeOf(spec: { p?: Record<string, number>; n?: Record<string, number> 
   };
 }
 
-function input(ladder: RoleLadder, over: Partial<RoleDecisionInput> = {}): RoleDecisionInput {
+/** The classify shape of a dispatch whose rules facts are `f` (no route line unless given). */
+function classifiedOf(f: TaskFacts, routeLine: RouteLine | null = null): ClassifiedDispatch {
+  return { facts: f, trace: { rules: f, routeLine } };
+}
+
+/** Test overrides: `facts` and a plain `detection` are wrapped into the classify shape and the effective brand. */
+type InputOver = Omit<Partial<RoleDecisionInput>, "detection"> & { facts?: TaskFacts; detection?: Detection };
+
+function input(ladder: RoleLadder, over: InputOver = {}): RoleDecisionInput {
+  const { facts: f, detection, ...rest } = over;
   return {
-    facts: facts(),
+    classified: classifiedOf(f ?? facts()),
     ladder,
-    detection: "deterministic",
+    detection: effectiveDetection(detection ?? "deterministic"),
     engine: "enforce",
     routing: ROUTING,
     store: null,
-    ...over,
+    ...rest,
   };
 }
 
@@ -207,7 +232,7 @@ describe("role ladders per class (T1.2.3)", () => {
   it("fails closed on a window it cannot place", () => {
     const none = ladderFor("implement", win("turbo", "heavy"));
     expect(none.candidates).toEqual([]);
-    expect(none.reasons).toEqual(["window:floor-off-ladder:turbo"]);
+    expect(none.reasons).toEqual(["window:floor-off-ladder:turbo", "window:no-candidates"]);
     const d = decideRole(input(none, { exploration: { rate: 0.2, decisionID: "x" } }));
     expect(d.dispatch).toBeNull();
     expect(d.base).toBeNull();
@@ -233,6 +258,7 @@ describe("role ladders per class (T1.2.3)", () => {
     expect(ladder.reachable?.map((c) => c.tier)).toEqual(["heavy"]);
     const pinned = buildRoleLadder({ cfg, facts: { class: "design", needs: [] }, role: "architect", window: win("medium", "heavy", "heavy") });
     expect(pinned.candidates[pinned.pinnedIndex!]!.tier).toBe("medium");
+    expect(pinned.reasons).toContain("pinned:heavy->medium"); // QA-P12-1-8: the requested tier had no rung of its own
   });
 
   it("a needs-carrying dispatch keeps every rung eligible (one agent, one grant)", () => {
@@ -324,7 +350,8 @@ describe("pin (route-line tier=)", () => {
 
   it("re-clamps a pin outside the window and ignores one off the ladder", () => {
     const clamped = ladderFor("implement", win("fast", "medium", "heavy"));
-    expect(clamped.reasons).toEqual(expect.arrayContaining(["pin:clamp", "pinned:medium"]));
+    expect(clamped.reasons).toEqual(expect.arrayContaining(["pin:clamp", "pinned:heavy->medium"]));
+    expect(clamped.reasons).not.toContain("pinned:medium");
     expect(clamped.candidates[clamped.pinnedIndex!]!.tier).toBe("medium");
     const off = ladderFor("implement", win("fast", "heavy", "turbo"));
     expect(off.pinnedIndex).toBeNull();
@@ -357,14 +384,14 @@ describe("resume", () => {
     expect(d.dispatch?.tier).toBe("heavy");
   });
 
-  it("a running rung below the default or off the ladder leaves the base alone", () => {
+  it("a running rung below the default leaves the base alone; an unknown running model lifts it (QA-P12-1-3)", () => {
     const ladder = ladderFor("implement", win("fast", "heavy"));
     const lower = decideRole(input(ladder, { resume: { model: HAIKU, variant: null } }));
     expect(lower.base?.tier).toBe("medium");
     expect(lower.reasons).not.toContain("resume:running");
     const off = decideRole(input(ladder, { resume: { model: "openai/gpt-9", variant: null } }));
-    expect(off.base?.tier).toBe("medium");
-    expect(off.reasons).toContain("resume:off-ladder");
+    expect(off.base?.tier).toBe("heavy");
+    expect(off.reasons).toContain("resume:off-ladder:lift");
   });
 });
 
@@ -450,7 +477,7 @@ describe("exploration (T1.2.4)", () => {
     }
   });
 
-  const off: Array<[string, Partial<RoleDecisionInput>, RoleLadder?]> = [
+  const off: Array<[string, InputOver, RoleLadder?]> = [
     ["rate 0", { exploration: { rate: 0, decisionID: "" } }],
     ["no exploration config", { exploration: null }],
     ["a non-enforce engine", { engine: "static" }],
@@ -558,14 +585,14 @@ describe("property I2: every role dispatch lies in [floor, ceiling] and never be
       const grant = grantOf(...ACTIONS.filter(() => next() < 0.5));
       const detection = oneOf(next, DETECTIONS);
       const raw = facts({ class: oneOf(next, CLASSES), risk: oneOf(next, RISKS), scope: oneOf(next, SCOPES) });
-      const routeLine = next() < 0.3 ? { risk: oneOf(next, RISKS), scope: oneOf(next, SCOPES) } : null;
-      const f = effectiveFacts(raw, { routeLine });
-      const bounds = tierBounds(spec, grant, raw, detection, {
+      const routeLine: RouteLine | null = next() < 0.3 ? { risk: oneOf(next, RISKS), scope: oneOf(next, SCOPES), pin: false, ignored: [] } : null;
+      const classified = classifiedOf(raw, routeLine);
+      const f = effectiveFactsOf(classified);
+      const bounds = tierBoundsOf(spec, grant, classified, effectiveDetection(detection), {
         floorTier: next() < 0.3 ? oneOf(next, ORDER) : null,
         runningTier: next() < 0.3 ? oneOf(next, ORDER) : null,
         pinTier: next() < 0.3 ? oneOf(next, [...ORDER, "turbo"]) : null,
         tiers,
-        routeLine,
       });
       const ladder = buildRoleLadder({ cfg, facts: f, role: spec.agent, window: bounds });
       const p: Record<string, number> = {};
@@ -575,9 +602,9 @@ describe("property I2: every role dispatch lies in [floor, ceiling] and never be
         n[keyOfCandidate(f.class, c)] = Math.floor(next() * 30);
       }
       const d = decideRole({
-        facts: f,
+        classified,
         ladder,
-        detection,
+        detection: effectiveDetection(detection),
         engine: next() < 0.8 ? "enforce" : "static",
         routing: ROUTING,
         store: next() < 0.9 ? storeOf({ p, n }) : null,
@@ -600,6 +627,90 @@ describe("property I2: every role dispatch lies in [floor, ceiling] and never be
       expect(d.propensity).toBeLessThanOrEqual(1);
       if (bounds.pinned !== null && !d.reasons.includes("resume:running")) expect(d.dispatch!.tier).toBe(bounds.pinned);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Senior QA round 1 (QA-P12-1-*)
+// ---------------------------------------------------------------------------
+
+describe("QA round 1", () => {
+  it("QA-P12-1-1: decideRole reads the raise-only risk from the classify shape (rules high, merged facts low → never-down)", () => {
+    const ladder = ladderFor("implement", win("fast", "heavy"));
+    const fast = roleKey("implement", HAIKU, null);
+    const medium = roleKey("implement", SONNET, "medium");
+    const store = storeOf({ p: { [fast]: 0.99, [medium]: 0.5 }, n: { [fast]: 40, [medium]: 40 } });
+    const merged = facts({ risk: "low" });
+    const rulesHigh = { facts: merged, trace: { rules: facts({ risk: "high" }), routeLine: null } };
+    const d = decideRole({ ...input(ladder, { store, detection: "none" }), classified: rulesHigh });
+    expect(d.decision.ineligible[fast]).toBe("never-down");
+    expect(d.dispatch?.tier).toBe("medium");
+    const routeHigh = classifiedOf(merged, { risk: "high", pin: false, ignored: [] });
+    expect(decideRole({ ...input(ladder, { store, detection: "none" }), classified: routeHigh }).dispatch?.tier).toBe("medium");
+    // the same merged facts without the raising sources do switch down
+    expect(decideRole(input(ladder, { store, detection: "none", facts: merged })).dispatch?.tier).toBe("fast");
+  });
+
+  it("QA-P12-1-1: high risk from the rules also blocks exploration", () => {
+    const ladder = ladderFor("implement", win("fast", "heavy"));
+    const rulesHigh = { facts: facts(), trace: { rules: facts({ risk: "high" }), routeLine: null } };
+    for (let i = 0; i < 100; i++) {
+      const d = decideRole({ ...input(ladder, { exploration: { rate: 0.2, decisionID: `h${i}` } }), classified: rulesHigh });
+      expect(d.explore).toBe(false);
+    }
+  });
+
+  describe("QA-P12-1-3: a resume on a model off the ladder is never moved below it", () => {
+    const ladder = ladderFor("search", win("fast", "heavy"));
+    const search = { facts: facts({ class: "search" }) };
+
+    it("a preset model of a higher tier (another variant) raises to the first rung at its capability rank", () => {
+      const d = decideRole(input(ladder, { ...search, resume: { model: OPUS, variant: "max" } }));
+      expect(d.reasons).toContain("resume:off-ladder");
+      expect(d.base?.tier).toBe("heavy");
+      expect(d.dispatch?.tier).toBe("heavy");
+    });
+
+    it("an unknown model fails closed to the window ceiling", () => {
+      const d = decideRole(input(ladder, { ...search, resume: { model: "openai/gpt-9", variant: null } }));
+      expect(d.reasons).toContain("resume:off-ladder:lift");
+      expect(d.base?.tier).toBe("heavy");
+      const narrow = ladderFor("search", win("fast", "medium"));
+      expect(decideRole(input(narrow, { ...search, resume: { model: "openai/gpt-9", variant: null } })).base?.tier).toBe("medium");
+    });
+
+    it("a known lower rank never lowers the base", () => {
+      const implement = ladderFor("implement", win("fast", "heavy"));
+      const d = decideRole(input(implement, { resume: { model: HAIKU, variant: "low" } }));
+      expect(d.reasons).toContain("resume:off-ladder");
+      expect(d.base?.tier).toBe("medium");
+    });
+  });
+
+  it("QA-P12-1-5: one tier order for tierBounds and the ladder; an empty window says so and dispatches nothing", () => {
+    const cfg = cfgOf(TIERS, { ladder: ["fast", "heavy"] });
+    expect(roleTierOrder(cfg)).toEqual(["fast", "heavy"]);
+    expect(roleTierOrder(CFG)).toEqual(escalateLadder(CFG));
+    const bounds = tierBounds(EXPLORER, grantOf(...LOCAL), facts({ class: "search" }), "none", {
+      floorTier: null, runningTier: null, pinTier: null, tiers: roleTierOrder(cfg),
+    });
+    const ladder = buildRoleLadder({ cfg, facts: { class: "search", needs: [] }, role: "explorer", window: bounds });
+    expect(ladder.candidates.map((c) => c.tier)).toEqual(["fast"]);
+    // a window named on another order than the ladder's: no candidate, no dispatch, never a fallback
+    const mismatched = buildRoleLadder({ cfg, facts: { class: "search", needs: [] }, role: "explorer", window: win("medium", "medium") });
+    expect(mismatched.reasons).toContain("window:no-candidates");
+    expect(decideRole(input(mismatched)).dispatch).toBeNull();
+    expect(roleEscalatePolicy(cfg, win("medium", "medium"))).toBeNull();
+  });
+
+  it("QA-P12-1-7: the ladder's paths are simulated under roleEscalatePolicy (a ladder ending below heavy never escalates past it)", () => {
+    const cfg = cfgOf(TIERS, { ...GENEROUS, ladder: ["fast", "medium"] });
+    const ladder = buildRoleLadder({ cfg, facts: { class: "implement", needs: [] }, role: "implementer", window: win("fast", "medium") });
+    const policy = roleEscalatePolicy(cfg, win("fast", "medium"))!;
+    const all = [...ladder.candidates, ...(ladder.reachable ?? [])];
+    ladder.candidates.forEach((start, k) => {
+      expect(ladder.paths![k]!.map((j) => `${all[j]!.tier}:${all[j]!.model}#${all[j]!.variant ?? "default"}`)).toEqual(runnerTrace(policy, TIERS, start).trace);
+    });
   });
 });
 

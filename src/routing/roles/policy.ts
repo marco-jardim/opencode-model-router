@@ -9,13 +9,43 @@
  */
 
 import type { AuthorityAction, RoleKind, RoleSpec } from "../../router/roles";
-import type { Detection, Need, Risk, RouteLine, Scope, TaskFacts } from "../classify/types";
+import { DETECTIONS } from "../classify/types";
+import type { ClassifyResult, ClassifyTrace, Detection, Need, Risk, RouteLine, Scope, TaskFacts } from "../classify/types";
 
 export interface DispatchGrant {
   actions: ReadonlySet<AuthorityAction>;
   notes: readonly string[];
-  /** null → no path outside the session directory, no router_run. */
+  /**
+   * null → local only: no write and no run (`edit` and `router_run` withheld), no path outside the session
+   * directory. A fixed egress role (researcher) keeps its egress: it touches no file.
+   */
   workRoot: string | null;
+}
+
+/**
+ * The classify shape a role dispatch is bounded from (`ClassifyResult` → `facts` and `trace.rules`/`trace.routeLine`):
+ * pass the classifier result itself, so the raise-only risk/scope of §2.3 cannot be lost by omitting an optional field.
+ */
+export interface ClassifiedDispatch {
+  readonly facts: ClassifyResult["facts"];
+  readonly trace: Pick<ClassifyTrace, "rules" | "routeLine">;
+}
+
+declare const EFFECTIVE_DETECTION: unique symbol;
+
+/**
+ * The EFFECTIVE detection of a dispatch (§2.1, A34): `deterministic` only when the router's own gate runs the acceptance
+ * checks for this dispatch, otherwise the weaker of the route-line claim and the prompt's `[acceptance]` block — never
+ * `ClassifyResult.detection` (a claim) as is. Built only with {@link effectiveDetection}.
+ */
+export type EffectiveDetection = Detection & { readonly [EFFECTIVE_DETECTION]: true };
+
+/**
+ * Brand a detection the caller has ALREADY resolved as effective (A34). It never raises a value; an unknown value is
+ * `none` (the strictest column of §2.3). Do not pass `ClassifyResult.detection` here: that is the route line's claim.
+ */
+export function effectiveDetection(detection: Detection): EffectiveDetection {
+  return ((DETECTIONS as readonly string[]).includes(detection) ? detection : "none") as EffectiveDetection;
 }
 
 const BUILTIN_TIERS = ["fast", "medium", "heavy"] as const;
@@ -62,7 +92,7 @@ export const GRANT_NOTES = {
   web: "web access is outside this role — use `researcher`",
   edit: "edit is outside this role — use `implementer`",
   externalDir: "paths outside the session directory need a work root (root=)",
-  noWorkRoot: "router_run needs a bound work root (root=) — not granted",
+  noWorkRoot: "no valid work root: write and run withheld",
   separation: "egress dropped: a grant never mixes local, exec or write actions with egress (separation rule)",
 } as const;
 
@@ -79,7 +109,8 @@ export const GRANT_NOTES = {
  *   `web` → no action, note when the result has no egress; `external_dir` → satisfied by a non-null
  *   work root (P2.1 resolves and validates it), otherwise a note; unknown needs are ignored.
  * - separation (I4): local/exec/write together with egress → egress dropped + note.
- * - `workRoot` null → `router_run` not granted + note (I9: no binding, no run); copied unchanged.
+ * - `workRoot` null → local only: `edit` and `router_run` withheld + note (I9: no binding, no write, no run);
+ *   egress of a fixed egress role is kept. The work root is copied unchanged.
  */
 export function grantFor(
   role: RoleSpec,
@@ -108,12 +139,19 @@ export function grantFor(
     for (const a of EGRESS) actions.delete(a);
     structural.push(GRANT_NOTES.separation);
   }
-  if (workRoot === null && actions.delete("router_run")) structural.push(GRANT_NOTES.noWorkRoot);
+  /** The role could edit: a missing edit is then the work root's doing (its note), not the role's. */
+  const roleEdits = actions.has("edit");
+  if (workRoot === null) {
+    // QA-P12-1-2: without a validated work root an edit would land in the session directory (the base checkout).
+    let withheld = false;
+    for (const a of [...WRITE, ...EXEC]) withheld = actions.delete(a) || withheld;
+    if (withheld) structural.push(GRANT_NOTES.noWorkRoot);
+  }
 
   const notes: string[] = [];
   if (wantsShell) notes.push(GRANT_NOTES.shell);
   if (needs.has("web") && !hasAny(actions, EGRESS)) notes.push(GRANT_NOTES.web);
-  if (needs.has("edit") && !actions.has("edit")) notes.push(GRANT_NOTES.edit);
+  if (needs.has("edit") && !roleEdits) notes.push(GRANT_NOTES.edit);
   if (needs.has("external_dir") && workRoot === null) notes.push(GRANT_NOTES.externalDir);
 
   return {
@@ -169,11 +207,18 @@ export interface TierBoundsOptions {
   runningTier: string | null;
   /** Route-line `tier=`, or null. */
   pinTier: string | null;
-  /** Active tier order, cheapest first (the escalate ladder); empty → `fast`, `medium`, `heavy`. */
-  tiers: readonly string[];
   /**
-   * The classifier's facts before the route line (`ClassifyResult.trace.rules`). `classify()` lets a route
-   * line override `scope` (tier-mode L3); passing these restores raise-only semantics for the floor.
+   * Active tier order, cheapest first: `engine/ladders.roleTierOrder(cfg, session)`, the same order the role ladder is
+   * built on (QA-P12-1-5); empty → `fast`, `medium`, `heavy`.
+   */
+  tiers: readonly string[];
+}
+
+/** Where the effective risk/scope of §2.3 come from besides `facts`. */
+export interface EffectiveFactsSources {
+  /**
+   * The classifier's facts before the route line (`ClassifyResult.trace.rules`). `classify()` lets a route line
+   * override `scope` (tier-mode L3); these restore raise-only semantics.
    */
   classifier?: Pick<TaskFacts, "risk" | "scope"> | null;
   /** The route line (`ClassifyResult.trace.routeLine`): raises risk/scope, never lowers them. */
@@ -202,16 +247,17 @@ function highest<T extends string>(order: readonly string[], base: T, values: Re
 /**
  * Position of a floor-type tier on `order`. A built-in name missing from the order rounds UP to the
  * cheapest present built-in tier at least as capable; with none, `fast` is vacuous (the cheapest tier) and
- * anything else fails closed to the most capable tier. Any other unknown name → null (ignored).
+ * anything else fails closed to the most capable tier. Any other unknown name fails closed to the top of
+ * the order (QA-P12-1-4: a floor is never dropped).
  */
-function placeFloor(tier: string, order: readonly string[]): { index: number; exact: boolean } | null {
+function placeFloor(tier: string, order: readonly string[]): { index: number; exact: boolean; known: boolean } {
   const at = order.indexOf(tier);
-  if (at >= 0) return { index: at, exact: true };
+  if (at >= 0) return { index: at, exact: true, known: true };
   const rank = tierIndex(tier);
-  if (rank < 0) return null;
+  if (rank < 0) return { index: order.length - 1, exact: false, known: false };
   const up = order.findIndex((t) => tierIndex(t) >= rank);
-  if (up >= 0) return { index: up, exact: false };
-  return { index: rank === 0 ? 0 : order.length - 1, exact: false };
+  if (up >= 0) return { index: up, exact: false, known: true };
+  return { index: rank === 0 ? 0 : order.length - 1, exact: false, known: true };
 }
 
 /**
@@ -233,36 +279,40 @@ function placeCeiling(tier: string, order: readonly string[]): { index: number; 
 }
 
 /**
- * `facts` with the effective risk and scope of §2.3: max(`facts`, `opts.classifier`, `opts.routeLine`) — a route line
- * raises them, never lowers them. {@link tierBounds} uses it for the floor; the role kernel (`engine.decideRole`) takes
- * its output as `facts`.
+ * `facts` with the effective risk and scope of §2.3: max(`facts`, `sources.classifier`, `sources.routeLine`) — a route
+ * line raises them, never lowers them.
  */
-export function effectiveFacts(
-  facts: TaskFacts,
-  opts: Pick<TierBoundsOptions, "classifier" | "routeLine">,
-): TaskFacts {
-  const risk = highest<Risk>(RISK_ORDER, facts.risk, [opts.classifier?.risk, opts.routeLine?.risk]);
-  const scope = highest<Scope>(SCOPE_ORDER, facts.scope, [opts.classifier?.scope, opts.routeLine?.scope]);
+export function effectiveFacts(facts: TaskFacts, sources: EffectiveFactsSources): TaskFacts {
+  const risk = highest<Risk>(RISK_ORDER, facts.risk, [sources.classifier?.risk, sources.routeLine?.risk]);
+  const scope = highest<Scope>(SCOPE_ORDER, facts.scope, [sources.classifier?.scope, sources.routeLine?.scope]);
   return risk === facts.risk && scope === facts.scope ? facts : { ...facts, risk, scope };
+}
+
+/** {@link effectiveFacts} of a classify result: `facts` raised by `trace.rules` and `trace.routeLine` (QA-P12-1-1). */
+export function effectiveFactsOf(classified: ClassifiedDispatch): TaskFacts {
+  return effectiveFacts(classified.facts, { classifier: classified.trace.rules, routeLine: classified.trace.routeLine });
 }
 
 /**
  * Tier window of a dispatch (§2.3).
  *
- * - risk/scope = max(`facts`, `opts.classifier`, `opts.routeLine`): a route line can raise them, never
- *   lower them.
+ * - risk/scope = max(`classified.facts`, `classified.trace.rules`, `classified.trace.routeLine`)
+ *   ({@link effectiveFactsOf}): a route line can raise them, never lower them.
+ * - `detection` is the EFFECTIVE detection ({@link effectiveDetection}), never `ClassifyResult.detection`.
  * - floor = max(role floor, `authorityFloor(grant, detection, risk, scope)`, `floorTier`, `runningTier`).
  * - ceiling = the role ceiling; when the floor is above it the floor wins and the ceiling is raised to the
  *   floor (the range is widened upward only).
  * - pin (`tier=`): inside [floor, ceiling] → pinned; below → lifted to the floor; above → clamped to the
  *   ceiling; not on the tier order → ignored (`pinned` null).
- * - Tier order = `opts.tiers` (empty → built-in). Floor names missing from it round up, the ceiling rounds
- *   down (see {@link placeFloor}); other unknown names are ignored.
+ * - Tier order = `opts.tiers` (empty → built-in). Built-in floor names missing from it round up, the ceiling
+ *   rounds down (see {@link placeFloor}); any other unknown FLOOR name fails closed to the top of the order; an
+ *   unknown ceiling or pin name is ignored.
  *
  * Reasons (deduplicated, in order of application):
  * `floor:<source>` a source raised the floor (source = authority | floorTier | running);
  * `round:<source>:<from>-><to>` a built-in name missing from the order was rounded (source adds role | ceiling);
- * `ignore:<source>:<name>` an unknown name was ignored (source adds pin);
+ * `unknown:<source>:<name>-><top>` an unknown floor name was placed at the top of the order (fail closed);
+ * `ignore:<source>:<name>` an unknown ceiling or pin name was ignored (source = ceiling | pin);
  * `lift:authority` the authority floor (on a tie it is named first) lifted the pin or the ceiling;
  * `lift:floor` any other floor source (role, floorTier, running) lifted the pin or the ceiling;
  * `clamp:ceiling` a pin above the ceiling was clamped to it.
@@ -270,15 +320,15 @@ export function effectiveFacts(
 export function tierBounds(
   role: RoleSpec,
   grant: DispatchGrant,
-  facts: TaskFacts,
-  detection: Detection,
+  classified: ClassifiedDispatch,
+  detection: EffectiveDetection,
   opts: TierBoundsOptions,
 ): TierBounds {
   const listed = opts.tiers.filter((t, i) => typeof t === "string" && t !== "" && opts.tiers.indexOf(t) === i);
   const order: readonly string[] = listed.length > 0 ? listed : BUILTIN_TIERS;
   const reasons: string[] = [];
 
-  const { risk, scope } = effectiveFacts(facts, opts);
+  const { risk, scope } = effectiveFactsOf(classified);
   const sources: Array<[FloorSource, string | null]> = [
     ["role", role.tierRange.floor],
     ["authority", authorityFloor(grant, detection, risk, scope)],
@@ -291,11 +341,8 @@ export function tierBounds(
   for (const [source, tier] of sources) {
     if (tier === null) continue;
     const placed = placeFloor(tier, order);
-    if (placed === null) {
-      reasons.push(`ignore:${source}:${tier}`);
-      continue;
-    }
-    if (!placed.exact) reasons.push(`round:${source}:${tier}->${order[placed.index]}`);
+    if (!placed.known) reasons.push(`unknown:${source}:${tier}->${order[placed.index]}`);
+    else if (!placed.exact) reasons.push(`round:${source}:${tier}->${order[placed.index]}`);
     if (placed.index > floor || owner === null) {
       if (placed.index > floor && source !== "role") reasons.push(`floor:${source}`);
       floor = Math.max(floor, placed.index);

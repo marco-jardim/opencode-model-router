@@ -50,6 +50,7 @@ import type {
   UnitCandidate,
 } from "../outcomes/types";
 import { makeKey, normalizeVariant, splitModelRef } from "../outcomes/types";
+import { effectiveFactsOf } from "../roles/policy";
 import type {
   Candidate,
   ChosenDispatch,
@@ -636,13 +637,22 @@ function rungAbove(a: Candidate, b: Candidate): boolean {
   return a.rank > b.rank || (a.rank === b.rank && lowerEffortOnSameModel(b, a));
 }
 
+/** First candidate of the first window tier at or above `rank` that has one, else of the highest tier that has one. */
+function roleCandidateAt(ladder: RoleDecisionInput["ladder"], rank: number): number | null {
+  for (const t of ladder.tiers) if (t.rank >= rank && t.first !== null) return t.first;
+  for (let i = ladder.tiers.length - 1; i >= 0; i--) if (ladder.tiers[i]!.first !== null) return ladder.tiers[i]!.first;
+  return null;
+}
+
 /**
  * Decide one ROLE dispatch (T1.2.3, T1.2.4) on a `ladders.buildRoleLadder` graph. Tier-mode {@link decide} is untouched;
  * this runs it with the role's pick and adds the role rules:
  *
+ * 0. facts = `effectiveFactsOf(input.classified)` (raise-only risk/scope, QA-P12-1-1); `detection` is EFFECTIVE (branded).
  * 1. base = the pinned tier's rung when the window has a pin, else the static default (class tier clamped into
  *    `[floor, ceiling]`); on a resume, raised to the running rung when that rung is a candidate above it
- *    (`resume:running`; never below the running rung — the window floor already holds its tier).
+ *    (`resume:running`), else to the first rung at the running model's capability rank (`resume:off-ladder`) or, when
+ *    that rank is unknown, to the window ceiling (`resume:off-ladder:lift`). Never below the running rung.
  * 2. `decide` with `chosen` = base, `pin` = pinned, `floorRank` = the window floor: A27 (evidence gate) and A34
  *    (never-down against the capability rank) apply exactly as in tier mode; every candidate is inside the window.
  * 3. `enforce` applies the kernel's switch, except on a resume (A30: `kept:resume`, the decision is only logged).
@@ -653,10 +663,13 @@ function rungAbove(a: Candidate, b: Candidate): boolean {
  *    `propensity` = P(dispatch) under this ε-greedy mixture: `(1 − r)·[dispatch = exploit] + r/|targets|·[dispatch ∈ targets]`,
  *    1 when no draw was possible.
  *
- * I2: `dispatch` is always a candidate, so always inside `[floor, ceiling]`. An empty ladder → `dispatch` null.
+ * I2: `dispatch` is always a candidate, so always inside `[floor, ceiling]`. An empty ladder → `dispatch` null
+ * (`window:no-candidates`): P2.1 refuses the role dispatch and never falls back to `buildEscalatePolicy`/`buildLadder`
+ * (QA-P12-1-5).
  */
 export function decideRole(input: RoleDecisionInput): RoleDecision {
   const { ladder } = input;
+  const facts = effectiveFactsOf(input.classified);
   const cands = ladder.candidates;
   const reasons: string[] = [...ladder.reasons];
   const pinned = ladder.pinnedIndex !== null;
@@ -669,10 +682,18 @@ export function decideRole(input: RoleDecisionInput): RoleDecision {
       const own = canonicalRung(c);
       return own.model === running.model && own.variant === running.variant;
     });
-    if (at < 0) reasons.push("resume:off-ladder");
-    else if (rungAbove(cands[at]!, cands[base]!)) {
-      base = at;
-      reasons.push("resume:running");
+    if (at >= 0) {
+      if (rungAbove(cands[at]!, cands[base]!)) {
+        base = at;
+        reasons.push("resume:running");
+      }
+    } else {
+      // QA-P12-1-3: a running model that is not a candidate is still never moved below: raise to the first rung at its
+      // capability rank (preset table); an unknown rank fails closed to the window ceiling.
+      const rank = capabilityRank(ladder, resume, null);
+      const lifted = rank === null ? roleCandidateAt(ladder, ladder.ceilingRank ?? Infinity) : roleCandidateAt(ladder, rank);
+      if (lifted !== null && cands[lifted]!.rank > cands[base]!.rank) base = lifted;
+      reasons.push(rank === null ? "resume:off-ladder:lift" : "resume:off-ladder");
     }
   }
 
@@ -680,7 +701,7 @@ export function decideRole(input: RoleDecisionInput): RoleDecision {
     ? { agent: { origin: "role", id: ladder.role }, model: "", variant: null }
     : { agent: cands[base]!.agent, model: cands[base]!.model, variant: cands[base]!.variant };
   const decision = decide({
-    facts: input.facts,
+    facts,
     chosen,
     ladder,
     detection: input.detection,
@@ -706,7 +727,7 @@ export function decideRole(input: RoleDecisionInput): RoleDecision {
   const targets: number[] = [];
   const def = ladder.staticDefault;
   const floorRank = ladder.floorRank;
-  const eligible = rate > 0 && !pinned && !resumed && input.facts.risk !== "high" && input.detection === "deterministic";
+  const eligible = rate > 0 && !pinned && !resumed && facts.risk !== "high" && input.detection === "deterministic";
   if (eligible && def !== null && floorRank !== null) {
     for (let k = 0; k < cands.length; k++) {
       if (cands[k]!.rank >= floorRank && rungAbove(cands[def]!, cands[k]!)) targets.push(k);
