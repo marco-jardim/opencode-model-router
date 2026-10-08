@@ -23,6 +23,8 @@ import { DEFAULT_VARIANT, catalogVariantIds, nextVariant, variantCovered, varian
 import type { VariantLadder } from "../../escalate/variants";
 import { CLASS_STATIC_TIER } from "../classify/types";
 import { isUnpriced, selectPriceEntry } from "../outcomes/cost";
+import type { RoleStatsTable } from "../outcomes/types";
+import { resolveRoleTable } from "../../router/roles";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +51,13 @@ export const FINDING_IDS = [
   "native-role-unmatched-rung",
   "tier-agent-unavailable",
   "classifier-model-missing",
+  "role-separation",
+  "roles-on-v1",
+  "role-budget-low",
+  "role-range-clamped",
+  "role-binding-unknown",
+  "native-explore-aliased",
+  "role-usage-share",
 ] as const;
 export type FindingId = (typeof FINDING_IDS)[number];
 
@@ -74,6 +83,13 @@ export const FINDING_TARGET: Readonly<Record<FindingId, FindingTarget>> = {
   "native-role-unmatched-rung": "router",
   "tier-agent-unavailable": "router",
   "classifier-model-missing": "router",
+  "role-separation": "router",
+  "roles-on-v1": "router",
+  "role-budget-low": "router",
+  "role-range-clamped": "router",
+  "role-binding-unknown": "router",
+  "native-explore-aliased": "router",
+  "role-usage-share": "router",
 };
 
 export interface Finding {
@@ -238,7 +254,26 @@ function activeTierEntries(cfg: RouterConfig): Array<[string, TierConfig]> {
   return Object.entries(getActiveTiers(cfg) ?? {}).filter(([, tier]) => tier !== null && typeof tier === "object" && typeof tier.model === "string" && tier.model !== "");
 }
 
+/**
+ * What the role checks need beyond the config: the host generation (a roles setting is inert on v1) and the outcome statistics of the
+ * roles layer. Every field is optional; a check whose input is absent says nothing.
+ */
+export interface AdvisorExtras {
+  /** `v1` makes `routing.delegation: roles` inert (info); absent = treated as v2 by the role checks. */
+  readonly host?: "v1" | "v2";
+  /** `summarizeRoles` over the window the caller cares about; `null`/absent = no statistics. */
+  readonly roleStats?: RoleStatsTable | null;
+  /** Dispatch rows WITHOUT a role in the same window (tier dispatches); with `roleStats` it gives the role usage share. */
+  readonly tierDispatches?: number;
+}
+
+/** A role whose budget ran out in at least this share of its dispatches (and at least {@link ROLE_STATS_MIN_DISPATCHES} of them) has a budget that is too low. */
+export const ROLE_BUDGET_LOW_SHARE = 0.2;
+/** Fewest dispatches a statistic needs before a finding is drawn from it. */
+export const ROLE_STATS_MIN_DISPATCHES = 5;
+
 interface CheckInput {
+  readonly extras: AdvisorExtras;
   readonly cfg: RouterConfig;
   readonly host: HostConfigView | null;
   readonly catalog: readonly AdvisorCatalogModel[] | null;
@@ -608,6 +643,134 @@ const classifierModel: Check = ({ cfg, byRef }) => {
   }];
 };
 
+// ---------------------------------------------------------------------------
+// Roles checks (P2.2): all silent in tiers mode
+// ---------------------------------------------------------------------------
+
+function rolesMode(cfg: RouterConfig): boolean {
+  return cfg.routing?.delegation === "roles";
+}
+
+/** The role table as v2 resolves it; `null` unless the config asks for roles mode on a host that is not known to be v1. */
+function activeRoleTable({ cfg, extras }: CheckInput): ReturnType<typeof resolveRoleTable> | null {
+  if (!rolesMode(cfg) || extras.host === "v1") return null;
+  return resolveRoleTable(cfg, "v2");
+}
+
+/** A #81 `agents` entry named like a shipped role that breaks the separation rule (I4): dropped, the shipped role stays. */
+const roleSeparation: Check = (input) => {
+  const table = activeRoleTable(input);
+  if (table === null) return [];
+  return table.droppedAgents.map((agent) => {
+    const issue = table.issues.find((i) => i.path === `agents.${agent}`);
+    return {
+      id: "role-separation" as const,
+      severity: "warning" as const,
+      subject: agent,
+      message: `${issue?.message ?? `agents.${agent} breaks the separation rule`}. No role may combine write, exec and egress (I4): remove the agent from \`agents\` or narrow its permissions, otherwise the shipped ${agent} role runs instead of yours.`,
+      snippet: null,
+    };
+  });
+};
+
+/** `routing.delegation: roles` on OpenCode v1: inert there (the orchestrator keeps the tier protocol). */
+const rolesOnV1: Check = ({ cfg, extras }) => {
+  if (extras.host !== "v1" || !rolesMode(cfg)) return [];
+  return [{
+    id: "roles-on-v1",
+    severity: "info",
+    subject: "",
+    message: "routing.delegation is `roles`, which does nothing on OpenCode v1: the orchestrator keeps the tier protocol and no role agent is registered. It takes effect on OpenCode v2.",
+    snippet: null,
+  }];
+};
+
+/** A role's range or budget was placed on this preset's tiers or clamped (a notice of the role table). */
+const roleRangeClamped: Check = (input) => {
+  const table = activeRoleTable(input);
+  if (table === null) return [];
+  return table.issues
+    .filter((i) => /^roleAgents\.[^.]+\.(tierRange|budget)(\.|$)/.test(i.path))
+    .map((i) => ({
+      id: "role-range-clamped" as const,
+      severity: "info" as const,
+      subject: i.path.split(".")[1] ?? "",
+      message: i.message,
+      snippet: null,
+    }));
+};
+
+/** Host native `explore` is aliased to the `explorer` role in roles mode, so a `subagentTiers.explore` mapping no longer decides its model. */
+const nativeExploreAliased: Check = (input) => {
+  const table = activeRoleTable(input);
+  if (table === null || !table.roles.has("explorer")) return [];
+  return [{
+    id: "native-explore-aliased",
+    severity: "info",
+    subject: "explore",
+    message: `In roles mode a dispatch of the host's native explore agent is aliased to the explorer role${input.cfg.subagentTiers?.explore === undefined ? "" : `, so subagentTiers.explore (${input.cfg.subagentTiers.explore}) no longer decides its model`}: the router picks the tier within the role's range.`,
+    snippet: null,
+  }];
+};
+
+/** A role spends its budget in a large share of its dispatches: the budget is too low for the work routed to it. */
+const roleBudgetLow: Check = (input) => {
+  const stats = input.extras.roleStats;
+  if (stats === undefined || stats === null || !rolesMode(input.cfg)) return [];
+  const byRole = new Map<string, { dispatches: number; exhausted: number }>();
+  for (const row of stats.byRoleTier) {
+    const acc = byRole.get(row.role) ?? { dispatches: 0, exhausted: 0 };
+    acc.dispatches += row.dispatches;
+    acc.exhausted += row.budgetExhaustions;
+    byRole.set(row.role, acc);
+  }
+  const findings: RawFinding[] = [];
+  for (const [role, acc] of [...byRole].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (acc.dispatches < ROLE_STATS_MIN_DISPATCHES || acc.exhausted / acc.dispatches < ROLE_BUDGET_LOW_SHARE) continue;
+    findings.push({
+      id: "role-budget-low",
+      severity: "warning",
+      subject: role,
+      message: `Role ${role} ran out of budget in ${acc.exhausted} of ${acc.dispatches} dispatches (${Math.round((100 * acc.exhausted) / acc.dispatches)}%): its work needs more steps than roleAgents.${role}.budget allows, so it keeps returning ESCALATE: budget. Raise roleAgents.${role}.budget for the tiers it runs on.`,
+      snippet: null,
+    });
+  }
+  return findings;
+};
+
+/** Child sessions that could not be bound to a role dispatch: their outcomes are not attributed. */
+const roleBindingUnknown: Check = (input) => {
+  const stats = input.extras.roleStats;
+  if (stats === undefined || stats === null || !rolesMode(input.cfg)) return [];
+  let total = stats.unattributed.unknownBindings;
+  for (const row of stats.byRoleTier) total += row.unknownBindings;
+  if (total <= 0) return [];
+  return [{
+    id: "role-binding-unknown",
+    severity: "warning",
+    subject: "",
+    message: `${total} child session${total === 1 ? "" : "s"} could not be bound to the role dispatch that created ${total === 1 ? "it" : "them"} (binding: unknown), so ${total === 1 ? "its" : "their"} outcomes and authority are not attributed. If this keeps happening the host's child-session events do not carry the parent link the router needs.`,
+    snippet: null,
+  }];
+};
+
+/** The share of role dispatches among all dispatches: tells whether the orchestrator follows the roles protocol or keeps naming tiers. */
+const roleUsageShare: Check = (input) => {
+  const stats = input.extras.roleStats;
+  const tierDispatches = input.extras.tierDispatches;
+  if (stats === undefined || stats === null || tierDispatches === undefined || !rolesMode(input.cfg)) return [];
+  const roleDispatches = stats.byRoleTier.reduce((sum, row) => sum + row.dispatches, 0);
+  const total = roleDispatches + tierDispatches;
+  if (total < ROLE_STATS_MIN_DISPATCHES || tierDispatches === 0) return [];
+  return [{
+    id: "role-usage-share",
+    severity: "info",
+    subject: "",
+    message: `${roleDispatches} of ${total} dispatches (${Math.round((100 * roleDispatches) / total)}%) went to a role; ${tierDispatches} named a tier directly. Explicit tier dispatch keeps working; the roles protocol asks the orchestrator to name roles.`,
+    snippet: null,
+  }];
+};
+
 const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["title-model", titleModel],
   ["ladder-catalog", ladderCatalog],
@@ -619,6 +782,13 @@ const CHECKS: ReadonlyArray<readonly [string, Check]> = [
   ["native-roles", nativeRoles],
   ["tier-agents", tierAgents],
   ["classifier-model", classifierModel],
+  ["role-separation", roleSeparation],
+  ["roles-on-v1", rolesOnV1],
+  ["role-range", roleRangeClamped],
+  ["native-explore", nativeExploreAliased],
+  ["role-budget", roleBudgetLow],
+  ["role-binding", roleBindingUnknown],
+  ["role-usage", roleUsageShare],
 ];
 
 /**
@@ -682,9 +852,10 @@ export function runChecks(
   host: HostConfigView | null,
   catalog: readonly AdvisorCatalogModel[] | null,
   onError: (check: string, error: unknown) => void,
+  extras: AdvisorExtras = {},
 ): Finding[] {
   const known = catalog !== null && catalog.length > 0 ? catalog : null;
-  const input: CheckInput = { cfg, host, catalog: known, byRef: known === null ? null : index(known) };
+  const input: CheckInput = { cfg, host, catalog: known, byRef: known === null ? null : index(known), extras };
   const out: Array<{ finding: Finding; order: number }> = [];
   let order = 0;
   for (const [name, check] of CHECKS) {
