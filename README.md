@@ -275,6 +275,11 @@ For a local checkout, replace the package name with its absolute directory path.
 V2 loads the package's `server.ts` definition; v1 continues to load the original
 function from `src/index.ts`. Existing v1 configuration does not need to change.
 
+> **OpenCode v1: feature freeze.** Since 2026-10-09, v1 support gets fixes for
+> regressions and security issues only. Every new feature targets OpenCode v2 and
+> stays inert on v1 (at most one notice, no behaviour), as roles mode already does.
+> See the [changelog entry](CHANGELOG.md#unreleased).
+
 Routing, tool guards and verification use the same engine on both versions. V2
 uses its native `subagent` tool to create real child sessions, preserving the
 host's permissions and cancellation. There are a few host differences:
@@ -1132,7 +1137,7 @@ What else ships with it:
 - **Observability.** A decision log and an outcome store under the trajectory directory, `/router stats`, and `npm run routing:stats` in a clone.
 - **Classifier backends** for uncertain task classes: `rules` (default, local), `openai-compatible` (Ollama, any OpenAI-style server), `typesafe`, and `host` (**experimental**). Backends receive at most a bounded, scrubbed excerpt of the task, are only configurable from the global override, and never block a dispatch.
 
-On OpenCode v1 the routing engine does not run: the `routing` block is validated and `engine` is forced to `static`; setting `routing.roles` adds an opt-in prose line. Roles mode is inert on v1 too: when `routing.delegation: "roles"`, `roleAgents`, `routing.exploration`, `routing.run` or `routing.workRoots` is set, the plugin logs one notice per process, `roles delegation requires OpenCode v2; using tiers`, and with `routing.delegation: "roles"` `/router` also reports the advisor info `roles-on-legacy-host`. v1 is not entirely unchanged by this release: the #84 guard and verification fixes apply on every host (see the [behaviour change entry](CHANGELOG.md#changed) of the changelog). Every key and default is in [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md#routing--cost-aware-routing-engine-74); the full guide is [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md) and the decision record is [`docs/adr/0005-cost-aware-routing-engine.md`](docs/adr/0005-cost-aware-routing-engine.md).
+On OpenCode v1 the routing engine does not run: the `routing` block is validated and `engine` is forced to `static`; setting `routing.roles` adds an opt-in prose line. Roles mode is inert on v1 too: when `routing.delegation: "roles"`, `roleAgents`, `routing.exploration`, `routing.run` or `routing.workRoots` is set, the plugin logs one notice per process, `roles delegation requires OpenCode v2; using tiers`, and with `routing.delegation: "roles"` `/router` also reports the advisor info `roles-on-legacy-host`. v1 is not entirely unchanged by this release: the #84 guard and verification fixes apply on every host (see the [behaviour change entry](CHANGELOG.md#240---2026-10-09) of the changelog). Every key and default is in [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md#routing--cost-aware-routing-engine-74); the full guide is [`docs/ROUTING_ENGINE.md`](docs/ROUTING_ENGINE.md) and the decision record is [`docs/adr/0005-cost-aware-routing-engine.md`](docs/adr/0005-cost-aware-routing-engine.md).
 
 ## Roles mode (opt-in, OpenCode v2)
 

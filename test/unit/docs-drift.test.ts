@@ -246,6 +246,29 @@ function brokenLinks(files: readonly string[], read: (path: string) => string | 
   return broken;
 }
 
+/**
+ * D16: what is wrong with `changelog` for the package `version`. It has exactly one `## [Unreleased]`, and the first
+ * `## ` heading after it is the dated release `## [<version>] - YYYY-MM-DD`. `###` subsections and entries may sit under
+ * [Unreleased]; another `## ` heading may not.
+ */
+function changelogReleaseProblems(changelog: string, version: string): string[] {
+  const text = changelog.replace(/\r\n/g, "\n");
+  const unreleased = [...text.matchAll(/^## \[Unreleased\]$/gm)];
+  if (unreleased.length !== 1) return [`expected one ## [Unreleased] heading, found ${unreleased.length}`];
+  const after = text.slice(unreleased[0]!.index! + unreleased[0]![0].length);
+  const problems: string[] = [];
+  for (const [heading] of after.matchAll(/^## .*$/gm)) {
+    const dated = /^## \[([^\]\n]+)\] - \d{4}-\d{2}-\d{2}$/.exec(heading);
+    if (dated === null) {
+      problems.push(`a ## heading between [Unreleased] and the first dated release: ${heading}`);
+      continue;
+    }
+    if (dated[1] !== version) problems.push(`the first dated release after [Unreleased] is ${heading}, not ${version}`);
+    return problems;
+  }
+  return [...problems, "no dated release after [Unreleased]"];
+}
+
 /** Every file or directory under the repo, read lazily; a directory answers an empty string. */
 function readRepo(path: string): string | undefined {
   try {
@@ -653,20 +676,16 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     for (const amendment of ["A31", "A32", "A33"]) expect(adr, amendment).toContain(amendment);
   });
 
-  it("D16: the package version is the newest dated CHANGELOG release, right under [Unreleased]; one PR closed both #74 and #73", () => {
+  it("D16: the package version is the newest dated CHANGELOG release, the first one after [Unreleased]; one PR closed both #74 and #73", () => {
     // Phase 3.4 prepared the D16 release without merging, tagging or publishing it. Later releases bump the package, so the
-    // package and both lockfile roots have to agree with each other and with the first release heading under [Unreleased].
+    // package and both lockfile roots have to agree with each other and with the first dated release after [Unreleased].
+    // [Unreleased] may hold `###` subsections and entries (QA-P34-1-3 had wrongly required it to be empty).
     const version = JSON.parse(read("package.json")).version as string;
     const lock = JSON.parse(read("package-lock.json"));
     expect(lock.version).toBe(version);
     expect(lock.packages[""].version).toBe(version);
     const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
-    const unreleasedHeadings = [...changelog.matchAll(/^## \[Unreleased\]$/gm)];
-    expect(unreleasedHeadings).toHaveLength(1);
-    const afterUnreleased = changelog.slice(unreleasedHeadings[0]!.index! + unreleasedHeadings[0]![0].length);
-    const next = /^## \[[^\]\n]*\].*$/m.exec(afterUnreleased);
-    expect(next?.[0]).toMatch(new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\] - \\d{4}-\\d{2}-\\d{2}$`));
-    expect(afterUnreleased.slice(0, next!.index).trim()).toBe("");
+    expect(changelogReleaseProblems(changelog, version)).toEqual([]);
     expect(changelog).toContain("## [2.3.0] - 2026-10-07");
     const pr = read("docs/qa/cost-aware-routing/pr-body.md").replace(/\r\n/g, "\n");
     expect(pr).toMatch(/^Closes #74$/m);
@@ -679,6 +698,28 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     const decision = adr.split("### D16 — ")[1]?.split("### D17 — ")[0];
     expect(decision).toContain("Release `2.3.0`, one PR");
     expect(decision).toContain("One pull request closes #74 and #73. Target version `2.3.0`.");
+  });
+
+  it("D16 detects a first dated release that is not the package version, a ## heading before it and a second [Unreleased]", () => {
+    const valid = "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- An entry.\n\n## [2.4.0] - 2026-10-09\n\n### Added\n\n- x\n\n## [2.3.0] - 2026-10-07\n";
+    expect(changelogReleaseProblems(valid, "2.4.0")).toEqual([]);
+    expect(changelogReleaseProblems(valid.replace(/\n/g, "\r\n"), "2.4.0")).toEqual([]);
+    expect(changelogReleaseProblems(valid.replace("### Changed\n\n- An entry.\n\n", ""), "2.4.0")).toEqual([]);
+    expect(changelogReleaseProblems(valid, "2.5.0")).toEqual([
+      "the first dated release after [Unreleased] is ## [2.4.0] - 2026-10-09, not 2.5.0",
+    ]);
+    expect(changelogReleaseProblems(valid.replace("## [2.4.0] - 2026-10-09\n\n### Added\n\n- x\n\n", ""), "2.4.0")).toEqual([
+      "the first dated release after [Unreleased] is ## [2.3.0] - 2026-10-07, not 2.4.0",
+    ]);
+    expect(changelogReleaseProblems(valid.replace("### Changed", "## Changed"), "2.4.0")).toEqual([
+      "a ## heading between [Unreleased] and the first dated release: ## Changed",
+    ]);
+    expect(changelogReleaseProblems(valid.replace("## [2.4.0] - 2026-10-09", "## [2.4.0]"), "2.4.0")).toEqual([
+      "a ## heading between [Unreleased] and the first dated release: ## [2.4.0]",
+      "the first dated release after [Unreleased] is ## [2.3.0] - 2026-10-07, not 2.4.0",
+    ]);
+    expect(changelogReleaseProblems(`${valid}\n## [Unreleased]\n`, "2.4.0")).toEqual(["expected one ## [Unreleased] heading, found 2"]);
+    expect(changelogReleaseProblems("# Changelog\n\n## [Unreleased]\n\n- x\n", "2.4.0")).toEqual(["no dated release after [Unreleased]"]);
   });
 
   it("D17: the guide documents the stats mode line and the enforce-period window", () => {
@@ -1264,12 +1305,13 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
     expect(readme).toContain(`the plugin logs one notice per process, \`${ROLES_V1_NOTICE}\``);
     expect(FINDING_IDS).toContain("roles-on-legacy-host");
     expect(readme).toContain("the advisor info `roles-on-legacy-host`");
-    expect(readme).toContain("[behaviour change entry](CHANGELOG.md#changed)");
-    expect(anchorsOf(read("CHANGELOG.md")).has("changed")).toBe(true);
-    // the first `### Changed` of the changelog is the one under [2.4.0], which holds the behaviour-change entry
-    const changelog = read("CHANGELOG.md");
-    expect(changelog.indexOf("### Changed")).toBeGreaterThan(changelog.indexOf("## [2.4.0] - 2026-10-09"));
-    expect(changelog.indexOf("### Changed")).toBeLessThan(changelog.indexOf("Behaviour change (#84)"));
+    // the link lands on the 2.4.0 release heading; its section's first `### Changed` holds the behaviour-change entry
+    expect(readme).toContain("[behaviour change entry](CHANGELOG.md#240---2026-10-09)");
+    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
+    expect(anchorsOf(changelog).has("240---2026-10-09")).toBe(true);
+    const release = /^## \[2\.4\.0\] - 2026-10-09$([\s\S]*?)^## \[/m.exec(changelog)?.[1] ?? "";
+    const firstChanged = release.split(/^### /m).find((section) => /^Changed\n/.test(section)) ?? "";
+    expect(firstChanged).toContain("Behaviour change (#84)");
     const adr = read("docs/adr/0006-role-tier-assurance-delegation.md");
     expect(adr).toContain("amendments R0–R10 and adversarial QA");
     expect(adr).not.toContain("amendments R0–R8");
