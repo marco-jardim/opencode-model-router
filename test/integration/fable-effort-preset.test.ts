@@ -3,10 +3,17 @@ import { join } from "node:path";
 import { describe, expect, it, test } from "vitest";
 import { buildAgentOptions } from "../../src/router/agent-options";
 import { validateConfig } from "../../src/router/config";
+import { FABLE_EFFORT_2_5_0, withLegacyPresets } from "../helpers/legacy-presets";
 
+// 2.6.0 removed `fable-effort` from the bundled tiers.json; these tests define the 2.5.0 block the way
+// a user keeps it (`presets` in the overrides file) and check it still works end to end.
 describe("fable-effort preset", () => {
   const raw = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8"));
-  const preset = validateConfig(raw).presets["fable-effort"];
+  const preset = validateConfig(withLegacyPresets(raw, ["fable-effort"])).presets["fable-effort"];
+
+  it("is no longer bundled", () => {
+    expect(validateConfig(raw).presets).not.toHaveProperty("fable-effort");
+  });
 
   it("uses the same Fable 5 model across all tiers", () => {
     expect(preset.fast.model).toBe("anthropic/claude-fable-5-1");
@@ -25,7 +32,7 @@ describe("fable-effort preset", () => {
   });
 });
 
-test("applies fable-effort preset options through config hook", async () => {
+test("applies an override-defined fable-effort preset's options through config hook", async () => {
   const { mkdtemp, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const path = await import("node:path");
@@ -44,6 +51,12 @@ test("applies fable-effort preset options through config hook", async () => {
     const { default: ModelRouterPlugin } = await import("../../src/index");
     const { invalidateConfigCache, writeState } = await import("../../src/router/config");
     invalidateConfigCache();
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(path.join(dir, ".config", "opencode"), { recursive: true });
+    writeFileSync(
+      path.join(dir, ".config", "opencode", "opencode-model-router.overrides.jsonc"),
+      JSON.stringify({ presets: { "fable-effort": FABLE_EFFORT_2_5_0 } }),
+    );
     writeState({ activePreset: "fable-effort" });
 
     const hooks: any = await ModelRouterPlugin(makeFableEffortCtx(dir) as any);
@@ -99,7 +112,7 @@ test("registers each anthropic tier's effort as `effort`", async () => {
 
     // The bundled anthropic preset sets `effort` on all three tiers. All use
     // Anthropic models, so they map onto `effort` (not `reasoningEffort`).
-    for (const [name, effort] of [["fast", "low"], ["medium", "medium"], ["heavy", "xhigh"]]) {
+    for (const [name, effort] of [["fast", "medium"], ["medium", "high"], ["heavy", "xhigh"]]) {
       const options = ocCfg.agent[name].options;
       expect(options.effort).toBe(effort);
       expect(options).not.toHaveProperty("reasoningEffort");
