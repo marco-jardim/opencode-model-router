@@ -779,6 +779,27 @@ async function inheritedConfig(executable: string, budget: Budget): Promise<read
 }
 
 /**
+ * QA-G-A2-2-1: the user's system/global `safe.directory` values (read by {@link inheritedConfig}, as `inspectGit` does) as
+ * `-c safe.directory=<value>` pairs for a hardened git run, whose environment hides the system and global config
+ * (`gitEnvironment()`): without them, a repository the user trusts that way fails with "dubious ownership". Only
+ * `safe.directory` is passed; any failure to read the user's config yields no pairs (never a wider trust than git's default).
+ */
+export async function inheritedSafeDirectoryArgs(executable: string, timeoutMs: number = DEADLINE_MS): Promise<string[]> {
+  const deadline = performance.now() + timeoutMs;
+  const budget: Budget = { timeoutMs: () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("Git configuration query timed out");
+    return remaining;
+  } };
+  try {
+    const inherited = await inheritedConfig(executable, budget);
+    return inherited.filter(pair => pair.startsWith("safe.directory=")).flatMap(pair => ["-c", pair]);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Repository-level (local, worktree, included) driver programs and line-ending
  * settings. Every configured filter/diff program is blanked with `-c key=` (G1);
  * filters also become optional so a blank one is not a hard failure.

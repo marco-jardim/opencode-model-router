@@ -17,7 +17,7 @@
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { resolveActiveTiers, resolveRolesRouting, type RouterConfig, type TierConfig } from "./config";
-import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, spawnBounded } from "./git-tools";
+import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded } from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
 import { CONTEXT7_DOC_TOOLS, type PermissionMap } from "./read-only";
@@ -165,12 +165,17 @@ const WORKTREE_LIST_TIMEOUT_MS = 10_000;
 
 /**
  * The worktree paths of the repository `directory` belongs to, as `git worktree list --porcelain`
- * prints them (hardened git: no hooks, no fsmonitor, no global/system config). Throws when git
- * fails, so the caller registers no worktree rule.
+ * prints them (hardened git: no hooks, no fsmonitor, no global/system config). The user's
+ * system/global `safe.directory` values are passed back as `-c safe.directory=…` pairs
+ * (QA-G-A2-2-1), so a repository trusted that way is not refused as "dubious ownership". Throws
+ * when git fails, so the caller registers no worktree rule.
  */
 export async function listWorktrees(directory: string): Promise<string[]> {
-  const result = await spawnBounded(gitExecutable(), [...hardeningArgs(), "worktree", "list", "--porcelain"], directory, {
-    env: gitEnvironment(), timeoutMs: WORKTREE_LIST_TIMEOUT_MS, maxBytes: 1024 * 1024,
+  const started = performance.now();
+  const executable = gitExecutable();
+  const trusted = await inheritedSafeDirectoryArgs(executable, WORKTREE_LIST_TIMEOUT_MS);
+  const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "worktree", "list", "--porcelain"], directory, {
+    env: gitEnvironment(), timeoutMs: Math.max(1, WORKTREE_LIST_TIMEOUT_MS - (performance.now() - started)), maxBytes: 1024 * 1024,
   });
   if (result.code !== 0 || result.truncated) {
     throw new Error(`git worktree list failed (exit ${String(result.code)}${result.truncated ? ", output truncated" : ""}): ${result.stderr.toString("utf8").trim()}`);

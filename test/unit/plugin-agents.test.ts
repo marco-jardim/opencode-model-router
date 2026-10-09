@@ -281,6 +281,40 @@ describe("plugin agents: layer rules", () => {
     expect(getConfigNotices(project).some((n) => n.message.includes("agents.bad.tier"))).toBe(true);
     expect(pluginAgentLines(cfg).join("\n")).toContain("good");
   });
+
+  it("QA-G-A2-2 nit 2: an edit-tool key that allows what `edit` denies keeps the agent and yields a notice naming the file", () => {
+    write(globalFile(), { agents: { editor: { tier: "fast", description: "d", permission: { read: "allow", apply_patch: "allow" } } } });
+    const cfg = loadConfig(project);
+    expect(Object.keys(cfg.agents ?? {})).toEqual(["editor"]);
+    const notice = getConfigNotices(project).find((n) => n.message.startsWith("agents.editor.permission.apply_patch:"));
+    expect(notice?.message).toMatch(/on OpenCode v2 .*only narrow.*`edit` decides/);
+    expect(notice?.message).toContain(OVERRIDE_FILENAME);
+  });
+});
+
+describe("plugin agents: edit-tool permission keys on v2 (QA-G-A2-2 nit 2)", () => {
+  const explicit = (permission: Record<string, unknown>) => ({ tier: "scout", description: "d", permission });
+
+  it("notices write/patch/multiedit/apply_patch keys (and patterns matching them) that allow or ask what `edit` denies; the agent is kept", () => {
+    const { agents, issues } = sanitizePluginAgents({
+      editor: explicit({ read: "allow", apply_patch: "allow", write: { "src/*": "ask" }, multiedit: "deny", "*patch": "allow" }),
+    }, ctx);
+    expect(Object.keys(agents ?? {})).toEqual(["editor"]);
+    expect(issues.map((issue) => issue.path)).toEqual([
+      "agents.editor.permission.apply_patch", "agents.editor.permission.write", "agents.editor.permission.*patch",
+    ]);
+    for (const issue of issues) {
+      expect(issue.name).toBe("editor");
+      expect(issue.message).toMatch(/on OpenCode v2 the host checks `edit` for these tools: this key can only narrow them .*`edit` decides/);
+    }
+  });
+
+  it("no notice when `edit` grants the same resource, for a deny, for `*`, or for a readOnly agent", () => {
+    expect(sanitizePluginAgents({ a: explicit({ edit: "allow", apply_patch: "allow", patch: "deny" }) }, ctx).issues).toEqual([]);
+    expect(sanitizePluginAgents({ b: explicit({ edit: { "src/*": "allow" }, write: { "src/*": "allow" } }) }, ctx).issues).toEqual([]);
+    expect(sanitizePluginAgents({ c: explicit({ "*": "allow", multiedit: "deny" }) }, ctx).issues).toEqual([]);
+    expect(sanitizePluginAgents({ d: { tier: "scout", description: "d", readOnly: true, permission: { apply_patch: "deny" } } }, ctx).issues).toEqual([]);
+  });
 });
 
 describe("plugin agents: one preset resolver (QA-81-9)", () => {
