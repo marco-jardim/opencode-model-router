@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-10-09
+
 ### Fixed
 
 - **OpenCode v1 no longer drops `agent.<tier>.permission` and `.tools` for `@medium` and `@heavy`.** The v1 `config`
