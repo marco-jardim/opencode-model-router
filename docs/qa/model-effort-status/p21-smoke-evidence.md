@@ -1,195 +1,203 @@
 # Phase P2.1 — real-host proof of the TUI status (G1/G2/G3), #90
 
-Worktree `D:\git\omr-msd-p21` (branch `msd/p21`), not committed (the executor commits).
+Branch `msd/p21`: the smoke is committed as `f0b6f7c`. The QA round 1 fixes below are in the working tree, for the executor
+to commit.
 
 ## Verdict
 
-All scenarios pass on OpenCode **2.0.24, 2.0.25 and 2.0.26**: 30/30 tests, 0 skipped, no `it.skip` needed. Three
-consecutive full runs passed (run ids `cd5b8ad6`, `bdbfe44c`, `002415f1`; the last is on the final code). A6 holds on every
-version: the G3 row is on screen while the child's first answer is still being held, so `status(child) === "running"` is
-set before the first token. Nothing in the P1.3 code needs changing (no `msd/p21-fix`).
+Every scenario passes on OpenCode **2.0.24, 2.0.25 and 2.0.26**, for both plugin sources:
+- the local path of this checkout;
+- a `node_modules` install of the `npm pack` tarball.
+
+Results: 49/49 tests in each of two consecutive full runs (`b61ffa82`, `549b8690`), with no skipped scenario.
+- **A6 holds on every version and flow.** The G3 row is on screen while the child's first answer is still held, so
+  `status(child) === "running"` is set before the first token.
+- **No P1.3 code change is needed.**
+
+## QA round 1 fixes
+
+| Id | Fix |
+|---|---|
+| P21-1 (major) | **No `taskkill /T` any more.**<br>- The process query reads `CreationDate` (epoch ms).<br>- A child is accepted only if it was created at or after its parent and after the spawn (250 ms clock slack), and it is not in the pre-spawn baseline (pid + creation time).<br>- Children are killed first, then the root, each with `taskkill /F /PID <pid>`. Before each kill the process is re-read with `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>"` and skipped if gone or if its name or creation time changed.<br>- `pty.kill()` comes after the root.<br>- Collect → kill repeats up to 3 times, and every taskkill output is kept.<br>- The test asserts every kill record is a tree member, the root is killed exactly once and last in its round, there is no overlap with the start-of-run list, and there are no survivors.<br>- `RoutingHost.doStop` is unchanged; see Follow-ups. |
+| P21-2 (major) | **`node_modules` install flow per version.**<br>- `npm pack` runs once into the temp dir. Then `npm install --no-save --no-audit --no-fund --ignore-scripts --no-package-lock --prefix <root>/install <tgz>`, with a minimal `package.json`. The peer `@opencode-ai/plugin` is installed and checked.<br>- Server config `plugins: ["<root>/install/node_modules/opencode-model-router", probe]`, no `cli.json`.<br>- Asserts boot, S1 default, the S2 G3 row (and A6) and S4 (screen and wire).<br>- At most 3 hosts at once, through a FIFO slot pool; installs run outside the slots. |
+| P21-3 | **Child view check corrected.**<br>- Round 1 had matched the root view with the picker open: the picker replaces the prompt row, so the "no root row" test passed on the wrong screen.<br>- Now the child view needs a line with `TUI_SMOKE_HOLD two` that has no `SPIKE_CALL`, no `SPIKE_CALL` anywhere on screen, and a screen different from the picker snapshot.<br>- The picker must list exactly one running entry, `Fast: tui smoke two`.<br>- G2 is asserted while the child is still held (`running: true`). |
+| P21-4 | - Throws if `pty.pid <= 4` after the wait (after `pty.kill()`).<br>- The root's identity (name, created after the spawn, not in the baseline) is checked at spawn.<br>- Teardown asserts `pid > 4`, `tree[0]` is the root, and the kill order described above.<br>- A last batch test asserts `newAfter` is empty and no own PID or identity is in the start-of-run lists.<br>- The suite is skipped off Windows, with the reason in its title. |
+| P21-5 | **Host environment is an allowlist.**<br>- Inherited: `PATH`, `PATHEXT`, `SystemRoot`, `windir`, `ComSpec`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE`, `OS`, `USERNAME`, `COMPUTERNAME`.<br>- Set: the isolated dirs, `HOMEDRIVE`/`HOMEPATH` from the temp home, the OpenCode settings and the harness's own variables.<br>- Any other name throws, and so does a credential-shaped name.<br>- Round 1's deny-list let `OPENCODE` (no underscore) through. |
+| P21-6 | **Every key waits for its expected screen change.** Typed prompt complete, root request seen, host row changed per `ctrl+t`, picker open, child view.<br>- The sidebar is toggled and toggled back, each waiting for the sidebar state, and the restored state is asserted.<br>- `<leader>b` retries at most 3 times; a stray `b` is erased. Both final runs needed 1 attempt each.<br>- The first draft failed because the second `ctrl+x` came right after the first chord. A 1 s pause before toggling back fixed it. |
+| P21-7 | - S1: the host row's last segment is one of `low\|medium\|high\|xhigh\|max` and was not one before.<br>- G3: the row is on `composerTop - 1`.<br>- S4: every request of agent `fast` has effort `medium` and a catalog model ending `#low`, at least 2 in the local flow and 1 in the npm flow. |
+| P21-8 | - `Promise.allSettled` over the flows.<br>- Each `finally` step has its own try.<br>- The hard stop has `.catch(() => {})`.<br>- Every process call has a 15 s timeout.<br>- An empty start-of-run process list throws.<br>- Flows are keyed by index, and binaries are de-duplicated by resolved path. |
+| P21-9 | `npm run smoke:v1` was **not run**: it is not isolated from the owner's environment (see below). |
+| P21-10 | This header is corrected, and paths are written as `<home>\AppData\Local\Temp\…`. |
+| P21-11 | Process-table, re-read and taskkill calls use async `execFile`, as does npm. |
 
 ## Files
 
 | File | Change |
 |---|---|
-| `test/smoke/tui-status.smoke.test.ts` | new, gated by `RUN_OC_SMOKE_TUI=1` (otherwise `describe.skip`: 30 skipped) |
-| `test/smoke/helpers/tui-pty.ts` | new: isolated env, process table, own-tree kill, `TuiSession` (ConPTY → `@xterm/headless`, replies written back) |
-| `test/smoke/helpers/routing-host.ts` | additive: `RoutingProvider.hold` / `holds` / `holdMarked(marker, ms)` (+6 lines in `handle`, inert when unset) |
-| `package.json` | script `smoke:tui`; devDependencies `@lydell/node-pty` `1.2.0-beta.15`, `@xterm/headless` `6.0.0` (exact) |
-| `package-lock.json` | from `npm install -D --save-exact` |
+| `test/smoke/tui-status.smoke.test.ts` | gated smoke (`RUN_OC_SMOKE_TUI=1`, Windows only): local and npm flows per version, checks, teardown and batch assertions |
+| `test/smoke/helpers/tui-pty.ts` | allowlisted env, async process table with `CreationDate`, `ProcessTree` (identity-checked collect and kill), `TuiSession` |
+| `test/smoke/helpers/routing-host.ts` | unchanged since `f0b6f7c` (additive `RoutingProvider.hold` / `holds` / `holdMarked`) |
+| `package.json`, `package-lock.json` | unchanged since `f0b6f7c` (`smoke:tui`, `@lydell/node-pty` 1.2.0-beta.15, `@xterm/headless` 6.0.0) |
 
-Run: `npm run smoke:tui`. Options: `OMR_TUI_SMOKE_BINS` (`;`-separated executables; defaults built from `homedir()` and
-the real temp dir to the three known installs; a missing one becomes `it.skip("skipped: executable not found (<path>)")`,
-verified with a fake `C:\nonexistent\opencode-2.0.99\opencode.exe`: `30 passed | 1 skipped`), `OMR_TUI_SMOKE_OUT`
-(evidence directory; default `<real temp>\omr-tui-smoke`). Evidence of the runs below: `C:\Users\Marquinho\AppData\Local\Temp\Claude\omr-p21\out\`
-(`<run>-<version>.screens.txt` = every distinct screen, `<run>-<version>.summary.json`, `<run>-pids.json`).
+Run with `npm run smoke:tui`. Options:
+- `OMR_TUI_SMOKE_BINS`: `;`-separated executables. A missing one is skipped with its path.
+- `OMR_TUI_SMOKE_OUT`: evidence directory.
+
+The evidence of the runs below is in `<home>\AppData\Local\Temp\Claude\omr-p21\out2\`:
+- `<run>-<version>-<flow>.screens.txt`
+- `<run>-<version>-<flow>.summary.json`
+- `<run>-pids.json`
 
 ## Method
 
-- One isolated root per version (`mkdtemp` under the smoke temp guard, `realpath`): HOME, USERPROFILE,
-  `XDG_CONFIG_HOME=<H>\.config`, XDG_DATA/STATE/CACHE, APPDATA, LOCALAPPDATA, TEMP/TMP/TMPDIR inside it;
-  `OPENCODE_DISABLE_MODELS_FETCH`, `OPENCODE_DISABLE_PROJECT_CONFIG`, `OPENCODE_TEST_HOME`, random `OPENCODE_PASSWORD`;
-  the caller's credential-shaped names and `OPENCODE_*`/`MODEL_ROUTER_*`/`OMR_*`/provider prefixes are dropped (a
-  leak check throws).
-- Server config only (`<H>\.config\opencode\opencode.json`): `model: anthropic/claude-opus-4-7`,
-  `plugins: [<worktree>, <probe plugin>]`, `providers.anthropic.settings.baseURL` = the scripted provider. No `cli.json`:
-  the host auto-loads the router's TUI entry (A4/C4). Router overrides in the same dir: preset `smoke` = `SMOKE_PRESET`
-  with **fast = `anthropic/claude-sonnet-5-5`, variant `low`, effort `medium`**, so the expected child effort is
-  `medium (low)` (A11d: effort and variant differ).
-- `opencode.exe --standalone --auto` in a 150x45 ConPTY; `@xterm/headless` mirrors it and its replies to the host's
-  terminal queries are written back. Waits for a real PID (> 4); kills only its own tree (`taskkill /T /F`, process-table
-  baseline taken before the spawn); `opencode.exe` PIDs recorded before and after the run.
-- Versions run in parallel (3 hosts, spawns staggered 4 s). Each step has its own deadline (≤ 90 s; whole flow 330 s).
-- The worktree's own `node_modules/solid-js` (devDependency 1.9.15) did not break the TUI entry: the footer is reactive
-  (S1 toggles it both ways) and no `Solid owner` notice appeared (`notices []`), so the host served its own solid-js,
-  as in A9 C5.
+- **Isolation and process handling:** as in the P21-1 and P21-5 rows above.
+- **Host config, per flow:**
+  - Server config only (`<H>\.config\opencode\opencode.json`): `model: anthropic/claude-opus-4-7`, the router plugin (local path or installed package) plus a probe plugin, and the scripted Anthropic provider.
+  - The host auto-loads the router's TUI entry (A4/A9).
+  - Router preset `smoke` has **fast = `anthropic/claude-sonnet-5-5`, variant `low`, effort `medium`**, so the expected child label is `medium (low)` (A11d).
+- **Host run:** `opencode.exe --standalone --auto` in a 150x45 ConPTY, mirrored by `@xterm/headless`; the mirror's replies to the host's terminal queries are written back.
+- **Host facts used** (`git -C D:\git\opencode show v2.0.24:<path>`, no `git grep`):
+  - `variant.cycle` = `ctrl+t`
+  - `session.child.first` = `down` (subagent picker)
+  - `composer.subagent.select` = `return`
+  - `session.sidebar.toggle` = `<leader>b`, with `LeaderDefault = "ctrl+x"`
+  - Root CLI flags: `--standalone`, `--auto`, `--session/-s`
+  - `git diff v2.0.24 v2.0.26` of `keybind.ts` and `commands.ts` touches none of these.
 
-Host facts (all via `git -C D:\git\opencode show v2.0.24:<path>`; no `git grep`):
-`packages/tui/src/config/keybind.ts`: `variant.cycle` = `ctrl+t`, `session.child.first` = `down` ("Toggle subagent
-picker"), `composer.subagent.down` = `down`, `composer.subagent.select` = `return`, `session.sidebar.toggle` =
-`<leader>b`, `LeaderDefault = "ctrl+x"`. `packages/tui/src/routes/session/index.tsx:1257-1261` (Down opens the composer
-on the `subagents` tab) and `composer/subagents-tab.tsx` (running family members, Enter navigates).
-`packages/cli/src/commands/commands.ts` (root TUI command): `--standalone`, `--server`, `--auto`, `--session/-s`,
-`--continue`, `--prompt`. `git diff v2.0.24 v2.0.26` of `keybind.ts` and `commands.ts` touches none of these.
+## Vitest summaries
 
-## Vitest summary (final run `002415f1`, `--reporter=verbose`)
-
+Run 1 (`b61ffa82`) and run 2 (`549b8690`), consecutive, final code, `--reporter=verbose`:
 ```
- ✓ … > OpenCode 2.0.24 > boots with the plugin's footer on the home screen 70488ms
- ✓ … > OpenCode 2.0.24 > S1 G1: home footer shows `effort default`
- ✓ … > OpenCode 2.0.24 > S1 G1: a selected variant shows in the host row and the plugin shows no effort
- ✓ … > OpenCode 2.0.24 > S1 G1: cycling back to no variant restores `effort default`
- ✓ … > OpenCode 2.0.24 > S2 G3: a running-delegate row above the composer while the child runs, gone after
- ✓ … > OpenCode 2.0.24 > S2 A6: the row is on screen before the child's first token
- ✓ … > OpenCode 2.0.24 > S3 G2: the child session view shows `fast · <model> · <effort>`
- ✓ … > OpenCode 2.0.24 > S4: the child's effort is the fast tier's (medium (low))
- ✓ … > OpenCode 2.0.24 > recorded: sidebar toggled and empty-box gap
- ✓ … > OpenCode 2.0.24 > teardown: every process this run spawned is gone
- (same 10 for OpenCode 2.0.25 and OpenCode 2.0.26)
+ Test Files  1 passed (1)
+      Tests  49 passed (49)
+   Start at  12:22:50
+   Duration  125.99s (tests 100%)
 
  Test Files  1 passed (1)
-      Tests  30 passed (30)
-   Start at  11:54:06
-   Duration  81.38s (tests 100%)
+      Tests  49 passed (49)
+   Start at  12:25:04
+   Duration  118.87s (tests 100%)
 ```
-(The first test carries the wait for the three parallel flows; the others read their recorded results.)
 
-Gate off (`vitest run --config vitest.smoke.config.ts test/smoke/tui-status.smoke.test.ts` without the variable):
-`Test Files 1 skipped (1)`, `Tests 30 skipped (30)`.
-
-## Per-scenario evidence
-
-The screens are the same on the three versions (path tails differ). They are quoted from 2.0.24 unless noted.
-
-### S1 G1 — home footer, variant, restore (PASS ×3)
-Home, no variant (footer under the prompt box):
+Test names, per version (×3):
 ```
-┃  Ask anything… "Fix a TODO in the codebase"
-┃
-┃  Build auto · Claude Opus 4.7 Anthropic
-╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-C:\…\omr-tui-2.…\project  effort default  shift+tab agents  ctrl+p commands
+✓ OpenCode <v> > local path (this checkout) > boots with the plugin's footer on the home screen
+✓ … > local path … > S1 G1: home footer shows `effort default`
+✓ … > local path … > S1 G1: a selected variant shows in the host row and the plugin shows no effort
+✓ … > local path … > S1 G1: cycling back to no variant restores `effort default`
+✓ … > local path … > S2 G3: a running-delegate row directly above the prompt box while the child runs, gone after
+✓ … > local path … > S2 A6: the row is on screen before the child's first token
+✓ … > local path … > S3 G2: the child's own view shows `fast · <model> · <effort>` while it runs
+✓ … > local path … > S4: the child's effort is the fast tier's (medium (low)) on screen and on the wire
+✓ … > local path … > recorded: sidebar toggled and back, empty-box gap
+✓ … > local path … > teardown: only this flow's processes were killed, children first, and none survive
+✓ … > node_modules install (npm pack) > boots / S1 default / S2 G3 / S2 A6 / S4 / teardown   (6 tests)
+✓ batch teardown: no opencode.exe left behind and no own PID among the processes present at the start
 ```
-After `ctrl+t` (variant.cycle): the host row shows the variant and the plugin shows no `effort`:
-```
-┃  Build auto · Claude Opus 4.7 Anthropic · low
-╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-C:\…\om…\omr-tui-2.0.24-cLehcU\project    shift+tab agents  ctrl+p commands
-```
-Five more presses cycle `medium → high → xhigh → max → (none)`, and `effort default` comes back on the last one, so the
-footer reacts both ways.
+16 × 3 + 1 = 49.
 
-### S2 G3 — running row (PASS ×3) and A6 (PASS ×3)
-The root prompt `SPIKE_CALL={"agent":"fast","description":"tui smoke one","prompt":"TUI_SMOKE_HOLD one","background":false}`
-is typed and submitted. The scripted provider holds the child's first answer for 15 s. Root view while the child runs
-(sidebar open by default at 150 columns):
+Other checks:
+- `npm run typecheck`: green.
+- `vitest run test/unit/smoke-redact.test.ts test/unit/roles.evidence.test.ts test/unit/packaging.test.ts`: 3 files, 25 tests passed.
+
+## Per-version / per-flow results
+
+Times are seconds after the submit. "Request" is when the child's first request reached the provider; "row" is when the
+G3 row was first seen; "release" is when the held first token was released.
+
+| Run | Version | Flow | Checks | A6 (request / row / release) | G3 / G2 run / G2 idle | Wire (fast) | Teardown (kills, order) |
+|---|---|---|---|---|---|---|---|
+| b61ffa82 | 2.0.24 | local | 10/10 PASS | 1.0 / 1.1 / 16.0 | `medium (low)` ×3 | 2× `sonnet-5-5#low` effort `medium` | conhost, opencode, root opencode; 0 survivors |
+| b61ffa82 | 2.0.24 | npm | 5/5 PASS | 0.7 / 0.8 / 15.7 | `medium (low)` | 1× same | same order; 0 survivors |
+| b61ffa82 | 2.0.25 | local | 10/10 PASS | 0.5 / 0.6 / 15.5 | `medium (low)` ×3 | 2× same | same order; 0 survivors |
+| b61ffa82 | 2.0.25 | npm | 5/5 PASS | 0.7 / 0.9 / 15.7 | `medium (low)` | 1× same | same order; 0 survivors |
+| b61ffa82 | 2.0.26 | local | 10/10 PASS | 0.8 / 0.8 / 15.8 | `medium (low)` ×3 | 2× same | same order; 0 survivors |
+| b61ffa82 | 2.0.26 | npm | 5/5 PASS | 0.5 / 0.6 / 15.5 | `medium (low)` | 1× same | same order; 0 survivors |
+| 549b8690 | 2.0.24 | local | 10/10 PASS | 0.9 / 1.0 / 15.9 | `medium (low)` ×3 | 2× same | same order; 0 survivors |
+| 549b8690 | 2.0.24 | npm | 5/5 PASS | 0.5 / 0.5 / 15.5 | `medium (low)` | 1× same | same order; 0 survivors |
+| 549b8690 | 2.0.25 | local | 10/10 PASS | 0.6 / 0.7 / 15.6 | `medium (low)` ×3 | 2× same | same order; 0 survivors |
+| 549b8690 | 2.0.25 | npm | 5/5 PASS | 0.5 / 0.7 / 15.5 | `medium (low)` | 1× same | same order; 0 survivors |
+| 549b8690 | 2.0.26 | local | 10/10 PASS | 0.8 / 1.0 / 15.8 | `medium (low)` ×3 | 2× same | same order; 0 survivors |
+| 549b8690 | 2.0.26 | npm | 5/5 PASS | 0.4 / 0.5 / 15.4 | `medium (low)` | 1× same | same order; 0 survivors |
+
+Notes on the table:
+- **Local-flow checks:** boot, S1 default/variant/restore, S2 G3, A6, S3 G2, S4, sidebar, gap.
+- **npm-flow checks:** boot, S1 default, S2 G3, A6, S4.
+- **Process trees:** every tree has 3 members: the root `opencode.exe`, a child `opencode.exe` and a `conhost.exe`. All were killed in round 1, children first.
+- **Batch, both runs:** `opencode.exe` PIDs `[12164,55072,56236,59416,65616,73448,75048]` before and after; `newAfter` and `gone` empty. 18 own processes per run, none in the start-of-run lists.
+
+## Screen evidence (2.0.24, run `549b8690`; the other versions are identical apart from path tails)
+
+**S1:** variant cycle.
+- Host row: `┃  Build auto · Claude Opus 4.7 Anthropic` → `┃  Build auto · Claude Opus 4.7 Anthropic · low`. There was no variant before, and the plugin footer is absent.
+- Restore: `medium → high → xhigh → max → (none)`, then `effort default` is back.
+
+**S2 G3**, npm flow (the plugin loaded from `…\install\node_modules\opencode-model-router`). The row is on line 37 and the
+prompt box starts on line 38:
 ```
   fast · Claude Sonnet 5.5 · medium (low)                                                                         use other models, including
   ┃                                                                                                               Claude, GPT, Gemini etc
   ┃
   ┃                                                                                                               Connect provider        /connect
   ┃  Build auto · Claude Opus 4.7 Anthropic
-  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-   ⬝■■■■■■⬝ esc interrupt                                    effort default  ↓ 1 subagent  ctrl+p commands    C:\…\project
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ■■■■■⬝⬝⬝ esc interrupt                                    effort default  ↓ 1 subagent  ctrl+p commands    C:\…\omr-tui-2.0.24-npm-oZBjRh\project
 ```
-The row sits on line 37, directly above the prompt box (lines 38–41). G1 in the root session stays `effort default` (the
-root agent has no effort). Timeline, in seconds after the submit:
 
-| Version | Child request reached the provider | Row first seen | First token released | Row gone (`ROOT_DONE` shown) |
-|---|---|---|---|---|
-| 2.0.24 | 0.5 | 0.6 | 15.5 | 15.9 |
-| 2.0.25 | 0.5 | 0.6 | 15.5 | 15.8 |
-| 2.0.26 | 0.6 | 0.7 | 15.6 | 16.0 (run `bdbfe44c`: 15.9) |
-
-**A6:** the row appears about 0.1 s after the child's request is sent and about 15 s before its first token, so
-`data.session.status(child)` is `running` before the first response. It never appears before the request (our polling
-interval is 100 ms). The row's first value is already `medium (low)`, so the channel answered on the first pull.
-
-### S3 G2 — child view (PASS ×3)
-A second delegation (`TUI_SMOKE_HOLD two`, held 30 s). Down opens the subagent picker, Down moves to the child, and Enter
-navigates to it. Child view while the child is still held:
+**S3 G2:** the child's own view while the child is still held (`running: true`). It shows the child's prompt (the
+router's dispatch preamble, then `TUI_SMOKE_HOLD two`), no `SPIKE_CALL`, and the picker entry `Fast: tui smoke two  Running`:
 ```
-  fast · Claude Sonnet 5.5 · medium (low)
-  ┃                                                                                                               OpenCode includes free models so
-  ┃  Subagents  Shell                                                                                esc          you can start immediately.
+  ┃  ---
   ┃
-  ┃  Fast: tui smoke two                                                                        Running           Connect from 75+ providers to
-```
-The same view after the child answered (2.0.26; the sidebar stayed closed after the S2 toggle):
-```
-     Fast · Claude Sonnet 5.5 · 31.2s · 0.2 tok/s
+  ┃  TUI_SMOKE_HOLD two
+  ┃
 
   fast · Claude Sonnet 5.5 · medium (low)
   ┃
   ┃  Subagents  Shell                                                                                                                          esc
   ┃
-  ┃  No active subagents
+  ┃  Fast: tui smoke two                                                                                                                  Running
 ```
 
-### S4 — effort channel (PASS ×3)
-Expected `medium (low)`, from the fast tier's effort `medium` and variant `low` (A11d rule). Observed on every version:
-G3 `medium (low)`, G2 while running `medium (low)`, G2 when idle `medium (low)`. On the wire, both child requests carried
-`catalogModel anthropic/claude-sonnet-5-5#low`, agent `fast`, effective effort `medium`. So the screen matches what the
-provider was actually told, not just the stored variant.
+**Sidebar (recorded and asserted):**
+- Open by default: `fast · Claude Sonnet 5.5 · medium (low)` on one line, with the sidebar text to its right.
+- After `<leader>b`: closed, same row, and the next line is the prompt border `┃`.
+- After `<leader>b` again: open again, restored. One attempt each time.
 
-### Recorded (not asserted as product requirements; both checks passed)
-- **Sidebar:** at 150 columns the sidebar is open by default. Open: `fast · Claude Sonnet 5.5 · medium (low)` on one line,
-  with the sidebar text to its right. After `<leader>b` (closed): `fast · Claude Sonnet 5.5 · medium (low)`, still on one
-  line, and the next line is the prompt border `┃`. There was no wrapping in either state. (The row width comes from the
-  renderer width − 4, not the composer width. A row longer than about 108 columns with the sidebar open would run under
-  the sidebar edge, but `wrapMode: none` prevents it from wrapping. Not reproduced, because the names here are short.)
-- **Empty-box gap:** with no delegate running, the prompt box top is on line 38, the same as with the row, and the line
-  above it is blank. The transcript is too short to tell an empty-box line apart from the transcript's own free space, so
-  this needs the DF-1 check below.
+**Gap (recorded):** the prompt box top is on line 38 with and without the row, and the row uses line 37. The transcript is
+too short to tell an empty-box line apart from free space; this stays a DF-1 check.
 
-### Teardown (PASS ×3)
-Each flow killed only its own tree. For example, 2.0.24 `{"pid":53068,"tree":[53068,80588,30488],"kill":["killed 53068"],"survivors":[]}`.
-`opencode.exe` PIDs were `[12164,55072,56236,59416,65616,73448,75048]` before and after the batch, with no new or missing
-PIDs, so the owner's live OpenCode was untouched.
+**Teardown record** (taskkill output as the Portuguese system prints it, decoded as UTF-8):
+`r1/child/64096 conhost.exe killed`, `r1/child/73348 opencode.exe killed`, `r1/root/30164 opencode.exe killed`. Each one's
+output is `ÊXITO: o processo com PID <pid> foi finalizado.`, with no survivors.
 
-## Notes
+## P21-9 — `npm run smoke:v1` not run (not isolated from the owner's environment)
 
-- **Session titles:** a TUI-created session asks the host's small model for a title. That request quotes the
-  `SPIKE_CALL` text and carries no tools, so the scripted fixture refuses it with a 400. This happens 4 times per version;
-  the titles fall back and nothing else is affected. The test records these as `notes` (auxiliary), keeps them out of
-  `errors`, and still reports any other provider error.
-- **Unit-suite flake:** `npm test` (full suite) had one failure: `test/unit/exec.test.ts:466` ("G4 load limit … holder not
-  dead 3 s after"). This is the known Windows timing flake (#88), unrelated to this change. The file passes alone
-  (42 passed, 2 skipped), and `packaging.test.ts` and `docs-drift.test.ts` pass (81). `npm run typecheck` is green.
-- **v1 untouched:** `smoke:keyless`/`smoke:v1` scripts, `vitest.smoke.config.ts` and every other smoke file are
-  unchanged. `routing-host.ts` is not in the v1-pinned file list. `npm run smoke:v1` (T2.1.2) was not run: it needs
-  OpenCode 1.x first on `PATH`, which this dispatch did not provide.
-- **R2-6** (old session from another directory) and the `node_modules` install variant of "server config only" (A9) are
-  not covered by this smoke. This smoke loads the local worktree path only, as the dispatch specified.
+`smoke:v1` runs `scripts/smoke-v1-preflight.mjs` and then `smoke:keyless`: `registration`, `subagent-tiers`,
+`deferred-catalog`, `depth-effort` and the scripted-provider test. These are the reasons it was not run:
+
+- **`deferred-catalog.smoke.test.ts:197`** spawns `opencode serve` with `env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }`.
+  - `APPDATA`, `LOCALAPPDATA` and `XDG_*` are not repointed. The file's own comment (`:271-273`) says opencode then uses the owner's `AppData\Roaming` provider metadata ("the isolation was weaker than it looked").
+  - The whole parent environment is passed. In this shell that includes provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` and others) and the live session's `OPENCODE_*` variables (`OPENCODE_SESSION_ID`, `OPENCODE_BINARY`, …). Only the names were checked; no values were printed.
+- **`registration.smoke.test.ts:64-81` and `subagent-tiers.smoke.test.ts:73-90`** repoint the dirs and delete `OPENCODE_*`, but pass every other parent variable, credentials included, and the bare `OPENCODE`.
+- **`depth-effort`'s v1 host** is isolated (it strips the prefixes and repoints every dir).
+
+v1 is not touched by this change in any case: the `smoke:keyless`/`smoke:v1` scripts, `vitest.smoke.config.ts` and the
+v1-pinned smoke files are unchanged, and `routing-host.ts` is not v1-pinned.
+
+## Follow-ups (not in P2.1 scope)
+
+1. **`RoutingHost.doStop`** (`test/smoke/helpers/routing-host.ts`, used by the other v2 smokes) still runs
+   `taskkill /PID <pid> /T /F`. It should get the same identity-checked, children-first kill as `tui-pty.ts`.
+2. **v1 keyless smokes:** isolate `deferred-catalog` (repoint `APPDATA`/`LOCALAPPDATA`/`XDG_*`, allowlist the env), and
+   allowlist the env of `registration`/`subagent-tiers`. After that, `smoke:v1` can run on this machine.
+3. **Session titles:** in a TUI-created session, the host's title request quotes `SPIKE_CALL` and has no tools, so the
+   fixture refuses it with a 400 (4 per local flow, 2 per npm flow). The test records these as notes, not errors.
 
 ## DF-1 manual checks (owner)
-1. G1: on the home screen and in a root session with no variant, the footer under the prompt reads `effort default` (or
-   `effort <applied>`). After `ctrl+t` the host row shows the variant and the plugin text disappears.
-2. G3: delegate to a tier. While the delegate runs, a row `<agent> · <model> · <effort>` sits directly above the prompt
-   box, and it disappears when the delegate finishes.
-3. G2: press Down, select the delegate and press Enter. The child view shows the same row above `Subagents  Shell`.
-4. Gap (the only item not provable here): in a long root session whose transcript fills the screen, with no delegate
-   running, the last transcript line or the host's `Jump to latest ↓` line sits directly above the prompt box. There
-   should be no extra blank line compared with the plugin disabled (`-opencode-model-router.status` in `cli.json`).
-5. Sidebar: with the sidebar open (`ctrl+x b`) the row stays on one line.
+
+1. **G1:** with no variant, the footer under the prompt reads `effort default`. After `ctrl+t` the host row shows the variant and the plugin text disappears.
+2. **G3:** while a delegate runs, `<agent> · <model> · <effort>` sits directly above the prompt box. It disappears when the delegate finishes.
+3. **G2:** press Down, then Enter on the delegate. The child view shows the same row above `Subagents  Shell`.
+4. **Gap** (not provable here): in a long root session with no delegate running, there is no extra blank line above the prompt box compared with the plugin disabled (`-opencode-model-router.status` in `cli.json`).
+5. **Sidebar:** with the sidebar open or closed (`ctrl+x b`), the row stays on one line.
