@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
@@ -36,7 +37,11 @@ import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
-import { buildLadder, resolveChosen } from "../../src/routing/engine/ladders";
+import { buildLadder, buildRoleLadder, resolveChosen } from "../../src/routing/engine/ladders";
+import { createDispatchRouter, resetDispatchRouting } from "../../src/routing/wire/dispatch";
+import { createEngineRuntime } from "../../src/routing/wire/runtime";
+import { resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { classifyTrivial, createSessionStore, DEFAULT_TIER_CAPS, resetDispatchRegistry } from "../../src/router/sessions";
 import { candidateKey, decide, MAX_EXPLORATION_RATE } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { advance, buildEscalatePolicy, newLadderState, nextAction, recordAttempt } from "../../src/escalate/ladder";
@@ -1261,5 +1266,114 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
     const adr = read("docs/adr/0006-role-tier-assurance-delegation.md");
     expect(adr).toContain("amendments R0–R10 and adversarial QA");
     expect(adr).not.toContain("amendments R0–R8");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P3.3 global QA round 2: what a dynamic role's route-line `needs=` does (QA-G-C-2-1), through the real role dispatch path,
+// and what a `subagentTiers` entry for a role name does (QA-G-C-2-2).
+// ---------------------------------------------------------------------------
+
+describe("docs drift: #84 P3.3 global QA round 2 (QA-G-C-2-1, QA-G-C-2-2)", () => {
+  const guide = read("docs/ROLES.md").replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
+  const engine = read("docs/ROUTING_ENGINE.md").replace(/\s+/g, " ");
+  const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+  const tiers = JSON.parse(read("tiers.json")) as Record<string, unknown>;
+
+  /** The router's dispatch path for `general` (roles mode, static engine) in a temp session directory; `grantOf` routes one prompt. */
+  async function rolePath<T>(run: (grantOf: (prompt: string) => Promise<string[]>) => Promise<T>): Promise<T> {
+    const main = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-drift-needs-")));
+    const outcomes = mkdtempSync(join(tmpdir(), "omr-drift-needs-outcomes-"));
+    const cfg = validateConfig({ ...tiers, activePreset: "anthropic", routing: { delegation: "roles", engine: "static", outcomes: { path: outcomes } } });
+    // the catalog: every tier's first role rung, with its variant
+    const byModel = new Map<string, Set<string>>();
+    for (const tier of ["fast", "medium", "heavy"]) {
+      const c = buildRoleLadder({ cfg, facts: { class: "implement", needs: [] }, role: "probe", window: { floor: tier, ceiling: tier, pinned: null } }).candidates[0]!;
+      const variants = byModel.get(c.model) ?? new Set<string>();
+      if (c.variant !== null && c.variant !== "default") variants.add(c.variant);
+      byModel.set(c.model, variants);
+    }
+    const catalog = [...byModel].map(([model, variants]) => {
+      const [providerID, id] = model.split("/") as [string, string];
+      return { providerID, id, variants: [...variants].map((v) => ({ id: v })), limit: { context: 200_000, output: 32_000 }, cost: [] };
+    });
+    const logger = { warn: () => undefined };
+    const runtime = createEngineRuntime({ loadConfig: () => cfg, listAgents: async () => [], listModels: async () => catalog, logger });
+    const router = createDispatchRouter({
+      runtime,
+      getSession: async (id) => (id === "root"
+        ? { id: "root", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5", variant: "xhigh" }, permissions: [], location: { directory: main } }
+        : { id, parentID: "root", agent: "general", location: { directory: main } }),
+      graderAgent: "router-grader",
+      directory: main,
+      logger,
+      listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0123\nbranch refs/heads/main\n`,
+      realpath: (path) => realpathSync.native(path),
+      isBypassed: () => false,
+      env: {},
+    });
+    let n = 0;
+    const grantOf = async (prompt: string): Promise<string[]> => {
+      const outcome = await router.route({ callID: `drift-${++n}`, sessionID: "root", agent: "build", args: { agent: "general", description: "work item", prompt }, cfg });
+      return [...outcome.role!.grant.actions];
+    };
+    try {
+      return await run(grantOf);
+    } finally {
+      await runtime.dispose();
+      resetDispatchRouting();
+      resetDispatchRegistry();
+      resetBindingRegistryForTests();
+      for (const dir of [main, outcomes]) rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("QA-G-C-2-1: a dynamic role's needs= replaces the needs the text implies — it adds a need the text never names", async () => {
+    await rolePath(async (grantOf) => {
+      const quiet = "Look at the parser module and list its entry points.";
+      const writes = "Read the release notes and write a short summary into your answer only.";
+      // no route-line needs: `general` gets what the text implies (local only here; edit for "write")
+      expect(await grantOf(`[route class=other risk=low scope=single]\n${quiet}`)).toEqual(["read", "glob", "grep", "router_git"]);
+      expect(await grantOf(`[route class=other risk=low scope=single]\n${writes}`)).toContain("edit");
+      // needs= ADDS: edit on a text that names no edit
+      expect(await grantOf(`[route class=other risk=low scope=single needs=edit]\n${quiet}`)).toContain("edit");
+      // needs= REPLACES: the text's edit is dropped, the listed shell gives router_run
+      const replaced = await grantOf(`[route class=other risk=low scope=single needs=shell]\n${writes}`);
+      expect(replaced).toContain("router_run");
+      expect(replaced).not.toContain("edit");
+      // the route class's implied needs stay: class=implement keeps edit with needs=shell
+      expect(await grantOf(`[route class=implement risk=low scope=single needs=shell]\n${quiet}`)).toEqual(expect.arrayContaining(["edit", "router_run"]));
+      // always inside the role max: needs=web gives `general` no egress
+      expect(await grantOf(`[route class=other risk=low scope=single needs=web]\n${quiet}`)).toEqual(["read", "glob", "grep", "router_git"]);
+    });
+    const sentence = "a route-line `needs=` replaces the needs the text implies";
+    for (const [name, text] of [["ROLES.md", guide], ["ROUTING_ENGINE.md", engine], ["CHANGELOG.md", unreleased]] as const) {
+      expect(text, name).toContain(sentence);
+      // negative: the wording QA-G-C-2-1 found false
+      for (const wrong of ["only narrows the classifier's needs", "never a need the classifier did not find", "a need the classifier did not find is never added", "the route line only narrows"]) {
+        expect(text, `${name}: ${wrong}`).not.toContain(wrong);
+      }
+    }
+    expect(guide).toContain("are the dispatch's needs, whether or not the text names them, always inside the role max");
+  });
+
+  it("QA-G-C-2-2: a subagentTiers entry for a role name gives its children the tier's default read-only cap and, for fast, the trivial bypass", () => {
+    const cfg = validateConfig({ ...tiers, subagentTiers: { explorer: "fast" } });
+    const tierNames = ["fast", "medium", "heavy"];
+    const store = createSessionStore();
+    const output = { parts: [{ type: "text", text: "Look at the parser module and list its entry points." }] };
+    expect(store.registerFromChatMessage({ agent: "explorer", sessionID: "s1" }, output, cfg, tierNames).registered).toBe(true);
+    expect(store.getCap("s1")).toBe(cfg.tierCaps?.fast ?? DEFAULT_TIER_CAPS.fast);
+    // without the entry a role name is no tier session: no cap from this path
+    const plain = validateConfig({ ...tiers });
+    expect(createSessionStore().registerFromChatMessage({ agent: "explorer", sessionID: "s2" }, output, plain, tierNames).registered).toBe(false);
+    // the trivial bypass is tier-gated to fast
+    expect(classifyTrivial("find the config loader", "medium", cfg)).toBe(false);
+    expect(DEFAULT_TIER_CAPS).toEqual({ fast: 8, medium: 5, heavy: 3 });
+    expect(guide).toContain(`gives that role's children the mapped tier's default read-only call cap (\`tierCaps\`, else ${DEFAULT_TIER_CAPS.fast} / ${DEFAULT_TIER_CAPS.medium} / ${DEFAULT_TIER_CAPS.heavy} for \`fast\` / \`medium\` / \`heavy\`) and, for \`fast\`, the trivial-dispatch bypass`);
+    expect(guide).toContain("only when it carries `CAP:N` or `CAP:none` (or when a `subagentTiers` entry maps the role's name to a tier");
+    // negative: the claim QA-G-C-2-2 found false
+    expect(guide).not.toContain("back under the tier agents' 25-call cap");
+    expect(read("docs/adr/0006-role-tier-assurance-delegation.md").replace(/\s+/g, " ")).toContain("or when a `subagentTiers` entry maps the role's name to a tier");
   });
 });

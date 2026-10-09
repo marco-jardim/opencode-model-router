@@ -41,7 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `[router budget]` resume note, never a tier penalty. Role agents' host `steps` = 2 × max(the top role budget, 25)
     + `REFUSAL_CAP` (10) + 5. A dispatch that a floor lifts above its role's ceiling, on a tier the role has no budget
     for, gets max(the role's budget for its ceiling tier, 25). The cumulative ceiling is 3 × the largest round budget
-    the child had. A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`.
+    the child had. A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`. A
+    `subagentTiers` entry for a role name gives that role's children the mapped tier's default read-only cap (and, for
+    `fast`, the trivial-dispatch bypass): remove such entries in roles mode.
   - Refused calls of a role child — role-authority refusals and structured host permission denials — count toward
     `denied_cap` in `advisory` mode too (`advisory` still never stops). In `advisory` mode a child out of budget that
     returns `NEED MORE: budget` records a `budget` signal and the parent's result gets the `[router budget]` note.
@@ -52,8 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     delegate's resume.
   - A role dispatch's detection is `none` when no verification will run (enforcement `off`, `/bypass`,
     `verify.require: "never"`, a `cwd` outside the root the gate verifies in).
-  - Dynamic roles: a route-line `needs=` only narrows the classifier's needs, and `class=` alone drops the implied
-    needs of the class it replaced; a role dispatch is classified in its work root. Decision rows carry
+  - Dynamic roles: a route-line `needs=` replaces the needs the text implies (the listed needs plus the route class's
+    implied needs, always inside the role max), and `class=` without `needs=` keeps the text's needs plus that class's
+    implied needs, dropping those of the class it replaced; a role dispatch is classified in its work root. Decision rows carry
     `trace.needTerms` (vocabulary labels, `term-<n>`, `url`, `path`, never free task text).
   - In a role dispatch's result, child lines starting with `[router` are defanged to `(router`, so only the router's
     notes start with `[router`.

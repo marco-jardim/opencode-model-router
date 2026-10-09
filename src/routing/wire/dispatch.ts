@@ -964,8 +964,9 @@ function resumeFactsOf(original: DispatchRecord["facts"] | undefined, current: T
  * - the route line names only `class=` → the needs the text itself names (`textNeeds`, never a class's implied ones) plus the
  *   route class's implied needs: the class the route line replaced takes its implied needs with it (DF-2: "a new file" made the
  *   rules class `implement`, whose `edit` outlived `class=other`).
- * Narrow only: the result is intersected with the classifier's needs, so nothing is ever added; the role max still bounds the
- * grant (`grantFor`).
+ * The result is intersected with `facts.needs`, which already holds the route line's needs (`applyRouteLine` merges them
+ * first, with the route class's implied needs): so a `needs=` list REPLACES the needs the text implies — a listed need the text
+ * never names is kept (QA-G-C-2-1), the text's other needs are dropped. Only the role max bounds the grant (`grantFor`).
  */
 function roleNeedsOf(facts: TaskFacts, line: RouteLine | null, spec: RoleSpec, textNeeds: ReadonlySet<Need>): TaskFacts {
   if (spec.authority.mode === "fixed" || line === null || (line.needs === undefined && line.class === undefined)) return facts;

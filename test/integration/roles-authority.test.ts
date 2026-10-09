@@ -93,7 +93,7 @@ vi.mock("../../src/verify/gate", async (importOriginal) => {
 });
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
-import { resetDispatchRegistry } from "../../src/router/sessions";
+import { markRunnerDispatch, resetDispatchRegistry, runnerDescription } from "../../src/router/sessions";
 import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { acquireOutcomes } from "../../src/routing/outcomes";
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
@@ -1470,6 +1470,38 @@ describe("P3.3 global QA round 1 (QA-G-B-2, QA-G-A1-2)", () => {
     };
     await v2.toolHooks["execute.after"]!(end);
     expect(resultText(end)).toContain(AUTHORITY_TEXT.dropped.otherParent);
+  });
+
+  it("QA-G-A1-2-2: a resume that route() leaves untouched (a runner-announced call) never consumes the request", async () => {
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    await dispatch(v2, sessions, "p1", "g1", "general", "Look at the parser module and report its entry points", dir);
+    await toolCall(v2, "g1", "general", "read", { path: join(dir, "a.ts") });
+    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
+    expect(await tools.router_request_authority!.execute({ actions: ["edit"], reason: "the fix needs an edit" }, toolCtx("g1"))).toMatch(/Authority request recorded: edit/);
+    await v2.toolHooks["execute.after"]!(parentCall("p1", "g1", "general", "ESCALATE: authority\nedit is needed"));
+    expect(requestedAuthority("g1")).toMatchObject({ annotated: true, callID: "p1", parentSessionID: "root" });
+    const maxOf = (agent: string) => roleMaxActions(resolveRoles(cfg, "v2").get(agent));
+    // The router's own runner resumes the child (it announced exactly this call): route() returns it untouched, no role routing.
+    const prompt = "continue";
+    const withdraw = markRunnerDispatch({ parentSessionID: "root", agent: "general", prompt });
+    const resume = {
+      sessionID: "root", agent: "build", messageID: "m", id: "r1", tool: "subagent",
+      input: { agent: "general", sessionID: "g1", prompt, description: runnerDescription("general") } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"]!(resume);
+    withdraw();
+    expect(routedRoleOf("r1")).toBeUndefined();
+    // Nothing was routed, so nothing is consumed: no widening outside a routed decision, the request stays for the next resume.
+    expect(currentBinding("g1", { maxOf })!.grant.actions.has("edit")).toBe(false);
+    expect(requestedAuthority("g1")).toMatchObject({ annotated: true, callID: "p1", parentSessionID: "root" });
+    // The orchestrator's own (routed) resume then applies it.
+    await v2.toolHooks["execute.before"]!({ ...resume, id: "n2", input: { agent: "general", sessionID: "g1", prompt } });
+    expect([...routedRoleOf("n2")!.grant.actions]).toContain("edit");
+    expect(requestedAuthority("g1")).toBeUndefined();
   });
 });
 

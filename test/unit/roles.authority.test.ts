@@ -404,6 +404,28 @@ describe("the ladder: annotation attaches the call, the first resume consumes", 
     expect(consumeAuthority("ses_i", d, mine)).toMatchObject({ status: "widened", widened: ["edit"] });
   });
 
+  it("QA-G-A1-2-1: the annotated call's session is the one escalated to — after a delegate D's resume, D applies the request, not the original dispatcher O", async () => {
+    await bound("ses_i", IMPLEMENTER, grant(LOCAL));
+    const ORIGINAL = PARENT;
+    const DELEGATE = "ses_delegate";
+    // While D's resumed call runs, the dispatch registry still names O's dispatch: the record starts with O as its parent.
+    const d = deps({ ses_i: IMPLEMENTER }, { dispatchOf: () => ({ parentSessionID: ORIGINAL, callID: "call_ses_i" }) });
+    const ask = (): void => {
+      requestAuthority("ses_i", { actions: ["edit"], reason: "x" }, d);
+      expect(requestedAuthority("ses_i")?.parentSessionID).toBe(ORIGINAL);
+      // D's call ended with `ESCALATE: authority` and its result was annotated: D is the session the request was escalated to.
+      expect(markAnnotated("ses_i", "call_delegate", DELEGATE)).toBe(true);
+    };
+    ask();
+    expect(requestedAuthority("ses_i")?.parentSessionID).toBe(DELEGATE);
+    expect(consumeAuthority("ses_i", d, { afterCall: "call_delegate", parentSessionID: ORIGINAL }))
+      .toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.otherParent });
+    expect(currentBinding("ses_i", { maxOf: () => roleMax(IMPLEMENTER) })!.grant.actions.has("edit")).toBe(false);
+    ask();
+    expect(consumeAuthority("ses_i", d, { afterCall: "call_delegate", parentSessionID: DELEGATE }))
+      .toMatchObject({ status: "widened", widened: ["edit"] });
+  });
+
   it("QA-G-A1-3: consumeAuthority with exactOnly never widens a binding that is not exact", async () => {
     const unknown: Binding = { childSessionID: "ses_k", kind: "unknown", grant: grant(LOCAL), candidates: [], decisionID: null, budget: null };
     const widen = vi.fn((_child: string, actions: readonly AuthorityAction[]) => grant([...LOCAL, ...actions]));

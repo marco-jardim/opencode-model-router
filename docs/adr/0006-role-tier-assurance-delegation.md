@@ -119,7 +119,9 @@ are not charged. On exhaustion the child returns `NEED MORE: budget` with a summ
 `[router budget]` note, and the same session is resumed (E7). The host `steps` limit is 2 × max(the top role budget,
 25) + `REFUSAL_CAP` + 5, so the router's stop always comes first (S4, R7, R8). Tier agents keep 25 / × 3; a role
 dispatch that a floor lifts above its role's ceiling, when the role has no budget for that tier, gets max(the role's
-budget for its ceiling tier, 25). A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`.
+budget for its ceiling tier, 25). A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`,
+or when a `subagentTiers` entry maps the role's name to a tier (that tier's default cap; the migration removes such
+entries).
 
 ### D10 — Outcome evidence only from external verification
 

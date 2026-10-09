@@ -1549,8 +1549,10 @@ export async function registerV2Hooks(
           ...(widened === undefined ? {} : { widened }),
         });
         // QA-G-A1-2: a delegate's resume (the unparsed, floor-rung path) never consumes the request: it widens nothing, and the
-        // request stays for the session it was escalated to.
-        if (routed.role?.delegate !== true) afterRoute?.();
+        // request stays for the session it was escalated to. QA-G-A1-2-2: neither does a resume route() left untouched (no role
+        // decision: a runner-announced call, a call another instance handled) — consuming it would widen the binding outside a
+        // routed decision, with no floor recomputed.
+        if (routed.role !== undefined && routed.role.delegate !== true) afterRoute?.();
         if (routed.prompt !== undefined) args.prompt = routed.prompt;
         // #84 P2.1-C: a fresh role dispatch carries its nonce at the END of the description (title marker, handoff 31).
         if (routed.description !== undefined) args.description = routed.description;
