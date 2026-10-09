@@ -113,10 +113,11 @@ actions. Tier ranges are placed on the active preset's cost order; the bundled p
   router's gate runs its acceptance checks, like any other role's.
 - **Fixed** roles get their whole max on every dispatch. **Dynamic** roles start from a base and add what the task
   needs: `implementer` starts with local + `edit`, `general` with local only; the classifier's `needs` add `edit`
-  (`edit`) and `router_run` (`shell` or `network`), always inside the max. For a dynamic role the route line only
-  narrows them: a `needs=` list plus the route class's implied needs is authoritative (a need the classifier did not
-  find is never added), and a `class=` without `needs=` keeps only the needs the text names plus that class's implied
-  needs, so the class it replaced takes its implied needs with it.
+  (`edit`) and `router_run` (`shell` or `network`), always inside the max. For a dynamic role a route-line `needs=`
+  replaces the needs the text implies: the listed needs plus the route class's implied needs (`network` ⇒ `shell`)
+  are the dispatch's needs, whether or not the text names them, always inside the role max. Without `needs=`, a
+  `class=` keeps the needs the text names plus that class's implied needs, so the class it replaced takes its implied
+  needs with it.
 - `router_git` stands for the six `router_git_*` tools; `context7` for the context7 documentation tools, present only
   when an MCP server named `context7` is configured. `execute` (Code Mode) is denied to every role: its inner calls
   are never permission-checked and its catalog cannot be filtered (spike S8). `brave_*` search is not available to
@@ -286,7 +287,8 @@ back a `deterministic` detection.
 
 Reader roles are never denied for "non-producing" reads; producer roles keep the read/draft guard. `CAP:N` (or
 `CAP:none` with a `reason:` line) changes only the read-only call counter, and a role dispatch has a read-only call cap
-only when it carries `CAP:N` or `CAP:none`; without one, only the total budget above bounds it.
+only when it carries `CAP:N` or `CAP:none` (or when a `subagentTiers` entry maps the role's name to a tier, see
+[Migration](#migration-from-subagenttiers-and-agents)); without one, only the total budget above bounds it.
 
 **Budgets stop a child only in `enforced` mode.** The router's guard enforces role budgets (and the read-only cap) only
 when the effective `enforcement.mode` is `enforced`. In `advisory` mode (the shipped default) it only warns: the child
@@ -418,8 +420,9 @@ keeps the tier model.
 ## Migration from `subagentTiers` and `agents`
 
 - **`subagentTiers.explore`.** In roles mode a dispatch of the host's `explore` goes to `explorer`, whose tier the
-  router picks; remove the mapping (a `subagentTiers` entry for a role name can also put a resumed child back under
-  the tier agents' 25-call cap).
+  router picks; remove the mapping. A `subagentTiers` entry for a role name (say `"explorer": "fast"`) gives that
+  role's children the mapped tier's default read-only call cap (`tierCaps`, else 8 / 5 / 3 for `fast` / `medium` /
+  `heavy`) and, for `fast`, the trivial-dispatch bypass (a trivial dispatch runs `enforced` as `advisory`); remove it.
 - **#81 `agents` with a role name** (`runner`, `reviewer`, `researcher`, …). In roles mode an entry that passes the
   separation rule **replaces** the shipped role of that name (notice
   `agents.<name> replaces the shipped role agent <name> in roles mode`); one that fails it (for example `read` with

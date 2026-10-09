@@ -365,7 +365,9 @@ export function markAnnotated(childSessionID: string, callID: string, parentSess
   if (record.annotated) return record.callID === callID;
   record.callID = callID;
   record.annotated = true;
-  if (nonEmpty(parentSessionID)) record.parentSessionID ??= parentSessionID;
+  // QA-G-A1-2-1: the session whose call was annotated is the one the request was escalated to — it replaces the parent the
+  // record started with (the dispatch registry's, which still names the original dispatcher during a delegate's resume).
+  if (nonEmpty(parentSessionID)) record.parentSessionID = parentSessionID;
   return true;
 }
 

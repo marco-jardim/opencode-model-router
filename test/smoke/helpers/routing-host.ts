@@ -88,7 +88,11 @@ const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&
  */
 export function redactText(text: string): string {
   const home = homedir();
-  const shortHome = path.dirname(path.dirname(path.dirname(tmpdir())));
+  // QA-G-C-11: the 8.3 short home is three folders above the REAL temp dir (`<home>\AppData\Local\Temp`). The smoke temp guard
+  // (test/setup/smoke-tmp-guard.ts) points TEMP one folder deeper and records the real one in OMR_SMOKE_REAL_TMPDIR; under the
+  // unit-test home guard (test/setup/home-guard.ts) it is OMR_TEST_REAL_TMPDIR. Only without either is os.tmpdir() the real one.
+  const realTmp = process.env.OMR_SMOKE_REAL_TMPDIR || process.env.OMR_TEST_REAL_TMPDIR || tmpdir();
+  const shortHome = path.dirname(path.dirname(path.dirname(realTmp)));
   const forms = (value: string): string[] => [value, value.replaceAll("\\", "/"), value.replaceAll("\\", "\\\\"), value.replaceAll("\\", "\\\\\\\\")];
   const homes = [...new Set([home, shortHome].flatMap(forms))].filter(h => h.length > 3).sort((x, y) => y.length - x.length);
   const names = [...new Set([path.basename(shortHome), userInfo().username].filter(n => n.length > 2))].sort((x, y) => y.length - x.length);
