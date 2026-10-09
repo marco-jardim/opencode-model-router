@@ -47,10 +47,10 @@
       "fast": {
         "readOnly": true,
         "model": "anthropic/claude-haiku-5-5",
-        "variant": "low",
-        "effort": "low",
+        "variant": "medium",
+        "effort": "medium",
         "costRatio": 1,
-        "description": "Haiku 5.5 low for exploration, search, and simple reads",
+        "description": "Haiku 5.5 medium for exploration, search, and simple reads",
         "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",
@@ -61,10 +61,10 @@
       },
       "medium": {
         "model": "anthropic/claude-sonnet-5-5",
-        "variant": "medium",
-        "effort": "medium",
+        "variant": "high",
+        "effort": "high",
         "costRatio": 5,
-        "description": "Sonnet 5.5 medium for implementation, refactoring, and tests",
+        "description": "Sonnet 5.5 high for implementation, refactoring, and tests",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -254,10 +254,11 @@
     "hybrid": {
       "fast": {
         "readOnly": true,
-        "model": "openai/gpt-6-luna-fast",
+        "model": "anthropic/claude-haiku-5-5",
         "variant": "medium",
+        "effort": "medium",
         "costRatio": 1,
-        "description": "GPT 6 Luna (medium) for exploration, search, and simple reads",
+        "description": "Haiku 5.5 medium for exploration, search, and simple reads",
         "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",
@@ -267,10 +268,10 @@
         ]
       },
       "medium": {
-        "model": "openai/gpt-6-astra-fast",
-        "variant": "high",
+        "model": "openai/gpt-6.1-sol-fast",
+        "variant": "xhigh",
         "costRatio": 5,
-        "description": "GPT-6 Astra Fast (high) for implementation and standard coding",
+        "description": "GPT-6.1 Sol Fast (xhigh) for implementation and standard coding",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -285,92 +286,6 @@
         "effort": "xhigh",
         "costRatio": 20,
         "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
-        "steps": 120,
-        "whenToUse": [
-          "Architecture decisions",
-          "Complex debugging (after 2+ failures)",
-          "Security review",
-          "Performance optimization"
-        ]
-      }
-    },
-    "hybrid-2": {
-      "fast": {
-        "readOnly": true,
-        "model": "openai/gpt-6-luna-fast",
-        "variant": "medium",
-        "costRatio": 1,
-        "description": "GPT 6 Luna (medium) for exploration, search, and simple reads",
-        "steps": 30,
-        "whenToUse": [
-          "Codebase exploration and search",
-          "Simple file reads and listing",
-          "Grep/glob operations",
-          "Quick lookups and research"
-        ]
-      },
-      "medium": {
-        "model": "anthropic/claude-sonnet-5-5",
-        "variant": "xhigh",
-        "effort": "xhigh",
-        "costRatio": 5,
-        "description": "Claude Sonnet (xhigh) for implementation and standard coding",
-        "steps": 50,
-        "whenToUse": [
-          "Feature implementation",
-          "Refactoring",
-          "Writing tests",
-          "Bug fixes"
-        ]
-      },
-      "heavy": {
-        "model": "anthropic/claude-opus-5-5",
-        "variant": "xhigh",
-        "effort": "xhigh",
-        "costRatio": 20,
-        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
-        "steps": 120,
-        "whenToUse": [
-          "Architecture decisions",
-          "Complex debugging (after 2+ failures)",
-          "Security review",
-          "Performance optimization"
-        ]
-      }
-    },
-    "fable-effort": {
-      "fast": {
-        "readOnly": true,
-        "model": "anthropic/claude-fable-5-1",
-        "effort": "low",
-        "costRatio": 1,
-        "description": "Fable 5 at low effort for exploration, search, and simple reads (token-spend ratios are estimates; same model across tiers preserves prompt cache)",
-        "steps": 30,
-        "whenToUse": [
-          "Codebase exploration and search",
-          "Simple file reads and listing",
-          "Grep/glob operations",
-          "Quick lookups and research"
-        ]
-      },
-      "medium": {
-        "model": "anthropic/claude-fable-5-1",
-        "effort": "high",
-        "costRatio": 3,
-        "description": "Fable 5 at high effort for implementation and standard coding (costRatio is an estimated token-spend multiplier, not a price difference)",
-        "steps": 50,
-        "whenToUse": [
-          "Feature implementation",
-          "Refactoring",
-          "Writing tests",
-          "Bug fixes"
-        ]
-      },
-      "heavy": {
-        "model": "anthropic/claude-fable-5-1",
-        "effort": "xhigh",
-        "costRatio": 6,
-        "description": "Fable 5 at xhigh effort for architecture, complex debugging, and security (costRatio is an estimated token-spend multiplier, not a price difference)",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
