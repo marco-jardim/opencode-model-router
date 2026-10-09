@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-09
+
 ### Added
 
 - **OpenCode v2 TUI status (#90).** The package ships a TUI entry, `tui.ts` (plugin id `opencode-model-router.status`),
