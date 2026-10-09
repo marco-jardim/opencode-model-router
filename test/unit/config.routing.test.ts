@@ -42,6 +42,7 @@ import {
 } from "../../src/router/build-info";
 import { parseJsonc } from "../../src/router/jsonc";
 import { assertHomeIsGuarded, guardedHomedir, sameDir, REAL_HOME } from "../setup/home-guard";
+import { legacyPresets } from "../helpers/legacy-presets";
 import { readFileSync } from "node:fs";
 
 const ROOT = resolve(__dirname, "..", "..");
@@ -833,6 +834,16 @@ describe("hot reload of the global override file with a routing block", () => {
     utimesSync(p, later, later);
   }
 
+  /**
+   * The override's `presets`: the 2.5.0 `anthropic` preset (Sonnet 5.5 medium) with `medium` patched, as a user's
+   * override would pin it. The candidates fixtures add a `high` rung, which must not be the tier's own rung whatever
+   * the bundled tiers.json ships.
+   */
+  function pinnedAnthropic(medium: Record<string, unknown> = {}): Record<string, unknown> {
+    const legacy = legacyPresets().anthropic;
+    return { anthropic: { ...legacy, medium: { ...legacy.medium, ...medium } } };
+  }
+
   it("picks up a routing block added, changed and removed, with no explicit invalidate", () => {
     const first = loadConfig();
     expect(first.routing).toBeUndefined();
@@ -861,12 +872,14 @@ describe("hot reload of the global override file with a routing block", () => {
   });
 
   it("returns candidates and variantSteps from the override layer too", () => {
+    editOverride({ presets: pinnedAnthropic() });
     const first = loadConfig();
     const presetName = first.activePreset;
+    expect(presetName).toBe("anthropic"); // the pin applies to the active preset
     const tier = first.presets[presetName]!.medium!;
     const own = tier.variant === undefined ? {} : { variant: tier.variant };
     editOverride({
-      presets: { [presetName]: { medium: { candidates: [own, { variant: "high", costRatio: 9 }] } } },
+      presets: pinnedAnthropic({ candidates: [own, { variant: "high", costRatio: 9 }] }),
       enforcement: { escalate: { variantSteps: "none" } },
     });
     const next = loadConfig();
@@ -880,19 +893,21 @@ describe("hot reload of the global override file with a routing block", () => {
   });
 
   it("keeps an override that sets candidates when the tier's variant later changes: candidates ignored with a notice, the rest of the layer applies (QA-1.1-25)", () => {
+    editOverride({ presets: pinnedAnthropic() });
     const first = loadConfig();
     const presetName = first.activePreset;
+    expect(presetName).toBe("anthropic"); // the pin applies to the active preset
     const tier = first.presets[presetName]!.medium!;
     const own = tier.variant === undefined ? {} : { variant: tier.variant };
     const candidates = [own, { variant: "high", costRatio: 9 }];
-    editOverride({ presets: { [presetName]: { medium: { candidates } } }, routing: { engine: "shadow" } });
+    editOverride({ presets: pinnedAnthropic({ candidates }), routing: { engine: "shadow" } });
     reload();
     expect(resolveCandidates("medium", loadConfig())).toHaveLength(2);
     expect(getConfigNotices().map((n) => n.message)).toEqual([]);
 
     // The bundled tier's variant moves (here: the override moves it, as a plugin update would):
     // the list no longer contains the tier's own rung.
-    editOverride({ presets: { [presetName]: { medium: { variant: "moved-variant", candidates } } }, routing: { engine: "shadow" } });
+    editOverride({ presets: pinnedAnthropic({ variant: "moved-variant", candidates }), routing: { engine: "shadow" } });
     const next = reload();
     expect(getConfigReloadError()).toBeNull();
     expect(resolveRouting(next, "v2").engine).toBe("shadow"); // the layer was not dropped

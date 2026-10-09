@@ -22,6 +22,7 @@ import { advisorSettings, createAdvisorNotifier, noticeFiles } from "../../src/r
 import type { AdvisorFs, AdvisorNotifierDeps, AdvisorSettings } from "../../src/routing/advisor";
 import type { RouterConfig, TierConfig } from "../../src/router/config";
 import { buildEscalatePolicy } from "../../src/escalate/ladder";
+import { withLegacyPresets } from "../helpers/legacy-presets";
 import {
   HOST_SMALL_MODEL_FAMILIES,
   catalogFromProviders,
@@ -47,10 +48,12 @@ interface CfgOver {
   /** `undefined` = no routing block at all. */
   readonly routing?: Record<string, unknown>;
   readonly escalate?: Record<string, unknown>;
+  /** 2.5.0 presets put back as a user override would (2.6.0 dropped them from the bundled file). */
+  readonly legacy?: ReadonlyArray<"hybrid-2" | "fable-effort" | "anthropic">;
 }
 
 function cfgOf(over: CfgOver = {}): RouterConfig {
-  const raw = structuredClone(shipped) as Record<string, unknown>;
+  const raw = withLegacyPresets(structuredClone(shipped) as { presets: Record<string, unknown> } & Record<string, unknown>, over.legacy ?? []) as Record<string, unknown>;
   const presets = raw.presets as Record<string, Record<string, unknown>>;
   for (const [name, preset] of Object.entries(over.presets ?? {})) {
     presets[name] = Object.fromEntries(
@@ -312,8 +315,8 @@ describe("cost doctor: variant ladders", () => {
     expect(medium?.message).toContain("Drop the effort");
     const snippet = JSON.parse(medium?.snippet ?? "null") as { presets: Record<string, Record<string, { candidates: Array<{ variant: string; costRatio?: number }> }>> };
     const candidates = snippet.presets.anthropic!.medium!.candidates;
-    expect(candidates[0]).toEqual({ variant: "medium", costRatio: 5 }); // the tier's own rung first (a list without it is ignored)
-    expect(candidates.slice(1).map((c) => c.variant)).toEqual(["high", "xhigh", "max"]);
+    expect(candidates[0]).toEqual({ variant: "high", costRatio: 5 }); // the tier's own rung first (bundled medium = Sonnet 5.5 high since 2.6.0) (a list without it is ignored)
+    expect(candidates.slice(1).map((c) => c.variant)).toEqual(["xhigh", "max"]);
   });
 
   it("clears without effort on the tier, and does not fire without a routing block (variant steps are then off)", () => {
@@ -376,12 +379,13 @@ describe("cost doctor: variant ladders", () => {
     const anthropic = cfgOf({ escalate: off });
     expect(Object.values(anthropic.presets.anthropic!).every((tier) => tier.effort !== undefined)).toBe(true);
     expect(find(runAdvisor(anthropic, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
-    // hybrid-2: only `fast` has no effort, so variant steps help on that tier and the finding stands.
-    const hybrid = cfgOf({ preset: "hybrid-2", escalate: off });
+    // hybrid-2 (the 2.5.0 block, defined as a user override since 2.6.0 dropped it): only `fast` has no effort, so variant
+    // steps help on that tier and the finding stands.
+    const hybrid = cfgOf({ preset: "hybrid-2", legacy: ["hybrid-2"], escalate: off });
     expect(hybrid.presets["hybrid-2"]!.fast!.effort).toBeUndefined();
     expect(find(runAdvisor(hybrid, noHost, CATALOG), "attempts-without-variants")?.message).toContain("on tiers without effort/thinking/reasoning");
     // a custom ladder naming only effort tiers is silent too, and one naming the effort-free tier fires
-    const onlyEffort = cfgOf({ preset: "hybrid-2", escalate: { ...off, ladder: ["medium", "heavy"] } });
+    const onlyEffort = cfgOf({ preset: "hybrid-2", legacy: ["hybrid-2"], escalate: { ...off, ladder: ["medium", "heavy"] } });
     expect(find(runAdvisor(onlyEffort, noHost, CATALOG), "attempts-without-variants")).toBeUndefined();
   });
 });
@@ -1378,7 +1382,7 @@ describe("cost doctor: effort-variant-mismatch (QA-3.2, O-32-5; QA-3.2-R2-1, R2-
     const modified = structuredClone(shipped.presets as Record<string, Record<string, Partial<TierConfig>>>).anthropic!;
     const bundled = cfgOf({ preset: "anthropic", routing: SHADOW, escalate: { variantSteps: "none" } });
     expect(runAdvisor(bundled, noHost, CATALOG).filter((f) => f.id === "effort-variant-mismatch")).toEqual([]);
-    modified.medium = { ...modified.medium!, effort: "high" }; // the user's change: now variant medium, effort high
+    modified.medium = { ...modified.medium!, effort: "medium" }; // the user's change: now variant high, effort medium
     const changed = runAdvisor(cfgOf({ preset: "anthropic", presets: { anthropic: modified }, routing: SHADOW, escalate: { variantSteps: "none" } }), noHost, CATALOG);
     expect(find(changed, "effort-variant-mismatch", "medium")).toMatchObject({ severity: "warning", notify: true, bundledTier: false });
     expect(formatFindings(changed).some((l) => l.includes("[warning] effort-variant-mismatch (medium)"))).toBe(true);

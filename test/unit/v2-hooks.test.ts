@@ -17,6 +17,7 @@ import { lastStepContext, rememberDispatch, resetDispatchRegistry } from "../../
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, DEFAULT_OUTCOMES_DIRNAME, makeKey } from "../../src/routing/outcomes";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
+import { FABLE_EFFORT_2_5_0 } from "../helpers/legacy-presets";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
@@ -251,10 +252,11 @@ describe("OpenCode 2 hook adapter", () => {
     vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
     vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
     mkdirSync(dirname(overridePath()), { recursive: true });
-    writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort" }));
+    const presets = { "fable-effort": FABLE_EFFORT_2_5_0 };
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", presets }));
     invalidateConfigCache();
     const tiers = getActiveTiers(loadConfig());
-    writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", enforcement: { verify: {
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", presets, enforcement: { verify: {
       graderTemperature: 0.25, graderTemperatureModels: Object.values(tiers).map(t => t.model),
     } } }));
     invalidateConfigCache();

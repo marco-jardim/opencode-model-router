@@ -1519,9 +1519,14 @@ function sectionOf(doc: string, heading: string): string {
  * The `### Added` section holding `marker`: that of `## [Unreleased]`, else that of the first dated release (where the
  * entry lands at release time); "" when neither holds it.
  */
-function changelogAdded(changelog: string, marker: string): string {
+/**
+ * The `### Added` section holding `marker`, in [Unreleased] or else in one release: `release` (the version that shipped
+ * the entry, e.g. "2.5.0") when given, otherwise the first dated release.
+ */
+function changelogAdded(changelog: string, marker: string, release?: string): string {
   const text = changelog.replace(/\r\n/g, "\n");
-  const dated = /^## \[[^\]\n]+\] - \d{4}-\d{2}-\d{2}$/m.exec(text)?.[0];
+  const heading = release === undefined ? /^## \[[^\]\n]+\] - \d{4}-\d{2}-\d{2}$/m : new RegExp(`^## \\[${release.replace(/\./g, "\\.")}\\] - \\d{4}-\\d{2}-\\d{2}$`, "m");
+  const dated = heading.exec(text)?.[0];
   const releases = [sectionOf(text, "## [Unreleased]"), dated === undefined ? "" : sectionOf(text, dated)];
   return releases.map((release) => sectionOf(release, "### Added")).find((added) => added.includes(marker)) ?? "";
 }
@@ -1610,11 +1615,11 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
   const flat = guide.replace(/\s+/g, " ");
   const section = sectionOf(read("docs/CONFIG_REFERENCE.md"), "## TUI status options (OpenCode v2)");
   const readme = sectionOf(read("README.md"), "## TUI status (OpenCode v2)");
-  const added = changelogAdded(read("CHANGELOG.md"), TUI_CHANGELOG_MARKER);
+  const added = changelogAdded(read("CHANGELOG.md"), TUI_CHANGELOG_MARKER, "2.5.0"); // shipped in 2.5.0
   const pluginID = STATUS_PLUGIN_ID;
   const docs = [["TUI_STATUS.md", guide], ["CONFIG_REFERENCE.md", section], ["README.md", readme], ["CHANGELOG.md", added]] as const;
 
-  it("finds the guide, both sections and the changelog entry, in [Unreleased] or else the first dated release", () => {
+  it("finds the guide, both sections and the changelog entry, in [Unreleased] or else its release (2.5.0)", () => {
     for (const [name, text] of docs) expect(text.length, name).toBeGreaterThan(200);
     const entry = `- ${TUI_CHANGELOG_MARKER} x\n`;
     const released = `# Changelog\n\n## [Unreleased]\n\n## [2.5.0] - 2026-10-10\n\n### Added\n\n${entry}\n## [2.4.0] - 2026-10-09\n`;
@@ -1625,6 +1630,9 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     // only in an older release, or nowhere: not found
     const older = `# Changelog\n\n## [Unreleased]\n\n## [2.5.0] - 2026-10-10\n\n### Added\n\n- y\n\n## [2.4.0] - 2026-10-09\n\n### Added\n\n${entry}`;
     expect(changelogAdded(older, TUI_CHANGELOG_MARKER)).toBe("");
+    // a named release finds the entry below a newer one, and only there
+    expect(changelogAdded(older, TUI_CHANGELOG_MARKER, "2.4.0")).toBe(`### Added\n\n${entry}`);
+    expect(changelogAdded(older, TUI_CHANGELOG_MARKER, "2.5.0")).toBe("");
   });
 
   it("(a) both options tables are STATUS_OPTION_KEYS with DEFAULT_STATUS_OPTIONS and the maxRows range parseOptions enforces", () => {

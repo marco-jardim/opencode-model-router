@@ -23,6 +23,7 @@ import { RESUME_NAMED_NEEDS_REASON, RESUME_NAMED_NEVER_DOWN_REASON, RESUME_REASO
 import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/types";
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { summarize } from "../../src/routing/outcomes/stats";
+import { legacyPresets } from "../helpers/legacy-presets";
 
 const logger = { warn: vi.fn() };
 
@@ -93,6 +94,19 @@ function catalog() {
   ];
 }
 
+/**
+ * The override's `presets`: the 2.5.0 `anthropic` preset (Haiku 5.5 low, Sonnet 5.5 medium, Opus 5.5 xhigh) pinned under
+ * any per-tier patch a test passes in `extra.presets`. These tests exercise the engine's dispatch decisions, not the
+ * values the bundled tiers.json ships.
+ */
+function pinnedPresets(own: unknown): Record<string, unknown> {
+  const presets = { ...((own ?? {}) as Record<string, Record<string, Record<string, unknown>>>) };
+  const legacy = legacyPresets().anthropic as Record<string, Record<string, unknown>>;
+  const anthropic: Record<string, Record<string, unknown>> = { ...legacy };
+  for (const [tier, patch] of Object.entries(presets.anthropic ?? {})) anthropic[tier] = { ...(legacy[tier] ?? {}), ...patch };
+  return { ...presets, anthropic };
+}
+
 /** `routing: null` writes no routing block at all; `extra` is merged into the override file. */
 async function makeWorld(routing: Record<string, unknown> | null, extra: Record<string, unknown> = {}): Promise<World> {
   const home = mkdtempSync(join(tmpdir(), "router-dispatch-"));
@@ -104,6 +118,7 @@ async function makeWorld(routing: Record<string, unknown> | null, extra: Record<
   writeFileSync(overridePath(), JSON.stringify({
     enforcement: { verify: { testBaseline: false } },
     ...extra,
+    presets: pinnedPresets(extra.presets),
     ...(routing === null ? {} : { routing: { outcomes: { path: outcomes }, ...routing } }),
   }));
   invalidateConfigCache();

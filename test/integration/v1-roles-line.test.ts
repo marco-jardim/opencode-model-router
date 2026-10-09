@@ -154,6 +154,17 @@ describe("v1: the text-only roles line (A28, D1)", () => {
    * single `@fast=` model name differs (one character shorter), nothing else. Derived from the 1fc94a3 constant above by that one inversion.
    */
   const SYSTEM_PROMPT_FAST_HAIKU = { sha256: "fefb07f47947ba1e37c48aca8e2d9197239017391c3bcf9d8715270b68145cab", length: 6356 } as const;
+  /**
+   * The same prompt after 2.6.0 moved the bundled `anthropic` fast tier from Haiku 5.5 low to Haiku 5.5 medium and the medium tier from
+   * Sonnet 5.5 medium to Sonnet 5.5 high: the `@fast=` and `@medium=` tier tokens differ (one character longer in total), nothing else.
+   * The test below derives the Haiku-low constant above from it by inverting exactly those two tokens.
+   */
+  const SYSTEM_PROMPT_2_6_0 = { sha256: "7623a64f56449fad04181e6d647479ab17aaef6ec9ce02fb897ded46aeccd931", length: 6357 } as const;
+  /** The two `anthropic` tier tokens 2.6.0 changed, as `[current, 2.5.0]`. */
+  const TIERS_2_6_0 = [
+    ["@fast=claude-haiku-5-5/medium(1x)", "@fast=claude-haiku-5-5/low(1x)"],
+    ["@medium=claude-sonnet-5-5/high(5x)", "@medium=claude-sonnet-5-5/medium(5x)"],
+  ] as const;
 
   it.each([
     ["no routing block", null],
@@ -163,7 +174,7 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     ["roles: {}", { roles: {} }],
     ["advisor disabled", { advisor: { enabled: false } }],
     ["classifier rules", { classifier: { backend: "rules" } }],
-  ] as const)("without an explicit routing.roles (%s) the whole output.system is 1fc94a3's output plus only the anthropic fast tier on Haiku 5.5: one part with the pinned SHA-256", async (_name, routing) => {
+  ] as const)("without an explicit routing.roles (%s) the whole output.system is 1fc94a3's output plus only the anthropic fast tier on Haiku 5.5 and the 2.6.0 fast/medium tier changes: one part with the pinned SHA-256", async (_name, routing) => {
     invalidateConfigCache();
     const { hooks, agentsCall } = await plugin(routing as Record<string, unknown> | null);
     const system = await turn(hooks);
@@ -171,9 +182,15 @@ describe("v1: the text-only roles line (A28, D1)", () => {
     // #77 deliberately moves rename to medium. Invert exactly that text delta
     // before checking the historical hash: NO other prompt byte may change.
     expect(system[0]).toContain("exists-check @medium→rename/impl-feature");
-    expect(system.map((part) => ({ sha256: sha(part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature")), length: part.length }))).toEqual([SYSTEM_PROMPT_FAST_HAIKU]);
-    // the bundled anthropic fast tier moved from Sonnet 5.5 to Haiku 5.5: invert exactly that one model name and the output is 1fc94a3's again
-    expect(system.map((part) => ({ sha256: sha(part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature").replace("@fast=claude-haiku-5-5/low", "@fast=claude-sonnet-5-5/low")), length: part.length + 1 }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
+    const unrename = (part: string) => part.replace("exists-check @medium→rename/impl-feature", "exists-check/rename @medium→impl-feature");
+    expect(system.map((part) => ({ sha256: sha(unrename(part)), length: part.length }))).toEqual([SYSTEM_PROMPT_2_6_0]);
+    // 2.6.0 changed the bundled anthropic fast and medium tiers: invert exactly those two tier tokens and the output is the Haiku-low one again
+    for (const [current] of TIERS_2_6_0) expect(system[0]!.split(current).length - 1).toBe(1);
+    const to250 = (part: string) => TIERS_2_6_0.reduce((text, [current, old]) => text.replace(current, old), unrename(part));
+    expect(system.map((part) => ({ sha256: sha(to250(part)), length: to250(part).length }))).toEqual([SYSTEM_PROMPT_FAST_HAIKU]);
+    // the bundled anthropic fast tier moved from Sonnet 5.5 to Haiku 5.5: invert exactly that one model name too and the output is 1fc94a3's again
+    const to1fc94a3 = (part: string) => to250(part).replace("@fast=claude-haiku-5-5/low", "@fast=claude-sonnet-5-5/low");
+    expect(system.map((part) => ({ sha256: sha(to1fc94a3(part)), length: to1fc94a3(part).length }))).toEqual([SYSTEM_PROMPT_1FC94A3]);
     expect(system[0]).toBe(baseline()); // and the current assembleSystemPrompt agrees with that commit's output
     expect(agentsCall).not.toHaveBeenCalled(); // the agent list is not even fetched
   });

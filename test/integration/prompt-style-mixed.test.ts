@@ -17,6 +17,7 @@ import {
   writeState,
 } from "../../src/router/config";
 import { GOAL_ORIENTED_TIER_PROMPTS } from "../../src/router/prompts";
+import { FABLE_EFFORT_2_5_0 } from "../helpers/legacy-presets";
 
 type AgentConfig = { model?: string; prompt?: string };
 type OpencodeConfig = { agent?: Record<string, AgentConfig> };
@@ -80,8 +81,8 @@ test("shipped hybrid preset mixes styles by model under auto", async () => {
     const agent = await registerAgents(dir);
 
     // No shipped preset sets promptStyle, so every tier resolves through auto.
-    expect(agent.fast?.model).toBe("openai/gpt-6-luna-fast");
-    expect(agent.medium?.model).toBe("openai/gpt-6-astra-fast");
+    expect(agent.fast?.model).toBe("anthropic/claude-haiku-5-5");
+    expect(agent.medium?.model).toBe("openai/gpt-6.1-sol-fast");
     expect(agent.heavy?.model).toBe("anthropic/claude-opus-5-5");
 
     // Weak models keep the enumerated prompts.
@@ -99,6 +100,7 @@ test("shipped hybrid preset mixes styles by model under auto", async () => {
 
 test("fable-effort preset resolves every tier to goal-oriented under auto", async () => {
   await withPluginHome("model-router-prompt-style-fable-", async (dir) => {
+    writeGlobalOverride(dir, { presets: { "fable-effort": FABLE_EFFORT_2_5_0 } });
     writeState({ activePreset: "fable-effort" });
     const agent = await registerAgents(dir);
 
@@ -178,7 +180,7 @@ test("tierPromptsGoalOriented overrides the built-in goal-oriented default", asy
 
 test("an empty modelGenerations.strong list keeps every tier prescriptive", async () => {
   await withPluginHome("model-router-prompt-style-nostrong-", async (dir) => {
-    writeGlobalOverride(dir, { modelGenerations: { strong: [] } });
+    writeGlobalOverride(dir, { modelGenerations: { strong: [] }, presets: { "fable-effort": FABLE_EFFORT_2_5_0 } });
     writeState({ activePreset: "fable-effort" });
     const agent = await registerAgents(dir);
 
