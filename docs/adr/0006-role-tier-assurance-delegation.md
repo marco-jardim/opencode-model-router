@@ -2,7 +2,7 @@
 
 > **Status:** Accepted (roles mode live in the owner's dogfood since checkpoint DF-2, 2026-10-08) **Date:** 2026-10-08 **Wave/Phase:** Role × Tier × Assurance delegation, Phase P3.2
 > **Supersedes:** none **Depends on:** ADR 0002 (acceptance gate: the deterministic verdicts that make detection effective), ADR 0005 (cost-aware routing engine: the kernel, ladders and outcome store roles mode extends)
-> **Deciders:** owner (Marco Jardim); amendments R0–R8 and adversarial QA recorded in the plan and phase reports
+> **Deciders:** owner (Marco Jardim); amendments R0–R10 and adversarial QA recorded in the plan and phase reports
 > **Plan:** [`../plans/role-tier-assurance-delegation-plan.md`](../plans/role-tier-assurance-delegation-plan.md) **User guide:** [`../ROLES.md`](../ROLES.md) **Spikes:** [`../qa/role-tier/spikes.md`](../qa/role-tier/spikes.md)
 > **Issue:** [#84](https://github.com/marco-jardim/opencode-model-router/issues/84)
 
@@ -40,7 +40,9 @@ A dispatch is **role × tier × assurance**. The orchestrator picks the role (in
 always sets the per-call `model` (E10); the effective detection of the dispatch bounds how cheap the tier may be.
 `routing.delegation: "roles"` turns it on; the default `"tiers"` leaves v2 (and v1) byte-identical to the base except
 the mode-independent fixes of D12, the dispatch header naming a route line's `root=`, and the I7 budget-incomplete rule
-(a `NEED MORE: budget` return backed by the guard's state is `incomplete`, not a failure). Role agents and role tools are registered only when the plugin **starts** in roles
+(a `NEED MORE: budget` return backed by the guard's state is `incomplete`, not a failure). R10 adds one more exemption,
+in every mode: verification reasons are rendered one per line, with line breaks joined, at most 20 items plus a count,
+and grader text cut at 500 characters. Role agents and role tools are registered only when the plugin **starts** in roles
 mode; a runtime switch logs a restart notice (R8).
 
 ### D2 — A small, explicit role set, defined in code
@@ -88,7 +90,8 @@ its first context build, **exactly only through a router-inserted nonce** (descr
 S2, R7); anything else is an unknown binding = role max ∩ local actions, no `router_run`, no `external_directory`, a
 visible row and advisor finding. Never a union. `router_request_authority` records a request inside the role max and
 tells the child to stop with `ESCALATE: authority`; the parent's result is annotated (S6); on the resume of the same
-session the grant widens — only for an exact binding (R8) — and the floor is recomputed, so the model may rise (S7).
+session the grant widens — only for an exact binding (R8), and only when the resuming session is the one the request
+was escalated to — and the floor is recomputed, so the model may rise (S7).
 Outside the max the request is refused, naming the role to use.
 
 ### D7 — One work root per dispatch
@@ -97,7 +100,8 @@ The session directory, or a git worktree of the same repository named by `root=`
 `git worktree list --porcelain` before any filesystem call; anything else withholds write and run. Max policies allow
 `external_directory` for the worktrees listed at registration plus `routing.workRoots` globs in canonical long form;
 the permission hook narrows each session to its own root (S11, P-11, P-13). `router_run` and `router_git_*` take the
-bound root, never the session location (P-10, P-18).
+bound root, never the session location (P-10, P-18). Role `edit` needs a validated work root (on the ladder too) and
+never writes `.git` or anything below it (R10).
 
 ### D8 — A structured, fixed-argv run tool
 
@@ -109,12 +113,13 @@ repository content run by npm's script shell (E9).
 
 ### D9 — Budgets belong to the role and tier; exhaustion is not failure
 
-A role dispatch's call budget is the role's budget for the routed tier (`budget=` raises it up to 2×), cumulative × 3;
-refused calls are not charged. On exhaustion the child returns `NEED MORE: budget` with a summary, the parent's result
-gets a `[router budget]` note, and the same session is resumed (E7). The host `steps` limit is 2 × the top role budget
-+ `REFUSAL_CAP` + 5, so the router's stop always comes first (S4, R7, R8). Tier agents keep 25 / × 3, and so does a
-role dispatch that a floor lifts above its role's ceiling, when the role has no budget for that tier. A role dispatch has a
-read-only call cap only when it carries `CAP:N` or `CAP:none`.
+A role dispatch's call budget is the role's budget for the routed tier (`budget=` raises it up to 2×; a resume without
+`budget=` keeps the previous one); the cumulative ceiling is 3 × the largest round budget the child had; refused calls
+are not charged. On exhaustion the child returns `NEED MORE: budget` with a summary, the parent's result gets a
+`[router budget]` note, and the same session is resumed (E7). The host `steps` limit is 2 × max(the top role budget,
+25) + `REFUSAL_CAP` + 5, so the router's stop always comes first (S4, R7, R8). Tier agents keep 25 / × 3; a role
+dispatch that a floor lifts above its role's ceiling, when the role has no budget for that tier, gets max(the role's
+budget for its ceiling tier, 25). A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`.
 
 ### D10 — Outcome evidence only from external verification
 
@@ -126,7 +131,9 @@ grader (tier ≥ producer, another model) moves the outcome store by 0.5 and wri
 that is not independent (or not known to be) records nothing — no store change, no verdict row, no signal row; a false
 refusal after an independent grader's pass takes back only its 0.5. An explicit `NEED MORE`/`ESCALATE` without a budget
 stop or authority request weighs 0.5 against; a re-dispatch of the same task to a higher tier within 30 minutes 0.5 against the earlier
-attempt; `DONE` alone 0; budget and authority events are recorded with no penalty (I6, I7).
+attempt; `DONE` alone 0; budget and authority events are recorded with no penalty (I6, I7). Only verdicts move the
+outcome store the kernel reads — deterministic verdicts at 1 and independent grader verdicts at 0.5; `run`,
+`incomplete` and `redispatch` signals are routing statistics only, decision-log rows read by `routing:stats` (R10).
 
 ### D11 — Exploration is experimental and off by default
 
@@ -183,8 +190,8 @@ no role agent, tool, hook or prompt change is registered (I8).
   links inside the work root; reading roles keep the host's tool-output folder, narrowed per session. Roles mode is not
   an OS sandbox.
 - Switching delegation mode needs an OpenCode restart; the kill switch is the previous override plus a restart.
-- I1/I8 hold except the D12 fixes, the header naming `root=` and the budget-incomplete rule; those are behaviour
-  changes in every mode, listed in the changelog.
+- I1/I8 hold except the D12 fixes, the header naming `root=`, the budget-incomplete rule and the verification-reason
+  rendering (R10); those are behaviour changes in every mode, listed in the changelog.
 - Signal rows are annotation rows of the decision log; readers older than this release drop them only through their
   decision-id dedupe, so downgrading past this release is unsupported.
 - The tier agents and tiers mode remain fully supported; a role defect has a recorded fallback.

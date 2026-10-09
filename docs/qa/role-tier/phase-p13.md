@@ -32,7 +32,7 @@ Commits on `rta/p13` (`git log a024bba..rta/p13`), all with body `Refs #84`:
 | `0c1cd26` | heavy | QA round 3: single-dash path rule, `globalconfig`/`userconfig`/`prefix` `.npmrc` refusal, version-probed `${VAR?}` control |
 
 Exported API (final): `routerRunTool`, `RunToolDeps` (`config`, `resolveWorkRoot: (sessionID) => WorkRootAnswer`,
-`recordRun?`, `envPassthrough?`, seams `nodeExecPath?`/`platform?`/`env?`), `RunRecord`, `planRun`, `executeRunPlan`,
+`recordRun?`, `envPassthrough?` (removed in P3.3, QA-G-A2-6 / R10(3)), seams `nodeExecPath?`/`platform?`/`env?`), `RunRecord`, `planRun`, `executeRunPlan`,
 `authorizeCwd` and the resolution/validation helpers; in git-tools: `WorkRootAnswer`, `GitWorkRootResolver`,
 `checkWorkRootAnswer`, `workRootGuards`, `mainWorktree`, `isFullPath`, `readBoundedRegularFile`, `spawnBounded`.
 
@@ -103,7 +103,7 @@ Accepted (QA round limit):
 | P2.1 | List `router_run` and `router_git_*` explicitly in role agent allows (P-12); the tools still check authority themselves |
 | P2.1 / P1.4 | Wire `recordRun` to the P1.4 `run` signal (`at` = run start; `exitCode: null` on timeout/abort/signal) |
 | P2.1 | Residual: a user-owned `~/.npmrc` `globalconfig` still outranks `--globalconfig` (outside every work root) |
-| P3.2 | Document `routing.run`: `commands.args` patterns (exact or trailing `*`, same option lead), the single-dash rule, npm commands limited to run/run-script/test/start/stop/restart with safe flags, package.json scripts take no caller args, pre/post hooks run, refused `.npmrc` keys, credential env stripping with `envPassthrough`, and what stays reachable (ssh-agent, credential helpers, cloud CLI caches) |
+| P3.2 | Document `routing.run`: `commands.args` patterns (exact or trailing `*`, same option lead), the single-dash rule, npm commands limited to run/run-script/test/start/stop/restart with safe flags, package.json scripts take no caller args, pre/post hooks run, refused `.npmrc` keys, credential env stripping with `envPassthrough` (removed in P3.3, QA-G-A2-6 / R10(3)), and what stays reachable (ssh-agent, credential helpers, cloud CLI caches) |
 | P3.1 | Run the POSIX-only tests on Linux CI (list under Tests) |
 
 ## Takeovers
