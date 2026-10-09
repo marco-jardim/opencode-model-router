@@ -715,10 +715,26 @@ export async function registerV2Hooks(
   const legacy = hooks as unknown as Record<string, LegacyHook | undefined>;
   const registrations: Array<{ dispose(): Promise<void> }> = [];
   /** #90 P1.2: per session, what the context hook's `chat.params` bridge applied to the latest turn (the TUI's `effortOf`). */
-  // QA-10: one store per adapter instance, not module state; every instance of a location records the same turns, the last registration answers.
+  // One store per adapter instance, not module state: every instance of a location records the same turns; the last registration answers.
   const effortStore = createEffortStore();
-  /** #90 P1.2 (QA-4): the context events whose turn was recorded; a hook that fails before recording forgets the session. */
-  const recordedTurns = new WeakSet<object>();
+  /**
+   * #90 P1.2: records what a turn's request carries (read-only: `event.options` is normalised into a copy, never written), root and
+   * child sessions alike. Only a non-empty string session id is recorded; a turn that cannot be read is forgotten, never left stale.
+   */
+  const recordEffortTurn = (event: SessionContext): void => {
+    const sessionID: unknown = event.sessionID;
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    try {
+      const applied = normalizeAgentOptions(event.options);
+      effortStore.record(sessionID, {
+        effort: appliedEffort(applied, { providerID: event.model.providerID, modelID: event.model.id }),
+        thinkingBudget: appliedThinkingBudget(applied), variant: event.model.variant,
+        providerID: event.model.providerID, modelID: event.model.id, agent: event.agent, at: Date.now(),
+      });
+    } catch {
+      effortStore.forget(sessionID);
+    }
+  };
   const abort = new AbortController();
   const verifyingCalls = new Set<string>();
   const depthBanners = new Map<string, string>();
@@ -1392,24 +1408,10 @@ export async function registerV2Hooks(
         if (!(key in event.options)) event.options[key] = value;
       }
       await legacy["chat.params"]?.(input, event.options);
-      // #90 P1.2 (A3): what this turn's request carries after the router's hook, root and child sessions alike; no effort key
-      // records none (clearing a stale one). Read-only: `event.options` is normalised into a copy, never written; the channel
-      // never changes the hook's outcome. QA-7: only a non-empty string session id is recorded.
-      // QA-2: host v2.0.24 core/src/session/model-request.ts:408-411 fires `context` for primary requests only (compaction, generate, title have their own hooks).
-      const effortSession: unknown = event.sessionID;
-      if (typeof effortSession === "string" && effortSession !== "") {
-        try {
-          const applied = normalizeAgentOptions(event.options);
-          effortStore.record(effortSession, {
-            effort: appliedEffort(applied, { providerID: event.model.providerID, modelID: event.model.id }),
-            thinkingBudget: appliedThinkingBudget(applied), variant: event.model.variant,
-            providerID: event.model.providerID, modelID: event.model.id, agent: event.agent, at: Date.now(),
-          });
-          recordedTurns.add(event);
-        } catch {
-          effortStore.forget(effortSession); // nothing usable for this turn: no stale answer either
-        }
-      }
+      // #90 P1.2 (A3): what this turn's request carries after the router's hook; no effort key records none (clearing a stale one).
+      // The channel never changes the hook's outcome.
+      // Host v2.0.24 core/src/session/model-request.ts:408-411 fires `context` for primary requests only (compaction, generate, title have their own hooks).
+      recordEffortTurn(event);
       const routerConfig = loadConfig(ctx.location.directory);
       const verify = routerConfig.enforcement?.verify;
       if (event.agent === V2_GRADER_AGENT
@@ -1470,7 +1472,8 @@ export async function registerV2Hooks(
       }
     }
     // #90 P1.2 (A1): the TUI's `effortOf` rpc, answered from `effortStore`; tiers and roles mode alike. Feature-detected (a host
-    // without `ctx.rpc.register` gets nothing), never throws; disposed with the other registrations.
+    // without `ctx.rpc.register` gets nothing), bounded (2 s: setup never waits longer; a late registration is kept), never
+    // throws; disposed with the other registrations.
     registrations.push({ dispose: await registerEffortChannel(ctx.rpc, effortStore, ingestLogger) });
     registrations.push(await ctx.session.hook("context", async (event) => {
       // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
@@ -1479,10 +1482,13 @@ export async function registerV2Hooks(
       try {
         await buildContext(event, role);
       } catch (error) {
-        // #90 P1.2 (QA-4): a turn that failed before its effort was recorded leaves no stale record (the error goes on as before).
-        if (!recordedTurns.has(event) && typeof event.sessionID === "string") effortStore.forget(event.sessionID);
-        if (role === undefined) throw error;
+        if (role === undefined) {
+          // #90 P1.2: the request does not go out, so nothing is recorded for it (not even a record made earlier in this turn).
+          if (typeof event.sessionID === "string") effortStore.forget(event.sessionID);
+          throw error;
+        }
         for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
+        recordEffortTurn(event); // #90 P1.2: the role session goes on fail-closed with these options: they are what is recorded
         warnPermissionOnce(`role tool catalog failed for ${role}: ${String(error)}`);
         const child = String(event.sessionID);
         if (!catalogFailures.has(child)) {
@@ -1836,7 +1842,7 @@ export async function registerV2Hooks(
               lookupNamedAgent.delete(data.sessionID);
               lastCallOfChild.delete(data.sessionID);
               hostBudget.forget(data.sessionID);
-              effortStore.forget(data.sessionID); // #90 P1.2 (QA-8)
+              effortStore.forget(data.sessionID); // #90 P1.2: a deleted session is no longer answered
             }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {

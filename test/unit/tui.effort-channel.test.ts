@@ -223,7 +223,7 @@ describe("effortRpc (the shared definition)", () => {
     expect(output.additionalProperties).toBe(false);
     expect(Object.keys(output.properties).sort()).toEqual(["agent", "at", "effort", "modelID", "providerID", "thinkingBudget", "variant"]);
     expect(output.properties.at).toEqual({ type: "number" });
-    expect(output.properties.thinkingBudget).toEqual({ type: "integer", minimum: 1 });
+    expect(output.properties.thinkingBudget).toEqual({ type: "number" }); // a plain number (the store keeps positive integers only)
     expect("required" in output).toBe(false);
     expect(JSON.parse(JSON.stringify(effortRpc))).toEqual(effortRpc); // JSON-safe: nothing but data
   });
@@ -468,7 +468,7 @@ describe("registerEffortChannel (feature detection, never throws)", () => {
     expect(String(warn.mock.calls[0]![0])).toContain("[model-router] TUI effort channel not registered");
   });
 
-  it("QA-1: a register that never settles is given up after the (injected) timeout: resolves, logs once, a no-op dispose", async () => {
+  it("QA-1: a register that never settles: setup goes on after the (injected) timeout, logged once, a no-op-safe dispose", async () => {
     const log = { warn: vi.fn() };
     const register = vi.fn(() => new Promise<never>(() => {}));
     const dispose = await registerEffortChannel({ register }, createEffortStore(), log, { timeoutMs: 20 });
@@ -476,36 +476,81 @@ describe("registerEffortChannel (feature detection, never throws)", () => {
     expect(log.warn).toHaveBeenCalledTimes(1);
     expect(log.warn.mock.calls[0]![0]).toContain("rpc.register did not settle within 20 ms");
     await expect(dispose()).resolves.toBeUndefined();
+    await expect(dispose()).resolves.toBeUndefined();
     expect(log.warn).toHaveBeenCalledTimes(1);
   });
 
-  it("QA-1: a registration that arrives after the timeout is disposed at once, also when dispose was called first", async () => {
-    const log = { warn: vi.fn() };
+  /** A register whose answer the test releases by hand; the handlers it was given answer from the store. */
+  function slowRegister() {
     let arrive!: (registration: unknown) => void;
+    let refuse!: (error: unknown) => void;
+    let handlers: Handlers | undefined;
+    const register = vi.fn((_definition: unknown, given: Handlers) => {
+      handlers = given;
+      return new Promise((resolve, reject) => { arrive = resolve; refuse = reject; });
+    });
+    return { register, arrive: (registration: unknown) => arrive(registration), refuse: (error: unknown) => refuse(error), handlers: () => handlers! };
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  it("R2-5: a registration that arrives after the timeout is KEPT (logged once that it arrived) and disposed with the channel", async () => {
+    const log = { warn: vi.fn() };
+    const store = createEffortStore();
+    store.record("s1", { effort: "high" });
+    const slow = slowRegister();
     const late = { dispose: vi.fn(async () => {}) };
-    const dispose = await registerEffortChannel({ register: () => new Promise((resolve) => { arrive = resolve; }) }, createEffortStore(), log, { timeoutMs: 10 });
+    const dispose = await registerEffortChannel({ register: slow.register }, store, log, { timeoutMs: 10 });
+    expect(log.warn).toHaveBeenCalledTimes(1); // the timeout
+    slow.arrive(late);
+    await vi.waitFor(() => expect(log.warn).toHaveBeenCalledTimes(2));
+    expect(log.warn.mock.calls[1]![0]).toContain("TUI effort channel registered late (after the 10 ms wait); effortOf is available");
+    await settle();
+    expect(late.dispose).not.toHaveBeenCalled(); // kept while the channel lives
+    expect(await slow.handlers().effortOf({ sessionID: "s1" })).toEqual({ effort: "high" }); // and it answers
+    await dispose();
+    expect(late.dispose).toHaveBeenCalledTimes(1);
+    await dispose();
+    expect(late.dispose).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("R2-5: a registration that arrives after the channel was disposed is disposed at once (not reported as available)", async () => {
+    const log = { warn: vi.fn() };
+    const slow = slowRegister();
+    const late = { dispose: vi.fn(async () => {}) };
+    const dispose = await registerEffortChannel({ register: slow.register }, createEffortStore(), log, { timeoutMs: 10 });
     await dispose(); // the plugin went away before the host answered
-    expect(late.dispose).not.toHaveBeenCalled();
-    arrive(late);
+    slow.arrive(late);
     await vi.waitFor(() => expect(late.dispose).toHaveBeenCalledTimes(1));
     await dispose();
     expect(late.dispose).toHaveBeenCalledTimes(1);
-    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledTimes(1); // only the timeout
   });
 
-  it("QA-1: after the timeout, a late throwing dispose and a late rejection are swallowed (no second log)", async () => {
+  it("R2-5: after the timeout, a throwing dispose (kept or immediate) and a late rejection are swallowed; a rejection is not logged", async () => {
     const log = { warn: vi.fn() };
-    let arrive!: (registration: unknown) => void;
-    const throwing = { dispose: vi.fn(() => { throw new Error("dispose failed"); }) };
-    await registerEffortChannel({ register: () => new Promise((resolve) => { arrive = resolve; }) }, createEffortStore(), log, { timeoutMs: 10 });
-    arrive(throwing);
-    await vi.waitFor(() => expect(throwing.dispose).toHaveBeenCalledTimes(1));
-    let refuse!: (error: unknown) => void;
-    await registerEffortChannel({ register: () => new Promise((_resolve, reject) => { refuse = reject; }) }, createEffortStore(), log, { timeoutMs: 10 });
-    refuse(new Error("too late"));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(log.warn).toHaveBeenCalledTimes(2); // one per timed-out registration, none for what arrived late
-    expect(log.warn.mock.calls.map(([line]) => String(line)).join("\n")).not.toContain("too late");
+    const kept = slowRegister();
+    const throwingKept = { dispose: vi.fn(() => { throw new Error("dispose failed"); }) };
+    const disposeKept = await registerEffortChannel({ register: kept.register }, createEffortStore(), log, { timeoutMs: 10 });
+    kept.arrive(throwingKept);
+    await settle();
+    await expect(disposeKept()).resolves.toBeUndefined();
+    expect(throwingKept.dispose).toHaveBeenCalledTimes(1);
+    const immediate = slowRegister();
+    const throwingImmediate = { dispose: vi.fn(async () => { throw new Error("dispose failed"); }) };
+    const disposeImmediate = await registerEffortChannel({ register: immediate.register }, createEffortStore(), log, { timeoutMs: 10 });
+    await disposeImmediate();
+    immediate.arrive(throwingImmediate);
+    await vi.waitFor(() => expect(throwingImmediate.dispose).toHaveBeenCalledTimes(1));
+    const refused = slowRegister();
+    const disposeRefused = await registerEffortChannel({ register: refused.register }, createEffortStore(), log, { timeoutMs: 10 });
+    refused.refuse(new Error("too late"));
+    await settle();
+    await expect(disposeRefused()).resolves.toBeUndefined();
+    const lines = log.warn.mock.calls.map(([line]) => String(line));
+    expect(lines.filter((line) => line.includes("did not settle"))).toHaveLength(3);
+    expect(lines.filter((line) => line.includes("registered late"))).toHaveLength(1); // only the kept one
+    expect(lines.join("\n")).not.toContain("too late");
   });
 
   it("QA-1: a registration in time is not touched by the timer", async () => {
@@ -598,6 +643,39 @@ describe("v2 adapter: registration", () => {
     expect(channel.records.at(-1)?.sessionID).toBe("s1");
     const logged = warn.mock.calls.filter(([line]) => String(line).includes("did not settle within 2000 ms"));
     expect(logged).toHaveLength(1);
+  });
+
+  it("R2-5: a registration that arrives after the 2 s wait is kept, answers the adapter's turns, and is disposed on plugin cleanup", async () => {
+    home();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let called!: () => void;
+    const registerCalled = new Promise<void>((resolve) => { called = resolve; });
+    let arrive!: (registration: unknown) => void;
+    let handlers: Handlers | undefined;
+    const late = { dispose: vi.fn(async () => {}) };
+    const rpc = { register: vi.fn((_definition: unknown, given: Handlers) => {
+      handlers = given;
+      called();
+      return new Promise((resolve) => { arrive = resolve; });
+    }) };
+    const host = v2Host(temp(), rpc);
+    let cleanup: () => Promise<void>;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const started = host.start();
+      await registerCalled;
+      await vi.advanceTimersByTimeAsync(EFFORT_REGISTER_TIMEOUT_MS);
+      cleanup = await started;
+    } finally {
+      vi.useRealTimers();
+    }
+    arrive(late);
+    await vi.waitFor(() => expect(warn.mock.calls.some(([line]) => String(line).includes("registered late"))).toBe(true));
+    await host.turn("s1", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    expect(await handlers!.effortOf({ sessionID: "s1" })).toMatchObject({ effort: "high", agent: "fast" });
+    expect(late.dispose).not.toHaveBeenCalled();
+    await cleanup();
+    expect(late.dispose).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -804,7 +882,7 @@ describe("v2 adapter: the recorded effort per path", () => {
     expect(await rpc.effortOf({ sessionID: "child" })).toMatchObject({ thinkingBudget: 2048, agent: "fast" });
   });
 
-  it("QA-4c: a roles-mode turn that fails before chat.params clears the session's previous record; the hook still resolves (fail closed)", async () => {
+  it("R2-2: a roles-mode turn that fails before chat.params goes on fail-closed and records what it actually sends; the hook still resolves", async () => {
     const dir = home({ routing: { delegation: "roles" } });
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const rpc = fakeRpc();
@@ -817,7 +895,20 @@ describe("v2 adapter: the recorded effort per path", () => {
     host.ctx.agent.list.mockRejectedValueOnce(new Error("agents down")); // the protected-catalog step, before chat.params
     const failed = await host.turn("child-role", "explorer", MODEL, { maxTokens: 64, reasoningEffort: "medium" }, { read: {}, grep: {} });
     expect(failed.tools).toEqual({}); // the role's fail-closed path ran, as before
+    expect(failed.options).toEqual({ maxTokens: 64, reasoningEffort: "medium" }); // what goes out
+    const found = await rpc.effortOf({ sessionID: "child-role" });
+    expect(found).toEqual({
+      effort: "medium", variant: "high", providerID: "anthropic", modelID: "claude-opus-5-5", agent: "explorer", at: found.at,
+    });
+    // No model on the event: nothing readable is sent, so the session is forgotten rather than left stale; the hook still resolves.
+    await expect(host.turn("child-role", "explorer", undefined, { maxTokens: 64 }, { read: {} })).resolves.toBeDefined();
     expect(await rpc.effortOf({ sessionID: "child-role" })).toEqual({});
+    // An invalid session id on the fail-closed path is not recorded.
+    const before = channel.records.length;
+    host.ctx.agent.list.mockRejectedValueOnce(new Error("agents down"));
+    await host.turn(42, "explorer", MODEL, { maxTokens: 64, reasoningEffort: "high" }, { read: {} });
+    expect(channel.records.length).toBe(before);
+    expect(await rpc.effortOf({ sessionID: "42" })).toEqual({});
   });
 
   it("QA-4c: a non-role turn that fails before recording still rejects as before, and clears the previous record", async () => {
@@ -831,13 +922,21 @@ describe("v2 adapter: the recorded effort per path", () => {
     expect(await rpc.effortOf({ sessionID: "child" })).toEqual({});
   });
 
-  it("QA-4c: a failure AFTER the turn was recorded keeps that record (it describes the request as the hook left it)", async () => {
+  it("R2-3: a non-role failure AFTER the turn was recorded also forgets the session (the request did not go out)", async () => {
     home();
     const rpc = fakeRpc();
     const host = v2Host(temp(), rpc.rpc);
-    await host.start({ "experimental.chat.system.transform": async () => { throw new Error("system transform failed"); } });
-    await expect(host.turn("child", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" })).rejects.toThrow("system transform failed");
-    expect(await rpc.effortOf({ sessionID: "child" })).toMatchObject({ effort: "high", agent: "fast" });
+    let fail = false;
+    await host.start({ "experimental.chat.system.transform": async () => { if (fail) throw new Error("system transform failed"); } });
+    await host.turn("child", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    await host.turn("other", "fast", GPT, { maxTokens: 1, reasoningEffort: "low" });
+    expect((await rpc.effortOf({ sessionID: "child" })).effort).toBe("high");
+    fail = true;
+    const before = channel.records.length;
+    await expect(host.turn("child", "fast", GPT, { maxTokens: 1, reasoningEffort: "medium" })).rejects.toThrow("system transform failed");
+    expect(channel.records.length).toBe(before + 1); // it WAS recorded after chat.params (the failure comes later)
+    expect(await rpc.effortOf({ sessionID: "child" })).toEqual({}); // and then forgotten
+    expect((await rpc.effortOf({ sessionID: "other" })).effort).toBe("low"); // other sessions untouched
   });
 
   it("QA-7: a turn whose session id is not a non-empty string is not recorded", async () => {

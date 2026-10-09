@@ -25,7 +25,7 @@ export const effortRpc = {
           modelID: { type: "string" },
           agent: { type: "string" },
           at: { type: "number" },
-          thinkingBudget: { type: "integer", minimum: 1 },
+          thinkingBudget: { type: "number" },
         },
         additionalProperties: false,
       },

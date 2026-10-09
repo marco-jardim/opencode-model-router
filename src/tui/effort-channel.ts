@@ -9,7 +9,7 @@ import { effortRpc, type EffortOfOutput } from "./effort-rpc";
 /** The store's default bound: the sessions of one location the TUI can still ask about. */
 export const EFFORT_STORE_MAX_SESSIONS = 1000;
 
-/** How long setup waits for the host's `rpc.register` before giving the channel up (QA-1). */
+/** How long setup waits for the host's `rpc.register` before it goes on without the channel (a late registration is kept). */
 export const EFFORT_REGISTER_TIMEOUT_MS = 2000;
 
 /** One turn as the adapter saw it; fields that are not strings (or a finite `at`, a positive integer budget) are dropped. */
@@ -28,7 +28,7 @@ export interface EffortStore {
   record(sessionID: string, turn: EffortTurn): void;
   /** A copy of the latest turn of `sessionID`, or `{}` when nothing is known. */
   lookup(sessionID: string): EffortOfOutput;
-  /** Drops what is known about `sessionID` (the session was deleted, or its latest turn failed before it was recorded). */
+  /** Drops what is known about `sessionID` (the session was deleted, or its latest request did not go out). */
   forget(sessionID: string): void;
   /** How many sessions are held. */
   size(): number;
@@ -77,7 +77,7 @@ export function createEffortStore(maxSessions: number = EFFORT_STORE_MAX_SESSION
 /**
  * The effort a turn's (already normalised) request options carry. Two keys can hold it: `effort` (what `buildAgentOptions`
  * writes for a Claude model, and what the escalation override replaces there) and `reasoningEffort` (every other family; the
- * `reasoning_effort` alias once normalised). QA-9: for a Claude model (the router's own `isClaudeModel`, on `provider/model`)
+ * `reasoning_effort` alias once normalised). For a Claude model (the router's own `isClaudeModel`, on `provider/model`)
  * `effort` is read first, otherwise `reasoningEffort`; each falls back to the other. Undefined when neither is a non-empty string.
  */
 export function appliedEffort(
@@ -154,8 +154,9 @@ const TIMED_OUT: unique symbol = Symbol("effort-channel-timeout");
 /**
  * Registers `effortOf` on the host's rpc domain (`ctx.rpc.register(definition, handlers)`, OpenCode v2 ≥ 2.0.24). Feature-detected
  * (no `register` function: nothing, silently); a throwing or rejecting `register` is logged once and swallowed — the channel is
- * optional and must never fail the plugin's setup. QA-1: `register` races a timeout (default 2000 ms); past it the channel is given
- * up (logged once) and a registration that still arrives is disposed at once. Resolves to a dispose function that never throws.
+ * optional and must never fail the plugin's setup. Setup waits for `register` a bounded time (default 2 s): past it setup goes on
+ * (logged once). A registration that arrives later is kept (logged once) and disposed with the channel; one that arrives after the
+ * channel was disposed is disposed at once; a late rejection is swallowed. Resolves to a dispose function that never throws.
  */
 export async function registerEffortChannel(
   rpcLike: unknown,
@@ -163,13 +164,14 @@ export async function registerEffortChannel(
   log: EffortChannelLog = defaultLog,
   options: EffortChannelOptions = {},
 ): Promise<() => Promise<void>> {
-  const warn = (message: string): void => {
+  const note = (message: string): void => {
     try {
-      log.warn(`TUI effort channel not registered (effortOf unavailable): ${message}`);
+      log.warn(message);
     } catch {
       // A failing log sink must not turn an optional channel into a setup failure.
     }
   };
+  const warn = (message: string): void => note(`TUI effort channel not registered (effortOf unavailable): ${message}`);
   const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
   let pending: Promise<unknown>;
   try {
@@ -190,18 +192,25 @@ export async function registerEffortChannel(
     new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs); }),
   ]);
   clearTimeout(timer);
-  if (outcome === TIMED_OUT) {
-    warn(`rpc.register did not settle within ${timeoutMs} ms`);
-    // Given up: a registration that arrives late is disposed at once (a late rejection is swallowed, not logged again).
-    pending.then(disposeQuietly, () => {});
-    return NO_OP;
-  }
-  if ("error" in outcome) {
+  if (outcome !== TIMED_OUT && "error" in outcome) {
     warn(messageOf(outcome.error));
     return NO_OP;
   }
-  const { registration } = outcome;
   let disposed = false;
+  let registration: unknown = outcome === TIMED_OUT ? undefined : outcome.registration;
+  if (outcome === TIMED_OUT) {
+    note(`TUI effort channel: rpc.register did not settle within ${timeoutMs} ms; setup goes on without it (a late registration is kept)`);
+    pending.then((late) => {
+      if (disposed) {
+        void disposeQuietly(late); // the channel is gone already: never leave a registration behind
+        return;
+      }
+      registration = late;
+      note(`TUI effort channel registered late (after the ${timeoutMs} ms wait); effortOf is available`);
+    }, () => {
+      // A late rejection: the channel stays unavailable, as the timeout already said.
+    });
+  }
   return async () => {
     if (disposed) return;
     disposed = true;
