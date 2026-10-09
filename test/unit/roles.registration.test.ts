@@ -151,6 +151,14 @@ describe("role agent max policies", () => {
     }
   });
 
+  it("QA-G-A3-6: the top budget of the steps is never below the tier agents' budget (the fallback of a lifted tier)", () => {
+    // A role whose own budgets are all below TIER_GUARD_BUDGET (25) can still be guarded at 25 (raised up to 2×) on a tier it has
+    // no budget for: its steps must cover that, or the host's step limit fires before the guard's `NEED MORE: budget`.
+    expect(roleAgentSteps({ budget: { fast: 10, medium: 12 } })).toBe(ROUTE_BUDGET_RAISE_MAX * 25 + REFUSAL_CAP + ROLE_STEPS_MARGIN);
+    expect(roleAgentSteps({ budget: {} })).toBe(ROUTE_BUDGET_RAISE_MAX * 25 + REFUSAL_CAP + ROLE_STEPS_MARGIN);
+    expect(roleAgentSteps({ budget: { fast: 40 } })).toBe(ROUTE_BUDGET_RAISE_MAX * 40 + REFUSAL_CAP + ROLE_STEPS_MARGIN);
+  });
+
   it("a definition carries the floor model/variant, the prompt verbatim, steps and the role marker", () => {
     const spec = SHIPPED_ROLE_SPECS.find((s) => s.agent === "implementer")!;
     const definition = buildRoleAgentDefinition(spec, { model: "prov/floor-model", variant: "low" }, { context7: false, externalDirectory: [] });

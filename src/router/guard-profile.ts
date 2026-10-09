@@ -75,18 +75,26 @@ export function raisedBudget(base: number, requested?: number | null): number {
   return Math.min(Math.max(base, asked), base * ROUTE_BUDGET_RAISE_MAX);
 }
 
+/** The role's own budget for `tier` (a positive integer), or undefined. */
+function ownBudget(role: Pick<RoleSpec, "budget">, tier: string): number | undefined {
+  return positiveBudget(Object.prototype.hasOwnProperty.call(role.budget, tier) ? role.budget[tier] : undefined);
+}
+
 /**
  * The guard profile of a role dispatch on `tier`: total = the role's budget for the
- * tier (TIER_GUARD_BUDGET when the role has none), raised by `budget=` up to 2×;
- * cumulative = total × GUARD_CUMULATIVE_MULTIPLIER.
+ * tier, raised by `budget=` up to 2×; cumulative = total × GUARD_CUMULATIVE_MULTIPLIER.
+ * A tier the role has no budget for (a floor lifted above the role's ceiling, an
+ * invalid entry) gets max(the role's budget for its ceiling tier, TIER_GUARD_BUDGET)
+ * (QA-G-A3-7): a lifted dispatch never gets less than the role on its ceiling, nor
+ * less than a tier agent. Without a known ceiling: TIER_GUARD_BUDGET.
  */
 export function roleGuardProfile(
-  role: Pick<RoleSpec, "guard" | "budget">,
+  role: Pick<RoleSpec, "guard" | "budget"> & { readonly tierRange?: Pick<RoleSpec["tierRange"], "ceiling"> },
   tier: string,
   routeBudget?: number | null,
 ): GuardProfile {
-  const own = Object.prototype.hasOwnProperty.call(role.budget, tier) ? role.budget[tier] : undefined;
-  const base = positiveBudget(own) ?? TIER_GUARD_BUDGET;
+  const ceiling = role.tierRange === undefined ? undefined : ownBudget(role, role.tierRange.ceiling);
+  const base = ownBudget(role, tier) ?? Math.max(ceiling ?? 0, TIER_GUARD_BUDGET);
   const budget = raisedBudget(base, routeBudget);
   return { kind: role.guard, budget, cumulative: budget * GUARD_CUMULATIVE_MULTIPLIER };
 }

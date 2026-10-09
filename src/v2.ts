@@ -23,6 +23,8 @@ export default {
     let observeHostBudget: ((childSessionID: string, stepLimit: number | null) => boolean | "unobserved") | undefined;
     let roleLive: ((agent: string) => boolean) | undefined;
     let verifyEnabled: (() => boolean) | undefined;
+    // QA-G-A3-2: the plugin's count of a role child's call refused outside its guard (role-authority refusals, permission denials).
+    let recordRefusal: ((sessionID: string, agent: string | undefined, tool: string, args: unknown) => string | undefined) | undefined;
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
@@ -48,11 +50,13 @@ export default {
       // QA-P21-2-4: the adapter's "this role agent is registered" check; QA-P21-2 nit 3: whether router_verify is registered.
       routerRoleLive: (agent: string) => roleLive?.(agent),
       routerOnVerifyEnabled: (read: () => boolean) => { verifyEnabled = read; },
+      routerOnRefusal: (record: NonNullable<typeof recordRefusal>) => { recordRefusal = record; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     return registerV2Hooks(ctx, hooks, runtime, {
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),
       ...(verifyEnabled ? { routerVerifyEnabled: verifyEnabled } : {}),
+      ...(recordRefusal ? { recordRefusal } : {}),
       onHostBudget: (observe) => { observeHostBudget = observe; },
       onRoleLive: (isLive) => { roleLive = isLive; },
     });

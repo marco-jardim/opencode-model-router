@@ -40,6 +40,9 @@ import {
   type TierBoundsOptions,
 } from "../../src/routing/roles/policy";
 import type { RouteLine } from "../../src/routing/classify/types";
+import { resolveRoles } from "../../src/router/roles";
+import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
+import { pendingResumeRaise, resetDispatchRouting, roleEscalationAfterFail } from "../../src/routing/wire/dispatch";
 
 /** `tierBounds` on a classify shape built from plain facts (and an optional route line), with an effective detection. */
 function tierBounds(spec: RoleSpec, grant: DispatchGrant, f: TaskFacts, d: Detection, o: TierBoundsOptions & { routeLine?: Partial<RouteLine> | null }) {
@@ -554,13 +557,53 @@ describe("simulate == runner on role ladders", () => {
   });
 
   it("the window policy never escalates above the ceiling (the unrestricted one does)", () => {
+    // QA-G-B-6: one attempt per tier (the runtime's raise path), whatever the escalate config's retries and attempt cap say.
     const single = cfgOf(TIERS, { maxAttemptsPerTier: 1, maxTotalAttempts: 6, costCeiling: { multiple: 1000 } });
     const walk = (window: RoleWindow): string[] => {
       const ladder = buildRoleLadder({ cfg: single, facts: { class: "implement", needs: [] }, role: "implementer", window });
       return ladder.paths![0]!.map((j) => ladder.candidates[j]!.tier);
     };
-    expect(walk(win("fast", "medium"))).toEqual(["fast", "fast", "medium", "medium"]);
-    expect(walk(win("fast", "heavy"))).toEqual(["fast", "fast", "medium", "medium", "heavy", "heavy"]);
+    expect(walk(win("fast", "medium"))).toEqual(["fast", "medium"]);
+    expect(walk(win("fast", "heavy"))).toEqual(["fast", "medium", "heavy"]);
+  });
+
+  it("QA-G-B-6: every priced path is the runtime's raise path (roleEscalationAfterFail: one tier per FAIL up to the ceiling)", () => {
+    // A config whose escalate policy retries, steps variants (session) and caps attempts: none of it applies to a role dispatch.
+    const cfg = { ...cfgOf(TIERS, { maxAttemptsPerTier: 2, maxTotalAttempts: 2, costCeiling: { multiple: 1.5 } }), routing: { delegation: "roles" } } as RouterConfig;
+    const session = { host: "v2" as const, catalog: () => ({ variants: [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "xhigh" }], limit: { context: 200_000, output: 32_000 } }) } as unknown as Parameters<typeof roleEscalatePolicy>[2];
+    const roles = resolveRoles(cfg, "v2");
+    expect(roles.size).toBeGreaterThan(0);
+    const order = roleTierOrder(cfg);
+    const facts = { class: "implement", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" } as const;
+    let checked = 0;
+    try {
+      for (const spec of roles.values()) {
+        const window: RoleWindow = { floor: spec.tierRange.floor, ceiling: spec.tierRange.ceiling, pinned: null };
+        const ladder = buildRoleLadder({ cfg, facts: { class: "implement", needs: [] }, role: spec.agent, window, session });
+        const all = [...ladder.candidates, ...(ladder.reachable ?? [])];
+        ladder.candidates.forEach((start, k) => {
+          const priced = ladder.paths![k]!.map((j) => all[j]!.tier);
+          // The runtime: a FAIL records the next tier of the role's range; the child's next resume runs on it.
+          const child = `qa-g-b6-${spec.agent}-${k}`;
+          const runtime = [start.tier];
+          for (let i = 0; i < order.length + 1; i++) {
+            resetDispatchRouting(); // a routed resume consumes the raise it applied
+            rememberDispatch(child, { facts, agent: spec.agent, model: start.model, tier: runtime.at(-1)!, parentSessionID: "root" });
+            expect(roleEscalationAfterFail(cfg, child, "root")).not.toBeNull();
+            const raised = pendingResumeRaise(child, "root");
+            if (raised === null) break;
+            runtime.push(raised);
+          }
+          expect(priced, `${spec.agent} from ${start.tier}:${start.model}#${start.variant ?? "default"}`).toEqual(runtime);
+          expect(runtime.at(-1)).toBe(spec.tierRange.ceiling);
+          checked += 1;
+        });
+      }
+    } finally {
+      resetDispatchRouting();
+      resetDispatchRegistry();
+    }
+    expect(checked).toBeGreaterThan(0);
   });
 
   it("no policy for a floor off the escalate ladder", () => {

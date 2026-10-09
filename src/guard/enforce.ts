@@ -6,6 +6,7 @@ import {
   forcingMessage,
   observationOk,
   guardStopped,
+  deniedCapDecision,
 } from "./guards";
 import type { GuardPolicy, GuardCall, GuardState } from "./guards";
 import { scrubText } from "./scrub";
@@ -191,7 +192,8 @@ export function formatScorecard(state: GuardState, tier: string | null): string 
  * mode this returns immediately WITHOUT creating guard state, so the after-hook
  * stays a no-op and behaviour is byte-identical (GA-1).
  */
-export function guardBeforeCall(params: {
+/** The inputs of one guarded call (the before-hook's, and those of a call refused outside the guard). */
+export interface GuardCallParams {
   cfg: RouterConfig;
   tier: string | null;
   sessionID: string;
@@ -204,16 +206,18 @@ export function guardBeforeCall(params: {
   profile?: GuardProfile;
   /** The current dispatch round's honoured CAP directive (sessions.ts getCap); "none" = CAP:none + reason:. */
   cap?: Cap | null;
-}): BeforeResult {
-  const { cfg, tier, sessionID, tool, toolArgs, store, env, trivial, profile, cap } = params;
-  let mode = resolveEnforcementMode({ config: cfg, tier: tier ?? undefined, env }).mode;
-  if (
-    mode === "enforced" &&
-    trivial === true &&
-    cfg.enforcement?.proportional?.trivialBypass !== false
-  ) {
-    mode = "advisory";
-  }
+}
+
+/** The enforcement mode of a guarded call: a trivial dispatch's enforced mode is advisory (unless trivialBypass is off). */
+function callMode(params: Pick<GuardCallParams, "cfg" | "tier" | "env" | "trivial">): EnforcementMode {
+  const { cfg, tier, env, trivial } = params;
+  const mode = resolveEnforcementMode({ config: cfg, tier: tier ?? undefined, env }).mode;
+  return mode === "enforced" && trivial === true && cfg.enforcement?.proportional?.trivialBypass !== false ? "advisory" : mode;
+}
+
+export function guardBeforeCall(params: GuardCallParams): BeforeResult {
+  const { cfg, tier, sessionID, tool, toolArgs, store, profile, cap } = params;
+  const mode = callMode(params);
   if (mode === "off") return { block: false, mode };
 
   const policy = buildGuardPolicy(cfg, tier, profile);
@@ -246,6 +250,36 @@ export function guardBeforeCall(params: {
     scrubText(`[\u26a0 GUARD:${decision.guard}] ${forcingMessage(state, policy)}`),
   );
   return { block: false, mode, guard: decision.guard };
+}
+
+/**
+ * QA-G-A3-2 (§2.9 E6, R7 REFUSAL_CAP): a call refused OUTSIDE the guard — the router's role-authority check in the v2 adapter's
+ * `execute.before` (thrown before the guard's own before-hook runs) or a host permission denial — is a refused call of the
+ * child's dispatch round all the same. It is counted like the guard's own refusals (`recordDenied`: not charged to the budget,
+ * not recorded as executed), in every mode but `off` (the refusal is real whatever the guard's mode), so `denied_cap` bounds a
+ * child that keeps retrying refused actions. Once the round's refusals are spent (CLAUSE 3c):
+ * - enforced: the guard stops the child as its before-hook would on the next call (`stopped`, denied_cap; budgetExhausted);
+ * - advisory: nothing is stopped; the would-stop is recorded and its banner returned.
+ * Returns the guard's text to add to the refusal the child sees (the denied_cap refusal, or the advisory banner), else
+ * undefined. Off mode: nothing at all (no guard state, GA-1).
+ */
+export function guardRefusedCall(params: GuardCallParams): string | undefined {
+  const { cfg, tier, sessionID, tool, toolArgs, store, profile, cap } = params;
+  const mode = callMode(params);
+  if (mode === "off") return undefined;
+  const policy = buildGuardPolicy(cfg, tier, profile);
+  const state = store.ensure(sessionID, policy);
+  trackBudget(sessionID, state, policy);
+  if (isReaderDispatch(cfg, tier, sessionID, profile, cap)) policy.reader = true;
+  recordDenied(state, { tool, args: (toolArgs ?? {}) as Record<string, unknown> }, policy);
+  const decision = deniedCapDecision(state, policy);
+  if (decision === null) return undefined;
+  recordBlock(state, decision);
+  if (mode === "enforced") {
+    state.stopped = { round: state.dispatches, guard: "denied_cap" };
+    return scrubText(`${decision.observation}\n${forcingMessage(state, policy)}`);
+  }
+  return scrubText(`[\u26a0 GUARD:${decision.guard}] ${forcingMessage(state, policy)}`);
 }
 
 /**

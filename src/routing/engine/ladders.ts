@@ -570,22 +570,27 @@ export function roleTierOrder(cfg: RouterConfig, _session?: LadderSessionPolicyI
 }
 
 /**
- * The escalation policy of a role dispatch: `buildEscalatePolicy(cfg, session)` with its ladder restricted to the tiers
- * of `[floor, ceiling]` on {@link roleTierOrder} and `floorTier` = the window floor, so the runner never escalates above
- * the ceiling nor starts below the floor (I2). The role runner (P2.1) and {@link buildRoleLadder}'s simulated paths use
- * this one policy, which is what makes `simulate.ts` equal to the runner on role ladders. `null` when the floor is not on
- * the order: P2.1 then refuses the role dispatch — it never falls back to the unrestricted `buildEscalatePolicy`.
+ * The escalation policy of a role dispatch, as the runtime escalates one (QA-G-B-6): after a verification FAIL the router raises
+ * the child to the NEXT tier of the role's range on its next resume (`roleEscalationAfterFail` / `nextRoleTier`, dispatch.ts) —
+ * one tier per FAIL, never a retry on the same tier, no variant step, no effort bump, no attempt or cost ceiling — and nothing
+ * above the ceiling. So: the ladder = the tiers of `[floor, ceiling]` on {@link roleTierOrder}, `floorTier` = the window floor
+ * (the runner never starts below the floor nor escalates above the ceiling, I2), `maxAttemptsPerTier` 0, `maxTotalAttempts` =
+ * one attempt per tier of the window, no `costMultiple`, `effortBump` or `variants`. {@link buildRoleLadder}'s simulated paths
+ * price role candidates with this one policy, so they price exactly the raise path the runtime takes (one attempt on each tier
+ * from the start tier up to the ceiling, each on the tier's base rung). `null` when the floor is not on the order: P2.1 then
+ * refuses the role dispatch — it never falls back to the unrestricted `buildEscalatePolicy`. (`session` only names the tier
+ * order's input; the session's variant steps never apply to a role dispatch.)
  */
 export function roleEscalatePolicy(
   cfg: RouterConfig,
   window: Pick<RoleWindow, "floor" | "ceiling">,
   session?: LadderSessionPolicyInput,
 ): EscalatePolicy | null {
-  const policy = buildEscalatePolicy(cfg, session);
   const order = roleTierOrder(cfg, session);
   const span = windowSpan(order, window);
   if (span === null) return null;
-  return { ...policy, ladder: order.slice(span.floor, span.ceiling + 1), floorTier: order[span.floor]! };
+  const ladder = order.slice(span.floor, span.ceiling + 1);
+  return { ladder, floorTier: order[span.floor]!, maxAttemptsPerTier: 0, maxTotalAttempts: ladder.length, costMultiple: null };
 }
 
 /**

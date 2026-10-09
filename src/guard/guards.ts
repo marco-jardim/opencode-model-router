@@ -237,13 +237,8 @@ export function evaluateGuards(
   // (§2.9 E6), so a model that keeps repeating refused calls would never reach
   // CLAUSE 3; after min(budget, REFUSAL_CAP) refusals in this dispatch every
   // call is refused (QA-P15-1-4).
-  if (refusalsSpent(state)) {
-    return {
-      allow: false,
-      guard: "denied_cap",
-      observation: `DENIED: ${deniedThisDispatch(state)} refused tool calls in this dispatch (limit ${refusalCap(state)}). ${stopInstruction(policy)}`,
-    };
-  }
+  const deniedCap = deniedCapDecision(state, policy);
+  if (deniedCap !== null) return deniedCap;
 
   // CLAUSE 4: redundancy
   if (kind === "read" && (state.seen.get(fp) ?? 0) >= policy.sameOpRetryCap) {
@@ -366,6 +361,16 @@ export function refusalCap(state: GuardState): number {
 export function refusalsSpent(state: GuardState): boolean {
   const denied = deniedThisDispatch(state);
   return denied >= refusalCap(state) && state.toolCallCount + denied >= state.budget;
+}
+
+/** CLAUSE 3c's refusal once this round's refusals are spent ({@link refusalsSpent}), else null. */
+export function deniedCapDecision(state: GuardState, policy: GuardPolicy): GuardDecision | null {
+  if (!refusalsSpent(state)) return null;
+  return {
+    allow: false,
+    guard: "denied_cap",
+    observation: `DENIED: ${deniedThisDispatch(state)} refused tool calls in this dispatch (limit ${refusalCap(state)}). ${stopInstruction(policy)}`,
+  };
 }
 
 /** Budget or refusals used up (validates a `NEED MORE: budget` claim; not itself a stop). */

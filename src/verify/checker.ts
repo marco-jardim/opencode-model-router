@@ -11,6 +11,7 @@ import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
 import { captureBudget } from "../guard/enforce";
 import type { BudgetSnapshot } from "../guard/enforce";
 import { parseReturnPrefix } from "../routing/outcomes/signals";
+import { oneLineReason } from "../routing/roles/authority";
 
 // ---------------------------------------------------------------------------
 // Incomplete returns (§2.9 E8, I7)
@@ -138,6 +139,17 @@ function incomplete(reason: string): Verdict {
  */
 function claimHonoured(snapshot: BudgetSnapshot): boolean {
   return !snapshot.tracked || snapshot.usedUp || snapshot.readCapReached === true;
+}
+
+/**
+ * QA-G-A3-1 (I7, §2.6): a budget stop the guard did not enforce. In advisory mode (the shipped default) nothing is refused, so
+ * the guard never records a stop: its banner only TELLS a child out of budget to return `NEED MORE: budget`. Such a return is
+ * an observed budget stop when the gate would honour the claim (`claimsNeedMoreBudget` + `claimHonoured`) on a session the guard
+ * TRACKED — its budget or refusals used up, or its read cap reached. An untracked session backs no claim here (nothing was
+ * observed; the outcome signals keep it `unobserved`).
+ */
+export function budgetClaimObserved(text: string | null | undefined, snapshot: BudgetSnapshot): boolean {
+  return snapshot.tracked && typeof text === "string" && claimsNeedMoreBudget(text) && claimHonoured(snapshot);
 }
 
 /**
@@ -389,6 +401,26 @@ export function parseGraderVerdict(text: string): { pass: boolean; reasons: stri
   }
 }
 
+/** QA-G-A3-5: the most grader reasons a verdict keeps; the rest are counted in one closing reason. */
+export const GRADER_REASONS_MAX = 20;
+
+/**
+ * QA-G-A3-5: one grader-written text as one reason — scrubbed first (a cut never leaves half a secret), then `cleanReason`'s line
+ * rule (`oneLineReason`, authority.ts): one line, at most 500 characters. The grader's text is model output the producer's
+ * artefact can steer, so it never reaches the parent's result as several lines (a line of its own could pose as a router note).
+ * Its characters are kept (`[REDACTED]`, `a[0]`): a one-line reason within the cap reads as before, in tiers mode too.
+ */
+function graderText(text: string): string {
+  return oneLineReason(scrubText(text));
+}
+
+/** QA-G-A3-5: the grader's reasons, each {@link graderText}, at most {@link GRADER_REASONS_MAX} (then one count of the rest). */
+function graderReasons(reasons: readonly string[]): string[] {
+  const kept = reasons.slice(0, GRADER_REASONS_MAX).map(graderText);
+  const rest = reasons.length - kept.length;
+  return rest > 0 ? [...kept, `(${rest} more grader reason${rest === 1 ? "" : "s"} omitted)`] : kept;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -465,7 +497,7 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
       method: "checker",
       reasons: [
         "could not parse grader verdict; defaulting to FAIL",
-        scrubText(res.text.slice(0, 300)),
+        graderText(res.text.slice(0, 300)),
       ],
       grader,
     };
@@ -478,7 +510,7 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     pass: parsed.pass === true && !partial,
     outcome: parsed.pass ? (partial ? "unverifiable" : "pass") : "fail",
     method: "checker",
-    reasons: parsed.reasons.map(scrubText),
+    reasons: graderReasons(parsed.reasons),
     evidence: scrubText("grader=" + graderTier),
     ...(partial ? { caveats: [omittedNote(omitted)] } : {}),
     grader,

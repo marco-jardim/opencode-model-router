@@ -296,7 +296,7 @@ export interface RoleLadderTier {
 /**
  * The candidate graph of a role dispatch (T1.2.3): the rungs of every tier in `[floor, ceiling]`, all run by the role agent
  * (`AgentRef` origin `role`, outcome keys `class|role:<agent>|provider/model#variant`). Every rung is priced through its
- * simulated runner path under `ladders.roleEscalatePolicy` (the escalate policy restricted to the window).
+ * simulated runner path under `ladders.roleEscalatePolicy` (the runtime's raise path: one tier per FAIL up to the ceiling).
  */
 export interface RoleLadder extends Ladder {
   /** The role agent. */
