@@ -13,13 +13,18 @@
  * created while a view needs them), else from the message/session variant.
  *
  * No JSX: views are built with the `@opentui/solid` reconciler primitives and `solid-js`, the only runtime imports
- * besides `./status-model` and `./effort-rpc` (both import-free). Every host member is feature-detected; `setup` never
- * throws and never calls rpc; a view never throws (errors render no rows and are logged once per area with
- * `console.warn`, the context has no logging API).
+ * besides `./status-model.ts` and `./effort-rpc.ts` (both import-free). Relative specifiers carry the explicit `.ts`
+ * extension: the host loads this file from `node_modules` and, for an extensionless one, resolves the bare imports
+ * outside its own runtime (`Cannot find package 'solid-js'`, A9 run on 2.0.24–2.0.26).
+ *
+ * Every host member is feature-detected; `setup` never throws and never calls rpc; a view never throws (errors render
+ * no rows). Reporting: the host swallows a TUI plugin's `console` output, so the two notices the user must see (invalid
+ * options, and a render without a Solid owner) go to `ui.toast` (once each, `console.warn` as a second sink); every
+ * other error is logged once per area with `console.warn` only (the context has no logging API).
  */
 import { createMemo, createRenderEffect, createRoot, createSignal, getOwner, onCleanup, untrack } from "solid-js";
 import { createElement, insert, setProp } from "@opentui/solid";
-import { effortRpc } from "./effort-rpc";
+import { effortRpc } from "./effort-rpc.ts";
 import type {
   ComposerTopInput,
   HostClient,
@@ -31,7 +36,7 @@ import type {
   HostSession,
   HostSlotClaim,
   PromptFooterInput,
-} from "./host-types";
+} from "./host-types.ts";
 import {
   childStatus,
   DEFAULT_EFFORT,
@@ -44,7 +49,7 @@ import {
   type CurrentModel,
   type SessionStatus,
   type StatusOptions,
-} from "./status-model";
+} from "./status-model.ts";
 
 /** The TUI plugin id (A4): deliberately not the package name. */
 export const STATUS_PLUGIN_ID = "opencode-model-router.status";
@@ -133,28 +138,46 @@ function describeError(error: unknown): string {
   }
 }
 
-/** One `console.warn` per key for the lifetime of a `setup`. */
+/** Once-per-key reports for the lifetime of a `setup`. */
 interface Log {
-  /** `model-router status: <area> failed: <error>`, once per area. */
+  /** `model-router status: <area> failed: <error>`, once per area, `console.warn` only (invisible on the host). */
   failed(area: string, error: unknown): void;
-  /** `model-router status: <message>`, once per key. */
-  notice(key: string, message: string): void;
+  /**
+   * A notice the user must see, once per key: shown with `toast` (the visible channel; the host swallows console
+   * output), then written with `console.warn`. `text` is the full line, `model-router status: …` included.
+   */
+  notice(key: string, text: string): void;
 }
 
-function createLog(): Log {
+/** @param toast shows a warning toast; may throw (logged as `notice failed`). */
+function createLog(toast: (message: string) => void): Log {
   const seen = new Set<string>();
-  const once = (key: string, text: () => string): void => {
-    if (seen.has(key)) return;
+  const first = (key: string): boolean => {
+    if (seen.has(key)) return false;
     seen.add(key);
+    return true;
+  };
+  const warn = (text: string): void => {
     try {
-      console.warn(`${STATUS_NOTICE_PREFIX}${text()}`);
+      console.warn(text);
     } catch {
       // No console: nothing else to report to.
     }
   };
+  const failed = (area: string, error: unknown): void => {
+    if (first(`failed:${area}`)) warn(`${STATUS_NOTICE_PREFIX}${area} failed: ${describeError(error)}`);
+  };
   return {
-    failed: (area, error) => once(`failed:${area}`, () => `${area} failed: ${describeError(error)}`),
-    notice: (key, message) => once(`notice:${key}`, () => message),
+    failed,
+    notice: (key, text) => {
+      if (!first(`notice:${key}`)) return;
+      try {
+        toast(text);
+      } catch (error) {
+        failed("notice", error);
+      }
+      warn(text);
+    },
   };
 }
 
@@ -738,7 +761,7 @@ function staticView(compute: (views: Views) => Rows, area: string, views: Views)
 function rowsView(compute: (views: Views) => Rows, area: string, views: Views): unknown {
   try {
     if (getOwner() === null) {
-      views.log.notice("owner", NO_OWNER_NOTICE);
+      views.log.notice("owner", `${STATUS_NOTICE_PREFIX}${NO_OWNER_NOTICE}`);
       return staticView(compute, area, views);
     }
     const rows = createMemo<Rows>(
@@ -831,7 +854,7 @@ function register(context: HostContext | undefined, claim: HostSlotClaim, cleanu
  * claims, the pollers with their timers and calls, and the resize listener. Never throws; makes no rpc call.
  */
 function setup(context: HostContext | undefined): () => void {
-  const log = createLog();
+  const log = createLog((message) => context?.ui?.toast?.show?.({ message, variant: "warning" }));
   const cleanups: Array<() => void> = [];
   let closed = false;
   const cleanup = (): void => {
@@ -847,13 +870,8 @@ function setup(context: HostContext | undefined): () => void {
   };
   try {
     const { options, notices } = parseOptions(context?.options);
-    if (notices.length > 0) {
-      try {
-        context?.ui?.toast?.show?.({ message: notices[0], variant: "warning" });
-      } catch (error) {
-        log.failed("notice", error);
-      }
-    }
+    // parseOptions gives at most one notice, already prefixed with `model-router status: `.
+    if (notices.length > 0) log.notice("options", notices[0]);
     if (!options.enabled || !(options.footer || options.childView || options.runningRow)) return cleanup;
 
     /**

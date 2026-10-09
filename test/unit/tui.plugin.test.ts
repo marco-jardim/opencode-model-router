@@ -391,15 +391,23 @@ describe("registration (D7, A4)", () => {
     expect(fake.claims.map((claim) => claim.append)).toEqual(expected);
   });
 
-  it("shows one warning toast for invalid options and keeps the defaults", () => {
+  it("shows one warning toast for invalid options, also on the console, and keeps the defaults", () => {
     const fake = fakeHost({ options: { footer: "yes", maxRows: 99, colour: 1 } });
     start(fake);
+    const notice =
+      'model-router status: invalid TUI options ("footer" must be true or false; "maxRows" must be an integer from 1 to 20; unknown keys "colour"); using defaults for those keys';
     expect(fake.toast).toHaveBeenCalledTimes(1);
-    expect(fake.toast).toHaveBeenCalledWith({
-      message: expect.stringMatching(/^model-router status: invalid TUI options \(/),
-      variant: "warning",
-    });
+    expect(fake.toast).toHaveBeenCalledWith({ message: notice, variant: "warning" });
+    // The host swallows plugin console output: the toast is the visible channel, the console a second sink.
+    expect(warnings()).toEqual([notice]);
     expect(fake.claims.map((claim) => claim.append)).toEqual([FOOTER_SLOT, COMPOSER_SLOT]);
+  });
+
+  it("shows no options toast for valid options", () => {
+    const fake = fakeHost({ options: { maxRows: 2, footer: false } });
+    start(fake);
+    expect(fake.toast).not.toHaveBeenCalled();
+    expect(warnings()).toEqual([]);
   });
 
   it("shows the notice and claims nothing when disabled with an invalid key", () => {
@@ -1130,6 +1138,7 @@ describe("feature detection and error isolation", () => {
     expect(() => cleanup()).not.toThrow();
     expect(warnings()).toEqual([
       "model-router status: notice failed: no toast",
+      'model-router status: invalid TUI options (unknown keys "bogus"); using defaults for those keys',
       "model-router status: slot prompt.footer.status failed: no slots",
       "model-router status: slot session.composer.top failed: no slots",
     ]);
@@ -1178,6 +1187,9 @@ describe("feature detection and error isolation", () => {
     expect(textNodes(footer).map((node) => [node.props.wrapMode, node.props.fg])).toEqual([["none", "muted"]]);
     const child = claimFor(fake.claims, COMPOSER_SLOT).render(composerInput(() => CHILD));
     expect(rowsOf(child)).toEqual(["explore · Claude Sonnet 4 · low"]);
+    // Shown once as a toast (the host swallows console output), across both renders; the console is a second sink.
+    expect(fake.toast).toHaveBeenCalledTimes(1);
+    expect(fake.toast).toHaveBeenCalledWith({ message: OWNER_WARNING, variant: "warning" });
     expect(warnings()).toEqual([OWNER_WARNING]);
     expect(NO_OWNER_NOTICE).toBe(OWNER_WARNING.replace("model-router status: ", ""));
     fake.setCurrent({ providerID: OPUS.providerID, modelID: OPUS.id, variant: "high" });
@@ -1198,8 +1210,36 @@ describe("feature detection and error isolation", () => {
     expect(rowsOf(composer.render(composerInput(() => CHILD)))).toEqual(["explore · Claude Sonnet 4 · low"]);
     expect(rowsOf(claimFor(fake.claims, FOOTER_SLOT).render(footerInput(() => ROOT)))).toEqual(["effort default"]);
     expect(warnings()).toEqual([OWNER_WARNING]);
+    expect(fake.toast).toHaveBeenCalledTimes(1);
     // With an owner, the same root shows the running delegate.
     expect(mountComposer(fake.claims, () => ROOT).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+  });
+
+  it("shows the options and owner notices as one toast each, in that order", () => {
+    const fake = fakeHost({ options: { bogus: 1 } });
+    start(fake);
+    claimFor(fake.claims, FOOTER_SLOT).render(footerInput(() => ROOT));
+    claimFor(fake.claims, FOOTER_SLOT).render(footerInput(() => ROOT));
+    expect(fake.toast.mock.calls).toEqual([
+      [{ message: 'model-router status: invalid TUI options (unknown keys "bogus"); using defaults for those keys', variant: "warning" }],
+      [{ message: OWNER_WARNING, variant: "warning" }],
+    ]);
+  });
+
+  it("writes the owner notice to the console when the host has no toast", () => {
+    const claims: HostSlotClaim[] = [];
+    teardown.push(
+      plugin.setup({
+        ui: {
+          slot: (claim) => {
+            claims.push(claim);
+            return undefined;
+          },
+        },
+      }),
+    );
+    expect(() => claimFor(claims, FOOTER_SLOT).render(footerInput(() => ROOT))).not.toThrow();
+    expect(warnings()).toEqual([OWNER_WARNING]);
   });
 
   it("renders no rows and warns once per view when data.session.get throws", () => {

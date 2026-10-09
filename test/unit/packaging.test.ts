@@ -116,10 +116,14 @@ function specifiersOf(text: string): string[] {
   return [...stripComments(text).matchAll(pattern)].map((match) => match[1]!);
 }
 
-/** Every file the TUI entry reaches through relative imports, and every bare specifier on the way. */
-function tuiClosure(read: (path: string) => string): { files: string[]; bare: string[] } {
+/**
+ * Every file the TUI entry reaches through relative imports, every bare specifier on the way, and every relative
+ * specifier as `<file> -> <specifier>`.
+ */
+function tuiClosure(read: (path: string) => string): { files: string[]; bare: string[]; relative: string[] } {
   const files = new Set<string>();
   const bare = new Set<string>();
+  const relative: string[] = [];
   const pending = ["tui.ts"];
   while (pending.length > 0) {
     const file = pending.pop()!;
@@ -130,11 +134,12 @@ function tuiClosure(read: (path: string) => string): { files: string[]; bare: st
         bare.add(specifier);
         continue;
       }
+      relative.push(`${file} -> ${specifier}`);
       const base = posix.normalize(posix.join(posix.dirname(file), specifier));
       pending.push(base.endsWith(".ts") ? base : `${base}.ts`);
     }
   }
-  return { files: [...files].sort(), bare: [...bare].sort() };
+  return { files: [...files].sort(), bare: [...bare].sort(), relative: relative.sort() };
 }
 
 const TUI_CLOSURE = ["src/tui/effort-rpc.ts", "src/tui/host-types.ts", "src/tui/plugin.ts", "src/tui/status-model.ts"] as const;
@@ -175,9 +180,10 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     expect(pkg.bundledDependencies).toBeUndefined();
   });
 
-  it("root tui.ts only re-exports the default of ./src/tui/plugin", () => {
+  it("root tui.ts only re-exports the default of exactly ./src/tui/plugin.ts", () => {
     expect(existsSync("tui.ts")).toBe(true);
-    expect(stripComments(read("tui.ts")).trim()).toMatch(/^export \{ default \} from "\.\/src\/tui\/plugin(?:\.ts)?";$/);
+    // The explicit extension is what makes the host load it from node_modules (A9 run, 2.0.24–2.0.26).
+    expect(stripComments(read("tui.ts")).trim()).toBe('export { default } from "./src/tui/plugin.ts";');
   });
 
   it("the TUI closure reaches only its own modules, solid-js and @opentui/solid", () => {
@@ -186,14 +192,25 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     expect(closure.bare).toEqual(["@opentui/solid", "solid-js"]);
   });
 
+  it("every relative specifier in the TUI closure carries the explicit .ts extension", () => {
+    const { relative } = tuiClosure(read);
+    expect(relative).toEqual([
+      "src/tui/plugin.ts -> ./effort-rpc.ts",
+      "src/tui/plugin.ts -> ./host-types.ts",
+      "src/tui/plugin.ts -> ./status-model.ts",
+      "tui.ts -> ./src/tui/plugin.ts",
+    ]);
+    expect(relative.filter((edge) => !edge.endsWith(".ts"))).toEqual([]);
+  });
+
   it("each TUI module imports exactly what it may", () => {
     expect(specifiersOf(read("src/tui/status-model.ts"))).toEqual([]);
     expect(specifiersOf(read("src/tui/effort-rpc.ts"))).toEqual([]);
     expect(specifiersOf(read("src/tui/host-types.ts"))).toEqual([]);
     expect([...new Set(specifiersOf(read("src/tui/plugin.ts")))].sort()).toEqual([
-      "./effort-rpc",
-      "./host-types",
-      "./status-model",
+      "./effort-rpc.ts",
+      "./host-types.ts",
+      "./status-model.ts",
       "@opentui/solid",
       "solid-js",
     ]);
