@@ -74,3 +74,31 @@ adds a blank line above the prompt in the main session (post-release; a gap is f
 
 RELEASABLE. F1 README v1-freeze link moved to `CHANGELOG.md#250---2026-10-09` with a docs-drift pin; F2 added to the
 residuals above; F3 accepted (2.0.20–2.0.23 behaviour is in `docs/TUI_STATUS.md`); F4, F5 plan text fixed.
+
+## Release (P3.2)
+
+- PR #91 merged with a merge commit: `master` `5212233`. CI green on the PR head (after re-running one #88 flake,
+  `verify-resource-budget.bound.test.ts:785`) and on the merge SHA (Test, smoke-keyless, CodeQL).
+- Capped full suite on `master` content (local, `--maxWorkers=8`): 182 files passed, 3 skipped; 13360 tests passed;
+  one failure in `test/unit/exec.test.ts` (`lowPriority › runs grandchildren of runArgv below normal priority`, known
+  WMI flake), green alone (42 passed, 2 skipped).
+- Base checkout `D:\git\opencode-model-router` → `master` `5212233`; owner restart; liveness: `/router` shows
+  `build=2.5.0+5212233`, host log `loading plugin … entrypoint=…/server.ts`, no plugin load failure after the restart.
+- Owner answer: "retomar e publicar". Tag `v2.5.0` on `5212233`; `Publish Package` run 37968910142 succeeded with
+  provenance (sigstore log index 3168918435); `npm view opencode-model-router` → `latest` `2.5.0`, integrity
+  `sha512-nuBoEV7y9QIVUJbBV1MmDaIwoVeCjx6z6hSYEthVRER4chQ/0V+HIXglR7AXKP40OdWkP7elMYsZ7MEV3iOUhQ==`.
+- A13a bare-name check (isolated HOMEs, server config `"plugins": ["opencode-model-router"]`, no `cli.json`): PASS on
+  2.0.24, 2.0.25 and 2.0.26 — the host installed 2.5.0 under `<HOME>\.cache\opencode\npm\opencode-model-router@latest\…`,
+  loaded `server.ts`, auto-loaded the TUI entry; footer `effort default`; `/plugins` rows
+  `TUI opencode-model-router.status` and `Server opencode-model-router 2.5.0`; no plugin failure; no `solid-js` next to
+  the package.
+- Clean install `npm install opencode-model-router@2.5.0 --ignore-scripts` (isolated cache): no `dependencies`; the 27
+  other top-level packages come from the `@opencode-ai/plugin` peer (1.18.35), including `effect`; no `solid-js`,
+  `@opentui/*` or `@opencode/plugin`.
+
+## Residuals carried after the release
+
+- GA-3: `effortOf` for a session of another directory not run on a host (bounded retry or fallback).
+- C-7: the `-opencode-model-router.status` selector and its placement rule are cited from host source only.
+- The owner's check whether the empty composer box adds a blank line in the main session (G3 off).
+- Follow-ups (issue): `RoutingHost.doStop` still uses `taskkill /T`; the v1 keyless smokes are not env-isolated.

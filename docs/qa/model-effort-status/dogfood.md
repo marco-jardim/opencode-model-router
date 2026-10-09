@@ -37,3 +37,8 @@
   recorded in `global.md`).
 - Whether the empty composer box in the main session (G3 off) adds a blank line above the prompt box is not yet seen
   by the owner: checked after the release restart.
+
+## Release restart (`5212233`)
+
+`/router` → `router: engine=enforce build=2.5.0+5212233`. G3 is off by default since A12; the owner confirmed the
+release restart and asked to publish.
