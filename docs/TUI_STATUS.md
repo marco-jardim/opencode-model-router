@@ -44,7 +44,8 @@ footer shows `effort default`. Root sessions normally show `effort default` (see
 When you open a delegated (child) session, for example from the host's subagent picker, a row above the composer
 (slot `session.composer.top`) shows `<agent> · <model> · <effort>`:
 
-- `<agent>`: the session's agent, else the agent of its latest assistant message; left out when neither is known.
+- `<agent>`: the session's agent, else the agent of its latest assistant message, else the session title, else
+  `subagent` (as in the running-delegates rows).
 - `<model>`: the model of the latest assistant message; before the first one, the child session's model. It is the
   model's display name from the model list, else its raw id, with ` (<providerID>)` appended when a model of another
   provider has the same name.
@@ -170,9 +171,11 @@ record (`{}` when it knows nothing about the session). On the verified hosts the
 provider received.
 
 The TUI calls `effortOf` while a view needs the session: the first call right away, then again, at most every 5 s,
-when the session's status or latest message changes, and every 5 s while the session runs. When the rpc is not
-available yet, or a call times out, it retries with backoff (1 s, doubling up to 30 s). After any other error it stops
-asking about that session for at least 30 s.
+when the session's status or latest message changes, and every 5 s while the session runs. While a running session
+has not reported an effort yet, an answer without one is followed by another call after 1 s, at most 3 times per
+session. A view that is closed and opened again shows the session's last answer at once, before its next call. When
+the rpc is not available yet, or a call times out, it retries with backoff (1 s, doubling up to 30 s). After any other
+error it stops asking about that session for at least 30 s.
 
 While the channel has no answer for a session (an older router version, the rpc not registered, an error, or a turn
 without an effort), the footer shows `effort default`, and the delegated session and running-delegate rows show the
@@ -195,6 +198,8 @@ message's variant, else `default`.
 - **The host resolves a package-name entry itself.** For an entry in `cli.json` that names the package, OpenCode
   resolves the package on its own and may install it, so the TUI can run another version of the package than the
   server entry. A local directory path is used as it is and avoids this.
+- **Verified on OpenCode 2.0.24–2.0.26.** On 2.0.20–2.0.23 the TUI entry is not verified; if it fails to load there,
+  the host shows `Plugin failed` and the server plugin keeps working.
 
 ## Troubleshooting
 
@@ -204,9 +209,9 @@ message's variant, else `default`.
   `Plugin failed: <path>` (for example `Plugin failed: C:\Users\…`), the footer marker `⊙ 1 plugin failed /plugins`,
   and, in the `/plugins` dialog under `TUI`, a row `x <path> failed, local` instead of the row above. Check that the
   server entry loads (the peer dependency) and that a local-path entry names the package directory.
-- **A `model-router status: render has no Solid owner: …` toast.** The views were then rendered once and do not
-  update: the rows show no router effort, and the running-delegates row stays hidden. The toast's named cause (a
-  local `node_modules/solid-js`) was not reproduced. Update OpenCode; if the toast persists, report it.
+- **A `model-router status: render has no Solid owner: the views are static (no live updates)` toast.** The views
+  were then rendered once and do not update: the rows show no router effort, and the running-delegates row stays
+  hidden. Update OpenCode; if the toast persists, report it.
 - **Nothing shows.** Check that the package is listed in `opencode.json` `plugins` and that the server entry loads (the
   peer dependency), that `cli.json` has no `"enabled": false` and no `"-opencode-model-router.status"`, and that a
   local-path entry names the package directory, not `tui.ts`. The footer shows nothing while a variant is selected.

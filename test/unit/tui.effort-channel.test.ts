@@ -645,6 +645,30 @@ describe("v2 adapter: registration", () => {
     expect(logged).toHaveLength(1);
   });
 
+  it("GA-4: a register that never settles does not delay the context and execute.before hooks; cleanup still resolves", async () => {
+    home();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rpc = { register: vi.fn(() => new Promise<never>(() => {})) };
+    const host = v2Host(temp(), rpc);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // No timer advanced: setup resolves, its hooks registered, while `register` is still pending.
+      const cleanup = await host.start();
+      expect(rpc.register).toHaveBeenCalledTimes(1);
+      expect(host.sessionHooks.context).toBeTypeOf("function");
+      expect(host.ctx.tool.hook).toHaveBeenCalledWith("execute.before", expect.any(Function));
+      expect(warn.mock.calls.some(([line]) => String(line).includes("did not settle"))).toBe(false);
+      // Cleanup waits for the bounded registration (2 s), then resolves.
+      let done = false;
+      const disposed = cleanup().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(EFFORT_REGISTER_TIMEOUT_MS);
+      await disposed;
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("R2-5: a registration that arrives after the 2 s wait is kept, answers the adapter's turns, and is disposed on plugin cleanup", async () => {
     home();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

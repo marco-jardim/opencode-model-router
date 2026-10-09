@@ -9,7 +9,7 @@ import { effortRpc, type EffortOfOutput } from "./effort-rpc";
 /** The store's default bound: the sessions of one location the TUI can still ask about. */
 export const EFFORT_STORE_MAX_SESSIONS = 1000;
 
-/** How long setup waits for the host's `rpc.register` before it goes on without the channel (a late registration is kept). */
+/** How long the registration waits for the host's `rpc.register` before it resolves without the channel (a late one is kept). */
 export const EFFORT_REGISTER_TIMEOUT_MS = 2000;
 
 /** One turn as the adapter saw it; fields that are not strings (or a finite `at`, a positive integer budget) are dropped. */
@@ -152,11 +152,12 @@ const NO_OP = async (): Promise<void> => {};
 const TIMED_OUT: unique symbol = Symbol("effort-channel-timeout");
 
 /**
- * Registers `effortOf` on the host's rpc domain (`ctx.rpc.register(definition, handlers)`, OpenCode v2 ≥ 2.0.24). Feature-detected
- * (no `register` function: nothing, silently); a throwing or rejecting `register` is logged once and swallowed — the channel is
- * optional and must never fail the plugin's setup. Setup waits for `register` a bounded time (default 2 s): past it setup goes on
- * (logged once). A registration that arrives later is kept (logged once) and disposed with the channel; one that arrives after the
- * channel was disposed is disposed at once; a late rejection is swallowed. Resolves to a dispose function that never throws.
+ * Registers `effortOf` on the host's rpc domain (`ctx.rpc.register(definition, handlers)`, OpenCode v2 ≥ 2.0.22 (types), verified
+ * 2.0.24–2.0.26). Feature-detected (no `register` function: nothing, silently); a throwing or rejecting `register` is logged once
+ * and swallowed — the channel is optional and must never fail the plugin's setup. The returned promise waits for `register` a
+ * bounded time (default 2 s): past it, it resolves without the channel (logged once); the v2 adapter does not await it (GA-4). A
+ * registration that arrives later is kept (logged once) and disposed with the channel; one that arrives after the channel was
+ * disposed is disposed at once; a late rejection is swallowed. Resolves to a dispose function that never throws.
  */
 export async function registerEffortChannel(
   rpcLike: unknown,

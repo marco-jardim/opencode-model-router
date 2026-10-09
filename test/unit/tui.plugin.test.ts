@@ -17,7 +17,7 @@ interface FakeNode {
 
 /** The node API `createRenderer` drives, plus fault switches for error-isolation tests. */
 const tree = vi.hoisted(() => {
-  const faults = { textInsert: false };
+  const faults = { textInsert: false, boxCreate: false };
   const make = (tag: string, text = ""): FakeNode => ({ tag, props: {}, children: [], parent: undefined, text });
   const detach = (node: FakeNode): void => {
     const parent = node.parent;
@@ -28,7 +28,10 @@ const tree = vi.hoisted(() => {
   };
   return {
     faults,
-    createElement: (tag: string): FakeNode => make(tag),
+    createElement: (tag: string): FakeNode => {
+      if (faults.boxCreate && tag === "box") throw new Error("box create failed");
+      return make(tag);
+    },
     createTextNode: (value: string | number): FakeNode => make("#text", String(value)),
     isTextNode: (node: FakeNode): boolean => node.tag === "#text",
     replaceText: (node: FakeNode, value: string): void => {
@@ -104,6 +107,7 @@ import plugin, {
   NO_OWNER_NOTICE,
   POLL_INTERVAL_MS,
   PULL_STATE_MAX,
+  QUICK_REPULLS,
   STATUS_PLUGIN_ID,
   SYNCED_MAX,
 } from "../../src/tui/plugin";
@@ -158,8 +162,8 @@ const MODELS: readonly HostModelInfo[] = [
   { ...SONNET, name: "Claude Sonnet 4" },
   { ...GPT, name: "GPT-5" },
 ];
-const OWNER_WARNING =
-  "model-router status: render has no Solid owner: the plugin's solid-js is not the host's (a local node_modules/solid-js shadows it)";
+/** GA-5: the toast names the effect, not an unreproduced cause. */
+const OWNER_WARNING = "model-router status: render has no Solid owner: the views are static (no live updates)";
 /** G3 is opt-in (A12): the options that turn the running-delegates rows on. */
 const G3_ON = Object.freeze({ runningRow: true });
 
@@ -341,6 +345,7 @@ beforeEach(() => {
 afterEach(() => {
   for (const step of teardown.splice(0).reverse()) step();
   tree.faults.textInsert = false;
+  tree.faults.boxCreate = false;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -758,6 +763,26 @@ describe("G2 child view (A5)", () => {
     expect(mountComposer(fake.claims, () => ROOT).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
   });
 
+  it("names a delegate without an agent by its session title, else subagent, as the running row does (GA-7)", () => {
+    const fake = fakeHost({ options: G3_ON });
+    const bare = { parentID: ROOT, model: { ...SONNET, variant: "low" }, time: { created: 2 } };
+    fake.addSession({ id: CHILD, ...bare, title: "Fix the parser" });
+    fake.addSession({ id: "ses_bare", ...bare, title: " " });
+    start(fake);
+    expect(mountComposer(fake.claims, () => CHILD).rows()).toEqual(["Fix the parser · Claude Sonnet 4 · low"]);
+    expect(mountComposer(fake.claims, () => "ses_bare").rows()).toEqual(["subagent · Claude Sonnet 4 · low"]);
+    // The same sessions in G3: the same agent labels.
+    fake.setStatus(CHILD, "running");
+    fake.setStatus("ses_bare", "running");
+    expect(mountComposer(fake.claims, () => ROOT).rows()).toEqual([
+      "subagent · Claude Sonnet 4 · low",
+      "Fix the parser · Claude Sonnet 4 · low",
+    ]);
+    // A message's agent still wins over the fallback.
+    fake.addMessage(CHILD, { id: "m1", type: "assistant", agent: "review", model: { ...SONNET }, time: { created: 3 } });
+    expect(mountComposer(fake.claims, () => CHILD).rows()).toEqual(["review · Claude Sonnet 4 · default"]);
+  });
+
   it("shows nothing while the session is unknown or has no model", () => {
     const fake = fakeHost();
     fake.addSession({ id: CHILD, parentID: ROOT, agent: "explore" });
@@ -926,6 +951,8 @@ describe("effort channel (A1)", () => {
   it("re-pulls when the status changes and polls every 5 s while running", async () => {
     const fake = fakeHost();
     fake.addSession(childSession(CHILD));
+    // An answer with an effort from the start: the plain cadence, no quick re-pulls (GA-2, tested below).
+    fake.answers.set(CHILD, { effort: "max", providerID: SONNET.providerID, modelID: SONNET.id });
     start(fake);
     mountComposer(fake.claims, () => CHILD);
     await tick(0);
@@ -985,6 +1012,125 @@ describe("effort channel (A1)", () => {
     expect(fake.effortOf).toHaveBeenCalledTimes(1);
     await tick(1);
     expect(fake.effortOf).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the last answer at once when a running → idle → running flip within 1 s reopens the poller (GA-1)", async () => {
+    const fake = fakeHost({ options: G3_ON });
+    fake.addSession(childSession("ses_a"));
+    fake.setStatus("ses_a", "running");
+    fake.answers.set("ses_a", { effort: "medium", variant: "low", providerID: SONNET.providerID, modelID: SONNET.id });
+    start(fake);
+    const view = mountComposer(fake.claims, () => ROOT);
+    await tick(0);
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · medium (low)"]);
+    fake.setStatus("ses_a", "idle");
+    expect(view.rows()).toEqual([]);
+    await microtasks();
+    expect(vi.getTimerCount()).toBe(0); // the poller closed
+    await tick(500);
+    fake.setStatus("ses_a", "running");
+    // No new pull yet (debounced to 5 s since the last one), and the row already shows the channel's answer.
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · medium (low)"]);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the last answer at once when a G2 view is reopened within 5 s (GA-1)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    fake.answers.set(CHILD, { effort: "medium", variant: "low", providerID: SONNET.providerID, modelID: SONNET.id });
+    start(fake);
+    const first = mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(first.rows()).toEqual(["explore · Claude Sonnet 4 · medium (low)"]);
+    first.dispose();
+    await microtasks();
+    expect(vi.getTimerCount()).toBe(0);
+    await tick(POLL_INTERVAL_MS - 1_000);
+    const again = mountComposer(fake.claims, () => CHILD);
+    expect(again.rows()).toEqual(["explore · Claude Sonnet 4 · medium (low)"]);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    await tick(1_000);
+    expect(fake.effortOf).toHaveBeenCalledTimes(2);
+    expect(again.rows()).toEqual(["explore · Claude Sonnet 4 · medium (low)"]);
+  });
+
+  it("keeps no answer across a reopen after a failure: the reopened view shows the fallback (GA-1)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    fake.setStatus(CHILD, "running");
+    fake.answers.set(CHILD, { effort: "max", providerID: SONNET.providerID, modelID: SONNET.id });
+    start(fake);
+    const first = mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(first.rows()).toEqual(["explore · Claude Sonnet 4 · max"]);
+    fake.effortOf.mockRejectedValue(rpcFailure("rpc.internal", "m"));
+    await tick(POLL_INTERVAL_MS);
+    expect(first.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    first.dispose();
+    await microtasks();
+    expect(mountComposer(fake.claims, () => CHILD).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    expect(fake.effortOf).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-pulls a running session's answer without an effort after 1 s, until one has an effort (GA-2)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    fake.setStatus(CHILD, "running");
+    start(fake);
+    const view = mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    fake.answers.set(CHILD, { effort: "max", providerID: SONNET.providerID, modelID: SONNET.id });
+    await tick(BACKOFF_START_MS - 1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    await tick(1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(2);
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · max"]);
+    // An effort was seen: a later answer without one waits for the 5 s poll.
+    fake.answers.delete(CHILD);
+    await tick(POLL_INTERVAL_MS - 1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(2);
+    await tick(1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(3);
+    await tick(BACKOFF_START_MS);
+    expect(fake.effortOf).toHaveBeenCalledTimes(3);
+    await tick(POLL_INTERVAL_MS - BACKOFF_START_MS);
+    expect(fake.effortOf).toHaveBeenCalledTimes(4);
+  });
+
+  it(`stops the quick re-pulls of a running session that never reports an effort after ${QUICK_REPULLS} (GA-2)`, async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    fake.setStatus(CHILD, "running");
+    start(fake);
+    const view = mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    for (let quick = 1; quick <= QUICK_REPULLS; quick++) {
+      await tick(BACKOFF_START_MS - 1);
+      expect(fake.effortOf).toHaveBeenCalledTimes(quick);
+      await tick(1);
+      expect(fake.effortOf).toHaveBeenCalledTimes(quick + 1);
+    }
+    // Then the 5 s poll only.
+    await tick(POLL_INTERVAL_MS - 1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(QUICK_REPULLS + 1);
+    await tick(1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(QUICK_REPULLS + 2);
+    await tick(BACKOFF_START_MS);
+    expect(fake.effortOf).toHaveBeenCalledTimes(QUICK_REPULLS + 2);
+    // The count is kept with the pull state: a reopened view starts no new quick re-pulls.
+    view.dispose();
+    await microtasks();
+    mountComposer(fake.claims, () => CHILD);
+    await tick(POLL_INTERVAL_MS - BACKOFF_START_MS - 1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(QUICK_REPULLS + 2);
+    await tick(1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(QUICK_REPULLS + 3);
+    await tick(BACKOFF_START_MS);
+    expect(fake.effortOf).toHaveBeenCalledTimes(QUICK_REPULLS + 3);
+    expect(warnings()).toEqual([]);
   });
 
   it(`keeps the pull state of the last ${PULL_STATE_MAX} sessions only (P13-5)`, async () => {
@@ -1304,6 +1450,67 @@ describe("feature detection and error isolation", () => {
       "model-router status: composer view failed: store gone",
       "model-router status: footer view failed: store gone",
     ]);
+  });
+
+  it("renders an empty box and warns once when data.session.get throws without a Solid owner (C-3)", () => {
+    const fake = fakeHost();
+    const session = fake.context.data?.session;
+    if (session === undefined) throw new Error("fake without data.session");
+    const context: HostContext = {
+      ...fake.context,
+      data: {
+        ...fake.context.data,
+        session: {
+          ...session,
+          get: () => {
+            throw new Error("store gone");
+          },
+        },
+      },
+    };
+    teardown.push(plugin.setup(context));
+    const composer = claimFor(fake.claims, COMPOSER_SLOT);
+    let child: unknown;
+    let root: unknown;
+    expect(() => {
+      child = composer.render(composerInput(() => CHILD));
+      root = composer.render(composerInput(() => ROOT));
+    }).not.toThrow();
+    expect(boxOf(child).children).toEqual([]);
+    expect(boxOf(root).children).toEqual([]);
+    // The owner notice, then one failure warning for the area across both renders.
+    expect(warnings()).toEqual([OWNER_WARNING, "model-router status: composer view failed: store gone"]);
+    expect(fake.toast).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns undefined and warns once when the box cannot be created, with or without a Solid owner (C-3)", () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    start(fake);
+    tree.faults.boxCreate = true;
+    const composer = claimFor(fake.claims, COMPOSER_SLOT);
+    let owned: unknown = null;
+    let again: unknown = null;
+    expect(() => {
+      owned = mount(() => composer.render(composerInput(() => CHILD))).view;
+      again = mount(() => composer.render(composerInput(() => CHILD))).view;
+    }).not.toThrow();
+    expect(owned).toBeUndefined();
+    expect(again).toBeUndefined();
+    expect(warnings()).toEqual(["model-router status: composer view failed: box create failed"]);
+    // Without an owner: the static view fails the same way, reported once for its own area.
+    let unowned: unknown = null;
+    expect(() => {
+      unowned = claimFor(fake.claims, FOOTER_SLOT).render(footerInput(() => ROOT));
+    }).not.toThrow();
+    expect(unowned).toBeUndefined();
+    expect(warnings()).toEqual([
+      "model-router status: composer view failed: box create failed",
+      OWNER_WARNING,
+      "model-router status: footer view failed: box create failed",
+    ]);
+    tree.faults.boxCreate = false;
+    expect(mountComposer(fake.claims, () => CHILD).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
   });
 
   it("renders no rows and warns once when message.list throws, and recovers", () => {

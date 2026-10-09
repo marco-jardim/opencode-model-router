@@ -64,7 +64,7 @@ import {
 import { effortRpc } from "../../src/tui/effort-rpc";
 import statusPlugin, {
   appliedOf, BACKOFF_MAX_MS, BACKOFF_START_MS, COMPOSER_SLOT, effortWithVariant, FAILURE_COOLDOWN_MS, FOOTER_SLOT, NO_OWNER_NOTICE,
-  POLL_INTERVAL_MS, STATUS_PLUGIN_ID, WIDTH_MARGIN,
+  POLL_INTERVAL_MS, QUICK_REPULLS, STATUS_PLUGIN_ID, WIDTH_MARGIN,
 } from "../../src/tui/plugin";
 import tuiEntry from "../../tui";
 
@@ -1819,6 +1819,16 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(flat).toContain(`every ${POLL_INTERVAL_MS / 1000} s while the session runs`);
     expect(flat).toContain(`(${BACKOFF_START_MS / 1000} s, doubling up to ${BACKOFF_MAX_MS / 1000} s)`);
     expect(flat).toContain(`it stops asking about that session for at least ${FAILURE_COOLDOWN_MS / 1000} s`);
+    // GA-2: the quick re-pulls of a running session without an effort yet; GA-1: a reopened view keeps the last answer
+    expect(flat).toContain(
+      `an answer without one is followed by another call after ${BACKOFF_START_MS / 1000} s, at most ${QUICK_REPULLS} times per session`,
+    );
+    expect(flat).toContain("the first call right away");
+    expect(flat).toContain("A view that is closed and opened again shows the session's last answer at once, before its next call.");
+    // B-1: the verified hosts, and what an unverified 2.0.20–2.0.23 host shows when the TUI entry fails
+    expect(flat).toContain(
+      "Verified on OpenCode 2.0.24–2.0.26.** On 2.0.20–2.0.23 the TUI entry is not verified; if it fails to load there, the host shows `Plugin failed` and the server plugin keeps working.",
+    );
     // R2-1: the terminal width, not the composer; long rows run into the sidebar, in the Width section and the limitation
     const width = new RegExp(`terminal width minus ${WIDTH_MARGIN} columns, not to the composer, and never wrap`, "g");
     expect(flat.match(width)).toHaveLength(2);
@@ -1896,13 +1906,13 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(flat).toMatch(/The `\/plugins` dialog shows a `TUI opencode-model-router\.status` row/);
     expect(flat).toMatch(/Observed on 2\.0\.24–2\.0\.26 when the TUI entry failed to load/);
     expect(flat).not.toMatch(/`plugin failed` marker in the footer|is marked `failed`|Cannot find package/);
-    // F17, R2-4: the no-owner toast as setup words it, what it means, and that its named cause was not reproduced
+    // F17, R2-4, GA-5: the no-owner toast verbatim as the code words it (its effect, no unreproduced cause), and what it means
     const owner = NO_OWNER_NOTICE.slice(0, NO_OWNER_NOTICE.indexOf(":") + 1);
     expect(owner).toBe("render has no Solid owner:");
-    expect(flat).toContain(`A \`${STATUS_NOTICE_PREFIX}${owner} …\` toast.`);
-    expect(NO_OWNER_NOTICE).toContain("node_modules/solid-js");
+    expect(flat).toContain(`A \`${STATUS_NOTICE_PREFIX}${NO_OWNER_NOTICE}\` toast.`);
+    expect(NO_OWNER_NOTICE).not.toMatch(/node_modules|solid-js|shadows/);
     expect(flat).toMatch(/running-delegates row stays hidden/);
-    expect(flat).toMatch(/named cause \(a local `node_modules\/solid-js`\) was not reproduced/);
+    expect(flat).not.toMatch(/named cause|was not reproduced/);
     expect(flat).toMatch(/if the toast persists, report it/);
     // F15: version skew of a package-name entry
     expect(flat).toMatch(/another version of the package than the server entry\. A local directory path .{0,40}avoids this/);
