@@ -71,6 +71,26 @@ vi.mock("../../src/verify/wiring", async (importOriginal) => {
     },
   };
 });
+// #84 QA-G-B-2-1: a pass-through spy on the gate — the change set each verification is judged on; `failNext` makes the next gate a
+// FAIL (as a failing test suite would), since no test runner is installed in the temp repositories.
+const gated = vi.hoisted(() => ({ inputs: [] as Array<{ changedFiles: string[] }>, failNext: false }));
+vi.mock("../../src/verify/gate", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/verify/gate")>();
+  return {
+    ...actual,
+    accept: async (...a: Parameters<typeof actual.accept>) => {
+      gated.inputs.push({ changedFiles: a[1].changedFiles.map((f) => f.path) });
+      if (gated.failNext) {
+        gated.failNext = false;
+        return actual.gateResult({
+          pass: false, outcome: "fail", method: "deterministic",
+          reasons: ["testsPass: introduced failures: gen.test.ts > builds; observed failures: gen.test.ts > builds"],
+        }, a[0].dod.source);
+      }
+      return actual.accept(...a);
+    },
+  };
+});
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { resetDispatchRegistry } from "../../src/router/sessions";
@@ -104,6 +124,8 @@ afterEach(async () => {
   resetDispatchRegistry();
   resetIngestState();
   noted.calls.length = 0;
+  gated.inputs.length = 0;
+  gated.failNext = false;
 });
 
 function temp(prefix = "omr-p23-"): string {
@@ -141,9 +163,10 @@ function catalogOf(cfg: RouterConfig) {
   });
 }
 
-async function plugin(directory: string): Promise<Record<string, any>> {
+async function plugin(directory: string, onIngest?: (ingest: { onVerdict: (...a: any[]) => unknown }) => void): Promise<Record<string, any>> {
   const hooks = await ModelRouterPlugin({
     directory, worktree: directory, routerHost: "v2",
+    ...(onIngest === undefined ? {} : { routerOnIngest: onIngest }),
     client: {
       session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } }) },
       app: { log: vi.fn(async () => ({})) },
@@ -941,6 +964,99 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     expect(at("start", "dd1")).toEqual([wt1]);
     expect(at("defer", "dd1")).toEqual([wt1]);
   }, 60_000);
+
+  // #84 QA-G-B-2-1: a resume that carries the acceptance of the attempt that introduced it is judged on everything the child changed
+  // since that attempt — never on its own call's changes alone (a no-change resume had no changed file: "no affected tests", a pass
+  // with no process).
+  describe("QA-G-B-2-1: a carried acceptance is judged on the child's cumulative change set", () => {
+    /** Paths as one spelling (separators, case), sorted, for comparison. */
+    const norm = (paths: readonly string[] | undefined): string[] => (paths ?? []).map((p) => p.replace(/\\/g, "/").toLowerCase()).sort();
+    /** A repo with one worktree, the plugin (verdicts recorded) and a started v2 host. */
+    const setup = async () => {
+      wired.calls.length = 0;
+      const base = temp("omr-g21-repo-");
+      const main = join(base, "main");
+      mkdirSync(main);
+      git(["init", "-q"], main);
+      writeFileSync(join(main, "a.ts"), "export const a = 1;\n");
+      git(["add", "a.ts"], main);
+      git(["commit", "-q", "-m", "init"], main);
+      git(["worktree", "add", "-q", "-b", "b1", join(base, "wt-1")], main);
+      const wt1 = realpathSync.native(join(base, "wt-1"));
+      const { cfg } = home(ROLES);
+      const verdicts: Array<[string, string]> = [];
+      const hooks = await plugin(main, (ingest) => {
+        const on = ingest.onVerdict.bind(ingest);
+        ingest.onVerdict = (child: string, verdict: string, ...rest: unknown[]) => { verdicts.push([child, verdict]); return on(child, verdict, ...rest); };
+      });
+      const sessions: Sessions = {};
+      const v2 = host(main, cfg, sessions);
+      await v2.start(hooks, { listWorktrees: gitWorktreeList });
+      /** The child writes `files` (observed as the host's write), then returns `text`; the parent's result text. */
+      const finish = async (callID: string, child: string, input: Record<string, unknown>, files: string[], text: string): Promise<string> => {
+        for (const [i, file] of files.entries()) {
+          writeFileSync(file, `export const v${i} = ${i};\n`);
+          await hooks["tool.execute.after"]({ tool: "write", sessionID: child, callID: `${callID}-w${i}`, args: { filePath: file } }, { title: "", output: "", metadata: {} });
+        }
+        const event = {
+          sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input, status: "completed",
+          result: { output: { status: "completed", output: text, sessionID: child }, content: [{ type: "text", text }] },
+        };
+        await v2.toolHooks["execute.after"]!(event);
+        return resultText(event);
+      };
+      const resume = async (callID: string, child: string, prompt: string): Promise<Record<string, unknown>> => {
+        const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "implementer", sessionID: child, prompt } as Record<string, unknown> };
+        await v2.toolHooks["execute.before"]!(event);
+        return event.input;
+      };
+      const at = (kind: "start" | "prepare" | "defer", callID: string) => wired.calls.filter((c) => c.kind === kind && c.id === `task:root:${callID}`).map((c) => c.cwd);
+      return { cfg, wt1, sessions, v2, verdicts, finish, resume, at };
+    };
+
+    it.skipIf(!hasGit())("(a) after a FAIL, a resume that changes nothing is not accepted on the carried acceptance and records no pass", async () => {
+      const { cfg, wt1, sessions, v2, verdicts, finish, resume } = await setup();
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nVERIFY: required\nWrite the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fa1", "kf", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "kf", "implementer")).toContain("edit");
+      expect(kindOf(cfg, "kf")).toBe("exact");
+      gated.failNext = true; // attempt 1's tests fail
+      const failed = await finish("fa1", "kf", first, [join(wt1, "gen.ts")], "DONE: wrote gen.ts:1");
+      expect(failed).toContain("the router raises it to");
+      // The resume addresses nothing: no file changes.
+      const second = await resume("fa2", "kf", "address the findings");
+      const text = await finish("fa2", "kf", second, [], "DONE: addressed the findings");
+      expect(text).not.toContain("verified: deterministic");
+      expect(verdicts.filter(([child]) => child === "kf").map(([, verdict]) => verdict)).toEqual(["fail", "unverifiable"]);
+      expect(norm(gated.inputs.at(-1)?.changedFiles)).toEqual(norm([join(wt1, "gen.ts")])); // judged on attempt 1's change
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(b) a budget stop's 'continue and finish' resume is judged on attempt 1's changes too", async () => {
+      const { wt1, sessions, v2, finish, resume } = await setup();
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nVERIFY: required\nWrite the two modules\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fb1", "kb", "implementer", prompt, wt1, "modules");
+      expect(await catalog(v2, "kb", "implementer")).toContain("edit");
+      await finish("fb1", "kb", first, [join(wt1, "one.ts")], "NEED MORE: budget — one.ts is written, two.ts is next");
+      expect(norm(gated.inputs.at(-1)?.changedFiles)).toEqual(norm([join(wt1, "one.ts")]));
+      const second = await resume("fb2", "kb", "continue and finish");
+      await finish("fb2", "kb", second, [join(wt1, "two.ts")], "DONE: wrote two.ts:1");
+      expect(norm(gated.inputs.at(-1)?.changedFiles)).toEqual(norm([join(wt1, "one.ts"), join(wt1, "two.ts")]));
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(c) a carried acceptance is never deferred: no second pending handle that passes on an empty change set", async () => {
+      const { wt1, sessions, v2, finish, resume, at } = await setup();
+      // testsPass without VERIFY: deferred by default — attempt 1 is deferred to router_verify.
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nWrite the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fc1", "kc", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "kc", "implementer")).toContain("edit");
+      await finish("fc1", "kc", first, [join(wt1, "gen.ts")], "DONE: wrote gen.ts:1");
+      expect(at("defer", "fc1")).toEqual([wt1]);
+      const second = await resume("fc2", "kc", "continue");
+      const text = await finish("fc2", "kc", second, [], "DONE: nothing left");
+      expect(at("defer", "fc2")).toEqual([]);
+      expect(text).not.toContain("verified: deterministic");
+    }, 60_000);
+  });
 });
 
 describe("QA round 1 (P2.3)", () => {

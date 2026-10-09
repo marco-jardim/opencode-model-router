@@ -505,6 +505,27 @@ describe("runDeterministic — command checks under per-check scopes", () => {
     expect(s.events).toEqual([]);
   });
 
+  // #84 QA-G-B-2-1: a carried acceptance (a role resume re-checking the block of an earlier attempt) never passes on a check that
+  // ran no process: "no affected tests" proves nothing about the child's earlier changes.
+  it("QA-G-B-2-1: with noAffectedUnverifiable, a NoAffected testsPass or lintClean is unverifiable (never a no-process pass)", async () => {
+    const reason = "a carried acceptance";
+    const noTests = testsPassHook({ scoped: { kind: "no-affected", note: "no changed files, no affected tests" }, recheck: undefined });
+    const tests = await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: noTests.fn, noAffectedUnverifiable: reason }));
+    expect(tests.outcome).toBe("unverifiable");
+    expect(tests.pass).toBe(false);
+    expect(tests.reasons.join("\n")).toContain(`${reason} (testsPass: no changed files, no affected tests)`);
+    const s = fakeScopes();
+    const lint = await runDeterministic(
+      makeDoD([{ kind: "lintClean", command: "npx eslint ." }]),
+      makeDeps({ exec: neverExec, openScope: s.openScope, planLint: async () => ({ noAffected: true, note: "no changed lintable files" }), noAffectedUnverifiable: reason }),
+    );
+    expect(lint.outcome).toBe("unverifiable");
+    expect(lint.reasons.join("\n")).toContain(`${reason} (lintClean: no changed lintable files)`);
+    expect(s.events).toEqual([]);
+    // Without the flag (every other dispatch, I1): unchanged.
+    expect((await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: noTests.fn }))).outcome).toBe("pass");
+  });
+
   it("lintClean: a LintSpec runs through the argv scope and its exit code decides", async () => {
     const s = fakeScopes(() => ranWith(1, "a.ts: 1 problem"));
     const changedFiles = [{ path: "/fake/cwd/a.ts", status: " M" }];

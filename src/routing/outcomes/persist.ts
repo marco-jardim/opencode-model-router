@@ -51,6 +51,7 @@ import {
   SIGNAL_KINDS,
   MAX_QUEUED_ROWS,
   MAX_CORRUPT_COPIES,
+  NEED_TERM_RE,
   OUTCOMES_CORRUPT_PREFIX,
   OUTCOMES_CORRUPT_RE,
   OUTCOMES_FILE,
@@ -306,7 +307,8 @@ function readTrace(x: unknown): DecisionTrace | undefined {
     backend,
     ...(x.backendSkipped === "credentials" ? { backendSkipped: "credentials" as const } : {}),
     ...(argmin === null ? {} : { argmin }),
-    ...(isStringArray(x.needTerms) ? { needTerms: [...x.needTerms] } : {}),
+    // QA-G-B-2-2 (D14): only well-shaped need terms; one that could carry prompt text (an older row's URL or path) is dropped.
+    ...(isStringArray(x.needTerms) ? { needTerms: x.needTerms.filter((term) => NEED_TERM_RE.test(term)) } : {}),
   };
 }
 function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {
