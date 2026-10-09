@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-09
+
+Role × tier × assurance delegation (#84), opt-in on OpenCode v2: role agents, tier floors from authority × detection,
+validated work roots, `router_run` and work-root-scoped `router_git_*`, and outcome signals from external verification
+only. OpenCode v1 is unchanged apart from the changes listed below; the roles keys are validated and inert there. See
+[Roles mode](docs/ROLES.md) and [ADR 0006](docs/adr/0006-role-tier-assurance-delegation.md).
+
 ### Added
 
 - **Roles mode: role × tier × assurance delegation (#84), OpenCode v2, opt-in.** With `routing.delegation: "roles"`

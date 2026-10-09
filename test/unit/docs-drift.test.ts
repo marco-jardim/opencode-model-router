@@ -654,11 +654,13 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
   });
 
   it("D16: the release contract is version 2.3.0 in one PR closing both #74 and #73", () => {
-    // Phase 3.4 prepares the release without merging, tagging or publishing it.
-    expect(JSON.parse(read("package.json")).version).toBe("2.3.0");
+    // Phase 3.4 prepared 2.3.0 without merging, tagging or publishing it. Later releases bump the package, so the
+    // package and both lockfile roots only have to agree with each other and with a dated CHANGELOG release heading.
+    const version = JSON.parse(read("package.json")).version as string;
     const lock = JSON.parse(read("package-lock.json"));
-    expect(lock.version).toBe("2.3.0");
-    expect(lock.packages[""].version).toBe("2.3.0");
+    expect(lock.version).toBe(version);
+    expect(lock.packages[""].version).toBe(version);
+    expect(read("CHANGELOG.md")).toMatch(new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\] - \\d{4}-\\d{2}-\\d{2}\\r?$`, "m"));
     expect(read("CHANGELOG.md")).toContain("## [2.3.0] - 2026-10-07");
     expect(read("CHANGELOG.md")).toMatch(/^## \[Unreleased\]\r?$/m);
     const pr = read("docs/qa/cost-aware-routing/pr-body.md").replace(/\r\n/g, "\n");
@@ -1075,8 +1077,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect([...adr.matchAll(/^\| RH(\d+) \|/gm)].map((m) => Number(m[1]))).toEqual(Array.from({ length: 10 }, (_, i) => i + 1));
   });
 
-  it("the changelog lists roles mode and the §2.9 behaviour changes under [Unreleased]", () => {
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+  it("the changelog lists roles mode and the §2.9 behaviour changes under [2.4.0]", () => {
+    const unreleased = /## \[2\.4\.0\] - 2026-10-09([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     expect(unreleased).toContain("Roles mode: role × tier × assurance delegation (#84)");
     expect(unreleased).toContain("(docs/ROLES.md)");
     expect(unreleased).toContain("Behaviour change (#84)");
@@ -1114,7 +1116,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(engine).toContain("an independent grader (tier ≥ the producer's, another model) adds 0.5");
     expect(engine).toContain("needs about twice as many verdicts");
     expect(engine).toContain("**Role dispatches have fewer verdict rows still:**");
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    const unreleased = /## \[2\.4\.0\] - 2026-10-09([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     expect(unreleased).toContain("moves the outcome store by 0.5 with a `grader` signal row only when the grader is independent");
     // run matching is by router_run entry name
     expect(flat).toContain("a command named `test` counts for `npm test`; one named `test-files` never does");
@@ -1183,7 +1185,7 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
   const enforcement = read("docs/ENFORCEMENT.md");
   const flatEnforcement = enforcement.replace(/\s+/g, " ");
   const guide = read("docs/ROLES.md").replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
-  const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+  const unreleased = /## \[2\.4\.0\] - 2026-10-09([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
   const names = guardNamesOf(read("src/guard/guards.ts"));
 
   it("the guard table of ENFORCEMENT.md lists every guard the code returns, and only those (C-1)", () => {
@@ -1259,9 +1261,9 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
     expect(readme).toContain("the advisor info `roles-on-legacy-host`");
     expect(readme).toContain("[behaviour change entry](CHANGELOG.md#changed)");
     expect(anchorsOf(read("CHANGELOG.md")).has("changed")).toBe(true);
-    // the first `### Changed` of the changelog is the one under [Unreleased], which holds the behaviour-change entry
+    // the first `### Changed` of the changelog is the one under [2.4.0], which holds the behaviour-change entry
     const changelog = read("CHANGELOG.md");
-    expect(changelog.indexOf("### Changed")).toBeGreaterThan(changelog.indexOf("## [Unreleased]"));
+    expect(changelog.indexOf("### Changed")).toBeGreaterThan(changelog.indexOf("## [2.4.0] - 2026-10-09"));
     expect(changelog.indexOf("### Changed")).toBeLessThan(changelog.indexOf("Behaviour change (#84)"));
     const adr = read("docs/adr/0006-role-tier-assurance-delegation.md");
     expect(adr).toContain("amendments R0–R10 and adversarial QA");
@@ -1277,7 +1279,7 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
 describe("docs drift: #84 P3.3 global QA round 2 (QA-G-C-2-1, QA-G-C-2-2)", () => {
   const guide = read("docs/ROLES.md").replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
   const engine = read("docs/ROUTING_ENGINE.md").replace(/\s+/g, " ");
-  const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+  const unreleased = /## \[2\.4\.0\] - 2026-10-09([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
   const tiers = JSON.parse(read("tiers.json")) as Record<string, unknown>;
 
   /** The router's dispatch path for `general` (roles mode, static engine) in a temp session directory; `grantOf` routes one prompt. */
