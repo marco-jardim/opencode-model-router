@@ -341,6 +341,13 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `cli.json` does not exist. Owner file: `C:\Users\Marquinho\.config\opencode\cli.json` (exists). Every "`tui.json`" in
   A4/A9/§3 means `cli.json`; P2.1, P2.2 and DF-1 use `cli.json`. The P0.1 probe rendered because its server config also
   listed the probe (auto-load), not through `tui.json`.
+- A11 (P1.3 QA) **TUI entry rules found on the real hosts.** (a) G2 shows `<agent> · <model> · <effort>` (the agent
+  identifies the delegate; D4 amended). (b) Every relative specifier in the TUI closure carries an explicit `.ts`
+  (`tui.ts` → `./src/tui/plugin.ts`; `allowImportingTsExtensions`, `noEmit`): with an extensionless re-export the
+  2.0.24–2.0.26 hosts loaded `plugin.ts` without serving `solid-js` (`Cannot find package 'solid-js'` from
+  `node_modules`); pinned by the packaging test. (c) The host swallows TUI plugin `console.*` output: user-facing notices
+  (invalid options, no Solid owner) are toasts. (d) When the channel's `variant` and `effort` differ, child views show
+  `<effort> (<variant>)` (P1.2 QA-6).
 
 ## 9. Risks
 | Risk | Mitigation |
