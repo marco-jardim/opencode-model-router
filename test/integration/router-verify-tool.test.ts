@@ -1333,7 +1333,10 @@ describe("the router_verify tool (2.4.3b)", () => {
     plugin.wiring = undefined;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // vitest runs this hook before the top-level one: wait for the in-flight gates here too, before `home`
+    // (and the environment they read) goes away.
+    await Promise.allSettled([...state.gates]);
     for (const key of ["HOME", "USERPROFILE"] as const) {
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];

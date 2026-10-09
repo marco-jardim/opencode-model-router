@@ -653,16 +653,21 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     for (const amendment of ["A31", "A32", "A33"]) expect(adr, amendment).toContain(amendment);
   });
 
-  it("D16: the release contract is version 2.3.0 in one PR closing both #74 and #73", () => {
-    // Phase 3.4 prepared 2.3.0 without merging, tagging or publishing it. Later releases bump the package, so the
-    // package and both lockfile roots only have to agree with each other and with a dated CHANGELOG release heading.
+  it("D16: the package version is the newest dated CHANGELOG release, right under [Unreleased]; one PR closed both #74 and #73", () => {
+    // Phase 3.4 prepared the D16 release without merging, tagging or publishing it. Later releases bump the package, so the
+    // package and both lockfile roots have to agree with each other and with the first release heading under [Unreleased].
     const version = JSON.parse(read("package.json")).version as string;
     const lock = JSON.parse(read("package-lock.json"));
     expect(lock.version).toBe(version);
     expect(lock.packages[""].version).toBe(version);
-    expect(read("CHANGELOG.md")).toMatch(new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\] - \\d{4}-\\d{2}-\\d{2}\\r?$`, "m"));
-    expect(read("CHANGELOG.md")).toContain("## [2.3.0] - 2026-10-07");
-    expect(read("CHANGELOG.md")).toMatch(/^## \[Unreleased\]\r?$/m);
+    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
+    const unreleasedHeadings = [...changelog.matchAll(/^## \[Unreleased\]$/gm)];
+    expect(unreleasedHeadings).toHaveLength(1);
+    const afterUnreleased = changelog.slice(unreleasedHeadings[0]!.index! + unreleasedHeadings[0]![0].length);
+    const next = /^## \[[^\]\n]*\].*$/m.exec(afterUnreleased);
+    expect(next?.[0]).toMatch(new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\] - \\d{4}-\\d{2}-\\d{2}$`));
+    expect(afterUnreleased.slice(0, next!.index).trim()).toBe("");
+    expect(changelog).toContain("## [2.3.0] - 2026-10-07");
     const pr = read("docs/qa/cost-aware-routing/pr-body.md").replace(/\r\n/g, "\n");
     expect(pr).toMatch(/^Closes #74$/m);
     expect(pr).toMatch(/^Closes #73$/m);
