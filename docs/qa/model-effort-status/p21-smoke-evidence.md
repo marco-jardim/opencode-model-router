@@ -1,9 +1,95 @@
 # Phase P2.1 — real-host proof of the TUI status (G1/G2/G3), #90
 
-Branch `msd/p21`: the smoke is committed as `f0b6f7c` and the QA round 1 fixes as `b8a8766`. QA round 2 passed; its code
-minors (below) are in the working tree, for the executor to commit.
+Branch `msd/p21`: the smoke was committed as `f0b6f7c`, the QA round 1 fixes as `b8a8766` and the QA round 2 fixes as
+`78fd594`. Branch `msd/p31-fix-1` (from `38d8f42`, A12) adapts the smoke to the opt-in G3. Those changes are in the
+working tree, for the executor to commit.
 
-## Verdict
+## A12 update (`msd/p31-fix-1`): G3 is opt-in
+
+Owner decision A12 (plan §8): `runningRow` (G3) now defaults to `false`. G1 and G2 are unchanged. The smoke now covers
+both settings.
+
+- **G3 flows (`local`, `npm`):** they keep their server config entry and also write the TUI config
+  `<H>\.config\opencode\cli.json` with `{"plugins":[{"package":"<the same package directory>","options":{"runningRow":true}}]}`.
+  The package is the directory, never the plugin id or `tui.ts` (A4). For the local flow it is the worktree; for the npm
+  flow it is `<root>\install\node_modules\opencode-model-router`. The G3, A6 and S4 scenarios run as before.
+- **One registration:** the `cli.json` entry replaces the auto-loaded registration instead of adding a second one. In
+  every flow the footer line holds exactly one plugin text (`effort default`), and every G3/G2 screen holds exactly one
+  `fast · …` row. Both are now asserted.
+- **New default-options flow (`off`, local path, server config only, no `cli.json`), per version:**
+  - boot, and the footer shows `effort default`;
+  - a delegation whose child is held for 30 s;
+  - from the submit until 8 s after the child's request reached the provider, the root view is polled every 100 ms.
+    The child is still held and the host shows its own `↓ 1 subagent` and `Subagent — tui smoke off` lines. No
+    `fast · …` row appears at any poll (76–79 polls), and the footer stays `effort default`;
+  - then the S3 navigation (Down, Enter) opens the child. Its own view shows `fast · Claude Sonnet 5.5 · medium (low)`
+    while it is still held, and again after it answered. Both child requests on the wire carry `claude-sonnet-5-5#low`
+    with effort `medium`.
+- **Code:** the S3 navigation moved into a shared `openChildView` helper, used by S3 and by the new flow.
+- **Counts:** 9 flows (3 per version) through the same 3-host slot pool; 64 tests (21 per version + 1 batch).
+
+### Vitest summary (run `eb2b0172`, `--reporter=verbose`)
+```
+ ✓ batch teardown: no new child of the test worker left behind, no own process (pid + creation time) present at the start 2344ms
+ Test Files  1 passed (1)
+      Tests  64 passed (64)
+   Start at  13:04:15
+   Duration  193.97s (tests 100%)
+```
+- Gate off (no `RUN_OC_SMOKE_TUI`): `Test Files 1 skipped (1)`, `Tests 64 skipped (64)`.
+- `npm run typecheck`: green.
+- Batch record: `leftovers []`, `ownOverlapStartIdentities []`, 27 own processes. The `opencode.exe` pids were the same
+  before and after (info only).
+
+### Per-version / per-flow results (run `eb2b0172`)
+
+Times are seconds after the submit: the child's first request reaching the provider / the row first seen / the held
+first token released.
+
+| Version | Flow | `cli.json` | Checks | A6 or A12 window | Row(s) shown | Teardown |
+|---|---|---|---|---|---|---|
+| 2.0.24 | local | runningRow: true | 10/10 PASS | 1.3 / 1.5 / 16.4 | G3, G2 running, G2 idle: `medium (low)`; 1 row | 3 kills, children first; 0 survivors, 0 strays |
+| 2.0.24 | npm | runningRow: true | 5/5 PASS | 0.8 / 0.9 / 15.8 | G3 `medium (low)`; 1 row | same |
+| 2.0.24 | off | none | 4/4 PASS | child at 0.7, held, 8.1 s polled, no row | G2 running and idle `medium (low)` | same |
+| 2.0.25 | local | runningRow: true | 10/10 PASS | 1.2 / 1.4 / 16.2 | as 2.0.24 local | same |
+| 2.0.25 | npm | runningRow: true | 5/5 PASS | 0.6 / 0.7 / 15.6 | as 2.0.24 npm | same |
+| 2.0.25 | off | none | 4/4 PASS | child at 0.7, held, 8.0 s polled, no row | as 2.0.24 off | same |
+| 2.0.26 | local | runningRow: true | 10/10 PASS | 0.7 / 0.8 / 15.7 | as 2.0.24 local | same |
+| 2.0.26 | npm | runningRow: true | 5/5 PASS | 0.5 / 0.6 / 15.5 | as 2.0.24 npm | same |
+| 2.0.26 | off | none | 4/4 PASS | child at 0.5, held, 8.1 s polled, no row | as 2.0.24 off | same |
+
+The off flow's checks are boot, S1 default, A12 no-row and A12 G2. Its fifth test is the teardown test, which reads the
+stop record rather than a check.
+
+### Screens (2.0.24; the other versions are identical apart from path tails)
+
+Default options: the root view while the held child runs. There is no row above the prompt box, and the footer shows
+the host's `↓ 1 subagent` and the plugin's `effort default`:
+```
+  ┃                                                                                                               Claude, GPT, Gemini etc
+  ┃
+  ┃                                                                                                               Connect provider        /connect
+  ┃  Build auto · Claude Opus 4.7 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝■■■ esc interrupt                                    effort default  ↓ 1 subagent  ctrl+p commands    C:\…\omr-tui-2.0.24-off-aj58lC\project
+```
+Default options: the child's own view while it is still held. G2 is unchanged:
+```
+  ┃  TUI_SMOKE_HOLD off
+  ┃
+
+  fast · Claude Sonnet 5.5 · medium (low)
+  ┃
+  ┃  Subagents  Shell                                                                                                                          esc
+  ┃
+  ┃  Fast: tui smoke off                                                                                                                  Running
+```
+With `cli.json` `runningRow: true`, the root view shows the G3 row on line 37 directly above the prompt box (top line
+38), exactly as in the earlier runs below.
+
+Evidence files: `<home>\AppData\Local\Temp\Claude\omr-p21\out4\eb2b0172-*`.
+
+## Verdict (P2.1, before A12)
 
 Every scenario passes on OpenCode **2.0.24, 2.0.25 and 2.0.26**, for both plugin sources:
 - the local path of this checkout;
@@ -234,7 +320,9 @@ v1-pinned smoke files are unchanged, and `routing-host.ts` is not v1-pinned.
 ## DF-1 manual checks (owner)
 
 1. **G1:** with no variant, the footer under the prompt reads `effort default`. After `ctrl+t` the host row shows the variant and the plugin text disappears.
-2. **G3:** while a delegate runs, `<agent> · <model> · <effort>` sits directly above the prompt box. It disappears when the delegate finishes.
+2. **G3 (opt-in since A12):** by default no row appears above the prompt box while a delegate runs. With
+   `{"package":"<package dir>","options":{"runningRow":true}}` in `cli.json`, `<agent> · <model> · <effort>` sits directly
+   above the prompt box while a delegate runs, and disappears when the delegate finishes.
 3. **G2:** press Down, then Enter on the delegate. The child view shows the same row above `Subagents  Shell`.
 4. **Gap** (not provable here): in a long root session with no delegate running, there is no extra blank line above the prompt box compared with the plugin disabled (`-opencode-model-router.status` in `cli.json`).
 5. **Sidebar:** with the sidebar open or closed (`ctrl+x b`), the row stays on one line.
