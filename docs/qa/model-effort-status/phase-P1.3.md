@@ -1,7 +1,7 @@
 # Phase P1.3 — TUI plugin entry and packaging (#90)
 
 Branch `msd/p13` (worktree `D:\git\omr-msd-p13`, from `msd/main` `374d3f1` with P1.1 and P1.2 merged), merged into
-`msd/main` after `3a76eef`.
+`msd/main` at `7e8350d` (after `3a76eef`).
 
 ## Pre-flight
 
@@ -48,7 +48,10 @@ unchanged). 2.0.25 binary from npm `@opencode/cli-windows-x64@2.0.25` (sha512 ma
 | C5 copy with its own `node_modules/solid-js` → renders; the host serves its own solid-js (marker never written) | PASS | PASS | PASS |
 
 The first matrix on `5c74da5` failed C3–C5 everywhere (`Cannot find package 'solid-js' imported from …\src\tui\plugin.ts`)
-because of the extensionless re-export in `tui.ts`; fixed in `3a76eef` (A11b) and re-run above. Other observations:
+because of the extensionless re-export in `tui.ts`; fixed in `3a76eef` (A11b) and re-run above. Failure signs captured
+in that run (screens `omr-a9\out2\P-C3a-*.screens.txt`): toast `Plugin failed: C:\Users\…`, footer
+`⊙ 1 plugin failed /plugins`, `/plugins` dialog row `x …\omr-a9\inst2\no…  failed, local` under `TUI`; host log
+`level=WARN message="plugin operation failed" component=plugin stage=read error="Cannot find package 'solid-js' …"`. Other observations:
 the v2 TUI config is `cli.json` (A10); the host swallows plugin console output (A11c); the server entry needs the
 `@opencode-ai/plugin` peer at runtime, and when the server entry fails the TUI entry is not auto-loaded (pre-existing;
 documented in P2.2). Probe incidents: an earlier `git grep` on the blobless `D:\git\opencode` clone may have fetched

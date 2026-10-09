@@ -1,8 +1,8 @@
 # Phase P2.1 — real-host proof of the TUI status (G1/G2/G3), #90
 
 Branch `msd/p21`: the smoke was committed as `f0b6f7c`, the QA round 1 fixes as `b8a8766` and the QA round 2 fixes as
-`78fd594`. Branch `msd/p31-fix-1` (from `38d8f42`, A12) adapts the smoke to the opt-in G3. Those changes are in the
-working tree, for the executor to commit.
+`78fd594`. Branch `msd/p31-fix-1` (from `38d8f42`, A12) adapts the smoke to the opt-in G3, committed as
+`af96cd8`.
 
 ## A12 update (`msd/p31-fix-1`): G3 is opt-in
 
@@ -202,7 +202,7 @@ Test names, per version (×3):
 ✓ … > local path … > recorded: sidebar toggled and back, empty-box gap
 ✓ … > local path … > teardown: only this flow's processes were killed, children first, and none survive
 ✓ … > node_modules install (npm pack) > boots / S1 default / S2 G3 / S2 A6 / S4 / teardown   (6 tests)
-✓ batch teardown: no opencode.exe left behind and no own PID among the processes present at the start
+✓ batch teardown: no opencode.exe left behind and no own PID among the processes present at the start (round 1 name)
 ```
 16 × 3 + 1 = 49.
 
@@ -240,7 +240,7 @@ Notes on the table:
 - **Local-flow checks:** boot, S1 default/variant/restore, S2 G3, A6, S3 G2, S4, sidebar, gap.
 - **npm-flow checks:** boot, S1 default, S2 G3, A6, S4.
 - **Process trees:** every tree has 3 members: the root `opencode.exe`, a child `opencode.exe` and a `conhost.exe`. All were killed in round 1, children first.
-- **Batch, both runs:** `opencode.exe` PIDs `[12164,55072,56236,59416,65616,73448,75048]` before and after; `newAfter` and `gone` empty. 18 own processes per run, none in the start-of-run lists.
+- **Batch, both runs:** `opencode.exe` PIDs `[12164,55072,56236,59416,65616,73448,75048]` before and after; `newAfter` and `gone` empty (round-1 fields). 18 own processes per run, none in the start-of-run lists.
 
 ## Screen evidence (2.0.24, run `549b8690`; the other versions are identical apart from path tails)
 
