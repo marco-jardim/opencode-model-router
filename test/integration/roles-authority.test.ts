@@ -79,7 +79,7 @@ import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/typ
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { BINDING_NOTES, bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { GRANT_NOTES } from "../../src/routing/roles/policy";
-import { resetAuthorityForTests } from "../../src/routing/roles/authority";
+import { AUTHORITY_TEXT, requestAuthority, requestedAuthority, resetAuthorityForTests } from "../../src/routing/roles/authority";
 import {
   createDispatchRouter, gitWorktreeList, parseWorktreeList, resetDispatchRouting, roleMaxActions, routedRoleOf,
 } from "../../src/routing/wire/dispatch";
@@ -1262,6 +1262,97 @@ describe("P3.3 global QA round 1", () => {
       expect(canonicalAuthorityPath(path, root), JSON.stringify(path)).toBeUndefined();
       expect(decide(root, "edit", [path]).allow, JSON.stringify(path)).toBe(false);
     }
+  });
+});
+
+describe("P3.3 global QA round 1 (QA-G-B-2, QA-G-A1-2)", () => {
+  /** Plants a request record for `child` as one made under another view of it would be (the tool refuses it now). */
+  const plant = (cfg: RouterConfig, child: string, root: string) => {
+    const roles = resolveRoles(cfg, "v2");
+    requestAuthority(child, { actions: ["edit"], reason: "the fix needs an edit" }, {
+      roleOf: () => roles.get("general"), roles: () => roles,
+      dispatchOf: () => ({ parentSessionID: "root", callID: "" }),
+      bindingOf: () => ({ childSessionID: child, kind: "exact", grant: { actions: new Set(), notes: [], workRoot: root }, candidates: ["c"], decisionID: null, budget: 1 }),
+    });
+    expect(requestedAuthority(child)?.actions).toEqual(["edit"]);
+  };
+
+  it("QA-G-B-2: an edit is never allowed under a grant without a work root — the plugin's directory is no fallback for it", () => {
+    const session = temp();
+    const noRoot = { kind: "exact" as const, grant: { actions: new Set(["read", "glob", "grep", "router_git", "edit"] as const), notes: [], workRoot: null } };
+    const decide = (action: string, paths: string[]) =>
+      roleAuthorityDecision({ action, paths, binding: noRoot, dynamic: true, sessionDirectory: session, fallbackRoot: session });
+    for (const action of ["edit", "write", "apply_patch"]) {
+      expect(decide(action, [join(session, "a.ts")]), action).toMatchObject({ allow: false, reason: `${action}: this dispatch has no work root (root=)` });
+    }
+    expect(decide("read", [join(session, "a.ts")]).allow).toBe(true); // local reads keep the fallback
+  });
+
+  it("QA-G-B-2: root= that is no worktree → the ladder refuses edit; even a request on record never widens; evaluate and the tool call refuse", async () => {
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const other = temp("omr-g-other-");
+    await dispatch(v2, sessions, "n1", "gn", "general", `[route class=other risk=low scope=single root=${other}]\nlook at the parser`, dir);
+    expect(routedRoleOf("n1")!.workRoot).toBeNull();
+    expect([...routedRoleOf("n1")!.grant.actions]).toEqual(["read", "glob", "grep", "router_git"]);
+    expect(await catalog(v2, "gn", "general")).toContain("router_request_authority");
+    expect(kindOf(cfg, "gn")).toBe("exact");
+    await toolCall(v2, "gn", "general", "read", { path: join(dir, "a.ts") }); // a granted call (local reads keep the fallback root)
+    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
+    expect(await tools.router_request_authority!.execute({ actions: ["edit"], reason: "the fix needs an edit" }, toolCtx("gn")))
+      .toMatch(/^Refused: edit \(router_run and edit need a work root bound to this dispatch/);
+    expect(requestedAuthority("gn")).toBeUndefined();
+    plant(cfg, "gn", other);
+    await v2.toolHooks["execute.after"]!(parentCall("n1", "gn", "general", "ESCALATE: authority\nedit is needed"));
+    const resume = { sessionID: "root", agent: "build", messageID: "m", id: "n2", tool: "subagent", input: { agent: "general", sessionID: "gn", prompt: "continue" } as Record<string, unknown> };
+    await v2.toolHooks["execute.before"]!(resume);
+    expect([...routedRoleOf("n2")!.grant.actions]).not.toContain("edit");
+    const maxOf = (agent: string) => roleMaxActions(resolveRoles(cfg, "v2").get(agent));
+    expect(currentBinding("gn", { maxOf })!.grant.actions.has("edit")).toBe(false);
+    const file = join(dir, "a.ts");
+    expect((await evaluate(v2, "gn", "general", "edit", [file])).effect).toBe("deny");
+    await expect(toolCall(v2, "gn", "general", "edit", { path: file, oldString: "a", newString: "b" })).rejects.toThrow(/Refused for role agent general/);
+  });
+
+  it("QA-G-A1-2: a delegate's resume never consumes the request; another session's resume drops it with a notice", async () => {
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {
+      other: { id: "other", agent: "build", model: { providerID: "anthropic", id: "claude-opus-5-5" }, location: { directory: dir } },
+      dlg: { id: "dlg", parentID: "root", agent: "medium", location: { directory: dir } },
+    };
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    await dispatch(v2, sessions, "p1", "g1", "general", "Look at the parser module and report its entry points", dir);
+    expect(await catalog(v2, "g1", "general")).toContain("router_request_authority");
+    await toolCall(v2, "g1", "general", "read", { path: join(dir, "a.ts") }); // a granted call passes (and marks the role session)
+    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
+    expect(await tools.router_request_authority!.execute({ actions: ["edit"], reason: "the fix needs an edit" }, toolCtx("g1"))).toMatch(/Authority request recorded: edit/);
+    await v2.toolHooks["execute.after"]!(parentCall("p1", "g1", "general", "ESCALATE: authority\nedit is needed"));
+    expect(requestedAuthority("g1")).toMatchObject({ annotated: true, callID: "p1", parentSessionID: "root" });
+    const maxOf = (agent: string) => roleMaxActions(resolveRoles(cfg, "v2").get(agent));
+    const resumeOf = (sessionID: string, agent: string, id: string) => ({
+      sessionID, agent, messageID: "m", id, tool: "subagent", input: { agent: "general", sessionID: "g1", prompt: "continue" } as Record<string, unknown>,
+    });
+    // A delegate (a session with a parent) resumes the child: the floor-rung path, which consumes nothing.
+    await v2.toolHooks["execute.before"]!(resumeOf("dlg", "medium", "d1"));
+    expect(routedRoleOf("d1")?.delegate).toBe(true);
+    expect(requestedAuthority("g1")).toMatchObject({ annotated: true, callID: "p1" });
+    expect(currentBinding("g1", { maxOf })!.grant.actions.has("edit")).toBe(false);
+    // Another orchestrator session resumes it: the request is not its own — dropped, with the notice on that result.
+    await v2.toolHooks["execute.before"]!(resumeOf("other", "build", "o1"));
+    expect(requestedAuthority("g1")).toBeUndefined();
+    expect(currentBinding("g1", { maxOf })!.grant.actions.has("edit")).toBe(false);
+    const text = "DONE: done";
+    const end = {
+      sessionID: "other", agent: "build", messageID: "m", id: "o1", tool: "subagent", input: { agent: "general", prompt: "x" }, status: "completed",
+      result: { output: { status: "completed", output: text, sessionID: "g1" }, content: [{ type: "text", text }] },
+    };
+    await v2.toolHooks["execute.after"]!(end);
+    expect(resultText(end)).toContain(AUTHORITY_TEXT.dropped.otherParent);
   });
 });
 

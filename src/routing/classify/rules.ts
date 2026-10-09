@@ -218,10 +218,20 @@ function scan(re: RegExp, s: string, visit: (match: RegExpExecArray) => boolean)
 
 /** True when at least one term has an occurrence (not negated, unless `negation` is false). */
 function hasHit(res: readonly RegExp[], s: string, negation: boolean): boolean {
+  return firstHit(res, s, negation) !== null;
+}
+
+/** The text of the first occurrence {@link hasHit} finds (terms in order), or null. */
+function firstHit(res: readonly RegExp[], s: string, negation: boolean): string | null {
   for (const re of res) {
-    if (scan(re, s, (m) => !negation || !isNegatedAt(s, m.index))) return true;
+    let hit: string | null = null;
+    if (scan(re, s, (m) => {
+      if (negation && isNegatedAt(s, m.index)) return false;
+      hit = m[0];
+      return true;
+    })) return hit;
   }
-  return false;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,17 +427,69 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
-function hasExternalPath(needsText: string, cwd: string): boolean {
+/** The first absolute path of `needsText` outside `cwd` (not negated), as written; null when there is none. */
+function externalPath(needsText: string, cwd: string): string | null {
   const base = normalizePath(cwd);
   for (const re of ABS_PATH_RES) {
-    const found = scan(re, needsText, (m) => {
+    let found: string | null = null;
+    if (scan(re, needsText, (m) => {
       if (isNegatedAt(needsText, m.index)) return false;
       const path = normalizePath(trimPathTail(m[0]));
-      return !(path === base || path.startsWith(base + "/"));
-    });
-    if (found) return true;
+      if (path === base || path.startsWith(base + "/")) return false;
+      found = trimPathTail(m[0]);
+      return true;
+    })) return found;
   }
-  return false;
+  return null;
+}
+
+/** One need R9 found in a text, and why: the matched term, `implied-by-<need>`, or the absolute path outside cwd. */
+export interface NeedMatch {
+  readonly need: Need;
+  readonly term: string;
+}
+
+/**
+ * R9 on the needs text: the needs its vocabulary and its absolute paths outside `cwd` name (class-implied needs are added by the
+ * caller). `matches`, when given, collects why ({@link NeedMatch}).
+ */
+function scanNeeds(needsText: string, cwd: string | null, matches?: NeedMatch[]): Set<Need> {
+  const needs = new Set<Need>();
+  const pathFreeText = withoutPaths(needsText);
+  for (const rule of COMPILED_NEEDS) {
+    const hit = firstHit(rule.res, rule.need === "external_dir" ? needsText : pathFreeText, true);
+    if (hit === null) continue;
+    needs.add(rule.need);
+    matches?.push({ need: rule.need, term: hit });
+    for (const implied of rule.implies) {
+      needs.add(implied);
+      matches?.push({ need: implied, term: `implied-by-${rule.need}` });
+    }
+  }
+  if (cwd !== null && !needs.has("external_dir")) {
+    const path = externalPath(needsText, cwd);
+    if (path !== null) {
+      needs.add("external_dir");
+      matches?.push({ need: "external_dir", term: path });
+    }
+  }
+  return needs;
+}
+
+/** Bound on the length of a reported term. */
+const NEED_TERM_CHARS = 120;
+
+/**
+ * #84 QA-G-B-3: the needs R9 finds in `text` itself (the text `analyzeRules` is given, the same `cwd` rule) and why, in the order
+ * of the needs table — never the class-implied needs. Pure; decides nothing by itself.
+ */
+export function needMatchesOf(text: string, ctx?: { cwd?: string }): NeedMatch[] {
+  const raw = collapseLongRuns(String(text ?? "").slice(0, RULES_MAX_CHARS));
+  const body = prepareBody(raw);
+  const { needsText, environmentText } = splitSections(body);
+  const matches: NeedMatch[] = [];
+  scanNeeds(needsText, resolveCwd(body, environmentText, ctx), matches);
+  return matches.map(({ need, term }) => ({ need, term: term.replace(/\s+/g, " ").slice(0, NEED_TERM_CHARS) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -547,17 +609,7 @@ export function analyzeRules(
         : CONFIDENCE.rulesMultiple;
 
   // R9 — needs
-  const needs = new Set<Need>();
-  const pathFreeText = withoutPaths(needsText);
-  for (const rule of COMPILED_NEEDS) {
-    if (hasHit(rule.res, rule.need === "external_dir" ? needsText : pathFreeText, true)) {
-      needs.add(rule.need);
-      for (const implied of rule.implies) needs.add(implied);
-    }
-  }
-  if (cwd !== null && !needs.has("external_dir") && hasExternalPath(needsText, cwd)) {
-    needs.add("external_dir");
-  }
+  const needs = scanNeeds(needsText, cwd);
   for (const implied of CLASS_IMPLIED_NEEDS[taskClass]) needs.add(implied);
 
   // R10 — scope

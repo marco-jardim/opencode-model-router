@@ -519,7 +519,8 @@ export function listedWorktreeRoot(
  * - `external_directory` (P-13): only an EXACT binding with a work root and a local action, every resource inside that root;
  *   an unknown binding or a grant without a root → refused (I9);
  * - path actions (`read`, `edit`, `glob`, `grep`): every path, canonical ({@link canonicalAuthorityPath}; case folded on win32),
- *   inside the bound work root — the plugin's directory when the grant has none; `read`/`edit` with no path refuse (QA-P23-A5);
+ *   inside the bound work root — the plugin's directory when the grant has none, except for `edit`, which a grant without a work
+ *   root never allows (QA-G-B-2); `read`/`edit` with no path refuse (QA-P23-A5);
  *   a `glob`/`grep` pattern that reaches outside its search root by itself refuses (QA-P23-A9); every edit tool refuses `.git`
  *   and everything below it ({@link editsGitMetadata}, QA-G-A2-2).
  */
@@ -555,6 +556,9 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
   }
   if (!grant.actions.has(cls)) return refuse(`${action} is not in this dispatch's grant (${[...grant.actions].join(", ") || "none"})`);
   if (cls === "read" || cls === "edit" || cls === "glob" || cls === "grep") {
+    // QA-G-B-2 (R7 null-root contract, I3): an edit never falls back to the plugin's directory — without a bound work root it would
+    // land in the base checkout. Only the local reads keep the fallback.
+    if (cls === "edit" && grant.workRoot === null) return refuse(`${action}: this dispatch has no work root (root=)`);
     const root = grant.workRoot ?? input.fallbackRoot;
     if (root === undefined) return refuse(`${action}: no work root could be resolved`);
     if ((cls === "read" || cls === "edit") && input.paths.length === 0) return refuse(`${action}: no path to check`);
@@ -746,7 +750,8 @@ export async function registerV2Hooks(
   // was bound as (a session resumed under another role never gets the union).
   // -------------------------------------------------------------------------
   /**
-   * Canonical long form of the plugin's directory: the work root of a grant without one (I9); undefined when it does not resolve.
+   * Canonical long form of the plugin's directory: the work root of a grant without one (I9), for local reads only — never for
+   * `edit` (QA-G-B-2); undefined when it does not resolve.
    * QA-P23-A11: only a resolved directory is cached; a failure is retried on the next call.
    */
   let pluginRoot: string | undefined;
@@ -1441,16 +1446,18 @@ export async function registerV2Hooks(
         // widened actions recompute the tier floor in `route()`. QA-P21-1-10: the request is only READ before routing and
         // consumed once `route()` succeeded — a refused dispatch keeps it and queues no notice. Q1 (P2.3 call site): only an
         // EXACT binding widens; any other drops the request ("binding unknown: dispatch a fresh task"), shown on this result.
+        // QA-G-A1-2: a resume by another session than the one the request was escalated to drops it, with the notice.
         const roles = rolesOf(cfg);
         const resumeID = typeof args.sessionID === "string" && args.sessionID !== "" ? args.sessionID : undefined;
         let widened: AuthorityAction[] | undefined;
         let afterRoute: (() => void) | undefined;
         if (resumeID !== undefined && roles.has(args.agent)) {
           hostBudget.begin(resumeID); // handoff 22: the host's step count starts over with the resumed attempt
-          // QA-P21-2 nit 2: one preview (authority.ts) decides what consumeAuthority would do; Q1 via `exactOnly`.
+          // QA-P21-2 nit 2: one preview (authority.ts) decides what consumeAuthority would do; Q1 via `exactOnly`. QA-G-A1-2: only
+          // the session the request was escalated to may apply it (`parentSessionID`); any other resuming session drops it.
           const deps = authorityDeps(roles, args.agent);
-          const afterCall = lastCallOfChild.get(resumeID) ?? "";
-          const preview = previewAuthority(resumeID, deps, { afterCall, exactOnly: true });
+          const resume = { afterCall: lastCallOfChild.get(resumeID) ?? "", exactOnly: true, parentSessionID: String(event.sessionID) };
+          const preview = previewAuthority(resumeID, deps, resume);
           if (preview.status === "widened") widened = [...preview.widened];
           if (preview.status === "dropped" && preview.reason === AUTHORITY_TEXT.dropped.bindingUnknown) {
             afterRoute = () => {
@@ -1459,7 +1466,8 @@ export async function registerV2Hooks(
             };
           } else if (preview.status !== "none") {
             afterRoute = () => {
-              const consumed = consumeAuthority(resumeID, deps, { afterCall });
+              // QA-G-A1-3: `exactOnly` here too, so the consume can never widen a binding the preview did not see as exact.
+              const consumed = consumeAuthority(resumeID, deps, resume);
               if (consumed.status === "dropped") annotateSubagentResult("authority", resumeID, `[router] ${consumed.reason}.`);
             };
           }
@@ -1468,7 +1476,9 @@ export async function registerV2Hooks(
           callID: event.id, sessionID: event.sessionID, agent: event.agent, args, tierModel, cfg,
           ...(widened === undefined ? {} : { widened }),
         });
-        afterRoute?.();
+        // QA-G-A1-2: a delegate's resume (the unparsed, floor-rung path) never consumes the request: it widens nothing, and the
+        // request stays for the session it was escalated to.
+        if (routed.role?.delegate !== true) afterRoute?.();
         if (routed.prompt !== undefined) args.prompt = routed.prompt;
         // #84 P2.1-C: a fresh role dispatch carries its nonce at the END of the description (title marker, handoff 31).
         if (routed.description !== undefined) args.description = routed.description;

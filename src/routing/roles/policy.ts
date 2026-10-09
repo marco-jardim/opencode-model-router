@@ -53,6 +53,12 @@ export interface EffectiveDetectionInput {
   readonly claim: Detection | null;
   /** The depth of the prompt's `[acceptance]` block, or null when it has none. */
   readonly acceptance: Detection | null;
+  /**
+   * #84 QA-G-B-7: some verification of this dispatch will run at all (enforcement not off, not bypassed, `verify.require` not
+   * `never`, the requested cwd inside the root the gate verifies in; dispatch.ts `roleVerificationRuns`). `false` → `none`: nothing
+   * checks the work, so neither a claim nor an `[acceptance]` block counts. Absent: it will.
+   */
+  readonly verifies?: boolean;
 }
 
 const DETECTION_STRENGTH: Readonly<Record<Detection, number>> = { none: 0, grader: 1, deterministic: 2 };
@@ -64,10 +70,11 @@ function strength(d: Detection | null): number {
 /**
  * A34 (QA-P12-2-1): `deterministic` only when the router's own gate runs the checks; otherwise the weaker of
  * `claim ?? "none"` and `acceptance ?? "none"`, capped at `grader` (a claim alone is never deterministic). Absent or
- * unknown values count as `none`. (Same order as `engine/plan.weakerDetection`, restated here: importing the engine
- * from the policy would close an import cycle.)
+ * unknown values count as `none`. QA-G-B-7: `none` whenever no verification runs at all (`verifies: false`). (Same order
+ * as `engine/plan.weakerDetection`, restated here: importing the engine from the policy would close an import cycle.)
  */
 export function effectiveDetection(input: EffectiveDetectionInput): EffectiveDetection {
+  if (input.verifies === false) return "none" as EffectiveDetection;
   if (input.routerGate === true) return "deterministic" as EffectiveDetection;
   const weaker = Math.min(strength(input.claim), strength(input.acceptance), DETECTION_STRENGTH.grader);
   return DETECTIONS.find((d) => DETECTION_STRENGTH[d] === weaker)! as EffectiveDetection;

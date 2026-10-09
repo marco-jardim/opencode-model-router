@@ -104,7 +104,8 @@ const NO_ACTIONS: ReadonlySet<AuthorityAction> = new Set<AuthorityAction>();
 /** Notes a binding can carry (exact texts, shared with the runtime and the tests). */
 export const BINDING_NOTES = {
   unknown:
-    "binding unknown: this session could not be matched to its dispatch; local actions only, no work root, no router_run — call `router_request_authority` to ask for more",
+    // QA-G-A1-4 (R8(4)): a request from an unknown binding is dropped on resume, so the note never points at the ladder.
+    "binding unknown: this session could not be matched to its dispatch; local actions only, no work root, no router_run — authority is not widened for it: dispatch a fresh task",
   lookupFailed: "binding unknown: session lookup failed",
   noParent: "binding unknown: the session lookup reported no parent or agent",
   noNonce: "binding unknown: this session carries no dispatch nonce",
@@ -112,7 +113,7 @@ export const BINDING_NOTES = {
   markers: "binding unknown: the session's title and first message name different dispatch nonces",
   claimed: "binding unknown: the dispatch named by this session's nonce is already bound to another session",
   beyondMax: (actions: readonly AuthorityAction[]): string => `outside the role max, dropped: ${actions.join(", ")}`,
-  noWorkRoot: "router_run needs a bound work root (root=) — not granted",
+  noWorkRoot: "router_run and edit need a bound work root (root=) — not granted",
   separation: GRANT_NOTES.separation,
   widened: (actions: readonly AuthorityAction[]): string => `authority widened on resume: ${actions.join(", ")}`,
   notBound: "no binding for this session: nothing widened",
@@ -458,7 +459,7 @@ export function currentBinding(childSessionID: string, opts: BindOptions): Bindi
 /**
  * Widens the grant of a bound child (the authority ladder's resume path) and returns the new grant. The
  * stored grant is first narrowed to `max`, then only actions inside `max` are added: never `execute`,
- * `router_run` only with a work root, nothing across the separation rule. `max` undefined → nothing is added
+ * `router_run` and `edit` only with a work root (QA-G-B-2), nothing across the separation rule. `max` undefined → nothing is added
  * and nothing stored; an unbound child gets an empty grant.
  */
 export function widen(
@@ -478,7 +479,8 @@ export function widen(
   const added: AuthorityAction[] = [];
   for (const action of ordered(actions)) {
     if (next.has(action) || !allowed.has(action)) continue;
-    if (action === "router_run" && before.workRoot === null) {
+    // QA-G-B-2 (R7 null-root contract, I3): no write and no run without a bound work root.
+    if ((action === "router_run" || action === "edit") && before.workRoot === null) {
       notes.push(BINDING_NOTES.noWorkRoot);
       continue;
     }

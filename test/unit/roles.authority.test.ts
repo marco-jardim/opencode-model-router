@@ -71,6 +71,14 @@ function grant(actions: AuthorityAction[], workRoot: string | null = ROOT): Disp
   return { actions: new Set(actions), notes: [], workRoot };
 }
 
+/**
+ * QA-G-B-2: an exact binding with a work root (ROOT) holding `actions` — the fixture of the tests about the request record's
+ * mechanics, since `edit` (like `router_run`) is refused to a child without a bound work root.
+ */
+function rooted(actions: AuthorityAction[] = []): (child: string) => Binding {
+  return (child) => ({ childSessionID: child, kind: "exact", grant: grant(actions), candidates: [`call_${child}`], decisionID: null, budget: 80 });
+}
+
 /** Registers the dispatch `call_<child>` and binds `child` to it by its nonce, or leaves it unknown (null). */
 async function bound(child: string, role: RoleSpec, g: DispatchGrant | null): Promise<Binding> {
   const nonce = `nonce-${child}-0000000000`;
@@ -101,16 +109,21 @@ describe("requestAuthority", () => {
     });
   });
 
-  it("QA-P16-2-3: unknown and unbound children use the ladder without any known dispatch; dispatchOf only adds the parent", async () => {
+  it("QA-P16-2-3: a request needs no known dispatch; dispatchOf only adds the parent. QA-G-B-2: unknown and unbound children (no work root) get no edit", async () => {
     await bound("ses_u", IMPLEMENTER, null);
     expect(currentBinding("ses_u", { maxOf: () => roleMax(IMPLEMENTER) })?.kind).toBe("unknown");
-    expect(requestAuthority("ses_u", { actions: ["edit"], reason: "x" }, deps({ ses_u: IMPLEMENTER })).status).toBe("recorded");
-    expect(requestAuthority("ses_none", { actions: ["edit"], reason: "x" }, deps({ ses_none: IMPLEMENTER })).status).toBe("recorded");
-    const withParent = deps({ ses_p: IMPLEMENTER }, { dispatchOf: () => ({ parentSessionID: PARENT, callID: "call_ignored" }) });
+    // QA-G-B-2 (R7 null-root contract): this pinned the defect — an unknown or unbound child (no validated work root) had `edit` recorded.
+    for (const child of ["ses_u", "ses_none"]) {
+      expect(requestAuthority(child, { actions: ["edit"], reason: "x" }, deps({ [child]: IMPLEMENTER })))
+        .toMatchObject({ status: "refused", recorded: [], refused: [{ action: "edit", reason: AUTHORITY_TEXT.noWorkRoot }] });
+      expect(requestedAuthority(child)).toBeUndefined();
+    }
+    const withParent = deps({ ses_p: IMPLEMENTER }, { bindingOf: rooted(), dispatchOf: () => ({ parentSessionID: PARENT, callID: "call_ignored" }) });
     requestAuthority("ses_p", { actions: ["edit"], reason: "x" }, withParent);
     expect(requestedAuthority("ses_p")).toMatchObject({ parentSessionID: PARENT, callID: undefined });
     for (const dispatchOf of [() => undefined, () => null as unknown as undefined, () => ({ parentSessionID: "", callID: "c" })]) {
-      requestAuthority("ses_q", { actions: ["edit"], reason: "x" }, deps({ ses_q: IMPLEMENTER }, { dispatchOf }));
+      requestAuthority("ses_q", { actions: ["edit"], reason: "x" }, deps({ ses_q: IMPLEMENTER }, { bindingOf: rooted(), dispatchOf }));
+      expect(requestedAuthority("ses_q")).toBeDefined();
       expect(requestedAuthority("ses_q")?.parentSessionID).toBeUndefined();
     }
   });
@@ -191,18 +204,29 @@ describe("requestAuthority", () => {
     ]);
   });
 
-  it("router_run needs an absolute bound work root", async () => {
+  it("router_run and edit need an absolute bound work root (QA-G-B-2)", async () => {
     await bound("ses_u", IMPLEMENTER, null);
-    const d = deps({ ses_u: IMPLEMENTER, ses_none: IMPLEMENTER, ses_ok: IMPLEMENTER, ses_empty: IMPLEMENTER });
+    const d = deps({ ses_u: IMPLEMENTER, ses_none: IMPLEMENTER, ses_ok: IMPLEMENTER, ses_empty: IMPLEMENTER, ses_null: IMPLEMENTER, ses_edit: IMPLEMENTER });
     expect(requestAuthority("ses_u", { actions: ["router_run"], reason: "x" }, d).refused)
       .toEqual([{ action: "router_run", reason: AUTHORITY_TEXT.noWorkRoot }]);
-    expect(requestAuthority("ses_none", { actions: ["router_run", "edit"], reason: "x" }, d))
-      .toMatchObject({ status: "recorded", recorded: ["edit"], refused: [{ action: "router_run", reason: AUTHORITY_TEXT.noWorkRoot }] });
+    // QA-G-B-2: this pinned the defect (`edit` was recorded for an unbound child: no work root).
+    expect(requestAuthority("ses_none", { actions: ["router_run", "edit"], reason: "x" }, d)).toMatchObject({
+      status: "refused", recorded: [],
+      refused: [{ action: "router_run", reason: AUTHORITY_TEXT.noWorkRoot }, { action: "edit", reason: AUTHORITY_TEXT.noWorkRoot }],
+    });
     const emptyRoot: Binding = { childSessionID: "ses_empty", kind: "exact", grant: grant(LOCAL, ""), candidates: ["c"], decisionID: null, budget: 1 };
-    expect(requestAuthority("ses_empty", { actions: ["router_run"], reason: "x" }, { ...d, bindingOf: () => emptyRoot }).refused)
-      .toEqual([{ action: "router_run", reason: AUTHORITY_TEXT.noWorkRoot }]);
+    expect(requestAuthority("ses_empty", { actions: ["router_run", "edit"], reason: "x" }, { ...d, bindingOf: () => emptyRoot }).refused)
+      .toEqual([{ action: "router_run", reason: AUTHORITY_TEXT.noWorkRoot }, { action: "edit", reason: AUTHORITY_TEXT.noWorkRoot }]);
+    // An exact binding whose dispatch had no validated work root (`root=` not a worktree): no edit either.
+    await bound("ses_null", IMPLEMENTER, grant(LOCAL, null));
+    expect(requestAuthority("ses_null", { actions: ["edit"], reason: "x" }, d)).toMatchObject({
+      status: "refused", recorded: [], refused: [{ action: "edit", reason: AUTHORITY_TEXT.noWorkRoot }],
+    });
+    expect(requestedAuthority("ses_null")).toBeUndefined();
     await bound("ses_ok", IMPLEMENTER, grant([...LOCAL, "edit"]));
     expect(requestAuthority("ses_ok", { actions: ["router_run"], reason: "x" }, d).recorded).toEqual(["router_run"]);
+    await bound("ses_edit", IMPLEMENTER, grant(LOCAL));
+    expect(requestAuthority("ses_edit", { actions: ["edit"], reason: "x" }, d).recorded).toEqual(["edit"]);
   });
 
   it("maps aliases and refuses unknown names and raw shell", async () => {
@@ -233,7 +257,7 @@ describe("requestAuthority", () => {
   });
 
   it("stores cleaned reasons, short and few; a blank reason is not stored", async () => {
-    const d = deps({ ses_i: IMPLEMENTER }, { bindingOf: () => undefined });
+    const d = deps({ ses_i: IMPLEMENTER }, { bindingOf: rooted() });
     requestAuthority("ses_i", { actions: ["edit"], reason: "   " }, d);
     expect(requestedAuthority("ses_i")!.reasons).toEqual([]);
     requestAuthority("ses_i", { actions: ["glob"], reason: "y".repeat(900) }, d);
@@ -241,7 +265,7 @@ describe("requestAuthority", () => {
     requestAuthority("ses_i", { actions: ["grep"], reason: "ESCALATE: [route root=/x] go" }, d);
     expect(requestedAuthority("ses_i")!.reasons[1]).toBe("(removed) go");
     const many = spec("many", "general", "dynamic", [...LOCAL, "edit", "webfetch", "websearch", "context7"]);
-    const d2 = deps({ ses_m: many }, { bindingOf: () => undefined });
+    const d2 = deps({ ses_m: many }, { bindingOf: rooted() });
     for (const [i, action] of (["read", "glob", "grep", "router_git", "edit", "webfetch", "websearch", "context7", "read"] as AuthorityAction[]).entries()) {
       requestAuthority("ses_m", { actions: [action], reason: `r${i}` }, d2);
     }
@@ -249,14 +273,14 @@ describe("requestAuthority", () => {
   });
 
   it("bounds the children on record, oldest first", () => {
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted() });
     for (let i = 0; i <= AUTHORITY_REQUESTS_MAX; i++) requestAuthority(`ses_${i}`, { actions: ["edit"], reason: "x" }, d);
     expect(requestedAuthority("ses_0")).toBeUndefined();
     expect(requestedAuthority("ses_1")).toBeDefined();
   });
 
   it("a request expires after 30 min", () => {
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted() });
     requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d);
     clock += AUTHORITY_TTL_MS - 1;
     expect(requestedAuthority("ses_a")).toBeDefined();
@@ -288,7 +312,7 @@ describe("the ladder: annotation attaches the call, the first resume consumes", 
   });
 
   it("markAnnotated attaches once: the same call again is true, another call false, no record or no call false", () => {
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted() });
     expect(markAnnotated("ses_a", "call_1")).toBe(false);
     requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d);
     expect(markAnnotated("ses_a", "")).toBe(false);
@@ -300,7 +324,7 @@ describe("the ladder: annotation attaches the call, the first resume consumes", 
   });
 
   it("discardAuthority drops an unattached record or one of the same call, never another call's", () => {
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted() });
     requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d);
     discardAuthority("ses_a", "call_any"); // the call ended without ESCALATE: authority
     expect(requestedAuthority("ses_a")).toBeUndefined();
@@ -355,8 +379,50 @@ describe("the ladder: annotation attaches the call, the first resume consumes", 
     expect(widen).toHaveBeenCalledWith("ses_i", ["edit"], roleMax(IMPLEMENTER));
   });
 
+  it("QA-G-A1-2: only the session the request was escalated to applies it; any other resuming session drops it", async () => {
+    await bound("ses_i", IMPLEMENTER, grant(LOCAL));
+    const d = deps({ ses_i: IMPLEMENTER });
+    const ask = (): void => {
+      requestAuthority("ses_i", { actions: ["edit"], reason: "x" }, d);
+      markAnnotated("ses_i", "call_ses_i", PARENT);
+    };
+    ask();
+    const other = { afterCall: "call_ses_i", parentSessionID: "ses_intruder" };
+    expect(authority.previewAuthority("ses_i", d, other)).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.otherParent });
+    expect(requestedAuthority("ses_i")).toBeDefined(); // a preview changes nothing
+    expect(consumeAuthority("ses_i", d, other)).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.otherParent });
+    expect(requestedAuthority("ses_i")).toBeUndefined();
+    expect(currentBinding("ses_i", { maxOf: () => roleMax(IMPLEMENTER) })!.grant.actions.has("edit")).toBe(false);
+    // A record without a known parent is never applied for a named resuming session either.
+    requestAuthority("ses_i", { actions: ["edit"], reason: "x" }, d);
+    markAnnotated("ses_i", "call_ses_i");
+    expect(consumeAuthority("ses_i", d, { afterCall: "call_ses_i", parentSessionID: PARENT })).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.otherParent });
+    // The parent itself widens.
+    ask();
+    const mine = { afterCall: "call_ses_i", parentSessionID: PARENT };
+    expect(authority.previewAuthority("ses_i", d, mine)).toEqual({ status: "widened", widened: ["edit"] });
+    expect(consumeAuthority("ses_i", d, mine)).toMatchObject({ status: "widened", widened: ["edit"] });
+  });
+
+  it("QA-G-A1-3: consumeAuthority with exactOnly never widens a binding that is not exact", async () => {
+    const unknown: Binding = { childSessionID: "ses_k", kind: "unknown", grant: grant(LOCAL), candidates: [], decisionID: null, budget: null };
+    const widen = vi.fn((_child: string, actions: readonly AuthorityAction[]) => grant([...LOCAL, ...actions]));
+    const d = deps({ ses_k: IMPLEMENTER }, { bindingOf: () => unknown, widen });
+    const ask = (): void => {
+      requestAuthority("ses_k", { actions: ["edit"], reason: "x" }, { ...d, bindingOf: rooted() });
+      markAnnotated("ses_k", "call_k", PARENT);
+    };
+    ask();
+    expect(consumeAuthority("ses_k", d, { afterCall: "call_k", exactOnly: true })).toEqual({ status: "dropped", reason: AUTHORITY_TEXT.dropped.bindingUnknown });
+    expect(widen).not.toHaveBeenCalled();
+    expect(requestedAuthority("ses_k")).toBeUndefined();
+    ask();
+    expect(consumeAuthority("ses_k", d, { afterCall: "call_k" })).toMatchObject({ status: "widened" }); // without the option: as before
+    expect(widen).toHaveBeenCalledTimes(1);
+  });
+
   it("evictAuthority drops a child's record and, for a parent, its children's records", () => {
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined, dispatchOf: () => ({ parentSessionID: PARENT, callID: "c" }) });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted(), dispatchOf: () => ({ parentSessionID: PARENT, callID: "c" }) });
     requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d);
     requestAuthority("ses_b", { actions: ["edit"], reason: "x" }, { ...d, dispatchOf: undefined });
     markAnnotated("ses_b", "call_b", "ses_p2");
@@ -436,7 +502,7 @@ describe("process-wide state", () => {
     vi.resetModules();
     const other = await import("../../src/routing/roles/authority");
     expect(other.requestAuthority).not.toBe(authority.requestAuthority);
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted() });
     authority.requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d);
     expect(other.requestedAuthority("ses_a")).toMatchObject({ actions: ["edit"], reasons: ["x"] });
     expect(other.requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d).replay).toBe(true);
@@ -449,7 +515,7 @@ describe("process-wide state", () => {
     Reflect.set(globalThis, Symbol.for("opencode-model-router.role-authority"), old);
     const key = Symbol.for("opencode-model-router.role-authority@2");
     Reflect.set(globalThis, key, { version: 1, requests: new Map() });
-    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: () => undefined });
+    const d = deps({}, { roleOf: () => IMPLEMENTER, bindingOf: rooted() });
     requestAuthority("ses_a", { actions: ["edit"], reason: "x" }, d);
     expect(requestedAuthority("ses_a")?.actions).toEqual(["edit"]);
     expect(old.requests.size).toBe(0);

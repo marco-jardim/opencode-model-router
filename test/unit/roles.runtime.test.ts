@@ -364,7 +364,16 @@ describe("authority ladder in the adapter (handoffs 34-37)", () => {
     const maxOf = (agent: string) => resolveRoles(cfg, "v2").get(agent)?.authority.allow;
     expect(currentBinding("g5", { maxOf })?.kind).toBe("unknown"); // no nonce: unknown
     const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
-    await tools.router_request_authority!.execute({ actions: ["edit"], reason: "patch" }, toolCtx("g5"));
+    // QA-G-B-2: an unknown binding has no work root, so the ladder refuses `edit` outright …
+    expect(await tools.router_request_authority!.execute({ actions: ["edit"], reason: "patch" }, toolCtx("g5"))).toMatch(/Refused: edit \(router_run and edit need a work root/);
+    expect(requestedAuthority("g5")).toBeUndefined();
+    // … so the record of the drop path below is planted as one made under another view of the child would be (fixture only).
+    const roles = resolveRoles(cfg, "v2");
+    requestAuthority("g5", { actions: ["edit"], reason: "patch" }, {
+      roleOf: () => roles.get("general"), roles: () => roles,
+      bindingOf: () => ({ childSessionID: "g5", kind: "exact", grant: { actions: new Set(), notes: [], workRoot: dir }, candidates: ["c"], decisionID: null, budget: 1 }),
+    });
+    expect(requestedAuthority("g5")?.actions).toEqual(["edit"]);
     await v2.toolHooks["execute.after"](parentCall("p1", "g5", "general", "ESCALATE: authority"));
     const resume = { sessionID: "root", agent: "build", messageID: "m", id: "p2", tool: "subagent", input: { agent: "general", sessionID: "g5", prompt: "continue" } as Record<string, unknown> };
     await v2.toolHooks["execute.before"](resume);
@@ -381,8 +390,13 @@ describe("authority ladder in the adapter (handoffs 34-37)", () => {
     const v2 = host(dir, cfg, { g2: { id: "g2", parentID: "root", agent: "general", location: { directory: dir } } });
     await v2.start(hooks);
     await v2.toolHooks["execute.before"]({ sessionID: "g2", agent: "general", messageID: "m", id: "t0", tool: "read", input: { path: join(dir, "a.ts") } });
-    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
-    await tools.router_request_authority!.execute({ actions: ["edit"], reason: "patch" }, toolCtx("g2"));
+    // QA-G-B-2: the unknown binding (no work root) cannot record `edit` through the tool; the record is planted (fixture only).
+    const roles = resolveRoles(cfg, "v2");
+    requestAuthority("g2", { actions: ["edit"], reason: "patch" }, {
+      roleOf: () => roles.get("general"), roles: () => roles,
+      bindingOf: () => ({ childSessionID: "g2", kind: "exact", grant: { actions: new Set(), notes: [], workRoot: dir }, candidates: ["c"], decisionID: null, budget: 1 }),
+    });
+    expect(requestedAuthority("g2")).toBeDefined();
     const event = parentCall("p1", "g2", "general", "DONE: nothing to patch after all");
     await v2.toolHooks["execute.after"](event);
     expect(requestedAuthority("g2")).toBeUndefined();
@@ -397,8 +411,12 @@ describe("authority ladder in the adapter (handoffs 34-37)", () => {
     await v2.toolHooks["execute.before"]({ sessionID: "g3", agent: "general", messageID: "m", id: "t0", tool: "read", input: { path: join(dir, "a.ts") } });
     const maxOf = (agent: string) => resolveRoles(cfg, "v2").get(agent)?.authority.allow;
     expect(currentBinding("g3", { maxOf })).toBeDefined(); // bound by the adapter before the child's tool ran
-    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
-    await tools.router_request_authority!.execute({ actions: ["edit"], reason: "patch" }, toolCtx("g3"));
+    // QA-G-B-2: the unknown binding (no work root) cannot record `edit` through the tool; the record is planted (fixture only).
+    const roles = resolveRoles(cfg, "v2");
+    requestAuthority("g3", { actions: ["edit"], reason: "patch" }, {
+      roleOf: () => roles.get("general"), roles: () => roles,
+      bindingOf: () => ({ childSessionID: "g3", kind: "exact", grant: { actions: new Set(), notes: [], workRoot: dir }, candidates: ["c"], decisionID: null, budget: 1 }),
+    });
     expect(requestedAuthority("g3")).toBeDefined();
     v2.emit({ type: "session.deleted", data: { sessionID: "g3" } });
     await vi.waitFor(() => expect(requestedAuthority("g3")).toBeUndefined());

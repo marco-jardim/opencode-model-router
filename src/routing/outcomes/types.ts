@@ -560,6 +560,12 @@ export interface DecisionTrace {
    * cheapest option the engine could not trust yet. `routing:stats` counts these to show where the gate holds it back.
    */
   readonly argmin?: RouteChoice;
+  /**
+   * #84 QA-G-B-3 (3), role dispatches only: why each need of `facts.needs` could be there — the classifier's matched terms
+   * (`edit:create`, `external_dir:<path>`, `shell:implied-by-network`), `<need>:route-line`, `<need>:class=<class>` and, on a resume,
+   * `<need>:resumed-dispatch`. Before any narrowing: `facts.needs` is what was decided.
+   */
+  readonly needTerms?: readonly string[];
 }
 
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */
