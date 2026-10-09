@@ -40,6 +40,11 @@ Host source read only at tags `v2.0.24` / `v2.0.25` / `v2.0.26` of `D:\git\openc
 
 ## S2 — TUI config
 
+**Correction (A10, P1.3):** the v2 TUI config file is `<config dir>\cli.json`
+(`v2.0.24:packages/cli/src/config/config.ts:31`, schema `cli/src/config/schema.ts:6-9` = `Config.Info` with `plugins`).
+`tui.json` below is a v1 legacy file, migrated by `cli/src/config/migrate.ts` only when `cli.json` is absent; the P0.1
+probe rendered through the server-config auto-load, not through `tui.json`. Read "`tui.json`" below as `cli.json`.
+
 - `v2.0.24:packages/tui/src/config/index.tsx:45-52`: `plugins: Array<string | { package: string; options?: Record<string, any> }>`;
   `-<id>` disables, `*`/`foo.*` patterns, exact id enables a built-in (`context.tsx:318-326`); options only from the
   object form (`context.tsx:332`); options reach `setup` as `context.options` (`plugin/src/tui/context.ts:545`,

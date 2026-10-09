@@ -334,6 +334,13 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `Bun.resolveSync("opencode-model-router/tui", dir)` returns the installed `tui.ts` for `dir` = both the temp install
   root and the package dir (the package-name branch). P2.1 adds the scenarios "server config only, no
   `tui.json`" for a local path and for a `node_modules` install, on the three versions.
+- A10 (S2 correction, found in the P1.3 A9 run) **The v2 TUI config file is `cli.json`, not `tui.json`.**
+  `v2.0.24:packages/cli/src/config/config.ts:31` `path.join(global.config, "cli.json")` (same at v2.0.26); its schema is
+  `{ $schema?, ...Config.Info.fields }` (`cli/src/config/schema.ts:6-9`, the TUI `Config.Info` with `plugins`).
+  `tui.json` is a v1 legacy file read only by `cli/src/config/migrate.ts` (key `plugin`, `[pkg, options]` pairs) when
+  `cli.json` does not exist. Owner file: `C:\Users\Marquinho\.config\opencode\cli.json` (exists). Every "`tui.json`" in
+  A4/A9/§3 means `cli.json`; P2.1, P2.2 and DF-1 use `cli.json`. The P0.1 probe rendered because its server config also
+  listed the probe (auto-load), not through `tui.json`.
 
 ## 9. Risks
 | Risk | Mitigation |
