@@ -4,10 +4,12 @@ import {
   DEFAULT_STATUS_OPTIONS,
   ELLIPSIS,
   FALLBACK_AGENT,
+  ROW_SEPARATOR,
   STATUS_NOTICE_PREFIX,
   STATUS_OPTION_KEYS,
   UNKNOWN_MODEL,
   childStatus,
+  clampMax,
   displayWidth,
   effectiveMainEffort,
   effortLabel,
@@ -18,6 +20,7 @@ import {
   runningChildren,
   truncate,
   type AppliedEffort,
+  type CreatedTime,
   type MessageLike,
   type ModelInfo,
   type ModelRef,
@@ -27,8 +30,8 @@ import {
 } from "../../src/tui/status-model";
 
 const MODELS: ModelInfo[] = [
-  { id: "claude-fable-5", providerID: "anthropic", name: "Claude Fable 5", variants: ["low", "high"] },
-  { id: "gpt-5", providerID: "openai", name: "GPT-5", variants: ["minimal", "high"] },
+  { id: "claude-fable-5", providerID: "anthropic", name: "Claude Fable 5", variants: [{ id: "low" }, { id: "high" }] },
+  { id: "gpt-5", providerID: "openai", name: "GPT-5", variants: [{ id: "minimal" }, { id: "high" }] },
   { id: "gpt-5", providerID: "azure", name: "GPT-5" },
   { id: "local-7b", providerID: "ollama" },
 ];
@@ -37,16 +40,22 @@ function ref(providerID: string, id: string, variant?: string): ModelRef {
   return variant === undefined ? { providerID, id } : { providerID, id, variant };
 }
 
-function assistant(id: string, model: ModelRef | undefined, created?: number, agent?: string): MessageLike {
-  const message: MessageLike = { id, role: "assistant" };
+/** An assistant message in the v2 host shape (`type: "assistant"`). */
+function assistant(id: string, model: ModelRef | undefined, created?: CreatedTime, agent?: string): MessageLike {
+  const message: MessageLike = { id, type: "assistant" };
   if (model !== undefined) message.model = model;
   if (created !== undefined) message.time = { created };
   if (agent !== undefined) message.agent = agent;
   return message;
 }
 
-function applied(providerID: string, modelID: string, effort: string): AppliedEffort {
-  return { providerID, modelID, effort };
+function applied(providerID: string, modelID: string, effort: string, variant?: string): AppliedEffort {
+  return variant === undefined ? { providerID, modelID, effort } : { providerID, modelID, effort, variant };
+}
+
+/** A host `DateTime.Utc`-like timestamp. */
+function dateTime(epochMillis: number): CreatedTime {
+  return { epochMillis };
 }
 
 const GRIN = "\u{1F600}";
@@ -56,10 +65,16 @@ const FLAG_BR = "\u{1F1E7}\u{1F1F7}";
 const FLAG_SCOTLAND = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
 const KEYCAP_ONE = "1\uFE0F\u20E3";
 const HEART_EMOJI = "\u2764\uFE0F";
+/** Devanagari KA + VOWEL SIGN I (a spacing mark, `\p{Mc}`). */
+const KI = "\u0915\u093F";
 
 /** True when the string holds a high or low surrogate without its pair. */
 function hasLoneSurrogate(text: string): boolean {
   return /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text);
+}
+
+function notice(...problems: string[]): string {
+  return `${STATUS_NOTICE_PREFIX}invalid TUI options (${problems.join("; ")}); using defaults for those keys`;
 }
 
 describe("modelLabel", () => {
@@ -120,6 +135,20 @@ describe("modelLabel", () => {
     ];
     expect(modelLabel(ref("", "m"), models)).toBe("Shared");
   });
+
+  test("accepts the host's list entries as they are (variants are objects, extra fields)", () => {
+    const hostEntry = {
+      id: "claude-fable-5",
+      providerID: "anthropic",
+      name: "Host Fable",
+      variants: [{ id: "high", settings: {}, headers: {} }],
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      status: "active",
+      enabled: true,
+    };
+    const models: readonly ModelInfo[] = [hostEntry];
+    expect(modelLabel(ref("anthropic", "claude-fable-5"), models)).toBe("Host Fable");
+  });
 });
 
 describe("effortLabel", () => {
@@ -168,6 +197,11 @@ describe("effectiveMainEffort (G1, A3)", () => {
     expect(effectiveMainEffort({ selectedVariant: "default" })).toBeUndefined();
   });
 
+  test("selectedVariant follows the host row's truthiness: a blank ' ' counts as selected", () => {
+    expect(effectiveMainEffort({ selectedVariant: " " })).toBeUndefined();
+    expect(effectiveMainEffort({ selectedVariant: " ", applied: applied("openai", "gpt-5", "high"), current })).toBeUndefined();
+  });
+
   test("an empty selected variant counts as none", () => {
     expect(effectiveMainEffort({ selectedVariant: "" })).toBe("default");
     expect(effectiveMainEffort({ selectedVariant: "", applied: applied("openai", "gpt-5", "high"), current })).toBe("high");
@@ -192,6 +226,19 @@ describe("effectiveMainEffort (G1, A3)", () => {
     expect(effectiveMainEffort({ applied: applied("openai", "gpt-5", ""), current })).toBe("default");
     expect(effectiveMainEffort({ applied: applied("openai", "gpt-5", "default"), current })).toBe("default");
   });
+
+  test("a turn that ran with a variant the user has since cleared is stale → default", () => {
+    expect(effectiveMainEffort({ applied: applied("openai", "gpt-5", "high", "high"), current })).toBe("default");
+    expect(effectiveMainEffort({ selectedVariant: "", applied: applied("openai", "gpt-5", "max", "low"), current })).toBe(
+      "default",
+    );
+  });
+
+  test("a recorded variant that is blank or 'default' counts as none", () => {
+    expect(effectiveMainEffort({ applied: applied("openai", "gpt-5", "medium", ""), current })).toBe("medium");
+    expect(effectiveMainEffort({ applied: applied("openai", "gpt-5", "medium", "  "), current })).toBe("medium");
+    expect(effectiveMainEffort({ applied: applied("openai", "gpt-5", "medium", "default"), current })).toBe("medium");
+  });
 });
 
 describe("latestAssistant", () => {
@@ -211,16 +258,32 @@ describe("latestAssistant", () => {
     expect(latestAssistant([first, second])).toBe(second);
   });
 
-  test("skips user messages and assistant messages without a usable model", () => {
+  test("reads the host's `type` tag; a legacy `role: \"assistant\"` still works", () => {
+    const host = assistant("m1", ref("openai", "gpt-5"), 100);
+    const legacy: MessageLike = { id: "m2", role: "assistant", model: ref("anthropic", "claude-fable-5"), time: { created: 200 } };
+    expect(latestAssistant([host])).toBe(host);
+    expect(latestAssistant([host, legacy])).toBe(legacy);
+  });
+
+  test("`type` wins over a legacy `role`", () => {
+    const message: MessageLike = { id: "m1", type: "user", role: "assistant", model: ref("openai", "gpt-5"), time: { created: 1 } };
+    expect(latestAssistant([message])).toBeUndefined();
+  });
+
+  test("skips `type: \"user\"` and `type: \"model-switched\"` entries even with a model", () => {
     const withModel = assistant("m1", ref("openai", "gpt-5"), 100);
-    const messages: MessageLike[] = [
+    const user: MessageLike = { id: "u1", type: "user", model: ref("openai", "gpt-5"), time: { created: 300 } };
+    const switched: MessageLike = { id: "s1", type: "model-switched", model: ref("anthropic", "claude-fable-5"), time: { created: 400 } };
+    expect(latestAssistant([withModel, user, switched])).toBe(withModel);
+    expect(latestAssistant([user, switched])).toBeUndefined();
+  });
+
+  test("skips messages with neither `type` nor `role`, and assistant messages without a usable model", () => {
+    const withModel = assistant("m1", ref("openai", "gpt-5"), 100);
+    const untagged: MessageLike = { id: "x1", model: ref("openai", "gpt-5"), time: { created: 300 } };
+    expect(latestAssistant([withModel, untagged, assistant("m2", undefined, 400), assistant("m3", ref("openai", ""), 500)])).toBe(
       withModel,
-      { id: "u1", role: "user", model: ref("openai", "gpt-5"), time: { created: 300 } },
-      assistant("m2", undefined, 400),
-      assistant("m3", ref("openai", ""), 500),
-    ];
-    expect(latestAssistant(messages)).toBe(withModel);
-    expect(latestAssistant([messages[1], messages[2]])).toBeUndefined();
+    );
   });
 
   test("a missing or non-finite time sorts as the oldest", () => {
@@ -229,6 +292,20 @@ describe("latestAssistant", () => {
     const nan = assistant("m3", ref("openai", "gpt-5"), Number.NaN);
     expect(latestAssistant([timed, untimed, nan])).toBe(timed);
     expect(latestAssistant([untimed, nan])).toBe(nan);
+  });
+
+  test("time.created as a host DateTime ({ epochMillis }) or a number", () => {
+    const asDate = assistant("m1", ref("openai", "gpt-5"), dateTime(300));
+    const asNumber = assistant("m2", ref("openai", "gpt-5"), 200);
+    expect(latestAssistant([asDate, asNumber])).toBe(asDate);
+    expect(latestAssistant([asNumber, assistant("m3", ref("openai", "gpt-5"), dateTime(100))])).toBe(asNumber);
+  });
+
+  test("a non-finite epochMillis sorts as the oldest", () => {
+    const timed = assistant("m1", ref("openai", "gpt-5"), 1);
+    const nan = assistant("m2", ref("openai", "gpt-5"), dateTime(Number.NaN));
+    const inf = assistant("m3", ref("openai", "gpt-5"), dateTime(Number.POSITIVE_INFINITY));
+    expect(latestAssistant([timed, nan, inf])).toBe(timed);
   });
 });
 
@@ -247,6 +324,14 @@ describe("childStatus (G2, A5)", () => {
     expect(childStatus({ session, messages, models: MODELS })).toEqual({ model: "Claude Fable 5", effort: "default" });
   });
 
+  test("a model-switched entry does not count as the latest assistant", () => {
+    const messages: MessageLike[] = [
+      assistant("m1", ref("anthropic", "claude-fable-5", "high"), 100),
+      { id: "s1", type: "model-switched", model: ref("openai", "gpt-5", "minimal"), time: { created: 200 } },
+    ];
+    expect(childStatus({ session, messages, models: MODELS })).toEqual({ model: "Claude Fable 5", effort: "high" });
+  });
+
   test("no ref anywhere → undefined", () => {
     expect(childStatus({ session: { id: "child", parentID: "root" }, messages: [], models: MODELS })).toBeUndefined();
     expect(
@@ -257,6 +342,11 @@ describe("childStatus (G2, A5)", () => {
   test("an applied effort recorded for the ref's model wins over the variant", () => {
     const status = childStatus({ session, messages: [], models: MODELS, applied: applied("openai", "gpt-5", "xhigh") });
     expect(status).toEqual({ model: "GPT-5 (openai)", effort: "xhigh" });
+  });
+
+  test("an applied effort recorded with a variant still applies when provider/model match", () => {
+    const status = childStatus({ session, messages: [], models: MODELS, applied: applied("openai", "gpt-5", "xhigh", "high") });
+    expect(status?.effort).toBe("xhigh");
   });
 
   test("an applied effort of another model is ignored", () => {
@@ -303,14 +393,20 @@ interface FakeChild {
   applied?: AppliedEffort;
 }
 
-function fakeHost(children: FakeChild[], extra: Partial<RunningChildrenInput> = {}): RunningChildrenInput & { messageCalls: string[] } {
+type FakeHost = RunningChildrenInput & { messageCalls: string[]; sessionCalls: string[] };
+
+function fakeHost(children: FakeChild[], extra: Partial<RunningChildrenInput> = {}): FakeHost {
   const byID = new Map(children.map((c) => [c.id, c]));
   const messageCalls: string[] = [];
+  const sessionCalls: string[] = [];
   return {
     rootID: "root",
     family: ["root", ...children.map((c) => c.id)],
     status: (id) => byID.get(id)?.status ?? "idle",
-    sessions: (id) => byID.get(id)?.session,
+    sessions: (id) => {
+      sessionCalls.push(id);
+      return byID.get(id)?.session;
+    },
     messages: (id) => {
       messageCalls.push(id);
       return byID.get(id)?.messages ?? [];
@@ -319,11 +415,12 @@ function fakeHost(children: FakeChild[], extra: Partial<RunningChildrenInput> = 
     applied: (id) => byID.get(id)?.applied,
     max: 4,
     messageCalls,
+    sessionCalls,
     ...extra,
   };
 }
 
-function child(id: string, created: number | undefined, more: Partial<SessionLike> = {}): SessionLike {
+function child(id: string, created: CreatedTime | undefined, more: Partial<SessionLike> = {}): SessionLike {
   const session: SessionLike = { id, parentID: "root", agent: `agent-${id}`, model: ref("openai", "gpt-5", "high"), ...more };
   if (created !== undefined) session.time = { created };
   return session;
@@ -345,6 +442,25 @@ describe("runningChildren (G3)", () => {
     const result = runningChildren(host);
     expect(result.rows.map((r) => r.id)).toEqual(["a", "c"]);
     expect(result.overflow).toBe(0);
+  });
+
+  test("the status is checked first: only running ids are looked up in sessions", () => {
+    const host = fakeHost([
+      { id: "a", status: "running", session: child("a", 1) },
+      { id: "b", status: "idle", session: child("b", 2) },
+      { id: "c", status: "idle" },
+      { id: "d", status: "running", session: child("d", 3) },
+    ]);
+    runningChildren(host);
+    expect(host.sessionCalls).toEqual(["a", "d"]);
+  });
+
+  test("grandchildren (parentID ≠ root) are listed: every running delegate of the family", () => {
+    const host = fakeHost([
+      { id: "a", status: "running", session: child("a", 1) },
+      { id: "a1", status: "running", session: child("a1", 2, { parentID: "a" }) },
+    ]);
+    expect(runningChildren(host).rows.map((r) => r.id)).toEqual(["a", "a1"]);
   });
 
   test("skips ids without a session or without a parentID", () => {
@@ -430,6 +546,16 @@ describe("runningChildren (G3)", () => {
     expect(backward.rows.map((r) => r.id)).toEqual(expected);
   });
 
+  test("session time.created as a host DateTime ({ epochMillis }) or a number", () => {
+    const host = fakeHost([
+      { id: "a", status: "running", session: child("a", dateTime(30)) },
+      { id: "b", status: "running", session: child("b", 20) },
+      { id: "c", status: "running", session: child("c", dateTime(10)) },
+      { id: "d", status: "running", session: child("d", dateTime(Number.NaN)) },
+    ]);
+    expect(runningChildren(host).rows.map((r) => r.id)).toEqual(["d", "c", "b", "a"]);
+  });
+
   test("a missing creation time sorts first", () => {
     const host = fakeHost([
       { id: "timed", status: "running", session: child("timed", 5) },
@@ -455,6 +581,7 @@ describe("runningChildren (G3)", () => {
     expect(result.overflow).toBe(496);
     expect(result.rows.map((r) => r.id)).toEqual(["ses_0998", "ses_0996", "ses_0994", "ses_0992"]);
     expect(host.messageCalls).toEqual(["ses_0998", "ses_0996", "ses_0994", "ses_0992"]);
+    expect(host.sessionCalls).toHaveLength(500);
   });
 
   test("max is clamped to at least 1 and floored; NaN → 1; Infinity → all", () => {
@@ -475,6 +602,29 @@ describe("runningChildren (G3)", () => {
       { id: "b", status: "running", session: child("b", 2, { model: ref("openai", "gpt-5") }) },
     ]);
     expect(runningChildren(host).rows.map((r) => r.model)).toEqual(["GPT-5 (azure)", "GPT-5 (openai)"]);
+  });
+});
+
+describe("clampMax", () => {
+  const cases: Array<[unknown, number]> = [
+    [1, 1],
+    [4, 4],
+    [2.9, 2],
+    [1.5, 1],
+    [0.5, 1],
+    [0, 1],
+    [-5, 1],
+    [Number.NaN, 1],
+    [Number.NEGATIVE_INFINITY, 1],
+    [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY],
+    [undefined, 1],
+    [null, 1],
+    ["3", 1],
+    [true, 1],
+    [{}, 1],
+  ];
+  test.each(cases)("clampMax(%j) → %j", (value, expected) => {
+    expect(clampMax(value)).toBe(expected);
   });
 });
 
@@ -506,10 +656,24 @@ describe("displayWidth", () => {
     expect(displayWidth(`${FLAG_BR}\u{1F1E6}`)).toBe(4);
   });
 
+  test("a leading or orphan ZWJ joins nothing and swallows nothing", () => {
+    expect(displayWidth("\u200Db")).toBe(1);
+    expect(displayWidth("a\u200Db")).toBe(2);
+    expect(displayWidth(`a\u200D${GRIN}`)).toBe(3);
+    expect(displayWidth(`\u200D${GRIN}`)).toBe(2);
+    expect(displayWidth(`${GRIN}\u200Da`)).toBe(3);
+    expect(displayWidth(`${FAMILY}${FAMILY}`)).toBe(4);
+  });
+
   test("text-presentation symbols stay 1", () => {
     expect(displayWidth("\u2764")).toBe(1);
     expect(displayWidth("\u00A9")).toBe(1);
     expect(displayWidth("\u{1F1E7}a")).toBe(3);
+  });
+
+  test("East Asian Ambiguous '…' and '·' count 1", () => {
+    expect(displayWidth(ELLIPSIS)).toBe(1);
+    expect(displayWidth(ROW_SEPARATOR)).toBe(3);
   });
 
   test("combining marks count 0", () => {
@@ -517,6 +681,14 @@ describe("displayWidth", () => {
     expect(displayWidth("a\u0300\u0301\u0302")).toBe(1);
     expect(displayWidth("\u0301")).toBe(0);
     expect(displayWidth("か\u3099")).toBe(2);
+  });
+
+  test("spacing marks (\\p{Mc}) and the soft hyphen count 1", () => {
+    expect(displayWidth(KI)).toBe(2);
+    expect(displayWidth("\u093F")).toBe(1);
+    expect(displayWidth("\u0915\u0903")).toBe(2);
+    expect(displayWidth("\u00AD")).toBe(1);
+    expect(displayWidth("a\u00ADb")).toBe(3);
   });
 
   test("control and format characters count 0", () => {
@@ -571,13 +743,36 @@ describe("truncate", () => {
     expect(truncate(`a${THUMBS_MEDIUM}b`, 3)).toBe("a…");
   });
 
-  test("keeps combining marks with their base", () => {
+  test("a leading ZWJ does not swallow the next character", () => {
+    const out = truncate("\u200Dab", 1);
+    expect(displayWidth(out)).toBeLessThanOrEqual(1);
+    expect(out).toBe("\u200D…");
+  });
+
+  test("keeps combining and spacing marks with their base", () => {
     expect(truncate("e\u0301e\u0301e\u0301e\u0301", 3)).toBe("e\u0301e\u0301…");
+    expect(truncate(KI.repeat(2), 3)).toBe(`${KI}…`);
   });
 
   test("zero-width characters are kept while they fit and dropped after the cut", () => {
     expect(truncate("ab\u200bcd", 3)).toBe("ab\u200b…");
     expect(truncate("a日\u200bb", 2)).toBe("a…");
+  });
+
+  test("control characters become one space each before measuring", () => {
+    expect(truncate("a\tb", 10)).toBe("a b");
+    expect(truncate("a\nb", 10)).toBe("a b");
+    expect(truncate("a\r\nb", 10)).toBe("a  b");
+    expect(truncate("\u001b[31mred", 10)).toBe(" [31mred");
+    expect(truncate("a\u0000\u007f\u0085b", 10)).toBe("a   b");
+    expect(truncate("a\n\n\nb", 3)).toBe("a …");
+  });
+
+  test("bidi controls become one space each before measuring", () => {
+    expect(truncate("abc\u202Edef", 10)).toBe("abc def");
+    const bidi = "\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069";
+    expect(truncate(`${bidi}x`, 20)).toBe(`${" ".repeat(11)}x`);
+    expect(truncate(`\u202Eevil${bidi}`, 5)).toBe(" evi…");
   });
 
   test("never exceeds the width and never leaves a lone surrogate", () => {
@@ -589,9 +784,11 @@ describe("truncate", () => {
       THUMBS_MEDIUM.repeat(3),
       `${FAMILY}${FLAG_SCOTLAND}${KEYCAP_ONE}${HEART_EMOJI}`,
       "a\u0301\u0302b",
+      `\u200Dab\u200D${GRIN}\u200Dc`,
+      `a\t\u001b[1m\u202E${KI}\u00AD`,
     ];
     for (const sample of samples) {
-      for (let width = 1; width <= displayWidth(sample) + 1; width++) {
+      for (let width = 1; width <= displayWidth(sample) + 12; width++) {
         const out = truncate(sample, width);
         expect(displayWidth(out)).toBeLessThanOrEqual(width);
         expect(hasLoneSurrogate(out)).toBe(false);
@@ -614,15 +811,54 @@ describe("formatRow", () => {
     expect(formatRow(["", "GPT-5", "  ", "high"], 80)).toBe("GPT-5 · high");
   });
 
-  test("truncates to the width", () => {
-    expect(formatRow(["implementer", "Claude Fable 5", "high"], 20)).toBe("implementer · Claud…");
-    expect(displayWidth(formatRow(["探索者", "モデル", "高"], 9))).toBeLessThanOrEqual(9);
+  test("the first part shrinks first, keeping the trailing parts whole", () => {
+    expect(formatRow(["implementer", "Claude Fable 5", "high"], 30)).toBe("imple… · Claude Fable 5 · high");
+    expect(formatRow(["implementer", "x"], 5)).toBe("… · x");
+  });
+
+  test("then the second part shrinks the same way; the trailing part stays whole", () => {
+    const row = formatRow(["implementer", "Claude Fable 5", "high"], 20);
+    expect(row).toBe("… · Claude F… · high");
+    expect(row.endsWith("· high")).toBe(true);
+    expect(displayWidth(row)).toBeLessThanOrEqual(20);
+  });
+
+  test("only then the whole row is cut from the end", () => {
+    expect(formatRow(["implementer", "Claude Fable 5", "high"], 8)).toBe("… · … ·…");
+    expect(formatRow(["implementer"], 5)).toBe("impl…");
+    expect(formatRow(["探索者", "モデル", "高"], 9)).toBe("… · … · …");
+  });
+
+  test("never exceeds the width for widths 1..40", () => {
+    const rows: string[][] = [
+      ["implementer", "Claude Fable 5", "high"],
+      ["探索者", "モデル", "高"],
+      ["a", "b", "c", "d"],
+      [`${FAMILY}${GRIN}`, `日本語${FLAG_BR}`, "xhigh"],
+      ["only-one-part-that-is-quite-long"],
+      ["\tagent\n", "\u001b[31mGPT-5\u001b[0m", "\u202Ehigh"],
+      [`${KI}${KI}`, "e\u0301e\u0301", "\u00ADx"],
+    ];
+    for (const parts of rows) {
+      for (let width = 1; width <= 40; width++) {
+        const out = formatRow(parts, width);
+        expect(displayWidth(out)).toBeLessThanOrEqual(width);
+        expect(hasLoneSurrogate(out)).toBe(false);
+      }
+    }
+  });
+
+  test("parts are sanitised, whitespace runs collapse to one space and parts are trimmed", () => {
+    expect(formatRow(["impl\tementer", " GPT-5\n", "\u001b[31mhigh\u001b[0m"], 80)).toBe("impl ementer · GPT-5 · [31mhigh [0m");
+    expect(formatRow(["a\u202Eb", "x  \t\n  y"], 80)).toBe("a b · x y");
+    expect(formatRow(["\n\t", "\u2066\u2069", "GPT-5"], 80)).toBe("GPT-5");
   });
 
   test("no parts or width 0 → empty", () => {
     expect(formatRow([], 10)).toBe("");
     expect(formatRow(["", " "], 10)).toBe("");
     expect(formatRow(["a", "b"], 0)).toBe("");
+    expect(formatRow(["a", "b"], Number.NaN)).toBe("");
   });
 });
 
@@ -648,7 +884,9 @@ describe("parseOptions (D7)", () => {
     (raw) => {
       const parsed = parseOptions(raw);
       expect(parsed.options).toEqual(DEFAULT_STATUS_OPTIONS);
-      expect(parsed.notices).toEqual(["model-router status: options must be an object; using the defaults."]);
+      expect(parsed.notices).toEqual([
+        "model-router status: invalid TUI options (not an object); using defaults for those keys",
+      ]);
     },
   );
 
@@ -656,7 +894,9 @@ describe("parseOptions (D7)", () => {
     for (const bad of ["yes", 1, 0, null, {}, "false"]) {
       const parsed = parseOptions({ [key]: bad });
       expect(parsed.options[key]).toBe(true);
-      expect(parsed.notices).toEqual([`model-router status: option "${key}" must be true or false; using true.`]);
+      expect(parsed.notices).toEqual([
+        `model-router status: invalid TUI options ("${key}" must be true or false); using defaults for those keys`,
+      ]);
     }
   });
 
@@ -665,29 +905,55 @@ describe("parseOptions (D7)", () => {
     (bad) => {
       const parsed = parseOptions({ maxRows: bad });
       expect(parsed.options.maxRows).toBe(4);
-      expect(parsed.notices).toEqual(['model-router status: option "maxRows" must be an integer from 1 to 20; using 4.']);
+      expect(parsed.notices).toEqual([
+        'model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20); using defaults for those keys',
+      ]);
     },
   );
 
-  test("unknown keys → one notice listing them; known keys still apply", () => {
+  test("unknown keys → listed in the notice; known keys still apply", () => {
     const parsed = parseOptions({ footer: false, colour: "red", max_rows: 3, "": 1 });
     expect(parsed.options).toEqual({ ...DEFAULT_STATUS_OPTIONS, footer: false });
-    expect(parsed.notices).toEqual(['model-router status: unknown options ignored: "colour", "max_rows", "".']);
+    expect(parsed.notices).toEqual([notice('unknown keys "colour", "max_rows", ""')]);
   });
 
-  test("several problems → one notice each, flags first, then maxRows, then unknown keys", () => {
+  test("several problems → exactly one notice: flags first, then maxRows, then unknown keys", () => {
     const parsed = parseOptions({ extra: 1, maxRows: 99, runningRow: "no", enabled: 0, childView: false });
     expect(parsed.options).toEqual({ ...DEFAULT_STATUS_OPTIONS, childView: false });
-    expect(parsed.notices).toHaveLength(4);
-    expect(parsed.notices[0]).toContain('"enabled"');
-    expect(parsed.notices[1]).toContain('"runningRow"');
-    expect(parsed.notices[2]).toContain('"maxRows"');
-    expect(parsed.notices[3]).toContain('"extra"');
-    for (const text of parsed.notices) expect(text.startsWith(STATUS_NOTICE_PREFIX)).toBe(true);
+    expect(parsed.notices).toEqual([
+      notice(
+        '"enabled" must be true or false',
+        '"runningRow" must be true or false',
+        '"maxRows" must be an integer from 1 to 20',
+        'unknown keys "extra"',
+      ),
+    ]);
+    expect(parsed.notices[0]?.startsWith(STATUS_NOTICE_PREFIX)).toBe(true);
   });
 
   test("explicit undefined values count as absent", () => {
     expect(parseOptions({ footer: undefined, maxRows: undefined })).toEqual({ options: { ...DEFAULT_STATUS_OPTIONS }, notices: [] });
+  });
+
+  test("inherited keys are not read", () => {
+    const parsed = parseOptions(Object.create({ footer: false, maxRows: 2, colour: "red" }));
+    expect(parsed).toEqual({ options: { ...DEFAULT_STATUS_OPTIONS }, notices: [] });
+  });
+
+  test("a null-prototype object with valid keys works", () => {
+    const raw: Record<string, unknown> = Object.create(null);
+    raw.footer = false;
+    raw.maxRows = 2;
+    expect(parseOptions(raw)).toEqual({ options: { ...DEFAULT_STATUS_OPTIONS, footer: false, maxRows: 2 }, notices: [] });
+  });
+
+  test("a JSON '__proto__' key is reported as unknown and pollutes nothing", () => {
+    const raw: unknown = JSON.parse('{"__proto__": {"x": 1, "footer": false}, "childView": false}');
+    const parsed = parseOptions(raw);
+    expect(parsed.options).toEqual({ ...DEFAULT_STATUS_OPTIONS, childView: false });
+    expect(parsed.notices).toEqual([notice('unknown keys "__proto__"')]);
+    expect(({} as Record<string, unknown>).x).toBeUndefined();
+    expect(Object.hasOwn(parsed.options, "x")).toBe(false);
   });
 
   test("the result is a fresh object, the defaults stay frozen", () => {
