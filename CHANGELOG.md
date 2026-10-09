@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
   The 2.5.0 `hybrid-2` block and the previous `hybrid` block are in `git show v2.5.0:tiers.json` (or in the 2.5.0
-  package's `tiers.json`); copy a block under its own name, or under `hybrid` to override the new values.
+  package's `tiers.json`); copy a block under its own name. For the previous `hybrid`, use a new name (for example `hybrid-2-5-0`) and set`n  `activePreset` to it: preset overrides merge key by key, so a block copied under `hybrid` would keep keys the new`n  bundled tiers set and the old ones do not (the new `@fast` has `effort: "medium"`).
 
   **Define the preset in the same file as `activePreset`.** An overrides file whose `activePreset` names a preset no
   layer defines is dropped as a whole layer, so its other settings are lost too. A preset you last chose with

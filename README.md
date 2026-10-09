@@ -467,10 +467,11 @@ The plugin ships with six presets (switch with `/preset <name>`):
 | @medium | `openai/gpt-6.1-sol-fast` (xhigh) | 5x |
 | @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
-> **Removed in the next release:** the bundled `hybrid-2` and `fable-effort` presets, and the
+> **Removed in 2.6.0:** the bundled `hybrid-2` and `fable-effort` presets, and the
 > previous `hybrid` values (OpenAI `gpt-6-luna-fast` / `gpt-6-astra-fast` for `@fast` / `@medium`).
 > To keep any of them, copy its block from the 2.5.0 `tiers.json` into `presets` in
-> `opencode-model-router.overrides.jsonc` and keep `activePreset` there. See the
+> `opencode-model-router.overrides.jsonc` and keep `activePreset` there (the previous `hybrid` under a new name:
+> preset overrides merge key by key). See the
 > [changelog](CHANGELOG.md#260---2026-10-09) for the `fable-effort` block and the migration notes.
 > A preset you chose with `/preset` that no layer defines any more is reported as a config notice
 > (`the preset '<name>' chosen with /preset is not defined …`), and the router keeps routing on the
