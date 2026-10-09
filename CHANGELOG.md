@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- OpenCode v1 support is in feature freeze: v1 keeps working and gets fixes for regressions and security issues only;
+  every new feature targets OpenCode v2 and stays inert on v1 (at most one notice, no behaviour). See
+  [AGENTS.md](AGENTS.md#host-support-policy).
+
 ## [2.4.0] - 2026-10-09
 
 Role × tier × assurance delegation (#84), opt-in on OpenCode v2: role agents, tier floors from authority × detection,
