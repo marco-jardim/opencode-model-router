@@ -54,3 +54,13 @@ Verdict FAIL (4 major, 7 minor). All fixed in docs (round-1 rule: fix everything
 | QA-9 | minor | `rpc.ts:19-40` overruns; `Bun.resolveSync` unverified; "last wins per target" | `:19-31`; `resolveModule`; per plugin id |
 | QA-10 | minor | §3 task text contradicts A2/A3 | A9 supersedes it |
 | QA-11 | minor | local-path server entry auto-load uses `path.dirname(source.path)` | UNVERIFIED in S2; P2.1 scenario (A9) |
+
+## QA round 2 (same heavy session)
+
+Verdict PASS (0 blocking/critical/major). Minors R2-1 (applied-effort definition, A3), R2-2 (5 s re-pull is a poll, A1),
+R2-3 (`resolveModule` = `Bun.resolveSync`, `import.bun.ts:7-8`; package-name branch assert in A9), R2-4 (local path must
+be the package dir; `-<id>` ordering, A4) fixed under the round-2 rule.
+
+## Verdict
+
+P0.1 DONE: S1–S7 have verdicts with evidence; D1/D3/D6/D7/D8 decided (A1–A9); QA PASS.

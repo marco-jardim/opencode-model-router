@@ -8,8 +8,8 @@ Host source read only at tags `v2.0.24` / `v2.0.25` / `v2.0.26` of `D:\git\openc
 ## S1 — entry resolution → D1: root `tui.ts`, no `exports` map, no JSX
 
 - `v2.0.24:packages/plugin/src/host.ts:17-43`: `Host.resolve` builds `<pkg>/<subpath>` (package) or
-  `path.resolve(dir, subpath || "index")` (local dir) and calls `resolveModule` (`@opencode/util/runtime-import`,
-  `host.ts:4,24`; Bun resolution underneath is UNVERIFIED in source, the probe below used `Bun.resolveSync`); misses with ENOENT, ENOTDIR,
+  `path.resolve(dir, subpath || "index")` (local dir) and calls `resolveModule` (`host.ts:4,24`), which is
+  `Bun.resolveSync(specifier, directory)` (`v2.0.24:packages/util/src/runtime/import.bun.ts:7-8`); misses with ENOENT, ENOTDIR,
   MODULE_NOT_FOUND, ERR_MODULE_NOT_FOUND, ERR_PACKAGE_PATH_NOT_EXPORTED, ERR_UNSUPPORTED_DIR_IMPORT fall through.
   `server: entry(["server",""])`, `tui: entry(["tui"])` (no fallback to the bare package), `rpc: entry(["rpc"])`.
   Without `exports`, `<pkg>/server` finds root `server.ts` by extension probing — why v2 loads `server.ts` today.

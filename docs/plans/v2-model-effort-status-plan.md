@@ -277,7 +277,8 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   handlers)` at setup and answers `effortOf({ sessionID })` from router memory (route-time agent/model/variant, the
   child's applied effort, the escalation override). The TUI calls `context.client.rpc(def).effortOf({ sessionID })`
   inside a tracked computation: it pulls again whenever the session's `data.session.status(id)` changes or the id/count
-  of its latest `data.session.message.list(id)` entry changes, and at most every 5 s while `status === "running"`. It
+  of its latest `data.session.message.list(id)` entry changes, and re-pulls every 5 s while `status === "running"`
+  (trigger-driven pulls are debounced to the same interval). It
   never calls from `setup` (setup is awaited inside the serialized reconciliation, `context.tsx:182-184,639-641`). On
   `rpc.unavailable` it retries with bounded backoff; on any other error it falls back to the message variant. Push
   through rpc `events` exists at v2.0.24 (`core/src/rpc.ts:87-104`) and is not used in this release. The registry is
@@ -297,7 +298,10 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `src\compat\v2-hooks.ts:1380`, v2 path only), and `effortOf` answers for root sessions too. G1 renders
   `effort <applied>` when no variant is selected and the channel reports one, `effort default` otherwise. P1.2
   pre-flight states with evidence whether `agentOptions` can hold an effort key for an agent that runs a root session;
-  if it cannot, that is recorded and G1 keeps `default`.
+  if it cannot, that is recorded and G1 keeps `default`. Applied effort = the `reasoningEffort` in `event.options` after
+  the router's hook, whatever set it, normalised as at `src\compat\v2-hooks.ts:1132`, recorded with the turn's
+  `{providerID, modelID}`. G1 uses it only when that model equals `ui.model.current()`; otherwise `effort default`.
+  P1.2 pre-flight also records whether core pre-fills `event.options` before the hook.
 - A4 (D7, S2) **Options and auto-load.** The TUI entry is auto-loaded (`optional`, no options) for every v2 user who
   lists the package in the server config (`context.tsx:301-305`). The TUI plugin id is `opencode-model-router.status`,
   deliberately not the package name: a `tui.json` entry whose `package` equals an already-loaded plugin id is treated as
@@ -305,7 +309,8 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `{ "package": "<spec or local path>", "options": … }`; that entry replaces the auto-loaded registration by id
   (`context.tsx:390`). Disable with `-opencode-model-router.status` or `options.enabled: false`. UNVERIFIED: a
   `tui.json` npm entry is resolved with `install: true` (`:306`) and may install a second copy whose version differs from
-  the server's; checked at the P3.2 clean install.
+  the server's; checked at the P3.2 clean install. Local paths must be the package directory, not `tui.ts`
+  (`context.tsx:333-341` skips a file silently). Put `-<id>` after any explicit entry for the same plugin (`:396`).
 - A5 (D4, S5) **G2 sources.** Latest assistant message `model` (after `Step.Started`), before it the child's
   `session.get(id).model`; the P1.2 effort preferred when available. `data.session.message.sync(id)` once per child when
   the list is empty (feature-detected).
@@ -325,7 +330,9 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `tsconfig.json` unchanged (A2); the packaging test also pins that the package has no root `index.*` (v1's TUI loader
   falls back to a root `index.{ts,tsx,js,mjs,cjs}` for local sources, `v1.18.35:packages/opencode/src/plugin/shared.ts:136-157`).
   P1.3 acceptance gains: the `npm pack` tarball installed into a temp `node_modules` and loaded by path on 2.0.24, 2.0.25
-  and 2.0.26 (probe B1 method, executor or a tier agent with shell). P2.1 adds the scenarios "server config only, no
+  and 2.0.26 (probe B1 method, executor or a tier agent with shell), and asserts
+  `Bun.resolveSync("opencode-model-router/tui", dir)` returns the installed `tui.ts` for `dir` = both the temp install
+  root and the package dir (the package-name branch). P2.1 adds the scenarios "server config only, no
   `tui.json`" for a local path and for a `node_modules` install, on the three versions.
 
 ## 9. Risks
