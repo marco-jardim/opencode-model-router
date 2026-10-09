@@ -1,5 +1,5 @@
 /**
- * Pure status model for the v2 TUI status views (#90, plan §2 D2–D5/D7, amendments A3, A5, A9). No host
+ * Pure status model for the v2 TUI status views (#90, plan §2 D2–D5/D7, amendments A3, A5, A9, A12). No host
  * imports: the host shapes are mirrored structurally and minimally; the TUI views (P1.3) read the host
  * context, call these functions and render the strings.
  *
@@ -8,7 +8,7 @@
  *   ran without a variant, else `default`.
  * - G2 child view: {@link childStatus} (A5): the latest assistant message's model, before it the session's.
  * - G3 running row: {@link runningChildren}: every running delegate of the family, stable order, at most `max`
- *   rows.
+ *   rows. Opt-in (A12): the `runningRow` option is off by default.
  * - Labels and layout: {@link modelLabel}, {@link effortLabel}, {@link formatRow}, width-aware
  *   {@link displayWidth} / {@link truncate}; rendered text is sanitised (control, bidi and line-separator
  *   characters → space) and measured as rendered.
@@ -138,7 +138,7 @@ export interface StatusOptions {
   footer: boolean;
   /** G2: model and effort in a child session view. */
   childView: boolean;
-  /** G3: running delegates above the main composer. */
+  /** G3: running delegates above the main composer. Opt-in (A12): off by default. */
   runningRow: boolean;
   maxRows: number;
 }
@@ -168,7 +168,7 @@ export const DEFAULT_STATUS_OPTIONS: Readonly<StatusOptions> = Object.freeze({
   enabled: true,
   footer: true,
   childView: true,
-  runningRow: true,
+  runningRow: false,
   maxRows: 4,
 });
 

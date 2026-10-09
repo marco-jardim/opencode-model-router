@@ -923,7 +923,8 @@ describe("parseOptions (D7)", () => {
   test("undefined or null → defaults, no notice", () => {
     expect(parseOptions(undefined)).toEqual({ options: DEFAULT_STATUS_OPTIONS, notices: [] });
     expect(parseOptions(null)).toEqual({ options: DEFAULT_STATUS_OPTIONS, notices: [] });
-    expect(DEFAULT_STATUS_OPTIONS).toEqual({ enabled: true, footer: true, childView: true, runningRow: true, maxRows: 4 });
+    // A12: G3 (`runningRow`) is opt-in; G1 and G2 stay on.
+    expect(DEFAULT_STATUS_OPTIONS).toEqual({ enabled: true, footer: true, childView: true, runningRow: false, maxRows: 4 });
   });
 
   test("an empty object → defaults, no notice", () => {
@@ -933,6 +934,10 @@ describe("parseOptions (D7)", () => {
   test("valid values are applied", () => {
     const raw = { enabled: false, footer: false, childView: false, runningRow: false, maxRows: 20 };
     expect(parseOptions(raw)).toEqual({ options: raw, notices: [] });
+    // every flag flipped from its default, `runningRow: true` (the G3 opt-in) included
+    const flipped = { enabled: false, footer: false, childView: false, runningRow: true, maxRows: 20 };
+    expect(parseOptions(flipped)).toEqual({ options: flipped, notices: [] });
+    expect(parseOptions({ runningRow: true })).toEqual({ options: { ...DEFAULT_STATUS_OPTIONS, runningRow: true }, notices: [] });
     expect(parseOptions({ maxRows: 1 }).options.maxRows).toBe(1);
   });
 
@@ -948,7 +953,8 @@ describe("parseOptions (D7)", () => {
   test.each(["enabled", "footer", "childView", "runningRow"] as const)("a non-boolean %s → default and a notice", (key) => {
     for (const bad of ["yes", 1, 0, null, {}, "false"]) {
       const parsed = parseOptions({ [key]: bad });
-      expect(parsed.options[key]).toBe(true);
+      expect(parsed.options[key]).toBe(DEFAULT_STATUS_OPTIONS[key]);
+      expect(parsed.options[key]).toBe(key !== "runningRow");
       expect(parsed.notices).toEqual([
         `model-router status: invalid TUI options ("${key}" must be true or false); using defaults for those keys`,
       ]);

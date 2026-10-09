@@ -153,6 +153,7 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     exports?: unknown;
     files?: unknown;
     dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     bundleDependencies?: unknown;
@@ -178,6 +179,17 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     }
     expect(pkg.bundleDependencies).toBeUndefined();
     expect(pkg.bundledDependencies).toBeUndefined();
+  });
+
+  it("has no runtime dependencies and pins the TUI dev tooling to exact versions (B-4)", () => {
+    // A2: the host serves solid-js and @opentui/solid; nothing is installed next to the package at runtime.
+    expect(pkg.dependencies ?? {}).toEqual({});
+    // The unit tests' reactive solid-js build and the real-host smoke (A7) depend on these exact versions.
+    expect(pkg.devDependencies).toMatchObject({
+      "solid-js": "1.9.15",
+      "@lydell/node-pty": "1.2.0-beta.15",
+      "@xterm/headless": "6.0.0",
+    });
   });
 
   it("root tui.ts only re-exports the default of exactly ./src/tui/plugin.ts", () => {

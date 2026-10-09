@@ -348,6 +348,22 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `node_modules`); pinned by the packaging test. (c) The host swallows TUI plugin `console.*` output: user-facing notices
   (invalid options, no Solid owner) are toasts. (d) When the channel's `variant` and `effort` differ, child views show
   `<effort> (<variant>)` (P1.2 QA-6).
+- A12 (G3, D5, D7; owner decision at DF-1, 2026-10-09) **G3 is opt-in.** Dogfooding showed the running-delegates rows
+  clutter the main session; the delegate's own view (G2) and the footer effort (G1) are enough. `runningRow` defaults
+  to `false`; `"options": { "runningRow": true }` in `cli.json` turns the rows on. G1 and G2 unchanged. The real-host
+  smoke enables `runningRow` explicitly for the G3 scenarios and asserts that the default shows no rows.
+- A13 (P3.1 global QA) **Release gates and refinements.** (a) The bare package name in the server config
+  (`"plugins": ["opencode-model-router"]`, the host installs it) was never loaded before publishing (C-1/B-2): P3.2
+  checks it after the npm publish on 2.0.24 and 2.0.26 (isolated HOME, server config with the package name, no
+  `cli.json`: footer `effort default`, `/plugins` row `TUI opencode-model-router.status`) before #90 closes; a failure is
+  fixed in a 2.5.1 before closing. (b) T2.1.2 is satisfied by CI `smoke-keyless` (OpenCode 1.18.19, `smoke:keyless`) on
+  the PR head instead of a local `smoke:v1` with 1.18.35: the local v1 smokes are not env-isolated (follow-up issue).
+  (c) A1 refinements in code: a call timeout (10 s) retries with the `unavailable` backoff, other errors pause the
+  session for 30 s; while a session runs and no effort was answered yet, up to 3 quick re-pulls 1 s apart; a reopened
+  view starts from the session's last answer. A3 refinement: an applied effort recorded on a turn that ran with a
+  variant is stale for G1 (`effort default`). (d) DF-1 did not write the owner's TUI config: the server config already
+  lists the package, so the TUI auto-loads (A4). (e) The effort-channel registration no longer delays setup (started,
+  not awaited).
 
 ## 9. Risks
 | Risk | Mitigation |

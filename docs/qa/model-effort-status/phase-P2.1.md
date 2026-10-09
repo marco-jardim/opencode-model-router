@@ -1,6 +1,6 @@
 # Phase P2.1 — real-host proof (#90)
 
-Branch `msd/p21` (worktree `D:\git\omr-msd-p21`), merged into `msd/main` (`00d07a6`, fixes `8764ce8`).
+Branch `msd/p21` (worktree `D:\git\omr-msd-p21`), merged into `msd/main` (`2bbfd11`, fixes `3c71fc1`).
 
 ## Pre-flight
 

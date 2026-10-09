@@ -1,15 +1,16 @@
 /**
- * #90 P1.3: the OpenCode v2 TUI entry (root `tui.ts` re-exports it), plan §2 D2–D7 as amended by §8 A1–A9.
+ * #90 P1.3: the OpenCode v2 TUI entry (root `tui.ts` re-exports it), plan §2 D2–D7 as amended by §8 A1–A9, A12.
  *
  * - G1 (`footer`): `prompt.footer.status` shows `effort <value>` in a root session (or the home prompt) when no variant
  *   is selected ({@link effectiveMainEffort}); nothing when one is (the host row shows it).
  * - G2 (`childView`): `session.composer.top` of a delegated session shows `<agent> · <model> · <effort>`
- *   ({@link childStatus}); the agent identifies the delegate.
- * - G3 (`runningRow`): `session.composer.top` of a root session shows one `<agent> · <model> · <effort>` row per
- *   running delegate ({@link runningChildren}), then `+<k> more`.
+ *   ({@link childStatus}); the agent identifies the delegate (without one: the session title, else `subagent`, as G3).
+ * - G3 (`runningRow`, opt-in, off by default, A12): `session.composer.top` of a root session shows one
+ *   `<agent> · <model> · <effort>` row per running delegate ({@link runningChildren}), then `+<k> more`.
  *
  * One claim serves G2 and G3: they target the same slot and a session is either a child or a root, so one box (empty
- * when there is nothing to show) is enough. The effort comes from the server's `effortOf` rpc (A1, per-session pollers
+ * when there is nothing to show) is enough. With the default options the claim exists for G2, and a root session's box
+ * stays empty. The effort comes from the server's `effortOf` rpc (A1, per-session pollers
  * created while a view needs them), else from the message/session variant.
  *
  * No JSX: views are built with the `@opentui/solid` reconciler primitives and `solid-js`, the only runtime imports
@@ -41,6 +42,7 @@ import {
   childStatus,
   DEFAULT_EFFORT,
   effectiveMainEffort,
+  FALLBACK_AGENT,
   formatRow,
   parseOptions,
   runningChildren,
@@ -59,9 +61,18 @@ export const COMPOSER_SLOT = "session.composer.top";
 export const POLL_INTERVAL_MS = 5_000;
 /** How long a session's channel stays off after an error other than `unavailable` or a timeout. */
 export const FAILURE_COOLDOWN_MS = 30_000;
-/** First retry delay after an `unavailable` error or a timeout; doubled per retry up to {@link BACKOFF_MAX_MS}. */
+/**
+ * First retry delay after an `unavailable` error or a timeout; doubled per retry up to {@link BACKOFF_MAX_MS}. Also the
+ * delay of a quick re-pull ({@link QUICK_REPULLS}).
+ */
 export const BACKOFF_START_MS = 1_000;
 export const BACKOFF_MAX_MS = 30_000;
+/**
+ * GA-2, R2-2: while a delegated session (one with a `parentID`) runs and no answer with an effort has been seen for it
+ * yet, an answer without one is pulled again after {@link BACKOFF_START_MS}, at most this many times per session (the
+ * count is kept with the pull state of the last {@link PULL_STATE_MAX} sessions). Root sessions keep the normal cadence.
+ */
+export const QUICK_REPULLS = 3;
 /** An `effortOf` call that has not settled by then is aborted and retried like `rpc.unavailable`. */
 export const CALL_TIMEOUT_MS = 10_000;
 /** Sessions whose pull state (last pull, cooldown, backoff) is kept across poller close/reopen. */
@@ -74,9 +85,8 @@ export const MODEL_SYNC_MAX = 50;
 export const DEFAULT_WIDTH = 80;
 /** Columns kept free around a row (composer padding). */
 export const WIDTH_MARGIN = 4;
-/** Logged once when a slot renders outside any Solid owner (P13-2). */
-export const NO_OWNER_NOTICE =
-  "render has no Solid owner: the plugin's solid-js is not the host's (a local node_modules/solid-js shadows it)";
+/** Shown once when a slot renders outside any Solid owner (P13-2); names the effect, not a cause (GA-5). */
+export const NO_OWNER_NOTICE = "render has no Solid owner: the views are static (no live updates)";
 
 type Timer = ReturnType<typeof setTimeout>;
 type Rows = readonly string[];
@@ -356,17 +366,28 @@ const NO_CHANNEL: EffortChannel = { applied: () => undefined, dispose: () => und
 interface ChannelDeps {
   client(): HostClient | undefined;
   status(id: string): SessionStatus;
+  /** The session has a `parentID` (a delegated session). */
+  isChild(id: string): boolean;
   messages(id: string): readonly HostMessage[];
   location(id: string): unknown;
   log: Log;
 }
 
-/** Per-session pull timing, kept across poller close/reopen (P13-5) for the last {@link PULL_STATE_MAX} sessions. */
+/**
+ * Per-session pull timing and last value, kept across poller close/reopen (P13-5) for the last {@link PULL_STATE_MAX}
+ * sessions.
+ */
 interface PullState {
   lastPull: number;
   failedUntil: number;
   /** Current retry delay after `unavailable` or a timeout; 0 after a success. */
   backoff: number;
+  /** GA-1: the last value written (undefined after a failure); a reopened poller starts from it. */
+  value?: AppliedEffort;
+  /** GA-2: an answer with an effort was seen for the session. */
+  effortSeen: boolean;
+  /** GA-2: quick re-pulls done (at most {@link QUICK_REPULLS}); reset by the first answer with an effort. */
+  quick: number;
 }
 
 interface Poller {
@@ -410,8 +431,11 @@ function triggerKey(deps: ChannelDeps, id: string): string {
  * A1: per-session pull of `effortOf`. A poller exists while a view needs its session (released pollers close on the
  * next microtask unless re-acquired). It pulls right away (on a timer, never synchronously), again when the trigger key
  * changes (debounced to {@link POLL_INTERVAL_MS} since the last pull, which survives a close/reopen), and every
- * {@link POLL_INTERVAL_MS} while the session runs. A call carries the session's `location` and an abort signal; it is
- * aborted when its poller closes or after {@link CALL_TIMEOUT_MS}. `unavailable` errors and timeouts retry with
+ * {@link POLL_INTERVAL_MS} while the session runs. While a running delegated session has no answer with an effort yet,
+ * an answer without one is pulled again after {@link BACKOFF_START_MS}, at most {@link QUICK_REPULLS} times (GA-2,
+ * R2-2; root sessions keep the normal cadence). A reopened
+ * poller starts from the session's last value (GA-1). A call carries the session's `location` and an abort signal; it
+ * is aborted when its poller closes or after {@link CALL_TIMEOUT_MS}. `unavailable` errors and timeouts retry with
  * backoff 1 s, 2 s, 4 s … {@link BACKOFF_MAX_MS}; any other error drops the value (views fall back to the message
  * variant) for {@link FAILURE_COOLDOWN_MS}.
  */
@@ -442,6 +466,14 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
   const isRunning = (id: string): boolean => {
     try {
       return untrack(() => deps.status(id)) === "running";
+    } catch {
+      return false;
+    }
+  };
+
+  const isChild = (id: string): boolean => {
+    try {
+      return untrack(() => deps.isChild(id));
     } catch {
       return false;
     }
@@ -522,7 +554,18 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
     if (poller.closed) return;
     if (result.ok) {
       state.backoff = 0;
-      poller.write(appliedOf(result.value));
+      const applied = appliedOf(result.value);
+      poller.write(applied);
+      if (applied !== undefined) {
+        state.effortSeen = true;
+        state.quick = 0;
+      } else if (!state.effortSeen && state.quick < QUICK_REPULLS && isRunning(poller.id) && isChild(poller.id)) {
+        // GA-2, R2-2: a delegate's running turn may not be recorded yet; ask again soon instead of after the poll
+        // interval. Root sessions normally carry no effort (A3), so they keep the normal cadence.
+        state.quick += 1;
+        schedule(poller, BACKOFF_START_MS);
+        return;
+      }
     } else if (isRetryable(result.error)) {
       state.backoff = state.backoff === 0 ? BACKOFF_START_MS : Math.min(state.backoff * 2, BACKOFF_MAX_MS);
       schedule(poller, state.backoff);
@@ -553,10 +596,17 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
     const state = remember(
       states,
       id,
-      states.get(id) ?? { lastPull: Number.NEGATIVE_INFINITY, failedUntil: Number.NEGATIVE_INFINITY, backoff: 0 },
+      states.get(id) ?? {
+        lastPull: Number.NEGATIVE_INFINITY,
+        failedUntil: Number.NEGATIVE_INFINITY,
+        backoff: 0,
+        effortSeen: false,
+        quick: 0,
+      },
       PULL_STATE_MAX,
     );
-    const [read, write] = createSignal<AppliedEffort | undefined>(undefined, { equals: sameApplied });
+    // GA-1: seeded with the last value, so a view reopened within the debounce shows it at once.
+    const [read, write] = createSignal<AppliedEffort | undefined>(state.value, { equals: sameApplied });
     const poller: Poller = {
       id,
       state,
@@ -564,6 +614,7 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
       closed: false,
       read,
       write: (value) => {
+        state.value = value;
         write(value);
       },
       timer: undefined,
@@ -660,7 +711,10 @@ function composerRows(input: ComposerTopInput | undefined, views: Views): Rows {
       models: models(),
       applied: childApplied(channel.applied(id)),
     });
-    return status === undefined ? NO_ROWS : [formatRow([status.agent ?? "", status.model, status.effort], width)];
+    if (status === undefined) return NO_ROWS;
+    // GA-7: the running row's agent fallback (session title, then `subagent`).
+    const agent = status.agent ?? nonBlank(session.title) ?? FALLBACK_AGENT;
+    return [formatRow([agent, status.model, status.effort], width)];
   }
   // G3 lists delegates that start and stop: a static view would show a stale list, so it shows none (R2-2).
   if (!options.runningRow || !views.live) return NO_ROWS;
@@ -728,9 +782,9 @@ function boxElement(): unknown {
 }
 
 /**
- * P13-2: without a Solid owner the plugin's `solid-js` is not the host's, so nothing reactive would update or ever be
- * disposed. The rows are computed once, untracked, without the effort channel, and rendered as static text: G1 and
- * G2 only, G3 (running delegates) would be stale at once (R2-2).
+ * P13-2: without a Solid owner (for example when the plugin's `solid-js` is not the host's; not reproduced on a real
+ * host, GA-5) nothing reactive would update or ever be disposed. The rows are computed once, untracked, without the
+ * effort channel, and rendered as static text: G1 and G2 only, G3 (running delegates) would be stale at once (R2-2).
  */
 function staticView(compute: (views: Views) => Rows, area: string, views: Views): unknown {
   let rows: Rows;
@@ -901,6 +955,7 @@ function setup(context: HostContext | undefined): () => void {
     const channel = createEffortChannel({
       client: () => context?.client,
       status: host.status,
+      isChild: host.isChild,
       messages: host.messages,
       location: host.location,
       log,

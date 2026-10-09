@@ -474,7 +474,10 @@ describe("registerEffortChannel (feature detection, never throws)", () => {
     const dispose = await registerEffortChannel({ register }, createEffortStore(), log, { timeoutMs: 20 });
     expect(register).toHaveBeenCalledTimes(1);
     expect(log.warn).toHaveBeenCalledTimes(1);
-    expect(log.warn.mock.calls[0]![0]).toContain("rpc.register did not settle within 20 ms");
+    // R2-3: the registration no longer holds setup (GA-4), so the message does not speak of setup.
+    expect(log.warn.mock.calls[0]![0]).toBe(
+      "TUI effort channel: rpc.register did not settle within 20 ms; continuing without it (a late registration is kept)",
+    );
     await expect(dispose()).resolves.toBeUndefined();
     await expect(dispose()).resolves.toBeUndefined();
     expect(log.warn).toHaveBeenCalledTimes(1);
@@ -643,6 +646,30 @@ describe("v2 adapter: registration", () => {
     expect(channel.records.at(-1)?.sessionID).toBe("s1");
     const logged = warn.mock.calls.filter(([line]) => String(line).includes("did not settle within 2000 ms"));
     expect(logged).toHaveLength(1);
+  });
+
+  it("GA-4: a register that never settles does not delay the context and execute.before hooks; cleanup still resolves", async () => {
+    home();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rpc = { register: vi.fn(() => new Promise<never>(() => {})) };
+    const host = v2Host(temp(), rpc);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // No timer advanced: setup resolves, its hooks registered, while `register` is still pending.
+      const cleanup = await host.start();
+      expect(rpc.register).toHaveBeenCalledTimes(1);
+      expect(host.sessionHooks.context).toBeTypeOf("function");
+      expect(host.ctx.tool.hook).toHaveBeenCalledWith("execute.before", expect.any(Function));
+      expect(warn.mock.calls.some(([line]) => String(line).includes("did not settle"))).toBe(false);
+      // Cleanup waits for the bounded registration (2 s), then resolves.
+      let done = false;
+      const disposed = cleanup().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(EFFORT_REGISTER_TIMEOUT_MS);
+      await disposed;
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("R2-5: a registration that arrives after the 2 s wait is kept, answers the adapter's turns, and is disposed on plugin cleanup", async () => {

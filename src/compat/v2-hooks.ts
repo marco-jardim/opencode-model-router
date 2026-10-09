@@ -1472,9 +1472,11 @@ export async function registerV2Hooks(
       }
     }
     // #90 P1.2 (A1): the TUI's `effortOf` rpc, answered from `effortStore`; tiers and roles mode alike. Feature-detected (a host
-    // without `ctx.rpc.register` gets nothing), bounded (2 s: setup never waits longer; a late registration is kept), never
-    // throws; disposed with the other registrations.
-    registrations.push({ dispose: await registerEffortChannel(ctx.rpc, effortStore, ingestLogger) });
+    // without `ctx.rpc.register` gets nothing), bounded (2 s; a late registration is kept), never throws; disposed with the other
+    // registrations. GA-4: not awaited here, so a slow `register` never delays the hooks below; its dispose waits for the
+    // registration to settle (at most the 2 s bound) and then disposes it.
+    const effortChannel = registerEffortChannel(ctx.rpc, effortStore, ingestLogger).catch(() => async () => {});
+    registrations.push({ dispose: async () => { await (await effortChannel)(); } });
     registrations.push(await ctx.session.hook("context", async (event) => {
       // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
       // strictest outcome) and is annotated for the parent's `subagent` result; every other agent keeps today's behaviour.

@@ -9,11 +9,17 @@
  *   dropped); a missing one is skipped with its path. OMR_TUI_SMOKE_OUT: evidence directory (screens, summary JSON);
  *   default `<real temp>/omr-tui-smoke`.
  *
- * Per version, two flows, each with its own isolated HOME, scripted Anthropic provider (`RoutingProvider`) and server
- * config `opencode.json` (no `cli.json`: the host auto-loads the router's TUI entry, A4/A9):
- *   local  `plugins: [<this checkout>, <probe>]` — S1, S2, S3, S4 below;
- *   npm    `plugins: [<root>/install/node_modules/opencode-model-router, <probe>]`, the checkout `npm pack`ed once and
- *          installed with `npm install --no-save --ignore-scripts <tgz>` (peers included) — boot, S1 default, S2, S4.
+ * Per version, three flows, each with its own isolated HOME, scripted Anthropic provider (`RoutingProvider`) and server
+ * config `opencode.json` listing the router package directory and a probe plugin (the host auto-loads the router's TUI
+ * entry, A4/A9). G3 is opt-in since A12 (`runningRow` defaults to false), so the two G3 flows also write the TUI config
+ * `cli.json` (A10) with `{"plugins":[{"package":"<the same package directory>","options":{"runningRow":true}}]}`, which
+ * replaces the auto-loaded registration (A4):
+ *   local  `plugins: [<this checkout>, <probe>]` + `cli.json` runningRow — S1, S2, S3, S4 below;
+ *   npm    `plugins: [<root>/install/node_modules/opencode-model-router, <probe>]` + `cli.json` runningRow, the checkout
+ *          `npm pack`ed once and installed with `npm install --no-save --ignore-scripts <tgz>` (peers included) — boot,
+ *          S1 default, S2, S4;
+ *   off    `plugins: [<this checkout>, <probe>]`, no `cli.json` (default options) — boot, S1 default, D below.
+ * Both G3 flows and the off flow also assert one registration only (one footer text, one row).
  * `opencode.exe --standalone --auto` runs in a 150x45 pty mirrored by a headless xterm (helpers/tui-pty.ts); at most 3
  * hosts run at once; every step has its own deadline (≤ 90 s) and every key waits for its expected screen change.
  *
@@ -26,6 +32,9 @@
  *       (its own prompt text, no root marker) shows `fast · <model> · <effort>` while the child is still held.
  *   S4  the effort shown for the child equals the router's tier effort (preset below), and every child request on the
  *       wire carries that effort for the `#low` variant.
+ *   D   A12 default: a held delegation; for at least 8 s after the child's request reaches the provider (the child still
+ *       held, the host showing its running subagent) the root view shows no `fast · …` row and its footer still reads
+ *       `effort default`; then the S3 navigation opens the child, whose view (G2) shows the row while it runs.
  *   Recorded: the row with the sidebar toggled and toggled back (<leader>b = ctrl+x b), and the lines above the prompt
  *   box when no delegate runs (empty-box gap).
  */
@@ -67,10 +76,17 @@ const TARGETS = (() => {
   }
   return list;
 })();
-type FlowKind = "local" | "npm";
+type FlowKind = "local" | "npm" | "off";
 interface Job { index: number; label: string; exe: string; kind: FlowKind }
-/** Flows keyed by index: per present binary, the local-path flow then the node_modules flow. */
-const JOBS: Job[] = TARGETS.filter(t => t.present).flatMap(t => (["local", "npm"] as const).map(kind => ({ label: t.label, exe: t.exe, kind }))).map((j, index) => ({ ...j, index }));
+/** Flows keyed by index: per present binary, the local-path flow, the node_modules flow, then the default-options flow. */
+const JOBS: Job[] = TARGETS.filter(t => t.present).flatMap(t => (["local", "npm", "off"] as const).map(kind => ({ label: t.label, exe: t.exe, kind }))).map((j, index) => ({ ...j, index }));
+/** The TUI options the flow writes to `cli.json` (A12: G3 is opt-in); none for the default-options flow. */
+const TUI_OPTIONS: Record<FlowKind, Obj | undefined> = { local: { runningRow: true }, npm: { runningRow: true }, off: undefined };
+const FLOW_TITLES: Record<FlowKind, string> = {
+  local: "local path (this checkout), cli.json runningRow: true",
+  npm: "node_modules install (npm pack), cli.json runningRow: true",
+  off: "local path, default options (server config only, no cli.json): runningRow off (A12)",
+};
 const MAX_HOSTS = 3;
 
 /** The fast tier carries an effort different from its variant, so the screen shows which source it follows (A11d). */
@@ -83,10 +99,10 @@ const STEP_MS = 90_000;
 const FLOW_MS = 330_000;
 const INSTALL_MS = 240_000;
 
-type CheckId = "boot" | "S1-default" | "S1-variant" | "S1-restore" | "S2-G3" | "A6" | "S3-G2" | "S4-effort" | "sidebar" | "gap";
+type CheckId = "boot" | "S1-default" | "S1-variant" | "S1-restore" | "S2-G3" | "A6" | "S3-G2" | "S4-effort" | "sidebar" | "gap" | "A12-no-row" | "A12-G2";
 interface Check { pass: boolean; detail: string; lines: string[]; data?: Obj }
 interface Flow {
-  index: number; label: string; kind: FlowKind; exe: string; plugin?: string; checks: Partial<Record<CheckId, Check>>; errors: string[];
+  index: number; label: string; kind: FlowKind; exe: string; plugin?: string; cliJson?: Obj; checks: Partial<Record<CheckId, Check>>; errors: string[];
   stop?: TuiStop; holds?: Obj[]; childWire?: Obj[]; requests?: Obj[]; notes?: string[]; logFile: string;
 }
 interface Row { index: number; line: string; model: string; effort: string }
@@ -104,6 +120,12 @@ function findRow(lines: readonly string[]): Row | undefined {
 const FOOTER_RE = /(?:^|\s)effort ([\w-]+(?: \([^)]*\))?)(?=\s*(?:[│┃]|$|\s{2,}))/;
 const footerOf = (lines: readonly string[]) => { for (const l of lines) { const m = FOOTER_RE.exec(l); if (m) return { line: l.trim(), value: m[1]! }; } return undefined; };
 const footerIndex = (lines: readonly string[]) => lines.findIndex(l => FOOTER_RE.test(l));
+/** How many plugin footer texts the footer line holds (2 would mean the TUI entry is registered twice). */
+const footerCount = (lines: readonly string[]) => { const i = footerIndex(lines); return i < 0 ? 0 : (lines[i]!.match(/(?:^|\s)effort [\w-]+/g) ?? []).length; };
+/** How many lines carry a `fast · …` row. */
+const rowCount = (lines: readonly string[]) => lines.filter(l => ROW_RE.test(l)).length;
+/** The host's own sign of a running delegation in the root view: its inline `… Subagent — <description>` line or the footer's `1 subagent`. */
+const hostShowsSubagent = (lines: readonly string[], description: string) => lines.some(l => l.includes(`Subagent — ${description}`) || /\b1 subagent\b/.test(l));
 /** The host's prompt metadata row of the root model inside the prompt box (`┃  Build auto · Claude Opus … · <variant>`),
  * the bottom-most one: a transcript line (`Build · Claude Opus 4.7 · 15.7s`) has no box border. -1 when there is no prompt. */
 const ROOT_META_RE = /^\s*┃\s+\S.*·.*Opus/i;
@@ -175,7 +197,7 @@ async function installInto(run: NpmRun, root: string, tgz: string): Promise<stri
 }
 
 // --------------------------------------------------------------------------- the host flow ----
-async function writeHostFiles(root: string, home: string, baseURL: string, plugin: string): Promise<Record<string, string>> {
+async function writeHostFiles(root: string, home: string, baseURL: string, plugin: string, tuiOptions: Obj | undefined): Promise<{ env: Record<string, string>; cliJson?: Obj }> {
   const configDir = path.join(home, ".config", "opencode");
   await mkdir(configDir, { recursive: true });
   const probe = path.join(root, "probe-plugin");
@@ -194,9 +216,41 @@ async function writeHostFiles(root: string, home: string, baseURL: string, plugi
     enforcement: { verify: { testBaseline: false } },
     routing: { engine: "shadow", outcomes: { path: path.join(root, "outcomes") } },
   }, null, 1));
+  // A12: the TUI config (`cli.json`, A10) re-lists the SAME package directory with options; that entry replaces the
+  // auto-loaded registration by id (A4). The package is the directory, never the plugin id or `tui.ts`.
+  let cliJson: Obj | undefined;
+  if (tuiOptions !== undefined) {
+    cliJson = { plugins: [{ package: plugin, options: tuiOptions }] };
+    await writeFile(path.join(configDir, "cli.json"), JSON.stringify(cliJson, null, 1));
+  }
   const logs = { SMOKE_HOOKS: path.join(root, "hooks.jsonl"), SMOKE_EVENTS: path.join(root, "events.jsonl"), SMOKE_DUMP: path.join(root, "dump.json") };
   for (const file of [logs.SMOKE_HOOKS, logs.SMOKE_EVENTS]) await writeFile(file, "");
-  return { ...logs, OPENCODE_FILEWATCHER_DISABLE: "true" };
+  return { env: { ...logs, OPENCODE_FILEWATCHER_DISABLE: "true" }, ...(cliJson ? { cliJson } : {}) };
+}
+
+interface ChildView { picker: string[]; running: boolean; child: { row: Row; lines: string[] }; idle: { row: Row | undefined; lines: string[] } }
+/**
+ * With a delegation running: Down (subagent picker; the child described `description` must be its only running entry),
+ * Enter, then the child's own view (its prompt `childMarker`, no root-only `SPIKE_CALL`, not the picker screen) with a
+ * `fast · …` row while the child is still held (`running`), and again once it answered (`CHILD_OK`).
+ */
+async function openChildView(t: TuiSession, provider: RoutingProvider, description: string, childMarker: string, label: string): Promise<ChildView> {
+  t.send(KEY.down);
+  const picker = await t.waitScreen(`${label}: subagent picker`, lines => {
+    if (!lines.some(l => /Subagents\s+Shell/.test(l))) return undefined;
+    const running = lines.filter(l => /┃\s+\S.*\s{2,}Running\b/.test(l)).map(l => (/┃\s+(\S.*?)\s{2,}Running\b/.exec(l)?.[1] ?? "").trim());
+    return running.length > 0 ? running : undefined;
+  }, 10_000);
+  if (picker.value.length !== 1 || !picker.value[0]!.includes(description)) throw new Error(`the picker's running entries are ${JSON.stringify(picker.value)}, expected only ${JSON.stringify(description)}`);
+  const pickerText = picker.lines.join("\n");
+  t.send(KEY.enter);
+  const isChildView = (lines: readonly string[]) => lines.join("\n") !== pickerText
+    && lines.some(l => l.includes(childMarker) && !l.includes("SPIKE_CALL")) && !lines.some(l => l.includes("SPIKE_CALL"));
+  const child = await t.waitScreen(`${label}: child view row`, lines => (isChildView(lines) ? findRow(lines) : undefined), 15_000);
+  const held = provider.holds.at(-1);
+  const running = held !== undefined && held.releasedAt === undefined;
+  const idle = await t.waitScreen(`${label}: child idle (CHILD_OK)`, lines => (isChildView(lines) && lines.some(l => l.includes("CHILD_OK")) ? findRow(lines) ?? null : undefined), 45_000);
+  return { picker: picker.value, running, child: { row: child.value, lines: child.lines }, idle: { row: idle.value ?? undefined, lines: idle.lines } };
 }
 
 /** Types a `SPIKE_CALL` for the fast tier, waits until the whole text is in the prompt box, submits it and waits for the root request. */
@@ -265,8 +319,9 @@ async function runFlow(job: Job, root: string, plugin: Promise<string>): Promise
   try {
     flow.plugin = await plugin;
     const baseURL = await provider.start();
-    const extra = await writeHostFiles(root, home, baseURL, flow.plugin);
-    const env = isolatedTuiEnv(home, extra);
+    const files = await writeHostFiles(root, home, baseURL, flow.plugin, TUI_OPTIONS[job.kind]);
+    if (files.cliJson) flow.cliJson = files.cliJson;
+    const env = isolatedTuiEnv(home, files.env);
     tui = await TuiSession.spawn({ label: `${job.label} ${job.kind}`, executable: job.exe, args: ["--standalone", "--auto"], cwd: project, env, logFile });
     const t = tui;
 
@@ -281,7 +336,8 @@ async function runFlow(job: Job, root: string, plugin: Promise<string>): Promise
       await delay(1_500);
       const lines = await t.snap("S1 home");
       const footer = footerOf(lines);
-      set("S1-default", { pass: footer?.value === "default" && notices(lines).length === 0, detail: `footer ${JSON.stringify(footer?.line)}; host row ${JSON.stringify(rootMetaOf(lines))}; notices ${JSON.stringify(notices(lines))}`, lines: footer ? around(lines, footerIndex(lines), 6, 0) : tail(bootLines) });
+      const count = footerCount(lines);
+      set("S1-default", { pass: footer?.value === "default" && count === 1 && notices(lines).length === 0, detail: `footer ${JSON.stringify(footer?.line)} (plugin footer texts: ${count}); host row ${JSON.stringify(rootMetaOf(lines))}; notices ${JSON.stringify(notices(lines))}; cli.json ${flow.cliJson ? "with options" : "absent"}`, lines: footer ? around(lines, footerIndex(lines), 6, 0) : tail(bootLines) });
     });
     if (job.kind === "local") {
       await step("S1-variant", async () => {
@@ -312,6 +368,64 @@ async function runFlow(job: Job, root: string, plugin: Promise<string>): Promise
         }
         set("S1-restore", { pass: false, detail: `no variant-free host row after 8 ctrl+t; host rows ${JSON.stringify(seen)}`, lines: tail(await t.screen()) });
       });
+    }
+
+    // ---- D (A12 default: no G3 row, G1 and G2 unchanged), off flow only ----
+    if (job.kind === "off") {
+      const description = "tui smoke off";
+      const childMarker = `${HOLD_MARKER} off`;
+      await step("A12-no-row", async () => {
+        provider.holdMarked(HOLD_MARKER, 30_000);
+        const sentAt = await delegate(t, provider, description, childMarker);
+        const rel = (at?: number) => at === undefined ? "n/a" : `${((at - sentAt) / 1000).toFixed(1)} s`;
+        // Poll the root view from the submit until 8 s after the child's request reached the provider (still held).
+        const deadline = sentAt + STEP_MS;
+        let arrivedAt: number | undefined;
+        let polls = 0;
+        let rowSeen: { at: number; row: Row; lines: string[] } | undefined;
+        let hostSeen = false;
+        let footerBad: string | undefined;
+        let lastLines: string[] = [];
+        let releasedDuringWindow = false;
+        while (Date.now() < deadline) {
+          const lines = await t.screen();
+          const now = Date.now();
+          polls += 1;
+          lastLines = lines;
+          const row = findRow(lines);
+          if (row && !rowSeen) { rowSeen = { at: now, row, lines }; await t.snap("A12 row seen (unexpected)"); }
+          if (hostShowsSubagent(lines, description)) hostSeen = true;
+          const footer = footerOf(lines);
+          if (footer !== undefined && (footer.value !== "default" || footerCount(lines) !== 1)) footerBad ??= footer.line;
+          arrivedAt ??= provider.holds.at(-1)?.arrivedAt;
+          if (provider.holds.at(-1)?.releasedAt !== undefined) releasedDuringWindow = true;
+          if (arrivedAt !== undefined && now >= arrivedAt + 8_000) break;
+          await delay(100);
+        }
+        const window = await t.snap("A12 root view, child held");
+        const footer = footerOf(window);
+        const meta = rootMetaIndex(window);
+        const top = meta >= 0 ? composerTop(window, meta) : -1;
+        const windowMs = arrivedAt === undefined ? 0 : Date.now() - arrivedAt;
+        set("A12-no-row", {
+          pass: arrivedAt !== undefined && windowMs >= 6_000 && !releasedDuringWindow && rowSeen === undefined && hostSeen && footerBad === undefined && footer?.value === "default",
+          detail: `child request reached the provider at ${rel(arrivedAt)} and stayed held for the ${(windowMs / 1000).toFixed(1)} s polled after it (released during the window: ${releasedDuringWindow}); ${polls} polls from the submit: fast row seen ${rowSeen ? `at ${rel(rowSeen.at)}: ${JSON.stringify(rowSeen.row.line)}` : "never"}; host shows the running subagent: ${hostSeen}; footer ${JSON.stringify(footer?.line)}${footerBad ? ` (bad footer seen: ${JSON.stringify(footerBad)})` : ""}; line above the prompt box: ${JSON.stringify(top > 0 ? window[top - 1]!.slice(0, 100).trim() : "")}`,
+          lines: meta >= 0 ? window.slice(Math.max(0, top - 6), meta + 3) : tail(lastLines),
+        });
+      });
+      await step("A12-G2", async () => {
+        if (provider.holds.length === 0) throw new Error("no held delegation to open (A12-no-row did not start one)");
+        const view = await openChildView(t, provider, description, childMarker, "A12");
+        const wire = provider.requests.filter(r => r.agent === "fast");
+        const wireOk = wire.length >= 1 && wire.every(r => effectiveEffort(r) === TUI_PRESET.fast.effort && (r.catalogModel ?? "").endsWith(`#${TUI_PRESET.fast.variant}`));
+        set("A12-G2", {
+          pass: view.running && /sonnet/i.test(view.child.row.model) && view.child.row.effort === EXPECTED_CHILD_EFFORT && view.idle.row?.effort === EXPECTED_CHILD_EFFORT && rowCount(view.child.lines) === 1 && wireOk,
+          detail: `child view row ${JSON.stringify(view.child.row.line)} while the child is held (running: ${view.running}); after the answer ${JSON.stringify(view.idle.row?.line)}; expected effort ${JSON.stringify(EXPECTED_CHILD_EFFORT)}; picker running entries ${JSON.stringify(view.picker)}; wire ${JSON.stringify(wire.map(r => `${r.catalogModel} effort=${String(effectiveEffort(r))}`))}`,
+          lines: around(view.child.lines, view.child.row.index, 8, 6),
+          data: { idleScreen: view.idle.row ? around(view.idle.lines, view.idle.row.index, 6, 6) : tail(view.idle.lines) },
+        });
+      });
+      return flow;
     }
 
     // ---- S2 (G3 + A6, sidebar + gap on the local flow) ----
@@ -362,9 +476,10 @@ async function runFlow(job: Job, root: string, plugin: Promise<string>): Promise
       const meta = first ? rootMetaIndex(first.lines) : -1;
       const top = first && meta >= 0 ? composerTop(first.lines, meta) : -1;
       const directlyAbove = first !== undefined && top >= 0 && first.row.index === top - 1;
+      const rows = first ? rowCount(first.lines) : 0;
       set("S2-G3", {
-        pass: first !== undefined && gone !== undefined && hold?.releasedAt !== undefined && gone.at > hold.releasedAt && directlyAbove,
-        detail: `row ${JSON.stringify(last?.row.line)} first at ${rel(first?.at)}, last at ${rel(last?.at)}, gone at ${rel(gone?.at)} (child request held ${rel(hold?.arrivedAt)} -> ${rel(hold?.releasedAt)}); row on line ${first?.row.index}, prompt box top ${top} (directly above: ${directlyAbove})`,
+        pass: first !== undefined && gone !== undefined && hold?.releasedAt !== undefined && gone.at > hold.releasedAt && directlyAbove && rows === 1,
+        detail: `row ${JSON.stringify(last?.row.line)} first at ${rel(first?.at)}, last at ${rel(last?.at)}, gone at ${rel(gone?.at)} (child request held ${rel(hold?.arrivedAt)} -> ${rel(hold?.releasedAt)}); row on line ${first?.row.index}, prompt box top ${top} (directly above: ${directlyAbove}); rows on screen: ${rows}`,
         lines: first ? around(first.lines, first.row.index, 3, 6) : tail(await t.screen()),
         data: { changes: changes.map(c => ({ t: rel(c.at), row: c.row })), goneScreen: gone ? tail(gone.lines) : undefined, footer: first ? footerOf(first.lines)?.line : undefined },
       });
@@ -396,29 +511,13 @@ async function runFlow(job: Job, root: string, plugin: Promise<string>): Promise
         provider.holdMarked(HOLD_MARKER, 30_000);
         await delegate(t, provider, "tui smoke two", childMarker);
         const g3 = await t.waitScreen("S3: G3 row of the second delegation", findRow, 30_000);
-        t.send(KEY.down);
-        // The picker lists running family members; the child must be its only running entry (selected by default).
-        const picker = await t.waitScreen("S3: subagent picker", lines => {
-          if (!lines.some(l => /Subagents\s+Shell/.test(l))) return undefined;
-          const running = lines.filter(l => /┃\s+\S.*\s{2,}Running\b/.test(l)).map(l => (/┃\s+(\S.*?)\s{2,}Running\b/.exec(l)?.[1] ?? "").trim());
-          return running.length > 0 ? running : undefined;
-        }, 10_000);
-        if (picker.value.length !== 1 || !picker.value[0]!.includes("tui smoke two")) throw new Error(`the picker's running entries are ${JSON.stringify(picker.value)}, expected only the second child`);
-        const pickerText = picker.lines.join("\n");
-        t.send(KEY.enter);
-        // The child view: its own prompt text, no root-only marker (`SPIKE_CALL`), a different screen than the picker.
-        const isChildView = (lines: readonly string[]) => lines.join("\n") !== pickerText
-          && lines.some(l => l.includes(childMarker) && !l.includes("SPIKE_CALL")) && !lines.some(l => l.includes("SPIKE_CALL"));
-        const child = await t.waitScreen("S3: child view row", lines => (isChildView(lines) ? findRow(lines) : undefined), 15_000);
-        const held = provider.holds.at(-1);
-        const running = held !== undefined && held.releasedAt === undefined;
-        const idle = await t.waitScreen("S3: child idle (CHILD_OK)", lines => (isChildView(lines) && lines.some(l => l.includes("CHILD_OK")) ? findRow(lines) ?? null : undefined), 45_000);
-        g2 = { running: child.value, idle: idle.value ?? undefined };
+        const view = await openChildView(t, provider, "tui smoke two", childMarker, "S3");
+        g2 = { running: view.child.row, idle: view.idle.row };
         set("S3-G2", {
-          pass: running && child.value.effort.length > 0 && /sonnet/i.test(child.value.model) && idle.value !== null,
-          detail: `child view row ${JSON.stringify(child.value.line)} while the child is held (running: ${running}); after the answer ${JSON.stringify(idle.value?.line)}; picker running entries ${JSON.stringify(picker.value)}; G3 row before navigating ${JSON.stringify(g3.value.line)}`,
-          lines: around(child.lines, child.value.index, 8, 6),
-          data: { idleScreen: idle.value ? around(idle.lines, idle.value.index, 6, 6) : tail(idle.lines) },
+          pass: view.running && view.child.row.effort.length > 0 && /sonnet/i.test(view.child.row.model) && view.idle.row !== undefined && rowCount(view.child.lines) === 1,
+          detail: `child view row ${JSON.stringify(view.child.row.line)} while the child is held (running: ${view.running}); after the answer ${JSON.stringify(view.idle.row?.line)}; picker running entries ${JSON.stringify(view.picker)}; G3 row before navigating ${JSON.stringify(g3.value.line)}`,
+          lines: around(view.child.lines, view.child.row.index, 8, 6),
+          data: { idleScreen: view.idle.row ? around(view.idle.lines, view.idle.row.index, 6, 6) : tail(view.idle.lines) },
         });
       });
     }
@@ -509,7 +608,7 @@ d(TITLE, () => {
     for (const job of JOBS) {
       const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), `omr-tui-${job.label}-${job.kind}-`)));
       // The install runs outside the host slots (no host yet); the flow waits for it after taking a slot.
-      const plugin = job.kind === "local" || !run ? Promise.resolve(ROOT) : pack.then(tgz => installInto(run, root, tgz));
+      const plugin = job.kind === "npm" && run ? pack.then(tgz => installInto(run, root, tgz)) : Promise.resolve(ROOT);
       plugin.catch(() => {});
       flows[job.index] = (async () => {
         if (job.kind === "npm") await plugin.catch(() => undefined);
@@ -521,9 +620,10 @@ d(TITLE, () => {
       })();
     }
   }, 60_000);
-  afterAll(async () => { await batchRecord(); }, 2 * FLOW_MS + INSTALL_MS);
+  // Three flows per version share at most MAX_HOSTS slots: a slot may run three flows back to back.
+  afterAll(async () => { await batchRecord(); }, 3 * FLOW_MS + INSTALL_MS);
 
-  const opts = { timeout: 2 * FLOW_MS + INSTALL_MS };
+  const opts = { timeout: 3 * FLOW_MS + INSTALL_MS };
   for (const target of TARGETS) {
     describe(`OpenCode ${target.label}`, () => {
       if (!target.present) {
@@ -531,7 +631,7 @@ d(TITLE, () => {
         return;
       }
       for (const job of JOBS.filter(j => j.exe === target.exe)) {
-        describe(job.kind === "local" ? "local path (this checkout)" : "node_modules install (npm pack)", () => {
+        describe(FLOW_TITLES[job.kind], () => {
           const flowOf = () => flows[job.index]!;
           const check = async (id: CheckId) => {
             const flow = await flowOf();
@@ -540,15 +640,20 @@ d(TITLE, () => {
             expect(c!.pass, `${id}: ${c!.detail}\n${c!.lines.join("\n")}`).toBe(true);
           };
           it("boots with the plugin's footer on the home screen", opts, async () => { await check("boot"); });
-          it("S1 G1: home footer shows `effort default`", opts, async () => { await check("S1-default"); });
+          it("S1 G1: home footer shows `effort default` (one plugin registration)", opts, async () => { await check("S1-default"); });
           if (job.kind === "local") {
             it("S1 G1: a selected variant shows in the host row and the plugin shows no effort", opts, async () => { await check("S1-variant"); });
             it("S1 G1: cycling back to no variant restores `effort default`", opts, async () => { await check("S1-restore"); });
           }
-          it("S2 G3: a running-delegate row directly above the prompt box while the child runs, gone after", opts, async () => { await check("S2-G3"); });
-          it("S2 A6: the row is on screen before the child's first token", opts, async () => { await check("A6"); });
-          if (job.kind === "local") it("S3 G2: the child's own view shows `fast · <model> · <effort>` while it runs", opts, async () => { await check("S3-G2"); });
-          it(`S4: the child's effort is the fast tier's (${EXPECTED_CHILD_EFFORT}) on screen and on the wire`, opts, async () => { await check("S4-effort"); });
+          if (job.kind === "off") {
+            it("A12 default: no running-delegate row in the root view while the held child runs; footer still `effort default`", opts, async () => { await check("A12-no-row"); });
+            it(`A12 default: G2 still shows \`fast · <model> · ${EXPECTED_CHILD_EFFORT}\` in the child's own view while it runs`, opts, async () => { await check("A12-G2"); });
+          } else {
+            it("S2 G3: a running-delegate row directly above the prompt box while the child runs, gone after", opts, async () => { await check("S2-G3"); });
+            it("S2 A6: the row is on screen before the child's first token", opts, async () => { await check("A6"); });
+            if (job.kind === "local") it("S3 G2: the child's own view shows `fast · <model> · <effort>` while it runs", opts, async () => { await check("S3-G2"); });
+            it(`S4: the child's effort is the fast tier's (${EXPECTED_CHILD_EFFORT}) on screen and on the wire`, opts, async () => { await check("S4-effort"); });
+          }
           if (job.kind === "local") {
             it("recorded: sidebar toggled and back, empty-box gap", opts, async () => {
               const flow = await flowOf();

@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2 TUI status (#90).** The package ships a TUI entry, `tui.ts` (plugin id `opencode-model-router.status`),
   that OpenCode v2 (2.0.24 or later) auto-loads for every package listed in `opencode.json` `plugins` when the server
   entry loads. The main session's prompt footer shows `effort <value>` when no variant is selected; a delegated
-  session's view shows `<agent> · <model> · <effort>` above the composer; while delegates run, the main session lists
-  them above the composer, one `<agent> · <model> · <effort>` row each, at most `maxRows`, then `+<k> more`. Options
+  session's view shows `<agent> · <model> · <effort>` above the composer. Opt-in (off by default, so the main session
+  shows only the footer's effort): with `"options": { "runningRow": true }` the main session lists running delegates
+  above the composer, one `<agent> · <model> · <effort>` row each, at most `maxRows`, then `+<k> more`. Options
   `enabled`, `footer`, `childView`, `runningRow` and `maxRows` go in OpenCode v2's TUI config file `cli.json`; turn it
   off with `enabled: false` or `"-opencode-model-router.status"`. The v2 server plugin answers the plugin rpc
   `opencode-model-router.effort` (`effortOf`) with the effort each session's latest turn carried; while it has no
