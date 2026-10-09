@@ -39,7 +39,7 @@ import { promisify } from "node:util";
 import {
   PROBE_PLUGIN, ROOT, ROOT_MODEL, RUN_ID, RoutingProvider, SMOKE_PRESET, delay, effectiveEffort, redactText, ref, type Obj,
 } from "./helpers/routing-host";
-import { KEY, TuiSession, identity, isolatedTuiEnv, opencodePids, processTable, type TuiStop } from "./helpers/tui-pty";
+import { KEY, TuiSession, identity, isolatedTuiEnv, opencodePids, processTable, type ProcessRow, type TuiStop } from "./helpers/tui-pty";
 
 const execFileAsync = promisify(execFile);
 const RUN = process.env.RUN_OC_SMOKE_TUI === "1";
@@ -127,33 +127,46 @@ function npmCli(): string {
   if (!found) throw new Error(`npm-cli.js not found (${candidates.join(" | ")})`);
   return found;
 }
-/** The caller's environment for npm: no credential-shaped, OpenCode/router or npm_* (the outer `npm run` config, e.g. its local prefix) variable. */
-function npmEnv(): NodeJS.ProcessEnv {
+/** One run's npm state (R2-1): a private cache shared by the run's installs and an empty user config (registry: npm's default). */
+interface NpmRun { readonly cache: string; readonly userconfig: string }
+function npmRun(): NpmRun {
+  const dir = mkdtempSync(path.join(tmpdir(), "omr-tui-npm-"));
+  const cache = path.join(dir, "npm-cache");
+  mkdirSync(cache, { recursive: true });
+  const userconfig = path.join(dir, "empty.npmrc");
+  writeFileSync(userconfig, "");
+  return { cache, userconfig };
+}
+/**
+ * The caller's environment for npm without credential-shaped, OpenCode/router or npm_* (the outer `npm run` config,
+ * e.g. its local prefix) variables, plus the run's own cache, no log files and an empty user config.
+ */
+function npmEnv(run: NpmRun): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (value === undefined || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(name) || /^(npm_|OPENCODE|MODEL_ROUTER|OMR_|SMOKE_|RUN_OC_)/i.test(name)) continue;
     env[name] = value;
   }
-  return env;
+  return { ...env, npm_config_cache: run.cache, npm_config_logs_max: "0", npm_config_userconfig: run.userconfig };
 }
-async function npm(args: string[], cwd: string, timeout: number): Promise<string> {
-  const { stdout, stderr } = await execFileAsync(process.execPath, [npmCli(), ...args], { cwd, env: npmEnv(), encoding: "utf8", timeout, maxBuffer: 64 * 1024 * 1024, windowsHide: true });
+async function npm(run: NpmRun, args: string[], cwd: string, timeout: number): Promise<string> {
+  const { stdout, stderr } = await execFileAsync(process.execPath, [npmCli(), ...args], { cwd, env: npmEnv(run), encoding: "utf8", timeout, maxBuffer: 64 * 1024 * 1024, windowsHide: true });
   return `${stdout}${stderr}`;
 }
 /** `npm pack` of this checkout into a temp directory; resolves to the tarball. */
-async function packOnce(): Promise<string> {
+async function packOnce(run: NpmRun): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), "omr-tui-pack-"));
-  await npm(["pack", "--ignore-scripts", "--pack-destination", dir], ROOT, 120_000);
+  await npm(run, ["pack", "--ignore-scripts", "--pack-destination", dir], ROOT, 120_000);
   const tgz = (await readdir(dir)).find(n => n.endsWith(".tgz"));
   if (!tgz) throw new Error(`npm pack wrote no tarball in ${dir}`);
   return path.join(dir, tgz);
 }
 /** Installs the tarball (and its peers) into `<root>/install`; resolves to the installed package directory. */
-async function installInto(root: string, tgz: string): Promise<string> {
+async function installInto(run: NpmRun, root: string, tgz: string): Promise<string> {
   const dir = path.join(root, "install");
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "omr-tui-smoke-install", version: "0.0.0", private: true }));
-  const log = await npm(["install", "--no-save", "--no-audit", "--no-fund", "--ignore-scripts", "--no-package-lock", "--prefix", dir, tgz], dir, INSTALL_MS);
+  const log = await npm(run, ["install", "--no-save", "--no-audit", "--no-fund", "--ignore-scripts", "--no-package-lock", "--prefix", dir, tgz], dir, INSTALL_MS);
   const pkg = path.join(dir, "node_modules", "opencode-model-router");
   for (const needed of [path.join(pkg, "tui.ts"), path.join(pkg, "server.ts"), path.join(dir, "node_modules", "@opencode-ai", "plugin", "package.json")]) {
     if (!existsSync(needed)) throw new Error(`npm install did not provide ${path.relative(dir, needed)}:\n${log.slice(-2_000)}`);
@@ -469,12 +482,15 @@ d(TITLE, () => {
     const after = await processTable();
     const pidsAfter = opencodePids(after);
     const own = done.flatMap(f => f.stop?.tree ?? []);
+    const row = (p: ProcessRow) => ({ pid: p.ProcessId, parent: p.ParentProcessId, name: p.Name, created: p.CreationDate });
     batch = {
-      runId: RUN_ID, pidsBefore, pidsAfter, tableAfterRead: after.length > 0,
-      ownTrees: own.map(p => ({ pid: p.ProcessId, name: p.Name, created: p.CreationDate })),
-      newAfter: pidsAfter.filter(p => !pidsBefore.includes(p)), gone: pidsBefore.filter(p => !pidsAfter.includes(p)),
-      ownOverlapPidsBefore: own.map(p => p.ProcessId).filter(p => pidsBefore.includes(p)),
-      ownOverlapStartIdentities: own.filter(p => startIdentities.has(identity(p))).map(p => p.ProcessId),
+      runId: RUN_ID, worker: process.pid, tableAfterRead: after.length > 0,
+      ownTrees: own.map(row),
+      // R2-2: left behind = a child of this test worker (the pty hosts, npm, process queries) that was not present at the start.
+      leftovers: after.filter(p => p.ParentProcessId === process.pid && !startIdentities.has(identity(p))).map(row),
+      // Overlap by pid + creation time only (a bare pid can be reused).
+      ownOverlapStartIdentities: own.filter(p => startIdentities.has(identity(p))).map(row),
+      info: { opencodePidsBefore: pidsBefore, opencodePidsAfter: pidsAfter, opencodeNewAfter: pidsAfter.filter(p => !pidsBefore.includes(p)), opencodeGone: pidsBefore.filter(p => !pidsAfter.includes(p)) },
     };
     writeFileSync(path.join(OUT, `${RUN8}-pids.json`), JSON.stringify(batch, null, 2));
     return batch;
@@ -486,13 +502,14 @@ d(TITLE, () => {
     if (start.length === 0) throw new Error("the start-of-run process table is empty: refusing to run hosts without a baseline");
     startIdentities = new Set(start.map(identity));
     pidsBefore = opencodePids(start);
-    const pack = JOBS.some(j => j.kind === "npm") ? packOnce() : Promise.resolve("");
+    const run = JOBS.some(j => j.kind === "npm") ? npmRun() : undefined;
+    const pack = run ? packOnce(run) : Promise.resolve("");
     pack.catch(() => {});
     const slots = new Slots(MAX_HOSTS);
     for (const job of JOBS) {
       const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), `omr-tui-${job.label}-${job.kind}-`)));
       // The install runs outside the host slots (no host yet); the flow waits for it after taking a slot.
-      const plugin = job.kind === "local" ? Promise.resolve(ROOT) : pack.then(tgz => installInto(root, tgz));
+      const plugin = job.kind === "local" || !run ? Promise.resolve(ROOT) : pack.then(tgz => installInto(run, root, tgz));
       plugin.catch(() => {});
       flows[job.index] = (async () => {
         if (job.kind === "npm") await plugin.catch(() => undefined);
@@ -556,17 +573,18 @@ d(TITLE, () => {
             expect(round.at(-1)?.role).toBe("root");
             expect(stop!.tree.filter(p => startIdentities.has(identity(p))).map(p => p.ProcessId)).toEqual([]);
             expect(stop!.survivors).toEqual([]);
+            // R2-3: descendants found after the kill rounds are reported, never killed; any fails the teardown.
+            expect(stop!.strays, `processes left by the tree: ${JSON.stringify(stop!.strays)}`).toEqual([]);
           });
         });
       }
     });
   }
 
-  it("batch teardown: no opencode.exe left behind and no own PID among the processes present at the start", opts, async () => {
+  it("batch teardown: no new child of the test worker left behind, no own process (pid + creation time) present at the start", opts, async () => {
     const record = await batchRecord();
     expect(record.tableAfterRead).toBe(true);
-    expect(record.newAfter).toEqual([]);
-    expect(record.ownOverlapPidsBefore).toEqual([]);
+    expect(record.leftovers).toEqual([]);
     expect(record.ownOverlapStartIdentities).toEqual([]);
   });
 });
