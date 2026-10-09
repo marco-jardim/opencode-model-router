@@ -397,6 +397,28 @@ export function toolCallPaths(tool: string, args: unknown): string[] | undefined
   return paths.length > 0 ? paths : undefined;
 }
 
+/**
+ * QA-G-A2-2: a path segment that names git's metadata entry `.git` — compared case-insensitively (win32, and stricter
+ * elsewhere), with the trailing dots and spaces win32 drops and an NTFS `:stream` suffix removed (`.git.`, `.GIT`,
+ * `.git::$INDEX_ALLOCATION` all name `.git` there).
+ */
+function gitMetadataSegment(segment: string): boolean {
+  return segment.replace(/:.*$/s, "").replace(/[. ]+$/, "").toLowerCase() === ".git";
+}
+
+/**
+ * QA-G-A2-2: an edit of `path` (canonical `target`, inside `root`) would write `.git` or anything below it — the work root's own
+ * repository pointer (a file in a linked worktree) or metadata (config, hooks, `commondir`), or a nested repository's. Such an
+ * edit could redirect router_git_* (and the work-root guards) to another repository or a network path. Checked on the canonical
+ * path below the root (a link or junction that resolves into `.git` counts, 8.3 spellings never reach here) and on every segment
+ * of the path as written.
+ */
+export function editsGitMetadata(path: string, target: string, root: string): boolean {
+  const base = root.replace(/[\\/]+$/, "");
+  const below = target.length > base.length ? target.slice(base.length) : "";
+  return [path, below].some((text) => text.split(/[\\/]/).some(gitMetadataSegment));
+}
+
 /** The decision for one role-session action: allowed, or refused with the reason the child sees. */
 export type RoleAuthorityDecision = { readonly allow: true } | { readonly allow: false; readonly reason: string };
 
@@ -498,7 +520,8 @@ export function listedWorktreeRoot(
  *   an unknown binding or a grant without a root → refused (I9);
  * - path actions (`read`, `edit`, `glob`, `grep`): every path, canonical ({@link canonicalAuthorityPath}; case folded on win32),
  *   inside the bound work root — the plugin's directory when the grant has none; `read`/`edit` with no path refuse (QA-P23-A5);
- *   a `glob`/`grep` pattern that reaches outside its search root by itself refuses (QA-P23-A9).
+ *   a `glob`/`grep` pattern that reaches outside its search root by itself refuses (QA-P23-A9); every edit tool refuses `.git`
+ *   and everything below it ({@link editsGitMetadata}, QA-G-A2-2).
  */
 export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityDecision {
   const { action, binding } = input;
@@ -540,7 +563,12 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
     }
     for (const path of input.paths) {
       const target = canonical(path, input.sessionDirectory);
-      if (target !== undefined && insideWorkRoot(target, root)) continue;
+      if (target !== undefined && insideWorkRoot(target, root)) {
+        if (cls === "edit" && editsGitMetadata(path, target, root)) {
+          return refuse(`${action}: ${path} is repository metadata (\`.git\` or below it); a role never edits it`);
+        }
+        continue;
+      }
       if (target !== undefined && (cls === "read" || cls === "grep") && ownOutput(target, input.ownOutputs)) continue; // QA-P23-2-A1
       return refuse(`${action}: ${path} is outside this dispatch's work root ${root} (use an absolute path inside it)`);
     }
@@ -1238,9 +1266,14 @@ export async function registerV2Hooks(
           // request snapshot only. Resource-specific asks remain callable.
           const agent = (await ctx.agent.list()).data.find(agent => agent.id === event.agent);
           for (const name of Object.keys(event.tools ?? {})) {
-            const action = name === "write" || name === "patch" ? "edit" : name;
-            if (!agent || (evaluatePermission(agent.permissions, action, "*") === "deny"
-              && !agent.permissions.some(rule => rule.effect !== "deny" && rule.action === action && rule.resource !== "*"))) delete event.tools[name];
+            // QA-G-A1-1: every host edit tool (`write`, `patch`, `multiedit`, `apply_patch`) is checked as `edit`, the permission
+            // the host asserts for it; a rule naming the tool itself (never the `*` catch-all) can still deny it.
+            const action = roleActionOf(name) === "edit" ? "edit" : name;
+            const denied = (checked: string): boolean => evaluatePermission(agent!.permissions, checked, "*") === "deny"
+              && !agent!.permissions.some(rule => rule.effect !== "deny" && rule.action === checked && rule.resource !== "*");
+            const ownDeny = (): boolean => action !== name
+              && evaluatePermission(agent!.permissions.filter(rule => rule.action !== "*"), name, "*") === "deny";
+            if (!agent || denied(action) || ownDeny()) delete event.tools[name];
           }
         } catch (error) {
           // QA-P23-B1: a role session's failure goes to the hook's own catch (empty catalog AND the parent's annotation).

@@ -502,14 +502,21 @@ export interface WorkRootDeps {
   readonly platform: NodeJS.Platform;
 }
 
-/** `git worktree list --porcelain` in `cwd` (stdout); rejects on any failure. */
-export function gitWorktreeList(cwd: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile("git", ["worktree", "list", "--porcelain"], { cwd, timeout: 5_000, windowsHide: true, maxBuffer: 1 << 20, encoding: "utf8" }, (error, stdout) => {
-      if (error) reject(error);
-      else resolve(String(stdout));
-    });
+/**
+ * `git worktree list --porcelain` in `cwd` (stdout); rejects on any failure. QA-G-A2-3: the hardened spawn of `listWorktrees`
+ * (role-agents.ts) — the absolute git executable selected outside the work-root guards of `cwd` (`workRootGuards`), the
+ * `hardeningArgs()` flags, `gitEnvironment()` (no inherited GIT_*, no system/global config), no shell — bounded to 5 s and 1 MiB.
+ */
+export async function gitWorktreeList(cwd: string): Promise<string> {
+  // Loaded lazily: the hardened git helpers are only needed when a worktree list actually runs.
+  const { gitEnvironment, gitExecutable, hardeningArgs, spawnBounded, workRootGuards } = await import("../../router/git-tools");
+  const result = await spawnBounded(gitExecutable(workRootGuards(cwd)), [...hardeningArgs(), "worktree", "list", "--porcelain"], cwd, {
+    env: gitEnvironment(), timeoutMs: 5_000, maxBytes: 1 << 20,
   });
+  if (result.code !== 0 || result.truncated) {
+    throw new Error(`git worktree list failed (exit ${String(result.code)}${result.truncated ? ", output truncated" : ""}): ${result.stderr.toString("utf8").trim()}`);
+  }
+  return result.output.toString("utf8");
 }
 
 /**

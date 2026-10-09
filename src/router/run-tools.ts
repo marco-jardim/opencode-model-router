@@ -114,8 +114,14 @@ const NPM_SAFE_FLAGS: ReadonlySet<string> = new Set(["--silent", "-s", "--quiet"
 const NPMRC_WORKSPACE_KEYS: ReadonlySet<string> = new Set(["workspace", "workspaces", "include-workspace-root"]);
 /** `.npmrc` keys that move npm's config files out of the tool's checks (QA-P13-3-3). */
 const NPMRC_LOCATION_KEYS: ReadonlySet<string> = new Set(["globalconfig", "userconfig", "prefix"]);
-/** Credential-bearing environment variable names (QA-P13-1-9). */
-export const CREDENTIAL_ENV_RE = /(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)($|_)/i;
+/**
+ * Credential-bearing environment variable names (QA-P13-1-9). QA-G-A2-6: PASSWORD/PASSWD match
+ * anywhere and PWD before the end or a `_`, without a leading `_` (`PGPASSWORD`, `MYSQL_PWD`);
+ * the working-directory variables `PWD`/`OLDPWD` are exempt ({@link WORKING_DIRECTORY_ENV}).
+ */
+export const CREDENTIAL_ENV_RE = /(^|_)(TOKEN|SECRET|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)($|_)|PASSW(OR)?D|PWD($|_)/i;
+/** The POSIX working directory and the previous one: never credentials, kept as they are. */
+const WORKING_DIRECTORY_ENV = /^(OLD)?PWD$/i;
 /** Provider credentials whose names the pattern above does not match. */
 const PROVIDER_ENV: ReadonlySet<string> = new Set(["OPENAI_KEY", "AZURE_OPENAI_KEY", "COHERE_KEY", "GROQ_KEY", "MISTRAL_KEY",
   "OPENROUTER_KEY", "DEEPSEEK_KEY", "XAI_KEY", "GEMINI_KEY", "GOOGLE_KEY", "DATABASE_URL"]);
@@ -143,11 +149,6 @@ export interface RunToolDeps {
   resolveWorkRoot: (sessionID: string) => WorkRootAnswer;
   /** P1.4 `run` signal. A throwing recorder never hides the run's result. */
   recordRun?: (e: RunRecord) => void;
-  /**
-   * Operator passthrough: exact environment variable names (case-insensitive) kept
-   * although they look like credentials (e.g. a test database URL). Default: none.
-   */
-  envPassthrough?: readonly string[];
   /** Test seam: the node executable (absolute; still refused inside the guarded directories). Default: F.1 lookup. */
   nodeExecPath?: string;
   /** Test seam for platform-dependent resolution (shell, PATH lookup, path comparison). Default: process.platform. */
@@ -169,7 +170,12 @@ export interface RunPlan {
   timeoutMs: number;
 }
 
-export interface RunHost { platform: NodeJS.Platform; env: NodeJS.ProcessEnv; nodeExecPath?: string; envPassthrough?: readonly string[] }
+/**
+ * QA-G-A2-6: there is no credential passthrough. The `envPassthrough` option was never wired to
+ * any configuration, so it was removed rather than kept as a dead knob: credential-like
+ * variables are always dropped.
+ */
+export interface RunHost { platform: NodeJS.Platform; env: NodeJS.ProcessEnv; nodeExecPath?: string }
 
 class RunRefused extends Error {}
 const refuse = (message: string) => new RunRefused(message);
@@ -185,9 +191,39 @@ function nativeRealpath(path: string): string | undefined {
 }
 
 /**
+ * Text form of a path for comparison WITHOUT touching the filesystem (QA-G-A2-1): separators
+ * unified (win32: `\`), repeated separators and `.` segments dropped (a leading `\\` is kept),
+ * no trailing separator except a root's; case folded on win32.
+ */
+function pathText(path: string, platform: NodeJS.Platform): string {
+  const win = platform === "win32";
+  const sep = win ? "\\" : "/";
+  const text = win ? path.replace(/\//g, "\\") : path;
+  const lead = win && text.startsWith("\\\\") ? "\\\\" : text.startsWith(sep) ? sep : "";
+  let out = lead + text.split(sep).filter(part => part !== "" && part !== ".").join(sep);
+  if (win && /^[A-Za-z]:$/.test(out)) out += sep;
+  return win ? out.toLowerCase() : out;
+}
+
+/**
+ * win32: the `host\share` (lower case) a network path names, `"device"` for any other `\\`/`//`
+ * path (`\\?\C:\…`, `\\.\pipe\…`), undefined for a local path. POSIX: always undefined.
+ */
+function networkShare(path: string, platform: NodeJS.Platform): string | undefined {
+  if (platform !== "win32" || !/^[\\/]{2}/.test(path)) return undefined;
+  const parts = path.replace(/\//g, "\\").split("\\").filter(part => part !== "");
+  const unc = parts[0] === "?" || parts[0] === "." ? (parts[1]?.toLowerCase() === "unc" ? parts.slice(2) : undefined) : parts;
+  return unc !== undefined && unc.length >= 2 ? `${unc[0]}\\${unc[1]}`.toLowerCase() : "device";
+}
+
+/**
  * The canonical work root a call may run in (P-10, I9): the session must be bound, and
- * `cwd` must resolve (realpathSync.native: links, junctions and 8.3 names expanded) to
- * the same directory as the bound root, case-insensitively on win32.
+ * `cwd` must name the same directory as the bound root, case-insensitively on win32.
+ * QA-G-A2-1: the cwd is first compared as TEXT with the bound root and its real path; only
+ * when that fails is it resolved (realpathSync.native: links, junctions and 8.3 names
+ * expanded). A network or device cwd (`\\host\share\…`, `//host/…`, `\\?\…`, `\\.\…`) is
+ * never resolved unless the bound root itself lies on that same `\\host\share`: no
+ * filesystem call reaches a host the work root is not on.
  */
 export function authorizeCwd(bound: unknown, cwd: unknown, platform: NodeJS.Platform = process.platform): string {
   if (typeof bound !== "string" || bound === "") throw refuse("this session has no bound work root (I9); router_run only runs in a dispatch's work root");
@@ -195,6 +231,12 @@ export function authorizeCwd(bound: unknown, cwd: unknown, platform: NodeJS.Plat
   const root = nativeRealpath(bound);
   if (root === undefined || !statSync(root).isDirectory()) throw refuse(`the bound work root does not exist: ${bound}`);
   if (typeof cwd !== "string" || !isFullPath(cwd, platform)) throw refuse(`cwd must be the absolute path of this dispatch's work root (${root})`);
+  const text = pathText(cwd, platform);
+  if (text === pathText(bound, platform) || text === pathText(root, platform)) return root;
+  const share = networkShare(cwd, platform);
+  if (share !== undefined && (share === "device" || (share !== networkShare(bound, platform) && share !== networkShare(root, platform)))) {
+    throw refuse(`cwd is not this dispatch's work root (${root})`);
+  }
   const real = nativeRealpath(cwd);
   if (real === undefined || !samePath(real, root, platform)) throw refuse(`cwd is not this dispatch's work root (${root})`);
   return root;
@@ -269,6 +311,7 @@ export function validateRunArgs(args: readonly unknown[]): string[] {
 
 /** A credential-bearing environment variable name (QA-P13-1-9). */
 export function isCredentialEnv(name: string): boolean {
+  if (WORKING_DIRECTORY_ENV.test(name)) return false;
   return CREDENTIAL_ENV_RE.test(name) || PROVIDER_ENV.has(name.toUpperCase());
 }
 
@@ -280,7 +323,7 @@ function insideAny(path: string, guards: readonly string[]): boolean {
  * The hardened environment of a run:
  * - dropped: every `npm_*` variable (any case: npm_config_*, NPM_CONFIG_*, inherited
  *   npm_lifecycle_* and npm_package_*), NODE_OPTIONS, PREFIX (npm's global-config
- *   location) and credential-like variables (isCredentialEnv) unless passed through;
+ *   location) and credential-like variables (isCredentialEnv; no passthrough, QA-G-A2-6);
  * - PATH: relative entries and entries inside the guarded directories removed, so a
  *   `#!/usr/bin/env node` tool or a bare name cannot resolve into the repository; each
  *   entry is tested as written and by its real path (a link into the repository counts
@@ -288,13 +331,12 @@ function insideAny(path: string, guards: readonly string[]): boolean {
  * - set: CI=1; on win32 ComSpec (the validated shell) and NoDefaultCurrentDirectoryInExePath=1.
  */
 export function runEnvironment(base: NodeJS.ProcessEnv, platform: NodeJS.Platform, shell?: string,
-  options: { guards?: readonly string[]; passthrough?: readonly string[] } = {}): NodeJS.ProcessEnv {
-  const passthrough = new Set((options.passthrough ?? []).map(name => name.toUpperCase()));
+  options: { guards?: readonly string[] } = {}): NodeJS.ProcessEnv {
   const guards = options.guards ?? [];
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined || /^npm_/i.test(key) || /^(NODE_OPTIONS|PREFIX)$/i.test(key)) continue;
-    if (isCredentialEnv(key) && !passthrough.has(key.toUpperCase())) continue;
+    if (isCredentialEnv(key)) continue;
     if (/^PATH$/i.test(key)) {
       const separator = platform === "win32" ? ";" : ":";
       env[key] = value.split(separator).filter(entry => {
@@ -597,7 +639,7 @@ function npmLaunch(root: string, host: RunHost, guards: readonly string[]): { no
   const shell = resolveSystemShell(host, guards);
   const cli = resolveNpmCli(node, host.platform, guards);
   checkNpmrc(root, host.platform, loadNpmIni(cli, host.platform, guards));
-  const env = runEnvironment(host.env, host.platform, shell, { guards, passthrough: host.envPassthrough ?? [] });
+  const env = runEnvironment(host.env, host.platform, shell, { guards });
   return { node, cli, shell, flags: npmHardeningFlags(shell, npmConfigPins(node, cli, env, host.platform, guards)) };
 }
 
@@ -720,7 +762,7 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
   }
   return {
     kind: command !== undefined ? "command" : "script", name, executable, argv, cwd: root,
-    env: runEnvironment(host.env, host.platform, shell, { guards: guarded(), passthrough: host.envPassthrough ?? [] }), timeoutMs,
+    env: runEnvironment(host.env, host.platform, shell, { guards: guarded() }), timeoutMs,
   };
 }
 
@@ -828,7 +870,7 @@ export function routerRunTool(deps: RunToolDeps) {
         const root = authorizeCwd(answer.root, (input as { cwd?: unknown } | undefined)?.cwd, platform);
         const parsed = inputSchema.parse(input);
         const plan = planRun(parsed, root, deps.config(), {
-          platform, env: deps.env ?? process.env, envPassthrough: deps.envPassthrough ?? [],
+          platform, env: deps.env ?? process.env,
           ...(deps.nodeExecPath !== undefined ? { nodeExecPath: deps.nodeExecPath } : {}),
         });
         const at = Date.now();

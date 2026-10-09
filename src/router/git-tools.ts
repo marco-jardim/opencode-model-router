@@ -11,7 +11,16 @@ export type GitOperation = typeof GIT_OPERATIONS[number];
 export const GIT_TOOL_NAMES = GIT_OPERATIONS.map(name => `router_git_${name}`);
 export interface GitInput { path?: string; ref?: string; limit?: number; mode?: "patch" | "stat" | "name-only" | "cached" }
 /** Extra inspection context: the session's project worktree (discovery boundary) and pre-resolved executables. */
-export interface GitInspectOptions { worktree?: string; executables?: readonly string[]; guards?: readonly string[] }
+export interface GitInspectOptions {
+  worktree?: string; executables?: readonly string[]; guards?: readonly string[];
+  /**
+   * Role mode: `directory` is the bound work root. QA-G-A2-2: its `.git` pointers are checked before anything is spawned (no
+   * network/device pointer), the git directories git reports must be the ones they name, a linked worktree's admin directory
+   * must point back to the root, and with `dispatchRepository` (the directory whose repository listed the worktrees at
+   * dispatch) the common directory must be that repository's. QA-G-A2-4: paths and output are limited to the work root.
+   */
+  role?: { dispatchRepository?: string };
+}
 
 const MAX_BYTES = 64 * 1024;
 const DEADLINE_MS = 15_000;
@@ -82,6 +91,13 @@ export function validateRef(ref: string): string {
 function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
   return rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !isAbsolute(rel);
+}
+
+/** A validated repository-relative path (`/`-separated) is `scope` or below it; case-insensitive on win32 (QA-G-A2-4). */
+function withinScope(path: string, scope: string): boolean {
+  const fold = (part: string) => (process.platform === "win32" ? part.toLowerCase() : part);
+  const parts = path.split("/").filter(part => part !== "" && part !== ".");
+  return scope.split("/").filter(part => part !== "").every((part, index) => parts[index] !== undefined && fold(parts[index]!) === fold(part));
 }
 
 /**
@@ -159,9 +175,14 @@ function validateInput(operation: GitOperation, input: GitInput): { ref?: string
  * the hardening; `exclude` lists repository paths hidden with exclude pathspecs.
  */
 export function gitArgv(operation: GitOperation, input: GitInput, root: string,
-  extra: { config?: readonly string[]; exclude?: readonly string[] } = {}): string[] {
+  extra: { config?: readonly string[]; exclude?: readonly string[]; scope?: string } = {}): string[] {
   const { ref } = validateInput(operation, input);
   const path = input.path === undefined ? undefined : validatePath(root, input.path);
+  // QA-G-A2-4: a role work root below the top level (`scope`, repository-relative) limits the path and, without one, the pathspec.
+  if (path !== undefined && extra.scope !== undefined && !withinScope(path, extra.scope)) {
+    throw new Error(`Git path is outside the work root (paths are repository-relative; the work root is ${extra.scope}/)`);
+  }
+  const limit = path === undefined && extra.scope !== undefined ? [`:(literal)${extra.scope}`] : [];
   const args = [...hardeningArgs(), ...(extra.config ?? [])];
   switch (operation) {
     case "status": args.push("status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=all"); break;
@@ -179,7 +200,7 @@ export function gitArgv(operation: GitOperation, input: GitInput, root: string,
   }
   // Blame accepts one literal filename, not exclusion pathspecs: explicit
   // sensitive paths were refused above. Status/ls-files may list names only.
-  return [...args, "--", ...(path ? [`:(literal)${path}`] : []),
+  return [...args, "--", ...(path ? [`:(literal)${path}`] : []), ...limit,
     ...(["show", "diff", "log"].includes(operation) ? sensitiveGitPathspecs() : []),
     ...(extra.exclude ?? []).map(dir => `:(exclude,literal)${dir}`)];
 }
@@ -319,23 +340,63 @@ export function readBoundedRegularFile(path: string, max: number, label: string)
 const GIT_POINTER_BYTES = 4 * 1024;
 
 /**
+ * A path that names another host or a device (`\\host\share`, `//host/share`, `\\?\…`, `\\.\…`), on any platform: a git
+ * pointer naming one is never followed (QA-G-A2-2), so no filesystem call or git process reaches a network host through it.
+ */
+export function isNetworkOrDevicePath(path: string): boolean {
+  return /^[\\/]{2}/.test(path);
+}
+
+/** The git directory of a checkout and its common directory, as the checkout's `.git` pointers name them (QA-G-A2-2). */
+export interface GitPointers {
+  /** The git directory: `<checkout>/.git`, or what a `.git` file's `gitdir:` names. */
+  gitdir: string;
+  /** The common directory: what the git directory's `commondir` names, else the git directory itself. */
+  common: string;
+  /** `.git` is a file (a linked worktree, or a submodule's checkout). */
+  file: boolean;
+  /** The git directory has a non-empty `commondir` (a linked worktree's admin directory). */
+  linked: boolean;
+}
+
+/**
+ * Read a checkout's `.git` (a directory, or a file `gitdir: <path>`) and the git directory's `commondir`, both bounded (4 KiB,
+ * regular files only), WITHOUT following a pointer that names a network or device path: such a pointer throws before any
+ * filesystem call reaches it, and so does a `.git` that is a link. Undefined when `.git` is missing or names no git directory.
+ */
+export function gitPointers(checkout: string): GitPointers | undefined {
+  const dotGit = join(checkout, ".git");
+  const stats = lstatOrUndefined(dotGit);
+  if (stats === undefined) return undefined;
+  if (stats.isSymbolicLink()) throw new Error("Refusing repository: its .git is a link");
+  const file = !stats.isDirectory();
+  let gitdir = dotGit;
+  if (file) {
+    const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readBoundedRegularFile(dotGit, GIT_POINTER_BYTES, ".git") ?? "")?.[1];
+    if (!pointer) return undefined;
+    if (isNetworkOrDevicePath(pointer)) throw new Error("Refusing repository: its .git file points to a network or device path");
+    gitdir = resolve(checkout, pointer);
+  }
+  const commondir = readBoundedRegularFile(join(gitdir, "commondir"), GIT_POINTER_BYTES, "commondir")?.trim() ?? "";
+  if (isNetworkOrDevicePath(commondir)) throw new Error("Refusing repository: its commondir points to a network or device path");
+  return { gitdir, common: commondir === "" ? gitdir : resolve(gitdir, commondir), file, linked: commondir !== "" };
+}
+
+/**
  * The main worktree of the checkout at `checkout` (QA-P13-1-6): the checkout itself
  * when `.git` is a directory; for a linked worktree (`.git` file → gitdir →
  * `commondir`) the directory holding the common `.git`, or the common directory
  * itself for a bare repository (QA-P13-2-3b). Both pointer files are read bounded
- * (4 KiB, regular files only). Undefined when unreadable.
+ * (4 KiB, regular files only) by {@link gitPointers}. Undefined when unreadable, and
+ * when a pointer names a network or device path (QA-G-A2-2: never followed).
  */
 export function mainWorktree(checkout: string): string | undefined {
   try {
-    const dotGit = join(checkout, ".git");
-    if (lstatSync(dotGit).isDirectory()) return checkout;
-    const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(readBoundedRegularFile(dotGit, GIT_POINTER_BYTES, ".git") ?? "")?.[1];
-    if (!pointer) return undefined;
-    const gitdir = resolve(checkout, pointer);
-    const commondir = readBoundedRegularFile(join(gitdir, "commondir"), GIT_POINTER_BYTES, "commondir");
-    if (commondir === undefined || commondir.trim() === "") return undefined;
-    const common = resolve(gitdir, commondir.trim());
-    return basename(common).toLowerCase() === ".git" ? dirname(common) : common;
+    const pointers = gitPointers(checkout);
+    if (pointers === undefined) return undefined;
+    if (!pointers.file) return checkout;
+    if (!pointers.linked) return undefined;
+    return basename(pointers.common).toLowerCase() === ".git" ? dirname(pointers.common) : pointers.common;
   } catch { return undefined; }
 }
 
@@ -371,9 +432,12 @@ export function workRootGuards(root: string): string[] {
   return out;
 }
 
-/** Git executable for the plugin process, without session guards (setup and tests). */
-export function gitExecutable(): string {
-  return selectGitExecutable(defaultCandidates(), []);
+/**
+ * Git executable for the plugin process: the first candidate outside `guards` (none by default: setup and tests;
+ * `workRootGuards(dir)` for a run in a work root, QA-G-A2-3).
+ */
+export function gitExecutable(guards: readonly string[] = []): string {
+  return selectGitExecutable(defaultCandidates(), guards);
 }
 
 /**
@@ -653,13 +717,14 @@ function queryFailure(label: string, result: BoundedResult): Error {
 }
 
 /** Keep sensitive-only commits visible, without mistaking genuinely empty commits for withheld patches. */
-async function annotateWithheld(output: string, executable: string, base: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget): Promise<string> {
+async function annotateWithheld(output: string, executable: string, base: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget,
+  pathspecs: readonly string[] = []): Promise<string> {
   const sections = output.split(/(?=^commit [a-f0-9]{40,64}(?:\s|$))/m);
   for (let index = 0; index < sections.length; index++) {
     const section = sections[index]!;
     const oid = /^commit ([a-f0-9]{40,64})(?:\s|$)/.exec(section)?.[1];
     if (!oid || /^diff --/m.test(section) || section.includes("[truncated:")) continue;
-    const names = await query(executable, [...base, "diff-tree", "--root", "-m", "--no-commit-id", "--name-only", "-r", "-z", oid, "--"], root, env, budget);
+    const names = await query(executable, [...base, "diff-tree", "--root", "-m", "--no-commit-id", "--name-only", "-r", "-z", oid, "--", ...pathspecs], root, env, budget);
     if (names.code !== 0) throw queryFailure("Cannot inspect withheld changes", names);
     const paths = names.output.toString("utf8").split("\0").filter(Boolean);
     if (paths.length && paths.every(path => isSensitivePath(path))) sections[index] = `${section.trimEnd()}\n\n[router_git] changes to sensitive files withheld\n\n`;
@@ -851,6 +916,58 @@ function sessionBoundary(session: string, worktree: string | undefined): string 
   return nearestRepository(session) ?? session;
 }
 
+/** Two existing paths are the same file or directory (real paths, case folded on win32); false when either does not resolve. */
+function sameOnDisk(a: string, b: string): boolean {
+  try { return foldCase(realpath(a)) === foldCase(realpath(b)); } catch { return false; }
+}
+
+/** A role work root's checkout and the git directories its `.git` pointers name (QA-G-A2-2). */
+interface RoleRepository { checkout: string; pointers: GitPointers }
+
+/**
+ * QA-G-A2-2, before anything is spawned: the work root's checkout and its `.git` pointers (a network/device pointer throws, see
+ * {@link gitPointers}); with `dispatchRepository`, the common directory must be the one of the repository the dispatch listed
+ * the worktrees in.
+ */
+function roleRepository(session: string, dispatchRepository: string | undefined): RoleRepository {
+  const checkout = nearestRepository(session);
+  if (checkout === undefined) throw new Error("The bound work root is not inside a git checkout");
+  const pointers = gitPointers(checkout);
+  if (pointers === undefined) throw new Error("Cannot read the work root's .git");
+  if (dispatchRepository !== undefined) {
+    const listedCheckout = isDirectory(dispatchRepository) ? nearestRepository(realpath(dispatchRepository)) : undefined;
+    const listed = listedCheckout === undefined ? undefined : gitPointers(listedCheckout);
+    if (listed === undefined) throw new Error("refused: the repository listed at dispatch cannot be read");
+    if (!sameOnDisk(listed.common, pointers.common)) throw new Error("refused: the work root's repository is not the repository listed at dispatch");
+  }
+  return { checkout, pointers };
+}
+
+/**
+ * QA-G-A2-2, once git can be run: `rev-parse --absolute-git-dir --git-common-dir` in the work root must name the directories its
+ * `.git` pointers name (never a network/device path); a linked worktree's git directory must be `<common>/worktrees/<id>` and its
+ * `gitdir` file must point back to this checkout's `.git` — which is how `git worktree list` listed the root at dispatch.
+ */
+async function verifyRoleRepository(executable: string, base: string[], session: string, env: NodeJS.ProcessEnv, budget: Budget, role: RoleRepository): Promise<void> {
+  const dirs = await query(executable, [...base, "rev-parse", "--absolute-git-dir", "--git-common-dir"], session, env, budget, 64 * 1024);
+  if (dirs.code !== 0) throw queryFailure("Cannot resolve the repository's git directories", dirs);
+  const [gitDir, commonDir] = dirs.output.toString("utf8").split(/\r?\n/).map(line => line.trim());
+  if (!gitDir || !commonDir) throw new Error("Cannot resolve the repository's git directories");
+  if (isNetworkOrDevicePath(gitDir) || isNetworkOrDevicePath(commonDir)) throw new Error("Refusing repository: git reports a network or device path");
+  const { pointers, checkout } = role;
+  if (!sameOnDisk(gitDir, pointers.gitdir) || !sameOnDisk(resolve(session, commonDir), pointers.common)) {
+    throw new Error("refused: the repository git reports is not the one the work root's .git names");
+  }
+  if (sameOnDisk(pointers.gitdir, pointers.common)) return; // a main worktree (or a submodule's checkout): its own git directory
+  if (!sameOnDisk(dirname(pointers.gitdir), join(pointers.common, "worktrees"))) {
+    throw new Error("refused: the work root's git directory is not a worktree of the repository listed at dispatch");
+  }
+  const back = readBoundedRegularFile(join(pointers.gitdir, "gitdir"), GIT_POINTER_BYTES, "gitdir")?.trim() ?? "";
+  if (back === "" || isNetworkOrDevicePath(back) || !sameOnDisk(resolve(pointers.gitdir, back), join(checkout, ".git"))) {
+    throw new Error("refused: the work root's git directory does not point back to this work root (not the worktree listed at dispatch)");
+  }
+}
+
 export async function inspectGit(operation: GitOperation, input: GitInput, directory: string, signal?: AbortSignal, options: GitInspectOptions = {}): Promise<string> {
   // Discovery and inspection share one tool-call deadline, not two 15 s waits.
   const deadline = performance.now() + DEADLINE_MS;
@@ -863,6 +980,8 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   if (!isDirectory(directory)) throw new Error("Session directory does not exist");
   const session = realpath(directory);
   const boundary = sessionBoundary(session, options.worktree);
+  // QA-G-A2-2: a role work root's `.git` pointers are checked before anything is spawned.
+  const role = options.role === undefined ? undefined : roleRepository(session, options.role.dispatchRepository);
   // G4: never run a git that lives in the session's tree, checked before anything is spawned.
   const nearest = nearestRepository(session);
   const executable = selectGitExecutable(options.executables ?? defaultCandidates(), [session, boundary, ...(nearest ? [nearest] : []), ...(options.guards ?? [])]);
@@ -878,13 +997,22 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
   const root = realpath(top);
   if (!inside(boundary, root)) throw new Error("Repository toplevel is outside the session worktree");
   if (inside(root, executable)) throw new Error(`Refusing git executable inside the repository: ${executable}`);
+  // QA-G-A2-4: a role work root below the top level limits every path and listing to it (`scope`, repository-relative).
+  let scope: string | undefined;
+  if (role !== undefined) {
+    await verifyRoleRepository(executable, base, session, env, budget, role);
+    if (!inside(root, session)) throw new Error("refused: the work root is not inside its repository's top level");
+    const below = relative(root, session);
+    scope = below === "" ? undefined : below.split(/[\\/]/).join("/");
+  }
+  const scopeSpec = scope === undefined ? [] : [`:(literal)${scope}`];
   const repository = await repositoryConfig(executable, root, env, base, budget);
   const config = [...trusted,
     ...inherited.filter(pair => !pair.startsWith("safe.directory=") && !repository.overridden.has(pair.slice(0, pair.indexOf("=")))).flatMap(pair => ["-c", pair]),
     ...repository.neutralize];
   let linked: string[] = [];
   if (readsWorktree(operation, input)) {
-    const index = await spawnBounded(executable, [...base, "ls-files", "-z", "--cached"], root,
+    const index = await spawnBounded(executable, [...base, "ls-files", "-z", "--cached", ...(scope === undefined ? [] : ["--", ...scopeSpec])], root,
       { env, signal, timeoutMs: budget.timeoutMs(), maxBytes: MAX_INDEX_BYTES });
     if (index.truncated) throw new Error(`Tracked-index listing size cap exceeded (${MAX_INDEX_BYTES} bytes); use diff mode: cached or a commit range`);
     if (index.code !== 0) throw queryFailure("Cannot list tracked files", index);
@@ -908,12 +1036,12 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
     }
     inspected = { ...input, ref: oid };
   }
-  const argv = gitArgv(operation, inspected, root, { config, exclude: linked });
+  const argv = gitArgv(operation, inspected, root, { config, exclude: linked, ...(scope === undefined ? {} : { scope }) });
   const raw = operation === "diff" && input.mode === "name-only"
     ? await diffNames(executable, argv, root, env, budget)
     : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
   let output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
-  if (operation === "show" || operation === "log") output = await annotateWithheld(output, executable, base, root, env, budget);
+  if (operation === "show" || operation === "log") output = await annotateWithheld(output, executable, base, root, env, budget, scopeSpec);
   if (linked.length === 0) return output;
   return `${output}${output.endsWith("\n") || output === "" ? "" : "\n"}[router_git] skipped tracked directories replaced by symlinks/junctions: ${linked.slice(0, 20).join(", ")}${linked.length > 20 ? ", ..." : ""}`;
 }
@@ -927,7 +1055,8 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
  *   `workRoot: null`). The tool refuses and spawns nothing (I9).
  * - `{ role: true, root }`: the absolute work root bound to the session (a drive or
  *   UNC path on win32, never root-relative). The tool inspects that directory (its
- *   repository is discovered from it, never above its checkout) and ignores
+ *   repository is discovered from it, never above its checkout; only paths inside the
+ *   root are shown or accepted, QA-G-A2-4; its `.git` pointers are checked, QA-G-A2-2) and ignores
  *   `context.directory`/`context.worktree`, which under the v2 bridge name the main
  *   checkout rather than a sibling worktree (S11, P-10).
  * Any other answer, or a throwing resolver, is reported as a tool error; nothing is spawned.
@@ -939,7 +1068,14 @@ export type WorkRootAnswer = { role: false } | { role: true; root: string | null
  * sessions only) as well as `{ role: true, root: null }`.
  */
 export type GitWorkRootResolver = (sessionID: string) => WorkRootAnswer;
-export interface GitToolsOptions { resolveWorkRoot?: GitWorkRootResolver }
+export interface GitToolsOptions {
+  resolveWorkRoot?: GitWorkRootResolver;
+  /**
+   * QA-G-A2-2: the directory in whose repository role dispatches list their worktrees (the plugin's directory). In role mode the
+   * bound work root's common git directory must be that repository's. Absent: only the work root's own pointers are checked.
+   */
+  dispatchRepository?: string;
+}
 
 /** Validate a resolver answer; throws for anything that is not a WorkRootAnswer. */
 export function checkWorkRootAnswer(answer: unknown): WorkRootAnswer {
@@ -979,8 +1115,10 @@ export function gitTools(opts: GitToolsOptions = {}) {
           const answer = checkWorkRootAnswer(opts.resolveWorkRoot(context.sessionID));
           if (answer.role) {
             if (answer.root === null) return "[router_git] error: refused: this role session has no bound work root (I9)";
-            return await inspectGit(operation, inputSchema.parse(input), answer.root, context.abort,
-              { executables, guards: workRootGuards(answer.root) });
+            return await inspectGit(operation, inputSchema.parse(input), answer.root, context.abort, {
+              executables, guards: workRootGuards(answer.root),
+              role: opts.dispatchRepository ? { dispatchRepository: opts.dispatchRepository } : {},
+            });
           }
         }
         return await inspectGit(operation, inputSchema.parse(input), context.directory, context.abort, { worktree: context.worktree, executables });

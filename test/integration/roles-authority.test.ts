@@ -1182,6 +1182,89 @@ describe("QA round 1 (P2.3)", () => {
   });
 });
 
+describe("P3.3 global QA round 1", () => {
+  const editGrant = (root: string) => ({ kind: "exact" as const, grant: { actions: new Set(["read", "glob", "grep", "router_git", "edit"] as const), notes: [], workRoot: root } });
+  const decide = (root: string, action: string, paths: string[]) =>
+    roleAuthorityDecision({ action, paths, binding: editGrant(root), dynamic: false, sessionDirectory: root, fallbackRoot: root });
+
+  it("QA-G-A2-2: no host edit tool may write `.git` or anything under it in the work root (any case, nested, win32 aliases); read may", () => {
+    const root = temp();
+    mkdirSync(join(root, ".git"));
+    for (const tool of ["edit", "write", "patch", "multiedit", "apply_patch"]) {
+      for (const path of [join(root, ".git"), join(root, ".git", "config"), join(root, ".git", "hooks", "pre-commit"), join(root, ".GIT", "HEAD"),
+        join(root, "vendor", "lib", ".git"), join(root, "vendor", ".Git", "config"), ".git/config", "sub/.git"]) {
+        const decision = decide(root, tool, [path]);
+        expect(decision.allow, `${tool} ${path}`).toBe(false);
+        if (!decision.allow) expect(decision.reason).toMatch(/repository metadata/);
+      }
+    }
+    if (process.platform === "win32") {
+      for (const path of [join(root, ".git."), join(root, ".git ", "config"), `${join(root, ".git")}::$INDEX_ALLOCATION\\config`]) {
+        expect(decide(root, "write", [path]).allow, path).toBe(false);
+      }
+    }
+    expect(decide(root, "read", [join(root, ".git", "config")]).allow).toBe(true);
+    for (const path of [join(root, "src", "a.ts"), join(root, ".github", "workflows", "ci.yml"), join(root, ".gitignore"), join(root, "x.git", "a")]) {
+      expect(decide(root, "edit", [path]).allow, path).toBe(true);
+    }
+  });
+
+  it("QA-G-A2-2: a link inside the work root that resolves into `.git` is refused by its canonical path", (ctx) => {
+    const root = temp();
+    mkdirSync(join(root, ".git"));
+    try {
+      symlinkSync(join(root, ".git"), join(root, "meta"), process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      ctx.skip();
+      return;
+    }
+    expect(decide(root, "edit", [join(root, "meta", "config")]).allow).toBe(false);
+    expect(decide(root, "apply_patch", [join(root, "meta", "hooks", "new")]).allow).toBe(false);
+  });
+
+  it("QA-G-A2-2 end to end: evaluate and execute.before refuse every edit tool on `.git`; other files stay editable", async () => {
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    await dispatch(v2, sessions, "g1", "y1", "general", "[route class=implement risk=low scope=single needs=edit]\nfix the parser", dir);
+    expect([...routedRoleOf("g1")!.grant.actions]).toContain("edit");
+    const denied = await evaluate(v2, "y1", "general", "edit", [join(dir, ".git", "config")]);
+    expect(denied.effect).toBe("deny");
+    expect(denied.message).toMatch(/repository metadata/);
+    expect((await evaluate(v2, "y1", "general", "edit", [join(dir, "a.ts")])).effect).toBe("allow");
+    await expect(toolCall(v2, "y1", "general", "write", { path: join(dir, ".git"), content: "gitdir: //attacker/share/x" })).rejects.toThrow(/repository metadata/);
+    const patch = ["*** Begin Patch", "*** Add File: .git/hooks/pre-commit", "+#!/bin/sh", "*** End Patch"].join("\n");
+    await expect(toolCall(v2, "y1", "general", "apply_patch", { patchText: patch })).rejects.toThrow(/repository metadata/);
+    await expect(toolCall(v2, "y1", "general", "multiedit", { filePath: join(dir, ".git", "config"), edits: [] })).rejects.toThrow(/repository metadata/);
+    await toolCall(v2, "y1", "general", "edit", { path: join(dir, "a.ts"), oldString: "a", newString: "b" });
+  });
+
+  it("QA-G-A1-1: a role granted edit keeps apply_patch and multiedit in its catalog; a role without edit does not", async () => {
+    const { dir, cfg } = home(ROLES);
+    const hooks = await plugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    await dispatch(v2, sessions, "g1", "y1", "general", "[route class=implement risk=low scope=single needs=edit]\nfix the parser", dir);
+    expect(await catalog(v2, "y1", "general", ["apply_patch"])).toEqual(["apply_patch"]);
+    expect(await catalog(v2, "y1", "general", ["apply_patch", "multiedit", "read", "shell"])).toEqual(["apply_patch", "multiedit", "read"]);
+    await dispatch(v2, sessions, "e1", "x1", "explorer", "find the parser", dir);
+    expect(await catalog(v2, "x1", "explorer", ["apply_patch", "multiedit", "read"])).toEqual(["read"]);
+  });
+
+  it("QA-G-A2-5: a path with leading or trailing whitespace is refused, never trimmed", () => {
+    const root = temp();
+    mkdirSync(join(root, "src"));
+    expect(canonicalAuthorityPath("src/a.ts", root)).toBe(join(root, "src", "a.ts"));
+    for (const path of [" src/a.ts", "src/a.ts ", `${join(root, "src", "a.ts")}\t`, `\n${join(root, "src", "a.ts")}`, "   "]) {
+      expect(canonicalAuthorityPath(path, root), JSON.stringify(path)).toBeUndefined();
+      expect(decide(root, "edit", [path]).allow, JSON.stringify(path)).toBe(false);
+    }
+  });
+});
+
 describe("tiers mode is untouched (I1)", () => {
   it("no role narrowing: host agents keep their catalog and permissions", async () => {
     const { dir, cfg } = home();
