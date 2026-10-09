@@ -1065,8 +1065,11 @@ The guide, with examples, is [`TUI_STATUS.md`](./TUI_STATUS.md).
 | `enabled` | `boolean` | `true` | `true \| false` | `false` turns every view off |
 | `footer` | `boolean` | `true` | `true \| false` | `effort <value>` in the main session's prompt footer (`prompt.footer.status`) |
 | `childView` | `boolean` | `true` | `true \| false` | `<agent> · <model> · <effort>` above a delegated session's composer (`session.composer.top`) |
-| `runningRow` | `boolean` | `true` | `true \| false` | one row per running delegate above the main session's composer (`session.composer.top`) |
+| `runningRow` | `boolean` | `false` | `true \| false` | one row per running delegate above the main session's composer (`session.composer.top`); opt-in |
 | `maxRows` | `integer` | `4` | `[1, 20]` | the most running-delegate rows; the rest is `+<k> more` |
+
+The running-delegates rows are opt-in: with the defaults the main session shows only the footer's `effort <value>`;
+set `"options": { "runningRow": true }` to show them.
 
 A key with an invalid value keeps its default and an unknown key is ignored; one warning toast names every invalid
 and every unknown key, for example

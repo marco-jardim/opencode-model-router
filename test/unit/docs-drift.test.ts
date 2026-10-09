@@ -1652,7 +1652,10 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     // what setup claims: G1 (`footer`) the footer slot, G2 and G3 (`childView`, `runningRow`) one composer slot
     expect(setupWith(undefined).slots).toEqual([footer, composer]);
     expect(setupWith({ footer: false }).slots).toEqual([composer]);
-    expect(setupWith({ childView: false }).slots).toEqual([footer, composer]);
+    // `childView: false` keeps the composer slot only when G3 is on (by default it is not, A12)
+    expect(setupWith({ childView: false }).slots).toEqual(DEFAULT_STATUS_OPTIONS.runningRow ? [footer, composer] : [footer]);
+    expect(setupWith({ childView: false, runningRow: true }).slots).toEqual([footer, composer]);
+    expect(setupWith({ runningRow: true }).slots).toEqual([footer, composer]);
     expect(setupWith({ runningRow: false }).slots).toEqual([footer, composer]);
     expect(setupWith({ childView: false, runningRow: false }).slots).toEqual([footer]);
     expect(setupWith({ footer: false, childView: false, runningRow: false }).slots).toEqual([]);
@@ -1667,6 +1670,26 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
       expect(controls.get("`runningRow`")).toContain(tick(composer));
     }
     expect(slotNamesOf("`prompt.footer` and `sidebar.content`")).toEqual(["prompt.footer", "sidebar.content"]);
+  });
+
+  it("(b) states what the defaults show: the running-delegates rows are opt-in, and how to turn them on (A12)", () => {
+    // the owner decision: G3 off by default, G1 and G2 on
+    expect([DEFAULT_STATUS_OPTIONS.footer, DEFAULT_STATUS_OPTIONS.childView, DEFAULT_STATUS_OPTIONS.runningRow]).toEqual([true, true, false]);
+    // the options the docs quote turn the rows on, away from the default
+    expect(parseOptions({ runningRow: true })).toEqual({ options: { ...DEFAULT_STATUS_OPTIONS, runningRow: true }, notices: [] });
+    const turnOn = tick('"options": { "runningRow": true }');
+    for (const [name, text] of docs) {
+      const prose = text.replace(/\s+/g, " ");
+      expect(prose, name).toContain(turnOn);
+      expect(prose, name).toMatch(/[Oo]pt-in/);
+      expect(prose, name).toMatch(/the main session shows only the footer's (?:`effort <value>`|effort)/);
+    }
+    // a cli.json example of the guide and of the README turns the rows on, as parseOptions reads it
+    const turnsOn = (plugins: readonly unknown[]): boolean =>
+      plugins.some((entry) => typeof entry === "object" && entry !== null && parseOptions((entry as { options?: unknown }).options).options.runningRow);
+    expect(turnsOn(cliJsonExamples(guide).flat())).toBe(true);
+    expect(turnsOn(cliJsonExamples(readme).flat())).toBe(true);
+    expect(turnsOn([{ package: "opencode-model-router", options: { maxRows: 6 } }])).toBe(false);
   });
 
   it("(c) names the plugin id and the effort rpc as the code defines them, and no other id", () => {

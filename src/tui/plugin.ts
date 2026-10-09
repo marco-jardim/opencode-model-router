@@ -1,15 +1,16 @@
 /**
- * #90 P1.3: the OpenCode v2 TUI entry (root `tui.ts` re-exports it), plan §2 D2–D7 as amended by §8 A1–A9.
+ * #90 P1.3: the OpenCode v2 TUI entry (root `tui.ts` re-exports it), plan §2 D2–D7 as amended by §8 A1–A9, A12.
  *
  * - G1 (`footer`): `prompt.footer.status` shows `effort <value>` in a root session (or the home prompt) when no variant
  *   is selected ({@link effectiveMainEffort}); nothing when one is (the host row shows it).
  * - G2 (`childView`): `session.composer.top` of a delegated session shows `<agent> · <model> · <effort>`
  *   ({@link childStatus}); the agent identifies the delegate.
- * - G3 (`runningRow`): `session.composer.top` of a root session shows one `<agent> · <model> · <effort>` row per
- *   running delegate ({@link runningChildren}), then `+<k> more`.
+ * - G3 (`runningRow`, opt-in, off by default, A12): `session.composer.top` of a root session shows one
+ *   `<agent> · <model> · <effort>` row per running delegate ({@link runningChildren}), then `+<k> more`.
  *
  * One claim serves G2 and G3: they target the same slot and a session is either a child or a root, so one box (empty
- * when there is nothing to show) is enough. The effort comes from the server's `effortOf` rpc (A1, per-session pollers
+ * when there is nothing to show) is enough. With the default options the claim exists for G2, and a root session's box
+ * stays empty. The effort comes from the server's `effortOf` rpc (A1, per-session pollers
  * created while a view needs them), else from the message/session variant.
  *
  * No JSX: views are built with the `@opentui/solid` reconciler primitives and `solid-js`, the only runtime imports

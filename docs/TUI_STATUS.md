@@ -25,7 +25,9 @@ nothing on this page applies: v1 never loads `tui.ts`, and v1 is in feature free
 
 ## What it shows
 
-Three views, each with its own option. Rows use the theme's muted text colour.
+Three views, each with its own option. Rows use the theme's muted text colour. The footer and the delegated session
+view are on by default; the running-delegates rows are opt-in (off by default), so with the default options the main
+session shows only the footer's `effort <value>`.
 
 ### Main session footer (`footer`)
 
@@ -56,6 +58,9 @@ The row stays empty until the session and a model for it are known.
 
 ### Running delegates (`runningRow`)
 
+Opt-in: off by default. Turn it on with `"options": { "runningRow": true }` on the plugin's entry in `cli.json` (see
+[Options in `cli.json`](#options-in-clijson)).
+
 In a root session, while delegates run, the same slot directly above the prompt box shows one
 `<agent> · <model> · <effort>` row per running delegate, with the same rules as the delegated session view, for example
 `fast · Claude Sonnet 5.5 · medium (low)`. A delegate's row appears as soon as its session runs, before its first
@@ -78,7 +83,8 @@ agent, else the model) shrinks first, then the part after it, and only then the 
 
 Nothing to do. OpenCode v2 loads the TUI entry of every package listed in the server config (`opencode.json`
 `plugins`), so with the [v2 installation](../README.md#opencode-v2) (`"plugins": ["opencode-model-router"]`) the status
-loads with the default options. A `cli.json` entry is needed only to change the options.
+loads with the default options: the footer and the delegated session view. A `cli.json` entry is needed only to change
+the options, for example to turn on the running-delegates rows.
 
 The TUI entry is auto-loaded only when the server entry loads. The server entry needs the `@opencode-ai/plugin` peer
 dependency installed; npm installs peer dependencies by default.
@@ -92,7 +98,7 @@ the `options` of an entry in its `plugins` list. For an npm install, `package` i
 ```json
 {
   "plugins": [
-    { "package": "opencode-model-router", "options": { "maxRows": 6 } }
+    { "package": "opencode-model-router", "options": { "runningRow": true } }
   ]
 }
 ```
@@ -103,7 +109,7 @@ For a local checkout, `package` is the absolute path of the package **directory*
 ```json
 {
   "plugins": [
-    { "package": "/absolute/path/to/opencode-model-router", "options": { "maxRows": 6, "runningRow": false } }
+    { "package": "/absolute/path/to/opencode-model-router", "options": { "runningRow": true, "maxRows": 6 } }
   ]
 }
 ```
@@ -121,7 +127,7 @@ put this entry in `cli.json`.
 | `enabled` | `boolean` | `true` | `true \| false` | `false` turns every view off |
 | `footer` | `boolean` | `true` | `true \| false` | `effort <value>` in the main session's prompt footer (`prompt.footer.status`) |
 | `childView` | `boolean` | `true` | `true \| false` | `<agent> · <model> · <effort>` above a delegated session's composer (`session.composer.top`) |
-| `runningRow` | `boolean` | `true` | `true \| false` | one row per running delegate above the main session's composer (`session.composer.top`) |
+| `runningRow` | `boolean` | `false` | `true \| false` | one row per running delegate above the main session's composer (`session.composer.top`); opt-in |
 | `maxRows` | `integer` | `4` | `[1, 20]` | the most running-delegate rows; the rest is `+<k> more` |
 
 With `enabled: false`, or with `footer`, `childView` and `runningRow` all `false`, the plugin claims no slot.
@@ -203,8 +209,8 @@ message's variant, else `default`.
   local `node_modules/solid-js`) was not reproduced. Update OpenCode; if the toast persists, report it.
 - **Nothing shows.** Check that the package is listed in `opencode.json` `plugins` and that the server entry loads (the
   peer dependency), that `cli.json` has no `"enabled": false` and no `"-opencode-model-router.status"`, and that a
-  local-path entry names the package directory, not `tui.ts`. The footer shows nothing while a variant is selected,
-  and the running-delegates row shows nothing while no delegate runs.
+  local-path entry names the package directory, not `tui.ts`. The footer shows nothing while a variant is selected.
+  The running-delegates rows show only with `"runningRow": true`, and nothing while no delegate runs.
 - **Options are ignored.** Check that the entry is in `cli.json` (not `opencode.json`) and that its `package` is the
   package name or directory, not `opencode-model-router.status`.
 

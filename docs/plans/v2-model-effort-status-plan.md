@@ -348,6 +348,10 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `node_modules`); pinned by the packaging test. (c) The host swallows TUI plugin `console.*` output: user-facing notices
   (invalid options, no Solid owner) are toasts. (d) When the channel's `variant` and `effort` differ, child views show
   `<effort> (<variant>)` (P1.2 QA-6).
+- A12 (G3, D5, D7; owner decision at DF-1, 2026-10-09) **G3 is opt-in.** Dogfooding showed the running-delegates rows
+  clutter the main session; the delegate's own view (G2) and the footer effort (G1) are enough. `runningRow` defaults
+  to `false`; `"options": { "runningRow": true }` in `cli.json` turns the rows on. G1 and G2 unchanged. The real-host
+  smoke enables `runningRow` explicitly for the G3 scenarios and asserts that the default shows no rows.
 
 ## 9. Risks
 | Risk | Mitigation |

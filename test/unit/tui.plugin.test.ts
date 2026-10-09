@@ -160,6 +160,8 @@ const MODELS: readonly HostModelInfo[] = [
 ];
 const OWNER_WARNING =
   "model-router status: render has no Solid owner: the plugin's solid-js is not the host's (a local node_modules/solid-js shadows it)";
+/** G3 is opt-in (A12): the options that turn the running-delegates rows on. */
+const G3_ON = Object.freeze({ runningRow: true });
 
 /** A host rpc failure as the client rethrows it: a plain `{ type, message }` (P13-1). */
 function rpcFailure(type: string, message: string): { type: string; message: string } {
@@ -367,7 +369,7 @@ describe("registration (D7, A4)", () => {
     expect(STATUS_PLUGIN_ID).toBe("opencode-model-router.status");
   });
 
-  it("appends to prompt.footer.status and session.composer.top by default", () => {
+  it("appends to prompt.footer.status and session.composer.top by default (the composer claim serves G2)", () => {
     const fake = fakeHost();
     start(fake);
     expect(fake.claims.map((claim) => claim.append)).toEqual(["prompt.footer.status", "session.composer.top"]);
@@ -381,8 +383,12 @@ describe("registration (D7, A4)", () => {
   it.each([
     [{ enabled: false }, []],
     [{ footer: false, childView: false, runningRow: false }, []],
+    [{ footer: false, childView: false }, []],
     [{ footer: false }, [COMPOSER_SLOT]],
-    [{ childView: false }, [FOOTER_SLOT, COMPOSER_SLOT]],
+    [{ footer: false, childView: false, runningRow: true }, [COMPOSER_SLOT]],
+    [{ childView: false }, [FOOTER_SLOT]],
+    [{ childView: false, runningRow: true }, [FOOTER_SLOT, COMPOSER_SLOT]],
+    [{ runningRow: true }, [FOOTER_SLOT, COMPOSER_SLOT]],
     [{ runningRow: false }, [FOOTER_SLOT, COMPOSER_SLOT]],
     [{ childView: false, runningRow: false }, [FOOTER_SLOT]],
   ])("options %j claim %j", (options, expected) => {
@@ -743,8 +749,8 @@ describe("G2 child view (A5)", () => {
     expect(listeners.size).toBe(0);
   });
 
-  it("shows nothing in a child session when childView is off, while G3 keeps working", () => {
-    const fake = fakeHost({ options: { childView: false } });
+  it("shows nothing in a child session when childView is off, while an opted-in G3 keeps working", () => {
+    const fake = fakeHost({ options: { childView: false, ...G3_ON } });
     fake.addSession(childSession(CHILD));
     fake.setStatus(CHILD, "running");
     start(fake);
@@ -766,8 +772,40 @@ describe("G3 running row", () => {
   const childA = childSession("ses_a", { agent: "explore", time: { created: 10 } });
   const childB = childSession("ses_b", { agent: "review", model: { ...GPT, variant: "high" }, time: { created: 20 } });
 
-  it("adds a row while a child runs and removes it when the child is idle", () => {
+  it("is opt-in: with the default options a root session shows no rows while delegates run; G1 and G2 still show (A12)", async () => {
     const fake = fakeHost();
+    fake.addSession(childA);
+    fake.addSession(childB);
+    fake.setStatus("ses_a", "running");
+    fake.setStatus("ses_b", "running");
+    start(fake);
+    expect(fake.claims.map((claim) => claim.append)).toEqual([FOOTER_SLOT, COMPOSER_SLOT]);
+    const view = mountComposer(fake.claims, () => ROOT);
+    expect(view.rows()).toEqual([]);
+    expect(boxOf(view.view).children).toEqual([]);
+    expect(mountFooter(fake.claims, () => ROOT).rows()).toEqual(["effort default"]);
+    expect(mountComposer(fake.claims, () => "ses_a").rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    await tick(0);
+    await microtasks();
+    expect(view.rows()).toEqual([]);
+    // The root's composer view pulls and syncs nothing for the delegates: only the footer (root) and ses_a's own view.
+    expect(fake.effortOf.mock.calls.map(([input]) => input.sessionID).sort()).toEqual(["ses_a", ROOT]);
+    expect(fake.sync.mock.calls).toEqual([["ses_a"]]);
+  });
+
+  it("shows the rows with runningRow: true and keeps G1 and G2 as by default", () => {
+    const fake = fakeHost({ options: G3_ON });
+    fake.addSession(childA);
+    fake.setStatus("ses_a", "running");
+    start(fake);
+    expect(fake.claims.map((claim) => claim.append)).toEqual([FOOTER_SLOT, COMPOSER_SLOT]);
+    expect(mountComposer(fake.claims, () => ROOT).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    expect(mountFooter(fake.claims, () => ROOT).rows()).toEqual(["effort default"]);
+    expect(mountComposer(fake.claims, () => "ses_a").rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+  });
+
+  it("adds a row while a child runs and removes it when the child is idle", () => {
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childB);
     fake.addSession(childA);
     start(fake);
@@ -786,7 +824,7 @@ describe("G3 running row", () => {
   });
 
   it("detaches a removed row and builds a new node when a row comes back (P13-9)", () => {
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childA);
     fake.setStatus("ses_a", "running");
     start(fake);
@@ -803,7 +841,7 @@ describe("G3 running row", () => {
   });
 
   it("shows at most maxRows rows, then +k more, and pulls only the shown children", async () => {
-    const fake = fakeHost({ options: { maxRows: 2 } });
+    const fake = fakeHost({ options: { maxRows: 2, ...G3_ON } });
     for (let i = 1; i <= 5; i++) {
       fake.addSession(childSession(`ses_${i}`, { agent: `agent${i}`, time: { created: i } }));
       fake.setStatus(`ses_${i}`, "running");
@@ -816,7 +854,7 @@ describe("G3 running row", () => {
   });
 
   it("defaults to 4 rows", () => {
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     for (let i = 1; i <= 6; i++) {
       fake.addSession(childSession(`ses_${i}`, { agent: `agent${i}`, time: { created: i } }));
       fake.setStatus(`ses_${i}`, "running");
@@ -828,7 +866,7 @@ describe("G3 running row", () => {
   });
 
   it("shows the channel's effort per child and syncs empty message lists once", async () => {
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childA);
     fake.setStatus("ses_a", "running");
     fake.answers.set("ses_a", { effort: "max", providerID: SONNET.providerID, modelID: SONNET.id });
@@ -843,7 +881,7 @@ describe("G3 running row", () => {
 
   it("uses the root session's location for the model list (P13-3)", () => {
     const location = { directory: "/work/root" };
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession({ id: ROOT, agent: "build", model: { ...OPUS }, time: { created: 1 }, location });
     fake.addSession(childA);
     fake.setStatus("ses_a", "running");
@@ -929,7 +967,7 @@ describe("effort channel (A1)", () => {
   });
 
   it("keeps the 5 s debounce across a running → idle → running flip that closes the poller (P13-5)", async () => {
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childSession("ses_a"));
     fake.setStatus("ses_a", "running");
     start(fake);
@@ -1165,7 +1203,7 @@ describe("feature detection and error isolation", () => {
   });
 
   it("colours every row with the theme's muted text colour and never wraps it (P13-7)", () => {
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childSession("ses_a"));
     fake.addSession(childSession("ses_b"));
     fake.setStatus("ses_a", "running");
@@ -1199,8 +1237,8 @@ describe("feature detection and error isolation", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("renders G1 and G2 but no G3 rows without a Solid owner (R2-2)", () => {
-    const fake = fakeHost();
+  it("renders G1 and G2 but no G3 rows without a Solid owner, even with runningRow on (R2-2)", () => {
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childSession(CHILD));
     fake.setStatus(CHILD, "running");
     start(fake);
@@ -1353,7 +1391,7 @@ describe("feature detection and error isolation", () => {
 
 describe("cleanup", () => {
   function running(): Fake {
-    const fake = fakeHost();
+    const fake = fakeHost({ options: G3_ON });
     fake.addSession(childSession(CHILD));
     fake.setStatus(CHILD, "running");
     return fake;
