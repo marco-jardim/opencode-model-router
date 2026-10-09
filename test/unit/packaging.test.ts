@@ -208,6 +208,19 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     expect(names.sort()).toEqual(["createElement", "insert", "setProp"]);
   });
 
+  it("keeps Solid in the TUI: no file under src/ outside src/tui/ imports solid-js or @opentui/solid", () => {
+    const sources = readdirSync("src", { recursive: true })
+      .map((name) => posix.join("src", String(name).replace(/\\/g, "/")))
+      .filter((path) => /\.[cm]?[jt]sx?$/.test(path) && !path.startsWith("src/tui/"));
+    expect(sources.length).toBeGreaterThan(0);
+    const offenders = sources.flatMap((path) =>
+      specifiersOf(read(path))
+        .filter((specifier) => /^(?:solid-js|@opentui\/solid)(?:\/|$)/.test(specifier))
+        .map((specifier) => `${path} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
   it("ships no JSX: no .tsx under src/tui or at the root", () => {
     const tui = readdirSync("src/tui", { recursive: true }).map(String);
     expect(tui.filter((name) => name.endsWith(".tsx"))).toEqual([]);

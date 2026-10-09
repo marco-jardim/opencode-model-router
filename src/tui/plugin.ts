@@ -1,12 +1,12 @@
 /**
  * #90 P1.3: the OpenCode v2 TUI entry (root `tui.ts` re-exports it), plan §2 D2–D7 as amended by §8 A1–A9.
  *
- * - G1 (`footer`): `prompt.footer.status` gets `effort <value>` in a root session (or the home prompt) when no variant
+ * - G1 (`footer`): `prompt.footer.status` shows `effort <value>` in a root session (or the home prompt) when no variant
  *   is selected ({@link effectiveMainEffort}); nothing when one is (the host row shows it).
- * - G2 (`childView`): `session.composer.top` of a delegated session gets `<agent> · <model> · <effort>`
- *   ({@link childStatus}).
- * - G3 (`runningRow`): `session.composer.top` of a root session gets one such row per running delegate
- *   ({@link runningChildren}), then `+<k> more`.
+ * - G2 (`childView`): `session.composer.top` of a delegated session shows `<agent> · <model> · <effort>`
+ *   ({@link childStatus}); the agent identifies the delegate.
+ * - G3 (`runningRow`): `session.composer.top` of a root session shows one `<agent> · <model> · <effort>` row per
+ *   running delegate ({@link runningChildren}), then `+<k> more`.
  *
  * One claim serves G2 and G3: they target the same slot and a session is either a child or a root, so one box (empty
  * when there is nothing to show) is enough. The effort comes from the server's `effortOf` rpc (A1, per-session pollers
@@ -17,7 +17,7 @@
  * throws and never calls rpc; a view never throws (errors render no rows and are logged once per area with
  * `console.warn`, the context has no logging API).
  */
-import { createMemo, createRenderEffect, createRoot, createSignal, onCleanup, untrack } from "solid-js";
+import { createMemo, createRenderEffect, createRoot, createSignal, getOwner, onCleanup, untrack } from "solid-js";
 import { createElement, insert, setProp } from "@opentui/solid";
 import { effortRpc } from "./effort-rpc";
 import type {
@@ -52,23 +52,35 @@ export const FOOTER_SLOT = "prompt.footer.status";
 export const COMPOSER_SLOT = "session.composer.top";
 /** Poll interval while a session runs, and the debounce of trigger-driven pulls (A1). */
 export const POLL_INTERVAL_MS = 5_000;
-/** How long a session's channel stays off after an error other than `unavailable`. */
+/** How long a session's channel stays off after an error other than `unavailable` or a timeout. */
 export const FAILURE_COOLDOWN_MS = 30_000;
-/** First retry delay after an `unavailable` error; doubled per retry up to {@link BACKOFF_MAX_MS}. */
+/** First retry delay after an `unavailable` error or a timeout; doubled per retry up to {@link BACKOFF_MAX_MS}. */
 export const BACKOFF_START_MS = 1_000;
 export const BACKOFF_MAX_MS = 30_000;
+/** An `effortOf` call that has not settled by then is aborted and retried like `rpc.unavailable`. */
+export const CALL_TIMEOUT_MS = 10_000;
+/** Sessions whose pull state (last pull, cooldown, backoff) is kept across poller close/reopen. */
+export const PULL_STATE_MAX = 200;
+/** Sessions remembered as already message-synced. */
+export const SYNCED_MAX = 200;
 /** Terminal width used when the renderer reports none. */
 export const DEFAULT_WIDTH = 80;
 /** Columns kept free around a row (composer padding). */
 export const WIDTH_MARGIN = 4;
+/** Logged once when a slot renders outside any Solid owner (P13-2). */
+export const NO_OWNER_NOTICE =
+  "render has no Solid owner: the plugin's solid-js is not the host's (a local node_modules/solid-js shadows it)";
 
-type Warn = (area: string, error: unknown) => void;
 type Timer = ReturnType<typeof setTimeout>;
 type Rows = readonly string[];
 
 const NO_ROWS: Rows = Object.freeze([]);
 const NO_MESSAGES: readonly HostMessage[] = Object.freeze([]);
 const NO_IDS: readonly string[] = Object.freeze([]);
+/** The rejection of an `effortOf` call that did not settle within {@link CALL_TIMEOUT_MS}. */
+const CALL_TIMEOUT = Object.freeze({ type: "rpc.timeout", message: `effortOf did not answer within ${CALL_TIMEOUT_MS} ms` });
+/** The rejection of an `effortOf` call aborted because its poller closed. */
+const CALL_ABORTED = Object.freeze({ type: "rpc.aborted", message: "effortOf aborted" });
 
 function isObject(value: unknown): value is object {
   return (typeof value === "object" && value !== null) || typeof value === "function";
@@ -92,26 +104,55 @@ function sameApplied(a: AppliedEffort | undefined, b: AppliedEffort | undefined)
   return a.effort === b.effort && a.variant === b.variant && a.providerID === b.providerID && a.modelID === b.modelID;
 }
 
+/** Puts `key` last in `map` (most recent) and drops the oldest entries beyond `max`. */
+function remember<K, V>(map: Map<K, V>, key: K, value: V, max: number): V {
+  map.delete(key);
+  map.set(key, value);
+  for (const oldest of map.keys()) {
+    if (map.size <= max) break;
+    map.delete(oldest);
+  }
+  return value;
+}
+
+/**
+ * An error as one line: an `Error`'s message; a host rpc failure (a plain `{ type, message, data? }`, P13-1) by its
+ * `message`, else its `type`; anything else as a string.
+ */
 function describeError(error: unknown): string {
   try {
     if (error instanceof Error) return error.message || error.name;
+    if (isObject(error)) {
+      return nonBlank(Reflect.get(error, "message")) ?? nonBlank(Reflect.get(error, "type")) ?? "unknown error";
+    }
     return String(error);
   } catch {
     return "unknown error";
   }
 }
 
-/** One `console.warn` per area for the lifetime of a `setup`. */
-function createWarn(): Warn {
+/** One `console.warn` per key for the lifetime of a `setup`. */
+interface Log {
+  /** `model-router status: <area> failed: <error>`, once per area. */
+  failed(area: string, error: unknown): void;
+  /** `model-router status: <message>`, once per key. */
+  notice(key: string, message: string): void;
+}
+
+function createLog(): Log {
   const seen = new Set<string>();
-  return (area, error) => {
-    if (seen.has(area)) return;
-    seen.add(area);
+  const once = (key: string, text: () => string): void => {
+    if (seen.has(key)) return;
+    seen.add(key);
     try {
-      console.warn(`${STATUS_NOTICE_PREFIX}${area} failed: ${describeError(error)}`);
+      console.warn(`${STATUS_NOTICE_PREFIX}${text()}`);
     } catch {
       // No console: nothing else to report to.
     }
+  };
+  return {
+    failed: (area, error) => once(`failed:${area}`, () => `${area} failed: ${describeError(error)}`),
+    notice: (key, message) => once(`notice:${key}`, () => message),
   };
 }
 
@@ -146,9 +187,14 @@ function childApplied(applied: AppliedEffort | undefined): AppliedEffort | undef
   return applied === undefined ? undefined : { ...applied, effort: effortWithVariant(applied.effort, applied.variant) };
 }
 
-/** An error the host reports while the server plugin's rpc is not (yet) registered (`rpc.unavailable`). */
+/**
+ * An error the host reports while the server plugin's rpc is not (yet) registered: the client rethrows rpc failures as
+ * plain `{ type, message, data? }` objects, so `type === "rpc.unavailable"` first; then any `name`, `message`, `_tag`
+ * or `code` (or the error itself, as a string) containing `unavailable`.
+ */
 export function isUnavailable(error: unknown): boolean {
   try {
+    if (isObject(error) && Reflect.get(error, "type") === "rpc.unavailable") return true;
     const parts: unknown[] = [error];
     if (isObject(error)) {
       for (const key of ["name", "message", "_tag", "code"]) parts.push(Reflect.get(error, key));
@@ -159,14 +205,21 @@ export function isUnavailable(error: unknown): boolean {
   }
 }
 
+/** Retried with backoff instead of a cooldown: `unavailable`, or a call that timed out. */
+function isRetryable(error: unknown): boolean {
+  return error === CALL_TIMEOUT || isUnavailable(error);
+}
+
 /** Reads of the host context. Missing members give empty answers; a throwing host member throws to the view. */
 interface Host {
   session(id: string): HostSession | undefined;
   isChild(id: string): boolean;
+  /** The session's `location` (its rpc and model-list scope); undefined when absent. */
+  location(id: string): unknown;
   messages(id: string): readonly HostMessage[];
   family(id: string): readonly string[];
   status(id: string): SessionStatus;
-  models(): readonly HostModelInfo[];
+  models(location?: unknown): readonly HostModelInfo[];
   current(): HostCurrentModel | undefined;
   muted(): unknown;
 }
@@ -180,6 +233,10 @@ function createHost(context: HostContext | undefined): Host {
   return {
     session,
     isChild: (id) => nonBlank(session(id)?.parentID) !== undefined,
+    location: (id) => {
+      const location = session(id)?.location;
+      return location === null ? undefined : location;
+    },
     messages: (id) => {
       const list = sessions()?.message?.list?.(id);
       if (list === undefined || list === null) return NO_MESSAGES;
@@ -191,14 +248,17 @@ function createHost(context: HostContext | undefined): Host {
       return arrayOf(ids).filter((item) => typeof item === "string");
     },
     status: (id) => (sessions()?.status?.(id) === "running" ? "running" : "idle"),
-    models: () =>
-      arrayOf(context?.data?.location?.model?.list?.()).filter(
-        (model) =>
-          typeof model === "object" &&
-          model !== null &&
-          typeof model.id === "string" &&
-          typeof model.providerID === "string",
-      ),
+    models: (location) => {
+      const model = context?.data?.location?.model;
+      const list = location === undefined || location === null ? model?.list?.() : model?.list?.(location);
+      return arrayOf(list).filter(
+        (entry) =>
+          typeof entry === "object" &&
+          entry !== null &&
+          typeof entry.id === "string" &&
+          typeof entry.providerID === "string",
+      );
+    },
     current: () => {
       const value = context?.ui?.model?.current?.();
       return typeof value === "object" && value !== null ? value : undefined;
@@ -215,8 +275,14 @@ function currentModelOf(current: HostCurrentModel | undefined): CurrentModel | u
   return { providerID: current.providerID, modelID: current.modelID };
 }
 
+/** The rpc call options of the host client (`{ location?, signal?, headers? }`). */
+interface CallOptions {
+  readonly signal: AbortSignal;
+  readonly location?: unknown;
+}
+
 interface EffortClient {
-  effortOf(input: { readonly sessionID: string }): unknown;
+  effortOf(input: { readonly sessionID: string }, options?: CallOptions): unknown;
 }
 
 function isEffortClient(value: unknown): value is EffortClient {
@@ -232,27 +298,38 @@ interface EffortChannel {
   dispose(): void;
 }
 
+/** A channel that never polls: for views rendered without a Solid owner. */
+const NO_CHANNEL: EffortChannel = { applied: () => undefined, dispose: () => undefined };
+
 interface ChannelDeps {
   client(): HostClient | undefined;
   status(id: string): SessionStatus;
   messages(id: string): readonly HostMessage[];
-  warn: Warn;
+  location(id: string): unknown;
+  log: Log;
+}
+
+/** Per-session pull timing, kept across poller close/reopen (P13-5) for the last {@link PULL_STATE_MAX} sessions. */
+interface PullState {
+  lastPull: number;
+  failedUntil: number;
+  /** Current retry delay after `unavailable` or a timeout; 0 after a success. */
+  backoff: number;
 }
 
 interface Poller {
   readonly id: string;
+  readonly state: PullState;
   refs: number;
   closed: boolean;
   read(): AppliedEffort | undefined;
   write(value: AppliedEffort | undefined): void;
   timer: Timer | undefined;
   inFlight: boolean;
+  /** Aborts the call in flight. */
+  controller: AbortController | undefined;
   /** A trigger fired while a pull was in flight. */
   dirty: boolean;
-  lastPull: number;
-  failedUntil: number;
-  /** Current `unavailable` retry delay; 0 after a success. */
-  backoff: number;
   disposeRoot(): void;
 }
 
@@ -280,12 +357,15 @@ function triggerKey(deps: ChannelDeps, id: string): string {
 /**
  * A1: per-session pull of `effortOf`. A poller exists while a view needs its session (released pollers close on the
  * next microtask unless re-acquired). It pulls right away (on a timer, never synchronously), again when the trigger key
- * changes (debounced to {@link POLL_INTERVAL_MS} since the last pull), and every {@link POLL_INTERVAL_MS} while the
- * session runs. `unavailable` errors retry with backoff 1 s, 2 s, 4 s … {@link BACKOFF_MAX_MS}; any other error drops
- * the value (views fall back to the message variant) for {@link FAILURE_COOLDOWN_MS}.
+ * changes (debounced to {@link POLL_INTERVAL_MS} since the last pull, which survives a close/reopen), and every
+ * {@link POLL_INTERVAL_MS} while the session runs. A call carries the session's `location` and an abort signal; it is
+ * aborted when its poller closes or after {@link CALL_TIMEOUT_MS}. `unavailable` errors and timeouts retry with
+ * backoff 1 s, 2 s, 4 s … {@link BACKOFF_MAX_MS}; any other error drops the value (views fall back to the message
+ * variant) for {@link FAILURE_COOLDOWN_MS}.
  */
 function createEffortChannel(deps: ChannelDeps): EffortChannel {
   const pollers = new Map<string, Poller>();
+  const states = new Map<string, PullState>();
   let closed = false;
   let client: EffortClient | undefined;
 
@@ -315,6 +395,14 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
     }
   };
 
+  const locationOf = (id: string): unknown => {
+    try {
+      return untrack(() => deps.location(id));
+    } catch {
+      return undefined;
+    }
+  };
+
   const schedule = (poller: Poller, delay: number): void => {
     poller.timer = setTimeout(() => {
       void pull(poller);
@@ -329,15 +417,44 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
     }
     if (poller.timer !== undefined) return;
     const now = Date.now();
-    schedule(poller, Math.max(0, poller.lastPull + POLL_INTERVAL_MS - now, poller.failedUntil - now));
+    const { lastPull, failedUntil } = poller.state;
+    schedule(poller, Math.max(0, lastPull + POLL_INTERVAL_MS - now, failedUntil - now));
+  };
+
+  /** One `effortOf` call, settled by its answer, by {@link CALL_TIMEOUT_MS}, or by the poller's abort. */
+  const call = async (poller: Poller, effort: EffortClient): Promise<unknown> => {
+    const controller = new AbortController();
+    poller.controller = controller;
+    let timer: Timer | undefined;
+    let onAbort: (() => void) | undefined;
+    const stopped = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(CALL_TIMEOUT);
+        controller.abort();
+      }, CALL_TIMEOUT_MS);
+      onAbort = () => reject(CALL_ABORTED);
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    stopped.catch(() => undefined);
+    try {
+      const location = locationOf(poller.id);
+      const options: CallOptions =
+        location === undefined ? { signal: controller.signal } : { location, signal: controller.signal };
+      return await Promise.race([effort.effortOf({ sessionID: poller.id }, options), stopped]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (onAbort !== undefined) controller.signal.removeEventListener("abort", onAbort);
+      if (poller.controller === controller) poller.controller = undefined;
+    }
   };
 
   const pull = async (poller: Poller): Promise<void> => {
     poller.timer = undefined;
     if (poller.closed) return;
+    const state = remember(states, poller.id, poller.state, PULL_STATE_MAX);
     poller.inFlight = true;
     poller.dirty = false;
-    poller.lastPull = Date.now();
+    state.lastPull = Date.now();
     let result: { ok: true; value: unknown } | { ok: false; error: unknown };
     try {
       const effort = resolveClient();
@@ -345,22 +462,22 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
         poller.inFlight = false;
         return;
       }
-      result = { ok: true, value: await effort.effortOf({ sessionID: poller.id }) };
+      result = { ok: true, value: await call(poller, effort) };
     } catch (error) {
       result = { ok: false, error };
     }
     poller.inFlight = false;
     if (poller.closed) return;
     if (result.ok) {
-      poller.backoff = 0;
+      state.backoff = 0;
       poller.write(appliedOf(result.value));
-    } else if (isUnavailable(result.error)) {
-      poller.backoff = poller.backoff === 0 ? BACKOFF_START_MS : Math.min(poller.backoff * 2, BACKOFF_MAX_MS);
-      schedule(poller, poller.backoff);
+    } else if (isRetryable(result.error)) {
+      state.backoff = state.backoff === 0 ? BACKOFF_START_MS : Math.min(state.backoff * 2, BACKOFF_MAX_MS);
+      schedule(poller, state.backoff);
       return;
     } else {
-      deps.warn("effort channel", result.error);
-      poller.failedUntil = Date.now() + FAILURE_COOLDOWN_MS;
+      deps.log.failed("effort channel", result.error);
+      state.failedUntil = Date.now() + FAILURE_COOLDOWN_MS;
       poller.write(undefined);
     }
     if (poller.dirty || isRunning(poller.id)) request(poller);
@@ -371,18 +488,26 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
     poller.closed = true;
     if (poller.timer !== undefined) clearTimeout(poller.timer);
     poller.timer = undefined;
+    poller.controller?.abort();
     try {
       poller.disposeRoot();
     } catch (error) {
-      deps.warn("effort channel", error);
+      deps.log.failed("effort channel", error);
     }
     if (pollers.get(poller.id) === poller) pollers.delete(poller.id);
   };
 
   const open = (id: string): Poller => {
+    const state = remember(
+      states,
+      id,
+      states.get(id) ?? { lastPull: Number.NEGATIVE_INFINITY, failedUntil: Number.NEGATIVE_INFINITY, backoff: 0 },
+      PULL_STATE_MAX,
+    );
     const [read, write] = createSignal<AppliedEffort | undefined>(undefined, { equals: sameApplied });
     const poller: Poller = {
       id,
+      state,
       refs: 0,
       closed: false,
       read,
@@ -391,12 +516,11 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
       },
       timer: undefined,
       inFlight: false,
+      controller: undefined,
       dirty: false,
-      lastPull: Number.NEGATIVE_INFINITY,
-      failedUntil: Number.NEGATIVE_INFINITY,
-      backoff: 0,
       disposeRoot: () => undefined,
     };
+    // Detached (P13-13): the poller outlives the view computation that opened it.
     poller.disposeRoot = createRoot((dispose) => {
       createRenderEffect((previous: string | undefined) => {
         const key = triggerKey(deps, id);
@@ -404,7 +528,7 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
         return key;
       }, undefined);
       return dispose;
-    });
+    }, null);
     return poller;
   };
 
@@ -433,6 +557,7 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
       closed = true;
       for (const poller of [...pollers.values()]) close(poller);
       pollers.clear();
+      states.clear();
     },
   };
 }
@@ -441,7 +566,7 @@ interface Views {
   readonly options: StatusOptions;
   readonly host: Host;
   readonly channel: EffortChannel;
-  readonly warn: Warn;
+  readonly log: Log;
   columns(): number;
   requestSync(id: string): void;
 }
@@ -472,12 +597,13 @@ function composerRows(input: ComposerTopInput | undefined, views: Views): Rows {
     return list;
   };
   const width = views.columns();
+  const models = (): readonly HostModelInfo[] => host.models(host.location(id));
   if (nonBlank(session.parentID) !== undefined) {
     if (!options.childView) return NO_ROWS;
     const status = childStatus({
       session,
       messages: messages(id),
-      models: host.models(),
+      models: models(),
       applied: childApplied(channel.applied(id)),
     });
     return status === undefined ? NO_ROWS : [formatRow([status.agent ?? "", status.model, status.effort], width)];
@@ -489,7 +615,7 @@ function composerRows(input: ComposerTopInput | undefined, views: Views): Rows {
     status: host.status,
     sessions: host.session,
     messages,
-    models: host.models(),
+    models: models(),
     applied: (child) => childApplied(channel.applied(child)),
     max: options.maxRows,
   });
@@ -498,22 +624,76 @@ function composerRows(input: ComposerTopInput | undefined, views: Views): Rows {
   return rows;
 }
 
-/** One `text` row, in its own root so it is disposed when the row goes away. */
-function rowNode(rows: () => Rows, index: number, views: Views): { node: unknown; dispose: () => void } {
+function readMuted(views: Views): unknown {
+  try {
+    return views.host.muted();
+  } catch {
+    return undefined;
+  }
+}
+
+/** A `text` element for one row: never wraps (P13-7; ignored by a host that lacks the prop). */
+function textElement(): unknown {
+  const node = createElement("text");
+  setProp(node, "wrapMode", "none");
+  return node;
+}
+
+interface Row {
+  readonly node: unknown;
+  dispose(): void;
+}
+
+/**
+ * One reactive `text` row in its own root, disposed when the row goes away. Not detached: `createElement` reads the
+ * renderer from the owner's context. A failure disposes the root before it propagates (P13-14).
+ */
+function rowNode(rows: () => Rows, index: number, views: Views): Row {
   return createRoot((dispose) => {
-    const node = createElement("text");
-    createRenderEffect((previous: unknown) => {
-      let fg: unknown;
-      try {
-        fg = views.host.muted();
-      } catch {
-        fg = undefined;
-      }
-      return fg === undefined || fg === previous ? previous : setProp(node, "fg", fg, previous);
-    }, undefined);
-    insert(node, () => rows()[index] ?? "");
-    return { node, dispose };
+    try {
+      const node = textElement();
+      createRenderEffect((previous: unknown) => {
+        const fg = readMuted(views);
+        return fg === undefined || fg === previous ? previous : setProp(node, "fg", fg, previous);
+      }, undefined);
+      insert(node, () => rows()[index] ?? "");
+      return { node, dispose };
+    } catch (error) {
+      dispose();
+      throw error;
+    }
   });
+}
+
+/** A column `box`, the element every slot render returns. */
+function boxElement(): unknown {
+  const box = createElement("box");
+  setProp(box, "flexDirection", "column");
+  return box;
+}
+
+/**
+ * P13-2: without a Solid owner the plugin's `solid-js` is not the host's, so nothing reactive would update or ever be
+ * disposed. The rows are computed once, untracked, without the effort channel, and rendered as static text.
+ */
+function staticView(compute: (views: Views) => Rows, area: string, views: Views): unknown {
+  let rows: Rows;
+  try {
+    rows = untrack(() => compute({ ...views, channel: NO_CHANNEL }));
+  } catch (error) {
+    views.log.failed(area, error);
+    rows = NO_ROWS;
+  }
+  const box = boxElement();
+  const muted = readMuted(views);
+  const nodes = rows.map((row) => {
+    const node = textElement();
+    if (muted !== undefined) setProp(node, "fg", muted);
+    insert(node, row);
+    return node;
+  });
+  if (nodes.length > 0) insert(box, nodes);
+  return box;
 }
 
 /**
@@ -522,14 +702,18 @@ function rowNode(rows: () => Rows, index: number, views: Views): { node: unknown
  * and disposed as the count changes, never reused (a removed host node may be destroyed). A throwing `compute` gives
  * no rows and one warning for `area`.
  */
-function rowsView(compute: () => Rows, area: string, views: Views): unknown {
+function rowsView(compute: (views: Views) => Rows, area: string, views: Views): unknown {
   try {
+    if (getOwner() === null) {
+      views.log.notice("owner", NO_OWNER_NOTICE);
+      return staticView(compute, area, views);
+    }
     const rows = createMemo<Rows>(
       () => {
         try {
-          return compute();
+          return compute(views);
         } catch (error) {
-          views.warn(area, error);
+          views.log.failed(area, error);
           return NO_ROWS;
         }
       },
@@ -537,9 +721,8 @@ function rowsView(compute: () => Rows, area: string, views: Views): unknown {
       { equals: sameRows },
     );
     const count = createMemo(() => rows().length);
-    const made: Array<{ node: unknown; dispose: () => void }> = [];
-    const box = createElement("box");
-    setProp(box, "flexDirection", "column");
+    const made: Row[] = [];
+    const box = boxElement();
     const children = createMemo(() => {
       const wanted = count();
       untrack(() => {
@@ -548,7 +731,7 @@ function rowsView(compute: () => Rows, area: string, views: Views): unknown {
           try {
             made.push(rowNode(rows, made.length, views));
           } catch (error) {
-            views.warn(area, error);
+            views.log.failed(area, error);
             break;
           }
         }
@@ -561,13 +744,13 @@ function rowsView(compute: () => Rows, area: string, views: Views): unknown {
     insert(box, children);
     return box;
   } catch (error) {
-    views.warn(area, error);
+    views.log.failed(area, error);
     return undefined;
   }
 }
 
 /** The renderer's width in columns (re-read on its `resize` event when it emits one). */
-function createWidth(context: HostContext | undefined, warn: Warn): { width: () => number; dispose: () => void } {
+function createWidth(context: HostContext | undefined, log: Log): { width: () => number; dispose: () => void } {
   const read = (): number => {
     try {
       const width = context?.renderer?.width;
@@ -590,7 +773,7 @@ function createWidth(context: HostContext | undefined, warn: Warn): { width: () 
       };
     }
   } catch (error) {
-    warn("renderer", error);
+    log.failed("renderer", error);
   }
   return { width, dispose: () => dispose() };
 }
@@ -599,23 +782,23 @@ function isDispose(value: unknown): value is () => void {
   return typeof value === "function";
 }
 
-function register(context: HostContext | undefined, claim: HostSlotClaim, cleanups: Array<() => void>, warn: Warn): void {
+function register(context: HostContext | undefined, claim: HostSlotClaim, cleanups: Array<() => void>, log: Log): void {
   try {
     const ui = context?.ui;
     if (ui === undefined || ui === null || typeof ui.slot !== "function") return;
     const dispose = ui.slot(claim);
     if (isDispose(dispose)) cleanups.push(() => dispose());
   } catch (error) {
-    warn(`slot ${claim.append}`, error);
+    log.failed(`slot ${claim.append}`, error);
   }
 }
 
 /**
  * The TUI `setup`: options (one toast for invalid ones), then the slot claims. Returns the cleanup that disposes the
- * claims, the pollers and their timers, and the resize listener. Never throws; makes no rpc call.
+ * claims, the pollers with their timers and calls, and the resize listener. Never throws; makes no rpc call.
  */
 function setup(context: HostContext | undefined): () => void {
-  const warn = createWarn();
+  const log = createLog();
   const cleanups: Array<() => void> = [];
   let closed = false;
   const cleanup = (): void => {
@@ -625,7 +808,7 @@ function setup(context: HostContext | undefined): () => void {
       try {
         dispose();
       } catch (error) {
-        warn("cleanup", error);
+        log.failed("cleanup", error);
       }
     }
   };
@@ -635,7 +818,7 @@ function setup(context: HostContext | undefined): () => void {
       try {
         context?.ui?.toast?.show?.({ message: notices[0], variant: "warning" });
       } catch (error) {
-        warn("notice", error);
+        log.failed("notice", error);
       }
     }
     if (!options.enabled || !(options.footer || options.childView || options.runningRow)) return cleanup;
@@ -645,29 +828,35 @@ function setup(context: HostContext | undefined): () => void {
       client: () => context?.client,
       status: host.status,
       messages: host.messages,
-      warn,
+      location: host.location,
+      log,
     });
     cleanups.push(() => channel.dispose());
-    const width = createWidth(context, warn);
+    const width = createWidth(context, log);
     cleanups.push(width.dispose);
     const synced = new Set<string>();
     const views: Views = {
       options,
       host,
       channel,
-      warn,
+      log,
       columns: () => Math.max(0, width.width() - WIDTH_MARGIN),
       requestSync: (id) => {
         if (synced.has(id)) return;
         synced.add(id);
+        for (const oldest of synced) {
+          if (synced.size <= SYNCED_MAX) break;
+          synced.delete(oldest);
+        }
         queueMicrotask(() => {
           if (closed) return;
           try {
             const message = context?.data?.session?.message;
             if (typeof message?.sync !== "function") return;
-            Promise.resolve(message.sync(id)).catch(() => undefined);
+            // A failed sync is forgotten, so the next view of the session tries again (P13-6).
+            Promise.resolve(message.sync(id)).catch(() => synced.delete(id));
           } catch {
-            // A failed sync leaves the list empty; the session's model is shown meanwhile.
+            synced.delete(id);
           }
         });
       },
@@ -676,21 +865,21 @@ function setup(context: HostContext | undefined): () => void {
     if (options.footer) {
       register(
         context,
-        { append: FOOTER_SLOT, render: (input) => rowsView(() => footerRows(input, views), "footer view", views) },
+        { append: FOOTER_SLOT, render: (input) => rowsView((v) => footerRows(input, v), "footer view", views) },
         cleanups,
-        warn,
+        log,
       );
     }
     if (options.childView || options.runningRow) {
       register(
         context,
-        { append: COMPOSER_SLOT, render: (input) => rowsView(() => composerRows(input, views), "composer view", views) },
+        { append: COMPOSER_SLOT, render: (input) => rowsView((v) => composerRows(input, v), "composer view", views) },
         cleanups,
-        warn,
+        log,
       );
     }
   } catch (error) {
-    warn("setup", error);
+    log.failed("setup", error);
   }
   return cleanup;
 }

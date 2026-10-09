@@ -1,10 +1,61 @@
 /**
- * #90 P1.3: the v2 TUI entry (`src/tui/plugin.ts`) against a fake host context. `@opentui/solid` is mocked with a node
- * tree that records tags, props and inserted accessors (evaluated to text by `rowsOf`); `solid-js` is its reactive
- * (browser) build, so signals drive the views as they do on the host. Timers are fake: the effort channel's pulls run
- * only when a test advances the clock.
+ * #90 P1.3: the v2 TUI entry (`src/tui/plugin.ts`) against a fake host context. `@opentui/solid` is the real
+ * `solid-js/universal` renderer (`createRenderer`) over a fake node tree, so every `insert` is a real render effect and
+ * the tree changes as the host's would; `solid-js` is its reactive (browser) build, so signals drive the views as on
+ * the host. Timers are fake: the effort channel's pulls run only when a test advances the clock.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+/** A node of the fake host tree (what `@opentui/solid` renderables are to the reconciler). */
+interface FakeNode {
+  readonly tag: string;
+  readonly props: Record<string, unknown>;
+  readonly children: FakeNode[];
+  parent: FakeNode | undefined;
+  text: string;
+}
+
+/** The node API `createRenderer` drives, plus fault switches for error-isolation tests. */
+const tree = vi.hoisted(() => {
+  const faults = { textInsert: false };
+  const make = (tag: string, text = ""): FakeNode => ({ tag, props: {}, children: [], parent: undefined, text });
+  const detach = (node: FakeNode): void => {
+    const parent = node.parent;
+    if (parent === undefined) return;
+    const index = parent.children.indexOf(node);
+    if (index >= 0) parent.children.splice(index, 1);
+    node.parent = undefined;
+  };
+  return {
+    faults,
+    createElement: (tag: string): FakeNode => make(tag),
+    createTextNode: (value: string | number): FakeNode => make("#text", String(value)),
+    isTextNode: (node: FakeNode): boolean => node.tag === "#text",
+    replaceText: (node: FakeNode, value: string): void => {
+      node.text = value;
+    },
+    insertNode: (parent: FakeNode, node: FakeNode, anchor?: FakeNode): void => {
+      if (faults.textInsert && parent.tag === "text") throw new Error("text insert failed");
+      detach(node);
+      const index = anchor === undefined ? -1 : parent.children.indexOf(anchor);
+      if (index >= 0) parent.children.splice(index, 0, node);
+      else parent.children.push(node);
+      node.parent = parent;
+    },
+    removeNode: (parent: FakeNode, node: FakeNode): void => {
+      if (node.parent === parent) detach(node);
+    },
+    setProperty: (node: FakeNode, name: string, value: unknown): void => {
+      node.props[name] = value;
+    },
+    getParentNode: (node: FakeNode): FakeNode | undefined => node.parent,
+    getFirstChild: (node: FakeNode): FakeNode | undefined => node.children[0],
+    getNextSibling: (node: FakeNode | undefined): FakeNode | undefined => {
+      const parent = node?.parent;
+      return parent === undefined || node === undefined ? undefined : parent.children[parent.children.indexOf(node) + 1];
+    },
+  };
+});
 
 vi.mock("solid-js", async () => {
   // Under Node `solid-js` resolves to its server build, where signals never update: load the reactive build.
@@ -12,18 +63,25 @@ vi.mock("solid-js", async () => {
   return import(/* @vite-ignore */ browserBuild);
 });
 
-vi.mock("@opentui/solid", () => {
-  type Node = { tag: string; props: Record<string, unknown>; inserts: unknown[] };
+vi.mock("@opentui/solid", async () => {
+  // The real `solid-js/universal` renderer over the fake tree. Its build imports bare `solid-js`, which Node would bind
+  // to the server build (a second, non-reactive Solid): evaluate it with the reactive build above injected instead.
+  const solid = await import("solid-js");
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync(new URL("../../node_modules/solid-js/universal/dist/universal.js", import.meta.url), "utf8");
+  const header = /^import \{ ([\w, ]+) \} from 'solid-js';\r?\n/;
+  const footer = /\r?\nexport \{ createRenderer \};\s*$/;
+  const names = header.exec(source)?.[1];
+  if (names === undefined || !footer.test(source)) throw new Error("unexpected solid-js/universal build");
+  const body = source.replace(header, "").replace(footer, "\n");
+  const make: unknown = new Function("solid", `const { ${names} } = solid;\n${body}\nreturn createRenderer;`)(solid);
+  if (typeof make !== "function") throw new Error("solid-js/universal has no createRenderer");
+  const renderer: unknown = make(tree);
+  if (typeof renderer !== "object" || renderer === null) throw new Error("createRenderer returned no renderer");
   return {
-    createElement: (tag: string): Node => ({ tag, props: {}, inserts: [] }),
-    insert: (parent: Node, accessor: unknown): unknown => {
-      parent.inserts.push(accessor);
-      return accessor;
-    },
-    setProp: <T>(node: Node, name: string, value: T): T => {
-      node.props[name] = value;
-      return value;
-    },
+    createElement: Reflect.get(renderer, "createElement"),
+    insert: Reflect.get(renderer, "insert"),
+    setProp: Reflect.get(renderer, "setProp"),
   };
 });
 
@@ -31,13 +89,18 @@ import { createEffect, createRoot, createSignal } from "solid-js";
 import plugin, {
   appliedOf,
   BACKOFF_MAX_MS,
+  BACKOFF_START_MS,
+  CALL_TIMEOUT_MS,
   COMPOSER_SLOT,
   effortWithVariant,
   FAILURE_COOLDOWN_MS,
   FOOTER_SLOT,
   isUnavailable,
+  NO_OWNER_NOTICE,
   POLL_INTERVAL_MS,
+  PULL_STATE_MAX,
   STATUS_PLUGIN_ID,
+  SYNCED_MAX,
 } from "../../src/tui/plugin";
 import type {
   ComposerTopInput,
@@ -51,24 +114,15 @@ import type {
   HostSession,
   HostSessionStatus,
   HostSlotClaim,
+  HostTheme,
   PromptFooterInput,
 } from "../../src/tui/host-types";
 import { displayWidth } from "../../src/tui/status-model";
 
-// ── fake @opentui/solid tree ──────────────────────────────────────────────────────────────────────────────────────
-
-interface FakeNode {
-  readonly tag: string;
-  readonly props: Record<string, unknown>;
-  readonly inserts: unknown[];
-}
+// ── fake tree reads ───────────────────────────────────────────────────────────────────────────────────────────────
 
 function isFakeNode(value: unknown): value is FakeNode {
-  return typeof value === "object" && value !== null && "tag" in value && "props" in value && "inserts" in value;
-}
-
-function evaluate(value: unknown): unknown {
-  return typeof value === "function" ? value() : value;
+  return typeof value === "object" && value !== null && "tag" in value && "children" in value && "props" in value;
 }
 
 function boxOf(view: unknown): FakeNode {
@@ -76,23 +130,15 @@ function boxOf(view: unknown): FakeNode {
   return view;
 }
 
-/** The `text` children the box currently holds. */
+/** The `text` children the box currently holds (it holds nothing else). */
 function textNodes(view: unknown): FakeNode[] {
-  return boxOf(view)
-    .inserts.flatMap((accessor) => {
-      const value = evaluate(accessor);
-      return Array.isArray(value) ? value : [value];
-    })
-    .filter(isFakeNode);
+  const children = boxOf(view).children;
+  expect(children.every((child) => child.tag === "text")).toBe(true);
+  return [...children];
 }
 
 function rowsOf(view: unknown): string[] {
-  return textNodes(view).map((node) =>
-    node.inserts
-      .map(evaluate)
-      .filter((value) => typeof value === "string")
-      .join(""),
-  );
+  return textNodes(view).map((node) => node.children.map((child) => child.text).join(""));
 }
 
 // ── fake host ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -107,15 +153,28 @@ const MODELS: readonly HostModelInfo[] = [
   { ...SONNET, name: "Claude Sonnet 4" },
   { ...GPT, name: "GPT-5" },
 ];
+const OWNER_WARNING =
+  "model-router status: render has no Solid owner: the plugin's solid-js is not the host's (a local node_modules/solid-js shadows it)";
+
+/** A host rpc failure as the client rethrows it: a plain `{ type, message }` (P13-1). */
+function rpcFailure(type: string, message: string): { type: string; message: string } {
+  return { type, message };
+}
 
 function childSession(id: string, extra: Partial<HostSession> = {}): HostSession {
   return { id, parentID: ROOT, agent: "explore", model: { ...SONNET, variant: "low" }, time: { created: 2 }, ...extra };
+}
+
+interface CallOptions {
+  readonly location?: unknown;
+  readonly signal?: AbortSignal;
 }
 
 interface FakeInit {
   options?: unknown;
   rpc?: boolean;
   renderer?: HostRenderer;
+  theme?: HostTheme;
 }
 
 function fakeHost(init: FakeInit = {}) {
@@ -126,9 +185,12 @@ function fakeHost(init: FakeInit = {}) {
   const [statuses, setStatuses] = createSignal<Record<string, HostSessionStatus>>({});
   const [current, setCurrent] = createSignal<HostCurrentModel | undefined>({ providerID: OPUS.providerID, modelID: OPUS.id });
   const answers = new Map<string, unknown>();
-  const effortOf = vi.fn(async (input: { sessionID: string }): Promise<unknown> => answers.get(input.sessionID) ?? {});
+  const effortOf = vi.fn(
+    async (input: { sessionID: string }, _options?: CallOptions): Promise<unknown> => answers.get(input.sessionID) ?? {},
+  );
   const rpc = vi.fn((_definition: HostRpcDefinition): unknown => ({ effortOf }));
   const sync = vi.fn(async (_sessionID: string): Promise<void> => undefined);
+  const modelList = vi.fn((_location?: unknown): readonly HostModelInfo[] => MODELS);
   const toast = vi.fn();
   const claims: HostSlotClaim[] = [];
   const disposers: Array<ReturnType<typeof vi.fn>> = [];
@@ -144,7 +206,7 @@ function fakeHost(init: FakeInit = {}) {
   const context: HostContext = {
     options: init.options,
     renderer: init.renderer ?? { width: 84 },
-    theme: { textMuted: "muted" },
+    theme: init.theme ?? { textMuted: "muted" },
     client: init.rpc === false ? {} : { rpc },
     data: {
       session: {
@@ -153,7 +215,7 @@ function fakeHost(init: FakeInit = {}) {
         status: (id) => statuses()[id] ?? "idle",
         message: { list: (id) => messages()[id] ?? [], sync },
       },
-      location: { model: { list: () => MODELS } },
+      location: { model: { list: modelList } },
     },
     ui: {
       toast: { show: toast },
@@ -174,6 +236,7 @@ function fakeHost(init: FakeInit = {}) {
     effortOf,
     rpc,
     sync,
+    modelList,
     answers,
     setCurrent,
     addSession: (session: HostSession) => setSessions((all) => ({ ...all, [session.id]: session })),
@@ -208,6 +271,7 @@ interface Mounted {
   dispose(): void;
 }
 
+/** Renders like the host: inside a Solid owner (a root standing in for the plugin boundary component). */
 function mount(render: () => unknown): Mounted {
   let dispose = (): void => undefined;
   const view = createRoot((disposeRoot) => {
@@ -218,36 +282,46 @@ function mount(render: () => unknown): Mounted {
   return { view, rows: () => rowsOf(view), dispose: () => dispose() };
 }
 
-function mountFooter(claims: readonly HostSlotClaim[], sessionID: () => string | undefined): Mounted {
-  const claim = claimFor(claims, FOOTER_SLOT);
-  const input: PromptFooterInput = {
+function footerInput(sessionID: () => string | undefined): PromptFooterInput {
+  return {
     get sessionID() {
       return sessionID();
     },
     mode: "normal",
     showDetails: false,
   };
-  return mount(() => claim.render(input));
 }
 
-function mountComposer(claims: readonly HostSlotClaim[], sessionID: () => string): Mounted {
-  const claim = claimFor(claims, COMPOSER_SLOT);
-  const input: ComposerTopInput = {
+function composerInput(sessionID: () => string): ComposerTopInput {
+  return {
     get sessionID() {
       return sessionID();
     },
   };
-  return mount(() => claim.render(input));
+}
+
+function mountFooter(claims: readonly HostSlotClaim[], sessionID: () => string | undefined): Mounted {
+  const claim = claimFor(claims, FOOTER_SLOT);
+  return mount(() => claim.render(footerInput(sessionID)));
+}
+
+function mountComposer(claims: readonly HostSlotClaim[], sessionID: () => string): Mounted {
+  const claim = claimFor(claims, COMPOSER_SLOT);
+  return mount(() => claim.render(composerInput(sessionID)));
 }
 
 const tick = (ms = 0): Promise<unknown> => vi.advanceTimersByTimeAsync(ms);
 
 async function microtasks(): Promise<void> {
-  for (let i = 0; i < 5; i++) await Promise.resolve();
+  for (let i = 0; i < 10; i++) await Promise.resolve();
 }
 
 function warnings(): string[] {
   return vi.mocked(console.warn).mock.calls.map((call) => String(call[0]));
+}
+
+function pullsOf(fake: Fake, sessionID: string): number {
+  return fake.effortOf.mock.calls.filter(([input]) => input.sessionID === sessionID).length;
 }
 
 beforeEach(() => {
@@ -257,6 +331,7 @@ beforeEach(() => {
 
 afterEach(() => {
   for (const step of teardown.splice(0).reverse()) step();
+  tree.faults.textInsert = false;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -334,6 +409,28 @@ describe("registration (D7, A4)", () => {
     expect(fake.effortOf).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("registers the composer claim when the footer claim throws, and disposes it exactly once (P13-10)", () => {
+    const claims: HostSlotClaim[] = [];
+    const disposers: Array<ReturnType<typeof vi.fn>> = [];
+    const cleanup = plugin.setup({
+      ui: {
+        slot: (claim) => {
+          if (claim.append === FOOTER_SLOT) throw new Error("footer slot gone");
+          claims.push(claim);
+          const dispose = vi.fn();
+          disposers.push(dispose);
+          return dispose;
+        },
+      },
+    });
+    expect(claims.map((claim) => claim.append)).toEqual([COMPOSER_SLOT]);
+    cleanup();
+    cleanup();
+    expect(disposers).toHaveLength(1);
+    expect(disposers[0]).toHaveBeenCalledTimes(1);
+    expect(warnings()).toEqual(["model-router status: slot prompt.footer.status failed: footer slot gone"]);
+  });
 });
 
 describe("G1 main footer (A3)", () => {
@@ -342,8 +439,7 @@ describe("G1 main footer (A3)", () => {
     start(fake);
     const footer = mountFooter(fake.claims, () => ROOT);
     expect(footer.rows()).toEqual(["effort default"]);
-    const box = boxOf(footer.view);
-    expect(box.props.flexDirection).toBe("column");
+    expect(boxOf(footer.view).props.flexDirection).toBe("column");
     expect(textNodes(footer.view).map((node) => node.tag)).toEqual(["text"]);
   });
 
@@ -363,7 +459,7 @@ describe("G1 main footer (A3)", () => {
     const [sessionID, setSessionID] = createSignal<string | undefined>(CHILD);
     const footer = mountFooter(fake.claims, sessionID);
     expect(footer.rows()).toEqual([]);
-    expect(textNodes(footer.view)).toEqual([]);
+    expect(boxOf(footer.view).children).toEqual([]);
     setSessionID(ROOT);
     expect(footer.rows()).toEqual(["effort default"]);
     setSessionID(CHILD);
@@ -389,7 +485,7 @@ describe("G1 main footer (A3)", () => {
     const footer = mountFooter(fake.claims, () => ROOT);
     expect(footer.rows()).toEqual(["effort default"]);
     await tick(0);
-    expect(fake.effortOf).toHaveBeenCalledWith({ sessionID: ROOT });
+    expect(fake.effortOf).toHaveBeenCalledWith({ sessionID: ROOT }, { signal: expect.any(AbortSignal) });
     expect(footer.rows()).toEqual(["effort high"]);
   });
 
@@ -432,15 +528,39 @@ describe("G2 child view (A5)", () => {
     expect(fake.sync).toHaveBeenCalledTimes(1);
   });
 
-  it("swallows a rejected message sync", async () => {
-    const fake = fakeHost();
-    fake.sync.mockRejectedValue(new Error("offline"));
+  it("forgets a session whose message sync failed, so the next view syncs it again (P13-6)", async () => {
+    const fake = fakeHost({ rpc: false });
+    fake.sync.mockRejectedValueOnce(rpcFailure("rpc.internal", "offline"));
     fake.addSession(childSession(CHILD));
     start(fake);
     const view = mountComposer(fake.claims, () => CHILD);
     await microtasks();
     expect(fake.sync).toHaveBeenCalledTimes(1);
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    mountComposer(fake.claims, () => CHILD);
+    await microtasks();
+    expect(fake.sync).toHaveBeenCalledTimes(2);
+    mountComposer(fake.claims, () => CHILD);
+    await microtasks();
+    expect(fake.sync).toHaveBeenCalledTimes(2);
+    expect(warnings()).toEqual([]);
+  });
+
+  it(`remembers at most ${SYNCED_MAX} synced sessions (P13-6)`, async () => {
+    const fake = fakeHost({ rpc: false });
+    const ids = Array.from({ length: SYNCED_MAX + 1 }, (_, index) => `ses_${index}`);
+    for (const id of ids) fake.addSession(childSession(id));
+    start(fake);
+    for (const id of ids) mountComposer(fake.claims, () => id);
+    await microtasks();
+    expect(fake.sync).toHaveBeenCalledTimes(SYNCED_MAX + 1);
+    mountComposer(fake.claims, () => ids[SYNCED_MAX] ?? "");
+    await microtasks();
+    expect(fake.sync).toHaveBeenCalledTimes(SYNCED_MAX + 1);
+    mountComposer(fake.claims, () => ids[0] ?? "");
+    await microtasks();
+    expect(fake.sync).toHaveBeenCalledTimes(SYNCED_MAX + 2);
+    expect(fake.sync).toHaveBeenLastCalledWith("ses_0");
   });
 
   it("follows the latest assistant message after a model switch", () => {
@@ -463,7 +583,7 @@ describe("G2 child view (A5)", () => {
     start(fake);
     const view = mountComposer(fake.claims, () => CHILD);
     await tick(0);
-    expect(fake.effortOf).toHaveBeenCalledWith({ sessionID: CHILD });
+    expect(fake.effortOf).toHaveBeenCalledWith({ sessionID: CHILD }, { signal: expect.any(AbortSignal) });
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · max"]);
   });
 
@@ -485,6 +605,28 @@ describe("G2 child view (A5)", () => {
     const view = mountComposer(fake.claims, () => CHILD);
     await tick(0);
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+  });
+
+  it("passes the session's location to the rpc call and to the model list (P13-3)", async () => {
+    const location = { directory: "/work/child", workspaceID: "wrk_1" };
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD, { location }));
+    start(fake);
+    mountComposer(fake.claims, () => CHILD);
+    expect(fake.modelList).toHaveBeenCalledWith(location);
+    await tick(0);
+    expect(fake.effortOf).toHaveBeenCalledWith({ sessionID: CHILD }, { location, signal: expect.any(AbortSignal) });
+  });
+
+  it("passes no location when the session has none (P13-3)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    start(fake);
+    mountComposer(fake.claims, () => CHILD);
+    expect(fake.modelList.mock.calls.length).toBeGreaterThan(0);
+    expect(fake.modelList.mock.calls.every((call) => call.length === 0)).toBe(true);
+    await tick(0);
+    expect(Object.keys(fake.effortOf.mock.calls[0]?.[1] ?? {})).toEqual(["signal"]);
   });
 
   it("fits the row to the renderer width minus 4", () => {
@@ -546,7 +688,7 @@ describe("G3 running row", () => {
     start(fake);
     const view = mountComposer(fake.claims, () => ROOT);
     expect(view.rows()).toEqual([]);
-    expect(textNodes(view.view)).toEqual([]);
+    expect(boxOf(view.view).children).toEqual([]);
     fake.setStatus("ses_b", "running");
     expect(view.rows()).toEqual(["review · GPT-5 · high"]);
     fake.setStatus("ses_a", "running");
@@ -555,7 +697,24 @@ describe("G3 running row", () => {
     expect(view.rows()).toEqual(["review · GPT-5 · high"]);
     fake.setStatus("ses_b", "idle");
     expect(view.rows()).toEqual([]);
-    expect(textNodes(view.view)).toEqual([]);
+    expect(boxOf(view.view).children).toEqual([]);
+  });
+
+  it("detaches a removed row and builds a new node when a row comes back (P13-9)", () => {
+    const fake = fakeHost();
+    fake.addSession(childA);
+    fake.setStatus("ses_a", "running");
+    start(fake);
+    const view = mountComposer(fake.claims, () => ROOT);
+    const [first] = textNodes(view.view);
+    expect(first?.parent).toBe(boxOf(view.view));
+    fake.setStatus("ses_a", "idle");
+    expect(first?.parent).toBeUndefined();
+    fake.setStatus("ses_a", "running");
+    const [again] = textNodes(view.view);
+    expect(again).toBeDefined();
+    expect(again).not.toBe(first);
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
   });
 
   it("shows at most maxRows rows, then +k more, and pulls only the shown children", async () => {
@@ -595,6 +754,17 @@ describe("G3 running row", () => {
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · max"]);
     expect(fake.sync).toHaveBeenCalledTimes(1);
     expect(fake.sync).toHaveBeenCalledWith("ses_a");
+  });
+
+  it("uses the root session's location for the model list (P13-3)", () => {
+    const location = { directory: "/work/root" };
+    const fake = fakeHost();
+    fake.addSession({ id: ROOT, agent: "build", model: { ...OPUS }, time: { created: 1 }, location });
+    fake.addSession(childA);
+    fake.setStatus("ses_a", "running");
+    start(fake);
+    expect(mountComposer(fake.claims, () => ROOT).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    expect(fake.modelList).toHaveBeenCalledWith(location);
   });
 
   it("shows nothing in a root session when runningRow is off", () => {
@@ -673,10 +843,52 @@ describe("effort channel (A1)", () => {
     expect(fake.effortOf).toHaveBeenCalledTimes(2);
   });
 
-  it("retries unavailable errors with backoff 1 s, 2 s, 4 s … 30 s, without warning", async () => {
+  it("keeps the 5 s debounce across a running → idle → running flip that closes the poller (P13-5)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession("ses_a"));
+    fake.setStatus("ses_a", "running");
+    start(fake);
+    const view = mountComposer(fake.claims, () => ROOT);
+    await tick(0);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    fake.setStatus("ses_a", "idle");
+    expect(view.rows()).toEqual([]);
+    await microtasks();
+    expect(vi.getTimerCount()).toBe(0);
+    await tick(1_000);
+    fake.setStatus("ses_a", "running");
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    await tick(POLL_INTERVAL_MS - 1_001);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    await tick(1);
+    expect(fake.effortOf).toHaveBeenCalledTimes(2);
+  });
+
+  it(`keeps the pull state of the last ${PULL_STATE_MAX} sessions only (P13-5)`, async () => {
+    const fake = fakeHost();
+    const ids = Array.from({ length: PULL_STATE_MAX + 1 }, (_, index) => `ses_${index}`);
+    for (const id of ids) fake.addSession(childSession(id));
+    start(fake);
+    const views = ids.map((id) => mountComposer(fake.claims, () => id));
+    await tick(0);
+    expect(fake.effortOf).toHaveBeenCalledTimes(PULL_STATE_MAX + 1);
+    for (const view of views) view.dispose();
+    await microtasks();
+    await tick(1_000);
+    // ses_1 first: opening the forgotten ses_0 adds a state and evicts the then-oldest one.
+    mountComposer(fake.claims, () => "ses_1");
+    mountComposer(fake.claims, () => "ses_0");
+    await tick(0);
+    expect(pullsOf(fake, "ses_0")).toBe(2);
+    expect(pullsOf(fake, "ses_1")).toBe(1);
+    await tick(POLL_INTERVAL_MS - 1_000);
+    expect(pullsOf(fake, "ses_1")).toBe(2);
+  });
+
+  it("retries rpc.unavailable with backoff 1 s, 2 s, 4 s … 30 s, without warning (P13-1)", async () => {
     const fake = fakeHost();
     fake.addSession(childSession(CHILD));
-    fake.effortOf.mockRejectedValue(new Error("rpc.unavailable: opencode-model-router.effort"));
+    fake.effortOf.mockRejectedValue(rpcFailure("rpc.unavailable", "x"));
     start(fake);
     const view = mountComposer(fake.claims, () => CHILD);
     await tick(0);
@@ -695,7 +907,7 @@ describe("effort channel (A1)", () => {
     expect(warnings()).toEqual([]);
   });
 
-  it("falls back to the message variant for 30 s after another error, warning once", async () => {
+  it("falls back to the message variant for 30 s after another rpc failure, warning its message once (P13-1)", async () => {
     const fake = fakeHost();
     fake.addSession(childSession(CHILD));
     fake.setStatus(CHILD, "running");
@@ -704,7 +916,7 @@ describe("effort channel (A1)", () => {
     const view = mountComposer(fake.claims, () => CHILD);
     await tick(0);
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · max"]);
-    fake.effortOf.mockRejectedValue(new Error("boom"));
+    fake.effortOf.mockRejectedValue(rpcFailure("rpc.internal", "m"));
     await tick(POLL_INTERVAL_MS);
     expect(fake.effortOf).toHaveBeenCalledTimes(2);
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
@@ -712,11 +924,63 @@ describe("effort channel (A1)", () => {
     expect(fake.effortOf).toHaveBeenCalledTimes(2);
     await tick(1);
     expect(fake.effortOf).toHaveBeenCalledTimes(3);
-    expect(warnings()).toEqual(["model-router status: effort channel failed: boom"]);
+    expect(warnings()).toEqual(["model-router status: effort channel failed: m"]);
     fake.effortOf.mockResolvedValue({ effort: "max", providerID: SONNET.providerID, modelID: SONNET.id });
     await tick(FAILURE_COOLDOWN_MS);
     expect(fake.effortOf).toHaveBeenCalledTimes(4);
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · max"]);
+  });
+
+  it("names an rpc failure without a message by its type (P13-1)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    fake.effortOf.mockRejectedValue({ type: "rpc.method_not_found", message: "" });
+    start(fake);
+    mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(warnings()).toEqual(["model-router status: effort channel failed: rpc.method_not_found"]);
+  });
+
+  it("aborts a call after 10 s and retries it like rpc.unavailable (P13-4)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    const signals: AbortSignal[] = [];
+    fake.effortOf.mockImplementation((_input, options) => {
+      if (options?.signal !== undefined) signals.push(options.signal);
+      return new Promise<unknown>(() => undefined);
+    });
+    start(fake);
+    mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    await tick(CALL_TIMEOUT_MS - 1);
+    expect(signals[0]?.aborted).toBe(false);
+    await tick(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
+    await tick(BACKOFF_START_MS);
+    expect(fake.effortOf).toHaveBeenCalledTimes(2);
+    expect(warnings()).toEqual([]);
+  });
+
+  it("aborts the call in flight when its poller closes (P13-4)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    const signals: AbortSignal[] = [];
+    fake.effortOf.mockImplementation((_input, options) => {
+      if (options?.signal !== undefined) signals.push(options.signal);
+      return new Promise<unknown>(() => undefined);
+    });
+    start(fake);
+    const view = mountComposer(fake.claims, () => CHILD);
+    await tick(0);
+    expect(vi.getTimerCount()).toBe(1);
+    view.dispose();
+    await microtasks();
+    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    await tick(60_000);
+    expect(fake.effortOf).toHaveBeenCalledTimes(1);
   });
 
   it("treats an rpc client without effortOf as an error", async () => {
@@ -814,7 +1078,7 @@ describe("feature detection and error isolation", () => {
     expect(warnings()).toEqual([]);
   });
 
-  it("colours every row with the theme's muted text colour", () => {
+  it("colours every row with the theme's muted text colour and never wraps it (P13-7)", () => {
     const fake = fakeHost();
     fake.addSession(childSession("ses_a"));
     fake.addSession(childSession("ses_b"));
@@ -823,6 +1087,27 @@ describe("feature detection and error isolation", () => {
     start(fake);
     const view = mountComposer(fake.claims, () => ROOT);
     expect(textNodes(view.view).map((node) => node.props.fg)).toEqual(["muted", "muted"]);
+    expect(textNodes(view.view).map((node) => node.props.wrapMode)).toEqual(["none", "none"]);
+    const footer = mountFooter(fake.claims, () => ROOT);
+    expect(textNodes(footer.view).map((node) => node.props.wrapMode)).toEqual(["none"]);
+  });
+
+  it("renders statically and warns once when a slot renders outside any Solid owner (P13-2)", async () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    start(fake);
+    const footer = claimFor(fake.claims, FOOTER_SLOT).render(footerInput(() => ROOT));
+    expect(rowsOf(footer)).toEqual(["effort default"]);
+    expect(textNodes(footer).map((node) => [node.props.wrapMode, node.props.fg])).toEqual([["none", "muted"]]);
+    const child = claimFor(fake.claims, COMPOSER_SLOT).render(composerInput(() => CHILD));
+    expect(rowsOf(child)).toEqual(["explore · Claude Sonnet 4 · low"]);
+    expect(warnings()).toEqual([OWNER_WARNING]);
+    expect(NO_OWNER_NOTICE).toBe(OWNER_WARNING.replace("model-router status: ", ""));
+    fake.setCurrent({ providerID: OPUS.providerID, modelID: OPUS.id, variant: "high" });
+    expect(rowsOf(footer)).toEqual(["effort default"]);
+    await tick(60_000);
+    expect(fake.effortOf).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("renders no rows and warns once per view when data.session.get throws", () => {
@@ -879,6 +1164,30 @@ describe("feature detection and error isolation", () => {
     expect(warnings()).toEqual(["model-router status: composer view failed: list gone"]);
     setBroken(false);
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+  });
+
+  it("disposes a row's root when building the row fails (P13-14)", () => {
+    const [muted, setMuted] = createSignal("muted");
+    let reads = 0;
+    const fake = fakeHost({
+      theme: {
+        get textMuted(): unknown {
+          reads++;
+          return muted();
+        },
+      },
+    });
+    fake.addSession(childSession(CHILD));
+    start(fake);
+    tree.faults.textInsert = true;
+    const view = mountComposer(fake.claims, () => CHILD);
+    tree.faults.textInsert = false;
+    expect(view.rows()).toEqual([]);
+    expect(warnings()).toEqual(["model-router status: composer view failed: text insert failed"]);
+    expect(reads).toBeGreaterThan(0);
+    const before = reads;
+    setMuted("other");
+    expect(reads).toBe(before);
   });
 
   it("keeps the fallback when client.rpc throws, warning once", async () => {
@@ -949,12 +1258,14 @@ describe("cleanup", () => {
     expect(fake.effortOf).toHaveBeenCalledTimes(1);
   });
 
-  it("drops an answer that arrives after cleanup", async () => {
+  it("aborts the call in flight and drops its answer on cleanup", async () => {
     const fake = running();
     let answer: (value: unknown) => void = () => undefined;
+    const signals: AbortSignal[] = [];
     fake.effortOf.mockImplementation(
-      () =>
+      (_input, options) =>
         new Promise<unknown>((resolve) => {
+          if (options?.signal !== undefined) signals.push(options.signal);
           answer = resolve;
         }),
     );
@@ -962,6 +1273,7 @@ describe("cleanup", () => {
     const view = mountComposer(fake.claims, () => CHILD);
     await tick(0);
     cleanup();
+    expect(signals[0]?.aborted).toBe(true);
     answer({ effort: "max", providerID: SONNET.providerID, modelID: SONNET.id });
     await microtasks();
     expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
@@ -1003,15 +1315,20 @@ describe("helpers", () => {
   });
 
   it.each([
-    [new Error("rpc.unavailable"), true],
-    [Object.assign(new Error("not registered"), { name: "RpcUnavailableError" }), true],
-    [{ _tag: "Unavailable" }, true],
-    [{ code: "RPC_UNAVAILABLE" }, true],
-    ["unavailable", true],
-    [new Error("boom"), false],
-    [null, false],
-    [42, false],
-  ])("isUnavailable(%s) → %s", (error, expected) => {
+    ["{ type: rpc.unavailable }", rpcFailure("rpc.unavailable", "x"), true],
+    ["{ type: rpc.unavailable, data }", { type: "rpc.unavailable", message: "x", data: { id: "opencode-model-router.effort" } }, true],
+    ["{ type: rpc.internal }", rpcFailure("rpc.internal", "m"), false],
+    ["{ type: rpc.method_not_found }", rpcFailure("rpc.method_not_found", "no such method"), false],
+    ["{ type: rpc.internal, message mentions unavailable }", rpcFailure("rpc.internal", "upstream unavailable"), true],
+    ["Error(rpc.unavailable)", new Error("rpc.unavailable"), true],
+    ["Error named RpcUnavailableError", Object.assign(new Error("not registered"), { name: "RpcUnavailableError" }), true],
+    ["{ _tag: Unavailable }", { _tag: "Unavailable" }, true],
+    ["{ code: RPC_UNAVAILABLE }", { code: "RPC_UNAVAILABLE" }, true],
+    ["the string unavailable", "unavailable", true],
+    ["Error(boom)", new Error("boom"), false],
+    ["null", null, false],
+    ["42", 42, false],
+  ])("isUnavailable(%s) → %s", (_label, error, expected) => {
     expect(isUnavailable(error)).toBe(expected);
   });
 });

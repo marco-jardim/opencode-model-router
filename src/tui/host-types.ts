@@ -45,6 +45,8 @@ export interface HostSession {
   readonly title?: string;
   readonly model?: HostModelRef;
   readonly time?: { readonly created?: HostTime | null };
+  /** `LocationRef`: passed as is to the rpc call options and to `data.location.model.list`. */
+  readonly location?: unknown;
 }
 
 /** The read subset of `SessionMessageInfo` (tagged by `type`; assistant messages carry `agent` and `model`). */
