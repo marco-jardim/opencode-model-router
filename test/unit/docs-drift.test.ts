@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   ROUTING_DEFAULTS,
   ROUTING_ENGINES,
@@ -57,6 +57,20 @@ import {
   buildDelegationProtocol,
 } from "../../src/router/protocol";
 import type { RouterConfig } from "../../src/index";
+import {
+  childStatus, DEFAULT_EFFORT, DEFAULT_STATUS_OPTIONS, effectiveMainEffort, FALLBACK_AGENT, formatRow, MAX_ROWS_MAX, MAX_ROWS_MIN, parseOptions,
+  ROW_SEPARATOR, runningChildren, STATUS_NOTICE_PREFIX, STATUS_OPTION_KEYS, UNKNOWN_MODEL,
+} from "../../src/tui/status-model";
+import { effortRpc } from "../../src/tui/effort-rpc";
+import statusPlugin, {
+  appliedOf, BACKOFF_MAX_MS, BACKOFF_START_MS, COMPOSER_SLOT, effortWithVariant, FAILURE_COOLDOWN_MS, FOOTER_SLOT, NO_OWNER_NOTICE,
+  POLL_INTERVAL_MS, PULL_STATE_MAX, QUICK_REPULLS, STATUS_PLUGIN_ID, WIDTH_MARGIN,
+} from "../../src/tui/plugin";
+import tuiEntry from "../../tui";
+
+// `src/tui/plugin.ts` imports `@opentui/solid`, which only the OpenCode host serves. The TUI status pins call `setup` and
+// never render, so the three reconciler primitives are stubs here (`test/unit/tui.plugin.test.ts` renders for real).
+vi.mock("@opentui/solid", () => ({ createElement: () => ({}), insert: () => undefined, setProp: () => undefined }));
 
 /**
  * Documentation-drift guards.
@@ -1316,6 +1330,17 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
     expect(adr).toContain("amendments R0–R10 and adversarial QA");
     expect(adr).not.toContain("amendments R0–R8");
   });
+
+  it("the README's v1-freeze note links to the 2.5.0 release, whose first `### Changed` holds the freeze entry", () => {
+    const readme = read("README.md");
+    expect(readme).toContain("[changelog entry](CHANGELOG.md#250---2026-10-09)");
+    expect(readme).not.toContain("CHANGELOG.md#unreleased");
+    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
+    expect(anchorsOf(changelog).has("250---2026-10-09")).toBe(true);
+    const release = /^## \[2\.5\.0\] - 2026-10-09$([\s\S]*?)^## \[/m.exec(changelog)?.[1] ?? "";
+    const firstChanged = release.split(/^### /m).find((section) => /^Changed\n/.test(section)) ?? "";
+    expect(firstChanged).toContain("OpenCode v1 support is in feature freeze");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1424,5 +1449,514 @@ describe("docs drift: #84 P3.3 global QA round 2 (QA-G-C-2-1, QA-G-C-2-2)", () =
     // negative: the claim QA-G-C-2-2 found false
     expect(guide).not.toContain("back under the tier agents' 25-call cap");
     expect(read("docs/adr/0006-role-tier-assurance-delegation.md").replace(/\s+/g, " ")).toContain("or when a `subagentTiers` entry maps the role's name to a tier");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenCode v2 TUI status (#90 P2.2): docs/TUI_STATUS.md, the "TUI status options (OpenCode v2)" section of
+// CONFIG_REFERENCE.md, the README section and the [Unreleased] entry. The options tables are the parser's keys,
+// defaults and `maxRows` range; the slot names are the ones `setup` claims per option; the plugin id, the rpc id, the
+// timings and the fallbacks are the code's; the v2 TUI config file is `cli.json`, never `tui.json`. The plugin is
+// imported with `@opentui/solid` stubbed (see the `vi.mock` at the top of this file).
+// ---------------------------------------------------------------------------
+
+/** `source` without block comments and `//` line comments (a `//` only counts after the line start or whitespace). */
+function withoutComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|\s)\/\/.*$/gm, "$1");
+}
+
+/** `text` as a literal inside a RegExp source. */
+function reEscape(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Prose lines of `text` (outside fenced blocks) longer than `max` columns; table rows are exempt. */
+function longProseLines(text: string, max = 120): string[] {
+  return proseLines(text).filter((line) => !line.text.startsWith("|") && line.text.length > max).map((line) => `${line.line}: ${line.text}`);
+}
+
+/** The lines inside the fenced blocks of `text`, fences excluded. */
+function fencedLines(text: string): string[] {
+  const prose = new Set(proseLines(text).map((line) => line.line));
+  return text.split(/\r?\n/).filter((line, index) => !prose.has(index + 1) && !/^\s{0,3}(`{3,}|~{3,})/.test(line));
+}
+
+/** What `statusPlugin.setup` does with `options`: the slots it claims and the toasts it shows (cleaned up at once). */
+function setupWith(options: unknown): { slots: string[]; toasts: string[] } {
+  const slots: string[] = [];
+  const toasts: string[] = [];
+  const context = {
+    options,
+    ui: {
+      slot: (claim: { append: string }) => {
+        slots.push(claim.append);
+        return () => undefined;
+      },
+      toast: { show: (toast: { message: string }) => void toasts.push(toast.message) },
+    },
+  };
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    statusPlugin.setup(context as unknown as Parameters<typeof statusPlugin.setup>[0])();
+  } finally {
+    warn.mockRestore();
+  }
+  return { slots, toasts };
+}
+
+/** The `heading` line of `doc` and what follows it up to the next heading of the same or a higher level (fences skipped); "" when absent. */
+function sectionOf(doc: string, heading: string): string {
+  const level = heading.indexOf(" ");
+  const prose = proseLines(doc);
+  const start = prose.find((line) => line.text === heading)?.line;
+  if (start === undefined) return "";
+  const next = new RegExp(`^#{1,${level}} `);
+  const end = prose.find((line) => line.line > start && next.test(line.text))?.line;
+  return doc.split(/\r?\n/).slice(start - 1, end === undefined ? undefined : end - 1).join("\n");
+}
+
+/**
+ * The `### Added` section holding `marker`: that of `## [Unreleased]`, else that of the first dated release (where the
+ * entry lands at release time); "" when neither holds it.
+ */
+function changelogAdded(changelog: string, marker: string): string {
+  const text = changelog.replace(/\r\n/g, "\n");
+  const dated = /^## \[[^\]\n]+\] - \d{4}-\d{2}-\d{2}$/m.exec(text)?.[0];
+  const releases = [sectionOf(text, "## [Unreleased]"), dated === undefined ? "" : sectionOf(text, dated)];
+  return releases.map((release) => sectionOf(release, "### Added")).find((added) => added.includes(marker)) ?? "";
+}
+
+const TUI_CHANGELOG_MARKER = "**OpenCode v2 TUI status (#90).**";
+
+const TUI_OPTIONS_HEADER: readonly string[] = ["Key", "Type", "Default", "Values / range", "Controls"];
+
+/** Every difference between the `<!-- tui-status-options -->` table of `doc` and the parser's keys, types, defaults and range. */
+function tuiOptionsTableProblems(doc: string): string[] {
+  const table = tableAfter(doc, "tui-status-options");
+  if (table === undefined) return ["no options table"];
+  const problems: string[] = [];
+  if (JSON.stringify(table.header) !== JSON.stringify(TUI_OPTIONS_HEADER)) problems.push(`header ${table.header.join(" | ")}`);
+  const keys = table.rows.map((row) => row[0] ?? "");
+  const want = STATUS_OPTION_KEYS.map((key) => tick(key));
+  if (JSON.stringify(keys) !== JSON.stringify(want)) problems.push(`keys ${keys.join(", ")}; code ${want.join(", ")}`);
+  for (const row of table.rows) {
+    const key = /^`(\w+)`$/.exec(row[0] ?? "")?.[1];
+    if (key === undefined || !Object.hasOwn(DEFAULT_STATUS_OPTIONS, key)) continue;
+    const value = (DEFAULT_STATUS_OPTIONS as Readonly<Record<string, unknown>>)[key];
+    const type = typeof value === "boolean" ? "`boolean`" : "`integer`";
+    const range = typeof value === "boolean" ? "`true \\| false`" : `\`[${MAX_ROWS_MIN}, ${MAX_ROWS_MAX}]\``;
+    if (row[1] !== type) problems.push(`${key} type: doc ${row[1] ?? "(none)"}, code ${type}`);
+    if (row[2] !== defaultCell(value)) problems.push(`${key} default: doc ${row[2] ?? "(none)"}, code ${defaultCell(value)}`);
+    if (row[3] !== range) problems.push(`${key} range: doc ${row[3] ?? "(none)"}, code ${range}`);
+  }
+  return problems;
+}
+
+/** The host slot names (`prompt.footer.status`, `session.composer.top`, …) `text` names in backticks, sorted. */
+function slotNamesOf(text: string): string[] {
+  return [...new Set([...text.matchAll(/`((?:app|home|prompt|session|sidebar)\.[a-z.]*[a-z])`/g)].map((m) => m[1]!))].sort();
+}
+
+/** The `plugins` list of every `<!-- cli.json example -->` JSON block of `text`. */
+function cliJsonExamples(text: string): unknown[][] {
+  return [...text.matchAll(/<!-- cli\.json example -->\s*```json\r?\n([\s\S]*?)\r?\n```/g)].map((m) => {
+    const parsed = JSON.parse(m[1]!) as { plugins?: unknown };
+    return Array.isArray(parsed.plugins) ? parsed.plugins : [];
+  });
+}
+
+/**
+ * What is wrong with a `cli.json` example's `plugins` list: a `package` that is the plugin id (its options would be
+ * dropped) or neither the package name nor a directory ending in it (the host ignores a path to `tui.ts`), options
+ * `parseOptions` rejects, a string other than the `-<id>` selector, or an explicit entry after that selector.
+ */
+function cliJsonEntryProblems(plugins: readonly unknown[], id: string): string[] {
+  const problems: string[] = [];
+  let selector = false;
+  for (const entry of plugins) {
+    if (typeof entry === "string") {
+      if (entry === `-${id}`) selector = true;
+      else problems.push(`string entry ${entry}`);
+      continue;
+    }
+    const { package: name, options } = (entry ?? {}) as { package?: unknown; options?: unknown };
+    if (selector) problems.push(`explicit entry ${String(name)} after -${id}`);
+    if (name === id) problems.push(`package is the plugin id ${id}`);
+    else if (typeof name !== "string" || !/(?:^|[\\/])opencode-model-router$/.test(name)) problems.push(`package ${String(name)}`);
+    problems.push(...parseOptions(options).notices);
+  }
+  return problems;
+}
+
+/**
+ * `tui.json` named in a fenced block, or in a prose paragraph that does not say it is OpenCode v1's file and name
+ * `cli.json` (the only way the docs may mention it).
+ */
+function tuiJsonProblems(text: string): string[] {
+  const prose = proseLines(text);
+  const proseNumbers = new Set(prose.map((line) => line.line));
+  const problems: string[] = [];
+  if (text.split(/\r?\n/).some((line, index) => !proseNumbers.has(index + 1) && line.includes("tui.json"))) problems.push("a fenced block names tui.json");
+  for (const paragraph of prose.map((line) => line.text).join("\n").split(/\n\s*\n/)) {
+    if (paragraph.includes("tui.json") && !(paragraph.includes("cli.json") && /\bv1\b/.test(paragraph))) {
+      problems.push(`tui.json as a v2 config file: ${paragraph.replace(/\s+/g, " ").trim()}`);
+    }
+  }
+  return problems;
+}
+
+describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
+  const guide = read("docs/TUI_STATUS.md");
+  const flat = guide.replace(/\s+/g, " ");
+  const section = sectionOf(read("docs/CONFIG_REFERENCE.md"), "## TUI status options (OpenCode v2)");
+  const readme = sectionOf(read("README.md"), "## TUI status (OpenCode v2)");
+  const added = changelogAdded(read("CHANGELOG.md"), TUI_CHANGELOG_MARKER);
+  const pluginID = STATUS_PLUGIN_ID;
+  const docs = [["TUI_STATUS.md", guide], ["CONFIG_REFERENCE.md", section], ["README.md", readme], ["CHANGELOG.md", added]] as const;
+
+  it("finds the guide, both sections and the changelog entry, in [Unreleased] or else the first dated release", () => {
+    for (const [name, text] of docs) expect(text.length, name).toBeGreaterThan(200);
+    const entry = `- ${TUI_CHANGELOG_MARKER} x\n`;
+    const released = `# Changelog\n\n## [Unreleased]\n\n## [2.5.0] - 2026-10-10\n\n### Added\n\n${entry}\n## [2.4.0] - 2026-10-09\n`;
+    expect(changelogAdded(released, TUI_CHANGELOG_MARKER)).toBe(`### Added\n\n${entry}`);
+    expect(changelogAdded(released.replace(/\n/g, "\r\n"), TUI_CHANGELOG_MARKER)).toBe(`### Added\n\n${entry}`);
+    const pending = `# Changelog\n\n## [Unreleased]\n\n### Added\n\n${entry}\n## [2.4.0] - 2026-10-09\n`;
+    expect(changelogAdded(pending, TUI_CHANGELOG_MARKER)).toBe(`### Added\n\n${entry}`);
+    // only in an older release, or nowhere: not found
+    const older = `# Changelog\n\n## [Unreleased]\n\n## [2.5.0] - 2026-10-10\n\n### Added\n\n- y\n\n## [2.4.0] - 2026-10-09\n\n### Added\n\n${entry}`;
+    expect(changelogAdded(older, TUI_CHANGELOG_MARKER)).toBe("");
+  });
+
+  it("(a) both options tables are STATUS_OPTION_KEYS with DEFAULT_STATUS_OPTIONS and the maxRows range parseOptions enforces", () => {
+    expect(Object.keys(DEFAULT_STATUS_OPTIONS)).toEqual([...STATUS_OPTION_KEYS]);
+    expect(tuiOptionsTableProblems(guide)).toEqual([]);
+    expect(tuiOptionsTableProblems(section)).toEqual([]);
+    const maxRowsNotices = (maxRows: unknown): number => parseOptions({ maxRows }).notices.length;
+    expect([MAX_ROWS_MIN, MAX_ROWS_MAX].map(maxRowsNotices)).toEqual([0, 0]);
+    expect([MAX_ROWS_MIN - 1, MAX_ROWS_MAX + 1, MAX_ROWS_MIN + 0.5, String(MAX_ROWS_MIN)].map(maxRowsNotices)).toEqual([1, 1, 1, 1]);
+    for (const key of STATUS_OPTION_KEYS.filter((k) => k !== "maxRows")) {
+      expect(parseOptions({ [key]: false }).options[key], key).toBe(false);
+      expect(parseOptions({ [key]: "false" }).notices, key).toHaveLength(1);
+    }
+    for (const [name, text] of docs) for (const key of STATUS_OPTION_KEYS) expect(text, `${name}: ${key}`).toContain(tick(key));
+  });
+
+  it("(a) detects a dropped row, a changed type, default or range, an extra row and a missing table", () => {
+    const dropped = section.split("\n").filter((line) => !line.startsWith("| `childView` |")).join("\n");
+    expect(tuiOptionsTableProblems(dropped)).toEqual([expect.stringMatching(/^keys .*; code /)]);
+    const maxRowsRow = section.split("\n").find((line) => line.startsWith("| `maxRows` |")) ?? "(no maxRows row)";
+    const withRow = (row: string): string => section.replace(maxRowsRow, row);
+    const range = `\`[${MAX_ROWS_MIN}, ${MAX_ROWS_MAX}]\``;
+    const fallback = tick(String(DEFAULT_STATUS_OPTIONS.maxRows));
+    expect(tuiOptionsTableProblems(withRow(maxRowsRow.replace(`| ${fallback} |`, "| `99` |")))).toEqual([`maxRows default: doc \`99\`, code ${fallback}`]);
+    expect(tuiOptionsTableProblems(withRow(maxRowsRow.replace(range, "`[1, 99]`")))).toEqual([`maxRows range: doc \`[1, 99]\`, code ${range}`]);
+    expect(tuiOptionsTableProblems(withRow(maxRowsRow.replace("`integer`", "`number`")))).toEqual(["maxRows type: doc `number`, code `integer`"]);
+    const extra = `${maxRowsRow}\n| \`compact\` | \`boolean\` | \`false\` | \`true \\| false\` | x |`;
+    expect(tuiOptionsTableProblems(withRow(extra))).toEqual([expect.stringMatching(/^keys .*`compact`; code /)]);
+    expect(tuiOptionsTableProblems("# no table\n")).toEqual(["no options table"]);
+  });
+
+  it("(b) names the two slots setup claims, each for the options that claim it, and no other slot", () => {
+    const footer = FOOTER_SLOT;
+    const composer = COMPOSER_SLOT;
+    expect([footer, composer]).toEqual(["prompt.footer.status", "session.composer.top"]);
+    // what setup claims: G1 (`footer`) the footer slot, G2 and G3 (`childView`, `runningRow`) one composer slot
+    expect(setupWith(undefined).slots).toEqual([footer, composer]);
+    expect(setupWith({ footer: false }).slots).toEqual([composer]);
+    // `childView: false` keeps the composer slot only when G3 is on (by default it is not, A12)
+    expect(setupWith({ childView: false }).slots).toEqual(DEFAULT_STATUS_OPTIONS.runningRow ? [footer, composer] : [footer]);
+    expect(setupWith({ childView: false, runningRow: true }).slots).toEqual([footer, composer]);
+    expect(setupWith({ runningRow: true }).slots).toEqual([footer, composer]);
+    expect(setupWith({ runningRow: false }).slots).toEqual([footer, composer]);
+    expect(setupWith({ childView: false, runningRow: false }).slots).toEqual([footer]);
+    expect(setupWith({ footer: false, childView: false, runningRow: false }).slots).toEqual([]);
+    expect(setupWith({ enabled: false }).slots).toEqual([]);
+    expect(slotNamesOf(guide)).toEqual([footer, composer]);
+    expect(slotNamesOf(section)).toEqual([footer, composer]);
+    for (const [name, text] of docs) expect(slotNamesOf(text).filter((slot) => slot !== footer && slot !== composer), name).toEqual([]);
+    for (const doc of [guide, section]) {
+      const controls = new Map((tableAfter(doc, "tui-status-options")?.rows ?? []).map((row) => [row[0] ?? "", row[4] ?? ""] as const));
+      expect(controls.get("`footer`")).toContain(tick(footer));
+      expect(controls.get("`childView`")).toContain(tick(composer));
+      expect(controls.get("`runningRow`")).toContain(tick(composer));
+    }
+    expect(slotNamesOf("`prompt.footer` and `sidebar.content`")).toEqual(["prompt.footer", "sidebar.content"]);
+  });
+
+  it("(b) states what the defaults show: the running-delegates rows are opt-in, and how to turn them on (A12)", () => {
+    // the owner decision: G3 off by default, G1 and G2 on
+    expect([DEFAULT_STATUS_OPTIONS.footer, DEFAULT_STATUS_OPTIONS.childView, DEFAULT_STATUS_OPTIONS.runningRow]).toEqual([true, true, false]);
+    // the options the docs quote turn the rows on, away from the default
+    expect(parseOptions({ runningRow: true })).toEqual({ options: { ...DEFAULT_STATUS_OPTIONS, runningRow: true }, notices: [] });
+    const turnOn = tick('"options": { "runningRow": true }');
+    for (const [name, text] of docs) {
+      const prose = text.replace(/\s+/g, " ");
+      expect(prose, name).toContain(turnOn);
+      expect(prose, name).toMatch(/[Oo]pt-in/);
+      expect(prose, name).toMatch(/the main session shows only the footer's (?:`effort <value>`|effort)/);
+    }
+    // a cli.json example of the guide and of the README turns the rows on, as parseOptions reads it
+    const turnsOn = (plugins: readonly unknown[]): boolean =>
+      plugins.some((entry) => typeof entry === "object" && entry !== null && parseOptions((entry as { options?: unknown }).options).options.runningRow);
+    expect(turnsOn(cliJsonExamples(guide).flat())).toBe(true);
+    expect(turnsOn(cliJsonExamples(readme).flat())).toBe(true);
+    expect(turnsOn([{ package: "opencode-model-router", options: { maxRows: 6 } }])).toBe(false);
+  });
+
+  it("(c) names the plugin id and the effort rpc as the code defines them, and no other id", () => {
+    expect(pluginID).toBe("opencode-model-router.status");
+    expect(statusPlugin.id).toBe(pluginID);
+    expect(tuiEntry).toBe(statusPlugin);
+    expect(effortRpc.id).toBe("opencode-model-router.effort");
+    expect(Object.keys(effortRpc.methods)).toEqual(["effortOf"]);
+    expect(Object.keys(effortRpc.methods.effortOf.input.properties)).toEqual(["sessionID"]);
+    expect(Object.keys(effortRpc.methods.effortOf.output.properties)).toContain("thinkingBudget");
+    expect(guide).toContain(tick(pluginID));
+    expect(section).toContain(tick(pluginID));
+    for (const text of [guide, readme, added]) expect(text).toContain(tick(effortRpc.id));
+    const [method] = Object.keys(effortRpc.methods);
+    const [input] = Object.keys(effortRpc.methods.effortOf.input.properties);
+    expect(flat).toContain(tick(`${method}({ ${input} })`));
+    expect(flat).toMatch(/`thinkingBudget`, but the views do not display it/);
+    for (const [name, text] of docs) {
+      expect(text, name).toContain(`"-${pluginID}"`);
+      const ids = new Set([...text.matchAll(/opencode-model-router\.[a-z]+\b/g)].map((m) => m[0]));
+      expect([...ids].filter((id) => id !== pluginID && id !== effortRpc.id), name).toEqual([]);
+    }
+    expect(flat).toMatch(new RegExp(`do not write \`"package": "${reEscape(pluginID)}"\`.{0,120}enable selector, and its \`options\` are dropped`));
+  });
+
+  it("(c) every cli.json example uses the package name or directory, valid options and the selector after the entries", () => {
+    const guideExamples = cliJsonExamples(guide);
+    const readmeExamples = cliJsonExamples(readme);
+    expect(guideExamples).toHaveLength(3);
+    expect(readmeExamples).toHaveLength(1);
+    for (const plugins of [...guideExamples, ...readmeExamples]) {
+      expect(plugins.length).toBeGreaterThan(0);
+      expect(cliJsonEntryProblems(plugins, pluginID)).toEqual([]);
+    }
+    const entries = guideExamples.flat();
+    expect(entries).toContainEqual(expect.objectContaining({ package: "opencode-model-router" }));
+    expect(entries).toContainEqual(expect.objectContaining({ package: expect.stringMatching(/^\/.*\/opencode-model-router$/) }));
+    expect(entries).toContain(`-${pluginID}`);
+    // negative fixtures
+    expect(cliJsonEntryProblems([{ package: pluginID, options: { maxRows: 6 } }], pluginID)).toEqual([`package is the plugin id ${pluginID}`]);
+    expect(cliJsonEntryProblems([{ package: "/x/opencode-model-router/tui.ts" }], pluginID)).toEqual(["package /x/opencode-model-router/tui.ts"]);
+    expect(cliJsonEntryProblems([{ package: "opencode-model-router", options: { maxRows: MAX_ROWS_MAX + 1 } }], pluginID)).toHaveLength(1);
+    expect(cliJsonEntryProblems([`-${pluginID}`, { package: "opencode-model-router" }], pluginID)).toEqual([`explicit entry opencode-model-router after -${pluginID}`]);
+    expect(cliJsonEntryProblems([pluginID], pluginID)).toEqual([`string entry ${pluginID}`]);
+  });
+
+  it("(d) names cli.json as the v2 TUI config file and never tells v2 users to use tui.json", () => {
+    for (const [name, text] of docs) {
+      expect(text, name).toContain("`cli.json`");
+      expect(tuiJsonProblems(text), name).toEqual([]);
+    }
+    for (const text of [guide, section]) {
+      expect(text).toContain("`<config dir>/cli.json`");
+      expect(text).toContain("`~/.config/opencode/cli.json`");
+    }
+    expect(flat).toMatch(/`tui\.json` is OpenCode v1's TUI config file\. OpenCode v2 reads it only to migrate it when `cli\.json` does not exist/);
+    // negative fixtures
+    expect(tuiJsonProblems("Add the entry to `~/.config/opencode/tui.json`.\n")).toHaveLength(1);
+    expect(tuiJsonProblems("Options go in `cli.json`.\n\nOr in `tui.json` on v2.\n")).toHaveLength(1);
+    expect(tuiJsonProblems("```json\n// tui.json\n{}\n```\n")).toEqual(["a fenced block names tui.json"]);
+    expect(tuiJsonProblems("`tui.json` is OpenCode v1's file; v2 uses `cli.json`.\n")).toEqual([]);
+  });
+
+  it("quotes the notices parseOptions emits and the rows the views render", () => {
+    const invalid = parseOptions({ maxRows: "x" }).notices[0] ?? "(no notice)";
+    expect(invalid).toBe(`${STATUS_NOTICE_PREFIX}invalid TUI options ("maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}); using defaults for those keys`);
+    expect(section.replace(/\s+/g, " ")).toContain(tick(invalid));
+    expect(flat).toContain(tick(parseOptions("x").notices[0] ?? "(no notice)"));
+    // F2: unknown keys are named in the same toast, which setup shows once; the guide prints both toasts, verbatim
+    const both = parseOptions({ maxRows: "x", compact: true }).notices;
+    expect(both).toEqual([`${STATUS_NOTICE_PREFIX}invalid TUI options ("maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}; unknown keys "compact"); using defaults for those keys`]);
+    const printed = fencedLines(guide);
+    expect(printed).toContain(invalid);
+    expect(printed).toContain(both[0]);
+    expect(flat).toMatch(/For `\{ "maxRows": "x" \}` and for `\{ "maxRows": "x", "compact": true \}` the toasts are/);
+    for (const text of [flat, section.replace(/\s+/g, " ")]) expect(text).toMatch(/names every invalid and every unknown key/);
+    expect(setupWith({ maxRows: "x" }).toasts).toEqual([invalid]);
+    expect(setupWith({ maxRows: "x", compact: true }).toasts).toEqual(both);
+    expect(setupWith({ maxRows: 6 }).toasts).toEqual([]);
+    // the rows
+    const row = ["<agent>", "<model>", "<effort>"].join(ROW_SEPARATOR);
+    expect(formatRow(["<agent>", "<model>", "<effort>"], 80)).toBe(row);
+    for (const [name, text] of docs) {
+      expect(text, name).toContain(tick(row));
+      expect(text, name).toContain("`+<k> more`");
+    }
+    expect(effortWithVariant("high", "max")).toBe("high (max)");
+    expect(effortWithVariant("high", "high")).toBe("high");
+    expect(effortWithVariant("high")).toBe("high");
+    expect(flat).toMatch(new RegExp(`\`<effort> \\(<variant>\\)\`, for example ${reEscape(tick(effortWithVariant("high", "max")))}`));
+    expect(flat).toContain(tick(`effort ${DEFAULT_EFFORT}`));
+    // F10: the fallbacks of a running delegate without agent, title or model
+    const bare = runningChildren({
+      rootID: "root", family: ["root", "child"], status: () => "running", sessions: (id) => ({ id, parentID: "root" }),
+      messages: () => [], models: [], max: 4,
+    });
+    expect(bare.rows).toEqual([{ id: "child", agent: FALLBACK_AGENT, model: UNKNOWN_MODEL, effort: DEFAULT_EFFORT }]);
+    expect(flat).toMatch(new RegExp(`session title, else ${reEscape(tick(FALLBACK_AGENT))}`));
+    expect(flat).toMatch(new RegExp(`model ${reEscape(tick(UNKNOWN_MODEL))} and the effort ${reEscape(tick(DEFAULT_EFFORT))}`));
+  });
+
+  it("states the effort fallbacks: the footer shows `effort default`, the delegate rows the message's variant (F1)", () => {
+    const current = { providerID: "p", modelID: "m" };
+    // footer: no channel answer → default; a selected variant → nothing (the host row shows it)
+    expect(effectiveMainEffort({ current })).toBe(DEFAULT_EFFORT);
+    expect(effectiveMainEffort({ selectedVariant: "max", current })).toBeUndefined();
+    expect(effectiveMainEffort({ current, applied: { effort: "high", ...current } })).toBe("high");
+    expect(effectiveMainEffort({ current, applied: { effort: "high", providerID: "p", modelID: "other" } })).toBe(DEFAULT_EFFORT);
+    // delegate rows: no channel answer → the message's variant, else default
+    const session = { id: "child", parentID: "root", agent: "fast" };
+    const message = (variant?: string) => ({ id: "a", type: "assistant", model: { id: "m", providerID: "p", ...(variant === undefined ? {} : { variant }) } });
+    expect(childStatus({ session, messages: [message("low")], models: [] })?.effort).toBe("low");
+    expect(childStatus({ session, messages: [message()], models: [] })?.effort).toBe(DEFAULT_EFFORT);
+    expect(childStatus({ session, messages: [message("low")], models: [], applied: { effort: "medium", ...current } })?.effort).toBe("medium");
+    const fallback = /footer shows `effort default`,? and the (?:delegated session and running-delegate|delegate) rows show the message's variant/;
+    for (const text of [flat, readme.replace(/\s+/g, " "), added.replace(/\s+/g, " ")]) expect(text).toMatch(fallback);
+    expect(flat).toMatch(/has no answer, the footer shows `effort default`/);
+    for (const [name, text] of docs) {
+      const prose = text.replace(/\s+/g, " ");
+      for (const wrong of ["views fall back to the message's variant", "the views use the message's variant", "without it the rows show"]) {
+        expect(prose, `${name}: ${wrong}`).not.toContain(wrong);
+      }
+    }
+  });
+
+  it("quotes the host versions, the poll, retry and width numbers and the peer dependency of the code", () => {
+    expect(flat).toContain(`every ${POLL_INTERVAL_MS / 1000} s while the session runs`);
+    expect(flat).toContain(`(${BACKOFF_START_MS / 1000} s, doubling up to ${BACKOFF_MAX_MS / 1000} s)`);
+    expect(flat).toContain(`it stops asking about that session for at least ${FAILURE_COOLDOWN_MS / 1000} s`);
+    // GA-2, R2-2: the quick re-pulls of a running delegated session without an effort yet, counted per remembered session;
+    // root sessions keep the normal cadence (also in the limitation). GA-1: a reopened view keeps the last answer
+    expect(flat).toContain(
+      `While a running delegated session has not reported an effort yet, an answer without one is followed by another call after ${BACKOFF_START_MS / 1000} s, at most ${QUICK_REPULLS} times per session; the count is kept per remembered session (the last ${PULL_STATE_MAX}). Root sessions keep the normal cadence.`,
+    );
+    expect(flat).toContain(
+      `The quick re-pulls after an answer without an effort apply to delegated sessions only (at most ${QUICK_REPULLS} per remembered session, the last ${PULL_STATE_MAX}); a root session is asked at the normal cadence.`,
+    );
+    expect(flat).toContain("the first call right away");
+    expect(flat).toContain("A view that is closed and opened again shows the session's last answer at once, before its next call.");
+    // B-1, R2-5: the verified hosts, and what an unverified 2.0.20–2.0.23 host is expected (not observed) to show
+    expect(flat).toContain(
+      "Verified on OpenCode 2.0.24–2.0.26.** On 2.0.20–2.0.23 the TUI entry is not verified; if it fails to load there, the host is expected to show `Plugin failed` and the server plugin keeps working.",
+    );
+    expect(flat).not.toContain("if it fails to load there, the host shows");
+    // R2-1: the terminal width, not the composer; long rows run into the sidebar, in the Width section and the limitation
+    const width = new RegExp(`terminal width minus ${WIDTH_MARGIN} columns, not to the composer, and never wrap`, "g");
+    expect(flat.match(width)).toHaveLength(2);
+    expect(flat.match(/row longer than the composer is not shortened to it and runs into the sidebar's columns/g)).toHaveLength(2);
+    expect(flat).toMatch(/short rows were verified on one line with the sidebar open and closed/);
+    // F4: what was verified on which hosts
+    expect(flat).toMatch(/needs OpenCode 2\.0\.24 or later/);
+    expect(flat).toMatch(/verified on 2\.0\.24, 2\.0\.25 and 2\.0\.26 with a scripted provider/);
+    expect(read("README.md")).toContain("v2 **2.0.20+** (TUI status: 2.0.24+)");
+    expect(flat).toMatch(/v1 never loads `tui\.ts`/);
+    const peers = Object.keys(JSON.parse(read("package.json")).peerDependencies as Record<string, string>);
+    expect(peers).toContain("@opencode-ai/plugin");
+    expect(flat).toMatch(/needs the `@opencode-ai\/plugin` peer dependency installed/);
+    for (const text of [flat, readme.replace(/\s+/g, " ")]) expect(text).toMatch(/[Tt]he router applies no effort to primary agents/);
+  });
+
+  it("links the guide from the README, the deep-dive list, the config reference and the changelog; the guide's links resolve", () => {
+    expect(readme).toContain("(docs/TUI_STATUS.md)");
+    expect(readme).toContain("(docs/CONFIG_REFERENCE.md#tui-status-options-opencode-v2)");
+    expect(read("README.md")).toContain("- `docs/TUI_STATUS.md` —");
+    expect(section).toContain("(./TUI_STATUS.md)");
+    expect(added).toContain(TUI_CHANGELOG_MARKER);
+    expect(added).toContain("(docs/TUI_STATUS.md)");
+    const v2 = read("docs/OPENCODE_V2.md");
+    expect(v2).toContain("(./TUI_STATUS.md)");
+    expect(v2.replace(/\s+/g, " ")).toContain(`plugin rpc ${tick(effortRpc.id)}`);
+    expect(brokenLinks(["docs/TUI_STATUS.md", "docs/OPENCODE_V2.md"], readRepo)).toEqual([]);
+    for (const path of ["tui.ts", "src/tui/plugin.ts", "src/tui/status-model.ts", "src/tui/effort-rpc.ts", "src/tui/effort-channel.ts"]) {
+      expect(readRepo(path), path).toBeDefined();
+      expect(guide, path).toContain(tick(path));
+    }
+    // F18, R2-5: the prose of the guide and of the CONFIG_REFERENCE section is wrapped (table rows and code blocks cannot be)
+    expect(longProseLines(guide)).toEqual([]);
+    expect(longProseLines(section)).toEqual([]);
+    const long = "x".repeat(121);
+    expect(longProseLines(`ok\n${long}\n`)).toEqual([`2: ${long}`]);
+    expect(longProseLines(`| ${long} |\n\`\`\`text\n${long}\n\`\`\`\n`)).toEqual([]);
+  });
+
+  it("the views never display the thinking budget (F9)", () => {
+    for (const path of ["src/tui/plugin.ts", "src/tui/status-model.ts"]) {
+      expect(withoutComments(read(path)), path).not.toContain("thinkingBudget");
+    }
+    // the channel output the views take: the budget is dropped, and a turn with a budget but no effort gives no effort
+    expect(appliedOf({ effort: "high", providerID: "p", modelID: "m", thinkingBudget: 2048 })).toEqual({ effort: "high", providerID: "p", modelID: "m" });
+    expect(appliedOf({ providerID: "p", modelID: "m", thinkingBudget: 2048 })).toBeUndefined();
+    expect(flat).toMatch(/thinking budget \(`thinking\.budgetTokens`\) instead of an effort, the row shows the variant or `default`/);
+    // the comment stripper keeps code and drops both comment forms
+    expect(withoutComments("const a = x.thinkingBudget; // thinkingBudget\n/* thinkingBudget */ const b = 1;")).toBe("const a = x.thinkingBudget; \n const b = 1;");
+    expect(withoutComments("// thinkingBudget\n/**\n * thinkingBudget\n */\nconst url = \"http://x\";")).not.toContain("thinkingBudget");
+  });
+
+  it("states the QA round 1 wording: auto-load, grandchildren, load failures, no Solid owner, version skew, the recorded effort", () => {
+    // F3: auto-loaded only when the server entry loads
+    expect(flat).toMatch(/auto-loaded only when the server entry loads/);
+    expect(flat).not.toMatch(/The TUI entry is loaded only when/);
+    expect(readme.replace(/\s+/g, " ")).toMatch(/auto-loads the TUI entry .{0,80}when the server entry loads/);
+    expect(section.replace(/\s+/g, " ")).toMatch(/and the server entry loads/);
+    // F5: grandchildren, as the code keeps them, hedged on the host's family list
+    const family = runningChildren({
+      rootID: "root", family: ["root", "child", "grandchild"], status: () => "running",
+      sessions: (id) => ({ id, agent: id, parentID: id === "grandchild" ? "child" : "root" }), messages: () => [], models: [], max: 1,
+    });
+    expect([family.rows.map((row) => row.id), family.overflow]).toEqual([["child"], 1]);
+    expect(flat).toMatch(/grandchildren\) are included when the host lists them in the root session's family/);
+    // R2-3: a row lasts while the delegate's session runs
+    expect(flat).toMatch(/goes away when the delegate finishes \(its session is no longer running\)/);
+    expect(readme.replace(/\s+/g, " ")).toMatch(/until the delegate finishes \(its session is no longer running\)/);
+    for (const text of [flat, readme.replace(/\s+/g, " ")]) expect(text).not.toMatch(/has answered/);
+    // F6, R2-2, R2-7: the forms observed on the real hosts, verbatim; no stale marker or solid-js item
+    for (const observed of [
+      "`TUI opencode-model-router.status`", "`TUI opencode-model-router.status local`", "`Plugin failed: <path>`",
+      "`Plugin failed: C:\\Users\\…`", "`⊙ 1 plugin failed /plugins`", "`x <path> failed, local`",
+    ]) expect(guide, observed).toContain(observed);
+    expect(flat).toMatch(/The `\/plugins` dialog shows a `TUI opencode-model-router\.status` row/);
+    expect(flat).toMatch(/Observed on 2\.0\.24–2\.0\.26 when the TUI entry failed to load/);
+    expect(flat).not.toMatch(/`plugin failed` marker in the footer|is marked `failed`|Cannot find package/);
+    // F17, R2-4, GA-5: the no-owner toast verbatim as the code words it (its effect, no unreproduced cause), and what it means
+    const owner = NO_OWNER_NOTICE.slice(0, NO_OWNER_NOTICE.indexOf(":") + 1);
+    expect(owner).toBe("render has no Solid owner:");
+    expect(flat).toContain(`A \`${STATUS_NOTICE_PREFIX}${NO_OWNER_NOTICE}\` toast.`);
+    expect(NO_OWNER_NOTICE).not.toMatch(/node_modules|solid-js|shadows/);
+    expect(flat).toMatch(/running-delegates row stays hidden/);
+    expect(flat).not.toMatch(/named cause|was not reproduced/);
+    expect(flat).toMatch(/if the toast persists, report it/);
+    // F15: version skew of a package-name entry
+    expect(flat).toMatch(/another version of the package than the server entry\. A local directory path .{0,40}avoids this/);
+    // F16: what the server records
+    expect(flat).toMatch(/records the effort the request carried after its `chat\.params` bridge .{0,90}with the turn's model and variant/);
+    expect(flat).not.toMatch(/a role dispatch's variant/);
+  });
+
+  it("states the QA round 1 rules for the effort suffix, the row shrinking and the pull spacing (F12–F14)", () => {
+    // F12: `(<variant>)` only when both are set, neither is `default`, and they differ ignoring case (values trimmed)
+    expect(effortWithVariant("high", "max")).toBe("high (max)");
+    expect(effortWithVariant(" high ", " max ")).toBe("high (max)");
+    expect(effortWithVariant("high", "High")).toBe("high");
+    expect(effortWithVariant("high", DEFAULT_EFFORT)).toBe("high");
+    expect(effortWithVariant(DEFAULT_EFFORT, "max")).toBe(DEFAULT_EFFORT);
+    expect(effortWithVariant("high", " ")).toBe("high");
+    expect(flat).toMatch(/else the variant of the message's \(or, before the first message, the session's\) model; else `default`/);
+    expect(flat).toMatch(/both values are set \(not blank\), neither is `default`, and they differ ignoring case/);
+    expect(flat).not.toMatch(/else the model's variant/);
+    // the session's model before the first message: its variant is the effort
+    const early = childStatus({ session: { id: "child", parentID: "root", model: { id: "m", providerID: "p", variant: "low" } }, messages: [], models: [] });
+    expect(early?.effort).toBe("low");
+    // F13: the first part (the agent, else the model) shrinks first
+    expect(formatRow(["abcdefghij", "model", "high"], 20)).toBe(`abcd…${ROW_SEPARATOR}model${ROW_SEPARATOR}high`);
+    expect(formatRow(["", "modelname-long", "high"], 12)).toBe(`mode…${ROW_SEPARATOR}high`);
+    expect(flat).toMatch(/the first part \(the agent, else the model\) shrinks first/);
+    expect(flat).not.toMatch(/: the agent shrinks first/);
+    // F14: trigger-driven pulls are spaced like the poll
+    expect(flat).toMatch(new RegExp(`at most every ${POLL_INTERVAL_MS / 1000} s, when the session's status or latest message changes`));
   });
 });

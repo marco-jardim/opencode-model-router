@@ -1,6 +1,6 @@
 {
   "name": "opencode-model-router",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "OpenCode plugin that routes tasks to tiered subagents (fast/medium/heavy) based on complexity",
   "type": "module",
   "main": "./src/index.ts",
@@ -14,6 +14,7 @@
     "smoke:v2": "cross-env RUN_OC_SMOKE_V2=1 vitest run --config vitest.smoke.config.ts test/smoke/v2-registration.smoke.test.ts",
     "smoke:routing": "cross-env RUN_OC_SMOKE_ROUTING=1 vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts",
     "smoke:v2:e2e": "cross-env RUN_OC_SMOKE_V2_E2E=1 vitest run --config vitest.smoke.config.ts test/smoke/v2-provider-e2e.smoke.test.ts",
+    "smoke:tui": "cross-env RUN_OC_SMOKE_TUI=1 vitest run --config vitest.smoke.config.ts test/smoke/tui-status.smoke.test.ts",
     "routing:stats": "node scripts/routing-stats.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -45,6 +46,7 @@
   ],
   "files": [
     "server.ts",
+    "tui.ts",
     "src/",
     "tiers.json",
     "LICENSE",
@@ -55,11 +57,14 @@
     "@opencode-ai/plugin": ">=1.0.0 <2.0.0"
   },
   "devDependencies": {
+    "@lydell/node-pty": "1.2.0-beta.15",
     "@opencode/plugin": "2.0.22",
     "@types/node": "^26.2.0",
     "@vitest/coverage-v8": "^5.0.3",
+    "@xterm/headless": "6.0.0",
     "cross-env": "^10.1.0",
     "istanbul-lib-coverage": "^3.2.2",
+    "solid-js": "1.9.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   }

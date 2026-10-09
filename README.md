@@ -278,7 +278,7 @@ function from `src/index.ts`. Existing v1 configuration does not need to change.
 > **OpenCode v1: feature freeze.** Since 2026-10-09, v1 support gets fixes for
 > regressions and security issues only. Every new feature targets OpenCode v2 and
 > stays inert on v1 (at most one notice, no behaviour), as roles mode already does.
-> See the [changelog entry](CHANGELOG.md#unreleased).
+> See the [changelog entry](CHANGELOG.md#250---2026-10-09).
 
 Routing, tool guards and verification use the same engine on both versions. V2
 uses its native `subagent` tool to create real child sessions, preserving the
@@ -1109,6 +1109,7 @@ Full field notes are in [docs/CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md).
 - `docs/adr/0005-cost-aware-routing-engine.md` — the decisions behind the routing engine
 - `docs/ROLES.md` — roles mode: role agents, authority and separation, tier floor, budgets, `router_run`, migration
 - `docs/adr/0006-role-tier-assurance-delegation.md` — the decisions behind roles mode
+- `docs/TUI_STATUS.md` — the OpenCode v2 TUI status: what it shows, `cli.json` options, the effort channel, limitations
 
 > These files are not included in the npm tarball. This section is the self-contained summary; the docs are available in the repository for contributors and advanced users.
 
@@ -1159,6 +1160,29 @@ With `routing.delegation: "roles"` the orchestrator stops picking tiers: it disp
 - **Evidence from verification only.** Only verdicts move the routing evidence: the router's deterministic checks, and an independent LLM grader at half weight. Router-observed runs, incomplete returns and re-dispatches are recorded as routing statistics; a bare `DONE` counts for nothing.
 
 Put `{ "routing": { "delegation": "roles" } }` in the global override file and **restart OpenCode** (roles mode is decided at plugin start); restore the previous file and restart to go back. OpenCode v1 keeps the tier model. Guide: [`docs/ROLES.md`](docs/ROLES.md); decision record: [`docs/adr/0006-role-tier-assurance-delegation.md`](docs/adr/0006-role-tier-assurance-delegation.md).
+
+## TUI status (OpenCode v2)
+
+On OpenCode v2 (2.0.24 or later) the package also ships a TUI entry, `tui.ts`, that shows which model and effort the router's sessions run with:
+
+- **Main session footer:** `effort <value>` in the prompt footer, only when no variant is selected (the host's footer row already shows a selected variant). Root sessions normally show `effort default`, because the router applies no effort to primary agents.
+- **Delegated session view:** `<agent> · <model> · <effort>` above the composer.
+- **Main session while delegates run (opt-in, `runningRow`):** one `<agent> · <model> · <effort>` row per running delegate directly above the prompt box, from before the delegate's first token until the delegate finishes (its session is no longer running); at most `maxRows` rows, then `+<k> more`; nothing when no delegate runs. Off by default, so the main session shows only the footer's effort; turn it on with `"options": { "runningRow": true }` in `cli.json`.
+
+The effort is what the router applied to the session's latest turn, reported by the server plugin over the rpc `opencode-model-router.effort`. While that channel has no answer, the footer shows `effort default` and the delegate rows show the message's variant.
+
+It is enabled automatically: OpenCode v2 auto-loads the TUI entry of every package listed in `opencode.json` `plugins`, when the server entry loads. Options (`enabled`, `footer`, `childView`, `runningRow`, `maxRows`) go in OpenCode v2's TUI config file `cli.json` (for example `~/.config/opencode/cli.json`), in an entry whose `package` is the package name, or the package directory for a local checkout:
+
+<!-- cli.json example -->
+```json
+{
+  "plugins": [
+    { "package": "opencode-model-router", "options": { "runningRow": true, "maxRows": 6 } }
+  ]
+}
+```
+
+Turn it off with `"options": { "enabled": false }`, or with the selector `"-opencode-model-router.status"` placed after any explicit entry for the plugin. On OpenCode v1 it does nothing: v1 never loads `tui.ts`. Guide: [`docs/TUI_STATUS.md`](docs/TUI_STATUS.md); options: [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md#tui-status-options-opencode-v2).
 
 ## Commands
 
@@ -1215,7 +1239,7 @@ These are character counts of the prompts the shipped config actually produces, 
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+**
+- [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+** (TUI status: 2.0.24+)
 - Node.js 20+
 - Provider API keys configured in OpenCode
 

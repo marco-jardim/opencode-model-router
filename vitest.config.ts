@@ -25,6 +25,9 @@ export const MERGED_PER_FILE_GATED = [
   "src/verify/directives.ts",
   "src/verify/risk.ts",
   "src/verify/pending.ts",
+  // #90 (C-6): the pure TUI status model and the server side of the TUI effort channel.
+  "src/tui/status-model.ts",
+  "src/tui/effort-channel.ts",
 ] as const;
 
 const mergedGates =
