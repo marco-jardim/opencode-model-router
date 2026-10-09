@@ -1167,11 +1167,11 @@ On OpenCode v2 (2.0.24 or later) the package also ships a TUI entry, `tui.ts`, t
 
 - **Main session footer:** `effort <value>` in the prompt footer, only when no variant is selected (the host's footer row already shows a selected variant). Root sessions normally show `effort default`, because the router applies no effort to primary agents.
 - **Delegated session view:** `<agent> · <model> · <effort>` above the composer.
-- **Main session while delegates run:** one `<agent> · <model> · <effort>` row per running delegate above the composer, at most `maxRows` rows, then `+<k> more`; nothing when no delegate runs.
+- **Main session while delegates run:** one `<agent> · <model> · <effort>` row per running delegate directly above the prompt box, from before the delegate's first token until it has answered; at most `maxRows` rows, then `+<k> more`; nothing when no delegate runs.
 
-The effort is what the router applied to the session's latest turn, reported by the server plugin over the rpc `opencode-model-router.effort`; without it the rows show the message's variant.
+The effort is what the router applied to the session's latest turn, reported by the server plugin over the rpc `opencode-model-router.effort`. While that channel has no answer, the footer shows `effort default` and the delegate rows show the message's variant.
 
-It is enabled automatically: OpenCode v2 loads the TUI entry of every package listed in `opencode.json` `plugins`. Options (`enabled`, `footer`, `childView`, `runningRow`, `maxRows`) go in OpenCode v2's TUI config file `cli.json` (for example `~/.config/opencode/cli.json`), in an entry whose `package` is the package name, or the package directory for a local checkout:
+It is enabled automatically: OpenCode v2 auto-loads the TUI entry of every package listed in `opencode.json` `plugins`, when the server entry loads. Options (`enabled`, `footer`, `childView`, `runningRow`, `maxRows`) go in OpenCode v2's TUI config file `cli.json` (for example `~/.config/opencode/cli.json`), in an entry whose `package` is the package name, or the package directory for a local checkout:
 
 <!-- cli.json example -->
 ```json
@@ -1239,7 +1239,7 @@ These are character counts of the prompts the shipped config actually produces, 
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+**
+- [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+** (TUI status: 2.0.24+)
 - Node.js 20+
 - Provider API keys configured in OpenCode
 

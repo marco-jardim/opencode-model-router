@@ -1051,13 +1051,13 @@ Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting
 
 **OpenCode v2 only** (2.0.24 or later); inert on v1, which never loads the TUI entry `tui.ts`. These options are not
 `tiers.json` or override-file keys: they are the `options` of the plugin's entry in `cli.json`, OpenCode v2's TUI
-config file: `<config dir>/cli.json` (for example `~/.config/opencode/cli.json`). Without such an entry the TUI status loads
-automatically, with the defaults below, whenever the package is listed in the server config (`opencode.json`
-`plugins`). The entry's `package` is the package name (npm install) or the package directory (local checkout), never
-the plugin id `opencode-model-router.status`: an entry whose `package` equals an already-loaded plugin id is an enable
-selector, and its `options` are dropped. To turn the status off, set `enabled: false` or add the selector
-`"-opencode-model-router.status"` after any explicit entry for the same plugin. The guide, with examples, is
-[`TUI_STATUS.md`](./TUI_STATUS.md).
+config file: `<config dir>/cli.json` (for example `~/.config/opencode/cli.json`). Without such an entry the TUI
+status is auto-loaded, with the defaults below, whenever the package is listed in the server config (`opencode.json`
+`plugins`) and the server entry loads. The entry's `package` is the package name (npm install) or the package
+directory (local checkout), never the plugin id `opencode-model-router.status`: an entry whose `package` equals an
+already-loaded plugin id is an enable selector, and its `options` are dropped. To turn the status off, set
+`enabled: false` or add the selector `"-opencode-model-router.status"` after any explicit entry for the same plugin.
+The guide, with examples, is [`TUI_STATUS.md`](./TUI_STATUS.md).
 
 <!-- tui-status-options -->
 | Key | Type | Default | Values / range | Controls |
@@ -1068,8 +1068,8 @@ selector, and its `options` are dropped. To turn the status off, set `enabled: f
 | `runningRow` | `boolean` | `true` | `true \| false` | one row per running delegate above the main session's composer (`session.composer.top`) |
 | `maxRows` | `integer` | `4` | `[1, 20]` | the most running-delegate rows; the rest is `+<k> more` |
 
-A key with an invalid value keeps its default and unknown keys are ignored; one warning toast lists every problem, for
-example
+A key with an invalid value keeps its default and an unknown key is ignored; one warning toast names every invalid
+and every unknown key, for example
 `model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20); using defaults for those keys`.
 
 ## Validation rules

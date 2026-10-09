@@ -1,9 +1,11 @@
 # TUI status: model and effort in the OpenCode v2 TUI (#90)
 
 The package ships a TUI entry, `tui.ts` (plugin id `opencode-model-router.status`), that shows which model and effort
-the main session and its delegated sessions run with. It is **OpenCode v2 only**: it needs OpenCode 2.0.24 or later and
-was verified on 2.0.24, 2.0.25 and 2.0.26. On OpenCode v1 nothing on this page applies: v1 never loads `tui.ts`, and v1
-is in feature freeze ([AGENTS.md](../AGENTS.md#host-support-policy)).
+the main session and its delegated sessions run with. It is **OpenCode v2 only**: it needs OpenCode 2.0.24 or later.
+It was verified on 2.0.24, 2.0.25 and 2.0.26 with a scripted provider: the footer, its hand-off to the host's row when
+a variant is selected, the running-delegate row, the delegated session's row, and the router's effort. On OpenCode v1
+nothing on this page applies: v1 never loads `tui.ts`, and v1 is in feature freeze
+([AGENTS.md](../AGENTS.md#host-support-policy)).
 
 > **Every option and default:** [`CONFIG_REFERENCE.md`](./CONFIG_REFERENCE.md#tui-status-options-opencode-v2).
 >
@@ -28,42 +30,47 @@ Three views, each with its own option. Rows use the theme's muted text colour.
 ### Main session footer (`footer`)
 
 In a root session, and on the home prompt before a session exists, the plugin appends `effort <value>` to the prompt
-footer (slot `prompt.footer.status`), **only when no variant is selected**. When a variant is selected the host's own
-footer row already shows it, and the plugin adds nothing.
+footer (slot `prompt.footer.status`), **only when no variant is selected**. When a variant is selected (for example
+with `ctrl+t`, which cycles the model's variants), the host's own footer row shows it and the plugin's text goes away.
 
 `<value>` is the effort the router applied to the session's latest turn, when that turn ran on the prompt's current
-model without a variant. Otherwise the footer shows `effort default`. Root sessions normally show `effort default`
-(see [Limitations](#limitations)).
+model without a variant. Otherwise, and whenever the [effort channel](#where-the-effort-comes-from) has no answer, the
+footer shows `effort default`. Root sessions normally show `effort default` (see [Limitations](#limitations)).
 
 ### Delegated session view (`childView`)
 
-When you open a delegated (child) session, a row above the composer (slot `session.composer.top`) shows
-`<agent> · <model> · <effort>`:
+When you open a delegated (child) session, for example from the host's subagent picker, a row above the composer
+(slot `session.composer.top`) shows `<agent> · <model> · <effort>`:
 
 - `<agent>`: the session's agent, else the agent of its latest assistant message; left out when neither is known.
 - `<model>`: the model of the latest assistant message; before the first one, the child session's model. It is the
   model's display name from the model list, else its raw id, with ` (<providerID>)` appended when a model of another
   provider has the same name.
 - `<effort>`: the effort from the router's [effort channel](#where-the-effort-comes-from) when it was recorded for that
-  model; else the model's variant; else `default`. When the channel reports an effort and a variant that differ, the
-  row shows `<effort> (<variant>)`, for example `high (max)`.
+  model; else the variant of the message's (or, before the first message, the session's) model; else `default`. When
+  the channel recorded a variant for that turn too, the row shows `<effort> (<variant>)`, for example `high (max)`,
+  only when both values are set (not blank), neither is `default`, and they differ ignoring case (`high` and `High`
+  do not); otherwise it shows the channel's effort alone.
 
 The row stays empty until the session and a model for it are known.
 
 ### Running delegates (`runningRow`)
 
-In a root session, while delegates run, the same slot above the composer shows one `<agent> · <model> · <effort>` row
-per running delegate, with the same rules as the delegated session view. Delegates of delegates (grandchildren) are
-included. Rows are ordered by session creation, oldest first. At most `maxRows` rows are shown, then `+<k> more` for
-the rest. Nothing is shown when no delegate runs.
+In a root session, while delegates run, the same slot directly above the prompt box shows one
+`<agent> · <model> · <effort>` row per running delegate, with the same rules as the delegated session view, for example
+`fast · Claude Sonnet 5.5 · medium (low)`. A delegate's row appears as soon as its session runs, before its first
+token, and goes away when the delegate has answered. Delegates of delegates (grandchildren) are included when the host
+lists them in the root session's family. Rows are ordered by session creation, oldest first. At most `maxRows` rows are
+shown, then `+<k> more` for the rest. Nothing is shown when no delegate runs.
 
 A running delegate without an agent shows its session title, else `subagent`; one without any model yet shows the
 model `unknown` and the effort `default`.
 
 ### Width
 
-Rows are fitted to the terminal width minus 4 columns and never wrap. A row that is too long is cut with `…`: the agent
-shrinks first, then the model, and only then the whole row is cut from the end.
+Rows are fitted to the terminal width minus 4 columns and never wrap, with the sidebar open or closed. A row that is
+too long is cut with `…`: the first part (the agent, else the model) shrinks first, then the part after it, and only
+then the whole row is cut from the end.
 
 ## Turning it on
 
@@ -71,7 +78,7 @@ Nothing to do. OpenCode v2 loads the TUI entry of every package listed in the se
 `plugins`), so with the [v2 installation](../README.md#opencode-v2) (`"plugins": ["opencode-model-router"]`) the status
 loads with the default options. A `cli.json` entry is needed only to change the options.
 
-The TUI entry is loaded only when the server entry loads. The server entry needs the `@opencode-ai/plugin` peer
+The TUI entry is auto-loaded only when the server entry loads. The server entry needs the `@opencode-ai/plugin` peer
 dependency installed; npm installs peer dependencies by default.
 
 ## Options in `cli.json`
@@ -117,9 +124,11 @@ put this entry in `cli.json`.
 
 With `enabled: false`, or with `footer`, `childView` and `runningRow` all `false`, the plugin claims no slot.
 
-**Invalid options.** A key with an invalid value keeps its default, and unknown keys are ignored. The plugin then shows
-one warning toast that lists every problem, for example
-`model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20); using defaults for those keys`.
+**Invalid options.** A key with an invalid value keeps its default, and an unknown key is ignored. The plugin shows one
+warning toast that names every invalid and every unknown key, for example
+`model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20); using defaults for those keys`,
+or, for `{ "maxRows": "x", "compact": true }`,
+`model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20; unknown keys "compact"); using defaults for those keys`.
 When `options` is not an object, the whole set falls back to the defaults with
 `model-router status: invalid TUI options (not an object); using the defaults`.
 
@@ -142,18 +151,20 @@ Either way the server plugin keeps running; only the TUI status is off.
 
 ## Where the effort comes from
 
-The v2 server plugin records what its `chat.params` bridge applied to each session's latest turn, for root and
-delegated sessions alike: a tier's effort, a role dispatch's variant, or a ladder escalation's effort override. It
-answers the plugin rpc `opencode-model-router.effort`, method `effortOf({ sessionID })`, from that record (`{}` when it
-knows nothing about the session).
+For each session's latest turn, root and delegated sessions alike, the v2 server plugin records the effort the request
+carried after its `chat.params` bridge (a tier's effort, or a ladder escalation's effort override), with the turn's
+model and variant. It answers the plugin rpc `opencode-model-router.effort`, method `effortOf({ sessionID })`, from that
+record (`{}` when it knows nothing about the session). On the verified hosts the reported effort was the one the
+provider received.
 
-The TUI calls `effortOf` while a view needs the session: the first call right away, then again when the session's
-status or latest message changes, and every 5 s while the session runs. When the rpc is not available yet, or a call
-times out, it retries with backoff (1 s, doubling up to 30 s). After any other error the views use the message's
-variant for 30 s.
+The TUI calls `effortOf` while a view needs the session: the first call right away, then again, at most every 5 s,
+when the session's status or latest message changes, and every 5 s while the session runs. When the rpc is not available yet, or a call
+times out, it retries with backoff (1 s, doubling up to 30 s). After any other error it stops asking about that session
+for at least 30 s.
 
-Without the channel (an older router version, the rpc not registered, or an error) the views fall back to the
-message's variant.
+While the channel has no answer for a session (an older router version, the rpc not registered, an error, or a turn
+without an effort), the footer shows `effort default`, and the delegated session and running-delegate rows show the
+message's variant, else `default`.
 
 ## Limitations
 
@@ -168,14 +179,18 @@ message's variant.
   entry needs the `@opencode-ai/plugin` peer dependency installed. npm installs peer dependencies by default.
 - **No wrapping.** Rows are fitted to the terminal width minus 4 columns and do not wrap.
 - **The host resolves a package-name entry itself.** For an entry in `cli.json` that names the package, OpenCode
-  resolves the package on its own and may install it. A local directory path is used as it is.
+  resolves the package on its own and may install it, so the TUI can run another version of the package than the
+  server entry. A local directory path is used as it is and avoids this.
 
 ## Troubleshooting
 
-- **Is it loaded?** The `/plugins` dialog lists `TUI opencode-model-router.status`.
-- **A `plugin failed` marker in the footer.** The host could not load a plugin entry; see the next two items.
-- **`Cannot find package 'solid-js'`.** An old local checkout whose `tui.ts` re-exports the plugin without the `.ts`
-  extension. Update the checkout.
+- **Is it loaded?** The `/plugins` dialog lists `opencode-model-router.status` under `TUI`.
+- **It failed to load.** The host shows a `Plugin failed: <path>` toast, and in the `/plugins` dialog the entry under
+  `TUI` is marked `failed`, or `opencode-model-router.status` is missing. Check that the server entry loads (the peer
+  dependency) and that a local-path entry names the package directory.
+- **A `model-router status: render has no Solid owner: …` toast.** The views were then rendered once and do not
+  update: the rows show no router effort, and the running-delegates row stays hidden. Update OpenCode; if the toast
+  persists, report it.
 - **Nothing shows.** Check that the package is listed in `opencode.json` `plugins` and that the server entry loads (the
   peer dependency), that `cli.json` has no `"enabled": false` and no `"-opencode-model-router.status"`, and that a
   local-path entry names the package directory, not `tui.ts`. The footer shows nothing while a variant is selected,
