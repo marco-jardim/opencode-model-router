@@ -59,18 +59,20 @@ The row stays empty until the session and a model for it are known.
 In a root session, while delegates run, the same slot directly above the prompt box shows one
 `<agent> · <model> · <effort>` row per running delegate, with the same rules as the delegated session view, for example
 `fast · Claude Sonnet 5.5 · medium (low)`. A delegate's row appears as soon as its session runs, before its first
-token, and goes away when the delegate has answered. Delegates of delegates (grandchildren) are included when the host
-lists them in the root session's family. Rows are ordered by session creation, oldest first. At most `maxRows` rows are
-shown, then `+<k> more` for the rest. Nothing is shown when no delegate runs.
+token, and goes away when the delegate finishes (its session is no longer running). Delegates of delegates
+(grandchildren) are included when the host lists them in the root session's family. Rows are ordered by session
+creation, oldest first. At most `maxRows` rows are shown, then `+<k> more` for the rest. Nothing is shown when no
+delegate runs.
 
 A running delegate without an agent shows its session title, else `subagent`; one without any model yet shows the
 model `unknown` and the effort `default`.
 
 ### Width
 
-Rows are fitted to the terminal width minus 4 columns and never wrap, with the sidebar open or closed. A row that is
-too long is cut with `…`: the first part (the agent, else the model) shrinks first, then the part after it, and only
-then the whole row is cut from the end.
+Rows are fitted to the terminal width minus 4 columns, not to the composer, and never wrap. With the sidebar open, a
+row longer than the composer is not shortened to it and runs into the sidebar's columns (short rows were verified on
+one line with the sidebar open and closed). A row too long for that width is cut with `…`: the first part (the
+agent, else the model) shrinks first, then the part after it, and only then the whole row is cut from the end.
 
 ## Turning it on
 
@@ -125,10 +127,14 @@ put this entry in `cli.json`.
 With `enabled: false`, or with `footer`, `childView` and `runningRow` all `false`, the plugin claims no slot.
 
 **Invalid options.** A key with an invalid value keeps its default, and an unknown key is ignored. The plugin shows one
-warning toast that names every invalid and every unknown key, for example
-`model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20); using defaults for those keys`,
-or, for `{ "maxRows": "x", "compact": true }`,
-`model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20; unknown keys "compact"); using defaults for those keys`.
+warning toast that names every invalid and every unknown key. For `{ "maxRows": "x" }` and for
+`{ "maxRows": "x", "compact": true }` the toasts are:
+
+```text
+model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20); using defaults for those keys
+model-router status: invalid TUI options ("maxRows" must be an integer from 1 to 20; unknown keys "compact"); using defaults for those keys
+```
+
 When `options` is not an object, the whole set falls back to the defaults with
 `model-router status: invalid TUI options (not an object); using the defaults`.
 
@@ -158,9 +164,9 @@ record (`{}` when it knows nothing about the session). On the verified hosts the
 provider received.
 
 The TUI calls `effortOf` while a view needs the session: the first call right away, then again, at most every 5 s,
-when the session's status or latest message changes, and every 5 s while the session runs. When the rpc is not available yet, or a call
-times out, it retries with backoff (1 s, doubling up to 30 s). After any other error it stops asking about that session
-for at least 30 s.
+when the session's status or latest message changes, and every 5 s while the session runs. When the rpc is not
+available yet, or a call times out, it retries with backoff (1 s, doubling up to 30 s). After any other error it stops
+asking about that session for at least 30 s.
 
 While the channel has no answer for a session (an older router version, the rpc not registered, an error, or a turn
 without an effort), the footer shows `effort default`, and the delegated session and running-delegate rows show the
@@ -177,20 +183,24 @@ message's variant, else `default`.
   a render without a Solid owner) are toasts.
 - **Auto-load needs the server entry.** The TUI entry is auto-loaded only when the server entry loads, and the server
   entry needs the `@opencode-ai/plugin` peer dependency installed. npm installs peer dependencies by default.
-- **No wrapping.** Rows are fitted to the terminal width minus 4 columns and do not wrap.
+- **Terminal width, not the composer.** Rows are fitted to the terminal width minus 4 columns, not to the composer,
+  and never wrap. With the sidebar open, a row longer than the composer is not shortened to it and runs into the
+  sidebar's columns (short rows were verified on one line with the sidebar open and closed).
 - **The host resolves a package-name entry itself.** For an entry in `cli.json` that names the package, OpenCode
   resolves the package on its own and may install it, so the TUI can run another version of the package than the
   server entry. A local directory path is used as it is and avoids this.
 
 ## Troubleshooting
 
-- **Is it loaded?** The `/plugins` dialog lists `opencode-model-router.status` under `TUI`.
-- **It failed to load.** The host shows a `Plugin failed: <path>` toast, and in the `/plugins` dialog the entry under
-  `TUI` is marked `failed`, or `opencode-model-router.status` is missing. Check that the server entry loads (the peer
-  dependency) and that a local-path entry names the package directory.
+- **Is it loaded?** The `/plugins` dialog shows a `TUI opencode-model-router.status` row
+  (`TUI opencode-model-router.status local` for a local-path entry).
+- **It failed to load.** Observed on 2.0.24–2.0.26 when the TUI entry failed to load: a toast
+  `Plugin failed: <path>` (for example `Plugin failed: C:\Users\…`), the footer marker `⊙ 1 plugin failed /plugins`,
+  and, in the `/plugins` dialog under `TUI`, a row `x <path> failed, local` instead of the row above. Check that the
+  server entry loads (the peer dependency) and that a local-path entry names the package directory.
 - **A `model-router status: render has no Solid owner: …` toast.** The views were then rendered once and do not
-  update: the rows show no router effort, and the running-delegates row stays hidden. Update OpenCode; if the toast
-  persists, report it.
+  update: the rows show no router effort, and the running-delegates row stays hidden. The toast's named cause (a
+  local `node_modules/solid-js`) was not reproduced. Update OpenCode; if the toast persists, report it.
 - **Nothing shows.** Check that the package is listed in `opencode.json` `plugins` and that the server entry loads (the
   peer dependency), that `cli.json` has no `"enabled": false` and no `"-opencode-model-router.status"`, and that a
   local-path entry names the package directory, not `tui.ts`. The footer shows nothing while a variant is selected,

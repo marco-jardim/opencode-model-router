@@ -1167,7 +1167,7 @@ On OpenCode v2 (2.0.24 or later) the package also ships a TUI entry, `tui.ts`, t
 
 - **Main session footer:** `effort <value>` in the prompt footer, only when no variant is selected (the host's footer row already shows a selected variant). Root sessions normally show `effort default`, because the router applies no effort to primary agents.
 - **Delegated session view:** `<agent> · <model> · <effort>` above the composer.
-- **Main session while delegates run:** one `<agent> · <model> · <effort>` row per running delegate directly above the prompt box, from before the delegate's first token until it has answered; at most `maxRows` rows, then `+<k> more`; nothing when no delegate runs.
+- **Main session while delegates run:** one `<agent> · <model> · <effort>` row per running delegate directly above the prompt box, from before the delegate's first token until the delegate finishes (its session is no longer running); at most `maxRows` rows, then `+<k> more`; nothing when no delegate runs.
 
 The effort is what the router applied to the session's latest turn, reported by the server plugin over the rpc `opencode-model-router.effort`. While that channel has no answer, the footer shows `effort default` and the delegate rows show the message's variant.
 
