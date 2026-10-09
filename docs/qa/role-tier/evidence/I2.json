@@ -1,6 +1,6 @@
 {
   "test": "I2",
-  "recordedAt": "2026-10-08T22:30:12.237Z",
+  "recordedAt": "2026-10-09T02:27:12.608Z",
   "observed": {
     "cases": [
       {
@@ -31,8 +31,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498581483:5b21b01d9cf54094:1",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (2.06 ratio); role @explorer on fast in fast..medium",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512771659:c253fe1b25bc7a34:1",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (2.045 ratio); role @explorer on fast in fast..medium",
           "role": "explorer",
           "tier": "fast",
           "grant": [
@@ -90,8 +90,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498584154:5b21b01d9cf54094:2",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (11.244 ratio); role @explorer on medium in fast..medium [default:clamp:ceiling]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512774380:c253fe1b25bc7a34:2",
+          "reason": "kept:margin: C(cheapest)=10.8175 (design|role:explorer|anthropic/claude-sonnet-5-5#low, gated by evidence) is not < (1 − 0.2)·C(chosen)=9.4 ratio; role @explorer on medium in fast..medium [default:clamp:ceiling]",
           "role": "explorer",
           "tier": "medium",
           "grant": [
@@ -142,8 +142,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498586359:5b21b01d9cf54094:3",
-          "reason": "kept:margin: C(best)=0.0058 is not < (1 − 0.2)·C(chosen)=0.0053 usd; role @researcher on fast in fast..medium",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512776866:c253fe1b25bc7a34:3",
+          "reason": "kept:margin: C(best)=0.0064 is not < (1 − 0.2)·C(chosen)=0.0053 usd; role @researcher on fast in fast..medium",
           "role": "researcher",
           "tier": "fast",
           "grant": [
@@ -176,7 +176,7 @@
       },
       {
         "agent": "runner",
-        "fields": "class=mechanical risk=low scope=single root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "fields": "class=mechanical risk=low scope=single root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-i2-u1QZB3\\wt-1\"",
         "minFloor": "fast",
         "task": "run the smoke marker script",
         "child": "runner",
@@ -203,8 +203,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498588281:5b21b01d9cf54094:4",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.58 ratio); role @runner on fast in fast..medium [edit is outside this role — use `implementer`]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512778989:c253fe1b25bc7a34:4",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.535 ratio); role @runner on fast in fast..medium [edit is outside this role — use `implementer`]",
           "role": "runner",
           "tier": "fast",
           "grant": [
@@ -239,7 +239,7 @@
       },
       {
         "agent": "implementer",
-        "fields": "class=mechanical risk=low scope=single needs=edit root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "fields": "class=mechanical risk=low scope=single needs=edit root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-i2-u1QZB3\\wt-1\"",
         "minFloor": "medium",
         "task": "rename one local variable in parser.ts",
         "child": "implementer",
@@ -268,8 +268,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498590287:5b21b01d9cf54094:5",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0048 usd); role @implementer on medium in medium..heavy [default:clamp:floor]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512781635:c253fe1b25bc7a34:5",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.005 usd); role @implementer on medium in medium..heavy [default:clamp:floor]",
           "role": "implementer",
           "tier": "medium",
           "grant": [
@@ -306,7 +306,7 @@
       },
       {
         "agent": "implementer",
-        "fields": "class=implement risk=high scope=single needs=edit root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "fields": "class=implement risk=high scope=single needs=edit root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-i2-u1QZB3\\wt-1\"",
         "minFloor": "heavy",
         "task": "rework the tokenizer of parser.ts",
         "child": "implementer",
@@ -335,8 +335,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498592153:5b21b01d9cf54094:6",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (25.37 ratio); role @implementer on heavy in heavy..heavy [default:clamp:floor]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512783838:c253fe1b25bc7a34:6",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (26 ratio); role @implementer on heavy in heavy..heavy [default:clamp:floor]",
           "role": "implementer",
           "tier": "heavy",
           "grant": [
@@ -400,8 +400,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498594053:5b21b01d9cf54094:7",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (22.5763 ratio); role @reviewer on heavy in heavy..heavy [default:clamp:floor]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512786084:c253fe1b25bc7a34:7",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (22.25 ratio); role @reviewer on heavy in heavy..heavy [default:clamp:floor]",
           "role": "reviewer",
           "tier": "heavy",
           "grant": [
@@ -460,8 +460,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498595816:5b21b01d9cf54094:8",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0052 usd); role @architect on medium in medium..heavy [default:clamp:floor]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512788437:c253fe1b25bc7a34:8",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0053 usd); role @architect on medium in medium..heavy [default:clamp:floor]",
           "role": "architect",
           "tier": "medium",
           "grant": [
@@ -519,8 +519,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498597652:5b21b01d9cf54094:9",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0122 usd); role @architect on heavy in medium..heavy",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512790699:c253fe1b25bc7a34:9",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0131 usd); role @architect on heavy in medium..heavy",
           "role": "architect",
           "tier": "heavy",
           "grant": [
@@ -579,8 +579,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498599632:5b21b01d9cf54094:10",
-          "reason": "kept:margin: C(best)=0.0048 is not < (1 − 0.2)·C(chosen)=0.0044 usd; role @general on fast in fast..heavy",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512793185:c253fe1b25bc7a34:10",
+          "reason": "kept:margin: C(best)=0.005 is not < (1 − 0.2)·C(chosen)=0.0043 usd; role @general on fast in fast..heavy",
           "role": "general",
           "tier": "fast",
           "grant": [
@@ -612,7 +612,7 @@
       },
       {
         "agent": "general",
-        "fields": "class=implement risk=low scope=single needs=edit,shell root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\wt-1\"",
+        "fields": "class=implement risk=low scope=single needs=edit,shell root=\"<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-i2-u1QZB3\\wt-1\"",
         "minFloor": "heavy",
         "task": "change parse and run the checks",
         "child": "general",
@@ -642,8 +642,8 @@
           }
         ],
         "row": {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498601525:5b21b01d9cf54094:11",
-          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.011 usd); role @general on heavy in heavy..heavy [default:clamp:floor; raw shell is outside roles mode — dispatch a tier agent explicitly]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512795720:c253fe1b25bc7a34:11",
+          "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (0.0109 usd); role @general on heavy in heavy..heavy [default:clamp:floor; raw shell is outside roles mode — dispatch a tier agent explicitly]",
           "role": "general",
           "tier": "heavy",
           "grant": [
@@ -707,8 +707,8 @@
         }
       ],
       "row": {
-        "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498603478:5b21b01d9cf54094:12",
-        "reason": "kept:pinned: pinned dispatch (best implement|role:implementer|anthropic/claude-opus-5-5#xhigh at 0.0108 usd); role @implementer on heavy in medium..heavy [pinned:heavy]",
+        "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512798012:c253fe1b25bc7a34:12",
+        "reason": "kept:pinned: pinned dispatch (best implement|role:implementer|anthropic/claude-opus-5-5#xhigh at 0.0105 usd); role @implementer on heavy in medium..heavy [pinned:heavy]",
         "role": "implementer",
         "tier": "heavy",
         "grant": [
@@ -743,7 +743,7 @@
       }
     },
     "keptRung": {
-      "childID": "ses_ee25cb244ffebMJNvVvUBdgWcD",
+      "childID": "ses_ee1841ad1ffedUpwEQzrllldVy",
       "requests": [
         {
           "seq": 38,
@@ -770,8 +770,8 @@
       ],
       "rows": [
         {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498605640:5b21b01d9cf54094:13",
-          "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:pinned: pinned dispatch (best mechanical|role:implementer|anthropic/claude-opus-5-5#xhigh at 0.0098 usd); role @implementer on heavy in heavy..heavy [default:clamp:floor; pinned:heavy]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512800539:c253fe1b25bc7a34:13",
+          "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:pinned: pinned dispatch (best implement|role:implementer|anthropic/claude-opus-5-5#xhigh at 0.0109 usd); role @implementer on heavy in heavy..heavy [default:clamp:floor; pinned:heavy]",
           "role": "implementer",
           "tier": "heavy",
           "grant": [
@@ -791,7 +791,7 @@
             "effective": "none"
           },
           "facts": {
-            "class": "mechanical",
+            "class": "implement",
             "risk": "medium",
             "scope": "single",
             "needs": [
@@ -801,7 +801,7 @@
             "source": "route-line"
           },
           "resume": true,
-          "childSessionID": "ses_ee25cb244ffebMJNvVvUBdgWcD",
+          "childSessionID": "ses_ee1841ad1ffedUpwEQzrllldVy",
           "explore": false,
           "propensity": 1,
           "pinned": true,
@@ -831,10 +831,10 @@
           "tier": "fast"
         }
       ],
-      "parentText": "<subagent sessionID=\"ses_ee25ca3a8ffeVx9HxN99VGv23s\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\project\\i2-never-created.txt\nNEXT: resume the same sessionID (\"ses_ee25ca3a8ffeVx9HxN99VGv23s\") with @explorer and the findings; the router raises it to medium from fast; set neither `model` nor `tier=`; do not start a new task.\nCHILD_OK\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-i2-cAVzKf\\project\\i2-never-created.txt\nNEXT: resume the same sessionID (\"ses_ee25ca3a8ffeVx9HxN99VGv23s\") with @explorer and the findings; the router raises it to medium from fast; set neither `model` nor `tier=`; do not start a new task.",
+      "parentText": "<subagent sessionID=\"ses_ee1840810ffeaWdmqD3xcMh7Cs\" state=\"completed\">\nCHILD_OK\n</subagent>\n\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-i2-u1QZB3\\project\\i2-never-created.txt\nNEXT: resume the same sessionID (\"ses_ee1840810ffeaWdmqD3xcMh7Cs\") with @explorer and the findings; the router raises it to medium from fast; set neither `model` nor `tier=`; do not start a new task.\nCHILD_OK\n\n[router ⚠ NOT ACCEPTED] The delegated result was not accepted by independent verification:\n- file not found: <home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-i2-u1QZB3\\project\\i2-never-created.txt\nNEXT: resume the same sessionID (\"ses_ee1840810ffeaWdmqD3xcMh7Cs\") with @explorer and the findings; the router raises it to medium from fast; set neither `model` nor `tier=`; do not start a new task.",
       "row": {
-        "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498607347:5b21b01d9cf54094:14",
-        "reason": "kept:pinned: pinned dispatch (best search|role:explorer|anthropic/claude-sonnet-5-5#medium at 0.004 usd); role @explorer on fast in fast..medium [pinned:fast]",
+        "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512802786:c253fe1b25bc7a34:14",
+        "reason": "kept:pinned: pinned dispatch (best search|role:explorer|anthropic/claude-sonnet-5-5#low at 0.005 usd); role @explorer on fast in fast..medium [pinned:fast]",
         "role": "explorer",
         "tier": "fast",
         "grant": [
@@ -864,7 +864,7 @@
       }
     },
     "raised": {
-      "childID": "ses_ee25ca3a8ffeVx9HxN99VGv23s",
+      "childID": "ses_ee1840810ffeaWdmqD3xcMh7Cs",
       "requests": [
         {
           "seq": 44,
@@ -888,8 +888,8 @@
       ],
       "rows": [
         {
-          "decisionID": "ses_ee25d1ad4ffeaQ9FoNLiVGNAKs:1791498609208:5b21b01d9cf54094:15",
-          "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0046 usd); role @explorer on medium in medium..medium [default:clamp:floor; resume:off-ladder; raise:verification-fail:medium]",
+          "decisionID": "ses_ee1849563ffevhlMIKomFbakdH:1791512805059:c253fe1b25bc7a34:15",
+          "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0049 usd); role @explorer on medium in medium..medium [default:clamp:floor; resume:off-ladder; acceptance carried from the resumed dispatch; raise:verification-fail:medium]",
           "role": "explorer",
           "tier": "medium",
           "grant": [
@@ -903,7 +903,7 @@
             "floor:floorTier"
           ],
           "detection": {
-            "effective": "none"
+            "effective": "deterministic"
           },
           "facts": {
             "class": "search",
@@ -914,7 +914,7 @@
             "source": "route-line"
           },
           "resume": true,
-          "childSessionID": "ses_ee25ca3a8ffeVx9HxN99VGv23s",
+          "childSessionID": "ses_ee1840810ffeaWdmqD3xcMh7Cs",
           "explore": false,
           "propensity": 1,
           "pinned": false,

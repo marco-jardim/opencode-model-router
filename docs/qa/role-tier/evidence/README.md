@@ -4,6 +4,9 @@ Redacted observations of the real-host smoke `test/smoke/roles.smoke.test.ts`, *
 isolated OpenCode **v2.0.24** host, 7 of 7 tests passed. The branch includes `rta/main` with the DF2-F1 and grader-signal fixes,
 and the QA round 1 additions. The phase report is [`../phase-p31.md`](../phase-p31.md).
 
+The files were regenerated in P3.3 from a re-run on `rta/main` @ `952de94` (all P3.3 global QA code fixes merged), again 7 of 7
+on OpenCode v2.0.24; see [`../global.md`](../global.md).
+
 Each file is the JSON one test writes: `{ "test", "recordedAt", "observed" }`. The assertions live in the test; the files keep
 what the host did so a reviewer can check the claims without rerunning.
 - **Placeholders:** `<home>` and `<user>` stand for the redacted home directory and user-name-like segments of temp paths.

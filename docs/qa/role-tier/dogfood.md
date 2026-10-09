@@ -147,6 +147,30 @@ The 25-call tier budget is unchanged in tiers mode (E7 is addressed by role budg
 | negative: read `C:\Windows\win.ini` and the base checkout from the worktree root | explorer | PASS: both denied by the router ("outside this dispatch's work root"); a parallel-call re-probe showed each refusal names its own path (the first probe's child misreported the second message) |
 
 Self-test findings (to fix in Wave 3, P3.3 fix branches; plan §0.10):
-- **DF2-F1 (major):** a role dispatch's `[acceptance]` checks run in the session directory instead of the dispatch's work root, so deterministic checks on a worktree root are unverifiable while the router still treats detection as deterministic for the floor. Workaround until fixed: every acceptance block carries `cwd: <work root>`.
-- **DF2-F2 (minor):** the rules classifier attributes `edit` to `class=other` prompts that contain no edit vocabulary (3/3 general probes), which makes the authority ladder rarely reachable live; investigate the matched term.
+- **DF2-F1 (major) — fixed** in `rta/p33-fix-1` (role checks run in the bound work root; resumes keep it) and proven on the real host (P3.1 smoke): a role dispatch's `[acceptance]` checks run in the session directory instead of the dispatch's work root, so deterministic checks on a worktree root are unverifiable while the router still treats detection as deterministic for the floor. Workaround until fixed: every acceptance block carries `cwd: <work root>`.
+- **DF2-F2 — fixed** as QA-G-B-3 (rated major) in `rta/p33-fix-4`: the classifier ran with the session directory as cwd (in-root absolute paths became `external_dir`) and a class-implied `edit` (from "a new file" → `implement`) survived `class=other`; dynamic roles now classify in the bound root and `needs=` replaces the text needs. Original note: the rules classifier attributes `edit` to `class=other` prompts that contain no edit vocabulary (3/3 general probes), which makes the authority ladder rarely reachable live; investigate the matched term.
 - Observation: classifier noise also gave the explorer `shell` and the researcher `risk=high`; harmless for fixed roles.
+
+## Wave 3 — executed through role agents (2026-10-08T19:12Z → 2026-10-09)
+
+All P3.1, P3.2 and P3.3 work was dispatched as role agents (explorer, researcher, runner, implementer, reviewer, general);
+no tier agent was named. Decision rows from a read-only copy of the live log (`decisions.jsonl`, rows with a role since
+19:12Z): 390 role rows.
+
+| Role, tier (dispatch rows with a grant) | Count |
+|---|---|
+| implementer, heavy (mostly `tier=heavy pin`) | 82 |
+| implementer, medium | 8 |
+| reviewer, heavy | 47 |
+| explorer, fast / medium | 26 / 2 |
+| researcher, fast | 10 |
+| general, medium / heavy | 3 / 1 |
+| runner, fast | 2 |
+
+Signal and binding notes: `note:binding:exact` 143, unknown bindings 0; `verdict:pass` 36, `verdict:fail` 16,
+`incomplete:fail` 13, `budget:none` 1. These rows predate the P3.3 fixes (the live host still runs `ae67429`), so grader
+verdicts appear as `verdict` rows (fixed in `rta/p33-fix-2`) and advisory budget returns as `incomplete` (fixed as QA-G-A3-1).
+
+Observed in use: the router's grader timed out (60 s) on most large fix reports and twice rejected results on truncated
+criteria; heavy children died on transport errors and were resumed by session id; resuming a reviewer bound to one root
+could not read a sibling worktree (expected: a resume keeps its bound root).

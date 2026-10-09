@@ -1,60 +1,81 @@
 {
   "scenario": "6-v1-untouched",
   "host": "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin",
-  "runId": "f4083c26-705d-4070-8558-9326793a280c",
-  "recordedAt": "2026-10-06T23:52:55.744Z",
+  "runId": "d59118c8-d257-407b-9758-0143a65d2a13",
+  "recordedAt": "2026-10-09T02:32:11.622Z",
   "harness": {
-    "headSha": "2979423676eee1df3da15005d0b661b1eddeec73",
+    "headSha": "952de94d8dd9cabcf420dbd8904d4748ed927d75",
     "blobShas": {
-      "test/smoke/routing-engine.smoke.test.ts": "126867764c605441b797450582c1e63125a36027",
-      "test/smoke/helpers/routing-host.ts": "4a6e339cb1ba4dfafef27b4cf440c37caffdd5b6"
+      "test/smoke/routing-engine.smoke.test.ts": "173ec828ba5001b63b1db22f225e02e6c3d49dd0",
+      "test/smoke/helpers/routing-host.ts": "53f5840cbc27b688c758e135dcfcbe5b387a1fc9"
     },
     "uncommittedChanges": false
   },
-  "expectation": "Phase 3.2 adds files only: no existing test/smoke file (the v1 suite smoke:keyless runs registration, subagent-tiers, deferred-catalog, depth-effort and the scripted-provider helper test) changed since the base commit 71815eb, and package.json gained exactly two lines, `smoke:routing` and `smoke:v1`, the alias of `smoke:keyless` behind a preflight that fails clearly when `opencode` on PATH is not 1.x (QA-3.2-11, QA-3.2-R2-2). The suite itself was run unchanged against OpenCode 1.18.34 (see phase-3.2.md and 6-smoke-keyless.log.txt).",
+  "expectation": "The v1 entry points are unchanged since bd1ecd1 (a commit on the #84 rta line, parent 66dcdff; for every guarded path it equals master before #84, eeab36b, except the FAST_MODEL literal of subagent-tiers.smoke.test.ts aligned with #83's Haiku fast tier — see V1_BASE_COMMIT): the v1 suite smoke:keyless runs (registration, subagent-tiers, deferred-catalog, depth-effort, the scripted-provider helper and its test, fetch-safe-port), vitest.smoke.config.ts, its temp guard test/setup/smoke-tmp-guard.ts, scripts/smoke-v1-preflight.mjs, and the package.json scripts smoke:keyless and smoke:v1 (the alias of smoke:keyless behind a preflight that fails clearly when `opencode` on PATH is not 1.x, QA-3.2-11, QA-3.2-R2-2). Repinned by #84 P3.1 from the stale Phase 3.2 base 71815eb. Every other test/smoke change since the v1 base is recorded, not asserted.",
   "observed": {
-    "baseCommit": "71815eb",
-    "changedSinceBase": [
-      "A\ttest/smoke/helpers/routing-host.ts",
-      "A\ttest/smoke/routing-engine.smoke.test.ts"
-    ],
-    "modifiedOrDeleted": [],
-    "packageJsonChangedLines": [
-      "+    \"smoke:v1\": \"node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless\",",
-      "+    \"smoke:routing\": \"cross-env RUN_OC_SMOKE_ROUTING=1 vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts\","
-    ],
-    "v1SuiteFiles": [
+    "v1BaseCommit": "bd1ecd1",
+    "phase32BaseCommit": "71815eb",
+    "v1Paths": [
       {
-        "file": "registration.smoke.test.ts",
+        "file": "test/smoke/registration.smoke.test.ts",
         "changed": false
       },
       {
-        "file": "subagent-tiers.smoke.test.ts",
+        "file": "test/smoke/subagent-tiers.smoke.test.ts",
         "changed": false
       },
       {
-        "file": "deferred-catalog.smoke.test.ts",
+        "file": "test/smoke/deferred-catalog.smoke.test.ts",
         "changed": false
       },
       {
-        "file": "depth-effort.smoke.test.ts",
+        "file": "test/smoke/depth-effort.smoke.test.ts",
         "changed": false
       },
       {
-        "file": "helpers/scripted-provider.ts",
+        "file": "test/smoke/helpers/scripted-provider.ts",
         "changed": false
       },
       {
-        "file": "helpers/scripted-provider.test.ts",
+        "file": "test/smoke/helpers/scripted-provider.test.ts",
         "changed": false
       },
       {
-        "file": "helpers/fetch-safe-port.ts",
+        "file": "test/smoke/helpers/fetch-safe-port.ts",
+        "changed": false
+      },
+      {
+        "file": "vitest.smoke.config.ts",
+        "changed": false
+      },
+      {
+        "file": "test/setup/smoke-tmp-guard.ts",
+        "changed": false
+      },
+      {
+        "file": "scripts/smoke-v1-preflight.mjs",
         "changed": false
       }
     ],
-    "externalRun": "npm run smoke:keyless with OpenCode 1.18.34 first on PATH: 5 files passed, 27 tests passed, 11 skipped (the v2 describes); log in 6-smoke-keyless.log.txt"
+    "v1Scripts": [
+      {
+        "name": "smoke:keyless",
+        "base": "cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts test/smoke/deferred-catalog.smoke.test.ts test/smoke/depth-effort.smoke.test.ts test/smoke/helpers/scripted-provider.test.ts",
+        "now": "cross-env RUN_OC_SMOKE_KEYLESS=1 vitest run --config vitest.smoke.config.ts test/smoke/registration.smoke.test.ts test/smoke/subagent-tiers.smoke.test.ts test/smoke/deferred-catalog.smoke.test.ts test/smoke/depth-effort.smoke.test.ts test/smoke/helpers/scripted-provider.test.ts"
+      },
+      {
+        "name": "smoke:v1",
+        "base": "node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless",
+        "now": "node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless"
+      }
+    ],
+    "otherSmokeChangesSinceV1Base": [
+      "M\ttest/smoke/helpers/routing-host.ts",
+      "A\ttest/smoke/roles.smoke.test.ts",
+      "M\ttest/smoke/routing-engine.smoke.test.ts"
+    ],
+    "externalRun": "npm run smoke:v1 (= preflight + smoke:keyless) with OpenCode 1.18.35 first on PATH: exit 0 (#84 P3.1, docs/qa/role-tier/phase-p31.md); earlier: smoke:keyless with OpenCode 1.18.34, 5 files passed (phase-3.2.md)"
   },
-  "assertionResult": "PASS: 2 path(s) changed under test/smoke since 71815eb (all added: true); package.json changed lines: +    \"smoke:v1\": \"node scripts/smoke-v1-preflight.mjs && npm run smoke:keyless\", | +    \"smoke:routing\": \"cross-env RUN_OC_SMOKE_ROUTING=1 vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts\",",
+  "assertionResult": "PASS: v1 paths changed since bd1ecd1: none; smoke:keyless/smoke:v1 unchanged: true",
   "notes": []
 }

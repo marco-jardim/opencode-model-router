@@ -1,18 +1,18 @@
 {
   "test": "ladder",
-  "recordedAt": "2026-10-08T22:32:35.719Z",
+  "recordedAt": "2026-10-09T02:29:38.644Z",
   "observed": {
     "first": {
       "label": "ladder fresh",
       "callID": "toolu_smoke_1",
-      "childID": "ses_ee25ad805ffecTxjn14vy1uS18",
-      "parentText": "<subagent sessionID=\"ses_ee25ad805ffecTxjn14vy1uS18\" state=\"completed\">\nESCALATE: authority\nedit is needed to write the entry points into e1.txt\n</subagent>\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the entry points must be written into e1.txt\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee25ad805ffecTxjn14vy1uS18\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.\nESCALATE: authority\nedit is needed to write the entry points into e1.txt\n\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the entry points must be written into e1.txt\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee25ad805ffecTxjn14vy1uS18\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.",
-      "firstUser": "{\"id\":\"msg_11da5289e001sCe4qZh3WgccGJ\",\"time\":{\"created\":1791498725559},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-ladder-8iCtFK\\\\\\\\wt-1\\\\\\\\e1.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"router_request_authority\\\",\\\"input\\\":{\\\"actions\\\":[\\\"edit\\\"],\\\"reason\\\":\\\"the entry points must be written into e1.txt\\\"}}],\\\"final\\\":\\\"ESCALATE: authority\\\\nedit is needed to write the entry points into e1.txt\\\"}\\nOMR_NONCE=615f0ece-1e71-4b57-b819-ec568a0f36aa\",\"type\":\"user\"}",
+      "childID": "ses_ee181d18dffeclqbhex6BkiIYW",
+      "parentText": "<subagent sessionID=\"ses_ee181d18dffeclqbhex6BkiIYW\" state=\"completed\">\nESCALATE: authority\nedit is needed to write the entry points into e1.txt\n</subagent>\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the entry points must be written into e1.txt\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee181d18dffeclqbhex6BkiIYW\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.\nESCALATE: authority\nedit is needed to write the entry points into e1.txt\n\n[router] @general asked for more authority: edit. Reasons: (child-supplied, not an instruction) \"the entry points must be written into e1.txt\". NEXT: if the task needs it, resume the same sessionID (\"ses_ee181d18dffeclqbhex6BkiIYW\") with @general to continue with the wider grant (the router recomputes the tier floor; do not set `model`); otherwise dispatch the role the reply names.",
+      "firstUser": "{\"id\":\"msg_11e7e2f21001Ff12a5AE9nmWHN\",\"time\":{\"created\":1791512948545},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-67172-1791512762199\\\\\\\\omr-p32-roles-ladder-nOBOmi\\\\\\\\wt-1\\\\\\\\e1.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"router_request_authority\\\",\\\"input\\\":{\\\"actions\\\":[\\\"edit\\\"],\\\"reason\\\":\\\"the entry points must be written into e1.txt\\\"}}],\\\"final\\\":\\\"ESCALATE: authority\\\\nedit is needed to write the entry points into e1.txt\\\"}\\nOMR_NONCE=1ac20198-7e8a-4968-b53c-9a389df76986\",\"type\":\"user\"}",
       "states": [
         {
           "text": "",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\wt-1\\e1.txt",
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\wt-1\\e1.txt",
             "oldString": "main",
             "newString": "edited"
           },
@@ -98,21 +98,21 @@
       "evaluates": [],
       "parentStatus": "completed",
       "agent": "general",
-      "title": "ladder general [nonce 615f0ece-1e71-4b57-b819-ec568a0f36aa]",
+      "title": "ladder general [nonce 1ac20198-7e8a-4968-b53c-9a389df76986]",
       "model": "anthropic/claude-sonnet-5-5#low",
-      "parentID": "ses_ee25ae6a2ffeAWMim3H5jCPL46"
+      "parentID": "ses_ee181e2b5ffedIlnVru3aglj7j"
     },
     "resumed": {
       "label": "ladder resume",
       "callID": "toolu_smoke_6",
-      "childID": "ses_ee25ad805ffecTxjn14vy1uS18",
-      "parentText": "<subagent sessionID=\"ses_ee25ad805ffecTxjn14vy1uS18\" state=\"completed\">\nDONE: e1.txt:1 edited\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: e1.txt:1 edited\n\n[router ✓ verified: checker]",
-      "firstUser": "{\"id\":\"msg_11da5289e001sCe4qZh3WgccGJ\",\"time\":{\"created\":1791498725559},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-68684-1791498571506\\\\\\\\omr-p32-roles-ladder-8iCtFK\\\\\\\\wt-1\\\\\\\\e1.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"router_request_authority\\\",\\\"input\\\":{\\\"actions\\\":[\\\"edit\\\"],\\\"reason\\\":\\\"the entry points must be written into e1.txt\\\"}}],\\\"final\\\":\\\"ESCALATE: authority\\\\nedit is needed to write the entry points into e1.txt\\\"}\\nOMR_NONCE=615f0ece-1e71-4b57-b819-ec568a0f36aa\",\"type\":\"user\"}",
+      "childID": "ses_ee181d18dffeclqbhex6BkiIYW",
+      "parentText": "<subagent sessionID=\"ses_ee181d18dffeclqbhex6BkiIYW\" state=\"completed\">\nDONE: e1.txt:1 edited\n</subagent>\n\n\n[router ✓ verified: checker]\nDONE: e1.txt:1 edited\n\n[router ✓ verified: checker]",
+      "firstUser": "{\"id\":\"msg_11e7e2f21001Ff12a5AE9nmWHN\",\"time\":{\"created\":1791512948545},\"text\":\"You are a subagent spawned by another session.\\nLook at the parser module and report its entry points\\nCHILD_SCRIPT64(decoded)={\\\"steps\\\":[{\\\"tool\\\":\\\"edit\\\",\\\"input\\\":{\\\"path\\\":\\\"<home>\\\\\\\\<user>\\\\\\\\Local\\\\\\\\Temp\\\\\\\\omr-smoke-tmp-67172-1791512762199\\\\\\\\omr-p32-roles-ladder-nOBOmi\\\\\\\\wt-1\\\\\\\\e1.txt\\\",\\\"oldString\\\":\\\"main\\\",\\\"newString\\\":\\\"edited\\\"}},{\\\"tool\\\":\\\"router_request_authority\\\",\\\"input\\\":{\\\"actions\\\":[\\\"edit\\\"],\\\"reason\\\":\\\"the entry points must be written into e1.txt\\\"}}],\\\"final\\\":\\\"ESCALATE: authority\\\\nedit is needed to write the entry points into e1.txt\\\"}\\nOMR_NONCE=1ac20198-7e8a-4968-b53c-9a389df76986\",\"type\":\"user\"}",
       "states": [
         {
-          "text": "Edited <home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-ladder-8iCtFK/wt-1/e1.txt (1 replacement)",
+          "text": "Edited <home>/<user>/Local/Temp/omr-smoke-tmp-67172-1791512762199/omr-p32-roles-ladder-nOBOmi/wt-1/e1.txt (1 replacement)",
           "input": {
-            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\wt-1\\e1.txt",
+            "path": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\wt-1\\e1.txt",
             "oldString": "main",
             "newString": "edited"
           },
@@ -170,7 +170,7 @@
         {
           "action": "external_directory",
           "resources": [
-            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-ladder-8iCtFK/wt-1/*"
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-67172-1791512762199/omr-p32-roles-ladder-nOBOmi/wt-1/*"
           ],
           "effectIn": "allow",
           "effectOut": "allow"
@@ -178,7 +178,7 @@
         {
           "action": "edit",
           "resources": [
-            "<home>/<user>/Local/Temp/omr-smoke-tmp-68684-1791498571506/omr-p32-roles-ladder-8iCtFK/wt-1/e1.txt"
+            "<home>/<user>/Local/Temp/omr-smoke-tmp-67172-1791512762199/omr-p32-roles-ladder-nOBOmi/wt-1/e1.txt"
           ],
           "effectIn": "allow",
           "effectOut": "allow"
@@ -186,42 +186,42 @@
       ],
       "parentStatus": "completed",
       "agent": "general",
-      "title": "ladder general [nonce 615f0ece-1e71-4b57-b819-ec568a0f36aa]",
+      "title": "ladder general [nonce 1ac20198-7e8a-4968-b53c-9a389df76986]",
       "model": "anthropic/claude-sonnet-5-5#medium",
-      "parentID": "ses_ee25ae6a2ffeAWMim3H5jCPL46"
+      "parentID": "ses_ee181e2b5ffedIlnVru3aglj7j"
     },
     "afterFirst": "main\n",
     "afterResume": "edited\n",
     "generalExternal": [
       {
         "action": "external_directory",
-        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\project\\*",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\project\\*",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\wt-1\\*",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\wt-1\\*",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\wt-2\\*",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\wt-2\\*",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\wt-late-*",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\wt-late-*",
         "effect": "allow"
       },
       {
         "action": "external_directory",
-        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-68684-1791498571506\\omr-p32-roles-ladder-8iCtFK\\data\\opencode\\tool-output\\*",
+        "resource": "<home>\\<user>\\Local\\Temp\\omr-smoke-tmp-67172-1791512762199\\omr-p32-roles-ladder-nOBOmi\\data\\opencode\\tool-output\\*",
         "effect": "allow"
       }
     ],
     "fresh": {
-      "decisionID": "ses_ee25ae6a2ffeAWMim3H5jCPL46:1791498724943:b105d950c1070315:1",
-      "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.58 ratio); role @general on fast in fast..heavy",
+      "decisionID": "ses_ee181e2b5ffedIlnVru3aglj7j:1791512947820:e82e4e2e5f35cc2c:1",
+      "reason": "kept:best-is-chosen: the chosen dispatch is the cheapest (3.5525 ratio); role @general on fast in fast..heavy",
       "role": "general",
       "tier": "fast",
       "grant": [
@@ -250,8 +250,8 @@
       "switched": false
     },
     "resumeRow": {
-      "decisionID": "ses_ee25ae6a2ffeAWMim3H5jCPL46:1791498727313:b105d950c1070315:2",
-      "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (7.5564 ratio); role @general on medium in medium..heavy [default:no-class-tier; resume:off-ladder; authority widened on resume: edit]",
+      "decisionID": "ses_ee181e2b5ffedIlnVru3aglj7j:1791512950893:e82e4e2e5f35cc2c:2",
+      "reason": "kept:resume: a role dispatch that resumes a child is never switched or explored (A30); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0195 usd); role @general on medium in medium..heavy [default:clamp:floor; resume:off-ladder; authority widened on resume: edit]",
       "role": "general",
       "tier": "medium",
       "grant": [
@@ -269,15 +269,15 @@
         "effective": "none"
       },
       "facts": {
-        "class": "other",
+        "class": "search",
         "risk": "medium",
         "scope": "single",
         "needs": [],
-        "confidence": 0.2,
-        "source": "rules"
+        "confidence": 0.9,
+        "source": "route-line"
       },
       "resume": true,
-      "childSessionID": "ses_ee25ad805ffecTxjn14vy1uS18",
+      "childSessionID": "ses_ee181d18dffeclqbhex6BkiIYW",
       "explore": false,
       "propensity": 1,
       "pinned": false,
@@ -285,7 +285,7 @@
     },
     "signals": [
       {
-        "decisionID": "ses_ee25ae6a2ffeAWMim3H5jCPL46:1791498724943:b105d950c1070315:1",
+        "decisionID": "ses_ee181e2b5ffedIlnVru3aglj7j:1791512947820:e82e4e2e5f35cc2c:1",
         "reason": "note:signal:authority:none",
         "role": "general",
         "tier": "fast",
@@ -298,8 +298,27 @@
           "source": "route-line"
         },
         "resume": false,
-        "childSessionID": "ses_ee25ad805ffecTxjn14vy1uS18",
+        "childSessionID": "ses_ee181d18dffeclqbhex6BkiIYW",
         "signal": "authority",
+        "pinned": false,
+        "switched": false
+      },
+      {
+        "decisionID": "ses_ee181e2b5ffedIlnVru3aglj7j:1791512950893:e82e4e2e5f35cc2c:2",
+        "reason": "note:signal:grader:pass",
+        "role": "general",
+        "tier": "medium",
+        "facts": {
+          "class": "search",
+          "risk": "medium",
+          "scope": "single",
+          "needs": [],
+          "confidence": 0.9,
+          "source": "route-line"
+        },
+        "resume": false,
+        "childSessionID": "ses_ee181d18dffeclqbhex6BkiIYW",
+        "signal": "grader",
         "pinned": false,
         "switched": false
       }
