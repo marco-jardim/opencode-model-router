@@ -157,4 +157,21 @@ describe("read-only tier policy", () => {
     expect(userOpted.agent?.fast?.tools).toEqual({ bash: false });
     await hooks.dispose?.();
   });
+  it.each(["medium", "heavy"])("v1 registration keeps user permission/tools for non-read-only tier %s (#97)", async tier => {
+    const home = mkdtempSync(join(tmpdir(), "router-readonly-")); roots.push(home);
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    invalidateConfigCache();
+    const hooks = await ModelRouterPlugin({ directory: home, worktree: home, client: {} } as unknown as RouterPluginInput);
+    // The SDK's permission type only lists built-in keys; MCP wildcard rules are valid at runtime.
+    const cfg = { agent: { [tier]: { permission: { "playwright_*": "deny" }, tools: { "playwright_*": false } } } } as unknown as Config;
+    await hooks.config?.(cfg);
+    expect(cfg.agent?.[tier]?.permission).toEqual({ "playwright_*": "deny" });
+    expect(cfg.agent?.[tier]?.tools).toEqual({ "playwright_*": false });
+    const bare: Config = {};
+    await hooks.config?.(bare);
+    expect(bare.agent?.[tier]).toBeDefined();
+    expect(bare.agent?.[tier]).not.toHaveProperty("permission");
+    expect(bare.agent?.[tier]).not.toHaveProperty("tools");
+    await hooks.dispose?.();
+  });
 });

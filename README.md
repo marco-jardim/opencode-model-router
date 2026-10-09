@@ -617,6 +617,82 @@ permissions: `readOnly: true` reuses the read-only policy, or give an explicit `
 Project overrides cannot define `agents`. `opencode.json` wins for the fields it sets when it defines the same
 name. `subagentTiers` no longer creates agents that do not exist (host built-ins such as `explore` still map). `allowTools` never grants edit, delegation, Code Mode or shell. See
 [CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md#agents--router-defined-subagents-81).
+
+#### Focused helpers with an MCP allowlist
+
+To give a subagent only the tools for one job, define it in the **global** overrides file,
+`~/.config/opencode/opencode-model-router.overrides.jsonc`. Project overrides cannot define `agents`, on purpose:
+a cloned repository must not be able to register agents with permissions.
+
+```jsonc
+{
+  "agents": {
+    "browser-tester": {
+      "tier": "fast",
+      "description": "Tests the app in a real browser with Playwright. Use for UI and end-to-end checks.",
+      "readOnly": true,
+      "allowTools": ["playwright_*"]
+    },
+    "docs-checker": {
+      "tier": "fast",
+      "description": "Looks up library docs and compares versions with Context7.",
+      "readOnly": true,
+      "allowTools": ["context7_*"]
+    },
+    "deep-thinker": {
+      "tier": "heavy",
+      "description": "Thinks through hard problems step by step before answering.",
+      "readOnly": true,
+      "allowTools": ["sequential-thinking_*"]
+    }
+  }
+}
+```
+
+- `tier`: a tier of the active preset. The model follows the preset, so it changes with `/preset`.
+- `description`: what the orchestrator reads to pick the helper. Be specific about the task and when to use it.
+- `readOnly: true` or a `permission` block is required: a router agent never inherits the host's allow-all defaults.
+- `allowTools`: extra tools allowed on top of that policy. MCP tools are named `<server>_<tool>`; use the server
+  names from your `opencode.json`. A wildcard is allowed only after a literal first character (`playwright_*`, not
+  `*_click`). `allowTools` cannot grant edit, shell, `read` or delegation; put those in `permission`.
+
+Restart OpenCode after adding agents so they are registered. Reserved names (`fast`, `medium`, `heavy`, every
+tier of the active preset) cannot be used as agent names.
+
+#### Restricting the built-in tiers
+
+`@medium` and `@heavy` otherwise see every installed tool, including MCP servers meant for a helper. Restrict them
+with host permission rules in `opencode.json`. The router keeps these rules when it registers the tiers.
+
+OpenCode 2:
+
+```json
+{
+  "agents": {
+    "heavy": {
+      "permissions": [
+        { "action": "playwright_*", "resource": "*", "effect": "deny" }
+      ]
+    }
+  }
+}
+```
+
+OpenCode 1:
+
+```json
+{
+  "agent": {
+    "heavy": {
+      "permission": { "playwright_*": "deny" }
+    }
+  }
+}
+```
+
+Prefer permission rules over the legacy `"tools": { "playwright_*": false }`, which is deprecated on OpenCode 1
+and absent on OpenCode 2.
+
 ### Read-only call caps
 
 Subagents carry a cap on their own read-only tool calls (grep/read/glob/ls) per dispatch. Enforcement is **two-layered**: prompt-level stop rules + runtime banners injected into tool results. Baselines (configurable via `tierCaps` — see below):

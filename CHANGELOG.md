@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-10-09
+
+### Fixed
+
+- **OpenCode v1 no longer drops `agent.<tier>.permission` and `.tools` for `@medium` and `@heavy`.** The v1 `config`
+  hook replaced the user's `opencode.json` entry wholesale for every non-read-only tier except `fast`; it now keeps
+  the user's `permission` and `tools` for every non-read-only tier (#97). Output without user entries is unchanged,
+  and v2 was already correct.
+
 ## [2.6.0] - 2026-10-09
 
 ### Changed
