@@ -43,6 +43,7 @@ import { createSystemAugmenter } from "../routing/wire/hint";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
+import { appliedEffort, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -657,6 +658,19 @@ export function roleCatalogFailureNotice(agent: string, childSessionID: string):
     + `again (the router could not build its tool catalog for this dispatch: fail closed, session "${childSessionID}").`;
 }
 
+/**
+ * Legacy agent-option aliases → the v2 per-turn keys (`reasoning_effort` → `reasoningEffort`, `reasoning_summary` →
+ * `reasoningSummary`, `budget_tokens` → `thinking`); an explicit v2 key wins. Returns a copy: `options` is never modified.
+ */
+export function normalizeAgentOptions(options: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const { reasoning_effort, reasoning_summary, budget_tokens, ...rest } = options;
+  const normalized: Record<string, unknown> = { ...rest };
+  if (reasoning_effort !== undefined && normalized.reasoningEffort === undefined) normalized.reasoningEffort = reasoning_effort;
+  if (reasoning_summary !== undefined && normalized.reasoningSummary === undefined) normalized.reasoningSummary = reasoning_summary;
+  if (budget_tokens !== undefined && normalized.thinking === undefined) normalized.thinking = { type: "enabled", budgetTokens: budget_tokens };
+  return normalized;
+}
+
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
 export async function registerV2Hooks(
   ctx: Context,
@@ -700,6 +714,8 @@ export async function registerV2Hooks(
   // casts confined to this adapter, rather than weakening the v2 event types.
   const legacy = hooks as unknown as Record<string, LegacyHook | undefined>;
   const registrations: Array<{ dispose(): Promise<void> }> = [];
+  /** #90 P1.2: per session, what the context hook's `chat.params` bridge applied to the latest turn (the TUI's `effortOf`). */
+  const effortStore = createEffortStore();
   const abort = new AbortController();
   const verifyingCalls = new Set<string>();
   const depthBanners = new Map<string, string>();
@@ -1127,12 +1143,7 @@ export async function registerV2Hooks(
       const nextOptions = new Map<string, Record<string, unknown>>();
       for (const [name, definition] of Object.entries(next.agent)) {
         if (nextOriginals.get(name) === JSON.stringify(definition) || !definition.options) continue;
-        const { reasoning_effort, reasoning_summary, budget_tokens, ...options } = definition.options;
-        const normalized = { ...options };
-        if (reasoning_effort !== undefined && normalized.reasoningEffort === undefined) normalized.reasoningEffort = reasoning_effort;
-        if (reasoning_summary !== undefined && normalized.reasoningSummary === undefined) normalized.reasoningSummary = reasoning_summary;
-        if (budget_tokens !== undefined && normalized.thinking === undefined) normalized.thinking = { type: "enabled", budgetTokens: budget_tokens };
-        nextOptions.set(name, normalized);
+        nextOptions.set(name, normalizeAgentOptions(definition.options));
       }
       config = next;
       originals = nextOriginals;
@@ -1378,6 +1389,17 @@ export async function registerV2Hooks(
         if (!(key in event.options)) event.options[key] = value;
       }
       await legacy["chat.params"]?.(input, event.options);
+      // #90 P1.2 (A3): what this turn's request carries after the router's hook, root and child sessions alike; no effort key
+      // records none (clearing a stale one). Read-only: `event.options` is normalised into a copy, never written; the channel
+      // never changes the hook's outcome.
+      try {
+        effortStore.record(String(event.sessionID), {
+          effort: appliedEffort(normalizeAgentOptions(event.options)), variant: event.model.variant,
+          providerID: event.model.providerID, modelID: event.model.id, agent: event.agent, at: Date.now(),
+        });
+      } catch {
+        // Nothing recorded for this turn: `effortOf` keeps answering the previous one.
+      }
       const routerConfig = loadConfig(ctx.location.directory);
       const verify = routerConfig.enforcement?.verify;
       if (event.agent === V2_GRADER_AGENT
@@ -1437,6 +1459,9 @@ export async function registerV2Hooks(
         }
       }
     }
+    // #90 P1.2 (A1): the TUI's `effortOf` rpc, answered from `effortStore`; tiers and roles mode alike. Feature-detected (a host
+    // without `ctx.rpc.register` gets nothing), never throws; disposed with the other registrations.
+    registrations.push({ dispose: await registerEffortChannel(ctx.rpc, effortStore, ingestLogger) });
     registrations.push(await ctx.session.hook("context", async (event) => {
       // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
       // strictest outcome) and is annotated for the parent's `subagent` result; every other agent keeps today's behaviour.
