@@ -23,6 +23,11 @@ tries `/server` first. The published `server.ts` re-exports the v2 definition,
 including a `server` factory for modern v1 loaders that explicitly use it. Both
 versions share the existing routing engine and configuration.
 
+The package also ships `tui.ts`, a TUI entry that v2 (2.0.24 or later) resolves
+as `/tui` and v1 never loads: it shows the model and effort of the main and the
+delegated sessions, with the effort the server plugin reports over the plugin rpc
+`opencode-model-router.effort` (see [TUI status](./TUI_STATUS.md)).
+
 ## What replaces the old hooks
 
 | Existing behavior | V1 surface | V2 implementation |
