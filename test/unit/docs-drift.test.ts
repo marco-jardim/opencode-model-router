@@ -1525,7 +1525,7 @@ function sectionOf(doc: string, heading: string): string {
  */
 function changelogAdded(changelog: string, marker: string, release?: string): string {
   const text = changelog.replace(/\r\n/g, "\n");
-  const heading = release === undefined ? /^## \[[^\]\n]+\] - \d{4}-\d{2}-\d{2}$/m : new RegExp(`^## \\[${release.replace(/\./g, "\\.")}\\] - \\d{4}-\\d{2}-\\d{2}$`, "m");
+  const heading = release === undefined ? /^## \[[^\]\n]+\] - \d{4}-\d{2}-\d{2}$/m : new RegExp(`^## \\[${release.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\] - \\d{4}-\\d{2}-\\d{2}$`, "m");
   const dated = heading.exec(text)?.[0];
   const releases = [sectionOf(text, "## [Unreleased]"), dated === undefined ? "" : sectionOf(text, dated)];
   return releases.map((section) => sectionOf(section, "### Added")).find((added) => added.includes(marker)) ?? "";
