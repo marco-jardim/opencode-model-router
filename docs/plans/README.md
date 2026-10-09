@@ -60,6 +60,14 @@ This directory holds design/implementation plans for `opencode-model-router`.
     — kickoff prompt, execution state, worktrees, planning considerations,
     troubleshooting, restart-stop messages and the phase log.
 
+- [`v2-model-effort-status-plan.md`](./v2-model-effort-status-plan.md)
+  — v2 TUI status (#90; target `2.5.0`, OpenCode v2 ≥ 2.0.24 only, v1 in
+  feature freeze): a TUI plugin entry shipped with the package shows the main
+  session's effort/variant in the prompt footer, each delegated session's model
+  and effort/variant in its own view, and a row of running delegates in the
+  main session.
+  - Handover: [`v2-model-effort-status-handover.md`](./v2-model-effort-status-handover.md)
+    — kickoff prompt, state, environment and troubleshooting.
 ## Related records
 
 - Architecture decision records: [`../adr/`](../adr/)
