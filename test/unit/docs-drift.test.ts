@@ -64,7 +64,7 @@ import {
 import { effortRpc } from "../../src/tui/effort-rpc";
 import statusPlugin, {
   appliedOf, BACKOFF_MAX_MS, BACKOFF_START_MS, COMPOSER_SLOT, effortWithVariant, FAILURE_COOLDOWN_MS, FOOTER_SLOT, NO_OWNER_NOTICE,
-  POLL_INTERVAL_MS, QUICK_REPULLS, STATUS_PLUGIN_ID, WIDTH_MARGIN,
+  POLL_INTERVAL_MS, PULL_STATE_MAX, QUICK_REPULLS, STATUS_PLUGIN_ID, WIDTH_MARGIN,
 } from "../../src/tui/plugin";
 import tuiEntry from "../../tui";
 
@@ -1819,16 +1819,21 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(flat).toContain(`every ${POLL_INTERVAL_MS / 1000} s while the session runs`);
     expect(flat).toContain(`(${BACKOFF_START_MS / 1000} s, doubling up to ${BACKOFF_MAX_MS / 1000} s)`);
     expect(flat).toContain(`it stops asking about that session for at least ${FAILURE_COOLDOWN_MS / 1000} s`);
-    // GA-2: the quick re-pulls of a running session without an effort yet; GA-1: a reopened view keeps the last answer
+    // GA-2, R2-2: the quick re-pulls of a running delegated session without an effort yet, counted per remembered session;
+    // root sessions keep the normal cadence (also in the limitation). GA-1: a reopened view keeps the last answer
     expect(flat).toContain(
-      `an answer without one is followed by another call after ${BACKOFF_START_MS / 1000} s, at most ${QUICK_REPULLS} times per session`,
+      `While a running delegated session has not reported an effort yet, an answer without one is followed by another call after ${BACKOFF_START_MS / 1000} s, at most ${QUICK_REPULLS} times per session; the count is kept per remembered session (the last ${PULL_STATE_MAX}). Root sessions keep the normal cadence.`,
+    );
+    expect(flat).toContain(
+      `The quick re-pulls after an answer without an effort apply to delegated sessions only (at most ${QUICK_REPULLS} per remembered session, the last ${PULL_STATE_MAX}); a root session is asked at the normal cadence.`,
     );
     expect(flat).toContain("the first call right away");
     expect(flat).toContain("A view that is closed and opened again shows the session's last answer at once, before its next call.");
-    // B-1: the verified hosts, and what an unverified 2.0.20–2.0.23 host shows when the TUI entry fails
+    // B-1, R2-5: the verified hosts, and what an unverified 2.0.20–2.0.23 host is expected (not observed) to show
     expect(flat).toContain(
-      "Verified on OpenCode 2.0.24–2.0.26.** On 2.0.20–2.0.23 the TUI entry is not verified; if it fails to load there, the host shows `Plugin failed` and the server plugin keeps working.",
+      "Verified on OpenCode 2.0.24–2.0.26.** On 2.0.20–2.0.23 the TUI entry is not verified; if it fails to load there, the host is expected to show `Plugin failed` and the server plugin keeps working.",
     );
+    expect(flat).not.toContain("if it fails to load there, the host shows");
     // R2-1: the terminal width, not the composer; long rows run into the sidebar, in the Width section and the limitation
     const width = new RegExp(`terminal width minus ${WIDTH_MARGIN} columns, not to the composer, and never wrap`, "g");
     expect(flat.match(width)).toHaveLength(2);

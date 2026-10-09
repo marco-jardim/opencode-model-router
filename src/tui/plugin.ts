@@ -68,8 +68,9 @@ export const FAILURE_COOLDOWN_MS = 30_000;
 export const BACKOFF_START_MS = 1_000;
 export const BACKOFF_MAX_MS = 30_000;
 /**
- * GA-2: while a session runs and no answer with an effort has been seen for it yet, an answer without one is pulled
- * again after {@link BACKOFF_START_MS}, at most this many times per session (the count is kept with the pull state).
+ * GA-2, R2-2: while a delegated session (one with a `parentID`) runs and no answer with an effort has been seen for it
+ * yet, an answer without one is pulled again after {@link BACKOFF_START_MS}, at most this many times per session (the
+ * count is kept with the pull state of the last {@link PULL_STATE_MAX} sessions). Root sessions keep the normal cadence.
  */
 export const QUICK_REPULLS = 3;
 /** An `effortOf` call that has not settled by then is aborted and retried like `rpc.unavailable`. */
@@ -365,6 +366,8 @@ const NO_CHANNEL: EffortChannel = { applied: () => undefined, dispose: () => und
 interface ChannelDeps {
   client(): HostClient | undefined;
   status(id: string): SessionStatus;
+  /** The session has a `parentID` (a delegated session). */
+  isChild(id: string): boolean;
   messages(id: string): readonly HostMessage[];
   location(id: string): unknown;
   log: Log;
@@ -428,8 +431,9 @@ function triggerKey(deps: ChannelDeps, id: string): string {
  * A1: per-session pull of `effortOf`. A poller exists while a view needs its session (released pollers close on the
  * next microtask unless re-acquired). It pulls right away (on a timer, never synchronously), again when the trigger key
  * changes (debounced to {@link POLL_INTERVAL_MS} since the last pull, which survives a close/reopen), and every
- * {@link POLL_INTERVAL_MS} while the session runs. While a running session has no answer with an effort yet, an answer
- * without one is pulled again after {@link BACKOFF_START_MS}, at most {@link QUICK_REPULLS} times (GA-2). A reopened
+ * {@link POLL_INTERVAL_MS} while the session runs. While a running delegated session has no answer with an effort yet,
+ * an answer without one is pulled again after {@link BACKOFF_START_MS}, at most {@link QUICK_REPULLS} times (GA-2,
+ * R2-2; root sessions keep the normal cadence). A reopened
  * poller starts from the session's last value (GA-1). A call carries the session's `location` and an abort signal; it
  * is aborted when its poller closes or after {@link CALL_TIMEOUT_MS}. `unavailable` errors and timeouts retry with
  * backoff 1 s, 2 s, 4 s … {@link BACKOFF_MAX_MS}; any other error drops the value (views fall back to the message
@@ -462,6 +466,14 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
   const isRunning = (id: string): boolean => {
     try {
       return untrack(() => deps.status(id)) === "running";
+    } catch {
+      return false;
+    }
+  };
+
+  const isChild = (id: string): boolean => {
+    try {
+      return untrack(() => deps.isChild(id));
     } catch {
       return false;
     }
@@ -547,8 +559,9 @@ function createEffortChannel(deps: ChannelDeps): EffortChannel {
       if (applied !== undefined) {
         state.effortSeen = true;
         state.quick = 0;
-      } else if (!state.effortSeen && state.quick < QUICK_REPULLS && isRunning(poller.id)) {
-        // GA-2: the running turn may not be recorded yet; ask again soon instead of after the poll interval.
+      } else if (!state.effortSeen && state.quick < QUICK_REPULLS && isRunning(poller.id) && isChild(poller.id)) {
+        // GA-2, R2-2: a delegate's running turn may not be recorded yet; ask again soon instead of after the poll
+        // interval. Root sessions normally carry no effort (A3), so they keep the normal cadence.
         state.quick += 1;
         schedule(poller, BACKOFF_START_MS);
         return;
@@ -942,6 +955,7 @@ function setup(context: HostContext | undefined): () => void {
     const channel = createEffortChannel({
       client: () => context?.client,
       status: host.status,
+      isChild: host.isChild,
       messages: host.messages,
       location: host.location,
       log,

@@ -1133,6 +1133,27 @@ describe("effort channel (A1)", () => {
     expect(warnings()).toEqual([]);
   });
 
+  it("gives a running root session's answers without an effort no quick re-pull: the normal cadence (R2-2)", async () => {
+    const fake = fakeHost();
+    fake.setStatus(ROOT, "running");
+    start(fake);
+    const footer = mountFooter(fake.claims, () => ROOT);
+    await tick(0);
+    expect(pullsOf(fake, ROOT)).toBe(1);
+    expect(footer.rows()).toEqual(["effort default"]);
+    await tick(BACKOFF_START_MS);
+    expect(pullsOf(fake, ROOT)).toBe(1);
+    await tick(POLL_INTERVAL_MS - BACKOFF_START_MS - 1);
+    expect(pullsOf(fake, ROOT)).toBe(1);
+    await tick(1);
+    expect(pullsOf(fake, ROOT)).toBe(2);
+    await tick(BACKOFF_START_MS * QUICK_REPULLS);
+    expect(pullsOf(fake, ROOT)).toBe(2);
+    await tick(POLL_INTERVAL_MS - BACKOFF_START_MS * QUICK_REPULLS);
+    expect(pullsOf(fake, ROOT)).toBe(3);
+    expect(fake.effortOf.mock.calls.every(([input]) => input.sessionID === ROOT)).toBe(true);
+  });
+
   it(`keeps the pull state of the last ${PULL_STATE_MAX} sessions only (P13-5)`, async () => {
     const fake = fakeHost();
     const ids = Array.from({ length: PULL_STATE_MAX + 1 }, (_, index) => `ses_${index}`);

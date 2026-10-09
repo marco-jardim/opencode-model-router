@@ -474,7 +474,10 @@ describe("registerEffortChannel (feature detection, never throws)", () => {
     const dispose = await registerEffortChannel({ register }, createEffortStore(), log, { timeoutMs: 20 });
     expect(register).toHaveBeenCalledTimes(1);
     expect(log.warn).toHaveBeenCalledTimes(1);
-    expect(log.warn.mock.calls[0]![0]).toContain("rpc.register did not settle within 20 ms");
+    // R2-3: the registration no longer holds setup (GA-4), so the message does not speak of setup.
+    expect(log.warn.mock.calls[0]![0]).toBe(
+      "TUI effort channel: rpc.register did not settle within 20 ms; continuing without it (a late registration is kept)",
+    );
     await expect(dispose()).resolves.toBeUndefined();
     await expect(dispose()).resolves.toBeUndefined();
     expect(log.warn).toHaveBeenCalledTimes(1);

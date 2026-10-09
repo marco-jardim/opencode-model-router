@@ -171,11 +171,12 @@ record (`{}` when it knows nothing about the session). On the verified hosts the
 provider received.
 
 The TUI calls `effortOf` while a view needs the session: the first call right away, then again, at most every 5 s,
-when the session's status or latest message changes, and every 5 s while the session runs. While a running session
-has not reported an effort yet, an answer without one is followed by another call after 1 s, at most 3 times per
-session. A view that is closed and opened again shows the session's last answer at once, before its next call. When
-the rpc is not available yet, or a call times out, it retries with backoff (1 s, doubling up to 30 s). After any other
-error it stops asking about that session for at least 30 s.
+when the session's status or latest message changes, and every 5 s while the session runs. While a running delegated
+session has not reported an effort yet, an answer without one is followed by another call after 1 s, at most 3 times
+per session; the count is kept per remembered session (the last 200). Root sessions keep the normal cadence. A view
+that is closed and opened again shows the session's last answer at once, before its next call. When the rpc is not
+available yet, or a call times out, it retries with backoff (1 s, doubling up to 30 s). After any other error it stops
+asking about that session for at least 30 s.
 
 While the channel has no answer for a session (an older router version, the rpc not registered, an error, or a turn
 without an effort), the footer shows `effort default`, and the delegated session and running-delegate rows show the
@@ -187,7 +188,9 @@ message's variant, else `default`.
   of an effort, the row shows the variant or `default`. The channel carries the budget as `thinkingBudget`, but the
   views do not display it.
 - **Root sessions normally show `effort default`.** The router applies no effort to primary agents (only its own tier
-  agents carry request options), so the channel reports no effort for a root session's turn.
+  agents carry request options), so the channel reports no effort for a root session's turn. The quick re-pulls after
+  an answer without an effort apply to delegated sessions only (at most 3 per remembered session, the last 200); a
+  root session is asked at the normal cadence.
 - **No console output.** The host swallows a TUI plugin's console output. The notices you must see (invalid options, and
   a render without a Solid owner) are toasts.
 - **Auto-load needs the server entry.** The TUI entry is auto-loaded only when the server entry loads, and the server
@@ -199,7 +202,7 @@ message's variant, else `default`.
   resolves the package on its own and may install it, so the TUI can run another version of the package than the
   server entry. A local directory path is used as it is and avoids this.
 - **Verified on OpenCode 2.0.24–2.0.26.** On 2.0.20–2.0.23 the TUI entry is not verified; if it fails to load there,
-  the host shows `Plugin failed` and the server plugin keeps working.
+  the host is expected to show `Plugin failed` and the server plugin keeps working.
 
 ## Troubleshooting
 

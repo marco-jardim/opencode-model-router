@@ -200,7 +200,7 @@ export async function registerEffortChannel(
   let disposed = false;
   let registration: unknown = outcome === TIMED_OUT ? undefined : outcome.registration;
   if (outcome === TIMED_OUT) {
-    note(`TUI effort channel: rpc.register did not settle within ${timeoutMs} ms; setup goes on without it (a late registration is kept)`);
+    note(`TUI effort channel: rpc.register did not settle within ${timeoutMs} ms; continuing without it (a late registration is kept)`);
     pending.then((late) => {
       if (disposed) {
         void disposeQuietly(late); // the channel is gone already: never leave a registration behind
