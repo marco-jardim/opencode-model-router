@@ -1,13 +1,16 @@
 import { describe, it, expect } from "vitest";
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { posix } from "node:path";
+
+/** The shipped entry points: v1 `main`, the v2 server entry and the v2 TUI entry (#90). */
+const ENTRY_POINTS = ["src/index.ts", "server.ts", "tui.ts"] as const;
 
 /** Traverse local static imports/re-exports and literal dynamic imports/require calls from shipped entry points. */
 function missingImports(paths: readonly string[], read: (path: string) => string): string[] {
   const shipped = new Set(paths);
   const visited = new Set<string>();
-  const pending = ["src/index.ts", "server.ts"];
+  const pending: string[] = [...ENTRY_POINTS];
   const missing: string[] = [];
   while (pending.length > 0) {
     const file = pending.pop()!;
@@ -37,8 +40,22 @@ describe("packaging: published tarball excludes tests and dev config (plan C4)",
       "src/index.ts": 'export { helper } from "./helper";',
       "src/helper.ts": 'import("./omitted");',
       "server.ts": 'import "./src/index";',
+      "tui.ts": 'export { default } from "./src/tui/plugin";',
+      "src/tui/plugin.ts": "",
     };
     expect(missingImports(Object.keys(files), (p) => files[p]!)).toEqual(["src/helper.ts -> ./omitted"]);
+  });
+  it("N3: import-closure guard follows the tui.ts entry (#90)", () => {
+    const files: Record<string, string> = {
+      "src/index.ts": "",
+      "server.ts": "",
+      "tui.ts": 'export { default } from "./src/tui/plugin";',
+      "src/tui/plugin.ts": 'import type { HostContext } from "./host-types";\nimport { parseOptions } from "./status-model";',
+      "src/tui/host-types.ts": "",
+    };
+    expect(missingImports(Object.keys(files), (p) => files[p]!)).toEqual(["src/tui/plugin.ts -> ./status-model"]);
+    delete files["tui.ts"];
+    expect(missingImports(Object.keys(files), (p) => files[p]!)).toEqual(["tui.ts"]);
   });
   it("npm pack --dry-run ships only the allowlisted files", { timeout: 60_000 }, () => {
     const raw = execSync("npm pack --dry-run --json", {
@@ -79,6 +96,154 @@ describe("packaging: published tarball excludes tests and dev config (plan C4)",
     expect(paths).toContain("server.ts");
     expect(paths).toContain("src/v2.ts");
     expect(paths).toContain("tiers.json");
+    // #90: the v2 TUI entry and its modules ship; no JSX, no root index.* (A2, A9).
+    expect(paths).toContain("tui.ts");
+    for (const file of TUI_CLOSURE) expect(paths).toContain(file);
+    expect(paths.filter((p) => p.endsWith(".tsx"))).toEqual([]);
+    expect(paths.filter((p) => /^index\./.test(p))).toEqual([]);
     expect(missingImports(paths, (p) => readFileSync(p, "utf8"))).toEqual([]);
+  });
+});
+
+/** Source text without block comments and whole-line `//` comments (so prose never reads as an import). */
+function stripComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
+
+/** Every module specifier of a source: static imports/re-exports (type-only included), side-effect imports, literal `import()`/`require()`. */
+function specifiersOf(text: string): string[] {
+  const pattern = /(?:\b(?:import|export)\s+(?:type\s+)?(?:[^"'`;]*?\sfrom\s*)?|\b(?:import|require)\s*\()\s*["']([^"']+)["']/g;
+  return [...stripComments(text).matchAll(pattern)].map((match) => match[1]!);
+}
+
+/**
+ * Every file the TUI entry reaches through relative imports, every bare specifier on the way, and every relative
+ * specifier as `<file> -> <specifier>`.
+ */
+function tuiClosure(read: (path: string) => string): { files: string[]; bare: string[]; relative: string[] } {
+  const files = new Set<string>();
+  const bare = new Set<string>();
+  const relative: string[] = [];
+  const pending = ["tui.ts"];
+  while (pending.length > 0) {
+    const file = pending.pop()!;
+    if (files.has(file)) continue;
+    files.add(file);
+    for (const specifier of specifiersOf(read(file))) {
+      if (!specifier.startsWith(".")) {
+        bare.add(specifier);
+        continue;
+      }
+      relative.push(`${file} -> ${specifier}`);
+      const base = posix.normalize(posix.join(posix.dirname(file), specifier));
+      pending.push(base.endsWith(".ts") ? base : `${base}.ts`);
+    }
+  }
+  return { files: [...files].sort(), bare: [...bare].sort(), relative: relative.sort() };
+}
+
+const TUI_CLOSURE = ["src/tui/effort-rpc.ts", "src/tui/host-types.ts", "src/tui/plugin.ts", "src/tui/status-model.ts"] as const;
+/** Packages the host serves to TUI plugins (A2); a bundled copy breaks 2.0.25+ or shadows the host's Solid. */
+const HOST_PACKAGE = /^(?:solid-js|effect|@opentui\/.+|@opencode\/.+)$/;
+
+describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
+  const read = (path: string): string => readFileSync(path, "utf8");
+  const pkg = JSON.parse(read("package.json")) as {
+    main?: unknown;
+    exports?: unknown;
+    files?: unknown;
+    dependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+    bundleDependencies?: unknown;
+    bundledDependencies?: unknown;
+  };
+
+  it("lists tui.ts in files next to server.ts and src/", () => {
+    expect(pkg.files).toEqual(expect.arrayContaining(["server.ts", "tui.ts", "src/"]));
+  });
+
+  it("keeps v1 on main: no exports map, main is ./src/index.ts", () => {
+    expect(Object.hasOwn(pkg, "exports")).toBe(false);
+    expect(pkg.main).toBe("./src/index.ts");
+  });
+
+  it("has no root index.* (v1's TUI loader falls back to it for local sources)", () => {
+    expect(readdirSync(".").filter((name) => /^index\./i.test(name))).toEqual([]);
+  });
+
+  it("declares no host package as a dependency, optional or peer dependency, and bundles nothing", () => {
+    for (const deps of [pkg.dependencies, pkg.optionalDependencies, pkg.peerDependencies]) {
+      expect(Object.keys(deps ?? {}).filter((name) => HOST_PACKAGE.test(name))).toEqual([]);
+    }
+    expect(pkg.bundleDependencies).toBeUndefined();
+    expect(pkg.bundledDependencies).toBeUndefined();
+  });
+
+  it("root tui.ts only re-exports the default of exactly ./src/tui/plugin.ts", () => {
+    expect(existsSync("tui.ts")).toBe(true);
+    // The explicit extension is what makes the host load it from node_modules (A9 run, 2.0.24–2.0.26).
+    expect(stripComments(read("tui.ts")).trim()).toBe('export { default } from "./src/tui/plugin.ts";');
+  });
+
+  it("the TUI closure reaches only its own modules, solid-js and @opentui/solid", () => {
+    const closure = tuiClosure(read);
+    expect(closure.files).toEqual([...TUI_CLOSURE, "tui.ts"]);
+    expect(closure.bare).toEqual(["@opentui/solid", "solid-js"]);
+  });
+
+  it("every relative specifier in the TUI closure carries the explicit .ts extension", () => {
+    const { relative } = tuiClosure(read);
+    expect(relative).toEqual([
+      "src/tui/plugin.ts -> ./effort-rpc.ts",
+      "src/tui/plugin.ts -> ./host-types.ts",
+      "src/tui/plugin.ts -> ./status-model.ts",
+      "tui.ts -> ./src/tui/plugin.ts",
+    ]);
+    expect(relative.filter((edge) => !edge.endsWith(".ts"))).toEqual([]);
+  });
+
+  it("each TUI module imports exactly what it may", () => {
+    expect(specifiersOf(read("src/tui/status-model.ts"))).toEqual([]);
+    expect(specifiersOf(read("src/tui/effort-rpc.ts"))).toEqual([]);
+    expect(specifiersOf(read("src/tui/host-types.ts"))).toEqual([]);
+    expect([...new Set(specifiersOf(read("src/tui/plugin.ts")))].sort()).toEqual([
+      "./effort-rpc.ts",
+      "./host-types.ts",
+      "./status-model.ts",
+      "@opentui/solid",
+      "solid-js",
+    ]);
+  });
+
+  it("takes only createElement, insert and setProp from @opentui/solid", () => {
+    const source = stripComments(read("src/tui/plugin.ts"));
+    const named = [...source.matchAll(/\bimport\s*\{([^}]*)\}\s*from\s*["']@opentui\/solid["']/g)];
+    expect(named).toHaveLength(1);
+    expect(specifiersOf(source).filter((specifier) => specifier === "@opentui/solid")).toHaveLength(1);
+    const names = named[0]![1]!.split(",").map((name) => name.trim()).filter((name) => name !== "");
+    expect(names.sort()).toEqual(["createElement", "insert", "setProp"]);
+  });
+
+  it("keeps Solid in the TUI closure: no other file under src/ imports solid-js or @opentui/solid", () => {
+    // Only the TUI entry's own files may; src/tui/effort-channel.ts (server side) is checked like any other (R2-5).
+    const allowed = new Set<string>(["tui.ts", ...TUI_CLOSURE, "src/tui/opentui-solid.d.ts"]);
+    const sources = readdirSync("src", { recursive: true })
+      .map((name) => posix.join("src", String(name).replace(/\\/g, "/")))
+      .filter((path) => /\.[cm]?[jt]sx?$/.test(path) && !allowed.has(path));
+    expect(sources).toContain("src/tui/effort-channel.ts");
+    expect(sources).not.toContain("src/tui/plugin.ts");
+    const offenders = sources.flatMap((path) =>
+      specifiersOf(read(path))
+        .filter((specifier) => /^(?:solid-js|@opentui\/solid)(?:\/|$)/.test(specifier))
+        .map((specifier) => `${path} -> ${specifier}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it("ships no JSX: no .tsx under src/tui or at the root", () => {
+    const tui = readdirSync("src/tui", { recursive: true }).map(String);
+    expect(tui.filter((name) => name.endsWith(".tsx"))).toEqual([]);
+    expect(readdirSync(".").filter((name) => name.endsWith(".tsx"))).toEqual([]);
   });
 });

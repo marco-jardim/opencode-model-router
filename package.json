@@ -45,6 +45,7 @@
   ],
   "files": [
     "server.ts",
+    "tui.ts",
     "src/",
     "tiers.json",
     "LICENSE",
@@ -60,6 +61,7 @@
     "@vitest/coverage-v8": "^5.0.3",
     "cross-env": "^10.1.0",
     "istanbul-lib-coverage": "^3.2.2",
+    "solid-js": "1.9.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   }
