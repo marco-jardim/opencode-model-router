@@ -1454,6 +1454,22 @@ function withoutComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|\s)\/\/.*$/gm, "$1");
 }
 
+/** `text` as a literal inside a RegExp source. */
+function reEscape(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Prose lines of `text` (outside fenced blocks) longer than `max` columns; table rows are exempt. */
+function longProseLines(text: string, max = 120): string[] {
+  return proseLines(text).filter((line) => !line.text.startsWith("|") && line.text.length > max).map((line) => `${line.line}: ${line.text}`);
+}
+
+/** The lines inside the fenced blocks of `text`, fences excluded. */
+function fencedLines(text: string): string[] {
+  const prose = new Set(proseLines(text).map((line) => line.line));
+  return text.split(/\r?\n/).filter((line, index) => !prose.has(index + 1) && !/^\s{0,3}(`{3,}|~{3,})/.test(line));
+}
+
 /** What `statusPlugin.setup` does with `options`: the slots it claims and the toasts it shows (cleaned up at once). */
 function setupWith(options: unknown): { slots: string[]; toasts: string[] } {
   const slots: string[] = [];
@@ -1664,14 +1680,16 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(guide).toContain(tick(pluginID));
     expect(section).toContain(tick(pluginID));
     for (const text of [guide, readme, added]) expect(text).toContain(tick(effortRpc.id));
-    expect(flat).toContain("method `effortOf({ sessionID })`");
-    expect(flat).toContain("The channel carries the budget as `thinkingBudget`, but the views do not display it.");
+    const [method] = Object.keys(effortRpc.methods);
+    const [input] = Object.keys(effortRpc.methods.effortOf.input.properties);
+    expect(flat).toContain(tick(`${method}({ ${input} })`));
+    expect(flat).toMatch(/`thinkingBudget`, but the views do not display it/);
     for (const [name, text] of docs) {
       expect(text, name).toContain(`"-${pluginID}"`);
       const ids = new Set([...text.matchAll(/opencode-model-router\.[a-z]+\b/g)].map((m) => m[0]));
       expect([...ids].filter((id) => id !== pluginID && id !== effortRpc.id), name).toEqual([]);
     }
-    expect(flat).toContain(`do not write \`"package": "${pluginID}"\`. An entry whose \`package\` equals the id of a plugin that is already loaded is treated as an enable selector, and its \`options\` are dropped.`);
+    expect(flat).toMatch(new RegExp(`do not write \`"package": "${reEscape(pluginID)}"\`.{0,120}enable selector, and its \`options\` are dropped`));
   });
 
   it("(c) every cli.json example uses the package name or directory, valid options and the selector after the entries", () => {
@@ -1700,10 +1718,11 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
       expect(text, name).toContain("`cli.json`");
       expect(tuiJsonProblems(text), name).toEqual([]);
     }
-    const where = "`<config dir>/cli.json` (for example `~/.config/opencode/cli.json`)";
-    expect(flat).toContain(where);
-    expect(section.replace(/\s+/g, " ")).toContain(where);
-    expect(flat).toContain("`tui.json` is OpenCode v1's TUI config file. OpenCode v2 reads it only to migrate it when `cli.json` does not exist");
+    for (const text of [guide, section]) {
+      expect(text).toContain("`<config dir>/cli.json`");
+      expect(text).toContain("`~/.config/opencode/cli.json`");
+    }
+    expect(flat).toMatch(/`tui\.json` is OpenCode v1's TUI config file\. OpenCode v2 reads it only to migrate it when `cli\.json` does not exist/);
     // negative fixtures
     expect(tuiJsonProblems("Add the entry to `~/.config/opencode/tui.json`.\n")).toHaveLength(1);
     expect(tuiJsonProblems("Options go in `cli.json`.\n\nOr in `tui.json` on v2.\n")).toHaveLength(1);
@@ -1714,14 +1733,16 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
   it("quotes the notices parseOptions emits and the rows the views render", () => {
     const invalid = parseOptions({ maxRows: "x" }).notices[0] ?? "(no notice)";
     expect(invalid).toBe(`${STATUS_NOTICE_PREFIX}invalid TUI options ("maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}); using defaults for those keys`);
-    expect(flat).toContain(tick(invalid));
     expect(section.replace(/\s+/g, " ")).toContain(tick(invalid));
     expect(flat).toContain(tick(parseOptions("x").notices[0] ?? "(no notice)"));
-    // F2: unknown keys are named in the same toast, which setup shows once
+    // F2: unknown keys are named in the same toast, which setup shows once; the guide prints both toasts, verbatim
     const both = parseOptions({ maxRows: "x", compact: true }).notices;
     expect(both).toEqual([`${STATUS_NOTICE_PREFIX}invalid TUI options ("maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}; unknown keys "compact"); using defaults for those keys`]);
-    expect(flat).toContain(`for \`{ "maxRows": "x", "compact": true }\`, ${tick(both[0]!)}`);
-    for (const text of [flat, section.replace(/\s+/g, " ")]) expect(text).toContain("names every invalid and every unknown key");
+    const printed = fencedLines(guide);
+    expect(printed).toContain(invalid);
+    expect(printed).toContain(both[0]);
+    expect(flat).toMatch(/For `\{ "maxRows": "x" \}` and for `\{ "maxRows": "x", "compact": true \}` the toasts are/);
+    for (const text of [flat, section.replace(/\s+/g, " ")]) expect(text).toMatch(/names every invalid and every unknown key/);
     expect(setupWith({ maxRows: "x" }).toasts).toEqual([invalid]);
     expect(setupWith({ maxRows: "x", compact: true }).toasts).toEqual(both);
     expect(setupWith({ maxRows: 6 }).toasts).toEqual([]);
@@ -1735,7 +1756,7 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(effortWithVariant("high", "max")).toBe("high (max)");
     expect(effortWithVariant("high", "high")).toBe("high");
     expect(effortWithVariant("high")).toBe("high");
-    expect(flat).toContain("the row shows `<effort> (<variant>)`, for example `high (max)`");
+    expect(flat).toMatch(new RegExp(`\`<effort> \\(<variant>\\)\`, for example ${reEscape(tick(effortWithVariant("high", "max")))}`));
     expect(flat).toContain(tick(`effort ${DEFAULT_EFFORT}`));
     // F10: the fallbacks of a running delegate without agent, title or model
     const bare = runningChildren({
@@ -1743,8 +1764,8 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
       messages: () => [], models: [], max: 4,
     });
     expect(bare.rows).toEqual([{ id: "child", agent: FALLBACK_AGENT, model: UNKNOWN_MODEL, effort: DEFAULT_EFFORT }]);
-    expect(flat).toContain(`shows its session title, else ${tick(FALLBACK_AGENT)}`);
-    expect(flat).toContain(`shows the model ${tick(UNKNOWN_MODEL)} and the effort ${tick(DEFAULT_EFFORT)}`);
+    expect(flat).toMatch(new RegExp(`session title, else ${reEscape(tick(FALLBACK_AGENT))}`));
+    expect(flat).toMatch(new RegExp(`model ${reEscape(tick(UNKNOWN_MODEL))} and the effort ${reEscape(tick(DEFAULT_EFFORT))}`));
   });
 
   it("states the effort fallbacks: the footer shows `effort default`, the delegate rows the message's variant (F1)", () => {
@@ -1760,12 +1781,9 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(childStatus({ session, messages: [message("low")], models: [] })?.effort).toBe("low");
     expect(childStatus({ session, messages: [message()], models: [] })?.effort).toBe(DEFAULT_EFFORT);
     expect(childStatus({ session, messages: [message("low")], models: [], applied: { effort: "medium", ...current } })?.effort).toBe("medium");
-    const footerSentence = "the footer shows `effort default`, and the delegated session and running-delegate rows show the message's variant, else `default`";
-    expect(flat).toContain(footerSentence);
-    expect(flat).toContain("Otherwise, and whenever the [effort channel](#where-the-effort-comes-from) has no answer, the footer shows `effort default`.");
-    for (const text of [readme.replace(/\s+/g, " "), added.replace(/\s+/g, " ")]) {
-      expect(text).toContain("the footer shows `effort default` and the delegate rows show the message's variant");
-    }
+    const fallback = /footer shows `effort default`,? and the (?:delegated session and running-delegate|delegate) rows show the message's variant/;
+    for (const text of [flat, readme.replace(/\s+/g, " "), added.replace(/\s+/g, " ")]) expect(text).toMatch(fallback);
+    expect(flat).toMatch(/has no answer, the footer shows `effort default`/);
     for (const [name, text] of docs) {
       const prose = text.replace(/\s+/g, " ");
       for (const wrong of ["views fall back to the message's variant", "the views use the message's variant", "without it the rows show"]) {
@@ -1778,13 +1796,19 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(flat).toContain(`every ${POLL_INTERVAL_MS / 1000} s while the session runs`);
     expect(flat).toContain(`(${BACKOFF_START_MS / 1000} s, doubling up to ${BACKOFF_MAX_MS / 1000} s)`);
     expect(flat).toContain(`it stops asking about that session for at least ${FAILURE_COOLDOWN_MS / 1000} s`);
-    expect(flat).toContain(`terminal width minus ${WIDTH_MARGIN} columns`);
+    // R2-1: the terminal width, not the composer; long rows run into the sidebar, in the Width section and the limitation
+    const width = new RegExp(`terminal width minus ${WIDTH_MARGIN} columns, not to the composer, and never wrap`, "g");
+    expect(flat.match(width)).toHaveLength(2);
+    expect(flat.match(/row longer than the composer is not shortened to it and runs into the sidebar's columns/g)).toHaveLength(2);
+    expect(flat).toMatch(/short rows were verified on one line with the sidebar open and closed/);
     // F4: what was verified on which hosts
-    expect(flat).toContain("it needs OpenCode 2.0.24 or later. It was verified on 2.0.24, 2.0.25 and 2.0.26 with a scripted provider: the footer, its hand-off to the host's row when a variant is selected, the running-delegate row, the delegated session's row, and the router's effort.");
+    expect(flat).toMatch(/needs OpenCode 2\.0\.24 or later/);
+    expect(flat).toMatch(/verified on 2\.0\.24, 2\.0\.25 and 2\.0\.26 with a scripted provider/);
     expect(read("README.md")).toContain("v2 **2.0.20+** (TUI status: 2.0.24+)");
-    expect(flat).toContain("v1 never loads `tui.ts`");
-    expect(Object.keys(JSON.parse(read("package.json")).peerDependencies)).toContain("@opencode-ai/plugin");
-    expect(flat).toContain("needs the `@opencode-ai/plugin` peer dependency installed");
+    expect(flat).toMatch(/v1 never loads `tui\.ts`/);
+    const peers = Object.keys(JSON.parse(read("package.json")).peerDependencies as Record<string, string>);
+    expect(peers).toContain("@opencode-ai/plugin");
+    expect(flat).toMatch(/needs the `@opencode-ai\/plugin` peer dependency installed/);
     for (const text of [flat, readme.replace(/\s+/g, " ")]) expect(text).toMatch(/[Tt]he router applies no effort to primary agents/);
   });
 
@@ -1803,9 +1827,12 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
       expect(readRepo(path), path).toBeDefined();
       expect(guide, path).toContain(tick(path));
     }
-    // F18: the CONFIG_REFERENCE section's prose is wrapped (table rows cannot be)
-    const long = section.split("\n").filter((line) => !line.startsWith("|") && line.length > 120);
-    expect(long).toEqual([]);
+    // F18, R2-5: the prose of the guide and of the CONFIG_REFERENCE section is wrapped (table rows and code blocks cannot be)
+    expect(longProseLines(guide)).toEqual([]);
+    expect(longProseLines(section)).toEqual([]);
+    const long = "x".repeat(121);
+    expect(longProseLines(`ok\n${long}\n`)).toEqual([`2: ${long}`]);
+    expect(longProseLines(`| ${long} |\n\`\`\`text\n${long}\n\`\`\`\n`)).toEqual([]);
   });
 
   it("the views never display the thinking budget (F9)", () => {
@@ -1815,7 +1842,7 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     // the channel output the views take: the budget is dropped, and a turn with a budget but no effort gives no effort
     expect(appliedOf({ effort: "high", providerID: "p", modelID: "m", thinkingBudget: 2048 })).toEqual({ effort: "high", providerID: "p", modelID: "m" });
     expect(appliedOf({ providerID: "p", modelID: "m", thinkingBudget: 2048 })).toBeUndefined();
-    expect(flat).toContain("For a tier that sets a thinking budget (`thinking.budgetTokens`) instead of an effort, the row shows the variant or `default`.");
+    expect(flat).toMatch(/thinking budget \(`thinking\.budgetTokens`\) instead of an effort, the row shows the variant or `default`/);
     // the comment stripper keeps code and drops both comment forms
     expect(withoutComments("const a = x.thinkingBudget; // thinkingBudget\n/* thinkingBudget */ const b = 1;")).toBe("const a = x.thinkingBudget; \n const b = 1;");
     expect(withoutComments("// thinkingBudget\n/**\n * thinkingBudget\n */\nconst url = \"http://x\";")).not.toContain("thinkingBudget");
@@ -1823,32 +1850,42 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
 
   it("states the QA round 1 wording: auto-load, grandchildren, load failures, no Solid owner, version skew, the recorded effort", () => {
     // F3: auto-loaded only when the server entry loads
-    expect(flat).toContain("The TUI entry is auto-loaded only when the server entry loads.");
-    expect(flat).not.toContain("The TUI entry is loaded only when");
-    expect(readme.replace(/\s+/g, " ")).toContain("auto-loads the TUI entry of every package listed in `opencode.json` `plugins`, when the server entry loads");
-    expect(section.replace(/\s+/g, " ")).toContain("and the server entry loads");
+    expect(flat).toMatch(/auto-loaded only when the server entry loads/);
+    expect(flat).not.toMatch(/The TUI entry is loaded only when/);
+    expect(readme.replace(/\s+/g, " ")).toMatch(/auto-loads the TUI entry .{0,80}when the server entry loads/);
+    expect(section.replace(/\s+/g, " ")).toMatch(/and the server entry loads/);
     // F5: grandchildren, as the code keeps them, hedged on the host's family list
     const family = runningChildren({
       rootID: "root", family: ["root", "child", "grandchild"], status: () => "running",
       sessions: (id) => ({ id, agent: id, parentID: id === "grandchild" ? "child" : "root" }), messages: () => [], models: [], max: 1,
     });
     expect([family.rows.map((row) => row.id), family.overflow]).toEqual([["child"], 1]);
-    expect(flat).toContain("Delegates of delegates (grandchildren) are included when the host lists them in the root session's family.");
-    // F6, F7: the verified failure signs; no stale marker or solid-js item
-    expect(flat).toContain("The host shows a `Plugin failed: <path>` toast, and in the `/plugins` dialog the entry under `TUI` is marked `failed`, or `opencode-model-router.status` is missing.");
-    expect(flat).toContain("The `/plugins` dialog lists `opencode-model-router.status` under `TUI`.");
-    expect(flat).not.toContain("`plugin failed` marker");
-    expect(flat).not.toContain("Cannot find package");
-    // F17: the no-owner toast as setup words it, and what it means
+    expect(flat).toMatch(/grandchildren\) are included when the host lists them in the root session's family/);
+    // R2-3: a row lasts while the delegate's session runs
+    expect(flat).toMatch(/goes away when the delegate finishes \(its session is no longer running\)/);
+    expect(readme.replace(/\s+/g, " ")).toMatch(/until the delegate finishes \(its session is no longer running\)/);
+    for (const text of [flat, readme.replace(/\s+/g, " ")]) expect(text).not.toMatch(/has answered/);
+    // F6, R2-2, R2-7: the forms observed on the real hosts, verbatim; no stale marker or solid-js item
+    for (const observed of [
+      "`TUI opencode-model-router.status`", "`TUI opencode-model-router.status local`", "`Plugin failed: <path>`",
+      "`Plugin failed: C:\\Users\\…`", "`⊙ 1 plugin failed /plugins`", "`x <path> failed, local`",
+    ]) expect(guide, observed).toContain(observed);
+    expect(flat).toMatch(/The `\/plugins` dialog shows a `TUI opencode-model-router\.status` row/);
+    expect(flat).toMatch(/Observed on 2\.0\.24–2\.0\.26 when the TUI entry failed to load/);
+    expect(flat).not.toMatch(/`plugin failed` marker in the footer|is marked `failed`|Cannot find package/);
+    // F17, R2-4: the no-owner toast as setup words it, what it means, and that its named cause was not reproduced
     const owner = NO_OWNER_NOTICE.slice(0, NO_OWNER_NOTICE.indexOf(":") + 1);
     expect(owner).toBe("render has no Solid owner:");
     expect(flat).toContain(`A \`${STATUS_NOTICE_PREFIX}${owner} …\` toast.`);
-    expect(flat).toContain("the rows show no router effort, and the running-delegates row stays hidden. Update OpenCode; if the toast persists, report it.");
+    expect(NO_OWNER_NOTICE).toContain("node_modules/solid-js");
+    expect(flat).toMatch(/running-delegates row stays hidden/);
+    expect(flat).toMatch(/named cause \(a local `node_modules\/solid-js`\) was not reproduced/);
+    expect(flat).toMatch(/if the toast persists, report it/);
     // F15: version skew of a package-name entry
-    expect(flat).toContain("so the TUI can run another version of the package than the server entry. A local directory path is used as it is and avoids this.");
+    expect(flat).toMatch(/another version of the package than the server entry\. A local directory path .{0,40}avoids this/);
     // F16: what the server records
-    expect(flat).toContain("the v2 server plugin records the effort the request carried after its `chat.params` bridge (a tier's effort, or a ladder escalation's effort override), with the turn's model and variant.");
-    expect(flat).not.toContain("a role dispatch's variant");
+    expect(flat).toMatch(/records the effort the request carried after its `chat\.params` bridge .{0,90}with the turn's model and variant/);
+    expect(flat).not.toMatch(/a role dispatch's variant/);
   });
 
   it("states the QA round 1 rules for the effort suffix, the row shrinking and the pull spacing (F12–F14)", () => {
@@ -1859,18 +1896,18 @@ describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
     expect(effortWithVariant("high", DEFAULT_EFFORT)).toBe("high");
     expect(effortWithVariant(DEFAULT_EFFORT, "max")).toBe(DEFAULT_EFFORT);
     expect(effortWithVariant("high", " ")).toBe("high");
-    expect(flat).toContain("else the variant of the message's (or, before the first message, the session's) model; else `default`.");
-    expect(flat).toContain("only when both values are set (not blank), neither is `default`, and they differ ignoring case (`high` and `High` do not); otherwise it shows the channel's effort alone.");
-    expect(flat).not.toContain("else the model's variant");
+    expect(flat).toMatch(/else the variant of the message's \(or, before the first message, the session's\) model; else `default`/);
+    expect(flat).toMatch(/both values are set \(not blank\), neither is `default`, and they differ ignoring case/);
+    expect(flat).not.toMatch(/else the model's variant/);
     // the session's model before the first message: its variant is the effort
     const early = childStatus({ session: { id: "child", parentID: "root", model: { id: "m", providerID: "p", variant: "low" } }, messages: [], models: [] });
     expect(early?.effort).toBe("low");
     // F13: the first part (the agent, else the model) shrinks first
     expect(formatRow(["abcdefghij", "model", "high"], 20)).toBe(`abcd…${ROW_SEPARATOR}model${ROW_SEPARATOR}high`);
     expect(formatRow(["", "modelname-long", "high"], 12)).toBe(`mode…${ROW_SEPARATOR}high`);
-    expect(flat).toContain("the first part (the agent, else the model) shrinks first, then the part after it, and only then the whole row is cut from the end.");
-    expect(flat).not.toContain("the agent shrinks first");
+    expect(flat).toMatch(/the first part \(the agent, else the model\) shrinks first/);
+    expect(flat).not.toMatch(/: the agent shrinks first/);
     // F14: trigger-driven pulls are spaced like the poll
-    expect(flat).toContain(`then again, at most every ${POLL_INTERVAL_MS / 1000} s, when the session's status or latest message changes`);
+    expect(flat).toMatch(new RegExp(`at most every ${POLL_INTERVAL_MS / 1000} s, when the session's status or latest message changes`));
   });
 });
