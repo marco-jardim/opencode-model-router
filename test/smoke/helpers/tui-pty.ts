@@ -91,7 +91,8 @@ export const identity = (p: ProcessRow): string => `${p.ProcessId}@${p.CreationD
 
 async function queryProcesses(filter?: string): Promise<ProcessRow[]> {
   const where = filter === undefined ? "" : ` -Filter "${filter}"`;
-  const script = "$ErrorActionPreference='Stop'; $rows = @(Get-CimInstance Win32_Process" + where + " | ForEach-Object { [pscustomobject]@{ ProcessId = [int]$_.ProcessId; ParentProcessId = [int]$_.ParentProcessId; Name = [string]$_.Name; CreationDate = $(if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }) } }); ConvertTo-Json -Compress -Depth 2 -InputObject $rows";
+  // The querying pwsh never reports itself (it is a fresh child of the caller, R2-2).
+  const script = "$ErrorActionPreference='Stop'; $rows = @(Get-CimInstance Win32_Process" + where + " | Where-Object { $_.ProcessId -ne $PID } | ForEach-Object { [pscustomobject]@{ ProcessId = [int]$_.ProcessId; ParentProcessId = [int]$_.ParentProcessId; Name = [string]$_.Name; CreationDate = $(if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }) } }); ConvertTo-Json -Compress -Depth 2 -InputObject $rows";
   const { stdout } = await execFileAsync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: PROCESS_CALL_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, windowsHide: true });
   const parsed: unknown = JSON.parse(stdout.trim() || "[]");
   return Array.isArray(parsed) ? parsed as ProcessRow[] : [];
@@ -123,6 +124,7 @@ export class ProcessTree {
   setRoot(row: ProcessRow, expectedName: string): void {
     if (row.Name.toLowerCase() !== expectedName.toLowerCase()) throw new Error(`root pid ${row.ProcessId} is ${row.Name}, expected ${expectedName}`);
     if (row.CreationDate < this.spawnAt - CLOCK_SLACK_MS) throw new Error(`root pid ${row.ProcessId} was created before the spawn (${row.CreationDate} < ${this.spawnAt})`);
+    if (row.CreationDate > Date.now() + 5_000) throw new Error(`root pid ${row.ProcessId} has a creation time in the future (${row.CreationDate} > now + 5 s)`);
     if (this.baseline.has(identity(row))) throw new Error(`root pid ${row.ProcessId} is in the baseline`);
     this.root = row;
     this.members.set(row.ProcessId, row);
@@ -143,6 +145,19 @@ export class ProcessTree {
         queue.push(proc);
       }
     }
+  }
+  /**
+   * Report only, never killed (R2-3): processes created after the spawn whose parent pid is a member's and that were
+   * created after that member, but are not members themselves (e.g. a child that appeared after the last collect).
+   */
+  async strays(): Promise<ProcessRow[]> {
+    const all = await processTable();
+    if (all.length === 0) throw new Error("process table unreadable");
+    const own = new Set([...this.members.values()].map(identity));
+    return all.filter(p => {
+      const parent = this.members.get(p.ParentProcessId);
+      return parent !== undefined && !own.has(identity(p)) && p.CreationDate >= this.spawnAt - CLOCK_SLACK_MS && p.CreationDate >= parent.CreationDate;
+    });
   }
   /** Members whose identity (pid + creation time) still exists. */
   async live(): Promise<ProcessRow[]> {
@@ -182,7 +197,8 @@ export interface TuiStart {
   /** Screens (deduplicated) and harness notes are appended here. */
   readonly logFile: string;
 }
-export interface TuiStop { pid: number; spawnAt: number; tree: ProcessRow[]; kills: KillRecord[]; rounds: number; survivors: number[]; errors: string[] }
+/** `strays`: descendants of members found after the kill rounds and not killed (R2-3); the teardown test fails on any. */
+export interface TuiStop { pid: number; spawnAt: number; tree: ProcessRow[]; kills: KillRecord[]; rounds: number; survivors: number[]; strays: ProcessRow[]; errors: string[] }
 export interface ScreenHit<T> { value: T; at: number; lines: string[] }
 
 /** One TUI process in a pty with a headless xterm mirror. */
@@ -299,7 +315,9 @@ export class TuiSession {
     killPty();
     let survivors: number[] = [];
     try { survivors = (await this.tree.live()).map(p => p.ProcessId); } catch (error) { errors.push(`survivors: ${error instanceof Error ? error.message : String(error)}`); }
-    const result: TuiStop = { pid: this.pid, spawnAt: this.tree.spawnAt, tree: [...this.tree.members.values()], kills: [...this.tree.kills], rounds, survivors, errors };
+    let strays: ProcessRow[] = [];
+    try { strays = await this.tree.strays(); } catch (error) { errors.push(`strays: ${error instanceof Error ? error.message : String(error)}`); }
+    const result: TuiStop = { pid: this.pid, spawnAt: this.tree.spawnAt, tree: [...this.tree.members.values()], kills: [...this.tree.kills], rounds, survivors, strays, errors };
     this.note(`stopped ${JSON.stringify(result)}`);
     return result;
   }

@@ -1,7 +1,7 @@
 # Phase P2.1 — real-host proof of the TUI status (G1/G2/G3), #90
 
-Branch `msd/p21`: the smoke is committed as `f0b6f7c`. The QA round 1 fixes below are in the working tree, for the executor
-to commit.
+Branch `msd/p21`: the smoke is committed as `f0b6f7c` and the QA round 1 fixes as `b8a8766`. QA round 2 passed; its code
+minors (below) are in the working tree, for the executor to commit.
 
 ## Verdict
 
@@ -9,7 +9,8 @@ Every scenario passes on OpenCode **2.0.24, 2.0.25 and 2.0.26**, for both plugin
 - the local path of this checkout;
 - a `node_modules` install of the `npm pack` tarball.
 
-Results: 49/49 tests in each of two consecutive full runs (`b61ffa82`, `549b8690`), with no skipped scenario.
+Results: 49/49 tests in each of two consecutive full runs after round 1 (`b61ffa82`, `549b8690`), and 49/49 in the
+confirming run after round 2 (`72d7caea`), with no skipped scenario.
 - **A6 holds on every version and flow.** The G3 row is on screen while the child's first answer is still held, so
   `status(child) === "running"` is set before the first token.
 - **No P1.3 code change is needed.**
@@ -29,6 +30,17 @@ Results: 49/49 tests in each of two consecutive full runs (`b61ffa82`, `549b8690
 | P21-9 | `npm run smoke:v1` was **not run**: it is not isolated from the owner's environment (see below). |
 | P21-10 | This header is corrected, and paths are written as `<home>\AppData\Local\Temp\…`. |
 | P21-11 | Process-table, re-read and taskkill calls use async `execFile`, as does npm. |
+
+## QA round 2 fixes (code minors)
+
+| Id | Fix |
+|---|---|
+| R2-1 | `npmEnv()` now sets `npm_config_cache=<run temp>/npm-cache` (one cache shared by the run's installs), `npm_config_logs_max=0` and `npm_config_userconfig=<empty temp file>`. The registry stays npm's default (public). The install is still `--ignore-scripts` from the local tarball, plus the peer from the public registry. |
+| R2-2 | The batch check counts as left behind only processes whose parent is the vitest worker (`process.pid`) and whose pid + `CreationDate` is absent from the start-of-run list. Overlap is checked by pid + `CreationDate` only. The process query excludes its own `pwsh` (`$PID`), which would otherwise always be a fresh child of the worker. The `opencode.exe` pid lists are kept as info. |
+| R2-3 | After the kill rounds the harness reads the process list once and reports, without killing, any process created after `spawnAt` whose parent pid is a member's and that was created after that member, but is not a member. The teardown test fails on any (`strays`). |
+| R2-5 | `setRoot` also requires the root's `CreationDate` to be no later than `Date.now() + 5_000`. |
+| R2-6 | This header names `b8a8766` and this round. |
+| R2-4, R2-7 | Recorded under Follow-ups only. |
 
 ## Files
 
@@ -66,7 +78,7 @@ The evidence of the runs below is in `<home>\AppData\Local\Temp\Claude\omr-p21\o
 
 ## Vitest summaries
 
-Run 1 (`b61ffa82`) and run 2 (`549b8690`), consecutive, final code, `--reporter=verbose`:
+After round 1: run 1 (`b61ffa82`) and run 2 (`549b8690`), consecutive, `--reporter=verbose`:
 ```
  Test Files  1 passed (1)
       Tests  49 passed (49)
@@ -78,6 +90,18 @@ Run 1 (`b61ffa82`) and run 2 (`549b8690`), consecutive, final code, `--reporter=
    Start at  12:25:04
    Duration  118.87s (tests 100%)
 ```
+
+After round 2: the confirming run (`72d7caea`) on the final code, `--reporter=verbose`:
+```
+ ✓ batch teardown: no new child of the test worker left behind, no own process (pid + creation time) present at the start 2401ms
+ Test Files  1 passed (1)
+      Tests  49 passed (49)
+   Start at  12:37:06
+   Duration  126.00s (tests 100%)
+```
+In that run the batch record shows `worker 26016`, `leftovers []`, `ownOverlapStartIdentities []` and 18 own processes.
+The `opencode.exe` pids were `[12164,55072,56236,59416,65616,73448,75048]` before and after (info only). Every flow
+reported `survivors []` and `strays []`.
 
 Test names, per version (×3):
 ```
@@ -119,6 +143,12 @@ G3 row was first seen; "release" is when the held first token was released.
 | 549b8690 | 2.0.25 | npm | 5/5 PASS | 0.5 / 0.7 / 15.5 | `medium (low)` | 1× same | same order; 0 survivors |
 | 549b8690 | 2.0.26 | local | 10/10 PASS | 0.8 / 1.0 / 15.8 | `medium (low)` ×3 | 2× same | same order; 0 survivors |
 | 549b8690 | 2.0.26 | npm | 5/5 PASS | 0.4 / 0.5 / 15.4 | `medium (low)` | 1× same | same order; 0 survivors |
+| 72d7caea | 2.0.24 | local | 10/10 PASS | 1.0 / 1.2 / 16.0 | `medium (low)` ×3 | 2× same | same order; 0 survivors, 0 strays |
+| 72d7caea | 2.0.24 | npm | 5/5 PASS | 0.5 / 0.6 / 15.5 | `medium (low)` | 1× same | same order; 0 survivors, 0 strays |
+| 72d7caea | 2.0.25 | local | 10/10 PASS | 0.5 / 0.6 / 15.5 | `medium (low)` ×3 | 2× same | same order; 0 survivors, 0 strays |
+| 72d7caea | 2.0.25 | npm | 5/5 PASS | 0.6 / 0.6 / 15.6 | `medium (low)` | 1× same | same order; 0 survivors, 0 strays |
+| 72d7caea | 2.0.26 | local | 10/10 PASS | 0.7 / 0.8 / 15.7 | `medium (low)` ×3 | 2× same | same order; 0 survivors, 0 strays |
+| 72d7caea | 2.0.26 | npm | 5/5 PASS | 0.7 / 0.9 / 15.7 | `medium (low)` | 1× same | same order; 0 survivors, 0 strays |
 
 Notes on the table:
 - **Local-flow checks:** boot, S1 default/variant/restore, S2 G3, A6, S3 G2, S4, sidebar, gap.
@@ -193,6 +223,13 @@ v1-pinned smoke files are unchanged, and `routing-host.ts` is not v1-pinned.
    allowlist the env of `registration`/`subagent-tiers`. After that, `smoke:v1` can run on this machine.
 3. **Session titles:** in a TUI-created session, the host's title request quotes `SPIKE_CALL` and has no tools, so the
    fixture refuses it with a 400 (4 per local flow, 2 per npm flow). The test records these as notes, not errors.
+4. **R2-4** (QA round 2, upstream residual, accepted): on `pty.kill()` node-pty lists the processes attached to the
+   pty's console and kills them; if that helper does not answer within 5 s it kills the root's bare PID after its handle
+   is closed (`@lydell/node-pty` `windowsPtyAgent.js:220-230`). Needs a > 5 s helper stall plus PID reuse. Option for
+   later: spawn with `useConptyDll: true` when the DLL ships (skips the helper).
+5. **R2-7** (QA round 2, outside P2.1): the v1 keyless smoke `test/smoke/deferred-catalog.smoke.test.ts:197` passes
+   `{...process.env}` to `opencode serve`, so a local run hands the owner's provider keys and live `OPENCODE_*`
+   variables to the child. Track as its own issue together with the `RoutingHost.doStop` `taskkill /T` follow-up.
 
 ## DF-1 manual checks (owner)
 
