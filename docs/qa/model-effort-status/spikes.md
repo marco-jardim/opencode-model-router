@@ -8,21 +8,28 @@ Host source read only at tags `v2.0.24` / `v2.0.25` / `v2.0.26` of `D:\git\openc
 ## S1 — entry resolution → D1: root `tui.ts`, no `exports` map, no JSX
 
 - `v2.0.24:packages/plugin/src/host.ts:17-43`: `Host.resolve` builds `<pkg>/<subpath>` (package) or
-  `path.resolve(dir, subpath || "index")` (local dir) and calls `Bun.resolveSync`; misses with ENOENT, ENOTDIR,
+  `path.resolve(dir, subpath || "index")` (local dir) and calls `resolveModule` (`@opencode/util/runtime-import`,
+  `host.ts:4,24`; Bun resolution underneath is UNVERIFIED in source, the probe below used `Bun.resolveSync`); misses with ENOENT, ENOTDIR,
   MODULE_NOT_FOUND, ERR_MODULE_NOT_FOUND, ERR_PACKAGE_PATH_NOT_EXPORTED, ERR_UNSUPPORTED_DIR_IMPORT fall through.
   `server: entry(["server",""])`, `tui: entry(["tui"])` (no fallback to the bare package), `rpc: entry(["rpc"])`.
   Without `exports`, `<pkg>/server` finds root `server.ts` by extension probing — why v2 loads `server.ts` today.
 - `v2.0.24:packages/tui/src/plugin/context.tsx:670-671`: `Host.resolve(target).tui`; undefined → `unsupported`.
 - Bun probe (no `exports`, root `tui.tsx`): `fakepkg/tui` → `…\node_modules\fakepkg\tui.tsx`. With an `exports` map
   lacking `./tui`, `fakepkg/tui` fails: an `exports` map makes every entry explicit.
-- v1 risk of an `exports` map: `v1.18.35:packages/opencode/src/plugin/shared.ts:74-113` checks `exports["./server"]`
-  before `main`, so `"./server": "./server.ts"` would switch the v1 entry from `src/index.ts` to the v2 module. Rejected.
-  Without `exports`, v1 keeps loading `main`; a root `tui.ts` is never looked at by v1.
+- v1 risk of an `exports` map: `v1.18.35:packages/opencode/src/plugin/shared.ts:103-114` (`resolvePackageEntrypoint`)
+  checks `exports["./${kind}"]` first and, for `server` only, falls back to `main`; so `"./server": "./server.ts"` would
+  switch the v1 entry from `src/index.ts` to the v2 module. Rejected. Without `exports`, v1 keeps loading `main`; v1's
+  TUI branch (`:136-157`) resolves only `exports["./tui"]`, or for local sources a root
+  `index.{ts,tsx,js,mjs,cjs}` (`INDEX_FILES`), and nothing for npm → a root `tui.ts` is never looked at by v1; the
+  package must never gain a root `index.*` (packaging test, A9).
 - Solid JSX transform scope (`@opentui/solid@0.5.14` `scripts/solid-plugin.js`, identical in 0.5.17):
   `/^(?!.*[/\\]node_modules[/\\]).*\.[cm]?[jt]sx?…$/` — files under `node_modules` are NOT transformed, so shipped JSX
   would break npm installs. Runtime probe P2: a root `tui.ts` built with `@opentui/solid` reconciler primitives
-  (`createElement`, `insert`, `setProp`, exported by `src/reconciler.d.ts`) renders and updates on 2.0.24 and 2.0.26,
-  both as a local path and from inside a `node_modules` folder with no `node_modules` of its own: bare `solid-js`,
+  (`createElement`, `insert`, `setProp`, exported by `src/reconciler.d.ts`) renders and updates on 2.0.24 as a local
+  path (run A) and inside `node_modules` (B1), and on 2.0.26 as a local path (D). Not run: 2.0.25 at all; 2.0.26 inside
+  `node_modules`; the package-name branch `<name>/tui` (B2 stopped at the npm 404). 2.0.26 changed the plugin bare-import
+  support (`runtime-plugin-support.bun.ts`: `ensurePluginRuntime()`, `preserve: provides`) → UNVERIFIED there; covered
+  by the P1.3 tarball check and P2.1 (A9). In B1 (no `node_modules` of its own) the bare `solid-js`,
   `@opentui/solid`, `@opencode/plugin/tui` imports are served by the host runtime plugin
   (`import.meta.resolve` on disk throws, the module still loads, a `createSignal` tick re-renders inside the host's
   `insert` effect → single Solid instance).
@@ -42,10 +49,13 @@ Host source read only at tags `v2.0.24` / `v2.0.25` / `v2.0.26` of `D:\git\openc
   `C:\Users\Marquinho\.config\opencode\tui.json` (exists; probe hosts read `<HOME>\.config\opencode\tui.json`).
   Project dirs `.opencode` in each ancestor (`util/config-directories.ts:5-6`). The provider reloads on change.
 - Sources merged (`context.tsx:299-305`): local discovery (`<config>/plugins/*`, `.opencode/plugins/*`, directories
-  only) → **the server config's plugin list (`serverTuiPlugins()`, no options)** → `tui.json` `plugins` (last wins per
-  target). Consequence: every v2 user who lists this package in the server config gets the TUI entry automatically
-  with default options; options need an explicit `tui.json` entry; disabling uses `enabled: false` or the `-<id>`
-  selector (recorded in A4).
+  only) → **the server config's plugin list (`serverTuiPlugins()`, `install: false`, `optional: true`, no options)** →
+  `tui.json` `plugins` (last wins per plugin id, `context.tsx:390`). For a non-package server entry the TUI uses
+  `path.dirname(plugin.source.path)` (`context.tsx:302`): whether that is the package dir for a local-path server entry
+  is UNVERIFIED (P2.1 scenario "server config only", A9). Consequence: every v2 user who lists this package in the server config gets the TUI entry automatically
+  with default options; options need an explicit `tui.json` entry whose `package` is not an already-loaded plugin id
+  (`context.tsx:326-332` treats it as an enable selector and drops `options`) → plugin id
+  `opencode-model-router.status`; the `-<id>` selector matches `Definition.id` (`:322`) (A4).
 - Listing by bare package name makes the host `npm install` it (probe B2: `NpmInstallFailedError … 404`); the owner and
   the smoke use local paths.
 - No difference 2.0.24 → 2.0.26 in config or discovery.
@@ -70,16 +80,19 @@ Host source read only at tags `v2.0.24` / `v2.0.25` / `v2.0.26` of `D:\git\openc
 ## S4 — server→TUI effort channel → A1: FEASIBLE (plugin rpc, pull)
 
 - Server: `v2.0.24:packages/core/src/plugin/host.ts:119` `rpc: Object.assign(rpc.client, { register })`;
-  `packages/plugin/src/promise/rpc.ts:19-40`; registrations keyed by definition id in-process (`core/src/rpc.ts`),
-  released with the plugin scope. The `rpc` package subpath only sets a flag (`core/src/plugin/module.ts:121`) and has no
+  `packages/plugin/src/promise/rpc.ts:19-31`; one registry per location (`core/src/rpc.ts:35-51`); a re-register with
+  the same id appends and the last one answers (`:83`, `:111`), dispose restores the previous (`:74-81`); never throws.
+  The TUI calls with the session's location (default: its own). The `rpc` package subpath only sets a flag (`core/src/plugin/module.ts:121`) and has no
   consumer — not needed.
 - TUI: `context.client.rpc(def).<method>(input)` (`packages/client/src/promise/client.ts:15`,
-  `client/src/promise/rpc.ts`), HTTP `rpc.call` (`packages/server/src/handlers/rpc.ts:9-13`). Events are bus-published
-  per location directory → pull, not push.
+  `client/src/promise/rpc.ts`), HTTP `rpc.call` (`packages/server/src/handlers/rpc.ts:9-13`). Rpc events are published
+  on the location bus (`core/src/rpc.ts:98-101`) and consumable via `client.rpc(def).events.on`
+  (`client/src/promise/rpc.ts:28-32`); pull is chosen, with the re-pull triggers in A1.
 - Runtime probe P4 (2.0.24 and 2.0.26): plain-object definition in a shared relative file with JSON-Schema
   `input`/`output` and `events: {}`, registered from the server plugin's `setup` via `ctx.rpc.register(def, handlers)`
   (returned `{dispose, events}`), called from the TUI → screen `OMR-PROBE-RPC:{"effort":"high:x"}`, server log
-  `effortOf called input={"sessionID":"x"}`. Registration preceded the first TUI call by ~1 s: the TUI must retry/lazy-call.
+  `effortOf called input={"sessionID":"x"}`. The HTTP rpc handler awaits plugin activation
+  (`server/src/handlers/rpc.ts:11`); the TUI retries only on `rpc.unavailable`, with bounded backoff, never inside `setup`.
 - Router data (repo): route time `src/routing/wire/dispatch.ts:1397-1401` (agent, model, variant); child `chat.params`
   `src/compat/v2-hooks.ts:1375-1380`; effective effort after an escalation `src/index.ts:1986` +
   `src/escalate/effort-override.ts:114-145` (in-memory, keyed by child session id).

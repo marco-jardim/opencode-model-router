@@ -70,7 +70,7 @@ first in a temp HOME, backed up (`<file>.bak-<timestamp>`), and recorded with it
 
 ### 1.2 Host facts at v2.0.24 (verified in the source, `D:\git\opencode` tags v2.0.24–v2.0.26)
 - F1 Main footer: `PromptMetadataRow` (`packages/tui/src/component/prompt/metadata.tsx:63-146`) renders
-  `Agent · model provider · variant`; the variant shows only when one is selected (`:93`); no effort is shown. Variant
+  `Agent · model provider · variant`; the variant shows only when one is selected (`:69`); no effort is shown. Variant
   selection: `local.model.variant.current()` (`packages/tui/src/context/local.tsx:472-478`), per session draft + per
   model preference (`:239-278`, `:488-491`). Core maps variant → effort (`packages/core/src/session/runner/to-llm-message.ts:234-236`).
 - F2 Child session view (`packages/tui/src/routes/session/index.tsx:1448-1459`): no `Prompt`, so no `prompt.footer*`
@@ -275,9 +275,14 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   `opencode-model-router.effort`, JSON-Schema `input`/`output`, `events: {}`, no imports) in
   `src\tui\effort-rpc.ts`, shared by both entries; the v2 server plugin registers it with `ctx.rpc.register(def,
   handlers)` at setup and answers `effortOf({ sessionID })` from router memory (route-time agent/model/variant, the
-  child's applied effort, the escalation override); the TUI pulls with `context.client.rpc(def).effortOf(...)`, retries
-  while the server is not registered yet, and falls back to the message variant on any error. No push events
-  (bus events are location-scoped). Nothing on v1. No `rpc` package subpath.
+  child's applied effort, the escalation override). The TUI calls `context.client.rpc(def).effortOf({ sessionID })`
+  inside a tracked computation: it pulls again whenever the session's `data.session.status(id)` changes or the id/count
+  of its latest `data.session.message.list(id)` entry changes, and at most every 5 s while `status === "running"`. It
+  never calls from `setup` (setup is awaited inside the serialized reconciliation, `context.tsx:182-184,639-641`). On
+  `rpc.unavailable` it retries with bounded backoff; on any other error it falls back to the message variant. Push
+  through rpc `events` exists at v2.0.24 (`core/src/rpc.ts:87-104`) and is not used in this release. The registry is
+  per location and a re-register with the same id appends (last answers), so tiers mode and several instances are
+  safe; the handler must read the same module state the routing writes. Nothing on v1. No `rpc` package subpath.
 - A2 (D1, D8, S1, S6) **Root `tui.ts`, no `exports` map, no JSX.** `tui.ts` (package root) re-exports
   `src\tui\plugin.ts` (not `.tsx`): the host's Solid transform skips `node_modules`. Views use the `@opentui/solid`
   reconciler primitives (`createElement`, `insert`, `setProp`) and `solid-js`; the default export is a plain
@@ -287,10 +292,20 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
 - A3 (D3, S3) **G1 rule.** Slot `prompt.footer.status`, placement `append`, root sessions (or no session yet): render
   `effort default` when `ui.model.current()?.variant` is unset (the host row shows no variant), nothing when a variant is
   selected (the host row shows it). The "last assistant message / agent variant" steps of D3 are dropped (already folded
-  into the selection; the message describes a past turn).
-- A4 (D7, S2) **Options and auto-load.** The TUI entry is auto-loaded for every v2 user who lists the package in the
-  server config (no options → defaults). Options come from a `tui.json` entry `{ "package": …, "options": … }`; the docs
-  (P2.2) give the enable/disable recipes (`enabled: false`, `-<id>` selector). Plugin id `opencode-model-router`.
+  into the selection; the message describes a past turn). QA P0.1 QA-3: P1.2 records, for every session (root
+  included), the effort its own `chat.params` actually applied (read `event.options` after `legacy["chat.params"]`,
+  `src\compat\v2-hooks.ts:1380`, v2 path only), and `effortOf` answers for root sessions too. G1 renders
+  `effort <applied>` when no variant is selected and the channel reports one, `effort default` otherwise. P1.2
+  pre-flight states with evidence whether `agentOptions` can hold an effort key for an agent that runs a root session;
+  if it cannot, that is recorded and G1 keeps `default`.
+- A4 (D7, S2) **Options and auto-load.** The TUI entry is auto-loaded (`optional`, no options) for every v2 user who
+  lists the package in the server config (`context.tsx:301-305`). The TUI plugin id is `opencode-model-router.status`,
+  deliberately not the package name: a `tui.json` entry whose `package` equals an already-loaded plugin id is treated as
+  an enable selector and its `options` are dropped (`context.tsx:326-332`). Options come from
+  `{ "package": "<spec or local path>", "options": … }`; that entry replaces the auto-loaded registration by id
+  (`context.tsx:390`). Disable with `-opencode-model-router.status` or `options.enabled: false`. UNVERIFIED: a
+  `tui.json` npm entry is resolved with `install: true` (`:306`) and may install a second copy whose version differs from
+  the server's; checked at the P3.2 clean install.
 - A5 (D4, S5) **G2 sources.** Latest assistant message `model` (after `Step.Started`), before it the child's
   `session.get(id).model`; the P1.2 effort preferred when available. `data.session.message.sync(id)` once per child when
   the list is empty (feature-detected).
@@ -305,6 +320,13 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   (`src\v2*.ts` or `src\compat\v2-hooks.ts`). P1.3 owns `tui.ts`, `src\tui\plugin.ts`, `src\tui\host-types.ts`,
   `src\tui\opentui-solid.d.ts` (instead of `plugin.tsx`). P2.1 owns `package.json`/`package-lock.json` changes for its
   devDependencies and the `smoke:tui` script.
+- A9 (§3, QA P0.1 QA-4/QA-10/QA-11) **Task text superseded.** P1.1 `effectiveMainEffort` takes
+  `{ selectedVariant?, appliedEffort? }` (A3), not the D3 chain. P1.3 writes `src\tui\plugin.ts` + root `tui.ts`, no JSX,
+  `tsconfig.json` unchanged (A2); the packaging test also pins that the package has no root `index.*` (v1's TUI loader
+  falls back to a root `index.{ts,tsx,js,mjs,cjs}` for local sources, `v1.18.35:packages/opencode/src/plugin/shared.ts:136-157`).
+  P1.3 acceptance gains: the `npm pack` tarball installed into a temp `node_modules` and loaded by path on 2.0.24, 2.0.25
+  and 2.0.26 (probe B1 method, executor or a tier agent with shell). P2.1 adds the scenarios "server config only, no
+  `tui.json`" for a local path and for a `node_modules` install, on the three versions.
 
 ## 9. Risks
 | Risk | Mitigation |

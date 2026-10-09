@@ -36,3 +36,21 @@ spikes.md S7.
 ## T0.1.3 amendments
 
 A1–A8 written in `docs\plans\v2-model-effort-status-plan.md` §8 (A1: effort channel feasible → P1.2 runs).
+
+## QA round 1 (heavy tier, adversarial; tier agent instead of role `reviewer` because the role cannot read `D:\git\opencode`)
+
+Verdict FAIL (4 major, 7 minor). All fixed in docs (round-1 rule: fix everything).
+
+| id | sev | finding | fix |
+|---|---|---|---|
+| QA-1 | major | plugin id = package name makes a `tui.json` `{package, options}` entry an enable selector that drops options | A4: id `opencode-model-router.status`, disable `-opencode-model-router.status` |
+| QA-2 | major | A1 had no re-pull rule; push rejection reason wrong | A1: tracked re-pull on status/message change, ≤5 s while running, never in setup; S4 text corrected |
+| QA-3 | major | root sessions may run a non-default effort via `agentOptions` while G1 prints `default` | A3: P1.2 records applied effort for every session, `effortOf` answers roots; P1.2 pre-flight checks `agentOptions` |
+| QA-4 | major | probe coverage overstated (no 2.0.25, no 2.0.26 `node_modules`, no `<name>/tui`) | S1 corrected; A9: P1.3 tarball check on 3 versions; P2.1 scenarios |
+| QA-5 | minor | F1 cites `metadata.tsx:93` | `:69` |
+| QA-6 | minor | v1 citation range; root `index.*` fallback of v1 TUI loader | S1 cites `shared.ts:103-114,136-157`; A9 packaging pin "no root `index.*`" |
+| QA-7 | minor | rpc registry described as per process | per location, append/last-wins/dispose-restores |
+| QA-8 | minor | retry rationale wrong | handler awaits activation; retry only on `rpc.unavailable` |
+| QA-9 | minor | `rpc.ts:19-40` overruns; `Bun.resolveSync` unverified; "last wins per target" | `:19-31`; `resolveModule`; per plugin id |
+| QA-10 | minor | §3 task text contradicts A2/A3 | A9 supersedes it |
+| QA-11 | minor | local-path server entry auto-load uses `path.dirname(source.path)` | UNVERIFIED in S2; P2.1 scenario (A9) |
