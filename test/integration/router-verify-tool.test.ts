@@ -102,6 +102,8 @@ const state = vi.hoisted(() => ({
   refDelayMs: 0,
   /** Called after each planScopedRun with the planned changed paths: a barrier or a hold. */
   planGate: undefined as undefined | ((changed: readonly string[]) => Promise<void> | undefined),
+  /** Every gate (accept) not yet settled, including one a cancelled or timed-out call stopped waiting for. */
+  gates: new Set<Promise<unknown>>(),
 }));
 
 vi.mock("../../src/verify/exec", () => ({
@@ -160,6 +162,26 @@ vi.mock("../../src/verify/runner", async importOriginal => {
       const changed = args[0].changedFiles;
       await state.planGate?.(changed === "unavailable" ? [] : changed.map(c => c.path));
       return plan;
+    },
+  };
+});
+
+// withTimeout does not stop the gate it gives up on: a router_verify call cancelled or timed out
+// answers at once while its gate still plans, reading the project's files (QA-2.2-9: planning runs
+// even under an exhausted deadline). The cleanup waits for every gate, so it never deletes the
+// project under a read in flight.
+vi.mock("../../src/verify/gate", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/gate")>();
+  return {
+    ...actual,
+    accept: (...args: Parameters<typeof actual.accept>) => {
+      const gate = actual.accept(...args);
+      state.gates.add(gate);
+      const done = (): void => {
+        state.gates.delete(gate);
+      };
+      gate.then(done, done);
+      return gate;
     },
   };
 });
@@ -424,7 +446,11 @@ beforeEach(() => {
   resetCounters();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Issue #84 (CI, node 20 on Windows): rmSync blocks the event loop through its retries, so a read
+  // that a gate still has in flight cannot close its handle; the deleted file then stays until the
+  // handle closes and every retry of rmdir fails with ENOTEMPTY. Wait for the gates first.
+  await Promise.allSettled([...state.gates]);
   rmSync(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   if (state.refRoot !== "") rmSync(state.refRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   for (const ref of Object.values(state.otherRefs)) rmSync(ref.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
