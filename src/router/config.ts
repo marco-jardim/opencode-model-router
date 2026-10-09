@@ -2726,6 +2726,14 @@ function buildConfig(
         const resolved = resolvePresetName(cfg, state.activePreset);
         if (resolved) {
           cfg.activePreset = resolved;
+        } else {
+          // A preset saved by `/preset` that no layer defines any more (2.6.0 removed the bundled
+          // `hybrid-2` and `fable-effort`). The config still loads on the configured activePreset,
+          // but saying so beats routing quietly on a different preset.
+          notices.push({
+            source: statePath(),
+            message: `the preset '${state.activePreset}' chosen with /preset is not defined (defined: ${Object.keys(cfg.presets).join(", ")}); using '${cfg.activePreset}'`,
+          });
         }
       }
       if (state.activeMode && cfg.modes?.[state.activeMode]) {

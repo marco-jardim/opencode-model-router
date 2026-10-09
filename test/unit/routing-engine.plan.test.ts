@@ -25,13 +25,18 @@ import type { AnnotateDeps, PlanStep } from "../../src/routing/engine/plan";
 import type { HostAgentInfo } from "../../src/routing/engine/types";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import type { OutcomeKey } from "../../src/routing/outcomes/types";
+import { withLegacyPresets } from "../helpers/legacy-presets";
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 const here = dirname(fileURLToPath(import.meta.url));
-const shipped: RouterConfig = validateConfig(JSON.parse(readFileSync(join(here, "../../tiers.json"), "utf-8")));
+// The engine decisions below are pinned to the 2.5.0 `anthropic` preset (Haiku 5.5 low, Sonnet 5.5 medium, Opus 5.5
+// xhigh), as a user's override would: they test the engine, not the values the bundled tiers.json ships.
+const shipped: RouterConfig = validateConfig(
+  withLegacyPresets(JSON.parse(readFileSync(join(here, "../../tiers.json"), "utf-8")), ["anthropic"]),
+);
 const cfg: RouterConfig = { ...shipped, activePreset: "anthropic" };
 const routing = resolveRouting(cfg, "v2");
 const ALL_NEEDS: readonly Need[] = ["shell", "web", "edit", "network", "external_dir"];

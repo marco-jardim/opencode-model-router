@@ -15,6 +15,7 @@ import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
 import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/child-session";
+import { FABLE_EFFORT_2_5_0 } from "../helpers/legacy-presets";
 
 // ---------------------------------------------------------------------------
 // Globally unique session counter (prevents duplicate IDs across all tests).
@@ -208,7 +209,7 @@ describe("effortBump false preserves the v2.0.0 golden ladder scenarios", () => 
     vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
     vi.stubEnv("MODEL_ROUTER_VERIFIED_DELEGATE", "1");
     fs.mkdirSync(path.dirname(overridePath()), { recursive: true });
-    fs.writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", enforcement: { escalate: { effortBump: false } } }));
+    fs.writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", presets: { "fable-effort": FABLE_EFFORT_2_5_0 }, enforcement: { escalate: { effortBump: false } } }));
     invalidateConfigCache();
   });
   afterEach(async () => {
@@ -282,7 +283,7 @@ describe("effortBump false preserves the v2.0.0 golden ladder scenarios", () => 
   it("registers exactly the same agent names with both features on or off", async () => {
     const names: string[][] = [];
     for (const enabled of [false, true]) {
-      fs.writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", enforcement: { maxDelegationDepth: enabled ? 1 : null, escalate: { effortBump: enabled } } }));
+      fs.writeFileSync(overridePath(), JSON.stringify({ activePreset: "fable-effort", presets: { "fable-effort": FABLE_EFFORT_2_5_0 }, enforcement: { maxDelegationDepth: enabled ? 1 : null, escalate: { effortBump: enabled } } }));
       invalidateConfigCache();
       const hooks = await ModelRouterPlugin({ directory: dir, worktree: dir, client: {} } as unknown as RouterPluginInput) as unknown as TestHooks;
       instances.push(hooks);

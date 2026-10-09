@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import type { ChildSessionRequest, RouterPluginInput } from "../../src/compat/child-session";
+import { FABLE_EFFORT_2_5_0 } from "../helpers/legacy-presets";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
 import { buildAgentOptions } from "../../src/router/agent-options";
@@ -72,7 +73,7 @@ describe("effort bump plugin wiring", () => {
 
   function configure(preset = "fable-effort", effortBump = true, verify: Record<string, unknown> = {}) {
     mkdirSync(dirname(overridePath()), { recursive: true });
-    writeFileSync(overridePath(), JSON.stringify({ activePreset: preset, enforcement: { escalate: { effortBump }, verify } }));
+    writeFileSync(overridePath(), JSON.stringify({ activePreset: preset, presets: { "fable-effort": FABLE_EFFORT_2_5_0 }, enforcement: { escalate: { effortBump }, verify } }));
     invalidateConfigCache();
   }
 

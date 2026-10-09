@@ -50,6 +50,7 @@ vi.mock("../../src/escalate/effort-override", async (importOriginal) => {
 });
 
 import { effortRpc, type EffortOfOutput } from "../../src/tui/effort-rpc";
+import { FABLE_EFFORT_2_5_0 } from "../helpers/legacy-presets";
 import {
   appliedEffort, appliedThinkingBudget, createEffortStore, EFFORT_REGISTER_TIMEOUT_MS, EFFORT_STORE_MAX_SESSIONS, effortOfHandler,
   registerEffortChannel, type EffortStore,
@@ -91,7 +92,11 @@ function home(override: Record<string, unknown> = {}): string {
   vi.stubEnv("HOME", dir); vi.stubEnv("USERPROFILE", dir);
   vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
   mkdirSync(dirname(overridePath()), { recursive: true });
-  writeFileSync(overridePath(), JSON.stringify(override));
+  // 2.6.0 dropped the bundled `fable-effort`: a test that activates it defines the 2.5.0 block as a user would.
+  const withFable = override.activePreset === "fable-effort"
+    ? { ...override, presets: { "fable-effort": FABLE_EFFORT_2_5_0, ...(override.presets as Record<string, unknown> | undefined) } }
+    : override;
+  writeFileSync(overridePath(), JSON.stringify(withFable));
   invalidateConfigCache();
   return dir;
 }

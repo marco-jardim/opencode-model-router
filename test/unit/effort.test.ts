@@ -7,6 +7,7 @@ import {
 } from "../../src/router/agent-options";
 import { nextTierAfter } from "../../src/escalate/ladder";
 import { validateConfig, EFFORT_LEVELS, type TierConfig } from "../../src/router/config";
+import { withLegacyPresets } from "../helpers/legacy-presets";
 
 /** A tier that has been through the real validator, as loaded from tiers.json. */
 function tier(model: string, extras: Record<string, unknown> = {}): TierConfig {
@@ -607,7 +608,7 @@ describe("effort through override layers", () => {
 });
 
 describe("S3.4.3 escalation effort correctness", () => {
-  const raw = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8"));
+  const raw = withLegacyPresets(JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")), ["fable-effort"]);
   const preset = validateConfig(raw).presets["fable-effort"];
 
   beforeEach(() => {

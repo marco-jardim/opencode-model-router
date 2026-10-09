@@ -21,6 +21,7 @@ import {
   type LadderVerdict,
 } from "../../src/escalate/ladder";
 import type { EffortLevel, Preset, RouterConfig, TierConfig } from "../../src/router/config";
+import { withLegacyPresets } from "../helpers/legacy-presets";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -750,6 +751,12 @@ describe("buildEscalatePolicy effort bump", () => {
     return { ...cfg, activePreset };
   }
 
+  /** tiers.json plus the 2.5.0 `fable-effort` block (no longer bundled), activated. */
+  function fableEffortCfg(): RouterConfig {
+    const cfg: RouterConfig = JSON.parse(readFileSync(new URL("../../tiers.json", import.meta.url), "utf8"));
+    return { ...withLegacyPresets(cfg, ["fable-effort"]), activePreset: "fable-effort" };
+  }
+
   const claude = { model: "anthropic/claude-sonnet-4-5", effort: "high" } satisfies TierConfig;
   const openai = { model: "openai/gpt-5", effort: "medium" } satisfies TierConfig;
 
@@ -835,8 +842,8 @@ describe("buildEscalatePolicy effort bump", () => {
     expect(buildEscalatePolicy(cfg)).not.toHaveProperty("effortBump");
   });
 
-  it("shipped fable-effort preset bumps fast and medium but excludes heavy", () => {
-    expect(buildEscalatePolicy(shippedCfg("fable-effort")).effortBump).toEqual({
+  it("2.5.0 fable-effort block bumps fast and medium but excludes heavy", () => {
+    expect(buildEscalatePolicy(fableEffortCfg()).effortBump).toEqual({
       perTier: {
         fast: { base: "low", bound: "xhigh" },
         medium: { base: "high", bound: "xhigh" },
@@ -844,8 +851,8 @@ describe("buildEscalatePolicy effort bump", () => {
     });
   });
 
-  it("shipped fable-effort defaults stop after three attempts just as with the bump disabled", () => {
-    const cfg = shippedCfg("fable-effort");
+  it("2.5.0 fable-effort block defaults stop after three attempts just as with the bump disabled", () => {
+    const cfg = fableEffortCfg();
     const tiers = cfg.presets["fable-effort"]!;
     const policy = buildEscalatePolicy(cfg);
     const plainPolicy = buildEscalatePolicy({
@@ -878,8 +885,8 @@ describe("buildEscalatePolicy effort bump", () => {
   });
 
   it("runs the fable-effort fail stream with recorded tier costs and a final scorecard", () => {
-    const cfg = shippedCfg("fable-effort");
-    // Allow four attempts at the shipped ratios (1, 1, 3, 3); the default
+    const cfg = fableEffortCfg();
+    // Allow four attempts at the 2.5.0 fable-effort ratios (1, 1, 3, 3); the default
     // multiple of four would stop after the first medium attempt costs five.
     cfg.enforcement = { ...cfg.enforcement, escalate: {
       ...cfg.enforcement?.escalate, costCeiling: { multiple: 8 },

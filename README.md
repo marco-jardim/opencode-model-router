@@ -4,7 +4,7 @@
 
 > **Use the cheapest model that can do the job. Automatically.**
 
-An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,248–6,356 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
+An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,249–6,357 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
 
 ## Why it's different
 
@@ -24,7 +24,7 @@ Most AI coding tools give you one model for everything. You pay Opus prices to r
 The orchestrator runs on *every* message. Put Sonnet there, not Opus. Sonnet reads a routing protocol and delegates just as well as Opus — at 4x lower cost. Reserve Opus for when it genuinely matters.
 
 **Inject a compressed, LLM-optimized routing protocol.**
-Instead of duplicated prose, the plugin injects a dense, machine-readable routing protocol. The protocol itself is 3,248 characters; a Claude orchestrator receives 4,020 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). Every message, every session.
+Instead of duplicated prose, the plugin injects a dense, machine-readable routing protocol. The protocol itself is 3,249 characters; a Claude orchestrator receives 4,021 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). Every message, every session.
 
 **Match task to tier using a configurable taxonomy.**
 A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/test`, `@heavy→arch/debug/security`) tells the orchestrator exactly which tier fits each task type. Fully customizable. No ambiguity.
@@ -45,7 +45,7 @@ Every tier carries its `costRatio` (fast=1x, medium=5x, heavy=20x) injected into
 If the orchestrator is already running on Opus, the rule `self∈opus→never→@heavy` fires — it does the heavy work itself rather than delegating to another Opus instance.
 
 **Multi-provider support with automatic fallback.**
-Eight presets out of the box: Anthropic, OpenAI, GitHub Copilot, Google, hybrid, hybrid-2, fable-effort, and Zai (GLM). Switch with `/preset`. If a provider fails, the fallback chain tries the next one automatically.
+Six presets out of the box: Anthropic, OpenAI, GitHub Copilot, Google, hybrid, and Zai (GLM). Switch with `/preset`. If a provider fails, the fallback chain tries the next one automatically.
 
 **Plan annotation for long tasks.**
 `/annotate-plan` reads a markdown plan and tags each step with `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` — removing all routing ambiguity from multi-step workflows.
@@ -77,7 +77,7 @@ opencode-model-router injects a **delegation protocol** into the system prompt t
 4. **Never over-qualify** — use the cheapest tier that can reliably handle the task
 5. **Fallback** across providers when one fails
 
-All of this adds 3,248 characters for a non-Claude orchestrator or 4,020 characters for a Claude orchestrator (roughly 812–1,117 tokens at 3.6–4.0 characters per token).
+All of this adds 3,249 characters for a non-Claude orchestrator or 4,021 characters for a Claude orchestrator (roughly 812–1,117 tokens at 3.6–4.0 characters per token).
 
 ## Understanding how it works
 
@@ -178,7 +178,7 @@ Task distribution: 18 exploration (60%), 10 implementation (33%), 2 architecture
 
 ## How it works
 
-On every message, the plugin injects a 3,248-character routing protocol. A Claude orchestrator receives 4,020 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it.
+On every message, the plugin injects a 3,249-character routing protocol. A Claude orchestrator receives 4,021 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it.
 
 What the orchestrator sees (Anthropic preset, normal mode):
 
@@ -230,7 +230,7 @@ With router → split:
 | Cross-provider fallback | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Cost ratio awareness | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Plan annotation with tiers | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Measured prompt overhead: 3,248–6,356 chars | ✅ | — | ❌ | ❌ | ❌ |
+| Measured prompt overhead: 3,249–6,357 chars | ✅ | — | ❌ | ❌ | ❌ |
 
 **Claude native**: single model for everything, no cost routing. If you're using claude.ai or OpenCode without plugins, you're paying the same price for `grep` as for architecture design.
 
@@ -430,13 +430,13 @@ For an npm install, `tiers.json` is **inside the cached package directory**, not
 
 ### Presets
 
-The plugin ships with eight presets (switch with `/preset <name>`):
+The plugin ships with six presets (switch with `/preset <name>`):
 
 **anthropic** (default):
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `anthropic/claude-haiku-5-5` (variant/effort: low) | 1x |
-| @medium | `anthropic/claude-sonnet-5-5` (variant/effort: medium) | 5x |
+| @fast | `anthropic/claude-haiku-5-5` (variant/effort: medium) | 1x |
+| @medium | `anthropic/claude-sonnet-5-5` (variant/effort: high) | 5x |
 | @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
 **openai**:
@@ -460,29 +460,22 @@ The plugin ships with eight presets (switch with `/preset <name>`):
 | @medium | `google/gemini-3.7-flash` | 5x |
 | @heavy | `google/gemini-3.1-pro-preview` | 20x |
 
-**hybrid** — OpenAI for exploration and implementation, Anthropic for heavy analysis:
+**hybrid** — Anthropic for exploration and heavy analysis, OpenAI for implementation:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `openai/gpt-6-luna-fast` (medium) | 1x |
-| @medium | `openai/gpt-6-astra-fast` (high) | 5x |
+| @fast | `anthropic/claude-haiku-5-5` (variant/effort: medium) | 1x |
+| @medium | `openai/gpt-6.1-sol-fast` (xhigh) | 5x |
 | @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
-**hybrid-2** — OpenAI for exploration, Anthropic for implementation and heavy analysis:
-| Tier | Model | Cost ratio |
-|------|-------|-----------|
-| @fast | `openai/gpt-6-luna-fast` (medium) | 1x |
-| @medium | `anthropic/claude-sonnet-5-5` (variant/effort: xhigh) | 5x |
-| @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
-
-**fable-effort** — one model, three reasoning depths (see [per-tier `effort`](#per-tier-effort)):
-| Tier | Model | Effort | Cost ratio |
-|------|-------|--------|-----------|
-| @fast | `anthropic/claude-fable-5-1` | `low` | 1x |
-| @medium | `anthropic/claude-fable-5-1` | `high` | 3x |
-| @heavy | `anthropic/claude-fable-5-1` | `xhigh` | 6x |
-
-Because the model string is identical across tiers, escalating a task keeps the prompt
-cache warm. The cost ratios are estimated token-spend multipliers, not price differences.
+> **Removed in 2.6.0:** the bundled `hybrid-2` and `fable-effort` presets, and the
+> previous `hybrid` values (OpenAI `gpt-6-luna-fast` / `gpt-6-astra-fast` for `@fast` / `@medium`).
+> To keep any of them, copy its block from the 2.5.0 `tiers.json` into `presets` in
+> `opencode-model-router.overrides.jsonc` and keep `activePreset` there (the previous `hybrid` under a new name:
+> preset overrides merge key by key). See the
+> [changelog](CHANGELOG.md#260---2026-10-09) for the `fable-effort` block and the migration notes.
+> A preset you chose with `/preset` that no layer defines any more is reported as a config notice
+> (`the preset '<name>' chosen with /preset is not defined …`), and the router keeps routing on the
+> configured `activePreset`.
 
 **zai** — GLM through the Z.AI Coding Plan (the `zai-coding-plan` provider, which is where `glm-5.3` lives):
 | Tier | Model | Variant | Cost ratio |
@@ -491,8 +484,8 @@ cache warm. The cost ratios are estimated token-spend multipliers, not price dif
 | @medium | `zai-coding-plan/glm-5.3` | `high` | 3x |
 | @heavy | `zai-coding-plan/glm-5.3` | `max` | 6x |
 
-@medium and @heavy share one model, so — as with `fable-effort` — the cost ratios are
-estimated token-spend multipliers, not price differences.
+@medium and @heavy share one model, so the cost ratios are estimated token-spend
+multipliers, not price differences.
 
 ### Per-tier `effort`
 
@@ -1021,13 +1014,13 @@ The bump applies to the optional `delegate` tool's automatic ladder, not native
 `/bypass` leaves the ladder and effort bump active; use `effortBump: false` to disable
 the bump.
 
-Among bundled presets, **only `fable-effort` fast and medium are eligible**
-(`low → medium` and `high → xhigh`). Its heavy tier is already at the default
-ceiling; all other presets either set a variant or omit `effort`. In particular,
-the default `anthropic` preset has no bumpable tier. Attempt and cost ceilings
-still apply: starting at fast with the default cost multiple of 4, `fable-effort`
-runs `fast@low → fast@medium → medium@high`, then stops on cost; medium's bump
-is not reached. Raise `enforcement.escalate.costCeiling.multiple` to allow it.
+**No bundled preset has a bumpable tier**: every tier that sets `effort` also sets a
+`variant`, and the rest omit `effort`. In particular, the default `anthropic` preset has
+no bumpable tier. The bump is for presets of your own that set `effort` without a
+`variant` (for example a one-model preset running at `low`, `high` and `xhigh`). Attempt
+and cost ceilings still apply: with the default cost multiple of 4, a ladder that
+starts at the cheapest tier may stop on cost before a later tier's bump is reached.
+Raise `enforcement.escalate.costCeiling.multiple` to allow it.
 
 See the [configuration reference](docs/CONFIG_REFERENCE.md) for eligibility and
 cost settings, and the [ADR](docs/adr/0004-delegation-depth-and-effort-bump.md) for
@@ -1227,7 +1220,7 @@ With the [routing engine](#cost-aware-routing-opt-in-opencode-v2) live on OpenCo
 
 ## Token overhead
 
-Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,248 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,020 characters after its authority prefix, or 6,356 characters when the 2,336-character DoD/enforcement section is enabled. That is roughly 812–1,766 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
+Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,249 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,021 characters after its authority prefix, or 6,357 characters when the 2,336-character DoD/enforcement section is enabled. That is roughly 812–1,766 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
 
 These are character counts of the prompts the shipped config actually produces, so they move whenever the protocol text does. `test/unit/docs-drift.test.ts` recomputes all three from `tiers.json` on every run and fails unless this section still quotes them, so a change that grows the protocol cannot land without updating these numbers.
 

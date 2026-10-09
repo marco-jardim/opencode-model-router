@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-10-09
+
+### Changed
+
+- **Bundled `anthropic` preset values.** `@fast` is now `anthropic/claude-haiku-5-5` with variant/effort `medium`
+  (was `low`); `@medium` is now `anthropic/claude-sonnet-5-5` with variant/effort `high` (was `medium`). `@heavy` is
+  unchanged.
+- **Bundled `hybrid` preset values.** `@fast` is now `anthropic/claude-haiku-5-5` with variant and effort `medium`
+  (was OpenAI `gpt-6-luna-fast`); `@medium` is now `openai/gpt-6.1-sol-fast` with variant `xhigh` and no `effort`
+  (was `gpt-6-astra-fast`). `@heavy` is unchanged.
+- **A preset chosen with `/preset` that no layer defines is now reported.** The config load adds one notice,
+  `the preset '<name>' chosen with /preset is not defined (defined: …); using '<active>'`, and keeps routing on the
+  configured `activePreset` (OpenCode v1 and v2 alike, since both load the same config). An overrides file whose own
+  `activePreset` names an undefined preset still drops that whole layer, as before.
+
+### Removed
+
+- **Bundled presets `hybrid-2` and `fable-effort`.** The bundled presets are now `anthropic`, `openai`,
+  `github-copilot`, `google`, `hybrid` and `zai`.
+
+  **Migration.** If you use `hybrid-2` or `fable-effort`, or want the previous `hybrid` values back, copy that block
+  into `presets` in `opencode-model-router.overrides.jsonc` and keep `activePreset` pointing at it. The 2.5.0
+  `fable-effort` block:
+
+  ```jsonc
+  {
+    "presets": {
+      "fable-effort": {
+        "fast": {
+          "readOnly": true,
+          "model": "anthropic/claude-fable-5-1",
+          "effort": "low",
+          "costRatio": 1,
+          "description": "Fable 5 at low effort for exploration, search, and simple reads (token-spend ratios are estimates; same model across tiers preserves prompt cache)",
+          "steps": 30,
+          "whenToUse": [
+            "Codebase exploration and search",
+            "Simple file reads and listing",
+            "Grep/glob operations",
+            "Quick lookups and research"
+          ]
+        },
+        "medium": {
+          "model": "anthropic/claude-fable-5-1",
+          "effort": "high",
+          "costRatio": 3,
+          "description": "Fable 5 at high effort for implementation and standard coding (costRatio is an estimated token-spend multiplier, not a price difference)",
+          "steps": 50,
+          "whenToUse": [
+            "Feature implementation",
+            "Refactoring",
+            "Writing tests",
+            "Bug fixes"
+          ]
+        },
+        "heavy": {
+          "model": "anthropic/claude-fable-5-1",
+          "effort": "xhigh",
+          "costRatio": 6,
+          "description": "Fable 5 at xhigh effort for architecture, complex debugging, and security (costRatio is an estimated token-spend multiplier, not a price difference)",
+          "steps": 120,
+          "whenToUse": [
+            "Architecture decisions",
+            "Complex debugging (after 2+ failures)",
+            "Security review",
+            "Performance optimization"
+          ]
+        }
+      }
+    },
+    "activePreset": "fable-effort"
+  }
+  ```
+
+  The 2.5.0 `hybrid-2` block and the previous `hybrid` block are in `git show v2.5.0:tiers.json` (or in the 2.5.0
+  package's `tiers.json`); copy a block under its own name. For the previous `hybrid`, use a new name (for example `hybrid-2-5-0`) and set`n  `activePreset` to it: preset overrides merge key by key, so a block copied under `hybrid` would keep keys the new`n  bundled tiers set and the old ones do not (the new `@fast` has `effort: "medium"`).
+
+  **Define the preset in the same file as `activePreset`.** An overrides file whose `activePreset` names a preset no
+  layer defines is dropped as a whole layer, so its other settings are lost too. A preset you last chose with
+  `/preset` and that is no longer defined only produces the notice above and routes on the configured `activePreset`.
+
 ## [2.5.0] - 2026-10-09
 
 ### Added

@@ -136,6 +136,9 @@ bound. An excluded tier keeps its ordinary retry: the router does not guess a pr
 override variant/explicit-option precedence. These are builder-based ceilings, not a claim that
 every live Claude endpoint accepts `xhigh`; users can lower the bound to `high`.
 
+*2.6.0 note: the bundled `fable-effort` preset was removed; no bundled preset has a bumpable tier any more (the text
+below describes 2.5.0 and earlier).*
+
 **D7 reach with bundled presets (A5):** the active/default `anthropic` preset has
 no bumpable tier because every tier sets a variant. Only `fable-effort` fast and
 medium are eligible at the default bump bound (`low → medium`, `high → xhigh`);

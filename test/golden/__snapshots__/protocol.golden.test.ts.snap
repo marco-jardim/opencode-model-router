@@ -5,7 +5,7 @@ exports[`protocol golden > protocol-anthropic > protocol-anthropic 1`] = `
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: anthropic. Tiers: @fast=claude-haiku-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x).
+Preset: anthropic. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=claude-sonnet-5-5/high(5x) @heavy=claude-opus-5-5/xhigh(20x).
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
@@ -29,7 +29,7 @@ exports[`protocol golden > protocol-anthropic-mode-budget > protocol-anthropic-m
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: anthropic. Tiers: @fast=claude-haiku-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:budget
+Preset: anthropic. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=claude-sonnet-5-5/high(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:budget
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
@@ -51,7 +51,7 @@ exports[`protocol golden > protocol-anthropic-mode-deep > protocol-anthropic-mod
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: anthropic. Tiers: @fast=claude-haiku-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:deep
+Preset: anthropic. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=claude-sonnet-5-5/high(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:deep
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
@@ -73,7 +73,7 @@ exports[`protocol golden > protocol-anthropic-mode-normal > protocol-anthropic-m
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: anthropic. Tiers: @fast=claude-haiku-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:normal
+Preset: anthropic. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=claude-sonnet-5-5/high(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:normal
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
@@ -97,7 +97,7 @@ exports[`protocol golden > protocol-anthropic-mode-quality > protocol-anthropic-
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: anthropic. Tiers: @fast=claude-haiku-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:quality
+Preset: anthropic. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=claude-sonnet-5-5/high(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:quality
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 
@@ -191,7 +191,7 @@ exports[`protocol golden > protocol-hybrid > protocol-hybrid 1`] = `
 
 You are the orchestrator: route each task to the right tier and delegate it with \`Task(subagent_type="fast"|"medium"|"heavy", prompt="...")\`. Information-gathering (grep, read, glob, ls) is execution and goes to @fast by default; your one exception is an allowance of about 2 direct read-only calls per turn for lookups that settle a question outright, so dispatch @fast once you would exceed it. Synthesize the subagents' results and answer the user yourself.
 
-Preset: hybrid. Tiers: @fast=gpt-6-luna-fast/medium(1x) @medium=gpt-6-astra-fast/high(5x) @heavy=claude-opus-5-5/xhigh(20x).
+Preset: hybrid. Tiers: @fast=claude-haiku-5-5/medium(1x) @medium=gpt-6.1-sol-fast/xhigh(5x) @heavy=claude-opus-5-5/xhigh(20x).
 
 If you ARE @heavy, handle heavy-tier work yourself: never self-call @heavy.
 

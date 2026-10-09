@@ -53,8 +53,8 @@ A preset is not done when `tiers.json` parses. It is done when all of these are 
 - The preset table in the README's `### Presets` section lists it.
 - The preset count is updated in both the README and `docs/CONFIG_REFERENCE.md`.
 - `costRatio` is honest. If two tiers share the same model, the ratio is a token-spend
-  multiplier and not a price difference — say so in the description, following the
-  `fable-effort` precedent.
+  multiplier and not a price difference — say so in the description, as the `zai`
+  preset does.
 - Snapshots regenerated (see above).
 
 ## Changelog
