@@ -45,6 +45,7 @@
   ],
   "files": [
     "server.ts",
+    "tui.ts",
     "src/",
     "tiers.json",
     "LICENSE",
