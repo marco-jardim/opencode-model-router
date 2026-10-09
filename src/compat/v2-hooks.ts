@@ -152,11 +152,13 @@ export function roleBudgetNotice(agent: string, childSessionID: string, cause: "
 
 /**
  * QA-G-A3-4: a `[router` that starts a line — after blanks and markdown quote, list or emphasis marks, any case, blanks allowed
- * between `[` and `router`. The router's notes start a line with it; a child's text must not.
+ * between `[` and `router`. The router's notes start a line with it; a child's text must not. QA-G-A3-2-3: the blanks are every
+ * Unicode space separator (`\p{Zs}`: no-break, ideographic, em …), tab and the zero-width ones (U+200B–U+200D, U+2060, U+FEFF);
+ * the marks include `+` and numbered list marks (`1.`, `12)`); the bracket may be the full-width `［` (U+FF3B).
  */
-const ROUTER_LINE_START = /^([ \t>*_#`-]*)\[(?=[ \t]*router\b)/gim;
+const ROUTER_LINE_START = /^((?:[\p{Zs}\t\u200b-\u200d\u2060\ufeff>*_#`+\-]|\d{1,9}[.)])*)[\[\uff3b](?=[\p{Zs}\t\u200b-\u200d\u2060\ufeff]*router\b)/gimu;
 
-/** QA-G-A3-4: `text` with the `[` of every line-start `[router` turned into `(`; every other character kept. */
+/** QA-G-A3-4: `text` with the `[` (or `［`) of every line-start `[router` turned into `(`; every other character kept. */
 export function defangRouterLines(text: string): string {
   return text.replace(ROUTER_LINE_START, "$1(");
 }
@@ -219,27 +221,28 @@ export interface HostBudgetObserver {
 }
 
 /**
- * QA-G-A3-2: a tool error that is a permission refusal — spike S4 (d): the tool hook sees `Permission.BlockedError` and the tool
- * state `permission.rejected` (a plugin `evaluate` deny); the host's own refusal reads `Permission denied: <action>` and this
- * adapter's `Permission denied by …`. Read from the error's tag, name, type and message, and those of its cause (two levels).
- * The adapter's own `execute.before` refusals (`[router] Refused …`) are not one: they are counted where they are thrown.
+ * QA-G-A3-2 / QA-G-A3-2-4: a tool error that is a permission refusal — only by STRUCTURE, or by this adapter's own text:
+ * - a `_tag`/`name` `Permission.<…>Error` (spike S4 (d): the tool hook sees `Permission.BlockedError` on a plugin `evaluate` deny),
+ *   or a `type` `permission.rejected` (the tool state's error type), on the error or its cause (two levels);
+ * - a message this adapter's `evaluate` hook wrote: `Permission denied by role agent …` / `… plugin agent …` / `… read-only agent …`.
+ * Never free text alone: an OS error such as ripgrep's `Permission denied (os error 13)` is a failed call, not a refusal. The
+ * adapter's own `execute.before` refusals (`[router] Refused …`) are not one either: they are counted where they are thrown.
  */
-const PERMISSION_REFUSAL = /\bPermission\.?(?:Blocked|Denied|Rejected)\w*Error\b|\bpermission\.rejected\b|^Permission denied\b/i;
+const PERMISSION_TAG = /^Permission\.[A-Za-z]*Error$/;
+const PERMISSION_TYPE = "permission.rejected";
+const ROUTER_PERMISSION_TEXT = /^Permission denied by (?:role|plugin|read-only) agent /;
 
 export function isPermissionRefusal(error: unknown): boolean {
-  const parts: string[] = [];
-  const collect = (value: unknown, depth: number): void => {
-    if (typeof value === "string") {
-      parts.push(value);
-      return;
-    }
-    if (value === null || typeof value !== "object" || depth > 2) return;
+  const refusal = (value: unknown, depth: number): boolean => {
+    if (typeof value === "string") return ROUTER_PERMISSION_TEXT.test(value);
+    if (value === null || typeof value !== "object" || depth > 2) return false;
     const e = value as Record<string, unknown>;
-    for (const key of ["_tag", "name", "type", "message"]) if (typeof e[key] === "string") parts.push(e[key] as string);
-    for (const key of ["error", "cause", "data"]) collect(e[key], depth + 1);
+    if ([e._tag, e.name].some((tag) => typeof tag === "string" && PERMISSION_TAG.test(tag))) return true;
+    if (e.type === PERMISSION_TYPE || e._tag === PERMISSION_TYPE) return true;
+    if (typeof e.message === "string" && ROUTER_PERMISSION_TEXT.test(e.message)) return true;
+    return ["error", "cause", "data"].some((key) => refusal(e[key], depth + 1));
   };
-  collect(error, 0);
-  return parts.some((part) => PERMISSION_REFUSAL.test(part));
+  return refusal(error, 0);
 }
 
 /** Q1 (P2.3 decision at the P2.1 call site): an authority request of a child whose binding is not exact is never applied. */

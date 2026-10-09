@@ -284,16 +284,30 @@ describe("QA-G-A3-5: rendered reasons are one line each, capped, and counted", (
     expect(buildForcingNote(["VERIFY\n:required"])).toContain("- VERIFY required\n");
   });
 
-  it("each reason is at most 500 characters; at most 20 are shown, the rest counted", () => {
+  it("at most 20 are shown, the rest counted; a long reason is never cut here (QA-G-A3-2-1: only grader text is, in checker.ts)", () => {
     const long = "x".repeat(2000);
     const note = buildForcingNote([long]);
-    expect(lines(note)[1]).toBe(`- ${"x".repeat(500)}`);
+    expect(lines(note)[1]).toBe(`- ${long}`);
     const many = Array.from({ length: 25 }, (_, i) => `reason ${i}`);
     const shown = lines(buildForcingNote(many)).filter((line) => line.startsWith("- "));
     expect(shown).toEqual([...many.slice(0, 20).map((r) => `- ${r}`), "- (5 more not shown)"]);
     const caveats = lines(buildAcceptedSuffix("none", "unverifiable", many)).filter((line) => line.startsWith("- "));
     expect(caveats).toHaveLength(21);
     expect(caveats[20]).toBe("- (5 more not shown)");
+  });
+
+  it("QA-G-A3-2-1: the router's own reasons are never cut — only their line breaks are joined; one-line text is unchanged", () => {
+    const ids = Array.from({ length: 30 }, (_, i) => `test/suite-${i}.test.ts > case ${i} keeps state`).join(", ");
+    // baseline.ts: a verified pass whose note ends in "suite is NOT green", and an introduced-failures reason with its id list
+    const note = `testsPass: no worse than before; pre-existing failures: ${ids}; suite is NOT green (affected tests checked against the exact dispatch reference)`;
+    expect(note.length).toBeGreaterThan(1000);
+    expect(buildAcceptedSuffix("deterministic", "pass", [], [note])).toBe(`\n\n[router \u2713 verified: deterministic]\nVerification notes:\n- ${note}`);
+    const introduced = `testsPass: introduced failures: ${ids}`;
+    expect(lines(buildForcingNote([introduced]))[1]).toBe(`- ${introduced}`);
+    expect(lines(buildAcceptedSuffix("none", "unverifiable", [introduced]))[4]).toBe(`- ${introduced}`);
+    // a one-line reason keeps its own spacing (tiers mode, I1); only line breaks (with the blanks around them) become one space
+    expect(lines(buildForcingNote(["a  b\tc "]))[1]).toBe("- a  b\tc ");
+    expect(lines(buildForcingNote(["a \n  b\r\n\r\nc\u2028d"]))[1]).toBe("- a b c d");
   });
 
   it("one-line reasons within the caps render byte-identically (tiers mode, I1)", () => {
