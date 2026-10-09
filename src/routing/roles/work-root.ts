@@ -17,7 +17,8 @@ const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\
  * resolved before any `..` after it (QA-P23-A1: POSIX `<root>/link/../x` is where the filesystem says, not `<root>/x`). A path that
  * does not exist is peeled to its longest existing ancestor, one component at a time, and only on a real "does not exist": an
  * entry `lstat` sees but `realpath` cannot resolve is a dangling (or looping) link and refuses; a `..` left in the missing tail
- * refuses. Undefined — the caller refuses — also for an empty path, a NUL, a wildcard, and on win32 an 8.3 spelling, a UNC/device
+ * refuses. Undefined — the caller refuses — also for an empty path, leading or trailing whitespace (QA-G-A2-5: refused, never
+ * trimmed), a NUL, a wildcard, and on win32 an 8.3 spelling, a UNC/device
  * path (`\\server\…`, `\\?\…`: no filesystem call may reach a remote host), a drive-relative path (`C:x`) or a rooted path without
  * a drive (`\x`); and when anything fails to resolve for another reason than "does not exist".
  */
@@ -29,8 +30,9 @@ export function canonicalAuthorityPath(
   const platform = opts.platform ?? process.platform;
   const realpath = opts.realpath ?? ((p: string) => realpathSync.native(p));
   const lstat = opts.lstat ?? ((p: string) => lstatSync(p));
-  const text = path.trim();
-  if (text === "" || text.includes("\0") || /[*?]/.test(text)) return undefined;
+  // QA-G-A2-5: leading/trailing whitespace refuses; it is never trimmed (the host would not trim the path it acts on either).
+  const text = path;
+  if (text.trim() !== text || text === "" || text.includes("\0") || /[*?]/.test(text)) return undefined;
   const api = platform === "win32" ? win32 : posix;
   const unc = (value: string): boolean => /^[\\/]{2}/.test(value);
   if (platform === "win32") {

@@ -1392,19 +1392,19 @@ describe("QA-P13-1-8 package.json is read as a bounded regular file", () => {
 });
 
 describe("QA-P13-1-9 credential environment", () => {
-  it("strips credential-like variables unless passed through, and says so in the description", async () => {
+  it("strips credential-like variables (no passthrough: QA-G-A2-6 removed the unwired option), and says so in the description", async () => {
     for (const name of ["GITHUB_TOKEN", "GH_TOKEN", "NODE_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_KEY", "AWS_SECRET_ACCESS_KEY",
       "AWS_ACCESS_KEY_ID", "HF_TOKEN", "DB_PASSWORD", "MY_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "SSH_PRIVATE_KEY", "DATABASE_URL", "apikey"]) {
       expect(isCredentialEnv(name), name).toBe(true);
     }
     for (const name of ["PATH", "HOME", "SSH_AUTH_SOCK", "TOKENIZER_MODE", "KEYBOARD", "CI"]) expect(isCredentialEnv(name), name).toBe(false);
-    const env = runEnvironment({ HOME: "/h", GITHUB_TOKEN: "t", OPENAI_API_KEY: "k", DATABASE_URL: "u" }, "linux", undefined, { passthrough: ["database_url"] });
-    expect(env).toEqual({ HOME: "/h", DATABASE_URL: "u", CI: "1" });
+    const env = runEnvironment({ HOME: "/h", GITHUB_TOKEN: "t", OPENAI_API_KEY: "k", DATABASE_URL: "u" }, "linux", undefined, { guards: [] });
+    expect(env).toEqual({ HOME: "/h", CI: "1" });
     project(root);
-    writeFileSync(join(root, "env.js"), "console.log('TOKEN=' + (process.env.ROUTER_RUN_FAKE_TOKEN ?? 'absent') + ' PASS=' + (process.env.KEEP_PASSWORD ?? 'absent'));");
-    const out = await makeTool({ env: testEnv({ ROUTER_RUN_FAKE_TOKEN: "s3cr3t", KEEP_PASSWORD: "kept" }), envPassthrough: ["KEEP_PASSWORD"],
+    writeFileSync(join(root, "env.js"), "console.log('TOKEN=' + (process.env.ROUTER_RUN_FAKE_TOKEN ?? 'absent') + ' PASS=' + (process.env.KEEP_PASSWORD ?? 'absent') + ' HOME=' + (process.env.HOME ? 'set' : 'absent'));");
+    const out = await makeTool({ env: testEnv({ ROUTER_RUN_FAKE_TOKEN: "s3cr3t", KEEP_PASSWORD: "kept" }),
       config: () => config({ commands: { e: { argv: ["node", "env.js"] } } }) })({ script: "e", cwd: root });
-    expect(out).toContain("TOKEN=absent PASS=kept");
+    expect(out).toContain("TOKEN=absent PASS=absent HOME=set");
     const description = (routerRunTool({ config: () => config(), resolveWorkRoot: () => bind(root) }) as unknown as { description: string }).description;
     expect(description).toMatch(/best effort, not a secret scanner/);
     expect(description).toMatch(/credential-like environment variables are not passed/);

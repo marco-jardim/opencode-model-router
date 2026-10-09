@@ -1211,7 +1211,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
-      ...gitTools(rolesAtStart ? { resolveWorkRoot: resolveWorkRootFor("router_git") } : {}),
+      // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
+      ...gitTools(rolesAtStart ? { resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}) } : {}),
       // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
       ...(rolesAtStart ? {
         router_run: routerRunTool({
