@@ -10,7 +10,8 @@
  * - G3 running row: {@link runningChildren}: every running delegate of the family, stable order, at most `max`
  *   rows.
  * - Labels and layout: {@link modelLabel}, {@link effortLabel}, {@link formatRow}, width-aware
- *   {@link displayWidth} / {@link truncate}; rendered text is sanitised (control and bidi characters → space).
+ *   {@link displayWidth} / {@link truncate}; rendered text is sanitised (control, bidi and line-separator
+ *   characters → space) and measured as rendered.
  * - Options (D7): {@link parseOptions}, defaults plus at most one notice.
  *
  * Empty and whitespace-only strings count as absent everywhere, and an effort or variant `"default"` too, except
@@ -36,8 +37,11 @@ export interface ModelInfo {
   readonly variants?: ReadonlyArray<{ readonly id: string }>;
 }
 
-/** A host timestamp: epoch milliseconds, or a `DateTime.Utc` (v2 decodes `time.created` to one). */
-export type CreatedTime = number | { readonly epochMillis: number };
+/**
+ * A host timestamp: epoch milliseconds, or an Effect `DateTime.Utc` (v2 decodes `time.created` to one; it carries
+ * `epochMilliseconds`). `time.created` may also be `null`: it sorts as the oldest.
+ */
+export type CreatedTime = number | { readonly epochMilliseconds: number };
 
 export interface SessionLike {
   id: string;
@@ -45,7 +49,7 @@ export interface SessionLike {
   agent?: string;
   title?: string;
   model?: ModelRef;
-  time?: { created?: CreatedTime };
+  time?: { created?: CreatedTime | null };
 }
 
 /** A session message. v2 tags it with `type` (`"assistant"`, `"user"`, `"model-switched"`, …); a legacy `role` is read when `type` is absent. */
@@ -55,7 +59,7 @@ export interface MessageLike {
   role?: string;
   agent?: string;
   model?: ModelRef;
-  time?: { created?: CreatedTime };
+  time?: { created?: CreatedTime | null };
 }
 
 /** The effort a session's own turn actually applied, as reported by the server channel (P1.2); may be absent. */
@@ -192,10 +196,10 @@ function sameModel(applied: AppliedEffort, providerID: string, modelID: string):
   return applied.providerID === providerID && applied.modelID === modelID;
 }
 
-/** Epoch milliseconds of `time.created` (a number or a `DateTime.Utc`); missing or non-finite sorts as the oldest. */
-function createdOf(time: { created?: CreatedTime } | undefined): number {
+/** Epoch milliseconds of `time.created` (a number or a `DateTime.Utc`); missing, null or non-finite sorts as the oldest. */
+function createdOf(time: { created?: CreatedTime | null } | undefined): number {
   const created = time?.created;
-  const millis = typeof created === "object" ? created.epochMillis : created;
+  const millis = created !== null && typeof created === "object" ? created.epochMilliseconds : created;
   return typeof millis === "number" && Number.isFinite(millis) ? millis : Number.NEGATIVE_INFINITY;
 }
 
@@ -339,14 +343,16 @@ export function runningChildren(input: RunningChildrenInput): RunningChildren {
 const ZWJ = 0x200d;
 const VS16 = 0xfe0f;
 const SOFT_HYPHEN = 0x00ad;
-const RE_CONTROL = /^\p{Cc}$/u;
 const RE_ZERO_WIDTH = /^[\p{Cf}\p{M}]$/u;
 const RE_MARK = /^\p{M}$/u;
 const RE_SPACING_MARK = /^\p{Mc}$/u;
 const RE_EMOJI_PRESENTATION = /^\p{Emoji_Presentation}$/u;
 const RE_PICTOGRAPHIC = /^\p{Extended_Pictographic}$/u;
-/** Control characters and bidi controls (LRM, RLM, LRE–RLO, LRI–PDI): each becomes one space in rendered text. */
-const RE_UNSAFE = /[\p{Cc}\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+/**
+ * Control characters (`\p{Cc}`), bidi controls (ALM U+061C, LRM, RLM, LRE–RLO, LRI–PDI) and the line and
+ * paragraph separators (U+2028, U+2029): each becomes one space in rendered and measured text.
+ */
+const RE_UNSAFE = /[\p{Cc}\u061C\u200E\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]/gu;
 const RE_WHITESPACE_RUN = /\s+/gu;
 
 /** East Asian Wide and Fullwidth ranges (emoji-presentation code points are matched separately). */
@@ -399,8 +405,6 @@ interface Cluster {
 }
 
 interface OpenCluster extends Cluster {
-  /** False after a control character: nothing joins it. */
-  joinable: boolean;
   /** The base is `\p{Extended_Pictographic}`. */
   pictographic: boolean;
   /** A pictographic cluster that ends in a ZWJ: the next pictograph joins it. */
@@ -417,19 +421,19 @@ function joins(open: OpenCluster, ch: string, cp: number): boolean {
  * tones and tags, pictographic ZWJ sequences, and regional-indicator pairs. Surrogate pairs are never split. A
  * ZWJ joins the next code point only when the open cluster is pictographic and that code point is
  * `\p{Extended_Pictographic}`; a leading or orphan ZWJ joins nothing after it. Width: the base's (see
- * `codePointWidth`; control characters 0), plus 1 per joined spacing mark, and 2 when a narrow base takes VS16
- * (emoji presentation).
+ * `codePointWidth`), plus 1 per joined spacing mark; at least 2 once a pictograph joins after a ZWJ, and 2 when
+ * a narrow base takes VS16 (emoji presentation). Expects sanitised text (see {@link sanitise}).
  */
 function clusters(text: string): Cluster[] {
   const out: Cluster[] = [];
   let open: OpenCluster | undefined;
   for (const ch of text) {
     const cp = ch.codePointAt(0) as number;
-    const control = RE_CONTROL.test(ch);
-    if (open !== undefined && open.joinable && !control && joins(open, ch, cp)) {
-      open.text += ch;
-      if (RE_SPACING_MARK.test(ch)) open.width += 1;
+    if (open !== undefined && joins(open, ch, cp)) {
+      if (open.afterZwj && RE_PICTOGRAPHIC.test(ch)) open.width = Math.max(open.width, 2);
+      else if (RE_SPACING_MARK.test(ch)) open.width += 1;
       else if (cp === VS16 && open.width === 1) open.width = 2;
+      open.text += ch;
       if (isRegional(cp)) open.regional += 1;
       open.afterZwj = cp === ZWJ && open.pictographic;
       continue;
@@ -437,8 +441,7 @@ function clusters(text: string): Cluster[] {
     if (open !== undefined) out.push({ text: open.text, width: open.width });
     open = {
       text: ch,
-      width: control ? 0 : codePointWidth(ch, cp),
-      joinable: !control,
+      width: codePointWidth(ch, cp),
       pictographic: RE_PICTOGRAPHIC.test(ch),
       afterZwj: false,
       regional: isRegional(cp) ? 1 : 0,
@@ -449,22 +452,24 @@ function clusters(text: string): Cluster[] {
 }
 
 /**
- * Terminal columns of `text`: East Asian wide/fullwidth and emoji 2; combining (non-spacing) marks, format and
- * control characters 0; spacing marks, the soft hyphen and East Asian Ambiguous characters 1.
+ * Terminal columns of `text` as rendered: East Asian wide/fullwidth and emoji 2; combining (non-spacing) marks
+ * and format characters 0; spacing marks, the soft hyphen and East Asian Ambiguous characters 1; every
+ * character that {@link sanitise} turns into a space (control, bidi control, line/paragraph separator) 1, so
+ * raw and sanitised text measure the same.
  */
 export function displayWidth(text: string): number {
   let width = 0;
-  for (const cluster of clusters(text)) width += cluster.width;
+  for (const cluster of clusters(sanitise(text))) width += cluster.width;
   return width;
 }
 
-/** Each control character (`\p{Cc}`) and bidi control replaced by one space. */
+/** Each control character, bidi control and line/paragraph separator (`RE_UNSAFE`) replaced by one space. */
 function sanitise(text: string): string {
   return text.replace(RE_UNSAFE, " ");
 }
 
 /**
- * `text`, sanitised (each control and bidi control character → one space), cut to at most `width` columns
+ * `text`, sanitised (see {@link sanitise}), cut to at most `width` columns
  * (floored); a cut appends `…` (1 column) and never splits a cluster (surrogate pair, base + combining marks,
  * ZWJ sequence, flag). Width ≤ 0 or NaN → `""`.
  */
@@ -516,39 +521,41 @@ function ownValue(record: object, key: string): unknown {
   return Object.hasOwn(record, key) ? (record as Record<string, unknown>)[key] : undefined;
 }
 
+/** The one options notice, sanitised (a key may carry bidi or separator characters). */
+function optionsNotice(problems: readonly string[], fallback: string): string {
+  return sanitise(`${STATUS_NOTICE_PREFIX}invalid TUI options (${problems.join("; ")}); ${fallback}`);
+}
+
 /**
- * D7: TUI plugin options. Undefined/null → defaults, no notice. Not an object (or an array) → defaults. Only own
- * keys are read. Each flag must be a boolean and `maxRows` an integer from 1 to 20; an invalid value keeps the
- * default. Unknown keys are ignored. All problems (flags, then `maxRows`, then unknown keys) go into one notice:
+ * D7: TUI plugin options. Undefined/null → defaults, no notice. Not an object (or an array) → defaults and the
+ * notice `model-router status: invalid TUI options (not an object); using the defaults`. Only own keys are read.
+ * Each flag must be a boolean and `maxRows` an integer from 1 to 20; an invalid value keeps the default. Unknown
+ * keys are ignored. All problems (flags, then `maxRows`, then unknown keys) go into one sanitised notice:
  * `model-router status: invalid TUI options (<problem>; …); using defaults for those keys`.
  */
 export function parseOptions(raw: unknown): ParsedOptions {
   const options: StatusOptions = { ...DEFAULT_STATUS_OPTIONS };
   if (raw === undefined || raw === null) return { options, notices: [] };
-  const problems: string[] = [];
   if (typeof raw !== "object" || Array.isArray(raw)) {
-    problems.push("not an object");
-  } else {
-    for (const key of FLAG_KEYS) {
-      const value = ownValue(raw, key);
-      if (value === undefined) continue;
-      if (typeof value === "boolean") options[key] = value;
-      else problems.push(`"${key}" must be true or false`);
-    }
-    const maxRows = ownValue(raw, "maxRows");
-    if (maxRows !== undefined) {
-      if (typeof maxRows === "number" && Number.isInteger(maxRows) && maxRows >= MAX_ROWS_MIN && maxRows <= MAX_ROWS_MAX) {
-        options.maxRows = maxRows;
-      } else {
-        problems.push(`"maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}`);
-      }
-    }
-    const unknownKeys = Object.keys(raw).filter((key) => !KNOWN_KEYS.has(key));
-    if (unknownKeys.length > 0) problems.push(`unknown keys ${unknownKeys.map((key) => JSON.stringify(key)).join(", ")}`);
+    return { options, notices: [optionsNotice(["not an object"], "using the defaults")] };
   }
-  const notices =
-    problems.length === 0
-      ? []
-      : [`${STATUS_NOTICE_PREFIX}invalid TUI options (${problems.join("; ")}); using defaults for those keys`];
+  const problems: string[] = [];
+  for (const key of FLAG_KEYS) {
+    const value = ownValue(raw, key);
+    if (value === undefined) continue;
+    if (typeof value === "boolean") options[key] = value;
+    else problems.push(`"${key}" must be true or false`);
+  }
+  const maxRows = ownValue(raw, "maxRows");
+  if (maxRows !== undefined) {
+    if (typeof maxRows === "number" && Number.isInteger(maxRows) && maxRows >= MAX_ROWS_MIN && maxRows <= MAX_ROWS_MAX) {
+      options.maxRows = maxRows;
+    } else {
+      problems.push(`"maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}`);
+    }
+  }
+  const unknownKeys = Object.keys(raw).filter((key) => !KNOWN_KEYS.has(key));
+  if (unknownKeys.length > 0) problems.push(`unknown keys ${unknownKeys.map((key) => JSON.stringify(key)).join(", ")}`);
+  const notices = problems.length === 0 ? [] : [optionsNotice(problems, "using defaults for those keys")];
   return { options, notices };
 }

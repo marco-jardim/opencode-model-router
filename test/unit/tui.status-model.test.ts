@@ -41,7 +41,7 @@ function ref(providerID: string, id: string, variant?: string): ModelRef {
 }
 
 /** An assistant message in the v2 host shape (`type: "assistant"`). */
-function assistant(id: string, model: ModelRef | undefined, created?: CreatedTime, agent?: string): MessageLike {
+function assistant(id: string, model: ModelRef | undefined, created?: CreatedTime | null, agent?: string): MessageLike {
   const message: MessageLike = { id, type: "assistant" };
   if (model !== undefined) message.model = model;
   if (created !== undefined) message.time = { created };
@@ -53,9 +53,10 @@ function applied(providerID: string, modelID: string, effort: string, variant?: 
   return variant === undefined ? { providerID, modelID, effort } : { providerID, modelID, effort, variant };
 }
 
-/** A host `DateTime.Utc`-like timestamp. */
-function dateTime(epochMillis: number): CreatedTime {
-  return { epochMillis };
+/** A host Effect `DateTime.Utc`-like timestamp (`_tag: "Utc"`, `epochMilliseconds`). */
+function dateTime(epochMilliseconds: number): CreatedTime {
+  const utc = { _tag: "Utc", epochMilliseconds };
+  return utc;
 }
 
 const GRIN = "\u{1F600}";
@@ -294,18 +295,27 @@ describe("latestAssistant", () => {
     expect(latestAssistant([untimed, nan])).toBe(nan);
   });
 
-  test("time.created as a host DateTime ({ epochMillis }) or a number", () => {
+  test("time.created as a host DateTime ({ _tag: \"Utc\", epochMilliseconds }) or a number", () => {
     const asDate = assistant("m1", ref("openai", "gpt-5"), dateTime(300));
     const asNumber = assistant("m2", ref("openai", "gpt-5"), 200);
     expect(latestAssistant([asDate, asNumber])).toBe(asDate);
     expect(latestAssistant([asNumber, assistant("m3", ref("openai", "gpt-5"), dateTime(100))])).toBe(asNumber);
   });
 
-  test("a non-finite epochMillis sorts as the oldest", () => {
+  test("a non-finite epochMilliseconds sorts as the oldest", () => {
     const timed = assistant("m1", ref("openai", "gpt-5"), 1);
     const nan = assistant("m2", ref("openai", "gpt-5"), dateTime(Number.NaN));
     const inf = assistant("m3", ref("openai", "gpt-5"), dateTime(Number.POSITIVE_INFINITY));
     expect(latestAssistant([timed, nan, inf])).toBe(timed);
+  });
+
+  test("time.created null does not throw and sorts as the oldest", () => {
+    const timed = assistant("m1", ref("openai", "gpt-5"), dateTime(1));
+    const nulled = assistant("m2", ref("openai", "gpt-5"), null);
+    expect(() => latestAssistant([nulled])).not.toThrow();
+    expect(latestAssistant([nulled])).toBe(nulled);
+    expect(latestAssistant([timed, nulled])).toBe(timed);
+    expect(latestAssistant([nulled, timed])).toBe(timed);
   });
 });
 
@@ -420,7 +430,7 @@ function fakeHost(children: FakeChild[], extra: Partial<RunningChildrenInput> = 
   };
 }
 
-function child(id: string, created: CreatedTime | undefined, more: Partial<SessionLike> = {}): SessionLike {
+function child(id: string, created: CreatedTime | null | undefined, more: Partial<SessionLike> = {}): SessionLike {
   const session: SessionLike = { id, parentID: "root", agent: `agent-${id}`, model: ref("openai", "gpt-5", "high"), ...more };
   if (created !== undefined) session.time = { created };
   return session;
@@ -546,7 +556,7 @@ describe("runningChildren (G3)", () => {
     expect(backward.rows.map((r) => r.id)).toEqual(expected);
   });
 
-  test("session time.created as a host DateTime ({ epochMillis }) or a number", () => {
+  test("session time.created as a host DateTime ({ _tag: \"Utc\", epochMilliseconds }) or a number", () => {
     const host = fakeHost([
       { id: "a", status: "running", session: child("a", dateTime(30)) },
       { id: "b", status: "running", session: child("b", 20) },
@@ -554,6 +564,15 @@ describe("runningChildren (G3)", () => {
       { id: "d", status: "running", session: child("d", dateTime(Number.NaN)) },
     ]);
     expect(runningChildren(host).rows.map((r) => r.id)).toEqual(["d", "c", "b", "a"]);
+  });
+
+  test("session time.created null does not throw and sorts first", () => {
+    const host = fakeHost([
+      { id: "a", status: "running", session: child("a", dateTime(5)) },
+      { id: "z", status: "running", session: child("z", null) },
+    ]);
+    expect(() => runningChildren(host)).not.toThrow();
+    expect(runningChildren(host).rows.map((r) => r.id)).toEqual(["z", "a"]);
   });
 
   test("a missing creation time sorts first", () => {
@@ -665,6 +684,14 @@ describe("displayWidth", () => {
     expect(displayWidth(`${FAMILY}${FAMILY}`)).toBe(4);
   });
 
+  test("a pictograph joined after a ZWJ makes the cluster at least 2 wide", () => {
+    expect(displayWidth("\u2764\u200D\u{1F525}")).toBe(2);
+    expect(displayWidth("\u2764\uFE0F\u200D\u{1F525}")).toBe(2);
+    expect(displayWidth("\u2764\u200D\u2764")).toBe(2);
+    expect(truncate("\u2764\u200D\u{1F525}x", 2)).toBe("…");
+    expect(truncate("\u2764\u200D\u{1F525}xy", 3)).toBe("\u2764\u200D\u{1F525}…");
+  });
+
   test("text-presentation symbols stay 1", () => {
     expect(displayWidth("\u2764")).toBe(1);
     expect(displayWidth("\u00A9")).toBe(1);
@@ -691,13 +718,37 @@ describe("displayWidth", () => {
     expect(displayWidth("a\u00ADb")).toBe(3);
   });
 
-  test("control and format characters count 0", () => {
-    expect(displayWidth("a\tb\n")).toBe(2);
-    expect(displayWidth("\u001b[31m")).toBe(4);
-    expect(displayWidth("\u007f\u0085")).toBe(0);
+  test("control, bidi and separator characters count 1 (the space they render as)", () => {
+    expect(displayWidth("a\tb")).toBe(3);
+    expect(displayWidth("a\tb\n")).toBe(4);
+    expect(displayWidth("\u001b[31m")).toBe(5);
+    expect(displayWidth("\u007f\u0085")).toBe(2);
+    expect(displayWidth("\n\u0301")).toBe(1);
+    expect(displayWidth("a\u202Eb")).toBe(3);
+    expect(displayWidth("\u061C\u200E\u200F\u2028\u2029\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069")).toBe(14);
+  });
+
+  test("other format characters and a lone ZWJ count 0", () => {
     expect(displayWidth("a\u200bb")).toBe(2);
     expect(displayWidth("\u200d")).toBe(0);
-    expect(displayWidth("\n\u0301")).toBe(0);
+    expect(displayWidth("\uFEFF")).toBe(0);
+  });
+
+  test("raw and sanitised text measure the same", () => {
+    const samples = [
+      "a\tb\n",
+      "\u001b[31mred\u001b[0m",
+      "\n\u0301",
+      "\n\uFE0F",
+      "\t\u093F",
+      `\u202E${GRIN}\u2028${FAMILY}\u2029`,
+      "\u061Cx\u0000y\u007f",
+    ];
+    for (const sample of samples) {
+      const sanitised = truncate(sample, Number.POSITIVE_INFINITY);
+      expect(sanitised).not.toBe(sample);
+      expect(displayWidth(sample)).toBe(displayWidth(sanitised));
+    }
   });
 
   test("a lone surrogate counts 1", () => {
@@ -773,6 +824,12 @@ describe("truncate", () => {
     const bidi = "\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069";
     expect(truncate(`${bidi}x`, 20)).toBe(`${" ".repeat(11)}x`);
     expect(truncate(`\u202Eevil${bidi}`, 5)).toBe(" evi…");
+    expect(truncate("a\u061Cb", 10)).toBe("a b");
+  });
+
+  test("line and paragraph separators become one space each", () => {
+    expect(truncate("a\u2028b\u2029c", 10)).toBe("a b c");
+    expect(truncate("ab\u2028\u2029cd", 4)).toBe("ab …");
   });
 
   test("never exceeds the width and never leaves a lone surrogate", () => {
@@ -884,9 +941,7 @@ describe("parseOptions (D7)", () => {
     (raw) => {
       const parsed = parseOptions(raw);
       expect(parsed.options).toEqual(DEFAULT_STATUS_OPTIONS);
-      expect(parsed.notices).toEqual([
-        "model-router status: invalid TUI options (not an object); using defaults for those keys",
-      ]);
+      expect(parsed.notices).toEqual(["model-router status: invalid TUI options (not an object); using the defaults"]);
     },
   );
 
@@ -929,6 +984,12 @@ describe("parseOptions (D7)", () => {
       ),
     ]);
     expect(parsed.notices[0]?.startsWith(STATUS_NOTICE_PREFIX)).toBe(true);
+  });
+
+  test("the notice is sanitised: a key with a bidi override or a line separator cannot reorder or break it", () => {
+    const parsed = parseOptions({ "evil\u202Ekey": 1, "two\u2028lines": 2, "tab\tkey": 3 });
+    expect(parsed.notices).toEqual([notice('unknown keys "evil key", "two lines", "tab\\tkey"')]);
+    expect(parsed.notices[0]).not.toMatch(/[\u202E\u2028\t]/u);
   });
 
   test("explicit undefined values count as absent", () => {
