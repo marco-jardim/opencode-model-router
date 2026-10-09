@@ -85,10 +85,10 @@ matter most:
 
 | Item | Value |
 |---|---|
-| Checkpoint reached | **P3.3 global QA fixes merged** (rta/main ≥ `952de94`, 2026-10-09). Waves 0–2, DF-1, DF-2, P3.1, P3.2 done; P3.3 areas A1/A2/A3/B PASS, area C round 3 and CI on the final head pending. Report `docs\qa\role-tier\global.md`. Amendments R0–R10 |
-| **Next task id** | Close P3.3 (area C round 3, CI 17/17 on the PR head, #84 comment), then **P3.4** release 2.4.0 (T3.4.1 merge PR #85 with a merge commit, R10(5); human publish gate "retomar e publicar" / "retomar sem publicar") |
+| Checkpoint reached | **Plan complete** (2026-10-09): 2.4.0 released (`v2.4.0` on `d3bc2e3`, npm with provenance), live for the owner in roles mode (exploration 0.05). Reports: `docs\qa\role-tier\global.md`, `phase-p34.md`, `dogfood.md` |
+| **Next task id** | none. T3.4.5 cleanup: this docs record merged to `master` via a follow-up PR; worktrees `D:\git\omr-rta-*` and `D:\git\omr-plan-rta`, `rta/*` and `docs/role-tier-plan` branches, tags `rta/df1-prev`, `rta/df2-prev`, `rta/sync-prev` removed; `routing.workRoots` removed from the owner override; #84 closed. Follow-up: #86 |
 | Incidents | (1) 2026-10-08 ≈05:12Z: a P1.2 producer wrote the base checkout via relative-path .NET `WriteAllText`; restored, never loaded; dispatches forbid .NET file APIs. (2) Heavy subagents die with `Decode error … socket connection was closed` (the `opencode-anthropic-fix` v2 bridge, `lib\host\v2-transport.mjs:238 response.destroy()`); mitigation ≤ 3 concurrent heavy dispatches, resume the same session. (3) P3.3: "Provider blocked the response" twice on the area-A security review prompt (split into A1/A2/A3); `Overloaded` once. (4) OpenCode snapshot index corrupt since 2026-10-07 (owner not yet asked); leaked MCP `node.exe` processes (not ours) |
-| Base checkout | `D:\git\opencode-model-router` on `rta/live` @ `ae67429` (DF-2 sync), clean; rollback tags `rta/df1-prev` (`eeab36b`), `rta/df2-prev` (`741a835`). P3.4 moves it back to `master` |
+| Base checkout | `D:\git\opencode-model-router` on `master` (≥ `d3bc2e3`), clean, live since the 08:26Z restart; rollback tags `rta/df1-prev` (`eeab36b`), `rta/df2-prev` (`741a835`). P3.4 moves it back to `master` |
 | Worktrees | `D:\git\omr-rta-main` → `rta/main` (integration, executor only); idle and merged: `omr-rta-p01`, `p11`–`p16`, `p21`, `p21b`, `p22`, `p23`, `w1i`, `fx1`–`fx3`, `p31`, `p32`, `p33` (`rta/p33-fix-1/-2/-3/-5/-8`), `p34` (`rta/p33-fix-4/-6/-7`); `D:\git\omr-plan-rta` frozen. All removed in T3.4.5 |
 | Draft PR `rta/main → master` | [#85](https://github.com/marco-jardim/opencode-model-router/pull/85) |
 | Live host | OpenCode **v2.0.24**, plugin from the base checkout, roles mode live since DF-2 (`router: engine=enforce build=2.3.0+ae67429`) |
@@ -96,7 +96,7 @@ matter most:
 | Owner override (`C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc`) | roles mode since DF-2: SHA-256 `E73373581618F1193A4E3AF9264FD59E603C1D66B2ECF100C4F3C246A1C50750` (copy `C:\Users\Marquinho\AppData\Local\Temp\Claude\rta-override-last.jsonc`); kill switch = restore `opencode-model-router.overrides.jsonc.bak-2026-10-08_16-10-50` (SHA `700E2587…88F8`) + restart. P3.4 T3.4.2 re-validates it against the final code in a temp HOME |
 | Live agent models | role agents and tiers: fast `anthropic/claude-haiku-5-5#low`, medium `anthropic/claude-sonnet-5-5#medium`, heavy `anthropic/claude-opus-5-5#xhigh`; reviewer heavy..heavy |
 | Dogfood | DF-1 done (12:34Z), DF-2 done (19:12Z); Wave 3 run through role agents (record in `docs\qa\role-tier\dogfood.md`) |
-| Restart stops | DF-1, DF-2 sync, DF-2 post-migration done; P3.4 next |
+| Restart stops | DF-1, DF-2 sync, DF-2 post-migration, P3.4 (08:26Z) done |
 | Plan amendments | R0–R10; next free id: R11 |
 | Reference sessions | P3.3 reviewers: A1 `ses_ee22971d6ffeS7fHgPXTaQFHDx`, A2 `ses_ee22957dfffeT3wgFjuvbi1zy3`, A3 `ses_ee21b8a7fffe6Wb3nR27Zpkaxb`, B `ses_ee24282d4ffeiCDteRQVxkvaVU`, C `ses_ee2426004ffeeqzLJEk3b6NUOy` |
 ---

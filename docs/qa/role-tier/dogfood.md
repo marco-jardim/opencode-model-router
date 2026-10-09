@@ -174,3 +174,18 @@ verdicts appear as `verdict` rows (fixed in `rta/p33-fix-2`) and advisory budget
 Observed in use: the router's grader timed out (60 s) on most large fix reports and twice rejected results on truncated
 criteria; heavy children died on transport errors and were resumed by session id; resuming a reviewer bound to one root
 could not read a sibling worktree (expected: a resume keeps its bound root).
+
+## P3.4 — final code live (2026-10-09)
+
+- Sync: base checkout `master` @ `d3bc2e3` (merge of PR #85, 2.4.0); restart by the owner at 08:26Z; `/router`: `build=2.4.0+d3bc2e3`, 7 roles; `/api/agent` lists the 7 role agents (steps 95/255); no plugin load error after the restart (one at 05:02Z came from a host reload during the checkout switch).
+- Override: `routing.exploration.rate: 0.05` added at the owner's request after temp-HOME validation on the final code (7 roles, zero notices; the rate is re-read per dispatch, no restart needed); backup `opencode-model-router.overrides.jsonc.bak-2026-10-09_05-30-50` (SHA `E7337358…0750`), new SHA `7BB7EE96…B256`. Kill switch unchanged (`…bak-2026-10-08_16-10-50`).
+
+| Probe | Result |
+|---|---|
+| explorer read in `D:\git\omr-rta-p34` | PASS (fast, binding exact) |
+| explorer reads outside the root (`C:\Windows\win.ini`, base checkout) | PASS: both refused by the router; with two parallel refusals the second message named the first path (cosmetic, follow-up issue) |
+| runner `router_run` `test-files` in the worktree | PASS: exit 0, 2/2 |
+| researcher web | PASS: web tools only |
+| implementer file + `.git\probe.txt` | PASS: file created, `.git` write refused ("repository metadata"), `verified: deterministic` |
+| general ladder (edit-free prompt) | PASS end to end: fast + local grant → `router_request_authority` → `ESCALATE: authority` note → resume of the same session → grant + `edit`, floor recomputed (medium) → `note:signal:grader:pass` |
+| unknown bindings | 1: a resume of a pre-restart session (fails closed, I9) |
