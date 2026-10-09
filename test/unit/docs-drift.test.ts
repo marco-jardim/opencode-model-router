@@ -28,6 +28,10 @@ import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import { authorityFloor, effectiveDetection, GRANT_NOTES } from "../../src/routing/roles/policy";
 import { REDISPATCH_WINDOW_MS, runSignal, SIGNAL_MASS_CAPS, SIGNAL_WEIGHTS } from "../../src/routing/outcomes/signals";
 import { CRITERIA_BUDGET_CHARS } from "../../src/verify/dod";
+import { RENDERED_REASONS_MAX } from "../../src/verify/dispatch";
+import { GRADER_REASONS_MAX } from "../../src/verify/checker";
+import { oneLineReason } from "../../src/routing/roles/authority";
+import { CREDENTIAL_ENV_RE } from "../../src/router/run-tools";
 import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
@@ -1016,12 +1020,14 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(Object.hasOwn(explorer.budget, "heavy")).toBe(false);
     // QA-G-A3-7: max(the ceiling tier's role budget, the tier agents' budget) — the explorer's medium budget (40) here.
     expect(roleGuardProfile(explorer, "heavy").budget).toBe(Math.max(explorer.budget[explorer.tierRange.ceiling]!, TIER_GUARD_BUDGET));
-    expect(flat).toContain(`the dispatch gets the tier agents' ${TIER_GUARD_BUDGET} calls`);
+    expect(flat).toContain(`the dispatch gets max(the role's budget for its ceiling tier, ${TIER_GUARD_BUDGET}) calls`);
+    // negative: the pre-QA-G-A3-7 sentence (a flat tier-agent budget) is gone
+    expect(flat).not.toContain(`the dispatch gets the tier agents' ${TIER_GUARD_BUDGET} calls`);
     expect(flat).toContain("has a read-only call cap only when it carries `CAP:N` or `CAP:none`");
   });
 
   it("quotes the budget, steps, signal, exploration and router_run numbers of the code", () => {
-    expect(flat).toContain(`${ROUTE_BUDGET_RAISE_MAX} × top role budget + \`REFUSAL_CAP\` + ${ROLE_STEPS_MARGIN}`);
+    expect(flat).toContain(`${ROUTE_BUDGET_RAISE_MAX} × max(top role budget, ${TIER_GUARD_BUDGET}) + \`REFUSAL_CAP\` + ${ROLE_STEPS_MARGIN}`);
     expect(flat).toContain(`\`REFUSAL_CAP\` = ${REFUSAL_CAP}`);
     expect(flat).toContain(`+ \`REFUSAL_CAP\` (${REFUSAL_CAP}) + ${ROLE_STEPS_MARGIN}`);
     expect(flat).toContain(`never above ${ROUTE_BUDGET_RAISE_MAX} ×`);
@@ -1074,7 +1080,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(unreleased).toContain(`Explicit \`[acceptance]\` lists over ${CRITERIA_BUDGET_CHARS} code points are no longer graded in full`);
     // QA-P32-1-5: R8(3), R8(2), R8(7), R7 single-dash, R7 cost-inverted roles, the v2-only class reader case
     expect(unreleased).toContain("After a verification FAIL of a role child the router raises its tier on the next resume itself; the orchestrator never sets `tier=` or `model`.");
-    expect(unreleased).toContain(`Role agents' host \`steps\` = ${ROUTE_BUDGET_RAISE_MAX} × the top role budget + \`REFUSAL_CAP\` (${REFUSAL_CAP}) + ${ROLE_STEPS_MARGIN}.`);
+    expect(unreleased).toContain(`Role agents' host \`steps\` = ${ROUTE_BUDGET_RAISE_MAX} × max(the top role budget, ${TIER_GUARD_BUDGET}) + \`REFUSAL_CAP\` (${REFUSAL_CAP}) + ${ROLE_STEPS_MARGIN}.`);
     expect(unreleased).toContain("A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`.");
     expect(unreleased).toContain("single-dash arguments carrying `/`, `\\` or `..` are refused");
     expect(unreleased).toContain("A role whose tier range the active preset's `costRatio` orders against the tier names is disabled with a notice.");
@@ -1144,5 +1150,116 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
 
   it("resolves every relative markdown link of the roles docs, anchors included", () => {
     expect(brokenLinks(ROLES_DOCS, readRepo)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P3.3 global QA (plan amendments R9, R10): the guard table of ENFORCEMENT.md, the budget numbers after the
+// P3.3 fixes, the R10 statements and the v1 statement of the README.
+// ---------------------------------------------------------------------------
+
+/** Every guard name `src/guard/guards.ts` can return (`guard: "<name>"` literals). */
+function guardNamesOf(source: string): string[] {
+  return [...new Set([...source.matchAll(/\bguard: "([a-z_]+)"/g)].map((m) => m[1]!))].sort();
+}
+
+/** Guard names missing from the `<!-- guard-table -->` table of `doc`, and names it lists that the code never returns. */
+function guardTableProblems(doc: string, names: readonly string[]): string[] {
+  const table = tableAfter(doc, "guard-table");
+  if (table === undefined) return ["no guard table"];
+  const listed = table.rows.map((row) => /^`([a-z_]+)`$/.exec(row[row.length - 1] ?? "")?.[1]).filter((name): name is string => name !== undefined);
+  return [
+    ...names.filter((name) => !listed.includes(name)).map((name) => `${name}: no row`),
+    ...listed.filter((name) => !names.includes(name)).map((name) => `${name}: not a guard of the code`),
+  ];
+}
+
+describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
+  const enforcement = read("docs/ENFORCEMENT.md");
+  const flatEnforcement = enforcement.replace(/\s+/g, " ");
+  const guide = read("docs/ROLES.md").replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
+  const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+  const names = guardNamesOf(read("src/guard/guards.ts"));
+
+  it("the guard table of ENFORCEMENT.md lists every guard the code returns, and only those (C-1)", () => {
+    expect(names).toEqual(["anti_self_script", "cumulative_iteration_cap", "deliverable_first", "denied_cap", "iteration_cap", "read_budget", "redundant_read"]);
+    expect(guardTableProblems(enforcement, names)).toEqual([]);
+    // negative fixtures: a dropped row, an invented guard, no table
+    const dropped = enforcement.split(/\r?\n/).filter((line) => !line.includes("| `denied_cap` |")).join("\n");
+    expect(guardTableProblems(dropped, names)).toEqual(["denied_cap: no row"]);
+    expect(guardTableProblems(enforcement, names.filter((name) => name !== "read_budget"))).toEqual(["read_budget: not a guard of the code"]);
+    expect(guardTableProblems("# no table\n", names)).toEqual(["no guard table"]);
+    // read_budget is producer-only; role agents are guarded with role budgets
+    expect(flatEnforcement).toContain("**producer profile only**; a reader dispatch never gets it");
+    expect(flatEnforcement).toContain("role-agent child sessions");
+    expect(flatEnforcement).toContain(`(\`REFUSAL_CAP\` = ${REFUSAL_CAP}, \`src/router/guard-profile.ts\`)`);
+    expect(flatEnforcement).toContain(`| \`cumulativeBudget\` | \`budget\` × ${GUARD_CUMULATIVE_MULTIPLIER} (\`CUMULATIVE_BUDGET_MULTIPLIER\`) |`);
+    expect(enforcement).toContain("(./READ_ONLY_TIERS.md#reader-guard-profile-84)");
+    expect(enforcement).toContain("(./ROLES.md#budgets)");
+    expect(brokenLinks(["docs/ENFORCEMENT.md"], readRepo)).toEqual([]);
+  });
+
+  it("quotes the P3.3 budget rules: the lifted-tier fallback, the host steps and the cumulative ceiling (QA-G-A3-6/7, QA-G-A3-2-2)", () => {
+    // fallback: max(the ceiling tier's role budget, TIER_GUARD_BUDGET); a small ceiling budget is lifted to the tier agents' budget
+    const small = { guard: "reader" as const, budget: { fast: 10 }, tierRange: { ceiling: "fast" } };
+    expect(roleGuardProfile(small, "medium").budget).toBe(TIER_GUARD_BUDGET);
+    expect(roleGuardProfile({ guard: "reader", budget: { fast: 60 }, tierRange: { ceiling: "fast" } }, "medium").budget).toBe(60);
+    expect(guide).toContain(`max(the role's budget for its ceiling tier, ${TIER_GUARD_BUDGET}) calls — never less than the role on its ceiling, nor less than a tier agent`);
+    // steps: 2 × max(top budget, TIER_GUARD_BUDGET) + REFUSAL_CAP + margin, also for a role whose budgets are all below it
+    expect(roleAgentSteps({ budget: { fast: 10 } })).toBe(ROUTE_BUDGET_RAISE_MAX * TIER_GUARD_BUDGET + REFUSAL_CAP + ROLE_STEPS_MARGIN);
+    expect(guide).toContain(`${ROUTE_BUDGET_RAISE_MAX} × max(the top budget of the role, ${TIER_GUARD_BUDGET}) + \`REFUSAL_CAP\` (${REFUSAL_CAP}) + ${ROLE_STEPS_MARGIN}`);
+    expect(guide).not.toContain(`${ROUTE_BUDGET_RAISE_MAX} × the top budget of the role + \`REFUSAL_CAP\``);
+    // cumulative: 3 × the largest round budget; a resume without budget= keeps the previous one
+    expect(guide).toContain(`${GUARD_CUMULATIVE_MULTIPLIER} × the largest round budget the child had`);
+    expect(guide).toContain("a resume without `budget=` keeps the child's previous `budget=`");
+    expect(unreleased).toContain(`gets max(the role's budget for its ceiling tier, ${TIER_GUARD_BUDGET}). The cumulative ceiling is ${GUARD_CUMULATIVE_MULTIPLIER} × the largest round budget the child had.`);
+    const adr = read("docs/adr/0006-role-tier-assurance-delegation.md").replace(/\s+/g, " ");
+    expect(adr).toContain(`${ROUTE_BUDGET_RAISE_MAX} × max(the top role budget, ${TIER_GUARD_BUDGET}) + \`REFUSAL_CAP\` + ${ROLE_STEPS_MARGIN}`);
+    expect(adr).toContain(`the cumulative ceiling is ${GUARD_CUMULATIVE_MULTIPLIER} × the largest round budget the child had`);
+    expect(adr).not.toContain("Tier agents keep 25 / × 3, and so does a role dispatch");
+    // advisory: refusals count toward denied_cap; an out-of-budget NEED MORE: budget is still a budget stop
+    expect(guide).toContain("in `advisory` mode as well (`advisory` never stops)");
+    expect(guide).not.toContain("the `[router budget]` note for a guard stop never appears");
+  });
+
+  it("states R10: verdict-only outcome store, the verification-reason rendering in tiers mode too, no credential passthrough", () => {
+    // R10(1)
+    expect(guide).toContain("`run`, `incomplete` and `redispatch` are routing statistics only");
+    expect(read("docs/adr/0006-role-tier-assurance-delegation.md").replace(/\s+/g, " ")).toContain("`run`, `incomplete` and `redispatch` signals are routing statistics only");
+    expect(unreleased).toContain("`run`, `incomplete` and `redispatch` rows are routing statistics only");
+    // R10(2): the behaviour-change entry quotes the code's limits
+    expect(RENDERED_REASONS_MAX).toBe(GRADER_REASONS_MAX);
+    const cap = oneLineReason("x".repeat(1000)).length;
+    expect(oneLineReason("a\n\nb")).toBe("a b");
+    const sentence = `Verification reasons are rendered one per line with line breaks joined, at most ${RENDERED_REASONS_MAX} items plus a count of the rest; an LLM grader's text is cut at ${cap} characters.`;
+    expect(unreleased).toContain(`**Verification reasons, in tiers mode too.** ${sentence}`);
+    const behaviour = unreleased.slice(unreleased.indexOf("Behaviour change (#84)"));
+    expect(behaviour).toContain(sentence);
+    // negative fixture: the sentence pinned with another limit is not in the changelog
+    expect(unreleased).not.toContain(sentence.replace(`at most ${RENDERED_REASONS_MAX} items`, `at most ${RENDERED_REASONS_MAX + 1} items`));
+    // R10(3): no envPassthrough; PGPASSWORD / MYSQL_PWD are credential-like
+    for (const name of ["PGPASSWORD", "MYSQL_PWD"]) {
+      expect(CREDENTIAL_ENV_RE.test(name), name).toBe(true);
+      expect(guide).toContain(`\`${name}\``);
+    }
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain("`routing.run` has no `envPassthrough` key");
+    expect(guide).toContain("There is no passthrough option: credential-like names are always stripped.");
+  });
+
+  it("the README names the v1 notice, the advisor info and the behaviour-change entry; ADR 0006 records R0–R10 (C-2, C-9)", () => {
+    const readme = read("README.md").replace(/\s+/g, " ");
+    expect(readme).not.toContain("the only effect is an opt-in prose line");
+    expect(readme).toContain(`the plugin logs one notice per process, \`${ROLES_V1_NOTICE}\``);
+    expect(FINDING_IDS).toContain("roles-on-legacy-host");
+    expect(readme).toContain("the advisor info `roles-on-legacy-host`");
+    expect(readme).toContain("[behaviour change entry](CHANGELOG.md#changed)");
+    expect(anchorsOf(read("CHANGELOG.md")).has("changed")).toBe(true);
+    // the first `### Changed` of the changelog is the one under [Unreleased], which holds the behaviour-change entry
+    const changelog = read("CHANGELOG.md");
+    expect(changelog.indexOf("### Changed")).toBeGreaterThan(changelog.indexOf("## [Unreleased]"));
+    expect(changelog.indexOf("### Changed")).toBeLessThan(changelog.indexOf("Behaviour change (#84)"));
+    const adr = read("docs/adr/0006-role-tier-assurance-delegation.md");
+    expect(adr).toContain("amendments R0–R10 and adversarial QA");
+    expect(adr).not.toContain("amendments R0–R8");
   });
 });
