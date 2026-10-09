@@ -205,6 +205,11 @@ export class RoutingProvider {
   /** When set, requests whose last user text contains `marker` are held until `n` of them are in flight (`arrivals`, `releasedByArrival`, `timedOut` record what happened). */
   barrier?: { marker: string; n: number; timeoutMs: number; arrivals: number[]; waiting: Array<() => void>; releasedByArrival: boolean; timedOut: boolean };
   holdUntilOverlap(marker: string, n: number, timeoutMs = 20_000): void { this.barrier = { marker, n, timeoutMs, arrivals: [], waiting: [], releasedByArrival: false, timedOut: false }; }
+  /** #90 P2.1 (additive, off unless {@link holdMarked} is called): requests whose last user text contains `marker` (no tool
+   * result, no grader, no SPIKE_* call) are answered only `ms` after they arrive; `holds` records arrival and release times. */
+  hold?: { marker: string; ms: number };
+  readonly holds: { seq: number; session?: string; arrivedAt: number; releasedAt?: number }[] = [];
+  holdMarked(marker: string, ms: number): void { this.hold = { marker, ms }; }
   private sequence = 0;
   private server = createServer((req, res) => { void this.handle(req, res); });
   async start(): Promise<string> { return `http://127.0.0.1:${await listenOnFetchSafePort(this.server)}/v1`; }
@@ -261,6 +266,12 @@ export class RoutingProvider {
       };
       this.requests.push(request);
       if (this.barrier && !toolResult && !grader && !multi && !subagentCall && lastText.includes(this.barrier.marker)) await this.holdAtBarrier(request.seq);
+      if (this.hold && !toolResult && !grader && !multi && !subagentCall && !delegateCall && lastText.includes(this.hold.marker)) {
+        const record: { seq: number; session?: string; arrivedAt: number; releasedAt?: number } = { seq: request.seq, session: request.session, arrivedAt: Date.now() };
+        this.holds.push(record);
+        await delay(this.hold.ms);
+        record.releasedAt = Date.now();
+      }
       if (toolName && !probe && !toolNames.includes(toolName)) throw new Error(`Fixture requested ${toolName} but the request carries no such tool (${toolNames.join(",")})`);
       let text = scripted && !scripted.step ? scripted.final : toolResult ? "ROOT_DONE" : lastText.includes("CHILD_DONE") ? "CHILD_DONE" : "CHILD_OK";
       if (grader) {
