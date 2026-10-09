@@ -269,7 +269,42 @@ P1.1 and P1.2 run in parallel; P1.3 starts after P1.1 is merged (and after P1.2 
 branches and tags cleaned; `routing.workRoots` removed again; #90 closed with the summary.
 
 ## 8. Amendments
-(none yet — A1 is written in P0.1)
+Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
+
+- A1 (D6, S4) **Effort channel feasible: plugin rpc, pull.** P1.2 runs. A plain-object definition (id
+  `opencode-model-router.effort`, JSON-Schema `input`/`output`, `events: {}`, no imports) in
+  `src\tui\effort-rpc.ts`, shared by both entries; the v2 server plugin registers it with `ctx.rpc.register(def,
+  handlers)` at setup and answers `effortOf({ sessionID })` from router memory (route-time agent/model/variant, the
+  child's applied effort, the escalation override); the TUI pulls with `context.client.rpc(def).effortOf(...)`, retries
+  while the server is not registered yet, and falls back to the message variant on any error. No push events
+  (bus events are location-scoped). Nothing on v1. No `rpc` package subpath.
+- A2 (D1, D8, S1, S6) **Root `tui.ts`, no `exports` map, no JSX.** `tui.ts` (package root) re-exports
+  `src\tui\plugin.ts` (not `.tsx`): the host's Solid transform skips `node_modules`. Views use the `@opentui/solid`
+  reconciler primitives (`createElement`, `insert`, `setProp`) and `solid-js`; the default export is a plain
+  `{ id, setup }` object. Runtime imports allowed: `@opentui/solid`, `solid-js` only (served by the host); no new
+  `dependencies`. Host context typed structurally in `src\tui\host-types.ts`; the three `@opentui/solid` functions in an
+  ambient `src\tui\opentui-solid.d.ts`; `solid-js` as devDependency. `tsconfig.json` unchanged unless P1.3 proves a need.
+- A3 (D3, S3) **G1 rule.** Slot `prompt.footer.status`, placement `append`, root sessions (or no session yet): render
+  `effort default` when `ui.model.current()?.variant` is unset (the host row shows no variant), nothing when a variant is
+  selected (the host row shows it). The "last assistant message / agent variant" steps of D3 are dropped (already folded
+  into the selection; the message describes a past turn).
+- A4 (D7, S2) **Options and auto-load.** The TUI entry is auto-loaded for every v2 user who lists the package in the
+  server config (no options → defaults). Options come from a `tui.json` entry `{ "package": …, "options": … }`; the docs
+  (P2.2) give the enable/disable recipes (`enabled: false`, `-<id>` selector). Plugin id `opencode-model-router`.
+- A5 (D4, S5) **G2 sources.** Latest assistant message `model` (after `Step.Started`), before it the child's
+  `session.get(id).model`; the P1.2 effort preferred when available. `data.session.message.sync(id)` once per child when
+  the list is empty (feature-detected).
+- A6 (S5) **G3 running signal.** `data.session.status(child) === "running"` is used; whether it is set before the first
+  response is verified in P2.1 on the real host; a failure there is fixed in P2.1 (owner P1.3 code reopened via a
+  `msd/p21-fix` branch).
+- A7 (S7) **Tests.** Unit: pure core in vitest; views with a fake context and a mocked `@opentui/solid`, Solid
+  reactivity from the reactive build. Real host (P2.1): Node + `@lydell/node-pty` + `@xterm/headless` (devDependencies,
+  owned by P2.1), `--standalone` mandatory, local-path plugin entries, wait for a real PID and kill only spawned PIDs,
+  env gate `RUN_OC_SMOKE_TUI=1`, script `smoke:tui`.
+- A8 (§4) **Ownership.** P1.2 also owns `src\tui\effort-rpc.ts` and the registration hunk of the v2 entry
+  (`src\v2*.ts` or `src\compat\v2-hooks.ts`). P1.3 owns `tui.ts`, `src\tui\plugin.ts`, `src\tui\host-types.ts`,
+  `src\tui\opentui-solid.d.ts` (instead of `plugin.tsx`). P2.1 owns `package.json`/`package-lock.json` changes for its
+  devDependencies and the `smoke:tui` script.
 
 ## 9. Risks
 | Risk | Mitigation |

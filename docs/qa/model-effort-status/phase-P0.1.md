@@ -22,3 +22,17 @@
 - Integration worktree `D:\git\omr-msd-main`, branch `msd/main` = `origin/master` (`f969139`) + merge of
   `docs/status-display-plan`; `npm ci` done; pushed; draft PR #91 `msd/main → master`.
 - Restart stop: role agents need the restart to pick up `routing.workRoots`.
+
+## T0.1.2 spikes
+
+Evidence and verdicts: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`. Dispatches: four `medium` tier
+agents for host source (S1+S2, S3+S5, S4, S6+S7; S4 and S1/S2 resumed once for follow-ups), one `heavy` tier agent for a
+runtime probe on the real 2.0.24/2.0.26 hosts in a temp dir (P1 pty capture, P2 root `tui.ts` load, P3 `define`,
+P4 rpc round-trip, P5 2.0.26). The router grader returned NOT ACCEPTED on the probe because the criterion was truncated
+(known, handover §4); the executor re-checked the captures it cites (`out\*.screens.txt`, probe logs) and accepted it.
+Incident: the probe's first pty run attempted `taskkill` on Windows system PIDs (all refused, nothing stopped); see
+spikes.md S7.
+
+## T0.1.3 amendments
+
+A1–A8 written in `docs\plans\v2-model-effort-status-plan.md` §8 (A1: effort channel feasible → P1.2 runs).
