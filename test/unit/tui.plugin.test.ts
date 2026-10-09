@@ -74,7 +74,10 @@ vi.mock("@opentui/solid", async () => {
   const names = header.exec(source)?.[1];
   if (names === undefined || !footer.test(source)) throw new Error("unexpected solid-js/universal build");
   const body = source.replace(header, "").replace(footer, "\n");
-  const make: unknown = new Function("solid", `const { ${names} } = solid;\n${body}\nreturn createRenderer;`)(solid);
+  const make: unknown = new Function(
+    "solid",
+    `"use strict";\nconst { ${names} } = solid;\n${body}\nreturn createRenderer;`,
+  )(solid);
   if (typeof make !== "function") throw new Error("solid-js/universal has no createRenderer");
   const renderer: unknown = make(tree);
   if (typeof renderer !== "object" || renderer === null) throw new Error("createRenderer returned no renderer");
@@ -96,6 +99,8 @@ import plugin, {
   FAILURE_COOLDOWN_MS,
   FOOTER_SLOT,
   isUnavailable,
+  locationKey,
+  MODEL_SYNC_MAX,
   NO_OWNER_NOTICE,
   POLL_INTERVAL_MS,
   PULL_STATE_MAX,
@@ -190,7 +195,8 @@ function fakeHost(init: FakeInit = {}) {
   );
   const rpc = vi.fn((_definition: HostRpcDefinition): unknown => ({ effortOf }));
   const sync = vi.fn(async (_sessionID: string): Promise<void> => undefined);
-  const modelList = vi.fn((_location?: unknown): readonly HostModelInfo[] => MODELS);
+  const modelList = vi.fn((_location?: unknown): readonly HostModelInfo[] | undefined => MODELS);
+  const modelSync = vi.fn(async (_location?: unknown): Promise<void> => undefined);
   const toast = vi.fn();
   const claims: HostSlotClaim[] = [];
   const disposers: Array<ReturnType<typeof vi.fn>> = [];
@@ -215,7 +221,7 @@ function fakeHost(init: FakeInit = {}) {
         status: (id) => statuses()[id] ?? "idle",
         message: { list: (id) => messages()[id] ?? [], sync },
       },
-      location: { model: { list: modelList } },
+      location: { model: { list: modelList, sync: modelSync } },
     },
     ui: {
       toast: { show: toast },
@@ -237,6 +243,7 @@ function fakeHost(init: FakeInit = {}) {
     rpc,
     sync,
     modelList,
+    modelSync,
     answers,
     setCurrent,
     addSession: (session: HostSession) => setSessions((all) => ({ ...all, [session.id]: session })),
@@ -627,6 +634,76 @@ describe("G2 child view (A5)", () => {
     expect(fake.modelList.mock.calls.every((call) => call.length === 0)).toBe(true);
     await tick(0);
     expect(Object.keys(fake.effortOf.mock.calls[0]?.[1] ?? {})).toEqual(["signal"]);
+    await microtasks();
+    expect(fake.modelSync).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the default model list while a location's list is not loaded, and syncs it once (R2-1)", async () => {
+    const location = { directory: "/work/child", workspaceID: "wrk_1" };
+    const fake = fakeHost();
+    fake.modelList.mockImplementation((at) => (at === undefined ? MODELS : undefined));
+    fake.addSession(childSession(CHILD, { location }));
+    fake.addSession(childSession("ses_twin", { location: { ...location } }));
+    start(fake);
+    const view = mountComposer(fake.claims, () => CHILD);
+    expect(view.rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+    expect(fake.modelList).toHaveBeenCalledWith(location);
+    expect(fake.modelList).toHaveBeenCalledWith();
+    expect(fake.modelSync).not.toHaveBeenCalled();
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(1);
+    expect(fake.modelSync).toHaveBeenCalledWith(location);
+    // Same directory and workspace: the same location key, no second sync.
+    mountComposer(fake.claims, () => "ses_twin");
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgets a location whose model sync failed, so the next view syncs it again (R2-1)", async () => {
+    const location = { directory: "/work/child" };
+    const fake = fakeHost({ rpc: false });
+    fake.modelList.mockImplementation((at) => (at === undefined ? MODELS : undefined));
+    fake.modelSync.mockRejectedValueOnce(rpcFailure("rpc.internal", "offline"));
+    fake.addSession(childSession(CHILD, { location }));
+    start(fake);
+    mountComposer(fake.claims, () => CHILD);
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(1);
+    mountComposer(fake.claims, () => CHILD);
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(2);
+    mountComposer(fake.claims, () => CHILD);
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(2);
+    expect(warnings()).toEqual([]);
+  });
+
+  it(`remembers at most ${MODEL_SYNC_MAX} synced locations (R2-1)`, async () => {
+    const fake = fakeHost({ rpc: false });
+    fake.modelList.mockImplementation((at) => (at === undefined ? MODELS : undefined));
+    const ids = Array.from({ length: MODEL_SYNC_MAX + 1 }, (_, index) => `ses_${index}`);
+    for (const id of ids) fake.addSession(childSession(id, { location: { directory: `/work/${id}` } }));
+    start(fake);
+    for (const id of ids) mountComposer(fake.claims, () => id);
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(MODEL_SYNC_MAX + 1);
+    mountComposer(fake.claims, () => ids[MODEL_SYNC_MAX] ?? "");
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(MODEL_SYNC_MAX + 1);
+    mountComposer(fake.claims, () => ids[0] ?? "");
+    await microtasks();
+    expect(fake.modelSync).toHaveBeenCalledTimes(MODEL_SYNC_MAX + 2);
+    expect(fake.modelSync).toHaveBeenLastCalledWith({ directory: "/work/ses_0" });
+  });
+
+  it.each([
+    [{ directory: "/a", workspaceID: "w" }, '["/a","w"]'],
+    [{ directory: "/a", workspaceID: "w", extra: 1 }, '["/a","w"]'],
+    [{ directory: "/a" }, '["/a",null]'],
+    [{}, "[null,null]"],
+    ["not a location", "[null,null]"],
+  ])("locationKey(%j) → %s (R2-1)", (location, expected) => {
+    expect(locationKey(location)).toBe(expected);
   });
 
   it("fits the row to the renderer width minus 4", () => {
@@ -1110,6 +1187,21 @@ describe("feature detection and error isolation", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("renders G1 and G2 but no G3 rows without a Solid owner (R2-2)", () => {
+    const fake = fakeHost();
+    fake.addSession(childSession(CHILD));
+    fake.setStatus(CHILD, "running");
+    start(fake);
+    const composer = claimFor(fake.claims, COMPOSER_SLOT);
+    const root = composer.render(composerInput(() => ROOT));
+    expect(boxOf(root).children).toEqual([]);
+    expect(rowsOf(composer.render(composerInput(() => CHILD)))).toEqual(["explore · Claude Sonnet 4 · low"]);
+    expect(rowsOf(claimFor(fake.claims, FOOTER_SLOT).render(footerInput(() => ROOT)))).toEqual(["effort default"]);
+    expect(warnings()).toEqual([OWNER_WARNING]);
+    // With an owner, the same root shows the running delegate.
+    expect(mountComposer(fake.claims, () => ROOT).rows()).toEqual(["explore · Claude Sonnet 4 · low"]);
+  });
+
   it("renders no rows and warns once per view when data.session.get throws", () => {
     const fake = fakeHost();
     const session = fake.context.data?.session;
@@ -1319,7 +1411,10 @@ describe("helpers", () => {
     ["{ type: rpc.unavailable, data }", { type: "rpc.unavailable", message: "x", data: { id: "opencode-model-router.effort" } }, true],
     ["{ type: rpc.internal }", rpcFailure("rpc.internal", "m"), false],
     ["{ type: rpc.method_not_found }", rpcFailure("rpc.method_not_found", "no such method"), false],
-    ["{ type: rpc.internal, message mentions unavailable }", rpcFailure("rpc.internal", "upstream unavailable"), true],
+    // R2-3: a string `type` decides alone; the text heuristics apply only without one.
+    ["{ type: rpc.internal, message mentions unavailable }", rpcFailure("rpc.internal", "upstream unavailable"), false],
+    ["{ type: service.unavailable }", rpcFailure("service.unavailable", "down"), false],
+    ["{ type: 42, message mentions unavailable }", { type: 42, message: "rpc unavailable" }, true],
     ["Error(rpc.unavailable)", new Error("rpc.unavailable"), true],
     ["Error named RpcUnavailableError", Object.assign(new Error("not registered"), { name: "RpcUnavailableError" }), true],
     ["{ _tag: Unavailable }", { _tag: "Unavailable" }, true],

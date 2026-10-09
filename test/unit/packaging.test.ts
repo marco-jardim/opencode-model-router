@@ -208,11 +208,14 @@ describe("packaging: v2 TUI entry (#90 P1.3, amendments A2/A9)", () => {
     expect(names.sort()).toEqual(["createElement", "insert", "setProp"]);
   });
 
-  it("keeps Solid in the TUI: no file under src/ outside src/tui/ imports solid-js or @opentui/solid", () => {
+  it("keeps Solid in the TUI closure: no other file under src/ imports solid-js or @opentui/solid", () => {
+    // Only the TUI entry's own files may; src/tui/effort-channel.ts (server side) is checked like any other (R2-5).
+    const allowed = new Set<string>(["tui.ts", ...TUI_CLOSURE, "src/tui/opentui-solid.d.ts"]);
     const sources = readdirSync("src", { recursive: true })
       .map((name) => posix.join("src", String(name).replace(/\\/g, "/")))
-      .filter((path) => /\.[cm]?[jt]sx?$/.test(path) && !path.startsWith("src/tui/"));
-    expect(sources.length).toBeGreaterThan(0);
+      .filter((path) => /\.[cm]?[jt]sx?$/.test(path) && !allowed.has(path));
+    expect(sources).toContain("src/tui/effort-channel.ts");
+    expect(sources).not.toContain("src/tui/plugin.ts");
     const offenders = sources.flatMap((path) =>
       specifiersOf(read(path))
         .filter((specifier) => /^(?:solid-js|@opentui\/solid)(?:\/|$)/.test(specifier))

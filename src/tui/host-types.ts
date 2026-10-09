@@ -82,7 +82,9 @@ export interface HostData {
   };
   readonly location?: {
     readonly model?: {
+      /** Undefined while the location's list is not loaded. */
       list?(location?: unknown): readonly HostModelInfo[] | undefined;
+      sync?(location?: unknown): Promise<void>;
     };
   };
 }

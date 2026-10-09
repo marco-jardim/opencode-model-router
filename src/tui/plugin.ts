@@ -63,6 +63,8 @@ export const CALL_TIMEOUT_MS = 10_000;
 export const PULL_STATE_MAX = 200;
 /** Sessions remembered as already message-synced. */
 export const SYNCED_MAX = 200;
+/** Locations whose model list was asked to sync (R2-1). */
+export const MODEL_SYNC_MAX = 50;
 /** Terminal width used when the renderer reports none. */
 export const DEFAULT_WIDTH = 80;
 /** Columns kept free around a row (composer padding). */
@@ -188,13 +190,15 @@ function childApplied(applied: AppliedEffort | undefined): AppliedEffort | undef
 }
 
 /**
- * An error the host reports while the server plugin's rpc is not (yet) registered: the client rethrows rpc failures as
- * plain `{ type, message, data? }` objects, so `type === "rpc.unavailable"` first; then any `name`, `message`, `_tag`
- * or `code` (or the error itself, as a string) containing `unavailable`.
+ * An error the host reports while the server plugin's rpc is not (yet) registered. The client rethrows rpc failures as
+ * plain `{ type, message, data? }` objects: an error with a string `type` is unavailable exactly when that type is
+ * `rpc.unavailable` (R2-3). Without a `type`, any `name`, `message`, `_tag` or `code` (or the error itself, as a
+ * string) containing `unavailable` counts.
  */
 export function isUnavailable(error: unknown): boolean {
   try {
-    if (isObject(error) && Reflect.get(error, "type") === "rpc.unavailable") return true;
+    const type = isObject(error) ? Reflect.get(error, "type") : undefined;
+    if (typeof type === "string") return type === "rpc.unavailable";
     const parts: unknown[] = [error];
     if (isObject(error)) {
       for (const key of ["name", "message", "_tag", "code"]) parts.push(Reflect.get(error, key));
@@ -224,7 +228,28 @@ interface Host {
   muted(): unknown;
 }
 
-function createHost(context: HostContext | undefined): Host {
+/**
+ * The key of a location for {@link Host.models}' sync bookkeeping: its `directory` and `workspaceID`, as JSON.
+ */
+export function locationKey(location: unknown): string {
+  try {
+    const field = (name: string): unknown => (isObject(location) ? Reflect.get(location, name) : undefined);
+    const directory = field("directory");
+    const workspaceID = field("workspaceID");
+    return JSON.stringify([
+      typeof directory === "string" ? directory : null,
+      typeof workspaceID === "string" ? workspaceID : null,
+    ]);
+  } catch {
+    return "[null,null]";
+  }
+}
+
+/**
+ * @param syncModels called when a location's model list is not loaded yet (`list(location)` gave no array); the views
+ *   then use the default location's list meanwhile (R2-1).
+ */
+function createHost(context: HostContext | undefined, syncModels: (location: unknown) => void): Host {
   const sessions = () => context?.data?.session;
   const session = (id: string): HostSession | undefined => {
     const value = sessions()?.get?.(id);
@@ -250,7 +275,11 @@ function createHost(context: HostContext | undefined): Host {
     status: (id) => (sessions()?.status?.(id) === "running" ? "running" : "idle"),
     models: (location) => {
       const model = context?.data?.location?.model;
-      const list = location === undefined || location === null ? model?.list?.() : model?.list?.(location);
+      let list = location === undefined || location === null ? undefined : model?.list?.(location);
+      if (!Array.isArray(list)) {
+        if (location !== undefined && location !== null) syncModels(location);
+        list = model?.list?.();
+      }
       return arrayOf(list).filter(
         (entry) =>
           typeof entry === "object" &&
@@ -567,6 +596,8 @@ interface Views {
   readonly host: Host;
   readonly channel: EffortChannel;
   readonly log: Log;
+  /** False for a view rendered without a Solid owner: no channel and no G3 (R2-2). */
+  readonly live: boolean;
   columns(): number;
   requestSync(id: string): void;
 }
@@ -608,7 +639,8 @@ function composerRows(input: ComposerTopInput | undefined, views: Views): Rows {
     });
     return status === undefined ? NO_ROWS : [formatRow([status.agent ?? "", status.model, status.effort], width)];
   }
-  if (!options.runningRow) return NO_ROWS;
+  // G3 lists delegates that start and stop: a static view would show a stale list, so it shows none (R2-2).
+  if (!options.runningRow || !views.live) return NO_ROWS;
   const running = runningChildren({
     rootID: id,
     family: host.family(id),
@@ -674,12 +706,13 @@ function boxElement(): unknown {
 
 /**
  * P13-2: without a Solid owner the plugin's `solid-js` is not the host's, so nothing reactive would update or ever be
- * disposed. The rows are computed once, untracked, without the effort channel, and rendered as static text.
+ * disposed. The rows are computed once, untracked, without the effort channel, and rendered as static text: G1 and
+ * G2 only, G3 (running delegates) would be stale at once (R2-2).
  */
 function staticView(compute: (views: Views) => Rows, area: string, views: Views): unknown {
   let rows: Rows;
   try {
-    rows = untrack(() => compute({ ...views, channel: NO_CHANNEL }));
+    rows = untrack(() => compute({ ...views, channel: NO_CHANNEL, live: false }));
   } catch (error) {
     views.log.failed(area, error);
     rows = NO_ROWS;
@@ -823,7 +856,30 @@ function setup(context: HostContext | undefined): () => void {
     }
     if (!options.enabled || !(options.footer || options.childView || options.runningRow)) return cleanup;
 
-    const host = createHost(context);
+    /**
+     * Runs `run` on the next microtask unless `key` is already in `seen` (kept to the last `max` keys); a rejected or
+     * throwing run forgets the key, so the next view tries again (P13-6, R2-1).
+     */
+    const syncOnce = (seen: Set<string>, key: string, max: number, run: () => unknown): void => {
+      if (seen.has(key)) return;
+      seen.add(key);
+      for (const oldest of seen) {
+        if (seen.size <= max) break;
+        seen.delete(oldest);
+      }
+      queueMicrotask(() => {
+        if (closed) return;
+        try {
+          Promise.resolve(run()).catch(() => seen.delete(key));
+        } catch {
+          seen.delete(key);
+        }
+      });
+    };
+    const modelsSynced = new Set<string>();
+    const host = createHost(context, (location) =>
+      syncOnce(modelsSynced, locationKey(location), MODEL_SYNC_MAX, () => context?.data?.location?.model?.sync?.(location)),
+    );
     const channel = createEffortChannel({
       client: () => context?.client,
       status: host.status,
@@ -840,26 +896,9 @@ function setup(context: HostContext | undefined): () => void {
       host,
       channel,
       log,
+      live: true,
       columns: () => Math.max(0, width.width() - WIDTH_MARGIN),
-      requestSync: (id) => {
-        if (synced.has(id)) return;
-        synced.add(id);
-        for (const oldest of synced) {
-          if (synced.size <= SYNCED_MAX) break;
-          synced.delete(oldest);
-        }
-        queueMicrotask(() => {
-          if (closed) return;
-          try {
-            const message = context?.data?.session?.message;
-            if (typeof message?.sync !== "function") return;
-            // A failed sync is forgotten, so the next view of the session tries again (P13-6).
-            Promise.resolve(message.sync(id)).catch(() => synced.delete(id));
-          } catch {
-            synced.delete(id);
-          }
-        });
-      },
+      requestSync: (id) => syncOnce(synced, id, SYNCED_MAX, () => context?.data?.session?.message?.sync?.(id)),
     };
 
     if (options.footer) {
