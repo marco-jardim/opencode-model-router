@@ -7,12 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-09
+
+Role × tier × assurance delegation (#84), opt-in on OpenCode v2: role agents, tier floors from authority × detection,
+validated work roots, `router_run` and work-root-scoped `router_git_*`, and outcome signals from external verification
+only. OpenCode v1 is unchanged apart from the changes listed below; the roles keys are validated and inert there. See
+[Roles mode](docs/ROLES.md) and [ADR 0006](docs/adr/0006-role-tier-assurance-delegation.md).
+
+**Upgrade notes.** Read these entries under [Changed](#changed) before upgrading:
+
+- **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).**
+- The #84 behaviour change: guard and verification fixes for every host and mode, OpenCode v1 included.
+- Its **Downgrades** item: downgrading past this version is unsupported.
+
 ### Added
 
+- **Roles mode: role × tier × assurance delegation (#84), OpenCode v2, opt-in.** With `routing.delegation: "roles"`
+  the orchestrator dispatches seven role agents — `explorer`, `researcher`, `runner`, `implementer`, `reviewer`,
+  `architect`, `general` — and the router picks the tier and the per-call model of every dispatch. Decided at plugin
+  start: restart OpenCode after switching. See [Roles mode](docs/ROLES.md) and
+  [ADR 0006](docs/adr/0006-role-tier-assurance-delegation.md).
+  - Role contracts in code (`SHIPPED_ROLE_SPECS`): maximum authority, tier range, a descriptive default assurance,
+    guard profile, call budget per tier; `roleAgents.<name>` (global only) can only narrow them. A role whose tier
+    range the active preset's `costRatio` orders against the tier names is disabled with a notice.
+  - Least privilege with capability separation: no grant mixes local, exec or write actions with egress; Code Mode
+    `execute`, shell and delegation are denied to every role; `researcher` is web and docs only.
+  - Tier floor from authority × effective detection (`authorityFloor`): edits reach `fast` only behind the router's
+    own deterministic checks on a low-risk single-file change; edit + run never below `medium`. After a verification
+    FAIL of a role child the router raises its tier on the next resume itself; the orchestrator never sets `tier=`
+    or `model`.
+  - Dynamic authority for `implementer` and `general`, with nonce-exact binding and a resume-based ladder
+    (`router_request_authority` → `ESCALATE: authority` → resume the same session; widening only for exact bindings).
+  - Work roots: `root=` on the route line (a git worktree of the repository) and `routing.workRoots` globs; the router
+    narrows each session to its own root. A role dispatch's acceptance checks run in its work root; a `cwd:` outside
+    it is refused. Role `edit` needs a validated work root (on the authority ladder too) and never falls back to the
+    session or plugin directory; it never writes `.git` or anything below it, through any host edit tool.
+    `router_git_*` are limited to the work root (a pathspec for a work root below the repository's top level) and are
+    refused for a repository other than the dispatch's or a `.git` pointer to a network or device path. The
+    `git worktree list` runs that validate work roots inherit the user's `safe.directory` values.
+  - `router_run`: `package.json` scripts listed by exact name and `routing.run.commands` with fixed argv, argument
+    patterns, pinned npm script shell and config files, refused `.npmrc` keys and a credential-stripped environment;
+    single-dash arguments carrying `/`, `\` or `..` are refused. A network or device `cwd` is refused before any
+    filesystem call. Credential-like variables (`PGPASSWORD`, `MYSQL_PWD` included; `PWD` and `OLDPWD` kept) are
+    always stripped: `routing.run` has no passthrough option.
+  - Role budgets (`budget=` up to 2×; a resume without `budget=` keeps the previous one), `NEED MORE: budget` with a
+    `[router budget]` resume note, never a tier penalty. Role agents' host `steps` = 2 × max(the top role budget, 25)
+    + `REFUSAL_CAP` (10) + 5. A dispatch that a floor lifts above its role's ceiling, on a tier the role has no budget
+    for, gets max(the role's budget for its ceiling tier, 25). The cumulative ceiling is 3 × the largest round budget
+    the child had. A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`. A
+    `subagentTiers` entry for a role name gives that role's children the mapped tier's default read-only cap (and, for
+    `fast`, the trivial-dispatch bypass): remove such entries in roles mode.
+  - Refused calls of a role child — role-authority refusals and structured host permission denials — count toward
+    `denied_cap` in `advisory` mode too (`advisory` still never stops). In `advisory` mode a child out of budget that
+    returns `NEED MORE: budget` records a `budget` signal and the parent's result gets the `[router budget]` note.
+  - Resumes of a role child keep the dispatch's class and needs (risk and scope: the max of both), its `[acceptance]`
+    block, `VERIFY:` lines and `d=` claim; a new block replaces them. Carried checks run at the resume's return (never
+    deferred) on the child's cumulative changes, and are unverifiable when the attempt that introduced them was never
+    gated. An authority request widens the grant only when the resuming session is the dispatch's parent, never on a
+    delegate's resume.
+  - A role dispatch's detection is `none` when no verification will run (enforcement `off`, `/bypass`,
+    `verify.require: "never"`, a `cwd` outside the root the gate verifies in).
+  - Dynamic roles: a route-line `needs=` replaces the needs the text implies (the listed needs plus the route class's
+    implied needs, always inside the role max), and `class=` without `needs=` keeps the text's needs plus that class's
+    implied needs, dropping those of the class it replaced; a role dispatch is classified in its work root. Decision rows carry
+    `trace.needTerms` (vocabulary labels, `term-<n>`, `url`, `path`, never free task text).
+  - In a role dispatch's result, child lines starting with `[router` are defanged to `(router`, so only the router's
+    notes start with `[router`.
+  - Outcome signals from external verification only (deterministic/run 1, independent grader 0.5, incomplete 0.5,
+    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only and counts only the current
+    attempt's runs). Only verdicts (deterministic, and independent graders at 0.5) move the outcome store the kernel
+    reads; `run`, `incomplete` and `redispatch` rows are routing statistics only. An LLM grader's verdict of
+    a role dispatch moves the outcome store by 0.5 with a `grader` signal row only when the grader is independent
+    (tier ≥ the producer's, another model); any other grader records nothing (no store change, no verdict row), so
+    `routing:stats` shows fewer verdict rows for role dispatches. Role × tier statistics and the advisor findings
+    `role-separation`,
+    `roles-on-legacy-host`, `role-budget-low`, `role-range-clamped`, `role-binding-unknown`,
+    `native-explore-aliased`, `roles-none-enabled`, `role-usage-share`.
+  - Exploration of cheaper rungs (`routing.exploration.rate`, off by default, at most 0.2, `enforce` and deterministic
+    detection only).
+  - New keys: `routing.delegation`, `roleAgents`, `routing.exploration`, `routing.run`, `routing.workRoots`. On
+    OpenCode v1 they are validated and inert, with one notice.
 - **`agents` block: subagents defined by the router (#81).** `tiers.json` and the global override can define
   subagents that run on a tier of the active preset (following `/preset`), with `readOnly`/`allowTools` or an
   explicit `permission`, on v1 and v2 with fail-closed permissions. Project overrides cannot define `agents`
-  (A18). `/router` lists them under "Plugin agents".
+  (A18). `/router` lists them under "Plugin agents". On OpenCode v2 a `permission` key naming `write`, `patch`,
+  `multiedit` or `apply_patch` only narrows that tool and `edit` decides; a key that allows or asks for what the
+  agent's `edit` rules deny gets a config notice.
+- Six shell-free `router_git_*` inspection tools: status, log, diff, show, blame,
+  ls_files. Fixed hardened argv, strict paths/refs, bounded output, timeout/tree
+  cancellation, and remote-URL userinfo redaction; no write commands or arbitrary
+  options. Read-only tiers can also use configured Context7 docs lookups.
+  See [Read-only tiers](docs/READ_ONLY_TIERS.md) for policy, overrides and limits
+  (not an OS sandbox).
 
 ### Fixed
 
@@ -20,8 +106,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `subagentTiers` no longer creates phantom primary, allow-all agents for names that no agent defines; such
   names are skipped with a notice. On v2 the router re-checks at the first prompt, so `opencode.json` agents
   registered after startup still get the tier model.
+
 ### Changed
 
+- **Behaviour change (#84): guard and verification fixes for every host and mode** (v1, v2 tiers mode and roles mode;
+  each ships with a before/after golden):
+  - **Reader guard profile.** The read-only `fast` tier, dispatches routed `class=review|recon|search` (OpenCode v2
+    with a routing engine other than `static`; never on v1), dispatches with `CAP:none` + `reason:` and reader roles are no longer denied or warned for "consecutive non-producing" reads;
+    readers are told to emit their final answer instead of to take a producing action.
+  - **Uncharged denials.** A refused call is no longer charged to the call budget nor recorded as executed by the
+    repeat check; a round is stopped for refusals only when it has min(budget, 10) of them and its executed plus refused
+    calls reach the budget.
+  - **Whole criteria.** Verification never cuts a criterion: the inferred criterion is the first task line whole (or
+    its leading whole sentences within 4000 code points), and grader criteria are kept whole within 4000 code points.
+    **Explicit `[acceptance]` lists over 4000 code points are no longer graded in full:** the overflow is named
+    ("n criteria omitted") and not graded, and a pass on the rest is unverifiable.
+  - **Header strip.** The router's dispatch header (through its first `---` separator) and router directives
+    (`CAP:`, `VERIFY:`, `VERIFY_WAIT:`, `reason:`, `[route …]`, `[router]`) are no longer gradable criteria.
+  - **Progress notes are incomplete.** A contract follower's progress note, and a `NEED MORE: budget` return backed
+    by the guard's state, is an `incomplete` verdict (`[router ⚠ INCOMPLETE]`): never accepted, no next tier, no
+    evidence, resume the same session. The budget claim is read from the return prefix; a progress summary written
+    before a line-start `NEED MORE: budget` still counts.
+  - **`root=` in the header.** The dispatch header's `Working directory:` names the route line's `root=` when present
+    (byte-identical otherwise).
+  - **Verification reasons, in tiers mode too.** Verification reasons are rendered one per line with line breaks
+    joined, at most 20 items plus a count of the rest; an LLM grader's text is cut at 500 characters. A list of at
+    most 20 one-line reasons renders as before.
+  - **Downgrades.** Outcome signals are written as annotation rows of the decision log, which earlier versions drop
+    only through their decision-id dedupe: downgrading past this version is unsupported.
 - `anthropic` preset: `fast` tier now uses Claude Haiku 5.5 (low) instead of Sonnet 5.5 (low).
 - **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).** Shell, edits,
   Code Mode, delegation and unspecified MCP tools are denied, including inherited
@@ -43,15 +155,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   “always allow” approvals are applied after host deny checks (QA-77-P8), but the
   v2 router hook now restores the protected agent's ask. Auto-answer modes may
   still approve that ask; denies remain denied.
-
-### Added
-
-- Six shell-free `router_git_*` inspection tools: status, log, diff, show, blame,
-  ls_files. Fixed hardened argv, strict paths/refs, bounded output, timeout/tree
-  cancellation, and remote-URL userinfo redaction; no write commands or arbitrary
-  options. Read-only tiers can also use configured Context7 docs lookups.
-  See [Read-only tiers](docs/READ_ONLY_TIERS.md) for policy, overrides and limits
-  (not an OS sandbox).
 
 ## [2.3.0] - 2026-10-07
 

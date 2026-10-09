@@ -40,6 +40,22 @@ export function verdictOf(verdict: Pick<VerificationVerdict, "pass" | "outcome">
   return verdict.outcome ?? (verdict.pass ? "pass" : "fail");
 }
 
+/** #84 P3.3 fix 2: the LLM grader of a gate verdict — the tier the checker asked for and its model (null: unknown). */
+export interface VerdictGrader {
+  readonly tier: string | null;
+  readonly model: string | null;
+}
+
+/**
+ * Who judged a gate verdict, for `Ingest.onVerdict` (plan §2.6, I6): a `checker` verdict was judged by an LLM grader — its
+ * `grader` (verify/types.ts), else an unknown one (no tier, no model: never independent) — and any other verdict by deterministic
+ * checks (`undefined`).
+ */
+export function verdictGraderOf(verdict: Pick<VerificationVerdict, "method" | "grader">): VerdictGrader | undefined {
+  if (verdict.method !== "checker") return undefined;
+  return { tier: verdict.grader?.tier ?? null, model: verdict.grader?.model ?? null };
+}
+
 /**
  * Kind of attempt a row or signal belongs to. `dispatch` = an orchestrator dispatch routed in
  * `execute.before` (2.2); the others are `delegate` ladder attempts (1.5 / 2.3): `variant` = same model,
@@ -63,7 +79,13 @@ export type LoggedRoutingMode = "shadow" | "advise" | "enforce";
  * (native `explore`/`general`, or user-defined in opencode.json) is `host`. The origin is part of the
  * key, so a router tier and a native agent with the same id never share evidence.
  */
-export type AgentOrigin = "router" | "host";
+export type AgentOrigin = "router" | "host" | "role";
+
+/** Kind of signal an outcome observation carries (role/tier assurance, plan §2.4). */
+export type SignalKind = "verdict" | "run" | "grader" | "incomplete" | "budget" | "authority" | "redispatch";
+
+/** Fixed order of signal kinds (persistence validation, statistics). */
+export const SIGNAL_KINDS: readonly SignalKind[] = ["verdict", "run", "grader", "incomplete", "budget", "authority", "redispatch"];
 
 export interface AgentRef {
   readonly origin: AgentOrigin;
@@ -79,7 +101,8 @@ export const UNKNOWN_PART = "unknown";
 
 /**
  * Canonical outcome key, e.g. `implement|router:medium|anthropic/claude-sonnet-5-5#medium` or
- * `search|host:explore|anthropic/claude-haiku-4-5#default`. Build it only with {@link makeKey}.
+ * `search|host:explore|anthropic/claude-haiku-4-5#default`. A role-origin key is
+ * `class|role:<agent>|provider/model#variant`. Build it only with {@link makeKey}.
  */
 export type OutcomeKey = `${string}|${string}:${string}|${string}/${string}#${string}`;
 
@@ -166,7 +189,7 @@ export function parseKey(key: string): OutcomeKeyParts | null {
   const colon = agentSeg.indexOf(":");
   if (colon < 0) return null;
   const origin = agentSeg.slice(0, colon);
-  if (origin !== "router" && origin !== "host") return null;
+  if (origin !== "router" && origin !== "host" && origin !== "role") return null;
 
   const hash = modelSeg.lastIndexOf("#");
   if (hash < 0) return null;
@@ -368,7 +391,11 @@ export interface AttemptSignal {
   readonly step: LadderStepKind;
 }
 
-/** Lifetime raw counters (integers, never decayed). */
+/**
+ * Lifetime raw counters (integers, never decayed). QA-G-B N2: `pass`/`fail` (and `variantPass`/`variantFail`) count scored
+ * VERDICTS, one per attempt whatever its weight — an independent grader's 0.5 observation adds 1 here, as a deterministic
+ * verdict does. The evidence mass (0.5 vs 1) lives in `beta` only; read these as "how many verdicts", never as evidence.
+ */
 export interface OutcomeCounts {
   readonly pass: number;
   readonly fail: number;
@@ -408,8 +435,12 @@ export interface OutcomeStore {
   readonly revision: number;
   /** Hot reload of `routing.outcomes` (applied lazily on the next read/write). */
   configure(tuning: Partial<OutcomeTuning>): void;
-  /** D4: pass → success, fail → failure, unverifiable → strict no-op. Returns whether the Beta changed. */
-  recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal): boolean;
+  /**
+   * D4: pass → success, fail → failure, unverifiable → strict no-op. Returns whether the Beta changed. `weight` (QA-P33F2-1-1,
+   * default 1): the observation's Beta weight in (0, 1] — an independent grader's verdict of a role dispatch weighs 0.5 (plan
+   * §2.6); any other value records nothing. The lifetime counters count the verdict once whatever its weight.
+   */
+  recordVerdict(key: OutcomeKey, verdict: Verdict, signal: AttemptSignal, weight?: number): boolean;
   /** D4: a false refusal is a failure of the key. Returns whether the Beta changed. */
   recordFalseRefusal(key: OutcomeKey, signal: AttemptSignal): boolean;
   /** Accumulate one step into its attempt; a `final` step folds the attempt into `cost(key)`. */
@@ -533,7 +564,20 @@ export interface DecisionTrace {
    * cheapest option the engine could not trust yet. `routing:stats` counts these to show where the gate holds it back.
    */
   readonly argmin?: RouteChoice;
+  /**
+   * #84 QA-G-B-3 (3), role dispatches only: why each need of `facts.needs` could be there — the classifier's matched terms
+   * (`edit:create`, `external_dir:<path>`, `shell:implied-by-network`), `<need>:route-line`, `<need>:class=<class>` and, on a resume,
+   * `<need>:resumed-dispatch`. Before any narrowing: `facts.needs` is what was decided.
+   */
+  readonly needTerms?: readonly string[];
 }
+
+/**
+ * #84 QA-G-B-2-2 (D14): the shape of one `DecisionTrace.needTerms` entry — `<need>:<label>` with a vocabulary word, a term id,
+ * a placeholder (`url`, `path`) or a router label (`route-line`, `class=<c>`, `implied-by-<need>`, `resumed-dispatch`). An entry
+ * of any other shape could carry prompt text and is dropped when a row is read.
+ */
+export const NEED_TERM_RE = /^[a-z_]+:[a-z0-9=_ -]{1,48}$/;
 
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */
 export interface DecisionRow extends LogRowBase {
@@ -566,6 +610,49 @@ export interface DecisionRow extends LogRowBase {
   readonly detection?: DecisionDetection;
   /** A34 (QA-G-B8): capability ranks of the pick and of what the host was handed. Absent on older rows and on ladder attempts. */
   readonly capability?: DecisionCapability;
+  /** Role/tier assurance (plan §2.4), all optional; absent on older rows. Agent name of the role the dispatch ran as. */
+  readonly role?: string;
+  /** Sorted authority action names granted to the dispatch. */
+  readonly grant?: readonly string[];
+  /** Bounds that limited the dispatch. */
+  readonly boundsReasons?: readonly string[];
+  /** Budget consumed by the attempt. */
+  readonly budgetUsed?: number;
+  /** Signal kind this row carries. */
+  readonly signal?: SignalKind;
+  /** The pick was an exploration draw. */
+  readonly explore?: boolean;
+  /** Probability with which the pick was drawn. */
+  readonly propensity?: number;
+  /** How the grant was bound to the child's permissions. */
+  readonly binding?: "exact" | "intersection" | "unknown";
+  /** P1.4: preset tier the dispatch ran at (role × tier statistics; the outcome key does not name it). */
+  readonly tier?: string;
+  /**
+   * P1.4: signed evidence mass of a signal row (`signal` set): > 0 success, < 0 failure, 0 recorded without mass
+   * (budget, authority). Readers clamp it per kind (signals.ts `signalMass`), so a row can never carry more than §2.6 allows.
+   */
+  readonly signalWeight?: number;
+  /** P1.4: the attempt an annotation row belongs to (ingest dedupes signals per attempt and kind; statistics do too). */
+  readonly attemptID?: string;
+}
+
+/**
+ * Reason prefix of a decision row written AFTER its dispatch to annotate it (an outcome signal, a binding): it shares the
+ * dispatch's `decisionID` and is never a dispatch of its own. `summarize` leaves every annotation row out.
+ */
+export const ANNOTATION_REASON = "note:";
+
+/** Reason prefix of a signal row: `note:signal:<kind>:<pass|fail|none>`. */
+export const SIGNAL_REASON = "note:signal:";
+
+/**
+ * A decision row that annotates a dispatch: its reason starts with {@link ANNOTATION_REASON} (the prefix alone decides;
+ * a `signal` field on a row with any other reason is just a field of a dispatch row). Readers before P1.4 drop annotation
+ * rows only through the C7 decision-id dedupe, so downgrading past P1.4 is unsupported (CHANGELOG, P3.2).
+ */
+export function isAnnotationRow(row: LogRow): boolean {
+  return row.kind === "decision" && row.reason.startsWith(ANNOTATION_REASON);
 }
 
 /** The `[acceptance]` depth vocabulary of 1.2 (`Detection`), restated here so this module keeps no runtime import. */
@@ -938,6 +1025,58 @@ export interface StatsTable {
    * fields) are not counted in either.
    */
   readonly neverDown: { readonly below: number; readonly recorded: number };
+}
+
+/** One signal kind of a role × tier bucket. Masses are clamped per kind (I6: no positive mass from self-report; I7: none for budget/authority). */
+export interface SignalKindStats {
+  readonly kind: SignalKind;
+  readonly pass: number;
+  readonly fail: number;
+  /** Rows recorded without mass (budget, authority, or a row without a weight). */
+  readonly none: number;
+  readonly positive: number;
+  readonly negative: number;
+}
+
+/** Σ of the dispatched key's `costs` entry over the bucket's dispatch rows of one unit. Units are never summed together. */
+export interface CostUnitRow {
+  readonly unit: CostUnit;
+  readonly total: number;
+  readonly rows: number;
+}
+
+/** P1.4: statistics of one role × tier bucket over the window (rendering is P2.2). */
+export interface RoleTierStatsRow {
+  readonly role: string;
+  /** Preset tier of the dispatch rows (`DecisionRow.tier`); `unknown` when a row carries none. */
+  readonly tier: string;
+  /** Windowed `dispatch` rows of the role at this tier (fresh and resumed; annotation rows excluded). */
+  readonly dispatches: number;
+  /** Fixed order: SIGNAL_KINDS. */
+  readonly signals: readonly SignalKindStats[];
+  readonly positiveMass: number;
+  readonly negativeMass: number;
+  readonly budgetExhaustions: number;
+  readonly authorityRequests: number;
+  readonly unknownBindings: number;
+  /** Dispatch rows drawn by exploration (`explore: true`). */
+  readonly explored: number;
+  /** n-weighted store token means per attempt over the bucket's dispatched keys (lifetime, not windowed); null without samples. */
+  readonly tokensPerDispatch: TokenMeans | null;
+  /** n-weighted store `measuredUSD` per attempt over the bucket's dispatched keys (lifetime); null without samples. */
+  readonly measuredUSD: MeanStat | null;
+  /** One entry per unit present, sorted by unit name. */
+  readonly costUnits: readonly CostUnitRow[];
+}
+
+/** P1.4: role × tier statistics. Rows without a role (tier mode) are not counted here; `summarize` is unchanged for them. */
+export interface RoleStatsTable {
+  readonly version: 1;
+  readonly window: { readonly since: string | null; readonly until: string | null };
+  /** Sorted by role, then tier. */
+  readonly byRoleTier: readonly RoleTierStatsRow[];
+  /** Windowed signal and unknown-binding rows whose dispatch has no role (or no decision row to join). */
+  readonly unattributed: { readonly signals: number; readonly unknownBindings: number };
 }
 
 /** What the CLI reads from a directory (a Persister satisfies it). */

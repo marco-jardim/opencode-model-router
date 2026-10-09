@@ -26,6 +26,12 @@ export interface Verdict {
    * this verdict classified, concatenated across testsPass checks. Absent when no check classified.
    */
   failures?: FailureClassification;
+  /**
+   * #84 P3.3 fix 2 (plan §2.6, I6): the LLM grader that judged this verdict (checker.ts runChecker, only once a grader
+   * session answered): the tier the checker asked for and the model the grader was dispatched on (`provider/model`, null when
+   * the router does not know it). Outcome signals weigh such a verdict as a grader's, never as a deterministic check's.
+   */
+  grader?: { readonly tier: string; readonly model: string | null };
 }
 
 export interface ExecResult {
@@ -96,6 +102,12 @@ export interface DeterministicDeps {
   deadline?: Deadline;
   /** Preserve completed failures if an outer gate budget expires later. */
   onFailure?: (reason: string) => void;
+  /**
+   * #84 QA-G-B-2-1: set for a CARRIED acceptance (a role resume re-checking the block of an earlier attempt): a testsPass or
+   * lintClean check that ran no process (NoAffected: nothing of the change set maps to a test or a lintable file) is unverifiable
+   * with this reason, never a pass. Absent (every other gate, I1): NoAffected passes with its note, as before.
+   */
+  noAffectedUnverifiable?: string;
   exec: ExecSeam;
   /** Any FsSeam; lintClean scoping also uses the optional PlannerFs members when present. */
   fs: import("./runner").PlannerFs;

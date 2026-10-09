@@ -7,6 +7,7 @@ import {
   type TierConfig,
 } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
+import { isIncompleteReason } from "../verify/checker";
 import {
   DEFAULT_VARIANT,
   buildVariantLadder,
@@ -170,7 +171,13 @@ export interface LadderVerdict {
   pass: boolean;
   outcome?: "pass" | "fail" | "unverifiable";
   reasons?: string[];
+  /** The gate classified the return as incomplete (verify/checker.ts isIncompleteVerdict). */
+  incomplete?: boolean;
 }
+
+/** QA-P15-2-9: the give-up reason of an incomplete return — resume the same session, no escalation. */
+export const INCOMPLETE_GIVE_UP_REASON =
+  "incomplete: the producer stopped before a final result; resume the same session to let it finish, no producer escalation";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -393,6 +400,11 @@ export function nextAction(
   // Strict policy may reject an unavailable check, but paying another producer
   // cannot repair the verifier. Only actual failures enter the retry ladder.
   if (verdict?.outcome === "unverifiable") {
+    // QA-P15-2-9: an incomplete return (progress note, budget stop) is neither a
+    // verifier limitation nor a failure: the same session resumes to finish it.
+    if (verdict.incomplete === true || (verdict.reasons ?? []).some(isIncompleteReason)) {
+      return { action: "give_up", reason: INCOMPLETE_GIVE_UP_REASON };
+    }
     return { action: "give_up", reason: "verification unavailable; no producer escalation" };
   }
 

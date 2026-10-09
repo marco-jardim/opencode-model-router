@@ -39,10 +39,11 @@ const AGENT = "SmokeScout";
 // `claude-haiku-4-5` / `claude-opus-4-8`, then from `claude-fable-5` when the
 // heavy tier moved to `claude-fable-5-1`, then from `claude-fable-5-1` "max"
 // when it moved to `claude-opus-5-5` "xhigh", then when fast moved to
-// `claude-sonnet-5-5` "low". Re-derive from tiers.json only if this keeps gating
-// CI on a preset bump. Current `anthropic` preset: fast is claude-sonnet-5-5 with
-// variant "low", heavy is claude-opus-5-5 with variant "xhigh".
-const FAST_MODEL = { providerID: "anthropic", modelID: "claude-sonnet-5-5" };
+// `claude-sonnet-5-5` "low", then back to `claude-haiku-5-5` "low". Re-derive from
+// tiers.json only if this keeps gating CI on a preset bump. Current `anthropic`
+// preset: fast is claude-haiku-5-5 with variant "low", heavy is claude-opus-5-5
+// with variant "xhigh".
+const FAST_MODEL = { providerID: "anthropic", modelID: "claude-haiku-5-5" };
 const HEAVY_MODEL = { providerID: "anthropic", modelID: "claude-opus-5-5" };
 const HEAVY_VARIANT = "xhigh";
 // Every `anthropic` tier now sets a variant, so the variant-clearing case uses

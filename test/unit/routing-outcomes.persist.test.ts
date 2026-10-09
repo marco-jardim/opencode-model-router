@@ -975,6 +975,16 @@ describe("parseLogLine", () => {
     }
   });
 
+  // #84 QA-G-B-2-2 (D14): a role row's need terms are vocabulary words, term ids or placeholders; a term carrying prompt text (a
+  // URL, a path, anything outside that shape) is dropped on read, so an older row's raw text never reaches a reader.
+  it("QA-G-B-2-2: keeps the well-formed need terms of a trace and drops any that carry prompt text", () => {
+    const routeLines = { count: 1, conflict: false, edgeOnly: true };
+    const good = ["web:url", "external_dir:path", "edit:update", "shell:term-14", "edit:class=implement", "web:route-line", "edit:resumed-dispatch", "shell:implied-by-network"];
+    const raw = ["web:https://example.com/api?token=tok_1", "external_dir:D:\\private\\notes.md", "shell:node scripts/x.js", "edit:" + "x".repeat(60), "nocolon"];
+    const parsed = parseLogLine(JSON.stringify({ ...decisionRow(5), trace: { routeLines, backend: null, needTerms: [...good, ...raw] } }));
+    expect(parsed?.kind === "decision" ? parsed.trace?.needTerms : undefined).toEqual(good);
+  });
+
   const base = (): Record<string, unknown> => JSON.parse(JSON.stringify(decisionRow(1))) as Record<string, unknown>;
   const verdictBase = (): Record<string, unknown> => JSON.parse(JSON.stringify(verdictRow(1))) as Record<string, unknown>;
   const mutate = (source: () => Record<string, unknown>, change: (r: Record<string, unknown>) => void): string => {

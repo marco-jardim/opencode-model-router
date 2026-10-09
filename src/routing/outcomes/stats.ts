@@ -10,22 +10,30 @@
 import type {
   ClassStatsRow,
   CostUnit,
+  CostUnitRow,
   DecisionRow,
   KeyStatsRow,
   LogRow,
+  MeanStat,
   OutcomeKey,
   OutcomeStoreView,
   RatioCell,
   RefusalRow,
   ResumeFreshRow,
+  RoleStatsTable,
+  RoleTierStatsRow,
   SavingsRow,
+  SignalKind,
+  SignalKindStats,
   StatsCliIO,
   StatsTable,
   StatsWindow,
+  TokenMeans,
   VerdictRow,
 } from "./types";
-import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, STATS_EXIT } from "./types";
+import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, SIGNAL_KINDS, STATS_EXIT, isAnnotationRow, parseKey } from "./types";
 import { createOutcomeStore } from "./store";
+import { signalMass } from "./signals";
 
 // ---------------------------------------------------------------------------
 // summarize
@@ -85,8 +93,10 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
   // An append may reach disk before reporting failure; retrying that batch must not inflate rates.
   // Decisions keep their first row. Signals dedupe per outcome, before windowing and joins:
   // a later decisive verdict must still replace an earlier unverifiable verdict (R2-9).
+  // P1.4: annotation rows (role signals, bindings) are not dispatches; they never reach the tier-mode numbers.
   const seen = new Set<string>();
   rows = rows.filter((row) => {
+    if (isAnnotationRow(row)) return false;
     const id = JSON.stringify(row.kind === "decision"
       ? [row.kind, row.decisionID]
       : [row.kind, row.decisionID, row.attemptID, row.kind === "verdict" ? row.verdict : row.overrides ?? null]);
@@ -305,6 +315,228 @@ export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[
 }
 
 // ---------------------------------------------------------------------------
+// summarizeRoles (P1.4): role × tier statistics; computation only, rendering is P2.2
+// ---------------------------------------------------------------------------
+
+const UNKNOWN_TIER = "unknown";
+
+/**
+ * Role of a decision row: its `role`, else the agent of its dispatched key when that key has origin `role` (QA-P14-2-5:
+ * a role dispatch row written without `role` is still the role's; P2.1 should write `role` anyway).
+ */
+function roleOf(row: DecisionRow): string | undefined {
+  if (row.role !== undefined) return row.role;
+  const parts = parseKey(dispatchedKey(row));
+  return parts !== null && parts.agent.origin === "role" ? parts.agent.id : undefined;
+}
+
+interface RoleTierAcc {
+  readonly role: string;
+  readonly tier: string;
+  dispatches: number;
+  explored: number;
+  unknownBindings: number;
+  readonly signals: Map<SignalKind, { pass: number; fail: number; none: number; positive: number; negative: number }>;
+  readonly keys: Set<OutcomeKey>;
+  readonly costs: Map<CostUnit, number[]>;
+}
+
+/** Ascending-order sum, so a total never depends on the row order. */
+function stableSum(values: readonly number[]): number {
+  return [...values].sort((a, b) => a - b).reduce((sum, x) => sum + x, 0);
+}
+
+function pooledTokens(store: OutcomeStoreView, keys: ReadonlySet<OutcomeKey>): TokenMeans | null {
+  let n = 0;
+  const sums = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const key of [...keys].sort(compareCodeUnits)) {
+    const t = store.cost(key).tokens;
+    if (t.n <= 0) continue;
+    n += t.n;
+    sums.input += t.input * t.n;
+    sums.output += t.output * t.n;
+    sums.reasoning += t.reasoning * t.n;
+    sums.cacheRead += t.cacheRead * t.n;
+    sums.cacheWrite += t.cacheWrite * t.n;
+  }
+  if (n === 0) return null;
+  return {
+    n,
+    input: sums.input / n,
+    output: sums.output / n,
+    reasoning: sums.reasoning / n,
+    cacheRead: sums.cacheRead / n,
+    cacheWrite: sums.cacheWrite / n,
+  };
+}
+
+function pooledUSD(store: OutcomeStoreView, keys: ReadonlySet<OutcomeKey>): MeanStat | null {
+  let n = 0;
+  let sum = 0;
+  for (const key of [...keys].sort(compareCodeUnits)) {
+    const m = store.cost(key).measuredUSD;
+    if (m.n <= 0) continue;
+    n += m.n;
+    sum += m.mean * m.n;
+  }
+  return n === 0 ? null : { mean: sum / n, n };
+}
+
+/**
+ * Role × tier statistics over `since ≤ ts < until`. Only rows of role dispatches count: a dispatch row is a non-annotation
+ * `dispatch` decision row with a role (`role`, else a role-origin dispatched key: {@link roleOf}); signal rows and unknown-binding rows are attributed to the role
+ * and tier of the dispatch row they join on `decisionID` (any window: the dispatch may precede the window), else to their
+ * own `role`/`tier`. Rows are deduplicated like `summarize` (C7): the first dispatch row per decision id, and identical
+ * annotation rows once. Signal masses are clamped per kind (`signalMass`): I6 and I7 hold whatever a row claims.
+ * Tokens and USD come from the store (lifetime per attempt, like `KeyStatsRow.measuredUSD`).
+ */
+export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly LogRow[], window: StatsWindow): RoleStatsTable {
+  const since = finiteOrNull(window.since);
+  const until = finiteOrNull(window.until);
+  const inWindow = (row: LogRow): boolean => {
+    const t = Date.parse(row.ts);
+    return Number.isFinite(t) && (since === null || t >= since) && (until === null || t < until);
+  };
+
+  const dispatchByID = new Map<string, DecisionRow>();
+  const annotations: DecisionRow[] = [];
+  const seenNotes = new Set<string>();
+  // Residual QA-P14-1-6: a refusal that records `overrides: "pass"` turned the attempt's store pass into a failure (as
+  // `summarize` moves that pass to a fail). The attempt's `verdict:pass` signal then counts as a failure of 1, and its
+  // `grader:pass` signal (#84 P3.3 fix 2: grader verdicts follow the store too) as a failure of the grader's 0.5. Every row
+  // handed in, not only the window: the refusal may land in another window than the signal.
+  const converted = new Set<string>();
+  for (const row of rows) if (row.kind === "refusal" && row.overrides === "pass") converted.add(row.attemptID);
+  for (const row of rows) {
+    if (row.kind !== "decision") continue;
+    if (isAnnotationRow(row)) {
+      // Signals: one row per attempt and kind, first wins (ingest's own identity and the store's one-observation rule);
+      // `attemptID` when the row carries it, else the child session. Other annotations: per attempt and reason.
+      const attempt = row.attemptID ?? row.childSessionID;
+      const id = JSON.stringify(row.signal !== undefined
+        ? ["signal", row.decisionID, attempt, row.signal]
+        : ["note", row.decisionID, attempt, row.reason, row.binding ?? null]);
+      if (seenNotes.has(id)) continue;
+      seenNotes.add(id);
+      annotations.push(row);
+    } else if (!dispatchByID.has(row.decisionID)) {
+      dispatchByID.set(row.decisionID, row);
+    }
+  }
+
+  const buckets = new Map<string, RoleTierAcc>();
+  const bucket = (role: string, tier: string): RoleTierAcc => {
+    const id = JSON.stringify([role, tier]);
+    let acc = buckets.get(id);
+    if (acc === undefined) {
+      acc = { role, tier, dispatches: 0, explored: 0, unknownBindings: 0, signals: new Map(), keys: new Set(), costs: new Map() };
+      buckets.set(id, acc);
+    }
+    return acc;
+  };
+  /**
+   * Role and tier of an annotation: when its dispatch row exists, that row's role AND tier only (a dispatch without a role
+   * is tier mode: unattributed); else the annotation's own. Null without a role.
+   */
+  const placeOf = (row: DecisionRow): RoleTierAcc | null => {
+    const dispatch = dispatchByID.get(row.decisionID);
+    const source = dispatch ?? row;
+    const role = roleOf(source);
+    if (role === undefined) return null;
+    return bucket(role, source.tier ?? UNKNOWN_TIER);
+  };
+
+  const unknownBindingSeen = new Set<string>();
+  const noteUnknownBinding = (row: DecisionRow, acc: RoleTierAcc | null): boolean => {
+    if (row.binding !== "unknown") return false;
+    const id = JSON.stringify([row.decisionID, row.childSessionID]);
+    if (unknownBindingSeen.has(id)) return false;
+    unknownBindingSeen.add(id);
+    if (acc !== null) acc.unknownBindings += 1;
+    return acc === null;
+  };
+
+  let unattributedSignals = 0;
+  let unattributedBindings = 0;
+  for (const row of dispatchByID.values()) {
+    const role = roleOf(row);
+    if (!inWindow(row) || role === undefined) continue;
+    const acc = bucket(role, row.tier ?? UNKNOWN_TIER);
+    if (noteUnknownBinding(row, acc)) unattributedBindings += 1;
+    if (row.step !== "dispatch") continue;
+    acc.dispatches += 1;
+    if (row.explore === true) acc.explored += 1;
+    const key = dispatchedKey(row);
+    acc.keys.add(key);
+    const cost = row.costs[key];
+    if (typeof cost === "number" && Number.isFinite(cost)) {
+      const list = acc.costs.get(row.unit) ?? [];
+      list.push(cost);
+      acc.costs.set(row.unit, list);
+    }
+  }
+  for (const row of annotations) {
+    if (!inWindow(row)) continue;
+    const acc = placeOf(row);
+    if (noteUnknownBinding(row, acc)) unattributedBindings += 1;
+    const kind = row.signal;
+    if (kind === undefined) continue;
+    if (acc === null) {
+      unattributedSignals += 1;
+      continue;
+    }
+    const cell = acc.signals.get(kind) ?? { pass: 0, fail: 0, none: 0, positive: 0, negative: 0 };
+    const overridden = (kind === "verdict" || kind === "grader") && row.attemptID !== undefined && converted.has(row.attemptID) && (row.signalWeight ?? 0) > 0;
+    const mass = signalMass(kind, overridden ? -1 : row.signalWeight);
+    if (mass.positive > 0) cell.pass += 1;
+    else if (mass.negative > 0) cell.fail += 1;
+    else cell.none += 1;
+    cell.positive += mass.positive;
+    cell.negative += mass.negative;
+    acc.signals.set(kind, cell);
+  }
+
+  const byRoleTier: RoleTierStatsRow[] = [...buckets.values()]
+    .sort((a, b) => compareCodeUnits(a.role, b.role) || compareCodeUnits(a.tier, b.tier))
+    .map((acc) => {
+      const signals: SignalKindStats[] = SIGNAL_KINDS.map((kind) => ({
+        kind,
+        ...(acc.signals.get(kind) ?? { pass: 0, fail: 0, none: 0, positive: 0, negative: 0 }),
+      }));
+      const costUnits: CostUnitRow[] = [...acc.costs.keys()].sort(compareCodeUnits).map((unit) => {
+        const list = acc.costs.get(unit) ?? [];
+        return { unit, total: stableSum(list), rows: list.length };
+      });
+      const count = (kind: SignalKind): number => {
+        const s = acc.signals.get(kind);
+        return s === undefined ? 0 : s.pass + s.fail + s.none;
+      };
+      return {
+        role: acc.role,
+        tier: acc.tier,
+        dispatches: acc.dispatches,
+        signals,
+        positiveMass: stableSum(signals.map((s) => s.positive)),
+        negativeMass: stableSum(signals.map((s) => s.negative)),
+        budgetExhaustions: count("budget"),
+        authorityRequests: count("authority"),
+        unknownBindings: acc.unknownBindings,
+        explored: acc.explored,
+        tokensPerDispatch: store === null ? null : pooledTokens(store, acc.keys),
+        measuredUSD: store === null ? null : pooledUSD(store, acc.keys),
+        costUnits,
+      };
+    });
+
+  return {
+    version: 1,
+    window: { since: isoOrNull(since), until: isoOrNull(until) },
+    byRoleTier,
+    unattributed: { signals: unattributedSignals, unknownBindings: unattributedBindings },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // renderMarkdown
 // ---------------------------------------------------------------------------
 
@@ -421,6 +653,37 @@ export function renderMarkdown(table: StatsTable): string {
     // QA-2.1-10: rows are only recorded under a trusted class, so the rates below the metrics are not over every dispatch.
     "_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._",
   ];
+  return blocks.join("\n\n") + "\n";
+}
+
+/**
+ * True when the log has role rows: a role dispatch bucket, or an unknown-binding row (only role dispatches are bound). Unattributed
+ * SIGNAL rows do not count: tier-origin verdict/run signals are written in every mode, so tier-only logs render exactly as before.
+ */
+export function hasRoleRows(table: RoleStatsTable): boolean {
+  return table.byRoleTier.length > 0 || table.unattributed.unknownBindings > 0;
+}
+
+/** P2.2: the role × tier section appended to the report when the log has role rows. Same determinism rules as {@link renderMarkdown}. */
+export function renderRoleMarkdown(table: RoleStatsTable): string {
+  const rows =
+    table.byRoleTier.length === 0
+      ? "_none_"
+      : [
+          "| Role | Tier | Dispatches | Pass | Fail | +mass | -mass | Budget exhaustions | Authority requests | Unknown bindings | Explored | Tokens/dispatch (in/out) | USD/attempt (lifetime) |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+          ...table.byRoleTier.map((r) => {
+            const pass = r.signals.reduce((sum, s) => sum + s.pass, 0);
+            const fail = r.signals.reduce((sum, s) => sum + s.fail, 0);
+            const tokens = r.tokensPerDispatch === null ? "n/a" : `${fix(r.tokensPerDispatch.input, 0)}/${fix(r.tokensPerDispatch.output, 0)} (n=${r.tokensPerDispatch.n})`;
+            const usd = r.measuredUSD === null ? "n/a" : `${fmtUSD(r.measuredUSD.mean)} (n=${r.measuredUSD.n})`;
+            return `| ${cell(r.role)} | ${cell(r.tier)} | ${r.dispatches} | ${pass} | ${fail} | ${fix(r.positiveMass, 2)} | ${fix(r.negativeMass, 2)} | ${r.budgetExhaustions} | ${r.authorityRequests} | ${r.unknownBindings} | ${r.explored} | ${tokens} | ${usd} |`;
+          }),
+        ].join("\n");
+  const blocks = ["### By role × tier", rows];
+  if (table.unattributed.signals > 0 || table.unattributed.unknownBindings > 0) {
+    blocks.push(`_Not attributed to a role: ${table.unattributed.signals} signal row(s), ${table.unattributed.unknownBindings} unknown binding(s)._`);
+  }
   return blocks.join("\n\n") + "\n";
 }
 
@@ -589,7 +852,15 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Prom
     }
 
     const table = summarize(store, read.rows, { since: args.since, until: args.until });
-    io.stdout(args.json ? JSON.stringify(table, null, 2) + "\n" : renderMarkdown(table));
+    const roles = summarizeRoles(store, read.rows, { since: args.since, until: args.until });
+    const withRoles = hasRoleRows(roles);
+    io.stdout(
+      args.json
+        ? JSON.stringify(withRoles ? { ...table, roles } : table, null, 2) + "\n"
+        : withRoles
+          ? `${renderMarkdown(table)}\n${renderRoleMarkdown(roles)}`
+          : renderMarkdown(table),
+    );
     return STATS_EXIT.ok;
   } catch (error) {
     try {

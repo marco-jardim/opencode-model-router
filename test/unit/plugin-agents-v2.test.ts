@@ -261,4 +261,25 @@ describe("plugin agents on v2", () => {
     expect(f.agents.hostprimary.mode).toBe("primary");
     expect(warn.mock.calls.map((args) => String(args[0])).some((text) => text.includes("collides with a host built-in agent"))).toBe(true);
   });
+
+  it("QA-G-A1-1: the context filter treats every host edit tool as `edit`; an explicit deny of the tool's own name still removes it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    cleanups.push(() => { vi.restoreAllMocks(); });
+    const editor = { tier: "fast", description: "Editor", permission: { read: "allow", edit: "allow", multiedit: "deny" } };
+    const f = fixture(defaults);
+    await f.start(await plugin(setup({ agents: { scout, editor } })));
+    const kept = async (agent: string) => {
+      const context = {
+        sessionID: "child", agent, model: { providerID: "anthropic", id: "claude-opus-5-5" }, options: {}, system: [], messages: [],
+        tools: Object.fromEntries(["apply_patch", "multiedit", "write", "patch", "edit", "read", "shell"].map((name) => [name, {}])),
+      };
+      await f.sessionHooks.context(context);
+      return Object.keys(context.tools).sort();
+    };
+    // `edit: allow` keeps apply_patch (the v2 host asserts `edit` for it); the agent's own `multiedit: deny` still removes multiedit.
+    expect(await kept("editor")).toEqual(["apply_patch", "edit", "patch", "read", "write"]);
+    // A readOnly agent (#77 map: edit denied) loses every edit tool, as before.
+    expect(await kept("scout")).toEqual(["read"]);
+    warn.mockRestore();
+  });
 });

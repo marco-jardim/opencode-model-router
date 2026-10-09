@@ -34,6 +34,7 @@ import type {
   ReadRowsResult,
   RefusalRow,
   RouteChoice,
+  SignalKind,
   VerdictRow,
   WriteResult,
 } from "./types";
@@ -47,8 +48,10 @@ import {
   FLUSH_MIN_INTERVAL_MS,
   LADDER_STEP_KINDS,
   LOG_ROW_VERSION,
+  SIGNAL_KINDS,
   MAX_QUEUED_ROWS,
   MAX_CORRUPT_COPIES,
+  NEED_TERM_RE,
   OUTCOMES_CORRUPT_PREFIX,
   OUTCOMES_CORRUPT_RE,
   OUTCOMES_FILE,
@@ -258,6 +261,12 @@ const LOGGED_MODES: readonly string[] = ["shadow", "advise", "enforce"];
 const COST_UNITS: readonly string[] = ["usd", "ratio"];
 const VERDICT_VALUES: readonly string[] = ["pass", "fail", "unverifiable"];
 
+const BINDINGS: readonly string[] = ["exact", "intersection", "unknown"];
+
+function isStringArray(x: unknown): x is string[] {
+  return Array.isArray(x) && x.every((v): v is string => typeof v === "string");
+}
+
 function isOutcomeKey(x: unknown): x is OutcomeKey {
   return typeof x === "string" && parseKey(x) !== null;
 }
@@ -270,7 +279,7 @@ function readChoice(x: unknown): RouteChoice | null {
   if (!isRec(x)) return null;
   const { key, agent, origin, model, variant } = x;
   if (!isOutcomeKey(key) || typeof agent !== "string" || typeof model !== "string" || typeof variant !== "string") return null;
-  if (origin !== "router" && origin !== "host") return null;
+  if (origin !== "router" && origin !== "host" && origin !== "role") return null;
   return { key, agent, origin, model, variant };
 }
 
@@ -298,6 +307,8 @@ function readTrace(x: unknown): DecisionTrace | undefined {
     backend,
     ...(x.backendSkipped === "credentials" ? { backendSkipped: "credentials" as const } : {}),
     ...(argmin === null ? {} : { argmin }),
+    // QA-G-B-2-2 (D14): only well-shaped need terms; one that could carry prompt text (an older row's URL or path) is dropped.
+    ...(isStringArray(x.needTerms) ? { needTerms: x.needTerms.filter((term) => NEED_TERM_RE.test(term)) } : {}),
   };
 }
 function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {
@@ -405,6 +416,17 @@ export function parseLogLine(line: string): LogRow | null {
     ...(trace === undefined ? {} : { trace }),
     ...(detection === undefined ? {} : { detection }),
     ...(capability === undefined ? {} : { capability }),
+    ...(typeof json.role === "string" ? { role: json.role } : {}),
+    ...(isStringArray(json.grant) ? { grant: [...json.grant] } : {}),
+    ...(isStringArray(json.boundsReasons) ? { boundsReasons: [...json.boundsReasons] } : {}),
+    ...(isFiniteNum(json.budgetUsed) ? { budgetUsed: json.budgetUsed } : {}),
+    ...(oneOf(SIGNAL_KINDS, json.signal) ? { signal: json.signal as SignalKind } : {}),
+    ...(typeof json.explore === "boolean" ? { explore: json.explore } : {}),
+    ...(isFiniteNum(json.propensity) ? { propensity: json.propensity } : {}),
+    ...(oneOf(BINDINGS, json.binding) ? { binding: json.binding as NonNullable<DecisionRow["binding"]> } : {}),
+    ...(typeof json.tier === "string" && json.tier !== "" ? { tier: json.tier } : {}),
+    ...(isFiniteNum(json.signalWeight) ? { signalWeight: json.signalWeight } : {}),
+    ...(typeof json.attemptID === "string" && json.attemptID !== "" ? { attemptID: json.attemptID } : {}),
   };
   return row;
 }

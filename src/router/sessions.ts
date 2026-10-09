@@ -3,6 +3,8 @@ import type { RouterConfig } from "./config";
 import { fingerprintToolCall } from "../guard/fingerprint";
 import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep";
 import type { DecisionFacts, LadderStepKind } from "../routing/outcomes/types";
+import type { ChangedFile } from "../verify/dispatch";
+import type { ReferenceState } from "../verify/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -376,6 +378,25 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
       return subagentCapState.get(sessionID)?.tierName ?? null;
     },
 
+    /**
+     * The current dispatch round's honoured cap: "none" only for CAP:none with a
+     * reason: line, else a number; null for an untracked session. A resume
+     * re-registers and replaces it (QA-P15-1-3: the guard's reader signal).
+     */
+    getCap(sessionID: string): Cap | null {
+      return subagentCapState.get(sessionID)?.cap ?? null;
+    },
+
+    /**
+     * The current round's read-only counter reached its cap (calls >= a numeric
+     * cap). Captured when a task returns, it validates a `NEED MORE: budget`
+     * claim (QA-P15-2-2); false for CAP:none and untracked sessions.
+     */
+    readCapReached(sessionID: string): boolean {
+      const state = subagentCapState.get(sessionID);
+      return state !== undefined && state.cap !== "none" && state.calls >= state.cap;
+    },
+
     /** Returns true when the session was classified as trivial at dispatch time. */
     isTrivial(sessionID: string): boolean {
       return subagentCapState.get(sessionID)?.trivial === true;
@@ -419,6 +440,21 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
       if (!sessionID) return;
       subagentSessionIDs.add(sessionID);
       touch(sessionID);
+    },
+
+    /**
+     * #84 QA-P21-3-1: a routed resume of a role child (the host gives no chat.message for it): start a new dispatch round of its
+     * read-only counter, as a same-tier re-registration does — calls back to 0, `seen` and totalCalls kept, the previous cap kept
+     * unless the resume names one. False (nothing done) when the child has no read-only cap state.
+     */
+    resumeRoleSession(sessionID: string, cap: Cap | null): boolean {
+      const existing = subagentCapState.get(sessionID);
+      if (existing === undefined) return false;
+      if (cap !== null) existing.cap = cap;
+      existing.calls = 0;
+      existing.dispatches += 1;
+      touch(sessionID);
+      return true;
     },
 
     /** Remove a session from tracking (used to clean up delegate producer sessions). */
@@ -584,6 +620,31 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
 /** `routing.detection` keys: how strongly the dispatch's acceptance checks detect a failure (D8). */
 export type DetectionDepth = "deterministic" | "grader" | "none";
 
+/**
+ * #84 QA-G-B-1: what a role dispatch's verification was built from — the first `[acceptance]` block of its prompt (verbatim lines)
+ * and its whole-line `VERIFY:` / `VERIFY_WAIT:` directives — so a resume that names none of its own ("continue and finish") is
+ * verified, and its tier floor computed, on the same acceptance as the dispatch it resumes.
+ */
+export interface CarriedVerification {
+  readonly block: string;
+  readonly directives: readonly string[];
+  /** QA-G-B N-a: the route line's `d=` claim of the dispatch that introduced the block; absent: none. */
+  readonly claim?: DetectionDepth;
+  /**
+   * QA-G-B-2-1: the change baseline of the child's attempts under this block — set by the gate of the attempt that introduced it
+   * (its dispatch reference and change set), widened by every later attempt that carried it. Absent until that gate ran.
+   */
+  readonly baseline?: VerificationBaseline;
+}
+
+/** QA-G-B-2-1: what a carried acceptance is judged against (see {@link CarriedVerification}.baseline). */
+export interface VerificationBaseline {
+  /** The dispatch reference of the attempt that introduced the block (its pre-existing failures are excused; later ones not). */
+  readonly reference: ReferenceState;
+  /** Every file the child changed in that attempt and every later one under the block; "unavailable" once any set was unknown. */
+  readonly changed: readonly ChangedFile[] | "unavailable";
+}
+
 export interface DispatchInput {
   /** Typed task facts of the dispatch (1.2 `TaskFacts` is assignable). */
   facts: DecisionFacts;
@@ -625,6 +686,8 @@ export interface DispatchInput {
    * resume or a ladder attempt is a new execution and starts from nothing.
    */
   keepExecution?: boolean;
+  /** #84 QA-G-B-1, role dispatches only: the verification its resumes carry ({@link CarriedVerification}). Absent: none. */
+  verification?: CarriedVerification | null;
 }
 
 export interface DispatchRecord {
@@ -646,6 +709,8 @@ export interface DispatchRecord {
   /** See `DispatchInput.outcomes`: false = ingestion was off where this child was registered. */
   readonly outcomes: boolean;
   readonly registeredAt: number;
+  /** See `DispatchInput.verification`; present only on a role dispatch that carries one. */
+  readonly verification?: CarriedVerification;
 }
 
 interface DispatchSlot {
@@ -715,6 +780,8 @@ export function rememberDispatch(
     step: input.step ?? "dispatch",
     outcomes: input.outcomes ?? true,
     registeredAt: nowMs,
+    // Only when there is one: every other record keeps its exact shape.
+    ...(input.verification === undefined || input.verification === null ? {} : { verification: frozenVerification(input.verification) }),
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
   // QA-2.3-1a: a registration of the same execution keeps what was observed of it (see `DispatchInput.keepExecution`).
@@ -731,6 +798,31 @@ export function rememberDispatch(
     dropDispatch(oldest.value);
   }
   return record;
+}
+
+/** A frozen copy of a carried verification; `claim` and `baseline` only when present (a record keeps its exact shape). */
+function frozenVerification(v: CarriedVerification): CarriedVerification {
+  return Object.freeze({
+    block: v.block,
+    directives: Object.freeze([...v.directives]),
+    ...(v.claim === undefined ? {} : { claim: v.claim }),
+    ...(v.baseline === undefined ? {} : {
+      baseline: Object.freeze({
+        reference: v.baseline.reference,
+        changed: v.baseline.changed === "unavailable" ? "unavailable" as const : Object.freeze(v.baseline.changed.map((f) => Object.freeze({ ...f }))),
+      }),
+    }),
+  });
+}
+
+/**
+ * #84 QA-G-B-2-1: replace the carried verification of a child's CURRENT registration — the same attempt (no new attempt id, nothing
+ * observed of the execution is reset), only its verification baseline moves on. Nothing when the child is not registered.
+ */
+export function updateDispatchVerification(childSessionID: string, verification: CarriedVerification): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return;
+  slot.record = Object.freeze({ ...slot.record, verification: frozenVerification(verification) });
 }
 
 /** The registered dispatch of a child session, or undefined (unknown, forgotten or swept). */

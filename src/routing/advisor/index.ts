@@ -27,10 +27,12 @@ import { nodePersistFs, renameWithRetry, resolveOutcomesDir } from "../outcomes/
 import type { PersistFs } from "../outcomes/types";
 import { agentModelRef } from "../wire/host-info";
 import { runChecks } from "./findings";
+import type { AdvisorExtras } from "./findings";
 import type { AdvisorCatalogModel, Finding, FindingTarget, HostAgentView, HostConfigView } from "./findings";
 
 export { FINDING_IDS, FINDING_TARGET, HOST_SMALL_MODEL_FAMILIES, SUBSCRIPTION_PROVIDERS, cheapestTitleModel, hostSmallModel, splitModelRef } from "./findings";
-export type { AdvisorCatalogModel, Finding, FindingId, FindingSeverity, FindingTarget, HostAgentView, HostConfigView } from "./findings";
+export { ROLE_BUDGET_LOW_SHARE, ROLE_STATS_MIN_DISPATCHES } from "./findings";
+export type { AdvisorExtras, AdvisorCatalogModel, Finding, FindingId, FindingSeverity, FindingTarget, HostAgentView, HostConfigView } from "./findings";
 
 export interface AdvisorLogger {
   warn(message: string, extra?: Record<string, unknown>): void;
@@ -57,11 +59,12 @@ export function runAdvisor(
   hostConfig: HostConfigView | null,
   catalog: readonly AdvisorCatalogModel[] | null,
   logger?: AdvisorLogger,
+  extras: AdvisorExtras = {},
 ): Finding[] {
   try {
     return runChecks(cfg, hostConfig, catalog, (check, error) => {
       logger?.warn(`[router] cost doctor: check ${check} failed`, { error: describeError(error) });
-    });
+    }, extras);
   } catch (error) {
     logger?.warn("[router] cost doctor: the advisor failed", { error: describeError(error) });
     return [];
@@ -318,7 +321,12 @@ export interface AdvisorNotifierDeps {
   readonly settings: () => AdvisorSettings | null;
   readonly config: () => RouterConfig;
   /** The host's agents and catalog; either may be `null` (unknown). May reject. */
-  readonly gather: () => Promise<{ readonly host: HostConfigView | null; readonly catalog: readonly AdvisorCatalogModel[] | null }>;
+  readonly gather: () => Promise<{
+    readonly host: HostConfigView | null;
+    readonly catalog: readonly AdvisorCatalogModel[] | null;
+    /** Host generation and role statistics for the roles checks; absent = those checks stay silent. */
+    readonly extras?: AdvisorExtras;
+  }>;
   readonly logger: AdvisorLogger;
   readonly now?: () => number;
   readonly fs?: AdvisorFs;
@@ -435,8 +443,8 @@ export function createAdvisorNotifier(deps: AdvisorNotifierDeps): AdvisorNotifie
   };
 
   const produce = async (): Promise<{ text: string | null; keys: string[] }> => {
-    const { host, catalog } = await deps.gather();
-    const findings = runAdvisor(deps.config(), host, catalog, deps.logger);
+    const { host, catalog, extras } = await deps.gather();
+    const findings = runAdvisor(deps.config(), host, catalog, deps.logger, extras);
     return { text: noticeWorthy(findings) ? formatNotice(findings) : null, keys: keysOf(findings) };
   };
 

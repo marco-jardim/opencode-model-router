@@ -24,7 +24,7 @@
 
 import { homedir, tmpdir } from "node:os";
 import type { RouterConfig, RouterHost } from "../../router/config";
-import { resolveRouting } from "../../router/config";
+import { resolveCandidates, resolveRouting } from "../../router/config";
 import { getActiveTiers } from "../../router/protocol";
 import {
   forgetDispatch,
@@ -41,7 +41,11 @@ import type { AcquireOutcomesOptions } from "./index";
 import { acquireOutcomes } from "./index";
 import { pricingState, tokenSampleFromEvent } from "./cost";
 import { resolveOutcomesDir } from "./persist";
+import { roleTierOrder } from "../engine/ladders";
+import type { SignalObservation, TierRung } from "./signals";
+import { SIGNAL_MASS_CAPS, graderSignal, isSignalObservation, signalRow, tierOfModel, verdictSignal } from "./signals";
 import type {
+  AgentOrigin,
   AttemptSignal,
   Clock,
   LoggedRoutingMode,
@@ -55,9 +59,10 @@ import type {
   StepEndedTokens,
   StepSample,
   Verdict,
+  VerdictGrader,
   VerdictRow,
 } from "./types";
-import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, safeNow, splitModelRef } from "./types";
+import { LOG_ROW_VERSION, classifyAgentOrigin, makeKey, normalizeVariant, safeNow, splitModelRef } from "./types";
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -73,6 +78,26 @@ export interface IngestSettings {
   readonly tuning: OutcomeTuning;
   /** Ids of the active preset's router tier agents (origin `router`); every other agent is `host`. */
   readonly routerAgentIds: ReadonlySet<string>;
+  /**
+   * P1.4: agent names of the resolved role agents (origin `role`, key `class|role:<agent>|…`). Absent or empty in tiers
+   * mode and on v1, so keys stay `router`/`host` there. Filled by P2.1 from `resolveRoles`.
+   */
+  readonly roleAgentIds?: ReadonlySet<string>;
+  /**
+   * #84 P3.3 fix 2: the tier order of role dispatches (`roleTierOrder`, cheapest first) and its rungs, which rank a grader
+   * against the producer (plan §2.6: grader tier ≥ producer tier). Absent or empty: no grader is ever independent.
+   */
+  readonly tierOrder?: readonly string[];
+  readonly tierRungs?: readonly TierRung[];
+}
+
+/** The role tier order of `cfg` and its rungs (empty without a config). */
+function tierLadderOf(cfg: RouterConfig | undefined): { readonly tierOrder: readonly string[]; readonly tierRungs: readonly TierRung[] } {
+  if (cfg === undefined) return { tierOrder: [], tierRungs: [] };
+  const tierOrder = Object.freeze([...roleTierOrder(cfg)]);
+  const tierRungs = Object.freeze(tierOrder.flatMap((tier) =>
+    resolveCandidates(tier, cfg).map((rung): TierRung => Object.freeze({ tier, model: rung.model, variant: rung.variant ?? null }))));
+  return { tierOrder, tierRungs };
 }
 
 const settingsCache = new WeakMap<RouterConfig, IngestSettings | null>();
@@ -98,6 +123,7 @@ export function ingestSettings(cfg: RouterConfig | undefined, host: RouterHost):
         maxEffectiveSamples: routing.outcomes.maxEffectiveSamples,
       }),
       routerAgentIds: new Set(cfg === undefined ? [] : Object.keys(getActiveTiers(cfg))),
+      ...tierLadderOf(cfg),
     });
   }
   if (cfg !== undefined) settingsCache.set(cfg, settings);
@@ -387,6 +413,15 @@ export interface IngestDeps {
   readonly acquire?: (options: AcquireOutcomesOptions) => OutcomesBundle;
 }
 
+/** P1.4: options of {@link Ingest.onSignal}. */
+export interface SignalOptions {
+  /**
+   * The decision id of the attempt the signal is about; the child's current registration must carry it, else nothing is
+   * written (a re-registered or evicted child). Required for `redispatch` (the previous attempt, `RedispatchMatch.previous`).
+   */
+  readonly expectDecisionID?: string;
+}
+
 export interface Ingest {
   /**
    * `session.step.ended` (and `session.step.failed`, when it carries a cost or tokens) of a registered child. Awaits
@@ -400,10 +435,27 @@ export interface Ingest {
    * (QA-2.3-R2-1). Without an id every delivery is applied.
    */
   onExecutionEnded(childSessionID: string, eventId?: unknown): void;
-  /** A verifier verdict for the child's current attempt. Never throws. */
-  onVerdict(childSessionID: string, outcome: Verdict): void;
+  /**
+   * A verifier verdict for the child's current attempt. Never throws. `grader` (#84 P3.3 fix 2, `verdictGraderOf`; always passed,
+   * `undefined` = deterministic checks): the LLM grader that judged the verdict. Tier and host dispatches: the store and the
+   * verdict row take it either way, at full weight (unchanged, I1). A ROLE dispatch's grader verdict (plan §2.6, I6,
+   * QA-P33F2-1-1) moves the store at 0.5 with a verdict row and a `grader` signal row only when the grader is independent (tier
+   * ≥ the producer's and another model); otherwise nothing at all — no store change, no verdict row, no signal row.
+   */
+  onVerdict(childSessionID: string, outcome: Verdict, grader: VerdictGrader | undefined): void;
   /** A false refusal (zero tool calls) observed for the child's current attempt. Never throws. */
   onFalseRefusal(childSessionID: string): void;
+  /**
+   * P1.4: append a signal row (signals.ts) for the child's current attempt. Rows only: the Beta store, its decay and the
+   * verdict/refusal rows are untouched. `verdict` and `grader` are refused (`onVerdict` writes them when the store takes the
+   * verdict; QA-P33F2-1 N2);
+   * `redispatch` needs `expectDecisionID`. Gated like a verdict (registered, keyable, trusted class), except that the
+   * zero-mass kinds (`budget`, `authority`) are written under class `unknown` when the class is not trusted. The dispatch
+   * must have a decision id (the row annotates its decision row). One row per attempt and kind (C7: a repeat, even with
+   * another outcome, writes nothing). Returns whether a row was enqueued. Never throws. Optional only so that existing test
+   * doubles still satisfy `Ingest`; `createIngest` and {@link NOOP_INGEST} implement it.
+   */
+  onSignal?(childSessionID: string, observation: SignalObservation, options?: SignalOptions): boolean;
   /** A session was deleted: the child's open attempt is folded and its registry entry dropped; children of the session too. */
   onSessionGone(sessionID: string): void;
   /** Idle/deleted flush point (D15): coalesced and throttled by the flusher, never awaited. No-op without recorded data. */
@@ -421,6 +473,7 @@ export const NOOP_INGEST: Ingest = Object.freeze({
   onExecutionEnded: () => undefined,
   onVerdict: () => undefined,
   onFalseRefusal: () => undefined,
+  onSignal: () => false,
   onSessionGone: () => undefined,
   requestFlush: () => undefined,
   sweep: () => undefined,
@@ -452,6 +505,10 @@ interface Target {
   readonly record: DispatchRecord;
   readonly settings: IngestSettings;
   readonly key: OutcomeKey;
+  readonly origin: AgentOrigin;
+  /** `provider/model`. */
+  readonly model: string;
+  readonly variant: string;
 }
 
 export function createIngest(deps: IngestDeps): Ingest {
@@ -489,7 +546,7 @@ export function createIngest(deps: IngestDeps): Ingest {
   };
 
   /** Registered, trusted and keyable? Otherwise nothing may be recorded for the child. */
-  const targetOf = (childSessionID: string): Target | null => {
+  const targetOf = (childSessionID: string, untrusted: "skip" | "unknown" = "skip"): Target | null => {
     // Registry first: most `session.step.ended` events belong to sessions that are not registered children
     // (the orchestrator's own), and the settings may cost a config fingerprint check.
     const record = lookupDispatch(childSessionID);
@@ -499,20 +556,22 @@ export function createIngest(deps: IngestDeps): Ingest {
     const settings = deps.settings();
     if (settings === null) return null;
     const confidence = record.facts.confidence;
+    const rawClass = record.facts.class;
     // Phase 1.2 handoff (QA-1.2-27): a class below the threshold is "unknown" for learning, not a class of
-    // its own. No fallback class, no store call, no row.
-    if (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < settings.minClassConfidence) {
-      return null;
-    }
-    const cls = record.facts.class;
-    if (typeof cls !== "string" || cls === "" || cls === "unknown") return null;
+    // its own. No fallback class, no store call, no row. P1.4 (`untrusted: "unknown"`): a zero-mass role signal
+    // (budget, authority) is still a row, keyed under class `unknown`; it never reaches the store.
+    const trusted =
+      typeof confidence === "number" && Number.isFinite(confidence) && confidence >= settings.minClassConfidence &&
+      typeof rawClass === "string" && rawClass !== "" && rawClass !== "unknown";
+    if (!trusted && untrusted === "skip") return null;
+    const cls = trusted ? rawClass : "unknown";
     if (record.model === null) return unkeyable(`${record.agent}|`, childSessionID, "the dispatch registered no model");
     const ref = splitModelRef(record.model);
     if (ref === null) return unkeyable(`${record.agent}|${record.model}`, childSessionID, `model "${record.model}" is not provider/model`);
     const variant = record.variant ?? ref.variant;
-    const origin = classifyAgentOrigin(record.agent, settings.routerAgentIds);
+    const origin: AgentOrigin = settings.roleAgentIds?.has(record.agent) === true ? "role" : classifyAgentOrigin(record.agent, settings.routerAgentIds);
     const key = makeKey(cls, { origin, id: record.agent }, ref.provider, ref.model, variant);
-    return { record, settings, key };
+    return { record, settings, key, origin, model: `${ref.provider}/${ref.model}`, variant: normalizeVariant(variant) };
   };
 
   // One warning per model reference (QA-2.1-12), not per child: every child of an unresolved agent says the same.
@@ -590,6 +649,55 @@ export function createIngest(deps: IngestDeps): Ingest {
     void current.bundle.release().catch((error: unknown) => warn("releasing the outcomes bundle failed", error));
     return true;
   };
+  /**
+   * P1.4: enqueue one signal row for the target's attempt: one per attempt and kind (C7, the store's one-observation
+   * rule), process-wide per outcomes directory. Needs the dispatch's decision id: without it there is no decision row
+   * to annotate and a pre-P1.4 reader would count the row as a dispatch (QA-P14-1-11).
+   */
+  const appendSignal = (target: Target, childSessionID: string, observation: SignalObservation, bundle: OutcomesBundle): boolean => {
+    const { record, settings, key } = target;
+    if (record.decisionID === null) return false;
+    if (!boundedAdd(signalled, `signal|${settings.outcomesDir}|${record.attemptId}|${observation.kind}`, SIGNAL_CAP)) return false;
+    bundle.flusher.enqueue(
+      signalRow(
+        {
+          ts: new Date(safeNow(now)).toISOString(),
+          sessionID: record.parentSessionID ?? "",
+          decisionID: record.decisionID,
+          mode: settings.engine,
+          childSessionID,
+          facts: record.facts,
+          chosen: { key, agent: record.agent, origin: target.origin, model: target.model, variant: target.variant },
+          step: record.step,
+          attemptID: record.attemptId,
+          ...(target.origin === "role" ? { role: record.agent } : {}),
+          ...(record.tier === null ? {} : { tier: record.tier }),
+        },
+        observation,
+      ),
+    );
+    return true;
+  };
+
+  /**
+   * #84 P3.3 fix 2 (plan §2.6, I6): the signal of a grader's verdict on the target's attempt. The grader's tier is the LOWER of
+   * the tier of the model it ran on (`tierOfModel`: a variant that is not a preset rung, as the host's `#default`, matches by
+   * model) and the tier the checker asked for (on the order, with a known model) — either one alone when the other is unknown
+   * (QA-P33F2-1 N3: a grader never ranks above either); the producer's is the registered tier, else its model's. `graderSignal`
+   * decides: independent (tier ≥ producer's, another model) → 0.5; unknown or not → none.
+   */
+  const graderSignalOf = (target: Target, outcome: Verdict, grader: VerdictGrader): SignalObservation | null => {
+    const tiers = target.settings.tierOrder ?? [];
+    const rungs = target.settings.tierRungs ?? [];
+    const requested = grader.model !== null && grader.tier !== null && tiers.includes(grader.tier) ? grader.tier : null;
+    const byModel = tierOfModel(grader.model, rungs);
+    const graderTier = byModel !== null && requested !== null
+      ? (tiers.indexOf(byModel) <= tiers.indexOf(requested) ? byModel : requested)
+      : (byModel ?? requested);
+    const producerTier = target.record.tier ?? tierOfModel(`${target.model}#${target.variant}`, rungs);
+    return graderSignal({ outcome, graderTier, graderModel: grader.model, producerTier, producerModel: target.model }, tiers);
+  };
+
   return {
     async onStepEnded(event: IngestEvent): Promise<void> {
       try {
@@ -678,7 +786,7 @@ export function createIngest(deps: IngestDeps): Ingest {
       }
     },
 
-    onVerdict(childSessionID: string, outcome: Verdict): void {
+    onVerdict(childSessionID: string, outcome: Verdict, grader: VerdictGrader | undefined): void {
       try {
         const target = targetOf(childSessionID);
         if (target === null) return;
@@ -686,13 +794,25 @@ export function createIngest(deps: IngestDeps): Ingest {
         const bundle = bundleFor(settings);
         if (bundle === null) return;
         const attempt = record.attemptId;
+        // QA-P33F2-1-1 (plan §2.6, I6): a role dispatch's GRADER verdict counts only from an independent grader, and then at
+        // the grader's 0.5 — in the store that role routing reads (kernel) as in the rows. A grader that is not independent, or
+        // not known to be, moves nothing: no store observation, no verdict row, no signal row, and the attempt stays unscored
+        // (a later false refusal is then its first terminal signal, as in the store). Tier and host dispatches: unchanged (I1).
+        const graded = outcome !== "unverifiable" && target.origin === "role" && grader !== undefined
+          ? graderSignalOf(target, outcome, grader)
+          : undefined;
+        if (graded === null) {
+          touchDispatch(childSessionID, safeNow(now));
+          return;
+        }
         // Rows follow the store (QA-2.1-3): a verdict that moves nothing (the attempt was scored already, by a
         // verdict or a refusal) writes no row, or `routing:stats` would count outcomes the store never saw.
         // `unverifiable` moves nothing by design; it is a row only while the attempt is still unscored.
         if (outcome === "unverifiable") {
           if (scored.has(attempt) || !boundedAdd(signalled, `unverifiable|${attempt}`, SIGNAL_CAP)) return;
         } else {
-          if (!bundle.store.recordVerdict(key, outcome, signalOf(record))) return;
+          const weight = graded === undefined ? undefined : graded.weight; // the grader's 0.5 (signals.ts SIGNAL_WEIGHTS.grader)
+          if (!bundle.store.recordVerdict(key, outcome, signalOf(record), weight)) return;
           boundedSet(scored, attempt, outcome, SIGNAL_CAP);
         }
         const row: VerdictRow = {
@@ -706,6 +826,12 @@ export function createIngest(deps: IngestDeps): Ingest {
           step: record.step,
         };
         bundle.flusher.enqueue(row);
+        // P1.4 (QA-P14-1-6): a role dispatch's verdict signal row follows the store: written only for a verdict it took.
+        // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a `grader` signal (0.5, independent graders only), never `verdict`.
+        if (outcome !== "unverifiable" && target.origin === "role") {
+          const signal = graded ?? verdictSignal(outcome);
+          if (signal !== null) appendSignal(target, childSessionID, signal, bundle);
+        }
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("verdict failed", error, { childSessionID });
@@ -741,6 +867,28 @@ export function createIngest(deps: IngestDeps): Ingest {
         touchDispatch(childSessionID, safeNow(now));
       } catch (error) {
         warn("false refusal failed", error, { childSessionID });
+      }
+    },
+
+    onSignal(childSessionID: string, observation: SignalObservation, options: SignalOptions = {}): boolean {
+      try {
+        if (!isSignalObservation(observation)) return false;
+        // QA-P14-1-6: verdict rows follow the store; only onVerdict writes them. QA-P33F2-1 N2: grader rows too.
+        if (observation.kind === "verdict" || observation.kind === "grader") return false;
+        // QA-P14-1-5: a re-dispatch failure belongs to one earlier attempt and must name it.
+        if (observation.kind === "redispatch" && options.expectDecisionID === undefined) return false;
+        const caps = SIGNAL_MASS_CAPS[observation.kind];
+        const target = targetOf(childSessionID, caps.positive === 0 && caps.negative === 0 ? "unknown" : "skip");
+        if (target === null) return false;
+        if (options.expectDecisionID !== undefined && target.record.decisionID !== options.expectDecisionID) return false;
+        const bundle = bundleFor(target.settings);
+        if (bundle === null) return false;
+        if (!appendSignal(target, childSessionID, observation, bundle)) return false;
+        touchDispatch(childSessionID, safeNow(now));
+        return true;
+      } catch (error) {
+        warn("signal failed", error, { childSessionID });
+        return false;
       }
     },
     onSessionGone(sessionID: string): void {

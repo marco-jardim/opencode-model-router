@@ -7,6 +7,184 @@
 
 import type { Verdict } from "./types";
 import { scrubText } from "../guard/scrub";
+import { CRITERIA_BUDGET_CHARS, fitCriteria, omittedCriteriaText } from "./dod";
+import { captureBudget } from "../guard/enforce";
+import type { BudgetSnapshot } from "../guard/enforce";
+import { parseReturnPrefix } from "../routing/outcomes/signals";
+import { oneLineReason } from "../routing/roles/authority";
+
+// ---------------------------------------------------------------------------
+// Incomplete returns (§2.9 E8, I7)
+// ---------------------------------------------------------------------------
+
+/** Verdict reason: the return is a progress note. Matched exactly, never by prefix (QA-P15-1-6). */
+export const INCOMPLETE_REASON =
+  "incomplete: the delegate returned a progress note (no DONE:, NEED MORE: or ESCALATE:), not a result; resume the same delegation to let it finish";
+
+/** Verdict reason: the producer stopped at its tool-call budget (I7: never a tier failure). */
+export const BUDGET_INCOMPLETE_REASON =
+  "incomplete: the delegate stopped at its tool-call budget (NEED MORE: budget), not with a result; resume the same delegation to let it finish";
+
+const INCOMPLETE_REASONS: ReadonlySet<string> = new Set([INCOMPLETE_REASON, BUDGET_INCOMPLETE_REASON]);
+
+/** One of the router's own incomplete reasons (a grader reason "incomplete: …" is not). */
+export function isIncompleteReason(reason: string): boolean {
+  return INCOMPLETE_REASONS.has(reason);
+}
+
+/**
+ * QA-P15-2-4: a verdict carries `incomplete: true` structurally (set only by
+ * incompleteVerdict), so caveats appended later (wiring.ts applyDispatchCaveats)
+ * never turn it back into an ordinary unverifiable result.
+ */
+export type IncompleteFlag = { incomplete?: boolean };
+
+/** An incomplete verdict (the structured flag). Never accepted (gate.ts gateResult). */
+export function isIncompleteVerdict(verdict: object): boolean {
+  return (verdict as IncompleteFlag).incomplete === true;
+}
+
+/** A return-contract marker at the start of a line (markdown emphasis and quotes allowed). */
+const CONTRACT_MARKER_RE = /^[ \t>*_#`-]*(?:DONE|NEED MORE|NEED CONTEXT|SCOPE GROWTH|ESCALATE)[*_]*[ \t]*:/m;
+
+/** `NEED MORE: budget` at the start of a line (QA-P15-1-2); the fallback when the first line carries no prefix. */
+const NEED_MORE_BUDGET_LINE_RE = /^[ \t>*_#`-]*NEED MORE[*_]*[ \t]*:[ \t*_`]*budget\b/im;
+
+/** A `SCOPE GROWTH:` / `NEED CONTEXT:` first line: a contract prefix unknown to parseReturnPrefix that still decides. */
+const OTHER_CONTRACT_FIRST_LINE_RE = /^(?:NEED[\s_-]*CONTEXT|SCOPE[\s_-]*GROWTH)\b[*_`\s]*:/i;
+
+/** The first non-empty line, past a leading `task_id:` / `<task_result>` envelope, with leading decoration stripped. */
+function firstLine(text: string): string {
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/^\s*<task_result>/i, "");
+    if (line.trim() === "" || /^\s*task_id\s*:/i.test(line)) continue;
+    return line.replace(/^[^\p{L}\p{N}]+/u, "").replace(/^\d+[.)]\s+/, "");
+  }
+  return "";
+}
+
+/**
+ * Two contract definitions coexist on purpose. CONTRACT_MARKER_RE (above) is an any-line test that also knows
+ * NEED CONTEXT / SCOPE GROWTH; the stop branch keeps it so a guard-stopped producer that wrote any marker
+ * anywhere is not forced to "incomplete" over a result it did state. parseReturnPrefix (signals.ts) is the
+ * FIRST-line contract (DONE / NEED MORE / ESCALATE) used for the claim decision below.
+ *
+ * `NEED MORE: budget` is claimed by the return prefix (the first non-empty line after unwrapping the task
+ * envelope and markdown/list decoration; DF-1 fix). A DONE:/ESCALATE: first line decides: a later line
+ * quoting the claim is never one. When the first line carries no prefix (a progress summary before the
+ * claim, as the guard's own message asks for), a line-start `NEED MORE: budget` still counts (I7).
+ */
+function claimsNeedMoreBudget(text: string): boolean {
+  const contract = parseReturnPrefix(text);
+  if (contract === null) return false;
+  if (contract.prefix === "none") return !OTHER_CONTRACT_FIRST_LINE_RE.test(firstLine(text)) && NEED_MORE_BUDGET_LINE_RE.test(text);
+  return contract.prefix === "need-more" && contract.claim === "budget";
+}
+
+/** A first-person announcement of finishing or continuing the work (QA-P15-1-1). */
+const ANNOUNCE_RE = /\b(?:I(?:'|\u2019)ll|I will|let me|I(?:'|\u2019)m going to|I am going to)\s+(?:now\s+|then\s+|next\s+)?(?:finish|continue)\b/i;
+
+/**
+ * Deferral to separate work, or a conditional offer ("If you'd like, I'll
+ * continue…", "I'll continue once you confirm…", QA-P15-2-7): a finished
+ * result, not a progress note.
+ */
+const DEFERRAL_RE = /\b(?:follow[- ]?up|later|separately|another (?:PR|change|task)|next (?:PR|release)|if|once|when|unless|would|want)\b/i;
+
+const SENTENCE_END = new Set([".", "!", "?", "\u2026"]);
+
+/** The last sentence of a text: after the last sentence end or line break that is followed by more text. */
+function finalSentence(text: string): string {
+  let end = text.length;
+  while (end > 0 && (SENTENCE_END.has(text[end - 1]!) || /\s/.test(text[end - 1]!))) end--;
+  let start = end;
+  while (start > 0) {
+    const ch = text[start - 1]!;
+    if (ch === "\n" || (/\s/.test(ch) && start >= 2 && SENTENCE_END.has(text[start - 2]!))) break;
+    start--;
+  }
+  return text.slice(start, end);
+}
+
+/**
+ * A progress-note return (QA-P15-1-1): no return-contract marker on any line,
+ * and its FINAL sentence is a first-person announcement of finishing or
+ * continuing ("I'll finish the tests next", "let me continue with …") that is
+ * not a deferral to separate work. Applied only to agents that follow the
+ * return contract (runChecker), never in place of grading for others.
+ */
+export function isProgressNote(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0 || CONTRACT_MARKER_RE.test(trimmed)) return false;
+  // QA-P15-2-7: a final question ("Shall I continue?") asks; it does not announce.
+  if (trimmed.endsWith("?")) return false;
+  const last = finalSentence(trimmed);
+  return ANNOUNCE_RE.test(last) && !DEFERRAL_RE.test(last);
+}
+
+const DEFAULT_LADDER = ["fast", "medium", "heavy"];
+
+function incomplete(reason: string): Verdict {
+  const verdict: Verdict & IncompleteFlag = {
+    pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason], incomplete: true,
+  };
+  return verdict;
+}
+
+/**
+ * The guard state a `NEED MORE: budget` claim is checked against (QA-P15-2-2):
+ * honoured when the guard did not track the session (enforcement off: nothing
+ * can be checked), or the budget/refusals were used up, or the read-only cap
+ * was reached. Any other claim is graded normally (P1.4 §2.6 scores it).
+ */
+function claimHonoured(snapshot: BudgetSnapshot): boolean {
+  return !snapshot.tracked || snapshot.usedUp || snapshot.readCapReached === true;
+}
+
+/**
+ * QA-G-A3-1 (I7, §2.6): a budget stop the guard did not enforce. In advisory mode (the shipped default) nothing is refused, so
+ * the guard never records a stop: its banner only TELLS a child out of budget to return `NEED MORE: budget`. Such a return is
+ * an observed budget stop when the gate would honour the claim (`claimsNeedMoreBudget` + `claimHonoured`) on a session the guard
+ * TRACKED — its budget or refusals used up, or its read cap reached. An untracked session backs no claim here (nothing was
+ * observed; the outcome signals keep it `unobserved`).
+ */
+export function budgetClaimObserved(text: string | null | undefined, snapshot: BudgetSnapshot): boolean {
+  return snapshot.tracked && typeof text === "string" && claimsNeedMoreBudget(text) && claimHonoured(snapshot);
+}
+
+/**
+ * The incomplete verdict of a return, or null (§2.9 E8, I7), judged on the
+ * budget snapshot captured when the task returned (`budget`, QA-P15-2-5; absent
+ * → read now through `budgetSnapshot`, default the live guard):
+ * - budget: the guard STOPPED the producer in that round (enforced) and it
+ *   returned no contract marker, or a `NEED MORE: budget` claim (return prefix, or, with no prefix, a line) the snapshot
+ *   backs (claimHonoured) — for every agent;
+ * - progress note (only when `progressNotes`): for an agent that follows the
+ *   return contract — `returnContract`, else a router tier of the ladder.
+ * Incomplete is never accepted, never escalates and never moves evidence.
+ */
+export function incompleteVerdict(
+  input: {
+    finalReturnText: string;
+    producerSessionID: string;
+    producerTier: string;
+    returnContract?: boolean;
+    budget?: BudgetSnapshot;
+  },
+  opts: { progressNotes: boolean; ladder?: readonly string[]; budgetSnapshot?: (sessionID: string) => BudgetSnapshot },
+): Verdict | null {
+  const text = input.finalReturnText;
+  const snapshot = input.budget ?? (opts.budgetSnapshot ?? captureBudget)(input.producerSessionID);
+  if (
+    (snapshot.stopped && !CONTRACT_MARKER_RE.test(text)) ||
+    (claimsNeedMoreBudget(text) && claimHonoured(snapshot))
+  ) {
+    return incomplete(BUDGET_INCOMPLETE_REASON);
+  }
+  const contract = input.returnContract ?? (opts.ladder ?? DEFAULT_LADDER).includes(input.producerTier);
+  if (opts.progressNotes && contract && isProgressNote(text)) return incomplete(INCOMPLETE_REASON);
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -34,6 +212,11 @@ export interface GraderRequest {
 export interface GraderResult {
   sessionID: string;
   text: string;
+  /**
+   * #84 P3.3 fix 2: the model the grader session was dispatched on (`provider/model`), when the dispatcher chose one; absent or
+   * null = the host's default (unknown to the router). Carried on the verdict (`Verdict.grader`) for the outcome signals.
+   */
+  model?: string | null;
 }
 
 /** MUST create a FRESH session each call */
@@ -45,6 +228,8 @@ export interface CheckerDeps {
   dispatchGrader: GraderDispatch;
   ladder?: string[];             // default ["fast","medium","heavy"]
   minGraderTier?: string | null; // optional floor
+  /** The guard's budget state of a producer session when no snapshot was captured. Default: the live guard (captureBudget). */
+  budgetSnapshot?: (sessionID: string) => BudgetSnapshot;
 }
 
 export interface CheckerInput {
@@ -54,6 +239,10 @@ export interface CheckerInput {
   producerSessionID: string;
   /** Effective producer working directory; scopes the grader + informs its prompt. */
   workingDir?: string;
+  /** The producer follows the DONE:/NEED MORE:/ESCALATE: return contract (role agents); absent = a router tier of the ladder. */
+  returnContract?: boolean;
+  /** The producer's budget state captured when its task returned (QA-P15-2-5). */
+  budget?: BudgetSnapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +300,11 @@ function sanitizeOneLine(value: string): string {
     : cleaned;
 }
 
+/** The note for criteria over the verification budget (prompt line and verdict caveat). */
+function omittedNote(omitted: number): string {
+  return `(${omittedCriteriaText(omitted)}: over the ${CRITERIA_BUDGET_CHARS}-character verification budget; not graded)`;
+}
+
 export function buildGradingPrompt(input: CheckerInput): { system: string; prompt: string } {
   const lines: string[] = [];
 
@@ -122,9 +316,12 @@ export function buildGradingPrompt(input: CheckerInput): { system: string; promp
   }
 
   lines.push("## Acceptance criteria (ALL must be satisfied)");
-  for (let i = 0; i < input.criteria.length; i++) {
-    lines.push(`${i + 1}. ${input.criteria[i]}`);
+  // §2.9 E8: whole criteria only; those over the budget are named as omitted, not graded.
+  const { criteria, omitted } = fitCriteria(input.criteria);
+  for (let i = 0; i < criteria.length; i++) {
+    lines.push(`${i + 1}. ${criteria[i]}`);
   }
+  if (omitted > 0) lines.push(omittedNote(omitted));
 
   lines.push("");
   lines.push("## Artefact to evaluate");
@@ -204,6 +401,26 @@ export function parseGraderVerdict(text: string): { pass: boolean; reasons: stri
   }
 }
 
+/** QA-G-A3-5: the most grader reasons a verdict keeps; the rest are counted in one closing reason. */
+export const GRADER_REASONS_MAX = 20;
+
+/**
+ * QA-G-A3-5: one grader-written text as one reason — scrubbed first (a cut never leaves half a secret), then `cleanReason`'s line
+ * rule (`oneLineReason`, authority.ts): one line, at most 500 characters. The grader's text is model output the producer's
+ * artefact can steer, so it never reaches the parent's result as several lines (a line of its own could pose as a router note).
+ * Its characters are kept (`[REDACTED]`, `a[0]`): a one-line reason within the cap reads as before, in tiers mode too.
+ */
+function graderText(text: string): string {
+  return oneLineReason(scrubText(text));
+}
+
+/** QA-G-A3-5: the grader's reasons, each {@link graderText}, at most {@link GRADER_REASONS_MAX} (then one count of the rest). */
+function graderReasons(reasons: readonly string[]): string[] {
+  const kept = reasons.slice(0, GRADER_REASONS_MAX).map(graderText);
+  const rest = reasons.length - kept.length;
+  return rest > 0 ? [...kept, `(${rest} more grader reason${rest === 1 ? "" : "s"} omitted)`] : kept;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -212,6 +429,21 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
   // 1. Empty criteria
   if (input.criteria.length === 0) {
     return { pass: false, method: "none", skipped: true, reasons: ["no criteria to grade"] };
+  }
+
+  // 1b. §2.9 E8 / I7: a budget stop, or a contract follower's progress note, is
+  // incomplete — never accepted, never escalated, never outcome evidence.
+  const stopped = incompleteVerdict(
+    { ...input, finalReturnText: input.artefact.finalReturnText },
+    { progressNotes: true, ladder: deps.ladder, budgetSnapshot: deps.budgetSnapshot },
+  );
+  if (stopped) return stopped;
+
+  // 1c. §2.9 E8: every criterion is over the verification budget — nothing gradable.
+  const { criteria: gradable, omitted } = fitCriteria(input.criteria);
+  if (gradable.length === 0) {
+    const reason = `no criterion fits the verification budget ${omittedNote(omitted)}`;
+    return { pass: false, outcome: "unverifiable", method: "checker", reasons: [reason], caveats: [reason] };
   }
 
   // 2. Determine grader tier
@@ -241,6 +473,9 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
     };
   }
 
+  // #84 P3.3 fix 2 (plan §2.6, I6): who judged — the outcome signals weigh it as a grader verdict, never a deterministic one.
+  const grader = { tier: graderTier, model: typeof res.model === "string" && res.model.trim() !== "" ? res.model : null };
+
   // 5. Independence check (fail-closed)
   if (res.sessionID === input.producerSessionID || !res.sessionID) {
     return {
@@ -249,6 +484,8 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
       reasons: [
         "grader session is not independent of the producer (producer=grader); refusing to accept",
       ],
+      // The producer judged itself: its model is the producer's, so the outcome signals give this verdict no mass.
+      grader: { tier: graderTier, model: null },
     };
   }
 
@@ -260,17 +497,22 @@ export async function runChecker(input: CheckerInput, deps: CheckerDeps): Promis
       method: "checker",
       reasons: [
         "could not parse grader verdict; defaulting to FAIL",
-        scrubText(res.text.slice(0, 300)),
+        graderText(res.text.slice(0, 300)),
       ],
+      grader,
     };
   }
 
-  // 7. Return verdict
+  // 7. Return verdict. Criteria omitted from grading (§2.9 E8) make a pass
+  // unverifiable with a caveat: what was not graded is not verified.
+  const partial = omitted > 0;
   return {
-    pass: parsed.pass === true,
-    outcome: parsed.pass ? "pass" : "fail",
+    pass: parsed.pass === true && !partial,
+    outcome: parsed.pass ? (partial ? "unverifiable" : "pass") : "fail",
     method: "checker",
-    reasons: parsed.reasons.map(scrubText),
+    reasons: graderReasons(parsed.reasons),
     evidence: scrubText("grader=" + graderTier),
+    ...(partial ? { caveats: [omittedNote(omitted)] } : {}),
+    grader,
   };
 }

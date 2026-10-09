@@ -179,6 +179,24 @@ describe("observe (D4)", () => {
     expect(Number.isFinite(fresh.alpha + fresh.beta + fresh.updatedAt)).toBe(true);
     expect(fresh.beta).toBe(1);
   });
+
+  // #84 P3.3 fix 2 (QA-P33F2-1-1, QA-P33F2-2 N-b): an independent grader's verdict weighs 0.5; a malformed weight is ignored.
+  it("a weight in (0, 1] is added in place of 1, after the decay", () => {
+    expect(observe(undefined, true, T0, TUNING, 0.5)).toEqual({ alpha: 0.5, beta: 0, updatedAt: T0 });
+    expect(observe(undefined, false, T0, TUNING, 0.5)).toEqual({ alpha: 0, beta: 0.5, updatedAt: T0 });
+    // One half-life: the stored 4 decays to 2, then the half failure is added.
+    expect(observe({ alpha: 4, beta: 0, updatedAt: T0 }, false, T0 + HALF_MS, TUNING, 0.5)).toEqual({ alpha: 2, beta: 0.5, updatedAt: T0 + HALF_MS });
+    expect(observe(undefined, true, T0, TUNING, 1)).toEqual(observe(undefined, true, T0, TUNING));
+  });
+
+  it("an invalid weight is no observation: the state comes back unchanged (not decayed), an absent one as empty evidence", () => {
+    const state: BetaState = { alpha: 4, beta: 1, updatedAt: T0 };
+    for (const weight of [0, -1, 1.5, 2, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(observe(state, true, T0 + HALF_MS, TUNING, weight), String(weight)).toBe(state);
+      expect(observe(state, false, T0 + HALF_MS, TUNING, weight), String(weight)).toEqual({ alpha: 4, beta: 1, updatedAt: T0 });
+      expect(observe(undefined, true, T0, TUNING, weight), String(weight)).toEqual({ alpha: 0, beta: 0, updatedAt: T0 });
+    }
+  });
 });
 
 describe("effective-sample cap", () => {

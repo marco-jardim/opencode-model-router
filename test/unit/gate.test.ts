@@ -9,6 +9,7 @@ import type { DeterministicDeps } from "../../src/verify/types";
 import { createMutexRegistry } from "../../src/verify/deterministic";
 import type { CheckerDeps } from "../../src/verify/checker";
 import { normalizeDoD } from "../../src/verify/dod";
+import type { Check } from "../../src/verify/dod";
 
 // --- fakes -----------------------------------------------------------------
 
@@ -185,6 +186,131 @@ describe("accept() — outside-directory safety net", () => {
     const r = await accept({ dod: checkerDoD() }, changed([join(outside, "file.ts")]), { ...d, checker: { ...d.checker, dispatchGrader } });
     expect(r.verdict.outcome).toBe("pass");
     expect(dispatchGrader).toHaveBeenCalled();
+  });
+});
+
+// #84 P3.3 DF2-F1 (DF-2 step 4, live): a role dispatch into a sibling worktree had its [acceptance] checks run in the SESSION
+// directory ("changed files only outside <session dir> … Add cwd:") while its detection was recorded deterministic.
+describe("accept() — a role dispatch is verified in its work root (DF2-F1)", () => {
+  const session = join(tmpdir(), "gate-session-dir");
+  const root = join(tmpdir(), "gate-sibling-worktree");
+  const probe = join(root, "tmp-df2-probe.txt");
+  function setup(checks: Check[] = [{ kind: "fileExists", path: probe }, { kind: "run", command: "node verify.js", expect: "OK" }]) {
+    const exec = vi.fn<DeterministicDeps["exec"]>().mockResolvedValue({ code: 0, stdout: "OK", stderr: "" });
+    const fileExists = vi.fn<DeterministicDeps["fs"]["fileExists"]>().mockResolvedValue(true);
+    const d = deps({ deterministic: { ...fakeDeterministicDeps(), cwd: session, exec, fs: { fileExists, readFile: async () => "{}" } } });
+    const dod = normalizeDoD({ ...detDoD(), checks });
+    return { exec, fileExists, d, dod };
+  }
+  const wrote = (path = probe) => artefact({ changedFiles: [{ path, status: "??" }] });
+
+  it("the live case: no cwd: in the block — the checks run in the work root, never the session directory", async () => {
+    const { exec, fileExists, d, dod } = setup();
+    const r = await accept({ dod, workRoot: root }, wrote(), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect([...r.verdict.reasons, ...(r.verdict.caveats ?? [])].join("\n")).not.toMatch(/only outside/);
+    expect(fileExists).toHaveBeenCalledWith(probe);
+    expect(exec).toHaveBeenCalledWith("node verify.js", expect.objectContaining({ cwd: root }));
+  });
+
+  it("a relative check path resolves against the work root", async () => {
+    const { fileExists, d, dod } = setup([{ kind: "fileExists", path: "tmp-df2-probe.txt" }]);
+    const r = await accept({ dod, workRoot: root }, wrote(), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(fileExists).toHaveBeenCalledWith(probe);
+  });
+
+  it("an explicit cwd: inside the work root still wins (a relative one is taken from the work root)", async () => {
+    for (const cwd of [join(root, "pkg"), "pkg"]) {
+      const { exec, d, dod } = setup();
+      const r = await accept({ dod, cwd, workRoot: root }, wrote(join(root, "pkg", "index.ts")), d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(exec).toHaveBeenCalledWith("node verify.js", expect.objectContaining({ cwd: join(root, "pkg") }));
+    }
+  });
+
+  it.each([false, true])("an explicit cwd: outside the work root is refused: unverifiable, no check runs (strict=%s)", async (strictUnverifiable) => {
+    for (const cwd of [session, `${root}-v2`, join(root, "..")]) {
+      const { exec, fileExists, d, dod } = setup();
+      const r = await accept({ dod, cwd, workRoot: root }, wrote(), { ...d, strictUnverifiable });
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.method).toBe("none");
+      expect(r.verdict.reasons).toHaveLength(1);
+      expect(r.verdict.reasons[0]).toMatch(/outside this role dispatch's work root/);
+      expect(r.verdict.caveats).toEqual(r.verdict.reasons);
+      expect(r.accepted).toBe(!strictUnverifiable);
+      expect(exec).not.toHaveBeenCalled();
+      expect(fileExists).not.toHaveBeenCalled();
+    }
+  });
+
+  it("the refusal also holds for a grader DoD; the grader of a role dispatch is scoped to the work root", async () => {
+    const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+    const { d } = setup();
+    const withGrader = { ...d, checker: { ...d.checker, dispatchGrader } };
+    const refused = await accept({ dod: checkerDoD(), cwd: session, workRoot: root }, wrote(), withGrader);
+    expect(refused.verdict.outcome).toBe("unverifiable");
+    expect(dispatchGrader).not.toHaveBeenCalled();
+    const graded = await accept({ dod: checkerDoD(), workRoot: root }, wrote(), withGrader);
+    expect(graded.verdict.outcome).toBe("pass");
+    expect(dispatchGrader).toHaveBeenCalledWith(expect.objectContaining({ cwd: root }));
+  });
+
+  it("changes that all landed outside the work root stay unverifiable, and the caveat names the work root", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod, workRoot: root }, wrote(join(session, "x.ts")), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons[0]).toMatch(/changed files only outside/);
+    expect(r.verdict.reasons[0]).toContain(`work root ${root}`);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("QA-P33F1-1-2: a cwd the caller refused (refusedCwd) is refused unresolved: no canonicalisation, no check", async () => {
+    const { exec, fileExists, d, dod } = setup();
+    const canonicalPath = vi.fn((path: string) => path);
+    const unc = "\\\\server\\share\\x";
+    const r = await accept({ dod, workRoot: root, refusedCwd: unc, cwdSource: "acceptance" }, wrote(), { ...d, canonicalPath });
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons).toEqual([expect.stringContaining(`the [acceptance] block's cwd ${unc} is outside this role dispatch's work root ${root}`)]);
+    expect(canonicalPath).not.toHaveBeenCalled();
+    expect(exec).not.toHaveBeenCalled();
+    expect(fileExists).not.toHaveBeenCalled();
+  });
+
+  it("fix-1 review nit: the refusal names where the cwd came from — the call's argument, the block, or neither", async () => {
+    const { exec, d, dod } = setup();
+    const refused = async (over: { refusedCwd?: string; cwd?: string; cwdSource?: "argument" | "acceptance" }) =>
+      (await accept({ dod, workRoot: root, ...over }, wrote(), d)).verdict.reasons[0] ?? "";
+    const argument = await refused({ refusedCwd: session, cwdSource: "argument" });
+    expect(argument).toContain(`the call's cwd argument ${session} is outside this role dispatch's work root ${root}`);
+    expect(argument).toContain(`Drop the "cwd" argument`);
+    expect(argument).not.toContain("[acceptance]");
+    const block = await refused({ refusedCwd: session, cwdSource: "acceptance" });
+    expect(block).toContain(`the [acceptance] block's cwd ${session} is outside`);
+    expect(block).toContain(`Remove "cwd:"`);
+    const unknown = await refused({ refusedCwd: session });
+    expect(unknown).toContain(`the requested cwd ${session} is outside`);
+    expect(unknown).not.toContain("[acceptance]");
+    // The lexical backstop (a cwd the caller did not check) names its source the same way.
+    expect(await refused({ cwd: session, cwdSource: "argument" })).toContain(`the call's cwd argument ${session} is outside`);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("QA-P33F1-1 nit 1: a cwd: inside the root but narrower than where the work landed suggests widening it", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod, cwd: join(root, "pkg"), workRoot: root }, wrote(join(root, "other", "x.ts")), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons[0]).toContain(`changed files only outside ${join(root, "pkg")}`);
+    expect(r.verdict.reasons[0]).toContain(`"cwd:" narrows verification to ${join(root, "pkg")} inside the work root ${root}: widen "cwd:"`);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("I1: a tier dispatch (no work root) keeps the session directory and today's caveat", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod }, wrote(), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons[0]).toBe(`the producer changed files only outside ${session} (e.g. ${probe}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`);
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

@@ -6,7 +6,9 @@ Converts advisory read-only caps into real hard-blocks for subagent sessions. Op
 
 A `tool.execute.before` hook. In `enforced` mode, when the guard denies a call it **throws**; opencode aborts the tool call and the thrown message reaches the model as that tool's error text (empirically confirmed).
 
-Applies **only** to subagent sessions — sessions whose agent matches a tier name, or plugin-created delegate producer sessions. Orchestrator sessions and `mode:"off"` are early-return no-ops.
+Applies **only** to subagent sessions — sessions whose agent matches a tier name, plugin-created delegate producer sessions and, in roles mode, role-agent child sessions. Orchestrator sessions and `mode:"off"` are early-return no-ops.
+
+Role agents are guarded too, with their **role profile** instead of the tier policy below: the role's budget for the tier the dispatch runs on (raised by a route-line `budget=`), its own cumulative ceiling, the reader or producer kind of the role, and a stop that asks for `NEED MORE: budget` (`roleGuardProfile`, `src/router/guard-profile.ts`). See [the reader guard profile](./READ_ONLY_TIERS.md#reader-guard-profile-84) and [role budgets](./ROLES.md#budgets).
 
 ## Modes (`enforcement.mode`)
 
@@ -18,17 +20,24 @@ Applies **only** to subagent sessions — sessions whose agent matches a tier na
 
 ## Guard evaluation (`evaluateGuards`)
 
-Pure / non-mutating. First match wins.
+Pure / non-mutating. First match wins. `test/unit/docs-drift.test.ts` checks that every guard name `evaluateGuards` (`src/guard/guards.ts`) returns has a row here.
 
+<!-- guard-table -->
 | # | condition | verdict | guard name |
 |---|-----------|---------|------------|
 | 1 | call is a finish / return / task_complete signal | ALLOW | — |
 | 2 | call matches self-script pattern | DENY | `anti_self_script` |
 | 3 | `toolCallCount >= budget` | DENY | `iteration_cap` |
+| 3b | `totalToolCallCount >= cumulativeBudget` (calls across every resumed round of the session) | DENY | `cumulative_iteration_cap` |
+| 3c | refused calls in this round `>= min(budget, REFUSAL_CAP)` AND executed + refused calls `>= budget` | DENY | `denied_cap` |
 | 4 | read whose fingerprint was seen `>= sameOpRetryCap` times | DENY | `redundant_read` |
-| 5 | read while `consecutiveNonProducing >= readDraftCap` | DENY | `read_budget` |
+| 5 | read while `consecutiveNonProducing >= readDraftCap` — **producer profile only**; a reader dispatch never gets it | DENY | `read_budget` |
 | 6 | `deliverableFirst` enabled AND deliverable signal exists AND not yet executed AND call is read/other | DENY | `deliverable_first` |
 | 7 | — | ALLOW | — |
+
+- **Refused calls are not charged.** A call the guard refuses in `enforced` mode does not count toward `budget` and is not recorded as executed by the repeat check; `denied_cap` bounds a loop of refusals instead (`REFUSAL_CAP` = 10, `src/router/guard-profile.ts`). Calls refused outside the guard — the router's role-authority refusals and structured host permission denials — count toward `denied_cap` too, in `advisory` mode as well as `enforced` (`guardRefusedCall`); in `advisory` the would-stop is only recorded with its banner, nothing is stopped.
+- **Stops.** In `enforced` mode a refusal by `iteration_cap`, `cumulative_iteration_cap` or `denied_cap` stops the child's round. `advisory` never stops anything.
+- **Reader profile.** Read-only tiers, routed classes `review`/`recon`/`search`, an uncapped `CAP:none` dispatch and the reader roles are guarded as readers: row 5 never applies and the forcing message never asks for a write ([details](./READ_ONLY_TIERS.md#reader-guard-profile-84)).
 
 ## Self-script detection (`isSelfScript`)
 
@@ -46,10 +55,13 @@ heredocs  ·  node|python|deno|bun -e/-c  ·  cat > file  ·  bash -c  ·  redir
 
 ## Policy defaults (`buildGuardPolicy`)
 
+For tier agents and delegate producer sessions. A role dispatch takes `budget` and `cumulativeBudget` from its role profile instead ([ROLES.md](./ROLES.md#budgets)); the other fields apply to it as listed.
+
 | field | default |
 |-------|---------|
 | `budget` | `25` (`DEFAULT_GUARD_BUDGET`) |
-| `readDraftCap` | `3` |
+| `cumulativeBudget` | `budget` × 3 (`CUMULATIVE_BUDGET_MULTIPLIER`) |
+| `readDraftCap` | `3` (producer profile only) |
 | `sameOpRetryCap` | `1` |
 | `blockSelfScript` | `true` |
 | `deliverableFirst` | `true` |

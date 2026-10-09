@@ -10,6 +10,8 @@ import type { RouterConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
 import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
+import { isIncompleteReason } from "./checker";
+import { stripDispatchHeader } from "../router/dispatch-header";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
@@ -553,10 +555,13 @@ export function buildDelegationDoD(
   args: { prompt?: string; description?: string; acceptance?: string },
   hints: InferHints = {},
 ): DoD {
-  const blockSource = args.acceptance ?? args.prompt ?? args.description ?? "";
+  // R6/P-15 (§2.9 E8): the router's dispatch header is a directive, never a
+  // criterion — parse and infer from the orchestrator's prompt behind it.
+  const prompt = typeof args.prompt === "string" ? stripDispatchHeader(args.prompt) : args.prompt;
+  const blockSource = args.acceptance ?? prompt ?? args.description ?? "";
   const explicit = parseDoDFromDispatch(blockSource);
   if (explicit) return explicit;
-  const dispatch = args.prompt ?? args.description ?? "";
+  const dispatch = prompt ?? args.description ?? "";
   return inferDoD(dispatch, "", hints);
 }
 
@@ -588,6 +593,46 @@ export function shouldVerifyTask(
   return true;
 }
 
+/** QA-G-A3-5: the most reasons (caveats, notes) one rendered list shows; the rest are counted in one closing line. */
+export const RENDERED_REASONS_MAX = 20;
+
+/** QA-G-A3-2-1: one line break of any kind. */
+const LINE_BREAK = /\r\n|[\r\n\u000b\u000c\u0085\u2028\u2029]/;
+
+/**
+ * QA-G-A3-2-1: `text` on one line — every line break, with the blanks (space, tab) around it, becomes one space, and a run of
+ * breaks (blank lines) one space too; every other character is kept. A text without a line break is returned as it is. Linear
+ * (no backtracking regex on producer-derived text).
+ */
+function joinLines(text: string): string {
+  const parts = text.split(LINE_BREAK);
+  if (parts.length === 1) return text;
+  const blank = (c: string | undefined): boolean => c === " " || c === "\t";
+  const kept: string[] = [];
+  parts.forEach((part, i) => {
+    let start = 0;
+    let end = part.length;
+    if (i > 0) while (start < end && blank(part[start])) start++;
+    if (i < parts.length - 1) while (end > start && blank(part[end - 1])) end--;
+    if (end > start) kept.push(part.slice(start, end));
+  });
+  return kept.join(" ");
+}
+
+/**
+ * QA-G-A3-5 / QA-G-A3-2-1: a list of reasons as `- ` lines: each reason on ONE line — its line breaks (with the blanks around them)
+ * joined into one space, since a line of its own could pose as a router note — and nothing else changed: the router's own reasons
+ * (baseline.ts failure-id lists, "suite is NOT green") are never cut; a grader's text was already cut to 500 characters where it
+ * entered the verdict (checker.ts `graderReasons`). Directive keys lose their colons (QA-2.4-6); at most
+ * {@link RENDERED_REASONS_MAX} lines plus a count of the rest. A list of at most that many one-line reasons renders as before.
+ */
+function reasonLines(reasons: readonly string[]): string {
+  const shown = reasons.slice(0, RENDERED_REASONS_MAX).map((r) => `- ${neutralizeDirectives(joinLines(r))}`);
+  const rest = reasons.length - shown.length;
+  if (rest > 0) shown.push(`- (${rest} more not shown)`);
+  return shown.join("\n");
+}
+
 /**
  * Build the advisory forcing note appended to a task result the gate did not accept.
  *
@@ -597,12 +642,24 @@ export function shouldVerifyTask(
  */
 export function buildForcingNote(
   reasons: string[],
-  escalation?: { producerTier?: string; nextTier?: string | null },
+  escalation?: { producerTier?: string; nextTier?: string | null; incomplete?: boolean },
 ): string {
   const body =
     reasons.length > 0
-      ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
+      ? reasonLines(reasons)
       : "- (no reasons provided)";
+  // §2.9 E8 / I7: a progress note or a budget stop is incomplete, not a failed result.
+  // QA-P15-2-4: the verdict's structured flag (`incomplete`); a caller that cannot
+  // pass it is recognised by the router's own incomplete reason among the reasons,
+  // matched exactly (QA-P15-1-6: a grader's "incomplete: …" stays a failure), so a
+  // caveat appended after it does not change the rendering.
+  if (escalation?.incomplete === true || reasons.some(isIncompleteReason)) {
+    return (
+      `[router \u26a0 INCOMPLETE] The delegate stopped before a final result:\n` +
+      `${body}\n` +
+      `NEXT: resume the same delegation so it can finish; do not treat the prior result as complete.`
+    );
+  }
   const next =
     escalation?.nextTier
       ? `NEXT: address the above, then re-run via \`Task(subagent_type="${escalation.nextTier}")\`` +
@@ -634,6 +691,6 @@ export function buildAcceptedSuffix(
   const verified = outcome === "pass" && caveats.length === 0;
   const label = verified ? `[router \u2713 verified: ${method}]` : `[router \u26a0 UNVERIFIED: ${method}]`;
   return `\n\n${label}` + (caveats.length
-    ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${caveats.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}`
-    : "") + (notes.length ? `\nVerification notes:\n${notes.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}` : "");
+    ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${reasonLines(caveats)}`
+    : "") + (notes.length ? `\nVerification notes:\n${reasonLines(notes)}` : "");
 }

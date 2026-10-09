@@ -36,6 +36,30 @@ const ROUTE_MENTION_RE = /\[route/i;
  */
 const NEEDS_LIST_RE = /(\bneeds=[a-z_]*)((?:\s*,\s*[a-z_]+(?![a-z_]|\s*=))+)/gi;
 const LINE_SPLIT_RE = /(\r\n|\n|\r)/;
+/** `root="D:\my dir"`: the only way to carry whitespace in a value; extracted before tokenising. */
+const QUOTED_ROOT_RE = /\broot\s*=\s*"([^"]*)"/gi;
+const QUOTED_PLACEHOLDER_RE = /^@q(\d+)$/;
+/** `tier=` literals the parser can know; the engine validates against the active tier list. */
+const TIER_NAMES = ["fast", "medium", "heavy"] as const;
+export const ROUTE_BUDGET_MAX = 10000;
+/** A drive-absolute Windows path (`D:\…`, `D:/…`) or a POSIX path with exactly one leading `/`. */
+const WORK_ROOT_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))/;
+/** A `..` path segment, with either separator. */
+const PARENT_SEGMENT_RE = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
+/**
+ * A first line that starts like a route line (`[route` + a separator, `]` or the end) but is not one (QA-P12-1-6).
+ * `[router …]` and friends are other tags, not malformed route lines.
+ */
+const ROUTE_START_RE = /^[ \t]*\[route(?![A-Za-z0-9_-])/i;
+
+/**
+ * A role work root (QA-P12-1-6): a local, drive-absolute Windows path or a POSIX path. Rejected: relative and
+ * drive-relative paths, every `\\` or `//` prefix (UNC `\\host\share`, `\\?\`, `\\.\` device paths — a work root is a
+ * local worktree), any `..` segment, and NUL.
+ */
+function isWorkRootPath(value: string): boolean {
+  return WORK_ROOT_RE.test(value) && !PARENT_SEGMENT_RE.test(value) && !value.includes("\0");
+}
 
 function isMember<T extends string>(values: readonly T[], value: string): value is T {
   return (values as readonly string[]).includes(value);
@@ -71,10 +95,15 @@ function parseFields(body: string): RouteLine {
   let needs: readonly Need[] | undefined;
   let detection: Detection | undefined;
   let pin = false;
+  let tier: string | undefined;
+  let budget: number | undefined;
+  let root: string | undefined;
   const ignored: string[] = [];
   const seen = new Set<string>();
 
+  const quotedRoots: string[] = [];
   const tokens = body
+    .replace(QUOTED_ROOT_RE, (_whole, path: string) => `root=@q${quotedRoots.push(path) - 1}`)
     .replace(/\s*=\s*/g, "=")
     .replace(NEEDS_LIST_RE, (_whole, head: string, tail: string) => head + tail.replace(/\s+/g, ""))
     .split(/\s+/)
@@ -82,7 +111,8 @@ function parseFields(body: string): RouteLine {
   for (const token of tokens) {
     const eq = token.indexOf("=");
     const key = stripTail((eq === -1 ? token : token.slice(0, eq)).toLowerCase());
-    const value = eq === -1 ? null : stripTail(token.slice(eq + 1).toLowerCase());
+    const rawValue = eq === -1 ? null : token.slice(eq + 1);
+    const value = rawValue === null ? null : stripTail(rawValue.toLowerCase());
     if (key === "") {
       ignored.push(token);
       continue;
@@ -121,6 +151,23 @@ function parseFields(body: string): RouteLine {
         else pin = parsed;
         break;
       }
+      case "tier":
+        if (value !== null && isMember(TIER_NAMES, value)) tier = value;
+        else ignored.push(key);
+        break;
+      case "budget": {
+        const n = value !== null && /^\d+$/.test(value) ? Number(value) : 0;
+        if (n >= 1 && n <= ROUTE_BUDGET_MAX) budget = n;
+        else ignored.push(key);
+        break;
+      }
+      case "root": {
+        const q = value === null ? null : QUOTED_PLACEHOLDER_RE.exec(value);
+        const candidate = q ? quotedRoots[Number(q[1])] : rawValue === null ? undefined : stripTail(rawValue);
+        if (candidate !== undefined && isWorkRootPath(candidate)) root = candidate;
+        else ignored.push(key);
+        break;
+      }
       default:
         ignored.push(key);
     }
@@ -132,6 +179,9 @@ function parseFields(body: string): RouteLine {
     ...(scope ? { scope } : {}),
     ...(needs ? { needs } : {}),
     ...(detection ? { detection } : {}),
+    ...(tier ? { tier } : {}),
+    ...(budget !== undefined ? { budget } : {}),
+    ...(root ? { root } : {}),
     pin,
     ignored,
   };
@@ -157,7 +207,7 @@ function isRecognisable(line: string, inFence: boolean): boolean {
 }
 
 function canonical(line: RouteLine): string {
-  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin]);
+  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root]);
 }
 
 /**
@@ -189,12 +239,18 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   const risk = keep("risk", first.risk, (l) => l.risk);
   const scope = keep("scope", first.scope, (l) => l.scope);
   const needs = keep("needs", first.needs, (l) => l.needs);
+  const tier = keep("tier", first.tier, (l) => l.tier);
+  const budget = keep("budget", first.budget, (l) => l.budget);
+  const root = keep("root", first.root, (l) => l.root);
   if (lines.some((l) => l.detection !== undefined)) ignored.push("conflict:d");
   return {
     ...(taskClass ? { class: taskClass } : {}),
     ...(risk ? { risk } : {}),
     ...(scope ? { scope } : {}),
     ...(needs ? { needs } : {}),
+    ...(tier ? { tier } : {}),
+    ...(budget !== undefined ? { budget } : {}),
+    ...(root ? { root } : {}),
     // The first line is the directive; a later line cannot take its pin away or add one (A22).
     pin: first.pin,
     ignored,
@@ -242,6 +298,12 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
     lastNonEmpty = i;
   });
 
+  // QA-P12-1-6: a first non-empty line that starts like a route line but does not parse is flagged, never silently
+  // dropped. It stays text (not stripped, not applied), so tier-mode facts are unchanged.
+  const head = firstNonEmpty >= 0 ? lines[firstNonEmpty]! : "";
+  const malformed = firstNonEmpty >= 0 && !fenced[firstNonEmpty] && !INDENTED_CODE_RE.test(head)
+    && ROUTE_START_RE.test(head) && !isRecognisable(head, false);
+
   const kept: string[] = [];
   const parsed: RouteLine[] = [];
   let edgeOnly = true;
@@ -259,15 +321,17 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
     parsed.push(parseFields(ROUTE_LINE_RE.exec(line)?.[1] ?? ""));
   }
   if (parsed.length === 0) {
-    return { line: null, count: 0, stripped: kept.join(""), conflict: false, edgeOnly: true };
+    return { line: null, count: 0, stripped: kept.join(""), conflict: false, edgeOnly: true, ...(malformed ? { malformed } : {}) };
   }
   const conflict = new Set(parsed.map(canonical)).size > 1;
   return {
+    // QA-P12-2-2: the flag lives on the parse result only; the line's `ignored` list is the tier-mode one.
     line: conflict ? resolveConflict(parsed) : parsed[0]!,
     count: parsed.length,
     stripped: kept.join(""),
     conflict,
     edgeOnly,
+    ...(malformed ? { malformed } : {}),
   };
 }
 const RISK_ORDER: readonly Risk[] = RISKS;

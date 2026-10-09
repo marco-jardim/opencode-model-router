@@ -12,13 +12,23 @@
  * The hint and the generated `R:` line come from the same kernel, but the hint is only emitted when the kernel says
  * `switched` for the class's static tier, i.e. when it agrees with a move the line itself could make (QA focus: a hint
  * must never contradict the `R:` line). Errors are logged and the system prompt stays as the legacy hook built it.
+ *
+ * Roles mode (`routing.delegation: "roles"`, plan #84 T2.2.1): nothing is added or rewritten — no per-turn hint, no tier
+ * `R:` line, no route-line paragraph. The roles protocol carries its own class → role line and route-line keys, and a
+ * hint or a tier line would name tiers; a system part that changes per turn would also cost the orchestrator its
+ * prompt cache. The check is the roles protocol's heading among the router's own parts, i.e. the text the orchestrator
+ * actually carries: a roles config with no enabled role falls back to the tiers protocol, augmented as in tiers mode.
  */
 
 import {
   DELEGATION_PROTOCOL_HEADING,
+  ROLES_PROTOCOL_HEADING,
   buildRouteLineProtocol,
   swapTaxonomyLine,
 } from "../../router/protocol";
+/** The roles heading only counts at the start of a line (QA-P22-2-4): a part that merely quotes it mid-line is not the roles protocol. */
+const ROLES_HEADING_LINE = /^## Role Delegation Protocol \(MANDATORY\)$/m;
+
 import { classify } from "../classify";
 import { CLASS_STATIC_TIER, type TaskFacts } from "../classify/types";
 import { buildLadder, decide, floorRankOf, generateTaxonomy, resolveChosen } from "../engine";
@@ -175,6 +185,10 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
   return {
     async augment(input, system, added): Promise<void> {
       try {
+        // Roles mode: no hint part, and the protocol text stays exactly as the legacy hook built it. Keyed on the roles
+        // protocol the orchestrator actually carries (QA-P22-1-5): `delegation: "roles"` with no enabled role keeps the
+        // tiers protocol, which is then augmented like tiers mode.
+        if (system.some((text) => added.has(text) && ROLES_HEADING_LINE.test(text))) return;
         const protocolAt: number[] = [];
         system.forEach((text, index) => {
           if (added.has(text) && text.includes(DELEGATION_PROTOCOL_HEADING)) protocolAt.push(index);

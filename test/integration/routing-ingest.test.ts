@@ -47,7 +47,9 @@ import {
   touchDispatch,
   type DispatchInput,
 } from "../../src/router/sessions";
-import type { RouterConfig } from "../../src/router/config";
+import { resolveCandidates, type RouterConfig } from "../../src/router/config";
+import { roleTierOrder } from "../../src/routing/engine/ladders";
+import { tierOfModel } from "../../src/routing/outcomes/signals";
 
 const T0 = Date.UTC(2026, 9, 6, 12, 0, 0);
 const MEDIUM_KEY = makeKey("implement", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "medium");
@@ -279,6 +281,25 @@ describe("ingest settings (§1.2: static writes nothing)", () => {
     const c = cfg({ engine: "shadow" });
     expect(ingestSettings(c, "v2")).toBe(ingestSettings(c, "v2"));
   });
+
+  // #84 P3.3 fix 2 (QA-P33F2-1-3): the grader's rank is judged on the role tier order and its rungs.
+  it("carries the role tier order (roleTierOrder) and its rungs (resolveCandidates), cheapest first", () => {
+    const c = { activePreset: "mixed", presets: { mixed: {
+      heavy: { model: "anthropic/claude-opus-5-5", variant: "max", costRatio: 10 },
+      fast: { model: "anthropic/claude-haiku-4-5", costRatio: 1 },
+      medium: { model: "anthropic/claude-sonnet-5-5", costRatio: 5, candidates: [{ variant: "low" }, { variant: "high", costRatio: 6 }] },
+    } }, routing: { engine: "shadow" } } as unknown as RouterConfig;
+    const settings = ingestSettings(c, "v2");
+    const order = roleTierOrder(c);
+    expect(order).toEqual(["fast", "medium", "heavy"]); // cost order, not listing order
+    expect(settings?.tierOrder).toEqual(order);
+    expect(settings?.tierRungs).toEqual(order.flatMap((tier) => resolveCandidates(tier, c).map((r) => ({ tier, model: r.model, variant: r.variant ?? null }))));
+    expect(settings?.tierRungs).toContainEqual({ tier: "fast", model: "anthropic/claude-haiku-4-5", variant: null });
+    expect(settings?.tierRungs).toContainEqual({ tier: "heavy", model: "anthropic/claude-opus-5-5", variant: "max" });
+    expect(settings?.tierRungs?.filter((r) => r.tier === "medium").length).toBe(resolveCandidates("medium", c).length);
+    // The live grader's `#default` reference of the heavy model ranks heavy on these rungs.
+    expect(tierOfModel("anthropic/claude-opus-5-5#default", settings?.tierRungs ?? [])).toBe("heavy");
+  });
 });
 
 describe("step ingestion (2.1.2)", () => {
@@ -389,7 +410,7 @@ describe("step ingestion (2.1.2)", () => {
     dispatch("c1", { model: null });
     await ingest.onStepEnded(step("e1", "c1"));
     await ingest.onStepEnded(step("e2", "c1"));
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.bundles).toHaveLength(0);
     expect(h.warnings.filter((w) => w.includes("not recorded"))).toHaveLength(1);
   });
@@ -406,7 +427,7 @@ describe("step ingestion (2.1.2)", () => {
     expect(cost.steps.n).toBe(2); // two attempts folded
     expect(cost.measuredUSD.n).toBe(2);
     expect(cost.measuredUSD.mean).toBeCloseTo(0.025, 9); // (0.01 + 0.04) / 2, each step once
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.pass).toBe(1); // scored on the current attempt only
   });
 
@@ -533,7 +554,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const ingest = h.make({ pricing: PRICED });
     for (const [child, verdict] of [["p", "pass"], ["f", "fail"], ["u", "unverifiable"]] as Array<[string, Verdict]>) {
       dispatch(child, { decisionID: `d-${child}` });
-      ingest.onVerdict(child, verdict);
+      ingest.onVerdict(child, verdict, undefined);
     }
     const entry = h.store().snapshot().entries[MEDIUM_KEY];
     expect(entry?.counts).toMatchObject({ pass: 1, fail: 1, falseRefusals: 0 });
@@ -549,8 +570,8 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "pass");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.pass).toBe(1);
     expect((await h.rows()).filter((r) => r.kind === "verdict")).toHaveLength(1);
   });
@@ -559,9 +580,9 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "unverifiable");
+    ingest.onVerdict("c1", "unverifiable", undefined);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.pass ?? 0).toBe(0);
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.pass).toBe(1);
     expect((await h.rows()).filter((r) => r.kind === "verdict")).toHaveLength(2);
   });
@@ -585,7 +606,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const ingest = h.make();
     dispatch("c1");
     ingest.onFalseRefusal("c1");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts).toMatchObject({ pass: 0, fail: 0, falseRefusals: 1 });
     expect((await h.rows()).map((r) => r.kind)).toEqual(["refusal"]);
   });
@@ -595,11 +616,11 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const ingest = h.make();
     dispatch("c1");
     dispatch("c2");
-    ingest.onVerdict("c1", "fail");
-    ingest.onVerdict("c1", "pass"); // the store keeps the first terminal signal
-    ingest.onVerdict("c1", "unverifiable"); // scored: nothing to say
-    ingest.onVerdict("c2", "unverifiable");
-    ingest.onVerdict("c2", "unverifiable");
+    ingest.onVerdict("c1", "fail", undefined);
+    ingest.onVerdict("c1", "pass", undefined); // the store keeps the first terminal signal
+    ingest.onVerdict("c1", "unverifiable", undefined); // scored: nothing to say
+    ingest.onVerdict("c2", "unverifiable", undefined);
+    ingest.onVerdict("c2", "unverifiable", undefined);
     const rows = await h.rows();
     expect(rows.map((r) => [r.childSessionID, r.verdict])).toEqual([["c1", "fail"], ["c2", "unverifiable"]]);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts).toMatchObject({ pass: 0, fail: 1 });
@@ -609,7 +630,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1"); // no decision id: stats counts refusals without a decision row (QA-1.3-13), as 2.2-less runs have none
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     ingest.onFalseRefusal("c1");
     const rows = await h.rows();
     expect(rows.map((r) => [r.kind, r.overrides ?? null])).toEqual([["verdict", null], ["refusal", "pass"]]);
@@ -624,7 +645,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "fail");
+    ingest.onVerdict("c1", "fail", undefined);
     ingest.onFalseRefusal("c1");
     await h.rows(); // flush
     const table = summarize(h.store(), (await h.bundles[0]!.persister.readRows()).rows, { since: null, until: null });
@@ -651,7 +672,7 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     ingest.onFalseRefusal("c1");
     const entry = h.store().snapshot().entries[MEDIUM_KEY];
     expect(entry?.counts).toMatchObject({ pass: 0, fail: 1, falseRefusals: 1 });
@@ -662,13 +683,13 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     h.clock.t = T0 + 61 * 60_000;
     ingest.sweep();
     expect(lookupDispatch("c1")).toBeUndefined();
     rememberDispatch("c1", { facts: FACTS, agent: "medium", model: "anthropic/claude-sonnet-5-5", variant: "medium", parentSessionID: "root" }, h.clock.t);
     expect(lookupDispatch("c1")!.attemptIndex).toBe(0);
-    ingest.onVerdict("c1", "fail");
+    ingest.onVerdict("c1", "fail", undefined);
     let entry = h.store().snapshot().entries[MEDIUM_KEY];
     expect(entry?.counts).toMatchObject({ pass: 1, fail: 1 });
     expect(entry?.beta.alpha).toBeGreaterThan(0);
@@ -681,14 +702,14 @@ describe("verdicts and false refusals (D4, C5)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1", { step: "variant" });
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts).toMatchObject({ pass: 1, variantPass: 1 });
   });
 
   it("ignores signals for unregistered children", () => {
     const h = harness();
     const ingest = h.make();
-    ingest.onVerdict("ghost", "pass");
+    ingest.onVerdict("ghost", "pass", undefined);
     ingest.onFalseRefusal("ghost");
     expect(h.bundles).toHaveLength(0);
     expect(readdirSync(h.dir)).toEqual([]);
@@ -701,7 +722,7 @@ describe("class confidence gate (phase 1.2 handoff)", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("low", { facts: { ...FACTS, confidence: 0.69 } });
     await ingest.onStepEnded(step("e1", "low", { finish: "stop" }));
-    ingest.onVerdict("low", "fail");
+    ingest.onVerdict("low", "fail", undefined);
     ingest.onFalseRefusal("low");
     expect(h.bundles).toHaveLength(0);
     expect(readdirSync(h.dir)).toEqual([]);
@@ -717,11 +738,11 @@ describe("class confidence gate (phase 1.2 handoff)", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("u", { facts: { ...FACTS, class: "unknown", confidence: 1 } });
     await ingest.onStepEnded(step("e1", "u", { finish: "stop" }));
-    ingest.onVerdict("u", "pass");
+    ingest.onVerdict("u", "pass", undefined);
     expect(h.bundles).toHaveLength(0);
     // a backend label is not part of the facts the registry carries: the key always uses facts.class
     dispatch("k", { facts: { ...FACTS, class: "review" } });
-    ingest.onVerdict("k", "pass");
+    ingest.onVerdict("k", "pass", undefined);
     expect(h.store().keys()).toEqual([makeKey("review", { origin: "router", id: "medium" }, "anthropic", "claude-sonnet-5-5", "medium")]);
   });
 
@@ -730,10 +751,10 @@ describe("class confidence gate (phase 1.2 handoff)", () => {
     const ingest = h.make();
     dispatch("c1", { facts: { ...FACTS, confidence: 0.8 } });
     h.settings = { ...h.settings!, minClassConfidence: 0.9 };
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.bundles).toHaveLength(0);
     h.settings = { ...h.settings, minClassConfidence: 0.8 };
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     expect(h.store().keys()).toHaveLength(1);
   });
 });
@@ -745,7 +766,7 @@ describe("engine static (§1.2): nothing is written", () => {
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1");
     await ingest.onStepEnded(step("e1", "c1", { finish: "stop" }));
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     ingest.onFalseRefusal("c1");
     ingest.onSessionGone("c1");
     ingest.requestFlush();
@@ -760,9 +781,9 @@ describe("engine static (§1.2): nothing is written", () => {
     const h = harness();
     const ingest = h.make({ pricing: PRICED });
     dispatch("c1");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     h.settings = null;
-    ingest.onVerdict("c1", "fail");
+    ingest.onVerdict("c1", "fail", undefined);
     await ingest.onStepEnded(step("e1", "c1", { finish: "stop" }));
     const entry = h.store().snapshot().entries[MEDIUM_KEY];
     expect(entry?.counts).toMatchObject({ pass: 1, fail: 0 });
@@ -783,7 +804,7 @@ describe("registry lifetime", () => {
     ingest.sweep();
     expect(lookupDispatch("c2")).toBeUndefined();
     await ingest.onStepEnded(step("e2", "c2", { finish: "stop" }));
-    ingest.onVerdict("c2", "pass");
+    ingest.onVerdict("c2", "pass", undefined);
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1);
     expect(h.store().snapshot().entries[MEDIUM_KEY]?.counts.pass).toBe(0);
   });
@@ -1021,11 +1042,11 @@ describe("ingestion switched off at runtime (QA-2.1-11)", () => {
     expect(h.store().cost(MEDIUM_KEY).steps.n).toBe(1); // the held final step was folded first
     // later signals do nothing while off
     dispatch("c2");
-    ingest.onVerdict("c2", "pass");
+    ingest.onVerdict("c2", "pass", undefined);
     expect(h.bundles).toHaveLength(1);
     // and recording resumes with a fresh holder when it is switched back on
     h.settings = { engine: "shadow", minClassConfidence: 0.7, outcomesDir: h.dir, tuning: DEFAULT_OUTCOME_TUNING, routerAgentIds: new Set(["medium"]) };
-    ingest.onVerdict("c2", "pass");
+    ingest.onVerdict("c2", "pass", undefined);
     expect(h.bundles).toHaveLength(2);
   });
 });
@@ -1037,8 +1058,8 @@ describe("unkeyable warnings (QA-2.1-12)", () => {
     for (const child of ["a", "b", "c"]) dispatch(child, { model: null, agent: "ghost" });
     dispatch("d", { model: null, agent: "other" });
     for (const child of ["e", "f"]) dispatch(child, { model: "not-a-reference", agent: "ghost" });
-    for (const child of ["a", "b", "c", "d", "e", "f"]) ingest.onVerdict(child, "pass");
-    ingest.onVerdict("a", "pass");
+    for (const child of ["a", "b", "c", "d", "e", "f"]) ingest.onVerdict(child, "pass", undefined);
+    ingest.onVerdict("a", "pass", undefined);
     expect(h.warnings.filter((w) => w.includes("not recorded"))).toHaveLength(3);
     expect(h.bundles).toHaveLength(0);
   });
@@ -1050,7 +1071,7 @@ describe("flush scheduling (D15)", () => {
     const ingest = h.make({ pricing: PRICED });
     for (let i = 0; i < 20; i++) {
       dispatch(`c${i}`);
-      ingest.onVerdict(`c${i}`, i % 2 === 0 ? "pass" : "fail");
+      ingest.onVerdict(`c${i}`, i % 2 === 0 ? "pass" : "fail", undefined);
       ingest.requestFlush();
     }
     ingest.onSessionGone("c0");
@@ -1077,12 +1098,12 @@ describe("flush scheduling (D15)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     await ingest.dispose();
     expect(existsSync(join(h.dir, "outcomes.json"))).toBe(true);
     // idempotent, and later signals are ignored
     await ingest.dispose();
-    ingest.onVerdict("c1", "fail");
+    ingest.onVerdict("c1", "fail", undefined);
     expect(h.bundles).toHaveLength(1);
   });
 
@@ -1090,12 +1111,12 @@ describe("flush scheduling (D15)", () => {
     const h = harness();
     const ingest = h.make();
     dispatch("c1");
-    ingest.onVerdict("c1", "pass");
+    ingest.onVerdict("c1", "pass", undefined);
     const second = mkdtempSync(join(tmpdir(), "omr-ingest-"));
     dirs.push(second);
     h.settings = { ...h.settings!, outcomesDir: second };
     dispatch("c2");
-    ingest.onVerdict("c2", "pass");
+    ingest.onVerdict("c2", "pass", undefined);
     expect(h.bundles.map((b) => b.dir)).toEqual([h.dir, second]);
     await ingest.dispose();
     await Promise.all(h.bundles.map((bundle) => bundle.release()));

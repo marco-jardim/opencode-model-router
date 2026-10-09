@@ -1,0 +1,86 @@
+{
+  "test": "exploration",
+  "recordedAt": "2026-10-09T02:32:03.167Z",
+  "observed": {
+    "draws": [
+      {
+        "label": "draw 0",
+        "tier": "medium",
+        "model": "anthropic/claude-sonnet-5-5#medium",
+        "row": {
+          "decisionID": "ses_ee17faac9ffe2QDmIukahK0y5C:1791513092659:cd8b8504426eea7c:1",
+          "reason": "kept:evidence: the cheapest option implement|role:explorer|anthropic/claude-sonnet-5-5#low (3.6775 ratio, rank 0, the pick is rank 1) needs ≥ 5 recorded outcomes, it has 0; the chosen dispatch is the cheapest eligible (6 ratio); role @explorer on medium in fast..medium [edit is outside this role — use `implementer`]",
+          "role": "explorer",
+          "tier": "medium",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "deterministic"
+          },
+          "facts": {
+            "class": "implement",
+            "risk": "low",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": false,
+          "propensity": 0.8,
+          "pinned": false,
+          "switched": false
+        }
+      },
+      {
+        "label": "draw 1",
+        "tier": "fast",
+        "model": "anthropic/claude-sonnet-5-5#low",
+        "row": {
+          "decisionID": "ses_ee17faac9ffe2QDmIukahK0y5C:1791513094766:cd8b8504426eea7c:2",
+          "reason": "explore: exploration draw (propensity 0.2); engine decision: kept:best-is-chosen: the chosen dispatch is the cheapest (0.0069 usd); role @explorer on fast in fast..medium [explore; edit is outside this role — use `implementer`]",
+          "role": "explorer",
+          "tier": "fast",
+          "grant": [
+            "glob",
+            "grep",
+            "read",
+            "router_git"
+          ],
+          "boundsReasons": [],
+          "detection": {
+            "effective": "deterministic"
+          },
+          "facts": {
+            "class": "implement",
+            "risk": "low",
+            "scope": "single",
+            "needs": [
+              "edit"
+            ],
+            "confidence": 0.9,
+            "source": "route-line"
+          },
+          "resume": false,
+          "childSessionID": null,
+          "explore": true,
+          "propensity": 0.2,
+          "pinned": false,
+          "switched": false
+        }
+      }
+    ],
+    "unknownBindings": [],
+    "routerWarnings": [],
+    "hostErrors": [],
+    "providerErrors": []
+  }
+}

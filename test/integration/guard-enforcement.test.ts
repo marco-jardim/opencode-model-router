@@ -72,8 +72,8 @@ describe("guard-enforcement integration", () => {
     expect(r.message).toContain("NEXT:");
   });
 
-  // 4: ENFORCED budget counter increments on blocked self-script calls
-  it("4: ENFORCED blocked calls increment budget counter in message", () => {
+  // 4: ENFORCED blocked self-script calls are not charged to the budget (§2.9 E6)
+  it("4: ENFORCED blocked calls do not increment the budget counter in the message", () => {
     const store = createGuardStore();
     const cfg = { enforcement: { mode: "enforced" } } as unknown as RouterConfig;
     const env: Record<string, string | undefined> = {};
@@ -87,13 +87,15 @@ describe("guard-enforcement integration", () => {
       env,
     };
 
+    // §2.9 E6 golden — before: each refused call was charged (budget 1/25, then 2/25);
+    // after: a refused call never ran, so the budget stays 0/25.
     const r1 = guardBeforeCall(callParams);
     expect(r1.block).toBe(true);
-    expect(r1.message).toContain(`budget 1/${DEFAULT_GUARD_BUDGET}`);
+    expect(r1.message).toContain(`budget 0/${DEFAULT_GUARD_BUDGET}`);
 
     const r2 = guardBeforeCall(callParams);
     expect(r2.block).toBe(true);
-    expect(r2.message).toContain(`budget 2/${DEFAULT_GUARD_BUDGET}`);
+    expect(r2.message).toContain(`budget 0/${DEFAULT_GUARD_BUDGET}`);
   });
 
   // 5: ENFORCED duplicate read blocks on second attempt

@@ -40,6 +40,11 @@ export function createGuardStore(options: GuardStoreOptions = {}) {
       if (!s) {
         s = newGuardState(policy);
         states.set(sessionID, s);
+      } else if (s.dispatches > 1 && s.budgetRound !== s.dispatches) {
+        // QA-P15-1-9: a resumed dispatch round takes its own per-dispatch budget
+        // (a role's `budget=` raise on the resume), set once per round.
+        s.budget = policy.budget;
+        s.budgetRound = s.dispatches;
       }
       return s;
     },

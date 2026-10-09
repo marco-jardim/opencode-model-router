@@ -44,10 +44,29 @@ This directory holds design/implementation plans for `opencode-model-router`.
     — kickoff prompt, execution state, planning-session considerations,
     troubleshooting, and the resume point after every host restart.
 
+- [`role-tier-assurance-delegation-plan.md`](./role-tier-assurance-delegation-plan.md)
+  — Role × Tier × Assurance delegation (#84; target `2.4.0`, OpenCode v2 only,
+  v1 keeps the tier model): the orchestrator picks a role, the router picks the
+  tier per dispatch under an authority × detection floor, least-privilege role
+  contracts with capability separation, dynamic authority with a resume-based
+  ladder for `general`, a structured `router_run` tool, role-aware guards and
+  budgets, and outcome evidence only from external verification. Revised
+  hypotheses grounded in the literature and the 2026-10-06/07 run evidence.
+  Decision record: [`../adr/0006-role-tier-assurance-delegation.md`](../adr/0006-role-tier-assurance-delegation.md).
+  User guide: [`../ROLES.md`](../ROLES.md) (config keys:
+  [`../CONFIG_REFERENCE.md`](../CONFIG_REFERENCE.md#roles-delegation-84)).
+  QA reports, spikes and the dogfood record: [`../qa/role-tier/`](../qa/role-tier/).
+  - Handover: [`role-tier-assurance-delegation-handover.md`](./role-tier-assurance-delegation-handover.md)
+    — kickoff prompt, execution state, worktrees, planning considerations,
+    troubleshooting, restart-stop messages and the phase log.
+
 ## Related records
 
 - Architecture decision records: [`../adr/`](../adr/)
   - `0000-spike-results.md` — Phase 0.0 enforcement-primitives capability spike.
   - [`0005-cost-aware-routing-engine.md`](../adr/0005-cost-aware-routing-engine.md) —
     cost-aware routing engine (#74): decisions D1–D18, alternatives, consequences.
+  - [`0006-role-tier-assurance-delegation.md`](../adr/0006-role-tier-assurance-delegation.md) —
+    role × tier × assurance delegation (#84): evidence E1–E13, decisions D1–D13,
+    alternatives, consequences, literature.
 - QA reports: `../qa/` (added during Wave 5).

@@ -20,7 +20,9 @@ import {
 } from "./backends/shared";
 import { createTypeSafeBackend } from "./backends/typesafe";
 import { applyRouteLine, parseRouteLine, type RouteLinePositions } from "./route-line";
-import { analyzeRules } from "./rules";
+import { analyzeRules, needMatchesOf, type NeedMatch } from "./rules";
+
+export type { NeedMatch } from "./rules";
 import { hasCredentialSignal } from "./scrub";
 import { buildClassifierState, classifierStateRawParts } from "./state";
 import {
@@ -269,13 +271,27 @@ function routeLineOptions(deps: ClassifyDeps): { readonly positions: RouteLinePo
   return { positions: deps.routeLinePositions ?? "first" };
 }
 
+/** The text the rules layer reads: the description, then the prompt without its route lines. */
+function ruleTextOf(input: ClassifyInput, parsed: RouteLineParse): string {
+  const description = typeof input.description === "string" ? input.description.trim() : "";
+  return [description.slice(0, RULES_MAX_CHARS), parsed.stripped.slice(0, RULES_MAX_CHARS)]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * #84 QA-G-B-3: the needs the rules layer finds in the text of `input` itself, and why (rules.ts `needMatchesOf` on the same text
+ * and `cwd` as `classify`; never the class-implied needs). Never calls a backend.
+ */
+export function classifyNeedMatches(input: ClassifyInput, deps: Pick<ClassifyDeps, "routeLinePositions">): NeedMatch[] {
+  const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "", { positions: deps.routeLinePositions ?? "first" });
+  return needMatchesOf(ruleTextOf(input, parsed), { ...(input.cwd === undefined ? {} : { cwd: input.cwd }) });
+}
+
 /** Steps 1–3: route line, rules, route line applied. */
 function prepare(input: ClassifyInput, deps: ClassifyDeps): Prepared {
   const parsed = parseRouteLine(typeof input.prompt === "string" ? input.prompt : "", routeLineOptions(deps));
-  const description = typeof input.description === "string" ? input.description.trim() : "";
-  const ruleText = [description.slice(0, RULES_MAX_CHARS), parsed.stripped.slice(0, RULES_MAX_CHARS)]
-    .filter(Boolean)
-    .join("\n");
+  const ruleText = ruleTextOf(input, parsed);
   const analysis = analyzeRules(ruleText, deps.cfg, { cwd: input.cwd });
   const rules = analysis.facts;
   const facts = parsed.line ? applyRouteLine(rules, parsed.line) : rules;
@@ -325,6 +341,8 @@ function resultOf(
         count: prepared.parsed.count,
         conflict: prepared.parsed.conflict,
         edgeOnly: prepared.parsed.edgeOnly,
+        // QA-P12-2-2 (P2.1): surface a malformed first route line; absent otherwise (tier rows copy only the three fields above).
+        ...(prepared.parsed.malformed === true ? { malformed: true as const } : {}),
       },
       ...(skipped ? { backendSkipped: skipped } : {}),
       backend:
