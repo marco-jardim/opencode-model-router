@@ -14,6 +14,12 @@ validated work roots, `router_run` and work-root-scoped `router_git_*`, and outc
 only. OpenCode v1 is unchanged apart from the changes listed below; the roles keys are validated and inert there. See
 [Roles mode](docs/ROLES.md) and [ADR 0006](docs/adr/0006-role-tier-assurance-delegation.md).
 
+**Upgrade notes.** Read these entries under [Changed](#changed) before upgrading:
+
+- **Breaking (behaviour): `fast` is now host-enforced read-only on v1 and v2 (#77).**
+- The #84 behaviour change: guard and verification fixes for every host and mode, OpenCode v1 included.
+- Its **Downgrades** item: downgrading past this version is unsupported.
+
 ### Added
 
 - **Roles mode: role × tier × assurance delegation (#84), OpenCode v2, opt-in.** With `routing.delegation: "roles"`
@@ -87,6 +93,12 @@ only. OpenCode v1 is unchanged apart from the changes listed below; the roles ke
   (A18). `/router` lists them under "Plugin agents". On OpenCode v2 a `permission` key naming `write`, `patch`,
   `multiedit` or `apply_patch` only narrows that tool and `edit` decides; a key that allows or asks for what the
   agent's `edit` rules deny gets a config notice.
+- Six shell-free `router_git_*` inspection tools: status, log, diff, show, blame,
+  ls_files. Fixed hardened argv, strict paths/refs, bounded output, timeout/tree
+  cancellation, and remote-URL userinfo redaction; no write commands or arbitrary
+  options. Read-only tiers can also use configured Context7 docs lookups.
+  See [Read-only tiers](docs/READ_ONLY_TIERS.md) for policy, overrides and limits
+  (not an OS sandbox).
 
 ### Fixed
 
@@ -94,6 +106,7 @@ only. OpenCode v1 is unchanged apart from the changes listed below; the roles ke
 - `subagentTiers` no longer creates phantom primary, allow-all agents for names that no agent defines; such
   names are skipped with a notice. On v2 the router re-checks at the first prompt, so `opencode.json` agents
   registered after startup still get the tier model.
+
 ### Changed
 
 - **Behaviour change (#84): guard and verification fixes for every host and mode** (v1, v2 tiers mode and roles mode;
@@ -142,15 +155,6 @@ only. OpenCode v1 is unchanged apart from the changes listed below; the roles ke
   “always allow” approvals are applied after host deny checks (QA-77-P8), but the
   v2 router hook now restores the protected agent's ask. Auto-answer modes may
   still approve that ask; denies remain denied.
-
-### Added
-
-- Six shell-free `router_git_*` inspection tools: status, log, diff, show, blame,
-  ls_files. Fixed hardened argv, strict paths/refs, bounded output, timeout/tree
-  cancellation, and remote-URL userinfo redaction; no write commands or arbitrary
-  options. Read-only tiers can also use configured Context7 docs lookups.
-  See [Read-only tiers](docs/READ_ONLY_TIERS.md) for policy, overrides and limits
-  (not an OS sandbox).
 
 ## [2.3.0] - 2026-10-07
 
