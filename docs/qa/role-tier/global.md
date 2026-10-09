@@ -60,15 +60,15 @@ Pre-existing (at `eeab36b`) test files with removed or changed lines, and why:
 | File | Commit | Reason |
 |---|---|---|
 | `test/integration/concurrency.test.ts`, `test/integration/guard-enforcement.test.ts` | `fb185db`, `f73edad` (P1.5) | §2.9 reader profile / uncharged denials (behaviour change in CHANGELOG) |
-| `test/unit/dod.test.ts` | `6c59af8` (P1.6) | §2.9 whole criteria |
+| `test/unit/dod.test.ts` | `6c59af8` (P1.5) | §2.9 whole criteria |
 | `test/unit/v2-hooks.test.ts` | `cab74ec` (Wave 2 CI) | timeouts under Windows CI load; assertions unchanged |
-| `test/unit/baseline-wiring.test.ts`, `test/unit/v2-client.test.ts`, `test/unit/wiring.test.ts` | `d48bc91` (fix-2) | `onVerdict`/grader signature; assertions unchanged |
+| `test/unit/baseline-wiring.test.ts`, `test/unit/v2-client.test.ts`, `test/unit/wiring.test.ts` | `d48bc91` (fix-2) | `onVerdict`/grader signature; expected `dispatchGrader` objects gained `model` |
 | `test/integration/routing-ingest.test.ts`, `test/unit/escalate-attempt-recorder.test.ts` | `7556fcb` (fix-2) | required `grader` parameter; role grader rows pinned to the fixed behaviour |
 | `test/smoke/routing-engine.smoke.test.ts` | `2d3eaa2`, `a976569`, `0c31c8f` (P3.1) | scenario 6 repinned from the stale `71815eb` to `bd1ecd1`, narrowed to v1 entry points |
 | `test/smoke/subagent-tiers.smoke.test.ts` | `bd1ecd1` | Haiku 5.5 fast model alignment (pre-#84 drift) |
 | `test/unit/docs-drift.test.ts` | P1.1, P3.2, P3.3 | pins updated to the new documented rules |
 
-Every other pre-existing test file only gained tests. Goldens: only `test/golden/roles-protocol.golden.test.ts` is new;
+`test/smoke/helpers/routing-host.ts` (pre-existing helper) was extended additively in P0.1/P3.1 and its redactor fixed in P3.3 (C-11). Every other pre-existing test file only gained tests. Goldens: only `test/golden/roles-protocol.golden.test.ts` is new;
 no pre-existing golden changed.
 
 ## Criterion 2 (v1 untouched, I8) — how it is met
@@ -95,4 +95,4 @@ v1-visible changes: the §2.9 behaviour changes and R10(2), all in the CHANGELOG
 
 ## Verdict
 
-Pending area C round 3 and CI on the final head.
+**PASS** — areas A1, A2, A3, B and C pass (0 open blocking/critical/major); round-limit minors listed above. Committed evidence predates the C-11 redactor fix, so some paths read `<home>\<user>\Local\Temp` (cosmetic). Release gate: CI on the final head (recorded on #84).
