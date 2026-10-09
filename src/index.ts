@@ -2781,8 +2781,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             && opencodeConfig.mcp.context7.enabled !== false), opencodeConfig.agent[name]?.permission);
           agentDef.permission = permission;
           agentDef.tools = { ...legacyReadOnlyTools(permission), ...opencodeConfig.agent[name]?.tools };
-        } else if (name === "fast" || tier.readOnly === false) {
-          // Opt-out removes OUR policy, not restrictions the user supplied.
+        } else {
+          // Opt-out removes OUR policy, not restrictions the user supplied; they are kept
+          // for every non-read-only tier, not just fast (#97).
           for (const key of ["permission", "tools"]) {
             if (opencodeConfig.agent[name]?.[key] !== undefined) agentDef[key] = opencodeConfig.agent[name][key];
           }

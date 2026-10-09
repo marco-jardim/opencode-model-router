@@ -33,7 +33,9 @@ without restating the model or any other tier field:
 Replace `anthropic` with each preset you intend to opt out of. Setting a custom
 tier's `readOnly: true` opts it in. Opt-out removes the plugin policy, not any
 separate host/user permission restrictions. Prompts still describe exploration;
-opt-out does not rewrite them. Non-read-only tier definitions are unchanged.
+opt-out does not rewrite them. Non-read-only tier definitions are unchanged; on
+v1 the user's `agent.<tier>.permission` and `.tools` are kept for every
+non-read-only tier (#97).
 
 The policy allows external-directory lookups by default. To tighten that, set
 host `agent.fast.permission.external_directory: "deny"` (v1-compatible config),
