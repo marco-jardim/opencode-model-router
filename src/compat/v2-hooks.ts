@@ -43,7 +43,7 @@ import { createSystemAugmenter } from "../routing/wire/hint";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
-import { appliedEffort, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
+import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -715,7 +715,10 @@ export async function registerV2Hooks(
   const legacy = hooks as unknown as Record<string, LegacyHook | undefined>;
   const registrations: Array<{ dispose(): Promise<void> }> = [];
   /** #90 P1.2: per session, what the context hook's `chat.params` bridge applied to the latest turn (the TUI's `effortOf`). */
+  // QA-10: one store per adapter instance, not module state; every instance of a location records the same turns, the last registration answers.
   const effortStore = createEffortStore();
+  /** #90 P1.2 (QA-4): the context events whose turn was recorded; a hook that fails before recording forgets the session. */
+  const recordedTurns = new WeakSet<object>();
   const abort = new AbortController();
   const verifyingCalls = new Set<string>();
   const depthBanners = new Map<string, string>();
@@ -1391,14 +1394,21 @@ export async function registerV2Hooks(
       await legacy["chat.params"]?.(input, event.options);
       // #90 P1.2 (A3): what this turn's request carries after the router's hook, root and child sessions alike; no effort key
       // records none (clearing a stale one). Read-only: `event.options` is normalised into a copy, never written; the channel
-      // never changes the hook's outcome.
-      try {
-        effortStore.record(String(event.sessionID), {
-          effort: appliedEffort(normalizeAgentOptions(event.options)), variant: event.model.variant,
-          providerID: event.model.providerID, modelID: event.model.id, agent: event.agent, at: Date.now(),
-        });
-      } catch {
-        // Nothing recorded for this turn: `effortOf` keeps answering the previous one.
+      // never changes the hook's outcome. QA-7: only a non-empty string session id is recorded.
+      // QA-2: host v2.0.24 core/src/session/model-request.ts:408-411 fires `context` for primary requests only (compaction, generate, title have their own hooks).
+      const effortSession: unknown = event.sessionID;
+      if (typeof effortSession === "string" && effortSession !== "") {
+        try {
+          const applied = normalizeAgentOptions(event.options);
+          effortStore.record(effortSession, {
+            effort: appliedEffort(applied, { providerID: event.model.providerID, modelID: event.model.id }),
+            thinkingBudget: appliedThinkingBudget(applied), variant: event.model.variant,
+            providerID: event.model.providerID, modelID: event.model.id, agent: event.agent, at: Date.now(),
+          });
+          recordedTurns.add(event);
+        } catch {
+          effortStore.forget(effortSession); // nothing usable for this turn: no stale answer either
+        }
       }
       const routerConfig = loadConfig(ctx.location.directory);
       const verify = routerConfig.enforcement?.verify;
@@ -1469,6 +1479,8 @@ export async function registerV2Hooks(
       try {
         await buildContext(event, role);
       } catch (error) {
+        // #90 P1.2 (QA-4): a turn that failed before its effort was recorded leaves no stale record (the error goes on as before).
+        if (!recordedTurns.has(event) && typeof event.sessionID === "string") effortStore.forget(event.sessionID);
         if (role === undefined) throw error;
         for (const name of Object.keys(event.tools ?? {})) delete event.tools[name];
         warnPermissionOnce(`role tool catalog failed for ${role}: ${String(error)}`);
@@ -1824,6 +1836,7 @@ export async function registerV2Hooks(
               lookupNamedAgent.delete(data.sessionID);
               lastCallOfChild.delete(data.sessionID);
               hostBudget.forget(data.sessionID);
+              effortStore.forget(data.sessionID); // #90 P1.2 (QA-8)
             }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {

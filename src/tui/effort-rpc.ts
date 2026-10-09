@@ -25,6 +25,7 @@ export const effortRpc = {
           modelID: { type: "string" },
           agent: { type: "string" },
           at: { type: "number" },
+          thinkingBudget: { type: "integer", minimum: 1 },
         },
         additionalProperties: false,
       },
@@ -42,7 +43,10 @@ export interface EffortOfInput {
 
 /** The output of `effortOf`; every field is absent when unknown (`{}` for a session the router never saw). */
 export interface EffortOfOutput {
-  /** The effort the turn's request carried after the router's hook (`reasoningEffort`, else the Anthropic `effort` key). */
+  /**
+   * The effort the turn's request carried after the router's hook: the Anthropic `effort` key first for a Claude model,
+   * `reasoningEffort` first for any other (each falling back to the other).
+   */
   readonly effort?: string;
   /** The turn's model variant (`Model.Ref.variant`). */
   readonly variant?: string;
@@ -51,4 +55,6 @@ export interface EffortOfOutput {
   readonly agent?: string;
   /** When the turn was recorded (epoch ms). */
   readonly at?: number;
+  /** The Anthropic thinking budget the request carried (`thinking: { type: "enabled", budgetTokens }`), a positive integer. */
+  readonly thinkingBudget?: number;
 }

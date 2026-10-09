@@ -51,7 +51,8 @@ vi.mock("../../src/escalate/effort-override", async (importOriginal) => {
 
 import { effortRpc, type EffortOfOutput } from "../../src/tui/effort-rpc";
 import {
-  appliedEffort, createEffortStore, EFFORT_STORE_MAX_SESSIONS, effortOfHandler, registerEffortChannel, type EffortStore,
+  appliedEffort, appliedThinkingBudget, createEffortStore, EFFORT_REGISTER_TIMEOUT_MS, EFFORT_STORE_MAX_SESSIONS, effortOfHandler,
+  registerEffortChannel, type EffortStore,
 } from "../../src/tui/effort-channel";
 import { normalizeAgentOptions, registerV2Hooks } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
@@ -126,6 +127,8 @@ function v2Host(directory: string, rpc?: unknown) {
   };
   const register = () => ({ dispose: vi.fn(async () => {}) });
   const sessions: Record<string, Record<string, unknown>> = {};
+  const queue: Array<Record<string, unknown>> = [];
+  let wake = () => {};
   const ctx = {
     location: { directory, project: { directory } },
     agent: {
@@ -152,12 +155,18 @@ function v2Host(directory: string, rpc?: unknown) {
     },
     permission: { hook: vi.fn(async () => register()) },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
-      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      signal.addEventListener("abort", () => wake(), { once: true });
+      while (!signal.aborted) {
+        if (queue.length) yield queue.shift()!;
+        else await new Promise<void>((resolve) => { wake = resolve; });
+      }
     } },
     ...(rpc === undefined ? {} : { rpc }),
   };
   return {
     ctx, agents, sessions, sessionHooks,
+    /** A host event on the adapter's event stream. */
+    emit(event: Record<string, unknown>) { queue.push(event); wake(); },
     async start(hooks: Record<string, unknown> = {}): Promise<() => Promise<void>> {
       const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as unknown as Hooks, undefined, {
         hostSettleMs: 0, listRegistrationWorktrees: async () => [],
@@ -166,7 +175,7 @@ function v2Host(directory: string, rpc?: unknown) {
       return cleanup;
     },
     /** One request build of `sessionID` as `agent` (the host's `context` hook event); returns the event after the hooks ran. */
-    async turn(sessionID: string, agent: string, model: Record<string, unknown>, options: Record<string, unknown> = { maxTokens: 32_000 }, tools: Record<string, unknown> = {}) {
+    async turn(sessionID: unknown, agent: string, model: Record<string, unknown> | undefined, options: Record<string, unknown> = { maxTokens: 32_000 }, tools: Record<string, unknown> = {}) {
       const event = { sessionID, agent, model, options, system: [], messages: [], tools };
       await sessionHooks.context!(event);
       return event;
@@ -183,6 +192,20 @@ async function v2Plugin(directory: string): Promise<Record<string, unknown>> {
 }
 
 const FABLE = { providerID: "anthropic", id: "claude-fable-5-1" };
+const GPT = { providerID: "openai", id: "gpt-6" };
+const SONNET = { providerID: "anthropic", id: "claude-sonnet-4-5" };
+/**
+ * An override-defined preset (QA-4): an OpenAI effort tier (`buildAgentOptions` → `reasoningEffort`), an Anthropic thinking-budget
+ * tier on a model that accepts a manual budget (→ `thinking`, no effort key), an Anthropic effort tier (→ `effort`).
+ */
+const MIXED_PRESET = {
+  activePreset: "omr-p12-mixed",
+  presets: { "omr-p12-mixed": {
+    fast: { model: "openai/gpt-6", effort: "low" },
+    medium: { model: "anthropic/claude-sonnet-4-5", thinking: { budgetTokens: 4000 } },
+    heavy: { model: "anthropic/claude-opus-5-5", effort: "xhigh" },
+  } },
+};
 
 // ---------------------------------------------------------------------------
 // The rpc definition
@@ -198,8 +221,9 @@ describe("effortRpc (the shared definition)", () => {
     });
     const output = effortRpc.methods.effortOf.output;
     expect(output.additionalProperties).toBe(false);
-    expect(Object.keys(output.properties).sort()).toEqual(["agent", "at", "effort", "modelID", "providerID", "variant"]);
+    expect(Object.keys(output.properties).sort()).toEqual(["agent", "at", "effort", "modelID", "providerID", "thinkingBudget", "variant"]);
     expect(output.properties.at).toEqual({ type: "number" });
+    expect(output.properties.thinkingBudget).toEqual({ type: "integer", minimum: 1 });
     expect("required" in output).toBe(false);
     expect(JSON.parse(JSON.stringify(effortRpc))).toEqual(effortRpc); // JSON-safe: nothing but data
   });
@@ -234,6 +258,31 @@ describe("effort store", () => {
     store.record("s1", { effort: "high", variant: "high", agent: "fast", at: 1 });
     store.record("s1", { agent: "medium", at: 2 });
     expect(store.lookup("s1")).toEqual({ agent: "medium", at: 2 });
+  });
+
+  it("thinkingBudget: kept only as a positive integer", () => {
+    const store = createEffortStore();
+    store.record("ok", { thinkingBudget: 4000 });
+    expect(store.lookup("ok")).toEqual({ thinkingBudget: 4000 });
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "4000", null]) {
+      store.record("bad", { effort: "low", thinkingBudget: bad });
+      expect([bad, store.lookup("bad")]).toEqual([bad, { effort: "low" }]);
+    }
+  });
+
+  it("forget drops one session (unknown or invalid ids are a no-op)", () => {
+    const store = createEffortStore();
+    store.record("s1", { effort: "high" });
+    store.record("s2", { effort: "low" });
+    store.forget("s1");
+    store.forget("never");
+    store.forget("");
+    store.forget(7 as unknown as string);
+    expect(store.lookup("s1")).toEqual({});
+    expect(store.lookup("s2")).toEqual({ effort: "low" });
+    expect(store.size()).toBe(1);
+    store.record("s1", { effort: "max" }); // recorded again after a forget
+    expect(store.lookup("s1")).toEqual({ effort: "max" });
   });
 
   it("ignores an empty or non-string session id", () => {
@@ -271,15 +320,46 @@ describe("effort store", () => {
 });
 
 describe("appliedEffort", () => {
-  it("reads reasoningEffort first, then the Anthropic effort key; anything else is no effort", () => {
+  const OPENAI = { providerID: "openai", modelID: "gpt-6" };
+  it("a non-Claude model (or none): reasoningEffort first, then effort; anything else is no effort", () => {
+    for (const model of [OPENAI, {}, { providerID: "google", modelID: "gemini-3.7-flash" }]) {
+      expect(appliedEffort({ reasoningEffort: "high", effort: "low" }, model)).toBe("high");
+      expect(appliedEffort({ effort: "max" }, model)).toBe("max");
+      expect(appliedEffort({ reasoningEffort: "", effort: "low" }, model)).toBe("low");
+    }
     expect(appliedEffort({ reasoningEffort: "high", effort: "low" })).toBe("high");
-    expect(appliedEffort({ effort: "max" })).toBe("max");
-    expect(appliedEffort({ reasoningEffort: "", effort: "low" })).toBe("low");
-    expect(appliedEffort({ reasoningEffort: 3 })).toBeUndefined();
-    expect(appliedEffort({ maxTokens: 100 })).toBeUndefined();
-    expect(appliedEffort({ reasoning_effort: "high" })).toBeUndefined(); // the alias only counts once normalised
-    expect(appliedEffort(normalizeAgentOptions({ reasoning_effort: "high" }))).toBe("high");
-    expect(appliedEffort(normalizeAgentOptions({ reasoning_effort: "low", reasoningEffort: "medium" }))).toBe("medium");
+    expect(appliedEffort({ reasoningEffort: 3 }, OPENAI)).toBeUndefined();
+    expect(appliedEffort({ maxTokens: 100 }, OPENAI)).toBeUndefined();
+    expect(appliedEffort({ reasoning_effort: "high" }, OPENAI)).toBeUndefined(); // the alias only counts once normalised
+    expect(appliedEffort(normalizeAgentOptions({ reasoning_effort: "high" }), OPENAI)).toBe("high");
+    expect(appliedEffort(normalizeAgentOptions({ reasoning_effort: "low", reasoningEffort: "medium" }), OPENAI)).toBe("medium");
+  });
+
+  it("QA-9: a Claude model (the router's isClaudeModel) reads effort first, then reasoningEffort", () => {
+    for (const model of [
+      { providerID: "anthropic", modelID: "claude-opus-5-5" },
+      { providerID: "anthropic" },
+      { providerID: "github-copilot", modelID: "claude-sonnet-5" },
+      { modelID: "claude-haiku-5-5" },
+    ]) {
+      expect([model, appliedEffort({ reasoningEffort: "high", effort: "low" }, model)]).toEqual([model, "low"]);
+      expect([model, appliedEffort({ reasoningEffort: "high" }, model)]).toEqual([model, "high"]);
+      expect([model, appliedEffort({ effort: "", reasoningEffort: "medium" }, model)]).toEqual([model, "medium"]);
+    }
+    expect(appliedEffort({ effort: 4 }, { providerID: "anthropic", modelID: "claude-opus-5-5" })).toBeUndefined();
+  });
+
+  it("appliedThinkingBudget: the router's shape only (type enabled, positive integer budget), the alias once normalised", () => {
+    expect(appliedThinkingBudget({ thinking: { type: "enabled", budgetTokens: 4000 } })).toBe(4000);
+    expect(appliedThinkingBudget(normalizeAgentOptions({ budget_tokens: 2048 }))).toBe(2048);
+    for (const thinking of [
+      undefined, null, "4000", { budgetTokens: 4000 }, { type: "disabled", budgetTokens: 4000 }, { type: "adaptive" },
+      { type: "enabled" }, { type: "enabled", budgetTokens: 0 }, { type: "enabled", budgetTokens: -5 },
+      { type: "enabled", budgetTokens: 1.5 }, { type: "enabled", budgetTokens: "4000" },
+    ]) {
+      expect([thinking, appliedThinkingBudget({ thinking })]).toEqual([thinking, undefined]);
+    }
+    expect(appliedThinkingBudget({ budget_tokens: 2048 })).toBeUndefined(); // the alias only counts once normalised
   });
 
   it("normalizeAgentOptions never modifies its input", () => {
@@ -313,7 +393,7 @@ describe("effortOf handler", () => {
   });
 
   it("never rejects: a failing store or a throwing input getter answers {}", async () => {
-    const broken: EffortStore = { record: () => {}, lookup: () => { throw new Error("boom"); }, size: () => 0 };
+    const broken: EffortStore = { record: () => {}, lookup: () => { throw new Error("boom"); }, forget: () => {}, size: () => 0 };
     await expect(effortOfHandler(broken)({ sessionID: "s1" })).resolves.toEqual({});
     const hostile = Object.defineProperty({}, "sessionID", { get: () => { throw new Error("getter"); } });
     await expect(effortOfHandler(createEffortStore())(hostile)).resolves.toEqual({});
@@ -387,6 +467,82 @@ describe("registerEffortChannel (feature detection, never throws)", () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0]![0])).toContain("[model-router] TUI effort channel not registered");
   });
+
+  it("QA-1: a register that never settles is given up after the (injected) timeout: resolves, logs once, a no-op dispose", async () => {
+    const log = { warn: vi.fn() };
+    const register = vi.fn(() => new Promise<never>(() => {}));
+    const dispose = await registerEffortChannel({ register }, createEffortStore(), log, { timeoutMs: 20 });
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls[0]![0]).toContain("rpc.register did not settle within 20 ms");
+    await expect(dispose()).resolves.toBeUndefined();
+    expect(log.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("QA-1: a registration that arrives after the timeout is disposed at once, also when dispose was called first", async () => {
+    const log = { warn: vi.fn() };
+    let arrive!: (registration: unknown) => void;
+    const late = { dispose: vi.fn(async () => {}) };
+    const dispose = await registerEffortChannel({ register: () => new Promise((resolve) => { arrive = resolve; }) }, createEffortStore(), log, { timeoutMs: 10 });
+    await dispose(); // the plugin went away before the host answered
+    expect(late.dispose).not.toHaveBeenCalled();
+    arrive(late);
+    await vi.waitFor(() => expect(late.dispose).toHaveBeenCalledTimes(1));
+    await dispose();
+    expect(late.dispose).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("QA-1: after the timeout, a late throwing dispose and a late rejection are swallowed (no second log)", async () => {
+    const log = { warn: vi.fn() };
+    let arrive!: (registration: unknown) => void;
+    const throwing = { dispose: vi.fn(() => { throw new Error("dispose failed"); }) };
+    await registerEffortChannel({ register: () => new Promise((resolve) => { arrive = resolve; }) }, createEffortStore(), log, { timeoutMs: 10 });
+    arrive(throwing);
+    await vi.waitFor(() => expect(throwing.dispose).toHaveBeenCalledTimes(1));
+    let refuse!: (error: unknown) => void;
+    await registerEffortChannel({ register: () => new Promise((_resolve, reject) => { refuse = reject; }) }, createEffortStore(), log, { timeoutMs: 10 });
+    refuse(new Error("too late"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(log.warn).toHaveBeenCalledTimes(2); // one per timed-out registration, none for what arrived late
+    expect(log.warn.mock.calls.map(([line]) => String(line)).join("\n")).not.toContain("too late");
+  });
+
+  it("QA-1: a registration in time is not touched by the timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const host = fakeRpc();
+      const log = { warn: vi.fn() };
+      const dispose = await registerEffortChannel(host.rpc, createEffortStore(), log, { timeoutMs: 10 });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(log.warn).not.toHaveBeenCalled();
+      expect(host.dispose).not.toHaveBeenCalled();
+      await dispose();
+      expect(host.dispose).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0); // the race's timer was cleared
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([undefined, Number.NaN, -1, Number.POSITIVE_INFINITY])("QA-1: the default timeout is 2000 ms (timeoutMs %s)", async (timeoutMs) => {
+    expect(EFFORT_REGISTER_TIMEOUT_MS).toBe(2000);
+    vi.useFakeTimers();
+    try {
+      const log = { warn: vi.fn() };
+      let settled = false;
+      const options = timeoutMs === undefined ? {} : { timeoutMs };
+      const pending = registerEffortChannel({ register: () => new Promise(() => {}) }, createEffortStore(), log, options).then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(EFFORT_REGISTER_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(settled).toBe(true);
+      expect(log.warn.mock.calls[0]![0]).toContain("within 2000 ms");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -406,7 +562,7 @@ describe("v2 adapter: registration", () => {
     expect(rpc.dispose).toHaveBeenCalledTimes(1);
   });
 
-  it("a second setup (another plugin instance) registers again; the last one answers, from its own turns", async () => {
+  it("QA-3: a second setup (another plugin instance) registers again; the last one answers, from its own turns only", async () => {
     home();
     const rpc = fakeRpc();
     const directory = temp();
@@ -415,9 +571,33 @@ describe("v2 adapter: registration", () => {
     const second = v2Host(directory, rpc.rpc);
     await second.start();
     expect(rpc.register).toHaveBeenCalledTimes(2);
-    await first.turn("s1", "fast", { providerID: "p", id: "m" });
-    await second.turn("s1", "fast", { providerID: "p", id: "m" });
-    expect(await rpc.effortOf({ sessionID: "s1" })).toMatchObject({ providerID: "p", modelID: "m", agent: "fast" });
+    await first.turn("s1", "fast", { providerID: "p", id: "m1" }); // only the FIRST instance sees this turn
+    expect(await rpc.calls[0]!.handlers.effortOf({ sessionID: "s1" })).toMatchObject({ modelID: "m1" }); // its own store has it
+    expect(await rpc.effortOf({ sessionID: "s1" })).toEqual({}); // the last-registered (second) handler answers: it never saw it
+    await second.turn("s1", "fast", { providerID: "p", id: "m2" });
+    expect(await rpc.effortOf({ sessionID: "s1" })).toMatchObject({ providerID: "p", modelID: "m2", agent: "fast" });
+  });
+
+  it("QA-1: a host whose rpc.register never settles does not hold setup past the timeout; turns still run and are recorded", async () => {
+    home();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let called!: () => void;
+    const registerCalled = new Promise<void>((resolve) => { called = resolve; });
+    const rpc = { register: vi.fn(() => { called(); return new Promise<never>(() => {}); }) };
+    const host = v2Host(temp(), rpc);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const started = host.start();
+      await registerCalled;
+      await vi.advanceTimersByTimeAsync(EFFORT_REGISTER_TIMEOUT_MS);
+      await expect(started).resolves.toBeTypeOf("function");
+    } finally {
+      vi.useRealTimers();
+    }
+    await host.turn("s1", "fast", { providerID: "p", id: "m" });
+    expect(channel.records.at(-1)?.sessionID).toBe("s1");
+    const logged = warn.mock.calls.filter(([line]) => String(line).includes("did not settle within 2000 ms"));
+    expect(logged).toHaveLength(1);
   });
 
   it.each([
@@ -577,6 +757,127 @@ describe("v2 adapter: the recorded effort per path", () => {
     const rpc = fakeRpc();
     await v2Host(temp(), rpc.rpc).start();
     expect(await rpc.effortOf({ sessionID: "never-seen" })).toEqual({});
+  });
+
+  it("QA-4a: an OpenAI tier through the real plugin records reasoningEffort; its escalation override (reasoningEffort written, reasoning_effort deleted) too", async () => {
+    const dir = home(MIXED_PRESET);
+    const rpc = fakeRpc();
+    const host = v2Host(dir, rpc.rpc);
+    await host.start(await v2Plugin(dir));
+    const first = await host.turn("child-oa", "fast", GPT);
+    expect(first.options).toEqual({ maxTokens: 32_000, reasoningEffort: "low" }); // OpenAI: `reasoningEffort` (buildAgentOptions)
+    expect(await rpc.effortOf({ sessionID: "child-oa" })).toMatchObject({ effort: "low", providerID: "openai", modelID: "gpt-6", agent: "fast" });
+    const tiers = getActiveTiers(loadConfig(dir));
+    overrides.stores[0]!.set("child-oa", "fast", tiers.fast!, "high");
+    const bumped = await host.turn("child-oa", "fast", GPT, { maxTokens: 32_000, reasoning_effort: "low" });
+    expect(bumped.options).toEqual({ maxTokens: 32_000, reasoningEffort: "high" }); // the override deleted the alias
+    expect((await rpc.effortOf({ sessionID: "child-oa" })).effort).toBe("high");
+    await host.turn("child-other", "fast", GPT);
+    expect((await rpc.effortOf({ sessionID: "child-other" })).effort).toBe("low");
+  });
+
+  it("QA-4b/QA-5: an Anthropic thinking-budget tier through the real plugin records no effort but its thinkingBudget; a later turn clears it", async () => {
+    const dir = home(MIXED_PRESET);
+    const rpc = fakeRpc();
+    const host = v2Host(dir, rpc.rpc);
+    await host.start(await v2Plugin(dir));
+    const event = await host.turn("child-think", "medium", SONNET);
+    expect(event.options).toEqual({ maxTokens: 32_000, thinking: { type: "enabled", budgetTokens: 4000 } });
+    const found = await rpc.effortOf({ sessionID: "child-think" });
+    expect(found).toMatchObject({ thinkingBudget: 4000, agent: "medium", providerID: "anthropic", modelID: "claude-sonnet-4-5" });
+    expect("effort" in found).toBe(false);
+    await host.turn("child-think", "heavy", { providerID: "anthropic", id: "claude-opus-5-5" });
+    const after = await rpc.effortOf({ sessionID: "child-think" });
+    expect(after).toMatchObject({ effort: "xhigh", agent: "heavy" });
+    expect("thinkingBudget" in after).toBe(false);
+  });
+
+  it("QA-5: a budget_tokens alias in the tier options is recorded once normalised (as agentOptions sends it)", async () => {
+    home();
+    const rpc = fakeRpc();
+    const host = v2Host(temp(), rpc.rpc);
+    await host.start({ config: async (cfg: { agent: Record<string, unknown> }) => {
+      cfg.agent.fast = { mode: "subagent", options: { budget_tokens: 2048 } };
+    } });
+    const event = await host.turn("child", "fast", SONNET);
+    expect(event.options).toEqual({ maxTokens: 32_000, thinking: { type: "enabled", budgetTokens: 2048 } });
+    expect(await rpc.effortOf({ sessionID: "child" })).toMatchObject({ thinkingBudget: 2048, agent: "fast" });
+  });
+
+  it("QA-4c: a roles-mode turn that fails before chat.params clears the session's previous record; the hook still resolves (fail closed)", async () => {
+    const dir = home({ routing: { delegation: "roles" } });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rpc = fakeRpc();
+    const host = v2Host(dir, rpc.rpc);
+    host.sessions["child-role"] = { id: "child-role", parentID: "root", agent: "explorer", location: { directory: dir } };
+    await host.start();
+    const MODEL = { providerID: "anthropic", id: "claude-opus-5-5", variant: "high" };
+    await host.turn("child-role", "explorer", MODEL, { maxTokens: 64, reasoningEffort: "low" }, { read: {} });
+    expect(await rpc.effortOf({ sessionID: "child-role" })).toMatchObject({ effort: "low", variant: "high", agent: "explorer" });
+    host.ctx.agent.list.mockRejectedValueOnce(new Error("agents down")); // the protected-catalog step, before chat.params
+    const failed = await host.turn("child-role", "explorer", MODEL, { maxTokens: 64, reasoningEffort: "medium" }, { read: {}, grep: {} });
+    expect(failed.tools).toEqual({}); // the role's fail-closed path ran, as before
+    expect(await rpc.effortOf({ sessionID: "child-role" })).toEqual({});
+  });
+
+  it("QA-4c: a non-role turn that fails before recording still rejects as before, and clears the previous record", async () => {
+    home();
+    const rpc = fakeRpc();
+    const host = v2Host(temp(), rpc.rpc);
+    await host.start();
+    await host.turn("child", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    expect((await rpc.effortOf({ sessionID: "child" })).effort).toBe("high");
+    await expect(host.turn("child", "fast", undefined)).rejects.toThrow(TypeError); // no model: the hook body throws before chat.params
+    expect(await rpc.effortOf({ sessionID: "child" })).toEqual({});
+  });
+
+  it("QA-4c: a failure AFTER the turn was recorded keeps that record (it describes the request as the hook left it)", async () => {
+    home();
+    const rpc = fakeRpc();
+    const host = v2Host(temp(), rpc.rpc);
+    await host.start({ "experimental.chat.system.transform": async () => { throw new Error("system transform failed"); } });
+    await expect(host.turn("child", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" })).rejects.toThrow("system transform failed");
+    expect(await rpc.effortOf({ sessionID: "child" })).toMatchObject({ effort: "high", agent: "fast" });
+  });
+
+  it("QA-7: a turn whose session id is not a non-empty string is not recorded", async () => {
+    home();
+    const rpc = fakeRpc();
+    const host = v2Host(temp(), rpc.rpc);
+    await host.start();
+    const before = channel.records.length;
+    await host.turn(42, "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    await host.turn("", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    await host.turn(undefined, "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    expect(channel.records.length).toBe(before);
+    expect(await rpc.effortOf({ sessionID: "42" })).toEqual({});
+    expect(await rpc.effortOf({ sessionID: "undefined" })).toEqual({});
+  });
+
+  it("QA-8: session.deleted forgets the session (and only that one)", async () => {
+    home();
+    const rpc = fakeRpc();
+    const host = v2Host(temp(), rpc.rpc);
+    await host.start();
+    await host.turn("gone", "fast", GPT, { maxTokens: 1, reasoningEffort: "high" });
+    await host.turn("kept", "fast", GPT, { maxTokens: 1, reasoningEffort: "low" });
+    host.emit({ type: "session.deleted", data: { sessionID: "gone" } });
+    await vi.waitFor(async () => expect(await rpc.effortOf({ sessionID: "gone" })).toEqual({}));
+    expect(await rpc.effortOf({ sessionID: "kept" })).toMatchObject({ effort: "low" });
+  });
+
+  it("QA-9: with both keys on the request, a Claude turn records effort and any other turn reasoningEffort", async () => {
+    home();
+    const rpc = fakeRpc();
+    const host = v2Host(temp(), rpc.rpc);
+    await host.start();
+    const both = () => ({ maxTokens: 1, effort: "low", reasoningEffort: "high" });
+    await host.turn("claude", "build", { providerID: "anthropic", id: "claude-opus-5-5" }, both());
+    await host.turn("copilot", "build", { providerID: "github-copilot", id: "claude-sonnet-5" }, both());
+    await host.turn("gpt", "build", GPT, both());
+    expect((await rpc.effortOf({ sessionID: "claude" })).effort).toBe("low");
+    expect((await rpc.effortOf({ sessionID: "copilot" })).effort).toBe("low");
+    expect((await rpc.effortOf({ sessionID: "gpt" })).effort).toBe("high");
   });
 });
 
