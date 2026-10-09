@@ -41,11 +41,13 @@ export const ROLE_AGENT_ALIASES: Readonly<Record<string, string>> = Object.freez
  * The host `steps` limit of a role agent: the largest guard budget any dispatch of the role can
  * get (the role's top tier budget raised by a route-line `budget=` up to
  * {@link ROUTE_BUDGET_RAISE_MAX}×), plus {@link REFUSAL_CAP} refused calls the guard does not
- * charge, plus {@link ROLE_STEPS_MARGIN}.
+ * charge, plus {@link ROLE_STEPS_MARGIN}. QA-G-A3-6: the top budget is never below
+ * {@link TIER_GUARD_BUDGET}, the budget a tier the role has no budget for can get
+ * (`roleGuardProfile`'s fallback), so the guard still stops before the host's step limit.
  */
 export function roleAgentSteps(spec: Pick<RoleSpec, "budget">): number {
   const budgets = Object.values(spec.budget).map((n) => positiveBudget(n) ?? TIER_GUARD_BUDGET);
-  const top = budgets.length > 0 ? Math.max(...budgets) : TIER_GUARD_BUDGET;
+  const top = Math.max(budgets.length > 0 ? Math.max(...budgets) : TIER_GUARD_BUDGET, TIER_GUARD_BUDGET);
   return ROUTE_BUDGET_RAISE_MAX * top + REFUSAL_CAP + ROLE_STEPS_MARGIN;
 }
 

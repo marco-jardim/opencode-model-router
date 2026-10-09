@@ -300,6 +300,20 @@ describe("runSignal", () => {
     expect(runSignal(input([run("test", 0, T0 + 10)], [T0, Number.POSITIVE_INFINITY]))).toBeNull();
     expect(runSignal(input([run("test", 0, Number.NaN)], []))).toBeNull();
   });
+
+  it("QA-G-B-5: only the attempt's own runs count (`since` = its dispatch time); earlier edits are covered by them", () => {
+    // Attempt 1 ran the tests after its edit; attempt 2 (the same child, resumed at T0 + 100) ran nothing: no signal for it.
+    const runs = [run("test", 0, T0 + 1)];
+    expect(runSignal({ ...input(runs), since: T0 + 100 })).toBeNull();
+    expect(runSignal({ ...input(runs), since: T0 })).toEqual(obs("run", "pass", 1));
+    // Attempt 2's own run counts; attempt 1's edit before it does not hide it, attempt 2's own later edit does.
+    const resumed = [...runs, run("test", 0, T0 + 101)];
+    expect(runSignal({ ...input(resumed, [T0, T0 + 50]), since: T0 + 100 })).toEqual(obs("run", "pass", 1));
+    expect(runSignal({ ...input(resumed, [T0, T0 + 102]), since: T0 + 100 })).toBeNull();
+    // An earlier attempt's failing run never decides this one; an unknown start gives no signal at all.
+    expect(runSignal({ ...input([run("test", 1, T0 + 99), run("test", 0, T0 + 101)]), since: T0 + 100 })).toEqual(obs("run", "pass", 1));
+    for (const since of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) expect(runSignal({ ...input(runs), since })).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

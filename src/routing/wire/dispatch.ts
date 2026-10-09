@@ -61,7 +61,6 @@ import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type Dispat
 import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
 } from "../roles/binding";
-import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
@@ -259,8 +258,8 @@ export interface DispatchRouterDeps {
   readonly logger: WireLogger;
   readonly now?: () => number;
   /**
-   * #84 P2.1 (role dispatches only): stdout of `git worktree list --porcelain` run in `cwd` (the session directory). Default: `git`
-   * through `execFile` (5 s timeout). Injected by tests.
+   * #84 P2.1 (role dispatches only): stdout of `git worktree list --porcelain` run in `cwd` (the session directory). Default:
+   * {@link gitWorktreeList} (the hardened spawn, 5 s timeout). Injected by tests.
    */
   readonly listWorktrees?: (cwd: string) => Promise<string>;
   /** #84 P2.1: canonical long form of an existing path (default `realpathSync.native`). Only called on an already matched root. */

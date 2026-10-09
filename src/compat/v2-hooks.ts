@@ -17,7 +17,7 @@ import { pluginAgentMarker } from "../router/plugin-agents";
 import { registerRoleAgents, roleAgentAlias, roleAgentOf, roleAgentSteps } from "../router/role-agents";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
-import { GRADER_SYSTEM } from "../verify/checker";
+import { budgetClaimObserved, GRADER_SYSTEM } from "../verify/checker";
 import { EXECUTION_END_TYPES, FLUSH_EVENT_TYPES, NOOP_INGEST } from "../routing/outcomes/ingest";
 import type { Ingest } from "../routing/outcomes/ingest";
 import { createEngineRuntime } from "../routing/wire/runtime";
@@ -150,6 +150,39 @@ export function roleBudgetNotice(agent: string, childSessionID: string, cause: "
     + "do not start a new task and do not set `model` (the router keeps the child's tier).";
 }
 
+/**
+ * QA-G-A3-4: a `[router` that starts a line — after blanks and markdown quote, list or emphasis marks, any case, blanks allowed
+ * between `[` and `router`. The router's notes start a line with it; a child's text must not.
+ */
+const ROUTER_LINE_START = /^([ \t>*_#`-]*)\[(?=[ \t]*router\b)/gim;
+
+/** QA-G-A3-4: `text` with the `[` of every line-start `[router` turned into `(`; every other character kept. */
+export function defangRouterLines(text: string): string {
+  return text.replace(ROUTER_LINE_START, "$1(");
+}
+
+/**
+ * QA-G-A3-4: a role dispatch's result with the child's text defanged ({@link defangRouterLines}) in every place the parent reads
+ * it: the text parts of `content` (or a string `content`) and the structured `output` (a string, or its `output` string). Fields
+ * the result does not have stay absent.
+ */
+export function defangChildResult<R extends { readonly content?: unknown; readonly output?: unknown }>(result: R): R {
+  const part = (value: unknown): unknown => {
+    if (value === null || typeof value !== "object") return value;
+    const p = value as { type?: unknown; text?: unknown };
+    return p.type === "text" && typeof p.text === "string" ? { ...p, text: defangRouterLines(p.text) } : value;
+  };
+  const out: Record<string, unknown> = { ...result };
+  if (Array.isArray(result.content)) out.content = result.content.map(part);
+  else if (typeof result.content === "string") out.content = defangRouterLines(result.content);
+  const output = result.output;
+  if (typeof output === "string") out.output = defangRouterLines(output);
+  else if (output !== null && typeof output === "object" && typeof (output as { output?: unknown }).output === "string") {
+    out.output = { ...(output as Record<string, unknown>), output: defangRouterLines((output as { output: string }).output) };
+  }
+  return out as R;
+}
+
 // ---------------------------------------------------------------------------
 // #84 P2.1 (handoff 22): the host's own budget stops of a child, from the event stream (spike S4)
 // ---------------------------------------------------------------------------
@@ -183,6 +216,30 @@ export interface HostBudgetObserver {
   /** Resolves when the child's execution end was seen, or after `timeoutMs` (the event may trail the tool result). */
   settled(childSessionID: string, timeoutMs: number): Promise<void>;
   forget(sessionID: string): void;
+}
+
+/**
+ * QA-G-A3-2: a tool error that is a permission refusal — spike S4 (d): the tool hook sees `Permission.BlockedError` and the tool
+ * state `permission.rejected` (a plugin `evaluate` deny); the host's own refusal reads `Permission denied: <action>` and this
+ * adapter's `Permission denied by …`. Read from the error's tag, name, type and message, and those of its cause (two levels).
+ * The adapter's own `execute.before` refusals (`[router] Refused …`) are not one: they are counted where they are thrown.
+ */
+const PERMISSION_REFUSAL = /\bPermission\.?(?:Blocked|Denied|Rejected)\w*Error\b|\bpermission\.rejected\b|^Permission denied\b/i;
+
+export function isPermissionRefusal(error: unknown): boolean {
+  const parts: string[] = [];
+  const collect = (value: unknown, depth: number): void => {
+    if (typeof value === "string") {
+      parts.push(value);
+      return;
+    }
+    if (value === null || typeof value !== "object" || depth > 2) return;
+    const e = value as Record<string, unknown>;
+    for (const key of ["_tag", "name", "type", "message"]) if (typeof e[key] === "string") parts.push(e[key] as string);
+    for (const key of ["error", "cause", "data"]) collect(e[key], depth + 1);
+  };
+  collect(error, 0);
+  return parts.some((part) => PERMISSION_REFUSAL.test(part));
 }
 
 /** Q1 (P2.3 decision at the P2.1 call site): an authority request of a child whose binding is not exact is never applied. */
@@ -628,6 +685,12 @@ export async function registerV2Hooks(
     listWorktrees?: (cwd: string) => Promise<string>;
     /** Role-agent registration (roles mode): the repository's worktree roots for the `external_directory` allow rules. Default: `listWorktrees` (role-agents.ts, a real `git worktree list`). */
     listRegistrationWorktrees?: (directory: string) => Promise<string[]>;
+    /**
+     * QA-G-A3-2: the plugin's count of a role child's call refused outside its guard (index.ts `recordRoleRefusal`): the router's
+     * role-authority refusal here in `execute.before`, a host permission denial in `execute.after`. Returns the guard's text to
+     * add to the refusal (its denied_cap stop or advisory banner), or undefined. Absent: refusals are not counted.
+     */
+    recordRefusal?: (sessionID: string, agent: string | undefined, tool: string, args: unknown) => string | undefined;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -1405,9 +1468,15 @@ export async function registerV2Hooks(
       // grant and work root. This is the router check that fires for plugin tools and Code Mode `execute` (no `evaluate` does,
       // S8/S11); errors refuse (fail closed). QA-P23-A8: an event without an agent from a session the router knows as a role child
       // is refused outright.
+      // QA-G-A3-2: a refusal here is thrown before the legacy hook (and its guard) sees the call: the plugin counts it on the
+      // child's guard state, and the guard's stop (denied_cap) or advisory banner is added to the refusal the child sees.
+      const refused = (message: string, agent: string | undefined): Error => {
+        const guard = options.recordRefusal?.(String(event.sessionID), agent, event.tool, args);
+        return new Error(guard === undefined ? message : `${message}\n${guard}`);
+      };
       if (typeof event.agent !== "string" || event.agent === "") {
         const known = knownRoleSession(String(event.sessionID));
-        if (known !== undefined) throw new Error(`[router] Refused for role session ${String(event.sessionID)}: the calling agent is unknown (fail closed)`);
+        if (known !== undefined) throw refused(`[router] Refused for role session ${String(event.sessionID)}: the calling agent is unknown (fail closed)`, known);
       }
       const callerRole = roleAgentName(event.agent);
       if (callerRole !== undefined) {
@@ -1417,7 +1486,7 @@ export async function registerV2Hooks(
         } catch {
           refusal = "the router could not check this dispatch's authority (fail closed)";
         }
-        if (refusal !== undefined) throw new Error(`[router] Refused for role agent ${callerRole} in this dispatch: ${refusal}`);
+        if (refusal !== undefined) throw refused(`[router] Refused for role agent ${callerRole} in this dispatch: ${refusal}`, callerRole);
       }
       // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
       let roleForeground = false;
@@ -1554,7 +1623,9 @@ export async function registerV2Hooks(
         const snapshot = options.budgetSnapshot?.(child);
         // QA-P21-3-1: a reached read cap counts only with a `NEED MORE` return (a DONE at the cap is a finished task).
         const capStop = snapshot?.readCapReached === true && contract?.prefix === "need-more";
-        const stopped = snapshot === undefined ? budgetExhausted(child) : snapshot.stopped || capStop;
+        // QA-G-A3-1: in advisory mode the guard enforces no stop; a `NEED MORE: budget` return of a tracked child whose budget is
+        // used up is one all the same (the signals' rule), so the parent gets the resume guidance too.
+        const stopped = snapshot === undefined ? budgetExhausted(child) : snapshot.stopped || capStop || budgetClaimObserved(text, snapshot);
         if (stopped) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child));
         else if (hostBudget.observe(child, hostStepLimitOf(roles, agent)) === true) annotateSubagentResult("budget", child, roleBudgetNotice(agent, child, "host"));
         for (const annotation of takeSubagentAnnotations(child)) notices.push(annotation.text);
@@ -1590,6 +1661,12 @@ export async function registerV2Hooks(
       const banner = role?.notice === undefined ? depthBanner : depthBanner === undefined ? role.notice : `${depthBanner}\n\n${role.notice}`;
       depthBanners.delete(event.id);
       const verifying = verifyingCalls.delete(event.id);
+      // QA-G-A3-2: a role child's call the host refused on a permission (the agent's policy, or this adapter's `evaluate` deny) never
+      // ran and never reached the guard's after-hook: the plugin counts it like the guard's own refusals.
+      if (event.status === "error" && isPermissionRefusal(event.error)) {
+        const agent = roleAgentName(event.agent) ?? (typeof event.agent === "string" && event.agent !== "" ? undefined : knownRoleSession(String(event.sessionID)));
+        if (agent !== undefined) options.recordRefusal?.(String(event.sessionID), agent, event.tool, (event as { input?: unknown }).input);
+      }
       if (event.status !== "completed") return;
       if (event.tool === "grep" && protectedAgent(event.agent)) {
         const content = event.result.content;
@@ -1605,6 +1682,13 @@ export async function registerV2Hooks(
               && typeof entry.path === "string" && !isSensitivePath(entry.path);
           }) } : {}),
         };
+      }
+      // QA-G-A3-4 (§2.5): a role child's own text reaches the parent, and a line of it that starts with `[router` would pose as a
+      // router note (`[router budget] … resume …`, `[router ✓ verified: deterministic]`). Every such line start of the child's
+      // text is defanged to `(router` BEFORE the router reads the result and appends its own notes. Role dispatches only: a tier
+      // dispatch's result is untouched (I1); a running acknowledgement is the host's text, not the child's.
+      if (role !== undefined && event.tool === "subagent" && event.result.output?.status !== "running") {
+        event.result = defangChildResult(event.result);
       }
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That

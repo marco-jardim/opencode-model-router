@@ -167,6 +167,22 @@ describe("role budgets (§2.6)", () => {
     expect(roleGuardProfile(explorer, "toString").budget).toBe(TIER_GUARD_BUDGET);
     expect(roleGuardProfile(explorer, "heavy").cumulative).toBe(TIER_GUARD_BUDGET * GUARD_CUMULATIVE_MULTIPLIER);
   });
+
+  it("QA-G-A3-7: a tier above the role's ceiling gets max(the ceiling tier's role budget, the tier budget)", () => {
+    // The shipped explorer (fast..medium, 30/40) lifted onto heavy: never less than on its ceiling.
+    const explorer = { ...role("reader", { fast: 30, medium: 40 }), tierRange: { ceiling: "medium" } };
+    expect(roleGuardProfile(explorer, "heavy")).toEqual({ kind: "reader", budget: 40, cumulative: 120 });
+    expect(roleGuardProfile(explorer, "heavy", 70)).toEqual({ kind: "reader", budget: 70, cumulative: 210 });
+    expect(roleGuardProfile(explorer, "heavy", 500).budget).toBe(80);
+    // A ceiling budget below the tier budget: the tier budget.
+    const small = { ...role("producer", { fast: 10, medium: 12 }), tierRange: { ceiling: "medium" } };
+    expect(roleGuardProfile(small, "heavy").budget).toBe(TIER_GUARD_BUDGET);
+    // An invalid ceiling budget: the tier budget. The role's own tiers are unchanged.
+    const broken = { ...role("reader", { fast: 30, medium: 0 }), tierRange: { ceiling: "medium" } };
+    expect(roleGuardProfile(broken, "heavy").budget).toBe(TIER_GUARD_BUDGET);
+    expect(roleGuardProfile(explorer, "fast").budget).toBe(30);
+    expect(roleGuardProfile(explorer, "medium").budget).toBe(40);
+  });
 });
 
 // ---------------------------------------------------------------------------

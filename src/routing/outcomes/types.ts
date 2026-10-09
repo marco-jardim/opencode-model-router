@@ -391,7 +391,11 @@ export interface AttemptSignal {
   readonly step: LadderStepKind;
 }
 
-/** Lifetime raw counters (integers, never decayed). */
+/**
+ * Lifetime raw counters (integers, never decayed). QA-G-B N2: `pass`/`fail` (and `variantPass`/`variantFail`) count scored
+ * VERDICTS, one per attempt whatever its weight — an independent grader's 0.5 observation adds 1 here, as a deterministic
+ * verdict does. The evidence mass (0.5 vs 1) lives in `beta` only; read these as "how many verdicts", never as evidence.
+ */
 export interface OutcomeCounts {
   readonly pass: number;
   readonly fail: number;

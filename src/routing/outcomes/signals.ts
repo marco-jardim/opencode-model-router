@@ -292,27 +292,35 @@ export interface RunSignalInput {
   readonly edits: readonly number[];
   /** The dispatch's acceptance commands (`routing.run` names). Empty → no run signal. */
   readonly acceptance: readonly string[];
+  /**
+   * QA-G-B-5: epoch ms the attempt was dispatched (the parent's `task` call). Runs that started before it belong to an earlier
+   * attempt of the same child and never count for this one; edits before it are covered by any run of this attempt. Absent: no
+   * lower bound. A non-finite value makes the attempt's start unknown: no run signal.
+   */
+  readonly since?: number;
 }
 
 /**
- * Success weight 1 when edits were tracked, EVERY acceptance command has a run by the child that started strictly after
- * its last edit, and the latest such run of each exited 0. A run that started before (or at) the last edit does not
- * cover it. A failing run is no signal (the deterministic verdict owns failures).
+ * Success weight 1 when edits were tracked, EVERY acceptance command has a run by the child in this attempt (at or after
+ * `since`) that started strictly after its last edit, and the latest such run of each exited 0. A run that started before
+ * (or at) the last edit does not cover it. A failing run is no signal (the deterministic verdict owns failures).
  */
 export function runSignal(input: RunSignalInput): SignalObservation | null {
   if (input.editsObserved !== true) return null;
   const acceptance = [...new Set(input.acceptance)];
   if (acceptance.length === 0) return null;
+  if (input.since !== undefined && !Number.isFinite(input.since)) return null;
+  const since = input.since ?? Number.NEGATIVE_INFINITY;
   let lastEdit = Number.NEGATIVE_INFINITY;
   for (const t of input.edits) {
     if (!Number.isFinite(t)) return null;
-    if (t > lastEdit) lastEdit = t;
+    if (t >= since && t > lastEdit) lastEdit = t;
   }
   for (const script of acceptance) {
     let latest: RunRecord | null = null;
     let latestFailed = false;
     for (const run of input.runs) {
-      if (run.sessionID !== input.childSessionID || run.script !== script || !Number.isFinite(run.at) || run.at <= lastEdit) continue;
+      if (run.sessionID !== input.childSessionID || run.script !== script || !Number.isFinite(run.at) || run.at < since || run.at <= lastEdit) continue;
       if (latest === null || run.at > latest.at) {
         latest = run;
         latestFailed = run.exitCode !== 0;

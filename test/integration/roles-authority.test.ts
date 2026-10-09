@@ -19,9 +19,10 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import {
-  canonicalAuthorityPath, insideWorkRoot, listedWorktreeRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision,
+  canonicalAuthorityPath, insideWorkRoot, isPermissionRefusal, listedWorktreeRoot, patchPaths, registerV2Hooks, roleActionOf, roleAuthorityDecision,
   roleCatalogFailureNotice, roleToolKept, toolCallPaths, unsafeSearchPattern, HOST_TOOL_SUCCESS_EVENT,
 } from "../../src/compat/v2-hooks";
+import { budgetExhausted, captureBudget } from "../../src/guard/enforce";
 import { evaluatePermission } from "../../src/router/read-only";
 import { SHIPPED_ROLE_SPECS } from "../../src/router/roles";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
@@ -1353,6 +1354,107 @@ describe("P3.3 global QA round 1 (QA-G-B-2, QA-G-A1-2)", () => {
     };
     await v2.toolHooks["execute.after"]!(end);
     expect(resultText(end)).toContain(AUTHORITY_TEXT.dropped.otherParent);
+  });
+});
+
+describe("P3.3 global QA round 1 (fix-5): QA-G-A3-2", () => {
+  /** The real plugin with the v2 entry's wiring of the refusal count (src/v2.ts: `routerOnRefusal` → `recordRefusal`). */
+  async function wiredPlugin(directory: string) {
+    let recordRefusal: ((sessionID: string, agent: string | undefined, tool: string, args: unknown) => string | undefined) | undefined;
+    const hooks = await ModelRouterPlugin({
+      directory, worktree: directory, routerHost: "v2",
+      client: {
+        session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } }) },
+        app: { log: vi.fn(async () => ({})) },
+      },
+      routerOnRefusal: (record: NonNullable<typeof recordRefusal>) => { recordRefusal = record; },
+    } as unknown as RouterPluginInput) as Record<string, any>;
+    cleanups.push(async () => { await hooks.dispose?.(); });
+    expect(recordRefusal).toBeDefined();
+    return { hooks, recordRefusal: recordRefusal! };
+  }
+
+  /** A permission refusal as the host reports it to `execute.after` (spike S4 (d): `Permission.BlockedError`). */
+  const permissionDenied = (sessionID: string, agent: string, path: string, id: string) => ({
+    sessionID, agent, messageID: "m", id, tool: "read", input: { path }, status: "error",
+    error: { _tag: "Tool.Error", message: "Permission denied: external_directory", error: { _tag: "Permission.BlockedError" } },
+  });
+
+  it("role-authority refusals and permission denials count toward denied_cap, which stops the child (enforced)", async () => {
+    const { dir, cfg } = home(ROLES);
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", "1");
+    const { hooks, recordRefusal } = await wiredPlugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks, { recordRefusal });
+    await dispatch(v2, sessions, "q1", "gq", "explorer", "Look at the parser module and report its entry points", dir);
+    const budget = routedRoleOf("q1")!.budget;
+    // budget − REFUSAL_CAP granted reads through the adapter and the plugin's after-hook (each one charged)...
+    const granted = budget - 10;
+    for (let i = 0; i < granted; i++) {
+      const input = { path: join(dir, `f${i}.ts`) };
+      await toolCall(v2, "gq", "explorer", "read", input, `gq-r${i}`);
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: "gq", agent: "explorer", callID: `gq-r${i}`, args: input }, { title: "", output: "x", metadata: {} });
+    }
+    // ...then 9 calls the adapter refuses before the guard sees them (edit is outside the explorer's grant): counted, no stop yet
+    const refusal = async (i: number): Promise<string> => {
+      try {
+        await toolCall(v2, "gq", "explorer", "edit", { path: join(dir, "a.ts"), oldString: "a", newString: "b" }, `gq-e${i}`);
+      } catch (error) {
+        return String((error as Error).message);
+      }
+      throw new Error("the edit was not refused");
+    };
+    for (let i = 0; i < 9; i++) expect(await refusal(i)).not.toContain("DENIED:");
+    expect(budgetExhausted("gq")).toBe(false);
+    // ...and one host permission denial (execute.after with a permission error): the tenth refusal spends the cap
+    await v2.toolHooks["execute.after"]!(permissionDenied("gq", "explorer", join(temp("omr-g-out-"), "x.ts"), "gq-p1"));
+    expect(budgetExhausted("gq")).toBe(true);
+    expect(captureBudget("gq")).toMatchObject({ tracked: true, stopped: true, usedUp: true });
+    // the next refused call carries the guard's stop; a granted call is refused by the guard itself (denied_cap)
+    const stop = await refusal(9);
+    expect(stop).toContain("Refused for role agent explorer");
+    expect(stop).toContain("DENIED: 11 refused tool calls in this dispatch (limit 10).");
+    expect(stop).toContain("NEED MORE: budget");
+    await expect(hooks["tool.execute.before"]({ tool: "read", sessionID: "gq", agent: "explorer", callID: "gq-last" }, { args: { filePath: join(dir, "z.ts") } }))
+      .rejects.toThrow(/DENIED: 11 refused tool calls in this dispatch \(limit 10\)/);
+  });
+
+  it("advisory: refusals are counted (a NEED MORE: budget claim is then backed) and the banner rides on the refusal; off: nothing", async () => {
+    const { dir, cfg } = home(ROLES); // advisory (the shipped default)
+    const { hooks, recordRefusal } = await wiredPlugin(dir);
+    const sessions: Sessions = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks, { recordRefusal });
+    await dispatch(v2, sessions, "q2", "ga", "explorer", "Look at the parser module and report its entry points", dir);
+    const budget = routedRoleOf("q2")!.budget;
+    await toolCall(v2, "ga", "explorer", "read", { path: join(dir, "a.ts") }, "ga-r0"); // binds the child
+    let last = "";
+    for (let i = 0; i < budget; i++) {
+      try {
+        await toolCall(v2, "ga", "explorer", "edit", { path: join(dir, "a.ts"), oldString: "a", newString: "b" }, `ga-e${i}`);
+      } catch (error) {
+        last = String((error as Error).message);
+      }
+    }
+    expect(budgetExhausted("ga")).toBe(false); // advisory never stops
+    expect(captureBudget("ga")).toMatchObject({ tracked: true, stopped: false, usedUp: true });
+    expect(last).toContain("[\u26a0 GUARD:denied_cap]");
+    expect(last).toContain("NEXT: return `NEED MORE: budget`");
+    // enforcement off: no guard state, nothing counted
+    vi.stubEnv("MODEL_ROUTER_ENFORCE", "0");
+    expect(recordRefusal("ga-off", "explorer", "edit", {})).toBeUndefined();
+    expect(captureBudget("ga-off").tracked).toBe(false);
+  });
+
+  it("the permission-refusal check: tags, names, types and messages of the error and its cause; never the adapter's own refusal", () => {
+    expect(isPermissionRefusal({ _tag: "Tool.Error", message: "x", error: { _tag: "Permission.BlockedError" } })).toBe(true);
+    expect(isPermissionRefusal({ message: "Permission denied by role agent explorer for this dispatch: read" })).toBe(true);
+    expect(isPermissionRefusal({ type: "permission.rejected", message: "PROBE_SESSION_DENIED: read" })).toBe(true);
+    expect(isPermissionRefusal(new Error("Permission denied: external_directory"))).toBe(true);
+    expect(isPermissionRefusal({ message: "[router] Refused for role agent explorer in this dispatch: edit is not in this dispatch's grant" })).toBe(false);
+    expect(isPermissionRefusal({ _tag: "Tool.Error", message: "file not found", error: new Error("ENOENT") })).toBe(false);
+    expect(isPermissionRefusal(undefined)).toBe(false);
   });
 });
 

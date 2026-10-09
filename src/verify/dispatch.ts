@@ -20,6 +20,7 @@ import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
+import { oneLineReason } from "../routing/roles/authority";
 
 export interface TreeSnapshot {
   cwd: string;
@@ -593,6 +594,22 @@ export function shouldVerifyTask(
   return true;
 }
 
+/** QA-G-A3-5: the most reasons (caveats, notes) one rendered list shows; the rest are counted in one closing line. */
+export const RENDERED_REASONS_MAX = 20;
+
+/**
+ * QA-G-A3-5: a list of reasons as `- ` lines: each one line of at most 500 characters (`oneLineReason`, the line rule of
+ * authority.ts `cleanReason`; a grader reason can carry line breaks, and a line of its own could pose as a router note), directive
+ * keys without their colons (QA-2.4-6), at most {@link RENDERED_REASONS_MAX} lines plus a count of the rest. A list of at most that
+ * many one-line reasons within the cap renders as before.
+ */
+function reasonLines(reasons: readonly string[]): string {
+  const shown = reasons.slice(0, RENDERED_REASONS_MAX).map((r) => `- ${neutralizeDirectives(oneLineReason(r))}`);
+  const rest = reasons.length - shown.length;
+  if (rest > 0) shown.push(`- (${rest} more not shown)`);
+  return shown.join("\n");
+}
+
 /**
  * Build the advisory forcing note appended to a task result the gate did not accept.
  *
@@ -606,7 +623,7 @@ export function buildForcingNote(
 ): string {
   const body =
     reasons.length > 0
-      ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
+      ? reasonLines(reasons)
       : "- (no reasons provided)";
   // §2.9 E8 / I7: a progress note or a budget stop is incomplete, not a failed result.
   // QA-P15-2-4: the verdict's structured flag (`incomplete`); a caller that cannot
@@ -651,6 +668,6 @@ export function buildAcceptedSuffix(
   const verified = outcome === "pass" && caveats.length === 0;
   const label = verified ? `[router \u2713 verified: ${method}]` : `[router \u26a0 UNVERIFIED: ${method}]`;
   return `\n\n${label}` + (caveats.length
-    ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${caveats.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}`
-    : "") + (notes.length ? `\nVerification notes:\n${notes.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}` : "");
+    ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${reasonLines(caveats)}`
+    : "") + (notes.length ? `\nVerification notes:\n${reasonLines(notes)}` : "");
 }

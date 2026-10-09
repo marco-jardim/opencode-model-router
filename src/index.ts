@@ -78,7 +78,7 @@ import { roleTierOrder } from "./routing/engine/ladders";
 import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
 import type { IngestSettings } from "./routing/outcomes/ingest";
 import { captureBudget } from "./guard/enforce";
-import { isIncompleteVerdict } from "./verify/checker";
+import { budgetClaimObserved, isIncompleteVerdict } from "./verify/checker";
 import { lookupDispatch } from "./router/sessions";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
@@ -122,7 +122,7 @@ import type { Cap, SubagentState } from "./router/sessions";
 import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
-import { guardBeforeCall, guardAfterCall, formatScorecard } from "./guard/enforce";
+import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
@@ -568,13 +568,46 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const grant = currentBinding(sessionID, { maxOf: roleMaxOf })?.grant;
     return grant !== undefined && grant.actions.has(action) ? answer : { role: true, root: null };
   };
+  /** What a routed role dispatch decided for its child's guard (QA-G-A3-3): the dispatched tier and the route line's `budget=`. */
+  interface RoutedGuardInput { readonly agent: string; readonly tier: string; readonly routeBudget: number | null }
   /**
-   * Handoff 27: the guard profile of a role child — the role's budget for the tier it runs on (the dispatch registry's tier, else
-   * the role's floor, which is its registered fallback model, P-1), raised by the dispatch's `budget=` (the bound dispatch budget).
+   * QA-G-B-5 / QA-G-A3-3: each routed role dispatch this instance noted, by the parent's call — when it was dispatched (the
+   * attempt's start, for the `run` signal) and its routed guard input. Bounded, oldest out.
+   */
+  const roleAttempts = new Map<string, RoutedGuardInput & { readonly at: number }>();
+  /** QA-G-A3-3: the routed guard input of each role child — its latest routed dispatch or resume (a resume replaces it). */
+  const roleChildGuards = new Map<string, RoutedGuardInput>();
+  const setBounded = <T>(map: Map<string, T>, key: string, value: T): void => {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > ROLE_STATE_MAX) map.delete(map.keys().next().value!);
+  };
+  /**
+   * QA-G-A3-3: the routed guard input of a role child. A resume set it in `noteRoleDispatch`; a fresh child takes its dispatch's
+   * once it is bound EXACTLY (its binding names the parent's call). Undefined when no routed decision is known for it.
+   */
+  const routedGuardOf = (sessionID: string): RoutedGuardInput | undefined => {
+    const known = roleChildGuards.get(sessionID);
+    if (known !== undefined) return known;
+    const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+    const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
+    const attempt = callID === undefined ? undefined : roleAttempts.get(callID);
+    if (attempt === undefined) return undefined;
+    const routed: RoutedGuardInput = { agent: attempt.agent, tier: attempt.tier, routeBudget: attempt.routeBudget };
+    setBounded(roleChildGuards, sessionID, routed);
+    return routed;
+  };
+  /**
+   * Handoff 27: the guard profile of a role child — the role's budget for the tier it runs on, raised by the dispatch's `budget=`.
+   * QA-G-A3-3: both come from the ROUTED decision of the child's current dispatch (a resume's own tier and `budget=`); only a child
+   * without one (a delegate's unbound child, another instance's) falls back to the dispatch registry's tier (else the role's floor,
+   * its registered fallback model, P-1) and the bound dispatch budget.
    */
   const roleGuardProfileOf = (sessionID: unknown, agent: unknown): GuardProfile | undefined => {
     const spec = roleSpecOf(agent) ?? roleOfSession(sessionID);
     if (spec === undefined || typeof sessionID !== "string") return undefined;
+    const routed = routedGuardOf(sessionID);
+    if (routed !== undefined && routed.agent === spec.agent) return roleGuardProfile(spec, routed.tier, routed.routeBudget);
     const record = lookupDispatch(sessionID);
     const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
     return roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
@@ -736,6 +769,37 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /** QA-P21-1-3: the budget snapshot of a role child as the signals AND the adapter's budget notice read it (guard + read cap). */
   const roleBudgetSnapshot = (childSessionID: string) => captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
   (ctx as RouterPluginInput & { routerOnBudgetSnapshot?: (read: typeof roleBudgetSnapshot) => void }).routerOnBudgetSnapshot?.(roleBudgetSnapshot);
+  /**
+   * QA-G-A3-2 (§2.9 E6, R7 REFUSAL_CAP): a role child's call refused where the guard's before-hook never sees it — the v2
+   * adapter's role-authority check (thrown in its `execute.before`, before this plugin's hook) and host permission denials (its
+   * `execute.after` with a permission error) — counted on the child's guard state like the guard's own refusals, so `denied_cap`
+   * stops a child that keeps retrying refused actions. Returns the guard's text for the refusal (its stop, or the advisory
+   * banner), or undefined. Role children only; nothing while bypassed or when enforcement is off. Never throws.
+   */
+  const recordRoleRefusal = (sessionID: string, agent: string | undefined, tool: string, args: unknown): string | undefined => {
+    try {
+      if (bypassed) return undefined;
+      // A child whose first calls are all refused never reached the before-hook that marks it: as there, from its own agent.
+      if (rememberRoleSession(sessionID, agent)) sessionStore.markChildSession(sessionID);
+      if (roleOfSession(sessionID) === undefined || !sessionStore.isSubagent(sessionID)) return undefined;
+      const profile = roleGuardProfileOf(sessionID, agent);
+      return guardRefusedCall({
+        cfg,
+        tier: sessionStore.getTier(sessionID),
+        trivial: sessionStore.isTrivial(sessionID),
+        cap: sessionStore.getCap(sessionID),
+        sessionID,
+        tool,
+        toolArgs: args,
+        store: guardStore,
+        env: process.env,
+        ...(profile === undefined ? {} : { profile }),
+      });
+    } catch {
+      return undefined; // never break a real session on a guard-internal error
+    }
+  };
+  (ctx as RouterPluginInput & { routerOnRefusal?: (record: typeof recordRoleRefusal) => void }).routerOnRefusal?.(recordRoleRefusal);
   /** #84 P2.1 (handoff 22): the v2 adapter's host-side budget observation of a role child (step limit, context overflow). */
   const hostBudgetOf = (ctx as RouterPluginInput & {
     routerHostBudget?: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation | undefined;
@@ -1105,6 +1169,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const noteRoleDispatch = (callID: string, parentSessionID: string, args: Record<string, unknown>): void => {
     const routed = routedRoleOf(callID);
     if (routed === undefined || routed.parentSessionID !== parentSessionID) return;
+    // QA-G-B-5: the attempt starts now. QA-G-A3-3: the routed tier and `budget=` guard its child — a resume's at once (its new
+    // guard round takes them), a fresh child's once it binds to this call.
+    const guard: RoutedGuardInput = { agent: routed.agent, tier: routed.tier, routeBudget: routed.routeBudget };
+    setBounded(roleAttempts, callID, { ...guard, at: Date.now() });
+    if (routed.resumeID !== null) setBounded(roleChildGuards, routed.resumeID, guard);
     if (routed.resumeID !== null) guardStore.beginDispatch(routed.resumeID);
     // QA-P21-2-3: the dispatch's own read-only cap. A resume names its child: registered now; a fresh child when it binds.
     // QA-P21-3-1: every routed resume starts a new round of the child's read counter (the previous cap kept unless it names one),
@@ -1137,8 +1206,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
   /**
    * The parent's `task` call of a role child returned (P1.4, handoffs 15-17, 23): the return signal with the REAL guard state
-   * (budget: the guard's enforced stop, `unobserved` when the guard never tracked the child; authority: the child's recorded
-   * request for this call), the router-observed run signal, and the dispatch text's end state for later re-dispatch checks.
+   * (budget: the guard's enforced stop, or a `NEED MORE: budget` return the guard backs — QA-G-A3-1; `unobserved` when the guard
+   * never tracked the child; authority: the child's recorded request for this call), the router-observed run signal of THIS
+   * attempt (QA-G-B-5), and the dispatch text's end state for later re-dispatch checks.
    * Verdict rows stay with `onVerdict`.
    */
   const observeRoleReturn = (callID: string, args: Record<string, unknown>, output: unknown): void => {
@@ -1150,9 +1220,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // child says so (`NEED MORE`, as the gate's claim check): a `DONE` or an unrelated `ESCALATE` at the cap is not one.
     const snapshot = roleBudgetSnapshot(childSessionID);
     const capStop = snapshot.readCapReached === true && parseReturnPrefix(finalReturnText)?.prefix === "need-more";
+    // QA-G-A3-1 (I7): advisory mode (the default) never enforces a stop; a `NEED MORE: budget` return of a tracked child whose
+    // budget or refusals are used up is a budget stop all the same — the gate's rule for honouring the claim (claimHonoured).
+    const claimStop = budgetClaimObserved(finalReturnText, snapshot);
     // Handoff 22: the guard's stop folded with the host's own (step limit, context overflow), as the v2 adapter observed them.
     const budgetObserved = foldBudgetObservation(
-      capStop ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
+      capStop || claimStop ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
       hostBudgetOf?.(childSessionID, roleAgentSteps(spec)),
     );
     const request = requestedAuthority(childSessionID);
@@ -1166,6 +1239,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       editsObserved: !roleBypassedCalls.has(childSessionID),
       edits: roleEdits.get(childSessionID) ?? [],
       acceptance: acceptanceScripts(args.prompt, args.description),
+      // QA-G-B-5: only this attempt's runs count (an earlier attempt's run of the same child is that attempt's evidence). An
+      // attempt this instance did not note has no known start: NaN, so it gets no run signal (I6: never unscoped evidence).
+      since: roleAttempts.get(callID)?.at ?? Number.NaN,
     });
     if (run !== null) ingest?.onSignal?.(childSessionID, run);
     const sent = roleDispatchTexts.get(callID);
@@ -1187,6 +1263,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roleRuns.delete(sessionID);
     roleEdits.delete(sessionID);
     roleBypassedCalls.delete(sessionID);
+    roleChildGuards.delete(sessionID);
     for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
   };
   return {

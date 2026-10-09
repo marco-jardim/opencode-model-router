@@ -237,7 +237,16 @@ export function cleanReason(reason: string): string {
   let text = reason;
   for (const pattern of CONTROL_TOKENS) text = text.replace(pattern, "(removed)");
   text = text.replaceAll("[", "(").replaceAll("]", ")").replace(/\s+/g, " ").trim();
-  return text.replace(RETURN_PREFIX, "").trim().slice(0, REASON_CHARS);
+  return oneLineReason(text.replace(RETURN_PREFIX, ""));
+}
+
+/**
+ * {@link cleanReason}'s line rule alone (QA-G-A3-5): every whitespace run — line breaks included — as one space, trimmed, at
+ * most 500 characters. For text that must stay one line of a router list (grader reasons, verification reasons) but keeps
+ * its own characters (`[REDACTED]`, `a[0]`). A one-line text within the cap and without doubled or edge whitespace is unchanged.
+ */
+export function oneLineReason(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, REASON_CHARS);
 }
 
 /** Presents a child-supplied text inside router-framed text as quoted data, never as instructions. */

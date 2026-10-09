@@ -1014,7 +1014,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     // a floor above the role's ceiling: the role has no budget for that tier → the tier agents' budget
     const explorer = SHIPPED_ROLE_SPECS.find((spec) => spec.agent === "explorer")!;
     expect(Object.hasOwn(explorer.budget, "heavy")).toBe(false);
-    expect(roleGuardProfile(explorer, "heavy").budget).toBe(TIER_GUARD_BUDGET);
+    // QA-G-A3-7: max(the ceiling tier's role budget, the tier agents' budget) — the explorer's medium budget (40) here.
+    expect(roleGuardProfile(explorer, "heavy").budget).toBe(Math.max(explorer.budget[explorer.tierRange.ceiling]!, TIER_GUARD_BUDGET));
     expect(flat).toContain(`the dispatch gets the tier agents' ${TIER_GUARD_BUDGET} calls`);
     expect(flat).toContain("has a read-only call cap only when it carries `CAP:N` or `CAP:none`");
   });
