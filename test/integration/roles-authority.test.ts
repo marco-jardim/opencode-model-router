@@ -1567,10 +1567,24 @@ describe("P3.3 global QA round 1 (fix-5): QA-G-A3-2", () => {
     expect(isPermissionRefusal({ _tag: "Tool.Error", message: "x", error: { _tag: "Permission.BlockedError" } })).toBe(true);
     expect(isPermissionRefusal({ message: "Permission denied by role agent explorer for this dispatch: read" })).toBe(true);
     expect(isPermissionRefusal({ type: "permission.rejected", message: "PROBE_SESSION_DENIED: read" })).toBe(true);
-    expect(isPermissionRefusal(new Error("Permission denied: external_directory"))).toBe(true);
+    // QA-G-A3-2-4: free text alone is no refusal; the host's refusal counts by its structured tag
+    expect(isPermissionRefusal(new Error("Permission denied: external_directory"))).toBe(false);
+    expect(isPermissionRefusal(Object.assign(new Error("Permission denied: external_directory"), { name: "Permission.DeniedError" }))).toBe(true);
     expect(isPermissionRefusal({ message: "[router] Refused for role agent explorer in this dispatch: edit is not in this dispatch's grant" })).toBe(false);
     expect(isPermissionRefusal({ _tag: "Tool.Error", message: "file not found", error: new Error("ENOENT") })).toBe(false);
     expect(isPermissionRefusal(undefined)).toBe(false);
+  });
+
+  it("QA-G-A3-2-4: an ordinary OS permission error is no refusal — only the structured tags and the router's own text count", () => {
+    // ripgrep (the host's grep) and other tools report an unreadable file like this: a failed call, not a refusal of the child
+    for (const error of [
+      { _tag: "Tool.Error", message: "Permission denied (os error 13)" },
+      new Error("Permission denied (os error 13)"),
+      { _tag: "Tool.Error", message: "x", error: new Error("permission denied, open '/srv/secret'") },
+      { message: "Permission denied: external_directory" }, // no tag: not known to be a permission refusal
+    ]) expect(isPermissionRefusal(error), JSON.stringify(String((error as { message?: unknown }).message))).toBe(false);
+    expect(isPermissionRefusal({ _tag: "Tool.Error", message: "Permission denied: external_directory", error: { _tag: "Permission.DeniedError" } })).toBe(true);
+    expect(isPermissionRefusal({ message: "Permission denied by plugin agent r-deny: external_directory" })).toBe(true);
   });
 });
 

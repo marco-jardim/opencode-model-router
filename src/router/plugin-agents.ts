@@ -1,6 +1,6 @@
 import type { Preset, TierConfig } from "./config";
 import {
-  legacyReadOnlyTools, mergePermissions, permissionMatches, permissionRules, readOnlyPermissions,
+  evaluatePermission, legacyReadOnlyTools, mergePermissions, permissionMatches, permissionRules, readOnlyPermissions,
   type PermissionEffect, type PermissionMap, type PermissionRule,
 } from "./read-only";
 import { SENSITIVE_PERMISSION_EXCEPTIONS, SENSITIVE_PERMISSION_GLOBS } from "./sensitive-paths";
@@ -55,7 +55,9 @@ export const RESERVED_AGENT_NAMES: readonly string[] = [
  * Actions a plugin agent's `allowTools` may never match. Shell, edits, code execution and delegation
  * are what makes an agent read-only or not; `read` carries the sensitive-path asks. They belong in
  * `permission`. `multiedit`/`apply_patch` are edit tools (the v1 host maps legacy edit tools to the
- * `edit` permission); `execute` is Code Mode; `delegate` is the router's delegation tool.
+ * `edit` permission); `execute` is Code Mode; `delegate` is the router's delegation tool. On v2 a
+ * `permission` key naming an edit tool only narrows it and `edit` decides; a key that allows what
+ * `edit` denies gets a config notice ({@link editToolKeyNotices}, QA-G-A2-2 round 2).
  */
 export const POLICY_ACTIONS: readonly string[] = [
   "shell", "bash", "edit", "write", "patch", "multiedit", "apply_patch", "execute", "subagent", "task", "delegate", "read",
@@ -232,10 +234,41 @@ export function sanitizePluginAgents(
   const agents: Record<string, PluginAgentConfig> = {};
   for (const [name, entry] of Object.entries(raw)) {
     const checked = validatePluginAgent(name, entry, ctx);
-    if (checked.ok) agents[name] = checked.value;
-    else issues.push({ ...checked.issue, name });
+    if (checked.ok) {
+      agents[name] = checked.value;
+      issues.push(...editToolKeyNotices(name, checked.value));
+    } else {
+      issues.push({ ...checked.issue, name });
+    }
   }
   return { agents, issues };
+}
+
+/** The host edit tools whose permission the OpenCode v2 host checks as `edit`. */
+const EDIT_TOOL_KEYS: readonly string[] = ["write", "patch", "multiedit", "apply_patch"];
+
+/**
+ * QA-G-A2-2 (round 2, nit 2): notices (the agent is kept) for `permission` keys that name an edit tool (`write`, `patch`,
+ * `multiedit`, `apply_patch`, or a pattern matching one but not `edit` itself) and allow or ask for a resource the agent's
+ * own `edit` rules deny. On OpenCode v2 the host checks `edit` for these tools, and the router's catalog filter keeps one
+ * only when `edit` is not denied: such a key can only narrow (a deny of the tool's own name removes it), never grant.
+ */
+function editToolKeyNotices(name: string, entry: PluginAgentConfig): PluginAgentIssue[] {
+  if (entry.permission === undefined) return [];
+  const rules = permissionRules(pluginAgentPolicy(entry, { context7: false, host: "v2" }).permission);
+  const notices: PluginAgentIssue[] = [];
+  for (const [key, rule] of Object.entries(entry.permission)) {
+    if (permissionMatches("edit", key) || !EDIT_TOOL_KEYS.some((tool) => permissionMatches(tool, key))) continue;
+    const grants = typeof rule === "string" ? [["*", rule] as const] : Object.entries(rule);
+    const dropped = grants.some(([resource, effect]) => effect !== "deny" && evaluatePermission(rules, "edit", resource) === "deny");
+    if (!dropped) continue;
+    notices.push({
+      name, path: `agents.${name}.permission.${key}`,
+      message: "on OpenCode v2 the host checks `edit` for these tools: this key can only narrow them (a deny removes the tool), "
+        + "`edit` decides; it allows or asks for something the agent's `edit` rules deny, so the tool is not offered there. Grant `edit` instead",
+    });
+  }
+  return notices;
 }
 
 /**

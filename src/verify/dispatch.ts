@@ -20,7 +20,6 @@ import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
-import { oneLineReason } from "../routing/roles/authority";
 
 export interface TreeSnapshot {
   cwd: string;
@@ -597,14 +596,38 @@ export function shouldVerifyTask(
 /** QA-G-A3-5: the most reasons (caveats, notes) one rendered list shows; the rest are counted in one closing line. */
 export const RENDERED_REASONS_MAX = 20;
 
+/** QA-G-A3-2-1: one line break of any kind. */
+const LINE_BREAK = /\r\n|[\r\n\u000b\u000c\u0085\u2028\u2029]/;
+
 /**
- * QA-G-A3-5: a list of reasons as `- ` lines: each one line of at most 500 characters (`oneLineReason`, the line rule of
- * authority.ts `cleanReason`; a grader reason can carry line breaks, and a line of its own could pose as a router note), directive
- * keys without their colons (QA-2.4-6), at most {@link RENDERED_REASONS_MAX} lines plus a count of the rest. A list of at most that
- * many one-line reasons within the cap renders as before.
+ * QA-G-A3-2-1: `text` on one line — every line break, with the blanks (space, tab) around it, becomes one space, and a run of
+ * breaks (blank lines) one space too; every other character is kept. A text without a line break is returned as it is. Linear
+ * (no backtracking regex on producer-derived text).
+ */
+function joinLines(text: string): string {
+  const parts = text.split(LINE_BREAK);
+  if (parts.length === 1) return text;
+  const blank = (c: string | undefined): boolean => c === " " || c === "\t";
+  const kept: string[] = [];
+  parts.forEach((part, i) => {
+    let start = 0;
+    let end = part.length;
+    if (i > 0) while (start < end && blank(part[start])) start++;
+    if (i < parts.length - 1) while (end > start && blank(part[end - 1])) end--;
+    if (end > start) kept.push(part.slice(start, end));
+  });
+  return kept.join(" ");
+}
+
+/**
+ * QA-G-A3-5 / QA-G-A3-2-1: a list of reasons as `- ` lines: each reason on ONE line — its line breaks (with the blanks around them)
+ * joined into one space, since a line of its own could pose as a router note — and nothing else changed: the router's own reasons
+ * (baseline.ts failure-id lists, "suite is NOT green") are never cut; a grader's text was already cut to 500 characters where it
+ * entered the verdict (checker.ts `graderReasons`). Directive keys lose their colons (QA-2.4-6); at most
+ * {@link RENDERED_REASONS_MAX} lines plus a count of the rest. A list of at most that many one-line reasons renders as before.
  */
 function reasonLines(reasons: readonly string[]): string {
-  const shown = reasons.slice(0, RENDERED_REASONS_MAX).map((r) => `- ${neutralizeDirectives(oneLineReason(r))}`);
+  const shown = reasons.slice(0, RENDERED_REASONS_MAX).map((r) => `- ${neutralizeDirectives(joinLines(r))}`);
   const rest = reasons.length - shown.length;
   if (rest > 0) shown.push(`- (${rest} more not shown)`);
   return shown.join("\n");

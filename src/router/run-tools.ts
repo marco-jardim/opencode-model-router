@@ -217,13 +217,36 @@ function networkShare(path: string, platform: NodeJS.Platform): string | undefin
 }
 
 /**
+ * QA-G-A2 round 2 (nit 1): may a LOCAL cwd that differs from the root as text be resolved?
+ * Never with a `..` segment. POSIX: only at or below the parent directory of the bound root or
+ * of its real path (elsewhere, an automounter path such as `/net/<host>/…` would make realpath
+ * contact that host). win32: only on the drive of the bound root or of its real path (another
+ * drive may be a mapped network drive); the same-drive rule keeps junction and 8.3 spellings.
+ */
+function resolvableNearRoot(cwd: string, bound: string, root: string, platform: NodeJS.Platform): boolean {
+  const sep = platform === "win32" ? "\\" : "/";
+  const text = pathText(cwd, platform);
+  if (text.split(sep).includes("..")) return false;
+  if (platform === "win32") {
+    const drive = (path: string) => (/^[a-z]:/.test(path) ? path.slice(0, 2) : undefined);
+    const own = drive(text);
+    return own !== undefined && [bound, root].some(base => drive(pathText(base, platform)) === own);
+  }
+  return [bound, root].some(base => {
+    const parent = pathText(posix.dirname(base), platform);
+    return text === parent || text.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
+  });
+}
+
+/**
  * The canonical work root a call may run in (P-10, I9): the session must be bound, and
  * `cwd` must name the same directory as the bound root, case-insensitively on win32.
  * QA-G-A2-1: the cwd is first compared as TEXT with the bound root and its real path; only
  * when that fails is it resolved (realpathSync.native: links, junctions and 8.3 names
  * expanded). A network or device cwd (`\\host\share\…`, `//host/…`, `\\?\…`, `\\.\…`) is
  * never resolved unless the bound root itself lies on that same `\\host\share`: no
- * filesystem call reaches a host the work root is not on.
+ * filesystem call reaches a host the work root is not on. A local cwd is resolved only near
+ * the root ({@link resolvableNearRoot}: POSIX below the root's parent, win32 on its drive).
  */
 export function authorizeCwd(bound: unknown, cwd: unknown, platform: NodeJS.Platform = process.platform): string {
   if (typeof bound !== "string" || bound === "") throw refuse("this session has no bound work root (I9); router_run only runs in a dispatch's work root");
@@ -237,6 +260,7 @@ export function authorizeCwd(bound: unknown, cwd: unknown, platform: NodeJS.Plat
   if (share !== undefined && (share === "device" || (share !== networkShare(bound, platform) && share !== networkShare(root, platform)))) {
     throw refuse(`cwd is not this dispatch's work root (${root})`);
   }
+  if (share === undefined && !resolvableNearRoot(cwd, bound, root, platform)) throw refuse(`cwd is not this dispatch's work root (${root})`);
   const real = nativeRealpath(cwd);
   if (real === undefined || !samePath(real, root, platform)) throw refuse(`cwd is not this dispatch's work root (${root})`);
   return root;

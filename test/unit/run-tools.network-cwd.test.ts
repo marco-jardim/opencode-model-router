@@ -11,6 +11,10 @@ import { authorizeCwd, isCredentialEnv, runEnvironment } from "../../src/router/
 
 /** Fake UNC directories: their "real path" (realpathSync.native) and that they are directories (statSync). */
 const fakeUnc = new Map<string, string>();
+/** Fake local directories (POSIX paths, other drives), by exact spelling: their real path; never recorded as remote. */
+const fakeLocal = new Map<string, string>();
+/** The fake local paths realpath was asked for. */
+const resolved: string[] = [];
 /** Every fs call whose first argument looks like a network or device path, or names the attacker host. */
 const touched: string[] = [];
 
@@ -27,16 +31,26 @@ vi.mock("node:fs", async importOriginal => {
       }
       return original(path, ...rest);
     }) as F;
-  const native = guard("realpath", actual.realpathSync.native, path => {
+  const guardedNative = guard("realpath", actual.realpathSync.native, path => {
     const real = fakeUnc.get(path.toLowerCase());
     if (real === undefined) throw enoent(path);
     return real;
   });
+  const native = (path: unknown, ...rest: unknown[]) => {
+    if (typeof path === "string" && fakeLocal.has(path)) {
+      resolved.push(path);
+      return fakeLocal.get(path);
+    }
+    return (guardedNative as (...args: unknown[]) => unknown)(path, ...rest);
+  };
   const realpathSync = Object.assign(guard("realpath", actual.realpathSync), { native });
-  const statSync = guard("stat", actual.statSync, path => {
+  const guardedStat = guard("stat", actual.statSync, path => {
     if (![...fakeUnc.values()].some(real => real.toLowerCase() === path.toLowerCase())) throw enoent(path);
     return { isDirectory: () => true, isFile: () => false };
   });
+  const statSync = (path: unknown, ...rest: unknown[]) => typeof path === "string" && [...fakeLocal.values()].includes(path)
+    ? { isDirectory: () => true, isFile: () => false }
+    : (guardedStat as (...args: unknown[]) => unknown)(path, ...rest);
   const lstatSync = guard("lstat", actual.lstatSync);
   const existsSync = guard("exists", actual.existsSync, () => false);
   const openSync = guard("open", actual.openSync);
@@ -50,11 +64,14 @@ let root: string;
 beforeEach(() => {
   root = realpathSync.native(mkdtempSync(join(tmpdir(), "router-run-cwd-")));
   touched.length = 0;
+  resolved.length = 0;
   fakeUnc.clear();
+  fakeLocal.clear();
 });
 afterEach(() => {
   rmSync(root, RM);
   fakeUnc.clear();
+  fakeLocal.clear();
 });
 
 const refusal = (bound: string, cwd: string, platform: NodeJS.Platform = "win32"): string => {
@@ -108,6 +125,31 @@ describe("QA-G-A2-1: router_run's cwd never reaches a network host", () => {
     expect(authorizeCwd(root, root)).toBe(root);
     expect(refusal(root, join(root, "missing"), process.platform)).toMatch(/cwd is not this dispatch's work root/);
     expect(refusal(root, "relative", process.platform)).toMatch(/cwd must be the absolute path/);
+  });
+});
+
+describe("QA-G-A2 round 2, nit 1: a cwd that differs from the root as text is resolved only near the root", () => {
+  it("POSIX: a cwd outside the root's parent directory (an automounter path such as /net/<host>/…) or with `..` is refused unresolved", () => {
+    fakeLocal.set("/srv/work/root", "/srv/work/root");
+    fakeLocal.set("/srv/work/alias", "/srv/work/root"); // e.g. a link beside the root
+    for (const cwd of ["/net/attacker/export/root", "/home/attacker/root", "/srv/work/root/../../../net/attacker/x"]) {
+      expect(refusal("/srv/work/root", cwd, "linux"), cwd).toMatch(/cwd is not this dispatch's work root/);
+    }
+    expect(touched).toEqual([]);
+    // Below the root's parent directory a cwd is still resolved (links keep working).
+    expect(refusal("/srv/work/root", "/srv/work/alias", "linux")).toBe("accepted");
+    expect(resolved).toContain("/srv/work/alias");
+  });
+
+  it("win32: a cwd on another drive than the root (a mapped network drive) or with `..` is refused unresolved", () => {
+    fakeLocal.set("C:\\work\\root", "C:\\work\\root");
+    fakeLocal.set("C:\\work\\alias", "C:\\work\\root");
+    for (const cwd of ["Z:\\attacker\\root", "Y:/attacker/root", "C:\\work\\root\\..\\..\\attacker\\x"]) {
+      expect(refusal("C:\\work\\root", cwd, "win32"), cwd).toMatch(/cwd is not this dispatch's work root/);
+    }
+    expect(touched).toEqual([]);
+    expect(refusal("C:\\work\\root", "C:\\work\\alias", "win32")).toBe("accepted"); // same drive: resolved (junction, 8.3)
+    expect(resolved).toContain("C:\\work\\alias");
   });
 });
 

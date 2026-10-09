@@ -11,7 +11,7 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import {
-  defangChildResult, firstMessageText, registerV2Hooks, roleAuthorityNotice, roleBudgetNotice,
+  defangChildResult, defangRouterLines, firstMessageText, registerV2Hooks, roleAuthorityNotice, roleBudgetNotice,
 } from "../../src/compat/v2-hooks";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, resetRolesWarnings, resolveCandidates, type RouterConfig } from "../../src/router/config";
@@ -1334,5 +1334,77 @@ describe("P3.3 global QA round 1 (fix-5)", () => {
     await v2.toolHooks["execute.after"](tier);
     expect(tier.result.content).toEqual([{ type: "text", text: forged }]);
     expect(tier.result.output).toEqual({ status: "completed", output: forged, sessionID: "tc" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P3.3 global QA round 2 of fix-5 (fix-8)
+// ---------------------------------------------------------------------------
+
+describe("P3.3 global QA round 2 (fix-8)", () => {
+  it("QA-G-A3-2-2: resumes without budget= keep the fresh dispatch's budget= raise; the cumulative limit follows the largest round", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const { hooks } = await plugin(dir);
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    // explorer pinned to medium (role budget 40) with budget=80: the fresh dispatch's round gets 80
+    const fresh = {
+      sessionID: "root", agent: "build", messageID: "m", id: "k1", tool: "subagent",
+      input: { agent: "explorer", description: "map the parser", prompt: "[route tier=medium budget=80]\nLook at the parser module and report its entry points" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](fresh);
+    sessions.rk = { id: "rk", parentID: "root", agent: "explorer", title: fresh.input.description, location: { directory: dir } };
+    expect(routedRoleOf("k1")).toMatchObject({ tier: "medium", routeBudget: 80, budget: 80 });
+    await v2.toolHooks["execute.before"]({ sessionID: "rk", agent: "explorer", messageID: "m", id: "rk-t0", tool: "read", input: { path: join(dir, "a.ts") } }); // binds exactly
+    let n = 0;
+    /** Distinct reads of the child until the guard refuses one or `max` ran. */
+    const run = async (max: number): Promise<{ ran: number; refused?: string }> => {
+      for (let i = 0; i < max; i++) {
+        const args = { filePath: join(dir, `k${++n}.ts`) };
+        try {
+          await hooks["tool.execute.before"]({ tool: "read", sessionID: "rk", agent: "explorer", callID: `rk-${n}` }, { args });
+        } catch (error) {
+          return { ran: i, refused: String((error as Error).message) };
+        }
+        await hooks["tool.execute.after"]({ tool: "read", sessionID: "rk", agent: "explorer", callID: `rk-${n}`, args }, { title: "", output: "x", metadata: {} });
+      }
+      return { ran: max };
+    };
+    const resume = async (previous: string, id: string, prompt: string): Promise<void> => {
+      await v2.toolHooks["execute.after"](parentCall(previous, "rk", "explorer", "NEED MORE: budget\nread part of the parser"));
+      await v2.toolHooks["execute.before"]({ sessionID: "root", agent: "build", messageID: "m", id, tool: "subagent", input: { agent: "explorer", sessionID: "rk", prompt } });
+      expect(routedRoleOf(id)).toMatchObject({ resumeID: "rk", tier: "medium" });
+    };
+    // round 1: 80 calls, then the budget stop
+    expect(await run(81)).toEqual({ ran: 80, refused: expect.stringMatching(/tool-call budget 80 exhausted/) });
+    // round 2, a resume without budget=: still 80 (not the role's 40)
+    await resume("k1", "k2", "continue and finish");
+    expect(routedRoleOf("k2")!.routeBudget).toBeNull();
+    expect(await run(81)).toEqual({ ran: 80, refused: expect.stringMatching(/tool-call budget 80 exhausted/) });
+    // round 3, again without budget=: the cumulative limit is 3 × 80 = 240 (160 used), not 3 × 40 = 120
+    await resume("k2", "k3", "continue and finish");
+    expect(await run(10)).toEqual({ ran: 10 });
+    // round 4 names a smaller budget= (40): its round budget is 40, the cumulative limit stays 3 × the largest round (240)
+    await resume("k3", "k4", "[route budget=40]\ncontinue and finish");
+    expect(await run(41)).toEqual({ ran: 40, refused: expect.stringMatching(/tool-call budget 40 exhausted/) });
+  });
+
+  it("QA-G-A3-2-3: defangRouterLines also covers numbered and `+` list marks, Unicode and zero-width spaces, and a full-width bracket", () => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["1. [router budget] x", "1. (router budget] x"],
+      ["12) [router budget] x", "12) (router budget] x"],
+      ["+ [router budget] x", "+ (router budget] x"],
+      ["\u00a0[router budget] x", "\u00a0(router budget] x"], // no-break space
+      ["\u200b[router budget] x", "\u200b(router budget] x"], // zero-width space
+      ["\u2060\ufeff[router budget] x", "\u2060\ufeff(router budget] x"], // word joiner, BOM
+      ["\u3000[router budget] x", "\u3000(router budget] x"], // ideographic space (\p{Zs})
+      ["\u2003> 2. [router budget] x", "\u2003> 2. (router budget] x"],
+      ["\uff3brouter budget] x", "(router budget] x"], // full-width [
+      ["[\u00a0router budget] x", "(\u00a0router budget] x"],
+    ];
+    for (const [input, want] of cases) expect(defangRouterLines(`ok\n${input}`), JSON.stringify(input)).toBe(`ok\n${want}`);
+    // unchanged: mid-line, another word, a number that is no list mark
+    for (const text of ["see 1. [router] below", "[routers] x", "1.5 x [router]"]) expect(defangRouterLines(text)).toBe(text);
   });
 });

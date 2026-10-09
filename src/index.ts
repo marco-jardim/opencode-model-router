@@ -70,7 +70,7 @@ import {
 import { resolveRoles, type RoleSpec } from "./router/roles";
 import { routerRunTool, type RunRecord } from "./router/run-tools";
 import type { WorkRootAnswer } from "./router/git-tools";
-import { roleGuardProfile, type GuardProfile } from "./router/guard-profile";
+import { GUARD_CUMULATIVE_MULTIPLIER, roleGuardProfile, type GuardProfile } from "./router/guard-profile";
 import { currentBinding } from "./routing/roles/binding";
 import { authorityTool, requestedAuthority } from "./routing/roles/authority";
 import {
@@ -579,6 +579,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const roleAttempts = new Map<string, RoutedGuardInput & { readonly at: number }>();
   /** QA-G-A3-3: the routed guard input of each role child — its latest routed dispatch or resume (a resume replaces it). */
   const roleChildGuards = new Map<string, RoutedGuardInput>();
+  /** QA-G-A3-2-2: the largest round budget each role child's guard profile had (its cumulative limit follows it). */
+  const roleBudgetPeaks = new Map<string, number>();
   const setBounded = <T>(map: Map<string, T>, key: string, value: T): void => {
     map.delete(key);
     map.set(key, value);
@@ -609,10 +611,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const spec = roleSpecOf(agent) ?? roleOfSession(sessionID);
     if (spec === undefined || typeof sessionID !== "string") return undefined;
     const routed = routedGuardOf(sessionID);
-    if (routed !== undefined && routed.agent === spec.agent) return roleGuardProfile(spec, routed.tier, routed.routeBudget);
-    const record = lookupDispatch(sessionID);
-    const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
-    return roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
+    let profile: GuardProfile;
+    if (routed !== undefined && routed.agent === spec.agent) {
+      profile = roleGuardProfile(spec, routed.tier, routed.routeBudget);
+    } else {
+      const record = lookupDispatch(sessionID);
+      const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
+      profile = roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
+    }
+    // QA-G-A3-2-2 (§2.6): the cumulative limit spans the child's rounds, so it follows the LARGEST round budget the child had
+    // (a later round with a smaller budget never shrinks it below what earlier rounds were allowed).
+    const peak = Math.max(roleBudgetPeaks.get(sessionID) ?? 0, profile.budget);
+    if (roleBudgetPeaks.get(sessionID) !== peak) setBounded(roleBudgetPeaks, sessionID, peak);
+    return { ...profile, cumulative: Math.max(profile.cumulative, peak * GUARD_CUMULATIVE_MULTIPLIER) };
   };
   /** Handoff 13 (P1.4 `run` signal): router-observed runs and edit times of role children, bounded per child and overall. */
   const roleRuns = new Map<string, RunRecord[]>();
@@ -1175,8 +1186,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // guard round takes them), a fresh child's once it binds to this call.
     const guard: RoutedGuardInput = { agent: routed.agent, tier: routed.tier, routeBudget: routed.routeBudget };
     setBounded(roleAttempts, callID, { ...guard, at: Date.now() });
-    if (routed.resumeID !== null) setBounded(roleChildGuards, routed.resumeID, guard);
-    if (routed.resumeID !== null) guardStore.beginDispatch(routed.resumeID);
+    if (routed.resumeID !== null) {
+      // QA-G-A3-2-2 (§2.6): a resume that names no `budget=` keeps the child's previous routed `budget=` (raise-only, applied to
+      // the resume's own tier); one that names a `budget=` takes its own.
+      const previous = routedGuardOf(routed.resumeID);
+      const inherited = routed.routeBudget ?? (previous?.agent === routed.agent ? previous.routeBudget : null);
+      setBounded(roleChildGuards, routed.resumeID, { ...guard, routeBudget: inherited });
+      guardStore.beginDispatch(routed.resumeID);
+    }
     // QA-P21-2-3: the dispatch's own read-only cap. A resume names its child: registered now; a fresh child when it binds.
     // QA-P21-3-1: every routed resume starts a new round of the child's read counter (the previous cap kept unless it names one),
     // so a "continue and finish" resume after a CAP stop does not inherit the exhausted counter.
@@ -1266,6 +1283,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roleEdits.delete(sessionID);
     roleBypassedCalls.delete(sessionID);
     roleChildGuards.delete(sessionID);
+    roleBudgetPeaks.delete(sessionID);
     for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
   };
   return {

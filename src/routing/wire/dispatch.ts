@@ -520,12 +520,17 @@ export interface WorkRootDeps {
  * `git worktree list --porcelain` in `cwd` (stdout); rejects on any failure. QA-G-A2-3: the hardened spawn of `listWorktrees`
  * (role-agents.ts) — the absolute git executable selected outside the work-root guards of `cwd` (`workRootGuards`), the
  * `hardeningArgs()` flags, `gitEnvironment()` (no inherited GIT_*, no system/global config), no shell — bounded to 5 s and 1 MiB.
+ * QA-G-A2-2-1: the user's system/global `safe.directory` values are passed back as `-c safe.directory=…` pairs (as `inspectGit`
+ * does), so a repository trusted that way is still listed instead of failing with "dubious ownership".
  */
 export async function gitWorktreeList(cwd: string): Promise<string> {
   // Loaded lazily: the hardened git helpers are only needed when a worktree list actually runs.
-  const { gitEnvironment, gitExecutable, hardeningArgs, spawnBounded, workRootGuards } = await import("../../router/git-tools");
-  const result = await spawnBounded(gitExecutable(workRootGuards(cwd)), [...hardeningArgs(), "worktree", "list", "--porcelain"], cwd, {
-    env: gitEnvironment(), timeoutMs: 5_000, maxBytes: 1 << 20,
+  const { gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } = await import("../../router/git-tools");
+  const started = performance.now();
+  const executable = gitExecutable(workRootGuards(cwd));
+  const trusted = await inheritedSafeDirectoryArgs(executable, 5_000);
+  const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "worktree", "list", "--porcelain"], cwd, {
+    env: gitEnvironment(), timeoutMs: Math.max(1, 5_000 - (performance.now() - started)), maxBytes: 1 << 20,
   });
   if (result.code !== 0 || result.truncated) {
     throw new Error(`git worktree list failed (exit ${String(result.code)}${result.truncated ? ", output truncated" : ""}): ${result.stderr.toString("utf8").trim()}`);
