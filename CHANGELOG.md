@@ -27,15 +27,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`router_request_authority` → `ESCALATE: authority` → resume the same session; widening only for exact bindings).
   - Work roots: `root=` on the route line (a git worktree of the repository) and `routing.workRoots` globs; the router
     narrows each session to its own root. A role dispatch's acceptance checks run in its work root; a `cwd:` outside
-    it is refused.
+    it is refused. Role `edit` needs a validated work root (on the authority ladder too) and never falls back to the
+    session or plugin directory; it never writes `.git` or anything below it, through any host edit tool.
+    `router_git_*` are limited to the work root (a pathspec for a work root below the repository's top level) and are
+    refused for a repository other than the dispatch's or a `.git` pointer to a network or device path. The
+    `git worktree list` runs that validate work roots inherit the user's `safe.directory` values.
   - `router_run`: `package.json` scripts listed by exact name and `routing.run.commands` with fixed argv, argument
     patterns, pinned npm script shell and config files, refused `.npmrc` keys and a credential-stripped environment;
-    single-dash arguments carrying `/`, `\` or `..` are refused.
-  - Role budgets (`budget=` up to 2×), `NEED MORE: budget` with a `[router budget]` resume note, never a tier penalty.
-    Role agents' host `steps` = 2 × the top role budget + `REFUSAL_CAP` (10) + 5. A role dispatch has a read-only
-    call cap only when it carries `CAP:N` or `CAP:none`.
+    single-dash arguments carrying `/`, `\` or `..` are refused. A network or device `cwd` is refused before any
+    filesystem call. Credential-like variables (`PGPASSWORD`, `MYSQL_PWD` included; `PWD` and `OLDPWD` kept) are
+    always stripped: `routing.run` has no passthrough option.
+  - Role budgets (`budget=` up to 2×; a resume without `budget=` keeps the previous one), `NEED MORE: budget` with a
+    `[router budget]` resume note, never a tier penalty. Role agents' host `steps` = 2 × max(the top role budget, 25)
+    + `REFUSAL_CAP` (10) + 5. A dispatch that a floor lifts above its role's ceiling, on a tier the role has no budget
+    for, gets max(the role's budget for its ceiling tier, 25). The cumulative ceiling is 3 × the largest round budget
+    the child had. A role dispatch has a read-only call cap only when it carries `CAP:N` or `CAP:none`.
+  - Refused calls of a role child — role-authority refusals and structured host permission denials — count toward
+    `denied_cap` in `advisory` mode too (`advisory` still never stops). In `advisory` mode a child out of budget that
+    returns `NEED MORE: budget` records a `budget` signal and the parent's result gets the `[router budget]` note.
+  - Resumes of a role child keep the dispatch's class and needs (risk and scope: the max of both), its `[acceptance]`
+    block, `VERIFY:` lines and `d=` claim; a new block replaces them. Carried checks run at the resume's return (never
+    deferred) on the child's cumulative changes, and are unverifiable when the attempt that introduced them was never
+    gated. An authority request widens the grant only when the resuming session is the dispatch's parent, never on a
+    delegate's resume.
+  - A role dispatch's detection is `none` when no verification will run (enforcement `off`, `/bypass`,
+    `verify.require: "never"`, a `cwd` outside the root the gate verifies in).
+  - Dynamic roles: a route-line `needs=` only narrows the classifier's needs, and `class=` alone drops the implied
+    needs of the class it replaced; a role dispatch is classified in its work root. Decision rows carry
+    `trace.needTerms` (vocabulary labels, `term-<n>`, `url`, `path`, never free task text).
+  - In a role dispatch's result, child lines starting with `[router` are defanged to `(router`, so only the router's
+    notes start with `[router`.
   - Outcome signals from external verification only (deterministic/run 1, independent grader 0.5, incomplete 0.5,
-    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only). An LLM grader's verdict of
+    re-dispatch 0.5, `DONE` alone 0; the `run` signal matches npm-script-form checks only and counts only the current
+    attempt's runs). Only verdicts (deterministic, and independent graders at 0.5) move the outcome store the kernel
+    reads; `run`, `incomplete` and `redispatch` rows are routing statistics only. An LLM grader's verdict of
     a role dispatch moves the outcome store by 0.5 with a `grader` signal row only when the grader is independent
     (tier ≥ the producer's, another model); any other grader records nothing (no store change, no verdict row), so
     `routing:stats` shows fewer verdict rows for role dispatches. Role × tier statistics and the advisor findings
@@ -49,7 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`agents` block: subagents defined by the router (#81).** `tiers.json` and the global override can define
   subagents that run on a tier of the active preset (following `/preset`), with `readOnly`/`allowTools` or an
   explicit `permission`, on v1 and v2 with fail-closed permissions. Project overrides cannot define `agents`
-  (A18). `/router` lists them under "Plugin agents".
+  (A18). `/router` lists them under "Plugin agents". On OpenCode v2 a `permission` key naming `write`, `patch`,
+  `multiedit` or `apply_patch` only narrows that tool and `edit` decides; a key that allows or asks for what the
+  agent's `edit` rules deny gets a config notice.
 
 ### Fixed
 
@@ -79,6 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before a line-start `NEED MORE: budget` still counts.
   - **`root=` in the header.** The dispatch header's `Working directory:` names the route line's `root=` when present
     (byte-identical otherwise).
+  - **Verification reasons, in tiers mode too.** Verification reasons are rendered one per line with line breaks
+    joined, at most 20 items plus a count of the rest; an LLM grader's text is cut at 500 characters. A list of at
+    most 20 one-line reasons renders as before.
   - **Downgrades.** Outcome signals are written as annotation rows of the decision log, which earlier versions drop
     only through their decision-id dedupe: downgrading past this version is unsupported.
 - `anthropic` preset: `fast` tier now uses Claude Haiku 5.5 (low) instead of Sonnet 5.5 (low).
