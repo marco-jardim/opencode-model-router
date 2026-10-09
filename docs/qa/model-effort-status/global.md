@@ -50,6 +50,21 @@ Resolution (`1ea4354` code/tests/docs, executor docs commit after it):
 | C-10 | failure strings quoted in `phase-P1.3.md` |
 | C-11 | A13c |
 
-## Round 2
+## Round 2 (heavy reviewer, `aa39ccf..617a8f2`)
 
-(below)
+Verdict PASS (553 unit tests in 6 files, goldens 88, typecheck green). Fixes in `d33e0f9`:
+
+| id | resolution |
+|---|---|
+| R2-1 | real-host smoke re-run on `d33e0f9` (run `169dea3b`): 64/64 on 2.0.24, 2.0.25, 2.0.26, flows local / npm install / default-off; S4 `medium (low)` everywhere equals the wire (`claude-sonnet-5-5#low`, effort `medium`); G3 row 0.1–0.2 s after the child request, ~15 s before its first token; default-off flow: no row in 8 s of polling while the child runs, G2 shows the row |
+| R2-2 | quick re-pulls only for delegated sessions; docs and pins |
+| R2-3 | timeout message "continuing without it" |
+| R2-4 | C-6: the gate measures lines and branches; the executor run reports 100% statements (284/284) and branches (260/260) for `status-model.ts` + `effort-channel.ts`. B-5: evidence header names the commits. B-6/C-5: round-1 test name and fields marked "round 1" |
+| R2-5 | 2.0.20–2.0.23 outcome stated as expected, not observed |
+
+On `msd/main` after the merge (`de35c9d`): 14 touched files incl. goldens, 642 passed; typecheck green.
+
+## Verdict
+
+P3.1 DONE: 0 open blocking/critical/major. Residuals: GA-3 (other-directory session), C-7 (selector from source),
+A13a (bare package name after publish: gate for closing #90).
