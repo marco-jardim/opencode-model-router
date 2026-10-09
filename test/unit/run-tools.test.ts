@@ -1236,6 +1236,11 @@ describe("QA-P13-2-3 guard set", () => {
     writeFileSync(join(dir, "f.txt"), "x\n");
     git(dir, "add", "-A"); git(dir, "commit", "-qm", "init");
   }
+  function caseSensitiveDir(dir: string): boolean {
+    const probe = join(dir, "case-probe");
+    mkdirSync(probe);
+    try { return !existsSync(join(dir, "CASE-PROBE")); } finally { rmSync(probe, RM); }
+  }
   it("guards the checkout of the plugin's working directory, never the working directory itself (a)", () => {
     const checkout = join(sibling, "plugin-repo");
     repo(checkout);
@@ -1264,7 +1269,8 @@ describe("QA-P13-2-3 guard set", () => {
     vi.spyOn(process, "cwd").mockReturnValue(home);
     expect(workRootGuards(realpathSync.native(linked)).map(fold)).toContain(fold(realpathSync.native(bare)));
   }, SPAWN_TIMEOUT);
-  it.skipIf(WIN)("deduplicates case-sensitively on POSIX (d)", () => {
+  it.skipIf(WIN)("deduplicates case-sensitively on POSIX (d)", (ctx) => {
+    if (!caseSensitiveDir(sibling)) ctx.skip("the filesystem under the temp dir is case-insensitive");
     const upper = join(sibling, "Repo");
     const lower = join(sibling, "repo");
     repo(upper); repo(lower);
