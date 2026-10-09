@@ -73,7 +73,9 @@ import type { WorkRootAnswer } from "./router/git-tools";
 import { roleGuardProfile, type GuardProfile } from "./router/guard-profile";
 import { currentBinding } from "./routing/roles/binding";
 import { authorityTool, requestedAuthority } from "./routing/roles/authority";
-import { roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot } from "./routing/wire/dispatch";
+import {
+  CARRIED_NO_PROCESS_REASON, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot,
+} from "./routing/wire/dispatch";
 import { roleTierOrder } from "./routing/engine/ladders";
 import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
 import type { IngestSettings } from "./routing/outcomes/ingest";
@@ -2396,6 +2398,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
             const effectiveCwd = scope.cwd;
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
+            // #84 QA-G-B-2-1: a routed role dispatch keeps its child's verification lineage; a resume that CARRIES the acceptance of an
+            // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
+            const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
+            const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
             const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
@@ -2406,7 +2412,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               : false;
             // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
             // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
-            if (!scope.outside && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+            if (!scope.outside && !carriedRole && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
@@ -2445,6 +2451,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               gateDeadline.dispose();
               throw error;
             }
+            // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
+            // changed since the attempt that introduced the carried block, against that attempt's reference.
+            if (routedRole !== undefined && childSessionID) verification = roleAttemptVerification(childSessionID, verification, { carried: carriedRole });
             // #84 P2.1: a role agent follows the return contract (handoff 26; roles mode only).
             const roleProducer = roleSpecOf(producerTier) !== undefined;
             const artefact = {
@@ -2483,6 +2492,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // Keep the native grader unparented on the backend; only depth tracking uses its caller.
             const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
             gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+            // #84 QA-G-B-2-1: a carried acceptance never passes on a testsPass/lintClean that ran no process.
+            if (carriedRole) gateDeps.deterministic.noAffectedUnverifiable = CARRIED_NO_PROCESS_REASON;
             let res;
             try {
               res = await withTimeout(

@@ -3,6 +3,8 @@ import type { RouterConfig } from "./config";
 import { fingerprintToolCall } from "../guard/fingerprint";
 import { DEFAULT_IDLE_TTL_MS } from "./idle-sweep";
 import type { DecisionFacts, LadderStepKind } from "../routing/outcomes/types";
+import type { ChangedFile } from "../verify/dispatch";
+import type { ReferenceState } from "../verify/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -626,6 +628,21 @@ export type DetectionDepth = "deterministic" | "grader" | "none";
 export interface CarriedVerification {
   readonly block: string;
   readonly directives: readonly string[];
+  /** QA-G-B N-a: the route line's `d=` claim of the dispatch that introduced the block; absent: none. */
+  readonly claim?: DetectionDepth;
+  /**
+   * QA-G-B-2-1: the change baseline of the child's attempts under this block — set by the gate of the attempt that introduced it
+   * (its dispatch reference and change set), widened by every later attempt that carried it. Absent until that gate ran.
+   */
+  readonly baseline?: VerificationBaseline;
+}
+
+/** QA-G-B-2-1: what a carried acceptance is judged against (see {@link CarriedVerification}.baseline). */
+export interface VerificationBaseline {
+  /** The dispatch reference of the attempt that introduced the block (its pre-existing failures are excused; later ones not). */
+  readonly reference: ReferenceState;
+  /** Every file the child changed in that attempt and every later one under the block; "unavailable" once any set was unknown. */
+  readonly changed: readonly ChangedFile[] | "unavailable";
 }
 
 export interface DispatchInput {
@@ -764,9 +781,7 @@ export function rememberDispatch(
     outcomes: input.outcomes ?? true,
     registeredAt: nowMs,
     // Only when there is one: every other record keeps its exact shape.
-    ...(input.verification === undefined || input.verification === null
-      ? {}
-      : { verification: Object.freeze({ block: input.verification.block, directives: Object.freeze([...input.verification.directives]) }) }),
+    ...(input.verification === undefined || input.verification === null ? {} : { verification: frozenVerification(input.verification) }),
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
   // QA-2.3-1a: a registration of the same execution keeps what was observed of it (see `DispatchInput.keepExecution`).
@@ -783,6 +798,31 @@ export function rememberDispatch(
     dropDispatch(oldest.value);
   }
   return record;
+}
+
+/** A frozen copy of a carried verification; `claim` and `baseline` only when present (a record keeps its exact shape). */
+function frozenVerification(v: CarriedVerification): CarriedVerification {
+  return Object.freeze({
+    block: v.block,
+    directives: Object.freeze([...v.directives]),
+    ...(v.claim === undefined ? {} : { claim: v.claim }),
+    ...(v.baseline === undefined ? {} : {
+      baseline: Object.freeze({
+        reference: v.baseline.reference,
+        changed: v.baseline.changed === "unavailable" ? "unavailable" as const : Object.freeze(v.baseline.changed.map((f) => Object.freeze({ ...f }))),
+      }),
+    }),
+  });
+}
+
+/**
+ * #84 QA-G-B-2-1: replace the carried verification of a child's CURRENT registration — the same attempt (no new attempt id, nothing
+ * observed of the execution is reset), only its verification baseline moves on. Nothing when the child is not registered.
+ */
+export function updateDispatchVerification(childSessionID: string, verification: CarriedVerification): void {
+  const slot = dispatchRegistry.get(childSessionID);
+  if (slot === undefined) return;
+  slot.record = Object.freeze({ ...slot.record, verification: frozenVerification(verification) });
 }
 
 /** The registered dispatch of a child session, or undefined (unknown, forgotten or swept). */

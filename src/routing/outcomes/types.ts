@@ -572,6 +572,13 @@ export interface DecisionTrace {
   readonly needTerms?: readonly string[];
 }
 
+/**
+ * #84 QA-G-B-2-2 (D14): the shape of one `DecisionTrace.needTerms` entry — `<need>:<label>` with a vocabulary word, a term id,
+ * a placeholder (`url`, `path`) or a router label (`route-line`, `class=<c>`, `implied-by-<need>`, `resumed-dispatch`). An entry
+ * of any other shape could carry prompt text and is dropped when a row is read.
+ */
+export const NEED_TERM_RE = /^[a-z_]+:[a-z0-9=_ -]{1,48}$/;
+
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */
 export interface DecisionRow extends LogRowBase {
   readonly kind: "decision";

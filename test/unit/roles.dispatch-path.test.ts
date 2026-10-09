@@ -382,7 +382,28 @@ describe("role dispatch path", () => {
     world.router.commit(elsewhere.callID, applied({ agent: "general", prompt, description: "elsewhere" }, out));
     const outRow = (await world.rows()).find((r) => r.decisionID === out.decisionID)!;
     expect(outRow.facts.needs).toEqual(["external_dir"]);
-    expect(outRow.trace?.needTerms).toEqual([`external_dir:${join(world.outside, "tmp.txt")}`, "edit:class=implement"]);
+    // QA-G-B-2-2: this pinned the defect (the absolute path itself was logged); the trace names a placeholder.
+    expect(outRow.trace?.needTerms).toEqual(["external_dir:path", "edit:class=implement"]);
+  });
+
+  // #84 QA-G-B-2-2 (D14, ROUTING_ENGINE.md: rows never carry prompt text): the matched need terms are vocabulary words, term ids or
+  // placeholders — never a URL with its query token or an absolute path from the prompt.
+  it("QA-G-B-2-2: the traced need terms carry no prompt text — `web:url`, `external_dir:path`, vocabulary words or term ids", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "shadow" });
+    const secret = "tok_9f8e7d6c5b4a";
+    const outsidePath = join(world.outside, "private", "notes.md");
+    const prompt = `[route class=other risk=low scope=single]\nRead https://example.com/api?token=${secret} and update ${outsidePath} && node scripts/${secret}.js`;
+    const c = call(world, { agent: "general", prompt, description: "trace probe" });
+    const outcome = await world.router.route(c);
+    world.router.commit(c.callID, applied(c.args, outcome));
+    const row = (await world.rows()).find((r) => r.decisionID === outcome.decisionID)!;
+    const terms = row.trace?.needTerms ?? [];
+    expect(terms).toEqual(expect.arrayContaining(["web:url", "external_dir:path", "edit:update"]));
+    expect(terms.every((term) => /^[a-z_]+:[a-z0-9=_ -]{1,48}$/.test(term))).toBe(true);
+    const logged = JSON.stringify(row);
+    expect(logged).not.toContain(secret);
+    expect(logged).not.toContain("example.com");
+    expect(logged).not.toContain("notes.md");
   });
 
   it("QA-G-B-3: a dynamic role's route-line needs= is authoritative, narrow-only; the text's terms are traced; a fixed role is unchanged", async () => {

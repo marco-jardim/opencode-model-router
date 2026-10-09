@@ -1508,6 +1508,10 @@ async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs:
         reference: deps.reference ?? defaultReference(deps),
         deadline,
       });
+      // QA-G-B-2-1: a carried acceptance never passes on a run that never happened.
+      if (deps.noAffectedUnverifiable !== undefined && run.scoped.kind === "no-affected") {
+        return { ok: false, unverifiable: true, reason: `${deps.noAffectedUnverifiable} (testsPass: ${run.scoped.note})` };
+      }
       return fromJudgement(judgeScoped(run.scoped, run.recheck));
     });
   } catch (err) {
@@ -1561,7 +1565,12 @@ async function runCommandCheck(
       if (kind === "lintClean" && deps.openScope) {
         // T8: NoAffected passes with its note and takes no slot; Unscoped runs the command as today.
         const plan = await planLint(command, deps);
-        if (isNoAffected(plan)) return { ok: true, note: `lintClean: ${plan.note}` };
+        if (isNoAffected(plan)) {
+          // QA-G-B-2-1: a carried acceptance never passes on a lint that never ran.
+          return deps.noAffectedUnverifiable !== undefined
+            ? { ok: false, unverifiable: true, reason: `${deps.noAffectedUnverifiable} (lintClean: ${plan.note})` }
+            : { ok: true, note: `lintClean: ${plan.note}` };
+        }
         if (!isUnscoped(plan)) {
           launch = (scope, deadline) => scope.runLint(plan, deadline);
           scopedTo = plan.inputs.length;

@@ -26,7 +26,7 @@ import type { EngineRuntime, WireLogger } from "../../src/routing/wire/runtime";
 const GOLDEN = [
   "## Role Delegation Protocol (MANDATORY)",
   "",
-  "You are the orchestrator: delegate execution to role agents with `subagent(agent=\"<role>\", prompt=\"...\")` and answer the user yourself. Reading, searching and running commands are execution; you may make about 2 direct read-only calls per turn for a lookup that settles a question. Run independent dispatches in parallel, in one message.",
+  "You are the orchestrator: delegate execution to role agents with `subagent(agent=\"<role>\", prompt=\"...\")` and answer the user yourself. Reading, searching and running commands are execution; you may make about 2 direct read-only calls per turn to settle a question. Run independent dispatches in parallel, in one message.",
   "",
   "Roles (pick by intent; the router narrows each grant to the task):",
   "- explorer: lookups: files, symbols, facts, git history. Authority: read.",
@@ -39,15 +39,15 @@ const GOLDEN = [
   "",
   "R: search/recon→explorer mechanical/implement/debug→implementer design→architect review→reviewer other→general",
   "",
-  "The router chooses the model for every dispatch: never set `model` and never pick a tier; name the role.",
+  "The router picks each dispatch's model: never set `model` or pick a tier; name the role.",
   "",
-  "Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): `[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (`edit` unlocks editing, `shell` unlocks router_run, where the role allows them); d=deterministic|grader|none (counts only when the prompt's `[acceptance]` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.",
+  "Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): `[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (`edit` unlocks editing, `shell` router_run, where the role allows); d=deterministic|grader|none (counts only when the prompt's `[acceptance]` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.",
   "",
-  "Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put `root=<absolute path>` on the route line (quote a path with spaces) and the same path in ENVIRONMENT.",
+  "Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put `root=<absolute path>` on the route line (quote a path with spaces) and in ENVIRONMENT.",
   "",
   "No role holds the web together with read, run or edit authority. Compose: researcher first, then paste its findings into the implementer dispatch. Raw shell is outside roles mode. Only when `router_run` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.",
   "",
-  "Resume, never restart: after `NEED MORE: budget` or a `[router budget]` note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, resume the SAME `sessionID` (the router widens the grant) unless the router names another role; after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier). Roles return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) changes only the read-only call cap.",
+  "Resume, never restart: after `NEED MORE: budget` or a `[router budget]` note, resume the SAME `sessionID` with \"continue and finish\"; after `ESCALATE: authority`, likewise (the router widens the grant) unless it names another role; after a verification FAIL, resume the SAME `sessionID` with the findings (the router raises the tier). A resume keeps the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them. Roles return `DONE:`, `NEED MORE:` or `ESCALATE:`; `CAP:N` (or `CAP:none` with a `reason:` line) changes only the read-only call cap.",
   "",
   "Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.",
   "",
@@ -105,6 +105,11 @@ describe("roles protocol golden", () => {
     expect(text).toContain("Only when the plan step carries `[tier:X]`, add `tier=X pin`; never otherwise.");
     expect(text).not.toMatch(/QA review →|→ `pin`/);
     expect(text.match(/tier=/g)).toHaveLength(1);
+  });
+
+  it("QA-G-B N-c: a resume without its own [acceptance] re-uses the dispatch's block and VERIFY: lines; a new block replaces them", () => {
+    const text = buildRolesProtocol(rolesCfg(), resolveRoles(rolesCfg(), "v2"));
+    expect(text).toContain("A resume keeps the dispatch's `[acceptance]` and `VERIFY:` lines; a new block replaces them.");
   });
 
   it("QA-P22-1-4/6/7/8/9: verification FAIL resume, budget note prefix, d= backing, runner refusal, quoted root", () => {

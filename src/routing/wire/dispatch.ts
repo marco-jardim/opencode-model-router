@@ -64,8 +64,10 @@ import {
 import { realpathSync } from "node:fs";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
-  type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
+  updateDispatchVerification, type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
+import type { ChangedFile } from "../../verify/dispatch";
+import type { ReferenceState } from "../../verify/types";
 import { randomBytes } from "node:crypto";
 import {
   FLOOR_LIFT_REASON,
@@ -179,6 +181,12 @@ export interface RoleRouted {
    * never consumes an authority request on it. Absent for every orchestrator dispatch.
    */
   readonly delegate?: true;
+  /**
+   * QA-G-B-2-1: a resume that CARRIES the acceptance of the dispatch it resumes (it names no `[acceptance]` block of its own). Its
+   * gate runs at once — never deferred — on the child's cumulative change set since the attempt that introduced the block
+   * ({@link roleAttemptVerification}), and a check that ran no process is unverifiable. Absent otherwise.
+   */
+  readonly carried?: true;
 }
 
 /**
@@ -820,10 +828,12 @@ function higherTier(order: readonly string[], a: string | null, b: string | null
 /**
  * QA-P21-2-1: the grant of a resume of an EXACTLY bound child: what the child holds (its bound grant) plus the actions widened for
  * this resume. Only adds; `router_run` and `edit` stay withheld from a child bound without a work root (I9, QA-G-B-2). The work root
- * is the bound one, else the resume's.
+ * is the bound one — QA-G-B N-b: a child bound without one keeps none, whatever root the resume's own route line names (the child
+ * cannot touch it: binding.ts holds its enforced grant), so the verification root, the outside-root check and the classification
+ * never use it.
  */
-function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityAction[], workRoot: string | null): DispatchGrant {
-  const root = boundGrant.workRoot ?? workRoot;
+function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityAction[]): DispatchGrant {
+  const root = boundGrant.workRoot;
   const actions = new Set<AuthorityAction>([...boundGrant.actions, ...widened]);
   if (boundGrant.workRoot === null) {
     // QA-G-B-2 (R7 null-root contract, I3): a child bound without a validated work root gets no run and no write, whatever root the
@@ -853,6 +863,72 @@ export function verificationParts(prompt: string): { readonly block: string | nu
   return {
     block: close < 0 ? null : lines.slice(open, close + 1).join("\n"),
     directives: lines.flatMap((line, i) => (!inBlock(i) && VERIFY_DIRECTIVE_LINE.test(line) ? [line.trim()] : [])),
+  };
+}
+
+/** QA-G-B-2-1: the block has a check judged on the change set (testsPass, lintClean). Fails toward "it has". */
+function carriedChecksChangeSet(block: string): boolean {
+  try {
+    return buildDelegationDoD({ prompt: block }).checks.some((check) => check.kind === "testsPass" || check.kind === "lintClean");
+  } catch {
+    return true;
+  }
+}
+
+/** QA-G-B-2-1: the reason a carried acceptance's testsPass/lintClean that ran no process is unverifiable (DeterministicDeps). */
+export const CARRIED_NO_PROCESS_REASON =
+  "a carried acceptance re-checked no earlier change of the child: a check that runs no process verifies nothing here";
+/** QA-G-B-2-1: the reference of a carried acceptance whose introducing attempt was never gated (no failure can be excused). */
+export const CARRIED_NO_REFERENCE: ReferenceState = Object.freeze({
+  kind: "none" as const, reason: "the attempt that introduced this carried acceptance was not verified at its return",
+});
+/** Bound on the files a carried baseline keeps; beyond it the cumulative change set is "unavailable" (fails safe). */
+export const MAX_CARRIED_CHANGES = 2000;
+
+/** What a gate prepares for one attempt (`PreparedVerification` of verify/wiring.ts, structurally). */
+export interface RoleAttemptChanges {
+  readonly changedFiles: ChangedFile[];
+  readonly changeBaseline: "available" | "unavailable";
+  readonly reference: ReferenceState;
+}
+
+/** The union of two change sets, keyed by path (separators unified, case folded on win32); `newer` wins. */
+function unionChanges(older: readonly ChangedFile[] | "unavailable", newer: readonly ChangedFile[] | "unavailable"): ChangedFile[] | "unavailable" {
+  if (older === "unavailable" || newer === "unavailable") return "unavailable";
+  const key = (path: string): string => (process.platform === "win32" ? path.replace(/\//g, "\\").toLowerCase() : path);
+  const all = new Map<string, ChangedFile>();
+  for (const file of [...older, ...newer]) all.set(key(file.path), { ...file });
+  return all.size > MAX_CARRIED_CHANGES ? "unavailable" : [...all.values()];
+}
+
+/**
+ * #84 QA-G-B-2-1: the change set and reference a role child's gate judges this attempt on, and the bookkeeping of its carried
+ * verification (the dispatch registry's `CarriedVerification.baseline`). Called by the after-hook once the attempt's own change
+ * set is prepared:
+ * - an attempt under its OWN block (a fresh dispatch, or a resume naming a new block) starts the lineage: its reference and change
+ *   set become the baseline; it is judged on them, as before;
+ * - a CARRIED attempt (`carried`: the resume re-checks the block of an earlier attempt) is judged on the union of every change the
+ *   child made since the attempt that introduced the block (and that attempt's reference: what it broke is never pre-existing);
+ *   without such a baseline (that attempt was never gated) the change set is unavailable and no failure can be excused.
+ * Not a role child with an acceptance on record: `prepared` unchanged, nothing recorded.
+ */
+export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessionID: string, prepared: T, opts: { readonly carried: boolean }): T {
+  const verification = lookupDispatch(childSessionID)?.verification;
+  if (verification === undefined) return prepared;
+  const own: readonly ChangedFile[] | "unavailable" = prepared.changeBaseline === "available" ? prepared.changedFiles : "unavailable";
+  if (!opts.carried) {
+    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own } });
+    return prepared;
+  }
+  const baseline = verification.baseline;
+  if (baseline === undefined) return { ...prepared, changeBaseline: "unavailable", reference: CARRIED_NO_REFERENCE };
+  const changed = unionChanges(baseline.changed, own);
+  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed } });
+  return {
+    ...prepared,
+    changedFiles: changed === "unavailable" ? prepared.changedFiles : changed,
+    changeBaseline: changed === "unavailable" ? "unavailable" : "available",
+    reference: baseline.reference,
   };
 }
 
@@ -1461,7 +1537,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
     // 4. grant (widened actions of a resume recompute the floor, handoff 36). QA-P21-2-1: a resume of an EXACTLY bound child keeps
     // what that child holds (its bound grant) plus the widened actions — the resume prompt alone ("continue") would lose them.
-    const grant: DispatchGrant = bound?.kind === "exact" ? resumedGrant(bound.grant, call.widened ?? [], root.workRoot)
+    const grant: DispatchGrant = bound?.kind === "exact" ? resumedGrant(bound.grant, call.widened ?? [])
       : grantFor(rp.spec, taskFacts, call.widened ?? [], root.workRoot, routeLine);
 
     // 5. effective detection (S10/P-9, A34; handoff 5): never `result.detection` as is. QA-G-B-1: a resume that names no
@@ -1471,17 +1547,28 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const carried = resumed && own.block === null ? original?.verification ?? null : null;
     const carriedText = carried === null ? null : [...(own.directives.length === 0 ? carried.directives : []), carried.block].join("\n");
     const verifyPrompt = carriedText === null ? prompt : withLastLine(prompt, carriedText);
+    // QA-G-B N-a: the `d=` claim travels with the block it was made for (a resume's own route line names its own).
+    const claim = result.detection ?? (carried === null ? null : carried.claim ?? null);
     const verification: CarriedVerification | null = own.block !== null
-      ? { block: own.block, directives: own.directives }
-      : carried === null ? null : { block: carried.block, directives: own.directives.length > 0 ? own.directives : carried.directives };
+      ? { block: own.block, directives: own.directives, ...(result.detection == null ? {} : { claim: result.detection }) }
+      : carried === null ? null : {
+          block: carried.block, directives: own.directives.length > 0 ? own.directives : carried.directives,
+          ...(claim === null ? {} : { claim }),
+          // QA-G-B-2-1: the same lineage — judged against the baseline of the attempt that introduced the block.
+          ...(carried.baseline === undefined ? {} : { baseline: carried.baseline }),
+        };
     const acceptance = detectionOf(verifyPrompt);
     const bypassed = deps.isBypassed?.(call.sessionID) === true;
     const env = deps.env === undefined ? {} : { env: deps.env };
     const verifyRoot = verifyRootOf(grant, sessionDirectory, workRootDeps.realpath);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed, acceptance, ...env,
-      // QA-P21-1-2, QA-P21-2 nit 3
-      deferred: roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false }),
+      // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
+      // checks (testsPass, lintClean) can cover the child's earlier attempts only once the attempt that introduced the block was
+      // gated with a known change set (its baseline) — until then the gate cannot back `deterministic`.
+      deferred: carried === null
+        ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
+        : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block),
       outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd), // DF2-F1, QA-P33F1-1-1, nit 3
     });
     // QA-G-B-7: the gate verifies nothing at all (enforcement off, /bypass, `require: never`, a cwd outside the root it verifies in)
@@ -1489,7 +1576,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const verifies = roleVerificationRuns({
       cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd),
     });
-    const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance, verifies });
+    const detection = effectiveDetection({ routerGate, claim, acceptance, verifies });
 
     // 6. bounds on the one role tier order (handoff 9); a resume passes the child's running tier. QA-P21-2-2: the raise recorded
     // after a verification FAIL of this child (for this parent) is a raise-only floor, like `floorTier`; consumed on success.
@@ -1631,6 +1718,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       resumeID,
       nextTier: nextRoleTier(tiers, rp.spec.tierRange.ceiling, tier),
       class: cls,
+      ...(carried !== null ? { carried: true as const } : {}), // QA-G-B-2-1
     };
     rememberRoutedRole(routed);
     if (raised !== null && resumeID !== null) resumeRaises.delete(resumeID); // QA-P21-2-2: consumed once, by a routed resume

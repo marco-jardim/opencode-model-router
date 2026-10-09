@@ -22,6 +22,7 @@ import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { bind, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
   CARRIED_ACCEPTANCE_NOTE, PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
+  roleAttemptVerification,
   roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
@@ -494,6 +495,56 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
       expect(row.explore).toBe(false);
       expect(row.reason.startsWith("kept:caller-model")).toBe(true);
     }
+  });
+
+  // #84 P3.3 global QA round 2 (area B)
+  it("QA-G-B N-a: a resume carries the resumed dispatch's `d=` claim with its block (a d=grader dispatch stays grader)", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const acceptance = "[acceptance]\ncriteria: the parser reports every error with its line\n[/acceptance]";
+    const fresh = await freshChild(world, "child-c", {
+      agent: "implementer", description: "errors",
+      prompt: `[route class=implement risk=low scope=single needs=edit d=grader root=${world.main}]\nimprove the parser errors\n${acceptance}`,
+    });
+    expect(fresh.role!.detection).toBe("grader");
+    const resumed = await world.router.route(call(world, { agent: "implementer", sessionID: "child-c", prompt: "continue and finish" }));
+    expect(resumed.role!.detection).toBe("grader"); // was none: the resume's own text names no d=
+    expect(lookupDispatch("child-c")?.verification?.claim).toBe("grader");
+  });
+
+  it("QA-G-B N-b: a child bound without a work root keeps none on a resume — never the resume's own root", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const other = temp("omr-g-noroot-");
+    const fresh = await freshChild(world, "child-n", {
+      agent: "implementer", description: "no root", prompt: `[route class=implement risk=low scope=single needs=edit root=${other}]\nchange x`,
+    });
+    expect(fresh.role!.workRoot).toBeNull();
+    const resumed = await world.router.route(call(world, {
+      agent: "implementer", sessionID: "child-n",
+      prompt: `continue\nVERIFY: required\n[acceptance]\ncheck: fileExists path=${join(world.main, "x.txt")}\n[/acceptance]`,
+    }));
+    expect(resumed.role!.grant.workRoot).toBeNull(); // was the session directory (the resume's own root)
+    expect(resumed.role!.detection).not.toBe("deterministic"); // no validated work root: the gate cannot back it
+    expect([...resumed.role!.grant.actions]).not.toContain("edit");
+  });
+
+  it("QA-G-B-2-1: a carried testsPass is deterministic only once the attempt that introduced it was gated (its change baseline)", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const acceptance = "[acceptance]\ncheck: testsPass\n[/acceptance]";
+    const fresh = await freshChild(world, "child-t", {
+      agent: "implementer", description: "tests",
+      prompt: `[route class=implement risk=low scope=single needs=edit root=${world.main}]\nVERIFY: required\nchange the generator\n${acceptance}`,
+    });
+    expect(fresh.role!.detection).toBe("deterministic");
+    const resumeOf = async () => (await world.router.route(call(world, { agent: "implementer", sessionID: "child-t", prompt: "continue and finish" }))).role!;
+    // No gate saw attempt 1: its change set is unknown, so the carried testsPass cannot cover it.
+    expect((await resumeOf()).detection).not.toBe("deterministic");
+    // Attempt 1's gate recorded its change baseline: the resume is judged on the cumulative change set.
+    roleAttemptVerification("child-t", {
+      changedFiles: [{ path: join(world.main, "gen.ts"), status: "written" }], changeBaseline: "available", reference: { kind: "none", reason: "test" },
+    }, { carried: false });
+    const resumed = await resumeOf();
+    expect(resumed.carried).toBe(true);
+    expect(resumed.detection).toBe("deterministic");
   });
 });
 
