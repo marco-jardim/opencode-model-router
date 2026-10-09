@@ -164,7 +164,7 @@ Handoffs, Verdict).
 
 ### 0.8 Wave integration
 [tier:medium] When every phase of a wave has passed QA and is merged: typecheck and the capped full suite on
-`rta/main`; push; the draft PR `rta/main → master` (opened in P0.1) runs the 12-job CI (CI runs only on PRs/master,
+`rta/main`; push; the draft PR `rta/main → master` (opened in P0.1) runs the full CI (17 checks on PR #85; CI runs only on PRs/master,
 E11). A wave closes only when CI is green. [tier:heavy] Hot-file merge conflicts get an integration review.
 
 ### 0.9 Owner operating rules (verbatim intent, binding)
@@ -980,7 +980,7 @@ load error.
 Tasks:
 - T3.4.1 [tier:medium] Version 2.4.0 in `D:\git\opencode-model-router\package.json` and
   `D:\git\opencode-model-router\package-lock.json`; `D:\git\opencode-model-router\CHANGELOG.md` release entry; PR
-  `rta/main → master` ready; CI green on the exact head; merge; CI green on the merge SHA.
+  `rta/main → master` ready; CI green on the exact head; merge with a merge commit (no squash or rebase: smoke pins such as `V1_BASE_COMMIT` and the evidence SHAs must stay reachable after the `rta/*` branches are deleted; R10); CI green on the merge SHA.
 - T3.4.2 [executor] Before the sync, validate the owner override (migrated at DF-2) against the final code in a temp
   HOME. If a P3.x change needs an adjustment, prepare and validate it there, but write it (with a backup) only after
   the T3.4.3 liveness probe shows the final code. Exploration stays 0 (recommend 0.05 in the summary, the owner
@@ -1026,7 +1026,7 @@ install, owner migration evidence.
 8. Stats show role × tier dispatches, signals by kind, budgets, authority requests, unknown bindings, exploration and
    tokens.
 9. Docs, ADR 0006, CONFIG_REFERENCE, README, CHANGELOG complete; docs-drift green.
-10. CI 12/12 green on the merge SHA; capped full suite green on `master`.
+10. Every CI check green on the merge SHA (17 on PR #85); capped full suite green on `master`.
 11. Global QA: zero open blocking/critical/major.
 12. Owner config migrated at DF-2 with a backup: validated in a temp HOME against the synced code, written only after
     the liveness probe, verified live, and re-validated against the final code in P3.4; 2.4.0 published after human
@@ -1172,6 +1172,17 @@ prompt (§0.2.3).
   orchestrators write `d=grader`/`d=deterministic` to claim detection. (5) Observed on host 2.0.24: tool-success
   events carry no `outputPaths`, so a role child cannot read its own truncated tool outputs (fails closed); recorded
   as a limitation. (6) A role's default assurance is descriptive only.
+- R10 (P3.3 global QA, 2026-10-09). (1) `run`, `incomplete` and `redispatch` signals are routing statistics only
+  (decision-log rows read by `routing:stats`); only verdicts (and independent grader verdicts at 0.5) move the outcome
+  store the kernel reads. (2) I1 exemption: verification reasons are rendered one per line with line breaks joined and
+  at most 20 items plus a count, in tier mode too; grader text is also cut at 500 characters. (3) `routing.run.envPassthrough`
+  is removed (it was never wired); credential-like names (incl. `PGPASSWORD`, `MYSQL_PWD`) are always stripped.
+  (4) Pre-existing tests edited in P3.3 fix branches are signature/fixture adjustments or pins of the defects being fixed;
+  each is named in `docs\qa\role-tier\global.md` (criterion 3 deviation record). (5) T3.4.1 merges PR #85 with a merge
+  commit. (6) Role resumes keep the dispatch's facts, `[acceptance]`, `VERIFY:` lines and `d=` claim (a new block
+  replaces them); carried checks are judged on the child's cumulative changes and are unverifiable when the first attempt
+  was never gated. (7) Dynamic roles: a route-line `needs=` narrows the classifier's needs; classification runs in the
+  bound work root. (8) Role `edit` needs a validated work root (ladder included) and never touches `.git`.
 
 ## 10. Risks and mitigations
 | Risk | Mitigation |
