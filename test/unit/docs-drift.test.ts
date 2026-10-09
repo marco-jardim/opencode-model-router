@@ -57,6 +57,10 @@ import {
   buildDelegationProtocol,
 } from "../../src/router/protocol";
 import type { RouterConfig } from "../../src/index";
+import {
+  DEFAULT_EFFORT, DEFAULT_STATUS_OPTIONS, MAX_ROWS_MAX, MAX_ROWS_MIN, parseOptions, ROW_SEPARATOR, STATUS_NOTICE_PREFIX, STATUS_OPTION_KEYS,
+} from "../../src/tui/status-model";
+import { effortRpc } from "../../src/tui/effort-rpc";
 
 /**
  * Documentation-drift guards.
@@ -1424,5 +1428,280 @@ describe("docs drift: #84 P3.3 global QA round 2 (QA-G-C-2-1, QA-G-C-2-2)", () =
     // negative: the claim QA-G-C-2-2 found false
     expect(guide).not.toContain("back under the tier agents' 25-call cap");
     expect(read("docs/adr/0006-role-tier-assurance-delegation.md").replace(/\s+/g, " ")).toContain("or when a `subagentTiers` entry maps the role's name to a tier");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenCode v2 TUI status (#90 P2.2): docs/TUI_STATUS.md, the "TUI status options (OpenCode v2)" section of
+// CONFIG_REFERENCE.md, the README section and the [Unreleased] entry. The options tables are the parser's keys,
+// defaults and `maxRows` range; the slot names, the plugin id and the rpc id are the code's; the v2 TUI config file is
+// `cli.json`, never `tui.json`. `src/tui/plugin.ts` imports `@opentui/solid`, which only the host serves, so its
+// constants are read from the source.
+// ---------------------------------------------------------------------------
+
+/** The value of `export const <name> = "<string>";` or `= <digits>;` in `source` (digit separators dropped). */
+function exportedConst(source: string, name: string): string | undefined {
+  const match = new RegExp(`^export const ${name} = (?:"([^"\\r\\n]*)"|([\\d_]+));\\r?$`, "m").exec(source);
+  return match === null ? undefined : (match[1] ?? match[2]!.replace(/_/g, ""));
+}
+
+/** The `heading` line of `doc` and what follows it up to the next heading of the same or a higher level (fences skipped); "" when absent. */
+function sectionOf(doc: string, heading: string): string {
+  const level = heading.indexOf(" ");
+  const prose = proseLines(doc);
+  const start = prose.find((line) => line.text === heading)?.line;
+  if (start === undefined) return "";
+  const next = new RegExp(`^#{1,${level}} `);
+  const end = prose.find((line) => line.line > start && next.test(line.text))?.line;
+  return doc.split(/\r?\n/).slice(start - 1, end === undefined ? undefined : end - 1).join("\n");
+}
+
+const TUI_OPTIONS_HEADER: readonly string[] = ["Key", "Type", "Default", "Values / range", "Controls"];
+
+/** Every difference between the `<!-- tui-status-options -->` table of `doc` and the parser's keys, types, defaults and range. */
+function tuiOptionsTableProblems(doc: string): string[] {
+  const table = tableAfter(doc, "tui-status-options");
+  if (table === undefined) return ["no options table"];
+  const problems: string[] = [];
+  if (JSON.stringify(table.header) !== JSON.stringify(TUI_OPTIONS_HEADER)) problems.push(`header ${table.header.join(" | ")}`);
+  const keys = table.rows.map((row) => row[0] ?? "");
+  const want = STATUS_OPTION_KEYS.map((key) => tick(key));
+  if (JSON.stringify(keys) !== JSON.stringify(want)) problems.push(`keys ${keys.join(", ")}; code ${want.join(", ")}`);
+  for (const row of table.rows) {
+    const key = /^`(\w+)`$/.exec(row[0] ?? "")?.[1];
+    if (key === undefined || !Object.hasOwn(DEFAULT_STATUS_OPTIONS, key)) continue;
+    const value = (DEFAULT_STATUS_OPTIONS as Readonly<Record<string, unknown>>)[key];
+    const type = typeof value === "boolean" ? "`boolean`" : "`integer`";
+    const range = typeof value === "boolean" ? "`true \\| false`" : `\`[${MAX_ROWS_MIN}, ${MAX_ROWS_MAX}]\``;
+    if (row[1] !== type) problems.push(`${key} type: doc ${row[1] ?? "(none)"}, code ${type}`);
+    if (row[2] !== defaultCell(value)) problems.push(`${key} default: doc ${row[2] ?? "(none)"}, code ${defaultCell(value)}`);
+    if (row[3] !== range) problems.push(`${key} range: doc ${row[3] ?? "(none)"}, code ${range}`);
+  }
+  return problems;
+}
+
+/** The host slot names (`prompt.footer.status`, `session.composer.top`, …) `text` names in backticks, sorted. */
+function slotNamesOf(text: string): string[] {
+  return [...new Set([...text.matchAll(/`((?:app|home|prompt|session|sidebar)\.[a-z.]*[a-z])`/g)].map((m) => m[1]!))].sort();
+}
+
+/** The `plugins` list of every `<!-- cli.json example -->` JSON block of `text`. */
+function cliJsonExamples(text: string): unknown[][] {
+  return [...text.matchAll(/<!-- cli\.json example -->\s*```json\r?\n([\s\S]*?)\r?\n```/g)].map((m) => {
+    const parsed = JSON.parse(m[1]!) as { plugins?: unknown };
+    return Array.isArray(parsed.plugins) ? parsed.plugins : [];
+  });
+}
+
+/**
+ * What is wrong with a `cli.json` example's `plugins` list: a `package` that is the plugin id (its options would be
+ * dropped) or neither the package name nor a directory ending in it (the host ignores a path to `tui.ts`), options
+ * `parseOptions` rejects, a string other than the `-<id>` selector, or an explicit entry after that selector.
+ */
+function cliJsonEntryProblems(plugins: readonly unknown[], id: string): string[] {
+  const problems: string[] = [];
+  let selector = false;
+  for (const entry of plugins) {
+    if (typeof entry === "string") {
+      if (entry === `-${id}`) selector = true;
+      else problems.push(`string entry ${entry}`);
+      continue;
+    }
+    const { package: name, options } = (entry ?? {}) as { package?: unknown; options?: unknown };
+    if (selector) problems.push(`explicit entry ${String(name)} after -${id}`);
+    if (name === id) problems.push(`package is the plugin id ${id}`);
+    else if (typeof name !== "string" || !/(?:^|[\\/])opencode-model-router$/.test(name)) problems.push(`package ${String(name)}`);
+    problems.push(...parseOptions(options).notices);
+  }
+  return problems;
+}
+
+/**
+ * `tui.json` named in a fenced block, or in a prose paragraph that does not say it is OpenCode v1's file and name
+ * `cli.json` (the only way the docs may mention it).
+ */
+function tuiJsonProblems(text: string): string[] {
+  const prose = proseLines(text);
+  const proseNumbers = new Set(prose.map((line) => line.line));
+  const problems: string[] = [];
+  if (text.split(/\r?\n/).some((line, index) => !proseNumbers.has(index + 1) && line.includes("tui.json"))) problems.push("a fenced block names tui.json");
+  for (const paragraph of prose.map((line) => line.text).join("\n").split(/\n\s*\n/)) {
+    if (paragraph.includes("tui.json") && !(paragraph.includes("cli.json") && /\bv1\b/.test(paragraph))) {
+      problems.push(`tui.json as a v2 config file: ${paragraph.replace(/\s+/g, " ").trim()}`);
+    }
+  }
+  return problems;
+}
+
+describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
+  const guide = read("docs/TUI_STATUS.md");
+  const flat = guide.replace(/\s+/g, " ");
+  const section = sectionOf(read("docs/CONFIG_REFERENCE.md"), "## TUI status options (OpenCode v2)");
+  const readme = sectionOf(read("README.md"), "## TUI status (OpenCode v2)");
+  const added = sectionOf(sectionOf(read("CHANGELOG.md"), "## [Unreleased]"), "### Added");
+  const plugin = read("src/tui/plugin.ts");
+  const pluginID = exportedConst(plugin, "STATUS_PLUGIN_ID") ?? "(no STATUS_PLUGIN_ID)";
+  const docs = [["TUI_STATUS.md", guide], ["CONFIG_REFERENCE.md", section], ["README.md", readme], ["CHANGELOG.md", added]] as const;
+
+  it("finds the guide, both sections and the [Unreleased] Added entry", () => {
+    for (const [name, text] of docs) expect(text.length, name).toBeGreaterThan(200);
+  });
+
+  it("(a) both options tables are STATUS_OPTION_KEYS with DEFAULT_STATUS_OPTIONS and the maxRows range parseOptions enforces", () => {
+    expect(Object.keys(DEFAULT_STATUS_OPTIONS)).toEqual([...STATUS_OPTION_KEYS]);
+    expect(tuiOptionsTableProblems(guide)).toEqual([]);
+    expect(tuiOptionsTableProblems(section)).toEqual([]);
+    const maxRowsNotices = (maxRows: unknown): number => parseOptions({ maxRows }).notices.length;
+    expect([MAX_ROWS_MIN, MAX_ROWS_MAX].map(maxRowsNotices)).toEqual([0, 0]);
+    expect([MAX_ROWS_MIN - 1, MAX_ROWS_MAX + 1, MAX_ROWS_MIN + 0.5, String(MAX_ROWS_MIN)].map(maxRowsNotices)).toEqual([1, 1, 1, 1]);
+    for (const key of STATUS_OPTION_KEYS.filter((k) => k !== "maxRows")) {
+      expect(parseOptions({ [key]: false }).options[key], key).toBe(false);
+      expect(parseOptions({ [key]: "false" }).notices, key).toHaveLength(1);
+    }
+    for (const [name, text] of docs) for (const key of STATUS_OPTION_KEYS) expect(text, `${name}: ${key}`).toContain(tick(key));
+  });
+
+  it("(a) detects a dropped row, a changed type, default or range, an extra row and a missing table", () => {
+    const dropped = section.split("\n").filter((line) => !line.startsWith("| `childView` |")).join("\n");
+    expect(tuiOptionsTableProblems(dropped)).toEqual([expect.stringMatching(/^keys .*; code /)]);
+    const maxRowsRow = section.split("\n").find((line) => line.startsWith("| `maxRows` |")) ?? "(no maxRows row)";
+    const withRow = (row: string): string => section.replace(maxRowsRow, row);
+    const range = `\`[${MAX_ROWS_MIN}, ${MAX_ROWS_MAX}]\``;
+    const fallback = tick(String(DEFAULT_STATUS_OPTIONS.maxRows));
+    expect(tuiOptionsTableProblems(withRow(maxRowsRow.replace(`| ${fallback} |`, "| `99` |")))).toEqual([`maxRows default: doc \`99\`, code ${fallback}`]);
+    expect(tuiOptionsTableProblems(withRow(maxRowsRow.replace(range, "`[1, 99]`")))).toEqual([`maxRows range: doc \`[1, 99]\`, code ${range}`]);
+    expect(tuiOptionsTableProblems(withRow(maxRowsRow.replace("`integer`", "`number`")))).toEqual(["maxRows type: doc `number`, code `integer`"]);
+    const extra = `${maxRowsRow}\n| \`compact\` | \`boolean\` | \`false\` | \`true \\| false\` | x |`;
+    expect(tuiOptionsTableProblems(withRow(extra))).toEqual([expect.stringMatching(/^keys .*`compact`; code /)]);
+    expect(tuiOptionsTableProblems("# no table\n")).toEqual(["no options table"]);
+  });
+
+  it("(b) names the two slots src/tui/plugin.ts claims, each for the views that claim it, and no other slot", () => {
+    const footer = exportedConst(plugin, "FOOTER_SLOT") ?? "(no FOOTER_SLOT)";
+    const composer = exportedConst(plugin, "COMPOSER_SLOT") ?? "(no COMPOSER_SLOT)";
+    expect([footer, composer]).toEqual(["prompt.footer.status", "session.composer.top"]);
+    // the code's claims: G1 (`footer`) the footer slot, G2 and G3 (`childView`, `runningRow`) the composer slot
+    expect([...plugin.matchAll(/\{ append: (\w+), render:/g)].map((m) => m[1])).toEqual(["FOOTER_SLOT", "COMPOSER_SLOT"]);
+    expect(plugin).toMatch(/if \(options\.footer\) \{\s+register\(\s+context,\s+\{ append: FOOTER_SLOT,/);
+    expect(plugin).toMatch(/if \(options\.childView \|\| options\.runningRow\) \{\s+register\(\s+context,\s+\{ append: COMPOSER_SLOT,/);
+    expect(slotNamesOf(guide)).toEqual([footer, composer]);
+    expect(slotNamesOf(section)).toEqual([footer, composer]);
+    for (const [name, text] of docs) expect(slotNamesOf(text).filter((slot) => slot !== footer && slot !== composer), name).toEqual([]);
+    for (const doc of [guide, section]) {
+      const controls = new Map((tableAfter(doc, "tui-status-options")?.rows ?? []).map((row) => [row[0] ?? "", row[4] ?? ""] as const));
+      expect(controls.get("`footer`")).toContain(tick(footer));
+      expect(controls.get("`childView`")).toContain(tick(composer));
+      expect(controls.get("`runningRow`")).toContain(tick(composer));
+    }
+    expect(slotNamesOf("`prompt.footer` and `sidebar.content`")).toEqual(["prompt.footer", "sidebar.content"]);
+  });
+
+  it("(c) names the plugin id and the effort rpc as the code defines them, and no other id", () => {
+    expect(pluginID).toBe("opencode-model-router.status");
+    expect(plugin).toContain("const plugin: StatusPluginDefinition = { id: STATUS_PLUGIN_ID, setup };");
+    expect(effortRpc.id).toBe("opencode-model-router.effort");
+    expect(Object.keys(effortRpc.methods)).toEqual(["effortOf"]);
+    expect(Object.keys(effortRpc.methods.effortOf.input.properties)).toEqual(["sessionID"]);
+    expect(Object.keys(effortRpc.methods.effortOf.output.properties)).toContain("thinkingBudget");
+    expect(plugin).toContain('import { effortRpc } from "./effort-rpc.ts";');
+    expect(plugin).toContain("host.rpc(effortRpc)");
+    expect(guide).toContain(tick(pluginID));
+    expect(section).toContain(tick(pluginID));
+    for (const text of [guide, readme, added]) expect(text).toContain(tick(effortRpc.id));
+    expect(flat).toContain("method `effortOf({ sessionID })`");
+    expect(flat).toContain("The channel carries the budget as `thinkingBudget`, but the views do not display it.");
+    for (const [name, text] of docs) {
+      expect(text, name).toContain(`"-${pluginID}"`);
+      const ids = new Set([...text.matchAll(/opencode-model-router\.[a-z]+\b/g)].map((m) => m[0]));
+      expect([...ids].filter((id) => id !== pluginID && id !== effortRpc.id), name).toEqual([]);
+    }
+    expect(flat).toContain(`do not write \`"package": "${pluginID}"\`. An entry whose \`package\` equals the id of a plugin that is already loaded is treated as an enable selector, and its \`options\` are dropped.`);
+  });
+
+  it("(c) every cli.json example uses the package name or directory, valid options and the selector after the entries", () => {
+    const guideExamples = cliJsonExamples(guide);
+    const readmeExamples = cliJsonExamples(readme);
+    expect(guideExamples).toHaveLength(3);
+    expect(readmeExamples).toHaveLength(1);
+    for (const plugins of [...guideExamples, ...readmeExamples]) {
+      expect(plugins.length).toBeGreaterThan(0);
+      expect(cliJsonEntryProblems(plugins, pluginID)).toEqual([]);
+    }
+    const entries = guideExamples.flat();
+    expect(entries).toContainEqual(expect.objectContaining({ package: "opencode-model-router" }));
+    expect(entries).toContainEqual(expect.objectContaining({ package: expect.stringMatching(/^\/.*\/opencode-model-router$/) }));
+    expect(entries).toContain(`-${pluginID}`);
+    // negative fixtures
+    expect(cliJsonEntryProblems([{ package: pluginID, options: { maxRows: 6 } }], pluginID)).toEqual([`package is the plugin id ${pluginID}`]);
+    expect(cliJsonEntryProblems([{ package: "/x/opencode-model-router/tui.ts" }], pluginID)).toEqual(["package /x/opencode-model-router/tui.ts"]);
+    expect(cliJsonEntryProblems([{ package: "opencode-model-router", options: { maxRows: MAX_ROWS_MAX + 1 } }], pluginID)).toHaveLength(1);
+    expect(cliJsonEntryProblems([`-${pluginID}`, { package: "opencode-model-router" }], pluginID)).toEqual([`explicit entry opencode-model-router after -${pluginID}`]);
+    expect(cliJsonEntryProblems([pluginID], pluginID)).toEqual([`string entry ${pluginID}`]);
+  });
+
+  it("(d) names cli.json as the v2 TUI config file and never tells v2 users to use tui.json", () => {
+    for (const [name, text] of docs) {
+      expect(text, name).toContain("`cli.json`");
+      expect(tuiJsonProblems(text), name).toEqual([]);
+    }
+    const where = "`<config dir>/cli.json` (for example `~/.config/opencode/cli.json`)";
+    expect(flat).toContain(where);
+    expect(section.replace(/\s+/g, " ")).toContain(where);
+    expect(flat).toContain("`tui.json` is OpenCode v1's TUI config file. OpenCode v2 reads it only to migrate it when `cli.json` does not exist");
+    // negative fixtures
+    expect(tuiJsonProblems("Add the entry to `~/.config/opencode/tui.json`.\n")).toHaveLength(1);
+    expect(tuiJsonProblems("Options go in `cli.json`.\n\nOr in `tui.json` on v2.\n")).toHaveLength(1);
+    expect(tuiJsonProblems("```json\n// tui.json\n{}\n```\n")).toEqual(["a fenced block names tui.json"]);
+    expect(tuiJsonProblems("`tui.json` is OpenCode v1's file; v2 uses `cli.json`.\n")).toEqual([]);
+  });
+
+  it("quotes the notices parseOptions emits and the rows the views render", () => {
+    const invalid = parseOptions({ maxRows: "x" }).notices[0] ?? "(no notice)";
+    expect(invalid).toBe(`${STATUS_NOTICE_PREFIX}invalid TUI options ("maxRows" must be an integer from ${MAX_ROWS_MIN} to ${MAX_ROWS_MAX}); using defaults for those keys`);
+    expect(flat).toContain(tick(invalid));
+    expect(section.replace(/\s+/g, " ")).toContain(tick(invalid));
+    expect(flat).toContain(tick(parseOptions("x").notices[0] ?? "(no notice)"));
+    const row = ["<agent>", "<model>", "<effort>"].join(ROW_SEPARATOR);
+    for (const [name, text] of docs) {
+      expect(text, name).toContain(tick(row));
+      expect(text, name).toContain("`+<k> more`");
+    }
+    expect(plugin).toContain("formatRow([`effort ${value}`]");
+    expect(plugin).toContain("formatRow([`+${running.overflow} more`]");
+    expect(plugin).toContain("`${shown} (${recorded})`");
+    expect(flat).toContain(tick(`effort ${DEFAULT_EFFORT}`));
+    expect(flat).toContain("`<effort> (<variant>)`");
+  });
+
+  it("quotes the host versions, the poll, retry and width numbers and the peer dependency of the code", () => {
+    const seconds = (name: string): number => Number(exportedConst(plugin, name)) / 1000;
+    const timings = ["POLL_INTERVAL_MS", "BACKOFF_START_MS", "BACKOFF_MAX_MS", "FAILURE_COOLDOWN_MS"].map(seconds);
+    expect(timings.every((value) => Number.isFinite(value) && value > 0)).toBe(true);
+    expect(flat).toContain(`every ${seconds("POLL_INTERVAL_MS")} s while the session runs`);
+    expect(flat).toContain(`(${seconds("BACKOFF_START_MS")} s, doubling up to ${seconds("BACKOFF_MAX_MS")} s)`);
+    expect(flat).toContain(`the views use the message's variant for ${seconds("FAILURE_COOLDOWN_MS")} s`);
+    const margin = Number(exportedConst(plugin, "WIDTH_MARGIN"));
+    expect(margin).toBeGreaterThan(0);
+    expect(flat).toContain(`terminal width minus ${margin} columns`);
+    expect(flat).toContain("needs OpenCode 2.0.24 or later and was verified on 2.0.24, 2.0.25 and 2.0.26");
+    expect(flat).toContain("v1 never loads `tui.ts`");
+    expect(Object.keys(JSON.parse(read("package.json")).peerDependencies)).toContain("@opencode-ai/plugin");
+    expect(flat).toContain("needs the `@opencode-ai/plugin` peer dependency installed");
+    for (const text of [flat, readme.replace(/\s+/g, " ")]) expect(text).toMatch(/[Tt]he router applies no effort to primary agents/);
+  });
+
+  it("links the guide from the README, the deep-dive list, the config reference and the changelog; the guide's links resolve", () => {
+    expect(readme).toContain("(docs/TUI_STATUS.md)");
+    expect(readme).toContain("(docs/CONFIG_REFERENCE.md#tui-status-options-opencode-v2)");
+    expect(read("README.md")).toContain("- `docs/TUI_STATUS.md` —");
+    expect(section).toContain("(./TUI_STATUS.md)");
+    expect(added).toContain("**OpenCode v2 TUI status (#90).**");
+    expect(added).toContain("(docs/TUI_STATUS.md)");
+    expect(brokenLinks(["docs/TUI_STATUS.md"], readRepo)).toEqual([]);
+    for (const path of ["tui.ts", "src/tui/plugin.ts", "src/tui/status-model.ts", "src/tui/effort-rpc.ts", "src/tui/effort-channel.ts"]) {
+      expect(readRepo(path), path).toBeDefined();
+      expect(guide, path).toContain(tick(path));
+    }
+    expect(read("tui.ts")).toContain('export { default } from "./src/tui/plugin.ts";');
   });
 });
